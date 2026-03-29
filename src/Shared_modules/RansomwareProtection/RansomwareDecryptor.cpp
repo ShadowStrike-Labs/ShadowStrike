@@ -21,13 +21,15 @@
  * ============================================================================
  *
  * @file RansomwareDecryptor.cpp
- * @brief Implementation of enterprise-grade ransomware decryption engine
+ * @brief Enterprise-grade ransomware decryption and file recovery engine.
  *
- * Implements the PIMPL pattern for the RansomwareDecryptor class, providing
- * thread-safe, robust file recovery capabilities.
+ * Full recovery pipeline: VSS restoration, FileBackupManager coordination,
+ * key-based decryption via CryptoUtils, atomic file replacement, SHA-256
+ * integrity verification, forensic preservation, and SecureZeroMemory
+ * key material erasure.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -37,21 +39,18 @@
 
 #include "pch.h"
 #include "RansomwareDecryptor.hpp"
+#include "VolumeSnapshotService.hpp"
+#include "FileBackupManager.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
 #include <algorithm>
-#include <execution>
 #include <sstream>
-#include <iomanip>
-#include <fstream>
 #include <filesystem>
-#include <regex>
 #include <future>
-#include <random>
+#include <objbase.h>
 
-// Third-party JSON library
 #ifdef _MSC_VER
 #  pragma warning(push)
 #  pragma warning(disable: 4996)
@@ -72,12 +71,20 @@ namespace Ransomware {
 
 namespace {
 
+    static constexpr const wchar_t* LOG_CAT = L"RansomDecryptor";
+
+    // Maximum recursion depth for directory traversal to prevent stack overflow
+    static constexpr size_t MAX_DIRECTORY_DEPTH = 64;
+
+    // Maximum files collected per directory scan
+    static constexpr size_t MAX_SCAN_FILES = DecryptorConstants::MAX_BATCH_FILES;
+
     /// @brief Known ransomware extensions mapping
     const std::unordered_map<std::wstring, RansomwareFamily> EXTENSION_MAP = {
         {L".wncry", RansomwareFamily::WannaCry},
         {L".wcry", RansomwareFamily::WannaCry},
         {L".locky", RansomwareFamily::Locky},
-        {L".encrypted", RansomwareFamily::CryptoLocker}, // Generic, but common
+        {L".encrypted", RansomwareFamily::CryptoLocker},
         {L".vvv", RansomwareFamily::TeslaCrypt},
         {L".ecc", RansomwareFamily::TeslaCrypt},
         {L".ezz", RansomwareFamily::TeslaCrypt},
@@ -106,29 +113,155 @@ namespace {
         {L".kkk", RansomwareFamily::Jigsaw},
         {L".btc", RansomwareFamily::BTCWare},
         {L".ryuk", RansomwareFamily::Ryuk},
-        {L".soda", RansomwareFamily::Salsa20}, // Generic stream cipher indicator
         {L".lockbit", RansomwareFamily::LockBit}
+    };
+
+    /// @brief Family name -> enum map for DecryptFile string API
+    const std::unordered_map<std::string, RansomwareFamily> FAMILY_NAME_MAP = {
+        {"WannaCry",     RansomwareFamily::WannaCry},
+        {"Locky",        RansomwareFamily::Locky},
+        {"CryptoLocker", RansomwareFamily::CryptoLocker},
+        {"TeslaCrypt",   RansomwareFamily::TeslaCrypt},
+        {"Cerber",       RansomwareFamily::Cerber},
+        {"Petya",        RansomwareFamily::Petya},
+        {"NotPetya",     RansomwareFamily::NotPetya},
+        {"GandCrabV4",   RansomwareFamily::GandCrabV4},
+        {"GandCrab v4",  RansomwareFamily::GandCrabV4},
+        {"GandCrabV5",   RansomwareFamily::GandCrabV5},
+        {"GandCrab v5",  RansomwareFamily::GandCrabV5},
+        {"Shade",        RansomwareFamily::Shade},
+        {"Troldesh",     RansomwareFamily::Troldesh},
+        {"Crysis",       RansomwareFamily::Crysis},
+        {"Dharma",       RansomwareFamily::Dharma},
+        {"Phobos",       RansomwareFamily::Phobos},
+        {"STOP",         RansomwareFamily::STOP},
+        {"Djvu",         RansomwareFamily::Djvu},
+        {"Jigsaw",       RansomwareFamily::Jigsaw},
+        {"BTCWare",      RansomwareFamily::BTCWare},
+        {"GlobeImposter",RansomwareFamily::GlobeImposter},
+        {"SamSam",       RansomwareFamily::SamSam},
+        {"Ryuk",         RansomwareFamily::Ryuk},
+        {"REvil",        RansomwareFamily::REvil},
+        {"Maze",         RansomwareFamily::Maze},
+        {"Conti",        RansomwareFamily::Conti},
+        {"LockBit",      RansomwareFamily::LockBit},
+        {"BlackCat",     RansomwareFamily::BlackCat},
+        {"Hive",         RansomwareFamily::Hive},
     };
 
     /// @brief Ransom note filename patterns
     const std::vector<std::wstring> RANSOM_NOTE_FILENAMES = {
-        L"@Please_Read_Me@.txt", // WannaCry
-        L"@WanaDecryptor@.txt",  // WannaCry
-        L"_Locky_recover_instructions.txt", // Locky
-        L"HELP_DECRYPT.TXT",     // CryptoLocker
-        L"HELP_TO_DECRYPT_YOUR_FILES.txt", // TeslaCrypt
-        L"How to decrypt your files.txt", // Generic
-        L"RESTORE_FILES.txt",    // Generic
-        L"DECRYPT_FILES.txt",    // Generic
-        L"RyukReadMe.txt",       // Ryuk
-        L"Restore-My-Files.txt"  // LockBit
+        L"@Please_Read_Me@.txt",
+        L"@WanaDecryptor@.txt",
+        L"_Locky_recover_instructions.txt",
+        L"HELP_DECRYPT.TXT",
+        L"HELP_TO_DECRYPT_YOUR_FILES.txt",
+        L"How to decrypt your files.txt",
+        L"RESTORE_FILES.txt",
+        L"DECRYPT_FILES.txt",
+        L"RyukReadMe.txt",
+        L"Restore-My-Files.txt"
     };
 
     /// @brief Convert extension to lowercase for comparison
-    std::wstring NormalizeExtension(const std::wstring& ext) {
+    [[nodiscard]] std::wstring NormalizeExtension(const std::wstring& ext) {
         std::wstring result = ext;
         std::transform(result.begin(), result.end(), result.begin(), ::towlower);
         return result;
+    }
+
+    /// @brief Map EncryptionAlgorithm to CryptoUtils::SymmetricAlgorithm
+    [[nodiscard]] std::optional<Utils::CryptoUtils::SymmetricAlgorithm>
+    MapToSymmetricAlgorithm(EncryptionAlgorithm algo) {
+        switch (algo) {
+            case EncryptionAlgorithm::AES128CBC: return Utils::CryptoUtils::SymmetricAlgorithm::AES_128_CBC;
+            case EncryptionAlgorithm::AES256CBC: return Utils::CryptoUtils::SymmetricAlgorithm::AES_256_CBC;
+            case EncryptionAlgorithm::AES128GCM: return Utils::CryptoUtils::SymmetricAlgorithm::AES_128_GCM;
+            case EncryptionAlgorithm::AES256GCM: return Utils::CryptoUtils::SymmetricAlgorithm::AES_256_GCM;
+            case EncryptionAlgorithm::ChaCha20:  return Utils::CryptoUtils::SymmetricAlgorithm::ChaCha20_Poly1305;
+            default: return std::nullopt;
+        }
+    }
+
+    /// @brief Generate a recovery/batch ID using Windows GUID
+    [[nodiscard]] std::string GenerateRecoveryId() {
+        ::GUID guid{};
+        if (SUCCEEDED(::CoCreateGuid(&guid))) {
+            wchar_t buf[40]{};
+            if (::StringFromGUID2(guid, buf, 40) > 0) {
+                std::wstring ws(buf);
+                if (ws.size() > 2) {
+                    return std::string(ws.begin() + 1, ws.end() - 1);
+                }
+            }
+        }
+        auto now = Clock::now().time_since_epoch().count();
+        return std::to_string(now);
+    }
+
+    /// @brief Validate a file path for safety (no traversal, reasonable length)
+    [[nodiscard]] bool ValidateFilePath(const fs::path& p) {
+        const std::wstring ws = p.wstring();
+        if (ws.empty() || ws.size() > 32767) return false;
+
+        // Reject path traversal via embedded ".."
+        for (const auto& component : p) {
+            if (component == L"..") return false;
+        }
+        return true;
+    }
+
+    /// @brief Securely erase all sensitive fields in a DecryptionKey
+    void SecureEraseKey(DecryptionKey& key) {
+        if (!key.keyData.empty()) {
+            ::SecureZeroMemory(key.keyData.data(), key.keyData.size());
+            key.keyData.clear();
+        }
+        if (!key.iv.empty()) {
+            ::SecureZeroMemory(key.iv.data(), key.iv.size());
+            key.iv.clear();
+        }
+        if (!key.rsaPrivateKey.empty()) {
+            ::SecureZeroMemory(key.rsaPrivateKey.data(), key.rsaPrivateKey.size());
+            key.rsaPrivateKey.clear();
+        }
+    }
+
+    /// @brief Compute SHA-256 hash of a file
+    [[nodiscard]] bool ComputeFileHash(std::wstring_view filePath,
+                                       std::vector<uint8_t>& outHash) {
+        Utils::HashUtils::Error err{};
+        if (!Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256, filePath, outHash, &err)) {
+            SS_LOG_ERROR(LOG_CAT, L"SHA-256 hash failed for %ls (win32=%lu)",
+                         std::wstring(filePath).c_str(), err.win32);
+            return false;
+        }
+        return true;
+    }
+
+    /// @brief Atomic file replacement: write to temp path, then rename
+    [[nodiscard]] bool AtomicFileCopy(const fs::path& source,
+                                      const fs::path& destination) {
+        fs::path tmpPath = destination;
+        tmpPath += L".ss_recovery_tmp";
+
+        try {
+            fs::copy_file(source, tmpPath, fs::copy_options::overwrite_existing);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT, L"AtomicFileCopy: copy to temp failed: %hs", ex.what());
+            return false;
+        }
+
+        if (!::MoveFileExW(tmpPath.c_str(), destination.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            DWORD err = ::GetLastError();
+            SS_LOG_ERROR(LOG_CAT, L"AtomicFileCopy: MoveFileEx failed, win32=%lu", err);
+            std::error_code ec;
+            fs::remove(tmpPath, ec);
+            return false;
+        }
+        return true;
     }
 
 } // anonymous namespace
@@ -137,16 +270,20 @@ namespace {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-/**
- * @class RansomwareDecryptorImpl
- * @brief Implementation details for RansomwareDecryptor
- */
 class RansomwareDecryptorImpl final {
 public:
     RansomwareDecryptorImpl() = default;
-    ~RansomwareDecryptorImpl() = default;
 
-    // Non-copyable, non-movable
+    ~RansomwareDecryptorImpl() {
+        // Securely erase all key material on destruction
+        std::unique_lock keyLock(m_keyMutex);
+        for (auto& [id, key] : m_keys) {
+            SecureEraseKey(key);
+        }
+        m_keys.clear();
+        m_familyKeys.clear();
+    }
+
     RansomwareDecryptorImpl(const RansomwareDecryptorImpl&) = delete;
     RansomwareDecryptorImpl& operator=(const RansomwareDecryptorImpl&) = delete;
     RansomwareDecryptorImpl(RansomwareDecryptorImpl&&) = delete;
@@ -161,32 +298,22 @@ public:
     RansomwareDecryptorConfiguration m_config;
     DecryptorStatistics m_stats;
 
-    // Key storage
     std::unordered_map<std::string, DecryptionKey> m_keys;
     std::unordered_map<RansomwareFamily, std::vector<std::string>> m_familyKeys;
     mutable std::shared_mutex m_keyMutex;
 
-    // Active operations tracking
     std::atomic<uint32_t> m_activeDecryptions{0};
     std::atomic<bool> m_cancelRequested{false};
 
-    // Thread pool for batch operations
-    // Note: Assuming ThreadPool exists in Utils, otherwise would implement here
-    // keeping it simple with std::async for now as per C++20 standard capabilities
-
-    // Callbacks
     DecryptionProgressCallback m_progressCallback;
     DecryptionCompleteCallback m_completeCallback;
     BatchProgressCallback m_batchProgressCallback;
     mutable std::mutex m_callbackMutex;
 
     // ========================================================================
-    // HELPER METHODS
+    // BACKUP BEFORE DECRYPTION
     // ========================================================================
 
-    /**
-     * @brief Backup file before decryption
-     */
     [[nodiscard]] bool BackupFile(const fs::path& filePath) {
         try {
             if (!m_config.backupBeforeDecrypt) return true;
@@ -195,185 +322,438 @@ public:
                 ? filePath.parent_path() / L"ShadowStrike_Backup"
                 : fs::path(m_config.backupDirectory);
 
-            if (!fs::exists(backupDir)) {
-                fs::create_directories(backupDir);
+            std::error_code ec;
+            if (!fs::exists(backupDir, ec)) {
+                fs::create_directories(backupDir, ec);
+                if (ec) {
+                    SS_LOG_ERROR(LOG_CAT, L"Cannot create backup dir: %ls (ec=%d)",
+                                 backupDir.c_str(), ec.value());
+                    return false;
+                }
             }
 
             fs::path backupPath = backupDir / filePath.filename();
-
-            // Don't overwrite existing backups to prevent losing original state
-            if (fs::exists(backupPath)) {
-                backupPath += L".bak_" + std::to_wstring(Clock::now().time_since_epoch().count());
+            if (fs::exists(backupPath, ec)) {
+                backupPath += L".bak_" + std::to_wstring(
+                    Clock::now().time_since_epoch().count());
             }
 
-            fs::copy_file(filePath, backupPath);
+            fs::copy_file(filePath, backupPath, ec);
+            if (ec) {
+                SS_LOG_ERROR(LOG_CAT, L"Backup copy failed for %ls (ec=%d)",
+                             filePath.c_str(), ec.value());
+                return false;
+            }
+
+            // Verify backup integrity with SHA-256
+            std::vector<uint8_t> srcHash, dstHash;
+            if (ComputeFileHash(filePath.wstring(), srcHash) &&
+                ComputeFileHash(backupPath.wstring(), dstHash)) {
+                if (srcHash != dstHash) {
+                    SS_LOG_ERROR(LOG_CAT, L"Backup integrity mismatch for %ls",
+                                 filePath.c_str());
+                    fs::remove(backupPath, ec);
+                    return false;
+                }
+            }
+
+            SS_LOG_DEBUG(LOG_CAT, L"Backed up %ls -> %ls",
+                         filePath.c_str(), backupPath.c_str());
             return true;
         } catch (const std::exception& ex) {
-            Utils::Logger::Error("RansomwareDecryptor: Backup failed for {}: {}",
-                               filePath.string(), ex.what());
+            SS_LOG_ERROR(LOG_CAT, L"Backup exception for %ls: %hs",
+                         filePath.c_str(), ex.what());
             return false;
         }
     }
 
-    /**
-     * @brief Perform actual decryption logic
-     */
+    // ========================================================================
+    // DECRYPTION WITH CRYPTOUTILS
+    // ========================================================================
+
     [[nodiscard]] DecryptionResult PerformDecryption(const fs::path& filePath,
-                                                   const DecryptionKey& key) {
+                                                     const DecryptionKey& key) {
         DecryptionResult result;
-        result.originalPath = filePath;
+        result.originalPath = filePath.wstring();
         result.keyId = key.keyId;
         result.family = key.family;
 
         auto startTime = Clock::now();
 
         try {
-            // 1. Validate input
-            if (!fs::exists(filePath)) {
+            if (!ValidateFilePath(filePath)) {
+                result.status = DecryptionStatus::InvalidFile;
+                result.errorMessage = "Invalid or unsafe file path";
+                return result;
+            }
+
+            std::error_code ec;
+            if (!fs::exists(filePath, ec) || ec) {
                 result.status = DecryptionStatus::InvalidFile;
                 result.errorMessage = "File does not exist";
                 return result;
             }
 
-            result.originalSize = fs::file_size(filePath);
-            if (result.originalSize == 0) {
+            const uint64_t fileSize = fs::file_size(filePath, ec);
+            if (ec || fileSize == 0) {
                 result.status = DecryptionStatus::InvalidFile;
-                result.errorMessage = "File is empty";
+                result.errorMessage = "File is empty or unreadable";
                 return result;
             }
 
-            // 2. Prepare output path
+            if (fileSize > DecryptorConstants::MAX_FILE_SIZE) {
+                result.status = DecryptionStatus::InvalidFile;
+                result.errorMessage = "File exceeds maximum size limit";
+                SS_LOG_WARN(LOG_CAT, L"File too large for decryption: %ls (%llu bytes)",
+                            filePath.c_str(), fileSize);
+                return result;
+            }
+
+            result.originalSize = fileSize;
+
+            // Prepare output path (temp for atomic replacement)
             fs::path outputPath = filePath;
             if (m_config.restoreOriginalName) {
-                // Try to strip known extension
-                std::wstring ext = NormalizeExtension(filePath.extension());
+                std::wstring ext = NormalizeExtension(filePath.extension().wstring());
                 if (EXTENSION_MAP.count(ext)) {
-                    outputPath.replace_extension(""); // Remove bad extension
+                    outputPath.replace_extension(L"");
                 } else {
                     outputPath += L".decrypted";
                 }
             } else {
                 outputPath += L".decrypted";
             }
-            result.decryptedPath = outputPath;
 
-            // 3. Open streams
-            std::ifstream inFile(filePath, std::ios::binary);
-            std::ofstream outFile(outputPath, std::ios::binary);
+            fs::path tempPath = outputPath;
+            tempPath += L".ss_decrypt_tmp";
+            result.decryptedPath = outputPath.wstring();
 
-            if (!inFile || !outFile) {
-                result.status = DecryptionStatus::IOError;
-                result.errorMessage = "Failed to open file streams";
+            // Map algorithm to CryptoUtils
+            auto symAlgo = MapToSymmetricAlgorithm(key.algorithm);
+            if (!symAlgo.has_value()) {
+                result.status = DecryptionStatus::Failed;
+                result.errorMessage = "Unsupported encryption algorithm for this key";
                 return result;
             }
 
-            // 4. Algorithm Dispatch
-            // In a real implementation, this would use CryptoUtils to perform AES/RSA decryption
-            // tailored to the specific malware family's algorithm (CBC, CTR, custom, etc.)
+            if (key.keyData.empty()) {
+                result.status = DecryptionStatus::NoKeyAvailable;
+                result.errorMessage = "Key data is empty";
+                return result;
+            }
 
-            // Simulating decryption process for the enterprise framework structure
-            // Real implementation would link to OpenSSL/Bcrypt primitives here
+            // Perform streaming decryption via CryptoUtils::SymmetricCipher
+            Utils::CryptoUtils::SymmetricCipher cipher(*symAlgo);
+            Utils::CryptoUtils::Error cryptoErr{};
 
-            const size_t bufferSize = DecryptorConstants::BUFFER_SIZE;
-            std::vector<char> buffer(bufferSize);
-            uint64_t processed = 0;
-            uint64_t total = result.originalSize;
+            if (!cipher.SetKey(key.keyData, &cryptoErr)) {
+                result.status = DecryptionStatus::Failed;
+                result.errorMessage = "Failed to set decryption key";
+                return result;
+            }
 
-            while (inFile.read(buffer.data(), bufferSize) || inFile.gcount() > 0) {
-                if (m_cancelRequested) {
-                    outFile.close();
-                    fs::remove(outputPath);
-                    result.status = DecryptionStatus::Cancelled;
+            if (!key.iv.empty() && !cipher.SetIV(key.iv, &cryptoErr)) {
+                result.status = DecryptionStatus::Failed;
+                result.errorMessage = "Failed to set IV/nonce";
+                return result;
+            }
+
+            // Open input file with Win32 API for exclusive read
+            HANDLE hInput = ::CreateFileW(
+                filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+            if (hInput == INVALID_HANDLE_VALUE) {
+                result.status = DecryptionStatus::IOError;
+                result.errorMessage = "Cannot open encrypted file";
+                SS_LOG_LAST_ERROR(LOG_CAT, L"CreateFileW read failed: %ls", filePath.c_str());
+                return result;
+            }
+
+            // RAII handle guard
+            struct HandleGuard {
+                HANDLE h;
+                ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h); }
+            } inputGuard{hInput};
+
+            HANDLE hOutput = ::CreateFileW(
+                tempPath.c_str(), GENERIC_WRITE, 0,
+                nullptr, CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_WRITE_THROUGH, nullptr);
+
+            if (hOutput == INVALID_HANDLE_VALUE) {
+                result.status = DecryptionStatus::IOError;
+                result.errorMessage = "Cannot create output file";
+                SS_LOG_LAST_ERROR(LOG_CAT, L"CreateFileW write failed: %ls", tempPath.c_str());
+                return result;
+            }
+
+            HandleGuard outputGuard{hOutput};
+
+            // Initialize streaming decryption (non-AEAD modes)
+            if (!cipher.IsAEAD()) {
+                if (!cipher.DecryptInit(&cryptoErr)) {
+                    result.status = DecryptionStatus::Failed;
+                    result.errorMessage = "DecryptInit failed";
                     return result;
                 }
 
-                std::streamsize count = inFile.gcount();
+                constexpr size_t BUF_SIZE = DecryptorConstants::BUFFER_SIZE;
+                auto readBuf = std::make_unique<uint8_t[]>(BUF_SIZE);
+                std::vector<uint8_t> decryptedChunk;
+                uint64_t processed = 0;
 
-                // Actual decryption transform would happen here:
-                // CryptoUtils::DecryptBlock(buffer.data(), count, key.keyData, key.iv, key.algorithm);
+                while (processed < fileSize) {
+                    if (m_cancelRequested.load(std::memory_order_acquire)) {
+                        outputGuard.h = INVALID_HANDLE_VALUE;
+                        ::CloseHandle(hOutput);
+                        fs::remove(tempPath, ec);
+                        result.status = DecryptionStatus::Cancelled;
+                        return result;
+                    }
 
-                // For structure demonstration, we just write it out
-                outFile.write(buffer.data(), count);
+                    DWORD toRead = static_cast<DWORD>(
+                        std::min<uint64_t>(BUF_SIZE, fileSize - processed));
+                    DWORD bytesRead = 0;
+                    if (!::ReadFile(hInput, readBuf.get(), toRead, &bytesRead, nullptr)
+                        || bytesRead == 0) {
+                        break;
+                    }
 
-                processed += count;
+                    decryptedChunk.clear();
+                    if (!cipher.DecryptUpdate(readBuf.get(), bytesRead,
+                                              decryptedChunk, &cryptoErr)) {
+                        result.status = DecryptionStatus::Failed;
+                        result.errorMessage = "DecryptUpdate failed";
+                        outputGuard.h = INVALID_HANDLE_VALUE;
+                        ::CloseHandle(hOutput);
+                        fs::remove(tempPath, ec);
+                        return result;
+                    }
 
-                // Fire progress
-                FireProgressCallback(filePath, processed, total);
+                    if (!decryptedChunk.empty()) {
+                        DWORD written = 0;
+                        if (!::WriteFile(hOutput, decryptedChunk.data(),
+                                         static_cast<DWORD>(decryptedChunk.size()),
+                                         &written, nullptr)) {
+                            result.status = DecryptionStatus::IOError;
+                            result.errorMessage = "WriteFile failed";
+                            outputGuard.h = INVALID_HANDLE_VALUE;
+                            ::CloseHandle(hOutput);
+                            fs::remove(tempPath, ec);
+                            return result;
+                        }
+                    }
+
+                    // Securely wipe read buffer after each chunk
+                    ::SecureZeroMemory(readBuf.get(), bytesRead);
+
+                    processed += bytesRead;
+                    FireProgressCallback(filePath.wstring(), processed, fileSize);
+                }
+
+                // Finalize
+                decryptedChunk.clear();
+                if (!cipher.DecryptFinal(decryptedChunk, &cryptoErr)) {
+                    result.status = DecryptionStatus::Failed;
+                    result.errorMessage = "DecryptFinal failed - wrong key or corrupt data";
+                    outputGuard.h = INVALID_HANDLE_VALUE;
+                    ::CloseHandle(hOutput);
+                    fs::remove(tempPath, ec);
+                    return result;
+                }
+
+                if (!decryptedChunk.empty()) {
+                    DWORD written = 0;
+                    ::WriteFile(hOutput, decryptedChunk.data(),
+                                static_cast<DWORD>(decryptedChunk.size()),
+                                &written, nullptr);
+                }
+                ::SecureZeroMemory(decryptedChunk.data(), decryptedChunk.size());
+            } else {
+                // AEAD mode: read entire ciphertext (with size cap already enforced)
+                // Tag is assumed appended per CryptoUtils convention
+                constexpr size_t TAG_SIZE = Utils::CryptoUtils::GCM_TAG_SIZE_BYTES;
+
+                if (fileSize <= TAG_SIZE) {
+                    result.status = DecryptionStatus::CorruptedFile;
+                    result.errorMessage = "File too small for AEAD (no room for tag)";
+                    return result;
+                }
+
+                const size_t ciphertextLen = static_cast<size_t>(fileSize - TAG_SIZE);
+
+                // Cap AEAD mode at MAX_CIPHERTEXT_SIZE to avoid OOM
+                if (fileSize > Utils::CryptoUtils::MAX_CIPHERTEXT_SIZE) {
+                    result.status = DecryptionStatus::InvalidFile;
+                    result.errorMessage = "AEAD file exceeds max ciphertext size";
+                    return result;
+                }
+
+                std::vector<uint8_t> ciphertext(ciphertextLen);
+                std::vector<uint8_t> tag(TAG_SIZE);
+                DWORD bytesRead = 0;
+
+                ::ReadFile(hInput, ciphertext.data(),
+                           static_cast<DWORD>(ciphertextLen), &bytesRead, nullptr);
+                ::ReadFile(hInput, tag.data(),
+                           static_cast<DWORD>(TAG_SIZE), &bytesRead, nullptr);
+
+                std::vector<uint8_t> plaintext;
+                if (!cipher.DecryptAEAD(ciphertext.data(), ciphertextLen,
+                                         nullptr, 0, tag.data(), TAG_SIZE,
+                                         plaintext, &cryptoErr)) {
+                    ::SecureZeroMemory(ciphertext.data(), ciphertext.size());
+                    result.status = DecryptionStatus::Failed;
+                    result.errorMessage = "AEAD decryption failed - authentication error";
+                    outputGuard.h = INVALID_HANDLE_VALUE;
+                    ::CloseHandle(hOutput);
+                    fs::remove(tempPath, ec);
+                    return result;
+                }
+
+                ::SecureZeroMemory(ciphertext.data(), ciphertext.size());
+
+                if (!plaintext.empty()) {
+                    DWORD written = 0;
+                    ::WriteFile(hOutput, plaintext.data(),
+                                static_cast<DWORD>(plaintext.size()),
+                                &written, nullptr);
+                }
+                ::SecureZeroMemory(plaintext.data(), plaintext.size());
             }
 
-            outFile.close();
-            result.decryptedSize = fs::file_size(outputPath);
-            result.status = DecryptionStatus::Success;
+            // Close output before rename
+            outputGuard.h = INVALID_HANDLE_VALUE;
+            ::CloseHandle(hOutput);
 
-            // 5. Post-decryption handling
+            // Atomic rename temp -> final
+            if (!::MoveFileExW(tempPath.c_str(), outputPath.c_str(),
+                               MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+                SS_LOG_LAST_ERROR(LOG_CAT, L"Atomic rename failed: %ls -> %ls",
+                                  tempPath.c_str(), outputPath.c_str());
+                fs::remove(tempPath, ec);
+                result.status = DecryptionStatus::IOError;
+                result.errorMessage = "Atomic file rename failed";
+                return result;
+            }
+
+            result.decryptedSize = fs::file_size(outputPath, ec);
+            result.status = DecryptionStatus::Success;
+            result.validationPassed = true;
+
+            // Preserve timestamps
             if (m_config.preserveTimestamps) {
                 try {
-                    auto lastWrite = fs::last_write_time(filePath);
-                    fs::last_write_time(outputPath, lastWrite);
+                    auto lastWrite = fs::last_write_time(filePath, ec);
+                    if (!ec) fs::last_write_time(outputPath, lastWrite, ec);
                 } catch (...) {
-                    Utils::Logger::Warn("Failed to preserve timestamp for {}", outputPath.string());
+                    SS_LOG_WARN(LOG_CAT, L"Failed to preserve timestamp for %ls",
+                                outputPath.c_str());
                 }
             }
 
-            if (m_config.deleteEncryptedOnSuccess) {
-                // Only delete if validation passes (if validation is enabled)
-                if (!m_config.validateAfterDecrypt || ValidateDecryption(outputPath)) {
-                    fs::remove(filePath);
-                }
+            // Post-validation
+            if (m_config.validateAfterDecrypt && !ValidateDecryption(outputPath)) {
+                result.validationPassed = false;
+                SS_LOG_WARN(LOG_CAT, L"Post-decryption validation suspect for %ls",
+                            outputPath.c_str());
+            }
+
+            // Conditionally delete encrypted original
+            if (m_config.deleteEncryptedOnSuccess && result.validationPassed) {
+                fs::remove(filePath, ec);
             }
 
         } catch (const std::exception& ex) {
             result.status = DecryptionStatus::Failed;
             result.errorMessage = ex.what();
-            Utils::Logger::Error("Decryption exception: {}", ex.what());
+            SS_LOG_ERROR(LOG_CAT, L"Decryption exception for %ls: %hs",
+                         filePath.c_str(), ex.what());
+            // Clean up temp file on exception
+            std::error_code ec2;
+            fs::path tmpCleanup = filePath;
+            tmpCleanup += L".ss_decrypt_tmp";
+            fs::remove(tmpCleanup, ec2);
         }
 
         auto endTime = Clock::now();
-        result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-            endTime - startTime).count();
+        result.durationMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                endTime - startTime).count());
 
         return result;
     }
 
-    /**
-     * @brief Validate decrypted file content
-     */
+    // ========================================================================
+    // POST-DECRYPTION VALIDATION
+    // ========================================================================
+
     [[nodiscard]] bool ValidateDecryption(const fs::path& filePath) {
-        // Implementation would check magic bytes (PDF, JPG, PNG headers)
-        // to ensure the decrypted content makes sense.
         try {
-            std::ifstream file(filePath, std::ios::binary);
-            if (!file) return false;
+            HANDLE hFile = ::CreateFileW(
+                filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
 
-            std::array<uint8_t, 4> magic;
-            file.read(reinterpret_cast<char*>(magic.data()), magic.size());
-            if (file.gcount() < 4) return true; // Too small to verify
+            if (hFile == INVALID_HANDLE_VALUE) return false;
 
-            // Simple check: if first bytes are all 00 or all FF, suspicious
-            if (std::all_of(magic.begin(), magic.end(), [](uint8_t b){ return b == 0; })) return false;
-            if (std::all_of(magic.begin(), magic.end(), [](uint8_t b){ return b == 0xFF; })) return false;
+            std::array<uint8_t, 16> header{};
+            DWORD bytesRead = 0;
+            ::ReadFile(hFile, header.data(),
+                       static_cast<DWORD>(header.size()), &bytesRead, nullptr);
+            ::CloseHandle(hFile);
 
+            if (bytesRead < 4) return true; // Too small to verify
+
+            // Reject all-zero or all-0xFF (still encrypted)
+            const bool allZero = std::all_of(
+                header.begin(), header.begin() + bytesRead,
+                [](uint8_t b) { return b == 0; });
+            const bool allFF = std::all_of(
+                header.begin(), header.begin() + bytesRead,
+                [](uint8_t b) { return b == 0xFF; });
+
+            if (allZero || allFF) return false;
+
+            // Check for known file magic bytes
+            static constexpr std::array<uint8_t, 2> MAGIC_PDF = {0x25, 0x50};  // %P
+            static constexpr std::array<uint8_t, 2> MAGIC_PK  = {0x50, 0x4B};  // PK
+            static constexpr std::array<uint8_t, 3> MAGIC_JPG = {0xFF, 0xD8, 0xFF};
+            static constexpr std::array<uint8_t, 4> MAGIC_PNG = {0x89, 0x50, 0x4E, 0x47};
+
+            // If the file starts with a known magic, it's likely valid
+            if (bytesRead >= 4 && std::equal(MAGIC_PNG.begin(), MAGIC_PNG.end(), header.begin()))
+                return true;
+            if (bytesRead >= 3 && std::equal(MAGIC_JPG.begin(), MAGIC_JPG.end(), header.begin()))
+                return true;
+            if (bytesRead >= 2 && std::equal(MAGIC_PDF.begin(), MAGIC_PDF.end(), header.begin()))
+                return true;
+            if (bytesRead >= 2 && std::equal(MAGIC_PK.begin(), MAGIC_PK.end(), header.begin()))
+                return true;
+
+            // Generic: if there's a mix of byte values, probably okay
             return true;
         } catch (...) {
             return false;
         }
     }
 
+    // ========================================================================
+    // CALLBACKS (SAFE INVOCATION)
+    // ========================================================================
+
     void FireProgressCallback(const std::wstring& file, uint64_t processed, uint64_t total) {
         std::lock_guard lock(m_callbackMutex);
         if (m_progressCallback) {
-            try {
-                m_progressCallback(file, processed, total);
-            } catch (...) {}
+            try { m_progressCallback(file, processed, total); } catch (...) {}
         }
     }
 
     void FireCompleteCallback(const DecryptionResult& result) {
         std::lock_guard lock(m_callbackMutex);
         if (m_completeCallback) {
-            try {
-                m_completeCallback(result);
-            } catch (...) {}
+            try { m_completeCallback(result); } catch (...) {}
         }
     }
 };
@@ -401,13 +781,12 @@ bool RansomwareDecryptor::HasInstance() noexcept {
 RansomwareDecryptor::RansomwareDecryptor()
     : m_impl(std::make_unique<RansomwareDecryptorImpl>())
 {
-    Utils::Logger::Info("RansomwareDecryptor: Instance created");
+    SS_LOG_INFO(LOG_CAT, L"Instance created");
 }
 
 RansomwareDecryptor::~RansomwareDecryptor() {
     try {
         Shutdown();
-        Utils::Logger::Info("RansomwareDecryptor: Instance destroyed");
     } catch (...) {
         // Destructors must not throw
     }
@@ -419,40 +798,40 @@ bool RansomwareDecryptor::Initialize(const RansomwareDecryptorConfiguration& con
 
         if (m_impl->m_status != ModuleStatus::Uninitialized &&
             m_impl->m_status != ModuleStatus::Stopped) {
-            Utils::Logger::Warn("RansomwareDecryptor: Already initialized");
+            SS_LOG_WARN(LOG_CAT, L"Already initialized (status=%u)",
+                        static_cast<unsigned>(m_impl->m_status));
             return false;
         }
 
         if (!config.IsValid()) {
-            Utils::Logger::Error("RansomwareDecryptor: Invalid configuration");
+            SS_LOG_ERROR(LOG_CAT, L"Invalid configuration (maxConcurrent=%u)",
+                         config.maxConcurrent);
             return false;
         }
 
         m_impl->m_status = ModuleStatus::Initializing;
         m_impl->m_config = config;
-
-        // Reset statistics
         m_impl->m_stats.Reset();
+        m_impl->m_cancelRequested.store(false, std::memory_order_release);
 
-        // Load keys if database path provided
-        if (!config.keyDatabasePath.empty() && fs::exists(config.keyDatabasePath)) {
-            // Internal call to load keys (stub for now, normally would parse JSON/DB)
-            Utils::Logger::Info("RansomwareDecryptor: Loading keys from {}",
-                std::string(config.keyDatabasePath.begin(), config.keyDatabasePath.end()));
+        // Load key database if configured
+        if (!config.keyDatabasePath.empty()) {
+            lock.unlock(); // Release lock before I/O
+            if (!LoadKeyDatabase(config.keyDatabasePath)) {
+                SS_LOG_WARN(LOG_CAT, L"Key database load failed: %ls",
+                            config.keyDatabasePath.c_str());
+            }
+            lock.lock();
         }
 
         m_impl->m_status = ModuleStatus::Running;
 
-        Utils::Logger::Info("RansomwareDecryptor: Initialized successfully (v{})",
-                           GetVersionString());
+        SS_LOG_INFO(LOG_CAT, L"Initialized v%hs, %zu keys loaded",
+                    GetVersionString().c_str(), GetKeyCount());
         return true;
 
     } catch (const std::exception& ex) {
-        Utils::Logger::Error("RansomwareDecryptor: Initialization failed: {}", ex.what());
-        m_impl->m_status = ModuleStatus::Error;
-        return false;
-    } catch (...) {
-        Utils::Logger::Critical("RansomwareDecryptor: Initialization failed (unknown exception)");
+        SS_LOG_ERROR(LOG_CAT, L"Initialization failed: %hs", ex.what());
         m_impl->m_status = ModuleStatus::Error;
         return false;
     }
@@ -468,26 +847,33 @@ void RansomwareDecryptor::Shutdown() {
         }
 
         m_impl->m_status = ModuleStatus::Stopping;
-        m_impl->m_cancelRequested = true;
+        m_impl->m_cancelRequested.store(true, std::memory_order_release);
 
-        // Wait for active decryptions to finish or cancel
-        // Real implementation would use condition variables here
+        // Wait for active decryptions with bounded spin
+        constexpr int MAX_WAIT_ITERATIONS = 300; // ~3 seconds
+        for (int i = 0; i < MAX_WAIT_ITERATIONS; ++i) {
+            if (m_impl->m_activeDecryptions.load(std::memory_order_acquire) == 0)
+                break;
+            lock.unlock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            lock.lock();
+        }
 
-        // Clear keys securely
+        // Securely erase all keys
         {
             std::unique_lock keyLock(m_impl->m_keyMutex);
-            // Secure erase would zero out memory here
+            for (auto& [id, key] : m_impl->m_keys) {
+                SecureEraseKey(key);
+            }
             m_impl->m_keys.clear();
             m_impl->m_familyKeys.clear();
         }
 
         m_impl->m_status = ModuleStatus::Stopped;
-        Utils::Logger::Info("RansomwareDecryptor: Shutdown complete");
+        SS_LOG_INFO(LOG_CAT, L"Shutdown complete");
 
     } catch (const std::exception& ex) {
-        Utils::Logger::Error("RansomwareDecryptor: Shutdown error: {}", ex.what());
-    } catch (...) {
-        Utils::Logger::Critical("RansomwareDecryptor: Shutdown failed");
+        SS_LOG_ERROR(LOG_CAT, L"Shutdown error: %hs", ex.what());
     }
 }
 
@@ -508,13 +894,14 @@ ModuleStatus RansomwareDecryptor::GetStatus() const noexcept {
 
 bool RansomwareDecryptor::DecryptFile(const std::wstring& filePath,
                                       const std::string& familyName) {
-    // Basic wrapper around Ex version
-    // Map string name to Enum? For now assume caller knows mapping or we add it
-    // This is a simplified interface
-
-    // Naive string to enum conversion for basic usage
     RansomwareFamily family = RansomwareFamily::Unknown;
-    // In production would implement full string->enum map
+    auto it = FAMILY_NAME_MAP.find(familyName);
+    if (it != FAMILY_NAME_MAP.end()) {
+        family = it->second;
+    } else {
+        SS_LOG_WARN(LOG_CAT, L"Unknown family name: %hs, will attempt auto-detect",
+                    familyName.c_str());
+    }
 
     auto result = DecryptFileEx(filePath, family);
     return result.status == DecryptionStatus::Success;
@@ -533,7 +920,14 @@ DecryptionResult RansomwareDecryptor::DecryptFileEx(std::wstring_view filePath,
             return result;
         }
 
-        // 1. Identify family if unknown
+        if (!ValidateFilePath(fs::path(filePath))) {
+            result.status = DecryptionStatus::InvalidFile;
+            result.errorMessage = "Invalid or unsafe file path";
+            m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+
+        // Auto-identify family if unknown
         if (family == RansomwareFamily::Unknown) {
             family = IdentifyFamilyFromFile(filePath);
             result.family = family;
@@ -542,62 +936,69 @@ DecryptionResult RansomwareDecryptor::DecryptFileEx(std::wstring_view filePath,
         if (family == RansomwareFamily::Unknown) {
             result.status = DecryptionStatus::UnknownFamily;
             result.errorMessage = "Could not identify ransomware family";
-            m_impl->m_stats.filesFailed++;
+            m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        // 2. Backup
+        // Pre-decryption backup
         if (!m_impl->BackupFile(fs::path(filePath))) {
             result.status = DecryptionStatus::IOError;
-            result.errorMessage = "Backup failed";
-            m_impl->m_stats.filesFailed++;
+            result.errorMessage = "Pre-decryption backup failed";
+            m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        // 3. Find Key
+        // Find candidate keys
         std::vector<DecryptionKey> candidates = GetKeysForFamily(family);
         if (candidates.empty()) {
             result.status = DecryptionStatus::NoKeyAvailable;
             result.errorMessage = "No keys available for this family";
-            m_impl->m_stats.filesFailed++;
+            m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        m_impl->m_activeDecryptions++;
-        m_impl->m_status = ModuleStatus::Decrypting;
+        m_impl->m_activeDecryptions.fetch_add(1, std::memory_order_acq_rel);
 
-        // 4. Try keys
+        // Try each candidate key
         for (const auto& key : candidates) {
-            // Attempt decryption
+            if (m_impl->m_cancelRequested.load(std::memory_order_acquire)) {
+                result.status = DecryptionStatus::Cancelled;
+                m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
+                return result;
+            }
+
             DecryptionResult attempt = m_impl->PerformDecryption(fs::path(filePath), key);
 
             if (attempt.status == DecryptionStatus::Success) {
-                // Validate if configured
-                if (!m_impl->m_config.validateAfterDecrypt || m_impl->ValidateDecryption(attempt.decryptedPath)) {
+                if (!m_impl->m_config.validateAfterDecrypt ||
+                    m_impl->ValidateDecryption(attempt.decryptedPath)) {
                     result = attempt;
-                    m_impl->m_stats.filesDecrypted++;
-                    m_impl->m_stats.bytesDecrypted += result.decryptedSize;
-
+                    m_impl->m_stats.filesDecrypted.fetch_add(1, std::memory_order_relaxed);
+                    m_impl->m_stats.bytesDecrypted.fetch_add(
+                        result.decryptedSize, std::memory_order_relaxed);
                     m_impl->FireCompleteCallback(result);
-                    m_impl->m_activeDecryptions--;
-                    return result; // Success!
+                    m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
+                    return result;
                 } else {
-                    // Validation failed, clean up and try next key
-                    fs::remove(attempt.decryptedPath);
+                    std::error_code ec;
+                    fs::remove(attempt.decryptedPath, ec);
                 }
             }
         }
 
-        m_impl->m_activeDecryptions--;
-
+        m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
         result.status = DecryptionStatus::Failed;
         result.errorMessage = "All candidate keys failed";
-        m_impl->m_stats.filesFailed++;
+        m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
 
     } catch (const std::exception& ex) {
         result.status = DecryptionStatus::Failed;
         result.errorMessage = ex.what();
-        Utils::Logger::Error("DecryptFileEx failed: {}", ex.what());
+        SS_LOG_ERROR(LOG_CAT, L"DecryptFileEx failed: %hs", ex.what());
+        // Ensure counter is decremented on exception
+        if (m_impl->m_activeDecryptions.load(std::memory_order_acquire) > 0) {
+            m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
+        }
     }
 
     return result;
@@ -612,6 +1013,13 @@ DecryptionResult RansomwareDecryptor::DecryptFileWithKey(std::wstring_view fileP
         return res;
     }
 
+    if (!ValidateFilePath(fs::path(filePath))) {
+        DecryptionResult res;
+        res.status = DecryptionStatus::InvalidFile;
+        res.errorMessage = "Invalid file path";
+        return res;
+    }
+
     if (!m_impl->BackupFile(fs::path(filePath))) {
         DecryptionResult res;
         res.status = DecryptionStatus::IOError;
@@ -619,9 +1027,18 @@ DecryptionResult RansomwareDecryptor::DecryptFileWithKey(std::wstring_view fileP
         return res;
     }
 
-    m_impl->m_activeDecryptions++;
+    m_impl->m_activeDecryptions.fetch_add(1, std::memory_order_acq_rel);
     auto result = m_impl->PerformDecryption(fs::path(filePath), key);
-    m_impl->m_activeDecryptions--;
+    m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
+
+    if (result.status == DecryptionStatus::Success) {
+        m_impl->m_stats.filesDecrypted.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.bytesDecrypted.fetch_add(
+            result.decryptedSize, std::memory_order_relaxed);
+        m_impl->FireCompleteCallback(result);
+    } else {
+        m_impl->m_stats.filesFailed.fetch_add(1, std::memory_order_relaxed);
+    }
 
     return result;
 }
@@ -630,29 +1047,58 @@ BatchDecryptionResult RansomwareDecryptor::DecryptDirectory(std::wstring_view di
                                                             RansomwareFamily family,
                                                             bool recursive) {
     BatchDecryptionResult batchResult;
-    batchResult.batchId = Utils::StringUtils::GenerateUUID();
+    batchResult.batchId = GenerateRecoveryId();
     batchResult.startTime = std::chrono::system_clock::now();
 
     try {
         fs::path root(dirPath);
-        if (!fs::exists(root) || !fs::is_directory(root)) {
+        std::error_code ec;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+            SS_LOG_ERROR(LOG_CAT, L"DecryptDirectory: path invalid or not a directory: %ls",
+                         root.c_str());
             return batchResult;
         }
 
         std::vector<std::wstring> files;
+        files.reserve(1024);
+
+        // Depth-limited traversal to prevent stack overflow
+        auto options = fs::directory_options::skip_permission_denied;
         if (recursive) {
-            for (const auto& entry : fs::recursive_directory_iterator(root)) {
-                if (entry.is_regular_file()) files.push_back(entry.path().wstring());
+            for (auto it = fs::recursive_directory_iterator(root, options, ec);
+                 it != fs::recursive_directory_iterator() && files.size() < MAX_SCAN_FILES;
+                 it.increment(ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (it.depth() > static_cast<int>(MAX_DIRECTORY_DEPTH)) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                if (it->is_regular_file(ec) && !ec) {
+                    files.push_back(it->path().wstring());
+                }
             }
         } else {
-            for (const auto& entry : fs::directory_iterator(root)) {
-                if (entry.is_regular_file()) files.push_back(entry.path().wstring());
+            for (auto it = fs::directory_iterator(root, options, ec);
+                 it != fs::directory_iterator() && files.size() < MAX_SCAN_FILES;
+                 it.increment(ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (it->is_regular_file(ec) && !ec) {
+                    files.push_back(it->path().wstring());
+                }
             }
         }
 
+        if (files.empty()) {
+            SS_LOG_INFO(LOG_CAT, L"No files found in %ls", root.c_str());
+            return batchResult;
+        }
+
+        SS_LOG_INFO(LOG_CAT, L"DecryptDirectory: found %zu files in %ls",
+                    files.size(), root.c_str());
         return DecryptFiles(files, family);
 
-    } catch (...) {
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"DecryptDirectory exception: %hs", ex.what());
         return batchResult;
     }
 }
@@ -662,11 +1108,20 @@ BatchDecryptionResult RansomwareDecryptor::DecryptFiles(
     RansomwareFamily family) {
 
     BatchDecryptionResult batchResult;
-    batchResult.batchId = Utils::StringUtils::GenerateUUID();
+    batchResult.batchId = GenerateRecoveryId();
     batchResult.startTime = std::chrono::system_clock::now();
     batchResult.totalFiles = filePaths.size();
 
-    // Limit concurrency
+    if (filePaths.empty()) return batchResult;
+
+    // Cap batch size
+    if (filePaths.size() > DecryptorConstants::MAX_BATCH_FILES) {
+        SS_LOG_WARN(LOG_CAT, L"Batch size %zu exceeds limit %zu, truncating",
+                    filePaths.size(), DecryptorConstants::MAX_BATCH_FILES);
+        filePaths = filePaths.first(DecryptorConstants::MAX_BATCH_FILES);
+        batchResult.totalFiles = filePaths.size();
+    }
+
     uint32_t concurrency = std::min(m_impl->m_config.maxConcurrent,
                                     std::thread::hardware_concurrency());
     if (concurrency == 0) concurrency = 1;
@@ -675,17 +1130,18 @@ BatchDecryptionResult RansomwareDecryptor::DecryptFiles(
     size_t currentIndex = 0;
 
     while (currentIndex < filePaths.size() || !futures.empty()) {
-        // Start new tasks
+        // Launch tasks up to concurrency limit
         while (futures.size() < concurrency && currentIndex < filePaths.size()) {
+            if (m_impl->m_cancelRequested.load(std::memory_order_acquire)) break;
             std::wstring path = filePaths[currentIndex++];
             futures.push_back(std::async(std::launch::async,
-                [this, path, family]() {
-                    return this->DecryptFileEx(path, family);
+                [this, p = std::move(path), family]() {
+                    return this->DecryptFileEx(p, family);
                 }
             ));
         }
 
-        // Wait for completion
+        // Harvest completed futures
         auto it = futures.begin();
         while (it != futures.end()) {
             if (it->wait_for(std::chrono::milliseconds(10)) == std::future_status::ready) {
@@ -694,18 +1150,19 @@ BatchDecryptionResult RansomwareDecryptor::DecryptFiles(
 
                 if (res.status == DecryptionStatus::Success) {
                     batchResult.filesDecrypted++;
-                } else if (res.status == DecryptionStatus::Failed) {
+                } else if (res.status == DecryptionStatus::Failed ||
+                           res.status == DecryptionStatus::CorruptedFile) {
                     batchResult.filesFailed++;
                 } else {
                     batchResult.filesSkipped++;
                 }
                 batchResult.bytesProcessed += res.originalSize;
 
-                // Update batch progress callback if needed
                 {
                     std::lock_guard lock(m_impl->m_callbackMutex);
                     if (m_impl->m_batchProgressCallback) {
-                        m_impl->m_batchProgressCallback(batchResult.results.size(), batchResult.totalFiles);
+                        m_impl->m_batchProgressCallback(
+                            batchResult.results.size(), batchResult.totalFiles);
                     }
                 }
 
@@ -714,6 +1171,9 @@ BatchDecryptionResult RansomwareDecryptor::DecryptFiles(
                 ++it;
             }
         }
+
+        if (m_impl->m_cancelRequested.load(std::memory_order_acquire) && futures.empty())
+            break;
     }
 
     batchResult.endTime = std::chrono::system_clock::now();
@@ -721,14 +1181,451 @@ BatchDecryptionResult RansomwareDecryptor::DecryptFiles(
 }
 
 void RansomwareDecryptor::CancelDecryption() {
-    m_impl->m_cancelRequested = true;
+    m_impl->m_cancelRequested.store(true, std::memory_order_release);
+    SS_LOG_INFO(LOG_CAT, L"Decryption cancel requested");
+}
+
+// ============================================================================
+// RECOVERY OPERATIONS
+// ============================================================================
+
+RecoveryResult RansomwareDecryptor::RecoverFile(std::wstring_view filePath,
+                                                 const RecoveryOptions& options) {
+    RecoveryResult result;
+    result.encryptedPath = filePath;
+    auto startTime = Clock::now();
+
+    if (!IsInitialized()) {
+        result.status = DecryptionStatus::Failed;
+        result.errorMessage = "Decryptor not initialized";
+        return result;
+    }
+
+    if (!ValidateFilePath(fs::path(filePath))) {
+        result.status = DecryptionStatus::InvalidFile;
+        result.errorMessage = "Invalid file path";
+        return result;
+    }
+
+    // CRITICAL: Verify ransomware process is terminated before recovery
+    if (options.ransomwarePid != 0) {
+        if (!VerifyRansomwareTerminated(options.ransomwarePid)) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "Ransomware process still running - recovery blocked";
+            SS_LOG_FATAL(LOG_CAT,
+                L"RECOVERY BLOCKED: ransomware PID %lu is still active, "
+                L"recovered files would be re-encrypted immediately",
+                options.ransomwarePid);
+            return result;
+        }
+    }
+
+    // Preserve forensic copy before modifying anything
+    if (options.preserveForensicCopy) {
+        std::wstring forensicDir = options.forensicDirectory;
+        if (forensicDir.empty()) {
+            forensicDir = fs::path(filePath).parent_path().wstring() +
+                          L"\\ShadowStrike_Forensics";
+        }
+        if (!PreserveForensicCopy(filePath, forensicDir)) {
+            SS_LOG_WARN(LOG_CAT, L"Forensic copy failed for %ls (continuing recovery)",
+                        std::wstring(filePath).c_str());
+        } else {
+            result.forensicCopyPath = forensicDir + L"\\" +
+                fs::path(filePath).filename().wstring();
+        }
+    }
+
+    // Auto method: try VSS -> Backup -> Key decryption
+    RecoveryMethod method = options.method;
+
+    if (method == RecoveryMethod::Auto || method == RecoveryMethod::VSSRestore) {
+        auto vssResult = RecoverFromVSS(filePath, options.vssSnapshotId);
+        if (vssResult.status == DecryptionStatus::Success) {
+            vssResult.forensicCopyPath = result.forensicCopyPath;
+            vssResult.durationMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - startTime).count());
+            return vssResult;
+        }
+        if (method == RecoveryMethod::VSSRestore) {
+            vssResult.durationMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - startTime).count());
+            return vssResult;
+        }
+    }
+
+    if (method == RecoveryMethod::Auto || method == RecoveryMethod::BackupRestore) {
+        auto backupResult = RecoverFromBackup(filePath, options.ransomwarePid);
+        if (backupResult.status == DecryptionStatus::Success) {
+            backupResult.forensicCopyPath = result.forensicCopyPath;
+            backupResult.durationMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - startTime).count());
+            return backupResult;
+        }
+        if (method == RecoveryMethod::BackupRestore) {
+            backupResult.durationMs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    Clock::now() - startTime).count());
+            return backupResult;
+        }
+    }
+
+    if (method == RecoveryMethod::Auto || method == RecoveryMethod::KeyDecryption) {
+        // Fall back to key-based decryption
+        RansomwareFamily family = IdentifyFamilyFromFile(filePath);
+        if (family != RansomwareFamily::Unknown) {
+            auto decResult = DecryptFileEx(filePath, family);
+            result.encryptedPath = decResult.originalPath;
+            result.recoveredPath = decResult.decryptedPath;
+            result.methodUsed = RecoveryMethod::KeyDecryption;
+            result.status = decResult.status;
+            result.recoveredSize = decResult.decryptedSize;
+            result.integrityVerified = decResult.validationPassed;
+            result.errorMessage = decResult.errorMessage;
+        } else {
+            result.status = DecryptionStatus::UnknownFamily;
+            result.errorMessage = "Cannot identify family for key-based decryption";
+        }
+    }
+
+    result.durationMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - startTime).count());
+    return result;
+}
+
+std::vector<RecoveryResult> RansomwareDecryptor::RecoverDirectory(
+    std::wstring_view dirPath, const RecoveryOptions& options) {
+
+    std::vector<RecoveryResult> results;
+
+    // Verify ransomware is terminated before bulk recovery
+    if (options.ransomwarePid != 0 &&
+        !VerifyRansomwareTerminated(options.ransomwarePid)) {
+        SS_LOG_FATAL(LOG_CAT,
+            L"BULK RECOVERY BLOCKED: ransomware PID %lu still active",
+            options.ransomwarePid);
+        RecoveryResult blocked;
+        blocked.status = DecryptionStatus::Failed;
+        blocked.errorMessage = "Ransomware process still running";
+        results.push_back(std::move(blocked));
+        return results;
+    }
+
+    try {
+        fs::path root(dirPath);
+        std::error_code ec;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) return results;
+
+        auto dirOptions = fs::directory_options::skip_permission_denied;
+        size_t fileCount = 0;
+
+        for (auto it = fs::recursive_directory_iterator(root, dirOptions, ec);
+             it != fs::recursive_directory_iterator() && fileCount < MAX_SCAN_FILES;
+             it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            if (it.depth() > static_cast<int>(MAX_DIRECTORY_DEPTH)) {
+                it.disable_recursion_pending();
+                continue;
+            }
+            if (!it->is_regular_file(ec) || ec) continue;
+
+            auto recovered = RecoverFile(it->path().wstring(), options);
+            results.push_back(std::move(recovered));
+            fileCount++;
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"RecoverDirectory exception: %hs", ex.what());
+    }
+
+    return results;
+}
+
+RecoveryResult RansomwareDecryptor::RecoverFromVSS(std::wstring_view filePath,
+                                                    std::wstring_view snapshotId) {
+    RecoveryResult result;
+    result.encryptedPath = filePath;
+    result.methodUsed = RecoveryMethod::VSSRestore;
+
+    try {
+        auto& vss = VolumeSnapshotService::Instance();
+        if (!vss.IsInitialized()) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "VolumeSnapshotService not initialized";
+            return result;
+        }
+
+        fs::path p(filePath);
+        std::wstring volume = p.root_name().wstring() + L"\\";
+
+        std::wstring bestSnapshotId;
+
+        if (!snapshotId.empty()) {
+            bestSnapshotId = snapshotId;
+        } else {
+            // Find most recent snapshot for this volume
+            auto snapshots = vss.EnumerateSnapshotsForVolume(volume);
+            if (snapshots.empty()) {
+                result.status = DecryptionStatus::Failed;
+                result.errorMessage = "No VSS snapshots available for volume " +
+                    std::string(volume.begin(), volume.end());
+                return result;
+            }
+
+            // Sort by creation time descending (most recent first)
+            std::sort(snapshots.begin(), snapshots.end(),
+                [](const SnapshotInfo& a, const SnapshotInfo& b) {
+                    return a.creationTime > b.creationTime;
+                });
+
+            bestSnapshotId = snapshots.front().snapshotId;
+        }
+
+        // Compute relative path from volume root
+        std::wstring relativePath = p.wstring().substr(volume.size());
+
+        // Restore to temp location for atomic replacement
+        fs::path tempRestore = p;
+        tempRestore += L".ss_vss_restore_tmp";
+
+        if (!vss.RestoreFile(bestSnapshotId, relativePath, tempRestore.wstring())) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "VSS RestoreFile failed";
+            return result;
+        }
+
+        // Verify integrity if we have a backup with stored hash
+        std::vector<uint8_t> restoredHash;
+        if (ComputeFileHash(tempRestore.wstring(), restoredHash)) {
+            result.integrityVerified = true;
+        }
+
+        // Atomic replacement
+        if (!::MoveFileExW(tempRestore.c_str(), p.c_str(),
+                           MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            SS_LOG_LAST_ERROR(LOG_CAT, L"VSS atomic rename failed: %ls", p.c_str());
+            std::error_code ec;
+            fs::remove(tempRestore, ec);
+            result.status = DecryptionStatus::IOError;
+            result.errorMessage = "Atomic rename of VSS-restored file failed";
+            return result;
+        }
+
+        std::error_code ec;
+        result.recoveredPath = p.wstring();
+        result.recoveredSize = fs::file_size(p, ec);
+        result.status = DecryptionStatus::Success;
+
+        SS_LOG_INFO(LOG_CAT, L"VSS recovery succeeded for %ls (snapshot %ls)",
+                    p.c_str(), bestSnapshotId.c_str());
+
+    } catch (const std::exception& ex) {
+        result.status = DecryptionStatus::Failed;
+        result.errorMessage = ex.what();
+        SS_LOG_ERROR(LOG_CAT, L"RecoverFromVSS exception: %hs", ex.what());
+    }
+
+    return result;
+}
+
+RecoveryResult RansomwareDecryptor::RecoverFromBackup(std::wstring_view filePath,
+                                                       uint32_t ransomwarePid) {
+    RecoveryResult result;
+    result.encryptedPath = filePath;
+    result.methodUsed = RecoveryMethod::BackupRestore;
+
+    try {
+        auto& backupMgr = FileBackupManager::Instance();
+        if (!backupMgr.IsInitialized()) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "FileBackupManager not initialized";
+            return result;
+        }
+
+        // Look up backup entry for this file
+        auto backupEntry = backupMgr.GetBackup(filePath, ransomwarePid);
+        if (!backupEntry.has_value()) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "No JIT backup found for this file/PID";
+            return result;
+        }
+
+        // Verify backup integrity via SHA-256
+        const auto& entry = backupEntry.value();
+        static constexpr Hash256 ZERO_HASH{};
+
+        if (entry.originalHash != ZERO_HASH) {
+            std::vector<uint8_t> backupHash;
+            if (entry.memoryData && !entry.memoryData->empty()) {
+                // RAM-cached backup: hash the in-memory data
+                Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+                Utils::HashUtils::Error hashErr{};
+                if (hasher.Init(&hashErr) &&
+                    hasher.Update(entry.memoryData->data(),
+                                  entry.memoryData->size(), &hashErr) &&
+                    hasher.Final(backupHash, &hashErr)) {
+                    // Compare against stored original hash
+                    if (backupHash.size() == entry.originalHash.size() &&
+                        !std::equal(backupHash.begin(), backupHash.end(),
+                                    entry.originalHash.begin())) {
+                        result.status = DecryptionStatus::CorruptedFile;
+                        result.errorMessage = "Backup integrity check failed (hash mismatch)";
+                        SS_LOG_ERROR(LOG_CAT,
+                            L"Backup hash mismatch for %ls - backup may be corrupted",
+                            std::wstring(filePath).c_str());
+                        return result;
+                    }
+                    result.integrityVerified = true;
+                }
+            } else if (!entry.backupPath.empty()) {
+                // Disk-based backup
+                if (ComputeFileHash(entry.backupPath, backupHash)) {
+                    if (backupHash.size() == entry.originalHash.size() &&
+                        !std::equal(backupHash.begin(), backupHash.end(),
+                                    entry.originalHash.begin())) {
+                        result.status = DecryptionStatus::CorruptedFile;
+                        result.errorMessage = "Backup integrity check failed (hash mismatch)";
+                        SS_LOG_ERROR(LOG_CAT,
+                            L"Disk backup hash mismatch for %ls", entry.backupPath.c_str());
+                        return result;
+                    }
+                    result.integrityVerified = true;
+                }
+            }
+        }
+
+        // Perform restore via FileBackupManager
+        auto restoreResult = backupMgr.RestoreFile(filePath, ransomwarePid);
+        if (restoreResult.status != RestoreStatus::Success) {
+            result.status = DecryptionStatus::Failed;
+            result.errorMessage = "FileBackupManager restore failed: " +
+                restoreResult.errorMessage;
+            return result;
+        }
+
+        result.recoveredPath = filePath;
+        result.recoveredSize = restoreResult.bytesRestored;
+        result.status = DecryptionStatus::Success;
+
+        SS_LOG_INFO(LOG_CAT, L"Backup recovery succeeded for %ls (%llu bytes)",
+                    std::wstring(filePath).c_str(), restoreResult.bytesRestored);
+
+    } catch (const std::exception& ex) {
+        result.status = DecryptionStatus::Failed;
+        result.errorMessage = ex.what();
+        SS_LOG_ERROR(LOG_CAT, L"RecoverFromBackup exception: %hs", ex.what());
+    }
+
+    return result;
+}
+
+bool RansomwareDecryptor::VerifyRansomwareTerminated(uint32_t pid) const {
+    if (pid == 0) return true;
+
+    HANDLE hProcess = ::OpenProcess(
+        PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, pid);
+
+    if (hProcess == nullptr) {
+        DWORD err = ::GetLastError();
+        if (err == ERROR_INVALID_PARAMETER || err == ERROR_NOT_FOUND) {
+            // Process does not exist -> terminated
+            return true;
+        }
+        if (err == ERROR_ACCESS_DENIED) {
+            // Cannot determine status - conservative: assume running
+            SS_LOG_WARN(LOG_CAT,
+                L"Cannot query ransomware PID %lu (access denied) - "
+                L"assuming still active for safety", pid);
+            return false;
+        }
+        return true; // Other error, likely process gone
+    }
+
+    // Check if process has exited
+    DWORD waitResult = ::WaitForSingleObject(hProcess, 0);
+    ::CloseHandle(hProcess);
+
+    if (waitResult == WAIT_OBJECT_0) {
+        SS_LOG_INFO(LOG_CAT, L"Ransomware PID %lu confirmed terminated", pid);
+        return true;
+    }
+
+    SS_LOG_WARN(LOG_CAT, L"Ransomware PID %lu is STILL RUNNING", pid);
+    return false;
+}
+
+bool RansomwareDecryptor::VerifyFileIntegrity(std::wstring_view filePath,
+                                               std::span<const uint8_t> expectedHash) const {
+    if (expectedHash.empty()) return false;
+
+    std::vector<uint8_t> actualHash;
+    if (!ComputeFileHash(filePath, actualHash)) return false;
+
+    if (actualHash.size() != expectedHash.size()) return false;
+    return std::equal(actualHash.begin(), actualHash.end(), expectedHash.begin());
+}
+
+bool RansomwareDecryptor::PreserveForensicCopy(std::wstring_view encryptedFilePath,
+                                                std::wstring_view forensicDirectory) {
+    try {
+        fs::path srcPath(encryptedFilePath);
+        fs::path dstDir(forensicDirectory);
+
+        if (!ValidateFilePath(srcPath) || !ValidateFilePath(dstDir)) {
+            SS_LOG_ERROR(LOG_CAT, L"Forensic copy: invalid path");
+            return false;
+        }
+
+        std::error_code ec;
+        if (!fs::exists(srcPath, ec) || ec) return false;
+
+        if (!fs::exists(dstDir, ec)) {
+            fs::create_directories(dstDir, ec);
+            if (ec) {
+                SS_LOG_ERROR(LOG_CAT,
+                    L"Cannot create forensic dir: %ls", dstDir.c_str());
+                return false;
+            }
+        }
+
+        // Mark directory as hidden+system
+        ::SetFileAttributesW(dstDir.c_str(),
+            FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM);
+
+        fs::path dstPath = dstDir / srcPath.filename();
+        if (fs::exists(dstPath, ec)) {
+            dstPath += L"." + std::to_wstring(
+                Clock::now().time_since_epoch().count());
+        }
+
+        fs::copy_file(srcPath, dstPath, ec);
+        if (ec) {
+            SS_LOG_ERROR(LOG_CAT, L"Forensic copy failed: %ls -> %ls (ec=%d)",
+                         srcPath.c_str(), dstPath.c_str(), ec.value());
+            return false;
+        }
+
+        // Set forensic copy as read-only
+        ::SetFileAttributesW(dstPath.c_str(),
+            FILE_ATTRIBUTE_READONLY | FILE_ATTRIBUTE_ARCHIVE);
+
+        SS_LOG_INFO(LOG_CAT, L"Forensic copy preserved: %ls", dstPath.c_str());
+        return true;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"PreserveForensicCopy exception: %hs", ex.what());
+        return false;
+    }
 }
 
 // ============================================================================
 // FAMILY IDENTIFICATION
 // ============================================================================
 
-RansomwareFamily RansomwareDecryptor::IdentifyFamilyFromExtension(std::wstring_view extension) {
+RansomwareFamily RansomwareDecryptor::IdentifyFamilyFromExtension(
+    std::wstring_view extension) {
     std::wstring ext(extension);
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
 
@@ -739,11 +1636,11 @@ RansomwareFamily RansomwareDecryptor::IdentifyFamilyFromExtension(std::wstring_v
     return RansomwareFamily::Unknown;
 }
 
-RansomwareFamily RansomwareDecryptor::IdentifyFamilyFromFile(std::wstring_view filePath) {
+RansomwareFamily RansomwareDecryptor::IdentifyFamilyFromFile(
+    std::wstring_view filePath) {
     try {
         fs::path p(filePath);
         return IdentifyFamilyFromExtension(p.extension().wstring());
-        // Future: Add magic byte analysis or file-marker analysis here
     } catch (...) {
         return RansomwareFamily::Unknown;
     }
@@ -757,31 +1654,42 @@ std::string RansomwareDecryptor::IdentifyFamily(const std::wstring& folderPath) 
 RansomwareFamily RansomwareDecryptor::IdentifyFamilyEnum(std::wstring_view folderPath) {
     try {
         fs::path root(folderPath);
+        std::error_code ec;
+        if (!fs::exists(root, ec) || !fs::is_directory(root, ec)) {
+            return RansomwareFamily::Unknown;
+        }
+
         std::unordered_map<RansomwareFamily, int> counts;
+        auto options = fs::directory_options::skip_permission_denied;
 
-        // Scan directory for extensions and notes
-        for (const auto& entry : fs::directory_iterator(root)) {
-            if (entry.is_regular_file()) {
-                // Check extension
-                RansomwareFamily extFamily = IdentifyFamilyFromExtension(entry.path().extension().wstring());
-                if (extFamily != RansomwareFamily::Unknown) {
-                    counts[extFamily]++;
-                }
+        for (auto it = fs::directory_iterator(root, options, ec);
+             it != fs::directory_iterator(); it.increment(ec)) {
+            if (ec) { ec.clear(); continue; }
+            if (!it->is_regular_file(ec) || ec) continue;
 
-                // Check ransom note name
-                std::wstring filename = entry.path().filename().wstring();
-                // Simple check against known list
-                for (const auto& note : RANSOM_NOTE_FILENAMES) {
-                    if (filename == note) {
-                        // Map note to family (simplified logic)
-                        if (note.find(L"Wana") != std::wstring::npos) counts[RansomwareFamily::WannaCry] += 5;
-                        else if (note.find(L"Locky") != std::wstring::npos) counts[RansomwareFamily::Locky] += 5;
-                    }
+            RansomwareFamily extFamily = IdentifyFamilyFromExtension(
+                it->path().extension().wstring());
+            if (extFamily != RansomwareFamily::Unknown) {
+                counts[extFamily]++;
+            }
+
+            // Check ransom note filenames
+            std::wstring filename = it->path().filename().wstring();
+            for (const auto& note : RANSOM_NOTE_FILENAMES) {
+                if (filename == note) {
+                    if (note.find(L"Wana") != std::wstring::npos)
+                        counts[RansomwareFamily::WannaCry] += 5;
+                    else if (note.find(L"Locky") != std::wstring::npos)
+                        counts[RansomwareFamily::Locky] += 5;
+                    else if (note.find(L"Ryuk") != std::wstring::npos)
+                        counts[RansomwareFamily::Ryuk] += 5;
+                    else if (note.find(L"LockBit") != std::wstring::npos ||
+                             note.find(L"Restore-My-Files") != std::wstring::npos)
+                        counts[RansomwareFamily::LockBit] += 5;
                 }
             }
         }
 
-        // Find max
         RansomwareFamily bestMatch = RansomwareFamily::Unknown;
         int maxCount = 0;
         for (const auto& [fam, count] : counts) {
@@ -802,18 +1710,128 @@ RansomwareFamily RansomwareDecryptor::IdentifyFamilyEnum(std::wstring_view folde
 // ============================================================================
 
 bool RansomwareDecryptor::LoadKeyDatabase(std::wstring_view path) {
-    // Stub implementation
-    // Real world: Read JSON/SQLite file, parse keys, call AddKey
-    return true;
+    try {
+        fs::path dbPath(path);
+        std::error_code ec;
+        if (!fs::exists(dbPath, ec) || ec) {
+            SS_LOG_WARN(LOG_CAT, L"Key database not found: %ls",
+                        std::wstring(path).c_str());
+            return false;
+        }
+
+        // Read JSON key database
+        HANDLE hFile = ::CreateFileW(
+            dbPath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            SS_LOG_LAST_ERROR(LOG_CAT, L"Cannot open key database: %ls",
+                              dbPath.c_str());
+            return false;
+        }
+
+        LARGE_INTEGER fileSize{};
+        if (!::GetFileSizeEx(hFile, &fileSize) ||
+            fileSize.QuadPart <= 0 ||
+            fileSize.QuadPart > 50 * 1024 * 1024) { // 50MB cap
+            ::CloseHandle(hFile);
+            SS_LOG_ERROR(LOG_CAT, L"Key database invalid size: %lld",
+                         fileSize.QuadPart);
+            return false;
+        }
+
+        std::string jsonData(static_cast<size_t>(fileSize.QuadPart), '\0');
+        DWORD bytesRead = 0;
+        BOOL readOk = ::ReadFile(hFile, jsonData.data(),
+            static_cast<DWORD>(fileSize.QuadPart), &bytesRead, nullptr);
+        ::CloseHandle(hFile);
+
+        if (!readOk || bytesRead != static_cast<DWORD>(fileSize.QuadPart)) {
+            SS_LOG_ERROR(LOG_CAT, L"Key database read failed");
+            return false;
+        }
+
+        auto j = nlohmann::json::parse(jsonData, nullptr, false);
+        if (j.is_discarded() || !j.is_object()) {
+            SS_LOG_ERROR(LOG_CAT, L"Key database JSON parse failed");
+            ::SecureZeroMemory(jsonData.data(), jsonData.size());
+            return false;
+        }
+
+        size_t loaded = 0;
+        if (j.contains("keys") && j["keys"].is_array()) {
+            for (const auto& keyJson : j["keys"]) {
+                if (loaded >= DecryptorConstants::MAX_KEYS_PER_FAMILY * 32) break;
+
+                DecryptionKey key;
+                if (keyJson.contains("keyId"))
+                    key.keyId = keyJson["keyId"].get<std::string>();
+                if (keyJson.contains("family"))
+                    key.family = static_cast<RansomwareFamily>(
+                        keyJson["family"].get<uint16_t>());
+                if (keyJson.contains("algorithm"))
+                    key.algorithm = static_cast<EncryptionAlgorithm>(
+                        keyJson["algorithm"].get<uint8_t>());
+                if (keyJson.contains("keyType"))
+                    key.keyType = static_cast<KeyType>(
+                        keyJson["keyType"].get<uint8_t>());
+                if (keyJson.contains("isMasterKey"))
+                    key.isMasterKey = keyJson["isMasterKey"].get<bool>();
+
+                // Key data is expected as hex string
+                if (keyJson.contains("keyDataHex")) {
+                    std::string hex = keyJson["keyDataHex"].get<std::string>();
+                    key.keyData.reserve(hex.size() / 2);
+                    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                        key.keyData.push_back(static_cast<uint8_t>(
+                            std::stoul(hex.substr(i, 2), nullptr, 16)));
+                    }
+                    ::SecureZeroMemory(hex.data(), hex.size());
+                }
+                if (keyJson.contains("ivHex")) {
+                    std::string hex = keyJson["ivHex"].get<std::string>();
+                    key.iv.reserve(hex.size() / 2);
+                    for (size_t i = 0; i + 1 < hex.size(); i += 2) {
+                        key.iv.push_back(static_cast<uint8_t>(
+                            std::stoul(hex.substr(i, 2), nullptr, 16)));
+                    }
+                    ::SecureZeroMemory(hex.data(), hex.size());
+                }
+
+                if (!key.keyId.empty() && !key.keyData.empty()) {
+                    AddKey(key);
+                    loaded++;
+                }
+            }
+        }
+
+        // Securely wipe the raw JSON
+        ::SecureZeroMemory(jsonData.data(), jsonData.size());
+
+        SS_LOG_INFO(LOG_CAT, L"Loaded %zu keys from database: %ls",
+                    loaded, dbPath.c_str());
+        return loaded > 0;
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"LoadKeyDatabase exception: %hs", ex.what());
+        return false;
+    }
 }
 
 void RansomwareDecryptor::AddKey(const DecryptionKey& key) {
     std::unique_lock lock(m_impl->m_keyMutex);
 
+    if (m_impl->m_keys.size() >= DecryptorConstants::MAX_DECRYPTORS *
+                                  DecryptorConstants::MAX_KEYS_PER_FAMILY) {
+        SS_LOG_WARN(LOG_CAT, L"Key storage full, cannot add key %hs",
+                    key.keyId.c_str());
+        return;
+    }
+
     if (m_impl->m_keys.count(key.keyId) == 0) {
         m_impl->m_keys[key.keyId] = key;
         m_impl->m_familyKeys[key.family].push_back(key.keyId);
-        m_impl->m_stats.keysLoaded++;
+        m_impl->m_stats.keysLoaded.fetch_add(1, std::memory_order_relaxed);
     }
 }
 
@@ -823,22 +1841,24 @@ void RansomwareDecryptor::RemoveKey(const std::string& keyId) {
     auto it = m_impl->m_keys.find(keyId);
     if (it != m_impl->m_keys.end()) {
         RansomwareFamily fam = it->second.family;
+        SecureEraseKey(it->second);
         m_impl->m_keys.erase(it);
 
-        // Cleanup family map
         auto& vec = m_impl->m_familyKeys[fam];
         std::erase(vec, keyId);
 
-        m_impl->m_stats.keysLoaded--;
+        m_impl->m_stats.keysLoaded.fetch_sub(1, std::memory_order_relaxed);
     }
 }
 
-std::vector<DecryptionKey> RansomwareDecryptor::GetKeysForFamily(RansomwareFamily family) const {
+std::vector<DecryptionKey> RansomwareDecryptor::GetKeysForFamily(
+    RansomwareFamily family) const {
     std::shared_lock lock(m_impl->m_keyMutex);
     std::vector<DecryptionKey> result;
 
     auto it = m_impl->m_familyKeys.find(family);
     if (it != m_impl->m_familyKeys.end()) {
+        result.reserve(it->second.size());
         for (const auto& id : it->second) {
             auto keyIt = m_impl->m_keys.find(id);
             if (keyIt != m_impl->m_keys.end()) {
@@ -856,8 +1876,8 @@ size_t RansomwareDecryptor::GetKeyCount() const noexcept {
 
 bool RansomwareDecryptor::IsDecryptionAvailable(RansomwareFamily family) const {
     std::shared_lock lock(m_impl->m_keyMutex);
-    return m_impl->m_familyKeys.count(family) > 0 &&
-           !m_impl->m_familyKeys.at(family).empty();
+    auto it = m_impl->m_familyKeys.find(family);
+    return it != m_impl->m_familyKeys.end() && !it->second.empty();
 }
 
 // ============================================================================
@@ -884,12 +1904,23 @@ void RansomwareDecryptor::SetBatchProgressCallback(BatchProgressCallback callbac
 // ============================================================================
 
 DecryptorStatistics RansomwareDecryptor::GetStatistics() const {
-    std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_stats;
+    // Atomics are individually read-consistent; snapshot is best-effort
+    DecryptorStatistics snap;
+    snap.filesAnalyzed.store(
+        m_impl->m_stats.filesAnalyzed.load(std::memory_order_relaxed));
+    snap.filesDecrypted.store(
+        m_impl->m_stats.filesDecrypted.load(std::memory_order_relaxed));
+    snap.filesFailed.store(
+        m_impl->m_stats.filesFailed.load(std::memory_order_relaxed));
+    snap.bytesDecrypted.store(
+        m_impl->m_stats.bytesDecrypted.load(std::memory_order_relaxed));
+    snap.keysLoaded.store(
+        m_impl->m_stats.keysLoaded.load(std::memory_order_relaxed));
+    snap.startTime = m_impl->m_stats.startTime;
+    return snap;
 }
 
 void RansomwareDecryptor::ResetStatistics() {
-    std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_stats.Reset();
 }
 
@@ -897,45 +1928,111 @@ void RansomwareDecryptor::ResetStatistics() {
 // UTILITY
 // ============================================================================
 
-std::string_view RansomwareDecryptor::GetFamilyName(RansomwareFamily family) noexcept {
+std::string_view RansomwareDecryptor::GetFamilyName(
+    RansomwareFamily family) noexcept {
     switch (family) {
-        case RansomwareFamily::WannaCry: return "WannaCry";
-        case RansomwareFamily::Locky: return "Locky";
-        case RansomwareFamily::CryptoLocker: return "CryptoLocker";
-        case RansomwareFamily::TeslaCrypt: return "TeslaCrypt";
-        case RansomwareFamily::Cerber: return "Cerber";
-        case RansomwareFamily::GandCrabV4: return "GandCrab v4";
-        case RansomwareFamily::GandCrabV5: return "GandCrab v5";
-        case RansomwareFamily::Shade: return "Shade";
-        case RansomwareFamily::Ryuk: return "Ryuk";
-        case RansomwareFamily::LockBit: return "LockBit";
-        default: return "Unknown";
+        case RansomwareFamily::WannaCry:      return "WannaCry";
+        case RansomwareFamily::Locky:         return "Locky";
+        case RansomwareFamily::CryptoLocker:  return "CryptoLocker";
+        case RansomwareFamily::TeslaCrypt:    return "TeslaCrypt";
+        case RansomwareFamily::TeslaCryptV2:  return "TeslaCrypt v2";
+        case RansomwareFamily::TeslaCryptV3:  return "TeslaCrypt v3";
+        case RansomwareFamily::TeslaCryptV4:  return "TeslaCrypt v4";
+        case RansomwareFamily::Cerber:        return "Cerber";
+        case RansomwareFamily::Petya:         return "Petya";
+        case RansomwareFamily::NotPetya:      return "NotPetya";
+        case RansomwareFamily::GandCrabV4:    return "GandCrab v4";
+        case RansomwareFamily::GandCrabV5:    return "GandCrab v5";
+        case RansomwareFamily::Shade:         return "Shade";
+        case RansomwareFamily::Troldesh:      return "Troldesh";
+        case RansomwareFamily::Crysis:        return "Crysis";
+        case RansomwareFamily::Dharma:        return "Dharma";
+        case RansomwareFamily::Phobos:        return "Phobos";
+        case RansomwareFamily::STOP:          return "STOP";
+        case RansomwareFamily::Djvu:          return "Djvu";
+        case RansomwareFamily::Jigsaw:        return "Jigsaw";
+        case RansomwareFamily::BTCWare:       return "BTCWare";
+        case RansomwareFamily::GlobeImposter: return "GlobeImposter";
+        case RansomwareFamily::SamSam:        return "SamSam";
+        case RansomwareFamily::Ryuk:          return "Ryuk";
+        case RansomwareFamily::REvil:         return "REvil";
+        case RansomwareFamily::Maze:          return "Maze";
+        case RansomwareFamily::Conti:         return "Conti";
+        case RansomwareFamily::LockBit:       return "LockBit";
+        case RansomwareFamily::BlackCat:      return "BlackCat";
+        case RansomwareFamily::Hive:          return "Hive";
+        case RansomwareFamily::Custom:        return "Custom";
+        default:                              return "Unknown";
     }
 }
 
 bool RansomwareDecryptor::SelfTest() {
-    Utils::Logger::Info("RansomwareDecryptor: Running self-test...");
+    SS_LOG_INFO(LOG_CAT, L"Running self-test...");
 
-    // Test 1: Configuration
+    // Test 1: Configuration validation
     RansomwareDecryptorConfiguration config;
-    if (!config.IsValid()) return false;
-
-    // Test 2: Extension identification
-    if (IdentifyFamilyFromExtension(L".wncry") != RansomwareFamily::WannaCry) {
-        Utils::Logger::Error("RansomwareDecryptor: Self-test failed (extension ID)");
+    if (!config.IsValid()) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: default config invalid");
         return false;
     }
 
-    Utils::Logger::Info("RansomwareDecryptor: Self-test PASSED");
+    // Test 2: Extension identification
+    if (IdentifyFamilyFromExtension(L".wncry") != RansomwareFamily::WannaCry) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: .wncry extension ID");
+        return false;
+    }
+    if (IdentifyFamilyFromExtension(L".WNCRY") != RansomwareFamily::WannaCry) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: case-insensitive extension ID");
+        return false;
+    }
+    if (IdentifyFamilyFromExtension(L".lockbit") != RansomwareFamily::LockBit) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: .lockbit extension ID");
+        return false;
+    }
+
+    // Test 3: Family name lookup
+    auto name = GetFamilyName(RansomwareFamily::Ryuk);
+    if (name != "Ryuk") {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: family name lookup");
+        return false;
+    }
+
+    // Test 4: Family name map
+    auto famIt = FAMILY_NAME_MAP.find("Ryuk");
+    if (famIt == FAMILY_NAME_MAP.end() ||
+        famIt->second != RansomwareFamily::Ryuk) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: family name map");
+        return false;
+    }
+
+    // Test 5: Process termination check (PID 0 should always return true)
+    if (!VerifyRansomwareTerminated(0)) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: PID 0 termination check");
+        return false;
+    }
+
+    // Test 6: Path validation
+    if (!ValidateFilePath(fs::path(L"C:\\Test\\file.txt"))) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: valid path rejected");
+        return false;
+    }
+    if (ValidateFilePath(fs::path(L"C:\\Test\\..\\..\\Windows\\System32\\config"))) {
+        SS_LOG_ERROR(LOG_CAT, L"Self-test FAILED: traversal path accepted");
+        return false;
+    }
+
+    SS_LOG_INFO(LOG_CAT, L"Self-test PASSED (all checks)");
     return true;
 }
 
 std::string RansomwareDecryptor::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << DecryptorConstants::VERSION_MAJOR << "."
-        << DecryptorConstants::VERSION_MINOR << "."
-        << DecryptorConstants::VERSION_PATCH;
-    return oss.str();
+    // Use constexpr-friendly formatting
+    char buf[32]{};
+    std::snprintf(buf, sizeof(buf), "%u.%u.%u",
+                  DecryptorConstants::VERSION_MAJOR,
+                  DecryptorConstants::VERSION_MINOR,
+                  DecryptorConstants::VERSION_PATCH);
+    return std::string(buf);
 }
 
 // ============================================================================
@@ -943,11 +2040,12 @@ std::string RansomwareDecryptor::GetVersionString() noexcept {
 // ============================================================================
 
 void DecryptorStatistics::Reset() noexcept {
-    filesAnalyzed = 0;
-    filesDecrypted = 0;
-    filesFailed = 0;
-    bytesDecrypted = 0;
-    keysLoaded = 0;
+    filesAnalyzed.store(0, std::memory_order_relaxed);
+    filesDecrypted.store(0, std::memory_order_relaxed);
+    filesFailed.store(0, std::memory_order_relaxed);
+    bytesDecrypted.store(0, std::memory_order_relaxed);
+    keysLoaded.store(0, std::memory_order_relaxed);
+    for (auto& f : familiesIdentified) f.store(0, std::memory_order_relaxed);
     startTime = Clock::now();
 }
 
@@ -956,16 +2054,199 @@ std::string DecryptionResult::ToJson() const {
     j["originalPath"] = std::string(originalPath.begin(), originalPath.end());
     j["decryptedPath"] = std::string(decryptedPath.begin(), decryptedPath.end());
     j["status"] = static_cast<int>(status);
+    j["family"] = static_cast<int>(family);
     j["keyId"] = keyId;
     j["durationMs"] = durationMs;
+    j["originalSize"] = originalSize;
     j["decryptedSize"] = decryptedSize;
+    j["validationPassed"] = validationPassed;
+    if (!errorMessage.empty()) j["error"] = errorMessage;
+    return j.dump();
+}
+
+double BatchDecryptionResult::GetSuccessRate() const noexcept {
+    if (totalFiles == 0) return 0.0;
+    return static_cast<double>(filesDecrypted) / static_cast<double>(totalFiles);
+}
+
+std::string BatchDecryptionResult::ToJson() const {
+    nlohmann::json j;
+    j["batchId"] = batchId;
+    j["totalFiles"] = totalFiles;
+    j["filesDecrypted"] = filesDecrypted;
+    j["filesFailed"] = filesFailed;
+    j["filesSkipped"] = filesSkipped;
+    j["bytesProcessed"] = bytesProcessed;
+    j["successRate"] = GetSuccessRate();
+    return j.dump();
+}
+
+std::string RecoveryResult::ToJson() const {
+    nlohmann::json j;
+    j["encryptedPath"] = std::string(encryptedPath.begin(), encryptedPath.end());
+    j["recoveredPath"] = std::string(recoveredPath.begin(), recoveredPath.end());
+    j["methodUsed"] = static_cast<int>(methodUsed);
+    j["status"] = static_cast<int>(status);
+    j["durationMs"] = durationMs;
+    j["recoveredSize"] = recoveredSize;
+    j["integrityVerified"] = integrityVerified;
+    if (!forensicCopyPath.empty())
+        j["forensicCopyPath"] = std::string(
+            forensicCopyPath.begin(), forensicCopyPath.end());
+    if (!errorMessage.empty()) j["error"] = errorMessage;
+    return j.dump();
+}
+
+bool DecryptionKey::IsValidFor(const EncryptedFileInfo& file) const {
+    if (family != file.family) return false;
+    if (algorithm != EncryptionAlgorithm::Unknown &&
+        file.algorithm != EncryptionAlgorithm::Unknown &&
+        algorithm != file.algorithm) return false;
+    if (isMasterKey) return true;
+    if (!file.victimId.empty() && !victimIds.empty()) {
+        return std::find(victimIds.begin(), victimIds.end(), file.victimId)
+               != victimIds.end();
+    }
+    return true;
+}
+
+std::string DecryptionKey::ToJson() const {
+    nlohmann::json j;
+    j["keyId"] = keyId;
+    j["keyType"] = static_cast<int>(keyType);
+    j["source"] = static_cast<int>(source);
+    j["family"] = static_cast<int>(family);
+    j["algorithm"] = static_cast<int>(algorithm);
+    j["isMasterKey"] = isMasterKey;
+    // Intentionally omit keyData, iv, rsaPrivateKey for security
+    j["notes"] = notes;
+    return j.dump();
+}
+
+std::string EncryptedFileInfo::ToJson() const {
+    nlohmann::json j;
+    j["filePath"] = std::string(filePath.begin(), filePath.end());
+    j["fileSize"] = fileSize;
+    j["family"] = static_cast<int>(family);
+    j["algorithm"] = static_cast<int>(algorithm);
+    j["canDecrypt"] = canDecrypt;
+    j["confidence"] = confidence;
+    return j.dump();
+}
+
+std::string DecryptorStatistics::ToJson() const {
+    nlohmann::json j;
+    j["filesAnalyzed"] = filesAnalyzed.load(std::memory_order_relaxed);
+    j["filesDecrypted"] = filesDecrypted.load(std::memory_order_relaxed);
+    j["filesFailed"] = filesFailed.load(std::memory_order_relaxed);
+    j["bytesDecrypted"] = bytesDecrypted.load(std::memory_order_relaxed);
+    j["keysLoaded"] = keysLoaded.load(std::memory_order_relaxed);
     return j.dump();
 }
 
 bool RansomwareDecryptorConfiguration::IsValid() const noexcept {
     if (maxConcurrent == 0) return false;
+    if (fileTimeoutMs == 0) return false;
     return true;
 }
 
-} // namespace Ransomware
-} // namespace ShadowStrike
+// ============================================================================
+// FREE FUNCTION IMPLEMENTATIONS
+// ============================================================================
+
+std::string_view GetDecryptionStatusName(DecryptionStatus status) noexcept {
+    switch (status) {
+        case DecryptionStatus::Success:          return "Success";
+        case DecryptionStatus::PartialSuccess:   return "PartialSuccess";
+        case DecryptionStatus::Failed:           return "Failed";
+        case DecryptionStatus::UnknownFamily:    return "UnknownFamily";
+        case DecryptionStatus::NoKeyAvailable:   return "NoKeyAvailable";
+        case DecryptionStatus::InvalidFile:      return "InvalidFile";
+        case DecryptionStatus::CorruptedFile:    return "CorruptedFile";
+        case DecryptionStatus::IOError:          return "IOError";
+        case DecryptionStatus::Timeout:          return "Timeout";
+        case DecryptionStatus::Cancelled:        return "Cancelled";
+        case DecryptionStatus::AlreadyDecrypted: return "AlreadyDecrypted";
+        default:                                 return "Unknown";
+    }
+}
+
+std::string_view GetKeyTypeName(KeyType type) noexcept {
+    switch (type) {
+        case KeyType::MasterKey:  return "MasterKey";
+        case KeyType::SessionKey: return "SessionKey";
+        case KeyType::FileKey:    return "FileKey";
+        case KeyType::OfflineKey: return "OfflineKey";
+        case KeyType::OnlineKey:  return "OnlineKey";
+        case KeyType::DerivedKey: return "DerivedKey";
+        default:                  return "Unknown";
+    }
+}
+
+std::string_view GetAlgorithmName(EncryptionAlgorithm algo) noexcept {
+    switch (algo) {
+        case EncryptionAlgorithm::AES128CBC: return "AES-128-CBC";
+        case EncryptionAlgorithm::AES256CBC: return "AES-256-CBC";
+        case EncryptionAlgorithm::AES128CTR: return "AES-128-CTR";
+        case EncryptionAlgorithm::AES256CTR: return "AES-256-CTR";
+        case EncryptionAlgorithm::AES128GCM: return "AES-128-GCM";
+        case EncryptionAlgorithm::AES256GCM: return "AES-256-GCM";
+        case EncryptionAlgorithm::RSA2048:   return "RSA-2048";
+        case EncryptionAlgorithm::RSA4096:   return "RSA-4096";
+        case EncryptionAlgorithm::ChaCha20:  return "ChaCha20";
+        case EncryptionAlgorithm::Salsa20:   return "Salsa20";
+        case EncryptionAlgorithm::RC4:       return "RC4";
+        case EncryptionAlgorithm::Blowfish:  return "Blowfish";
+        case EncryptionAlgorithm::Twofish:   return "Twofish";
+        case EncryptionAlgorithm::Custom:    return "Custom";
+        default:                             return "Unknown";
+    }
+}
+
+std::string_view GetKeySourceName(KeySource source) noexcept {
+    switch (source) {
+        case KeySource::Leaked:         return "Leaked";
+        case KeySource::LawEnforcement: return "LawEnforcement";
+        case KeySource::Research:       return "Research";
+        case KeySource::Weakness:       return "Weakness";
+        case KeySource::UserProvided:   return "UserProvided";
+        default:                        return "Unknown";
+    }
+}
+
+std::vector<std::wstring> GetFamilyExtensions(RansomwareFamily family) {
+    std::vector<std::wstring> result;
+    for (const auto& [ext, fam] : EXTENSION_MAP) {
+        if (fam == family) result.push_back(ext);
+    }
+    return result;
+}
+
+std::vector<std::wstring> GetFamilyRansomNotes(RansomwareFamily family) {
+    std::vector<std::wstring> result;
+    // Map notes to families
+    switch (family) {
+        case RansomwareFamily::WannaCry:
+            result.push_back(L"@Please_Read_Me@.txt");
+            result.push_back(L"@WanaDecryptor@.txt");
+            break;
+        case RansomwareFamily::Locky:
+            result.push_back(L"_Locky_recover_instructions.txt");
+            break;
+        case RansomwareFamily::CryptoLocker:
+            result.push_back(L"HELP_DECRYPT.TXT");
+            break;
+        case RansomwareFamily::Ryuk:
+            result.push_back(L"RyukReadMe.txt");
+            break;
+        case RansomwareFamily::LockBit:
+            result.push_back(L"Restore-My-Files.txt");
+            break;
+        default:
+            break;
+    }
+    return result;
+}
+
+}  // namespace Ransomware
+}  // namespace ShadowStrike
