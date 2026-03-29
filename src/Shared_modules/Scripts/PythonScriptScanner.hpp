@@ -176,12 +176,20 @@ namespace PythonConstants {
     /// @brief Maximum decompiled bytecode size
     inline constexpr size_t MAX_DECOMPILED_SIZE = 100 * 1024 * 1024;
     
-    /// @brief Python 2.7 magic number
-    inline constexpr uint32_t PYC_MAGIC_27 = 0x03F30D0A;
-    
-    /// @brief Python 3.x magic numbers (range)
-    inline constexpr uint32_t PYC_MAGIC_3X_MIN = 0x0D0A0000;
-    inline constexpr uint32_t PYC_MAGIC_3X_MAX = 0x0D0AFFFF;
+    /// @brief Python 2.7 version magic (lower 16 bits of little-endian uint32 read)
+    inline constexpr uint16_t PYC_VERSION_MAGIC_27 = 62211;  // 0xF303
+
+    /// @brief CRLF suffix in .pyc magic (upper 16 bits on little-endian)
+    inline constexpr uint16_t PYC_CRLF_SUFFIX = 0x0A0D;
+
+    /// @brief Maximum regex input size to prevent ReDoS
+    inline constexpr size_t MAX_REGEX_INPUT_SIZE = 2 * 1024 * 1024;
+
+    /// @brief Maximum bytecode string extraction size
+    inline constexpr size_t MAX_BYTECODE_STRINGS_SIZE = 10 * 1024 * 1024;
+
+    /// @brief Minimum printable string length for bytecode extraction
+    inline constexpr size_t MIN_EXTRACTED_STRING_LENGTH = 6;
     
     /// @brief Suspicious imports
     inline constexpr const char* SUSPICIOUS_IMPORTS[] = {
@@ -192,6 +200,7 @@ namespace PythonConstants {
         "requests", "urllib", "http.client", "paramiko",
         "pexpect", "ptyprocess", "keyboard", "mouse",
         "pyperclip", "pyHook", "pythoncom", "wmi",
+        "impacket", "mss", "pyscreenshot", "browser_cookie3",
     };
 
 }  // namespace PythonConstants
@@ -229,7 +238,7 @@ enum class PythonArtifactType : uint8_t {
 /**
  * @brief Python version
  */
-enum class PythonVersion : uint8_t {
+enum class PythonVersion : uint16_t {
     Unknown     = 0,
     Python27    = 27,
     Python30    = 30,
@@ -240,7 +249,8 @@ enum class PythonVersion : uint8_t {
     Python39    = 39,
     Python310   = 310,
     Python311   = 311,
-    Python312   = 312
+    Python312   = 312,
+    Python313   = 313
 };
 
 /**
@@ -267,7 +277,12 @@ enum class PythonCapability : uint32_t {
     DynamicExecution        = 1 << 16,  ///< exec/eval usage
     ShellAccess             = 1 << 17,  ///< Shell command execution
     EmailAccess             = 1 << 18,  ///< Email operations
-    BrowserManipulation     = 1 << 19   ///< Browser automation
+    BrowserManipulation     = 1 << 19,  ///< Browser automation
+    ShellcodeInjection      = 1 << 20,  ///< Shellcode via ctypes
+    LsassDumping            = 1 << 21,  ///< LSASS credential dump
+    C2Communication         = 1 << 22,  ///< C2 download-and-exec
+    AttackFramework         = 1 << 23,  ///< impacket / offensive tool
+    ReverseShell            = 1 << 24   ///< Reverse/bind shell
 };
 
 /**

@@ -48,6 +48,7 @@
  * ============================================================================
  */
 
+#include "pch.h"
 #include "PythonScriptScanner.hpp"
 
 // Standard library includes
@@ -101,6 +102,7 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
         case PythonVersion::Python310: return "Python 3.10";
         case PythonVersion::Python311: return "Python 3.11";
         case PythonVersion::Python312: return "Python 3.12";
+        case PythonVersion::Python313: return "Python 3.13";
         default:                       return "Unknown";
     }
 }
@@ -147,6 +149,16 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
         return "Email Access";
     if (capVal & static_cast<uint32_t>(PythonCapability::BrowserManipulation))
         return "Browser Manipulation";
+    if (capVal & static_cast<uint32_t>(PythonCapability::ShellcodeInjection))
+        return "Shellcode Injection";
+    if (capVal & static_cast<uint32_t>(PythonCapability::LsassDumping))
+        return "LSASS Credential Dump";
+    if (capVal & static_cast<uint32_t>(PythonCapability::C2Communication))
+        return "C2 Communication";
+    if (capVal & static_cast<uint32_t>(PythonCapability::AttackFramework))
+        return "Attack Framework";
+    if (capVal & static_cast<uint32_t>(PythonCapability::ReverseShell))
+        return "Reverse Shell";
     return "None";
 }
 
@@ -196,11 +208,20 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
 }
 
 [[nodiscard]] PythonVersion DetectPythonVersionFromMagic(uint32_t magic) noexcept {
-    // Python 2.7 magic numbers
-    if (magic == 0x03F30D0A) return PythonVersion::Python27;
-
-    // Python 3.x magic numbers (first two bytes are version-specific)
+    // .pyc magic is 4 bytes on disk: [version_lo, version_hi, 0x0D, 0x0A]
+    // When read as little-endian uint32_t: upper 16 bits = 0x0A0D, lower 16 = version
     uint16_t versionMagic = static_cast<uint16_t>(magic & 0xFFFF);
+    uint16_t suffix = static_cast<uint16_t>((magic >> 16) & 0xFFFF);
+
+    // Validate CRLF suffix (0x0A0D in little-endian = bytes 0D 0A)
+    if (suffix != PythonConstants::PYC_CRLF_SUFFIX) {
+        return PythonVersion::Unknown;
+    }
+
+    // Python 2.7: version magic 62211 (0xF303)
+    if (versionMagic == PythonConstants::PYC_VERSION_MAGIC_27) {
+        return PythonVersion::Python27;
+    }
 
     // Python 3.5: 3350-3351
     if (versionMagic >= 3350 && versionMagic <= 3351) return PythonVersion::Python35;
@@ -216,8 +237,10 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
     if (versionMagic >= 3430 && versionMagic <= 3439) return PythonVersion::Python310;
     // Python 3.11: 3490-3499
     if (versionMagic >= 3490 && versionMagic <= 3499) return PythonVersion::Python311;
-    // Python 3.12: 3500+
-    if (versionMagic >= 3500) return PythonVersion::Python312;
+    // Python 3.12: 3531
+    if (versionMagic >= 3500 && versionMagic <= 3549) return PythonVersion::Python312;
+    // Python 3.13: 3550+
+    if (versionMagic >= 3550 && versionMagic <= 3599) return PythonVersion::Python313;
 
     return PythonVersion::Unknown;
 }
@@ -226,20 +249,52 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
 // JSON SERIALIZATION IMPLEMENTATIONS
 // ============================================================================
 
+namespace {
+
+/// @brief Escape a string for safe JSON embedding. Handles backslashes,
+///        quotes, control characters, and non-printable bytes.
+void JsonEscapeInto(std::ostringstream& oss, std::string_view sv) {
+    for (const char c : sv) {
+        switch (c) {
+            case '"':  oss << "\\\""; break;
+            case '\\': oss << "\\\\"; break;
+            case '\n': oss << "\\n";  break;
+            case '\r': oss << "\\r";  break;
+            case '\t': oss << "\\t";  break;
+            case '\b': oss << "\\b";  break;
+            case '\f': oss << "\\f";  break;
+            default:
+                if (static_cast<unsigned char>(c) >= 0x20 &&
+                    static_cast<unsigned char>(c) < 0x7F) {
+                    oss << c;
+                } else {
+                    // Encode as \u00XX for control/high bytes
+                    oss << "\\u" << std::hex << std::setfill('0')
+                        << std::setw(4)
+                        << static_cast<unsigned>(static_cast<unsigned char>(c))
+                        << std::dec;
+                }
+                break;
+        }
+    }
+}
+
+}  // anonymous namespace
+
 [[nodiscard]] std::string PythonImportInfo::ToJson() const {
     std::ostringstream oss;
     oss << "{";
-    oss << "\"moduleName\":\"" << moduleName << "\",";
+    oss << "\"moduleName\":\""; JsonEscapeInto(oss, moduleName); oss << "\",";
     oss << "\"isStdLib\":" << (isStdLib ? "true" : "false") << ",";
     oss << "\"isSuspicious\":" << (isSuspicious ? "true" : "false") << ",";
-    oss << "\"suspicionReason\":\"" << suspicionReason << "\",";
+    oss << "\"suspicionReason\":\""; JsonEscapeInto(oss, suspicionReason); oss << "\",";
     oss << "\"lineNumber\":" << lineNumber << ",";
     oss << "\"capabilities\":" << static_cast<uint32_t>(capabilities) << ",";
 
     oss << "\"functionsImported\":[";
     for (size_t i = 0; i < functionsImported.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << functionsImported[i] << "\"";
+        oss << "\""; JsonEscapeInto(oss, functionsImported[i]); oss << "\"";
     }
     oss << "]";
 
@@ -256,7 +311,7 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
     oss << "\"sourceSize\":" << sourceSize << ",";
     oss << "\"codeObjectCount\":" << codeObjectCount << ",";
     oss << "\"wasDecompiled\":" << (wasDecompiled ? "true" : "false") << ",";
-    oss << "\"decompileError\":\"" << decompileError << "\"";
+    oss << "\"decompileError\":\""; JsonEscapeInto(oss, decompileError); oss << "\"";
     oss << "}";
     return oss.str();
 }
@@ -265,17 +320,17 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
     std::ostringstream oss;
     oss << "{";
     oss << "\"packerType\":\"" << GetPythonArtifactTypeName(packerType) << "\",";
-    oss << "\"packerVersion\":\"" << packerVersion << "\",";
-    oss << "\"entryScript\":\"" << entryScript << "\",";
+    oss << "\"packerVersion\":\""; JsonEscapeInto(oss, packerVersion); oss << "\",";
+    oss << "\"entryScript\":\""; JsonEscapeInto(oss, entryScript); oss << "\",";
     oss << "\"embeddedScriptCount\":" << embeddedScriptCount << ",";
     oss << "\"pythonVersion\":\"" << GetPythonVersionName(pythonVersion) << "\",";
     oss << "\"wasExtracted\":" << (wasExtracted ? "true" : "false") << ",";
-    oss << "\"extractionError\":\"" << extractionError << "\",";
+    oss << "\"extractionError\":\""; JsonEscapeInto(oss, extractionError); oss << "\",";
 
     oss << "\"embeddedScripts\":[";
     for (size_t i = 0; i < embeddedScripts.size() && i < 50; ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << embeddedScripts[i] << "\"";
+        oss << "\""; JsonEscapeInto(oss, embeddedScripts[i]); oss << "\"";
     }
     oss << "]";
 
@@ -298,21 +353,21 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
     oss << "\"isMalicious\":" << (isMalicious ? "true" : "false") << ",";
     oss << "\"category\":\"" << GetPythonThreatCategoryName(category) << "\",";
     oss << "\"riskScore\":" << riskScore << ",";
-    oss << "\"detectedFamily\":\"" << detectedFamily << "\",";
-    oss << "\"threatName\":\"" << threatName << "\",";
+    oss << "\"detectedFamily\":\""; JsonEscapeInto(oss, detectedFamily); oss << "\",";
+    oss << "\"threatName\":\""; JsonEscapeInto(oss, threatName); oss << "\",";
     oss << "\"artifactType\":\"" << GetPythonArtifactTypeName(artifactType) << "\",";
     oss << "\"capabilities\":" << static_cast<uint32_t>(capabilities) << ",";
     oss << "\"isObfuscated\":" << (isObfuscated ? "true" : "false") << ",";
     oss << "\"obfuscationType\":\"" << GetPythonObfuscationTypeName(obfuscationType) << "\",";
-    oss << "\"filePath\":\"" << filePath.string() << "\",";
-    oss << "\"sha256\":\"" << sha256 << "\",";
+    oss << "\"filePath\":\""; JsonEscapeInto(oss, filePath.string()); oss << "\",";
+    oss << "\"sha256\":\""; JsonEscapeInto(oss, sha256); oss << "\",";
     oss << "\"fileSize\":" << fileSize << ",";
     oss << "\"scanDurationUs\":" << scanDuration.count() << ",";
 
     oss << "\"detectedCapabilities\":[";
     for (size_t i = 0; i < detectedCapabilities.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << detectedCapabilities[i] << "\"";
+        oss << "\""; JsonEscapeInto(oss, detectedCapabilities[i]); oss << "\"";
     }
     oss << "],";
 
@@ -326,14 +381,14 @@ std::atomic<bool> PythonScriptScanner::s_instanceCreated{false};
     oss << "\"matchedSignatures\":[";
     for (size_t i = 0; i < matchedSignatures.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << matchedSignatures[i] << "\"";
+        oss << "\""; JsonEscapeInto(oss, matchedSignatures[i]); oss << "\"";
     }
     oss << "],";
 
     oss << "\"extractedIOCs\":[";
     for (size_t i = 0; i < extractedIOCs.size(); ++i) {
         if (i > 0) oss << ",";
-        oss << "\"" << extractedIOCs[i] << "\"";
+        oss << "\""; JsonEscapeInto(oss, extractedIOCs[i]); oss << "\"";
     }
     oss << "],";
 
@@ -643,6 +698,68 @@ PythonScriptScannerImpl::s_dangerousPatterns = {
     {"selenium.webdriver", PythonCapability::BrowserManipulation, 25, "Browser automation"},
     {"webdriver.Chrome", PythonCapability::BrowserManipulation, 25, "Chrome automation"},
     {"webdriver.Firefox", PythonCapability::BrowserManipulation, 25, "Firefox automation"},
+
+    // === APT / NATION-STATE PATTERNS ===
+
+    // Shellcode injection via ctypes (APT29, Cobalt Strike, etc.)
+    {"ctypes.windll.kernel32.VirtualAlloc", PythonCapability::ShellcodeInjection, 55, "Ctypes VirtualAlloc for shellcode"},
+    {"ctypes.windll.kernel32.CreateThread", PythonCapability::ShellcodeInjection, 55, "Ctypes CreateThread for shellcode exec"},
+    {"ctypes.windll.kernel32.RtlMoveMemory", PythonCapability::ShellcodeInjection, 55, "Ctypes memory copy for shellcode"},
+    {"ctypes.windll.kernel32.WriteProcessMemory", PythonCapability::ShellcodeInjection, 55, "Ctypes process memory write"},
+    {"ctypes.windll.kernel32.CreateRemoteThread", PythonCapability::ShellcodeInjection, 55, "Ctypes remote thread creation"},
+    {"ctypes.windll.kernel32.VirtualAllocEx", PythonCapability::ShellcodeInjection, 55, "Ctypes remote memory alloc"},
+    {"ctypes.windll.kernel32.OpenProcess", PythonCapability::ShellcodeInjection, 50, "Ctypes process open"},
+    {"ctypes.windll.kernel32.VirtualProtect", PythonCapability::ShellcodeInjection, 50, "Ctypes memory protection change"},
+    {"ctypes.CFUNCTYPE", PythonCapability::ShellcodeInjection, 50, "Ctypes function pointer cast"},
+    {"ctypes.cast", PythonCapability::ShellcodeInjection, 40, "Ctypes type cast for shellcode"},
+    {"ctypes.memmove", PythonCapability::ShellcodeInjection, 45, "Ctypes memory move"},
+    {"ctypes.c_char_p", PythonCapability::ShellcodeInjection, 35, "Ctypes char pointer"},
+    {"kernel32.EnumWindows", PythonCapability::ShellcodeInjection, 45, "EnumWindows callback shellcode exec"},
+
+    // LSASS credential dumping (Mimikatz-like via ctypes)
+    {"MiniDumpWriteDump", PythonCapability::LsassDumping, 55, "Memory dump via MiniDumpWriteDump"},
+    {"lsass", PythonCapability::LsassDumping, 50, "LSASS process targeting"},
+    {"PROCESS_ALL_ACCESS", PythonCapability::LsassDumping, 45, "Full process access rights"},
+    {"dbghelp", PythonCapability::LsassDumping, 45, "Debug help library for dumps"},
+    {"sekurlsa", PythonCapability::LsassDumping, 50, "Mimikatz sekurlsa module"},
+
+    // C2 communication (download-and-exec pattern)
+    {"urllib.request.urlopen", PythonCapability::C2Communication, 30, "URL fetch for C2"},
+    {"urllib.request.urlretrieve", PythonCapability::C2Communication, 35, "File download for C2"},
+    {"http.server", PythonCapability::C2Communication, 30, "HTTP server for staging"},
+
+    // Attack frameworks
+    {"impacket", PythonCapability::AttackFramework, 55, "Impacket attack framework"},
+    {"impacket.smbconnection", PythonCapability::AttackFramework, 55, "Impacket SMB attack"},
+    {"impacket.dcerpc", PythonCapability::AttackFramework, 55, "Impacket DCERPC attack"},
+    {"impacket.ntlm", PythonCapability::AttackFramework, 55, "Impacket NTLM attack"},
+    {"impacket.kerberos", PythonCapability::AttackFramework, 55, "Impacket Kerberos attack"},
+    {"impacket.secretsdump", PythonCapability::AttackFramework, 55, "Impacket credential dump"},
+    {"impacket.wmiexec", PythonCapability::AttackFramework, 55, "Impacket WMI execution"},
+    {"impacket.smbexec", PythonCapability::AttackFramework, 55, "Impacket SMB execution"},
+    {"impacket.psexec", PythonCapability::AttackFramework, 55, "Impacket PsExec execution"},
+    {"impacket.atexec", PythonCapability::AttackFramework, 55, "Impacket AT execution"},
+    {"mimikatz", PythonCapability::AttackFramework, 55, "Mimikatz tooling"},
+    {"bloodhound", PythonCapability::AttackFramework, 50, "BloodHound AD recon"},
+    {"responder", PythonCapability::AttackFramework, 50, "Responder LLMNR/NBT-NS"},
+    {"lazagne", PythonCapability::AttackFramework, 50, "LaZagne credential harvester"},
+
+    // Reverse / bind shell patterns
+    {"dup2", PythonCapability::ReverseShell, 40, "File descriptor duplication"},
+    {"pty.spawn", PythonCapability::ReverseShell, 45, "PTY shell spawn"},
+    {"bash -i", PythonCapability::ReverseShell, 50, "Interactive bash shell"},
+    {"cmd.exe", PythonCapability::ReverseShell, 40, "Command shell"},
+    {"powershell.exe", PythonCapability::ReverseShell, 45, "PowerShell execution"},
+
+    // Registry persistence — Run key
+    {"CurrentVersion\\\\Run", PythonCapability::Persistence, 50, "Registry Run key persistence"},
+    {"CurrentVersion\\Run", PythonCapability::Persistence, 50, "Registry Run key persistence"},
+
+    // Obfuscation chains
+    {"base64.b64decode", PythonCapability::DynamicExecution, 30, "Base64 decode (obfuscation)"},
+    {"marshal.loads", PythonCapability::DynamicExecution, 40, "Marshal deserialization"},
+    {"zlib.decompress", PythonCapability::DynamicExecution, 25, "Zlib decompression"},
+    {"codecs.decode", PythonCapability::DynamicExecution, 25, "Codecs decode"},
 };
 
 const std::vector<std::string> PythonScriptScannerImpl::s_ratIndicators = {
@@ -773,6 +890,13 @@ void PythonScriptScannerImpl::Shutdown() {
         return result;
     }
 
+    // Thread-safe config snapshot
+    PythonScannerConfiguration configSnapshot;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnapshot = m_config;
+    }
+
     std::wstring widePath = path.wstring();
 
     // Check file exists
@@ -794,16 +918,17 @@ void PythonScriptScannerImpl::Shutdown() {
 
     result.fileSize = fileStat.size;
 
-    // Size check
-    if (fileStat.size > m_config.maxFileSize) {
+    // Size check — use config snapshot, not m_config directly
+    if (fileStat.size > configSnapshot.maxFileSize) {
         SS_LOG_WARN(L"PythonScanner", L"File too large (%llu bytes): %ls",
-                    fileStat.size, widePath.c_str());
+                    static_cast<unsigned long long>(fileStat.size), widePath.c_str());
         result.status = PythonScanStatus::SkippedSizeLimit;
         return result;
     }
 
     // Detect artifact type
-    result.artifactType = DetectArtifactType(path);
+    PythonArtifactType detectedType = DetectArtifactType(path);
+    result.artifactType = detectedType;
 
     // Read file content
     std::vector<std::byte> content;
@@ -814,18 +939,20 @@ void PythonScriptScannerImpl::Shutdown() {
     }
 
     // Compute file hash
-    std::array<uint8_t, 32> hashBytes;
+    std::array<uint8_t, 32> hashBytes{};
+    std::string fileHash;
     if (Utils::FileUtils::ComputeFileSHA256(widePath, hashBytes, &fileErr)) {
-        result.sha256 = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
+        fileHash = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
+        result.sha256 = fileHash;
     }
 
     // Route to appropriate scanner
     try {
-        switch (result.artifactType) {
+        switch (detectedType) {
             case PythonArtifactType::SourcePy:
             case PythonArtifactType::Notebook: {
                 std::string source(reinterpret_cast<const char*>(content.data()), content.size());
-                result = AnalyzeSource(source, path.filename().string(), result.artifactType);
+                result = AnalyzeSource(source, path.filename().string(), detectedType);
                 m_stats.sourceFilesScanned++;
                 break;
             }
@@ -848,7 +975,6 @@ void PythonScriptScannerImpl::Shutdown() {
             }
 
             default: {
-                // Try as source anyway
                 std::string source(reinterpret_cast<const char*>(content.data()), content.size());
                 result = AnalyzeSource(source, path.filename().string(), PythonArtifactType::SourcePy);
                 break;
@@ -860,11 +986,13 @@ void PythonScriptScannerImpl::Shutdown() {
         NotifyError(std::string("Scan exception: ") + e.what(), -1);
     }
 
-    // Restore file info
+    // Restore file metadata that sub-scanners may have overwritten
     result.filePath = path;
-    result.sha256 = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
+    if (!fileHash.empty()) {
+        result.sha256 = fileHash;
+    }
     result.fileSize = fileStat.size;
-    result.artifactType = result.artifactType;
+    result.artifactType = detectedType;
 
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
@@ -889,7 +1017,7 @@ void PythonScriptScannerImpl::Shutdown() {
 
     NotifyCallback(result);
 
-    if (m_config.verboseLogging) {
+    if (configSnapshot.verboseLogging) {
         SS_LOG_INFO(L"PythonScanner", L"Scan complete: %ls - Status: %d, Risk: %d",
                     widePath.c_str(), static_cast<int>(result.status), result.riskScore);
     }
