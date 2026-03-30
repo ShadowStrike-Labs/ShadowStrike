@@ -42,7 +42,7 @@
  * - Statistics tracked for security dashboards
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2024
  * @copyright (c) 2024 ShadowStrike Security. All rights reserved.
  * ============================================================================
@@ -50,6 +50,15 @@
 
 #include "pch.h"
 #include "AntiDebug.hpp"
+
+// ============================================================================
+// COMMUNICATION INCLUDES — KERNEL BRIDGE & WIRING
+// ============================================================================
+
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../Utils/StringUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -61,6 +70,7 @@
 #include <iomanip>
 #include <cmath>
 #include <random>
+#include <cwctype>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES (Additional)
@@ -96,13 +106,13 @@ typedef NTSTATUS(NTAPI* NtClose_t)(
     HANDLE Handle
 );
 
-// Process information classes not in winternl.h
-constexpr PROCESSINFOCLASS ProcessDebugPort = static_cast<PROCESSINFOCLASS>(7);
-constexpr PROCESSINFOCLASS ProcessDebugFlags = static_cast<PROCESSINFOCLASS>(31);
-constexpr PROCESSINFOCLASS ProcessDebugObjectHandle = static_cast<PROCESSINFOCLASS>(30);
+// Process information classes — prefixed to avoid conflict with winternl.h PROCESSINFOCLASS enum
+constexpr PROCESSINFOCLASS SsProcessDebugPort = static_cast<PROCESSINFOCLASS>(7);
+constexpr PROCESSINFOCLASS SsProcessDebugFlags = static_cast<PROCESSINFOCLASS>(31);
+constexpr PROCESSINFOCLASS SsProcessDebugObjectHandle = static_cast<PROCESSINFOCLASS>(30);
 
 // Thread information class for hiding
-constexpr THREADINFOCLASS ThreadHideFromDebugger = static_cast<THREADINFOCLASS>(17);
+constexpr THREADINFOCLASS SsThreadHideFromDebugger = static_cast<THREADINFOCLASS>(17);
 
 // NtGlobalFlag values indicating debugger
 constexpr ULONG FLG_HEAP_ENABLE_TAIL_CHECK = 0x10;
@@ -255,7 +265,98 @@ void SerializeExecution() noexcept {
 #endif
 }
 
-} // anonymous namespace
+}
+
+// ============================================================================
+// SEH HELPER FUNCTIONS (must be in separate functions — no C++ destructors)
+// MSVC C2712: __try cannot coexist with objects requiring stack unwinding.
+// These helpers use only POD types and return a bool for the SEH outcome.
+// ============================================================================
+
+#ifdef _WIN32
+
+/**
+ * @brief SEH wrapper for CloseHandle debugger check.
+ * @return true if CloseHandle threw an exception (debugger detected).
+ */
+static bool SehCloseHandleCheck() noexcept {
+    HANDLE hInvalid = reinterpret_cast<HANDLE>(static_cast<ULONG_PTR>(0xDEADBEEF));
+    __try {
+        ::CloseHandle(hInvalid);
+        return false;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+}
+
+/**
+ * @brief SEH wrapper for INT3 breakpoint exception check.
+ * @return true if exception was caught (normal — no debugger), false if swallowed.
+ */
+static bool SehInt3ExceptionCheck() noexcept {
+    __try {
+        __debugbreak();
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;  // Exception caught normally
+    }
+    return false;  // Debugger swallowed the exception
+}
+
+/**
+ * @brief SEH wrapper for guard page exception check.
+ * @param pMem VirtualAlloc'd memory with PAGE_GUARD.
+ * @return true if guard page exception was caught (normal), false if swallowed.
+ */
+static bool SehGuardPageCheck(LPVOID pMem) noexcept {
+    __try {
+        volatile BYTE* p = static_cast<volatile BYTE*>(pMem);
+        *p = 0x42;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;  // Exception caught normally
+    }
+    return false;  // Debugger swallowed the exception
+}
+
+/**
+ * @brief SEH wrapper for VEH analysis — raises an access violation.
+ * @return true if the exception was handled by SEH.
+ */
+static bool SehRaiseAccessViolation() noexcept {
+    __try {
+        ::RaiseException(0xC0000005, 0, 0, nullptr);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return true;
+    }
+    return false;
+}
+
+/**
+ * @brief SEH wrapper for scanning memory for software breakpoints (0xCC).
+ * @param pStart Start address.
+ * @param size Size in bytes.
+ * @param outBreakpoints Output: number of 0xCC bytes found.
+ * @return true if scan completed, false if access violation occurred.
+ */
+static bool SehScanBreakpoints(const BYTE* pStart, size_t size, size_t& outBreakpoints) noexcept {
+    outBreakpoints = 0;
+    __try {
+        for (size_t i = 0; i < size; ++i) {
+            if (pStart[i] == 0xCC) {
+                outBreakpoints++;
+            }
+        }
+        return true;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return false;
+    }
+}
+
+#endif // _WIN32
 
 // ============================================================================
 // ANTIDEBUG IMPLEMENTATION CLASS
@@ -465,6 +566,18 @@ public:
 
     [[nodiscard]] bool SelfTest();
     void ForceGarbageCollection();
+
+    // ========================================================================
+    // KERNEL BRIDGE & COMMUNICATION WIRING
+    // ========================================================================
+
+    void OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                               std::wstring_view imagePath, bool isCreate);
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uintptr_t imageBase, size_t imageSize);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId, std::string_view reason);
+    void ReportDetectionToAlertSystem(const DetectionResult& result);
+    void ReportScanTelemetry(const DetectionResult& result);
 
 private:
     // ========================================================================
@@ -907,14 +1020,19 @@ DetectionResult AntiDebugImpl::PerformFullScan() {
         m_detectionScore.store(result.totalScore, std::memory_order_release);
     }
 
-    // Update statistics
-    m_stats.totalChecks.fetch_add(result.checksPerformed, std::memory_order_relaxed);
-    m_stats.lastCheckTime = Clock::now();
+    // Update statistics (under exclusive lock — m_stats is plain uint64_t, not atomic)
+    {
+        std::unique_lock statsLock(m_mutex);
+        m_stats.totalChecks += result.checksPerformed;
+        m_stats.lastCheckTime = Clock::now();
+
+        if (result.debuggerDetected) {
+            m_stats.totalDetections += 1;
+            m_stats.lastDetectionTime = Clock::now();
+        }
+    }
 
     if (result.debuggerDetected) {
-        m_stats.totalDetections.fetch_add(1, std::memory_order_relaxed);
-        m_stats.lastDetectionTime = Clock::now();
-
         // Generate detection event
         DetectionEvent event;
         event.eventId = GenerateEventId();
@@ -934,7 +1052,13 @@ DetectionResult AntiDebugImpl::PerformFullScan() {
                            result.totalScore,
                            static_cast<int>(result.overallConfidence),
                            static_cast<int>(result.primaryDebuggerType));
+
+        // Wire to communication subsystems
+        ReportDetectionToAlertSystem(result);
     }
+
+    // Always report scan telemetry (detection or clean)
+    ReportScanTelemetry(result);
 
     return result;
 }
@@ -963,6 +1087,11 @@ DetectionResult AntiDebugImpl::PerformQuickScan() {
         m_debuggerDetected.store(result.debuggerDetected, std::memory_order_release);
         m_detectionScore.store(result.totalScore, std::memory_order_release);
     }
+
+    if (result.debuggerDetected) {
+        ReportDetectionToAlertSystem(result);
+    }
+    ReportScanTelemetry(result);
 
     return result;
 }
@@ -1114,39 +1243,51 @@ DetectionCheckResult AntiDebugImpl::CheckPEB_HeapFlags() {
 #ifdef _WIN32
     try {
         PPEB pPeb = GetPEB();
-        if (pPeb && pPeb->ProcessHeap) {
-            // Heap flags are at different offsets depending on architecture
-            // ForceFlags at offset 0x44 (x86) or 0x74 (x64)
-            // Flags at offset 0x40 (x86) or 0x70 (x64)
+        if (pPeb) {
+            // PEB::ProcessHeap is not declared in winternl.h (opaque struct).
+            // Access via documented offset: 0x30 on x64, 0x18 on x86.
 #ifdef _WIN64
-            ULONG heapFlags = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb->ProcessHeap) + 0x70);
-            ULONG forceFlags = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb->ProcessHeap) + 0x74);
+            constexpr size_t kProcessHeapOffset = 0x30;
 #else
-            ULONG heapFlags = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb->ProcessHeap) + 0x40);
-            ULONG forceFlags = *reinterpret_cast<PULONG>(
-                reinterpret_cast<PBYTE>(pPeb->ProcessHeap) + 0x44);
+            constexpr size_t kProcessHeapOffset = 0x18;
+#endif
+            PVOID processHeap = *reinterpret_cast<PVOID*>(
+                reinterpret_cast<PBYTE>(pPeb) + kProcessHeapOffset);
+
+            if (processHeap) {
+                // Heap flags are at different offsets depending on architecture
+                // ForceFlags at offset 0x44 (x86) or 0x74 (x64)
+                // Flags at offset 0x40 (x86) or 0x70 (x64)
+#ifdef _WIN64
+                ULONG heapFlags = *reinterpret_cast<PULONG>(
+                    reinterpret_cast<PBYTE>(processHeap) + 0x70);
+                ULONG forceFlags = *reinterpret_cast<PULONG>(
+                    reinterpret_cast<PBYTE>(processHeap) + 0x74);
+#else
+                ULONG heapFlags = *reinterpret_cast<PULONG>(
+                    reinterpret_cast<PBYTE>(processHeap) + 0x40);
+                ULONG forceFlags = *reinterpret_cast<PULONG>(
+                    reinterpret_cast<PBYTE>(processHeap) + 0x44);
 #endif
 
-            // Normal heap has Flags = 2 and ForceFlags = 0
-            // Debugged heap has additional flags set
-            constexpr ULONG HEAP_GROWABLE = 0x00000002;
+                // Normal heap has Flags = 2 and ForceFlags = 0
+                // Debugged heap has additional flags set
+                constexpr ULONG kHeapGrowableFlag = 0x00000002;
 
-            if ((heapFlags & ~HEAP_GROWABLE) != 0 || forceFlags != 0) {
-                result.detected = true;
-                result.confidence = DetectionConfidence::Medium;
-                result.score = AntiDebugConstants::WEIGHT_PEB_DETECTION / 2;
-                result.debuggerType = DebuggerType::UserMode;
-                result.message = "Heap flags indicate debugger presence";
-                result.details["heap_flags"] = std::to_string(heapFlags);
-                result.details["force_flags"] = std::to_string(forceFlags);
+                if ((heapFlags & ~kHeapGrowableFlag) != 0 || forceFlags != 0) {
+                    result.detected = true;
+                    result.confidence = DetectionConfidence::Medium;
+                    result.score = AntiDebugConstants::WEIGHT_PEB_DETECTION / 2;
+                    result.debuggerType = DebuggerType::UserMode;
+                    result.message = "Heap flags indicate debugger presence";
+                    result.details["heap_flags"] = std::to_string(heapFlags);
+                    result.details["force_flags"] = std::to_string(forceFlags);
 
-                SS_LOG_WARN(L"AntiDebug", L"Heap debug flags detected: Flags=0x%lX, ForceFlags=0x%lX",
-                                   heapFlags, forceFlags);
-            } else {
-                result.message = "Heap flags are clean";
+                    SS_LOG_WARN(L"AntiDebug", L"Heap debug flags detected: Flags=0x%lX, ForceFlags=0x%lX",
+                                       heapFlags, forceFlags);
+                } else {
+                    result.message = "Heap flags are clean";
+                }
             }
         }
     } catch (const std::exception& e) {
@@ -1303,7 +1444,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugPort
         DWORD_PTR debugPort = 0;
         NTSTATUS status = m_pNtQueryInformationProcess(
             ::GetCurrentProcess(),
-            ProcessDebugPort,
+            SsProcessDebugPort,
             &debugPort,
             sizeof(debugPort),
             nullptr
@@ -1344,7 +1485,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugFlag
         DWORD debugFlags = 0;
         NTSTATUS status = m_pNtQueryInformationProcess(
             ::GetCurrentProcess(),
-            ProcessDebugFlags,
+            SsProcessDebugFlags,
             &debugFlags,
             sizeof(debugFlags),
             nullptr
@@ -1385,7 +1526,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_NtQueryInformationProcess_DebugObje
         HANDLE debugObject = nullptr;
         NTSTATUS status = m_pNtQueryInformationProcess(
             ::GetCurrentProcess(),
-            ProcessDebugObjectHandle,
+            SsProcessDebugObjectHandle,
             &debugObject,
             sizeof(debugObject),
             nullptr
@@ -1460,16 +1601,7 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_CloseHandle() {
     result.timestamp = startTime;
 
 #ifdef _WIN32
-    // Create an invalid handle value
-    HANDLE hInvalid = reinterpret_cast<HANDLE>(0xDEADBEEF);
-
-    __try {
-        // If no debugger, CloseHandle returns FALSE with ERROR_INVALID_HANDLE
-        // If debugger attached, it may throw EXCEPTION_INVALID_HANDLE
-        ::CloseHandle(hInvalid);
-        result.message = "CloseHandle test passed - no exception";
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
+    if (SehCloseHandleCheck()) {
         result.detected = true;
         result.confidence = DetectionConfidence::High;
         result.score = AntiDebugConstants::WEIGHT_API_DETECTION;
@@ -1477,6 +1609,8 @@ DetectionCheckResult AntiDebugImpl::CheckAPI_CloseHandle() {
         result.message = "CloseHandle threw exception - debugger attached";
 
         SS_LOG_WARN(L"AntiDebug", L"CloseHandle exception detected - debugger present");
+    } else {
+        result.message = "CloseHandle test passed - no exception";
     }
 #else
     result.message = "CloseHandle check not supported on this platform";
@@ -2018,14 +2152,7 @@ DetectionCheckResult AntiDebugImpl::CheckException_INT3() {
     result.timestamp = startTime;
 
 #ifdef _WIN32
-    bool exceptionCaught = false;
-
-    __try {
-        __debugbreak();
-    }
-    __except (EXCEPTION_EXECUTE_HANDLER) {
-        exceptionCaught = true;
-    }
+    bool exceptionCaught = SehInt3ExceptionCheck();
 
     if (!exceptionCaught) {
         result.detected = true;
@@ -2138,16 +2265,7 @@ DetectionCheckResult AntiDebugImpl::CheckException_GuardPage() {
     LPVOID pMem = ::VirtualAlloc(nullptr, 4096, MEM_COMMIT, PAGE_READWRITE | PAGE_GUARD);
 
     if (pMem) {
-        bool exceptionCaught = false;
-
-        __try {
-            // Access the guard page - should trigger exception
-            volatile BYTE* p = static_cast<volatile BYTE*>(pMem);
-            *p = 0x42;
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            exceptionCaught = true;
-        }
+        bool exceptionCaught = SehGuardPageCheck(pMem);
 
         if (!exceptionCaught) {
             result.detected = true;
@@ -2194,13 +2312,8 @@ DetectionCheckResult AntiDebugImpl::CheckException_VEH() {
 
     PVOID handle = ::AddVectoredExceptionHandler(0 /* last */, vehHandler);
     if (handle) {
-        // Trigger exception and verify our VEH sees it
-        __try {
-            ::RaiseException(0xC0000005, 0, 0, nullptr);
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
-            // Expected
-        }
+        // Trigger exception via SEH helper and verify our VEH sees it
+        SehRaiseAccessViolation();
 
         // If our VEH at the end of the chain didn't fire, something intercepted it
         bool fired = s_vehFired.load(std::memory_order_acquire);
@@ -2356,14 +2469,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_SoftwareBreakpoints(uintptr_t ad
         const PBYTE pStart = reinterpret_cast<PBYTE>(address);
         size_t breakpointCount = 0;
 
-        __try {
-            for (size_t i = 0; i < size; ++i) {
-                if (pStart[i] == 0xCC) {
-                    breakpointCount++;
-                }
-            }
-        }
-        __except (EXCEPTION_EXECUTE_HANDLER) {
+        if (!SehScanBreakpoints(pStart, size, breakpointCount)) {
             result.errorCode = 1;
             result.message = "Access violation while scanning memory";
             result.checkDuration = std::chrono::duration_cast<Microseconds>(Clock::now() - startTime);
@@ -2423,7 +2529,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_CodeIntegrity() {
                 SS_LOG_WARN(L"AntiDebug", L"Code integrity violation in region '%hs': expected CRC 0x%08X, got 0x%08X",
                                    id.c_str(), region.expectedCrc32, currentCrc);
 
-                m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+                m_stats.integrityViolations += 1;
             } else {
                 region.status = IntegrityStatus::Valid;
             }
@@ -2532,8 +2638,8 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_IATHooks() {
             for (auto& h : foundHooks) {
                 m_detectedHooks.push_back(std::move(h));
             }
+            m_stats.hooksDetected += hookCount;
         }
-        m_stats.hooksDetected.fetch_add(hookCount, std::memory_order_relaxed);
 
         result.detected = true;
         result.confidence = DetectionConfidence::High;
@@ -2625,8 +2731,8 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_InlineHooks() {
             for (auto& h : foundHooks) {
                 m_detectedHooks.push_back(std::move(h));
             }
+            m_stats.hooksDetected += hookCount;
         }
-        m_stats.hooksDetected.fetch_add(hookCount, std::memory_order_relaxed);
 
         result.detected = true;
         result.confidence = DetectionConfidence::Critical;
@@ -3084,7 +3190,7 @@ bool AntiDebugImpl::HideThread(uint32_t threadId) {
 
     NTSTATUS status = m_pNtSetInformationThread(
         hThread,
-        ThreadHideFromDebugger,
+        SsThreadHideFromDebugger,
         nullptr,
         0
     );
@@ -3100,7 +3206,7 @@ bool AntiDebugImpl::HideThread(uint32_t threadId) {
         state.isHidden = true;
         state.protectionTime = Clock::now();
 
-        m_stats.threadsHidden.fetch_add(1, std::memory_order_relaxed);
+        m_stats.threadsHidden += 1;
 
         SS_LOG_INFO(L"AntiDebug", L"Thread %u hidden from debugger", tid);
         return true;
@@ -3154,8 +3260,8 @@ ThreadProtectionState AntiDebugImpl::GetThreadProtectionState(uint32_t threadId)
 }
 
 void AntiDebugImpl::SecureThread() {
-    HideThread(0);
-    ClearDebugRegisters(0);
+    (void)HideThread(0);
+    (void)ClearDebugRegisters(0);
 }
 
 bool AntiDebugImpl::ProtectThread(uint32_t threadId) {
@@ -3225,9 +3331,8 @@ bool AntiDebugImpl::ClearDebugRegisters(uint32_t threadId) {
         auto& state = m_threadStates[tid];
         state.threadId = tid;
         state.debugRegistersClear = true;
+        m_stats.breakpointsCleared += 1;
     }
-
-    m_stats.breakpointsCleared.fetch_add(1, std::memory_order_relaxed);
 
     SS_LOG_INFO(L"AntiDebug", L"Debug registers cleared for thread %u", tid);
     return true;
@@ -3368,10 +3473,10 @@ IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
         region.status = IntegrityStatus::Modified;
         region.failureCount++;
 
-        m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+        m_stats.integrityViolations += 1;
 
-        SS_LOG_WARN(L"AntiDebug", L"Integrity violation in '%hs': expected 0x%08X, got 0x%08X",
-                           id.c_str(), region.expectedCrc32, region.currentCrc32);
+        SS_LOG_WARN(L"AntiDebug", L"Integrity violation in '%.*hs': expected 0x%08X, got 0x%08X",
+                           static_cast<int>(id.size()), id.data(), region.expectedCrc32, region.currentCrc32);
     } else {
         region.status = IntegrityStatus::Valid;
     }
@@ -3458,18 +3563,19 @@ bool AntiDebugImpl::ExecuteResponse(ResponseAction action, const DetectionResult
 
     // Hide threads
     if ((static_cast<uint32_t>(action) & static_cast<uint32_t>(ResponseAction::HideThreads)) != 0) {
-        HideAllThreads();
+        (void)HideAllThreads();
         executed = true;
     }
 
     // Clear breakpoints
     if ((static_cast<uint32_t>(action) & static_cast<uint32_t>(ResponseAction::ClearBreakpoints)) != 0) {
-        ClearAllDebugRegisters();
+        (void)ClearAllDebugRegisters();
         executed = true;
     }
 
     if (executed) {
-        m_stats.actionsExecuted.fetch_add(1, std::memory_order_relaxed);
+        std::unique_lock lock(m_mutex);
+        m_stats.actionsExecuted += 1;
     }
 
     return executed;
@@ -3487,7 +3593,7 @@ ResponseAction AntiDebugImpl::ExecuteRecommendedResponse(const DetectionResult& 
     // Only execute actions that are both recommended and configured
     ResponseAction toExecute = recommended & configured;
 
-    ExecuteResponse(toExecute, result);
+    (void)ExecuteResponse(toExecute, result);
 
     return toExecute;
 }
@@ -3498,7 +3604,7 @@ ResponseAction AntiDebugImpl::ExecuteRecommendedResponse(const DetectionResult& 
 
 uint64_t AntiDebugImpl::RegisterDetectionCallback(DetectionCallback callback) {
     std::lock_guard lock(m_callbackMutex);
-    uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = m_nextCallbackId += 1;
     m_detectionCallbacks[id] = std::move(callback);
     return id;
 }
@@ -3510,7 +3616,7 @@ void AntiDebugImpl::UnregisterDetectionCallback(uint64_t callbackId) {
 
 uint64_t AntiDebugImpl::RegisterResponseCallback(ResponseCallback callback) {
     std::lock_guard lock(m_callbackMutex);
-    uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = m_nextCallbackId += 1;
     m_responseCallbacks[id] = std::move(callback);
     return id;
 }
@@ -3522,7 +3628,7 @@ void AntiDebugImpl::UnregisterResponseCallback(uint64_t callbackId) {
 
 uint64_t AntiDebugImpl::RegisterIntegrityCallback(IntegrityCallback callback) {
     std::lock_guard lock(m_callbackMutex);
-    uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = m_nextCallbackId += 1;
     m_integrityCallbacks[id] = std::move(callback);
     return id;
 }
@@ -3534,7 +3640,7 @@ void AntiDebugImpl::UnregisterIntegrityCallback(uint64_t callbackId) {
 
 uint64_t AntiDebugImpl::RegisterHookCallback(HookCallback callback) {
     std::lock_guard lock(m_callbackMutex);
-    uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = m_nextCallbackId += 1;
     m_hookCallbacks[id] = std::move(callback);
     return id;
 }
@@ -3546,7 +3652,7 @@ void AntiDebugImpl::UnregisterHookCallback(uint64_t callbackId) {
 
 uint64_t AntiDebugImpl::RegisterStatusCallback(StatusCallback callback) {
     std::lock_guard lock(m_callbackMutex);
-    uint64_t id = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    uint64_t id = m_nextCallbackId += 1;
     m_statusCallbacks[id] = std::move(callback);
     return id;
 }
@@ -3602,14 +3708,14 @@ std::string AntiDebugImpl::ExportReport() const {
     oss << "  \"debuggerDetected\": " << (m_debuggerDetected.load() ? "true" : "false") << ",\n";
     oss << "  \"detectionScore\": " << m_detectionScore.load() << ",\n";
     oss << "  \"statistics\": {\n";
-    oss << "    \"totalChecks\": " << m_stats.totalChecks.load() << ",\n";
-    oss << "    \"totalDetections\": " << m_stats.totalDetections.load() << ",\n";
-    oss << "    \"falsePositives\": " << m_stats.falsePositives.load() << ",\n";
-    oss << "    \"actionsExecuted\": " << m_stats.actionsExecuted.load() << ",\n";
-    oss << "    \"threadsHidden\": " << m_stats.threadsHidden.load() << ",\n";
-    oss << "    \"breakpointsCleared\": " << m_stats.breakpointsCleared.load() << ",\n";
-    oss << "    \"hooksDetected\": " << m_stats.hooksDetected.load() << ",\n";
-    oss << "    \"integrityViolations\": " << m_stats.integrityViolations.load() << ",\n";
+    oss << "    \"totalChecks\": " << m_stats.totalChecks << ",\n";
+    oss << "    \"totalDetections\": " << m_stats.totalDetections << ",\n";
+    oss << "    \"falsePositives\": " << m_stats.falsePositives << ",\n";
+    oss << "    \"actionsExecuted\": " << m_stats.actionsExecuted << ",\n";
+    oss << "    \"threadsHidden\": " << m_stats.threadsHidden << ",\n";
+    oss << "    \"breakpointsCleared\": " << m_stats.breakpointsCleared << ",\n";
+    oss << "    \"hooksDetected\": " << m_stats.hooksDetected << ",\n";
+    oss << "    \"integrityViolations\": " << m_stats.integrityViolations << ",\n";
     oss << "    \"uptimeSeconds\": " << m_stats.GetUptimeSeconds() << "\n";
     oss << "  },\n";
     oss << "  \"integrityRegions\": " << m_integrityRegions.size() << ",\n";
@@ -3666,8 +3772,11 @@ bool AntiDebugImpl::SelfTest() {
     }
 
     // Test 5: Statistics
-    if (m_stats.GetUptimeSeconds() == 0 && m_initialized.load()) {
-        // May be okay if just started
+    {
+        std::shared_lock statsLock(m_mutex);
+        if (m_stats.GetUptimeSeconds() == 0 && m_initialized) {
+            // May be okay if just started
+        }
     }
 
     SS_LOG_INFO(L"AntiDebug", L"Self-test completed: %hs", passed ? "PASSED" : "FAILED");
@@ -3771,21 +3880,21 @@ void AntiDebugImpl::MonitoringThreadFunc() {
         }
 
         if (mode == MonitoringMode::Continuous) {
-            PerformFullScan();
+            (void)PerformFullScan();
         } else if (mode == MonitoringMode::Periodic) {
-            PerformQuickScan();
+            (void)PerformQuickScan();
         } else if (mode == MonitoringMode::Adaptive) {
             // Use quick scan normally, full scan if something was detected recently
             if (m_debuggerDetected.load(std::memory_order_acquire)) {
-                PerformFullScan();
+                (void)PerformFullScan();
             } else {
-                PerformQuickScan();
+                (void)PerformQuickScan();
             }
         }
 
         // Auto-clear debug registers if enabled
         if (m_autoClearing.load(std::memory_order_acquire)) {
-            ClearAllDebugRegisters();
+            (void)ClearAllDebugRegisters();
         }
     }
 }
@@ -3857,15 +3966,12 @@ void AntiDebugImpl::RecordDetection(const DetectionCheckResult& check) {
 }
 
 void AntiDebugImpl::UpdateStatistics(const DetectionCheckResult& check, Microseconds duration) {
-    m_stats.totalChecks.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock lock(m_mutex);
+    m_stats.totalChecks += 1;
 
     uint64_t durationUs = static_cast<uint64_t>(duration.count());
-    uint64_t currentMax = m_stats.maxCheckDurationUs.load(std::memory_order_relaxed);
-
-    while (durationUs > currentMax) {
-        if (m_stats.maxCheckDurationUs.compare_exchange_weak(currentMax, durationUs)) {
-            break;
-        }
+    if (durationUs > m_stats.maxCheckDurationUs) {
+        m_stats.maxCheckDurationUs = durationUs;
     }
 }
 
@@ -4516,6 +4622,283 @@ void AntiDebug::ForceGarbageCollection() {
 }
 
 // ============================================================================
+// KERNEL BRIDGE — INBOUND NOTIFICATIONS
+// ============================================================================
+
+void AntiDebug::OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                                       std::wstring_view imagePath, bool isCreate) {
+    m_impl->OnKernelProcessNotify(processId, parentProcessId, imagePath, isCreate);
+}
+
+void AntiDebug::OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                                   uintptr_t imageBase, size_t imageSize) {
+    m_impl->OnKernelImageLoad(processId, imagePath, imageBase, imageSize);
+}
+
+bool AntiDebug::RequestKernelProcessBlock(uint32_t processId, std::string_view reason) {
+    return m_impl->RequestKernelProcessBlock(processId, reason);
+}
+
+void AntiDebug::ReportDetectionToAlertSystem(const DetectionResult& result) {
+    m_impl->ReportDetectionToAlertSystem(result);
+}
+
+void AntiDebug::ReportScanTelemetry(const DetectionResult& result) {
+    m_impl->ReportScanTelemetry(result);
+}
+
+// ============================================================================
+// KERNEL BRIDGE & WIRING IMPLEMENTATIONS (AntiDebugImpl)
+// ============================================================================
+
+void AntiDebugImpl::OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                                           std::wstring_view imagePath, bool isCreate) {
+    if (!isCreate || !IsInitialized()) {
+        return;
+    }
+
+    // Extract process name from full image path
+    std::wstring_view processName = imagePath;
+    auto lastSlash = imagePath.find_last_of(L'\\');
+    if (lastSlash != std::wstring_view::npos && lastSlash + 1 < imagePath.size()) {
+        processName = imagePath.substr(lastSlash + 1);
+    }
+
+    // Check if the newly created process is a known debugger
+    std::wstring lowerName(processName);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+    bool isDebugger = false;
+    for (const auto& dbgName : AntiDebugConstants::DEBUGGER_PROCESSES) {
+        std::wstring wDbgName = NarrowToWide(std::string(dbgName));
+        std::transform(wDbgName.begin(), wDbgName.end(), wDbgName.begin(), ::towlower);
+
+        if (lowerName == wDbgName) {
+            isDebugger = true;
+            break;
+        }
+    }
+
+    if (!isDebugger) {
+        return;
+    }
+
+    // Check whitelist before flagging
+    if (IsWhitelisted(std::wstring(processName))) {
+        SS_LOG_INFO(L"AntiDebug", L"Kernel: whitelisted debugger process %u (%.*ls)",
+                    processId, static_cast<int>(processName.size()), processName.data());
+        return;
+    }
+
+    SS_LOG_WARN(L"AntiDebug", L"Kernel: debugger process detected PID=%u parent=%u path=%.*ls",
+                processId, parentProcessId,
+                static_cast<int>(imagePath.size()), imagePath.data());
+
+    // Record detection
+    DebuggerProcessInfo info;
+    info.processId = processId;
+    info.processName = std::wstring(processName);
+    info.type = DebuggerType::UserMode;
+    info.confidence = DetectionConfidence::High;
+
+    {
+        std::unique_lock lock(m_mutex);
+        m_detectedDebuggers.push_back(info);
+    }
+
+    m_debuggerDetected.store(true, std::memory_order_release);
+
+    // Generate detection event
+    DetectionEvent event;
+    event.eventId = GenerateEventId();
+    event.technique = DetectionTechnique::Process_DebuggerSearch;
+    event.confidence = DetectionConfidence::High;
+    event.score = AntiDebugConstants::WEIGHT_PROCESS_DETECTION;
+    event.debuggerType = DebuggerType::UserMode;
+    event.message = "Kernel: debugger process launched — PID " + std::to_string(processId);
+    event.timestamp = Clock::now();
+    event.threadId = GetCurrentThreadIdSafe();
+    event.processId = GetCurrentProcessIdSafe();
+
+    NotifyDetection(event);
+
+    // Report to AlertSystem
+    DetectionResult detResult;
+    detResult.debuggerDetected = true;
+    detResult.totalScore = AntiDebugConstants::WEIGHT_PROCESS_DETECTION;
+    detResult.overallConfidence = DetectionConfidence::High;
+    detResult.primaryDebuggerType = DebuggerType::UserMode;
+    detResult.checksPerformed = 1;
+    detResult.scanTimestamp = Clock::now();
+    ReportDetectionToAlertSystem(detResult);
+
+    // Request kernel to block if response actions include termination
+    ResponseAction configured;
+    {
+        std::shared_lock lock(m_mutex);
+        configured = m_config.responseActions;
+    }
+    if ((static_cast<uint32_t>(configured) &
+         static_cast<uint32_t>(ResponseAction::SuspendDebugger)) != 0) {
+        (void)RequestKernelProcessBlock(processId, "Known debugger process detected via kernel notify");
+    }
+}
+
+void AntiDebugImpl::OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                                       uintptr_t imageBase, size_t imageSize) {
+    if (!IsInitialized()) {
+        return;
+    }
+
+    // Only care about images loaded into our own process
+    if (processId != GetCurrentProcessIdSafe()) {
+        return;
+    }
+
+    // Extract DLL name from full path
+    std::wstring_view dllName = imagePath;
+    auto lastSlash = imagePath.find_last_of(L'\\');
+    if (lastSlash != std::wstring_view::npos && lastSlash + 1 < imagePath.size()) {
+        dllName = imagePath.substr(lastSlash + 1);
+    }
+
+    // Check for known debugger DLLs being injected
+    std::wstring lowerDll(dllName);
+    std::transform(lowerDll.begin(), lowerDll.end(), lowerDll.begin(), ::towlower);
+
+    static constexpr std::array<std::wstring_view, 8> kDebuggerDlls = {
+        L"dbghelp.dll", L"dbgcore.dll", L"symsrv.dll", L"srcsrv.dll",
+        L"vehdebug.dll", L"titanengine.dll", L"scyllahide.dll", L"sharpod.dll"
+    };
+
+    bool suspicious = false;
+    for (const auto& dbgDll : kDebuggerDlls) {
+        if (lowerDll == dbgDll) {
+            suspicious = true;
+            break;
+        }
+    }
+
+    if (!suspicious) {
+        return;
+    }
+
+    SS_LOG_WARN(L"AntiDebug", L"Kernel: suspicious DLL loaded into our process: %.*ls at 0x%IX size=%zu",
+                static_cast<int>(dllName.size()), dllName.data(), imageBase, imageSize);
+
+    // Register the loaded region for integrity monitoring
+    std::string regionId = "kernel_img_" + WideToNarrow(std::wstring(dllName));
+    (void)RegisterIntegrityRegion(regionId, imageBase, std::min(imageSize, static_cast<size_t>(4096)));
+
+    // Generate detection event
+    DetectionEvent event;
+    event.eventId = GenerateEventId();
+    event.technique = DetectionTechnique::Process_DebuggerSearch;
+    event.confidence = DetectionConfidence::Medium;
+    event.score = AntiDebugConstants::WEIGHT_PROCESS_DETECTION / 2;
+    event.debuggerType = DebuggerType::Instrumentation;
+    event.message = "Kernel: debugger DLL loaded — " + WideToNarrow(std::wstring(dllName));
+    event.timestamp = Clock::now();
+    event.threadId = GetCurrentThreadIdSafe();
+    event.processId = processId;
+
+    NotifyDetection(event);
+}
+
+bool AntiDebugImpl::RequestKernelProcessBlock(uint32_t processId, std::string_view reason) {
+    using namespace Communication;
+
+    if (!IPCManager::HasInstance()) {
+        SS_LOG_DEBUG(L"AntiDebug", L"RequestKernelProcessBlock: IPCManager not available");
+        return false;
+    }
+
+    auto& ipc = IPCManager::Instance();
+    if (!ipc.IsFilterPortConnected()) {
+        SS_LOG_WARN(L"AntiDebug", L"RequestKernelProcessBlock: kernel port not connected");
+        return false;
+    }
+
+    // Build IPC message: msgType(4) + PID(4) + reasonLen(4) + reason(N)
+    constexpr uint32_t kMsgTypeAntiDebugBlock = 0x00AD0001;
+    const uint32_t reasonLen = static_cast<uint32_t>(std::min(reason.size(), static_cast<size_t>(256)));
+    const size_t totalSize = sizeof(uint32_t) * 3 + reasonLen;
+
+    std::vector<uint8_t> buffer(totalSize);
+    uint8_t* ptr = buffer.data();
+
+    std::memcpy(ptr, &kMsgTypeAntiDebugBlock, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    std::memcpy(ptr, &processId, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    std::memcpy(ptr, &reasonLen, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    std::memcpy(ptr, reason.data(), reasonLen);
+
+    bool sent = ipc.SendToKernel(buffer.data(), buffer.size());
+    if (sent) {
+        SS_LOG_INFO(L"AntiDebug", L"Kernel process block requested for PID %u", processId);
+    } else {
+        SS_LOG_ERROR(L"AntiDebug", L"Failed to send kernel block request for PID %u", processId);
+    }
+    return sent;
+}
+
+void AntiDebugImpl::ReportDetectionToAlertSystem(const DetectionResult& result) {
+    using namespace Communication;
+
+    if (!AlertSystem::HasInstance()) {
+        return;
+    }
+
+    auto& alerts = AlertSystem::Instance();
+
+    // Map detection confidence to alert severity
+    AlertSeverity severity = AlertSeverity::Medium;
+    if (result.overallConfidence == DetectionConfidence::Critical) {
+        severity = AlertSeverity::Critical;
+    } else if (result.overallConfidence == DetectionConfidence::High) {
+        severity = AlertSeverity::High;
+    } else if (result.overallConfidence == DetectionConfidence::Low) {
+        severity = AlertSeverity::Low;
+    }
+
+    std::string summary = "Debugger/tampering detected — score: " + std::to_string(result.totalScore)
+                        + ", type: " + std::string(GetDebuggerTypeName(result.primaryDebuggerType));
+
+    (void)alerts.RaiseAlert(
+        severity,
+        AlertType::ThreatDetection,
+        "AntiDebug",
+        summary,
+        "AntiDebug module v" + AntiDebug::GetVersionString()
+    );
+}
+
+void AntiDebugImpl::ReportScanTelemetry(const DetectionResult& result) {
+    using namespace Communication;
+
+    if (!TelemetryCollector::HasInstance()) {
+        return;
+    }
+
+    auto& telemetry = TelemetryCollector::Instance();
+
+    std::map<std::string, std::string> fields;
+    fields["module"] = "AntiDebug";
+    fields["version"] = AntiDebug::GetVersionString();
+    fields["debugger_detected"] = result.debuggerDetected ? "true" : "false";
+    fields["total_score"] = std::to_string(result.totalScore);
+    fields["checks_performed"] = std::to_string(result.checksPerformed);
+    fields["confidence"] = std::string(GetConfidenceName(result.overallConfidence));
+    fields["debugger_type"] = std::string(GetDebuggerTypeName(result.primaryDebuggerType));
+    fields["scan_duration_us"] = std::to_string(
+        std::chrono::duration_cast<Microseconds>(Clock::now() - result.scanTimestamp).count());
+
+    telemetry.RecordCustom("antidebug_scan", fields);
+}
+
+// ============================================================================
 // CONFIGURATION METHODS
 // ============================================================================
 
@@ -4653,16 +5036,16 @@ uint32_t DebugRegisterState::GetActiveBreakpointCount() const noexcept {
 }
 
 void AntiDebugStatistics::Reset() noexcept {
-    totalChecks.store(0, std::memory_order_relaxed);
-    totalDetections.store(0, std::memory_order_relaxed);
-    falsePositives.store(0, std::memory_order_relaxed);
-    actionsExecuted.store(0, std::memory_order_relaxed);
-    threadsHidden.store(0, std::memory_order_relaxed);
-    breakpointsCleared.store(0, std::memory_order_relaxed);
-    hooksDetected.store(0, std::memory_order_relaxed);
-    integrityViolations.store(0, std::memory_order_relaxed);
-    avgCheckDurationUs.store(0, std::memory_order_relaxed);
-    maxCheckDurationUs.store(0, std::memory_order_relaxed);
+    totalChecks = 0;
+    totalDetections = 0;
+    falsePositives = 0;
+    actionsExecuted = 0;
+    threadsHidden = 0;
+    breakpointsCleared = 0;
+    hooksDetected = 0;
+    integrityViolations = 0;
+    avgCheckDurationUs = 0;
+    maxCheckDurationUs = 0;
     startTime = Clock::now();
 }
 
@@ -4670,16 +5053,16 @@ std::string AntiDebugStatistics::ToJson() const {
     std::ostringstream oss;
 
     oss << "{\n";
-    oss << "  \"totalChecks\": " << totalChecks.load() << ",\n";
-    oss << "  \"totalDetections\": " << totalDetections.load() << ",\n";
-    oss << "  \"falsePositives\": " << falsePositives.load() << ",\n";
-    oss << "  \"actionsExecuted\": " << actionsExecuted.load() << ",\n";
-    oss << "  \"threadsHidden\": " << threadsHidden.load() << ",\n";
-    oss << "  \"breakpointsCleared\": " << breakpointsCleared.load() << ",\n";
-    oss << "  \"hooksDetected\": " << hooksDetected.load() << ",\n";
-    oss << "  \"integrityViolations\": " << integrityViolations.load() << ",\n";
-    oss << "  \"avgCheckDurationUs\": " << avgCheckDurationUs.load() << ",\n";
-    oss << "  \"maxCheckDurationUs\": " << maxCheckDurationUs.load() << ",\n";
+    oss << "  \"totalChecks\": " << totalChecks << ",\n";
+    oss << "  \"totalDetections\": " << totalDetections << ",\n";
+    oss << "  \"falsePositives\": " << falsePositives << ",\n";
+    oss << "  \"actionsExecuted\": " << actionsExecuted << ",\n";
+    oss << "  \"threadsHidden\": " << threadsHidden << ",\n";
+    oss << "  \"breakpointsCleared\": " << breakpointsCleared << ",\n";
+    oss << "  \"hooksDetected\": " << hooksDetected << ",\n";
+    oss << "  \"integrityViolations\": " << integrityViolations << ",\n";
+    oss << "  \"avgCheckDurationUs\": " << avgCheckDurationUs << ",\n";
+    oss << "  \"maxCheckDurationUs\": " << maxCheckDurationUs << ",\n";
     oss << "  \"uptimeSeconds\": " << GetUptimeSeconds() << "\n";
     oss << "}";
 

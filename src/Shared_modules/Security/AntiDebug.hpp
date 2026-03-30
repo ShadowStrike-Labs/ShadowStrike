@@ -119,7 +119,7 @@
  * @note Some techniques may trigger AV false positives on other systems.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -219,7 +219,7 @@ namespace AntiDebugConstants {
     inline constexpr uint32_t VERSION_MAJOR = 3;
     
     /// @brief Module minor version
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     
     /// @brief Module patch version
     inline constexpr uint32_t VERSION_PATCH = 0;
@@ -1067,10 +1067,10 @@ struct DetectionEvent {
  */
 struct AntiDebugStatistics {
     /// @brief Total detection checks performed
-    std::atomic<uint64_t> totalChecks{0};
+    uint64_t totalChecks{0};
     
     /// @brief Total detections triggered
-    std::atomic<uint64_t> totalDetections{0};
+    uint64_t totalDetections{0};
     
     /// @brief Detections by technique
     std::unordered_map<DetectionTechnique, uint64_t> detectionsByTechnique;
@@ -1079,28 +1079,28 @@ struct AntiDebugStatistics {
     std::unordered_map<DebuggerType, uint64_t> detectionsByType;
     
     /// @brief False positives identified
-    std::atomic<uint64_t> falsePositives{0};
+    uint64_t falsePositives{0};
     
     /// @brief Response actions executed
-    std::atomic<uint64_t> actionsExecuted{0};
+    uint64_t actionsExecuted{0};
     
     /// @brief Threads hidden
-    std::atomic<uint64_t> threadsHidden{0};
+    uint64_t threadsHidden{0};
     
     /// @brief Hardware breakpoints cleared
-    std::atomic<uint64_t> breakpointsCleared{0};
+    uint64_t breakpointsCleared{0};
     
     /// @brief Hooks detected
-    std::atomic<uint64_t> hooksDetected{0};
+    uint64_t hooksDetected{0};
     
     /// @brief Integrity violations detected
-    std::atomic<uint64_t> integrityViolations{0};
+    uint64_t integrityViolations{0};
     
     /// @brief Average check duration (microseconds)
-    std::atomic<uint64_t> avgCheckDurationUs{0};
+    uint64_t avgCheckDurationUs{0};
     
     /// @brief Maximum check duration (microseconds)
-    std::atomic<uint64_t> maxCheckDurationUs{0};
+    uint64_t maxCheckDurationUs{0};
     
     /// @brief Module uptime
     TimePoint startTime = Clock::now();
@@ -2043,6 +2043,57 @@ public:
      * @brief Force garbage collection of internal caches
      */
     void ForceGarbageCollection();
+
+    // ========================================================================
+    // KERNEL BRIDGE — INBOUND NOTIFICATIONS FROM KERNEL SENSOR
+    // ========================================================================
+    
+    /**
+     * @brief Handle kernel process creation notification.
+     * Checks if newly created process is a known debugger and triggers detection.
+     * @param processId PID of the new process
+     * @param parentProcessId Parent PID
+     * @param imagePath Full image path of the new process
+     * @param isCreate true = created, false = terminated
+     */
+    void OnKernelProcessNotify(uint32_t processId, uint32_t parentProcessId,
+                               std::wstring_view imagePath, bool isCreate);
+    
+    /**
+     * @brief Handle kernel image load notification.
+     * Detects debugger DLLs being loaded into our process or child processes.
+     * @param processId Target PID where image was loaded
+     * @param imagePath Full path of the loaded image
+     * @param imageBase Base address of the loaded image
+     * @param imageSize Size of the loaded image
+     */
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uintptr_t imageBase, size_t imageSize);
+    
+    /**
+     * @brief Request kernel sensor to block a debugger process.
+     * Sends IPC command to the kernel driver to terminate or deny access.
+     * @param processId PID of the debugger process to block
+     * @param reason Human-readable reason for the block
+     * @return true if kernel acknowledged the request
+     */
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId, std::string_view reason);
+
+    // ========================================================================
+    // COMMUNICATION WIRING — ALERTSYSTEM / TELEMETRY / IPC
+    // ========================================================================
+    
+    /**
+     * @brief Report a debugger detection to the AlertSystem.
+     * @param result The detection result to report
+     */
+    void ReportDetectionToAlertSystem(const DetectionResult& result);
+    
+    /**
+     * @brief Report anti-debug scan telemetry to the TelemetryCollector.
+     * @param result The scan result with timing and detection info
+     */
+    void ReportScanTelemetry(const DetectionResult& result);
 
 private:
     // ========================================================================
