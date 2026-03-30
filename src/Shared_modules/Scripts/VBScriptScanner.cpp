@@ -535,12 +535,23 @@ public:
     static constexpr size_t MAX_CACHE_SIZE = 10000;
     static constexpr std::chrono::minutes CACHE_TTL{ 30 };
 
-    // External Integrations (optional, may be null)
+    // External Integrations (optional, may be null — atomic for thread-safe injection)
     PatternStore::PatternStore* m_patternStore{ nullptr };
-    SignatureStore::SignatureStore* m_signatureStore{ nullptr };
-    HashStore::HashStore* m_hashStore{ nullptr };
+    std::atomic<SignatureStore::SignatureStore*> m_signatureStore{ nullptr };
+    std::atomic<HashStore::HashStore*> m_hashStore{ nullptr };
     ThreatIntel::ThreatIntelManager* m_threatIntel{ nullptr };
-    Whitelist::WhiteListStore* m_whitelistStore{ nullptr };
+    std::atomic<Whitelist::WhitelistStore*> m_whitelistStore{ nullptr };
+
+    // Setters for non-singleton infrastructure (injected by orchestrator)
+    void SetSignatureStore(SignatureStore::SignatureStore* store) noexcept {
+        m_signatureStore.store(store, std::memory_order_release);
+    }
+    void SetHashStore(HashStore::HashStore* store) noexcept {
+        m_hashStore.store(store, std::memory_order_release);
+    }
+    void SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
+        m_whitelistStore.store(store, std::memory_order_release);
+    }
 
     // =========================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -580,25 +591,22 @@ public:
         }
 
         // Connect to infrastructure singletons (optional — graceful if unavailable)
-        try {
-            auto& sigStore = SignatureStore::SignatureStore::Instance();
-            if (sigStore.IsInitialized()) m_signatureStore = &sigStore;
-        } catch (...) {}
-        try {
-            auto& hashStore = HashStore::HashStore::Instance();
-            if (hashStore.IsInitialized()) m_hashStore = &hashStore;
-        } catch (...) {}
+        // NOTE: ThreatIntelManager is the only infrastructure module with a Meyers'
+        // singleton.  SignatureStore, HashStore, and WhitelistStore are non-singleton
+        // components — they must be injected via SetSignatureStore/SetHashStore/
+        // SetWhitelistStore once the orchestrator creates them.  Until wired, the
+        // scanner degrades gracefully (hash/signature/whitelist checks are skipped).
         try {
             auto& tiStore = ThreatIntel::ThreatIntelManager::Instance();
             if (tiStore.IsInitialized()) m_threatIntel = &tiStore;
-        } catch (...) {}
-        try {
-            auto& wlStore = Whitelist::WhiteListStore::Instance();
-            if (wlStore.IsInitialized()) m_whitelistStore = &wlStore;
-        } catch (...) {}
+        } catch (...) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"ThreatIntelManager unavailable");
+        }
 
-        if (!m_signatureStore && !m_hashStore && !m_threatIntel) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Some infrastructure modules unavailable");
+        if (!m_signatureStore.load(std::memory_order_acquire) &&
+            !m_hashStore.load(std::memory_order_acquire) && !m_threatIntel) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Some infrastructure modules unavailable — "
+                L"inject via SetSignatureStore/SetHashStore/SetWhitelistStore");
         }
 
         m_stats.Reset();
@@ -974,7 +982,7 @@ public:
         // Resolve "str1" & "str2" -> "str1str2"
         std::string result(source);
 
-        static const std::regex concatPattern(R"("([^"]*)"\s*&\s*"([^"]*)")",
+        static const std::regex concatPattern(R"re("([^"]*)"\s*&\s*"([^"]*)")re",
             std::regex::optimize);
 
         std::string previous;
@@ -991,7 +999,7 @@ public:
     std::string ResolveStrReverse(std::string_view source) {
         // Resolve StrReverse("literal") -> reversed string
         static const std::regex reversePattern(
-            R"(strreverse\s*\(\s*"([^"]*)"\s*\))",
+            R"re(strreverse\s*\(\s*"([^"]*)"\s*\))re",
             std::regex::icase | std::regex::optimize);
 
         std::string result(source);
@@ -1011,7 +1019,7 @@ public:
     }
 
     void ExtractStringsFromScript(std::string_view source, std::vector<std::string>& strings) {
-        static const std::regex stringPattern(R"("([^"]{4,})")", std::regex::optimize);
+        static const std::regex stringPattern(R"re("([^"]{4,})")re", std::regex::optimize);
         std::string src(source);
 
         std::sregex_iterator it(src.begin(), src.end(), stringPattern);
@@ -1537,8 +1545,9 @@ public:
             }
 
             // Check hash store for known malware
-            if (m_hashStore && !result.sha256.empty()) {
-                auto hashLookup = m_hashStore->LookupHashString(
+            auto* hashStore = m_hashStore.load(std::memory_order_acquire);
+            if (hashStore && !result.sha256.empty()) {
+                auto hashLookup = hashStore->LookupHashString(
                     result.sha256, HashStore::HashType::SHA256);
                 if (hashLookup.has_value()) {
                     result.status = VBSScanStatus::Malicious;
@@ -1554,12 +1563,11 @@ public:
             }
 
             // Check whitelist by hash — skip scanning for known-good files
-            if (m_whitelistStore && !result.sha256.empty()) {
-                HashStore::HashValue wlHash{};
-                wlHash.type = HashStore::HashType::SHA256;
-                Utils::HashUtils::FromHex(result.sha256, wlHash.bytes);
-                auto wlResult = m_whitelistStore->IsHashWhitelisted(wlHash);
-                if (wlResult.isWhitelisted) {
+            auto* whitelistStore = m_whitelistStore.load(std::memory_order_acquire);
+            if (whitelistStore && !result.sha256.empty()) {
+                auto wlResult = whitelistStore->IsHashWhitelisted(
+                    result.sha256, Whitelist::HashAlgorithm::SHA256);
+                if (wlResult.found) {
                     result.status = VBSScanStatus::SkippedWhitelisted;
                     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
                         Clock::now() - startTime);
@@ -1616,7 +1624,8 @@ public:
                 for (const auto& url : result.extractedUrls) {
                     auto intel = m_threatIntel->LookupURL(url);
                     if (intel.found) {
-                        result.matchedSignatures.push_back("TI:" + intel.threatName);
+                        result.matchedSignatures.push_back(
+                            std::string("TI:") + ThreatIntel::ThreatCategoryToString(intel.category));
                     }
                 }
             }
@@ -1634,7 +1643,8 @@ public:
                         tiResult = m_threatIntel->LookupDomain(value);
                     }
                     if (tiResult.found) {
-                        result.matchedSignatures.push_back("TI:" + tiResult.threatName);
+                        result.matchedSignatures.push_back(
+                            std::string("TI:") + ThreatIntel::ThreatCategoryToString(tiResult.category));
                     }
                 }
             }
@@ -1675,6 +1685,7 @@ public:
                 // Raise alert for malicious/suspicious VBScript detections
                 if (Communication::AlertSystem::HasInstance()) {
                     try {
+                        auto& alertSys = Communication::AlertSystem::Instance();
                         auto severity = (result.status == VBSScanStatus::Malicious)
                             ? Communication::AlertSeverity::Critical
                             : Communication::AlertSeverity::High;
@@ -1696,8 +1707,7 @@ public:
                             " matchedSigs=" + std::to_string(result.matchedSignatures.size()) +
                             " obfuscated=" + (obfusc ? "true" : "false");
 
-                        [[maybe_unused]] auto alertId =
-                            Communication::AlertSystem::Instance().RaiseAlert(
+                        [[maybe_unused]] auto alertId = alertSys.RaiseAlert(
                                 severity,
                                 Communication::AlertType::ThreatDetection,
                                 "VBScriptScanner",
@@ -1713,6 +1723,7 @@ public:
                 // Emit telemetry for threat intelligence correlation
                 if (Communication::TelemetryCollector::HasInstance()) {
                     try {
+                        auto& telemetryCollector = Communication::TelemetryCollector::Instance();
                         std::map<std::string, std::string> telemetry;
                         telemetry["module"]          = "VBScriptScanner";
                         telemetry["status"]          = (result.status == VBSScanStatus::Malicious) ? "malicious" : "suspicious";
@@ -1727,7 +1738,7 @@ public:
                         telemetry["obfuscated"]      = (result.obfuscationType != VBSObfuscationType::None) ? "true" : "false";
                         telemetry["filePath"]        = result.filePath.string();
 
-                        Communication::TelemetryCollector::Instance().RecordCustom(
+                        telemetryCollector.RecordCustom(
                             "vbscript_threat_detection", telemetry);
                     }
                     catch (const std::exception& e) {
@@ -1738,15 +1749,17 @@ public:
 
                 // Log IPC availability for kernel-level blocking
                 if (result.status == VBSScanStatus::Malicious && result.riskScore >= 90) {
-                    if (Communication::IPCManager::HasInstance()) {
-                        auto& ipc = Communication::IPCManager::Instance();
-                        if (ipc.IsFilterPortConnected()) {
-                            SS_LOG_INFO(LOG_CATEGORY,
-                                L"High-risk VBScript malware detected (score=%d), "
-                                L"kernel block available via RequestKernelProcessBlock",
-                                result.riskScore);
+                    try {
+                        if (Communication::IPCManager::HasInstance()) {
+                            auto& ipc = Communication::IPCManager::Instance();
+                            if (ipc.IsFilterPortConnected()) {
+                                SS_LOG_INFO(LOG_CATEGORY,
+                                    L"High-risk VBScript malware detected (score=%d), "
+                                    L"kernel block available via RequestKernelProcessBlock",
+                                    result.riskScore);
+                            }
                         }
-                    }
+                    } catch (...) {}
                 }
             }
 
@@ -2020,7 +2033,7 @@ public:
     std::vector<std::pair<size_t, std::string>> FindFlaggedLines(std::string_view source) {
         std::vector<std::pair<size_t, std::string>> flagged;
 
-        std::istringstream stream(std::string(source));
+        std::istringstream stream{std::string(source)};
         std::string line;
         size_t lineNum = 0;
 
@@ -2520,6 +2533,7 @@ void VBScriptScanner::OnKernelProcessNotify(
     // Telemetry: VBS host process creation event
     if (Communication::TelemetryCollector::HasInstance()) {
         try {
+            auto& tc = Communication::TelemetryCollector::Instance();
             std::map<std::string, std::string> telemetry;
             telemetry["module"]    = "VBScriptScanner";
             telemetry["event"]     = "vbs_host_process_created";
@@ -2527,7 +2541,7 @@ void VBScriptScanner::OnKernelProcessNotify(
             telemetry["parentPid"] = std::to_string(parentPid);
             telemetry["imagePath"] = Utils::StringUtils::ToNarrow(imagePath);
 
-            Communication::TelemetryCollector::Instance().RecordCustom(
+            tc.RecordCustom(
                 "vbs_process_notify", telemetry);
         }
         catch (const std::exception& e) {
@@ -2566,7 +2580,8 @@ void VBScriptScanner::OnKernelImageLoad(
         return false;
     }
 
-    auto& ipc = Communication::IPCManager::Instance();
+    try {
+        auto& ipc = Communication::IPCManager::Instance();
     if (!ipc.IsFilterPortConnected()) {
         SS_LOG_WARN(LOG_CATEGORY,
             L"Cannot block PID=%u: kernel filter port not connected", pid);
@@ -2599,6 +2614,11 @@ void VBScriptScanner::OnKernelImageLoad(
         static_cast<int>(copyLen), reason.data());
 
     return sent;
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"RequestKernelProcessBlock failed for PID=%u: %hs", pid, e.what());
+        return false;
+    }
 }
 
 // ============================================================================
@@ -2611,6 +2631,7 @@ void VBScriptScanner::ReportDetectionToAlertSystem(
     if (!Communication::AlertSystem::HasInstance()) return;
 
     try {
+        auto& alertSys = Communication::AlertSystem::Instance();
         auto severity = Communication::AlertSeverity::High;
         if (result.status == VBSScanStatus::Malicious)
             severity = Communication::AlertSeverity::Critical;
@@ -2624,8 +2645,7 @@ void VBScriptScanner::ReportDetectionToAlertSystem(
             " dangerousObjs=" + std::to_string(result.dangerousObjects.size()) +
             " sigs=" + std::to_string(result.matchedSignatures.size());
 
-        [[maybe_unused]] auto alertId =
-            Communication::AlertSystem::Instance().RaiseAlert(
+        [[maybe_unused]] auto alertId = alertSys.RaiseAlert(
                 severity,
                 Communication::AlertType::ThreatDetection,
                 "VBScriptScanner",
@@ -2642,6 +2662,7 @@ void VBScriptScanner::ReportScanTelemetry(const VBSScanResult& result) {
     if (!Communication::TelemetryCollector::HasInstance()) return;
 
     try {
+        auto& tc = Communication::TelemetryCollector::Instance();
         std::map<std::string, std::string> telemetry;
         telemetry["module"]       = "VBScriptScanner";
         telemetry["filePath"]     = result.filePath.string();
@@ -2654,7 +2675,7 @@ void VBScriptScanner::ReportScanTelemetry(const VBSScanResult& result) {
         telemetry["category"]     = std::string(GetVBSThreatCategoryName(result.category));
         telemetry["fileType"]     = std::string(GetVBSFileTypeName(result.fileType));
 
-        Communication::TelemetryCollector::Instance().RecordCustom(
+        tc.RecordCustom(
             "vbs_scan_result", telemetry);
     }
     catch (const std::exception& e) {
