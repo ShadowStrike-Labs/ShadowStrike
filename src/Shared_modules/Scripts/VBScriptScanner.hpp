@@ -160,7 +160,7 @@ namespace Scripts {
 namespace VBSConstants {
 
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     /// @brief Maximum script size (25 MB)
@@ -686,6 +686,22 @@ public:
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+    // ========================================================================
+
+    void OnKernelProcessNotify(uint32_t pid, uint32_t parentPid,
+                               std::wstring_view imagePath, bool isCreate);
+    void OnKernelImageLoad(uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t pid, std::wstring_view reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+    // ========================================================================
+
+    void ReportDetectionToAlertSystem(uint32_t pid, const VBSScanResult& result);
+    void ReportScanTelemetry(const VBSScanResult& result);
 
 private:
     VBScriptScanner();

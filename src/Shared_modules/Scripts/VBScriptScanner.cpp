@@ -57,6 +57,11 @@
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
@@ -67,6 +72,8 @@
 #include <iomanip>
 #include <numeric>
 #include <sstream>
+#include <map>
+#include <cstring>
 #include <nlohmann/json.hpp>
 
 namespace fs = std::filesystem;
@@ -1658,6 +1665,91 @@ public:
                 result.status = VBSScanStatus::Clean;
             }
 
+            // ================================================================
+            // CROSS-MODULE WIRING — AlertSystem + TelemetryCollector
+            // ================================================================
+
+            if (result.status == VBSScanStatus::Malicious ||
+                result.status == VBSScanStatus::Suspicious)
+            {
+                // Raise alert for malicious/suspicious VBScript detections
+                if (Communication::AlertSystem::HasInstance()) {
+                    try {
+                        auto severity = (result.status == VBSScanStatus::Malicious)
+                            ? Communication::AlertSeverity::Critical
+                            : Communication::AlertSeverity::High;
+
+                        auto statusStr = (result.status == VBSScanStatus::Malicious)
+                            ? "MALICIOUS" : "SUSPICIOUS";
+                        auto nameStr = result.threatName.empty()
+                            ? result.filePath.string() : result.threatName;
+                        auto familyStr = result.detectedFamily.empty()
+                            ? std::string("unknown") : result.detectedFamily;
+                        bool obfusc = (result.obfuscationType != VBSObfuscationType::None);
+
+                        std::string alertDetail =
+                            "VBScriptScanner detected " + std::string(statusStr) +
+                            " script: " + nameStr +
+                            " | risk=" + std::to_string(result.riskScore) +
+                            " family=" + familyStr +
+                            " dangerousObjects=" + std::to_string(result.dangerousObjects.size()) +
+                            " matchedSigs=" + std::to_string(result.matchedSignatures.size()) +
+                            " obfuscated=" + (obfusc ? "true" : "false");
+
+                        [[maybe_unused]] auto alertId =
+                            Communication::AlertSystem::Instance().RaiseAlert(
+                                severity,
+                                Communication::AlertType::ThreatDetection,
+                                "VBScriptScanner",
+                                alertDetail,
+                                result.sha256);
+                    }
+                    catch (const std::exception& e) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"AlertSystem wiring failed: %hs", e.what());
+                    }
+                }
+
+                // Emit telemetry for threat intelligence correlation
+                if (Communication::TelemetryCollector::HasInstance()) {
+                    try {
+                        std::map<std::string, std::string> telemetry;
+                        telemetry["module"]          = "VBScriptScanner";
+                        telemetry["status"]          = (result.status == VBSScanStatus::Malicious) ? "malicious" : "suspicious";
+                        telemetry["threatName"]      = result.threatName;
+                        telemetry["riskScore"]       = std::to_string(result.riskScore);
+                        telemetry["sha256"]          = result.sha256;
+                        telemetry["family"]          = result.detectedFamily;
+                        telemetry["category"]        = std::string(GetVBSThreatCategoryName(result.category));
+                        telemetry["fileType"]        = std::string(GetVBSFileTypeName(result.fileType));
+                        telemetry["dangerousObjs"]   = std::to_string(result.dangerousObjects.size());
+                        telemetry["sigCount"]        = std::to_string(result.matchedSignatures.size());
+                        telemetry["obfuscated"]      = (result.obfuscationType != VBSObfuscationType::None) ? "true" : "false";
+                        telemetry["filePath"]        = result.filePath.string();
+
+                        Communication::TelemetryCollector::Instance().RecordCustom(
+                            "vbscript_threat_detection", telemetry);
+                    }
+                    catch (const std::exception& e) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"TelemetryCollector wiring failed: %hs", e.what());
+                    }
+                }
+
+                // Log IPC availability for kernel-level blocking
+                if (result.status == VBSScanStatus::Malicious && result.riskScore >= 90) {
+                    if (Communication::IPCManager::HasInstance()) {
+                        auto& ipc = Communication::IPCManager::Instance();
+                        if (ipc.IsFilterPortConnected()) {
+                            SS_LOG_INFO(LOG_CATEGORY,
+                                L"High-risk VBScript malware detected (score=%d), "
+                                L"kernel block available via RequestKernelProcessBlock",
+                                result.riskScore);
+                        }
+                    }
+                }
+            }
+
             // Populate cache
             {
                 std::unique_lock lock(m_cacheMutex);
@@ -2398,6 +2490,177 @@ std::string VBScriptScanner::GetVersionString() noexcept {
         VBSConstants::VERSION_MAJOR,
         VBSConstants::VERSION_MINOR,
         VBSConstants::VERSION_PATCH);
+}
+
+// ============================================================================
+// KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+// ============================================================================
+
+void VBScriptScanner::OnKernelProcessNotify(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, bool isCreate)
+{
+    if (!isCreate || !m_impl || !m_impl->m_initialized) return;
+
+    // Detect cscript.exe / wscript.exe launches (VBS host processes)
+    auto lowerPath = Utils::StringUtils::ToLowerCopy(imagePath);
+
+    bool isVBSHost = (lowerPath.find(L"cscript.exe") != std::wstring::npos) ||
+                     (lowerPath.find(L"wscript.exe") != std::wstring::npos) ||
+                     (lowerPath.find(L"mshta.exe") != std::wstring::npos);
+
+    if (!isVBSHost) return;
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Kernel process notify: VBS host launched PID=%u "
+        L"ParentPID=%u Path=%.*s",
+        pid, parentPid,
+        static_cast<int>(imagePath.size()), imagePath.data());
+
+    // Telemetry: VBS host process creation event
+    if (Communication::TelemetryCollector::HasInstance()) {
+        try {
+            std::map<std::string, std::string> telemetry;
+            telemetry["module"]    = "VBScriptScanner";
+            telemetry["event"]     = "vbs_host_process_created";
+            telemetry["pid"]       = std::to_string(pid);
+            telemetry["parentPid"] = std::to_string(parentPid);
+            telemetry["imagePath"] = Utils::StringUtils::ToNarrow(imagePath);
+
+            Communication::TelemetryCollector::Instance().RecordCustom(
+                "vbs_process_notify", telemetry);
+        }
+        catch (const std::exception& e) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Telemetry failed for process notify: %hs", e.what());
+        }
+    }
+}
+
+void VBScriptScanner::OnKernelImageLoad(
+    uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase)
+{
+    if (!m_impl || !m_impl->m_initialized) return;
+
+    auto lowerPath = Utils::StringUtils::ToLowerCopy(imagePath);
+
+    // Watch for VBScript engine DLL loads (vbscript.dll)
+    bool isVBSEngine = (lowerPath.find(L"vbscript.dll") != std::wstring::npos) ||
+                       (lowerPath.find(L"mshtml.dll") != std::wstring::npos);
+
+    if (!isVBSEngine) return;
+
+    SS_LOG_DEBUG(LOG_CATEGORY,
+        L"Kernel image load: VBS engine loaded in PID=%u Path=%.*s Base=0x%llX",
+        pid,
+        static_cast<int>(imagePath.size()), imagePath.data(),
+        static_cast<unsigned long long>(imageBase));
+}
+
+[[nodiscard]] bool VBScriptScanner::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    if (!Communication::IPCManager::HasInstance()) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Cannot block PID=%u: IPCManager not available", pid);
+        return false;
+    }
+
+    auto& ipc = Communication::IPCManager::Instance();
+    if (!ipc.IsFilterPortConnected()) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Cannot block PID=%u: kernel filter port not connected", pid);
+        return false;
+    }
+
+#pragma pack(push, 1)
+    struct KernelBlockRequest {
+        uint32_t msgType;       // 0x36 = VBScriptScanner process block
+        uint32_t targetPid;
+        uint32_t reasonLen;
+        wchar_t  reason[256];
+    };
+#pragma pack(pop)
+
+    KernelBlockRequest req{};
+    req.msgType   = 0x36;
+    req.targetPid = pid;
+
+    auto copyLen = (std::min)(reason.size(), static_cast<size_t>(255));
+    std::memcpy(req.reason, reason.data(), copyLen * sizeof(wchar_t));
+    req.reason[copyLen] = L'\0';
+    req.reasonLen = static_cast<uint32_t>(copyLen);
+
+    [[maybe_unused]] bool sent = ipc.SendToKernel(&req, sizeof(req));
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Kernel process block request for PID=%u sent=%d reason=%.*s",
+        pid, sent ? 1 : 0,
+        static_cast<int>(copyLen), reason.data());
+
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — Public API wrappers
+// ============================================================================
+
+void VBScriptScanner::ReportDetectionToAlertSystem(
+    uint32_t pid, const VBSScanResult& result)
+{
+    if (!Communication::AlertSystem::HasInstance()) return;
+
+    try {
+        auto severity = Communication::AlertSeverity::High;
+        if (result.status == VBSScanStatus::Malicious)
+            severity = Communication::AlertSeverity::Critical;
+
+        std::string detail =
+            "VBScriptScanner PID=" + std::to_string(pid) +
+            " threat=" + (result.threatName.empty() ? "unknown" : result.threatName) +
+            " risk=" + std::to_string(result.riskScore) +
+            " family=" + (result.detectedFamily.empty() ? "none" : result.detectedFamily) +
+            " sha256=" + (result.sha256.empty() ? "n/a" : result.sha256) +
+            " dangerousObjs=" + std::to_string(result.dangerousObjects.size()) +
+            " sigs=" + std::to_string(result.matchedSignatures.size());
+
+        [[maybe_unused]] auto alertId =
+            Communication::AlertSystem::Instance().RaiseAlert(
+                severity,
+                Communication::AlertType::ThreatDetection,
+                "VBScriptScanner",
+                detail,
+                result.sha256);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"ReportDetectionToAlertSystem failed: %hs", e.what());
+    }
+}
+
+void VBScriptScanner::ReportScanTelemetry(const VBSScanResult& result) {
+    if (!Communication::TelemetryCollector::HasInstance()) return;
+
+    try {
+        std::map<std::string, std::string> telemetry;
+        telemetry["module"]       = "VBScriptScanner";
+        telemetry["filePath"]     = result.filePath.string();
+        telemetry["status"]       = (result.status == VBSScanStatus::Malicious) ? "malicious" :
+                                    (result.status == VBSScanStatus::Suspicious) ? "suspicious" : "clean";
+        telemetry["riskScore"]    = std::to_string(result.riskScore);
+        telemetry["sha256"]       = result.sha256;
+        telemetry["threatName"]   = result.threatName;
+        telemetry["family"]       = result.detectedFamily;
+        telemetry["category"]     = std::string(GetVBSThreatCategoryName(result.category));
+        telemetry["fileType"]     = std::string(GetVBSFileTypeName(result.fileType));
+
+        Communication::TelemetryCollector::Instance().RecordCustom(
+            "vbs_scan_result", telemetry);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"ReportScanTelemetry failed: %hs", e.what());
+    }
 }
 
 // ============================================================================
