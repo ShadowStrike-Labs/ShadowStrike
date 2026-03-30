@@ -1875,4 +1875,8 @@ void PowerShellScanner::ReportThreatToBehaviorAnalyzer(const ScanResult& result)
     pImpl->reportThreatToBehaviorAnalyzer(result);
 }
 
+std::string PowerShellScanner::GetVersionString() noexcept {
+    return "4.1.0";
+}
+
 } // namespace ShadowStrike::Scripts

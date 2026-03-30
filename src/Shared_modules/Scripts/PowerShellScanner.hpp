@@ -329,6 +329,10 @@ public:
     void ReportScanTelemetry(const ScanResult& result);
     void ReportThreatToBehaviorAnalyzer(const ScanResult& result);
 
+    // ── Version ──────────────────────────────────────────────────────────
+
+    [[nodiscard]] static std::string GetVersionString() noexcept;
+
 private:
     class Impl;
     std::unique_ptr<Impl> pImpl;
