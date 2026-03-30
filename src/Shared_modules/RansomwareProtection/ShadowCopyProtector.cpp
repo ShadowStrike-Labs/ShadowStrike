@@ -72,6 +72,9 @@
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/Timer.hpp"
 #include "../Utils/HashUtils.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
 #include <vss.h>
 #include <vswriter.h>
 #include <vsbackup.h>
@@ -824,9 +827,9 @@ public:
             ::CloseHandle(hProcess);
 
             if (terminated) {
-                Utils::Logger::Critical("ShadowCopyProtector: TERMINATED malicious process PID={} [{}] reason={}",
-                    pid, Utils::StringUtils::WideToUtf8(processName),
-                    Utils::StringUtils::WideToUtf8(reason));
+                Utils::Logger::Fatal("ShadowCopyProtector: TERMINATED malicious process PID={} [{}] reason={}",
+                    pid, Utils::StringUtils::ToNarrow(processName),
+                    Utils::StringUtils::ToNarrow(reason));
                 m_stats.processesKilled.fetch_add(1, std::memory_order_relaxed);
                 return true;
             }
@@ -1082,10 +1085,9 @@ public:
                         info.devicePath = prop.Obj.Snap.m_pwszSnapshotDeviceObject;
                     }
 
-                    // Convert VSS_TIMESTAMP to system_clock::time_point
+                    // Convert VSS_TIMESTAMP (LONGLONG / 100-nanosecond intervals) to system_clock::time_point
                     ULARGE_INTEGER ull;
-                    ull.LowPart = prop.Obj.Snap.m_tsCreationTimestamp.dwLowDateTime;
-                    ull.HighPart = prop.Obj.Snap.m_tsCreationTimestamp.dwHighDateTime;
+                    ull.QuadPart = static_cast<ULONGLONG>(prop.Obj.Snap.m_tsCreationTimestamp);
                     // Windows FILETIME epoch = Jan 1, 1601. Unix epoch = Jan 1, 1970.
                     constexpr uint64_t FILETIME_UNIX_DIFF = 116444736000000000ULL;
                     if (ull.QuadPart > FILETIME_UNIX_DIFF) {
@@ -1151,7 +1153,7 @@ public:
 
                 // 2. Re-establish service lock if needed
                 if (m_config.lockService && !m_serviceLocked.load(std::memory_order_acquire)) {
-                    LockVssServiceInternal();
+                    (void)LockVssServiceInternal();
                 }
 
                 // 3. Check if VSS service was disabled by an attacker
@@ -1164,7 +1166,7 @@ public:
                         pConfig = reinterpret_cast<QUERY_SERVICE_CONFIGW*>(buf.data());
                         if (::QueryServiceConfigW(m_vssService.Get(), pConfig, bytesNeeded, &bytesNeeded)) {
                             if (pConfig->dwStartType == SERVICE_DISABLED) {
-                                Utils::Logger::Critical("ShadowCopyProtector: VSS service was DISABLED by attacker! Re-enabling.");
+                                Utils::Logger::Fatal("ShadowCopyProtector: VSS service was DISABLED by attacker! Re-enabling.");
                                 ::ChangeServiceConfigW(m_vssService.Get(),
                                     SERVICE_NO_CHANGE, SERVICE_DEMAND_START,
                                     SERVICE_NO_CHANGE, nullptr, nullptr,
@@ -1183,7 +1185,7 @@ public:
                     uint64_t deleted = previousCount - currentCount;
                     m_stats.snapshotDecreaseAlerts.fetch_add(1, std::memory_order_relaxed);
 
-                    Utils::Logger::Critical(
+                    Utils::Logger::Fatal(
                         "ShadowCopyProtector: SNAPSHOT COUNT DECREASED! Previous={}, Current={}, Deleted={}",
                         previousCount, currentCount, deleted);
 
@@ -1309,11 +1311,11 @@ ShadowCopyProtector::~ShadowCopyProtector() {
 
         // Lock VSS service if configured
         if (config.lockService) {
-            m_impl->LockVssServiceInternal();
+            (void)m_impl->LockVssServiceInternal();
         }
 
         // Ensure VSS service is running
-        m_impl->EnsureVssServiceRunningInternal();
+        (void)m_impl->EnsureVssServiceRunningInternal();
 
         // Take initial snapshot count baseline
         auto initialShadows = m_impl->EnumerateShadowCopiesInternal();
@@ -1425,7 +1427,7 @@ void ShadowCopyProtector::Shutdown() {
         if (!processPathStr.empty() && m_impl->IsWhitelistedInternal(processPathStr)) {
             if (m_impl->m_config.verboseLogging) {
                 Utils::Logger::Debug("ShadowCopyProtector: Whitelisted process allowed: {}",
-                    Utils::StringUtils::WideToUtf8(processPathStr));
+                    Utils::StringUtils::ToNarrow(processPathStr));
             }
             return false;
         }
@@ -1455,13 +1457,13 @@ void ShadowCopyProtector::Shutdown() {
 
         // Terminate process if configured
         if (m_impl->m_config.killAttacker) {
-            m_impl->TerminateAttacker(pid, L"VSS destruction attempt");
+            (void)m_impl->TerminateAttacker(pid, L"VSS destruction attempt");
         }
 
-        Utils::Logger::Critical(
+        Utils::Logger::Fatal(
             "ShadowCopyProtector: BLOCKED VSS attack [Type={}] [PID={}] [Process={}]",
             static_cast<int>(attackType.value()), pid,
-            Utils::StringUtils::WideToUtf8(event.processName));
+            Utils::StringUtils::ToNarrow(event.processName));
 
         return true;
 
@@ -1560,10 +1562,36 @@ void ShadowCopyProtector::Shutdown() {
         m_impl->IncrementAttackStats(attackType.value());
         m_impl->NotifyAttack(event);
 
-        Utils::Logger::Critical(
+        // ── Direct AlertSystem wiring ──
+        try {
+            using namespace Communication;
+            if (AlertSystem::HasInstance()) {
+                std::string subject = "VSS Attack Blocked (PID " + std::to_string(pid) + ")";
+                (void)AlertSystem::Instance().RaiseAlert(
+                    AlertSeverity::Critical, AlertType::ThreatDetection,
+                    subject, event.ToJson(), "ShadowCopyProtector");
+            }
+        } catch (...) {}
+
+        // ── Direct TelemetryCollector wiring ──
+        try {
+            using namespace Communication;
+            if (TelemetryCollector::HasInstance()) {
+                std::map<std::string, std::string> data;
+                data["pid"] = std::to_string(pid);
+                data["parent_pid"] = std::to_string(parentPid);
+                data["attack_type"] = std::string(GetVSSAttackTypeName(attackType.value()));
+                data["image"] = Utils::StringUtils::ToNarrow(filename);
+                data["action"] = "kernel_blocked";
+                data["mitre_technique"] = "T1490";
+                TelemetryCollector::Instance().RecordCustom("vss_attack_blocked", data);
+            }
+        } catch (...) {}
+
+        Utils::Logger::Fatal(
             "ShadowCopyProtector: KERNEL BLOCKED process creation [Type={}] [PID={}] [Image={}] [ParentPID={}]",
             static_cast<int>(attackType.value()), pid,
-            Utils::StringUtils::WideToUtf8(filename), parentPid);
+            Utils::StringUtils::ToNarrow(filename), parentPid);
 
         return ProcessCreationVerdict::Block;
 
@@ -1578,7 +1606,7 @@ void ShadowCopyProtector::Shutdown() {
 // ============================================================================
 
 void ShadowCopyProtector::LockVssService() {
-    m_impl->LockVssServiceInternal();
+    (void)m_impl->LockVssServiceInternal();
 }
 
 void ShadowCopyProtector::UnlockVssService() {
@@ -1619,7 +1647,7 @@ void ShadowCopyProtector::UnlockVssService() {
         }
 
         Utils::Logger::Info("ShadowCopyProtector: Creating protective snapshot for volume: {}",
-            Utils::StringUtils::WideToUtf8(std::wstring(volume)));
+            Utils::StringUtils::ToNarrow(std::wstring(volume)));
 
         ComScope comGuard(COINIT_MULTITHREADED);
 
@@ -1699,7 +1727,7 @@ void ShadowCopyProtector::UnlockVssService() {
         ::StringFromGUID2(snapshotId, guidStr, 64);
 
         Utils::Logger::Info("ShadowCopyProtector: Protective snapshot created: {}",
-                            Utils::StringUtils::WideToUtf8(guidStr));
+                            Utils::StringUtils::ToNarrow(guidStr));
         return std::wstring(guidStr);
 
     } catch (const std::exception& e) {
@@ -1747,7 +1775,7 @@ void ShadowCopyProtector::AddToWhitelist(std::wstring_view processPath) {
 
     m_impl->m_whitelist.emplace_back(processPath);
     Utils::Logger::Info("ShadowCopyProtector: Added to whitelist: {}",
-                        Utils::StringUtils::WideToUtf8(std::wstring(processPath)));
+                        Utils::StringUtils::ToNarrow(std::wstring(processPath)));
 }
 
 void ShadowCopyProtector::RemoveFromWhitelist(std::wstring_view processPath) {
@@ -1762,7 +1790,7 @@ void ShadowCopyProtector::RemoveFromWhitelist(std::wstring_view processPath) {
     if (it != wl.end()) {
         wl.erase(it, wl.end());
         Utils::Logger::Info("ShadowCopyProtector: Removed from whitelist: {}",
-                            Utils::StringUtils::WideToUtf8(std::wstring(processPath)));
+                            Utils::StringUtils::ToNarrow(std::wstring(processPath)));
     }
 }
 
@@ -1788,12 +1816,25 @@ void ShadowCopyProtector::SetDecisionCallback(DecisionCallback callback) {
 // STATISTICS
 // ============================================================================
 
-[[nodiscard]] ShadowCopyStatistics ShadowCopyProtector::GetStatistics() const {
-    // ShadowCopyStatistics now has a proper copy constructor that loads atomics
-    return m_impl->m_stats;
+[[nodiscard]] ShadowCopyStatisticsSnapshot ShadowCopyProtector::GetStatistics() const {
+    ShadowCopyStatisticsSnapshot snap;
+    snap.attacksBlocked         = m_impl->m_stats.attacksBlocked.load(std::memory_order_relaxed);
+    snap.processesKilled        = m_impl->m_stats.processesKilled.load(std::memory_order_relaxed);
+    snap.processesBlockedKernel = m_impl->m_stats.processesBlockedKernel.load(std::memory_order_relaxed);
+    snap.snapshotDecreaseAlerts = m_impl->m_stats.snapshotDecreaseAlerts.load(std::memory_order_relaxed);
+    snap.currentShadowCopies    = m_impl->m_stats.currentShadowCopies.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.byAttackType.size(); ++i)
+        snap.byAttackType[i] = m_impl->m_stats.byAttackType[i].load(std::memory_order_relaxed);
+    {
+        std::shared_lock lk(m_impl->m_mutex);
+        auto elapsed = Clock::now() - m_impl->m_stats.startTime;
+        snap.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    }
+    return snap;
 }
 
 void ShadowCopyProtector::ResetStatistics() {
+    std::unique_lock lk(m_impl->m_mutex);
     m_impl->m_stats.Reset();
     m_impl->m_stats.startTime = Clock::now();
     Utils::Logger::Info("ShadowCopyProtector: Statistics reset");
@@ -1880,7 +1921,7 @@ void ShadowCopyProtector::ResetStatistics() {
         // Test 5: Statistics copy (verifies ShadowCopyStatistics copy constructor)
         try {
             auto stats = GetStatistics();
-            (void)stats.attacksBlocked.load();
+            (void)stats.attacksBlocked;
         } catch (...) {
             Utils::Logger::Error("ShadowCopyProtector: Self-test FAILED: Statistics copy threw");
             allPassed = false;
@@ -1915,14 +1956,14 @@ void ShadowCopyProtector::ResetStatistics() {
 
     Json j = Json::object();
 
-    j["shadowId"] = Utils::StringUtils::WideToUtf8(shadowId);
-    j["volume"] = Utils::StringUtils::WideToUtf8(volume);
-    j["devicePath"] = Utils::StringUtils::WideToUtf8(devicePath);
+    j["shadowId"] = Utils::StringUtils::ToNarrow(shadowId);
+    j["volume"] = Utils::StringUtils::ToNarrow(volume);
+    j["devicePath"] = Utils::StringUtils::ToNarrow(devicePath);
     j["creationTime"] = creationTime.time_since_epoch().count();
     j["state"] = static_cast<int>(state);
     j["sizeBytes"] = sizeBytes;
     j["isProtected"] = isProtected;
-    j["providerId"] = Utils::StringUtils::WideToUtf8(providerId);
+    j["providerId"] = Utils::StringUtils::ToNarrow(providerId);
 
     return j.dump(2);
 }
@@ -1937,11 +1978,11 @@ void ShadowCopyProtector::ResetStatistics() {
     j["attackType"] = static_cast<int>(attackType);
     j["attackTypeName"] = std::string(GetVSSAttackTypeName(attackType));
     j["pid"] = pid;
-    j["processName"] = Utils::StringUtils::WideToUtf8(processName);
-    j["processPath"] = Utils::StringUtils::WideToUtf8(processPath);
-    j["commandLine"] = Utils::StringUtils::WideToUtf8(commandLine);
+    j["processName"] = Utils::StringUtils::ToNarrow(processName);
+    j["processPath"] = Utils::StringUtils::ToNarrow(processPath);
+    j["commandLine"] = Utils::StringUtils::ToNarrow(commandLine);
     j["wasBlocked"] = wasBlocked;
-    j["details"] = Utils::StringUtils::WideToUtf8(details);
+    j["details"] = Utils::StringUtils::ToNarrow(details);
 
     return j.dump(2);
 }
@@ -2023,6 +2064,120 @@ void ShadowCopyStatistics::Reset() noexcept {
         case ShadowCopyState::Deleted:   return "Deleted";
         case ShadowCopyState::Corrupted: return "Corrupted";
         default:                         return "Unknown";
+    }
+}
+
+[[nodiscard]] std::string ShadowCopyStatisticsSnapshot::ToJson() const {
+    using namespace ShadowStrike::Utils::JSON;
+
+    Json j = Json::object();
+    j["attacksBlocked"] = attacksBlocked;
+    j["processesKilled"] = processesKilled;
+    j["processesBlockedKernel"] = processesBlockedKernel;
+    j["snapshotDecreaseAlerts"] = snapshotDecreaseAlerts;
+    j["currentShadowCopies"] = currentShadowCopies;
+    j["uptimeSeconds"] = uptimeSeconds;
+
+    Json attackTypeBreakdown = Json::object();
+    for (size_t i = 0; i < byAttackType.size(); ++i) {
+        if (byAttackType[i] > 0) {
+            attackTypeBreakdown[std::string(GetVSSAttackTypeName(static_cast<VSSAttackType>(i)))] = byAttackType[i];
+        }
+    }
+    j["byAttackType"] = attackTypeBreakdown;
+
+    return j.dump(2);
+}
+
+// ============================================================================
+// KERNEL BRIDGE
+// ============================================================================
+
+void ShadowCopyProtector::OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                                                  std::wstring_view commandLine, bool isCreate) {
+    try {
+        if (!isCreate || !IsInitialized()) return;
+        // Delegate to OnProcessCreation — the verdict is consumed by the kernel driver
+        // via the IPC return path, not here. This is for telemetry/logging only.
+        (void)OnProcessCreation(processId, 0, imagePath, commandLine);
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("ShadowCopyProtector: OnKernelProcessNotify error: {}", e.what());
+    }
+}
+
+void ShadowCopyProtector::OnKernelImageLoad(uint32_t /*processId*/, std::wstring_view /*imagePath*/,
+                                              uint64_t /*imageBase*/, size_t /*imageSize*/) {
+    // ShadowCopyProtector operates on process creation, not image loads.
+}
+
+bool ShadowCopyProtector::RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason) {
+    try {
+        using namespace Communication;
+        if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
+            return false;
+        }
+#pragma pack(push, 1)
+        struct KernelBlockRequest {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t  reason[256];
+        };
+#pragma pack(pop)
+        KernelBlockRequest req{};
+        req.messageType = 0x30;
+        req.processId = processId;
+        wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
+        req.reason[_countof(req.reason) - 1] = L'\0';
+
+        bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+        if (result)
+            Utils::Logger::Info("ShadowCopyProtector: Kernel block requested for PID={}", processId);
+        return result;
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("ShadowCopyProtector: RequestKernelProcessBlock error: {}", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING
+// ============================================================================
+
+void ShadowCopyProtector::ReportThreatToAlertSystem(const VSSAttackEvent& event) {
+    try {
+        using namespace Communication;
+        if (!AlertSystem::HasInstance()) return;
+
+        auto severity = event.wasBlocked ? AlertSeverity::Critical : AlertSeverity::High;
+        std::string subject = "VSS Attack " +
+            std::string(event.wasBlocked ? "Blocked" : "Detected") +
+            " — " + std::string(GetVSSAttackTypeName(event.attackType)) +
+            " (PID " + std::to_string(event.pid) + ")";
+
+        (void)AlertSystem::Instance().RaiseAlert(
+            severity, AlertType::ThreatDetection,
+            subject, event.ToJson(), "ShadowCopyProtector");
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("ShadowCopyProtector: AlertSystem report failed: {}", e.what());
+    }
+}
+
+void ShadowCopyProtector::ReportDetectionTelemetry(const VSSAttackEvent& event) {
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+
+        std::map<std::string, std::string> data;
+        data["event_id"] = std::to_string(event.eventId);
+        data["pid"] = std::to_string(event.pid);
+        data["attack_type"] = std::string(GetVSSAttackTypeName(event.attackType));
+        data["process_name"] = Utils::StringUtils::ToNarrow(event.processName);
+        data["was_blocked"] = event.wasBlocked ? "true" : "false";
+        data["mitre_technique"] = "T1490";
+
+        TelemetryCollector::Instance().RecordCustom("vss_attack_detection", data);
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("ShadowCopyProtector: Telemetry report failed: {}", e.what());
     }
 }
 

@@ -64,6 +64,11 @@
 #include "../Utils/SystemUtils.hpp"
 #include "../PatternStore/PatternStore.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
@@ -72,6 +77,7 @@
 #include <unordered_map>
 #include <unordered_set>
 #include <format>
+#include <map>
 #include <nlohmann/json.hpp>
 #include <ctime>
 
@@ -587,6 +593,11 @@ public:
         });
     }
 
+    void PurgeProcessState(uint32_t pid) {
+        std::unique_lock lock(m_mutex);
+        m_processBehaviors.erase(pid);
+    }
+
     // ====================================================================
     // WHITELISTING
     // ====================================================================
@@ -698,6 +709,58 @@ public:
             GetDetectionConfidenceName(result.confidence).data(),
             GetLockyVariantName(result.variant).data(),
             result.indicators.size());
+
+        // =================================================================
+        // CROSS-MODULE WIRING — AlertSystem + TelemetryCollector + kernel IPC
+        // =================================================================
+        const auto narrow = Utils::StringUtils::ToNarrow(result.processName);
+        const auto variantStr = std::string(GetLockyVariantName(result.variant));
+        const auto confStr = std::string(GetDetectionConfidenceName(result.confidence));
+
+        if (Communication::AlertSystem::HasInstance()) {
+            const auto severity = (result.score >= m_config.scoreBlockThreshold)
+                ? Communication::AlertSeverity::Critical
+                : Communication::AlertSeverity::High;
+            (void)Communication::AlertSystem::Instance().RaiseAlert(
+                severity,
+                Communication::AlertType::ThreatDetection,
+                "LockyDetector",
+                std::format("Locky ransomware detected — PID {} ({}) variant={} score={:.0f}",
+                    result.pid, narrow, variantStr, result.score),
+                std::format("confidence={} indicators={}", confStr, result.indicators.size()));
+        }
+
+        if (Communication::TelemetryCollector::HasInstance()) {
+            Communication::TelemetryCollector::Instance().RecordCustom(
+                "locky_detection",
+                {
+                    {"pid",         std::to_string(result.pid)},
+                    {"process",     narrow},
+                    {"variant",     variantStr},
+                    {"confidence",  confStr},
+                    {"score",       std::format("{:.0f}", result.score)},
+                    {"indicators",  std::to_string(result.indicators.size())},
+                    {"terminated",  (m_config.autoTerminate &&
+                                     pb.score >= m_config.scoreBlockThreshold) ? "true" : "false"}
+                });
+        }
+
+        if (Communication::IPCManager::HasInstance() &&
+            Communication::IPCManager::Instance().IsFilterPortConnected())
+        {
+            #pragma pack(push, 1)
+            struct KernelLockyMsg {
+                uint32_t msgType  = 0x31;   // Locky-specific
+                uint32_t pid      = 0;
+                double   score    = 0.0;
+                uint8_t  variant  = 0;
+            } msg;
+            #pragma pack(pop)
+            msg.pid     = pb.pid;
+            msg.score   = pb.score;
+            msg.variant = static_cast<uint8_t>(pb.variant);
+            (void)Communication::IPCManager::Instance().SendToKernel(&msg, sizeof(msg));
+        }
     }
 
     // ====================================================================
@@ -872,10 +935,10 @@ public:
         }
 
         // Check child processes
-        std::vector<uint32_t> children;
+        std::vector<DWORD> children;
         Utils::ProcessUtils::Error childErr{};
         if (Utils::ProcessUtils::GetChildProcesses(
-                pb.pid, children, &childErr))
+                static_cast<DWORD>(pb.pid), children, &childErr))
         {
             for (const uint32_t childPid : children) {
                 auto childCmd = Utils::ProcessUtils::GetProcessCommandLine(childPid);
@@ -1587,23 +1650,18 @@ void LockyDetector::SetDetectionCallback(LockyDetectionCallback callback) {
 // STATISTICS
 // ============================================================================
 
-LockyStatistics LockyDetector::GetStatistics() const {
+LockyStatisticsSnapshot LockyDetector::GetStatistics() const {
     if (!m_impl) return {};
-    // LockyStatistics has atomics — copy element by element
-    LockyStatistics copy;
-    copy.totalDetections.store(
-        m_impl->m_stats.totalDetections.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.processesTerminated.store(
-        m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
+    LockyStatisticsSnapshot snap;
+    snap.totalDetections     = m_impl->m_stats.totalDetections.load(std::memory_order_relaxed);
+    snap.processesTerminated = m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed);
     for (size_t i = 0; i < m_impl->m_stats.byVariant.size(); ++i) {
-        copy.byVariant[i].store(
-            m_impl->m_stats.byVariant[i].load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
+        snap.byVariant[i] = m_impl->m_stats.byVariant[i].load(std::memory_order_relaxed);
     }
-    copy.startTime = m_impl->m_stats.startTime;
-    return copy;
+    const auto now = Clock::now();
+    snap.uptimeSeconds = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_impl->m_stats.startTime).count());
+    return snap;
 }
 
 void LockyDetector::ResetStatistics() {
@@ -1696,7 +1754,7 @@ bool LockyDetector::SelfTest() {
     // 8. Statistics reset
     ResetStatistics();
     auto resetStats = GetStatistics();
-    if (resetStats.totalDetections.load() != 0) {
+    if (resetStats.totalDetections != 0) {
         SS_LOG_ERROR(LOG_CAT, L"SelfTest FAIL: Statistics reset failed");
         return false;
     }
@@ -1766,6 +1824,114 @@ std::wstring_view GetLockyExtension(LockyVariant variant) noexcept {
         case LockyVariant::Ykcol:    return L".ykcol";
         default:                     return L"";
     }
+}
+
+// ============================================================================
+// LOCKY STATISTICS SNAPSHOT — ToJson
+// ============================================================================
+
+std::string LockyStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["totalDetections"]     = totalDetections;
+    j["processesTerminated"] = processesTerminated;
+    j["uptimeSeconds"]       = uptimeSeconds;
+    nlohmann::json varArr = nlohmann::json::array();
+    for (size_t i = 0; i < byVariant.size(); ++i) {
+        if (byVariant[i] > 0) {
+            varArr.push_back({
+                {"variant", std::string(GetLockyVariantName(static_cast<LockyVariant>(i)))},
+                {"count",   byVariant[i]}
+            });
+        }
+    }
+    j["byVariant"] = std::move(varArr);
+    return j.dump();
+}
+
+// ============================================================================
+// KERNEL BRIDGE — OnKernelProcessNotify / OnKernelImageLoad / RequestBlock
+// ============================================================================
+
+void LockyDetector::OnKernelProcessNotify(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, bool isCreate)
+{
+    if (!m_impl) return;
+    if (isCreate) {
+        (void)OnProcessCreate(pid, parentPid, imagePath, L"");
+    } else {
+        m_impl->PurgeProcessState(pid);
+    }
+}
+
+void LockyDetector::OnKernelImageLoad(
+    uint32_t pid, std::wstring_view imagePath, uintptr_t /*imageBase*/)
+{
+    if (!m_impl) return;
+    // DLL side-load detection: check if image path has Locky extension
+    if (IsLockyExtension(imagePath)) {
+        SS_LOG_WARN(LOG_CAT,
+            L"Locky-named image loaded into PID %u: %.*s",
+            pid,
+            static_cast<int>(imagePath.size()), imagePath.data());
+    }
+}
+
+[[nodiscard]] bool LockyDetector::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    if (!Communication::IPCManager::HasInstance() ||
+        !Communication::IPCManager::Instance().IsFilterPortConnected())
+    {
+        return false;
+    }
+    #pragma pack(push, 1)
+    struct KernelBlockMsg {
+        uint32_t msgType = 0x30;  // standard process block
+        uint32_t pid     = 0;
+    } msg;
+    #pragma pack(pop)
+    msg.pid = pid;
+    const bool sent = Communication::IPCManager::Instance().SendToKernel(&msg, sizeof(msg));
+    if (sent) {
+        SS_LOG_INFO(LOG_CAT,
+            L"Kernel process block requested for PID %u: %.*s",
+            pid,
+            static_cast<int>(reason.size()), reason.data());
+    }
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — AlertSystem & TelemetryCollector helpers
+// ============================================================================
+
+void LockyDetector::ReportDetectionToAlertSystem(
+    uint32_t pid, const LockyDetectionResult& result)
+{
+    if (!Communication::AlertSystem::HasInstance()) return;
+
+    const auto severity = (result.score >= 90.0)
+        ? Communication::AlertSeverity::Critical
+        : Communication::AlertSeverity::High;
+    (void)Communication::AlertSystem::Instance().RaiseAlert(
+        severity,
+        Communication::AlertType::ThreatDetection,
+        "LockyDetector",
+        std::format("Locky {} PID {} ({}) score={:.0f}",
+            GetLockyVariantName(result.variant),
+            pid,
+            Utils::StringUtils::ToNarrow(result.processName),
+            result.score),
+        std::format("confidence={}", GetDetectionConfidenceName(result.confidence)));
+}
+
+void LockyDetector::ReportDetectionTelemetry(
+    const std::string& eventName,
+    const std::map<std::string, std::string>& fields)
+{
+    if (!Communication::TelemetryCollector::HasInstance()) return;
+    Communication::TelemetryCollector::Instance().RecordCustom(eventName, fields);
 }
 
 } // namespace Ransomware

@@ -64,6 +64,9 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Core/Process/ProcessKiller.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
 
 namespace ShadowStrike {
 namespace Ransomware {
@@ -890,10 +893,10 @@ bool BackupProtectorImpl::ShouldBlockRegistryOperation(std::wstring_view keyPath
     if (IsWhitelisted(callerPath))
         return false;
 
-    constexpr uint32_t kRegDelete   = KEY_SET_VALUE;   // 0x0002
-    constexpr uint32_t kRegSetValue = KEY_CREATE_SUB_KEY;  // 0x0004
+    constexpr uint32_t kRegSetValue    = KEY_SET_VALUE;      // 0x0002
+    constexpr uint32_t kRegCreateSubKey = KEY_CREATE_SUB_KEY; // 0x0004
 
-    if (operation & (kRegDelete | kRegSetValue | DELETE)) {
+    if (operation & (kRegSetValue | kRegCreateSubKey | DELETE)) {
         SS_LOG_WARN(kLogCat,
             L"Blocking registry op: Key=%ls Value=%ls Op=0x%08X PID=%u",
             std::wstring(keyPath).c_str(),
@@ -1116,6 +1119,31 @@ void BackupProtectorImpl::NotifyBlock(const BlockedAttempt& attempt) {
             SS_LOG_ERROR(kLogCat, L"Block callback threw unknown exception");
         }
     }
+
+    // ── Direct AlertSystem wiring ──
+    try {
+        using namespace Communication;
+        if (AlertSystem::HasInstance()) {
+            std::string subject = "Backup threat blocked (PID " + std::to_string(attempt.pid) + ")";
+            (void)AlertSystem::Instance().RaiseAlert(
+                AlertSeverity::Critical, AlertType::ThreatDetection,
+                subject, attempt.ToJson(), "BackupProtector");
+        }
+    } catch (...) {}
+
+    // ── Direct TelemetryCollector wiring ──
+    try {
+        using namespace Communication;
+        if (TelemetryCollector::HasInstance()) {
+            std::map<std::string, std::string> data;
+            data["pid"] = std::to_string(attempt.pid);
+            data["threat_type"] = std::string(GetThreatTypeName(attempt.threatType));
+            data["action"] = std::string(GetProtectionActionName(attempt.action));
+            data["process_name"] = Utils::StringUtils::ToNarrow(attempt.processName);
+            data["mitre_technique"] = "T1490";
+            TelemetryCollector::Instance().RecordCustom("backup_threat_blocked", data);
+        }
+    } catch (...) {}
 }
 
 ProtectionAction BackupProtectorImpl::QueryDecision(uint32_t pid,
@@ -1633,6 +1661,98 @@ BackupThreatType IdentifyThreat(std::wstring_view commandLine) noexcept {
         return BackupThreatType::ServiceStop;
 
     return BackupThreatType::Unknown;
+}
+
+// ============================================================================
+// KERNEL BRIDGE
+// ============================================================================
+
+void BackupProtector::OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                                             std::wstring_view commandLine, bool isCreate) {
+    try {
+        if (!isCreate || !IsInitialized()) return;
+        auto result = AnalyzeProcess(processId, imagePath, commandLine);
+        if (result.has_value()) {
+            SS_LOG_WARN(L"BackupProtector",
+                L"Kernel process notify: detected threat PID=%u type=%u",
+                processId, static_cast<unsigned>(result->threatType));
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"BackupProtector", L"OnKernelProcessNotify error: %hs", e.what());
+    }
+}
+
+void BackupProtector::OnKernelImageLoad(uint32_t /*processId*/, std::wstring_view /*imagePath*/,
+                                         uint64_t /*imageBase*/, size_t /*imageSize*/) {
+    // BackupProtector operates on process creation and file access, not image loads.
+}
+
+bool BackupProtector::RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason) {
+    try {
+        using namespace Communication;
+        if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected())
+            return false;
+#pragma pack(push, 1)
+        struct KernelBlockRequest {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t  reason[256];
+        };
+#pragma pack(pop)
+        KernelBlockRequest req{};
+        req.messageType = 0x30;
+        req.processId = processId;
+        wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
+        req.reason[_countof(req.reason) - 1] = L'\0';
+
+        bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+        if (result)
+            SS_LOG_INFO(L"BackupProtector", L"Kernel block requested for PID=%u", processId);
+        return result;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"BackupProtector", L"RequestKernelProcessBlock error: %hs", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING
+// ============================================================================
+
+void BackupProtector::ReportThreatToAlertSystem(const BlockedAttempt& attempt) {
+    try {
+        using namespace Communication;
+        if (!AlertSystem::HasInstance()) return;
+
+        std::string subject = "Backup Threat " +
+            std::string(GetProtectionActionName(attempt.action)) +
+            " — " + std::string(GetThreatTypeName(attempt.threatType)) +
+            " (PID " + std::to_string(attempt.pid) + ")";
+
+        (void)AlertSystem::Instance().RaiseAlert(
+            AlertSeverity::Critical, AlertType::ThreatDetection,
+            subject, attempt.ToJson(), "BackupProtector");
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"BackupProtector", L"AlertSystem report failed: %hs", e.what());
+    }
+}
+
+void BackupProtector::ReportDetectionTelemetry(const BlockedAttempt& attempt) {
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+
+        std::map<std::string, std::string> data;
+        data["pid"] = std::to_string(attempt.pid);
+        data["threat_type"] = std::string(GetThreatTypeName(attempt.threatType));
+        data["action"] = std::string(GetProtectionActionName(attempt.action));
+        data["process_name"] = Utils::StringUtils::ToNarrow(attempt.processName);
+        data["mitre_technique"] = "T1490";
+
+        TelemetryCollector::Instance().RecordCustom("backup_threat_detection", data);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"BackupProtector", L"Telemetry report failed: %hs", e.what());
+    }
 }
 
 }  // namespace Ransomware

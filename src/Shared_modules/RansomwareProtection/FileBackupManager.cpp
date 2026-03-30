@@ -38,7 +38,7 @@
  * - Non-obvious backup directory with restrictive attributes
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -59,6 +59,11 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
 
 #include <filesystem>
 #include <algorithm>
@@ -309,8 +314,8 @@ public:
 
     void CleanupFailedBackupFile(const std::wstring& path) {
         if (!path.empty()) {
-            ::SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
-            Utils::FileUtils::RemoveFile(path);
+            (void)::SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+            (void)Utils::FileUtils::RemoveFile(path);
         }
     }
 
@@ -524,8 +529,8 @@ public:
                 std::memory_order_relaxed);
             entry.memoryData.reset();
         } else if (entry.storageType == BackupStorageType::Disk && !entry.backupPath.empty()) {
-            ::SetFileAttributesW(entry.backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
-            Utils::FileUtils::RemoveFile(entry.backupPath);
+            (void)::SetFileAttributesW(entry.backupPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+            (void)Utils::FileUtils::RemoveFile(entry.backupPath);
             auto current = m_currentDiskUsage.load(std::memory_order_relaxed);
             m_currentDiskUsage.store(
                 (entry.backupSize <= current) ? current - entry.backupSize : 0,
@@ -895,11 +900,31 @@ RollbackResult FileBackupManager::RollbackChanges(uint32_t pid) {
     result.durationMs = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - start).count();
 
-    SS_LOG_ERROR(kLogCategory, L"ROLLBACK PID=%u: %llu/%llu files restored (%llu ms)",
-        pid,
-        static_cast<unsigned long long>(result.filesRestored),
-        static_cast<unsigned long long>(result.filesAttempted),
-        static_cast<unsigned long long>(result.durationMs));
+    if (result.filesFailed > 0) {
+        SS_LOG_ERROR(kLogCategory, L"ROLLBACK PID=%u: %llu/%llu restored, %llu FAILED (%llu ms)",
+            pid,
+            static_cast<unsigned long long>(result.filesRestored),
+            static_cast<unsigned long long>(result.filesAttempted),
+            static_cast<unsigned long long>(result.filesFailed),
+            static_cast<unsigned long long>(result.durationMs));
+    } else {
+        SS_LOG_INFO(kLogCategory, L"ROLLBACK PID=%u: %llu/%llu files restored (%llu ms)",
+            pid,
+            static_cast<unsigned long long>(result.filesRestored),
+            static_cast<unsigned long long>(result.filesAttempted),
+            static_cast<unsigned long long>(result.durationMs));
+    }
+
+    // === Cross-module wiring: alert + telemetry on rollback ===
+    ReportRollbackToAlertSystem(pid, result);
+    ReportBackupTelemetry("ransomware_rollback", {
+        {"pid", std::to_string(pid)},
+        {"filesAttempted", std::to_string(result.filesAttempted)},
+        {"filesRestored", std::to_string(result.filesRestored)},
+        {"filesFailed", std::to_string(result.filesFailed)},
+        {"bytesRestored", std::to_string(result.bytesRestored)},
+        {"durationMs", std::to_string(result.durationMs)}
+    });
 
     RestoreCompleteCallback cb;
     {
@@ -1101,12 +1126,16 @@ void FileBackupManager::SetProgressCallback(BackupProgressCallback callback) {
     snap.currentRamUsage = m_impl->m_currentRamUsage.load(std::memory_order_relaxed);
     snap.currentDiskUsage = m_impl->m_currentDiskUsage.load(std::memory_order_relaxed);
     snap.activeBackups = m_impl->m_stats.activeBackups.load(std::memory_order_relaxed);
-    snap.startTime = m_impl->m_stats.startTime;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        snap.startTime = m_impl->m_stats.startTime;
+    }
     return snap;
 }
 
 void FileBackupManager::ResetStatistics() {
     m_impl->m_stats.Reset();
+    std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_stats.startTime = Clock::now();
 }
 // ============================================================================
@@ -1146,46 +1175,46 @@ void FileBackupManager::ResetStatistics() {
 
         constexpr uint32_t kTestPid = 0xFFFFFFFE;
         if (!BackupFile(testPath, kTestPid)) {
-            Utils::FileUtils::RemoveFile(testPath);
+            (void)Utils::FileUtils::RemoveFile(testPath);
             SS_LOG_ERROR(kLogCategory, L"Self-test: BackupFile failed");
             return false;
         }
         if (!IsBackedUp(testPath, kTestPid)) {
-            Utils::FileUtils::RemoveFile(testPath);
+            (void)Utils::FileUtils::RemoveFile(testPath);
             SS_LOG_ERROR(kLogCategory, L"Self-test: IsBackedUp check failed");
             return false;
         }
 
         {
             const std::string corrupted = "ENCRYPTED_BY_RANSOMWARE";
-            Utils::FileUtils::WriteAllBytesAtomic(testPath,
+            (void)Utils::FileUtils::WriteAllBytesAtomic(testPath,
                 reinterpret_cast<const std::byte*>(corrupted.data()),
                 corrupted.size());
         }
 
         auto restoreRes = RestoreFile(testPath, kTestPid);
         if (restoreRes.status != RestoreStatus::Success) {
-            Utils::FileUtils::RemoveFile(testPath);
+            (void)Utils::FileUtils::RemoveFile(testPath);
             SS_LOG_ERROR(kLogCategory, L"Self-test: restore failed");
             return false;
         }
         if (!restoreRes.integrityVerified) {
-            Utils::FileUtils::RemoveFile(testPath);
+            (void)Utils::FileUtils::RemoveFile(testPath);
             SS_LOG_ERROR(kLogCategory, L"Self-test: integrity not verified");
             return false;
         }
 
         std::vector<std::byte> readBack;
-        Utils::FileUtils::ReadAllBytes(testPath, readBack);
+        (void)Utils::FileUtils::ReadAllBytes(testPath, readBack);
         if (readBack.size() != testContent.size() ||
             std::memcmp(readBack.data(), testContent.data(), testContent.size()) != 0) {
-            Utils::FileUtils::RemoveFile(testPath);
+            (void)Utils::FileUtils::RemoveFile(testPath);
             SS_LOG_ERROR(kLogCategory, L"Self-test: content verification FAILED");
             return false;
         }
 
         CommitChanges(kTestPid);
-        Utils::FileUtils::RemoveFile(testPath);
+        (void)Utils::FileUtils::RemoveFile(testPath);
         if (!wasRunning) Shutdown();
 
         SS_LOG_INFO(kLogCategory, L"Self-test PASSED");
@@ -1289,6 +1318,9 @@ void BackupStatistics::Reset() noexcept {
     j["activeBackups"] = activeBackups;
     j["ramUsage"] = currentRamUsage;
     j["diskUsage"] = currentDiskUsage;
+    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - startTime).count();
+    j["uptimeSeconds"] = static_cast<uint64_t>(uptimeMs > 0 ? uptimeMs / 1000 : 0);
     return j.dump(2);
 }
 
@@ -1345,6 +1377,123 @@ void BackupStatistics::Reset() noexcept {
         case RestoreStatus::AccessDenied:   return "AccessDenied";
         default:                            return "Unknown";
     }
+}
+
+// ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void FileBackupManager::OnKernelProcessNotify(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, bool isCreate)
+{
+    if (!IsInitialized()) return;
+
+    if (!isCreate) {
+        // Process exit: commit backups for this PID (process exited normally)
+        size_t count = GetBackupCount(pid);
+        if (count > 0) {
+            SS_LOG_DEBUG(kLogCategory,
+                L"[KernelBridge] PID %u exited with %zu active backups — committing",
+                pid, count);
+            CommitChanges(pid);
+        }
+        return;
+    }
+
+    // Process creation: no backup action needed at this stage.
+    // Backups are demand-driven via BackupFile() when file modifications are intercepted.
+    (void)parentPid;
+    (void)imagePath;
+}
+
+void FileBackupManager::OnKernelImageLoad(
+    uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase)
+{
+    (void)imageBase;
+    if (!IsInitialized()) return;
+
+    // If a DLL is loaded into a process with active backups, log for forensic awareness.
+    size_t count = GetBackupCount(pid);
+    if (count > 0) {
+        SS_LOG_TRACE(kLogCategory,
+            L"[KernelBridge] Image load in backed-up PID %u: %.*s",
+            pid, static_cast<int>(imagePath.size()), imagePath.data());
+    }
+}
+
+[[nodiscard]] bool FileBackupManager::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    using Communication::IPCManager;
+    if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
+        SS_LOG_WARN(kLogCategory,
+            L"[KernelBridge] Cannot block PID %u — kernel IPC not connected", pid);
+        return false;
+    }
+
+#pragma pack(push, 1)
+    struct KernelBlockRequest {
+        uint32_t msgType = 0x30;   // BLOCK_PROCESS
+        uint32_t targetPid = 0;
+        wchar_t  reason[256]{};
+    };
+#pragma pack(pop)
+
+    KernelBlockRequest req;
+    req.targetPid = pid;
+    if (!reason.empty()) {
+        wcsncpy_s(req.reason, 256, reason.data(),
+                  std::min<size_t>(reason.size(), 255));
+    }
+
+    bool sent = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+    if (!sent) {
+        SS_LOG_ERROR(kLogCategory,
+            L"[KernelBridge] Failed to send block request for PID %u", pid);
+    }
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING IMPLEMENTATIONS
+// ============================================================================
+
+void FileBackupManager::ReportRollbackToAlertSystem(
+    uint32_t pid, const RollbackResult& result)
+{
+    using Communication::AlertSystem;
+    if (!AlertSystem::HasInstance()) return;
+
+    auto severity = (result.filesFailed > 0)
+        ? Communication::AlertSeverity::Critical
+        : Communication::AlertSeverity::High;
+
+    std::string title = "Ransomware rollback for PID " + std::to_string(pid);
+    std::string detail = "Restored " + std::to_string(result.filesRestored) + "/" +
+                         std::to_string(result.filesAttempted) + " files (" +
+                         std::to_string(result.bytesRestored) + " bytes) in " +
+                         std::to_string(result.durationMs) + "ms";
+    if (result.filesFailed > 0) {
+        detail += " — " + std::to_string(result.filesFailed) + " FAILED";
+    }
+
+    (void)AlertSystem::Instance().RaiseAlert(
+        severity,
+        Communication::AlertType::ThreatDetection,
+        "FileBackupManager",
+        title,
+        detail);
+}
+
+void FileBackupManager::ReportBackupTelemetry(
+    const std::string& eventName,
+    const std::map<std::string, std::string>& fields)
+{
+    using Communication::TelemetryCollector;
+    if (!TelemetryCollector::HasInstance()) return;
+
+    TelemetryCollector::Instance().RecordCustom(eventName, fields);
 }
 
 }  // namespace ShadowStrike::Ransomware

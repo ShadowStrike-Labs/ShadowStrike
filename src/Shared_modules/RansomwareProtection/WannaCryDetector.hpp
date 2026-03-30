@@ -86,7 +86,7 @@ namespace Ransomware {
 
 namespace WannaCryConstants {
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 1;
+    inline constexpr uint32_t VERSION_MINOR = 2;
     inline constexpr uint32_t VERSION_PATCH = 0;
     inline constexpr const wchar_t* WNCRY_EXTENSION = L".WNCRY";
     inline constexpr const wchar_t* SUPPORT_FILES[] = {
@@ -110,6 +110,9 @@ namespace WannaCryConstants {
     inline constexpr const wchar_t* WANNACRY_SERVICE_NAME = L"mssecsvc2.0";
     inline constexpr size_t MAX_TRACKED_PIDS = 10000;
     inline constexpr size_t MAX_EVENTS_PER_PID = 1000;
+    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS = 0x30;
+    inline constexpr uint32_t KERNEL_MSG_NETWORK_ISOLATION = 0x31;
+    inline constexpr size_t MAX_CALLBACKS = 16;
 }
 
 using Clock = std::chrono::steady_clock;
@@ -131,10 +134,13 @@ enum class DetectionConfidence : uint8_t {
     None = 0, Low = 1, Medium = 2, High = 3, Confirmed = 4
 };
 
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized = 0, Initializing = 1, Running = 2, Degraded = 3,
     Paused = 4, Stopping = 5, Stopped = 6, Error = 7
 };
+#endif
 
 struct WannaCryDetectionResult {
     bool detected = false;
@@ -265,6 +271,21 @@ struct WannaCryStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
+/// @brief Copyable, non-atomic snapshot for public API — no atomic fields leaked.
+struct WannaCryStatisticsSnapshot {
+    uint64_t totalDetections{0};
+    std::array<uint64_t, 8> byVariant{};
+    uint64_t smbExploitsBlocked{0};
+    uint64_t killSwitchQueries{0};
+    uint64_t processesTerminated{0};
+    uint64_t hostsProtected{0};
+    uint64_t smbScansDetected{0};
+    uint64_t mutexDetections{0};
+    uint64_t serviceDetections{0};
+    int64_t  uptimeSeconds{0};
+    [[nodiscard]] std::string ToJson() const;
+};
+
 using WannaCryDetectionCallback = std::function<void(const WannaCryDetectionResult&)>;
 using EternalBlueCallback = std::function<void(const EternalBlueIndicator&)>;
 using SMBScanCallback = std::function<void(uint32_t pid, uint32_t connectionCount)>;
@@ -316,11 +337,30 @@ public:
     void SetEternalBlueCallback(EternalBlueCallback callback);
     void SetSMBScanCallback(SMBScanCallback callback);
 
-    [[nodiscard]] WannaCryStatistics GetStatistics() const;
+    [[nodiscard]] WannaCryStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
 
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ── Kernel Bridge ─────────────────────────────────────────────────────
+    /// @brief Called from kernel process creation callback to detect WannaCry executables.
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+    /// @brief Called from kernel image load callback to detect WannaCry DLLs/payloads.
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+    /// @brief Request kernel to block a process via IPC.
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                 const std::wstring& reason);
+
+    // ── Cross-Module Wiring ───────────────────────────────────────────────
+    /// @brief Report WannaCry detection to AlertSystem for SOC visibility.
+    void ReportThreatToAlertSystem(const WannaCryDetectionResult& result);
+    /// @brief Report detection telemetry to TelemetryCollector.
+    void ReportDetectionTelemetry(const WannaCryDetectionResult& result);
+    /// @brief Report threat indicators to BehaviorAnalyzer for correlation.
+    void ReportThreatToBehaviorAnalyzer(const WannaCryDetectionResult& result);
 
 private:
     WannaCryDetector();

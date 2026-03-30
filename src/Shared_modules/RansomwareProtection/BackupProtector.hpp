@@ -166,7 +166,7 @@ namespace BackupProtectorConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -266,6 +266,8 @@ enum class DangerousToolType : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -276,6 +278,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -692,6 +695,23 @@ public:
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING
+    // ========================================================================
+
+    void ReportThreatToAlertSystem(const BlockedAttempt& attempt);
+    void ReportDetectionTelemetry(const BlockedAttempt& attempt);
 
 private:
     BackupProtector();

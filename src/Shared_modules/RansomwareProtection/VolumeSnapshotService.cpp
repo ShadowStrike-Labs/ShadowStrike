@@ -50,6 +50,11 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 #include <Windows.h>
 #include <vss.h>
 #include <vswriter.h>
@@ -60,6 +65,9 @@
 #include <iomanip>
 #include <filesystem>
 #include <unordered_map>
+#include <cctype>
+#include <cwctype>
+#include <format>
 #include <nlohmann/json.hpp>
 #include <comdef.h>
 
@@ -85,6 +93,13 @@ std::atomic<bool> VolumeSnapshotService::s_instanceCreated{false};
 namespace {
 
 constexpr wchar_t kLogCategory[] = L"VSS";
+
+// VSS Software Provider GUID (not declared in older SDK headers)
+// {b5946137-7b9f-4925-af80-51abd60b20d5}
+static const VSS_ID VSS_SWPRV_ProviderId = {
+    0xb5946137, 0x7b9f, 0x4925,
+    { 0xaf, 0x80, 0x51, 0xab, 0xd6, 0x0b, 0x20, 0xd5 }
+};
 
 /// @brief RAII guard for per-thread COM initialization.
 struct ComInitGuard {
@@ -244,13 +259,11 @@ struct VssComponentsGuard {
     return false;
 }
 
-// Convert FILETIME-epoch 100ns ticks to system_clock::time_point
+// Convert FILETIME-epoch 100ns ticks (VSS_TIMESTAMP = LONGLONG) to system_clock::time_point
 [[nodiscard]] SystemTimePoint FileTimeToSystemTime(const VSS_TIMESTAMP& ts) {
-    FILETIME ft{};
-    SystemTimeToFileTime(&ts, &ft);
+    // VSS_TIMESTAMP is a LONGLONG representing 100ns intervals since 1601-01-01
     ULARGE_INTEGER ull;
-    ull.LowPart  = ft.dwLowDateTime;
-    ull.HighPart = ft.dwHighDateTime;
+    ull.QuadPart = static_cast<ULONGLONG>(ts);
     constexpr int64_t kEpochDelta = 116444736000000000LL;
     auto ticks = std::chrono::duration<int64_t, std::ratio<1, 10000000>>(
         static_cast<int64_t>(ull.QuadPart));
@@ -465,7 +478,7 @@ public:
     void UnregisterCallbacks();
 
     // --- Statistics ---
-    VolumeSnapshotStatistics GetStatistics() const;
+    VolumeSnapshotStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     bool SelfTest();
 
@@ -535,9 +548,9 @@ VolumeSnapshotServiceImpl::~VolumeSnapshotServiceImpl() {
 
 bool VolumeSnapshotServiceImpl::AcquireRequiredPrivileges() {
     bool ok = true;
-    ok &= AcquirePrivilege(SE_BACKUP_NAME);
-    ok &= AcquirePrivilege(SE_RESTORE_NAME);
-    ok &= AcquirePrivilege(SE_SECURITY_NAME);
+    ok &= AcquirePrivilege(L"SeBackupPrivilege");
+    ok &= AcquirePrivilege(L"SeRestorePrivilege");
+    ok &= AcquirePrivilege(L"SeSecurityPrivilege");
     if (!ok) {
         SS_LOG_WARN(kLogCategory,
             L"Not all VSS privileges acquired — some operations may fail");
@@ -834,10 +847,33 @@ VSSResult VolumeSnapshotServiceImpl::CreateSnapshotEx(
         // Notify ShadowCopyProtector so this snapshot is tamper-protected
         NotifyShadowCopyProtector(outSnapshotId);
 
+        // Cross-module wiring: AlertSystem + TelemetryCollector
+        if (Communication::TelemetryCollector::HasInstance()) {
+            Communication::TelemetryCollector::Instance().RecordCustom(
+                "vss_snapshot_created",
+                {
+                    {"volume",     Utils::StringUtils::ToNarrow(volumeName)},
+                    {"snapshotId", Utils::StringUtils::ToNarrow(outSnapshotId)},
+                    {"durationMs", std::to_string(durationMs)}
+                });
+        }
+
         SS_LOG_INFO(kLogCategory, L"Snapshot created: %ls (%lldms)",
                     outSnapshotId.c_str(), static_cast<long long>(durationMs));
     } else {
         m_stats.operationsFailed++;
+
+        if (Communication::AlertSystem::HasInstance()) {
+            (void)Communication::AlertSystem::Instance().RaiseAlert(
+                Communication::AlertSeverity::High,
+                Communication::AlertType::Operational,
+                "VolumeSnapshotService",
+                std::format("Snapshot creation failed for {} — result={}",
+                    Utils::StringUtils::ToNarrow(volumeName),
+                    static_cast<int>(result)),
+                std::format("durationMs={}", durationMs));
+        }
+
         SS_LOG_ERROR(kLogCategory, L"Snapshot creation failed: result=%d (%lldms)",
                      static_cast<int>(result), static_cast<long long>(durationMs));
     }
@@ -2006,9 +2042,27 @@ void VolumeSnapshotServiceImpl::NotifyShadowCopyProtector(
 // STATISTICS
 // ============================================================================
 
-VolumeSnapshotStatistics VolumeSnapshotServiceImpl::GetStatistics() const {
-    // Atomics are individually consistent; no need for lock
-    return m_stats;
+VolumeSnapshotStatisticsSnapshot VolumeSnapshotServiceImpl::GetStatistics() const {
+    VolumeSnapshotStatisticsSnapshot snap;
+    snap.snapshotsCreated         = m_stats.snapshotsCreated.load(std::memory_order_relaxed);
+    snap.snapshotsDeleted         = m_stats.snapshotsDeleted.load(std::memory_order_relaxed);
+    snap.snapshotsMounted         = m_stats.snapshotsMounted.load(std::memory_order_relaxed);
+    snap.filesRestored            = m_stats.filesRestored.load(std::memory_order_relaxed);
+    snap.directoriesRestored      = m_stats.directoriesRestored.load(std::memory_order_relaxed);
+    snap.operationsFailed         = m_stats.operationsFailed.load(std::memory_order_relaxed);
+    snap.totalCreationTimeMs      = m_stats.totalCreationTimeMs.load(std::memory_order_relaxed);
+    snap.totalDeletionTimeMs      = m_stats.totalDeletionTimeMs.load(std::memory_order_relaxed);
+    snap.totalRestorationTimeMs   = m_stats.totalRestorationTimeMs.load(std::memory_order_relaxed);
+    snap.currentOperations        = m_stats.currentOperations.load(std::memory_order_relaxed);
+    snap.emergencySnapshotsCreated = m_stats.emergencySnapshotsCreated.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.byType.size(); ++i)
+        snap.byType[i] = m_stats.byType[i].load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.byResult.size(); ++i)
+        snap.byResult[i] = m_stats.byResult[i].load(std::memory_order_relaxed);
+    const auto now = Clock::now();
+    snap.uptimeSeconds = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_stats.startTime).count());
+    return snap;
 }
 
 void VolumeSnapshotServiceImpl::ResetStatistics() {
@@ -2151,7 +2205,7 @@ void VolumeSnapshotService::RegisterErrorCallback(ErrorCallback cb) { m_impl->Re
 void VolumeSnapshotService::UnregisterCallbacks() { m_impl->UnregisterCallbacks(); }
 
 // --- Statistics ---
-VolumeSnapshotStatistics VolumeSnapshotService::GetStatistics() const { return m_impl->GetStatistics(); }
+VolumeSnapshotStatisticsSnapshot VolumeSnapshotService::GetStatistics() const { return m_impl->GetStatistics(); }
 void VolumeSnapshotService::ResetStatistics() { m_impl->ResetStatistics(); }
 
 // --- Utility ---
@@ -2224,6 +2278,101 @@ std::string_view GetWriterStateName(WriterState state) noexcept {
         case WriterState::Failed:               return "Failed";
         default:                                return "Unknown";
     }
+}
+
+// ============================================================================
+// VOLUME SNAPSHOT STATISTICS SNAPSHOT — ToJson
+// ============================================================================
+
+std::string VolumeSnapshotStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["snapshotsCreated"]          = snapshotsCreated;
+    j["snapshotsDeleted"]          = snapshotsDeleted;
+    j["snapshotsMounted"]          = snapshotsMounted;
+    j["filesRestored"]             = filesRestored;
+    j["directoriesRestored"]       = directoriesRestored;
+    j["operationsFailed"]          = operationsFailed;
+    j["totalCreationTimeMs"]       = totalCreationTimeMs;
+    j["totalDeletionTimeMs"]       = totalDeletionTimeMs;
+    j["totalRestorationTimeMs"]    = totalRestorationTimeMs;
+    j["currentOperations"]         = currentOperations;
+    j["emergencySnapshotsCreated"] = emergencySnapshotsCreated;
+    j["uptimeSeconds"]             = uptimeSeconds;
+    nlohmann::json types = nlohmann::json::array();
+    for (size_t i = 0; i < byType.size(); ++i) {
+        if (byType[i] > 0) {
+            types.push_back({{"type", std::string(GetSnapshotTypeName(static_cast<SnapshotType>(i)))},
+                             {"count", byType[i]}});
+        }
+    }
+    j["byType"] = std::move(types);
+    return j.dump();
+}
+
+// ============================================================================
+// KERNEL BRIDGE — OnKernelProcessNotify / OnKernelImageLoad / RequestBlock
+// ============================================================================
+
+void VolumeSnapshotService::OnKernelProcessNotify(
+    uint32_t /*pid*/, uint32_t /*parentPid*/,
+    std::wstring_view /*imagePath*/, bool /*isCreate*/)
+{
+    // VSS is passive — no per-process tracking needed
+}
+
+void VolumeSnapshotService::OnKernelImageLoad(
+    uint32_t /*pid*/, std::wstring_view /*imagePath*/, uintptr_t /*imageBase*/)
+{
+    // VSS is passive — no image-load analysis needed
+}
+
+[[nodiscard]] bool VolumeSnapshotService::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    if (!Communication::IPCManager::HasInstance() ||
+        !Communication::IPCManager::Instance().IsFilterPortConnected())
+    {
+        return false;
+    }
+    #pragma pack(push, 1)
+    struct KernelBlockMsg {
+        uint32_t msgType = 0x30;
+        uint32_t pid     = 0;
+    } msg;
+    #pragma pack(pop)
+    msg.pid = pid;
+    const bool sent = Communication::IPCManager::Instance().SendToKernel(&msg, sizeof(msg));
+    if (sent) {
+        SS_LOG_INFO(kLogCategory,
+            L"Kernel process block requested for PID %u: %.*s",
+            pid,
+            static_cast<int>(reason.size()), reason.data());
+    }
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+// ============================================================================
+
+void VolumeSnapshotService::ReportSnapshotEventToAlertSystem(
+    const std::string& event, const std::string& detail)
+{
+    if (!Communication::AlertSystem::HasInstance()) return;
+    (void)Communication::AlertSystem::Instance().RaiseAlert(
+        Communication::AlertSeverity::Info,
+        Communication::AlertType::Operational,
+        "VolumeSnapshotService",
+        event,
+        detail);
+}
+
+void VolumeSnapshotService::ReportSnapshotTelemetry(
+    const std::string& eventName,
+    const std::map<std::string, std::string>& fields)
+{
+    if (!Communication::TelemetryCollector::HasInstance()) return;
+    Communication::TelemetryCollector::Instance().RecordCustom(eventName, fields);
 }
 
 }  // namespace Ransomware

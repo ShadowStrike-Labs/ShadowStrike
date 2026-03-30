@@ -84,7 +84,7 @@
  * @note False positive rate should be near-zero for legitimate users.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -167,7 +167,7 @@ namespace HoneypotConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -313,7 +313,8 @@ enum class HoneypotStatus : uint8_t {
     Missing     = 2,    ///< Honeypot file missing
     Modified    = 3,    ///< Honeypot was modified
     Compromised = 4,    ///< Honeypot was accessed by malware
-    Disabled    = 5     ///< Honeypot disabled
+    Disabled    = 5,    ///< Honeypot disabled
+    Error       = 6     ///< Honeypot in error state
 };
 
 /**
@@ -321,6 +322,8 @@ enum class HoneypotStatus : uint8_t {
  */
 #ifndef SHADOWSTRIKE_MODULE_STATUS_DEFINED
 #define SHADOWSTRIKE_MODULE_STATUS_DEFINED
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -331,6 +334,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 #endif // SHADOWSTRIKE_MODULE_STATUS_DEFINED
 
 // ============================================================================
@@ -646,6 +650,25 @@ struct HoneypotStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
+/**
+ * @brief Thread-safe snapshot of honeypot statistics (non-atomic, copyable by value)
+ *
+ * HoneypotStatistics contains std::atomic members; this snapshot captures a
+ * consistent point-in-time view for callers without leaking atomics.
+ */
+struct HoneypotStatisticsSnapshot {
+    uint64_t totalDeployed   = 0;
+    uint64_t currentlyActive = 0;
+    uint64_t accessEvents    = 0;
+    uint64_t processesKilled = 0;
+    uint64_t regenerations   = 0;
+    uint64_t falsePositives  = 0;
+    std::array<uint64_t, 8> eventsByType{};
+    uint64_t uptimeSeconds   = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
@@ -904,7 +927,7 @@ public:
     /**
      * @brief Get statistics
      */
-    [[nodiscard]] HoneypotStatistics GetStatistics() const;
+    [[nodiscard]] HoneypotStatisticsSnapshot GetStatistics() const;
     
     /**
      * @brief Reset statistics
@@ -958,6 +981,31 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+    // ========================================================================
+
+    /// @brief Handle kernel process-create notification for honeypot checks
+    void OnKernelProcessNotify(uint32_t pid, uint32_t parentPid,
+                               std::wstring_view imagePath, bool isCreate);
+
+    /// @brief Handle kernel image-load notification
+    void OnKernelImageLoad(uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase);
+
+    /// @brief Request kernel-level process block via IPC filter port
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t pid, std::wstring_view reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+    // ========================================================================
+
+    /// @brief Emit alert when honeypot is accessed
+    void ReportAccessToAlertSystem(uint32_t pid, const HoneypotAccessEvent& event);
+
+    /// @brief Emit telemetry for honeypot events
+    void ReportHoneypotTelemetry(const std::string& eventName,
+                                 const std::map<std::string, std::string>& fields);
 
 private:
     // ========================================================================

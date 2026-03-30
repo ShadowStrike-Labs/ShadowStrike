@@ -65,6 +65,7 @@
 #include <atomic>
 #include <mutex>
 #include <shared_mutex>
+#include <map>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -181,6 +182,8 @@ enum class VSSResult : uint8_t {
 };
 
 /// @brief Module lifecycle status
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized = 0,
     Initializing  = 1,
@@ -191,6 +194,7 @@ enum class ModuleStatus : uint8_t {
     Stopped       = 6,
     Error         = 7
 };
+#endif // SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 
 /// @brief Snapshot operation type (for tracking active operations)
 enum class OperationType : uint8_t {
@@ -318,6 +322,28 @@ struct VolumeSnapshotStatistics {
     TimePoint startTime = Clock::now();
 
     void Reset() noexcept;
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Thread-safe snapshot of VSS statistics (non-atomic, copyable)
+ */
+struct VolumeSnapshotStatisticsSnapshot {
+    uint64_t snapshotsCreated        = 0;
+    uint64_t snapshotsDeleted        = 0;
+    uint64_t snapshotsMounted        = 0;
+    uint64_t filesRestored           = 0;
+    uint64_t directoriesRestored     = 0;
+    uint64_t operationsFailed        = 0;
+    uint64_t totalCreationTimeMs     = 0;
+    uint64_t totalDeletionTimeMs     = 0;
+    uint64_t totalRestorationTimeMs  = 0;
+    uint64_t currentOperations       = 0;
+    uint64_t emergencySnapshotsCreated = 0;
+    std::array<uint64_t, 4>  byType{};
+    std::array<uint64_t, 19> byResult{};
+    uint64_t uptimeSeconds           = 0;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -500,7 +526,7 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] VolumeSnapshotStatistics GetStatistics() const;
+    [[nodiscard]] VolumeSnapshotStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
 
     // ========================================================================
@@ -509,6 +535,24 @@ public:
 
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+    // ========================================================================
+
+    void OnKernelProcessNotify(uint32_t pid, uint32_t parentPid,
+                               std::wstring_view imagePath, bool isCreate);
+    void OnKernelImageLoad(uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t pid, std::wstring_view reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+    // ========================================================================
+
+    void ReportSnapshotEventToAlertSystem(const std::string& event,
+                                          const std::string& detail);
+    void ReportSnapshotTelemetry(const std::string& eventName,
+                                  const std::map<std::string, std::string>& fields);
 
 private:
     VolumeSnapshotService();

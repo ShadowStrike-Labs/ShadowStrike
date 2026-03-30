@@ -90,6 +90,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <map>
 #include <unordered_set>
 
 // ============================================================================
@@ -120,10 +121,6 @@
 // FORWARD DECLARATIONS
 // ============================================================================
 
-namespace ShadowStrike::Ransomware {
-    class LockyDetectorImpl;
-}
-
 namespace ShadowStrike {
 namespace Ransomware {
 
@@ -133,7 +130,7 @@ namespace Ransomware {
 
 namespace LockyConstants {
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
     
     /// @brief Known Locky extensions
@@ -258,6 +255,8 @@ enum class DetectionConfidence : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -268,6 +267,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -385,6 +385,18 @@ struct LockyStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Thread-safe snapshot of Locky statistics (non-atomic, copyable by value)
+ */
+struct LockyStatisticsSnapshot {
+    uint64_t totalDetections    = 0;
+    uint64_t processesTerminated = 0;
+    std::array<uint64_t, 12> byVariant{};
+    uint64_t uptimeSeconds      = 0;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -585,7 +597,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] LockyStatistics GetStatistics() const;
+    [[nodiscard]] LockyStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     // ========================================================================
@@ -595,10 +607,28 @@ public:
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
+    // ========================================================================
+    // KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+    // ========================================================================
+
+    void OnKernelProcessNotify(uint32_t pid, uint32_t parentPid,
+                               std::wstring_view imagePath, bool isCreate);
+    void OnKernelImageLoad(uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t pid, std::wstring_view reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+    // ========================================================================
+
+    void ReportDetectionToAlertSystem(uint32_t pid, const LockyDetectionResult& result);
+    void ReportDetectionTelemetry(const std::string& eventName,
+                                  const std::map<std::string, std::string>& fields);
+
 private:
     LockyDetector();
     ~LockyDetector();
     
+    class LockyDetectorImpl;
     std::unique_ptr<LockyDetectorImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };

@@ -47,6 +47,10 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Core/Process/ProcessKiller.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../ThreatIntel/ThreatIntelManager.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -252,13 +256,50 @@ public:
     void FireDetectionCallback(const DetectionEvent& event) noexcept {
         DetectionCallback cb;
         { std::lock_guard lk(m_callbackMutex); cb = m_detectionCallback; }
-        if (!cb) return;
-        try { cb(event); }
-        catch (const std::exception& ex) {
-            SS_LOG_ERROR(L"RansomwareDetector", L"Detection callback threw: %hs", ex.what());
-        } catch (...) {
-            SS_LOG_ERROR(L"RansomwareDetector", L"Detection callback threw unknown exception");
+        if (cb) {
+            try { cb(event); }
+            catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"RansomwareDetector", L"Detection callback threw: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"RansomwareDetector", L"Detection callback threw unknown exception");
+            }
         }
+
+        // ── Direct AlertSystem wiring (fallback even if callback not set) ──
+        try {
+            using namespace Communication;
+            if (AlertSystem::HasInstance() &&
+                event.verdict >= DetectionVerdict::Suspicious) {
+                auto severity = AlertSeverity::Medium;
+                if (event.verdict >= DetectionVerdict::ConfirmedRansom)
+                    severity = AlertSeverity::Emergency;
+                else if (event.verdict >= DetectionVerdict::PossibleRansom)
+                    severity = AlertSeverity::Critical;
+
+                std::string subject = "Ransomware " +
+                    std::string(GetVerdictName(event.verdict)) +
+                    " (PID " + std::to_string(event.pid) + ")";
+                (void)AlertSystem::Instance().RaiseAlert(
+                    severity, AlertType::ThreatDetection,
+                    subject, event.ToJson(), "RansomwareDetector");
+            }
+        } catch (...) {}
+
+        // ── Direct TelemetryCollector wiring ──
+        try {
+            using namespace Communication;
+            if (TelemetryCollector::HasInstance()) {
+                std::map<std::string, std::string> data;
+                data["pid"] = std::to_string(event.pid);
+                data["verdict"] = std::string(GetVerdictName(event.verdict));
+                data["action"] = std::string(GetActionName(event.action));
+                data["family"] = std::string(GetFamilyName(event.family));
+                data["confidence"] = std::to_string(event.confidence);
+                data["entropy"] = std::to_string(event.entropy.shannon);
+                data["techniques"] = std::to_string(event.techniques);
+                TelemetryCollector::Instance().RecordCustom("ransomware_detection", data);
+            }
+        } catch (...) {}
     }
 
     void FireBlockCallback(uint32_t pid, const std::wstring& reason) noexcept {
@@ -289,6 +330,17 @@ public:
         SS_LOG_FATAL(L"RansomwareDetector",
             L"=== RANSOMWARE CONFIRMED === PID %u  confidence=%.2f  family=%u",
             pid, event.confidence, static_cast<unsigned>(event.family));
+
+        // 0. Request kernel process block via IPC (fastest path)
+        try {
+            using namespace Communication;
+            if (IPCManager::HasInstance() && IPCManager::Instance().IsFilterPortConnected()) {
+#pragma pack(push, 1)
+                struct { uint32_t msgType; uint32_t pid; } blockReq{0x30, pid};
+#pragma pack(pop)
+                (void)IPCManager::Instance().SendToKernel(&blockReq, sizeof(blockReq));
+            }
+        } catch (...) {}
 
         // 1. Terminate process tree via ProcessKiller
         auto killResult = Core::Process::ProcessKiller::TerminateTree(pid);
@@ -1148,11 +1200,30 @@ void RansomwareDetector::SetRecoveryCallback(RecoveryCallback cb) {
 // STATISTICS
 // ============================================================================
 
-DetectionStatistics RansomwareDetector::GetStatistics() const {
-    return m_impl->m_stats;
+DetectionStatisticsSnapshot RansomwareDetector::GetStatistics() const {
+    DetectionStatisticsSnapshot snap;
+    snap.totalOperations    = m_impl->m_stats.totalOperations.load(std::memory_order_relaxed);
+    snap.operationsBlocked  = m_impl->m_stats.operationsBlocked.load(std::memory_order_relaxed);
+    snap.processesTerminated = m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed);
+    snap.honeypotTriggers   = m_impl->m_stats.honeypotTriggers.load(std::memory_order_relaxed);
+    snap.highEntropyWrites  = m_impl->m_stats.highEntropyWrites.load(std::memory_order_relaxed);
+    snap.filesBackedUp      = m_impl->m_stats.filesBackedUp.load(std::memory_order_relaxed);
+    snap.filesRestored      = m_impl->m_stats.filesRestored.load(std::memory_order_relaxed);
+    snap.falsePositives     = m_impl->m_stats.falsePositives.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.detectionsByFamily.size(); ++i)
+        snap.detectionsByFamily[i] = m_impl->m_stats.detectionsByFamily[i].load(std::memory_order_relaxed);
+    // startTime is non-atomic — protect with module mutex to avoid data race with ResetStatistics
+    {
+        std::shared_lock lk(m_impl->m_mutex);
+        auto elapsed = Clock::now() - m_impl->m_stats.startTime;
+        snap.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    }
+    return snap;
 }
 
 void RansomwareDetector::ResetStatistics() {
+    // Hold module mutex to synchronize non-atomic startTime write with GetStatistics read
+    std::unique_lock lk(m_impl->m_mutex);
     m_impl->m_stats.Reset();
 }
 
@@ -1372,6 +1443,20 @@ std::string DetectionStatistics::ToJson() const {
     return j.dump();
 }
 
+std::string DetectionStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["totalOperations"] = totalOperations;
+    j["operationsBlocked"] = operationsBlocked;
+    j["processesTerminated"] = processesTerminated;
+    j["honeypotTriggers"] = honeypotTriggers;
+    j["highEntropyWrites"] = highEntropyWrites;
+    j["filesBackedUp"] = filesBackedUp;
+    j["filesRestored"] = filesRestored;
+    j["falsePositives"] = falsePositives;
+    j["uptimeSeconds"] = uptimeSeconds;
+    return j.dump();
+}
+
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
@@ -1493,6 +1578,108 @@ double CalculateConfidence(double entropy, uint32_t writeRate, uint32_t renameRa
     if (honeypotTriggered) score += 0.35;
     if (knownFamily) score += 0.10;
     return std::clamp(score, 0.0, 1.0);
+}
+
+// ============================================================================
+// KERNEL BRIDGE
+// ============================================================================
+
+void RansomwareDetector::OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                                                std::wstring_view commandLine, bool isCreate) {
+    try {
+        if (!IsInitialized()) return;
+        if (isCreate) {
+            OnProcessCreated(processId, imagePath, commandLine);
+        } else {
+            ClearProcessStats(processId);
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"RansomwareDetector", L"OnKernelProcessNotify error: %hs", ex.what());
+    } catch (...) {}
+}
+
+void RansomwareDetector::OnKernelImageLoad(uint32_t /*processId*/, std::wstring_view /*imagePath*/,
+                                            uint64_t /*imageBase*/, size_t /*imageSize*/) {
+    // RansomwareDetector operates on file I/O patterns, not image loads.
+    // This is a no-op passthrough for kernel bridge API uniformity.
+}
+
+bool RansomwareDetector::RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason) {
+    try {
+        using namespace Communication;
+        if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
+            SS_LOG_DEBUG(L"RansomwareDetector", L"Kernel IPC not available for process block PID=%u", processId);
+            return false;
+        }
+#pragma pack(push, 1)
+        struct KernelBlockRequest {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t  reason[256];
+        };
+#pragma pack(pop)
+        KernelBlockRequest req{};
+        req.messageType = 0x30;
+        req.processId = processId;
+        wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
+        req.reason[_countof(req.reason) - 1] = L'\0';
+
+        bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+        if (result)
+            SS_LOG_INFO(L"RansomwareDetector", L"Kernel block requested for PID=%u", processId);
+        return result;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"RansomwareDetector", L"RequestKernelProcessBlock error: %hs", ex.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING (Public Delegating Methods)
+// ============================================================================
+
+void RansomwareDetector::ReportThreatToAlertSystem(const DetectionEvent& event) {
+    try {
+        using namespace Communication;
+        if (!AlertSystem::HasInstance()) return;
+
+        auto severity = AlertSeverity::High;
+        if (event.verdict >= DetectionVerdict::ConfirmedRansom)
+            severity = AlertSeverity::Emergency;
+        else if (event.verdict >= DetectionVerdict::PossibleRansom)
+            severity = AlertSeverity::Critical;
+
+        std::string subject = "Ransomware " +
+            std::string(GetVerdictName(event.verdict)) +
+            " — " + std::string(GetFamilyName(event.family)) +
+            " (PID " + std::to_string(event.pid) + ")";
+
+        (void)AlertSystem::Instance().RaiseAlert(
+            severity, AlertType::ThreatDetection,
+            subject, event.ToJson(), "RansomwareDetector");
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"RansomwareDetector", L"AlertSystem report failed: %hs", ex.what());
+    }
+}
+
+void RansomwareDetector::ReportDetectionTelemetry(const DetectionEvent& event) {
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+
+        std::map<std::string, std::string> data;
+        data["pid"] = std::to_string(event.pid);
+        data["verdict"] = std::string(GetVerdictName(event.verdict));
+        data["action"] = std::string(GetActionName(event.action));
+        data["family"] = std::string(GetFamilyName(event.family));
+        data["confidence"] = std::to_string(event.confidence);
+        data["entropy"] = std::to_string(event.entropy.shannon);
+        data["event_id"] = std::to_string(event.eventId);
+
+        TelemetryCollector::Instance().RecordCustom("ransomware_detection", data);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"RansomwareDetector", L"Telemetry report failed: %hs", ex.what());
+    }
 }
 
 } // namespace Ransomware
