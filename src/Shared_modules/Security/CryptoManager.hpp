@@ -687,56 +687,27 @@ struct CryptoManagerConfiguration {
 };
 
 /**
- * @brief Crypto manager statistics
+ * @brief Copyable statistics snapshot returned via public API
+ * 
+ * Uses plain uint64_t instead of std::atomic to allow copy/assign.
+ * Internal implementation uses atomics; this is the public-facing snapshot.
  */
 struct CryptoManagerStatistics {
-    /// @brief Total encryptions
-    std::atomic<uint64_t> totalEncryptions{0};
-    
-    /// @brief Total decryptions
-    std::atomic<uint64_t> totalDecryptions{0};
-    
-    /// @brief Total hashes
-    std::atomic<uint64_t> totalHashes{0};
-    
-    /// @brief Total signatures
-    std::atomic<uint64_t> totalSignatures{0};
-    
-    /// @brief Total verifications
-    std::atomic<uint64_t> totalVerifications{0};
-    
-    /// @brief Total key generations
-    std::atomic<uint64_t> totalKeyGenerations{0};
-    
-    /// @brief Total key derivations
-    std::atomic<uint64_t> totalKeyDerivations{0};
-    
-    /// @brief Total random bytes generated
-    std::atomic<uint64_t> totalRandomBytes{0};
-    
-    /// @brief Authentication failures
-    std::atomic<uint64_t> authenticationFailures{0};
-    
-    /// @brief Hardware acceleration used
-    std::atomic<uint64_t> hardwareAccelerationOps{0};
-    
-    /// @brief TPM operations
-    std::atomic<uint64_t> tpmOperations{0};
-    
-    /// @brief Active keys
-    std::atomic<size_t> activeKeys{0};
-    
-    /// @brief Start time
+    uint64_t totalEncryptions = 0;
+    uint64_t totalDecryptions = 0;
+    uint64_t totalHashes = 0;
+    uint64_t totalSignatures = 0;
+    uint64_t totalVerifications = 0;
+    uint64_t totalKeyGenerations = 0;
+    uint64_t totalKeyDerivations = 0;
+    uint64_t totalRandomBytes = 0;
+    uint64_t authenticationFailures = 0;
+    uint64_t hardwareAccelerationOps = 0;
+    uint64_t tpmOperations = 0;
+    size_t activeKeys = 0;
     TimePoint startTime = Clock::now();
-    
-    /**
-     * @brief Reset statistics
-     */
+
     void Reset() noexcept;
-    
-    /**
-     * @brief Serialize to JSON
-     */
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -1277,6 +1248,73 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL CHANNEL ATTESTATION & APT DEFENSE
+    // ========================================================================
+
+    /**
+     * @brief Result of kernel session key derivation.
+     * Contains both the derived session key and the ephemeral public key
+     * that must be sent to the kernel driver for its side of the ECDH agreement.
+     */
+    struct KernelSessionKeyResult {
+        std::vector<uint8_t> sessionKey;     ///< AES-256 session key (32 bytes)
+        std::vector<uint8_t> localPublicKey; ///< ECDH P-256 public key blob to send to driver
+    };
+
+    /**
+     * @brief Derive a session key for kernel<->usermode secure channel.
+     * Uses ECDH key agreement + HMAC-based KDF to produce a shared AES-256-GCM key
+     * bound to both the driver identity hash and the agent's code integrity.
+     *
+     * @param driverPublicKey   ECDH public key blob from the kernel driver
+     * @param driverHash        SHA-256 hash of the driver image (.sys)
+     * @param contextLabel      Application-specific KDF label (e.g. "ShadowStrike-Kernel-Session-v2")
+     * @return KernelSessionKeyResult with session key + local public key, or nullopt on failure
+     */
+    [[nodiscard]] std::optional<KernelSessionKeyResult> DeriveKernelSessionKey(
+        std::span<const uint8_t> driverPublicKey,
+        std::span<const uint8_t> driverHash,
+        std::string_view contextLabel);
+
+    /**
+     * @brief Verify integrity of a message received from the kernel driver.
+     * Checks HMAC-SHA256 over the message using the current session key.
+     *
+     * @param message   Raw message bytes (header + payload)
+     * @param hmac      Expected HMAC-SHA256 tag
+     * @param sessionKey Active session key from DeriveKernelSessionKey
+     * @return true if integrity check passes
+     */
+    [[nodiscard]] bool VerifyKernelMessageIntegrity(
+        std::span<const uint8_t> message,
+        std::span<const uint8_t> hmac,
+        std::span<const uint8_t> sessionKey);
+
+    /**
+     * @brief Compute HMAC-SHA256 tag for a message to be sent to the kernel.
+     *
+     * @param message   Raw message bytes
+     * @param sessionKey Active session key
+     * @return HMAC tag bytes (empty on failure)
+     */
+    [[nodiscard]] std::vector<uint8_t> ComputeKernelMessageHMAC(
+        std::span<const uint8_t> message,
+        std::span<const uint8_t> sessionKey);
+
+    /**
+     * @brief Validate that the kernel driver is authentic and untampered.
+     * Loads the driver file, checks its Authenticode signature chain,
+     * and verifies its SHA-256 hash against an expected value.
+     *
+     * @param driverPath  Full path to the .sys driver file
+     * @param expectedHash SHA-256 of the known-good driver binary
+     * @return true if driver passes all attestation checks
+     */
+    [[nodiscard]] bool ValidateKernelDriverAttestation(
+        const std::wstring& driverPath,
+        std::span<const uint8_t> expectedHash);
 
 private:
     // ========================================================================
