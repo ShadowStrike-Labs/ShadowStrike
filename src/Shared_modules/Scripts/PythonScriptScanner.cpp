@@ -51,6 +51,11 @@
 #include "pch.h"
 #include "PythonScriptScanner.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 // Standard library includes
 #include <algorithm>
 #include <regex>
@@ -59,6 +64,9 @@
 #include <cstring>
 #include <cctype>
 #include <bitset>
+#include <format>
+#include <charconv>
+#include <map>
 
 namespace ShadowStrike {
 namespace Scripts {
@@ -1755,6 +1763,90 @@ void PythonScriptScannerImpl::ResetStatistics() {
         result.status = PythonScanStatus::Clean;
     }
 
+    // ========================================================================
+    // CROSS-MODULE WIRING — AlertSystem + TelemetryCollector
+    // ========================================================================
+
+    if (result.status == PythonScanStatus::Malicious ||
+        result.status == PythonScanStatus::Suspicious)
+    {
+        // Raise alert for malicious/suspicious detections
+        if (Communication::AlertSystem::HasInstance()) {
+            try {
+                auto severity = (result.status == PythonScanStatus::Malicious)
+                    ? Communication::AlertSeverity::Critical
+                    : Communication::AlertSeverity::High;
+
+                auto statusStr = (result.status == PythonScanStatus::Malicious)
+                    ? "MALICIOUS" : "SUSPICIOUS";
+                auto nameStr = result.threatName.empty()
+                    ? result.filePath.string() : result.threatName;
+                auto familyStr = result.detectedFamily.empty()
+                    ? std::string("unknown") : result.detectedFamily;
+                bool obfusc = (result.obfuscationType != PythonObfuscationType::None);
+
+                std::string alertDetail =
+                    "PythonScriptScanner detected " + std::string(statusStr) +
+                    " script: " + nameStr +
+                    " | risk=" + std::to_string(result.riskScore) +
+                    " family=" + familyStr +
+                    " suspiciousImports=" + std::to_string(result.suspiciousImports.size()) +
+                    " matchedSigs=" + std::to_string(result.matchedSignatures.size()) +
+                    " obfuscated=" + (obfusc ? "true" : "false");
+
+                [[maybe_unused]] auto alertId =
+                    Communication::AlertSystem::Instance().RaiseAlert(
+                        severity,
+                        Communication::AlertType::ThreatDetection,
+                        "PythonScriptScanner",
+                        alertDetail,
+                        result.sha256);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"PythonScanner",
+                    L"AlertSystem wiring failed: %hs", e.what());
+            }
+        }
+
+        // Emit telemetry for threat intelligence correlation
+        if (Communication::TelemetryCollector::HasInstance()) {
+            try {
+                std::map<std::string, std::string> telemetry;
+                telemetry["module"]          = "PythonScriptScanner";
+                telemetry["status"]          = (result.status == PythonScanStatus::Malicious) ? "malicious" : "suspicious";
+                telemetry["threatName"]      = result.threatName;
+                telemetry["riskScore"]       = std::to_string(result.riskScore);
+                telemetry["sha256"]          = result.sha256;
+                telemetry["family"]          = result.detectedFamily;
+                telemetry["category"]        = std::string(GetPythonThreatCategoryName(result.category));
+                telemetry["importCount"]     = std::to_string(result.suspiciousImports.size());
+                telemetry["sigCount"]        = std::to_string(result.matchedSignatures.size());
+                telemetry["obfuscated"]      = (result.obfuscationType != PythonObfuscationType::None) ? "true" : "false";
+                telemetry["filePath"]        = result.filePath.string();
+
+                Communication::TelemetryCollector::Instance().RecordCustom(
+                    "python_threat_detection", telemetry);
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"PythonScanner",
+                    L"TelemetryCollector wiring failed: %hs", e.what());
+            }
+        }
+
+        // Request kernel-level process block for high-risk malicious scripts
+        if (result.status == PythonScanStatus::Malicious && result.riskScore >= 90) {
+            if (Communication::IPCManager::HasInstance()) {
+                auto& ipc = Communication::IPCManager::Instance();
+                if (ipc.IsFilterPortConnected()) {
+                    SS_LOG_INFO(L"PythonScanner",
+                        L"High-risk Python malware detected (score=%d), "
+                        L"kernel block available via RequestKernelProcessBlock",
+                        result.riskScore);
+                }
+            }
+        }
+    }
+
     return result;
 }
 
@@ -1969,8 +2061,15 @@ void PythonScriptScannerImpl::ResetStatistics() {
         std::istringstream ipStream(ip);
         std::string octet;
         while (std::getline(ipStream, octet, '.')) {
-            int val = std::stoi(octet);
-            if (val < 0 || val > 255) { validIp = false; break; }
+            int val = 0;
+            auto [ptr, ec] = std::from_chars(
+                octet.data(), octet.data() + octet.size(), val);
+            if (ec != std::errc{} || ptr != octet.data() + octet.size() ||
+                val > 255)
+            {
+                validIp = false;
+                break;
+            }
         }
 
         if (!validIp) continue;
@@ -2363,6 +2462,176 @@ void PythonScriptScanner::ResetStatistics() {
     return std::to_string(PythonConstants::VERSION_MAJOR) + "." +
            std::to_string(PythonConstants::VERSION_MINOR) + "." +
            std::to_string(PythonConstants::VERSION_PATCH);
+}
+
+// ============================================================================
+// KERNEL BRIDGE — IPC integration with PhantomSensor kernel driver
+// ============================================================================
+
+void PythonScriptScanner::OnKernelProcessNotify(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, bool isCreate)
+{
+    if (!isCreate || !m_impl || !m_impl->IsInitialized()) return;
+
+    // Detect python.exe / pythonw.exe / python3.exe launches
+    auto lowerPath = Utils::StringUtils::ToLowerCopy(imagePath);
+
+    bool isPython = (lowerPath.find(L"python.exe") != std::wstring::npos) ||
+                    (lowerPath.find(L"pythonw.exe") != std::wstring::npos) ||
+                    (lowerPath.find(L"python3.exe") != std::wstring::npos);
+
+    if (!isPython) return;
+
+    SS_LOG_INFO(L"PythonScanner",
+        L"Kernel process notify: Python interpreter launched PID=%u "
+        L"ParentPID=%u Path=%.*s",
+        pid, parentPid,
+        static_cast<int>(imagePath.size()), imagePath.data());
+
+    // Telemetry: Python process creation event
+    if (Communication::TelemetryCollector::HasInstance()) {
+        try {
+            std::map<std::string, std::string> telemetry;
+            telemetry["module"]    = "PythonScriptScanner";
+            telemetry["event"]     = "python_process_created";
+            telemetry["pid"]       = std::to_string(pid);
+            telemetry["parentPid"] = std::to_string(parentPid);
+            telemetry["imagePath"] = Utils::StringUtils::ToNarrow(imagePath);
+
+            Communication::TelemetryCollector::Instance().RecordCustom(
+                "python_process_notify", telemetry);
+        }
+        catch (const std::exception& e) {
+            SS_LOG_WARN(L"PythonScanner",
+                L"Telemetry failed for process notify: %hs", e.what());
+        }
+    }
+}
+
+void PythonScriptScanner::OnKernelImageLoad(
+    uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase)
+{
+    if (!m_impl || !m_impl->IsInitialized()) return;
+
+    auto lowerPath = Utils::StringUtils::ToLowerCopy(imagePath);
+
+    // Watch for packed Python executables (PyInstaller, cx_Freeze, py2exe)
+    bool isPythonDll = (lowerPath.find(L"python3") != std::wstring::npos &&
+                        lowerPath.ends_with(L".dll"));
+
+    if (!isPythonDll) return;
+
+    SS_LOG_DEBUG(L"PythonScanner",
+        L"Kernel image load: Python DLL loaded in PID=%u Path=%.*s Base=0x%llX",
+        pid,
+        static_cast<int>(imagePath.size()), imagePath.data(),
+        static_cast<unsigned long long>(imageBase));
+}
+
+[[nodiscard]] bool PythonScriptScanner::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    if (!Communication::IPCManager::HasInstance()) {
+        SS_LOG_WARN(L"PythonScanner",
+            L"Cannot block PID=%u: IPCManager not available", pid);
+        return false;
+    }
+
+    auto& ipc = Communication::IPCManager::Instance();
+    if (!ipc.IsFilterPortConnected()) {
+        SS_LOG_WARN(L"PythonScanner",
+            L"Cannot block PID=%u: kernel filter port not connected", pid);
+        return false;
+    }
+
+#pragma pack(push, 1)
+    struct KernelBlockRequest {
+        uint32_t msgType;       // 0x35 = PythonScanner process block
+        uint32_t targetPid;
+        uint32_t reasonLen;
+        wchar_t  reason[256];
+    };
+#pragma pack(pop)
+
+    KernelBlockRequest req{};
+    req.msgType   = 0x35;
+    req.targetPid = pid;
+
+    auto copyLen = (std::min)(reason.size(), static_cast<size_t>(255));
+    std::memcpy(req.reason, reason.data(), copyLen * sizeof(wchar_t));
+    req.reason[copyLen] = L'\0';
+    req.reasonLen = static_cast<uint32_t>(copyLen);
+
+    [[maybe_unused]] bool sent = ipc.SendToKernel(&req, sizeof(req));
+
+    SS_LOG_INFO(L"PythonScanner",
+        L"Kernel process block request for PID=%u sent=%d reason=%.*s",
+        pid, sent ? 1 : 0,
+        static_cast<int>(copyLen), reason.data());
+
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — Public API wrappers
+// ============================================================================
+
+void PythonScriptScanner::ReportDetectionToAlertSystem(
+    uint32_t pid, const PythonScanResult& result)
+{
+    if (!Communication::AlertSystem::HasInstance()) return;
+
+    try {
+        auto severity = Communication::AlertSeverity::High;
+        if (result.status == PythonScanStatus::Malicious)
+            severity = Communication::AlertSeverity::Critical;
+
+        std::string detail =
+            "PythonScriptScanner PID=" + std::to_string(pid) +
+            " threat=" + (result.threatName.empty() ? "unknown" : result.threatName) +
+            " risk=" + std::to_string(result.riskScore) +
+            " family=" + (result.detectedFamily.empty() ? "none" : result.detectedFamily) +
+            " sha256=" + (result.sha256.empty() ? "n/a" : result.sha256) +
+            " imports=" + std::to_string(result.suspiciousImports.size()) +
+            " sigs=" + std::to_string(result.matchedSignatures.size());
+
+        [[maybe_unused]] auto alertId =
+            Communication::AlertSystem::Instance().RaiseAlert(
+                severity,
+                Communication::AlertType::ThreatDetection,
+                "PythonScriptScanner",
+                detail,
+                result.sha256);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"PythonScanner",
+            L"ReportDetectionToAlertSystem failed: %hs", e.what());
+    }
+}
+
+void PythonScriptScanner::ReportScanTelemetry(const PythonScanResult& result) {
+    if (!Communication::TelemetryCollector::HasInstance()) return;
+
+    try {
+        std::map<std::string, std::string> telemetry;
+        telemetry["module"]       = "PythonScriptScanner";
+        telemetry["filePath"]     = result.filePath.string();
+        telemetry["status"]       = (result.status == PythonScanStatus::Malicious) ? "malicious" :
+                                    (result.status == PythonScanStatus::Suspicious) ? "suspicious" : "clean";
+        telemetry["riskScore"]    = std::to_string(result.riskScore);
+        telemetry["sha256"]       = result.sha256;
+        telemetry["threatName"]   = result.threatName;
+        telemetry["family"]       = result.detectedFamily;
+        telemetry["category"]     = std::string(GetPythonThreatCategoryName(result.category));
+
+        Communication::TelemetryCollector::Instance().RecordCustom(
+            "python_scan_result", telemetry);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"PythonScanner",
+            L"ReportScanTelemetry failed: %hs", e.what());
+    }
 }
 
 }  // namespace Scripts
