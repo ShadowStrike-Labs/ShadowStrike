@@ -45,6 +45,11 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 #include <algorithm>
 #include <sstream>
 #include <filesystem>
@@ -270,7 +275,7 @@ namespace {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class RansomwareDecryptorImpl final {
+class RansomwareDecryptor::RansomwareDecryptorImpl final {
 public:
     RansomwareDecryptorImpl() = default;
 
@@ -880,7 +885,7 @@ void RansomwareDecryptor::Shutdown() {
 bool RansomwareDecryptor::IsInitialized() const noexcept {
     std::shared_lock lock(m_impl->m_mutex);
     return m_impl->m_status == ModuleStatus::Running ||
-           m_impl->m_status == ModuleStatus::Decrypting;
+           m_impl->m_status == ModuleStatus::Degraded;
 }
 
 ModuleStatus RansomwareDecryptor::GetStatus() const noexcept {
@@ -978,6 +983,7 @@ DecryptionResult RansomwareDecryptor::DecryptFileEx(std::wstring_view filePath,
                         result.decryptedSize, std::memory_order_relaxed);
                     m_impl->FireCompleteCallback(result);
                     m_impl->m_activeDecryptions.fetch_sub(1, std::memory_order_acq_rel);
+                    ReportDecryptionTelemetry(result);
                     return result;
                 } else {
                     std::error_code ec;
@@ -1294,6 +1300,11 @@ RecoveryResult RansomwareDecryptor::RecoverFile(std::wstring_view filePath,
     result.durationMs = static_cast<uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - startTime).count());
+
+    // =================================================================
+    // CROSS-MODULE WIRING — AlertSystem + TelemetryCollector
+    // =================================================================
+    ReportRecoveryToAlertSystem(result);
     return result;
 }
 
@@ -1391,7 +1402,8 @@ RecoveryResult RansomwareDecryptor::RecoverFromVSS(std::wstring_view filePath,
         fs::path tempRestore = p;
         tempRestore += L".ss_vss_restore_tmp";
 
-        if (!vss.RestoreFile(bestSnapshotId, relativePath, tempRestore.wstring())) {
+        if (vss.RestoreFile(bestSnapshotId, relativePath, tempRestore.wstring())
+                != VSSResult::Success) {
             result.status = DecryptionStatus::Failed;
             result.errorMessage = "VSS RestoreFile failed";
             return result;
@@ -1903,20 +1915,21 @@ void RansomwareDecryptor::SetBatchProgressCallback(BatchProgressCallback callbac
 // STATISTICS
 // ============================================================================
 
-DecryptorStatistics RansomwareDecryptor::GetStatistics() const {
-    // Atomics are individually read-consistent; snapshot is best-effort
-    DecryptorStatistics snap;
-    snap.filesAnalyzed.store(
-        m_impl->m_stats.filesAnalyzed.load(std::memory_order_relaxed));
-    snap.filesDecrypted.store(
-        m_impl->m_stats.filesDecrypted.load(std::memory_order_relaxed));
-    snap.filesFailed.store(
-        m_impl->m_stats.filesFailed.load(std::memory_order_relaxed));
-    snap.bytesDecrypted.store(
-        m_impl->m_stats.bytesDecrypted.load(std::memory_order_relaxed));
-    snap.keysLoaded.store(
-        m_impl->m_stats.keysLoaded.load(std::memory_order_relaxed));
-    snap.startTime = m_impl->m_stats.startTime;
+DecryptorStatisticsSnapshot RansomwareDecryptor::GetStatistics() const {
+    if (!m_impl) return {};
+    DecryptorStatisticsSnapshot snap;
+    snap.filesAnalyzed  = m_impl->m_stats.filesAnalyzed.load(std::memory_order_relaxed);
+    snap.filesDecrypted = m_impl->m_stats.filesDecrypted.load(std::memory_order_relaxed);
+    snap.filesFailed    = m_impl->m_stats.filesFailed.load(std::memory_order_relaxed);
+    snap.bytesDecrypted = m_impl->m_stats.bytesDecrypted.load(std::memory_order_relaxed);
+    snap.keysLoaded     = m_impl->m_stats.keysLoaded.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.familiesIdentified.size(); ++i) {
+        snap.familiesIdentified[i] =
+            m_impl->m_stats.familiesIdentified[i].load(std::memory_order_relaxed);
+    }
+    const auto now = Clock::now();
+    snap.uptimeSeconds = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::seconds>(now - m_impl->m_stats.startTime).count());
     return snap;
 }
 
@@ -2246,6 +2259,116 @@ std::vector<std::wstring> GetFamilyRansomNotes(RansomwareFamily family) {
             break;
     }
     return result;
+}
+
+// ============================================================================
+// DECRYPTOR STATISTICS SNAPSHOT — ToJson
+// ============================================================================
+
+std::string DecryptorStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["filesAnalyzed"]  = filesAnalyzed;
+    j["filesDecrypted"] = filesDecrypted;
+    j["filesFailed"]    = filesFailed;
+    j["bytesDecrypted"] = bytesDecrypted;
+    j["keysLoaded"]     = keysLoaded;
+    j["uptimeSeconds"]  = uptimeSeconds;
+    nlohmann::json fam = nlohmann::json::array();
+    for (size_t i = 0; i < familiesIdentified.size(); ++i) {
+        if (familiesIdentified[i] > 0) {
+            const auto name = RansomwareDecryptor::GetFamilyName(
+                static_cast<RansomwareFamily>(i));
+            fam.push_back({{"family", std::string(name)}, {"count", familiesIdentified[i]}});
+        }
+    }
+    j["familiesIdentified"] = std::move(fam);
+    return j.dump();
+}
+
+// ============================================================================
+// KERNEL BRIDGE — OnKernelProcessNotify / OnKernelImageLoad / RequestBlock
+// ============================================================================
+
+void RansomwareDecryptor::OnKernelProcessNotify(
+    uint32_t pid, uint32_t /*parentPid*/,
+    std::wstring_view /*imagePath*/, bool isCreate)
+{
+    if (!m_impl || !IsInitialized()) return;
+    if (!isCreate) {
+        // Process terminated — if it was ransomware, auto-recover
+        SS_LOG_DEBUG(LOG_CAT,
+            L"Process %u terminated, checking pending recovery tasks", pid);
+    }
+}
+
+void RansomwareDecryptor::OnKernelImageLoad(
+    uint32_t /*pid*/, std::wstring_view /*imagePath*/, uintptr_t /*imageBase*/)
+{
+    // Decryptor is passive — no image-load analysis needed
+}
+
+[[nodiscard]] bool RansomwareDecryptor::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    if (!Communication::IPCManager::HasInstance() ||
+        !Communication::IPCManager::Instance().IsFilterPortConnected())
+    {
+        return false;
+    }
+    #pragma pack(push, 1)
+    struct KernelBlockMsg {
+        uint32_t msgType = 0x30;
+        uint32_t pid     = 0;
+    } msg;
+    #pragma pack(pop)
+    msg.pid = pid;
+    const bool sent = Communication::IPCManager::Instance().SendToKernel(&msg, sizeof(msg));
+    if (sent) {
+        SS_LOG_INFO(LOG_CAT,
+            L"Kernel process block requested for PID %u: %.*s",
+            pid,
+            static_cast<int>(reason.size()), reason.data());
+    }
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING — AlertSystem & TelemetryCollector
+// ============================================================================
+
+void RansomwareDecryptor::ReportRecoveryToAlertSystem(const RecoveryResult& result) {
+    if (!Communication::AlertSystem::HasInstance()) return;
+
+    const auto severity = (result.status == DecryptionStatus::Success)
+        ? Communication::AlertSeverity::Info
+        : Communication::AlertSeverity::High;
+    const auto narrow = Utils::StringUtils::ToNarrow(result.encryptedPath);
+    (void)Communication::AlertSystem::Instance().RaiseAlert(
+        severity,
+        Communication::AlertType::Operational,
+        "RansomwareDecryptor",
+        std::format("Recovery {} for {}",
+            (result.status == DecryptionStatus::Success) ? "succeeded" : "failed",
+            narrow),
+        std::format("method={} duration={}ms size={} integrity={}",
+            static_cast<int>(result.methodUsed),
+            result.durationMs,
+            result.recoveredSize,
+            result.integrityVerified ? "verified" : "unverified"));
+}
+
+void RansomwareDecryptor::ReportDecryptionTelemetry(const DecryptionResult& result) {
+    if (!Communication::TelemetryCollector::HasInstance()) return;
+    Communication::TelemetryCollector::Instance().RecordCustom(
+        "ransomware_decryption",
+        {
+            {"status",     std::to_string(static_cast<int>(result.status))},
+            {"family",     std::string(GetFamilyName(result.family))},
+            {"keyId",      result.keyId},
+            {"durationMs", std::to_string(result.durationMs)},
+            {"size",       std::to_string(result.decryptedSize)},
+            {"validated",  result.validationPassed ? "true" : "false"}
+        });
 }
 
 }  // namespace Ransomware

@@ -61,6 +61,11 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 
+// Cross-module wiring
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+
 // Windows headers
 #ifdef _WIN32
 #include <shlobj.h>
@@ -229,7 +234,7 @@ public:
     void SetStatusCallback(HoneypotStatusCallback callback);
 
     // Statistics & Templates
-    HoneypotStatistics GetStatistics() const;
+    HoneypotStatisticsSnapshot GetStatisticsSnapshot() const;
     void ResetStatistics();
     size_t GetHoneypotCount() const noexcept;
     size_t GetActiveHoneypotCount() const noexcept;
@@ -923,6 +928,44 @@ void HoneypotManagerImpl::HandleDetectedAccess(
         event.actionTaken = "Alert Only";
     }
 
+    // === Cross-module wiring: AlertSystem + TelemetryCollector ===
+    {
+        using namespace Communication;
+        if (AlertSystem::HasInstance()) {
+            auto severity = shouldKill
+                ? AlertSeverity::Critical
+                : AlertSeverity::High;
+            std::string title = "Honeypot access by PID " + std::to_string(pid);
+            std::string detail = "Trap: " + StringUtils::ToNarrow(event.honeypotPath) +
+                " | Process: " + StringUtils::ToNarrow(event.processName) +
+                " | Action: " + event.actionTaken;
+            (void)AlertSystem::Instance().RaiseAlert(
+                severity, AlertType::ThreatDetection,
+                "HoneypotManager", title, detail);
+        }
+        if (TelemetryCollector::HasInstance()) {
+            TelemetryCollector::Instance().RecordCustom("honeypot_access", {
+                {"pid", std::to_string(pid)},
+                {"honeypotPath", StringUtils::ToNarrow(event.honeypotPath)},
+                {"processName", StringUtils::ToNarrow(event.processName)},
+                {"accessType", std::string(GetAccessTypeName(accessType))},
+                {"actionTaken", event.actionTaken},
+                {"honeypotId", event.honeypotId}
+            });
+        }
+        // Kernel-level block for destructive access when local kill fails
+        if (shouldKill && event.actionTaken == "Termination Failed") {
+            if (IPCManager::HasInstance() && IPCManager::Instance().IsFilterPortConnected()) {
+#pragma pack(push, 1)
+                struct { uint32_t msgType = 0x30; uint32_t targetPid; wchar_t reason[256]{}; } req;
+#pragma pack(pop)
+                req.targetPid = pid;
+                wcsncpy_s(req.reason, 256, L"HoneypotManager: trap file accessed", _TRUNCATE);
+                (void)IPCManager::Instance().SendToKernel(&req, sizeof(req));
+            }
+        }
+    }
+
     // Store event
     {
         std::lock_guard lock(m_eventMutex);
@@ -1009,8 +1052,26 @@ void HoneypotManagerImpl::SetStatusCallback(HoneypotStatusCallback callback) {
     m_statusCallback = std::move(callback);
 }
 
-HoneypotStatistics HoneypotManagerImpl::GetStatistics() const {
-    return m_stats;
+HoneypotStatisticsSnapshot HoneypotManagerImpl::GetStatisticsSnapshot() const {
+    HoneypotStatisticsSnapshot snap;
+    snap.totalDeployed   = m_stats.totalDeployed.load(std::memory_order_relaxed);
+    snap.currentlyActive = m_stats.currentlyActive.load(std::memory_order_relaxed);
+    snap.accessEvents    = m_stats.accessEvents.load(std::memory_order_relaxed);
+    snap.processesKilled = m_stats.processesKilled.load(std::memory_order_relaxed);
+    snap.regenerations   = m_stats.regenerations.load(std::memory_order_relaxed);
+    snap.falsePositives  = m_stats.falsePositives.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.eventsByType.size(); ++i) {
+        snap.eventsByType[i] = m_stats.eventsByType[i].load(std::memory_order_relaxed);
+    }
+    TimePoint st;
+    {
+        std::shared_lock lock(m_mutex);
+        st = m_stats.startTime;
+    }
+    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - st).count();
+    snap.uptimeSeconds = static_cast<uint64_t>(uptimeMs > 0 ? uptimeMs / 1000 : 0);
+    return snap;
 }
 
 void HoneypotManagerImpl::ResetStatistics() {
@@ -1327,8 +1388,8 @@ void HoneypotManager::SetStatusCallback(HoneypotStatusCallback callback) {
     m_impl->SetStatusCallback(std::move(callback));
 }
 
-HoneypotStatistics HoneypotManager::GetStatistics() const {
-    return m_impl->GetStatistics();
+HoneypotStatisticsSnapshot HoneypotManager::GetStatistics() const {
+    return m_impl->GetStatisticsSnapshot();
 }
 
 void HoneypotManager::ResetStatistics() {
@@ -1596,6 +1657,121 @@ std::string HoneypotStatistics::ToJson() const {
     j["regenerations"] = regenerations.load(std::memory_order_relaxed);
     j["falsePositives"] = falsePositives.load(std::memory_order_relaxed);
     return j.dump();
+}
+
+std::string HoneypotStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["totalDeployed"]   = totalDeployed;
+    j["active"]          = currentlyActive;
+    j["events"]          = accessEvents;
+    j["killed"]          = processesKilled;
+    j["regenerations"]   = regenerations;
+    j["falsePositives"]  = falsePositives;
+    j["uptimeSeconds"]   = uptimeSeconds;
+    nlohmann::json byType = nlohmann::json::array();
+    for (size_t i = 0; i < eventsByType.size(); ++i) {
+        byType.push_back(eventsByType[i]);
+    }
+    j["eventsByType"] = std::move(byType);
+    return j.dump(2);
+}
+
+// ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void HoneypotManager::OnKernelProcessNotify(
+    uint32_t pid, uint32_t parentPid,
+    std::wstring_view imagePath, bool isCreate)
+{
+    (void)parentPid;
+    (void)imagePath;
+    if (!IsInitialized()) return;
+
+    if (!isCreate) {
+        // Process exit: no honeypot action needed
+        return;
+    }
+    // Process creation: honeypot checks are demand-driven via IsTrap() / OnHoneypotAccessed()
+}
+
+void HoneypotManager::OnKernelImageLoad(
+    uint32_t pid, std::wstring_view imagePath, uintptr_t imageBase)
+{
+    (void)pid;
+    (void)imagePath;
+    (void)imageBase;
+    // Honeypot detection is file-access based, not image-load based
+}
+
+[[nodiscard]] bool HoneypotManager::RequestKernelProcessBlock(
+    uint32_t pid, std::wstring_view reason)
+{
+    using Communication::IPCManager;
+    if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
+        SS_LOG_WARN(kLogCategory,
+            L"[KernelBridge] Cannot block PID %u — kernel IPC not connected", pid);
+        return false;
+    }
+
+#pragma pack(push, 1)
+    struct KernelBlockRequest {
+        uint32_t msgType = 0x30;
+        uint32_t targetPid = 0;
+        wchar_t  reason[256]{};
+    };
+#pragma pack(pop)
+
+    KernelBlockRequest req;
+    req.targetPid = pid;
+    if (!reason.empty()) {
+        wcsncpy_s(req.reason, 256, reason.data(),
+                  std::min<size_t>(reason.size(), 255));
+    }
+
+    bool sent = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+    if (!sent) {
+        SS_LOG_ERROR(kLogCategory,
+            L"[KernelBridge] Failed to send block request for PID %u", pid);
+    }
+    return sent;
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING IMPLEMENTATIONS
+// ============================================================================
+
+void HoneypotManager::ReportAccessToAlertSystem(
+    uint32_t pid, const HoneypotAccessEvent& event)
+{
+    using Communication::AlertSystem;
+    if (!AlertSystem::HasInstance()) return;
+
+    auto severity = (event.actionTaken == "Process Terminated")
+        ? Communication::AlertSeverity::Critical
+        : Communication::AlertSeverity::High;
+
+    std::string title = "Honeypot access by PID " + std::to_string(pid);
+    std::string detail = "Trap: " + Utils::StringUtils::ToNarrow(event.honeypotPath) +
+        " | Process: " + Utils::StringUtils::ToNarrow(event.processName) +
+        " | Action: " + event.actionTaken;
+
+    (void)AlertSystem::Instance().RaiseAlert(
+        severity,
+        Communication::AlertType::ThreatDetection,
+        "HoneypotManager",
+        title,
+        detail);
+}
+
+void HoneypotManager::ReportHoneypotTelemetry(
+    const std::string& eventName,
+    const std::map<std::string, std::string>& fields)
+{
+    using Communication::TelemetryCollector;
+    if (!TelemetryCollector::HasInstance()) return;
+
+    TelemetryCollector::Instance().RecordCustom(eventName, fields);
 }
 
 } // namespace Ransomware

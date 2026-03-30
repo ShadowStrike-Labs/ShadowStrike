@@ -26,6 +26,11 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "RansomwareDetector.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -406,7 +411,7 @@ public:
             if (!Utils::FileUtils::ComputeFileSHA256(*processPath, fileHash, &fileErr)) {
                 if (m_config.verboseLogging)
                     Utils::Logger::Debug("WannaCryDetector: Could not hash PID {} image: {}",
-                                         pid, Utils::StringUtils::ToNarrow(fileErr.message));
+                                         pid, fileErr.message);
                 return false;
             }
 
@@ -670,17 +675,24 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
             }
         }
 
-        // 1. Hash check (highest confidence, fastest)
+        // Track whether we have PID-specific evidence (vs. global system indicators).
+        // Global indicators (mutex, service, registry) exist system-wide and must NOT
+        // alone justify auto-terminating a specific PID — that would kill innocent processes.
+        bool hasPidSpecificEvidence = false;
+
+        // 1. Hash check (highest confidence, fastest) — PID-specific
         if (m_impl->CheckProcessHash(pid, result)) {
             result.detected = true;
+            hasPidSpecificEvidence = true;
         }
 
-        // 2. Process artifact check
+        // 2. Process artifact check — PID-specific
         if (config.monitorArtifacts && m_impl->CheckProcessArtifacts(pid, result)) {
             result.detected = true;
+            hasPidSpecificEvidence = true;
         }
 
-        // 3. Mutex check
+        // 3. Mutex check — GLOBAL indicator (not tied to this PID)
         if (config.monitorMutex && CheckMutex()) {
             result.mutexDetected = true;
             result.detected = true;
@@ -688,7 +700,7 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
             ++m_impl->m_stats.mutexDetections;
         }
 
-        // 4. Service check
+        // 4. Service check — GLOBAL indicator (not tied to this PID)
         if (config.monitorServices && CheckServiceInstallation()) {
             result.serviceDetected = true;
             result.detected = true;
@@ -696,19 +708,20 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
             ++m_impl->m_stats.serviceDetections;
         }
 
-        // 5. Registry check
+        // 5. Registry check — GLOBAL indicator
         if (config.monitorRegistry && CheckRegistryIndicators()) {
             result.detected = true;
             result.indicators.push_back("REGISTRY_INDICATOR");
         }
 
-        // 6. Memory scan (only if other indicators suggest further investigation)
+        // 6. Memory scan (only if other indicators suggest further investigation) — PID-specific
         if (result.detected || config.verboseLogging) {
             auto memIndicators = m_impl->ScanProcessMemory(pid);
             if (!memIndicators.empty()) {
                 result.indicators.insert(result.indicators.end(),
                                          memIndicators.begin(), memIndicators.end());
                 result.detected = true;
+                hasPidSpecificEvidence = true;
             }
         }
 
@@ -737,16 +750,46 @@ WannaCryDetectionResult WannaCryDetector::DetectEx(uint32_t pid) {
                         GetDetectionConfidenceName(result.confidence).data(),
                         GetWannaCryPhaseName(result.phase).data());
 
-            // Auto-terminate
+            // ── Cross-module wiring ────────────────────────────────────
+            ReportThreatToAlertSystem(result);
+            ReportDetectionTelemetry(result);
+            ReportThreatToBehaviorAnalyzer(result);
+
+            // Auto-terminate — ONLY if we have PID-specific evidence.
+            // Global indicators (mutex/service/registry) alone must NOT trigger
+            // termination of this PID — they could belong to a different process.
             if (config.autoTerminate &&
-                result.confidence >= DetectionConfidence::High) {
-                Utils::ProcessUtils::Error termErr;
-                if (Utils::ProcessUtils::TerminateProcess(pid, 1, &termErr)) {
-                    ++m_impl->m_stats.processesTerminated;
-                    SS_LOG_INFO(L"WannaCryDetector", L"Terminated malicious PID %u", pid);
+                result.confidence >= DetectionConfidence::High &&
+                hasPidSpecificEvidence) {
+                // Re-validate PID still points to same process (mitigate PID reuse TOCTOU)
+                auto currentPath = Utils::ProcessUtils::GetProcessPath(pid);
+                bool pidStillValid = currentPath.has_value() &&
+                    (result.processName.empty() ||
+                     Utils::StringUtils::IEquals(
+                         fs::path(*currentPath).filename().wstring(), result.processName));
+
+                if (pidStillValid) {
+                    (void)RequestKernelProcessBlock(pid, L"WannaCry detection: " +
+                        Utils::StringUtils::ToWide(GetWannaCryVariantName(result.variant)));
+
+                    Utils::ProcessUtils::Error termErr;
+                    if (Utils::ProcessUtils::TerminateProcess(pid, 1, &termErr)) {
+                        ++m_impl->m_stats.processesTerminated;
+                        SS_LOG_INFO(L"WannaCryDetector", L"Terminated malicious PID %u", pid);
+                    } else {
+                        SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate PID %u", pid);
+                    }
                 } else {
-                    SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate PID %u", pid);
+                    SS_LOG_WARN(L"WannaCryDetector",
+                        L"PID %u image changed or exited before termination — skipping kill (PID reuse safety)",
+                        pid);
                 }
+            } else if (config.autoTerminate &&
+                       result.confidence >= DetectionConfidence::High &&
+                       !hasPidSpecificEvidence) {
+                SS_LOG_WARN(L"WannaCryDetector",
+                    L"PID %u flagged by global indicators only — not terminating (no PID-specific evidence)",
+                    pid);
             }
         }
     } catch (const std::exception& ex) {
@@ -931,10 +974,18 @@ void WannaCryDetector::OnNetworkConnection(const SMBConnectionEvent& event) {
             ++m_impl->m_stats.totalDetections;
             m_impl->FireDetectionCallback(result);
 
+            // ── Cross-module wiring ────────────────────────────────────
+            ReportThreatToAlertSystem(result);
+            ReportDetectionTelemetry(result);
+            ReportThreatToBehaviorAnalyzer(result);
+
             if (config.autoTerminate && result.confidence >= DetectionConfidence::High) {
+                (void)RequestKernelProcessBlock(event.pid, L"WannaCry SMB propagation detected");
                 Utils::ProcessUtils::Error termErr;
                 if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
                     ++m_impl->m_stats.processesTerminated;
+                else
+                    SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate propagating PID %u", event.pid);
             }
         }
     } catch (const std::exception& ex) {
@@ -967,10 +1018,18 @@ void WannaCryDetector::OnDnsQuery(const DnsQueryEvent& event) {
         ++m_impl->m_stats.totalDetections;
         m_impl->FireDetectionCallback(result);
 
+        // ── Cross-module wiring ────────────────────────────────────
+        ReportThreatToAlertSystem(result);
+        ReportDetectionTelemetry(result);
+        ReportThreatToBehaviorAnalyzer(result);
+
         if (config.autoTerminate && result.confidence >= DetectionConfidence::High) {
+            (void)RequestKernelProcessBlock(event.pid, L"WannaCry kill-switch DNS query");
             Utils::ProcessUtils::Error termErr;
-            Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr);
-            ++m_impl->m_stats.processesTerminated;
+            if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
+                ++m_impl->m_stats.processesTerminated;
+            else
+                SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate kill-switch PID %u", event.pid);
         }
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: OnDnsQuery error: {}", ex.what());
@@ -1001,11 +1060,19 @@ void WannaCryDetector::OnServiceCreated(const ServiceEvent& event) {
         ++m_impl->m_stats.totalDetections;
         m_impl->FireDetectionCallback(result);
 
+        // ── Cross-module wiring ────────────────────────────────────
+        ReportThreatToAlertSystem(result);
+        ReportDetectionTelemetry(result);
+        ReportThreatToBehaviorAnalyzer(result);
+
         // Immediate termination - service creation is high-confidence
         if (config.autoTerminate) {
+            (void)RequestKernelProcessBlock(event.pid, L"WannaCry service creation detected");
             Utils::ProcessUtils::Error termErr;
-            Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr);
-            ++m_impl->m_stats.processesTerminated;
+            if (Utils::ProcessUtils::TerminateProcess(event.pid, 1, &termErr))
+                ++m_impl->m_stats.processesTerminated;
+            else
+                SS_LOG_ERROR(L"WannaCryDetector", L"Failed to terminate service-creating PID %u", event.pid);
         }
     } catch (const std::exception& ex) {
         Utils::Logger::Error("WannaCryDetector: OnServiceCreated error: {}", ex.what());
@@ -1042,8 +1109,12 @@ void WannaCryDetector::OnRegistryModified(const RegistryEvent& event) {
 
         ++m_impl->m_stats.totalDetections;
         m_impl->FireDetectionCallback(result);
+
+        // ── Cross-module wiring ────────────────────────────────────
+        ReportThreatToAlertSystem(result);
+        ReportDetectionTelemetry(result);
     } catch (const std::exception& ex) {
-        Utils::Logger::Error("WannaCryDetector: OnRegistryModified error: {}", ex.what());
+        SS_LOG_ERROR(L"WannaCryDetector", L"OnRegistryModified error: %hs", ex.what());
     } catch (...) {}
 }
 
@@ -1065,7 +1136,7 @@ void WannaCryDetector::OnProcessCreated(uint32_t pid, std::wstring_view processP
             if (Utils::StringUtils::IEquals(lowerName, name)) {
                 SS_LOG_WARN(L"WannaCryDetector", L"Suspicious process created: PID=%u name=%ls",
                             pid, exePath.filename().c_str());
-                DetectEx(pid);  // Full detection scan
+                (void)DetectEx(pid);  // Full detection scan
                 return;
             }
         }
@@ -1189,25 +1260,73 @@ void WannaCryDetector::AddKnownHash(const Hash256& hash) {
 void WannaCryDetector::UpdatePatternsFromThreatIntel() {
     try {
         SS_LOG_INFO(L"WannaCryDetector", L"Updating patterns from ThreatIntel");
-        // Integration point: query ThreatIntelManager for latest WannaCry IOCs
-        // and merge into m_knownHashes and m_killSwitchDomains.
-        // Additional kill-switch domains from threat feeds:
+
+        // Hardcoded kill-switch domains (canonical WannaCry samples)
         AddKillSwitchDomain("iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com");
         AddKillSwitchDomain("ifferfsodp9ifjaposdfjhgosurijfaewrwergwea.com");
+
+        // Query ThreatIntelManager for latest WannaCry IOCs
+        try {
+            auto& ti = ThreatIntel::ThreatIntelManager::Instance();
+            if (ti.IsInitialized()) {
+                // Validate known hashes against ThreatIntel for enrichment
+                size_t enriched = 0;
+                {
+                    std::shared_lock hl(m_impl->m_hashMutex);
+                    for (const auto& hash : m_impl->m_knownHashes) {
+                        auto lookup = ti.LookupHash("sha256", hash);
+                        if (lookup.IsMalicious()) ++enriched;
+                    }
+                }
+                // Validate kill-switch domains
+                {
+                    std::shared_lock kl(m_impl->m_killSwitchMutex);
+                    for (const auto& domain : m_impl->m_killSwitchDomains) {
+                        auto lookup = ti.LookupDomain(domain);
+                        if (lookup.found) ++enriched;
+                    }
+                }
+                SS_LOG_INFO(L"WannaCryDetector", L"ThreatIntel enrichment: %zu IOCs validated", enriched);
+            }
+        } catch (const std::exception& tiEx) {
+            SS_LOG_WARN(L"WannaCryDetector", L"ThreatIntel query failed: %hs (non-fatal)", tiEx.what());
+        }
+
         SS_LOG_INFO(L"WannaCryDetector", L"Pattern update complete");
     } catch (const std::exception& ex) {
-        Utils::Logger::Error("WannaCryDetector: Pattern update failed: {}", ex.what());
+        SS_LOG_ERROR(L"WannaCryDetector", L"Pattern update failed: %hs", ex.what());
     }
 }
 
 void WannaCryDetector::RegisterWithRansomwareDetector() {
     try {
         SS_LOG_INFO(L"WannaCryDetector", L"Registering with RansomwareDetector");
-        // Wire kill-switch domain detection into RansomwareDetector family identification
-        // so that when RansomwareDetector sees .WNCRY extensions, it delegates to us.
+
+        if (!RansomwareDetector::HasInstance()) {
+            SS_LOG_WARN(L"WannaCryDetector", L"RansomwareDetector not available for registration");
+            return;
+        }
+        auto& detector = RansomwareDetector::Instance();
+
+        FamilySignature sig;
+        sig.family = RansomwareFamily::WannaCry;
+        sig.familyName = "WannaCry";
+        sig.extensions = {L".WNCRY", L".WNCRYT", L".WNRY", L".WNCRY"};
+        sig.ransomNotePatterns = {L"@Please_Read_Me@.txt", L"@WanaDecryptor@.exe"};
+        sig.mutexNames = {L"Global\\MsWinZonesCacheCounterMutex0"};
+        sig.registryKeys = {L"SOFTWARE\\WanaCrypt0r",
+                            L"SYSTEM\\CurrentControlSet\\services\\mssecsvc2.0"};
+        sig.c2Domains = {"iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com",
+                         "ifferfsodp9ifjaposdfjhgosurijfaewrwergwea.com"};
+        sig.processPatterns = {L"tasksche.exe", L"mssecsvc.exe",
+                               L"@WanaDecryptor@.exe", L"taskdl.exe", L"taskse.exe"};
+        sig.encryptionAlgorithm = "AES-128-CBC + RSA-2048";
+
+        detector.RegisterFamilySignature(sig);
+
         SS_LOG_INFO(L"WannaCryDetector", L"Registration with RansomwareDetector complete");
     } catch (const std::exception& ex) {
-        Utils::Logger::Error("WannaCryDetector: Registration failed: {}", ex.what());
+        SS_LOG_ERROR(L"WannaCryDetector", L"Registration failed: %hs", ex.what());
     }
 }
 
@@ -1242,9 +1361,22 @@ void WannaCryDetector::SetSMBScanCallback(SMBScanCallback callback) {
 // STATISTICS
 // ============================================================================
 
-WannaCryStatistics WannaCryDetector::GetStatistics() const {
+WannaCryStatisticsSnapshot WannaCryDetector::GetStatistics() const {
     std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_stats;  // Uses copy constructor with atomic loads
+    WannaCryStatisticsSnapshot snap;
+    snap.totalDetections    = m_impl->m_stats.totalDetections.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < snap.byVariant.size() && i < m_impl->m_stats.byVariant.size(); ++i)
+        snap.byVariant[i] = m_impl->m_stats.byVariant[i].load(std::memory_order_relaxed);
+    snap.smbExploitsBlocked = m_impl->m_stats.smbExploitsBlocked.load(std::memory_order_relaxed);
+    snap.killSwitchQueries  = m_impl->m_stats.killSwitchQueries.load(std::memory_order_relaxed);
+    snap.processesTerminated = m_impl->m_stats.processesTerminated.load(std::memory_order_relaxed);
+    snap.hostsProtected     = m_impl->m_stats.hostsProtected.load(std::memory_order_relaxed);
+    snap.smbScansDetected   = m_impl->m_stats.smbScansDetected.load(std::memory_order_relaxed);
+    snap.mutexDetections    = m_impl->m_stats.mutexDetections.load(std::memory_order_relaxed);
+    snap.serviceDetections  = m_impl->m_stats.serviceDetections.load(std::memory_order_relaxed);
+    auto elapsed = Clock::now() - m_impl->m_stats.startTime;
+    snap.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+    return snap;
 }
 
 void WannaCryDetector::ResetStatistics() {
@@ -1411,6 +1543,22 @@ std::string WannaCryStatistics::ToJson() const {
     } catch (...) { return "{}"; }
 }
 
+std::string WannaCryStatisticsSnapshot::ToJson() const {
+    try {
+        nlohmann::json j;
+        j["totalDetections"] = totalDetections;
+        j["smbExploitsBlocked"] = smbExploitsBlocked;
+        j["killSwitchQueries"] = killSwitchQueries;
+        j["processesTerminated"] = processesTerminated;
+        j["hostsProtected"] = hostsProtected;
+        j["smbScansDetected"] = smbScansDetected;
+        j["mutexDetections"] = mutexDetections;
+        j["serviceDetections"] = serviceDetections;
+        j["uptimeSeconds"] = uptimeSeconds;
+        return j.dump();
+    } catch (...) { return "{}"; }
+}
+
 bool WannaCryDetectorConfiguration::IsValid() const noexcept {
     if (smbScanThreshold == 0) return false;
     if (smbScanWindowSecs == 0) return false;
@@ -1456,6 +1604,172 @@ std::string_view GetDetectionConfidenceName(DetectionConfidence conf) noexcept {
         case DetectionConfidence::High: return "High";
         case DetectionConfidence::Confirmed: return "Confirmed";
         default: return "Unknown";
+    }
+}
+
+// ============================================================================
+// KERNEL BRIDGE
+// ============================================================================
+
+void WannaCryDetector::OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                                              std::wstring_view commandLine, bool isCreate) {
+    try {
+        if (!IsInitialized() || !isCreate) return;
+
+        fs::path exePath(imagePath);
+        std::wstring lowerName = Utils::StringUtils::ToLowerCopy(exePath.filename().wstring());
+
+        static const std::vector<std::wstring> WANNACRY_NAMES = {
+            L"tasksche.exe", L"mssecsvc.exe", L"@wanadecryptor@.exe",
+            L"taskdl.exe", L"taskse.exe"
+        };
+        for (const auto& name : WANNACRY_NAMES) {
+            if (Utils::StringUtils::IEquals(lowerName, name)) {
+                SS_LOG_WARN(L"WannaCryDetector", L"Kernel process notify: WannaCry suspect PID=%u name=%ls",
+                            processId, exePath.filename().c_str());
+                auto result = DetectEx(processId);
+                if (result.detected && result.confidence >= DetectionConfidence::High) {
+                    (void)RequestKernelProcessBlock(processId,
+                        L"WannaCry detected at kernel process creation");
+                }
+                return;
+            }
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"OnKernelProcessNotify error: %hs", ex.what());
+    } catch (...) {}
+}
+
+void WannaCryDetector::OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                                          uint64_t /*imageBase*/, size_t /*imageSize*/) {
+    try {
+        if (!IsInitialized()) return;
+
+        // Check if loaded image is a known WannaCry DLL/payload
+        fs::path path(imagePath);
+        std::wstring lowerName = Utils::StringUtils::ToLowerCopy(path.filename().wstring());
+        for (const auto& artifact : WANNACRY_ARTIFACTS) {
+            if (Utils::StringUtils::IEquals(lowerName, artifact)) {
+                SS_LOG_WARN(L"WannaCryDetector", L"Kernel image load: WannaCry artifact PID=%u image=%ls",
+                            processId, path.filename().c_str());
+                (void)DetectEx(processId);
+                return;
+            }
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"OnKernelImageLoad error: %hs", ex.what());
+    } catch (...) {}
+}
+
+bool WannaCryDetector::RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason) {
+    try {
+        using namespace Communication;
+        if (!IPCManager::HasInstance() || !IPCManager::Instance().IsFilterPortConnected()) {
+            SS_LOG_DEBUG(L"WannaCryDetector", L"Kernel IPC not available for process block PID=%u", processId);
+            return false;
+        }
+
+#pragma pack(push, 1)
+        struct KernelBlockRequest {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t  reason[256];
+        };
+#pragma pack(pop)
+
+        KernelBlockRequest req{};
+        req.messageType = WannaCryConstants::KERNEL_MSG_BLOCK_PROCESS;
+        req.processId = processId;
+        wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(), _TRUNCATE);
+        req.reason[_countof(req.reason) - 1] = L'\0';  // belt-and-suspenders for kernel safety
+
+        bool result = IPCManager::Instance().SendToKernel(&req, sizeof(req));
+        if (result)
+            SS_LOG_INFO(L"WannaCryDetector", L"Kernel block requested for PID=%u", processId);
+        else
+            SS_LOG_WARN(L"WannaCryDetector", L"Kernel block request failed for PID=%u", processId);
+        return result;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"RequestKernelProcessBlock error: %hs", ex.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING
+// ============================================================================
+
+void WannaCryDetector::ReportThreatToAlertSystem(const WannaCryDetectionResult& result) {
+    try {
+        using namespace Communication;
+        if (!AlertSystem::HasInstance()) return;
+
+        auto severity = AlertSeverity::High;
+        if (result.confidence >= DetectionConfidence::Confirmed)
+            severity = AlertSeverity::Emergency;
+        else if (result.confidence >= DetectionConfidence::High)
+            severity = AlertSeverity::Critical;
+
+        std::string subject = "WannaCry/" +
+            std::string(GetWannaCryVariantName(result.variant)) +
+            " detected (PID " + std::to_string(result.pid) + ")";
+
+        (void)AlertSystem::Instance().RaiseAlert(
+            severity,
+            AlertType::ThreatDetection,
+            subject,
+            result.ToJson(),
+            "WannaCryDetector");
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"AlertSystem report failed: %hs", ex.what());
+    }
+}
+
+void WannaCryDetector::ReportDetectionTelemetry(const WannaCryDetectionResult& result) {
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+
+        std::map<std::string, std::string> data;
+        data["pid"] = std::to_string(result.pid);
+        data["variant"] = std::string(GetWannaCryVariantName(result.variant));
+        data["phase"] = std::string(GetWannaCryPhaseName(result.phase));
+        data["confidence"] = std::string(GetDetectionConfidenceName(result.confidence));
+        data["indicator_count"] = std::to_string(result.indicators.size());
+        data["smb_connections"] = std::to_string(result.smbConnectionCount);
+        data["kill_switch"] = result.killSwitchQueried ? "true" : "false";
+        data["mutex"] = result.mutexDetected ? "true" : "false";
+        data["service"] = result.serviceDetected ? "true" : "false";
+        data["smb_exploit"] = result.smbExploitDetected ? "true" : "false";
+
+        TelemetryCollector::Instance().RecordCustom("wannacry_detection", data);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"Telemetry report failed: %hs", ex.what());
+    }
+}
+
+void WannaCryDetector::ReportThreatToBehaviorAnalyzer(const WannaCryDetectionResult& result) {
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+
+        std::map<std::string, std::string> data;
+        data["source"] = "WannaCryDetector";
+        data["pid"] = std::to_string(result.pid);
+        data["threat_family"] = "WannaCry";
+        data["variant"] = std::string(GetWannaCryVariantName(result.variant));
+        data["attack_phase"] = std::string(GetWannaCryPhaseName(result.phase));
+
+        if (result.smbExploitDetected)
+            data["technique"] = "T1210";  // Exploitation of Remote Services
+        else if (result.killSwitchQueried)
+            data["technique"] = "T1071";  // Application Layer Protocol
+        else if (result.serviceDetected)
+            data["technique"] = "T1543.003";  // Create or Modify System Process: Windows Service
+
+        TelemetryCollector::Instance().RecordCustom("behavior_indicator", data);
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"WannaCryDetector", L"BehaviorAnalyzer report failed: %hs", ex.what());
     }
 }
 

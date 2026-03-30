@@ -167,7 +167,7 @@ namespace RansomwareConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -377,6 +377,8 @@ enum class ProcessRiskLevel : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -387,6 +389,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif
 
 // ============================================================================
 // STRUCTURES
@@ -713,9 +716,20 @@ struct DetectionStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
-// ============================================================================
-// CALLBACK TYPES
-// ============================================================================
+/// @brief Copyable, non-atomic snapshot for public API — no atomic fields leaked.
+struct DetectionStatisticsSnapshot {
+    uint64_t totalOperations{0};
+    uint64_t operationsBlocked{0};
+    uint64_t processesTerminated{0};
+    uint64_t honeypotTriggers{0};
+    uint64_t highEntropyWrites{0};
+    uint64_t filesBackedUp{0};
+    uint64_t filesRestored{0};
+    uint64_t falsePositives{0};
+    std::array<uint64_t, 32> detectionsByFamily{};
+    int64_t  uptimeSeconds{0};
+    [[nodiscard]] std::string ToJson() const;
+};
 
 /// @brief Detection callback
 using DetectionCallback = std::function<void(const DetectionEvent&)>;
@@ -1106,7 +1120,7 @@ public:
     /**
      * @brief Get detection statistics
      */
-    [[nodiscard]] DetectionStatistics GetStatistics() const;
+    [[nodiscard]] DetectionStatisticsSnapshot GetStatistics() const;
     
     /**
      * @brief Reset statistics
@@ -1147,6 +1161,29 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    /// @brief Called from kernel process creation notify callback.
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+    /// @brief Called from kernel image load notify callback.
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+    /// @brief Request kernel to block a process via IPC.
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                 const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING
+    // ========================================================================
+
+    /// @brief Report ransomware detection to AlertSystem for SOC visibility.
+    void ReportThreatToAlertSystem(const DetectionEvent& event);
+    /// @brief Report detection telemetry to TelemetryCollector.
+    void ReportDetectionTelemetry(const DetectionEvent& event);
 
 private:
     // ========================================================================

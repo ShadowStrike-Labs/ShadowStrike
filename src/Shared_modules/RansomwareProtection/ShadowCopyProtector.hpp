@@ -198,6 +198,8 @@ enum class ShadowCopyState : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
+#define SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -208,6 +210,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_RANSOMWARE_MODULE_STATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -389,6 +392,23 @@ struct ShadowCopyStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
+/**
+ * @brief Non-atomic snapshot of ShadowCopyStatistics for public API
+ *
+ * Copyable, assignable, no std::atomic fields. Returned by GetStatistics().
+ */
+struct ShadowCopyStatisticsSnapshot {
+    uint64_t attacksBlocked         = 0;
+    uint64_t processesKilled        = 0;
+    uint64_t processesBlockedKernel = 0;
+    uint64_t snapshotDecreaseAlerts = 0;
+    std::array<uint64_t, 8> byAttackType{};
+    uint64_t currentShadowCopies    = 0;
+    int64_t  uptimeSeconds          = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
 // ============================================================================
 // CALLBACK TYPES
 // ============================================================================
@@ -552,7 +572,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] ShadowCopyStatistics GetStatistics() const;
+    [[nodiscard]] ShadowCopyStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     [[nodiscard]] std::vector<VSSAttackEvent> GetRecentAttacks(size_t maxCount = 100) const;
     
@@ -562,6 +582,36 @@ public:
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    /**
+     * @brief Receive kernel process creation/termination notification
+     *
+     * Delegates to OnProcessCreation for create events, clears state on exit.
+     */
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+
+    /**
+     * @brief Receive kernel image load notification (no-op for this module)
+     */
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+
+    /**
+     * @brief Request kernel-level process block via IPC
+     */
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId, const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING
+    // ========================================================================
+
+    void ReportThreatToAlertSystem(const VSSAttackEvent& event);
+    void ReportDetectionTelemetry(const VSSAttackEvent& event);
 
 private:
     ShadowCopyProtector();
