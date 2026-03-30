@@ -47,11 +47,14 @@
 #include <algorithm>
 #include <cstring>
 #include <intrin.h>
+#include <wintrust.h>
+#include <softpub.h>
 
 // Link with required libraries
 #pragma comment(lib, "bcrypt.lib")
 #pragma comment(lib, "ncrypt.lib")
 #pragma comment(lib, "crypt32.lib")
+#pragma comment(lib, "wintrust.lib")
 
 namespace ShadowStrike {
 namespace Security {
@@ -76,6 +79,90 @@ namespace {
 
     /// NT Status success
     constexpr NTSTATUS STATUS_SUCCESS = 0;
+
+    /**
+     * @brief Internal atomic statistics (thread-safe counters for the impl).
+     * The public CryptoManagerStatistics uses plain uint64_t snapshots.
+     */
+    struct InternalCryptoStats {
+        std::atomic<uint64_t> totalEncryptions{0};
+        std::atomic<uint64_t> totalDecryptions{0};
+        std::atomic<uint64_t> totalHashes{0};
+        std::atomic<uint64_t> totalSignatures{0};
+        std::atomic<uint64_t> totalVerifications{0};
+        std::atomic<uint64_t> totalKeyGenerations{0};
+        std::atomic<uint64_t> totalKeyDerivations{0};
+        std::atomic<uint64_t> totalRandomBytes{0};
+        std::atomic<uint64_t> authenticationFailures{0};
+        std::atomic<uint64_t> hardwareAccelerationOps{0};
+        std::atomic<uint64_t> tpmOperations{0};
+        std::atomic<size_t> activeKeys{0};
+        TimePoint startTime = Clock::now();
+
+        [[nodiscard]] CryptoManagerStatistics Snapshot() const noexcept {
+            CryptoManagerStatistics snap;
+            snap.totalEncryptions = totalEncryptions.load(std::memory_order_relaxed);
+            snap.totalDecryptions = totalDecryptions.load(std::memory_order_relaxed);
+            snap.totalHashes = totalHashes.load(std::memory_order_relaxed);
+            snap.totalSignatures = totalSignatures.load(std::memory_order_relaxed);
+            snap.totalVerifications = totalVerifications.load(std::memory_order_relaxed);
+            snap.totalKeyGenerations = totalKeyGenerations.load(std::memory_order_relaxed);
+            snap.totalKeyDerivations = totalKeyDerivations.load(std::memory_order_relaxed);
+            snap.totalRandomBytes = totalRandomBytes.load(std::memory_order_relaxed);
+            snap.authenticationFailures = authenticationFailures.load(std::memory_order_relaxed);
+            snap.hardwareAccelerationOps = hardwareAccelerationOps.load(std::memory_order_relaxed);
+            snap.tpmOperations = tpmOperations.load(std::memory_order_relaxed);
+            snap.activeKeys = activeKeys.load(std::memory_order_relaxed);
+            snap.startTime = startTime;
+            return snap;
+        }
+
+        void Reset() noexcept {
+            totalEncryptions.store(0, std::memory_order_relaxed);
+            totalDecryptions.store(0, std::memory_order_relaxed);
+            totalHashes.store(0, std::memory_order_relaxed);
+            totalSignatures.store(0, std::memory_order_relaxed);
+            totalVerifications.store(0, std::memory_order_relaxed);
+            totalKeyGenerations.store(0, std::memory_order_relaxed);
+            totalKeyDerivations.store(0, std::memory_order_relaxed);
+            totalRandomBytes.store(0, std::memory_order_relaxed);
+            authenticationFailures.store(0, std::memory_order_relaxed);
+            hardwareAccelerationOps.store(0, std::memory_order_relaxed);
+            tpmOperations.store(0, std::memory_order_relaxed);
+            activeKeys.store(0, std::memory_order_relaxed);
+            startTime = Clock::now();
+        }
+    };
+
+    /**
+     * @brief JSON-escape a string to prevent injection.
+     * Escapes: \\ \" \n \r \t \b \f and control characters < 0x20.
+     */
+    [[nodiscard]] std::string JsonEscape(std::string_view input) {
+        std::string out;
+        out.reserve(input.size() + 8);
+        for (char ch : input) {
+            switch (ch) {
+                case '\\': out += "\\\\"; break;
+                case '"':  out += "\\\""; break;
+                case '\n': out += "\\n";  break;
+                case '\r': out += "\\r";  break;
+                case '\t': out += "\\t";  break;
+                case '\b': out += "\\b";  break;
+                case '\f': out += "\\f";  break;
+                default:
+                    if (static_cast<unsigned char>(ch) < 0x20) {
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(static_cast<unsigned char>(ch)));
+                        out += buf;
+                    } else {
+                        out += ch;
+                    }
+                    break;
+            }
+        }
+        return out;
+    }
 
     /**
      * @brief RAII wrapper for BCrypt algorithm handles
@@ -242,14 +329,20 @@ namespace {
     [[nodiscard]] std::string GenerateKeyId() {
         UUID uuid;
         if (UuidCreate(&uuid) != RPC_S_OK) {
-            std::random_device rd;
-            std::mt19937_64 gen(rd());
-            std::uniform_int_distribution<uint64_t> dis;
-
+            // Fallback: use CSPRNG instead of mt19937 (CRITICAL: mt19937 is not cryptographically secure)
+            uint8_t randomBytes[16]{};
+            NTSTATUS status = BCryptGenRandom(
+                nullptr, randomBytes, sizeof(randomBytes),
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG);
+            if (!NT_SUCCESS(status)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"GenerateKeyId: BCryptGenRandom fallback failed, NTSTATUS=0x%08X", status);
+                return "";
+            }
             std::ostringstream oss;
             oss << std::hex << std::setfill('0');
-            oss << std::setw(16) << dis(gen);
-            oss << std::setw(16) << dis(gen);
+            for (uint8_t b : randomBytes) {
+                oss << std::setw(2) << static_cast<int>(b);
+            }
             return oss.str();
         }
 
@@ -550,6 +643,22 @@ public:
     void ResetStatistics();
     [[nodiscard]] bool SelfTest();
 
+    // Kernel channel attestation APIs
+    [[nodiscard]] std::optional<CryptoManager::KernelSessionKeyResult> DeriveKernelSessionKey(
+        std::span<const uint8_t> driverPublicKey,
+        std::span<const uint8_t> driverHash,
+        std::string_view contextLabel);
+    [[nodiscard]] bool VerifyKernelMessageIntegrity(
+        std::span<const uint8_t> message,
+        std::span<const uint8_t> hmac,
+        std::span<const uint8_t> sessionKey);
+    [[nodiscard]] std::vector<uint8_t> ComputeKernelMessageHMAC(
+        std::span<const uint8_t> message,
+        std::span<const uint8_t> sessionKey);
+    [[nodiscard]] bool ValidateKernelDriverAttestation(
+        const std::wstring& driverPath,
+        std::span<const uint8_t> expectedHash);
+
 private:
     mutable std::shared_mutex m_configMutex;
     CryptoManagerConfiguration m_config;
@@ -578,7 +687,7 @@ private:
     KeyRotationCallback m_keyRotationCallback;
     CryptoAuditCallback m_auditCallback;
 
-    mutable CryptoManagerStatistics m_stats;
+    mutable InternalCryptoStats m_stats;
 
     std::atomic<bool> m_hasAESNI{false};
     std::atomic<bool> m_hasRDRAND{false};
@@ -614,7 +723,8 @@ private:
     [[nodiscard]] DecryptionResult DecryptAESCBC(
         std::span<const uint8_t> ciphertext,
         std::span<const uint8_t> key,
-        std::span<const uint8_t> iv);
+        std::span<const uint8_t> iv,
+        std::span<const uint8_t> macTag);
 
     void NotifyKeyRotation(const std::string& keyId,
                            const KeyMetadata& oldMeta,
@@ -1045,6 +1155,36 @@ std::string CryptoManager::GetVersionString() noexcept {
 }
 
 // ============================================================================
+// CRYPTOMANAGER - KERNEL ATTESTATION WRAPPERS
+// ============================================================================
+
+std::optional<CryptoManager::KernelSessionKeyResult> CryptoManager::DeriveKernelSessionKey(
+    std::span<const uint8_t> driverPublicKey,
+    std::span<const uint8_t> driverHash,
+    std::string_view contextLabel) {
+    return m_impl->DeriveKernelSessionKey(driverPublicKey, driverHash, contextLabel);
+}
+
+bool CryptoManager::VerifyKernelMessageIntegrity(
+    std::span<const uint8_t> message,
+    std::span<const uint8_t> hmac,
+    std::span<const uint8_t> sessionKey) {
+    return m_impl->VerifyKernelMessageIntegrity(message, hmac, sessionKey);
+}
+
+std::vector<uint8_t> CryptoManager::ComputeKernelMessageHMAC(
+    std::span<const uint8_t> message,
+    std::span<const uint8_t> sessionKey) {
+    return m_impl->ComputeKernelMessageHMAC(message, sessionKey);
+}
+
+bool CryptoManager::ValidateKernelDriverAttestation(
+    const std::wstring& driverPath,
+    std::span<const uint8_t> expectedHash) {
+    return m_impl->ValidateKernelDriverAttestation(driverPath, expectedHash);
+}
+
+// ============================================================================
 // CRYPTOMANAGERIMPL - LIFECYCLE
 // ============================================================================
 
@@ -1329,7 +1469,12 @@ DecryptionResult CryptoManagerImpl::Decrypt(
                     result.errorMessage = "CBC requires IV";
                     return result;
                 }
-                result = DecryptAESCBC(ciphertext, key, iv);
+                if (tag.empty()) {
+                    result.result = CryptoResult::AuthenticationFailed;
+                    result.errorMessage = "CBC Encrypt-then-MAC requires authentication tag";
+                    return result;
+                }
+                result = DecryptAESCBC(ciphertext, key, iv, tag);
                 break;
             }
 
@@ -1588,6 +1733,29 @@ EncryptionResult CryptoManagerImpl::EncryptAESCBC(
 
     EncryptionResult result;
 
+    // Encrypt-then-MAC: derive separate encryption and MAC keys from the
+    // provided key via HMAC-based key separation (NIST SP 800-108 KDF in feedback mode).
+    // macKey = HMAC-SHA256(key, "ShadowStrike-CBC-MAC")
+    // encKey = HMAC-SHA256(key, "ShadowStrike-CBC-ENC") truncated to key.size()
+    static constexpr uint8_t kMacInfo[] = "ShadowStrike-CBC-MAC";
+    static constexpr uint8_t kEncInfo[] = "ShadowStrike-CBC-ENC";
+
+    auto macKey = ComputeHMAC(
+        std::span<const uint8_t>(kMacInfo, sizeof(kMacInfo) - 1),
+        key, HashAlgorithm::SHA256);
+    auto encKey = ComputeHMAC(
+        std::span<const uint8_t>(kEncInfo, sizeof(kEncInfo) - 1),
+        key, HashAlgorithm::SHA256);
+
+    if (macKey.empty() || encKey.empty()) {
+        result.result = CryptoResult::InternalError;
+        return result;
+    }
+    // Truncate encKey to match original key size (supports AES-128 and AES-256)
+    if (encKey.size() > key.size()) {
+        encKey.resize(key.size());
+    }
+
     BCryptAlgorithmHandle cbcAlg;
     if (!cbcAlg.Open(BCRYPT_AES_ALGORITHM)) {
         result.result = CryptoResult::InternalError;
@@ -1619,11 +1787,14 @@ EncryptionResult CryptoManagerImpl::EncryptAESCBC(
         keyHandle.GetAddressOf(),
         keyHandle.GetKeyObjectBuffer(),
         keyObjectSize,
-        const_cast<PUCHAR>(key.data()),
-        static_cast<ULONG>(key.size()),
+        encKey.data(),
+        static_cast<ULONG>(encKey.size()),
         0);
 
+    SecureZeroMemory(encKey.data(), encKey.size());
+
     if (!NT_SUCCESS(status)) {
+        SecureZeroMemory(macKey.data(), macKey.size());
         result.result = CryptoResult::InvalidKey;
         return result;
     }
@@ -1653,6 +1824,7 @@ EncryptionResult CryptoManagerImpl::EncryptAESCBC(
 
     if (!NT_SUCCESS(status)) {
         SecureZeroMemory(paddedPlaintext.data(), paddedPlaintext.size());
+        SecureZeroMemory(macKey.data(), macKey.size());
         result.result = CryptoResult::InternalError;
         return result;
     }
@@ -1675,25 +1847,79 @@ EncryptionResult CryptoManagerImpl::EncryptAESCBC(
     SecureZeroMemory(paddedPlaintext.data(), paddedPlaintext.size());
 
     if (!NT_SUCCESS(status)) {
+        SecureZeroMemory(macKey.data(), macKey.size());
         result.result = CryptoResult::InternalError;
         return result;
     }
 
     result.ciphertext.resize(ciphertextSize);
-    result.result = CryptoResult::Success;
 
+    // Encrypt-then-MAC: HMAC-SHA256(macKey, IV || ciphertext)
+    // Store the tag in the EncryptionResult::tag field.
+    std::vector<uint8_t> macInput;
+    macInput.reserve(iv.size() + result.ciphertext.size());
+    macInput.insert(macInput.end(), iv.begin(), iv.end());
+    macInput.insert(macInput.end(), result.ciphertext.begin(), result.ciphertext.end());
+
+    result.tag = ComputeHMAC(macInput, macKey, HashAlgorithm::SHA256);
+    SecureZeroMemory(macKey.data(), macKey.size());
+
+    if (result.tag.empty()) {
+        result.result = CryptoResult::InternalError;
+        return result;
+    }
+
+    result.result = CryptoResult::Success;
     return result;
 }
 
 DecryptionResult CryptoManagerImpl::DecryptAESCBC(
     std::span<const uint8_t> ciphertext,
     std::span<const uint8_t> key,
-    std::span<const uint8_t> iv) {
+    std::span<const uint8_t> iv,
+    std::span<const uint8_t> macTag) {
 
     DecryptionResult result;
 
+    // Encrypt-then-MAC: derive MAC and ENC keys identically to encrypt path.
+    static constexpr uint8_t kMacInfo[] = "ShadowStrike-CBC-MAC";
+    static constexpr uint8_t kEncInfo[] = "ShadowStrike-CBC-ENC";
+
+    auto macKey = ComputeHMAC(
+        std::span<const uint8_t>(kMacInfo, sizeof(kMacInfo) - 1),
+        key, HashAlgorithm::SHA256);
+    auto encKey = ComputeHMAC(
+        std::span<const uint8_t>(kEncInfo, sizeof(kEncInfo) - 1),
+        key, HashAlgorithm::SHA256);
+
+    if (macKey.empty() || encKey.empty()) {
+        result.result = CryptoResult::InternalError;
+        return result;
+    }
+    if (encKey.size() > key.size()) {
+        encKey.resize(key.size());
+    }
+
+    // VERIFY MAC BEFORE DECRYPTION — this is the core defense against padding oracle.
+    std::vector<uint8_t> macInput;
+    macInput.reserve(iv.size() + ciphertext.size());
+    macInput.insert(macInput.end(), iv.begin(), iv.end());
+    macInput.insert(macInput.end(), ciphertext.begin(), ciphertext.end());
+
+    auto computedMac = ComputeHMAC(macInput, macKey, HashAlgorithm::SHA256);
+    SecureZeroMemory(macKey.data(), macKey.size());
+
+    if (computedMac.empty() || !ConstantTimeCompare(computedMac, macTag)) {
+        SecureZeroMemory(encKey.data(), encKey.size());
+        result.result = CryptoResult::AuthenticationFailed;
+        result.errorMessage = "CBC MAC verification failed";
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+        return result;
+    }
+
     BCryptAlgorithmHandle cbcAlg;
     if (!cbcAlg.Open(BCRYPT_AES_ALGORITHM)) {
+        SecureZeroMemory(encKey.data(), encKey.size());
         result.result = CryptoResult::InternalError;
         return result;
     }
@@ -1706,6 +1932,7 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
         0);
 
     if (!NT_SUCCESS(status)) {
+        SecureZeroMemory(encKey.data(), encKey.size());
         result.result = CryptoResult::InternalError;
         return result;
     }
@@ -1723,9 +1950,11 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
         keyHandle.GetAddressOf(),
         keyHandle.GetKeyObjectBuffer(),
         keyObjectSize,
-        const_cast<PUCHAR>(key.data()),
-        static_cast<ULONG>(key.size()),
+        encKey.data(),
+        static_cast<ULONG>(encKey.size()),
         0);
+
+    SecureZeroMemory(encKey.data(), encKey.size());
 
     if (!NT_SUCCESS(status)) {
         result.result = CryptoResult::InvalidKey;
@@ -1774,7 +2003,7 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
 
     result.plaintext.resize(plaintextSize);
 
-    // Constant-time PKCS7 padding validation (mitigates padding oracle attacks)
+    // PKCS7 padding removal (MAC already verified, so padding oracle is not a risk here)
     if (result.plaintext.empty()) {
         result.result = CryptoResult::InvalidData;
         result.errorMessage = "Empty decryption output";
@@ -1785,12 +2014,12 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
     if (paddingValue == 0 || paddingValue > 16 ||
         static_cast<size_t>(paddingValue) > result.plaintext.size()) {
         SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
-        result.result = CryptoResult::AuthenticationFailed;
-        result.errorMessage = "Decryption failed";
+        result.result = CryptoResult::InvalidData;
+        result.errorMessage = "Invalid padding (integrity already verified)";
         return result;
     }
 
-    // Constant-time validation of all padding bytes
+    // Still do constant-time padding check for defense-in-depth
     volatile uint8_t paddingError = 0;
     for (size_t i = result.plaintext.size() - paddingValue; i < result.plaintext.size(); ++i) {
         paddingError |= result.plaintext[i] ^ paddingValue;
@@ -1798,8 +2027,8 @@ DecryptionResult CryptoManagerImpl::DecryptAESCBC(
 
     if (paddingError != 0) {
         SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
-        result.result = CryptoResult::AuthenticationFailed;
-        result.errorMessage = "Decryption failed";
+        result.result = CryptoResult::InvalidData;
+        result.errorMessage = "Invalid padding (integrity already verified)";
         return result;
     }
 
@@ -1988,15 +2217,39 @@ std::vector<uint8_t> CryptoManagerImpl::Hash(
         return result;
     }
 
-    BCryptAlgorithmHandle alg;
-    if (!alg.Open(algId)) {
-        return result;
+    // Use cached algorithm handles for SHA-256/384/512 to avoid per-call Open overhead.
+    // Copy the BCRYPT_ALG_HANDLE value (not a pointer to the wrapper) while holding the lock
+    // to prevent TOCTOU if Shutdown() closes the handle between lock acquisitions.
+    BCryptAlgorithmHandle tempAlg;
+    BCRYPT_ALG_HANDLE algHandle = nullptr;
+    {
+        std::shared_lock algLock(m_algMutex);
+        switch (algorithm) {
+            case HashAlgorithm::SHA256:
+                if (m_sha256Alg.IsValid()) algHandle = m_sha256Alg.Get();
+                break;
+            case HashAlgorithm::SHA384:
+                if (m_sha384Alg.IsValid()) algHandle = m_sha384Alg.Get();
+                break;
+            case HashAlgorithm::SHA512:
+                if (m_sha512Alg.IsValid()) algHandle = m_sha512Alg.Get();
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (!algHandle) {
+        if (!tempAlg.Open(algId)) {
+            return result;
+        }
+        algHandle = tempAlg.Get();
     }
 
     DWORD hashObjectSize = 0;
     DWORD dataSize = 0;
     NTSTATUS status = BCryptGetProperty(
-        alg.Get(),
+        algHandle,
         BCRYPT_OBJECT_LENGTH,
         reinterpret_cast<PUCHAR>(&hashObjectSize),
         sizeof(hashObjectSize),
@@ -2009,7 +2262,7 @@ std::vector<uint8_t> CryptoManagerImpl::Hash(
 
     DWORD hashSize = 0;
     status = BCryptGetProperty(
-        alg.Get(),
+        algHandle,
         BCRYPT_HASH_LENGTH,
         reinterpret_cast<PUCHAR>(&hashSize),
         sizeof(hashSize),
@@ -2024,7 +2277,7 @@ std::vector<uint8_t> CryptoManagerImpl::Hash(
     hashHandle.ResizeHashObject(hashObjectSize);
 
     status = BCryptCreateHash(
-        alg.Get(),
+        algHandle,
         hashHandle.GetAddressOf(),
         hashHandle.GetHashObjectBuffer(),
         hashObjectSize,
@@ -2865,7 +3118,13 @@ bool CryptoManagerImpl::VerifyPassword(
     }
 
     try {
-        KDFAlgorithm algorithm = static_cast<KDFAlgorithm>(std::stoi(parts[0]));
+        int rawAlgorithm = std::stoi(parts[0]);
+        if (rawAlgorithm < static_cast<int>(KDFAlgorithm::None) ||
+            rawAlgorithm > static_cast<int>(KDFAlgorithm::BCrypt)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"VerifyPassword: invalid KDF algorithm value %d", rawAlgorithm);
+            return false;
+        }
+        KDFAlgorithm algorithm = static_cast<KDFAlgorithm>(rawAlgorithm);
         uint32_t iterations = static_cast<uint32_t>(std::stoul(parts[1]));
 
         std::vector<uint8_t> salt;
@@ -3503,13 +3762,22 @@ bool CryptoManagerImpl::ConstantTimeCompare(
     std::span<const uint8_t> a,
     std::span<const uint8_t> b) noexcept {
 
-    if (a.size() != b.size()) {
-        return false;
+    // Prevent timing side-channel: normalize execution time regardless of size match.
+    // If sizes differ, iterate over the longer span with dummy XORs, then fail.
+    const size_t maxLen = (std::max)(a.size(), b.size());
+    if (maxLen == 0) {
+        return a.size() == b.size();
     }
 
     volatile uint8_t result = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
-        result |= a[i] ^ b[i];
+    // XOR mismatch on size difference: ensures size inequality always causes failure
+    result |= static_cast<uint8_t>(a.size() ^ b.size());
+
+    for (size_t i = 0; i < maxLen; ++i) {
+        // Safe indexing: clamp to valid range to avoid OOB while still iterating
+        const uint8_t byteA = (i < a.size()) ? a[i] : 0;
+        const uint8_t byteB = (i < b.size()) ? b[i] : 0;
+        result |= byteA ^ byteB;
     }
 
     return result == 0;
@@ -3638,46 +3906,83 @@ bool CryptoManagerImpl::Verify(
         return false;
     }
 
+    // Determine key type from BCRYPT_KEY_BLOB Magic field instead of blindly trying both.
+    // This prevents key type confusion attacks where an attacker crafts an ambiguous blob.
+    if (publicKey.size() < sizeof(ULONG)) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Verify: public key blob too small to contain magic");
+        return false;
+    }
+
+    ULONG magic = 0;
+    std::memcpy(&magic, publicKey.data(), sizeof(ULONG));
+
     BCryptAlgorithmHandle alg;
     BCRYPT_KEY_HANDLE keyHandle = nullptr;
     NTSTATUS status;
 
-    if (alg.Open(BCRYPT_RSA_ALGORITHM)) {
+    // RSA public key blobs: BCRYPT_RSAPUBLIC_MAGIC = 0x31415352 ('RSA1')
+    if (magic == BCRYPT_RSAPUBLIC_MAGIC) {
+        if (!alg.Open(BCRYPT_RSA_ALGORITHM)) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Verify: failed to open RSA algorithm");
+            return false;
+        }
         status = BCryptImportKeyPair(alg.Get(), nullptr, BCRYPT_RSAPUBLIC_BLOB,
             &keyHandle, const_cast<PUCHAR>(publicKey.data()),
             static_cast<ULONG>(publicKey.size()), 0);
-
-        if (NT_SUCCESS(status)) {
-            status = BCryptVerifySignature(keyHandle, nullptr,
-                hash.data(), static_cast<ULONG>(hash.size()),
-                const_cast<PUCHAR>(signature.data()),
-                static_cast<ULONG>(signature.size()), 0);
-
-            BCryptDestroyKey(keyHandle);
-            m_stats.totalVerifications.fetch_add(1, std::memory_order_relaxed);
-            return NT_SUCCESS(status);
+        if (!NT_SUCCESS(status)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Verify: RSA key import failed, NTSTATUS=0x%08X", status);
+            return false;
         }
+
+        BCRYPT_PKCS1_PADDING_INFO pkcs1Info;
+        pkcs1Info.pszAlgId = GetBCryptHashAlgorithm(hashAlgorithm);
+        status = BCryptVerifySignature(keyHandle, &pkcs1Info,
+            hash.data(), static_cast<ULONG>(hash.size()),
+            const_cast<PUCHAR>(signature.data()),
+            static_cast<ULONG>(signature.size()), BCRYPT_PAD_PKCS1);
+
+        BCryptDestroyKey(keyHandle);
+        m_stats.totalVerifications.fetch_add(1, std::memory_order_relaxed);
+        return NT_SUCCESS(status);
     }
 
-    alg.Close();
-    if (alg.Open(BCRYPT_ECDSA_P256_ALGORITHM)) {
-        status = BCryptImportKeyPair(alg.Get(), nullptr, BCRYPT_ECCPUBLIC_BLOB,
-            &keyHandle, const_cast<PUCHAR>(publicKey.data()),
-            static_cast<ULONG>(publicKey.size()), 0);
-
-        if (NT_SUCCESS(status)) {
-            status = BCryptVerifySignature(keyHandle, nullptr,
-                hash.data(), static_cast<ULONG>(hash.size()),
-                const_cast<PUCHAR>(signature.data()),
-                static_cast<ULONG>(signature.size()), 0);
-
-            BCryptDestroyKey(keyHandle);
-            m_stats.totalVerifications.fetch_add(1, std::memory_order_relaxed);
-            return NT_SUCCESS(status);
+    // ECC public key blobs: BCRYPT_ECDSA_PUBLIC_P256_MAGIC = 0x31534345 ('ECS1')
+    //                        BCRYPT_ECDSA_PUBLIC_P384_MAGIC = 0x33534345 ('ECS3')
+    //                        BCRYPT_ECDSA_PUBLIC_P521_MAGIC = 0x35534345 ('ECS5')
+    if (magic == BCRYPT_ECDSA_PUBLIC_P256_MAGIC) {
+        if (!alg.Open(BCRYPT_ECDSA_P256_ALGORITHM)) {
+            return false;
         }
+    } else if (magic == BCRYPT_ECDSA_PUBLIC_P384_MAGIC) {
+        if (!alg.Open(BCRYPT_ECDSA_P384_ALGORITHM)) {
+            return false;
+        }
+    } else if (magic == BCRYPT_ECDSA_PUBLIC_P521_MAGIC) {
+        if (!alg.Open(BCRYPT_ECDSA_P521_ALGORITHM)) {
+            return false;
+        }
+    } else {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Verify: unrecognized key blob magic 0x%08X", magic);
+        return false;
     }
 
-    return false;
+    status = BCryptImportKeyPair(alg.Get(), nullptr, BCRYPT_ECCPUBLIC_BLOB,
+        &keyHandle, const_cast<PUCHAR>(publicKey.data()),
+        static_cast<ULONG>(publicKey.size()), 0);
+
+    if (!NT_SUCCESS(status)) {
+        SS_LOG_WARN(LOG_CATEGORY, L"Verify: ECC key import failed, NTSTATUS=0x%08X", status);
+        return false;
+    }
+
+    status = BCryptVerifySignature(keyHandle, nullptr,
+        hash.data(), static_cast<ULONG>(hash.size()),
+        const_cast<PUCHAR>(signature.data()),
+        static_cast<ULONG>(signature.size()), 0);
+
+    BCryptDestroyKey(keyHandle);
+    m_stats.totalVerifications.fetch_add(1, std::memory_order_relaxed);
+    return NT_SUCCESS(status);
 }
 
 SignatureResult CryptoManagerImpl::SignEd25519(
@@ -3743,6 +4048,14 @@ EncryptionResult CryptoManagerImpl::RSAEncrypt(
             flags = BCRYPT_PAD_OAEP;
             break;
         case RSAPadding::PKCS1:
+            if (IsFIPSModeEnabled()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"RSAEncrypt: PKCS1 v1.5 padding prohibited in FIPS mode — use OAEP");
+                BCryptDestroyKey(keyHandle);
+                result.result = CryptoResult::AlgorithmNotSupported;
+                result.errorMessage = "PKCS1 v1.5 prohibited in FIPS mode";
+                return result;
+            }
+            SS_LOG_WARN(LOG_CATEGORY, L"RSAEncrypt: PKCS1 v1.5 is DEPRECATED — migrate to OAEP");
             flags = BCRYPT_PAD_PKCS1;
             break;
         default:
@@ -3832,6 +4145,14 @@ DecryptionResult CryptoManagerImpl::RSADecrypt(
             flags = BCRYPT_PAD_OAEP;
             break;
         case RSAPadding::PKCS1:
+            if (IsFIPSModeEnabled()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"RSADecrypt: PKCS1 v1.5 padding prohibited in FIPS mode — use OAEP");
+                BCryptDestroyKey(keyHandle);
+                result.result = CryptoResult::AlgorithmNotSupported;
+                result.errorMessage = "PKCS1 v1.5 prohibited in FIPS mode";
+                return result;
+            }
+            SS_LOG_WARN(LOG_CATEGORY, L"RSADecrypt: PKCS1 v1.5 is DEPRECATED — migrate to OAEP");
             flags = BCRYPT_PAD_PKCS1;
             break;
         default:
@@ -4203,36 +4524,11 @@ void CryptoManagerImpl::NotifyAudit(
 // ============================================================================
 
 CryptoManagerStatistics CryptoManagerImpl::GetStatistics() const {
-    CryptoManagerStatistics stats;
-    stats.totalEncryptions.store(m_stats.totalEncryptions.load(std::memory_order_relaxed));
-    stats.totalDecryptions.store(m_stats.totalDecryptions.load(std::memory_order_relaxed));
-    stats.totalHashes.store(m_stats.totalHashes.load(std::memory_order_relaxed));
-    stats.totalSignatures.store(m_stats.totalSignatures.load(std::memory_order_relaxed));
-    stats.totalVerifications.store(m_stats.totalVerifications.load(std::memory_order_relaxed));
-    stats.totalKeyGenerations.store(m_stats.totalKeyGenerations.load(std::memory_order_relaxed));
-    stats.totalKeyDerivations.store(m_stats.totalKeyDerivations.load(std::memory_order_relaxed));
-    stats.totalRandomBytes.store(m_stats.totalRandomBytes.load(std::memory_order_relaxed));
-    stats.authenticationFailures.store(m_stats.authenticationFailures.load(std::memory_order_relaxed));
-    stats.hardwareAccelerationOps.store(m_stats.hardwareAccelerationOps.load(std::memory_order_relaxed));
-    stats.tpmOperations.store(m_stats.tpmOperations.load(std::memory_order_relaxed));
-    stats.activeKeys.store(m_stats.activeKeys.load(std::memory_order_relaxed));
-    stats.startTime = m_stats.startTime;
-    return stats;
+    return m_stats.Snapshot();
 }
 
 void CryptoManagerImpl::ResetStatistics() {
-    m_stats.totalEncryptions.store(0, std::memory_order_relaxed);
-    m_stats.totalDecryptions.store(0, std::memory_order_relaxed);
-    m_stats.totalHashes.store(0, std::memory_order_relaxed);
-    m_stats.totalSignatures.store(0, std::memory_order_relaxed);
-    m_stats.totalVerifications.store(0, std::memory_order_relaxed);
-    m_stats.totalKeyGenerations.store(0, std::memory_order_relaxed);
-    m_stats.totalKeyDerivations.store(0, std::memory_order_relaxed);
-    m_stats.totalRandomBytes.store(0, std::memory_order_relaxed);
-    m_stats.authenticationFailures.store(0, std::memory_order_relaxed);
-    m_stats.hardwareAccelerationOps.store(0, std::memory_order_relaxed);
-    m_stats.tpmOperations.store(0, std::memory_order_relaxed);
-    m_stats.startTime = Clock::now();
+    m_stats.Reset();
 }
 
 bool CryptoManagerImpl::SelfTest() {
@@ -4346,6 +4642,272 @@ bool CryptoManagerImpl::SelfTest() {
 }
 
 // ============================================================================
+// CRYPTOMANAGERIMPL - KERNEL CHANNEL ATTESTATION
+// ============================================================================
+
+std::optional<CryptoManager::KernelSessionKeyResult> CryptoManagerImpl::DeriveKernelSessionKey(
+    std::span<const uint8_t> driverPublicKey,
+    std::span<const uint8_t> driverHash,
+    std::string_view contextLabel) {
+
+    if (driverPublicKey.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: empty driver public key");
+        return std::nullopt;
+    }
+    if (driverHash.size() != 32) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: driver hash must be SHA-256 (32 bytes), got %zu", driverHash.size());
+        return std::nullopt;
+    }
+    if (contextLabel.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: empty context label");
+        return std::nullopt;
+    }
+
+    // Step 1: Generate ephemeral ECDH P-256 key pair for this session
+    std::shared_lock algLock(m_algMutex);
+    if (!m_ecdhP256Alg.IsValid()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: ECDH P-256 algorithm not initialized");
+        return std::nullopt;
+    }
+
+    BCRYPT_KEY_HANDLE localKeyHandle = nullptr;
+    NTSTATUS status = BCryptGenerateKeyPair(
+        m_ecdhP256Alg.Get(), &localKeyHandle, 256, 0);
+    algLock.unlock();
+
+    if (!NT_SUCCESS(status) || !localKeyHandle) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: key pair generation failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    status = BCryptFinalizeKeyPair(localKeyHandle, 0);
+    if (!NT_SUCCESS(status)) {
+        BCryptDestroyKey(localKeyHandle);
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: key pair finalization failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    // Step 1b: Export our ephemeral public key — the driver needs this for its side of ECDH
+    DWORD localPubKeySize = 0;
+    status = BCryptExportKey(localKeyHandle, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+        nullptr, 0, &localPubKeySize, 0);
+    if (!NT_SUCCESS(status) || localPubKeySize == 0) {
+        BCryptDestroyKey(localKeyHandle);
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: public key size query failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> localPublicKey(localPubKeySize);
+    status = BCryptExportKey(localKeyHandle, nullptr, BCRYPT_ECCPUBLIC_BLOB,
+        localPublicKey.data(), localPubKeySize, &localPubKeySize, 0);
+    if (!NT_SUCCESS(status)) {
+        BCryptDestroyKey(localKeyHandle);
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: public key export failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+    localPublicKey.resize(localPubKeySize);
+
+    // Step 2: Import driver's ECDH public key
+    std::shared_lock algLock2(m_algMutex);
+    BCRYPT_KEY_HANDLE remoteKeyHandle = nullptr;
+    status = BCryptImportKeyPair(
+        m_ecdhP256Alg.Get(), nullptr, BCRYPT_ECCPUBLIC_BLOB,
+        &remoteKeyHandle, const_cast<PUCHAR>(driverPublicKey.data()),
+        static_cast<ULONG>(driverPublicKey.size()), 0);
+    algLock2.unlock();
+
+    if (!NT_SUCCESS(status) || !remoteKeyHandle) {
+        BCryptDestroyKey(localKeyHandle);
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: driver key import failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    // Step 3: Perform ECDH key agreement to derive shared secret
+    BCRYPT_SECRET_HANDLE secretHandle = nullptr;
+    status = BCryptSecretAgreement(localKeyHandle, remoteKeyHandle, &secretHandle, 0);
+
+    BCryptDestroyKey(localKeyHandle);
+    BCryptDestroyKey(remoteKeyHandle);
+
+    if (!NT_SUCCESS(status) || !secretHandle) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: ECDH agreement failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    // Step 4: Derive session key via BCryptDeriveKey (HKDF-like KDF)
+    // Bind the key to the driver hash and context label for domain separation
+    std::vector<uint8_t> kdfInfo;
+    kdfInfo.reserve(contextLabel.size() + driverHash.size());
+    kdfInfo.insert(kdfInfo.end(), contextLabel.begin(), contextLabel.end());
+    kdfInfo.insert(kdfInfo.end(), driverHash.begin(), driverHash.end());
+
+    BCryptBuffer paramBuffers[1] = {};
+    paramBuffers[0].BufferType = KDF_HASH_ALGORITHM;
+    paramBuffers[0].cbBuffer = static_cast<ULONG>(sizeof(BCRYPT_SHA256_ALGORITHM));
+    paramBuffers[0].pvBuffer = const_cast<wchar_t*>(BCRYPT_SHA256_ALGORITHM);
+
+    BCryptBufferDesc paramList = {};
+    paramList.ulVersion = BCRYPTBUFFER_VERSION;
+    paramList.cBuffers = 1;
+    paramList.pBuffers = paramBuffers;
+
+    constexpr ULONG sessionKeySize = 32; // AES-256
+    std::vector<uint8_t> sessionKey(sessionKeySize);
+
+    ULONG derivedSize = 0;
+    status = BCryptDeriveKey(
+        secretHandle,
+        BCRYPT_KDF_HASH,
+        &paramList,
+        sessionKey.data(),
+        sessionKeySize,
+        &derivedSize,
+        0);
+
+    BCryptDestroySecret(secretHandle);
+
+    if (!NT_SUCCESS(status) || derivedSize < sessionKeySize) {
+        SecureZeroMemory(sessionKey.data(), sessionKey.size());
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: key derivation failed, NTSTATUS=0x%08X", status);
+        return std::nullopt;
+    }
+
+    // Step 5: Mix in driver hash for additional binding via HMAC(sessionKey, driverHash || label)
+    auto finalKey = ComputeHMAC(kdfInfo, sessionKey, HashAlgorithm::SHA256);
+    SecureZeroMemory(sessionKey.data(), sessionKey.size());
+
+    if (finalKey.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"DeriveKernelSessionKey: final HMAC mixing failed");
+        return std::nullopt;
+    }
+
+    SS_LOG_INFO(LOG_CATEGORY, L"DeriveKernelSessionKey: session key derived successfully");
+    m_stats.totalKeyDerivations.fetch_add(1, std::memory_order_relaxed);
+
+    CryptoManager::KernelSessionKeyResult result;
+    result.sessionKey = std::move(finalKey);
+    result.localPublicKey = std::move(localPublicKey);
+    return result;
+}
+
+bool CryptoManagerImpl::VerifyKernelMessageIntegrity(
+    std::span<const uint8_t> message,
+    std::span<const uint8_t> hmac,
+    std::span<const uint8_t> sessionKey) {
+
+    if (message.empty() || hmac.empty() || sessionKey.empty()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"VerifyKernelMessageIntegrity: empty input parameter");
+        return false;
+    }
+    if (hmac.size() != 32) {
+        SS_LOG_WARN(LOG_CATEGORY, L"VerifyKernelMessageIntegrity: expected 32-byte HMAC-SHA256, got %zu", hmac.size());
+        return false;
+    }
+
+    auto computed = ComputeHMAC(message, sessionKey, HashAlgorithm::SHA256);
+    if (computed.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"VerifyKernelMessageIntegrity: HMAC computation failed");
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+        return false;
+    }
+
+    bool valid = ConstantTimeCompare(computed, hmac);
+    if (!valid) {
+        m_stats.authenticationFailures.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_WARN(LOG_CATEGORY, L"VerifyKernelMessageIntegrity: HMAC mismatch — potential tampering or replay");
+    }
+    return valid;
+}
+
+std::vector<uint8_t> CryptoManagerImpl::ComputeKernelMessageHMAC(
+    std::span<const uint8_t> message,
+    std::span<const uint8_t> sessionKey) {
+
+    if (message.empty() || sessionKey.empty()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"ComputeKernelMessageHMAC: empty input parameter");
+        return {};
+    }
+
+    auto tag = ComputeHMAC(message, sessionKey, HashAlgorithm::SHA256);
+    if (tag.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ComputeKernelMessageHMAC: HMAC-SHA256 computation failed");
+    }
+    return tag;
+}
+
+bool CryptoManagerImpl::ValidateKernelDriverAttestation(
+    const std::wstring& driverPath,
+    std::span<const uint8_t> expectedHash) {
+
+    if (driverPath.empty()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ValidateKernelDriverAttestation: empty driver path");
+        return false;
+    }
+    if (expectedHash.size() != 32) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ValidateKernelDriverAttestation: expected 32-byte SHA-256 hash");
+        return false;
+    }
+
+    // Step 1: Verify Authenticode signature via WinVerifyTrust
+    WINTRUST_FILE_INFO fileInfo = {};
+    fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+    fileInfo.pcwszFilePath = driverPath.c_str();
+    fileInfo.hFile = nullptr;
+    fileInfo.pgKnownSubject = nullptr;
+
+    GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+    WINTRUST_DATA winTrustData = {};
+    winTrustData.cbStruct = sizeof(WINTRUST_DATA);
+    winTrustData.dwUIChoice = WTD_UI_NONE;
+    winTrustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
+    winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
+    winTrustData.pFile = &fileInfo;
+    winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
+    winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+
+    LONG trustResult = WinVerifyTrust(
+        static_cast<HWND>(INVALID_HANDLE_VALUE),
+        &policyGUID,
+        &winTrustData);
+
+    // Close the trust state
+    winTrustData.dwStateAction = WTD_STATEACTION_CLOSE;
+    WinVerifyTrust(
+        static_cast<HWND>(INVALID_HANDLE_VALUE),
+        &policyGUID,
+        &winTrustData);
+
+    if (trustResult != ERROR_SUCCESS) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"ValidateKernelDriverAttestation: Authenticode verification FAILED for '%s' (result=0x%08lX)",
+            driverPath.c_str(), trustResult);
+        return false;
+    }
+
+    // Step 2: Hash the driver file and compare against expected hash
+    auto fileHash = HashFile(driverPath, HashAlgorithm::SHA256);
+    if (!fileHash.has_value()) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"ValidateKernelDriverAttestation: failed to hash driver file '%s'",
+            driverPath.c_str());
+        return false;
+    }
+
+    if (!ConstantTimeCompare(fileHash.value(), expectedHash)) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+            L"ValidateKernelDriverAttestation: driver hash MISMATCH for '%s' — possible tamper",
+            driverPath.c_str());
+        return false;
+    }
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"ValidateKernelDriverAttestation: driver '%s' passed Authenticode + hash attestation",
+        driverPath.c_str());
+    return true;
+}
+
+// ============================================================================
 // STRUCTURE IMPLEMENTATIONS
 // ============================================================================
 
@@ -4359,13 +4921,13 @@ bool KeyMetadata::IsExpired() const {
 std::string KeyMetadata::ToJson() const {
     std::ostringstream oss;
     oss << "{";
-    oss << "\"id\":\"" << id << "\",";
+    oss << "\"id\":\"" << JsonEscape(id) << "\",";
     oss << "\"type\":" << static_cast<int>(type) << ",";
     oss << "\"keySizeBits\":" << keySizeBits << ",";
     oss << "\"storage\":" << static_cast<int>(storage) << ",";
     oss << "\"usageCount\":" << usageCount << ",";
     oss << "\"isExportable\":" << (isExportable ? "true" : "false") << ",";
-    oss << "\"description\":\"" << description << "\"";
+    oss << "\"description\":\"" << JsonEscape(description) << "\"";
     oss << "}";
     return oss.str();
 }
@@ -4416,36 +4978,36 @@ bool CryptoManagerConfiguration::IsValid() const noexcept {
 }
 
 void CryptoManagerStatistics::Reset() noexcept {
-    totalEncryptions.store(0, std::memory_order_relaxed);
-    totalDecryptions.store(0, std::memory_order_relaxed);
-    totalHashes.store(0, std::memory_order_relaxed);
-    totalSignatures.store(0, std::memory_order_relaxed);
-    totalVerifications.store(0, std::memory_order_relaxed);
-    totalKeyGenerations.store(0, std::memory_order_relaxed);
-    totalKeyDerivations.store(0, std::memory_order_relaxed);
-    totalRandomBytes.store(0, std::memory_order_relaxed);
-    authenticationFailures.store(0, std::memory_order_relaxed);
-    hardwareAccelerationOps.store(0, std::memory_order_relaxed);
-    tpmOperations.store(0, std::memory_order_relaxed);
-    activeKeys.store(0, std::memory_order_relaxed);
+    totalEncryptions = 0;
+    totalDecryptions = 0;
+    totalHashes = 0;
+    totalSignatures = 0;
+    totalVerifications = 0;
+    totalKeyGenerations = 0;
+    totalKeyDerivations = 0;
+    totalRandomBytes = 0;
+    authenticationFailures = 0;
+    hardwareAccelerationOps = 0;
+    tpmOperations = 0;
+    activeKeys = 0;
     startTime = Clock::now();
 }
 
 std::string CryptoManagerStatistics::ToJson() const {
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalEncryptions\":" << totalEncryptions.load() << ",";
-    oss << "\"totalDecryptions\":" << totalDecryptions.load() << ",";
-    oss << "\"totalHashes\":" << totalHashes.load() << ",";
-    oss << "\"totalSignatures\":" << totalSignatures.load() << ",";
-    oss << "\"totalVerifications\":" << totalVerifications.load() << ",";
-    oss << "\"totalKeyGenerations\":" << totalKeyGenerations.load() << ",";
-    oss << "\"totalKeyDerivations\":" << totalKeyDerivations.load() << ",";
-    oss << "\"totalRandomBytes\":" << totalRandomBytes.load() << ",";
-    oss << "\"authenticationFailures\":" << authenticationFailures.load() << ",";
-    oss << "\"hardwareAccelerationOps\":" << hardwareAccelerationOps.load() << ",";
-    oss << "\"tpmOperations\":" << tpmOperations.load() << ",";
-    oss << "\"activeKeys\":" << activeKeys.load();
+    oss << "\"totalEncryptions\":" << totalEncryptions << ",";
+    oss << "\"totalDecryptions\":" << totalDecryptions << ",";
+    oss << "\"totalHashes\":" << totalHashes << ",";
+    oss << "\"totalSignatures\":" << totalSignatures << ",";
+    oss << "\"totalVerifications\":" << totalVerifications << ",";
+    oss << "\"totalKeyGenerations\":" << totalKeyGenerations << ",";
+    oss << "\"totalKeyDerivations\":" << totalKeyDerivations << ",";
+    oss << "\"totalRandomBytes\":" << totalRandomBytes << ",";
+    oss << "\"authenticationFailures\":" << authenticationFailures << ",";
+    oss << "\"hardwareAccelerationOps\":" << hardwareAccelerationOps << ",";
+    oss << "\"tpmOperations\":" << tpmOperations << ",";
+    oss << "\"activeKeys\":" << activeKeys;
     oss << "}";
     return oss.str();
 }
