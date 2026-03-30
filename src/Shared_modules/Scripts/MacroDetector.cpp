@@ -40,7 +40,7 @@
  * - Integration with threat intelligence
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -65,6 +65,11 @@
 #include <comdef.h>
 #pragma comment(lib, "ole32.lib")
 #endif
+
+// Cross-module integration
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
 
 namespace ShadowStrike {
 namespace Scripts {
@@ -493,6 +498,27 @@ void MacroStatistics::Reset() noexcept {
     return oss.str();
 }
 
+[[nodiscard]] std::string MacroStatisticsSnapshot::ToJson() const {
+    std::ostringstream oss;
+    auto now = Clock::now();
+    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(now - startTime).count();
+
+    oss << "{";
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"documentsWithMacros\":" << documentsWithMacros << ",";
+    oss << "\"maliciousDetected\":" << maliciousDetected << ",";
+    oss << "\"suspiciousDetected\":" << suspiciousDetected << ",";
+    oss << "\"xlmMacrosDetected\":" << xlmMacrosDetected << ",";
+    oss << "\"vbaMacrosDetected\":" << vbaMacrosDetected << ",";
+    oss << "\"obfuscatedDetected\":" << obfuscatedDetected << ",";
+    oss << "\"passwordProtected\":" << passwordProtected << ",";
+    oss << "\"parseErrors\":" << parseErrors << ",";
+    oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
+    oss << "\"uptimeMs\":" << uptimeMs;
+    oss << "}";
+    return oss.str();
+}
+
 [[nodiscard]] bool MacroDetectorConfiguration::IsValid() const noexcept {
     if (maxDocumentSize == 0 || maxDocumentSize > 1ULL * 1024 * 1024 * 1024) {
         return false;
@@ -552,9 +578,22 @@ public:
     void UnregisterCallbacks();
 
     // Statistics
-    [[nodiscard]] MacroStatistics GetStatistics() const;
+    [[nodiscard]] MacroStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     [[nodiscard]] bool SelfTest();
+
+    // Kernel bridge
+    void OnKernelProcessNotify(uint32_t processId, std::wstring_view imagePath,
+                               std::wstring_view commandLine, bool isCreate);
+    void OnKernelImageLoad(uint32_t processId, std::wstring_view imagePath,
+                           uint64_t imageBase, size_t imageSize);
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  const std::wstring& reason);
+
+    // Cross-module wiring
+    void ReportThreatToAlertSystem(const MacroScanResult& result);
+    void ReportScanTelemetry(const MacroScanResult& result);
+    void ReportThreatToBehaviorAnalyzer(const MacroScanResult& result);
 
 private:
     // ========================================================================
@@ -650,8 +689,17 @@ private:
     MacroDetectorConfiguration m_config;
     MacroStatistics m_stats;
 
-    MacroScanResultCallback m_resultCallback;
+    std::vector<MacroScanResultCallback> m_resultCallbacks;
     ErrorCallback m_errorCallback;
+
+    // LRU+TTL scan cache
+    struct CacheEntry {
+        MacroScanResult result;
+        TimePoint insertTime;
+    };
+    std::unordered_map<std::string, std::list<std::pair<std::string, CacheEntry>>::iterator> m_cacheMap;
+    std::list<std::pair<std::string, CacheEntry>> m_cacheList;
+    mutable std::shared_mutex m_cacheMutex;
 
     // COM initialization state
     bool m_comInitialized{false};
@@ -836,8 +884,15 @@ void MacroDetectorImpl::Shutdown() {
     }
 #endif
 
-    m_resultCallback = nullptr;
+    m_resultCallbacks.clear();
     m_errorCallback = nullptr;
+
+    // Purge scan cache
+    {
+        std::unique_lock cacheLock(m_cacheMutex);
+        m_cacheMap.clear();
+        m_cacheList.clear();
+    }
 
     m_initialized.store(false);
     m_status.store(ModuleStatus::Stopped);
@@ -876,6 +931,12 @@ void MacroDetectorImpl::Shutdown() {
     result.filePath = path;
     result.scanTime = std::chrono::system_clock::now();
     auto startTime = Clock::now();
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"MacroDetector", L"ScanDocument called before initialization");
+        result.status = MacroScanStatus::ErrorParsing;
+        return result;
+    }
 
     // Validation
     if (path.empty()) {
@@ -932,6 +993,27 @@ void MacroDetectorImpl::Shutdown() {
         sha256Hex = Utils::HashUtils::ToHexLower(hashBytes.data(), hashBytes.size());
     }
 
+    // Check scan cache (LRU+TTL) before performing full analysis
+    if (!sha256Hex.empty()) {
+        std::shared_lock cacheLock(m_cacheMutex);
+        auto cacheIt = m_cacheMap.find(sha256Hex);
+        if (cacheIt != m_cacheMap.end()) {
+            auto& entry = cacheIt->second->second;
+            auto age = Clock::now() - entry.insertTime;
+            if (age < MacroConstants::SCAN_CACHE_TTL) {
+                result = entry.result;
+                result.filePath = path;
+                result.sha256 = sha256Hex;
+                result.fileSize = fileStat.size;
+                result.scanTime = std::chrono::system_clock::now();
+                auto endTime = Clock::now();
+                result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
+                SS_LOG_DEBUG(L"MacroDetector", L"Cache hit for %ls", widePath.c_str());
+                return result;
+            }
+        }
+    }
+
     // Convert to uint8_t span
     std::span<const uint8_t> contentSpan(
         reinterpret_cast<const uint8_t*>(content.data()),
@@ -950,23 +1032,36 @@ void MacroDetectorImpl::Shutdown() {
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
-    // Update statistics
-    m_stats.totalScans++;
-    m_stats.totalBytesScanned += result.fileSize;
-    if (result.hasMacros) {
-        m_stats.documentsWithMacros++;
-    }
-    if (result.isMalicious) {
-        m_stats.maliciousDetected++;
-    } else if (result.status == MacroScanStatus::Suspicious) {
-        m_stats.suspiciousDetected++;
-    }
+    // Stats already tracked in span overload — only add path-specific reporting
 
-    if (static_cast<size_t>(result.format) < m_stats.byFormat.size()) {
-        m_stats.byFormat[static_cast<size_t>(result.format)]++;
+    // Insert into scan cache
+    if (!sha256Hex.empty()) {
+        std::unique_lock cacheLock(m_cacheMutex);
+        auto existing = m_cacheMap.find(sha256Hex);
+        if (existing != m_cacheMap.end()) {
+            m_cacheList.erase(existing->second);
+            m_cacheMap.erase(existing);
+        }
+        if (m_cacheMap.size() >= MacroConstants::SCAN_CACHE_CAPACITY) {
+            auto& oldest = m_cacheList.back();
+            m_cacheMap.erase(oldest.first);
+            m_cacheList.pop_back();
+        }
+        CacheEntry ce{result, Clock::now()};
+        m_cacheList.emplace_front(sha256Hex, std::move(ce));
+        m_cacheMap.emplace(sha256Hex, m_cacheList.begin());
     }
 
     NotifyCallback(result);
+
+    // Cross-module threat reporting
+    if (result.isMalicious || result.isSuspicious) {
+        ReportThreatToAlertSystem(result);
+        ReportScanTelemetry(result);
+    }
+    if (result.isMalicious) {
+        ReportThreatToBehaviorAnalyzer(result);
+    }
 
     if (m_config.verboseLogging) {
         SS_LOG_INFO(L"MacroDetector", L"Scan complete: %ls - Status: %d, Risk: %d",
@@ -984,6 +1079,12 @@ void MacroDetectorImpl::Shutdown() {
     result.scanTime = std::chrono::system_clock::now();
     result.fileSize = content.size();
     auto startTime = Clock::now();
+
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"MacroDetector", L"ScanDocument called before initialization");
+        result.status = MacroScanStatus::ErrorParsing;
+        return result;
+    }
 
     // Validate content
     if (content.empty()) {
@@ -1073,7 +1174,26 @@ void MacroDetectorImpl::Shutdown() {
                 result.macroTypes.push_back(MacroType::RTF_OLE);
                 SS_LOG_WARN(L"MacroDetector", L"RTF with embedded OLE object detected");
             }
-        } else if (content.size() >= 2 &&
+        }
+
+        // DDE (Dynamic Data Exchange) detection — applies to any format
+        if (BinaryContains(content, "DDE") ||
+            BinaryContains(content, "DDEAUTO") ||
+            BinaryContains(content, "ddeLink") ||
+            BinaryContains(content, "{\\field{\\*\\fldinst") ||
+            BinaryContains(content, "dde\"")) {
+            bool alreadyHasDDE = false;
+            for (auto t : result.macroTypes) {
+                if (t == MacroType::DDE) { alreadyHasDDE = true; break; }
+            }
+            if (!alreadyHasDDE) {
+                result.hasMacros = true;
+                result.macroTypes.push_back(MacroType::DDE);
+                SS_LOG_WARN(L"MacroDetector", L"DDE link detected in document");
+            }
+        }
+
+        if (content.size() >= 2 &&
                    content[0] == 'M' && content[1] == 'Z') {
             // Possible XLL add-in (PE/DLL loaded by Excel)
             XLLInfo xll;
@@ -1163,6 +1283,24 @@ void MacroDetectorImpl::Shutdown() {
     auto endTime = Clock::now();
     result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime);
 
+    // Track stats for memory-buffer scans (e.g., AMSI dispatch)
+    m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalBytesScanned.fetch_add(content.size(), std::memory_order_relaxed);
+    if (result.hasMacros) {
+        m_stats.documentsWithMacros.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result.isMalicious) {
+        m_stats.maliciousDetected.fetch_add(1, std::memory_order_relaxed);
+    } else if (result.status == MacroScanStatus::Suspicious) {
+        m_stats.suspiciousDetected.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (static_cast<size_t>(result.format) < m_stats.byFormat.size()) {
+        m_stats.byFormat[static_cast<size_t>(result.format)].fetch_add(1, std::memory_order_relaxed);
+    }
+    if (static_cast<size_t>(result.category) < m_stats.byCategory.size()) {
+        m_stats.byCategory[static_cast<size_t>(result.category)].fetch_add(1, std::memory_order_relaxed);
+    }
+
     return result;
 }
 
@@ -1245,7 +1383,7 @@ void MacroDetectorImpl::Shutdown() {
         content.size()
     );
 
-    ExtractXLMFromOLE(contentSpan, result);
+    (void)ExtractXLMFromOLE(contentSpan, result);
 
     return result;
 }
@@ -1594,7 +1732,12 @@ void MacroDetectorImpl::Shutdown() {
 
 void MacroDetectorImpl::RegisterCallback(MacroScanResultCallback callback) {
     std::unique_lock lock(m_mutex);
-    m_resultCallback = std::move(callback);
+    if (m_resultCallbacks.size() >= MacroConstants::MAX_CALLBACKS) {
+        SS_LOG_WARN(L"MacroDetector", L"Max callbacks (%zu) reached, ignoring",
+                    MacroConstants::MAX_CALLBACKS);
+        return;
+    }
+    m_resultCallbacks.push_back(std::move(callback));
 }
 
 void MacroDetectorImpl::RegisterErrorCallback(ErrorCallback callback) {
@@ -1604,27 +1747,27 @@ void MacroDetectorImpl::RegisterErrorCallback(ErrorCallback callback) {
 
 void MacroDetectorImpl::UnregisterCallbacks() {
     std::unique_lock lock(m_mutex);
-    m_resultCallback = nullptr;
+    m_resultCallbacks.clear();
     m_errorCallback = nullptr;
 }
 
-[[nodiscard]] MacroStatistics MacroDetectorImpl::GetStatistics() const {
-    MacroStatistics snapshot;
-    snapshot.totalScans.store(m_stats.totalScans.load());
-    snapshot.documentsWithMacros.store(m_stats.documentsWithMacros.load());
-    snapshot.maliciousDetected.store(m_stats.maliciousDetected.load());
-    snapshot.suspiciousDetected.store(m_stats.suspiciousDetected.load());
-    snapshot.xlmMacrosDetected.store(m_stats.xlmMacrosDetected.load());
-    snapshot.vbaMacrosDetected.store(m_stats.vbaMacrosDetected.load());
-    snapshot.obfuscatedDetected.store(m_stats.obfuscatedDetected.load());
-    snapshot.passwordProtected.store(m_stats.passwordProtected.load());
-    snapshot.parseErrors.store(m_stats.parseErrors.load());
-    snapshot.totalBytesScanned.store(m_stats.totalBytesScanned.load());
+[[nodiscard]] MacroStatisticsSnapshot MacroDetectorImpl::GetStatistics() const {
+    MacroStatisticsSnapshot snapshot;
+    snapshot.totalScans = m_stats.totalScans.load(std::memory_order_relaxed);
+    snapshot.documentsWithMacros = m_stats.documentsWithMacros.load(std::memory_order_relaxed);
+    snapshot.maliciousDetected = m_stats.maliciousDetected.load(std::memory_order_relaxed);
+    snapshot.suspiciousDetected = m_stats.suspiciousDetected.load(std::memory_order_relaxed);
+    snapshot.xlmMacrosDetected = m_stats.xlmMacrosDetected.load(std::memory_order_relaxed);
+    snapshot.vbaMacrosDetected = m_stats.vbaMacrosDetected.load(std::memory_order_relaxed);
+    snapshot.obfuscatedDetected = m_stats.obfuscatedDetected.load(std::memory_order_relaxed);
+    snapshot.passwordProtected = m_stats.passwordProtected.load(std::memory_order_relaxed);
+    snapshot.parseErrors = m_stats.parseErrors.load(std::memory_order_relaxed);
+    snapshot.totalBytesScanned = m_stats.totalBytesScanned.load(std::memory_order_relaxed);
     for (size_t i = 0; i < m_stats.byFormat.size(); ++i) {
-        snapshot.byFormat[i].store(m_stats.byFormat[i].load());
+        snapshot.byFormat[i] = m_stats.byFormat[i].load(std::memory_order_relaxed);
     }
     for (size_t i = 0; i < m_stats.byCategory.size(); ++i) {
-        snapshot.byCategory[i].store(m_stats.byCategory[i].load());
+        snapshot.byCategory[i] = m_stats.byCategory[i].load(std::memory_order_relaxed);
     }
     snapshot.startTime = m_stats.startTime;
     return snapshot;
@@ -2244,8 +2387,10 @@ void MacroDetectorImpl::ResetStatistics() {
     // Template injection uses relationship XML in OpenXML to reference
     // a remote URL for macros/content — enabling "macro-less" initial delivery.
     for (const auto* marker : MacroConstants::TEMPLATE_INJECTION_MARKERS) {
+        if (outInjections.size() >= MacroConstants::MAX_TEMPLATE_INJECTIONS) break;
         size_t pos = 0;
         while ((pos = BinaryFind(content, std::string_view(marker), pos)) != std::string::npos) {
+            if (outInjections.size() >= MacroConstants::MAX_TEMPLATE_INJECTIONS) break;
             // Try to extract a URL near this marker
             // Look ahead up to 512 bytes for http:// or https://
             size_t searchEnd = std::min(pos + 512, content.size());
@@ -2264,7 +2409,8 @@ void MacroDetectorImpl::ResetStatistics() {
                     }
                     ++urlEnd;
                 }
-                if (urlEnd > urlStart) {
+                if (urlEnd > urlStart &&
+                    outInjections.size() < MacroConstants::MAX_TEMPLATE_INJECTIONS) {
                     TemplateInjectionInfo info;
                     info.templateUrl.assign(
                         reinterpret_cast<const char*>(window.data() + urlStart),
@@ -2371,11 +2517,13 @@ void MacroDetectorImpl::ResetStatistics() {
 
 void MacroDetectorImpl::NotifyCallback(const MacroScanResult& result) {
     std::shared_lock lock(m_mutex);
-    if (m_resultCallback) {
-        try {
-            m_resultCallback(result);
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"MacroDetector", L"Callback exception: %hs", e.what());
+    for (const auto& cb : m_resultCallbacks) {
+        if (cb) {
+            try {
+                cb(result);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"MacroDetector", L"Callback exception: %hs", e.what());
+            }
         }
     }
 }
@@ -2388,6 +2536,253 @@ void MacroDetectorImpl::NotifyError(const std::string& message, int code) {
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MacroDetector", L"Error callback exception: %hs", e.what());
         }
+    }
+}
+
+// ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void MacroDetectorImpl::OnKernelProcessNotify(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    std::wstring_view commandLine,
+    bool isCreate) {
+
+    if (!m_initialized.load(std::memory_order_acquire)) return;
+    if (!isCreate) return;
+
+    // Extract filename from path
+    const auto lastSep = imagePath.find_last_of(L"\\/");
+    const auto fileName = (lastSep != std::wstring_view::npos)
+        ? imagePath.substr(lastSep + 1) : imagePath;
+    std::wstring lowerName(fileName);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+    // Detect Office host processes that execute macros
+    const bool isOfficeHost =
+        lowerName == L"winword.exe" ||
+        lowerName == L"excel.exe" ||
+        lowerName == L"powerpnt.exe" ||
+        lowerName == L"mspub.exe" ||
+        lowerName == L"visio.exe" ||
+        lowerName == L"outlook.exe";
+
+    if (!isOfficeHost) return;
+
+    SS_LOG_INFO(L"MacroDetector",
+        L"Kernel: Office process created PID=%u image=%.*ls",
+        processId,
+        static_cast<int>(std::min(imagePath.size(), size_t(260))),
+        imagePath.data());
+
+    // Check command line for suspicious macro-related arguments
+    if (!commandLine.empty()) {
+        std::wstring lowerCmd(commandLine);
+        std::transform(lowerCmd.begin(), lowerCmd.end(), lowerCmd.begin(), ::towlower);
+
+        const bool hasMacroArg =
+            lowerCmd.find(L"/mfilesafe") != std::wstring::npos ||
+            lowerCmd.find(L"/m ") != std::wstring::npos ||
+            lowerCmd.find(L".docm") != std::wstring::npos ||
+            lowerCmd.find(L".xlsm") != std::wstring::npos ||
+            lowerCmd.find(L".pptm") != std::wstring::npos ||
+            lowerCmd.find(L".xlsb") != std::wstring::npos ||
+            lowerCmd.find(L".xll") != std::wstring::npos;
+
+        if (hasMacroArg) {
+            SS_LOG_WARN(L"MacroDetector",
+                L"Kernel: Office macro-enabled document opened PID=%u cmd=%.*ls",
+                processId,
+                static_cast<int>(std::min(commandLine.size(), size_t(512))),
+                commandLine.data());
+        }
+    }
+}
+
+void MacroDetectorImpl::OnKernelImageLoad(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    uint64_t imageBase,
+    size_t imageSize) {
+
+    if (!m_initialized.load(std::memory_order_acquire)) return;
+
+    const auto lastSep = imagePath.find_last_of(L"\\/");
+    const auto fileName = (lastSep != std::wstring_view::npos)
+        ? imagePath.substr(lastSep + 1) : imagePath;
+    std::wstring lowerName(fileName);
+    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+    // Detect VBA/macro runtime DLLs being loaded
+    const bool isMacroRuntime =
+        lowerName == L"vbe7.dll" ||
+        lowerName == L"vbe6.dll" ||
+        lowerName == L"vbeui.dll" ||
+        lowerName == L"mso.dll" ||
+        lowerName == L"vba7.dll" ||
+        lowerName == L"vba6.dll";
+
+    if (!isMacroRuntime) return;
+
+    SS_LOG_INFO(L"MacroDetector",
+        L"Kernel: Macro runtime loaded PID=%u image=%.*ls base=0x%llX size=%zu",
+        processId,
+        static_cast<int>(std::min(imagePath.size(), size_t(260))),
+        imagePath.data(),
+        imageBase, imageSize);
+}
+
+[[nodiscard]] bool MacroDetectorImpl::RequestKernelProcessBlock(
+    uint32_t processId,
+    const std::wstring& reason) {
+
+    try {
+        if (!Communication::IPCManager::HasInstance()) {
+            SS_LOG_WARN(L"MacroDetector",
+                L"IPCManager not available for kernel block PID=%u", processId);
+            return false;
+        }
+
+        auto& ipc = Communication::IPCManager::Instance();
+
+        struct {
+            uint32_t messageType;
+            uint32_t processId;
+            wchar_t reason[256];
+        } blockRequest{};
+
+        blockRequest.messageType = MacroConstants::KERNEL_MSG_BLOCK_PROCESS;
+        blockRequest.processId = processId;
+        wcsncpy_s(blockRequest.reason, reason.c_str(),
+                   std::min(reason.size(), size_t(255)));
+
+        if (ipc.SendToKernel(&blockRequest, sizeof(blockRequest))) {
+            SS_LOG_INFO(L"MacroDetector",
+                L"Kernel process block requested PID=%u reason=%ls",
+                processId, reason.c_str());
+            return true;
+        }
+
+        SS_LOG_ERROR(L"MacroDetector",
+            L"Failed to send kernel process block PID=%u", processId);
+        return false;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"MacroDetector",
+            L"Kernel process block exception PID=%u: %hs",
+            processId, e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING IMPLEMENTATIONS
+// ============================================================================
+
+void MacroDetectorImpl::ReportThreatToAlertSystem(const MacroScanResult& result) {
+    try {
+        if (!Communication::AlertSystem::HasInstance()) return;
+
+        auto& alerts = Communication::AlertSystem::Instance();
+
+        auto severity = result.isMalicious
+            ? Communication::AlertSeverity::Critical
+            : Communication::AlertSeverity::High;
+
+        std::string subject = "Malicious macro detected";
+        if (!result.detectedFamily.empty()) {
+            subject += " [" + result.detectedFamily + "]";
+        }
+
+        std::string details = result.ToJson();
+
+        (void)alerts.RaiseAlert(severity,
+            Communication::AlertType::ThreatDetection,
+            subject, details, "MacroDetector");
+
+        SS_LOG_INFO(L"MacroDetector",
+            L"Alert raised: %hs (risk=%d)",
+            subject.c_str(), result.riskScore);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"MacroDetector",
+            L"AlertSystem report failed: %hs", e.what());
+    }
+}
+
+void MacroDetectorImpl::ReportScanTelemetry(const MacroScanResult& result) {
+    try {
+        if (!Communication::TelemetryCollector::HasInstance()) return;
+
+        auto& telemetry = Communication::TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> data;
+        data["module"] = "MacroDetector";
+        data["status"] = std::to_string(static_cast<int>(result.status));
+        data["hasMacros"] = result.hasMacros ? "true" : "false";
+        data["isMalicious"] = result.isMalicious ? "true" : "false";
+        data["riskScore"] = std::to_string(result.riskScore);
+        data["format"] = std::string(GetDocumentFormatName(result.format));
+        data["scanDurationUs"] = std::to_string(result.scanDuration.count());
+
+        if (!result.sha256.empty()) {
+            data["sha256"] = result.sha256;
+        }
+        if (!result.detectedFamily.empty()) {
+            data["family"] = result.detectedFamily;
+        }
+        if (!result.threatName.empty()) {
+            data["threatName"] = result.threatName;
+        }
+
+        telemetry.RecordCustom("macro_scan", data);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"MacroDetector",
+            L"Telemetry report failed: %hs", e.what());
+    }
+}
+
+void MacroDetectorImpl::ReportThreatToBehaviorAnalyzer(const MacroScanResult& result) {
+    try {
+        if (!Communication::TelemetryCollector::HasInstance()) return;
+
+        auto& telemetry = Communication::TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> data;
+        data["module"] = "MacroDetector";
+        data["event"] = "macro_threat_behavior";
+        data["category"] = std::string(GetMacroThreatCategoryName(result.category));
+        data["riskScore"] = std::to_string(result.riskScore);
+
+        if (!result.triggerFunctions.empty()) {
+            std::string triggers;
+            for (const auto& fn : result.triggerFunctions) {
+                if (!triggers.empty()) triggers += ",";
+                triggers += fn;
+            }
+            data["triggerFunctions"] = triggers;
+        }
+
+        if (!result.suspiciousAPIs.empty()) {
+            std::string apis;
+            for (const auto& api : result.suspiciousAPIs) {
+                if (!apis.empty()) apis += ",";
+                apis += api;
+            }
+            data["suspiciousAPIs"] = apis;
+        }
+
+        if (!result.extractedIOCs.empty()) {
+            data["iocCount"] = std::to_string(result.extractedIOCs.size());
+        }
+
+        telemetry.RecordCustom("macro_behavior", data);
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"MacroDetector",
+            L"BehaviorAnalyzer report failed: %hs", e.what());
     }
 }
 
@@ -2516,7 +2911,7 @@ void MacroDetector::UnregisterCallbacks() {
     m_impl->UnregisterCallbacks();
 }
 
-[[nodiscard]] MacroStatistics MacroDetector::GetStatistics() const {
+[[nodiscard]] MacroStatisticsSnapshot MacroDetector::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -2536,6 +2931,48 @@ void MacroDetector::ResetStatistics() {
     } catch (...) {
         return "0.0.0";
     }
+}
+
+// ============================================================================
+// KERNEL BRIDGE PUBLIC WRAPPERS
+// ============================================================================
+
+void MacroDetector::OnKernelProcessNotify(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    std::wstring_view commandLine,
+    bool isCreate) {
+    m_impl->OnKernelProcessNotify(processId, imagePath, commandLine, isCreate);
+}
+
+void MacroDetector::OnKernelImageLoad(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    uint64_t imageBase,
+    size_t imageSize) {
+    m_impl->OnKernelImageLoad(processId, imagePath, imageBase, imageSize);
+}
+
+[[nodiscard]] bool MacroDetector::RequestKernelProcessBlock(
+    uint32_t processId,
+    const std::wstring& reason) {
+    return m_impl->RequestKernelProcessBlock(processId, reason);
+}
+
+// ============================================================================
+// CROSS-MODULE WIRING PUBLIC WRAPPERS
+// ============================================================================
+
+void MacroDetector::ReportThreatToAlertSystem(const MacroScanResult& result) {
+    m_impl->ReportThreatToAlertSystem(result);
+}
+
+void MacroDetector::ReportScanTelemetry(const MacroScanResult& result) {
+    m_impl->ReportScanTelemetry(result);
+}
+
+void MacroDetector::ReportThreatToBehaviorAnalyzer(const MacroScanResult& result) {
+    m_impl->ReportThreatToBehaviorAnalyzer(result);
 }
 
 }  // namespace Scripts
