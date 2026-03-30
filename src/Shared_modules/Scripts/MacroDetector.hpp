@@ -87,7 +87,7 @@
  * @note Supports password-protected document detection.
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -164,11 +164,29 @@ namespace Scripts {
 namespace MacroConstants {
 
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     /// @brief Maximum document size (100 MB)
     inline constexpr size_t MAX_DOCUMENT_SIZE = 100 * 1024 * 1024;
+
+    /// @brief Scan cache capacity (LRU entries)
+    inline constexpr size_t SCAN_CACHE_CAPACITY = 2048;
+
+    /// @brief Scan cache TTL (5 minutes)
+    inline constexpr std::chrono::seconds SCAN_CACHE_TTL{300};
+
+    /// @brief Maximum callbacks that can be registered
+    inline constexpr size_t MAX_CALLBACKS = 16;
+
+    /// @brief Maximum template injection findings per document
+    inline constexpr size_t MAX_TEMPLATE_INJECTIONS = 64;
+
+    /// @brief Maximum XLL export names per file
+    inline constexpr size_t MAX_XLL_EXPORTS = 64;
+
+    /// @brief Kernel bridge message type for process block
+    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS = 0x30;
     
     /// @brief Maximum VBA project size
     inline constexpr size_t MAX_VBA_PROJECT_SIZE = 50 * 1024 * 1024;
@@ -614,6 +632,27 @@ struct MacroStatistics {
 };
 
 /**
+ * @brief Copyable statistics snapshot (no atomics — safe for public API return)
+ */
+struct MacroStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t documentsWithMacros = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t suspiciousDetected = 0;
+    uint64_t xlmMacrosDetected = 0;
+    uint64_t vbaMacrosDetected = 0;
+    uint64_t obfuscatedDetected = 0;
+    uint64_t passwordProtected = 0;
+    uint64_t parseErrors = 0;
+    uint64_t totalBytesScanned = 0;
+    std::array<uint64_t, 16> byFormat{};
+    std::array<uint64_t, 16> byCategory{};
+    TimePoint startTime{};
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Configuration
  */
 struct MacroDetectorConfiguration {
@@ -766,11 +805,49 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] MacroStatistics GetStatistics() const;
+    [[nodiscard]] MacroStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    /// @brief Handle kernel process-creation notification to detect Office macro
+    ///        execution at process launch (e.g., WINWORD.EXE with macro args).
+    void OnKernelProcessNotify(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        std::wstring_view commandLine,
+        bool isCreate);
+
+    /// @brief Handle kernel image-load notification to detect Office runtime
+    ///        DLLs being loaded (VBE7.DLL, MSO.DLL, etc.).
+    void OnKernelImageLoad(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        uint64_t imageBase,
+        size_t imageSize);
+
+    /// @brief Request kernel-side process block for a malicious macro host.
+    [[nodiscard]] bool RequestKernelProcessBlock(
+        uint32_t processId,
+        const std::wstring& reason);
+
+    // ========================================================================
+    // CROSS-MODULE WIRING
+    // ========================================================================
+
+    /// @brief Report detected macro threat to AlertSystem.
+    void ReportThreatToAlertSystem(const MacroScanResult& result);
+
+    /// @brief Report scan event to TelemetryCollector.
+    void ReportScanTelemetry(const MacroScanResult& result);
+
+    /// @brief Report macro behavior to BehaviorAnalyzer for correlation.
+    void ReportThreatToBehaviorAnalyzer(const MacroScanResult& result);
 
 private:
     MacroDetector();
