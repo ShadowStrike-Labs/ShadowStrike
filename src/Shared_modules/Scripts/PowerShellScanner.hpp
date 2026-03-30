@@ -37,7 +37,7 @@
  *      Integrates with Windows AMSI, ETW, Script Block Logging, and
  *      kernel driver (PhantomSensor) for process-level enforcement.
  *
- * Version: 4.0.0 Enterprise Edition
+ * Version: 4.1.0 Enterprise Edition
  * Build: 2026.01.28
  * Author: ShadowStrike Advanced Threat Research Team
  * Classification: CONFIDENTIAL - Enterprise Security Infrastructure
@@ -62,6 +62,8 @@
 #include <shared_mutex>
 #include <atomic>
 #include <array>
+#include <unordered_map>
+#include <list>
 #include <cstdint>
 
 #include "../Utils/Logger.hpp"
@@ -114,9 +116,22 @@ namespace Constants {
     }
 }
 
+namespace PSConstants {
+    inline constexpr size_t SCAN_CACHE_CAPACITY       = 4096;
+    inline constexpr std::chrono::seconds SCAN_CACHE_TTL{300};
+    inline constexpr size_t MAX_CALLBACKS              = 16;
+    inline constexpr uint32_t KERNEL_MSG_BLOCK_PROCESS = 0x30;
+}
+
 // ════════════════════════════════════════════════════════════════════════════════
 // ENUMS
 // ════════════════════════════════════════════════════════════════════════════════
+
+#ifdef ERROR_TIMEOUT
+#pragma push_macro("ERROR_TIMEOUT")
+#undef ERROR_TIMEOUT
+#define SHADOWSTRIKE_RESTORE_ERROR_TIMEOUT_
+#endif
 
 enum class ScanStatus {
     CLEAN,
@@ -128,6 +143,11 @@ enum class ScanStatus {
     SKIPPED_WHITELISTED,
     SKIPPED_SIZE_LIMIT
 };
+
+#ifdef SHADOWSTRIKE_RESTORE_ERROR_TIMEOUT_
+#pragma pop_macro("ERROR_TIMEOUT")
+#undef SHADOWSTRIKE_RESTORE_ERROR_TIMEOUT_
+#endif
 
 enum class ObfuscationType {
     NONE,
@@ -221,16 +241,24 @@ struct ScanResult {
     }
 };
 
-struct PowerShellStats {
-    uint64_t totalScans{0};
-    uint64_t maliciousDetected{0};
-    uint64_t suspiciousDetected{0};
-    uint64_t obfuscatedDetected{0};
-    uint64_t amsiBypassesBlocked{0};
-    uint64_t v2DowngradesBlocked{0};
-    uint64_t timeouts{0};
-    uint64_t totalBytesScanned{0};
-    uint64_t averageScanTimeUs{0};
+using Clock = std::chrono::steady_clock;
+using TimePoint = Clock::time_point;
+
+struct PSStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t suspiciousDetected = 0;
+    uint64_t obfuscatedDetected = 0;
+    uint64_t amsiBypassesBlocked = 0;
+    uint64_t v2DowngradesBlocked = 0;
+    uint64_t timeouts = 0;
+    uint64_t totalBytesScanned = 0;
+    uint64_t averageScanTimeUs = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    TimePoint startTime{};
+
+    [[nodiscard]] std::string ToJson() const;
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -271,11 +299,35 @@ public:
 
     void setWhitelistStore(Whitelist::WhitelistStore* store) noexcept;
 
-    [[nodiscard]] PowerShellStats getStats() const;
+    [[nodiscard]] PSStatisticsSnapshot getStats() const;
 
     void resetStats();
 
     [[nodiscard]] bool healthCheck();
+
+    // ── Kernel Bridge ────────────────────────────────────────────────────
+
+    void OnKernelProcessNotify(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        std::wstring_view commandLine,
+        bool isCreate);
+
+    void OnKernelImageLoad(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        uint64_t imageBase,
+        size_t imageSize);
+
+    [[nodiscard]] bool RequestKernelProcessBlock(
+        uint32_t processId,
+        const std::wstring& reason);
+
+    // ── Cross-Module Wiring ──────────────────────────────────────────────
+
+    void ReportThreatToAlertSystem(const ScanResult& result);
+    void ReportScanTelemetry(const ScanResult& result);
+    void ReportThreatToBehaviorAnalyzer(const ScanResult& result);
 
 private:
     class Impl;

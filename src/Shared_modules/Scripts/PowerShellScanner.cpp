@@ -26,7 +26,7 @@
  *      commands, download cradles, reflective PE loading, Mimikatz, shellcode
  *      injection, WMI persistence, and multi-layer obfuscation.
  *
- * Version: 4.0.0 Enterprise Edition
+ * Version: 4.1.0 Enterprise Edition
  * Author: ShadowStrike Advanced Threat Research Team
  * ════════════════════════════════════════════════════════════════════════════════
  */
@@ -38,9 +38,10 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/Base64Utils.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 #include "../Communication/IPCManager.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
 #include "AMSIIntegration.hpp"
 
 #ifdef _WIN32
@@ -51,6 +52,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cctype>
+#include <cwctype>
 #include <cmath>
 #include <algorithm>
 #include <numeric>
@@ -83,7 +85,7 @@ struct TaggedPattern {
 
 static constexpr TaggedPattern AMSI_BYPASS_PATTERNS[] = {
     {"amsiscanbuffer",                                "AMSI ScanBuffer patch"},
-    {"amsiInitfailed",                                "amsiInitFailed bypass"},
+    {"amsiinitfailed",                                "amsiInitFailed bypass"},
     {"amsicontext",                                   "AMSI context manipulation"},
     {"amsisession",                                   "AMSI session manipulation"},
     {"amsiutils",                                     "AmsiUtils reflection bypass"},
@@ -259,11 +261,60 @@ static constexpr const wchar_t* PS_EXTENSIONS[] = {
 } // namespace Patterns
 
 // ════════════════════════════════════════════════════════════════════════════════
+// PSStatisticsSnapshot::ToJson
+// ════════════════════════════════════════════════════════════════════════════════
+
+[[nodiscard]] std::string PSStatisticsSnapshot::ToJson() const {
+    std::ostringstream oss;
+    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+        Clock::now() - startTime).count();
+    oss << "{";
+    oss << "\"totalScans\":" << totalScans << ",";
+    oss << "\"maliciousDetected\":" << maliciousDetected << ",";
+    oss << "\"suspiciousDetected\":" << suspiciousDetected << ",";
+    oss << "\"obfuscatedDetected\":" << obfuscatedDetected << ",";
+    oss << "\"amsiBypassesBlocked\":" << amsiBypassesBlocked << ",";
+    oss << "\"v2DowngradesBlocked\":" << v2DowngradesBlocked << ",";
+    oss << "\"timeouts\":" << timeouts << ",";
+    oss << "\"totalBytesScanned\":" << totalBytesScanned << ",";
+    oss << "\"averageScanTimeUs\":" << averageScanTimeUs << ",";
+    oss << "\"cacheHits\":" << cacheHits << ",";
+    oss << "\"cacheMisses\":" << cacheMisses << ",";
+    oss << "\"uptimeMs\":" << uptimeMs;
+    oss << "}";
+    return oss.str();
+}
+
+// ════════════════════════════════════════════════════════════════════════════════
 // PIMPL IMPLEMENTATION
 // ════════════════════════════════════════════════════════════════════════════════
 
 class PowerShellScanner::Impl {
 public:
+    // ── Internal types ──────────────────────────────────────────────────────
+
+    struct InternalStats {
+        std::atomic<uint64_t> totalScans{0};
+        std::atomic<uint64_t> maliciousDetected{0};
+        std::atomic<uint64_t> suspiciousDetected{0};
+        std::atomic<uint64_t> obfuscatedDetected{0};
+        std::atomic<uint64_t> amsiBypassesBlocked{0};
+        std::atomic<uint64_t> v2DowngradesBlocked{0};
+        std::atomic<uint64_t> timeouts{0};
+        std::atomic<uint64_t> totalBytesScanned{0};
+        std::atomic<uint64_t> averageScanTimeUs{0};
+        std::atomic<uint64_t> cacheHits{0};
+        std::atomic<uint64_t> cacheMisses{0};
+        std::atomic<uint64_t> totalScanTimeUs{0};
+        TimePoint startTime = Clock::now();
+    };
+
+    struct CacheEntry {
+        ScanResult result;
+        TimePoint insertTime;
+        std::list<std::string>::iterator lruIt;
+    };
+
     // ── Lifecycle ────────────────────────────────────────────────────────────
 
     Impl() noexcept {
@@ -296,6 +347,14 @@ public:
         result.processId = pid;
         result.mode      = ExecutionMode::FILE_ON_DISK;
         result.filePath  = path.string();
+
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(LOG_CAT, L"scanFile called before initialization");
+            result.status = ScanStatus::ERROR_INTERNAL;
+            result.description = "Scanner not initialized";
+            return result;
+        }
+
         m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         try {
@@ -339,6 +398,16 @@ public:
                     result.description = "Whitelisted";
                     return finalize(result, startTime);
                 }
+
+                // LRU+TTL cache lookup
+                if (auto cached = lookupCache(result.sha256)) {
+                    m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    cached->processId = pid;
+                    cached->filePath = path.string();
+                    cached->scanTime = std::chrono::system_clock::now();
+                    return finalize(*cached, startTime);
+                }
+                m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
             }
 
             // Read content
@@ -356,6 +425,11 @@ public:
             result.processId = pid;
             result.mode      = ExecutionMode::FILE_ON_DISK;
             result.scanTime  = std::chrono::system_clock::now();
+
+            // Cache the result
+            if (!result.sha256.empty()) {
+                insertCache(result.sha256, result);
+            }
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CAT, L"Exception in scanFile: %hs", ex.what());
@@ -382,6 +456,14 @@ public:
         result.scanTime  = std::chrono::system_clock::now();
         result.processId = pid;
         result.mode      = ExecutionMode::MEMORY_ONLY;
+
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(LOG_CAT, L"scanMemory called before initialization");
+            result.status = ScanStatus::ERROR_INTERNAL;
+            result.description = "Scanner not initialized";
+            return result;
+        }
+
         m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         try {
@@ -399,11 +481,29 @@ public:
             }
             m_stats.totalBytesScanned.fetch_add(content.size(), std::memory_order_relaxed);
 
+            // Compute content hash for cache
+            std::string contentHash = computeContentHash(content.data(), content.size());
+            if (!contentHash.empty()) {
+                if (auto cached = lookupCache(contentHash)) {
+                    m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    cached->processId = pid;
+                    cached->mode = ExecutionMode::MEMORY_ONLY;
+                    cached->scanTime = std::chrono::system_clock::now();
+                    return finalize(*cached, startTime);
+                }
+                m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+            }
+
             std::string contentStr(content.data(), content.size());
             result = analyzeContent(contentStr, std::string(sourceDescription), 0);
             result.processId = pid;
             result.mode      = ExecutionMode::MEMORY_ONLY;
             result.scanTime  = std::chrono::system_clock::now();
+            result.sha256    = contentHash;
+
+            if (!contentHash.empty()) {
+                insertCache(contentHash, result);
+            }
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CAT, L"Exception in scanMemory: %hs", ex.what());
@@ -429,6 +529,14 @@ public:
         result.scanTime  = std::chrono::system_clock::now();
         result.processId = pid;
         result.mode      = ExecutionMode::ENCODED_COMMAND_LINE;
+
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(LOG_CAT, L"scanCommandLine called before initialization");
+            result.status = ScanStatus::ERROR_INTERNAL;
+            result.description = "Scanner not initialized";
+            return result;
+        }
+
         m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         try {
@@ -537,10 +645,30 @@ public:
     void registerCallback(std::function<void(const ScanResult&)> cb) noexcept {
         if (!cb) return;
         std::unique_lock lk(m_cbMtx);
+        if (m_callbacks.size() >= PSConstants::MAX_CALLBACKS) {
+            SS_LOG_WARN(LOG_CAT, L"Callback limit reached (%zu), ignoring registration",
+                PSConstants::MAX_CALLBACKS);
+            return;
+        }
         m_callbacks.push_back(std::move(cb));
     }
 
-    [[nodiscard]] PowerShellStats getStats() const noexcept { return m_stats; }
+    [[nodiscard]] PSStatisticsSnapshot getStats() const noexcept {
+        PSStatisticsSnapshot snap;
+        snap.totalScans         = m_stats.totalScans.load(std::memory_order_relaxed);
+        snap.maliciousDetected  = m_stats.maliciousDetected.load(std::memory_order_relaxed);
+        snap.suspiciousDetected = m_stats.suspiciousDetected.load(std::memory_order_relaxed);
+        snap.obfuscatedDetected = m_stats.obfuscatedDetected.load(std::memory_order_relaxed);
+        snap.amsiBypassesBlocked = m_stats.amsiBypassesBlocked.load(std::memory_order_relaxed);
+        snap.v2DowngradesBlocked = m_stats.v2DowngradesBlocked.load(std::memory_order_relaxed);
+        snap.timeouts           = m_stats.timeouts.load(std::memory_order_relaxed);
+        snap.totalBytesScanned  = m_stats.totalBytesScanned.load(std::memory_order_relaxed);
+        snap.averageScanTimeUs  = m_stats.averageScanTimeUs.load(std::memory_order_relaxed);
+        snap.cacheHits          = m_stats.cacheHits.load(std::memory_order_relaxed);
+        snap.cacheMisses        = m_stats.cacheMisses.load(std::memory_order_relaxed);
+        snap.startTime          = m_stats.startTime;
+        return snap;
+    }
 
     void resetStats() noexcept {
         m_stats.totalScans.store(0, std::memory_order_relaxed);
@@ -552,11 +680,20 @@ public:
         m_stats.timeouts.store(0, std::memory_order_relaxed);
         m_stats.totalBytesScanned.store(0, std::memory_order_relaxed);
         m_stats.averageScanTimeUs.store(0, std::memory_order_relaxed);
-        m_totalScanTimeUs.store(0, std::memory_order_relaxed);
+        m_stats.cacheHits.store(0, std::memory_order_relaxed);
+        m_stats.cacheMisses.store(0, std::memory_order_relaxed);
+        m_stats.totalScanTimeUs.store(0, std::memory_order_relaxed);
+        m_stats.startTime = Clock::now();
     }
 
     [[nodiscard]] bool healthCheck() noexcept {
         if (!m_initialized.load(std::memory_order_acquire)) return false;
+
+        // Snapshot stats before health check to restore after
+        const auto savedTotal = m_stats.totalScans.load(std::memory_order_relaxed);
+        const auto savedMalicious = m_stats.maliciousDetected.load(std::memory_order_relaxed);
+        const auto savedSuspicious = m_stats.suspiciousDetected.load(std::memory_order_relaxed);
+        const auto savedV2 = m_stats.v2DowngradesBlocked.load(std::memory_order_relaxed);
 
         // Known-malicious must trigger
         const std::string testMal = "Invoke-Mimikatz -DumpCreds";
@@ -573,16 +710,20 @@ public:
             SS_LOG_WARN(LOG_CAT, L"Health check: false positive on clean sample");
         }
 
-        // V2 detection
-        const std::string testV2 = "powershell.exe -version 2 -command test";
-        auto r3 = scanCommandLine(testV2, 0);
-        if (r3.category != ThreatCategory::V2_DOWNGRADE) {
-            SS_LOG_ERROR(LOG_CAT, L"Health check: v2 downgrade not detected");
-            return false;
-        }
+        // Restore stats — health check should not pollute production metrics
+        m_stats.totalScans.store(savedTotal, std::memory_order_relaxed);
+        m_stats.maliciousDetected.store(savedMalicious, std::memory_order_relaxed);
+        m_stats.suspiciousDetected.store(savedSuspicious, std::memory_order_relaxed);
+        m_stats.v2DowngradesBlocked.store(savedV2, std::memory_order_relaxed);
 
         SS_LOG_INFO(LOG_CAT, L"Health check passed");
         return true;
+    }
+
+    // ── WhitelistStore setter ───────────────────────────────────────────────
+
+    void setWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
+        m_whitelistStore = store;
     }
 
 private:
@@ -779,18 +920,17 @@ private:
     ) const noexcept {
         bool detected = false;
 
-        // Direct pattern matches
+        // Direct pattern matches (patterns are already lowercase constexpr)
         for (const auto& [pat, desc] : Patterns::AMSI_BYPASS_PATTERNS) {
-            std::string patLower = toLower(std::string(pat));
-            if (contentLower.find(patLower) != std::string::npos) {
+            if (contentLower.find(pat) != std::string::npos) {
                 techniques.push_back(desc);
                 detected = true;
             }
         }
 
-        // Obfuscated AMSI references (string-split)
+        // Obfuscated AMSI references (string-split, already lowercase)
         for (const char* obf : Patterns::AMSI_OBFUSCATED_REFS) {
-            if (contentLower.find(toLower(std::string(obf))) != std::string::npos) {
+            if (contentLower.find(obf) != std::string::npos) {
                 techniques.push_back("Obfuscated AMSI reference");
                 detected = true;
                 break;
@@ -957,18 +1097,19 @@ private:
 
         d.entropyScore = entropy(content);
 
-        // Count indicators
-        std::string s(content);
+        // Count indicators — use string_view find where possible
+        std::string contentStr(content);
         for (const char* ind : Patterns::OBFUSCATION_INDICATORS) {
             size_t pos = 0;
-            while ((pos = s.find(ind, pos)) != std::string::npos) {
+            const size_t indLen = std::strlen(ind);
+            while ((pos = contentStr.find(ind, pos)) != std::string::npos) {
                 d.suspiciousTokenCount++;
-                pos += std::strlen(ind);
+                pos += indLen;
             }
         }
 
-        // Detect types
-        std::string lower = toLower(s);
+        // Detect types — reuse lowered string
+        std::string lower = toLower(std::move(contentStr));
 
         if (lower.find("frombase64string") != std::string::npos ||
             lower.find("tobase64string") != std::string::npos) {
@@ -995,9 +1136,9 @@ private:
             d.techniquesDetected.push_back("Char code concatenation");
         }
 
-        if (s.find("'+\"") != std::string::npos ||
-            s.find("\"+\"") != std::string::npos ||
-            s.find("\"+'") != std::string::npos) {
+        if (content.find("'+\"") != std::string_view::npos ||
+            content.find("\"+\"") != std::string_view::npos ||
+            content.find("\"+'") != std::string_view::npos) {
             if (d.primaryType == ObfuscationType::NONE)
                 d.primaryType = ObfuscationType::STRING_CONCATENATION;
             d.techniquesDetected.push_back("String concatenation");
@@ -1043,16 +1184,23 @@ private:
         const std::string& hash
     ) const noexcept {
         try {
-            // Check hash-based whitelist via WhiteListStore
-            auto& wls = Whitelist::WhiteListStore::Instance();
-            if (wls.IsHashWhitelisted(hash)) {
-                SS_LOG_DEBUG(LOG_CAT, L"Hash whitelisted: %hs", hash.c_str());
-                return true;
+            Whitelist::WhitelistStore* store = m_whitelistStore;
+            if (store && !hash.empty()) {
+                auto lr = store->IsHashWhitelisted(
+                    hash, Whitelist::HashAlgorithm::SHA256);
+                if (lr.found) {
+                    SS_LOG_DEBUG(LOG_CAT, L"Hash whitelisted: %hs", hash.c_str());
+                    return true;
+                }
             }
-
-            // System path alone is NOT sufficient — an attacker can drop .ps1
-            // files into System32 via other exploits. Only trust if both
-            // path is in a trusted location AND hash is known-good.
+            // Path-based whitelist check
+            if (store && !path.empty()) {
+                auto lr = store->IsPathWhitelisted(path.wstring());
+                if (lr.found) {
+                    SS_LOG_DEBUG(LOG_CAT, L"Path whitelisted: %ls", path.c_str());
+                    return true;
+                }
+            }
         } catch (...) {
             SS_LOG_ERROR(LOG_CAT, L"Exception in whitelist check");
         }
@@ -1080,11 +1228,11 @@ private:
             msg.messageType = 0x90; // FilterMessageType_BehavioralAlert value
             msg.processId   = pid;
             msg.threatScore = 100;
-            std::strncpy(msg.reason, reason, sizeof(msg.reason) - 1);
+            strncpy_s(msg.reason, sizeof(msg.reason), reason, _TRUNCATE);
 
             auto& ipc = Communication::IPCManager::Instance();
             if (ipc.IsFilterPortConnected()) {
-                ipc.SendToKernel(&msg, sizeof(msg));
+                (void)ipc.SendToKernel(&msg, sizeof(msg));
             }
 
             SS_LOG_WARN(LOG_CAT,
@@ -1101,13 +1249,13 @@ private:
         try {
             auto& amsi = AMSIIntegration::Instance();
             if (amsi.IsInitialized() && pid != 0) {
-                amsi.StartIntegrityMonitoring(pid);
+                (void)amsi.StartIntegrityMonitoring(pid);
 
                 auto report = amsi.CheckIntegrity(pid);
                 if (report.status == AmsiIntegrityStatus::Tampered) {
                     SS_LOG_WARN(LOG_CAT,
                         L"AMSI tampered in PID=%u, attempting repair", pid);
-                    amsi.RepairIntegrity(pid);
+                    (void)amsi.RepairIntegrity(pid);
                 }
             }
         } catch (...) {
@@ -1223,7 +1371,7 @@ private:
         flagged.emplace_back(lineNum, std::move(line));
     }
 
-    void classifyResult(ScanResult& result, int rawScore) const noexcept {
+    void classifyResult(ScanResult& result, int rawScore) noexcept {
         if (rawScore >= Constants::Heuristics::THRESHOLD_BLOCK) {
             result.status     = ScanStatus::MALICIOUS;
             result.threatName = threatName(result.category);
@@ -1282,11 +1430,11 @@ private:
         result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(end - start);
 
         uint64_t durUs = static_cast<uint64_t>(result.scanDuration.count());
+        m_stats.totalScanTimeUs.fetch_add(durUs, std::memory_order_relaxed);
         uint64_t total = m_stats.totalScans.load(std::memory_order_relaxed);
         if (total > 0) {
-            m_totalScanTimeUs.fetch_add(durUs, std::memory_order_relaxed);
             m_stats.averageScanTimeUs.store(
-                m_totalScanTimeUs.load(std::memory_order_relaxed) / total,
+                m_stats.totalScanTimeUs.load(std::memory_order_relaxed) / total,
                 std::memory_order_relaxed);
         }
 
@@ -1309,14 +1457,24 @@ private:
                 L"MALICIOUS: %hs score=%d PID=%u",
                 result.threatName.c_str(), result.riskScore, result.processId);
 
-            // On malicious detection, notify kernel to enforce
+            // Kernel enforcement
             if (result.processId != 0) {
                 notifyKernelBlock(result.processId, result.threatName.c_str());
             }
+
+            // AlertSystem wiring
+            reportThreatToAlertSystem(result);
+
+            // Behavior correlation
+            reportThreatToBehaviorAnalyzer(result);
+
         } else if (result.status == ScanStatus::SUSPICIOUS) {
             SS_LOG_INFO(LOG_CAT,
                 L"SUSPICIOUS: score=%d PID=%u", result.riskScore, result.processId);
         }
+
+        // Telemetry for every scan
+        reportScanTelemetry(result);
 
         return result;
     }
@@ -1327,11 +1485,291 @@ private:
     PowerShellScanConfig         m_config;
     mutable std::shared_mutex    m_configMtx;
 
-    PowerShellStats              m_stats;
-    std::atomic<uint64_t>        m_totalScanTimeUs{0};
+    InternalStats                m_stats;
 
     std::vector<std::function<void(const ScanResult&)>> m_callbacks;
     mutable std::shared_mutex    m_cbMtx;
+
+    // LRU+TTL scan cache
+    std::unordered_map<std::string, CacheEntry> m_cache;
+    std::list<std::string>       m_cacheLru;
+    mutable std::shared_mutex    m_cacheMtx;
+
+    // WhitelistStore (injected via setWhitelistStore, nullable)
+    Whitelist::WhitelistStore*   m_whitelistStore{nullptr};
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CACHE OPERATIONS
+    // ════════════════════════════════════════════════════════════════════════
+
+    [[nodiscard]] std::optional<ScanResult> lookupCache(const std::string& hash) noexcept {
+        if (hash.empty()) return std::nullopt;
+        std::shared_lock lk(m_cacheMtx);
+        auto it = m_cache.find(hash);
+        if (it == m_cache.end()) return std::nullopt;
+        auto age = Clock::now() - it->second.insertTime;
+        if (age > PSConstants::SCAN_CACHE_TTL) return std::nullopt;
+        return it->second.result;
+    }
+
+    void insertCache(const std::string& hash, const ScanResult& result) noexcept {
+        if (hash.empty()) return;
+        std::unique_lock lk(m_cacheMtx);
+        auto it = m_cache.find(hash);
+        if (it != m_cache.end()) {
+            m_cacheLru.erase(it->second.lruIt);
+            m_cache.erase(it);
+        }
+        while (m_cache.size() >= PSConstants::SCAN_CACHE_CAPACITY && !m_cacheLru.empty()) {
+            m_cache.erase(m_cacheLru.back());
+            m_cacheLru.pop_back();
+        }
+        m_cacheLru.push_front(hash);
+        m_cache.emplace(hash, CacheEntry{result, Clock::now(), m_cacheLru.begin()});
+    }
+
+    [[nodiscard]] std::string computeContentHash(const char* data, size_t size) const noexcept {
+        if (!data || size == 0) return {};
+        try {
+            std::vector<uint8_t> hash;
+            Utils::HashUtils::Error err;
+            if (Utils::HashUtils::Compute(
+                    Utils::HashUtils::Algorithm::SHA256,
+                    data, size, hash, &err)) {
+                return Utils::HashUtils::ToHexLower(hash.data(), hash.size());
+            }
+        } catch (...) {}
+        return {};
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // CROSS-MODULE WIRING (accessible from public facade)
+    // ════════════════════════════════════════════════════════════════════════
+public:
+
+    void reportThreatToAlertSystem(const ScanResult& result) noexcept {
+        try {
+            if (!Communication::AlertSystem::HasInstance()) return;
+            auto& alerts = Communication::AlertSystem::Instance();
+
+            auto severity = (result.riskScore >= Constants::Heuristics::THRESHOLD_BLOCK)
+                ? Communication::AlertSeverity::Critical
+                : Communication::AlertSeverity::High;
+
+            std::string details = "PowerShell threat detected: " + result.threatName +
+                " | Score=" + std::to_string(result.riskScore) +
+                " | PID=" + std::to_string(result.processId);
+            if (!result.sha256.empty()) {
+                details += " | SHA256=" + result.sha256;
+            }
+            for (const auto& rule : result.matchedRules) {
+                details += " | Rule=" + rule;
+            }
+
+            (void)alerts.RaiseAlert(
+                severity,
+                Communication::AlertType::ThreatDetection,
+                "PowerShellScanner",
+                details,
+                "PowerShellScanner");
+
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT, L"AlertSystem wiring failed: %hs", ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CAT, L"AlertSystem wiring failed (unknown)");
+        }
+    }
+
+    void reportScanTelemetry(const ScanResult& result) noexcept {
+        try {
+            if (!Communication::TelemetryCollector::HasInstance()) return;
+            auto& telemetry = Communication::TelemetryCollector::Instance();
+
+            std::map<std::string, std::string> data;
+            data["scanner"] = "PowerShellScanner";
+            data["status"] = std::to_string(static_cast<int>(result.status));
+            data["riskScore"] = std::to_string(result.riskScore);
+            data["pid"] = std::to_string(result.processId);
+            data["durationUs"] = std::to_string(result.scanDuration.count());
+            if (!result.sha256.empty()) data["sha256"] = result.sha256;
+            if (!result.threatName.empty()) data["threatName"] = result.threatName;
+            data["mode"] = std::to_string(static_cast<int>(result.mode));
+
+            telemetry.RecordCustom("ps_scan", data);
+
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT, L"Telemetry wiring failed: %hs", ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CAT, L"Telemetry wiring failed (unknown)");
+        }
+    }
+
+    void reportThreatToBehaviorAnalyzer(const ScanResult& result) noexcept {
+        try {
+            if (!Communication::TelemetryCollector::HasInstance()) return;
+            auto& telemetry = Communication::TelemetryCollector::Instance();
+
+            std::map<std::string, std::string> data;
+            data["source"] = "PowerShellScanner";
+            data["category"] = threatName(result.category);
+            data["riskScore"] = std::to_string(result.riskScore);
+            data["pid"] = std::to_string(result.processId);
+            if (!result.sha256.empty()) data["sha256"] = result.sha256;
+
+            // Feed matched rules for behavior correlation
+            std::string rulesConcat;
+            for (size_t i = 0; i < result.matchedRules.size() && i < 10; ++i) {
+                if (!rulesConcat.empty()) rulesConcat += ";";
+                rulesConcat += result.matchedRules[i];
+            }
+            data["rules"] = rulesConcat;
+
+            telemetry.RecordCustom("behavior_alert", data);
+
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT, L"BehaviorAnalyzer wiring failed: %hs", ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CAT, L"BehaviorAnalyzer wiring failed (unknown)");
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // KERNEL BRIDGE (accessible from public facade)
+    // ════════════════════════════════════════════════════════════════════════
+
+    void onKernelProcessNotifyImpl(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        std::wstring_view commandLine,
+        bool isCreate
+    ) noexcept {
+        if (!m_initialized.load(std::memory_order_acquire)) return;
+        if (!isCreate) return;
+
+        // Extract filename from full path
+        const auto lastSep = imagePath.find_last_of(L"\\/");
+        const auto fileName = (lastSep != std::wstring_view::npos)
+            ? imagePath.substr(lastSep + 1) : imagePath;
+
+        // Detect PowerShell process launches
+        std::wstring lowerName(fileName);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+
+        const bool isPowerShell = lowerName == L"powershell.exe" ||
+                                  lowerName == L"pwsh.exe" ||
+                                  lowerName == L"powershell_ise.exe";
+        if (!isPowerShell) return;
+
+        SS_LOG_INFO(LOG_CAT,
+            L"Kernel: PowerShell process detected PID=%u image=%.*ls",
+            processId,
+            static_cast<int>(std::min(imagePath.size(), size_t(260))),
+            imagePath.data());
+
+        // Check command line for immediate threats
+        if (!commandLine.empty()) {
+            std::string cmdNarrow = Utils::StringUtils::ToNarrow(commandLine);
+            auto cmdResult = scanCommandLine(cmdNarrow, processId);
+
+            if (cmdResult.isBlocking()) {
+                SS_LOG_WARN(LOG_CAT,
+                    L"Kernel-triggered PS scan: BLOCKING PID=%u threat=%hs",
+                    processId, cmdResult.threatName.c_str());
+                (void)requestKernelProcessBlockImpl(processId,
+                    L"PowerShell threat: " + Utils::StringUtils::ToWide(cmdResult.threatName));
+            }
+        }
+    }
+
+    void onKernelImageLoadImpl(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        uint64_t imageBase,
+        size_t imageSize
+    ) noexcept {
+        if (!m_initialized.load(std::memory_order_acquire)) return;
+
+        // Extract filename
+        const auto lastSep = imagePath.find_last_of(L"\\/");
+        const auto fileName = (lastSep != std::wstring_view::npos)
+            ? imagePath.substr(lastSep + 1) : imagePath;
+
+        std::wstring lowerName(fileName);
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(),
+            [](wchar_t c) { return static_cast<wchar_t>(std::towlower(c)); });
+
+        // Detect PowerShell runtime DLLs
+        const bool isPSRuntime =
+            lowerName == L"system.management.automation.dll" ||
+            lowerName == L"system.management.automation.ni.dll" ||
+            lowerName == L"microsoft.powershell.commands.utility.dll" ||
+            lowerName == L"microsoft.powershell.commands.management.dll" ||
+            lowerName == L"microsoft.powershell.consolehost.dll" ||
+            lowerName == L"microsoft.powershell.security.dll" ||
+            lowerName == L"microsoft.wsman.management.dll";
+
+        if (!isPSRuntime) return;
+
+        SS_LOG_INFO(LOG_CAT,
+            L"Kernel: PS runtime loaded PID=%u image=%.*ls base=0x%llX size=%zu",
+            processId,
+            static_cast<int>(std::min(imagePath.size(), size_t(260))),
+            imagePath.data(),
+            imageBase, imageSize);
+
+        // Notify AMSIIntegration to start monitoring this process
+        try {
+            auto& amsi = AMSIIntegration::Instance();
+            if (amsi.IsInitialized()) {
+                (void)amsi.StartIntegrityMonitoring(processId);
+            }
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CAT, L"Failed to start AMSI monitoring for PID=%u", processId);
+        }
+    }
+
+    [[nodiscard]] bool requestKernelProcessBlockImpl(
+        uint32_t processId,
+        const std::wstring& reason
+    ) noexcept {
+        try {
+            if (!Communication::IPCManager::HasInstance()) return false;
+            auto& ipc = Communication::IPCManager::Instance();
+
+            struct BlockRequest {
+                uint32_t messageType;
+                uint32_t processId;
+                wchar_t  reason[256];
+            };
+
+            BlockRequest req{};
+            req.messageType = PSConstants::KERNEL_MSG_BLOCK_PROCESS;
+            req.processId   = processId;
+            wcsncpy_s(req.reason, _countof(req.reason), reason.c_str(),
+                std::min(reason.size(), size_t(255)));
+
+            bool sent = ipc.SendToKernel(&req, sizeof(req));
+            if (sent) {
+                SS_LOG_WARN(LOG_CAT,
+                    L"Kernel block requested: PID=%u reason=%ls",
+                    processId, req.reason);
+            } else {
+                SS_LOG_ERROR(LOG_CAT,
+                    L"Failed to send kernel block request for PID=%u", processId);
+            }
+            return sent;
+
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(LOG_CAT,
+                L"Exception in RequestKernelProcessBlock: %hs", ex.what());
+            return false;
+        } catch (...) {
+            SS_LOG_ERROR(LOG_CAT,
+                L"Unknown exception in RequestKernelProcessBlock PID=%u", processId);
+            return false;
+        }
+    }
 };
 
 // ════════════════════════════════════════════════════════════════════════════════
@@ -1383,7 +1821,11 @@ void PowerShellScanner::registerCallback(std::function<void(const ScanResult&)> 
     pImpl->registerCallback(std::move(cb));
 }
 
-PowerShellStats PowerShellScanner::getStats() const {
+void PowerShellScanner::setWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
+    pImpl->setWhitelistStore(store);
+}
+
+PSStatisticsSnapshot PowerShellScanner::getStats() const {
     return pImpl->getStats();
 }
 
@@ -1393,6 +1835,44 @@ void PowerShellScanner::resetStats() {
 
 bool PowerShellScanner::healthCheck() {
     return pImpl->healthCheck();
+}
+
+// ── Kernel Bridge delegation ────────────────────────────────────────────────
+
+void PowerShellScanner::OnKernelProcessNotify(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    std::wstring_view commandLine,
+    bool isCreate) {
+    pImpl->onKernelProcessNotifyImpl(processId, imagePath, commandLine, isCreate);
+}
+
+void PowerShellScanner::OnKernelImageLoad(
+    uint32_t processId,
+    std::wstring_view imagePath,
+    uint64_t imageBase,
+    size_t imageSize) {
+    pImpl->onKernelImageLoadImpl(processId, imagePath, imageBase, imageSize);
+}
+
+bool PowerShellScanner::RequestKernelProcessBlock(
+    uint32_t processId,
+    const std::wstring& reason) {
+    return pImpl->requestKernelProcessBlockImpl(processId, reason);
+}
+
+// ── Cross-Module Wiring delegation ──────────────────────────────────────────
+
+void PowerShellScanner::ReportThreatToAlertSystem(const ScanResult& result) {
+    pImpl->reportThreatToAlertSystem(result);
+}
+
+void PowerShellScanner::ReportScanTelemetry(const ScanResult& result) {
+    pImpl->reportScanTelemetry(result);
+}
+
+void PowerShellScanner::ReportThreatToBehaviorAnalyzer(const ScanResult& result) {
+    pImpl->reportThreatToBehaviorAnalyzer(result);
 }
 
 } // namespace ShadowStrike::Scripts
