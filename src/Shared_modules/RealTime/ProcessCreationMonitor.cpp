@@ -39,6 +39,7 @@
 #include "../Core/Engine/ScanEngine.hpp"
 #include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/BehaviorAnalyzer.hpp"
+#include "../Security/DigitalSignatureValidator.hpp"
 
 #include <algorithm>
 #include <regex>
@@ -438,15 +439,51 @@ struct ProcessCreationMonitor::Impl {
     ProcessVerdict PerformScan(const ProcessCreateEvent& event) {
         stats.scansPerformed++;
 
-        // Use infrastructure ScanEngine
+        // ================================================================
+        // DIGITAL SIGNATURE VALIDATION (Pre-Execution Gate)
+        // ================================================================
+        // Validate the process image signature before allowing execution.
+        // Blocks stolen certificates, revoked certs, and high-risk anomalies.
+        try {
+            auto& dsv = Security::DigitalSignatureValidator::Instance();
+            auto sigAnalysis = dsv.ValidateProcessImage(
+                event.processId, event.parentProcessId, event.imagePath);
+
+            // Stolen cert or critical risk → block immediately
+            if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
+                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                    L"BLOCKED process with APT signature: PID=%u Path=%ls riskScore=%u",
+                    event.processId, event.imagePath.c_str(), sigAnalysis.riskScore);
+                return ProcessVerdict::Block;
+            }
+
+            // Revoked certificate → block
+            if (sigAnalysis.signatureInfo.result ==
+                Security::SignatureResult::Revoked) {
+                SS_LOG_WARN(L"ProcessCreationMonitor",
+                    L"BLOCKED process with revoked certificate: PID=%u Path=%ls",
+                    event.processId, event.imagePath.c_str());
+                return ProcessVerdict::Block;
+            }
+
+            // Valid trusted signature with no anomalies → allow (skip heavy scan)
+            if (sigAnalysis.signatureInfo.isValid &&
+                sigAnalysis.signatureInfo.isMicrosoftSigned &&
+                sigAnalysis.riskScore == 0) {
+                return ProcessVerdict::Allow;
+            }
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"DSV exception in pre-exec gate PID=%u: %hs",
+                event.processId, ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"DSV unknown exception in pre-exec gate PID=%u",
+                event.processId);
+        }
+
+        // Fall through to ScanEngine for content-based analysis
         if (!scanEngine) return ProcessVerdict::Allow;
-
-        // Note: ScanEngine::ScanFile should be synchronous or we wait
-        // In a real kernel callback scenario, we must be fast.
-        // Here we simulate a quick scan or cache lookup.
-
-        // auto result = scanEngine->ScanFile(event.imagePath);
-        // if (result.verdict == Engine::Verdict::Malware) return ProcessVerdict::Block;
 
         return ProcessVerdict::Allow;
     }

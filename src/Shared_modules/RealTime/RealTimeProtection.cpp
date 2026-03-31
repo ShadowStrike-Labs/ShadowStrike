@@ -88,6 +88,7 @@
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
+#include "../Security/DigitalSignatureValidator.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -1917,6 +1918,67 @@ public:
         }
 
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
+
+        // ================================================================
+        // DIGITAL SIGNATURE VALIDATION (APT Hunting Gate)
+        // ================================================================
+        // Run full signature analysis + stolen cert detection + anomaly engine
+        // BEFORE packer detection for faster verdicts on known-bad certs.
+        try {
+            auto& dsv = Security::DigitalSignatureValidator::Instance();
+            auto sigAnalysis = dsv.OnKernelImageLoad(
+                req.processId, imagePath,
+                req.imageBase, req.imageSize,
+                req.signatureLevel, static_cast<bool>(req.isSystemModule));
+
+            // Stolen certificate or critical anomaly → immediate block
+            if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
+                Utils::Logger::Error(
+                    L"RealTimeProtection: BLOCKED APT-signed module in PID {}: {} "
+                    L"[stolenCert={} riskScore={} anomalies={}]",
+                    req.processId, imagePath.substr(0, 120),
+                    sigAnalysis.isStolenCert ? L"YES" : L"NO",
+                    sigAnalysis.riskScore,
+                    sigAnalysis.anomalies.size());
+
+                if (Communication::TelemetryCollector::HasInstance()) {
+                    Communication::DetectionEventData detection;
+                    detection.threatName = sigAnalysis.isStolenCert
+                        ? ("APT.StolenCert." + sigAnalysis.threatActorName)
+                        : "APT.SignatureAnomaly";
+                    detection.threatType = "APT";
+                    detection.detectionMethod = "DigitalSignatureValidator";
+                    detection.actionTaken = "Blocked";
+                    detection.filePath = Utils::StringUtils::ToNarrow(imagePath);
+                    Communication::TelemetryCollector::Instance().ReportDetection(detection);
+                }
+
+                return Communication::KernelVerdict::Block;
+            }
+
+            // High-risk anomalies (but not critical) → log and flag for deeper scan
+            if (sigAnalysis.riskScore >= 60) {
+                Utils::Logger::Warn(
+                    L"RealTimeProtection: High-risk signature on module in PID {}: {} "
+                    L"[riskScore={} anomalies={}]",
+                    req.processId, imagePath.substr(0, 120),
+                    sigAnalysis.riskScore, sigAnalysis.anomalies.size());
+            }
+
+            // Valid Microsoft/EV signature with no anomalies → fast-path allow
+            if (sigAnalysis.signatureInfo.isMicrosoftSigned &&
+                sigAnalysis.riskScore == 0 && sigAnalysis.anomalies.empty()) {
+                return Communication::KernelVerdict::Allow;
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(
+                L"RealTimeProtection: DSV exception on image load PID {}: {}",
+                req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+        } catch (...) {
+            Utils::Logger::Error(
+                L"RealTimeProtection: DSV unknown exception on image load PID {}",
+                req.processId);
+        }
 
         // System modules are trusted — skip analysis
         if (req.isSystemModule) {

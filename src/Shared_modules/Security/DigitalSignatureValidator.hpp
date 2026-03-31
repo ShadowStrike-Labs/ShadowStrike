@@ -370,6 +370,10 @@ inline constexpr ValidationFlags operator&(ValidationFlags a, ValidationFlags b)
     return static_cast<ValidationFlags>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
+inline constexpr ValidationFlags operator~(ValidationFlags a) noexcept {
+    return static_cast<ValidationFlags>(~static_cast<uint32_t>(a));
+}
+
 /**
  * @brief File type for signature verification
  */
