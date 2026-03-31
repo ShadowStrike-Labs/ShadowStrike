@@ -118,7 +118,6 @@
 #include <unordered_set>
 #include <set>
 #include <optional>
-#include <variant>
 #include <memory>
 #include <functional>
 #include <chrono>
@@ -126,10 +125,6 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
-#include <future>
-#include <span>
-#include <bitset>
-#include <any>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -748,54 +743,25 @@ struct RegistryProtectionEvent {
 };
 
 /**
- * @brief Registry protection statistics
+ * @brief Registry protection statistics snapshot (plain copyable struct).
+ *
+ * Internal tracking uses std::atomic; this struct is a point-in-time
+ * snapshot returned by GetStatistics() so callers get a safe, copyable value.
  */
 struct RegistryProtectionStatistics {
-    /// @brief Total protected keys
-    std::atomic<uint64_t> totalProtectedKeys{0};
-    
-    /// @brief Total protected values
-    std::atomic<uint64_t> totalProtectedValues{0};
-    
-    /// @brief Total operations processed
-    std::atomic<uint64_t> totalOperations{0};
-    
-    /// @brief Total operations blocked
-    std::atomic<uint64_t> totalBlocked{0};
-    
-    /// @brief Total rollbacks performed
-    std::atomic<uint64_t> totalRollbacks{0};
-    
-    /// @brief Total integrity checks
-    std::atomic<uint64_t> totalIntegrityChecks{0};
-    
-    /// @brief Integrity violations
-    std::atomic<uint64_t> integrityViolations{0};
-    
-    /// @brief Snapshots created
-    std::atomic<uint64_t> snapshotsCreated{0};
-    
-    /// @brief Snapshots restored
-    std::atomic<uint64_t> snapshotsRestored{0};
-    
-    /// @brief Start time
-    TimePoint startTime = Clock::now();
-    
-    /// @brief Last event time
+    uint64_t totalProtectedKeys   = 0;
+    uint64_t totalProtectedValues = 0;
+    uint64_t totalOperations      = 0;
+    uint64_t totalBlocked         = 0;
+    uint64_t totalRollbacks       = 0;
+    uint64_t totalIntegrityChecks = 0;
+    uint64_t integrityViolations  = 0;
+    uint64_t snapshotsCreated     = 0;
+    uint64_t snapshotsRestored    = 0;
+
+    TimePoint startTime  = Clock::now();
     TimePoint lastEventTime;
 
-    RegistryProtectionStatistics() = default;
-    ~RegistryProtectionStatistics() = default;
-
-    /// Explicit copy to load atomics safely
-    RegistryProtectionStatistics(const RegistryProtectionStatistics& other) noexcept;
-    RegistryProtectionStatistics& operator=(const RegistryProtectionStatistics& other) noexcept;
-    
-    /**
-     * @brief Reset statistics
-     */
-    void Reset() noexcept;
-    
     /**
      * @brief Serialize to JSON
      */

@@ -194,7 +194,7 @@ namespace ProcessProtectionConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -444,8 +444,9 @@ inline constexpr ThreatResponse operator~(ThreatResponse a) noexcept {
 }
 
 /**
- * @brief Module status
+ * @brief Module status (guarded to prevent ODR redefinition across Security headers)
  */
+__if_not_exists(ModuleStatus) {
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -456,6 +457,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+}
 
 // ============================================================================
 // STRUCTURES
@@ -745,87 +747,59 @@ struct BlockedAccessEvent {
 };
 
 /**
- * @brief Process protection statistics
+ * @brief Process protection statistics — plain snapshot (thread-safe copies)
+ * 
+ * Internal PIMPL uses std::atomic<uint64_t>; this struct holds a plain snapshot
+ * for public API consumption. Trivially copyable / movable.
  */
 struct ProcessProtectionStatistics {
     /// @brief Total protected processes
-    std::atomic<uint64_t> totalProtectedProcesses{0};
+    uint64_t totalProtectedProcesses = 0;
     
     /// @brief Total protected threads
-    std::atomic<uint64_t> totalProtectedThreads{0};
+    uint64_t totalProtectedThreads = 0;
     
     /// @brief Total access requests processed
-    std::atomic<uint64_t> totalAccessRequests{0};
+    uint64_t totalAccessRequests = 0;
     
     /// @brief Total access blocked
-    std::atomic<uint64_t> totalAccessBlocked{0};
+    uint64_t totalAccessBlocked = 0;
     
     /// @brief Total access reduced
-    std::atomic<uint64_t> totalAccessReduced{0};
+    uint64_t totalAccessReduced = 0;
     
     /// @brief Process termination blocked
-    std::atomic<uint64_t> processTerminationBlocked{0};
+    uint64_t processTerminationBlocked = 0;
     
     /// @brief Thread termination blocked
-    std::atomic<uint64_t> threadTerminationBlocked{0};
+    uint64_t threadTerminationBlocked = 0;
     
     /// @brief Memory write blocked
-    std::atomic<uint64_t> memoryWriteBlocked{0};
+    uint64_t memoryWriteBlocked = 0;
     
     /// @brief Thread creation blocked
-    std::atomic<uint64_t> threadCreationBlocked{0};
+    uint64_t threadCreationBlocked = 0;
     
     /// @brief APC injection blocked
-    std::atomic<uint64_t> apcInjectionBlocked{0};
+    uint64_t apcInjectionBlocked = 0;
     
     /// @brief Handle duplication blocked
-    std::atomic<uint64_t> handleDuplicationBlocked{0};
+    uint64_t handleDuplicationBlocked = 0;
+
+    /// @brief Suspension attempts blocked
+    uint64_t suspensionBlocked = 0;
+
+    /// @brief Kernel handle operations reported
+    uint64_t kernelHandleOperations = 0;
+
+    /// @brief Alerts raised to AlertSystem
+    uint64_t alertsRaised = 0;
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
     
     /// @brief Last event time
     TimePoint lastEventTime;
-
-    /// @brief Default constructor
-    ProcessProtectionStatistics() noexcept = default;
-
-    /// @brief Copy constructor (loads atomic values)
-    ProcessProtectionStatistics(const ProcessProtectionStatistics& other) noexcept
-        : totalProtectedProcesses(other.totalProtectedProcesses.load(std::memory_order_relaxed))
-        , totalProtectedThreads(other.totalProtectedThreads.load(std::memory_order_relaxed))
-        , totalAccessRequests(other.totalAccessRequests.load(std::memory_order_relaxed))
-        , totalAccessBlocked(other.totalAccessBlocked.load(std::memory_order_relaxed))
-        , totalAccessReduced(other.totalAccessReduced.load(std::memory_order_relaxed))
-        , processTerminationBlocked(other.processTerminationBlocked.load(std::memory_order_relaxed))
-        , threadTerminationBlocked(other.threadTerminationBlocked.load(std::memory_order_relaxed))
-        , memoryWriteBlocked(other.memoryWriteBlocked.load(std::memory_order_relaxed))
-        , threadCreationBlocked(other.threadCreationBlocked.load(std::memory_order_relaxed))
-        , apcInjectionBlocked(other.apcInjectionBlocked.load(std::memory_order_relaxed))
-        , handleDuplicationBlocked(other.handleDuplicationBlocked.load(std::memory_order_relaxed))
-        , startTime(other.startTime)
-        , lastEventTime(other.lastEventTime)
-    {}
-
-    /// @brief Copy assignment (loads/stores atomic values)
-    ProcessProtectionStatistics& operator=(const ProcessProtectionStatistics& other) noexcept {
-        if (this != &other) {
-            totalProtectedProcesses.store(other.totalProtectedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            totalProtectedThreads.store(other.totalProtectedThreads.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            totalAccessRequests.store(other.totalAccessRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            totalAccessBlocked.store(other.totalAccessBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            totalAccessReduced.store(other.totalAccessReduced.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            processTerminationBlocked.store(other.processTerminationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            threadTerminationBlocked.store(other.threadTerminationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            memoryWriteBlocked.store(other.memoryWriteBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            threadCreationBlocked.store(other.threadCreationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            apcInjectionBlocked.store(other.apcInjectionBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            handleDuplicationBlocked.store(other.handleDuplicationBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = other.startTime;
-            lastEventTime = other.lastEventTime;
-        }
-        return *this;
-    }
 
     /**
      * @brief Reset statistics
@@ -1242,6 +1216,61 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — PhantomSensor ↔ User-Mode Coordination
+    // ========================================================================
+
+    /**
+     * @brief Process a handle-operation alert received from the kernel driver.
+     *        Called by IPCManager when FilterMessageType_HandleAlert arrives.
+     * @param sourceProcessId   PID that opened / duplicated the handle
+     * @param targetProcessId   PID whose handle was opened
+     * @param requestedAccess   Original access mask
+     * @param grantedAccess     Access mask after kernel stripping
+     * @param suspicionScore    Score computed by kernel's ProcessProtection.c
+     * @param suspiciousFlags   PP_SUSPICIOUS_FLAGS bitmask from kernel
+     */
+    void OnKernelHandleAlert(uint32_t sourceProcessId,
+                             uint32_t targetProcessId,
+                             uint32_t requestedAccess,
+                             uint32_t grantedAccess,
+                             uint32_t suspicionScore,
+                             uint32_t suspiciousFlags);
+
+    /**
+     * @brief Request the kernel driver to elevate this process to PPL.
+     *        Sends a message to PhantomSensor which calls
+     *        PsRegisterElamCertificate / PsSetCreateProcessNotifyRoutineEx.
+     * @return true if kernel acknowledged the request
+     */
+    [[nodiscard]] bool RequestKernelPPLElevation();
+
+    /**
+     * @brief Request the kernel driver to block a process via handle stripping.
+     * @param processId    PID of the process to block
+     * @param reason       Human-readable reason for audit trail
+     * @return true if kernel acknowledged the request
+     */
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  std::string_view reason);
+
+    // ========================================================================
+    // COMMUNICATION WIRING — AlertSystem + TelemetryCollector
+    // ========================================================================
+
+    /**
+     * @brief Raise an alert for a blocked access event.
+     *        Routes through Communication::AlertSystem.
+     */
+    void ReportBlockedAccessAlert(const BlockedAccessEvent& event);
+
+    /**
+     * @brief Record an access-filter decision as a telemetry event.
+     *        Routes through Communication::TelemetryCollector.
+     */
+    void ReportAccessTelemetry(const AccessRequest& request,
+                               const AccessDecisionResult& decision);
 
 private:
     // ========================================================================

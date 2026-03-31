@@ -49,6 +49,15 @@
 #include "ProcessProtection.hpp"
 
 // ============================================================================
+// COMMUNICATION INFRASTRUCTURE INCLUDES
+// ============================================================================
+
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../Utils/StringUtils.hpp"
+
+// ============================================================================
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 
@@ -169,47 +178,17 @@ namespace {
 }
 
 /**
- * @brief Wide to narrow string conversion
+ * @brief Wide to narrow string conversion — delegates to StringUtils
  */
 [[nodiscard]] std::string WideToNarrow(std::wstring_view wide) {
-    if (wide.empty()) return {};
-
-#ifdef _WIN32
-    int size = ::WideCharToMultiByte(CP_UTF8, 0, wide.data(),
-                                      static_cast<int>(wide.size()),
-                                      nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return {};
-
-    std::string result(static_cast<size_t>(size), '\0');
-    ::WideCharToMultiByte(CP_UTF8, 0, wide.data(),
-                          static_cast<int>(wide.size()),
-                          result.data(), size, nullptr, nullptr);
-    return result;
-#else
-    return std::string(wide.begin(), wide.end());
-#endif
+    return Utils::StringUtils::ToNarrow(wide);
 }
 
 /**
- * @brief Narrow to wide string conversion
+ * @brief Narrow to wide string conversion — delegates to StringUtils
  */
 [[nodiscard]] std::wstring NarrowToWide(std::string_view narrow) {
-    if (narrow.empty()) return {};
-
-#ifdef _WIN32
-    int size = ::MultiByteToWideChar(CP_UTF8, 0, narrow.data(),
-                                      static_cast<int>(narrow.size()),
-                                      nullptr, 0);
-    if (size <= 0) return {};
-
-    std::wstring result(static_cast<size_t>(size), L'\0');
-    ::MultiByteToWideChar(CP_UTF8, 0, narrow.data(),
-                          static_cast<int>(narrow.size()),
-                          result.data(), size);
-    return result;
-#else
-    return std::wstring(narrow.begin(), narrow.end());
-#endif
+    return Utils::StringUtils::ToWide(narrow);
 }
 
 /**
@@ -227,12 +206,17 @@ namespace {
 }
 
 /**
- * @brief Constant-time string comparison to prevent timing attacks
+ * @brief Constant-time string comparison to prevent timing attacks.
+ *        XOR-folds the length difference into the result so that a mismatch
+ *        in length does NOT short-circuit (prevents length-oracle).
  */
 [[nodiscard]] bool ConstantTimeCompare(std::string_view a, std::string_view b) noexcept {
-    if (a.size() != b.size()) return false;
-    volatile uint8_t result = 0;
-    for (size_t i = 0; i < a.size(); ++i) {
+    const size_t lenA = a.size();
+    const size_t lenB = b.size();
+    const size_t minLen = (lenA < lenB) ? lenA : lenB;
+
+    volatile uint8_t result = static_cast<uint8_t>(lenA ^ lenB);
+    for (size_t i = 0; i < minLen; ++i) {
         result |= static_cast<uint8_t>(a[i]) ^ static_cast<uint8_t>(b[i]);
     }
     return result == 0;
@@ -365,6 +349,88 @@ namespace {
 } // anonymous namespace
 
 // ============================================================================
+// INTERNAL ATOMIC STATISTICS — thread-safe counters inside PIMPL
+// ============================================================================
+
+/**
+ * @brief Internal atomic statistics. Used exclusively inside ProcessProtectionImpl.
+ *        Public API returns a plain ProcessProtectionStatistics snapshot via Snapshot().
+ */
+struct InternalAtomicStats {
+    std::atomic<uint64_t> totalProtectedProcesses{0};
+    std::atomic<uint64_t> totalProtectedThreads{0};
+    std::atomic<uint64_t> totalAccessRequests{0};
+    std::atomic<uint64_t> totalAccessBlocked{0};
+    std::atomic<uint64_t> totalAccessReduced{0};
+    std::atomic<uint64_t> processTerminationBlocked{0};
+    std::atomic<uint64_t> threadTerminationBlocked{0};
+    std::atomic<uint64_t> memoryWriteBlocked{0};
+    std::atomic<uint64_t> threadCreationBlocked{0};
+    std::atomic<uint64_t> apcInjectionBlocked{0};
+    std::atomic<uint64_t> handleDuplicationBlocked{0};
+    std::atomic<uint64_t> suspensionBlocked{0};
+    std::atomic<uint64_t> kernelHandleOperations{0};
+    std::atomic<uint64_t> alertsRaised{0};
+    TimePoint startTime = Clock::now();
+
+    // lastEventTime stored as ticks (duration since epoch) to allow lock-free atomic access.
+    // Plain TimePoint would cause torn reads/writes when accessed from IPC + monitoring threads.
+    std::atomic<int64_t> lastEventTimeTicks{0};
+
+    void TouchEventTime() noexcept {
+        lastEventTimeTicks.store(
+            Clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
+    }
+
+    [[nodiscard]] TimePoint GetLastEventTime() const noexcept {
+        return TimePoint{Clock::duration{
+            lastEventTimeTicks.load(std::memory_order_relaxed)}};
+    }
+
+    /// @brief Create a plain, copyable snapshot for the public API
+    [[nodiscard]] ProcessProtectionStatistics Snapshot() const noexcept {
+        ProcessProtectionStatistics s;
+        s.totalProtectedProcesses   = totalProtectedProcesses.load(std::memory_order_relaxed);
+        s.totalProtectedThreads     = totalProtectedThreads.load(std::memory_order_relaxed);
+        s.totalAccessRequests       = totalAccessRequests.load(std::memory_order_relaxed);
+        s.totalAccessBlocked        = totalAccessBlocked.load(std::memory_order_relaxed);
+        s.totalAccessReduced        = totalAccessReduced.load(std::memory_order_relaxed);
+        s.processTerminationBlocked = processTerminationBlocked.load(std::memory_order_relaxed);
+        s.threadTerminationBlocked  = threadTerminationBlocked.load(std::memory_order_relaxed);
+        s.memoryWriteBlocked        = memoryWriteBlocked.load(std::memory_order_relaxed);
+        s.threadCreationBlocked     = threadCreationBlocked.load(std::memory_order_relaxed);
+        s.apcInjectionBlocked       = apcInjectionBlocked.load(std::memory_order_relaxed);
+        s.handleDuplicationBlocked  = handleDuplicationBlocked.load(std::memory_order_relaxed);
+        s.suspensionBlocked         = suspensionBlocked.load(std::memory_order_relaxed);
+        s.kernelHandleOperations    = kernelHandleOperations.load(std::memory_order_relaxed);
+        s.alertsRaised              = alertsRaised.load(std::memory_order_relaxed);
+        s.startTime                 = startTime;
+        s.lastEventTime             = GetLastEventTime();
+        return s;
+    }
+
+    void Reset() noexcept {
+        totalProtectedProcesses.store(0, std::memory_order_relaxed);
+        totalProtectedThreads.store(0, std::memory_order_relaxed);
+        totalAccessRequests.store(0, std::memory_order_relaxed);
+        totalAccessBlocked.store(0, std::memory_order_relaxed);
+        totalAccessReduced.store(0, std::memory_order_relaxed);
+        processTerminationBlocked.store(0, std::memory_order_relaxed);
+        threadTerminationBlocked.store(0, std::memory_order_relaxed);
+        memoryWriteBlocked.store(0, std::memory_order_relaxed);
+        threadCreationBlocked.store(0, std::memory_order_relaxed);
+        apcInjectionBlocked.store(0, std::memory_order_relaxed);
+        handleDuplicationBlocked.store(0, std::memory_order_relaxed);
+        suspensionBlocked.store(0, std::memory_order_relaxed);
+        kernelHandleOperations.store(0, std::memory_order_relaxed);
+        alertsRaised.store(0, std::memory_order_relaxed);
+        startTime = Clock::now();
+        lastEventTimeTicks.store(0, std::memory_order_relaxed);
+    }
+};
+
+// ============================================================================
 // PROCESS PROTECTION IMPLEMENTATION CLASS
 // ============================================================================
 
@@ -491,6 +557,18 @@ public:
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] bool VerifyProcessIntegrity(uint32_t processId);
 
+    // ========================================================================
+    // KERNEL BRIDGE + COMMUNICATION WIRING
+    // ========================================================================
+
+    void OnKernelHandleAlert(uint32_t sourceProcessId, uint32_t targetProcessId,
+                             uint32_t requestedAccess, uint32_t grantedAccess,
+                             uint32_t suspicionScore, uint32_t suspiciousFlags);
+    [[nodiscard]] bool RequestKernelPPLElevation();
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId, std::string_view reason);
+    void ReportBlockedAccessAlert(const BlockedAccessEvent& event);
+    void ReportAccessTelemetry(const AccessRequest& request, const AccessDecisionResult& decision);
+
     /// @brief Get the internal auth token for trusted callers
     [[nodiscard]] const std::string& GetInternalAuthToken() const noexcept { return m_internalAuthToken; }
 
@@ -556,8 +634,8 @@ private:
     std::deque<BlockedAccessEvent> m_blockedAccessHistory;
     static constexpr size_t MAX_HISTORY_SIZE = 1000;
 
-    // Statistics
-    ProcessProtectionStatistics m_stats;
+    // Statistics (internal atomic — public API gets plain snapshots via Snapshot())
+    InternalAtomicStats m_stats;
 
     // Callbacks
     std::unordered_map<uint64_t, AccessDecisionCallback> m_accessCallbacks;
@@ -754,11 +832,6 @@ void ProcessProtectionImpl::SetThreatResponse(ThreatAction action, ThreatRespons
 
 bool ProcessProtectionImpl::ElevateToPPL() {
 #ifdef _WIN32
-    // PPL elevation requires:
-    // 1. ELAM (Early Launch Anti-Malware) driver signed by Microsoft
-    // 2. The driver to call PsRegisterElamCertificate during boot
-    // 3. The user-mode process to be started by the ELAM driver
-
     // Check if already PPL protected
     ProtectionLevel level = GetProtectionLevel(GetCurrentProcessIdSafe());
     if (level.IsPPL()) {
@@ -767,11 +840,22 @@ bool ProcessProtectionImpl::ElevateToPPL() {
         return true;
     }
 
-    // User-mode cannot directly elevate to PPL
-    // This would require communication with the kernel driver
-    Utils::Logger::Warn("[ProcessProtection] PPL elevation requires kernel driver support");
+    // User-mode cannot directly elevate to PPL — request via kernel driver
+    if (!RequestKernelPPLElevation()) {
+        Utils::Logger::Warn("[ProcessProtection] PPL elevation requires kernel driver (PhantomSensor) — "
+                            "driver not connected or elevation denied");
+        return false;
+    }
 
-    // For now, return false - actual implementation would communicate with Shadow Sensor driver
+    // Re-query to confirm kernel-side elevation succeeded
+    level = GetProtectionLevel(GetCurrentProcessIdSafe());
+    if (level.IsPPL()) {
+        m_isPPL.store(true, std::memory_order_release);
+        Utils::Logger::Info("[ProcessProtection] Successfully elevated to PPL via PhantomSensor");
+        return true;
+    }
+
+    Utils::Logger::Warn("[ProcessProtection] PPL elevation request acknowledged but not yet effective");
     return false;
 #else
     return false;
@@ -1374,7 +1458,7 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
             m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
         }
         if (dangerousAccess & PROCESS_SUSPEND_RESUME) {
-            // Track suspension attempts too
+            m_stats.suspensionBlocked.fetch_add(1, std::memory_order_relaxed);
         }
         if (dangerousAccess & PROCESS_VM_WRITE) {
             m_stats.memoryWriteBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -1777,8 +1861,7 @@ void ProcessProtectionImpl::UnregisterThreatCallback(uint64_t callbackId) {
 // ============================================================================
 
 ProcessProtectionStatistics ProcessProtectionImpl::GetStatistics() const {
-    std::shared_lock lock(m_mutex);
-    return m_stats;
+    return m_stats.Snapshot();
 }
 
 void ProcessProtectionImpl::ResetStatistics(std::string_view authorizationToken) {
@@ -1826,7 +1909,7 @@ std::string ProcessProtectionImpl::ExportReport() const {
     oss << "  \"isPPL\": " << (m_isPPL.load() ? "true" : "false") << ",\n";
     oss << "  \"protectedProcesses\": " << m_protectedProcesses.size() << ",\n";
     oss << "  \"protectedThreads\": " << m_protectedThreads.size() << ",\n";
-    oss << "  \"statistics\": " << m_stats.ToJson() << "\n";
+    oss << "  \"statistics\": " << m_stats.Snapshot().ToJson() << "\n";
     oss << "}\n";
 
     return oss.str();
@@ -2018,7 +2101,7 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
 
         // Remove dead processes
         for (uint32_t pid : deadProcesses) {
-            UnprotectProcess(pid, m_internalAuthToken);
+            (void)UnprotectProcess(pid, m_internalAuthToken);
             Utils::Logger::Warn("[ProcessProtection] Removed terminated process {} from protection", pid);
         }
 
@@ -2048,6 +2131,11 @@ void ProcessProtectionImpl::MonitoringThreadFunc() {
 }
 
 void ProcessProtectionImpl::NotifyBlockedAccess(const BlockedAccessEvent& event) {
+    // --- Communication wiring: raise alert + record telemetry ---
+    ReportBlockedAccessAlert(event);
+    ReportAccessTelemetry(event.request, event.decision);
+
+    // --- Existing callback dispatch ---
     std::vector<BlockedAccessCallback> callbacks;
     {
         std::lock_guard lock(m_callbackMutex);
@@ -2110,7 +2198,7 @@ void ProcessProtectionImpl::RecordBlockedAccess(const BlockedAccessEvent& event)
         m_blockedAccessHistory.pop_front();
     }
 
-    m_stats.lastEventTime = event.timestamp;
+    m_stats.TouchEventTime();
 }
 
 bool ProcessProtectionImpl::ValidateConfiguration(const ProcessProtectionConfiguration& config) const {
@@ -2575,6 +2663,34 @@ std::string ProcessProtection::GetVersionString() noexcept {
            std::to_string(ProcessProtectionConstants::VERSION_PATCH);
 }
 
+// --- Kernel Bridge public forwarders ---
+
+void ProcessProtection::OnKernelHandleAlert(
+    uint32_t sourceProcessId, uint32_t targetProcessId,
+    uint32_t requestedAccess, uint32_t grantedAccess,
+    uint32_t suspicionScore, uint32_t suspiciousFlags) {
+    m_impl->OnKernelHandleAlert(sourceProcessId, targetProcessId,
+                                requestedAccess, grantedAccess,
+                                suspicionScore, suspiciousFlags);
+}
+
+bool ProcessProtection::RequestKernelPPLElevation() {
+    return m_impl->RequestKernelPPLElevation();
+}
+
+bool ProcessProtection::RequestKernelProcessBlock(uint32_t processId, std::string_view reason) {
+    return m_impl->RequestKernelProcessBlock(processId, reason);
+}
+
+void ProcessProtection::ReportBlockedAccessAlert(const BlockedAccessEvent& event) {
+    m_impl->ReportBlockedAccessAlert(event);
+}
+
+void ProcessProtection::ReportAccessTelemetry(const AccessRequest& request,
+                                               const AccessDecisionResult& decision) {
+    m_impl->ReportAccessTelemetry(request, decision);
+}
+
 // ============================================================================
 // CONFIGURATION METHODS
 // ============================================================================
@@ -2614,32 +2730,41 @@ std::string BlockedAccessEvent::ToJson() const {
 }
 
 void ProcessProtectionStatistics::Reset() noexcept {
-    totalProtectedProcesses.store(0, std::memory_order_relaxed);
-    totalProtectedThreads.store(0, std::memory_order_relaxed);
-    totalAccessRequests.store(0, std::memory_order_relaxed);
-    totalAccessBlocked.store(0, std::memory_order_relaxed);
-    totalAccessReduced.store(0, std::memory_order_relaxed);
-    processTerminationBlocked.store(0, std::memory_order_relaxed);
-    threadTerminationBlocked.store(0, std::memory_order_relaxed);
-    memoryWriteBlocked.store(0, std::memory_order_relaxed);
-    threadCreationBlocked.store(0, std::memory_order_relaxed);
-    apcInjectionBlocked.store(0, std::memory_order_relaxed);
-    handleDuplicationBlocked.store(0, std::memory_order_relaxed);
+    totalProtectedProcesses = 0;
+    totalProtectedThreads = 0;
+    totalAccessRequests = 0;
+    totalAccessBlocked = 0;
+    totalAccessReduced = 0;
+    processTerminationBlocked = 0;
+    threadTerminationBlocked = 0;
+    memoryWriteBlocked = 0;
+    threadCreationBlocked = 0;
+    apcInjectionBlocked = 0;
+    handleDuplicationBlocked = 0;
+    suspensionBlocked = 0;
+    kernelHandleOperations = 0;
+    alertsRaised = 0;
     startTime = Clock::now();
+    lastEventTime = {};
 }
 
 std::string ProcessProtectionStatistics::ToJson() const {
     std::ostringstream oss;
     oss << "{\n";
-    oss << "  \"totalProtectedProcesses\": " << totalProtectedProcesses.load() << ",\n";
-    oss << "  \"totalProtectedThreads\": " << totalProtectedThreads.load() << ",\n";
-    oss << "  \"totalAccessRequests\": " << totalAccessRequests.load() << ",\n";
-    oss << "  \"totalAccessBlocked\": " << totalAccessBlocked.load() << ",\n";
-    oss << "  \"processTerminationBlocked\": " << processTerminationBlocked.load() << ",\n";
-    oss << "  \"threadTerminationBlocked\": " << threadTerminationBlocked.load() << ",\n";
-    oss << "  \"memoryWriteBlocked\": " << memoryWriteBlocked.load() << ",\n";
-    oss << "  \"threadCreationBlocked\": " << threadCreationBlocked.load() << ",\n";
-    oss << "  \"apcInjectionBlocked\": " << apcInjectionBlocked.load() << "\n";
+    oss << "  \"totalProtectedProcesses\": " << totalProtectedProcesses << ",\n";
+    oss << "  \"totalProtectedThreads\": " << totalProtectedThreads << ",\n";
+    oss << "  \"totalAccessRequests\": " << totalAccessRequests << ",\n";
+    oss << "  \"totalAccessBlocked\": " << totalAccessBlocked << ",\n";
+    oss << "  \"totalAccessReduced\": " << totalAccessReduced << ",\n";
+    oss << "  \"processTerminationBlocked\": " << processTerminationBlocked << ",\n";
+    oss << "  \"threadTerminationBlocked\": " << threadTerminationBlocked << ",\n";
+    oss << "  \"memoryWriteBlocked\": " << memoryWriteBlocked << ",\n";
+    oss << "  \"threadCreationBlocked\": " << threadCreationBlocked << ",\n";
+    oss << "  \"apcInjectionBlocked\": " << apcInjectionBlocked << ",\n";
+    oss << "  \"handleDuplicationBlocked\": " << handleDuplicationBlocked << ",\n";
+    oss << "  \"suspensionBlocked\": " << suspensionBlocked << ",\n";
+    oss << "  \"kernelHandleOperations\": " << kernelHandleOperations << ",\n";
+    oss << "  \"alertsRaised\": " << alertsRaised << "\n";
     oss << "}";
     return oss.str();
 }
@@ -2750,6 +2875,229 @@ std::string FormatAccessRights(uint32_t accessRights, bool isThread) {
 }
 
 // ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void ProcessProtectionImpl::OnKernelHandleAlert(
+    uint32_t sourceProcessId,
+    uint32_t targetProcessId,
+    uint32_t requestedAccess,
+    uint32_t grantedAccess,
+    uint32_t suspicionScore,
+    uint32_t suspiciousFlags) {
+
+    m_stats.kernelHandleOperations.fetch_add(1, std::memory_order_relaxed);
+    m_stats.TouchEventTime();
+
+    Utils::Logger::Info("[ProcessProtection] Kernel handle alert: src={} target={} "
+                        "req=0x{:X} granted=0x{:X} score={} flags=0x{:X}",
+                        sourceProcessId, targetProcessId,
+                        requestedAccess, grantedAccess,
+                        suspicionScore, suspiciousFlags);
+
+    // If target is one of our protected processes, route through access filter
+    if (IsProcessProtected(targetProcessId)) {
+        AccessRequest request;
+        request.type = AccessRequestType::ProcessOpen;
+        request.callerProcessId = sourceProcessId;
+        request.targetProcessId = targetProcessId;
+        request.desiredAccess = requestedAccess;
+        request.callerImagePath = GetProcessName(sourceProcessId);
+        request.timestamp = Clock::now();
+
+        auto decision = FilterAccessRequest(request);
+
+        // If kernel already stripped, but user-mode would have blocked further,
+        // raise a high-severity alert for correlated threat hunting
+        if (suspicionScore >= 70 && decision.decision != AccessDecision::Allow) {
+            BlockedAccessEvent event;
+            event.eventId = GenerateEventId();
+            event.request = request;
+            event.decision = decision;
+            event.timestamp = Clock::now();
+            event.threatAction = ClassifyAccessRequest(request);
+
+            ReportBlockedAccessAlert(event);
+        }
+    }
+
+    // Record telemetry for all kernel handle alerts (even for unprotected targets)
+    if (Communication::TelemetryCollector::HasInstance()) {
+        try {
+            auto& telemetry = Communication::TelemetryCollector::Instance();
+            std::map<std::string, std::string> fields;
+            fields["source_pid"] = std::to_string(sourceProcessId);
+            fields["target_pid"] = std::to_string(targetProcessId);
+            fields["requested_access"] = std::format("0x{:X}", requestedAccess);
+            fields["granted_access"] = std::format("0x{:X}", grantedAccess);
+            fields["suspicion_score"] = std::to_string(suspicionScore);
+            fields["suspicious_flags"] = std::format("0x{:X}", suspiciousFlags);
+            telemetry.RecordCustom("ProcessProtection.KernelHandleAlert", fields);
+        } catch (...) {
+            // Telemetry must never disrupt the protection path
+        }
+    }
+}
+
+bool ProcessProtectionImpl::RequestKernelPPLElevation() {
+    if (!Communication::IPCManager::HasInstance()) {
+        Utils::Logger::Warn("[ProcessProtection] IPCManager not available for PPL elevation request");
+        return false;
+    }
+
+    auto& ipc = Communication::IPCManager::Instance();
+    if (!ipc.IsFilterPortConnected()) {
+        Utils::Logger::Warn("[ProcessProtection] Kernel filter port not connected — cannot request PPL");
+        return false;
+    }
+
+    // Message type 0x00BB0001 — PPL elevation request (ProcessProtection ↔ PhantomSensor)
+#pragma pack(push, 1)
+    struct KernelPPLRequest {
+        uint32_t messageType = 0x00BB0001u;
+        uint32_t processId;
+        uint32_t reserved = 0;
+    };
+#pragma pack(pop)
+
+    static_assert(sizeof(KernelPPLRequest) == 12, "KernelPPLRequest must be 12 bytes packed");
+
+    KernelPPLRequest req{};
+    req.processId = GetCurrentProcessIdSafe();
+
+    // Expect a reply: 4-byte NTSTATUS
+    uint32_t replyStatus = 0;
+    size_t replySize = sizeof(replyStatus);
+
+    bool sent = ipc.SendToKernel(&req, sizeof(req), &replyStatus, &replySize, 5000);
+    if (!sent) {
+        Utils::Logger::Error("[ProcessProtection] Failed to send PPL elevation request to kernel");
+        return false;
+    }
+
+    if (replySize >= sizeof(uint32_t) && replyStatus == 0) {
+        Utils::Logger::Info("[ProcessProtection] Kernel acknowledged PPL elevation for PID {}",
+                            req.processId);
+        return true;
+    }
+
+    Utils::Logger::Warn("[ProcessProtection] Kernel denied PPL elevation, NTSTATUS=0x{:X}",
+                         replyStatus);
+    return false;
+}
+
+bool ProcessProtectionImpl::RequestKernelProcessBlock(uint32_t processId, std::string_view reason) {
+    if (!Communication::IPCManager::HasInstance()) {
+        return false;
+    }
+
+    auto& ipc = Communication::IPCManager::Instance();
+    if (!ipc.IsFilterPortConnected()) {
+        return false;
+    }
+
+    // Message type 0x00BB0002 — process block request (ProcessProtection ↔ PhantomSensor)
+#pragma pack(push, 1)
+    struct KernelBlockRequest {
+        uint32_t messageType = 0x00BB0002u;
+        uint32_t processId;
+        uint32_t reasonLen;
+        char reason[256];
+    };
+#pragma pack(pop)
+
+    KernelBlockRequest req{};
+    req.processId = processId;
+    const size_t copyLen = std::min(reason.size(), size_t{255});
+    std::memcpy(req.reason, reason.data(), copyLen);
+    req.reason[copyLen] = '\0';
+    req.reasonLen = static_cast<uint32_t>(copyLen);
+
+    bool sent = ipc.SendToKernel(&req, sizeof(req));
+    if (sent) {
+        Utils::Logger::Info("[ProcessProtection] Requested kernel block for PID {}: {}",
+                            processId, std::string(reason.substr(0, 128)));
+    }
+    return sent;
+}
+
+// ============================================================================
+// COMMUNICATION WIRING IMPLEMENTATIONS
+// ============================================================================
+
+void ProcessProtectionImpl::ReportBlockedAccessAlert(const BlockedAccessEvent& event) {
+    if (!Communication::AlertSystem::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& alerts = Communication::AlertSystem::Instance();
+
+        // Severity: PROCESS_TERMINATE → Critical, injection → High, rest → Medium
+        Communication::AlertSeverity severity = Communication::AlertSeverity::Medium;
+        if (event.decision.strippedAccess & PROCESS_TERMINATE) {
+            severity = Communication::AlertSeverity::Critical;
+        } else if (event.decision.strippedAccess & (PROCESS_VM_WRITE | PROCESS_CREATE_THREAD)) {
+            severity = Communication::AlertSeverity::High;
+        }
+
+        std::string callerName = WideToNarrow(event.request.callerImagePath);
+        if (callerName.empty()) {
+            callerName = std::format("PID:{}", event.request.callerProcessId);
+        }
+
+        std::string summary = std::format(
+            "Process protection: blocked access from {} to PID {} "
+            "(stripped=0x{:X}, threat={})",
+            callerName,
+            event.request.targetProcessId,
+            event.decision.strippedAccess,
+            std::string(GetThreatActionName(event.threatAction)));
+
+        std::string details = event.GetSummary();
+
+        (void)alerts.RaiseAlert(
+            severity,
+            Communication::AlertType::Security,
+            "ProcessProtection",
+            summary,
+            details);
+
+        m_stats.alertsRaised.fetch_add(1, std::memory_order_relaxed);
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("[ProcessProtection] Failed to raise alert: {}", e.what());
+    }
+}
+
+void ProcessProtectionImpl::ReportAccessTelemetry(
+    const AccessRequest& request,
+    const AccessDecisionResult& decision) {
+
+    if (!Communication::TelemetryCollector::HasInstance()) {
+        return;
+    }
+
+    try {
+        auto& telemetry = Communication::TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> fields;
+        fields["caller_pid"] = std::to_string(request.callerProcessId);
+        fields["target_pid"] = std::to_string(request.targetProcessId);
+        fields["caller_name"] = WideToNarrow(request.callerImagePath);
+        fields["request_type"] = std::string(GetAccessRequestTypeName(request.type));
+        fields["desired_access"] = std::format("0x{:X}", request.desiredAccess);
+        fields["granted_access"] = std::format("0x{:X}", decision.grantedAccess);
+        fields["stripped_access"] = std::format("0x{:X}", decision.strippedAccess);
+        fields["decision"] = std::to_string(static_cast<int>(decision.decision));
+        fields["reason"] = decision.reason;
+
+        telemetry.RecordCustom("ProcessProtection.AccessDecision", fields);
+    } catch (...) {
+        // Telemetry must never disrupt the protection path
+    }
+}
+
+// ============================================================================
 // RAII HELPERS
 // ============================================================================
 
@@ -2770,7 +3118,7 @@ ProcessProtectionGuard::~ProcessProtectionGuard() {
 void ProcessProtectionGuard::Release() noexcept {
     if (m_protected && ProcessProtection::HasInstance()) {
         try {
-            ProcessProtection::Instance().UnprotectProcess(m_processId, m_authToken);
+            (void)ProcessProtection::Instance().UnprotectProcess(m_processId, m_authToken);
         } catch (...) {
             // Destructor must not throw
         }
