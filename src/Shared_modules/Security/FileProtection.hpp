@@ -1291,6 +1291,38 @@ public:
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    /**
+     * @brief Synchronize all protected paths and extensions to the kernel
+     *        minifilter FP_ENGINE via the FilterConnection communication port.
+     *
+     * This pushes every currently-registered path/extension rule into the
+     * kernel-mode FileProtection engine so the minifilter's PreCreate and
+     * PreSetInfo callbacks enforce the same protection policy.
+     */
+    void SyncProtectedPathsToKernel();
+
+    /**
+     * @brief Handle a blocked-operation event received from the kernel driver.
+     *        Called by the IPCManager message dispatch loop when
+     *        FilterMessageType_SelfProtectAlert arrives from the minifilter.
+     *
+     * @param data  Raw message payload from kernel.
+     * @param size  Size of the payload in bytes.
+     */
+    void OnKernelBlockEvent(const void* data, uint32_t size);
+
+    /**
+     * @brief Generate a cryptographically secure authorization token
+     *        for use with protected operations (unprotect, baseline update, etc.).
+     *
+     * @return HMAC-SHA256 token string. Empty on failure.
+     */
+    [[nodiscard]] std::string GenerateAuthorizationToken() const;
+
 private:
     // ========================================================================
     // PRIVATE CONSTRUCTOR

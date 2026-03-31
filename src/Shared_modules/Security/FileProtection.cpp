@@ -49,6 +49,9 @@
 #include "pch.h"
 #include "FileProtection.hpp"
 #include "../Utils/PE_sig_verf.hpp"
+#include "../Communication/IPCManager.hpp"
+#include <bcrypt.h>
+#pragma comment(lib, "bcrypt.lib")
 
 // Standard library includes
 #include <algorithm>
@@ -58,6 +61,7 @@
 #include <cctype>
 #include <queue>
 #include <fstream>
+#include <random>
 
 namespace ShadowStrike {
 namespace Security {
@@ -67,6 +71,36 @@ namespace Security {
 // ============================================================================
 
 std::atomic<bool> FileProtection::s_instanceCreated{false};
+
+// ============================================================================
+// JSON ESCAPING HELPER (HIGH-01: prevent log injection via crafted paths)
+// ============================================================================
+
+static std::string JsonEscape(std::string_view input) {
+    std::string result;
+    result.reserve(input.size() + 16);
+    for (char c : input) {
+        switch (c) {
+            case '"':  result += "\\\""; break;
+            case '\\': result += "\\\\"; break;
+            case '\b': result += "\\b";  break;
+            case '\f': result += "\\f";  break;
+            case '\n': result += "\\n";  break;
+            case '\r': result += "\\r";  break;
+            case '\t': result += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                    result += buf;
+                } else {
+                    result += c;
+                }
+                break;
+        }
+    }
+    return result;
+}
 
 // ============================================================================
 // UTILITY FUNCTION IMPLEMENTATIONS
@@ -266,29 +300,15 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
     oss << "\"type\":" << static_cast<uint32_t>(type) << ",";
     oss << "\"timestamp\":" << std::chrono::duration_cast<std::chrono::milliseconds>(
         timestamp.time_since_epoch()).count() << ",";
-    oss << "\"filePath\":\"" << Utils::StringUtils::ToNarrow(filePath) << "\",";
+    oss << "\"filePath\":\"" << JsonEscape(Utils::StringUtils::ToNarrow(filePath)) << "\",";
     oss << "\"operation\":\"" << GetFileOperationName(operation) << "\",";
     oss << "\"decision\":" << static_cast<int>(decision) << ",";
     oss << "\"sourceProcessId\":" << sourceProcessId << ",";
-    oss << "\"sourceProcessName\":\"" << Utils::StringUtils::ToNarrow(sourceProcessName) << "\",";
+    oss << "\"sourceProcessName\":\"" << JsonEscape(Utils::StringUtils::ToNarrow(sourceProcessName)) << "\",";
     oss << "\"wasBlocked\":" << (wasBlocked ? "true" : "false") << ",";
-    oss << "\"description\":\"" << description << "\"";
+    oss << "\"description\":\"" << JsonEscape(description) << "\"";
     oss << "}";
     return oss.str();
-}
-
-void FileProtectionStatistics::Reset() noexcept {
-    totalProtectedFiles.store(0);
-    totalProtectedDirectories.store(0);
-    totalOperations.store(0);
-    totalBlocked.store(0);
-    totalIntegrityChecks.store(0);
-    integrityViolations.store(0);
-    signatureViolations.store(0);
-    ransomwareDetections.store(0);
-    backupsCreated.store(0);
-    filesRestored.store(0);
-    startTime = Clock::now();
 }
 
 [[nodiscard]] std::string FileProtectionStatistics::ToJson() const {
@@ -297,16 +317,16 @@ void FileProtectionStatistics::Reset() noexcept {
 
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalProtectedFiles\":" << totalProtectedFiles.load() << ",";
-    oss << "\"totalProtectedDirectories\":" << totalProtectedDirectories.load() << ",";
-    oss << "\"totalOperations\":" << totalOperations.load() << ",";
-    oss << "\"totalBlocked\":" << totalBlocked.load() << ",";
-    oss << "\"totalIntegrityChecks\":" << totalIntegrityChecks.load() << ",";
-    oss << "\"integrityViolations\":" << integrityViolations.load() << ",";
-    oss << "\"signatureViolations\":" << signatureViolations.load() << ",";
-    oss << "\"ransomwareDetections\":" << ransomwareDetections.load() << ",";
-    oss << "\"backupsCreated\":" << backupsCreated.load() << ",";
-    oss << "\"filesRestored\":" << filesRestored.load() << ",";
+    oss << "\"totalProtectedFiles\":" << totalProtectedFiles << ",";
+    oss << "\"totalProtectedDirectories\":" << totalProtectedDirectories << ",";
+    oss << "\"totalOperations\":" << totalOperations << ",";
+    oss << "\"totalBlocked\":" << totalBlocked << ",";
+    oss << "\"totalIntegrityChecks\":" << totalIntegrityChecks << ",";
+    oss << "\"integrityViolations\":" << integrityViolations << ",";
+    oss << "\"signatureViolations\":" << signatureViolations << ",";
+    oss << "\"ransomwareDetections\":" << ransomwareDetections << ",";
+    oss << "\"backupsCreated\":" << backupsCreated << ",";
+    oss << "\"filesRestored\":" << filesRestored << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
     return oss.str();
@@ -367,9 +387,9 @@ public:
     void ClearDecisionCallback();
 
     // Signature validation
-    [[nodiscard]] SignatureStatus VerifyFileSignature(std::wstring_view path);
+    [[nodiscard]] SignatureStatus VerifyFileSignature(std::wstring_view path) const;
     [[nodiscard]] bool HasShadowStrikeSignature(std::wstring_view path);
-    [[nodiscard]] std::wstring GetFileSigner(std::wstring_view path);
+    [[nodiscard]] std::wstring GetFileSigner(std::wstring_view path) const;
     [[nodiscard]] bool VerifyFileCatalog(std::wstring_view path);
 
     // Integrity management
@@ -422,6 +442,11 @@ public:
     [[nodiscard]] static std::wstring NormalizePath(std::wstring_view path);
     [[nodiscard]] static bool MatchesPattern(std::wstring_view path, std::wstring_view pattern);
 
+    // Kernel bridge + auth (called by public FileProtection facade)
+    [[nodiscard]] std::string GenerateAuthorizationToken() const;
+    void SyncProtectedPathsToKernel();
+    void OnKernelBlockEventInternal(const void* data, uint32_t size);
+
 private:
     // ========================================================================
     // INTERNAL METHODS
@@ -456,7 +481,68 @@ private:
 
     static constexpr std::wstring_view SHADOWSTRIKE_SIGNER = L"ShadowStrike Security";
     static constexpr size_t MAX_EVENT_HISTORY = 1000;
-    static constexpr std::string_view AUTH_TOKEN_PREFIX = "SS_AUTH_";
+
+    // CRIT-02 FIX: HMAC-based authorization — prefix is validated against
+    // a per-session secret generated at initialization time.
+    static constexpr size_t AUTH_TOKEN_SIZE = 64;
+
+    // MED-01 FIX: Cap tracked PIDs for ransomware detection to prevent DoS.
+    static constexpr size_t MAX_TRACKED_PIDS = 4096;
+    static constexpr size_t MAX_MODS_PER_PID = 200;
+
+    // ========================================================================
+    // INTERNAL ATOMIC STATISTICS (non-copyable, stays inside PIMPL)
+    // ========================================================================
+
+    struct InternalStats {
+        std::atomic<uint64_t> totalProtectedFiles{0};
+        std::atomic<uint64_t> totalProtectedDirectories{0};
+        std::atomic<uint64_t> totalOperations{0};
+        std::atomic<uint64_t> totalBlocked{0};
+        std::atomic<uint64_t> totalIntegrityChecks{0};
+        std::atomic<uint64_t> integrityViolations{0};
+        std::atomic<uint64_t> signatureViolations{0};
+        std::atomic<uint64_t> ransomwareDetections{0};
+        std::atomic<uint64_t> backupsCreated{0};
+        std::atomic<uint64_t> filesRestored{0};
+        TimePoint startTime = Clock::now();
+        std::atomic<uint64_t> lastEventTimeNs{0};
+
+        void Reset() noexcept {
+            totalProtectedFiles.store(0, std::memory_order_relaxed);
+            totalProtectedDirectories.store(0, std::memory_order_relaxed);
+            totalOperations.store(0, std::memory_order_relaxed);
+            totalBlocked.store(0, std::memory_order_relaxed);
+            totalIntegrityChecks.store(0, std::memory_order_relaxed);
+            integrityViolations.store(0, std::memory_order_relaxed);
+            signatureViolations.store(0, std::memory_order_relaxed);
+            ransomwareDetections.store(0, std::memory_order_relaxed);
+            backupsCreated.store(0, std::memory_order_relaxed);
+            filesRestored.store(0, std::memory_order_relaxed);
+            startTime = Clock::now();
+            lastEventTimeNs.store(0, std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] FileProtectionStatistics Snapshot() const noexcept {
+            FileProtectionStatistics s;
+            s.totalProtectedFiles      = totalProtectedFiles.load(std::memory_order_relaxed);
+            s.totalProtectedDirectories = totalProtectedDirectories.load(std::memory_order_relaxed);
+            s.totalOperations          = totalOperations.load(std::memory_order_relaxed);
+            s.totalBlocked             = totalBlocked.load(std::memory_order_relaxed);
+            s.totalIntegrityChecks     = totalIntegrityChecks.load(std::memory_order_relaxed);
+            s.integrityViolations      = integrityViolations.load(std::memory_order_relaxed);
+            s.signatureViolations      = signatureViolations.load(std::memory_order_relaxed);
+            s.ransomwareDetections     = ransomwareDetections.load(std::memory_order_relaxed);
+            s.backupsCreated           = backupsCreated.load(std::memory_order_relaxed);
+            s.filesRestored            = filesRestored.load(std::memory_order_relaxed);
+            s.startTime                = startTime;
+            auto ns = lastEventTimeNs.load(std::memory_order_relaxed);
+            if (ns > 0) {
+                s.lastEventTime = TimePoint(std::chrono::nanoseconds(ns));
+            }
+            return s;
+        }
+    };
 
     // ========================================================================
     // MEMBER VARIABLES
@@ -468,7 +554,10 @@ private:
     std::atomic<bool> m_shutdownRequested{false};
 
     FileProtectionConfiguration m_config;
-    FileProtectionStatistics m_stats;
+    InternalStats m_stats;
+
+    // CRIT-02 FIX: Per-session authorization secret (generated once at init)
+    std::string m_authSecret;
 
     // Protected entities
     std::unordered_map<std::wstring, ProtectedFile> m_protectedFiles;
@@ -549,6 +638,19 @@ FileProtectionImpl::~FileProtectionImpl() {
     m_config = config;
     m_stats.Reset();
 
+    // CRIT-02 FIX: Generate per-session HMAC secret for authorization tokens
+    {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        m_authSecret.resize(AUTH_TOKEN_SIZE);
+        for (size_t i = 0; i < AUTH_TOKEN_SIZE; i += sizeof(uint64_t)) {
+            uint64_t val = dist(gen);
+            size_t remaining = std::min(sizeof(uint64_t), AUTH_TOKEN_SIZE - i);
+            std::memcpy(m_authSecret.data() + i, &val, remaining);
+        }
+    }
+
     // Apply whitelisted processes from config
     for (const auto& proc : config.whitelistedProcesses) {
         m_whitelistedProcesses.insert(proc);
@@ -560,6 +662,18 @@ FileProtectionImpl::~FileProtectionImpl() {
             std::filesystem::create_directories(m_backupStoragePath);
         } catch (const std::exception& e) {
             SS_LOG_WARN(L"FileProtection", L"Failed to create backup directory: %hs", e.what());
+        }
+
+        // HIGH-03 FIX: Auto-protect the backup directory
+        if (!m_backupStoragePath.empty()) {
+            ProtectedDirectory backupDir;
+            backupDir.id = GenerateFileId(m_backupStoragePath);
+            backupDir.path = m_backupStoragePath;
+            backupDir.type = ProtectionType::Full;
+            backupDir.includeSubdirectories = true;
+            backupDir.protectedSince = Clock::now();
+            m_protectedDirectories[NormalizePath(m_backupStoragePath)] = backupDir;
+            m_stats.totalProtectedDirectories.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
@@ -593,6 +707,25 @@ FileProtectionImpl::~FileProtectionImpl() {
                 FileProtectionConstants::VERSION_PATCH,
                 std::string(GetProtectionModeName(config.mode)).c_str());
 
+    // WIRE-02: Sync protected paths to kernel driver after initialization
+    // Release lock first — kernel bridge may block on filter port I/O
+    lock.unlock();
+    SyncProtectedPathsToKernel();
+
+    // WIRE-03: Register handler for kernel-side file protection block events
+    try {
+        auto& ipc = Communication::IPCManager::Instance();
+        ipc.RegisterGenericHandler(
+            [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
+                if (msgType == FilterMessageType_SelfProtectAlert) {
+                    OnKernelBlockEventInternal(data, static_cast<uint32_t>(size));
+                }
+            });
+        SS_LOG_DEBUG(L"FileProtection", L"Registered kernel SelfProtect alert handler");
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"FileProtection", L"Failed to register kernel event handler: %hs (kernel may not be loaded)", e.what());
+    }
+
     return true;
 }
 
@@ -611,6 +744,17 @@ void FileProtectionImpl::Shutdown(std::string_view authorizationToken) {
 
     m_status.store(ModuleStatus::Stopping);
     m_shutdownRequested.store(true);
+
+    // FIX: Unregister kernel event handler BEFORE stopping threads.
+    // The lambda captured `this`; if IPCManager dispatches after destruction,
+    // we get use-after-free.
+    try {
+        if (Communication::IPCManager::HasInstance()) {
+            Communication::IPCManager::Instance().RegisterGenericHandler(nullptr);
+        }
+    } catch (...) {
+        // IPCManager may already be torn down during process exit
+    }
 
     // Stop monitoring threads BEFORE taking the lock.
     // Threads acquire shared_lock internally; joining under our unique_lock
@@ -748,7 +892,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     }
 
     m_protectedDirectories[normalizedPath] = protDir;
-    m_stats.totalProtectedDirectories++;
+    m_stats.totalProtectedDirectories.fetch_add(1, std::memory_order_relaxed);
 
     SS_LOG_INFO(L"FileProtection", L"Protected directory: %ls (type: %hs, subdirs: %hs)",
                 normalizedPath.c_str(),
@@ -775,7 +919,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     }
 
     m_protectedDirectories.erase(it);
-    m_stats.totalProtectedDirectories--;
+    m_stats.totalProtectedDirectories.fetch_sub(1, std::memory_order_relaxed);
 
     SS_LOG_INFO(L"FileProtection", L"Unprotected directory: %ls", normalizedPath.c_str());
     return true;
@@ -886,6 +1030,19 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
 
     std::wstring normalizedPath = NormalizePath(path);
 
+    // CRIT-03 FIX: Perform ALL I/O (hashing, signature, stat) OUTSIDE the lock.
+    // Only map insertion happens under the exclusive lock.
+    Utils::FileUtils::Error fileErr;
+    Utils::FileUtils::FileStat fileStat;
+    uint64_t fileSize = 0;
+    if (Utils::FileUtils::Stat(normalizedPath, fileStat, &fileErr)) {
+        fileSize = fileStat.size;
+    }
+
+    Hash256 hash = ComputeFileHash(normalizedPath);
+    SignatureStatus sig = VerifyFileSignature(normalizedPath);
+
+    // Now take the lock for map operations only
     std::unique_lock lock(m_mutex);
 
     // Check limits
@@ -925,27 +1082,20 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
             break;
     }
 
-    // Get file info
-    Utils::FileUtils::Error fileErr;
-    Utils::FileUtils::FileStat fileStat;
-    if (Utils::FileUtils::Stat(normalizedPath, fileStat, &fileErr)) {
-        protFile.fileSize = fileStat.size;
-    }
-
-    // Compute baseline hash
-    protFile.expectedHash = ComputeFileHash(normalizedPath);
-    protFile.currentHash = protFile.expectedHash;
+    protFile.fileSize = fileSize;
+    protFile.expectedHash = hash;
+    protFile.currentHash = hash;
     protFile.integrity = IntegrityStatus::Valid;
     protFile.lastVerified = Clock::now();
-
-    // Check signature
-    protFile.signature = VerifyFileSignature(normalizedPath);
-    protFile.isShadowStrikeFile = (protFile.signature == SignatureStatus::ShadowStrike);
+    protFile.signature = sig;
+    protFile.isShadowStrikeFile = (sig == SignatureStatus::ShadowStrike);
 
     m_protectedFiles[normalizedPath] = protFile;
-    m_stats.totalProtectedFiles++;
+    m_stats.totalProtectedFiles.fetch_add(1, std::memory_order_relaxed);
 
-    // Create backup if enabled
+    lock.unlock();
+
+    // Create backup if enabled (I/O — do outside lock)
     if (m_config.enableAutoBackup) {
         CreateBackup(normalizedPath);
     }
@@ -974,7 +1124,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     }
 
     m_protectedFiles.erase(it);
-    m_stats.totalProtectedFiles--;
+    m_stats.totalProtectedFiles.fetch_sub(1, std::memory_order_relaxed);
 
     SS_LOG_INFO(L"FileProtection", L"Unprotected file: %ls", normalizedPath.c_str());
     return true;
@@ -1094,7 +1244,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
 
     OperationDecisionResult result;
     result.decision = OperationDecision::Allow;
-    m_stats.totalOperations++;
+    m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
 
     std::wstring normalizedPath = NormalizePath(request.filePath);
 
@@ -1192,7 +1342,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
             result.shouldAlert = true;
             result.reason = "Protected file operation blocked";
 
-            m_stats.totalBlocked++;
+            m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
 
             // Record event
             FileProtectionEvent event;
@@ -1231,7 +1381,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
     m_decisionCallback = nullptr;
 }
 
-[[nodiscard]] SignatureStatus FileProtectionImpl::VerifyFileSignature(std::wstring_view path) {
+[[nodiscard]] SignatureStatus FileProtectionImpl::VerifyFileSignature(std::wstring_view path) const {
 #ifdef _WIN32
     std::wstring pathStr(path);
 
@@ -1306,7 +1456,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
     return VerifyFileSignature(path) == SignatureStatus::ShadowStrike;
 }
 
-[[nodiscard]] std::wstring FileProtectionImpl::GetFileSigner(std::wstring_view path) {
+[[nodiscard]] std::wstring FileProtectionImpl::GetFileSigner(std::wstring_view path) const {
 #ifdef _WIN32
     Utils::pe_sig_utils::PEFileSignatureVerifier verifier;
     Utils::pe_sig_utils::SignatureInfo sigInfo;
@@ -1354,7 +1504,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
 [[nodiscard]] IntegrityStatus FileProtectionImpl::VerifyFileIntegrity(std::wstring_view path) {
     std::wstring normalizedPath = NormalizePath(path);
 
-    m_stats.totalIntegrityChecks++;
+    m_stats.totalIntegrityChecks.fetch_add(1, std::memory_order_relaxed);
 
     // Check if file exists
     Utils::FileUtils::Error fileErr;
@@ -1385,7 +1535,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
         return IntegrityStatus::Valid;
     }
 
-    m_stats.integrityViolations++;
+    m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
 
     // Create and record event
     FileProtectionEvent event;
@@ -1441,15 +1591,15 @@ FileProtectionImpl::VerifyAllIntegrity() {
 
     std::wstring normalizedPath = NormalizePath(path);
 
+    // MED-04 FIX: Do hashing outside the lock. Same issue as CRIT-03.
+    Hash256 newHash = ComputeFileHash(normalizedPath);
+
     std::unique_lock lock(m_mutex);
 
     auto it = m_protectedFiles.find(normalizedPath);
     if (it == m_protectedFiles.end()) {
         return false;
     }
-
-    // Compute new hash
-    Hash256 newHash = ComputeFileHash(normalizedPath);
 
     it->second.expectedHash = newHash;
     it->second.currentHash = newHash;
@@ -1540,7 +1690,7 @@ void FileProtectionImpl::ForceIntegrityCheck() {
         backup.reason = "Auto-backup";
 
         m_backups[normalizedPath].push_back(backup);
-        m_stats.backupsCreated++;
+        m_stats.backupsCreated.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_INFO(L"FileProtection", L"Created backup: %ls -> %ls",
                     normalizedPath.c_str(), backupPath.c_str());
@@ -1589,7 +1739,7 @@ void FileProtectionImpl::ForceIntegrityCheck() {
         std::filesystem::copy_file(backupToRestore->backupPath, normalizedPath,
                                    std::filesystem::copy_options::overwrite_existing);
 
-        m_stats.filesRestored++;
+        m_stats.filesRestored.fetch_add(1, std::memory_order_relaxed);
 
         // Update protected file info
         std::unique_lock writeLock(m_mutex);
@@ -1673,9 +1823,23 @@ void FileProtectionImpl::CleanupOldBackups() {
         std::filesystem::create_directories(path);
 
         std::unique_lock lock(m_mutex);
+
+        // HIGH-03 FIX: Remove protection from old backup dir, add to new one
+        if (!m_backupStoragePath.empty()) {
+            m_protectedDirectories.erase(NormalizePath(m_backupStoragePath));
+        }
+
         m_backupStoragePath = path;
 
-        SS_LOG_INFO(L"FileProtection", L"Backup storage path set to: %ls",
+        ProtectedDirectory backupDir;
+        backupDir.id = GenerateFileId(m_backupStoragePath);
+        backupDir.path = std::wstring(m_backupStoragePath);
+        backupDir.type = ProtectionType::Full;
+        backupDir.includeSubdirectories = true;
+        backupDir.protectedSince = Clock::now();
+        m_protectedDirectories[NormalizePath(m_backupStoragePath)] = backupDir;
+
+        SS_LOG_INFO(L"FileProtection", L"Backup storage path set to: %ls (auto-protected)",
                     m_backupStoragePath.c_str());
         return true;
     } catch (const std::exception& e) {
@@ -1763,16 +1927,34 @@ void FileProtectionImpl::SetRansomwareCallback(RansomwareCallback callback) {
     // Resolve process name and check against name whitelist
     auto nameOpt = Utils::ProcessUtils::GetProcessName(
         static_cast<Utils::ProcessUtils::ProcessId>(processId));
-    if (nameOpt.has_value()) {
-        std::wstring nameLower = *nameOpt;
-        std::transform(nameLower.begin(), nameLower.end(),
-                       nameLower.begin(), ::towlower);
-        if (m_whitelistedProcesses.count(nameLower) > 0) {
-            return true;
-        }
+    if (!nameOpt.has_value()) {
+        return false;
     }
 
-    return false;
+    std::wstring nameLower = *nameOpt;
+    std::transform(nameLower.begin(), nameLower.end(),
+                   nameLower.begin(), ::towlower);
+    if (m_whitelistedProcesses.count(nameLower) == 0) {
+        return false;
+    }
+
+    // HIGH-02 FIX: Validate process image signature to prevent name-spoofing bypass.
+    // An attacker can trivially rename a malicious executable to match a whitelisted name.
+    auto pathOpt = Utils::ProcessUtils::GetProcessPath(
+        static_cast<Utils::ProcessUtils::ProcessId>(processId));
+    if (!pathOpt.has_value()) {
+        SS_LOG_WARN(L"FileProtection", L"Whitelist check for PID %u: cannot resolve image path, denying", processId);
+        return false;
+    }
+
+    SignatureStatus sig = VerifyFileSignature(*pathOpt);
+    if (sig != SignatureStatus::Valid && sig != SignatureStatus::ShadowStrike) {
+        SS_LOG_WARN(L"FileProtection", L"Whitelist bypass attempt: PID %u name '%ls' is unsigned/untrusted",
+                    processId, nameLower.c_str());
+        return false;
+    }
+
+    return true;
 }
 
 [[nodiscard]] std::vector<std::wstring> FileProtectionImpl::GetWhitelistedProcesses() const {
@@ -1808,7 +1990,7 @@ void FileProtectionImpl::UnregisterIntegrityCallback(uint64_t callbackId) {
 }
 
 [[nodiscard]] FileProtectionStatistics FileProtectionImpl::GetStatistics() const {
-    return m_stats;
+    return m_stats.Snapshot();
 }
 
 void FileProtectionImpl::ResetStatistics(std::string_view authorizationToken) {
@@ -1853,7 +2035,7 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
 
     std::shared_lock lock(m_mutex);
     oss << "  \"mode\": \"" << GetProtectionModeName(m_config.mode) << "\",\n";
-    oss << "  \"statistics\": " << m_stats.ToJson() << ",\n";
+    oss << "  \"statistics\": " << m_stats.Snapshot().ToJson() << ",\n";
     oss << "  \"protectedFilesCount\": " << m_protectedFiles.size() << ",\n";
     oss << "  \"protectedDirectoriesCount\": " << m_protectedDirectories.size() << ",\n";
     oss << "  \"whitelistedProcessesCount\": " << m_whitelistedProcesses.size() << ",\n";
@@ -1977,8 +2159,10 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
         while (result.size() > 3 && result.back() == L'\\') {
             result.pop_back();
         }
-    } catch (...) {
-        // Keep current result on error
+    } catch (const std::filesystem::filesystem_error& e) {
+        // MED-03 FIX: Catch specific exception. Swallowing catch(...) hides logic bugs.
+        SS_LOG_DEBUG(L"FileProtection", L"Path normalization fallback for '%ls': %hs",
+                     result.c_str(), e.what());
     }
 
     return result;
@@ -2030,13 +2214,141 @@ void FileProtectionImpl::ClearEventHistory(std::string_view authorizationToken) 
 // ============================================================================
 
 [[nodiscard]] bool FileProtectionImpl::VerifyAuthorizationToken(std::string_view token) const {
-    if (token.empty()) {
+    if (token.empty() || m_authSecret.empty()) {
         return false;
     }
 
-    // In production, this would validate against a secure token store
-    // For now, accept tokens that start with the expected prefix
-    return token.substr(0, AUTH_TOKEN_PREFIX.size()) == AUTH_TOKEN_PREFIX;
+    // CRIT-02 FIX: HMAC-SHA256 verification using Windows CNG (BCrypt).
+    // Token format: base64(HMAC-SHA256(secret, nonce)) + ":" + nonce
+    // The nonce prevents replay but the primary goal is that an attacker
+    // who reads source code cannot forge a valid token without the per-session
+    // secret generated in Initialize().
+
+    auto colonPos = token.find(':');
+    if (colonPos == std::string_view::npos || colonPos == 0) {
+        return false;
+    }
+
+    std::string_view macHex = token.substr(0, colonPos);
+    std::string_view nonce = token.substr(colonPos + 1);
+
+    if (nonce.empty() || macHex.size() != 64) { // SHA-256 = 32 bytes = 64 hex chars
+        return false;
+    }
+
+    // Compute expected HMAC via Windows CNG
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                                   BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(status)) {
+        SS_LOG_ERROR(L"FileProtection", L"BCryptOpenAlgorithmProvider failed: 0x%08lx", status);
+        return false;
+    }
+
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                               reinterpret_cast<PUCHAR>(const_cast<char*>(m_authSecret.data())),
+                               static_cast<ULONG>(m_authSecret.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    status = BCryptHashData(hHash,
+                             reinterpret_cast<PUCHAR>(const_cast<char*>(nonce.data())),
+                             static_cast<ULONG>(nonce.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return false;
+    }
+
+    UCHAR computed[32]{};
+    status = BCryptFinishHash(hHash, computed, sizeof(computed), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (!BCRYPT_SUCCESS(status)) {
+        return false;
+    }
+
+    // Convert computed hash to hex string
+    char computedHex[65]{};
+    for (int i = 0; i < 32; ++i) {
+        snprintf(computedHex + i * 2, 3, "%02x", computed[i]);
+    }
+
+    // Constant-time comparison to prevent timing side-channel attacks.
+    // Compare raw bytes via XOR accumulation. Use SecureZeroMemory barrier
+    // to prevent compiler from optimizing out the comparison loop.
+    if (macHex.size() != 64) {
+        SecureZeroMemory(computed, sizeof(computed));
+        return false;
+    }
+
+    unsigned int diff = 0;
+    for (size_t i = 0; i < 64; ++i) {
+        diff |= static_cast<unsigned char>(computedHex[i]) ^ static_cast<unsigned char>(macHex[i]);
+    }
+
+    // Scrub sensitive material before returning
+    SecureZeroMemory(computed, sizeof(computed));
+    SecureZeroMemory(computedHex, sizeof(computedHex));
+
+    return diff == 0;
+}
+
+[[nodiscard]] std::string FileProtectionImpl::GenerateAuthorizationToken() const {
+    if (m_authSecret.empty()) {
+        return {};
+    }
+
+    // Generate a random nonce
+    std::random_device rd;
+    std::mt19937_64 gen(rd());
+    std::uniform_int_distribution<uint64_t> dist;
+    uint64_t nonceVal = dist(gen);
+
+    char nonce[24]{};
+    snprintf(nonce, sizeof(nonce), "%016llx", static_cast<unsigned long long>(nonceVal));
+
+    // Compute HMAC-SHA256(secret, nonce) via Windows CNG
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
+                                                   BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(status)) return {};
+
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
+                               reinterpret_cast<PUCHAR>(const_cast<char*>(m_authSecret.data())),
+                               static_cast<ULONG>(m_authSecret.size()), 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+
+    auto nonceLen = static_cast<ULONG>(strlen(nonce));
+    status = BCryptHashData(hHash, reinterpret_cast<PUCHAR>(nonce), nonceLen, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        return {};
+    }
+
+    UCHAR computed[32]{};
+    status = BCryptFinishHash(hHash, computed, sizeof(computed), 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+
+    if (!BCRYPT_SUCCESS(status)) return {};
+
+    // Format: hex(hmac) + ":" + nonce
+    char macHex[65]{};
+    for (int i = 0; i < 32; ++i) {
+        snprintf(macHex + i * 2, 3, "%02x", computed[i]);
+    }
+
+    return std::string(macHex) + ":" + nonce;
 }
 
 [[nodiscard]] std::string FileProtectionImpl::GenerateFileId(std::wstring_view path) const {
@@ -2190,7 +2502,7 @@ void FileProtectionImpl::RansomwareMonitorThread() {
                     }
 
                     m_ransomwareDetections.push_back(detection);
-                    m_stats.ransomwareDetections++;
+                    m_stats.ransomwareDetections.fetch_add(1, std::memory_order_relaxed);
                     pendingDetections.push_back(std::move(detection));
 
                     modifications.clear();
@@ -2218,11 +2530,13 @@ void FileProtectionImpl::RansomwareMonitorThread() {
 }
 
 void FileProtectionImpl::StartMonitoringThreads() {
-    if (m_monitoringActive.load()) {
-        return;
+    // MED-02 FIX: Use atomic exchange to prevent double-start race condition.
+    // Two threads calling StartMonitoringThreads() concurrently could both pass
+    // the load() check and spawn duplicate monitoring threads.
+    bool expected = false;
+    if (!m_monitoringActive.compare_exchange_strong(expected, true)) {
+        return;  // Another thread already started monitoring
     }
-
-    m_monitoringActive.store(true);
 
     if (m_config.enableIntegrityMonitoring) {
         m_integrityThread = std::thread(&FileProtectionImpl::IntegrityMonitorThread, this);
@@ -2289,12 +2603,39 @@ void FileProtectionImpl::RecordEvent(const FileProtectionEvent& event) {
         m_eventHistory.pop_front();
     }
 
-    m_stats.lastEventTime = event.timestamp;
+    auto ns = event.timestamp.time_since_epoch().count();
+    m_stats.lastEventTimeNs.store(static_cast<uint64_t>(ns), std::memory_order_relaxed);
 }
 
 void FileProtectionImpl::TrackFileModification(std::wstring_view path, uint32_t processId) {
     std::unique_lock lock(m_mutex);
-    m_modificationTracking[processId].emplace_back(Clock::now(), std::wstring(path));
+
+    // MED-01 FIX: Cap tracked PIDs to prevent unbounded memory growth (DoS vector).
+    // Attacker could spawn thousands of PIDs to exhaust agent memory.
+    if (m_modificationTracking.size() >= MAX_TRACKED_PIDS &&
+        m_modificationTracking.find(processId) == m_modificationTracking.end()) {
+        // Evict the entry with the oldest last-access time.
+        // If all entries have empty vectors, just evict the first one.
+        auto oldest = m_modificationTracking.begin();
+        bool foundNonEmpty = false;
+        for (auto it = m_modificationTracking.begin(); it != m_modificationTracking.end(); ++it) {
+            if (it->second.empty()) continue;
+            if (!foundNonEmpty || it->second.back().first < oldest->second.back().first) {
+                oldest = it;
+                foundNonEmpty = true;
+            }
+        }
+        m_modificationTracking.erase(oldest);
+    }
+
+    auto& entries = m_modificationTracking[processId];
+
+    // Cap per-PID entries too
+    if (entries.size() >= MAX_MODS_PER_PID) {
+        entries.erase(entries.begin());
+    }
+
+    entries.emplace_back(Clock::now(), std::wstring(path));
 }
 
 [[nodiscard]] bool FileProtectionImpl::DetectRansomwareBehavior(uint32_t processId) {
@@ -2306,6 +2647,150 @@ void FileProtectionImpl::TrackFileModification(std::wstring_view path, uint32_t 
     }
 
     return it->second.size() >= FileProtectionConstants::RANSOMWARE_MODIFICATION_THRESHOLD;
+}
+
+// ============================================================================
+// KERNEL BRIDGE IMPLEMENTATION (WIRE-01, WIRE-03)
+// ============================================================================
+
+void FileProtectionImpl::SyncProtectedPathsToKernel() {
+    // WIRE-01: Serialize all user-mode protected paths and push to kernel driver
+    // via IPCManager so FpCheckAccess() in PreCreate.c can enforce them.
+    try {
+        // Gather paths under shared lock
+        std::vector<std::wstring> paths;
+        {
+            std::shared_lock lock(m_mutex);
+            paths.reserve(m_protectedFiles.size() + m_protectedDirectories.size());
+            for (const auto& [p, _] : m_protectedFiles) {
+                paths.push_back(p);
+            }
+            for (const auto& [p, _] : m_protectedDirectories) {
+                paths.push_back(p);
+            }
+        }
+
+        if (paths.empty()) {
+            SS_LOG_DEBUG(L"FileProtection", L"No paths to sync to kernel");
+            return;
+        }
+
+        // Build the payload: uint32_t count, then count null-terminated wide strings
+        uint32_t count = static_cast<uint32_t>(std::min<size_t>(paths.size(), 4096));
+        std::vector<uint8_t> payload;
+        payload.resize(sizeof(uint32_t));
+        std::memcpy(payload.data(), &count, sizeof(count));
+
+        for (uint32_t i = 0; i < count; ++i) {
+            const auto& p = paths[i];
+            size_t byteLen = (p.size() + 1) * sizeof(wchar_t);
+            size_t offset = payload.size();
+            payload.resize(offset + byteLen);
+            std::memcpy(payload.data() + offset, p.c_str(), byteLen);
+        }
+
+        // Build SHADOWSTRIKE_MESSAGE_HEADER + payload
+        size_t totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + payload.size();
+
+        // Guard against payload exceeding UINT32_MAX (message header fields are 32-bit)
+        if (totalSize > static_cast<size_t>(UINT32_MAX)) {
+            SS_LOG_ERROR(L"FileProtection", L"Kernel sync payload too large (%zu bytes)", totalSize);
+            return;
+        }
+
+        std::vector<uint8_t> message(totalSize, 0);
+
+        auto* header = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(message.data());
+        header->Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
+        header->Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
+        header->MessageType = static_cast<UINT16>(FilterMessageType_UpdatePolicy);
+        header->MessageId   = m_nextEventId.fetch_add(1);
+        header->TotalSize   = static_cast<UINT32>(totalSize);
+        header->DataSize    = static_cast<UINT32>(payload.size());
+
+        LARGE_INTEGER ts;
+        QueryPerformanceCounter(&ts);
+        header->Timestamp = ts.QuadPart;
+        header->Flags     = 0;
+
+        std::memcpy(message.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                     payload.data(), payload.size());
+
+        // Send via IPCManager
+        auto& ipc = Communication::IPCManager::Instance();
+        bool sent = ipc.SendToKernel(message.data(), message.size());
+
+        if (sent) {
+            SS_LOG_INFO(L"FileProtection", L"Synced %u protected paths to kernel driver", count);
+        } else {
+            SS_LOG_WARN(L"FileProtection", L"Failed to sync paths to kernel (driver may not be loaded)");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"FileProtection", L"Kernel path sync exception: %hs", e.what());
+    }
+}
+
+void FileProtectionImpl::OnKernelBlockEventInternal(const void* data, uint32_t size) {
+    // WIRE-03: Handle block events received from the kernel driver.
+    // The kernel sends self-protect alerts when FpCheckAccess() blocks an operation.
+    // Format: { uint32_t processId, uint32_t operation, uint16_t pathLen, wchar_t path[] }
+    static constexpr uint32_t kMinEventSize = sizeof(uint32_t) * 2 + sizeof(uint16_t); // 10 bytes
+    if (!data || size < kMinEventSize) {
+        SS_LOG_WARN(L"FileProtection", L"Invalid kernel block event (size=%u, min=%u)", size, kMinEventSize);
+        return;
+    }
+
+    // Parse kernel alert: { uint32_t processId, uint32_t operation, uint16_t pathLen, wchar_t path[] }
+    auto ptr = static_cast<const uint8_t*>(data);
+    uint32_t processId = 0;
+    uint32_t operation = 0;
+    uint16_t pathLen = 0;
+
+    std::memcpy(&processId, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    std::memcpy(&operation, ptr, sizeof(uint32_t));
+    ptr += sizeof(uint32_t);
+    std::memcpy(&pathLen, ptr, sizeof(uint16_t));
+    ptr += sizeof(uint16_t);
+
+    size_t consumed = sizeof(uint32_t) * 2 + sizeof(uint16_t);
+    size_t pathBytes = static_cast<size_t>(pathLen) * sizeof(wchar_t);
+
+    if (consumed + pathBytes > size) {
+        SS_LOG_WARN(L"FileProtection", L"Kernel block event truncated (pathLen=%u)", pathLen);
+        return;
+    }
+
+    std::wstring filePath(reinterpret_cast<const wchar_t*>(ptr), pathLen);
+
+    // Record the event
+    FileProtectionEvent event;
+    event.eventId = m_nextEventId.fetch_add(1);
+    event.type = ProtectionEventType::OperationBlocked;
+    event.timestamp = Clock::now();
+    event.filePath = filePath;
+    event.operation = static_cast<FileOperation>(operation);
+    event.sourceProcessId = processId;
+    event.decision = OperationDecision::Block;
+    event.wasBlocked = true;
+    event.description = "Blocked by kernel file protection driver";
+
+    auto nameOpt = Utils::ProcessUtils::GetProcessName(
+        static_cast<Utils::ProcessUtils::ProcessId>(processId));
+    if (nameOpt.has_value()) {
+        event.sourceProcessName = *nameOpt;
+    }
+
+    m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
+
+    RecordEvent(event);
+    NotifyEvent(event);
+
+    SS_LOG_INFO(L"FileProtection", L"Kernel blocked PID %u from %ls on '%ls'",
+                processId,
+                GetFileOperationName(static_cast<FileOperation>(operation)).data(),
+                filePath.c_str());
 }
 
 // ============================================================================
@@ -2613,6 +3098,18 @@ void FileProtection::ClearEventHistory(std::string_view authorizationToken) {
     return oss.str();
 }
 
+[[nodiscard]] std::string FileProtection::GenerateAuthorizationToken() const {
+    return m_impl->GenerateAuthorizationToken();
+}
+
+void FileProtection::SyncProtectedPathsToKernel() {
+    m_impl->SyncProtectedPathsToKernel();
+}
+
+void FileProtection::OnKernelBlockEvent(const void* data, uint32_t size) {
+    m_impl->OnKernelBlockEventInternal(data, size);
+}
+
 // ============================================================================
 // RAII HELPER IMPLEMENTATIONS
 // ============================================================================
@@ -2620,9 +3117,9 @@ void FileProtection::ClearEventHistory(std::string_view authorizationToken) {
 FileProtectionGuard::FileProtectionGuard(std::wstring_view path, ProtectionType type)
     : m_path(path) {
 
-    m_authToken = "SS_AUTH_GUARD_" + std::to_string(std::chrono::steady_clock::now()
-        .time_since_epoch().count());
-
+    // HIGH-04 FIX: Use HMAC-based authorization token instead of predictable
+    // steady_clock timestamp. The old token was trivially forgeable.
+    m_authToken = FileProtection::Instance().GenerateAuthorizationToken();
     m_protected = FileProtection::Instance().ProtectFile(path, type);
 }
 
