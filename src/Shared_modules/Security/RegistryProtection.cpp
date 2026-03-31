@@ -50,10 +50,13 @@
 #include "pch.h"
 #include "RegistryProtection.hpp"
 
+#include "../Communication/IPCManager.hpp"
+#include "DigitalSignatureValidator.hpp"
+
 #include <algorithm>
+#include <deque>
 #include <sstream>
 #include <iomanip>
-#include <random>
 #include <format>
 #include <utility>
 #include <cwctype>
@@ -99,30 +102,12 @@ namespace {
 
     /// @brief Convert wide string to narrow string for JSON
     [[nodiscard]] std::string WideToNarrow(std::wstring_view wide) {
-        if (wide.empty()) return {};
-
-        const int len = WideCharToMultiByte(CP_UTF8, 0, wide.data(),
-            static_cast<int>(wide.size()), nullptr, 0, nullptr, nullptr);
-        if (len <= 0) return {};
-
-        std::string result(static_cast<size_t>(len), '\0');
-        WideCharToMultiByte(CP_UTF8, 0, wide.data(), static_cast<int>(wide.size()),
-            result.data(), len, nullptr, nullptr);
-        return result;
+        return Utils::StringUtils::ToNarrow(wide);
     }
 
     /// @brief Convert narrow string to wide string
     [[nodiscard]] std::wstring NarrowToWide(std::string_view narrow) {
-        if (narrow.empty()) return {};
-
-        const int len = MultiByteToWideChar(CP_UTF8, 0, narrow.data(),
-            static_cast<int>(narrow.size()), nullptr, 0);
-        if (len <= 0) return {};
-
-        std::wstring result(static_cast<size_t>(len), L'\0');
-        MultiByteToWideChar(CP_UTF8, 0, narrow.data(), static_cast<int>(narrow.size()),
-            result.data(), len);
-        return result;
+        return Utils::StringUtils::ToWide(narrow);
     }
 
     /// @brief Escape string for JSON
@@ -222,6 +207,40 @@ public:
     RegistryProtectionImpl& operator=(RegistryProtectionImpl&&) = delete;
 
     // ========================================================================
+    // INTERNAL STATS (atomic for thread safety; public struct uses uint64_t)
+    // ========================================================================
+
+    struct InternalStats {
+        std::atomic<uint64_t> totalProtectedKeys{0};
+        std::atomic<uint64_t> totalProtectedValues{0};
+        std::atomic<uint64_t> totalOperations{0};
+        std::atomic<uint64_t> totalBlocked{0};
+        std::atomic<uint64_t> totalRollbacks{0};
+        std::atomic<uint64_t> totalIntegrityChecks{0};
+        std::atomic<uint64_t> integrityViolations{0};
+        std::atomic<uint64_t> snapshotsCreated{0};
+        std::atomic<uint64_t> snapshotsRestored{0};
+
+        // TimePoints guarded by m_mutex
+        TimePoint startTime = Clock::now();
+        TimePoint lastEventTime;
+
+        void Reset() noexcept {
+            totalProtectedKeys.store(0, std::memory_order_relaxed);
+            totalProtectedValues.store(0, std::memory_order_relaxed);
+            totalOperations.store(0, std::memory_order_relaxed);
+            totalBlocked.store(0, std::memory_order_relaxed);
+            totalRollbacks.store(0, std::memory_order_relaxed);
+            totalIntegrityChecks.store(0, std::memory_order_relaxed);
+            integrityViolations.store(0, std::memory_order_relaxed);
+            snapshotsCreated.store(0, std::memory_order_relaxed);
+            snapshotsRestored.store(0, std::memory_order_relaxed);
+            startTime = Clock::now();
+            lastEventTime = TimePoint{};
+        }
+    };
+
+    // ========================================================================
     // LIFECYCLE
     // ========================================================================
 
@@ -296,8 +315,14 @@ public:
         m_status = ModuleStatus::Running;
         SS_LOG_INFO(LOG_CATEGORY, L"Registry protection initialized successfully");
         SS_LOG_INFO(LOG_CATEGORY, L"Protected keys: %llu, Mode: %hs",
-            m_stats.totalProtectedKeys.load(),
+            m_stats.totalProtectedKeys.load(std::memory_order_relaxed),
             std::string(GetProtectionModeName(m_mode)).c_str());
+
+        // Kernel bridge: sync protected keys and register event handler
+        // Release lock first — kernel I/O may block on filter port
+        lock.unlock();
+        SyncProtectedKeysToKernel();
+        RegisterKernelHandler();
 
         return true;
     }
@@ -321,6 +346,10 @@ public:
         // Stop monitoring thread (release lock first - StopMonitoring joins thread)
         lock.unlock();
         StopMonitoring();
+
+        // Unregister kernel handler BEFORE clearing state to prevent use-after-free
+        UnregisterKernelHandler();
+
         lock.lock();
 
         // Clear protected keys
@@ -362,17 +391,24 @@ public:
             return false;
         }
 
-        std::unique_lock lock(m_mutex);
+        bool restartMonitoring = false;
+        {
+            std::unique_lock lock(m_mutex);
 
-        // Capture old interval BEFORE overwriting config
-        const auto oldPollingInterval = m_config.pollingIntervalMs;
+            // Capture old interval BEFORE overwriting config
+            const auto oldPollingInterval = m_config.pollingIntervalMs;
 
-        m_config = config;
-        m_mode = config.mode;
+            m_config = config;
+            m_mode = config.mode;
 
-        // Update monitoring interval if changed
-        if (m_monitoringActive &&
-            config.pollingIntervalMs != oldPollingInterval) {
+            // Check if monitoring needs restart (decided under lock, executed outside)
+            if (m_monitoringActive &&
+                config.pollingIntervalMs != oldPollingInterval) {
+                restartMonitoring = true;
+            }
+        }
+        // Lock released — safe to join/launch monitor thread (fixes DEADLOCK)
+        if (restartMonitoring) {
             StopMonitoring();
             StartMonitoring();
         }
@@ -439,7 +475,11 @@ public:
         }
 
         m_protectedKeys.erase(it);
-        m_stats.totalProtectedKeys--;
+        // Guard against underflow
+        const auto prev = m_stats.totalProtectedKeys.load(std::memory_order_relaxed);
+        if (prev > 0) {
+            m_stats.totalProtectedKeys.fetch_sub(1, std::memory_order_relaxed);
+        }
 
         SS_LOG_INFO(LOG_CATEGORY, L"Key unprotected: %ls", normalized.c_str());
         return true;
@@ -648,8 +688,6 @@ public:
             return false;
         }
 
-        std::unique_lock lock(m_mutex);
-
         ProtectedValue pv;
         pv.id = GenerateUniqueId();
         pv.keyPath = keyPath;
@@ -657,14 +695,17 @@ public:
         pv.protectedSince = Clock::now();
         pv.integrity = IntegrityStatus::Unknown;
 
-        // Read current value and compute hash
+        // Registry I/O OUTSIDE lock to avoid blocking readers
         if (ReadValueAndComputeHash(pv)) {
             pv.integrity = IntegrityStatus::Valid;
         }
 
         const auto key = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
-        m_protectedValues[key] = std::move(pv);
-        m_stats.totalProtectedValues++;
+        {
+            std::unique_lock lock(m_mutex);
+            m_protectedValues[key] = std::move(pv);
+        }
+        m_stats.totalProtectedValues.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_INFO(LOG_CATEGORY, L"Value protected: %ls\\%ls",
             std::wstring(keyPath).c_str(), std::wstring(valueName).c_str());
@@ -686,7 +727,10 @@ public:
         }
 
         m_protectedValues.erase(it);
-        m_stats.totalProtectedValues--;
+        const auto prev = m_stats.totalProtectedValues.load(std::memory_order_relaxed);
+        if (prev > 0) {
+            m_stats.totalProtectedValues.fetch_sub(1, std::memory_order_relaxed);
+        }
         return true;
     }
 
@@ -842,22 +886,30 @@ public:
     // ========================================================================
 
     [[nodiscard]] IntegrityStatus VerifyKeyIntegrity(std::wstring_view keyPath) {
-        std::unique_lock lock(m_mutex);
         const auto normalized = NormalizeKeyPath(keyPath);
 
-        auto it = m_protectedKeys.find(normalized);
-        if (it == m_protectedKeys.end()) {
-            return IntegrityStatus::Unknown;
-        }
-
-        m_stats.totalIntegrityChecks++;
-        it->second.lastVerified = Clock::now();
-
-        // Check if key exists
+        // Gather key info under shared lock, then do I/O outside
         HKEY rootKey = nullptr;
         std::wstring subKey;
+        bool found = false;
+        {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedKeys.find(normalized);
+            if (it == m_protectedKeys.end()) {
+                return IntegrityStatus::Unknown;
+            }
+            found = true;
+        }
+
+        m_stats.totalIntegrityChecks.fetch_add(1, std::memory_order_relaxed);
+
+        // Registry I/O OUTSIDE lock
         if (!Utils::RegistryUtils::SplitPath(normalized, rootKey, subKey)) {
-            it->second.integrity = IntegrityStatus::Missing;
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedKeys.find(normalized);
+            if (it != m_protectedKeys.end()) {
+                it->second.integrity = IntegrityStatus::Missing;
+            }
             return IntegrityStatus::Missing;
         }
 
@@ -866,57 +918,93 @@ public:
         opts.access = KEY_READ;
 
         if (!regKey.Open(rootKey, subKey, opts)) {
-            it->second.integrity = IntegrityStatus::Missing;
-            m_stats.integrityViolations++;
-
-            // Fire integrity callback
-            lock.unlock();
-            FireIntegrityCallback(it->second);
-
+            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+            ProtectedKey keyCopy;
+            {
+                std::unique_lock lock(m_mutex);
+                auto it = m_protectedKeys.find(normalized);
+                if (it != m_protectedKeys.end()) {
+                    it->second.integrity = IntegrityStatus::Missing;
+                    keyCopy = it->second;  // Copy BEFORE unlock
+                }
+            }
+            // Fire callback outside lock, using safe copy
+            FireIntegrityCallback(keyCopy);
             return IntegrityStatus::Missing;
         }
 
-        it->second.integrity = IntegrityStatus::Valid;
+        {
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedKeys.find(normalized);
+            if (it != m_protectedKeys.end()) {
+                it->second.integrity = IntegrityStatus::Valid;
+                it->second.lastVerified = Clock::now();
+            }
+        }
         return IntegrityStatus::Valid;
     }
 
     [[nodiscard]] IntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
                                                        std::wstring_view valueName) {
-        std::unique_lock lock(m_mutex);
-        const auto key = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
+        const auto compositeKey = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
 
-        auto it = m_protectedValues.find(key);
-        if (it == m_protectedValues.end()) {
-            return IntegrityStatus::Unknown;
+        // Copy protected value snapshot under shared lock for I/O outside lock
+        ProtectedValue snapshot;
+        Hash256 expectedHash{};
+        {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it == m_protectedValues.end()) {
+                return IntegrityStatus::Unknown;
+            }
+            snapshot = it->second;
+            expectedHash = it->second.expectedHash;
         }
 
-        m_stats.totalIntegrityChecks++;
-        it->second.lastVerified = Clock::now();
+        m_stats.totalIntegrityChecks.fetch_add(1, std::memory_order_relaxed);
 
-        // Read current value and compare hash
-        ProtectedValue currentValue = it->second;
+        // Registry I/O OUTSIDE lock
+        ProtectedValue currentValue = snapshot;
         if (!ReadValueAndComputeHash(currentValue)) {
-            it->second.integrity = IntegrityStatus::Missing;
-            m_stats.integrityViolations++;
+            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it != m_protectedValues.end()) {
+                it->second.integrity = IntegrityStatus::Missing;
+                it->second.lastVerified = Clock::now();
+            }
             return IntegrityStatus::Missing;
         }
 
-        if (currentValue.currentHash != it->second.expectedHash) {
-            it->second.integrity = IntegrityStatus::Modified;
-            it->second.currentHash = currentValue.currentHash;
-            it->second.modificationCount++;
-            m_stats.integrityViolations++;
-
-            // Fire value change callback
-            const auto oldData = it->second.expectedData;
-            const auto newData = currentValue.expectedData;
-            lock.unlock();
-            FireValueChangeCallback(it->second, oldData, newData);
-
+        if (currentValue.currentHash != expectedHash) {
+            m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
+            ProtectedValue valueCopy;
+            std::vector<uint8_t> oldData, newData;
+            {
+                std::unique_lock lock(m_mutex);
+                auto it = m_protectedValues.find(compositeKey);
+                if (it != m_protectedValues.end()) {
+                    it->second.integrity = IntegrityStatus::Modified;
+                    it->second.currentHash = currentValue.currentHash;
+                    it->second.modificationCount++;
+                    it->second.lastVerified = Clock::now();
+                    oldData = it->second.expectedData;
+                    newData = currentValue.expectedData;
+                    valueCopy = it->second;
+                }
+            }
+            FireValueChangeCallback(valueCopy, oldData, newData);
             return IntegrityStatus::Modified;
         }
 
-        it->second.integrity = IntegrityStatus::Valid;
+        {
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it != m_protectedValues.end()) {
+                it->second.integrity = IntegrityStatus::Valid;
+                it->second.lastVerified = Clock::now();
+            }
+        }
         return IntegrityStatus::Valid;
     }
 
@@ -1278,17 +1366,16 @@ public:
     // ========================================================================
 
     [[nodiscard]] RegistryProtectionStatistics GetStatistics() const {
-        // Atomics are thread-safe, but TimePoints need lock protection
         RegistryProtectionStatistics result;
-        result.totalProtectedKeys.store(m_stats.totalProtectedKeys.load(std::memory_order_relaxed));
-        result.totalProtectedValues.store(m_stats.totalProtectedValues.load(std::memory_order_relaxed));
-        result.totalOperations.store(m_stats.totalOperations.load(std::memory_order_relaxed));
-        result.totalBlocked.store(m_stats.totalBlocked.load(std::memory_order_relaxed));
-        result.totalRollbacks.store(m_stats.totalRollbacks.load(std::memory_order_relaxed));
-        result.totalIntegrityChecks.store(m_stats.totalIntegrityChecks.load(std::memory_order_relaxed));
-        result.integrityViolations.store(m_stats.integrityViolations.load(std::memory_order_relaxed));
-        result.snapshotsCreated.store(m_stats.snapshotsCreated.load(std::memory_order_relaxed));
-        result.snapshotsRestored.store(m_stats.snapshotsRestored.load(std::memory_order_relaxed));
+        result.totalProtectedKeys = m_stats.totalProtectedKeys.load(std::memory_order_relaxed);
+        result.totalProtectedValues = m_stats.totalProtectedValues.load(std::memory_order_relaxed);
+        result.totalOperations = m_stats.totalOperations.load(std::memory_order_relaxed);
+        result.totalBlocked = m_stats.totalBlocked.load(std::memory_order_relaxed);
+        result.totalRollbacks = m_stats.totalRollbacks.load(std::memory_order_relaxed);
+        result.totalIntegrityChecks = m_stats.totalIntegrityChecks.load(std::memory_order_relaxed);
+        result.integrityViolations = m_stats.integrityViolations.load(std::memory_order_relaxed);
+        result.snapshotsCreated = m_stats.snapshotsCreated.load(std::memory_order_relaxed);
+        result.snapshotsRestored = m_stats.snapshotsRestored.load(std::memory_order_relaxed);
         {
             std::shared_lock lock(m_mutex);
             result.startTime = m_stats.startTime;
@@ -1338,7 +1425,7 @@ public:
         json << "  \"version\": \"" << GetVersionString() << "\",\n";
         json << "  \"status\": \"" << (IsInitialized() ? "Running" : "Stopped") << "\",\n";
         json << "  \"mode\": \"" << GetProtectionModeName(m_mode) << "\",\n";
-        json << "  \"statistics\": " << m_stats.ToJson() << ",\n";
+        json << "  \"statistics\": " << GetStatistics().ToJson() << ",\n";
 
         // Protected keys summary
         {
@@ -1440,6 +1527,14 @@ public:
             result.replace(0, rootSegment.size(), L"HKU");
         } else if (rootUpper == L"HKEY_CURRENT_CONFIG" || rootUpper == L"HKCC") {
             result.replace(0, rootSegment.size(), L"HKCC");
+        }
+
+        // Case-fold the entire subkey path (registry paths are case-insensitive)
+        // Without this, an attacker can bypass protection via alternate casing
+        if (slashPos != std::wstring::npos && slashPos + 1 < result.size()) {
+            for (size_t i = slashPos + 1; i < result.size(); ++i) {
+                result[i] = static_cast<wchar_t>(towlower(result[i]));
+            }
         }
 
         // Remove trailing backslash
@@ -1661,6 +1756,15 @@ private:
             return false;
         }
 
+        // Cap data size to prevent DoS from maliciously large registry values
+        constexpr size_t MAX_REGISTRY_DATA_READ = 1u << 20; // 1 MB
+        if (data.size() > MAX_REGISTRY_DATA_READ) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Registry value exceeds safety cap (%zu bytes): %ls\\%ls",
+                data.size(), pv.keyPath.c_str(), pv.valueName.c_str());
+            return false;
+        }
+
         pv.valueType = static_cast<RegistryValueType>(actualType);
         pv.dataSize = data.size();
         pv.currentHash = ComputeHash256(data);
@@ -1680,15 +1784,42 @@ private:
             return false;
         }
 
-        std::shared_lock lock(m_mutex);
-
-        // Case-insensitive name comparison against whitelist
-        for (const auto& whitelisted : m_whitelistedProcesses) {
-            if (Utils::StringUtils::IEquals(processInfo.first, whitelisted)) {
-                return true;
+        // Check whitelist under shared lock, copy match result before unlock
+        bool nameMatched = false;
+        {
+            std::shared_lock lock(m_mutex);
+            for (const auto& whitelisted : m_whitelistedProcesses) {
+                if (Utils::StringUtils::IEquals(processInfo.first, whitelisted)) {
+                    nameMatched = true;
+                    break;
+                }
             }
         }
-        return false;
+        // Lock released here by RAII — safe for I/O below
+
+        if (!nameMatched) {
+            return false;
+        }
+
+        // Verify code signature to prevent whitelist bypass via name spoofing.
+        // An attacker can rename any executable to match a whitelisted name;
+        // without signature verification this would bypass all registry protection.
+        try {
+            auto& validator = Security::DigitalSignatureValidator::Instance();
+            auto sigInfo = validator.VerifyFile(processInfo.second);
+            if (!sigInfo.isValid) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Whitelist bypass attempt: process '%ls' (PID %u) matches name but has invalid signature",
+                    processInfo.second.c_str(), processId);
+                return false;
+            }
+        } catch (...) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Signature verification failed for whitelisted process '%ls' (PID %u), denying whitelist",
+                processInfo.second.c_str(), processId);
+            return false;
+        }
+        return true;
     }
 
     /// @brief Returns {processName, fullPath} from PID with RAII handle management
@@ -1896,7 +2027,7 @@ private:
             std::unique_lock lock(m_mutex);
             m_eventHistory.push_back(event);
             while (m_eventHistory.size() > MAX_EVENT_HISTORY) {
-                m_eventHistory.erase(m_eventHistory.begin());
+                m_eventHistory.pop_front();
             }
             // Update lastEventTime under lock to avoid data race on TimePoint
             m_stats.lastEventTime = event.timestamp;
@@ -1962,8 +2093,198 @@ private:
     }
 
     // ========================================================================
+    // KERNEL BRIDGE METHODS (public — called by forwarding wrappers)
+    // ========================================================================
+public:
+
+    [[nodiscard]] bool SyncProtectedKeysToKernel() {
+        try {
+            // Gather keys under shared lock
+            std::vector<std::wstring> keys;
+            {
+                std::shared_lock lock(m_mutex);
+                keys.reserve(m_protectedKeys.size());
+                for (const auto& [path, _] : m_protectedKeys) {
+                    keys.push_back(path);
+                }
+            }
+
+            if (keys.empty()) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"No registry keys to sync to kernel");
+                return true;
+            }
+
+            // Build payload: uint32_t count, then count null-terminated wide strings
+            uint32_t count = static_cast<uint32_t>(std::min<size_t>(keys.size(), 4096));
+            std::vector<uint8_t> payload;
+            payload.resize(sizeof(uint32_t));
+            std::memcpy(payload.data(), &count, sizeof(count));
+
+            for (uint32_t i = 0; i < count; ++i) {
+                const auto& k = keys[i];
+                // Sanity cap: skip key paths > 32KB to prevent overflow
+                constexpr size_t MAX_KEY_PATH_BYTES = 32768;
+                size_t byteLen = (k.size() + 1) * sizeof(wchar_t);
+                if (k.size() > MAX_KEY_PATH_BYTES / sizeof(wchar_t) || byteLen > MAX_KEY_PATH_BYTES) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Skipping oversized key path (%zu chars)", k.size());
+                    continue;
+                }
+                size_t offset = payload.size();
+                payload.resize(offset + byteLen);
+                std::memcpy(payload.data() + offset, k.c_str(), byteLen);
+            }
+
+            size_t totalSize = sizeof(SHADOWSTRIKE_MESSAGE_HEADER) + payload.size();
+            if (totalSize > static_cast<size_t>(UINT32_MAX)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Kernel registry sync payload too large (%zu bytes)", totalSize);
+                return false;
+            }
+
+            std::vector<uint8_t> message(totalSize, 0);
+            auto* header = reinterpret_cast<SHADOWSTRIKE_MESSAGE_HEADER*>(message.data());
+            header->Magic       = SHADOWSTRIKE_MESSAGE_MAGIC;
+            header->Version     = SHADOWSTRIKE_PROTOCOL_VERSION;
+            header->MessageType = static_cast<UINT16>(FilterMessageType_UpdatePolicy);
+            header->MessageId   = m_nextEventId.fetch_add(1);
+            header->TotalSize   = static_cast<UINT32>(totalSize);
+            header->DataSize    = static_cast<UINT32>(payload.size());
+
+            LARGE_INTEGER ts;
+            QueryPerformanceCounter(&ts);
+            header->Timestamp = ts.QuadPart;
+            header->Flags     = 0;
+
+            std::memcpy(message.data() + sizeof(SHADOWSTRIKE_MESSAGE_HEADER),
+                         payload.data(), payload.size());
+
+            auto& ipc = Communication::IPCManager::Instance();
+            bool sent = ipc.SendToKernel(message.data(), message.size());
+
+            if (sent) {
+                SS_LOG_INFO(LOG_CATEGORY, L"Synced %u protected registry keys to kernel driver", count);
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to sync registry keys to kernel (driver may not be loaded)");
+            }
+            return sent;
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Kernel registry sync exception: %hs", e.what());
+            return false;
+        }
+    }
+
+    void OnKernelRegistryEventInternal(const void* data, size_t size) {
+        // Parse RegistryOpRequest from kernel notification
+        if (!data || size < sizeof(Communication::RegistryOpRequest)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Invalid kernel registry event (size=%zu, min=%zu)",
+                size, sizeof(Communication::RegistryOpRequest));
+            return;
+        }
+
+        const auto* req = static_cast<const Communication::RegistryOpRequest*>(data);
+
+        // Validate variable-length fields individually to prevent integer overflow
+        const size_t headerSize = sizeof(Communication::RegistryOpRequest);
+        const size_t remaining = size - headerSize;
+        if (req->keyPathLength > remaining ||
+            req->valueNameLength > remaining - req->keyPathLength ||
+            req->dataSize > remaining - req->keyPathLength - req->valueNameLength) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"Kernel registry event truncated (keyPath=%u, valueName=%u, data=%u, avail=%zu)",
+                req->keyPathLength, req->valueNameLength, req->dataSize, remaining);
+            return;
+        }
+
+        // Extract key path safely
+        std::wstring keyPath;
+        if (req->keyPathLength > 0 && req->keyPathCharLen() > 0) {
+            keyPath.assign(req->keyPathData(), req->keyPathCharLen());
+        }
+        std::wstring valueName;
+        if (req->valueNameLength > 0 && req->valueNameCharLen() > 0) {
+            valueName.assign(req->valueNameData(), req->valueNameCharLen());
+        }
+
+        // Map kernel operation to our RegistryOperation enum
+        auto operation = static_cast<RegistryOperation>(req->operation);
+
+        SS_LOG_DEBUG(LOG_CATEGORY,
+            L"Kernel registry event: PID=%u Op=%u Key=%ls Value=%ls",
+            req->processId, req->operation, keyPath.c_str(), valueName.c_str());
+
+        // Build and dispatch event through our normal event pipeline
+        RegistryProtectionEvent event;
+        event.eventId = m_nextEventId.fetch_add(1);
+        event.operation = operation;
+        event.keyPath = std::move(keyPath);
+        event.valueName = std::move(valueName);
+        event.sourceProcessId = req->processId;
+        event.sourceProcessPath = GetProcessNameFromPid(req->processId);
+        event.wasBlocked = true;
+        event.description = "Blocked by kernel registry callback";
+        event.timestamp = Clock::now();
+
+        m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
+        m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
+
+        // Add to history
+        {
+            std::unique_lock lock(m_mutex);
+            m_eventHistory.push_back(event);
+            while (m_eventHistory.size() > MAX_EVENT_HISTORY) {
+                m_eventHistory.pop_front();
+            }
+            m_stats.lastEventTime = event.timestamp;
+        }
+
+        // Fire callbacks outside lock
+        std::vector<RegistryEventCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_eventCallbacks.size());
+            for (const auto& [id, cb] : m_eventCallbacks) {
+                callbacks.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacks) {
+            try {
+                callback(event);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Kernel event callback exception: %hs", e.what());
+            }
+        }
+    }
+
+    void RegisterKernelHandler() {
+        try {
+            auto& ipc = Communication::IPCManager::Instance();
+            ipc.RegisterGenericHandler(
+                [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
+                    if (msgType == FilterMessageType_RegistryNotify &&
+                        m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
+                        OnKernelRegistryEventInternal(data, size);
+                    }
+                });
+            m_kernelHandlerRegistered.store(true, std::memory_order_release);
+            SS_LOG_INFO(LOG_CATEGORY, L"Kernel registry handler registered");
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to register kernel handler: %hs", e.what());
+        }
+    }
+
+    void UnregisterKernelHandler() {
+        if (m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
+            // Atomically deactivate handler before any further cleanup.
+            // The registered lambda checks this flag and becomes a no-op.
+            m_kernelHandlerRegistered.store(false, std::memory_order_release);
+            SS_LOG_INFO(LOG_CATEGORY, L"Kernel registry handler unregistered");
+        }
+    }
+
+    // ========================================================================
     // MEMBER VARIABLES
     // ========================================================================
+private:
 
     // Synchronization
     mutable std::shared_mutex m_mutex;
@@ -1989,11 +2310,11 @@ private:
     std::atomic<uint64_t> m_nextCallbackId;
 
     // Events
-    std::vector<RegistryProtectionEvent> m_eventHistory;
+    std::deque<RegistryProtectionEvent> m_eventHistory;
     std::atomic<uint64_t> m_nextEventId;
 
-    // Statistics
-    RegistryProtectionStatistics m_stats;
+    // Statistics (InternalStats has atomics; public API returns plain uint64_t snapshot)
+    InternalStats m_stats;
 
     // Monitoring thread
     std::thread m_monitorThread;
@@ -2005,6 +2326,9 @@ private:
 
     // Monotonic snapshot version counter (survives snapshot pruning)
     uint32_t m_nextSnapshotVersion{0};
+
+    // Kernel bridge state
+    std::atomic<bool> m_kernelHandlerRegistered{false};
 };
 
 // ============================================================================
@@ -2289,6 +2613,14 @@ std::string RegistryProtection::GetVersionString() noexcept {
     return RegistryProtectionImpl::GetVersionString();
 }
 
+bool RegistryProtection::SyncProtectedKeysToKernel() {
+    return m_impl->SyncProtectedKeysToKernel();
+}
+
+void RegistryProtection::OnKernelRegistryEvent(const void* data, size_t size) {
+    m_impl->OnKernelRegistryEventInternal(data, size);
+}
+
 // ============================================================================
 // STRUCTURE IMPLEMENTATIONS
 // ============================================================================
@@ -2394,84 +2726,21 @@ std::string RegistryProtectionEvent::ToJson() const {
     return json.str();
 }
 
-RegistryProtectionStatistics::RegistryProtectionStatistics(
-    const RegistryProtectionStatistics& other) noexcept
-    : startTime(other.startTime)
-    , lastEventTime(other.lastEventTime)
-{
-    totalProtectedKeys.store(other.totalProtectedKeys.load(std::memory_order_relaxed),
-                             std::memory_order_relaxed);
-    totalProtectedValues.store(other.totalProtectedValues.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
-    totalOperations.store(other.totalOperations.load(std::memory_order_relaxed),
-                          std::memory_order_relaxed);
-    totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed),
-                       std::memory_order_relaxed);
-    totalRollbacks.store(other.totalRollbacks.load(std::memory_order_relaxed),
-                         std::memory_order_relaxed);
-    totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
-    integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-    snapshotsCreated.store(other.snapshotsCreated.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-    snapshotsRestored.store(other.snapshotsRestored.load(std::memory_order_relaxed),
-                            std::memory_order_relaxed);
-}
-
-RegistryProtectionStatistics& RegistryProtectionStatistics::operator=(
-    const RegistryProtectionStatistics& other) noexcept {
-    if (this != &other) {
-        totalProtectedKeys.store(other.totalProtectedKeys.load(std::memory_order_relaxed),
-                                 std::memory_order_relaxed);
-        totalProtectedValues.store(other.totalProtectedValues.load(std::memory_order_relaxed),
-                                   std::memory_order_relaxed);
-        totalOperations.store(other.totalOperations.load(std::memory_order_relaxed),
-                              std::memory_order_relaxed);
-        totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed),
-                           std::memory_order_relaxed);
-        totalRollbacks.store(other.totalRollbacks.load(std::memory_order_relaxed),
-                             std::memory_order_relaxed);
-        totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed),
-                                   std::memory_order_relaxed);
-        integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed),
-                                  std::memory_order_relaxed);
-        snapshotsCreated.store(other.snapshotsCreated.load(std::memory_order_relaxed),
-                               std::memory_order_relaxed);
-        snapshotsRestored.store(other.snapshotsRestored.load(std::memory_order_relaxed),
-                                std::memory_order_relaxed);
-        startTime = other.startTime;
-        lastEventTime = other.lastEventTime;
-    }
-    return *this;
-}
-
-void RegistryProtectionStatistics::Reset() noexcept {
-    totalProtectedKeys = 0;
-    totalProtectedValues = 0;
-    totalOperations = 0;
-    totalBlocked = 0;
-    totalRollbacks = 0;
-    totalIntegrityChecks = 0;
-    integrityViolations = 0;
-    snapshotsCreated = 0;
-    snapshotsRestored = 0;
-    startTime = Clock::now();
-    lastEventTime = TimePoint{};
-}
+// Statistics struct is now a plain snapshot (no atomics) — no copy ctor/operator= needed.
+// Only ToJson remains as a convenience method.
 
 std::string RegistryProtectionStatistics::ToJson() const {
     std::ostringstream json;
     json << "{";
-    json << "\"totalProtectedKeys\":" << totalProtectedKeys.load() << ",";
-    json << "\"totalProtectedValues\":" << totalProtectedValues.load() << ",";
-    json << "\"totalOperations\":" << totalOperations.load() << ",";
-    json << "\"totalBlocked\":" << totalBlocked.load() << ",";
-    json << "\"totalRollbacks\":" << totalRollbacks.load() << ",";
-    json << "\"totalIntegrityChecks\":" << totalIntegrityChecks.load() << ",";
-    json << "\"integrityViolations\":" << integrityViolations.load() << ",";
-    json << "\"snapshotsCreated\":" << snapshotsCreated.load() << ",";
-    json << "\"snapshotsRestored\":" << snapshotsRestored.load() << ",";
+    json << "\"totalProtectedKeys\":" << totalProtectedKeys << ",";
+    json << "\"totalProtectedValues\":" << totalProtectedValues << ",";
+    json << "\"totalOperations\":" << totalOperations << ",";
+    json << "\"totalBlocked\":" << totalBlocked << ",";
+    json << "\"totalRollbacks\":" << totalRollbacks << ",";
+    json << "\"totalIntegrityChecks\":" << totalIntegrityChecks << ",";
+    json << "\"integrityViolations\":" << integrityViolations << ",";
+    json << "\"snapshotsCreated\":" << snapshotsCreated << ",";
+    json << "\"snapshotsRestored\":" << snapshotsRestored << ",";
     json << "\"startTime\":\"" << FormatTimestamp(startTime) << "\",";
     json << "\"uptimeSeconds\":" << std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
@@ -2599,6 +2868,11 @@ RegistryProtectionGuard::~RegistryProtectionGuard() {
     if (m_protected) {
         RegistryProtection::Instance().UnprotectKey(m_keyPath, m_authToken);
         SS_LOG_DEBUG(LOG_CATEGORY, L"Guard: Key unprotected: %ls", m_keyPath.c_str());
+    }
+    // Scrub auth token from memory to prevent credential harvesting
+    if (!m_authToken.empty()) {
+        SecureZeroMemory(m_authToken.data(), m_authToken.size());
+        m_authToken.clear();
     }
 }
 

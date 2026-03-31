@@ -1208,6 +1208,31 @@ public:
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
+    // ========================================================================
+    // KERNEL BRIDGE
+    // ========================================================================
+
+    /**
+     * @brief Synchronize protected key list to kernel driver.
+     *
+     * Sends the current protected-key set via IPCManager so the kernel
+     * RegistryCallback module can block writes in real time (pre-operation).
+     *
+     * @return true if the message was sent successfully.
+     */
+    [[nodiscard]] bool SyncProtectedKeysToKernel();
+
+    /**
+     * @brief Handle a registry event that arrived from the kernel driver.
+     *
+     * Called by the IPCManager generic-handler dispatch when
+     * FilterMessageType_RegistryNotify is received.
+     *
+     * @param data     Raw payload (SHADOWSTRIKE_REGISTRY_NOTIFICATION).
+     * @param dataSize Payload size in bytes.
+     */
+    void OnKernelRegistryEvent(const void* data, size_t dataSize);
+
 private:
     // ========================================================================
     // PRIVATE CONSTRUCTOR
