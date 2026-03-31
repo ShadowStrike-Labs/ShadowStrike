@@ -1554,6 +1554,70 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
             sessionKeyCopy.data(),
             sessionKeyCopy.size()
         );
+
+        // ── APT DEFENSE: Append HMAC-SHA256 for message integrity ────
+        // Compute HMAC over header + encrypted payload. The HMAC key is the
+        // session key (which was scrubbed above, so re-derive a copy under lock).
+        // This protects against pipe injection by a rogue process.
+        if (!encryptedPayload.empty()) {
+            // Set final header values BEFORE computing HMAC so the receiver,
+            // which reads these values from the wire, computes the same HMAC.
+            outHdr.flags |= ServiceCommConstants::MSG_FLAG_HMAC;
+            outHdr.payloadLength = static_cast<uint32_t>(encryptedPayload.size() + 32);
+
+            // Build HMAC input from the finalized header + encrypted payload
+            std::vector<uint8_t> hmacInput;
+            hmacInput.reserve(sizeof(outHdr) + encryptedPayload.size());
+            hmacInput.insert(hmacInput.end(),
+                             reinterpret_cast<const uint8_t*>(&outHdr),
+                             reinterpret_cast<const uint8_t*>(&outHdr) + sizeof(outHdr));
+            hmacInput.insert(hmacInput.end(),
+                             encryptedPayload.begin(), encryptedPayload.end());
+
+            // Re-acquire key for HMAC computation
+            std::array<uint8_t, ServiceCommConstants::AES_KEY_SIZE> hmacKey{};
+            bool gotKey = false;
+            if (!m_isService) {
+                if (m_clientEncryptionEstablished) {
+                    hmacKey = m_clientSessionKey;
+                    gotKey = true;
+                }
+            } else {
+                std::shared_lock clientLock(m_clientsMutex);
+                for (auto& c : m_clients) {
+                    if (c && c->pipeHandle.h == pipe && c->encryptionEstablished) {
+                        memcpy(hmacKey.data(), c->sessionKey.data(), hmacKey.size());
+                        gotKey = true;
+                        break;
+                    }
+                }
+            }
+
+            if (gotKey) {
+                auto hmac = ShadowStrike::Security::CryptoManager::Instance()
+                    .ComputeKernelMessageHMAC(
+                        std::span<const uint8_t>(hmacInput.data(), hmacInput.size()),
+                        std::span<const uint8_t>(hmacKey.data(), hmacKey.size()));
+
+                ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                    hmacKey.data(), hmacKey.size());
+
+                if (hmac.size() == 32) {
+                    encryptedPayload.insert(encryptedPayload.end(),
+                                            hmac.begin(), hmac.end());
+                } else {
+                    // HMAC computation failed — revert flags
+                    outHdr.flags &= ~ServiceCommConstants::MSG_FLAG_HMAC;
+                    outHdr.payloadLength = static_cast<uint32_t>(encryptedPayload.size());
+                }
+            } else {
+                // No session key available — revert flags
+                outHdr.flags &= ~ServiceCommConstants::MSG_FLAG_HMAC;
+                outHdr.payloadLength = static_cast<uint32_t>(encryptedPayload.size());
+                ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                    hmacKey.data(), hmacKey.size());
+            }
+        }
     } else {
         // CRC32 for backward compatibility on pre-auth messages
         if (payloadLen > 0 && payload) {
@@ -1676,6 +1740,75 @@ bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
 
         // Encrypted messages: decrypt using session key
         if (hdr.flags & ServiceCommConstants::MSG_FLAG_ENCRYPTED) {
+            // ── APT DEFENSE: Verify HMAC before decryption ───────────
+            // If HMAC flag is set, the last 32 bytes are HMAC-SHA256 over
+            // (header || encrypted_payload_without_hmac). Verify first to
+            // detect pipe injection by rogue processes.
+            if (hdr.flags & ServiceCommConstants::MSG_FLAG_HMAC) {
+                constexpr size_t kHmacSize = 32;
+                if (payload.size() <= kHmacSize) {
+                    Utils::Logger::Warn("[ServiceComm] HMAC flag set but payload too small");
+                    return false;
+                }
+
+                // Copy session key for HMAC verification
+                std::array<uint8_t, ServiceCommConstants::AES_KEY_SIZE> hmacKey{};
+                bool gotHmacKey = false;
+                if (!m_isService) {
+                    if (m_clientEncryptionEstablished) {
+                        hmacKey = m_clientSessionKey;
+                        gotHmacKey = true;
+                    }
+                } else {
+                    std::shared_lock clientLock(m_clientsMutex);
+                    for (auto& c : m_clients) {
+                        if (c && c->pipeHandle.h == pipe && c->encryptionEstablished) {
+                            memcpy(hmacKey.data(), c->sessionKey.data(), hmacKey.size());
+                            gotHmacKey = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (gotHmacKey) {
+                    // Build HMAC input: header + payload_without_hmac
+                    const size_t dataLen = payload.size() - kHmacSize;
+                    std::vector<uint8_t> hmacInput;
+                    hmacInput.reserve(sizeof(hdr) + dataLen);
+                    hmacInput.insert(hmacInput.end(),
+                                     reinterpret_cast<const uint8_t*>(&hdr),
+                                     reinterpret_cast<const uint8_t*>(&hdr) + sizeof(hdr));
+                    hmacInput.insert(hmacInput.end(),
+                                     payload.begin(), payload.begin() + dataLen);
+
+                    std::span<const uint8_t> receivedHmac(
+                        payload.data() + dataLen, kHmacSize);
+
+                    using namespace ShadowStrike::Security;
+                    bool hmacValid = CryptoManager::Instance().VerifyKernelMessageIntegrity(
+                        std::span<const uint8_t>(hmacInput.data(), hmacInput.size()),
+                        receivedHmac,
+                        std::span<const uint8_t>(hmacKey.data(), hmacKey.size()));
+
+                    CryptoManager::Instance().SecureZero(
+                        hmacKey.data(), hmacKey.size());
+
+                    if (!hmacValid) {
+                        Utils::Logger::Error("[ServiceComm] Message HMAC verification FAILED "
+                                             "— potential pipe injection attack");
+                        m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+                        return false;
+                    }
+
+                    // Strip HMAC from payload before decryption
+                    payload.resize(dataLen);
+                } else {
+                    ShadowStrike::Security::CryptoManager::Instance().SecureZero(
+                        hmacKey.data(), hmacKey.size());
+                    Utils::Logger::Warn("[ServiceComm] HMAC flag set but no session key for verification");
+                }
+            }
+
             // Extract nonce counter for replay detection BEFORE decryption strips it.
             // Wire format: [12-byte nonce][ciphertext][16-byte tag]
             // Nonce layout: bytes 0-7 = counter, byte 8 = direction, bytes 9-11 = zero
