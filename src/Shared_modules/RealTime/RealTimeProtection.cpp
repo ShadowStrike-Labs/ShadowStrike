@@ -89,6 +89,7 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Security/DigitalSignatureValidator.hpp"
+#include "../Security/ProcessProtection.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -2232,6 +2233,18 @@ public:
                             L"Source PID: {} -> Target PID: {}, Score: {}, Access: 0x{:08X}",
                             alert->SourceProcessId, alert->TargetProcessId,
                             alert->SuspicionScore, alert->RequestedAccess);
+                    }
+
+                    // Route to ProcessProtection for access filtering,
+                    // telemetry, and coordinated kernel-user threat response
+                    if (Security::ProcessProtection::HasInstance()) {
+                        Security::ProcessProtection::Instance().OnKernelHandleAlert(
+                            alert->SourceProcessId,
+                            alert->TargetProcessId,
+                            alert->RequestedAccess,
+                            alert->GrantedAccess,
+                            alert->SuspicionScore,
+                            alert->SuspiciousFlags);
                     }
                 }
                 break;

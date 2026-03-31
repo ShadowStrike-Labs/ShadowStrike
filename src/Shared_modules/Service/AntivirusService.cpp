@@ -45,6 +45,7 @@
 // SECURITY MODULE INCLUDES
 // ============================================================================
 #include "../Security/TamperProtection.hpp"
+#include "../Security/ProcessProtection.hpp"
 #include "../Security/CertificateValidator.hpp"
 #include "../Scripts/AMSIIntegration.hpp"
 #include "../RealTime/RealTimeProtection.hpp"
@@ -125,6 +126,18 @@ public:
                 return false;
             }
             Security::TamperProtection::Instance().ProtectSelf();
+
+            // Process Protection (must be initialized before RealTimeProtection
+            // so the kernel HandleAlert bridge is ready when IPC starts)
+            Security::ProcessProtectionConfiguration ppConfig;
+            if (!Security::ProcessProtection::Instance().Initialize(ppConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize ProcessProtection");
+                // Non-fatal: handle monitoring degrades but service can continue
+            } else {
+                // Initialize() already protects our own PID internally.
+                // Attempt PPL elevation via kernel driver for maximum protection.
+                (void)Security::ProcessProtection::Instance().ElevateToPPL();
+            }
 
             // Real-Time Protection
             if (!RealTime::RealTimeProtection::Instance().Initialize()) {
@@ -229,6 +242,14 @@ public:
 
         RealTime::RealTimeProtection::Instance().Stop();
         RealTime::RealTimeProtection::Instance().Shutdown();
+
+        // ProcessProtection shutdown (before TamperProtection so tamper hooks
+        // are still active while we close protected handles)
+        if (Security::ProcessProtection::HasInstance() &&
+            Security::ProcessProtection::Instance().IsInitialized()) {
+            Security::ProcessProtection::Instance().Shutdown(
+                Security::ProcessProtection::Instance().GetInternalAuthToken());
+        }
 
         Security::TamperProtection::Instance().Shutdown("INTERNAL_SHUTDOWN");
 
