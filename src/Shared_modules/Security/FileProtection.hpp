@@ -137,7 +137,8 @@
 #include <span>
 #include <bitset>
 #include <filesystem>
-#include <regex>
+// std::regex intentionally excluded — heavy allocator, not used in hot paths.
+// Wildcard matching is handled by dedicated MatchesPattern() implementation.
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -805,50 +806,24 @@ struct RansomwareDetection {
 };
 
 /**
- * @brief File protection statistics
+ * @brief File protection statistics snapshot (copyable, no atomics).
+ *        Public API always returns this by value — safe for cross-thread use.
  */
 struct FileProtectionStatistics {
-    /// @brief Total protected files
-    std::atomic<uint64_t> totalProtectedFiles{0};
-    
-    /// @brief Total protected directories
-    std::atomic<uint64_t> totalProtectedDirectories{0};
-    
-    /// @brief Total operations processed
-    std::atomic<uint64_t> totalOperations{0};
-    
-    /// @brief Total operations blocked
-    std::atomic<uint64_t> totalBlocked{0};
-    
-    /// @brief Total integrity checks
-    std::atomic<uint64_t> totalIntegrityChecks{0};
-    
-    /// @brief Integrity violations
-    std::atomic<uint64_t> integrityViolations{0};
-    
-    /// @brief Signature violations
-    std::atomic<uint64_t> signatureViolations{0};
-    
-    /// @brief Ransomware detections
-    std::atomic<uint64_t> ransomwareDetections{0};
-    
-    /// @brief Backups created
-    std::atomic<uint64_t> backupsCreated{0};
-    
-    /// @brief Files restored
-    std::atomic<uint64_t> filesRestored{0};
-    
-    /// @brief Start time
-    TimePoint startTime = Clock::now();
-    
-    /// @brief Last event time
+    uint64_t totalProtectedFiles      = 0;
+    uint64_t totalProtectedDirectories = 0;
+    uint64_t totalOperations          = 0;
+    uint64_t totalBlocked             = 0;
+    uint64_t totalIntegrityChecks     = 0;
+    uint64_t integrityViolations      = 0;
+    uint64_t signatureViolations      = 0;
+    uint64_t ransomwareDetections     = 0;
+    uint64_t backupsCreated           = 0;
+    uint64_t filesRestored            = 0;
+
+    TimePoint startTime  = Clock::now();
     TimePoint lastEventTime;
-    
-    /**
-     * @brief Reset statistics
-     */
-    void Reset() noexcept;
-    
+
     /**
      * @brief Serialize to JSON
      */

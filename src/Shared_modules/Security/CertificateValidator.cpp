@@ -63,6 +63,15 @@
 #include <filesystem>
 #include <queue>
 
+// ============================================================================
+// COMMUNICATION & UTILITY INFRASTRUCTURE
+// ============================================================================
+
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
+#include "../Communication/IPCManager.hpp"
+#include "../Utils/StringUtils.hpp"
+
 namespace ShadowStrike {
 namespace Security {
 
@@ -124,36 +133,14 @@ namespace {
     return oss.str();
 }
 
-// Convert wide string to UTF-8
+// Convert wide string to UTF-8 — delegates to Utils::StringUtils::ToNarrow
 [[nodiscard]] std::string WideToUtf8(const std::wstring& wide) {
-    if (wide.empty()) return {};
-
-    int size = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                                    static_cast<int>(wide.size()),
-                                    nullptr, 0, nullptr, nullptr);
-    if (size <= 0) return {};
-
-    std::string result(static_cast<size_t>(size), '\0');
-    WideCharToMultiByte(CP_UTF8, 0, wide.c_str(),
-                        static_cast<int>(wide.size()),
-                        result.data(), size, nullptr, nullptr);
-    return result;
+    return Utils::StringUtils::ToNarrow(wide);
 }
 
-// Convert UTF-8 to wide string
+// Convert UTF-8 to wide string — delegates to Utils::StringUtils::ToWide
 [[nodiscard]] std::wstring Utf8ToWide(const std::string& utf8) {
-    if (utf8.empty()) return {};
-
-    int size = MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                                    static_cast<int>(utf8.size()),
-                                    nullptr, 0);
-    if (size <= 0) return {};
-
-    std::wstring result(static_cast<size_t>(size), L'\0');
-    MultiByteToWideChar(CP_UTF8, 0, utf8.c_str(),
-                        static_cast<int>(utf8.size()),
-                        result.data(), size);
-    return result;
+    return Utils::StringUtils::ToWide(utf8);
 }
 
 // Convert bytes to hex string
@@ -514,18 +501,18 @@ private:
 }
 
 void CertificateValidatorStatistics::Reset() noexcept {
-    totalValidations.store(0, std::memory_order_relaxed);
-    validCertificates.store(0, std::memory_order_relaxed);
-    invalidCertificates.store(0, std::memory_order_relaxed);
-    expiredCertificates.store(0, std::memory_order_relaxed);
-    revokedCertificates.store(0, std::memory_order_relaxed);
-    ocspChecks.store(0, std::memory_order_relaxed);
-    ocspCacheHits.store(0, std::memory_order_relaxed);
-    crlChecks.store(0, std::memory_order_relaxed);
-    crlCacheHits.store(0, std::memory_order_relaxed);
-    validationCacheHits.store(0, std::memory_order_relaxed);
-    chainBuildFailures.store(0, std::memory_order_relaxed);
-    avgValidationTimeUs.store(0, std::memory_order_relaxed);
+    totalValidations = 0;
+    validCertificates = 0;
+    invalidCertificates = 0;
+    expiredCertificates = 0;
+    revokedCertificates = 0;
+    ocspChecks = 0;
+    ocspCacheHits = 0;
+    crlChecks = 0;
+    crlCacheHits = 0;
+    validationCacheHits = 0;
+    chainBuildFailures = 0;
+    avgValidationTimeUs = 0;
     startTime = Clock::now();
 }
 
@@ -535,18 +522,18 @@ void CertificateValidatorStatistics::Reset() noexcept {
 
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalValidations\":" << totalValidations.load(std::memory_order_relaxed) << ",";
-    oss << "\"validCertificates\":" << validCertificates.load(std::memory_order_relaxed) << ",";
-    oss << "\"invalidCertificates\":" << invalidCertificates.load(std::memory_order_relaxed) << ",";
-    oss << "\"expiredCertificates\":" << expiredCertificates.load(std::memory_order_relaxed) << ",";
-    oss << "\"revokedCertificates\":" << revokedCertificates.load(std::memory_order_relaxed) << ",";
-    oss << "\"ocspChecks\":" << ocspChecks.load(std::memory_order_relaxed) << ",";
-    oss << "\"ocspCacheHits\":" << ocspCacheHits.load(std::memory_order_relaxed) << ",";
-    oss << "\"crlChecks\":" << crlChecks.load(std::memory_order_relaxed) << ",";
-    oss << "\"crlCacheHits\":" << crlCacheHits.load(std::memory_order_relaxed) << ",";
-    oss << "\"validationCacheHits\":" << validationCacheHits.load(std::memory_order_relaxed) << ",";
-    oss << "\"chainBuildFailures\":" << chainBuildFailures.load(std::memory_order_relaxed) << ",";
-    oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs.load(std::memory_order_relaxed) << ",";
+    oss << "\"totalValidations\":" << totalValidations << ",";
+    oss << "\"validCertificates\":" << validCertificates << ",";
+    oss << "\"invalidCertificates\":" << invalidCertificates << ",";
+    oss << "\"expiredCertificates\":" << expiredCertificates << ",";
+    oss << "\"revokedCertificates\":" << revokedCertificates << ",";
+    oss << "\"ocspChecks\":" << ocspChecks << ",";
+    oss << "\"ocspCacheHits\":" << ocspCacheHits << ",";
+    oss << "\"crlChecks\":" << crlChecks << ",";
+    oss << "\"crlCacheHits\":" << crlCacheHits << ",";
+    oss << "\"validationCacheHits\":" << validationCacheHits << ",";
+    oss << "\"chainBuildFailures\":" << chainBuildFailures << ",";
+    oss << "\"avgValidationTimeUs\":" << avgValidationTimeUs << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
     return oss.str();
@@ -667,6 +654,264 @@ void CertificateValidatorStatistics::Reset() noexcept {
 }
 
 // ============================================================================
+// INTERNAL ATOMIC STATISTICS (PIMPL-private; snapshots to public non-atomic struct)
+// ============================================================================
+
+struct InternalAtomicStats {
+    std::atomic<uint64_t> totalValidations{0};
+    std::atomic<uint64_t> validCertificates{0};
+    std::atomic<uint64_t> invalidCertificates{0};
+    std::atomic<uint64_t> expiredCertificates{0};
+    std::atomic<uint64_t> revokedCertificates{0};
+    std::atomic<uint64_t> ocspChecks{0};
+    std::atomic<uint64_t> ocspCacheHits{0};
+    std::atomic<uint64_t> crlChecks{0};
+    std::atomic<uint64_t> crlCacheHits{0};
+    std::atomic<uint64_t> validationCacheHits{0};
+    std::atomic<uint64_t> chainBuildFailures{0};
+    std::atomic<uint64_t> avgValidationTimeUs{0};
+    TimePoint startTime = Clock::now();
+
+    void Reset() noexcept {
+        totalValidations.store(0, std::memory_order_relaxed);
+        validCertificates.store(0, std::memory_order_relaxed);
+        invalidCertificates.store(0, std::memory_order_relaxed);
+        expiredCertificates.store(0, std::memory_order_relaxed);
+        revokedCertificates.store(0, std::memory_order_relaxed);
+        ocspChecks.store(0, std::memory_order_relaxed);
+        ocspCacheHits.store(0, std::memory_order_relaxed);
+        crlChecks.store(0, std::memory_order_relaxed);
+        crlCacheHits.store(0, std::memory_order_relaxed);
+        validationCacheHits.store(0, std::memory_order_relaxed);
+        chainBuildFailures.store(0, std::memory_order_relaxed);
+        avgValidationTimeUs.store(0, std::memory_order_relaxed);
+        startTime = Clock::now();
+    }
+
+    [[nodiscard]] CertificateValidatorStatistics Snapshot() const noexcept {
+        CertificateValidatorStatistics snap;
+        snap.totalValidations    = totalValidations.load(std::memory_order_relaxed);
+        snap.validCertificates   = validCertificates.load(std::memory_order_relaxed);
+        snap.invalidCertificates = invalidCertificates.load(std::memory_order_relaxed);
+        snap.expiredCertificates = expiredCertificates.load(std::memory_order_relaxed);
+        snap.revokedCertificates = revokedCertificates.load(std::memory_order_relaxed);
+        snap.ocspChecks          = ocspChecks.load(std::memory_order_relaxed);
+        snap.ocspCacheHits       = ocspCacheHits.load(std::memory_order_relaxed);
+        snap.crlChecks           = crlChecks.load(std::memory_order_relaxed);
+        snap.crlCacheHits        = crlCacheHits.load(std::memory_order_relaxed);
+        snap.validationCacheHits = validationCacheHits.load(std::memory_order_relaxed);
+        snap.chainBuildFailures  = chainBuildFailures.load(std::memory_order_relaxed);
+        snap.avgValidationTimeUs = avgValidationTimeUs.load(std::memory_order_relaxed);
+        snap.startTime           = startTime;
+        return snap;
+    }
+
+    /// @brief Exponential moving average update (alpha ≈ 0.125 = 1/8 for stability)
+    void UpdateAvgValidationTime(uint64_t durationUs) noexcept {
+        uint64_t oldAvg = avgValidationTimeUs.load(std::memory_order_relaxed);
+        uint64_t newAvg = (oldAvg == 0)
+            ? durationUs
+            : oldAvg - (oldAvg >> 3) + (durationUs >> 3);
+        avgValidationTimeUs.store(newAvg, std::memory_order_relaxed);
+    }
+};
+
+// ============================================================================
+// BOUNDED ASYNC VALIDATION WORKER POOL
+// ============================================================================
+
+static constexpr size_t MAX_ASYNC_WORKERS = 4;
+
+// ============================================================================
+// STATIC TELEMETRY/ALERT HELPERS (no `this` required — safe for async lambdas)
+// ============================================================================
+
+/// @brief Emit certificate validation telemetry without instance dependency.
+///        All data is passed by value — safe to call from detached threads.
+static void EmitCertTelemetryStatic(
+    const ValidationDetails& details,
+    const std::string& context,
+    const std::string& version,
+    uint64_t totalValidations,
+    uint64_t avgValidationUs) noexcept {
+
+    try {
+        using namespace Communication;
+        if (!TelemetryCollector::HasInstance()) return;
+        auto& telemetry = TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> fields;
+        fields["module"] = "CertificateValidator";
+        fields["version"] = version;
+        fields["result"] = std::string(GetValidationResultName(details.result));
+        fields["valid"] = details.IsValid() ? "true" : "false";
+        fields["context"] = context;
+
+        if (!details.errorMessage.empty()) {
+            fields["error"] = details.errorMessage;
+        }
+        if (!details.chain.empty()) {
+            fields["subject_cn"] = details.chain[0].subject.commonName;
+            fields["issuer_cn"] = details.chain[0].issuer.commonName;
+            fields["serial"] = details.chain[0].serialNumber;
+            fields["chain_length"] = std::to_string(details.chain.size());
+        }
+        fields["total_validations"] = std::to_string(totalValidations);
+        fields["avg_validation_us"] = std::to_string(avgValidationUs);
+
+        telemetry.RecordCustom("cert_validation", fields);
+
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"CertificateValidator",
+            L"Async telemetry dispatch failed: %hs", e.what());
+    }
+}
+
+/// @brief Emit certificate validation alert without instance dependency.
+static void EmitCertAlertStatic(
+    const ValidationDetails& details,
+    const std::string& context,
+    const std::string& version) noexcept {
+
+    try {
+        using namespace Communication;
+        if (!AlertSystem::HasInstance()) return;
+        auto& alerts = AlertSystem::Instance();
+        if (!alerts.IsInitialized()) return;
+
+        if (details.IsValid()) return;
+
+        AlertSeverity severity = AlertSeverity::Medium;
+        if (details.result == ValidationResult::Revoked) {
+            severity = AlertSeverity::Critical;
+        } else if (details.result == ValidationResult::UntrustedRoot ||
+                   details.result == ValidationResult::SignatureInvalid) {
+            severity = AlertSeverity::High;
+        } else if (details.result == ValidationResult::Expired ||
+                   details.result == ValidationResult::WeakAlgorithm) {
+            severity = AlertSeverity::Medium;
+        } else if (details.result == ValidationResult::RevocationUnknown) {
+            severity = AlertSeverity::Low;
+        }
+
+        std::string subject = "Certificate validation failure — "
+            + std::string(GetValidationResultName(details.result));
+        if (!details.errorMessage.empty()) {
+            subject += " (" + details.errorMessage + ")";
+        }
+
+        std::string detailStr = "Context: " + context;
+        if (!details.chain.empty()) {
+            detailStr += " | Subject: " + details.chain[0].subject.commonName;
+            detailStr += " | Issuer: " + details.chain[0].issuer.commonName;
+            detailStr += " | Serial: " + details.chain[0].serialNumber;
+        }
+
+        (void)alerts.RaiseAlert(
+            severity,
+            AlertType::Security,
+            subject,
+            detailStr,
+            "CertificateValidator v" + version);
+
+        SS_LOG_DEBUG(L"CertificateValidator",
+            L"Async alert dispatched: severity=%d result=%hs",
+            static_cast<int>(severity),
+            std::string(GetValidationResultName(details.result)).c_str());
+
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"CertificateValidator",
+            L"Async alert dispatch failed: %hs", e.what());
+    }
+}
+
+class AsyncValidationPool final {
+public:
+    AsyncValidationPool() = default;
+
+    ~AsyncValidationPool() {
+        DrainAndShutdown();
+    }
+
+    AsyncValidationPool(const AsyncValidationPool&) = delete;
+    AsyncValidationPool& operator=(const AsyncValidationPool&) = delete;
+
+    /// @brief Submit a validation task. Returns false if pool is saturated.
+    [[nodiscard]] bool Submit(std::function<void()> task) {
+        std::unique_lock lock(m_queueMutex);
+
+        if (m_shuttingDown) return false;
+
+        // Start a new worker if below cap and queue is not empty
+        if (m_activeWorkers < MAX_ASYNC_WORKERS) {
+            ++m_activeWorkers;
+            lock.unlock();
+
+            std::thread([this, fn = std::move(task)]() {
+                try {
+                    fn();
+                } catch (...) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Async validation worker threw exception");
+                }
+                WorkerFinished();
+            }).detach();  // Safe: worker captures only shared_ptr data + pool ptr (singleton-backed)
+            return true;
+        }
+
+        // All workers busy — queue if under limit
+        if (m_pendingTasks.size() >= MAX_ASYNC_WORKERS * 4) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Async validation pool saturated — dropping request");
+            return false;
+        }
+
+        m_pendingTasks.push(std::move(task));
+        return true;
+    }
+
+    void DrainAndShutdown() {
+        {
+            std::unique_lock lock(m_queueMutex);
+            m_shuttingDown = true;
+            while (!m_pendingTasks.empty()) m_pendingTasks.pop();
+        }
+        // Wait briefly for active workers to finish
+        auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::unique_lock lock(m_queueMutex);
+        m_drainCv.wait_until(lock, deadline, [this] { return m_activeWorkers == 0; });
+    }
+
+private:
+    void WorkerFinished() {
+        while (true) {
+            std::function<void()> nextTask;
+            {
+                std::unique_lock lock(m_queueMutex);
+                if (!m_pendingTasks.empty() && !m_shuttingDown) {
+                    nextTask = std::move(m_pendingTasks.front());
+                    m_pendingTasks.pop();
+                } else {
+                    --m_activeWorkers;
+                    if (m_activeWorkers == 0) m_drainCv.notify_all();
+                    return;
+                }
+            }
+
+            try {
+                nextTask();
+            } catch (...) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Async validation queued task threw exception");
+            }
+        }
+    }
+
+    mutable std::mutex m_queueMutex;
+    std::condition_variable m_drainCv;
+    std::queue<std::function<void()>> m_pendingTasks;
+    size_t m_activeWorkers = 0;
+    bool m_shuttingDown = false;
+};
+
+// ============================================================================
 // CERTIFICATE VALIDATOR IMPLEMENTATION CLASS (PIMPL)
 // ============================================================================
 
@@ -727,7 +972,9 @@ public:
 
         // Add additional roots
         for (const auto& rootData : m_config.additionalRoots) {
-            AddTrustedRootInternal(rootData);
+            if (!AddTrustedRootInternal(rootData)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to add one of the configured additional roots");
+            }
         }
 
         // Add blocked certificates
@@ -758,6 +1005,7 @@ public:
 
         // Clear caches
         m_validationCache.clear();
+        m_serialIndex.clear();
         m_ocspCache.clear();
         m_crlCache.clear();
         m_customRoots.clear();
@@ -965,18 +1213,32 @@ public:
             }
         }
 
-        // Update timing
+        // Update timing — exponential moving average
         auto endTime = Clock::now();
         auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(
             endTime - startTime).count();
-        m_stats.avgValidationTimeUs.store(
-            static_cast<uint64_t>(durationUs), std::memory_order_relaxed);
+        m_stats.UpdateAvgValidationTime(static_cast<uint64_t>(durationUs));
 
-        // Cache result
+        // Cache result and populate serial index for O(1) IsRevoked lookups
         if ((options.flags & ValidationFlags::CacheResult) != ValidationFlags::None) {
             std::unique_lock lock(m_mutex);
             if (m_validationCache.size() < CertificateConstants::MAX_CACHED_CERTIFICATES) {
                 m_validationCache[certInfo->sha256Fingerprint] = details;
+
+                // Build serial-to-fingerprint index entry
+                if (!details.chain.empty() && !details.chain[0].serialNumber.empty()) {
+                    std::string normSerial;
+                    normSerial.reserve(details.chain[0].serialNumber.size());
+                    for (char c : details.chain[0].serialNumber) {
+                        if (c != ':' && c != ' ') {
+                            normSerial.push_back(
+                                static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
+                        }
+                    }
+                    if (!normSerial.empty()) {
+                        m_serialIndex.emplace(std::move(normSerial), certInfo->sha256Fingerprint);
+                    }
+                }
             }
         }
 
@@ -1151,7 +1413,7 @@ public:
         auto cb = std::make_shared<ValidationCallback>(std::move(callback));
         auto opts = options;
 
-        std::thread worker([this, data, cb, opts]() {
+        bool submitted = m_asyncPool.Submit([this, data, cb, opts]() {
             try {
                 auto details = VerifyCertificateWithOptions(
                     std::span<const uint8_t>(data->data(), data->size()), opts);
@@ -1165,12 +1427,24 @@ public:
             }
         });
 
-        // Track the thread; detach only after moving it so the impl can be destroyed safely.
-        // In a production system this would use a thread pool. For now, detach is acceptable
-        // because we hold shared_ptr copies of all data the thread needs - no dangling references
-        // to stack objects. The only risk is calling methods on `this` after destruction,
-        // which the singleton lifetime guarantees against during normal operation.
-        worker.detach();
+        if (!submitted) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Async validation pool saturated — running synchronously");
+            try {
+                auto details = VerifyCertificateWithOptions(
+                    std::span<const uint8_t>(data->data(), data->size()), opts);
+                (*cb)(details);
+            } catch (...) {
+                ValidationDetails errDetails;
+                errDetails.result = ValidationResult::Error;
+                errDetails.errorMessage = "Async fallback threw unexpected exception";
+                try { (*cb)(errDetails); } catch (...) {}
+            }
+        }
+    }
+
+    /// @brief Submit a fire-and-forget task to the async pool (for telemetry offload)
+    [[nodiscard]] bool SubmitAsync(std::function<void()> task) {
+        return m_asyncPool.Submit(std::move(task));
     }
 
     // ========================================================================
@@ -1194,23 +1468,16 @@ public:
             }
         }
 
-        // Check our validation cache for a previously-seen cert with this serial
+        // O(1)-amortized lookup via serial-to-fingerprint multimap index.
+        // Iterates all fingerprints matching the serial (handles cross-issuer collisions).
         {
             std::shared_lock lock(m_mutex);
-            for (const auto& [fp, details] : m_validationCache) {
-                if (details.chain.empty()) continue;
-                std::string cachedSerial = details.chain[0].serialNumber;
-                // Normalize cached serial
-                std::string normalizedCached;
-                normalizedCached.reserve(cachedSerial.size());
-                for (char c : cachedSerial) {
-                    if (c != ':' && c != ' ') {
-                        normalizedCached.push_back(
-                            static_cast<char>(std::tolower(static_cast<unsigned char>(c))));
-                    }
-                }
-                if (normalizedCached == normalizedSerial) {
-                    if (details.result == ValidationResult::Revoked) return true;
+            auto [rangeBegin, rangeEnd] = m_serialIndex.equal_range(normalizedSerial);
+            for (auto it = rangeBegin; it != rangeEnd; ++it) {
+                const auto& fp = it->second;
+                auto cacheIt = m_validationCache.find(fp);
+                if (cacheIt != m_validationCache.end()) {
+                    if (cacheIt->second.result == ValidationResult::Revoked) return true;
                     if (m_blockedCerts.find(fp) != m_blockedCerts.end()) return true;
                 }
             }
@@ -1720,6 +1987,7 @@ public:
     void ClearCaches() {
         std::unique_lock lock(m_mutex);
         m_validationCache.clear();
+        m_serialIndex.clear();
         m_ocspCache.clear();
         m_crlCache.clear();
         SS_LOG_INFO(LOG_CATEGORY, L"All caches cleared");
@@ -1738,6 +2006,7 @@ public:
     void ClearValidationCache() {
         std::unique_lock lock(m_mutex);
         m_validationCache.clear();
+        m_serialIndex.clear();
     }
 
     [[nodiscard]] std::unordered_map<std::string, size_t> GetCacheStats() const {
@@ -1816,21 +2085,7 @@ public:
     // ========================================================================
 
     [[nodiscard]] CertificateValidatorStatistics GetStatistics() const {
-        CertificateValidatorStatistics copy;
-        copy.totalValidations.store(m_stats.totalValidations.load(std::memory_order_relaxed));
-        copy.validCertificates.store(m_stats.validCertificates.load(std::memory_order_relaxed));
-        copy.invalidCertificates.store(m_stats.invalidCertificates.load(std::memory_order_relaxed));
-        copy.expiredCertificates.store(m_stats.expiredCertificates.load(std::memory_order_relaxed));
-        copy.revokedCertificates.store(m_stats.revokedCertificates.load(std::memory_order_relaxed));
-        copy.ocspChecks.store(m_stats.ocspChecks.load(std::memory_order_relaxed));
-        copy.ocspCacheHits.store(m_stats.ocspCacheHits.load(std::memory_order_relaxed));
-        copy.crlChecks.store(m_stats.crlChecks.load(std::memory_order_relaxed));
-        copy.crlCacheHits.store(m_stats.crlCacheHits.load(std::memory_order_relaxed));
-        copy.validationCacheHits.store(m_stats.validationCacheHits.load(std::memory_order_relaxed));
-        copy.chainBuildFailures.store(m_stats.chainBuildFailures.load(std::memory_order_relaxed));
-        copy.avgValidationTimeUs.store(m_stats.avgValidationTimeUs.load(std::memory_order_relaxed));
-        copy.startTime = m_stats.startTime;
-        return copy;
+        return m_stats.Snapshot();
     }
 
     void ResetStatistics() {
@@ -1839,19 +2094,20 @@ public:
     }
 
     [[nodiscard]] std::string ExportReport() const {
+        auto snapshot = m_stats.Snapshot();
         std::ostringstream oss;
         oss << "{\n";
         oss << "  \"module\": \"CertificateValidator\",\n";
         oss << "  \"version\": \"" << CertificateValidator::GetVersionString() << "\",\n";
         oss << "  \"status\": " << static_cast<int>(m_status.load()) << ",\n";
-        oss << "  \"statistics\": " << m_stats.ToJson() << ",\n";
+        oss << "  \"statistics\": " << snapshot.ToJson() << ",\n";
 
         auto cacheStats = GetCacheStats();
         oss << "  \"caches\": {\n";
         bool first = true;
         for (const auto& [name, size] : cacheStats) {
             if (!first) oss << ",\n";
-            oss << "    \"" << name << "\": " << size;
+            oss << "    \"" << EscapeJsonString(name) << "\": " << size;
             first = false;
         }
         oss << "\n  }\n";
@@ -1892,12 +2148,15 @@ public:
             CertificateFingerprint testFp{};
             testFp[0] = 0xFF;
 
-            BlockCertificate(testFp, "Self-test");
+            if (!BlockCertificate(testFp, "Self-test")) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test FAILED: BlockCertificate returned false");
+                allPassed = false;
+            }
             if (!IsBlockedInternal(testFp)) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test FAILED: Block/unblock not working");
                 allPassed = false;
             }
-            UnblockCertificate(testFp);
+            (void)UnblockCertificate(testFp);
         }
 
         // Test 4: Trust store access
@@ -2655,8 +2914,16 @@ private:
     // Certificate fetch callback
     CertificateFetchCallback m_fetchCallback;
 
-    // Statistics
-    CertificateValidatorStatistics m_stats;
+    // Statistics (internal atomic counters — snapshot via m_stats.Snapshot())
+    InternalAtomicStats m_stats;
+
+    // Bounded async worker pool (replaces fire-and-forget thread::detach)
+    AsyncValidationPool m_asyncPool;
+
+    // Serial-to-fingerprint index for O(1) IsRevoked lookups.
+    // Uses multimap because serial uniqueness is per-issuer, not global —
+    // different CAs may issue certs with the same serial number.
+    std::unordered_multimap<std::string, CertificateFingerprint> m_serialIndex;
 };
 
 // ============================================================================
@@ -2738,25 +3005,46 @@ void CertificateValidator::Shutdown() {
 [[nodiscard]] ValidationDetails CertificateValidator::VerifyCertificate(
     std::span<const uint8_t> certData,
     const ValidationOptions& options) {
-    return m_impl->VerifyCertificateWithOptions(certData, options);
+    auto details = m_impl->VerifyCertificateWithOptions(certData, options);
+    ReportValidationTelemetry(details, "VerifyCertificate(span)");
+    if (!details.IsValid()) {
+        ReportValidationToAlertSystem(details, "VerifyCertificate(span)");
+    }
+    return details;
 }
 
 [[nodiscard]] ValidationDetails CertificateValidator::VerifyCertificate(
     const CertificateInfo& certInfo,
     const ValidationOptions& options) {
-    return m_impl->VerifyCertificateInfo(certInfo, options);
+    auto details = m_impl->VerifyCertificateInfo(certInfo, options);
+    ReportValidationTelemetry(details, "VerifyCertificate(CertInfo)");
+    if (!details.IsValid()) {
+        ReportValidationToAlertSystem(details, "VerifyCertificate(CertInfo)");
+    }
+    return details;
 }
 
 [[nodiscard]] ValidationDetails CertificateValidator::VerifyChain(
     const std::vector<CertificateInfo>& chain,
     const ValidationOptions& options) {
-    return m_impl->VerifyChain(chain, options);
+    auto details = m_impl->VerifyChain(chain, options);
+    ReportValidationTelemetry(details, "VerifyChain");
+    if (!details.IsValid()) {
+        ReportValidationToAlertSystem(details, "VerifyChain");
+    }
+    return details;
 }
 
 [[nodiscard]] ValidationDetails CertificateValidator::VerifyFile(
     const std::wstring& filePath,
     const ValidationOptions& options) {
-    return m_impl->VerifyFile(filePath, options);
+    auto details = m_impl->VerifyFile(filePath, options);
+    std::string ctx = "VerifyFile " + Utils::StringUtils::ToNarrow(filePath);
+    ReportValidationTelemetry(details, ctx);
+    if (!details.IsValid()) {
+        ReportValidationToAlertSystem(details, ctx);
+    }
+    return details;
 }
 
 void CertificateValidator::VerifyCertificateAsync(
@@ -2980,6 +3268,277 @@ void CertificateValidator::ResetStatistics() {
 }
 
 // ============================================================================
+// KERNEL BRIDGE IMPLEMENTATIONS
+// ============================================================================
+
+void CertificateValidator::OnKernelImageLoad(
+    std::wstring_view imagePath,
+    uintptr_t /*imageBase*/,
+    size_t /*imageSize*/,
+    uint32_t processId) {
+
+    try {
+        if (!m_impl || !m_impl->IsInitialized()) return;
+
+        std::wstring path(imagePath);
+        if (path.empty()) return;
+
+        // Only validate executables, DLLs, and drivers
+        auto ext = std::filesystem::path(path).extension().wstring();
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext != L".exe" && ext != L".dll" && ext != L".sys") return;
+
+        // Use CacheResult flag so repeat loads resolve from in-memory cache.
+        // VerifyFile reads the Authenticode signature and checks the cache internally.
+        ValidationOptions opts;
+        opts.flags = opts.flags | ValidationFlags::CacheResult;
+        auto details = m_impl->VerifyFile(path, opts);
+
+        // For revoked / untrusted certs, block synchronously BEFORE returning to kernel
+        if (!details.IsValid() &&
+            (details.result == ValidationResult::Revoked ||
+             details.result == ValidationResult::UntrustedRoot)) {
+            (void)RequestKernelProcessBlock(processId,
+                "Certificate validation failed: " +
+                std::string(GetValidationResultName(details.result)));
+        }
+
+        // Pre-compute data needed by async helpers (no `this` capture — safe from UAF)
+        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(details));
+        auto pid = processId;
+        auto narrowPath = std::make_shared<std::string>(
+            Utils::StringUtils::ToNarrow(imagePath));
+        auto ver = GetVersionString();
+        auto statsSnap = GetStatistics();
+
+        (void)m_impl->SubmitAsync([detailsCopy, pid, narrowPath, ver, statsSnap]() {
+            EmitCertTelemetryStatic(*detailsCopy, *narrowPath, ver,
+                statsSnap.totalValidations, statsSnap.avgValidationTimeUs);
+            if (!detailsCopy->IsValid()) {
+                SS_LOG_WARN(L"CertificateValidator",
+                    L"Invalid code-signing cert on image loaded by PID %u: %hs — result=%hs",
+                    pid, narrowPath->c_str(),
+                    std::string(GetValidationResultName(detailsCopy->result)).c_str());
+                EmitCertAlertStatic(*detailsCopy,
+                    "ImageLoad PID=" + std::to_string(pid) + " " + *narrowPath, ver);
+            }
+        });
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"CertificateValidator",
+            L"OnKernelImageLoad exception: %hs", e.what());
+    }
+}
+
+void CertificateValidator::OnKernelProcessCreate(
+    uint32_t processId,
+    uint32_t parentProcessId,
+    std::wstring_view imagePath) {
+
+    try {
+        if (!m_impl || !m_impl->IsInitialized()) return;
+
+        std::wstring path(imagePath);
+        if (path.empty()) return;
+
+        ValidationOptions opts;
+        opts.flags = opts.flags | ValidationFlags::CacheResult;
+        auto details = m_impl->VerifyFile(path, opts);
+
+        // Synchronous block for revoked certs — must happen before kernel returns
+        if (!details.IsValid() && details.result == ValidationResult::Revoked) {
+            std::string narrowPath = Utils::StringUtils::ToNarrow(imagePath);
+            (void)RequestKernelProcessBlock(processId,
+                "Process certificate revoked: " + narrowPath);
+        }
+
+        // Pre-compute data for async helpers (no `this` capture — safe from UAF)
+        auto detailsCopy = std::make_shared<ValidationDetails>(std::move(details));
+        auto pid = processId;
+        auto ppid = parentProcessId;
+        auto narrowPath = std::make_shared<std::string>(
+            Utils::StringUtils::ToNarrow(imagePath));
+        auto ver = GetVersionString();
+        auto statsSnap = GetStatistics();
+
+        (void)m_impl->SubmitAsync([detailsCopy, pid, ppid, narrowPath, ver, statsSnap]() {
+            std::string ctx = "ProcessCreate PID=" + std::to_string(pid) +
+                " PPID=" + std::to_string(ppid);
+            EmitCertTelemetryStatic(*detailsCopy, ctx, ver,
+                statsSnap.totalValidations, statsSnap.avgValidationTimeUs);
+            if (!detailsCopy->IsValid()) {
+                SS_LOG_WARN(L"CertificateValidator",
+                    L"New process PID %u (PPID %u) has invalid certificate: %hs — %hs",
+                    pid, ppid, narrowPath->c_str(),
+                    std::string(GetValidationResultName(detailsCopy->result)).c_str());
+                EmitCertAlertStatic(*detailsCopy, ctx + " " + *narrowPath, ver);
+            }
+        });
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"CertificateValidator",
+            L"OnKernelProcessCreate exception: %hs", e.what());
+    }
+}
+
+[[nodiscard]] bool CertificateValidator::RequestKernelProcessBlock(
+    uint32_t processId,
+    std::string_view reason) {
+
+    try {
+        using namespace Communication;
+
+        if (!IPCManager::HasInstance()) {
+            SS_LOG_DEBUG(L"CertificateValidator",
+                L"IPCManager not available — cannot request kernel block for PID %u",
+                processId);
+            return false;
+        }
+
+        auto& ipc = IPCManager::Instance();
+        if (!ipc.IsFilterPortConnected()) {
+            SS_LOG_DEBUG(L"CertificateValidator",
+                L"Kernel filter port not connected — cannot block PID %u",
+                processId);
+            return false;
+        }
+
+        // Build a kernel block request message
+        // Using a simple packed struct for the IPC message
+        struct KernelBlockRequest {
+            uint32_t messageType = 0x0010;  // CERT_BLOCK_REQUEST
+            uint32_t processId;
+            char reason[256];
+        };
+
+        KernelBlockRequest req{};
+        req.processId = processId;
+        auto reasonStr = std::string(reason);
+        auto copyLen = (std::min)(reasonStr.size(), sizeof(req.reason) - 1);
+        std::memcpy(req.reason, reasonStr.c_str(), copyLen);
+        req.reason[copyLen] = '\0';
+
+        bool sent = ipc.SendToKernel(&req, sizeof(req));
+        if (sent) {
+            SS_LOG_INFO(L"CertificateValidator",
+                L"Kernel block request sent for PID %u: %hs",
+                processId, req.reason);
+        } else {
+            SS_LOG_WARN(L"CertificateValidator",
+                L"Failed to send kernel block request for PID %u", processId);
+        }
+
+        return sent;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"CertificateValidator",
+            L"RequestKernelProcessBlock exception: %hs", e.what());
+        return false;
+    }
+}
+
+// ============================================================================
+// COMMUNICATION WIRING IMPLEMENTATIONS
+// ============================================================================
+
+void CertificateValidator::ReportValidationToAlertSystem(
+    const ValidationDetails& details,
+    std::string_view context) {
+
+    try {
+        using namespace Communication;
+
+        if (!AlertSystem::HasInstance()) return;
+        auto& alerts = AlertSystem::Instance();
+        if (!alerts.IsInitialized()) return;
+
+        // Only alert on failures
+        if (details.IsValid()) return;
+
+        AlertSeverity severity = AlertSeverity::Medium;
+        if (details.result == ValidationResult::Revoked) {
+            severity = AlertSeverity::Critical;
+        } else if (details.result == ValidationResult::UntrustedRoot ||
+                   details.result == ValidationResult::SignatureInvalid) {
+            severity = AlertSeverity::High;
+        } else if (details.result == ValidationResult::Expired ||
+                   details.result == ValidationResult::WeakAlgorithm) {
+            severity = AlertSeverity::Medium;
+        } else if (details.result == ValidationResult::RevocationUnknown) {
+            severity = AlertSeverity::Low;
+        }
+
+        std::string subject = "Certificate validation failure — "
+            + std::string(GetValidationResultName(details.result));
+        if (!details.errorMessage.empty()) {
+            subject += " (" + details.errorMessage + ")";
+        }
+
+        std::string detailStr = "Context: " + std::string(context);
+        if (!details.chain.empty()) {
+            detailStr += " | Subject: " + details.chain[0].subject.commonName;
+            detailStr += " | Issuer: " + details.chain[0].issuer.commonName;
+            detailStr += " | Serial: " + details.chain[0].serialNumber;
+        }
+
+        (void)alerts.RaiseAlert(
+            severity,
+            AlertType::Security,
+            subject,
+            detailStr,
+            "CertificateValidator v" + GetVersionString());
+
+        SS_LOG_DEBUG(L"CertificateValidator",
+            L"Alert dispatched: severity=%d result=%hs",
+            static_cast<int>(severity),
+            std::string(GetValidationResultName(details.result)).c_str());
+
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"CertificateValidator",
+            L"AlertSystem dispatch failed: %hs", e.what());
+    }
+}
+
+void CertificateValidator::ReportValidationTelemetry(
+    const ValidationDetails& details,
+    std::string_view context) {
+
+    try {
+        using namespace Communication;
+
+        if (!TelemetryCollector::HasInstance()) return;
+        auto& telemetry = TelemetryCollector::Instance();
+
+        std::map<std::string, std::string> fields;
+        fields["module"] = "CertificateValidator";
+        fields["version"] = GetVersionString();
+        fields["result"] = std::string(GetValidationResultName(details.result));
+        fields["valid"] = details.IsValid() ? "true" : "false";
+        fields["context"] = std::string(context);
+
+        if (!details.errorMessage.empty()) {
+            fields["error"] = details.errorMessage;
+        }
+
+        if (!details.chain.empty()) {
+            fields["subject_cn"] = details.chain[0].subject.commonName;
+            fields["issuer_cn"] = details.chain[0].issuer.commonName;
+            fields["serial"] = details.chain[0].serialNumber;
+            fields["chain_length"] = std::to_string(details.chain.size());
+        }
+
+        auto stats = GetStatistics();
+        fields["total_validations"] = std::to_string(stats.totalValidations);
+        fields["avg_validation_us"] = std::to_string(stats.avgValidationTimeUs);
+
+        telemetry.RecordCustom("cert_validation", fields);
+
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"CertificateValidator",
+            L"TelemetryCollector dispatch failed: %hs", e.what());
+    }
+}
+
+// ============================================================================
 // RAII HELPER IMPLEMENTATIONS
 // ============================================================================
 
@@ -2992,7 +3551,7 @@ CertificatePinGuard::CertificatePinGuard(
 
 CertificatePinGuard::~CertificatePinGuard() {
     if (m_pinned) {
-        CertificateValidator::Instance().UnpinCertificate(m_hostname);
+        (void)CertificateValidator::Instance().UnpinCertificate(m_hostname);
     }
 }
 

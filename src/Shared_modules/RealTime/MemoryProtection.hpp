@@ -24,131 +24,251 @@
 #include <cstdint>
 #include <chrono>
 #include <atomic>
+#include <functional>
 
 #include "../Utils/ProcessUtils.hpp"
 
 namespace ShadowStrike {
-    namespace RealTime {
+namespace RealTime {
 
-        /**
-         * @brief Type of memory violation detected.
-         */
-        enum class MemoryViolationType {
-            None,
-            RWX_Page,           ///< Page with Read-Write-Execute permissions (often shellcode)
-            Shellcode_Pattern,  ///< Known shellcode pattern (e.g., NOP sled, reverse shell)
-            Module_Stomping,    ///< Module memory does not match disk (hollowing/stomping)
-            ROP_Gadget,         ///< Suspicious return addresses on stack
-            Heap_Spray,         ///< Repetitive patterns in heap
-            Thread_Injection    ///< Thread start address in suspicious memory
-        };
+    // =========================================================================
+    // Enumerations
+    // =========================================================================
 
-        /**
-         * @brief Scan intensity mode.
-         */
-        enum class ScanMode {
-            Fast,               ///< Check permissions (RWX) and headers only
-            Deep,               ///< Full memory scan for patterns
-            Heuristic           ///< Analyze behavior and stack traces
-        };
+    /**
+     * @brief Type of memory violation detected.
+     * Extended for nation-state APT detection including kernel-reported events.
+     */
+    enum class MemoryViolationType : uint16_t {
+        None                    = 0,
 
-        /**
-         * @brief Details of a detected violation.
-         */
-        struct MemoryViolation {
-            MemoryViolationType type = MemoryViolationType::None;
-            uint64_t address = 0;
-            size_t size = 0;
-            std::vector<uint8_t> dump;  ///< First few bytes of the violation
-            float confidence = 0.0f;    ///< 0.0 to 1.0
-            std::string details;
+        // Core detections
+        RWX_Page                = 1,    ///< Read-Write-Execute page
+        Shellcode_Pattern       = 2,    ///< Shellcode pattern (NOP sled, encoder, PIC)
+        Module_Stomping         = 3,    ///< Module .text section mismatch vs disk
+        ROP_Gadget              = 4,    ///< ROP chain / gadget sequence on stack
+        Heap_Spray              = 5,    ///< Heap spray pattern
+        Thread_Injection        = 6,    ///< Thread start address in non-module memory
 
-            [[nodiscard]] std::string ToJson() const;
-        };
+        // Advanced APT detections
+        W_to_X_Transition       = 10,   ///< Write -> Execute protection change (W^X violation)
+        Unbacked_Executable     = 11,   ///< Private executable memory with no file backing
+        API_Hash_Resolution     = 12,   ///< API hashing loop (ror13, crc32, djb2)
+        Syscall_Stub            = 13,   ///< Direct syscall / Hell's Gate / Halo's Gate
+        CFG_Bypass              = 14,   ///< Control Flow Guard bypass
+        Stack_Pivot             = 15,   ///< RSP outside thread stack limits
+        Process_Hollowing       = 16,   ///< Hollowed process image
+        Reflective_DLL          = 17,   ///< Reflective DLL loading
+        Early_Bird_APC          = 18,   ///< Early bird APC injection
+        Phantom_DLL             = 19,   ///< Memory-only DLL (no file backing)
+        AtomBombing             = 20,   ///< AtomBombing injection
+        Process_Doppelganging   = 21,   ///< NTFS transacted section injection
+        Trampolining            = 22,   ///< Function hook / trampoline
+        Entropy_Anomaly         = 23,   ///< High entropy in executable region
+        IAT_Tampering           = 24,   ///< Import Address Table modification
+        Callback_Overwrite      = 25,   ///< System callback pointer overwrite
 
-        /**
-         * @brief Result of a memory scan operation.
-         */
-        struct MemoryScanResult {
-            Utils::ProcessUtils::ProcessId pid = 0;
-            bool compromised = false;
-            size_t pagesScanned = 0;
-            std::vector<MemoryViolation> violations;
-            std::chrono::microseconds scanDuration{ 0 };
+        // Kernel-sourced detections (from PhantomSensor driver)
+        Kernel_Shellcode        = 100,  ///< Driver-detected shellcode
+        Kernel_Injection        = 101,  ///< Driver-detected injection technique
+        Kernel_Hollowing        = 102,  ///< Driver-detected process hollowing
+        Kernel_MemoryProtect    = 103,  ///< Driver-detected suspicious VirtualProtect
+        Kernel_CrossProcess     = 104,  ///< Driver-detected cross-process memory access
+        Kernel_SuspiciousAlloc  = 105   ///< Driver-detected suspicious VirtualAlloc
+    };
 
-            [[nodiscard]] std::string ToJson() const;
-        };
+    /**
+     * @brief Scan intensity mode.
+     */
+    enum class ScanMode : uint8_t {
+        Fast        = 0,    ///< Permissions + headers only (~1ms)
+        Deep        = 1,    ///< Full pattern scan + module comparison (~50ms)
+        Heuristic   = 2,    ///< Behavioral + stack analysis (~100ms)
+        Targeted    = 3,    ///< Single region deep scan
+        APT_Hunt    = 4     ///< Full nation-state APT sweep (~500ms)
+    };
 
-        /**
-         * @brief Memory Protection Engine.
-         *
-         * Detects memory-resident threats including:
-         * - Shellcode injection
-         * - Process Hollowing / Module Stomping
-         * - ROP chains
-         * - RWX memory hunting
-         */
-        class MemoryProtection final {
-        public:
-            /**
-             * @brief Singleton Accessor.
-             */
-            [[nodiscard]] static MemoryProtection& Instance() noexcept;
+    /**
+     * @brief Threat severity aligned with AlertSystem severity levels.
+     */
+    enum class MemoryThreatSeverity : uint8_t {
+        None        = 0,
+        Low         = 1,    ///< Informational / possible benign
+        Medium      = 2,    ///< Suspicious, investigation required
+        High        = 3,    ///< Likely malicious
+        Critical    = 4,    ///< Active exploitation
+        Emergency   = 5     ///< Zero-day / nation-state pattern
+    };
 
-            // Delete copy/move
-            MemoryProtection(const MemoryProtection&) = delete;
-            MemoryProtection& operator=(const MemoryProtection&) = delete;
-            MemoryProtection(MemoryProtection&&) = delete;
-            MemoryProtection& operator=(MemoryProtection&&) = delete;
+    /**
+     * @brief MITRE ATT&CK technique mapping for forensic correlation.
+     */
+    enum class MitreTechnique : uint16_t {
+        None        = 0,
+        T1055_001   = 1,    ///< Process Injection: DLL Injection
+        T1055_002   = 2,    ///< Process Injection: PE Injection
+        T1055_003   = 3,    ///< Process Injection: Thread Execution Hijacking
+        T1055_004   = 4,    ///< Process Injection: APC Injection
+        T1055_005   = 5,    ///< Process Injection: Thread Local Storage
+        T1055_009   = 6,    ///< Process Injection: Proc Memory
+        T1055_012   = 8,    ///< Process Injection: Process Hollowing
+        T1055_013   = 9,    ///< Process Injection: Process Doppelganging
+        T1620       = 12,   ///< Reflective Code Loading
+        T1574       = 13,   ///< Hijack Execution Flow
+        T1106       = 14,   ///< Native API (direct syscalls)
+        T1027       = 15    ///< Obfuscated Files or Information
+    };
 
-            /**
-             * @brief Scan a specific process for memory threats.
-             * @param pid Process ID to scan.
-             * @param mode Scan intensity.
-             * @return Detailed scan result.
-             */
-            [[nodiscard]] MemoryScanResult ScanProcess(Utils::ProcessUtils::ProcessId pid, ScanMode mode = ScanMode::Fast);
+    // =========================================================================
+    // Data Structures
+    // =========================================================================
 
-            /**
-             * @brief Add a process to the real-time monitoring list.
-             * @param pid Process ID.
-             * @return true if successfully added.
-             */
-            [[nodiscard]] bool MonitorProcess(Utils::ProcessUtils::ProcessId pid);
+    /**
+     * @brief Full details of a detected memory violation.
+     */
+    struct MemoryViolation {
+        MemoryViolationType type            = MemoryViolationType::None;
+        uint64_t            address         = 0;
+        size_t              size            = 0;
+        std::vector<uint8_t> dump;                  ///< First bytes of violation region
+        float               confidence      = 0.0f; ///< 0.0 - 1.0
+        std::string         details;
 
-            /**
-             * @brief Enable specific exploit mitigation flags for a process.
-             * @param pid Process ID.
-             * @param flags Protection flags (implementation dependent).
-             * @return true on success.
-             */
-            [[nodiscard]] bool EnableExploitProtection(Utils::ProcessUtils::ProcessId pid, uint32_t flags);
+        // APT-grade enrichment
+        MemoryThreatSeverity severity       = MemoryThreatSeverity::None;
+        MitreTechnique       mitreTechnique = MitreTechnique::None;
+        uint32_t            targetPid       = 0;    ///< Target process (cross-process ops)
+        uint32_t            sourcePid       = 0;    ///< Source/actor process
+        uint64_t            threadId        = 0;    ///< Associated thread
+        double              entropy         = 0.0;  ///< Shannon entropy of region
+        bool                fromKernel      = false; ///< Kernel-driver sourced detection
+        std::chrono::system_clock::time_point detectedAt;
 
-            /**
-             * @brief Quick check if a process is compromised.
-             * @param pid Process ID.
-             * @return true if threats were found.
-             */
-            [[nodiscard]] bool IsProcessCompromised(Utils::ProcessUtils::ProcessId pid);
+        [[nodiscard]] std::string ToJson() const;
+    };
 
-            /**
-             * @brief Run self-diagnostics.
-             * @return true if the engine is functioning correctly.
-             */
-            [[nodiscard]] bool SelfTest();
+    /**
+     * @brief Aggregated result of a memory scan operation.
+     */
+    struct MemoryScanResult {
+        Utils::ProcessUtils::ProcessId pid  = 0;
+        bool                compromised     = false;
+        size_t              pagesScanned    = 0;
+        std::vector<MemoryViolation> violations;
+        std::chrono::microseconds scanDuration{ 0 };
+        MemoryThreatSeverity highestSeverity = MemoryThreatSeverity::None;
+        float               overallThreatScore = 0.0f; ///< 0.0 - 100.0
 
-            /**
-             * @brief Get engine statistics in JSON format.
-             */
-            [[nodiscard]] std::string GetStatistics() const;
+        [[nodiscard]] std::string ToJson() const;
+    };
 
-        private:
-            MemoryProtection();
-            ~MemoryProtection();
+    /**
+     * @brief Runtime configuration for the memory protection engine.
+     */
+    struct MemoryProtectionConfig {
+        bool enableKernelIntegration    = true;
+        bool enableContinuousMonitoring = true;
+        bool enableAPTHunting           = true;
+        bool enableAlertSystem          = true;
+        bool enableTelemetry            = true;
+        bool enableBehaviorFeedback     = true;
+        bool scanOnProcessCreate        = true;
 
-            class MemoryProtectionImpl;
-            std::unique_ptr<MemoryProtectionImpl> m_impl;
-        };
+        ScanMode processCreateScanMode  = ScanMode::Fast;
+        float    alertThreshold         = 0.6f;    ///< Min confidence to alert
+        float    blockThreshold         = 0.85f;   ///< Min confidence to block
+        uint32_t maxRegionsPerScan      = 50000;
+        std::chrono::milliseconds scanTimeout{ 30000 };
+        double   highEntropyThreshold   = 7.2;
+    };
 
-    } // namespace RealTime
+    /// Callback for external consumers of memory threat events.
+    using MemoryThreatCallback = std::function<void(const MemoryViolation&, uint32_t /*pid*/)>;
+
+    // =========================================================================
+    // Memory Protection Engine
+    // =========================================================================
+
+    /**
+     * @brief Enterprise memory threat detection engine.
+     *
+     * Detects memory-resident threats including nation-state APT techniques:
+     *  - Shellcode injection (NOP sled, API hashing, direct syscall, encoders)
+     *  - Process hollowing / module stomping / doppelganging
+     *  - ROP chains and stack pivots
+     *  - Reflective DLL loading
+     *  - Thread injection and APC abuse
+     *  - W^X policy violation monitoring
+     *
+     * Integrates with:
+     *  - PhantomSensor kernel driver (real-time memory events via IPC)
+     *  - AlertSystem (severity-based alerting)
+     *  - TelemetryCollector (anonymous event telemetry)
+     *  - BehaviorAnalyzer (behavioral scoring feed)
+     *  - ProcessCreationMonitor (auto-scan on process creation)
+     */
+    class MemoryProtection final {
+    public:
+        [[nodiscard]] static MemoryProtection& Instance() noexcept;
+
+        MemoryProtection(const MemoryProtection&) = delete;
+        MemoryProtection& operator=(const MemoryProtection&) = delete;
+        MemoryProtection(MemoryProtection&&) = delete;
+        MemoryProtection& operator=(MemoryProtection&&) = delete;
+
+        // ----- Lifecycle -----
+        void Start();
+        void Stop();
+        [[nodiscard]] bool IsRunning() const noexcept;
+
+        // ----- Configuration -----
+        void Configure(const MemoryProtectionConfig& config);
+        [[nodiscard]] MemoryProtectionConfig GetConfig() const;
+
+        // ----- Core Scanning -----
+        [[nodiscard]] MemoryScanResult ScanProcess(
+            Utils::ProcessUtils::ProcessId pid,
+            ScanMode mode = ScanMode::Fast);
+
+        [[nodiscard]] MemoryScanResult ScanRegion(
+            Utils::ProcessUtils::ProcessId pid,
+            uint64_t address, size_t size);
+
+        // ----- Process Monitoring -----
+        [[nodiscard]] bool MonitorProcess(Utils::ProcessUtils::ProcessId pid);
+        [[nodiscard]] bool UnmonitorProcess(Utils::ProcessUtils::ProcessId pid);
+        [[nodiscard]] bool IsProcessCompromised(Utils::ProcessUtils::ProcessId pid);
+
+        // ----- APT Hunting -----
+        [[nodiscard]] MemoryScanResult HuntAPT(Utils::ProcessUtils::ProcessId pid);
+        [[nodiscard]] std::vector<MemoryScanResult> HuntAllProcesses();
+
+        // ----- Kernel Event Ingestion (IPC dispatcher) -----
+        void ProcessKernelMemoryAlert(
+            uint32_t messageType,
+            const void* payload,
+            size_t payloadSize);
+
+        // ----- Consumer Callbacks -----
+        [[nodiscard]] uint64_t RegisterThreatCallback(MemoryThreatCallback callback);
+        bool UnregisterThreatCallback(uint64_t callbackId);
+
+        // ----- Exploit Protection -----
+        [[nodiscard]] bool EnableExploitProtection(
+            Utils::ProcessUtils::ProcessId pid,
+            uint32_t flags);
+
+        // ----- Diagnostics -----
+        [[nodiscard]] bool SelfTest();
+        [[nodiscard]] std::string GetStatistics() const;
+
+    private:
+        MemoryProtection();
+        ~MemoryProtection();
+
+        class MemoryProtectionImpl;
+        std::unique_ptr<MemoryProtectionImpl> m_impl;
+    };
+
+} // namespace RealTime
 } // namespace ShadowStrike

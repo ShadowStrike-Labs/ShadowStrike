@@ -663,54 +663,104 @@ struct SignatureValidationOptions {
 };
 
 /**
- * @brief Validation statistics
+ * @brief Copyable statistics snapshot returned from public API.
+ *        Internal counters use std::atomic; this struct holds plain
+ *        uint64_t copies that are safe to pass across API boundaries.
  */
 struct SignatureValidatorStatistics {
-    /// @brief Total validations
-    std::atomic<uint64_t> totalValidations{0};
-    
-    /// @brief Valid signatures
-    std::atomic<uint64_t> validSignatures{0};
-    
-    /// @brief Invalid signatures
-    std::atomic<uint64_t> invalidSignatures{0};
-    
-    /// @brief Unsigned files
-    std::atomic<uint64_t> unsignedFiles{0};
-    
-    /// @brief Cache hits
-    std::atomic<uint64_t> cacheHits{0};
-    
-    /// @brief Cache misses
-    std::atomic<uint64_t> cacheMisses{0};
-    
-    /// @brief Revocation checks
-    std::atomic<uint64_t> revocationChecks{0};
-    
-    /// @brief Revoked certificates
-    std::atomic<uint64_t> revokedCertificates{0};
-    
-    /// @brief Expired certificates
-    std::atomic<uint64_t> expiredCertificates{0};
-    
-    /// @brief Blocked signers detected
-    std::atomic<uint64_t> blockedSigners{0};
-    
-    /// @brief Average validation time (microseconds)
-    std::atomic<uint64_t> avgValidationTimeUs{0};
-    
-    /// @brief Start time
+    uint64_t totalValidations    = 0;
+    uint64_t validSignatures     = 0;
+    uint64_t invalidSignatures   = 0;
+    uint64_t unsignedFiles       = 0;
+    uint64_t cacheHits           = 0;
+    uint64_t cacheMisses         = 0;
+    uint64_t revocationChecks    = 0;
+    uint64_t revokedCertificates = 0;
+    uint64_t expiredCertificates = 0;
+    uint64_t blockedSigners      = 0;
+    uint64_t avgValidationTimeUs = 0;
+    uint64_t stolenCertDetections = 0;
+    uint64_t anomalyDetections    = 0;
     TimePoint startTime = Clock::now();
-    
-    /**
-     * @brief Reset statistics
-     */
-    void Reset() noexcept;
-    
-    /**
-     * @brief Serialize to JSON
-     */
+
     [[nodiscard]] std::string ToJson() const;
+};
+
+// ============================================================================
+// APT HUNTING STRUCTURES
+// ============================================================================
+
+/**
+ * @brief Severity level for signature anomalies
+ */
+enum class AnomalySeverity : uint8_t {
+    Info        = 0,
+    Low         = 1,
+    Medium      = 2,
+    High        = 3,
+    Critical    = 4
+};
+
+/**
+ * @brief Type of signature anomaly detected
+ */
+enum class AnomalyType : uint8_t {
+    None                     = 0,
+    StolenCertificate        = 1,   ///< Known compromised cert (APT groups)
+    SelfSignedExecutable     = 2,   ///< Self-signed PE in unusual location
+    ShortValidityCert        = 3,   ///< Cert valid < 30 days (burner cert)
+    RecentlyIssuedCert       = 4,   ///< Cert issued < 7 days ago
+    UnusualCertAuthority     = 5,   ///< CA not in common trusted set
+    MismatchedSignerVersion  = 6,   ///< Signer changed for known software
+    ExpiredButTimestamped    = 7,   ///< Expired cert relying solely on timestamp
+    WeakHashAlgorithm        = 8,   ///< MD5 or SHA-1 only signature
+    TestSignatureInProd      = 9,   ///< Test-signed binary in production
+    CrossSignedSuspicious    = 10,  ///< Cross-signed via revoked/untrusted CA
+    SupplyChainAnomaly       = 11,  ///< Legitimate vendor, unexpected binary hash
+    CatalogOnlyNoEmbedded    = 12,  ///< PE relies on catalog only (evasion technique)
+    TimestampInFuture        = 13,  ///< Counter-signature timestamp is in the future
+    RevokedButStillUsed      = 14   ///< Cert revoked but binary still executing
+};
+
+/**
+ * @brief Signature anomaly detected during APT-grade analysis
+ */
+struct SignatureAnomaly {
+    AnomalyType type                = AnomalyType::None;
+    AnomalySeverity severity        = AnomalySeverity::Info;
+    std::wstring filePath;
+    std::wstring signerName;
+    std::string description;
+    std::string mitreAttackId;      ///< e.g., "T1553.002" (Code Signing)
+    SystemTimePoint detectedAt      = std::chrono::system_clock::now();
+};
+
+/**
+ * @brief Known compromised certificate entry for APT detection
+ */
+struct StolenCertEntry {
+    std::array<uint8_t, 20> thumbprint{};
+    std::string threatActorName;    ///< e.g., "Equation Group", "Lazarus"
+    std::string campaignName;       ///< e.g., "ShadowHammer", "SolarWinds"
+    std::string mitreGroupId;       ///< e.g., "G0016" (APT29)
+    AnomalySeverity severity = AnomalySeverity::Critical;
+};
+
+/**
+ * @brief Callback invoked when a signature anomaly is detected
+ */
+using SignatureAnomalyCallback = std::function<void(const SignatureAnomaly&)>;
+
+/**
+ * @brief Extended signature info with APT-grade analysis results
+ */
+struct SignatureAnalysisResult {
+    SignatureInfo signatureInfo;
+    std::vector<SignatureAnomaly> anomalies;
+    bool isStolenCert           = false;
+    bool isSupplyChainSuspect   = false;
+    std::string threatActorName;
+    uint32_t riskScore          = 0;    ///< 0-100, aggregated from anomalies
 };
 
 // ============================================================================
@@ -1071,6 +1121,67 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // APT-GRADE SIGNATURE ANALYSIS
+    // ========================================================================
+
+    /**
+     * @brief Deep-analyze a file signature for APT indicators.
+     *        Runs stolen cert check, anomaly detection, and risk scoring.
+     */
+    [[nodiscard]] SignatureAnalysisResult AnalyzeSignature(std::wstring_view filePath);
+
+    /**
+     * @brief Register a known compromised/stolen certificate.
+     *        Used for nation-state APT detection (Stuxnet, ShadowHammer, etc.)
+     */
+    [[nodiscard]] bool AddStolenCertificate(const StolenCertEntry& entry);
+
+    /**
+     * @brief Bulk-load stolen certificate database from threat intel feed.
+     */
+    [[nodiscard]] size_t LoadStolenCertDatabase(std::span<const StolenCertEntry> entries);
+
+    /**
+     * @brief Check if a signer thumbprint matches a known stolen certificate.
+     */
+    [[nodiscard]] std::optional<StolenCertEntry> CheckStolenCertificate(
+        const std::array<uint8_t, 20>& thumbprint) const;
+
+    /**
+     * @brief Set callback for signature anomaly alerts (real-time APT hunting).
+     */
+    void SetAnomalyCallback(SignatureAnomalyCallback callback);
+
+    /**
+     * @brief Handle kernel ImageLoad notification for real-time driver/DLL validation.
+     *        Called by IPCManager when receiving MessageType::ImageLoad.
+     * @param processId     Target process ID
+     * @param imagePath     Full path to the loaded image
+     * @param imageBase     Base address of loaded image
+     * @param imageSize     Size of loaded image
+     * @param kernelSigLevel  Kernel-reported signature level
+     * @param isSystemImage   Whether kernel considers this a system image
+     * @return SignatureAnalysisResult with full APT analysis
+     */
+    [[nodiscard]] SignatureAnalysisResult OnKernelImageLoad(
+        uint32_t processId,
+        std::wstring_view imagePath,
+        uint64_t imageBase,
+        uint64_t imageSize,
+        uint8_t kernelSigLevel,
+        bool isSystemImage);
+
+    /**
+     * @brief Validate a process image at creation time.
+     *        Called by ProcessCreationMonitor for pre-execution gate.
+     * @return SignatureAnalysisResult with risk assessment
+     */
+    [[nodiscard]] SignatureAnalysisResult ValidateProcessImage(
+        uint32_t processId,
+        uint32_t parentProcessId,
+        std::wstring_view imagePath);
 
 private:
     // ========================================================================

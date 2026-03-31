@@ -175,7 +175,7 @@ namespace CertificateConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -485,10 +485,10 @@ enum class TrustLevel : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Module status — defined once per namespace; guarded to avoid ODR violations
+ *        when multiple Security headers are included in the same translation unit.
  */
-#ifndef SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
-#define SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
+__if_not_exists(ModuleStatus) {
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -499,7 +499,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
-#endif // SHADOWSTRIKE_SECURITY_MODULE_STATUS_DEFINED
+}
 
 // ============================================================================
 // STRUCTURES
@@ -833,81 +833,43 @@ struct CertificateValidatorConfiguration {
  */
 struct CertificateValidatorStatistics {
     /// @brief Total validations
-    std::atomic<uint64_t> totalValidations{0};
+    uint64_t totalValidations{0};
     
     /// @brief Valid certificates
-    std::atomic<uint64_t> validCertificates{0};
+    uint64_t validCertificates{0};
     
     /// @brief Invalid certificates
-    std::atomic<uint64_t> invalidCertificates{0};
+    uint64_t invalidCertificates{0};
     
     /// @brief Expired certificates
-    std::atomic<uint64_t> expiredCertificates{0};
+    uint64_t expiredCertificates{0};
     
     /// @brief Revoked certificates
-    std::atomic<uint64_t> revokedCertificates{0};
+    uint64_t revokedCertificates{0};
     
     /// @brief OCSP checks performed
-    std::atomic<uint64_t> ocspChecks{0};
+    uint64_t ocspChecks{0};
     
     /// @brief OCSP cache hits
-    std::atomic<uint64_t> ocspCacheHits{0};
+    uint64_t ocspCacheHits{0};
     
     /// @brief CRL checks performed
-    std::atomic<uint64_t> crlChecks{0};
+    uint64_t crlChecks{0};
     
     /// @brief CRL cache hits
-    std::atomic<uint64_t> crlCacheHits{0};
+    uint64_t crlCacheHits{0};
     
     /// @brief Validation cache hits
-    std::atomic<uint64_t> validationCacheHits{0};
+    uint64_t validationCacheHits{0};
     
     /// @brief Chain building failures
-    std::atomic<uint64_t> chainBuildFailures{0};
+    uint64_t chainBuildFailures{0};
     
-    /// @brief Average validation time (microseconds)
-    std::atomic<uint64_t> avgValidationTimeUs{0};
+    /// @brief Average validation time (microseconds) — exponential moving average
+    uint64_t avgValidationTimeUs{0};
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
-
-    CertificateValidatorStatistics() = default;
-
-    /// @brief Copy constructor (loads atomics with relaxed ordering)
-    CertificateValidatorStatistics(const CertificateValidatorStatistics& other)
-        : startTime(other.startTime) {
-        totalValidations.store(other.totalValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        validCertificates.store(other.validCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        invalidCertificates.store(other.invalidCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        expiredCertificates.store(other.expiredCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        revokedCertificates.store(other.revokedCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        ocspChecks.store(other.ocspChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        ocspCacheHits.store(other.ocspCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        crlChecks.store(other.crlChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        crlCacheHits.store(other.crlCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        validationCacheHits.store(other.validationCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        chainBuildFailures.store(other.chainBuildFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
-        avgValidationTimeUs.store(other.avgValidationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-    }
-
-    CertificateValidatorStatistics& operator=(const CertificateValidatorStatistics& other) {
-        if (this != &other) {
-            totalValidations.store(other.totalValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            validCertificates.store(other.validCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            invalidCertificates.store(other.invalidCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            expiredCertificates.store(other.expiredCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            revokedCertificates.store(other.revokedCertificates.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            ocspChecks.store(other.ocspChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            ocspCacheHits.store(other.ocspCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            crlChecks.store(other.crlChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            crlCacheHits.store(other.crlCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            validationCacheHits.store(other.validationCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            chainBuildFailures.store(other.chainBuildFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            avgValidationTimeUs.store(other.avgValidationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
-            startTime = other.startTime;
-        }
-        return *this;
-    }
     
     /**
      * @brief Reset statistics
@@ -1351,6 +1313,57 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE — image load / process validation hooks
+    // ========================================================================
+
+    /**
+     * @brief Handle kernel image-load notification — validate code-signing certificate
+     * @param imagePath Full NT path of the loaded image
+     * @param imageBase Base address (informational, unused for cert validation)
+     * @param imageSize Size in bytes
+     * @param processId Owning process ID
+     */
+    void OnKernelImageLoad(std::wstring_view imagePath,
+                           uintptr_t imageBase,
+                           size_t imageSize,
+                           uint32_t processId);
+
+    /**
+     * @brief Handle kernel process creation — validate signer of the new process image
+     * @param processId New PID
+     * @param parentProcessId Parent PID
+     * @param imagePath Full image path of the process
+     */
+    void OnKernelProcessCreate(uint32_t processId,
+                               uint32_t parentProcessId,
+                               std::wstring_view imagePath);
+
+    /**
+     * @brief Request the kernel driver to block a process whose certificate is invalid
+     * @param processId PID to block
+     * @param reason Human-readable reason (e.g. "Revoked code-signing certificate")
+     * @return true if the kernel accepted the request
+     */
+    [[nodiscard]] bool RequestKernelProcessBlock(uint32_t processId,
+                                                  std::string_view reason);
+
+    // ========================================================================
+    // COMMUNICATION WIRING — AlertSystem / TelemetryCollector
+    // ========================================================================
+
+    /**
+     * @brief Raise an alert when a certificate validation failure is detected
+     */
+    void ReportValidationToAlertSystem(const ValidationDetails& details,
+                                       std::string_view context);
+
+    /**
+     * @brief Emit certificate-validation telemetry
+     */
+    void ReportValidationTelemetry(const ValidationDetails& details,
+                                   std::string_view context);
 
 private:
     // ========================================================================
