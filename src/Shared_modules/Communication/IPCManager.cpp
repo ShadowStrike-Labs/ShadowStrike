@@ -31,6 +31,7 @@
 #include "ThreatIntelPusher.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "../RealTime/MemoryProtection.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -1495,12 +1496,12 @@ void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {
         }
 
         case FilterMessageType_MemoryAlert: {
-            if (genericHandler) {
-                try {
-                    genericHandler(FilterMessageType_MemoryAlert, pPayload, pAppHeader->DataSize);
-                } catch (const std::exception& e) {
-                    Utils::Logger::Error("[IPCManager] MemoryAlert handler exception: {}", e.what());
-                }
+            // Route to MemoryProtection engine for kernel event processing
+            try {
+                RealTime::MemoryProtection::Instance().ProcessKernelMemoryAlert(
+                    static_cast<uint32_t>(FilterMessageType_MemoryAlert), pPayload, pAppHeader->DataSize);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("[IPCManager] MemoryAlert handler exception: {}", e.what());
             }
             auto idx = static_cast<size_t>(FilterMessageType_MemoryAlert);
             if (idx < m_impl->stats.byMessageType.size()) {
