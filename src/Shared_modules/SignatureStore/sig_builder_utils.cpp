@@ -138,11 +138,16 @@ namespace {
          * @brief Opens a CNG algorithm provider.
          * @param algId Algorithm identifier (e.g., BCRYPT_SHA256_ALGORITHM)
          * @param flags Optional flags
+         * @param outStatus Optional pointer to receive the NTSTATUS result
          * @return true on success, false on failure
          */
-        [[nodiscard]] bool Open(LPCWSTR algId, ULONG flags = 0) noexcept {
+        [[nodiscard]] bool Open(LPCWSTR algId, ULONG flags = 0,
+                                NTSTATUS* outStatus = nullptr) noexcept {
             Close();
             NTSTATUS status = BCryptOpenAlgorithmProvider(&m_alg, algId, nullptr, flags);
+            if (outStatus) {
+                *outStatus = status;
+            }
             if (!BCRYPT_SUCCESS(status)) {
                 m_alg = nullptr;
                 return false;
@@ -244,13 +249,22 @@ namespace {
 
         AlignedBuffer& operator=(AlignedBuffer&& other) noexcept {
             if (this != &other) {
-                Free();
+                // Save old pointer, adopt new state, then free old to prevent
+                // use-after-free if Free() encounters an issue
+                uint8_t* oldBuffer = m_buffer;
+                size_t oldSize = m_size;
+                size_t oldAlignment = m_alignment;
+
                 m_buffer = other.m_buffer;
                 m_size = other.m_size;
                 m_alignment = other.m_alignment;
                 other.m_buffer = nullptr;
                 other.m_size = 0;
                 other.m_alignment = 0;
+
+                if (oldBuffer) {
+                    _aligned_free(oldBuffer);
+                }
             }
             return *this;
         }
@@ -268,12 +282,9 @@ namespace {
                 return false;
             }
 
-            // HARDENED: Try-catch around allocation to handle bad_alloc gracefully
-            try {
-                m_buffer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
-            } catch (...) {
-                m_buffer = nullptr;
-            }
+            // _aligned_malloc is a C runtime function that returns nullptr on
+            // failure; it does not throw. No try-catch needed.
+            m_buffer = static_cast<uint8_t*>(_aligned_malloc(size, alignment));
             
             if (m_buffer) {
                 m_size = size;
@@ -465,15 +476,46 @@ namespace {
             // CRITICAL: FILE_FLAG_NO_BUFFERING requires sector-aligned reads
             // We open WITHOUT FILE_FLAG_NO_BUFFERING to avoid alignment issues
             // FILE_FLAG_SEQUENTIAL_SCAN provides similar performance benefits
+            //
+            // SECURITY: First attempt without FILE_SHARE_WRITE to prevent TOCTOU
+            // race conditions (another process modifying the file during hashing).
+            // Fall back to FILE_SHARE_WRITE only if the exclusive open fails with
+            // a sharing violation (file in active use by another writer).
+            bool shareWriteFallback = false;
             HandleGuard fileGuard(CreateFileW(
                 filePath.c_str(),
                 GENERIC_READ,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_SHARE_READ | FILE_SHARE_DELETE,
                 nullptr,
                 OPEN_EXISTING,
-                FILE_FLAG_SEQUENTIAL_SCAN,  // Hint to cache manager for sequential access
+                FILE_FLAG_SEQUENTIAL_SCAN,
                 nullptr
             ));
+
+            if (!fileGuard.IsValid()) {
+                DWORD firstError = GetLastError();
+                if (firstError == ERROR_SHARING_VIOLATION) {
+                    // Retry with FILE_SHARE_WRITE for files held open by other writers.
+                    // The resulting hash may be unreliable if the file is actively
+                    // being modified (TOCTOU window), so log a warning.
+                    fileGuard = HandleGuard(CreateFileW(
+                        filePath.c_str(),
+                        GENERIC_READ,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        nullptr,
+                        OPEN_EXISTING,
+                        FILE_FLAG_SEQUENTIAL_SCAN,
+                        nullptr
+                    ));
+                    if (fileGuard.IsValid()) {
+                        shareWriteFallback = true;
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ComputeFileHash: Opened with FILE_SHARE_WRITE fallback "
+                            L"(TOCTOU risk) - file may be modified concurrently: %s",
+                            filePath.c_str());
+                    }
+                }
+            }
 
             if (!fileGuard.IsValid()) {
                 DWORD lastError = GetLastError();
@@ -497,6 +539,18 @@ namespace {
             // ========================================================================
 
             constexpr uint64_t MAX_FILE_SIZE = 100ULL * 1024 * 1024 * 1024;  // 100GB limit
+
+            // HARDENED: Reject negative file size (corrupt filesystem or adversarial
+            // filter driver). A negative LONGLONG cast to uint64_t would produce
+            // an astronomically large value, corrupting downstream calculations.
+            if (fileSize.QuadPart < 0) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"ComputeFileHash: Negative file size reported (%lld) - "
+                    L"possible filesystem corruption",
+                    fileSize.QuadPart);
+                return std::nullopt;
+            }
+
             if (fileSize.QuadPart > static_cast<LONGLONG>(MAX_FILE_SIZE)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
                     L"ComputeFileHash: File too large (%llu bytes > %llu bytes)",
@@ -522,10 +576,11 @@ namespace {
             // ========================================================================
 
             BCryptAlgGuard algGuard;
-            if (!algGuard.Open(algId)) {
-                DWORD lastError = GetLastError();
+            NTSTATUS algStatus = 0;
+            if (!algGuard.Open(algId, 0, &algStatus)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: BCryptOpenAlgorithmProvider failed (error: %lu)", lastError);
+                    L"ComputeFileHash: BCryptOpenAlgorithmProvider failed "
+                    L"(NTSTATUS: 0x%08lX)", static_cast<unsigned long>(algStatus));
                 return std::nullopt;
             }
 
@@ -533,8 +588,8 @@ namespace {
             NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: BCryptCreateHash failed (status: 0x%08X)",
-                    static_cast<unsigned int>(status));
+                    L"ComputeFileHash: BCryptCreateHash failed (NTSTATUS: 0x%08lX)",
+                    static_cast<unsigned long>(status));
                 return std::nullopt;
             }
             BCryptHashGuard hashGuard(hHashRaw);
@@ -587,9 +642,12 @@ namespace {
                     break;  // EOF reached
                 }
 
-                // Timeout check for large files
+                // Timeout check -- every 64MB to catch slow I/O before timeout is
+                // greatly exceeded (at 1 MB/s, 64MB ~= 64s, well within 10min).
                 bytesProcessed += bytesRead;
-                if ((bytesProcessed % (1ULL * 1024 * 1024 * 1024)) < bytesRead) {
+                // Check if we crossed a 64MB boundary (correct boundary-crossing detection)
+                if ((bytesProcessed / (64ULL * 1024 * 1024)) !=
+                    ((bytesProcessed - bytesRead) / (64ULL * 1024 * 1024))) {
                     LARGE_INTEGER currentTime{};
                     QueryPerformanceCounter(&currentTime);
 
@@ -612,8 +670,10 @@ namespace {
                         return std::nullopt;
                     }
 
-                    // Progress log for large files
-                    if (fileSize.QuadPart > 0) {
+                    // Progress log for large files (every ~1GB boundary crossing)
+                    if (fileSize.QuadPart > 0 &&
+                        (bytesProcessed / (1ULL * 1024 * 1024 * 1024)) !=
+                        ((bytesProcessed - bytesRead) / (1ULL * 1024 * 1024 * 1024))) {
                         double percentComplete = (static_cast<double>(bytesProcessed) / 
                                                    static_cast<double>(fileSize.QuadPart)) * 100.0;
                         SS_LOG_DEBUG(L"SignatureBuilder",
@@ -628,8 +688,8 @@ namespace {
                 status = BCryptHashData(hashGuard.Get(), buffer.Data(), bytesRead, 0);
                 if (!BCRYPT_SUCCESS(status)) {
                     SS_LOG_ERROR(L"SignatureBuilder",
-                        L"ComputeFileHash: BCryptHashData failed (status: 0x%08X, bytesRead: %lu)",
-                        static_cast<unsigned int>(status), bytesRead);
+                        L"ComputeFileHash: BCryptHashData failed (NTSTATUS: 0x%08lX, bytesRead: %lu)",
+                        static_cast<unsigned long>(status), bytesRead);
                     return std::nullopt;
                 }
             }
@@ -655,8 +715,8 @@ namespace {
                                       static_cast<ULONG>(expectedLen), 0);
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeFileHash: BCryptFinishHash failed (status: 0x%08X)", 
-                    static_cast<unsigned int>(status));
+                    L"ComputeFileHash: BCryptFinishHash failed (NTSTATUS: 0x%08lX)", 
+                    static_cast<unsigned long>(status));
                 return std::nullopt;
             }
 
@@ -686,10 +746,11 @@ namespace {
 
             SS_LOG_INFO(L"SignatureBuilder",
                 L"ComputeFileHash: Complete - file: %s, hash: %S, size: %llu MB, "
-                L"time: %llu ms, throughput: %.2f MB/s",
+                L"time: %llu ms, throughput: %.2f MB/s%s",
                 filePath.c_str(), Format::HashTypeToString(type),
                 static_cast<uint64_t>(fileSize.QuadPart) / (1024 * 1024),
-                totalTimeMs, throughputMBps);
+                totalTimeMs, throughputMBps,
+                shareWriteFallback ? L" [SHARE_WRITE fallback]" : L"");
 
             return hash;
         }
@@ -807,10 +868,11 @@ namespace {
             // ========================================================================
 
             BCryptAlgGuard algGuard;
-            if (!algGuard.Open(algId)) {
-                DWORD lastError = GetLastError();
+            NTSTATUS algStatus = 0;
+            if (!algGuard.Open(algId, 0, &algStatus)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: BCryptOpenAlgorithmProvider failed (error: %lu)", lastError);
+                    L"ComputeBufferHash: BCryptOpenAlgorithmProvider failed "
+                    L"(NTSTATUS: 0x%08lX)", static_cast<unsigned long>(algStatus));
                 return std::nullopt;
             }
 
@@ -818,8 +880,8 @@ namespace {
             NTSTATUS status = BCryptCreateHash(algGuard.Get(), &hHashRaw, nullptr, 0, nullptr, 0, 0);
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: BCryptCreateHash failed (status: 0x%08X)",
-                    static_cast<unsigned int>(status));
+                    L"ComputeBufferHash: BCryptCreateHash failed (NTSTATUS: 0x%08lX)",
+                    static_cast<unsigned long>(status));
                 return std::nullopt;
             }
             BCryptHashGuard hashGuard(hHashRaw);
@@ -845,14 +907,17 @@ namespace {
                   
                     size_t chunkSize = (std::min)(CHUNK_SIZE, buffer.size() - offset);
                     
-                    status = BCryptHashData(hashGuard.Get(), 
-                                           const_cast<PUCHAR>(buffer.data() + offset), 
+                    // BCryptHashData takes PUCHAR (non-const) due to the Win32 API
+                    // lacking const-correctness, but it only reads from the buffer.
+                    // The const_cast is safe and is the standard workaround.
+                    status = BCryptHashData(hashGuard.Get(),
+                                           const_cast<PUCHAR>(buffer.data() + offset),
                                            static_cast<ULONG>(chunkSize), 
                                            0);
                     if (!BCRYPT_SUCCESS(status)) {
                         SS_LOG_ERROR(L"SignatureBuilder",
-                            L"ComputeBufferHash: BCryptHashData failed (offset: %zu, size: %zu, status: 0x%08X)",
-                            offset, chunkSize, static_cast<unsigned int>(status));
+                            L"ComputeBufferHash: BCryptHashData failed (offset: %zu, size: %zu, NTSTATUS: 0x%08lX)",
+                            offset, chunkSize, static_cast<unsigned long>(status));
                         return std::nullopt;
                     }
                     offset += chunkSize;
@@ -880,27 +945,37 @@ namespace {
                                       static_cast<ULONG>(expectedLen), 0);
             if (!BCRYPT_SUCCESS(status)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ComputeBufferHash: BCryptFinishHash failed (status: 0x%08X)", 
-                    static_cast<unsigned int>(status));
+                    L"ComputeBufferHash: BCryptFinishHash failed (NTSTATUS: 0x%08lX)", 
+                    static_cast<unsigned long>(status));
                 return std::nullopt;
             }
 
             // ========================================================================
-            // STEP 6: SUCCESS LOGGING (RAII handles cleanup)
+            // STEP 6: SUCCESS LOGGING (RAII handles all cleanup)
             // ========================================================================
 
             LARGE_INTEGER endTime{};
             QueryPerformanceCounter(&endTime);
-            
-            uint64_t timeUs = 0;
+
+            uint64_t totalTimeMs = 0;
             if (perfFreq.QuadPart > 0) {
-                timeUs = static_cast<uint64_t>(
-                    (endTime.QuadPart - startTime.QuadPart) * 1000000 / perfFreq.QuadPart);
+                const int64_t elapsed = endTime.QuadPart - startTime.QuadPart;
+                const double elapsedSec = static_cast<double>(elapsed) /
+                                           static_cast<double>(perfFreq.QuadPart);
+                totalTimeMs = static_cast<uint64_t>(elapsedSec * 1000.0);
             }
 
-            SS_LOG_DEBUG(L"SignatureBuilder",
-                L"ComputeBufferHash: Complete - size: %zu bytes, hash: %S, time: %llu us",
-                buffer.size(), Format::HashTypeToString(type), timeUs);
+            double throughputMBps = 0.0;
+            if (totalTimeMs > 0) {
+                throughputMBps = (static_cast<double>(buffer.size()) / (1024.0 * 1024.0)) /
+                                 (static_cast<double>(totalTimeMs) / 1000.0);
+            }
+
+            SS_LOG_INFO(L"SignatureBuilder",
+                L"ComputeBufferHash: Complete - buffer: %zu bytes, hash: %S, "
+                L"time: %llu ms, throughput: %.2f MB/s",
+                buffer.size(), Format::HashTypeToString(type),
+                totalTimeMs, throughputMBps);
 
             return hash;
         }
@@ -959,9 +1034,11 @@ namespace {
                 return false;
             }
 
-            // Use constant-time comparison to prevent timing attacks
-            // This ensures comparison time is independent of where mismatch occurs
-            uint8_t result = 0;
+            // Use constant-time comparison to prevent timing attacks.
+            // The volatile qualifier prevents the compiler from optimizing this
+            // into a short-circuit comparison that would leak information about
+            // which byte position first differs.
+            volatile uint8_t result = 0;
             for (size_t i = 0; i < a.length; ++i) {
                 result |= (a.data[i] ^ b.data[i]);
             }

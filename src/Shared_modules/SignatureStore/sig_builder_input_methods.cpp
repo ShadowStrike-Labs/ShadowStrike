@@ -37,10 +37,6 @@ namespace SignatureStore {
             // Default performance frequency fallback (1MHz) for division-by-zero protection
             constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000LL;
             
-            // Lock acquisition timeout constants
-            constexpr int LOCK_MAX_ATTEMPTS = 50;
-            constexpr std::chrono::milliseconds LOCK_SLEEP_DURATION{100};
-            
             // Safe elapsed time calculation helper with division-by-zero protection
             [[nodiscard]] inline uint64_t safeElapsedUs(
                 const LARGE_INTEGER& start,
@@ -54,8 +50,10 @@ namespace SignatureStore {
                 if (diff < 0) {
                     return 0;  // Timer wrapped or invalid
                 }
-                // Use safe multiplication order to prevent overflow
-                return static_cast<uint64_t>((diff * 1'000'000LL) / freq.QuadPart);
+                // Divide first, then multiply to prevent overflow.
+                // Loss of sub-microsecond precision is acceptable.
+                return static_cast<uint64_t>(diff / freq.QuadPart) * 1'000'000ULL
+                     + static_cast<uint64_t>((diff % freq.QuadPart) * 1'000'000LL / freq.QuadPart);
             }
 
             [[nodiscard]] inline uint64_t safeElapsedMs(
@@ -70,7 +68,8 @@ namespace SignatureStore {
                 if (diff < 0) {
                     return 0;
                 }
-                return static_cast<uint64_t>((diff * 1'000LL) / freq.QuadPart);
+                return static_cast<uint64_t>(diff / freq.QuadPart) * 1'000ULL
+                     + static_cast<uint64_t>((diff % freq.QuadPart) * 1'000LL / freq.QuadPart);
             }
         } // anonymous namespace
 
@@ -141,7 +140,7 @@ namespace SignatureStore {
             case HashType::SHA1:   expectedLen = 20; break;
             case HashType::SHA256: expectedLen = 32; break;
             case HashType::SHA512: expectedLen = 64; break;
-            case HashType::IMPHASH: expectedLen = 32; break;
+            case HashType::IMPHASH: expectedLen = 16; break;
             case HashType::FUZZY:
             case HashType::TLSH:
                 expectedLen = 0;  // Variable length
@@ -244,7 +243,7 @@ namespace SignatureStore {
             // Use a spin-wait with timeout instead
             std::unique_lock<std::shared_mutex> lock(m_stateMutex, std::defer_lock);
             
-            constexpr int MAX_LOCK_ATTEMPTS = 50;  // 50 * 100ms = 5 seconds
+            constexpr int MAX_LOCK_ATTEMPTS = 50;
             int lockAttempts = 0;
             while (!lock.try_lock()) {
                 if (++lockAttempts >= MAX_LOCK_ATTEMPTS) {
@@ -253,7 +252,9 @@ namespace SignatureStore {
                     return StoreError{ SignatureStoreError::Unknown, 0,
                                       "Internal lock timeout" };
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                // Exponential backoff with jitter to prevent thundering herd
+                int backoffMs = (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800);
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
             }
 
             // ========================================================================
@@ -287,9 +288,16 @@ namespace SignatureStore {
             bool isDuplicate = (dupIt != m_hashFingerprints.end());
 
             if (isDuplicate) {
-                // Additional validation: compare full hash (prevent collision false positives)
-                // In production, you'd do full byte comparison here
-                bool isActualDuplicate = true;  // Simplified
+                // Full byte comparison to eliminate fingerprint collision false positives.
+                // FastHash (FNV-1a 64-bit) has non-zero collision probability at scale;
+                // we must verify by comparing the actual hash bytes.
+                bool isActualDuplicate = false;
+                for (const auto& existing : m_pendingHashes) {
+                    if (existing.hash == input.hash) {
+                        isActualDuplicate = true;
+                        break;
+                    }
+                }
 
                 if (isActualDuplicate) {
                     if (m_config.enableDeduplication) {
@@ -369,10 +377,11 @@ namespace SignatureStore {
                                           "Hash has insufficient entropy (trivial/weak hash)" };
                     }
                     
-                    // Very high entropy (> 8.0) is suspicious but allowed
-                    if (entropy > 8.1) {
+                    // Very high entropy approaching the theoretical maximum of 8.0 bits
+                    // may indicate random/encrypted data rather than a real hash digest.
+                    if (entropy > 7.9) {
                         SS_LOG_WARN(L"SignatureBuilder",
-                            L"AddHash: Suspicious high entropy %.2f for hash (name: %S)",
+                            L"AddHash: Near-maximum entropy %.2f for hash (name: %S) - may be random data",
                             entropy, input.name.c_str());
                         // Log warning but don't fail - might be intentional
                     }
@@ -394,8 +403,18 @@ namespace SignatureStore {
                     m_pendingHashes.reserve(newCap);
                 }
 
-                m_pendingHashes.push_back(input);
+                // Insert fingerprint first -- std::set::insert is nothrow if the element
+                // is already present, and strong-guarantee if it throws (no partial insert).
+                // This ordering ensures that if push_back throws after fingerprint insert,
+                // we can roll back the fingerprint cleanly.
                 m_hashFingerprints.insert(hashFingerprint);
+                try {
+                    m_pendingHashes.push_back(input);
+                } catch (...) {
+                    // Roll back fingerprint on push_back failure to keep data structures in sync
+                    m_hashFingerprints.erase(hashFingerprint);
+                    throw;
+                }
                 m_statistics.totalHashesAdded++;
 
                 SS_LOG_TRACE(L"SignatureBuilder",
@@ -536,14 +555,20 @@ namespace SignatureStore {
             // STEP 3: REGEX COMPLEXITY ANALYSIS (ReDoS prevention)
             // ========================================================================
 
-            // For regex patterns, perform complexity analysis
+            // Only perform regex safety analysis on patterns that actually contain
+            // regex metacharacters beyond the hex-pattern syntax (which uses ?, [, ]).
+            // Hex patterns like "48 8B [2-4] ??" are NOT regex -- they use
+            // bracket-ranges and ? as wildcards, not as regex quantifiers.
+            // True regex patterns will contain constructs like (group), +, {n,m}, |, etc.
             if (input.patternString.find('(') != std::string::npos ||
-                input.patternString.find('[') != std::string::npos ||
-                input.patternString.find('*') != std::string::npos) {
+                input.patternString.find('+') != std::string::npos ||
+                input.patternString.find('{') != std::string::npos ||
+                input.patternString.find('|') != std::string::npos) {
 
-                if (!IsRegexSafe(input.patternString, validationError)) {
+                std::string regexError;
+                if (!IsRegexSafe(input.patternString, regexError)) {
                     SS_LOG_ERROR(L"SignatureBuilder",
-                        L"AddPattern: Potentially dangerous regex: %S", validationError.c_str());
+                        L"AddPattern: Potentially dangerous regex: %S", regexError.c_str());
                     return StoreError{ SignatureStoreError::InvalidSignature, 0,
                                       "Regex pattern too complex (ReDoS risk)" };
                 }
@@ -562,7 +587,8 @@ namespace SignatureStore {
                     SS_LOG_ERROR(L"SignatureBuilder", L"AddPattern: Lock timeout");
                     return StoreError{ SignatureStoreError::Unknown, 0, "Lock timeout" };
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                int backoffMs = (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800);
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
             }
 
             // ========================================================================
@@ -607,8 +633,13 @@ namespace SignatureStore {
                     m_pendingPatterns.reserve(newCap);
                 }
 
-                m_pendingPatterns.push_back(input);
                 m_patternFingerprints.insert(input.patternString);
+                try {
+                    m_pendingPatterns.push_back(input);
+                } catch (...) {
+                    m_patternFingerprints.erase(input.patternString);
+                    throw;
+                }
                 m_statistics.totalPatternsAdded++;
 
                 SS_LOG_TRACE(L"SignatureBuilder",
@@ -817,7 +848,8 @@ namespace SignatureStore {
                     SS_LOG_ERROR(L"SignatureBuilder", L"AddYaraRule: Lock timeout");
                     return StoreError{ SignatureStoreError::Unknown, 0, "Lock timeout" };
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                int backoffMs = (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800);
+                std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
             }
 
             // ========================================================================
@@ -864,8 +896,13 @@ namespace SignatureStore {
                     m_pendingYaraRules.reserve(newCap);
                 }
 
-                m_pendingYaraRules.push_back(input);
                 m_yaraRuleNames.insert(fullName);
+                try {
+                    m_pendingYaraRules.push_back(input);
+                } catch (...) {
+                    m_yaraRuleNames.erase(fullName);
+                    throw;
+                }
                 m_statistics.totalYaraRulesAdded++;
 
                 SS_LOG_INFO(L"SignatureBuilder",
@@ -1098,23 +1135,10 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 4: BASIC PATTERN SYNTAX VALIDATION
+            // STEP 4: CONSTRUCT FULL INPUT STRUCTURE
             // ========================================================================
-
-            // Check for obvious syntax errors (quick validation)
-            std::string patternError;
-            if (!ValidatePatternSyntax(patternString, patternError)) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"AddPattern (overload): Pattern syntax validation failed: %S",
-                    patternError.c_str());
-                return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "Pattern syntax error: " + patternError };
-            }
-
-            SS_LOG_TRACE(L"SignatureBuilder",
-                L"AddPattern (overload): Pattern syntax validation passed");
-
-            // ========================================================================
+            // Pattern syntax validation is performed by the full
+            // AddPattern(PatternSignatureInput) method. Avoid double validation.
             // STEP 5: CONSTRUCT FULL INPUT STRUCTURE
             // ========================================================================
 
@@ -1259,57 +1283,11 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 3: RULE SAFETY CHECK
+            // STEP 3: CONSTRUCT FULL INPUT STRUCTURE
             // ========================================================================
-
-            std::string safetyErrors;
-            if (!IsYaraRuleSafe(ruleSource, safetyErrors)) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"AddYaraRule (overload): Rule safety check failed: %S",
-                    safetyErrors.c_str());
-                return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "YARA rule failed safety check: " + safetyErrors };
-            }
-
-            SS_LOG_TRACE(L"SignatureBuilder",
-                L"AddYaraRule (overload): Rule safety check passed");
-
-            // ========================================================================
-            // STEP 4: COMPILATION TEST (Verify rule compiles)
-            // ========================================================================
-
-            std::vector<std::string> compilationErrors;
-            if (!TestYaraRuleCompilation(ruleSource, namespace_, compilationErrors)) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"AddYaraRule (overload): Rule compilation test failed");
-
-                // Log first 3 compilation errors
-                for (size_t i = 0; i < std::min(compilationErrors.size(), size_t(3)); ++i) {
-                    SS_LOG_ERROR(L"SignatureBuilder", L"  Error: %S",
-                        compilationErrors[i].c_str());
-                }
-
-                if (compilationErrors.size() > 3) {
-                    SS_LOG_ERROR(L"SignatureBuilder",
-                        L"  ... and %zu more compilation errors",
-                        compilationErrors.size() - 3);
-                }
-
-                std::string allErrors;
-                for (const auto& err : compilationErrors) {
-                    allErrors += err + "; ";
-                }
-
-                return StoreError{ SignatureStoreError::InvalidSignature, 0,
-                                  "YARA rule compilation failed: " + allErrors };
-            }
-
-            SS_LOG_TRACE(L"SignatureBuilder",
-                L"AddYaraRule (overload): Rule compilation test passed");
-
-            // ========================================================================
-            // STEP 5: CONSTRUCT FULL INPUT STRUCTURE
-            // ========================================================================
+            // Safety check and compilation test are performed by the full
+            // AddYaraRule(YaraRuleInput) method. Doing them here would cause
+            // double YARA compilation, which is expensive.
 
             YaraRuleInput input{};
             input.ruleSource = ruleSource;
@@ -1555,14 +1533,42 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 4: ACQUIRE LOCK FOR EXISTING SIGNATURE CHECK
+            // STEP 4: ACQUIRE LOCK WITH TIMEOUT FOR EXISTING SIGNATURE CHECK
             // ========================================================================
-            // Note: HasHash requires lock, so we need to acquire it before checking
 
             LARGE_INTEGER batchStartTime;
             QueryPerformanceCounter(&batchStartTime);
 
-            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex, std::defer_lock);
+
+            {
+                constexpr int MAX_LOCK_ATTEMPTS_BATCH = 50;
+                int lockAttempts = 0;
+                while (!lock.try_lock()) {
+                    if (++lockAttempts >= MAX_LOCK_ATTEMPTS_BATCH) {
+                        SS_LOG_ERROR(L"SignatureBuilder",
+                            L"AddHashBatch: Lock acquisition timeout (possible deadlock)");
+                        return StoreError{ SignatureStoreError::Unknown, 0,
+                                          "Internal lock timeout" };
+                    }
+                    // Exponential backoff with jitter to prevent thundering herd
+                    int backoffMs = (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800);
+                    std::this_thread::sleep_for(std::chrono::milliseconds(backoffMs));
+                }
+            }
+
+            // ========================================================================
+            // STEP 4b: CHECK RESOURCE LIMITS (DoS prevention under lock)
+            // ========================================================================
+
+            constexpr size_t MAX_PENDING_HASHES = 10'000'000;  // 10 million
+            if (m_pendingHashes.size() + uniqueCount > MAX_PENDING_HASHES) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddHashBatch: Adding %zu hashes would exceed max pending limit (%zu + %zu > %zu)",
+                    uniqueCount, m_pendingHashes.size(), uniqueCount, MAX_PENDING_HASHES);
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Batch would exceed max pending hashes limit (10M)" };
+            }
 
             // ========================================================================
             // STEP 5: DUPLICATE DETECTION - AGAINST EXISTING SIGNATURES (under lock)
@@ -1639,12 +1645,17 @@ namespace SignatureStore {
                 }
 
                 // Add to pending hashes with exception safety
+                // Insert fingerprint FIRST, then push hash — on push_back failure,
+                // roll back the fingerprint to keep data structures consistent
                 try {
-                    m_pendingHashes.push_back(inputs[i]);
-
-                    // Add fingerprint to deduplication set
                     uint64_t fingerprint = inputs[i].hash.FastHash();
                     m_hashFingerprints.insert(fingerprint);
+                    try {
+                        m_pendingHashes.push_back(inputs[i]);
+                    } catch (...) {
+                        m_hashFingerprints.erase(fingerprint);
+                        throw;
+                    }
 
                     addedCount++;
                 } catch (const std::bad_alloc&) {
@@ -1679,7 +1690,7 @@ namespace SignatureStore {
             // ========================================================================
 
             m_statistics.totalHashesAdded += addedCount;
-            m_statistics.duplicatesRemoved += (inputs.size() - addedCount);
+            m_statistics.duplicatesRemoved += duplicateSet.size() + existingDuplicateSet.size();
             m_statistics.invalidSignaturesSkipped += invalidIndices.size();
 
             // ========================================================================
@@ -1880,7 +1891,7 @@ namespace SignatureStore {
 
             std::unordered_set<std::string> seenPatterns;
             seenPatterns.reserve(inputs.size());
-            
+
             // Use unordered_set for O(1) lookups
             std::unordered_set<size_t> invalidSet(invalidIndices.begin(), invalidIndices.end());
             std::unordered_set<size_t> duplicateSet;
@@ -1900,13 +1911,37 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 4: ACQUIRE LOCK & ADD TO PENDING
+            // STEP 4: ACQUIRE LOCK WITH TIMEOUT & ADD TO PENDING
             // ========================================================================
 
             LARGE_INTEGER batchStartTime{};
             QueryPerformanceCounter(&batchStartTime);
 
-            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex, std::defer_lock);
+
+            {
+                constexpr int MAX_LOCK_ATTEMPTS_BATCH = 50;
+                int lockAttempts = 0;
+                while (!lock.try_lock()) {
+                    if (++lockAttempts >= MAX_LOCK_ATTEMPTS_BATCH) {
+                        SS_LOG_ERROR(L"SignatureBuilder",
+                            L"AddPatternBatch: Lock acquisition timeout (possible deadlock)");
+                        return StoreError{ SignatureStoreError::Unknown, 0,
+                                          "Internal lock timeout" };
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                        (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800)));
+                }
+            }
+
+            // Check pending limit under lock
+            constexpr size_t MAX_PENDING_PATTERNS_TOTAL = 1'000'000;
+            if (m_pendingPatterns.size() + validCount > MAX_PENDING_PATTERNS_TOTAL) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddPatternBatch: Adding patterns would exceed max pending limit");
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Batch would exceed max pending patterns limit (1M)" };
+            }
 
             size_t addedCount = 0;
             
@@ -1955,7 +1990,7 @@ namespace SignatureStore {
             // ========================================================================
 
             m_statistics.totalPatternsAdded += addedCount;
-            m_statistics.duplicatesRemoved += (inputs.size() - addedCount);
+            m_statistics.duplicatesRemoved += duplicateSet.size();
             m_statistics.invalidSignaturesSkipped += invalidIndices.size();
 
             LARGE_INTEGER batchEndTime{};
@@ -2131,9 +2166,10 @@ namespace SignatureStore {
             // STEP 3: DUPLICATE DETECTION (O(n) with hash sets)
             // ========================================================================
 
-            std::unordered_set<std::string> seenRuleNames;
-            seenRuleNames.reserve(inputs.size());
-            
+            // Use namespace::ruleName as the dedup key, consistent with AddYaraRule()
+            std::unordered_set<std::string> seenRuleFullNames;
+            seenRuleFullNames.reserve(inputs.size());
+
             // Use unordered_set for O(1) lookups
             std::unordered_set<size_t> invalidSet(invalidIndices.begin(), invalidIndices.end());
             std::unordered_set<size_t> duplicateSet;
@@ -2146,33 +2182,38 @@ namespace SignatureStore {
 
                 // Extract rule name from source with bounds checking
                 size_t rulePos = inputs[i].ruleSource.find("rule ");
-                if (rulePos != std::string::npos && 
+                if (rulePos != std::string::npos &&
                     rulePos < inputs[i].ruleSource.length() - 5) {
                     size_t nameStart = rulePos + 5;
-                    
+
                     // Skip whitespace with bounds checking
-                    while (nameStart < inputs[i].ruleSource.length() && 
+                    while (nameStart < inputs[i].ruleSource.length() &&
                            std::isspace(static_cast<unsigned char>(inputs[i].ruleSource[nameStart]))) {
                         nameStart++;
                     }
-                    
+
                     // Find name end with bounds checking
                     size_t nameEnd = inputs[i].ruleSource.find_first_of(" :\t{", nameStart);
                     if (nameEnd == std::string::npos) {
                         nameEnd = inputs[i].ruleSource.length();
                     }
-                    
+
                     // Validate bounds before substring extraction
                     if (nameEnd > nameStart && nameStart < inputs[i].ruleSource.length()) {
                         size_t nameLen = nameEnd - nameStart;
-                        // Limit name length for safety
                         if (nameLen > 256) {
-                            nameLen = 256;
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"AddYaraRuleBatch: Rule name too long at index %zu, skipping", i);
+                            invalidSet.insert(i);
+                            continue;
                         }
-                        
-                        std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameLen);
 
-                        if (!seenRuleNames.insert(ruleName).second) {
+                        std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameLen);
+                        // Use namespace::ruleName as key, consistent with AddYaraRule single method
+                        std::string ns = inputs[i].namespace_.empty() ? "default" : inputs[i].namespace_;
+                        std::string fullKey = ns + "::" + ruleName;
+
+                        if (!seenRuleFullNames.insert(fullKey).second) {
                             SS_LOG_WARN(L"SignatureBuilder",
                                 L"AddYaraRuleBatch: Duplicate rule at index %zu",
                                 i);
@@ -2183,16 +2224,40 @@ namespace SignatureStore {
             }
 
             // ========================================================================
-            // STEP 4: ACQUIRE LOCK & ADD TO PENDING
+            // STEP 4: ACQUIRE LOCK WITH TIMEOUT & ADD TO PENDING
             // ========================================================================
 
             LARGE_INTEGER batchStartTime{};
             QueryPerformanceCounter(&batchStartTime);
 
-            std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+            std::unique_lock<std::shared_mutex> lock(m_stateMutex, std::defer_lock);
+
+            {
+                constexpr int MAX_LOCK_ATTEMPTS_BATCH = 50;
+                int lockAttempts = 0;
+                while (!lock.try_lock()) {
+                    if (++lockAttempts >= MAX_LOCK_ATTEMPTS_BATCH) {
+                        SS_LOG_ERROR(L"SignatureBuilder",
+                            L"AddYaraRuleBatch: Lock acquisition timeout (possible deadlock)");
+                        return StoreError{ SignatureStoreError::Unknown, 0,
+                                          "Internal lock timeout" };
+                    }
+                    std::this_thread::sleep_for(std::chrono::milliseconds(
+                        (std::min)(100 * (1 << (std::min)(lockAttempts / 10, 3)), 800)));
+                }
+            }
+
+            // Check pending limit under lock
+            constexpr size_t MAX_PENDING_RULES_TOTAL = 100'000;
+            if (m_pendingYaraRules.size() + validCount > MAX_PENDING_RULES_TOTAL) {
+                SS_LOG_ERROR(L"SignatureBuilder",
+                    L"AddYaraRuleBatch: Adding rules would exceed max pending limit");
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Batch would exceed max pending YARA rules limit (100K)" };
+            }
 
             size_t addedCount = 0;
-            
+
             // Reserve space to avoid reallocations - with exception safety
             try {
                 m_pendingYaraRules.reserve(m_pendingYaraRules.size() + validCount);
@@ -2211,35 +2276,31 @@ namespace SignatureStore {
 
                 // Extract rule name for existing check with bounds safety
                 std::string fullName = inputs[i].namespace_.empty() ? "default" : inputs[i].namespace_;
-                
+
                 // Check rule name extraction with bounds validation
                 size_t rulePos = inputs[i].ruleSource.find("rule ");
                 if (rulePos != std::string::npos &&
                     rulePos < inputs[i].ruleSource.length() - 5) {
                     size_t nameStart = rulePos + 5;
-                    
+
                     // Skip whitespace with bounds checking
-                    while (nameStart < inputs[i].ruleSource.length() && 
+                    while (nameStart < inputs[i].ruleSource.length() &&
                            std::isspace(static_cast<unsigned char>(inputs[i].ruleSource[nameStart]))) {
                         nameStart++;
                     }
-                    
+
                     // Find name end with bounds checking
                     size_t nameEnd = inputs[i].ruleSource.find_first_of(" :\t{", nameStart);
                     if (nameEnd == std::string::npos) {
                         nameEnd = inputs[i].ruleSource.length();
                     }
-                    
+
                     // Validate bounds before substring extraction
                     if (nameEnd > nameStart && nameStart < inputs[i].ruleSource.length()) {
-                        size_t nameLen = nameEnd - nameStart;
-                        // Limit name length for safety
-                        if (nameLen > 256) {
-                            nameLen = 256;
-                        }
-                        
+                        size_t nameLen = std::min(nameEnd - nameStart, static_cast<size_t>(256));
+
                         std::string ruleName = inputs[i].ruleSource.substr(nameStart, nameLen);
-                        fullName = inputs[i].namespace_.empty() ? 
+                        fullName = inputs[i].namespace_.empty() ?
                             "default::" + ruleName : inputs[i].namespace_ + "::" + ruleName;
                     }
                 }
@@ -2258,7 +2319,7 @@ namespace SignatureStore {
                     m_yaraRuleNames.insert(fullName);
                     addedCount++;
                 } catch (const std::bad_alloc&) {
-                    SS_LOG_ERROR(L"SignatureBuilder", 
+                    SS_LOG_ERROR(L"SignatureBuilder",
                         L"AddYaraRuleBatch: Memory allocation failed at index %zu", i);
                     break;  // Stop processing on memory error
                 } catch (const std::exception& ex) {
@@ -2273,7 +2334,7 @@ namespace SignatureStore {
             // ========================================================================
 
             m_statistics.totalYaraRulesAdded += addedCount;
-            m_statistics.duplicatesRemoved += (inputs.size() - addedCount);
+            m_statistics.duplicatesRemoved += duplicateSet.size();
             m_statistics.invalidSignaturesSkipped += invalidIndices.size();
 
             LARGE_INTEGER batchEndTime{};

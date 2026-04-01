@@ -217,19 +217,14 @@ BatchSignatureBuilder::BatchSignatureBuilder(const BuildConfiguration& config)
 
 /**
  * @brief Destructor - cleanup handled by RAII members
+ *
+ * NOTE: Deliberately does NOT acquire m_progressMutex here. If another
+ * thread still references this object during destruction, the program has
+ * a lifetime bug that a lock cannot fix -- and attempting to acquire the
+ * mutex would deadlock if the other thread is blocked waiting on us.
+ * std::vector and BatchProgress destructors are inherently safe.
  */
-BatchSignatureBuilder::~BatchSignatureBuilder() {
-    // All resources managed by RAII containers (std::vector, std::mutex)
-    // Explicitly clear for defense-in-depth
-    try {
-        std::lock_guard<std::mutex> lock(m_progressMutex);
-        m_sourceFiles.clear();
-        m_progress = BatchProgress{};
-    }
-    catch (...) {
-        // Destructor must not throw - ignore any exception
-    }
-}
+BatchSignatureBuilder::~BatchSignatureBuilder() = default;
 
 // ============================================================================
 // SOURCE FILE MANAGEMENT
@@ -389,9 +384,17 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
         // DUPLICATE DETECTION (prevent processing same file twice)
         // ====================================================================
         // Use canonical path for deduplication to catch different representations
-        // of the same file (e.g., C:\foo\..\bar vs C:\bar)
+        // of the same file (e.g., C:\foo\..\bar vs C:\bar).
+        // SECURITY: Windows paths are case-insensitive. Normalize to lowercase
+        // for comparison to prevent processing the same file via C:\Foo vs C:\foo.
 
-        auto [it, inserted] = seenPaths.insert(validatedPath);
+        std::wstring dedupeKey = validatedPath;
+        std::transform(dedupeKey.begin(), dedupeKey.end(), dedupeKey.begin(),
+            [](wchar_t c) -> wchar_t {
+                return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
+            });
+
+        auto [it, inserted] = seenPaths.insert(std::move(dedupeKey));
         if (!inserted) {
             SS_LOG_DEBUG(L"BatchSignatureBuilder",
                 L"AddSourceFiles: Duplicate file at index %zu - skipping", i);
@@ -416,12 +419,17 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
     {
         std::lock_guard<std::mutex> lock(m_progressMutex);
 
-        // Final overflow check before insertion
-        if (WouldOverflow(m_sourceFiles.size(), validatedPaths.size())) {
+        // Final overflow AND limit check before insertion.
+        // SECURITY: Must re-check MAX_BATCH_FILES here because another thread
+        // may have called AddSourceFiles() between our first lock release and
+        // this second acquisition, growing m_sourceFiles beyond the limit.
+        if (WouldOverflow(m_sourceFiles.size(), validatedPaths.size()) ||
+            m_sourceFiles.size() + validatedPaths.size() > MAX_BATCH_FILES) {
             SS_LOG_ERROR(L"BatchSignatureBuilder",
-                L"AddSourceFiles: Overflow would occur during insertion");
+                L"AddSourceFiles: Total would exceed limit after re-check (%zu + %zu > %zu)",
+                m_sourceFiles.size(), validatedPaths.size(), MAX_BATCH_FILES);
             return StoreError{ SignatureStoreError::TooLarge, 0,
-                              "File count overflow" };
+                              "Total batch size would exceed limit (concurrent addition)" };
         }
 
         m_sourceFiles.insert(m_sourceFiles.end(),
@@ -473,27 +481,31 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
                           "Directory path too long" };
     }
 
-    // Prevent directory traversal attacks
-    if (directoryPath.find(L"..") != std::wstring::npos) {
+    // ====================================================================
+    // PATH VALIDATION (SECURITY FIX)
+    // ====================================================================
+    //
+    // SECURITY FIX: The original code used a weak `find(L"..")` substring
+    // check. This false-positives on legitimate paths containing ".." in
+    // directory names and is trivially bypassed. Use the same robust
+    // canonicalization used by AddSourceFiles (Format::ValidateAndCanonicalizePath)
+    // which resolves traversal, device names, UNC paths, and NUL injection.
+    //
+    std::wstring canonicalDirPath;
+    std::string validationError;
+    if (!Format::ValidateAndCanonicalizePath(directoryPath, canonicalDirPath, validationError)) {
         SS_LOG_ERROR(L"BatchSignatureBuilder",
-            L"AddSourceDirectory: Path contains directory traversal");
+            L"AddSourceDirectory: Path validation failed: %S", validationError.c_str());
         return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                          "Path contains directory traversal" };
-    }
-
-    // Reject null bytes in path
-    if (directoryPath.find(L'\0') != std::wstring::npos) {
-        SS_LOG_ERROR(L"BatchSignatureBuilder",
-            L"AddSourceDirectory: Path contains null byte");
-        return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                          "Path contains null byte" };
+                          "Directory path validation failed: " + validationError };
     }
 
     // ========================================================================
     // STEP 2: VERIFY DIRECTORY EXISTS
     // ========================================================================
 
-    const DWORD attribs = GetFileAttributesW(directoryPath.c_str());
+    // Use validated canonical path for all subsequent operations
+    const DWORD attribs = GetFileAttributesW(canonicalDirPath.c_str());
 
     if (attribs == INVALID_FILE_ATTRIBUTES) {
         const DWORD err = GetLastError();
@@ -523,6 +535,9 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
     // STEP 3: SCAN CONTEXT INITIALIZATION
     // ========================================================================
 
+    // DoS prevention: cap total bytes discovered during directory scan
+    constexpr uint64_t MAX_TOTAL_SCAN_SIZE = 10ULL * 1024ULL * 1024ULL * 1024ULL;  // 10 GB
+
     struct ScanContext {
         std::vector<std::wstring> foundFiles;
         size_t maxFiles = MAX_BATCH_FILES;
@@ -532,9 +547,10 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
         LARGE_INTEGER perfFreq{};
         uint64_t timeoutMs = DIRECTORY_SCAN_TIMEOUT_MS;
         std::unordered_set<std::wstring> processedDirs;  // Prevent loops
-        std::atomic<bool> timedOut{ false };  // Timeout flag
+        bool timedOut = false;  // Timeout flag (single-threaded scan, no atomic needed)
         size_t filesExamined = 0;  // Statistics
         size_t dirsExamined = 0;
+        uint64_t totalSizeAccumulated = 0;                  // DoS prevention: total bytes cap
     };
 
     ScanContext context;
@@ -595,7 +611,7 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
         [&](const std::wstring& dirPath, ScanContext& ctx) -> void {
 
         // Early exit if already timed out
-        if (ctx.timedOut.load(std::memory_order_relaxed)) {
+        if (ctx.timedOut) {
             return;
         }
 
@@ -618,12 +634,12 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
             LARGE_INTEGER currentTime{};
             QueryPerformanceCounter(&currentTime);
 
-            const uint64_t elapsedMs = 
+            const uint64_t elapsedMs =
                 ((currentTime.QuadPart - ctx.startTime.QuadPart) * 1000ULL) /
                 ctx.perfFreq.QuadPart;
 
             if (elapsedMs > ctx.timeoutMs) {
-                ctx.timedOut.store(true, std::memory_order_relaxed);
+                ctx.timedOut = true;
                 SS_LOG_WARN(L"BatchSignatureBuilder",
                     L"AddSourceDirectory: Scan timeout after %llu ms", elapsedMs);
                 return;
@@ -636,7 +652,8 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
         // SYMLINK/LOOP DETECTION
         // ====================================================================
 
-        // Canonicalize path to detect loops
+        // Normalize path for loop detection: strip trailing backslash and
+        // lowercase for case-insensitive comparison (Windows paths).
         std::wstring canonPath = dirPath;
 
         // Remove trailing backslash for consistent comparison
@@ -648,6 +665,12 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
         if (canonPath.empty()) {
             return;
         }
+
+        // Case-insensitive normalization for Windows filesystem
+        std::transform(canonPath.begin(), canonPath.end(), canonPath.begin(),
+            [](wchar_t c) -> wchar_t {
+                return static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
+            });
 
         // Check if we've already processed this directory (loop detection)
         auto [it, inserted] = ctx.processedDirs.insert(canonPath);
@@ -710,7 +733,7 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
 
         do {
             // Early exit check for timeout
-            if (ctx.timedOut.load(std::memory_order_relaxed)) {
+            if (ctx.timedOut) {
                 break;
             }
 
@@ -732,8 +755,12 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
             }
 
             // Check for path length overflow before appending filename
-            const size_t filenameLen = wcsnlen(findData.cFileName, MAX_PATH);
-            if (WouldOverflow(fullPath.length(), filenameLen) ||
+            // findData.cFileName is guaranteed null-terminated by Windows API,
+            // so wcslen is safe here. wcsnlen(MAX_PATH) would silently truncate
+            // names > 260 chars, creating a false sense of safety.
+            const size_t filenameLen = wcslen(findData.cFileName);
+            if (filenameLen > MAX_PATH_LENGTH - 2 ||
+                WouldOverflow(fullPath.length(), filenameLen) ||
                 fullPath.length() + filenameLen > MAX_PATH_LENGTH) {
                 SS_LOG_WARN(L"BatchSignatureBuilder",
                     L"AddSourceDirectory: Full path would be too long, skipping entry");
@@ -795,7 +822,15 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
             // ============================================================
 
             if (ctx.foundFiles.size() < ctx.maxFiles) {
+                // Cap total accumulated size to prevent heap exhaustion DoS
+                if (ctx.totalSizeAccumulated + fileSize.QuadPart > MAX_TOTAL_SCAN_SIZE) {
+                    SS_LOG_WARN(L"BatchSignatureBuilder",
+                        L"AddSourceDirectory: Total scan size would exceed %llu GB limit",
+                        MAX_TOTAL_SCAN_SIZE / (1024ULL * 1024ULL * 1024ULL));
+                    break;
+                }
                 ctx.foundFiles.push_back(std::move(fullPath));
+                ctx.totalSizeAccumulated += fileSize.QuadPart;
             }
             else {
                 SS_LOG_WARN(L"BatchSignatureBuilder",
@@ -817,7 +852,7 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
         recursive ? L"yes" : L"no");
 
     try {
-        scanDir(directoryPath, context);
+        scanDir(canonicalDirPath, context);
     }
     catch (const std::exception& ex) {
         SS_LOG_ERROR(L"BatchSignatureBuilder",
@@ -841,7 +876,7 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
     // STEP 6: VALIDATE RESULTS
     // ========================================================================
 
-    if (context.timedOut.load(std::memory_order_relaxed)) {
+    if (context.timedOut) {
         SS_LOG_WARN(L"BatchSignatureBuilder",
             L"AddSourceDirectory: Scan timed out, results may be incomplete");
     }
@@ -875,6 +910,24 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
  * tracked via atomic counters and errors are aggregated for reporting.
  */
 StoreError BatchSignatureBuilder::BuildParallel() noexcept {
+    // ========================================================================
+    // STEP 0: REENTRY GUARD
+    // ========================================================================
+    // Prevent concurrent or re-entrant calls. If a build is already running,
+    // reject immediately rather than corrupting shared state.
+    if (m_buildInProgress.exchange(true, std::memory_order_acq_rel)) {
+        SS_LOG_ERROR(L"BatchSignatureBuilder",
+            L"BuildParallel: Build already in progress - rejecting concurrent call");
+        return StoreError{ SignatureStoreError::Unknown, 0,
+                          "Build already in progress" };
+    }
+
+    // RAII guard to ensure m_buildInProgress is always reset on exit
+    struct BuildGuard {
+        std::atomic<bool>& flag;
+        ~BuildGuard() { flag.store(false, std::memory_order_release); }
+    } buildGuard{ m_buildInProgress };
+
     // ========================================================================
     // STEP 1: VALIDATION & INITIALIZATION
     // ========================================================================
@@ -935,10 +988,11 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
     LARGE_INTEGER perfFrequency{};
 
     if (!QueryPerformanceFrequency(&perfFrequency) || perfFrequency.QuadPart == 0) {
-        // Fallback: use a reasonable default
-        perfFrequency.QuadPart = 10'000'000;  // 10 MHz as fallback
+        // QPC unavailable -- disable all timing rather than using a meaningless
+        // arbitrary frequency that would produce incorrect metrics.
+        perfFrequency.QuadPart = 0;
         SS_LOG_WARN(L"BatchSignatureBuilder",
-            L"BuildParallel: QueryPerformanceFrequency failed, using fallback");
+            L"BuildParallel: QueryPerformanceFrequency failed, timing disabled");
     }
 
     QueryPerformanceCounter(&buildStartTime);
@@ -1023,7 +1077,13 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
             c = static_cast<wchar_t>(std::towlower(static_cast<wint_t>(c)));
         }
 
-        // Import file with builder mutex protection
+        // Import file with builder mutex protection.
+        //
+        // DESIGN NOTE: Since SignatureBuilder is NOT thread-safe, all Import*
+        // calls must be serialized via builderMutex. This means std::execution::par
+        // provides benefit only for the per-file validation above (extension check,
+        // path validation), while the heavy Import work is effectively serial.
+        // For a future optimization, consider batching per-thread and merging.
         StoreError err{};
         {
             std::lock_guard<std::mutex> builderLock(builderMutex);
@@ -1036,10 +1096,21 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
                     err = m_builder.ImportHashesFromCsv(filePath);
                 }
                 else if (ext == L".txt") {
-                    // Auto-detect: try hash file first, then patterns
+                    // Detect format by attempting hash import. If it fails, treat
+                    // the file as a pattern file. We use the pending counts to
+                    // detect partial state corruption: if the hash import added
+                    // entries before failing, we do NOT retry as patterns since
+                    // the builder state has already been modified.
+                    const size_t hashCountBefore = m_builder.GetPendingHashCount();
                     err = m_builder.ImportHashesFromFile(filePath);
                     if (!err.IsSuccess()) {
-                        err = m_builder.ImportPatternsFromFile(filePath);
+                        const size_t hashCountAfter = m_builder.GetPendingHashCount();
+                        if (hashCountAfter == hashCountBefore) {
+                            // Hash import added nothing -- safe to retry as patterns
+                            err = m_builder.ImportPatternsFromFile(filePath);
+                        }
+                        // else: hash import partially succeeded -- keep what was added,
+                        // report the original error for the remainder
                     }
                 }
                 else if (ext == L".clamav" || ext == L".sigs") {

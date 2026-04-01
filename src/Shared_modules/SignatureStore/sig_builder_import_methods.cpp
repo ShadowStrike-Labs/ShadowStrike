@@ -38,6 +38,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <fstream>
+#include <iomanip>
 #include <sstream>
 #include <charconv>
 #include <cstring>
@@ -297,29 +298,31 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path cannot be empty" };
             }
 
-            // Path length check (Windows MAX_PATH = 260)
-            if (filePath.length() > MAX_PATH) {
+            // Path traversal protection (CWE-22)
+            std::wstring canonicalPath;
+            std::string pathError;
+            if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromFile: Path too long (%zu > %u)",
-                    filePath.length(), MAX_PATH);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
+                    L"ImportHashesFromFile: Path validation failed: %S", pathError.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Path validation failed: " + pathError };
             }
 
             // Check if file exists
-            DWORD attribs = GetFileAttributesW(filePath.c_str());
+            DWORD attribs = GetFileAttributesW(canonicalPath.c_str());
             if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromFile: File not found or is directory: %s",
-                    filePath.c_str());
+                    canonicalPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found or is directory" };
             }
 
             // Check file size (security limit)
-            FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            FileHandleGuard hFileGuard(CreateFileW(canonicalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
 
             if (!hFileGuard.isValid()) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromFile: Cannot open file: %s",
-                    filePath.c_str());
+                    canonicalPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "Cannot open file" };
             }
 
@@ -347,7 +350,7 @@ namespace {
             // ========================================================================
             // STEP 2: OPEN FILE FOR READING
             // ========================================================================
-            std::ifstream file(filePath, std::ios::binary);
+            std::ifstream file(canonicalPath, std::ios::binary);
             if (!file.is_open()) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromFile: Cannot open file stream");
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file stream" };
@@ -570,11 +573,14 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path cannot be empty" };
             }
 
-            if (filePath.length() > MAX_PATH) {
+            // Path traversal protection (CWE-22)
+            std::wstring canonicalPath;
+            std::string pathError;
+            if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromCsv: Path too long (%zu > %u)",
-                    filePath.length(), MAX_PATH);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
+                    L"ImportHashesFromCsv: Path validation failed: %S", pathError.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Path validation failed: " + pathError };
             }
 
             // Validate delimiter (must be printable ASCII, not alphanumeric)
@@ -594,14 +600,14 @@ namespace {
             // ========================================================================
             // STEP 2: FILE EXISTENCE & SIZE CHECK
             // ========================================================================
-            DWORD attribs = GetFileAttributesW(filePath.c_str());
+            DWORD attribs = GetFileAttributesW(canonicalPath.c_str());
             if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportHashesFromCsv: File not found or is directory: %s", filePath.c_str());
+                    L"ImportHashesFromCsv: File not found or is directory: %s", canonicalPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found" };
             }
 
-            FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            FileHandleGuard hFileGuard(CreateFileW(canonicalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
 
             if (!hFileGuard.isValid()) {
@@ -631,7 +637,7 @@ namespace {
             // ========================================================================
             // STEP 3: OPEN & VALIDATE FILE STREAM
             // ========================================================================
-            std::ifstream file(filePath);
+            std::ifstream file(canonicalPath);
             if (!file.is_open()) {
                 SS_LOG_ERROR(L"SignatureBuilder", L"ImportHashesFromCsv: Cannot open file stream");
                 return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file stream" };
@@ -948,23 +954,26 @@ namespace {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path cannot be empty" };
             }
 
-            if (filePath.length() > MAX_PATH) {
+            // Path traversal protection (CWE-22)
+            std::wstring canonicalPath;
+            std::string pathError;
+            if (!Format::ValidateAndCanonicalizePath(filePath, canonicalPath, pathError)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromFile: Path too long (%zu > %u)",
-                    filePath.length(), MAX_PATH);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
+                    L"ImportPatternsFromFile: Path validation failed: %S", pathError.c_str());
+                return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                    "Path validation failed: " + pathError };
             }
 
             // Check file existence
-            DWORD attribs = GetFileAttributesW(filePath.c_str());
+            DWORD attribs = GetFileAttributesW(canonicalPath.c_str());
             if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
                 SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromFile: File not found or is directory: %s", filePath.c_str());
+                    L"ImportPatternsFromFile: File not found or is directory: %s", canonicalPath.c_str());
                 return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found" };
             }
 
             // Check file size using RAII guard
-            FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
+            FileHandleGuard hFileGuard(CreateFileW(canonicalPath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
                 OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
 
             if (!hFileGuard.isValid()) {
@@ -1113,7 +1122,7 @@ namespace {
 
                 // Validate pattern is valid hex or wildcard pattern
                 std::string errorMsg;
-                if (!PatternUtils::IsValidPatternString(patternInput->patternString, errorMsg)) {
+                if (!PatternStore::PatternUtils::IsValidPatternString(patternInput->patternString, errorMsg)) {
                     SS_LOG_WARN(L"SignatureBuilder",
                         L"ImportPatternsFromFile: Line %zu invalid pattern: %S",
                         lineNum, errorMsg.c_str());
@@ -1322,7 +1331,7 @@ namespace {
                 return StoreError{ SignatureStoreError::Unknown, 0, "File stream error" };
             }
 
-            file.close();;
+            file.close();
 
             // ========================================================================
             // STEP 4: VALIDATE CONTENT
@@ -2413,8 +2422,14 @@ namespace {
                     size_t nameLen = 0;
                     constexpr size_t MAX_NAME_LEN = 256;
 
-                    while (nameLen < MAX_NAME_LEN && namePtr[nameLen] != '\0' &&
-                        currentOffset + sizeof(HashValue) + nameLen < sourceView.fileSize) {
+                    // Compute maximum safe read length from file bounds BEFORE accessing memory
+                    size_t maxSafeLen = 0;
+                    if (currentOffset + sizeof(HashValue) < sourceView.fileSize) {
+                        maxSafeLen = sourceView.fileSize - (currentOffset + sizeof(HashValue));
+                    }
+                    if (maxSafeLen > MAX_NAME_LEN) maxSafeLen = MAX_NAME_LEN;
+
+                    while (nameLen < maxSafeLen && namePtr[nameLen] != '\0') {
                         nameLen++;
                     }
 
@@ -2467,6 +2482,13 @@ namespace {
                 if (hashIdx % 1000 == 0) {
                     LARGE_INTEGER currentTime;
                     QueryPerformanceCounter(&currentTime);
+
+                    // Division-by-zero protection for performance counter
+                    if (m_perfFrequency.QuadPart <= 0) {
+                        SS_LOG_WARN(L"SignatureBuilder",
+                            L"ImportFromDatabase: Invalid performance frequency, skipping timeout check");
+                        continue;
+                    }
 
                     uint64_t elapsedMs = ((currentTime.QuadPart - importStartTime.QuadPart) * 1000ULL) /
                         m_perfFrequency.QuadPart;
@@ -2588,8 +2610,14 @@ namespace {
                     size_t nameLen = 0;
                     constexpr size_t MAX_PATTERN_NAME_LEN = 256;
 
-                    while (nameLen < MAX_PATTERN_NAME_LEN && patternNamePtr[nameLen] != '\0' &&
-                        patternEntryPtr->nameOffset + nameLen < sourceView.fileSize) {
+                    // Compute safe read length from file bounds BEFORE accessing memory
+                    size_t maxSafeLen = 0;
+                    if (patternEntryPtr->nameOffset < sourceView.fileSize) {
+                        maxSafeLen = sourceView.fileSize - patternEntryPtr->nameOffset;
+                    }
+                    if (maxSafeLen > MAX_PATTERN_NAME_LEN) maxSafeLen = MAX_PATTERN_NAME_LEN;
+
+                    while (nameLen < maxSafeLen && patternNamePtr[nameLen] != '\0') {
                         nameLen++;
                     }
 
