@@ -487,9 +487,10 @@ enum class TamperSubsystem : uint8_t {
     SelfDefense         = 8
 };
 
-/**
- * @brief Module status
- */
+// ModuleStatus: canonical definition lives in SecurityEnums.hpp.
+// Kept behind __if_not_exists for TUs that include TamperProtection.hpp
+// without SecurityEnums.hpp (backward compatibility).
+__if_not_exists(ModuleStatus) {
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -500,6 +501,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+}
 
 /**
  * @brief Verification method
@@ -832,45 +834,24 @@ struct SubsystemStatus {
 /**
  * @brief Tamper protection statistics
  */
+/**
+ * @brief Tamper protection statistics — plain copyable snapshot.
+ *
+ * Internal implementation uses std::atomic fields. This struct is a
+ * point-in-time snapshot with plain uint64_t copies, safe to pass
+ * across API boundaries (copyable, serializable).
+ */
 struct TamperProtectionStatistics {
-    /// @brief Total resources monitored
-    std::atomic<uint64_t> totalResourcesMonitored{0};
-    
-    /// @brief Total integrity checks performed
-    std::atomic<uint64_t> totalIntegrityChecks{0};
-    
-    /// @brief Total tampering events detected
-    std::atomic<uint64_t> totalTamperingDetected{0};
-    
-    /// @brief Total tampering blocked
-    std::atomic<uint64_t> totalTamperingBlocked{0};
-    
-    /// @brief Total repairs performed
-    std::atomic<uint64_t> totalRepairsPerformed{0};
-    
-    /// @brief Successful repairs
-    std::atomic<uint64_t> successfulRepairs{0};
-    
-    /// @brief Events by type
-    std::unordered_map<TamperEventType, uint64_t> eventsByType;
-    
-    /// @brief Events by resource type
-    std::unordered_map<ProtectedResourceType, uint64_t> eventsByResource;
-    
-    /// @brief Start time
-    TimePoint startTime = Clock::now();
-    
-    /// @brief Last event time
-    TimePoint lastEventTime;
-    
-    /// @brief Last check time
-    TimePoint lastCheckTime;
-    
-    /**
-     * @brief Reset statistics
-     */
-    void Reset() noexcept;
-    
+    uint64_t totalResourcesMonitored = 0;
+    uint64_t totalIntegrityChecks    = 0;
+    uint64_t totalTamperingDetected  = 0;
+    uint64_t totalTamperingBlocked   = 0;
+    uint64_t totalRepairsPerformed   = 0;
+    uint64_t successfulRepairs       = 0;
+    uint64_t kernelTamperEvents      = 0;   ///< Tamper events from kernel driver
+    uint64_t hookDetections          = 0;   ///< IAT/EAT/inline hook detections
+    uint64_t uptimeMs                = 0;
+
     /**
      * @brief Serialize to JSON
      */
@@ -1300,33 +1281,31 @@ public:
     /**
      * @brief Check if subsystem is enabled
      */
-    [[nodiscard]] bool IsSubsystemEnabled(TamperSubsystem subsystem) const;
+    [[nodiscard]] bool IsSubsystemActive(TamperSubsystem subsystem) const noexcept;
     
     // ========================================================================
     // WHITELIST MANAGEMENT
     // ========================================================================
     
     /**
-     * @brief Add source to whitelist
+     * @brief Add resource to whitelist
      */
-    [[nodiscard]] bool AddToWhitelist(std::wstring_view source, 
-                                      std::string_view authorizationToken);
+    [[nodiscard]] bool AddToWhitelist(std::wstring_view resourcePath, std::string_view reason);
     
     /**
-     * @brief Remove source from whitelist
+     * @brief Remove resource from whitelist
      */
-    [[nodiscard]] bool RemoveFromWhitelist(std::wstring_view source,
-                                           std::string_view authorizationToken);
+    [[nodiscard]] bool RemoveFromWhitelist(std::wstring_view resourcePath);
     
     /**
-     * @brief Check if source is whitelisted
+     * @brief Check if resource is whitelisted
      */
-    [[nodiscard]] bool IsWhitelisted(std::wstring_view source) const;
+    [[nodiscard]] bool IsWhitelisted(std::wstring_view resourcePath) const;
     
     /**
-     * @brief Check if process is whitelisted
+     * @brief Get all whitelisted resources
      */
-    [[nodiscard]] bool IsWhitelisted(uint32_t processId) const;
+    [[nodiscard]] std::vector<std::pair<std::wstring, std::string>> GetWhitelistedResources() const;
     
     // ========================================================================
     // CALLBACKS AND EVENTS
@@ -1334,76 +1313,47 @@ public:
     
     /**
      * @brief Register tamper event callback
-     * @return Callback ID for unregistration
      */
-    [[nodiscard]] uint64_t RegisterEventCallback(TamperEventCallback callback);
-    
-    /**
-     * @brief Unregister event callback
-     */
-    void UnregisterEventCallback(uint64_t callbackId);
+    void RegisterEventCallback(TamperEventCallback callback);
     
     /**
      * @brief Register verification callback
-     * @return Callback ID for unregistration
      */
-    [[nodiscard]] uint64_t RegisterVerificationCallback(VerificationCallback callback);
-    
-    /**
-     * @brief Unregister verification callback
-     */
-    void UnregisterVerificationCallback(uint64_t callbackId);
+    void RegisterVerificationCallback(VerificationCallback callback);
     
     /**
      * @brief Register repair callback
-     * @return Callback ID for unregistration
      */
-    [[nodiscard]] uint64_t RegisterRepairCallback(RepairCallback callback);
-    
-    /**
-     * @brief Unregister repair callback
-     */
-    void UnregisterRepairCallback(uint64_t callbackId);
+    void RegisterRepairCallback(RepairCallback callback);
     
     /**
      * @brief Register subsystem status callback
-     * @return Callback ID for unregistration
      */
-    [[nodiscard]] uint64_t RegisterStatusCallback(SubsystemStatusCallback callback);
+    void RegisterStatusCallback(SubsystemStatusCallback callback);
     
     /**
-     * @brief Unregister status callback
+     * @brief Unregister all callbacks
      */
-    void UnregisterStatusCallback(uint64_t callbackId);
-    
-    /**
-     * @brief Unregister all callbacks at once
-     */
-    void UnregisterAllCallbacks();
+    void UnregisterCallbacks();
     
     /**
      * @brief Set custom response handler
      */
     void SetResponseHandler(ResponseHandler handler);
     
-    /**
-     * @brief Clear custom response handler
-     */
-    void ClearResponseHandler();
-    
     // ========================================================================
     // STATISTICS AND REPORTING
     // ========================================================================
     
     /**
-     * @brief Get statistics
+     * @brief Get statistics snapshot (plain copyable struct)
      */
     [[nodiscard]] TamperProtectionStatistics GetStatistics() const;
     
     /**
      * @brief Reset statistics
      */
-    void ResetStatistics(std::string_view authorizationToken);
+    void ResetStatistics();
     
     /**
      * @brief Get event history
@@ -1411,19 +1361,9 @@ public:
     [[nodiscard]] std::vector<TamperEvent> GetEventHistory(size_t maxEntries = 100) const;
     
     /**
-     * @brief Clear event history
-     */
-    void ClearEventHistory(std::string_view authorizationToken);
-    
-    /**
-     * @brief Export report
+     * @brief Export report as JSON string
      */
     [[nodiscard]] std::string ExportReport() const;
-    
-    /**
-     * @brief Export report to file
-     */
-    [[nodiscard]] bool ExportReportToFile(std::wstring_view filePath) const;
     
     // ========================================================================
     // UTILITY METHODS
@@ -1435,19 +1375,46 @@ public:
     [[nodiscard]] bool SelfTest();
     
     /**
-     * @brief Verify authorization token
-     */
-    [[nodiscard]] bool VerifyAuthorizationToken(std::string_view token) const;
-    
-    /**
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
-    
+
+    // ========================================================================
+    // APT-GRADE TAMPER DETECTION
+    // ========================================================================
+
     /**
-     * @brief Force garbage collection
+     * @brief Scan for inline hooks in IAT/EAT of our protected modules.
+     * Detects APT-class hooking (Lazarus, APT41, FIN7 etc.) that intercept
+     * our security calls at the import table level.
+     * @return Number of hooks detected (0 = clean)
      */
-    void ForceGarbageCollection();
+    [[nodiscard]] uint32_t ScanForInlineHooks();
+
+    /**
+     * @brief Validate parent process chain of our own process.
+     * Nation-state actors inject into parent processes or use re-parenting
+     * to appear legitimate. Detects orphaned or re-parented agent processes.
+     * @return true if parent chain is valid (services.exe → svchost → us)
+     */
+    [[nodiscard]] bool ValidateParentProcessChain();
+
+    /**
+     * @brief Detect handle stripping attacks against our process.
+     * APTs use NtDuplicateObject with DUPLICATE_CLOSE_SOURCE or
+     * direct handle table manipulation to strip our handles, blinding
+     * the agent to file/registry/process events.
+     * @return Number of stripped/degraded handles detected
+     */
+    [[nodiscard]] uint32_t DetectHandleStripping();
+
+    /**
+     * @brief Full APT tamper sweep — runs all APT detection checks.
+     * Combines hook scanning, parent chain validation, handle stripping,
+     * and kernel notification integrity in a single pass.
+     * @return true if ALL checks pass clean
+     */
+    [[nodiscard]] bool RunAPTTamperSweep();
 
 private:
     // ========================================================================

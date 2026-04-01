@@ -90,6 +90,7 @@
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Security/DigitalSignatureValidator.hpp"
 #include "../Security/ProcessProtection.hpp"
+#include "../Security/TamperProtection.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -448,6 +449,34 @@ public:
                 SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::ERROR);
             } else {
                 SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::RUNNING);
+            }
+
+            // 4.5. Initialize TamperProtection — self-defense and integrity monitoring
+            try {
+                Security::TamperProtectionConfiguration tamperConfig;
+                tamperConfig.mode = Security::TamperProtectionMode::Enforce;
+                tamperConfig.enableAutoRepair = true;
+                tamperConfig.enablePeriodicChecks = true;
+                tamperConfig.checkIntervalMs = 30000; // 30s periodic integrity scans
+
+                if (Security::TamperProtection::Instance().Initialize(tamperConfig)) {
+                    // Protect our own installation files and critical registry keys
+                    Security::TamperProtection::Instance().ProtectSelf();
+                    Security::TamperProtection::Instance().ProtectInstallation();
+                    Security::TamperProtection::Instance().ProtectServiceRegistry();
+
+                    // Run initial APT tamper sweep — detect hooks/injection from before we started
+                    Security::TamperProtection::Instance().RunAPTTamperSweep();
+
+                    SS_LOG_INFO(L"RealTimeProtection",
+                        L"TamperProtection initialized in Enforce mode with auto-repair + APT sweep");
+                } else {
+                    SS_LOG_WARN(L"RealTimeProtection",
+                        L"TamperProtection initialization failed — running unprotected");
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(L"RealTimeProtection",
+                    L"TamperProtection init exception: %hs", ex.what());
             }
 
             // 5. Start Protection Components
@@ -2318,7 +2347,37 @@ public:
             }
 
             case FilterMessageType_SelfProtectAlert: {
-                Utils::Logger::Error(L"RealTimeProtection: SELF-PROTECTION ALERT from kernel (payload {} bytes)", size);
+                SS_LOG_ERROR(L"RealTimeProtection",
+                    L"SELF-PROTECTION ALERT from kernel (payload %zu bytes)", size);
+
+                // Route to TamperProtection for tamper event handling + auto-repair
+                if (Security::TamperProtection::HasInstance() &&
+                    Security::TamperProtection::Instance().IsInitialized()) {
+                    auto& tp = Security::TamperProtection::Instance();
+
+                    // Parse kernel self-protect alert payload:
+                    // [uint32_t alertType][uint32_t sourcePid][uint32_t targetPid][uint32_t accessMask]
+                    if (size >= sizeof(uint32_t) * 4 && data) {
+                        auto* payload = static_cast<const uint32_t*>(data);
+                        uint32_t alertType  = payload[0];
+                        uint32_t sourcePid  = payload[1];
+                        uint32_t targetPid  = payload[2];
+
+                        // Force integrity check on our protected files when tamper detected
+                        tp.ForceIntegrityCheck();
+
+                        // Run APT sweep — kernel tamper alerts often indicate advanced attacks
+                        tp.RunAPTTamperSweep();
+
+                        // Log event for correlation
+                        SS_LOG_WARN(L"RealTimeProtection",
+                            L"Kernel tamper: type=%u src_pid=%u target_pid=%u — "
+                            L"integrity check + APT sweep triggered",
+                            alertType, sourcePid, targetPid);
+                    }
+                }
+
+                m_stats.threatsDetected++;
                 break;
             }
 

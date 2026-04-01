@@ -46,6 +46,7 @@
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <AclAPI.h>
+#include <winternl.h>  // PROCESS_BASIC_INFORMATION for parent chain validation
 
 // ============================================================================
 // STANDARD LIBRARY
@@ -56,6 +57,8 @@
 #include <algorithm>
 #include <random>
 #include <condition_variable>
+#include <deque>
+#include <array>
 
 namespace ShadowStrike {
 namespace Security {
@@ -83,9 +86,14 @@ namespace {
     return std::chrono::system_clock::now();
 }
 
-// Format time point to ISO 8601
+// Format time point to ISO 8601 — converts steady_clock delta to wall-clock time
 [[nodiscard]] std::string FormatTimePoint(const TimePoint& tp) {
-    auto sysTime = std::chrono::system_clock::now();
+    // Convert steady_clock offset to system_clock by computing the delta from now
+    auto steadyNow = std::chrono::steady_clock::now();
+    auto sysNow = std::chrono::system_clock::now();
+    auto delta = tp - steadyNow;
+    auto sysTime = sysNow + delta;
+
     auto time_t_val = std::chrono::system_clock::to_time_t(sysTime);
     std::tm tm_val{};
     gmtime_s(&tm_val, &time_t_val);
@@ -313,30 +321,17 @@ TamperProtectionConfiguration TamperProtectionConfiguration::FromMode(TamperProt
     return oss.str();
 }
 
-void TamperProtectionStatistics::Reset() noexcept {
-    totalResourcesMonitored.store(0, std::memory_order_relaxed);
-    totalIntegrityChecks.store(0, std::memory_order_relaxed);
-    totalTamperingDetected.store(0, std::memory_order_relaxed);
-    totalTamperingBlocked.store(0, std::memory_order_relaxed);
-    totalRepairsPerformed.store(0, std::memory_order_relaxed);
-    successfulRepairs.store(0, std::memory_order_relaxed);
-    eventsByType.clear();
-    eventsByResource.clear();
-    startTime = Clock::now();
-}
-
 [[nodiscard]] std::string TamperProtectionStatistics::ToJson() const {
-    auto uptimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-        Clock::now() - startTime).count();
-
     std::ostringstream oss;
     oss << "{";
-    oss << "\"totalResourcesMonitored\":" << totalResourcesMonitored.load(std::memory_order_relaxed) << ",";
-    oss << "\"totalIntegrityChecks\":" << totalIntegrityChecks.load(std::memory_order_relaxed) << ",";
-    oss << "\"totalTamperingDetected\":" << totalTamperingDetected.load(std::memory_order_relaxed) << ",";
-    oss << "\"totalTamperingBlocked\":" << totalTamperingBlocked.load(std::memory_order_relaxed) << ",";
-    oss << "\"totalRepairsPerformed\":" << totalRepairsPerformed.load(std::memory_order_relaxed) << ",";
-    oss << "\"successfulRepairs\":" << successfulRepairs.load(std::memory_order_relaxed) << ",";
+    oss << "\"totalResourcesMonitored\":" << totalResourcesMonitored << ",";
+    oss << "\"totalIntegrityChecks\":" << totalIntegrityChecks << ",";
+    oss << "\"totalTamperingDetected\":" << totalTamperingDetected << ",";
+    oss << "\"totalTamperingBlocked\":" << totalTamperingBlocked << ",";
+    oss << "\"totalRepairsPerformed\":" << totalRepairsPerformed << ",";
+    oss << "\"successfulRepairs\":" << successfulRepairs << ",";
+    oss << "\"kernelTamperEvents\":" << kernelTamperEvents << ",";
+    oss << "\"hookDetections\":" << hookDetections << ",";
     oss << "\"uptimeMs\":" << uptimeMs;
     oss << "}";
     return oss.str();
@@ -519,7 +514,7 @@ public:
             InitializeProcessProtection();
         }
 
-        m_stats.Reset();
+        m_stats.startTime = Clock::now();
         m_status = ModuleStatus::Running;
 
         SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection initialized in %hs mode",
@@ -599,8 +594,14 @@ public:
             return false;
         }
 
+        // Enforce minimum pause duration to prevent infinite pause
+        if (durationMs == 0) durationMs = 60000; // 1 minute default
+
+        {
+            std::unique_lock lock(m_mutex);
+            m_pauseEndTime = Clock::now() + Milliseconds(durationMs);
+        }
         m_paused.store(true, std::memory_order_release);
-        m_pauseEndTime = Clock::now() + Milliseconds(durationMs);
 
         SS_LOG_INFO(LOG_CATEGORY, L"TamperProtection paused for %u ms", durationMs);
         return true;
@@ -914,20 +915,37 @@ public:
             return false;
         }
 
+        // Verify the target is not a symlink/junction (anti-symlink attack)
+        if (std::filesystem::is_symlink(dirPath)) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Refusing to protect symlink directory: %ls", dirPath.c_str());
+            return false;
+        }
+
         size_t filesProtected = 0;
+        constexpr size_t kMaxFilesPerDirectory = 50000; // DoS prevention
 
         try {
+            // skip_permission_denied + follow_directory_symlink OFF prevents symlink attacks
+            namespace fs = std::filesystem;
+            auto dirOpts = fs::directory_options::skip_permission_denied;
+
             if (recursive) {
-                for (const auto& entry : std::filesystem::recursive_directory_iterator(dirPath)) {
-                    if (entry.is_regular_file()) {
+                for (const auto& entry : fs::recursive_directory_iterator(dirPath, dirOpts)) {
+                    if (filesProtected >= kMaxFilesPerDirectory) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"File cap reached (%zu) in: %ls",
+                                    kMaxFilesPerDirectory, dirPath.c_str());
+                        break;
+                    }
+                    if (entry.is_regular_file() && !entry.is_symlink()) {
                         if (ProtectFile(entry.path().wstring(), false)) {
                             filesProtected++;
                         }
                     }
                 }
             } else {
-                for (const auto& entry : std::filesystem::directory_iterator(dirPath)) {
-                    if (entry.is_regular_file()) {
+                for (const auto& entry : fs::directory_iterator(dirPath, dirOpts)) {
+                    if (filesProtected >= kMaxFilesPerDirectory) break;
+                    if (entry.is_regular_file() && !entry.is_symlink()) {
                         if (ProtectFile(entry.path().wstring(), false)) {
                             filesProtected++;
                         }
@@ -1193,6 +1211,53 @@ public:
         baseline.fileSize = size;
         baseline.status = IntegrityStatus::Valid;
 
+        // Compute baseline hash of the memory region NOW
+        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
+        if (!hProcess) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Cannot open PID %u for memory baseline", processId);
+            return false;
+        }
+
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool hashOk = false;
+
+        do {
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) break;
+            if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) break;
+
+            constexpr size_t kChunkSize = 65536;
+            auto buffer = std::make_unique<uint8_t[]>(kChunkSize);
+            size_t offset = 0;
+
+            while (offset < size) {
+                SIZE_T toRead = (std::min)(kChunkSize, size - offset);
+                SIZE_T bytesRead = 0;
+                if (ReadProcessMemory(hProcess,
+                                      reinterpret_cast<LPCVOID>(address + offset),
+                                      buffer.get(), toRead, &bytesRead) && bytesRead > 0) {
+                    BCryptHashData(hHash, buffer.get(), static_cast<ULONG>(bytesRead), 0);
+                    offset += bytesRead;
+                } else {
+                    break;
+                }
+            }
+
+            if (BCryptFinishHash(hHash, baseline.contentHash.data(),
+                                 static_cast<ULONG>(baseline.contentHash.size()), 0) == 0) {
+                hashOk = true;
+            }
+        } while (false);
+
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+        CloseHandle(hProcess);
+
+        if (!hashOk) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to compute memory baseline hash for PID %u", processId);
+            return false;
+        }
+
         {
             std::unique_lock lock(m_mutex);
             m_protectedMemoryRegions[key] = baseline;
@@ -1217,7 +1282,68 @@ public:
         }
 
         result.resourceId = it->second.resourceId;
-        result.status = IntegrityStatus::Valid;
+        result.expectedHash = it->second.contentHash;
+        lock.unlock();
+
+        // Compute current memory hash
+        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
+        if (!hProcess) {
+            result.status = IntegrityStatus::Error;
+            result.errorMessage = "Cannot open process for memory verification";
+            return result;
+        }
+
+        Hash256 currentHash{};
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool hashOk = false;
+
+        do {
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) break;
+            if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) break;
+
+            constexpr size_t kChunkSize = 65536;
+            auto buffer = std::make_unique<uint8_t[]>(kChunkSize);
+            size_t offset = 0;
+
+            while (offset < size) {
+                SIZE_T toRead = (std::min)(kChunkSize, size - offset);
+                SIZE_T bytesRead = 0;
+                if (ReadProcessMemory(hProcess,
+                                      reinterpret_cast<LPCVOID>(address + offset),
+                                      buffer.get(), toRead, &bytesRead) && bytesRead > 0) {
+                    BCryptHashData(hHash, buffer.get(), static_cast<ULONG>(bytesRead), 0);
+                    offset += bytesRead;
+                } else {
+                    break;
+                }
+            }
+
+            if (BCryptFinishHash(hHash, currentHash.data(), static_cast<ULONG>(currentHash.size()), 0) == 0) {
+                hashOk = true;
+            }
+        } while (false);
+
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+        CloseHandle(hProcess);
+
+        if (!hashOk) {
+            result.status = IntegrityStatus::Error;
+            result.errorMessage = "Failed to compute memory hash";
+            return result;
+        }
+
+        result.computedHash = currentHash;
+
+        if (currentHash == result.expectedHash) {
+            result.status = IntegrityStatus::Valid;
+        } else {
+            result.status = IntegrityStatus::Modified;
+            result.errorMessage = "Memory region content has been modified";
+            SS_LOG_WARN(LOG_CATEGORY, L"Memory tamper detected: PID %u addr 0x%llX",
+                        processId, static_cast<uint64_t>(address));
+        }
 
         m_stats.totalIntegrityChecks.fetch_add(1, std::memory_order_relaxed);
         return result;
@@ -1265,7 +1391,7 @@ public:
         WINTRUST_DATA trustData{};
         trustData.cbStruct = sizeof(trustData);
         trustData.dwUIChoice = WTD_UI_NONE;
-        trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+        trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
         trustData.dwUnionChoice = WTD_CHOICE_FILE;
         trustData.pFile = &fileInfo;
         trustData.dwStateAction = WTD_STATEACTION_VERIFY;
@@ -1430,16 +1556,44 @@ public:
             return result;
         }
 
-        // Use most recent backup
+        // Find the original file path for this resource
+        std::wstring originalPath;
+        {
+            std::shared_lock lock(m_mutex);
+            for (const auto& [path, baseline] : m_protectedFiles) {
+                if (baseline.resourceId == resourceId) {
+                    originalPath = path;
+                    break;
+                }
+            }
+        }
+
+        if (originalPath.empty()) {
+            result.success = false;
+            result.errorMessage = "Resource not found in protected files";
+            return result;
+        }
+
+        // Use most recent backup — actually copy the file
         result.backupPath = backups.back();
         result.repairMethod = "RestoreFromBackup";
 
-        // Perform restore logic here
-        result.success = true;
-        result.details = "Restored from backup";
+        try {
+            std::filesystem::copy_file(result.backupPath, originalPath,
+                std::filesystem::copy_options::overwrite_existing);
+            result.success = true;
+            result.details = "Restored from backup: " + WideToUtf8(result.backupPath);
 
-        m_stats.totalRepairsPerformed.fetch_add(1, std::memory_order_relaxed);
-        m_stats.successfulRepairs.fetch_add(1, std::memory_order_relaxed);
+            m_stats.totalRepairsPerformed.fetch_add(1, std::memory_order_relaxed);
+            m_stats.successfulRepairs.fetch_add(1, std::memory_order_relaxed);
+
+            SS_LOG_INFO(LOG_CATEGORY, L"Restored %ls from backup %ls",
+                        originalPath.c_str(), std::wstring(result.backupPath).c_str());
+        } catch (const std::exception& e) {
+            result.success = false;
+            result.errorMessage = std::string("Restore failed: ") + e.what();
+            SS_LOG_ERROR(LOG_CATEGORY, L"RestoreFromBackup failed: %hs", e.what());
+        }
 
         return result;
     }
@@ -1585,22 +1739,22 @@ public:
         m_eventCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterVerificationCallback(VerificationResultCallback callback) {
+    void RegisterVerificationCallback(VerificationCallback callback) {
         std::unique_lock lock(m_mutex);
         m_verificationCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterRepairCallback(RepairResultCallback callback) {
+    void RegisterRepairCallback(RepairCallback callback) {
         std::unique_lock lock(m_mutex);
         m_repairCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterStatusCallback(StatusChangeCallback callback) {
+    void RegisterStatusCallback(SubsystemStatusCallback callback) {
         std::unique_lock lock(m_mutex);
         m_statusCallbacks.push_back(std::move(callback));
     }
 
-    void SetResponseHandler(TamperResponseHandler handler) {
+    void SetResponseHandler(ResponseHandler handler) {
         std::unique_lock lock(m_mutex);
         m_responseHandler = std::move(handler);
     }
@@ -1619,19 +1773,32 @@ public:
     // ========================================================================
 
     [[nodiscard]] TamperProtectionStatistics GetStatistics() const {
-        TamperProtectionStatistics copy;
-        copy.totalResourcesMonitored.store(m_stats.totalResourcesMonitored.load(std::memory_order_relaxed));
-        copy.totalIntegrityChecks.store(m_stats.totalIntegrityChecks.load(std::memory_order_relaxed));
-        copy.totalTamperingDetected.store(m_stats.totalTamperingDetected.load(std::memory_order_relaxed));
-        copy.totalTamperingBlocked.store(m_stats.totalTamperingBlocked.load(std::memory_order_relaxed));
-        copy.totalRepairsPerformed.store(m_stats.totalRepairsPerformed.load(std::memory_order_relaxed));
-        copy.successfulRepairs.store(m_stats.successfulRepairs.load(std::memory_order_relaxed));
-        copy.startTime = m_stats.startTime;
-        return copy;
+        TamperProtectionStatistics snap;
+        snap.totalResourcesMonitored = m_stats.totalResourcesMonitored.load(std::memory_order_relaxed);
+        snap.totalIntegrityChecks    = m_stats.totalIntegrityChecks.load(std::memory_order_relaxed);
+        snap.totalTamperingDetected  = m_stats.totalTamperingDetected.load(std::memory_order_relaxed);
+        snap.totalTamperingBlocked   = m_stats.totalTamperingBlocked.load(std::memory_order_relaxed);
+        snap.totalRepairsPerformed   = m_stats.totalRepairsPerformed.load(std::memory_order_relaxed);
+        snap.successfulRepairs       = m_stats.successfulRepairs.load(std::memory_order_relaxed);
+        snap.kernelTamperEvents      = m_stats.kernelTamperEvents.load(std::memory_order_relaxed);
+        snap.hookDetections          = m_stats.hookDetections.load(std::memory_order_relaxed);
+
+        auto elapsed = Clock::now() - m_stats.startTime;
+        snap.uptimeMs = static_cast<uint64_t>(
+            std::chrono::duration_cast<Milliseconds>(elapsed).count());
+        return snap;
     }
 
     void ResetStatistics() {
-        m_stats.Reset();
+        m_stats.totalResourcesMonitored.store(0, std::memory_order_relaxed);
+        m_stats.totalIntegrityChecks.store(0, std::memory_order_relaxed);
+        m_stats.totalTamperingDetected.store(0, std::memory_order_relaxed);
+        m_stats.totalTamperingBlocked.store(0, std::memory_order_relaxed);
+        m_stats.totalRepairsPerformed.store(0, std::memory_order_relaxed);
+        m_stats.successfulRepairs.store(0, std::memory_order_relaxed);
+        m_stats.kernelTamperEvents.store(0, std::memory_order_relaxed);
+        m_stats.hookDetections.store(0, std::memory_order_relaxed);
+        m_stats.startTime = Clock::now();
         SS_LOG_INFO(LOG_CATEGORY, L"Statistics reset");
     }
 
@@ -1655,7 +1822,7 @@ public:
         oss << "  \"version\": \"" << TamperProtection::GetVersionString() << "\",\n";
         oss << "  \"status\": " << static_cast<int>(m_status.load()) << ",\n";
         oss << "  \"mode\": \"" << GetModeName(m_config.mode) << "\",\n";
-        oss << "  \"statistics\": " << m_stats.ToJson() << ",\n";
+        oss << "  \"statistics\": " << GetStatistics().ToJson() << ",\n";
 
         std::shared_lock lock(m_mutex);
         oss << "  \"protectedFiles\": " << m_protectedFiles.size() << ",\n";
@@ -1705,13 +1872,394 @@ public:
         return allPassed;
     }
 
+    // ========================================================================
+    // APT-GRADE TAMPER DETECTION — IMPL
+    // ========================================================================
+
+    [[nodiscard]] uint32_t ScanForInlineHooks() {
+        uint32_t hooksFound = 0;
+
+        SS_LOG_INFO(LOG_CATEGORY, L"APT: Starting IAT/EAT inline hook scan");
+
+        // Get our own module base
+        HMODULE selfModule = GetModuleHandleW(nullptr);
+        if (!selfModule) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"APT: Failed to get own module handle");
+            return 0;
+        }
+
+        // Critical DLLs we depend on — hooking these blinds the agent
+        static constexpr std::array<const wchar_t*, 6> criticalDlls = {
+            L"ntdll.dll", L"kernel32.dll", L"advapi32.dll",
+            L"bcrypt.dll", L"wintrust.dll", L"crypt32.dll"
+        };
+
+        for (const auto* dllName : criticalDlls) {
+            HMODULE hMod = GetModuleHandleW(dllName);
+            if (!hMod) continue;
+
+            auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(hMod);
+            if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) continue;
+
+            auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+                reinterpret_cast<const uint8_t*>(hMod) + dosHeader->e_lfanew);
+            if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) continue;
+
+            // Check export table entries — detect JMP hooks in first bytes
+            const auto& exportDir = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT];
+            if (exportDir.VirtualAddress == 0 || exportDir.Size == 0) continue;
+
+            auto* exportTable = reinterpret_cast<const IMAGE_EXPORT_DIRECTORY*>(
+                reinterpret_cast<const uint8_t*>(hMod) + exportDir.VirtualAddress);
+
+            auto* functions = reinterpret_cast<const uint32_t*>(
+                reinterpret_cast<const uint8_t*>(hMod) + exportTable->AddressOfFunctions);
+
+            // Module boundaries for detecting out-of-module JMPs
+            auto moduleBase = reinterpret_cast<uintptr_t>(hMod);
+            auto moduleEnd = moduleBase + ntHeaders->OptionalHeader.SizeOfImage;
+
+            uint32_t numFunctions = std::min(exportTable->NumberOfFunctions, 4096u);
+            for (uint32_t i = 0; i < numFunctions; ++i) {
+                if (functions[i] == 0) continue;
+
+                auto* funcAddr = reinterpret_cast<const uint8_t*>(hMod) + functions[i];
+                auto funcPtr = reinterpret_cast<uintptr_t>(funcAddr);
+
+                // Skip forwarded exports (RVA within export directory)
+                if (funcPtr >= moduleBase + exportDir.VirtualAddress &&
+                    funcPtr < moduleBase + exportDir.VirtualAddress + exportDir.Size) {
+                    continue;
+                }
+
+                // Detect common hook patterns:
+                // 0xE9 = JMP rel32 (5 bytes) — most common inline hook
+                // 0xFF 0x25 = JMP [addr] — indirect jump hook
+                // 0x48 0xB8 ... 0xFF 0xE0 = MOV RAX, imm64; JMP RAX — 64-bit trampoline
+                __try {
+                    if (funcAddr[0] == 0xE9) {
+                        // Relative JMP — check if target is outside module
+                        int32_t relOffset = *reinterpret_cast<const int32_t*>(funcAddr + 1);
+                        auto target = funcPtr + 5 + relOffset;
+                        if (target < moduleBase || target >= moduleEnd) {
+                            hooksFound++;
+                            SS_LOG_ERROR(LOG_CATEGORY,
+                                L"APT HOOK: %ls export #%u has JMP to 0x%llX (outside module)",
+                                dllName, i, static_cast<uint64_t>(target));
+                        }
+                    }
+                    else if (funcAddr[0] == 0xFF && funcAddr[1] == 0x25) {
+                        hooksFound++;
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"APT HOOK: %ls export #%u has indirect JMP [addr]", dllName, i);
+                    }
+                    else if (funcAddr[0] == 0x48 && funcAddr[1] == 0xB8 &&
+                             funcAddr[10] == 0xFF && funcAddr[11] == 0xE0) {
+                        uint64_t movTarget = *reinterpret_cast<const uint64_t*>(funcAddr + 2);
+                        if (movTarget < moduleBase || movTarget >= moduleEnd) {
+                            hooksFound++;
+                            SS_LOG_ERROR(LOG_CATEGORY,
+                                L"APT HOOK: %ls export #%u has MOV RAX+JMP RAX to 0x%llX",
+                                dllName, i, movTarget);
+                        }
+                    }
+                } __except (EXCEPTION_EXECUTE_HANDLER) {
+                    // Page fault reading function — suspicious (guard page hook?)
+                    hooksFound++;
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"APT HOOK: Exception reading %ls export #%u — possible guard page hook",
+                        dllName, i);
+                }
+            }
+        }
+
+        m_stats.hookDetections.fetch_add(hooksFound, std::memory_order_relaxed);
+
+        if (hooksFound > 0) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"APT: Detected %u inline hooks across critical DLLs", hooksFound);
+        } else {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"APT: IAT/EAT hook scan clean");
+        }
+
+        return hooksFound;
+    }
+
+    [[nodiscard]] bool ValidateParentProcessChain() {
+        SS_LOG_INFO(LOG_CATEGORY, L"APT: Validating parent process chain");
+
+        DWORD ourPid = GetCurrentProcessId();
+        DWORD parentPid = 0;
+
+        // Get parent PID via NtQueryInformationProcess (more reliable than toolhelp)
+        HANDLE hSelf = GetCurrentProcess();
+        PROCESS_BASIC_INFORMATION pbi{};
+        ULONG returnLength = 0;
+
+        using NtQueryInformationProcessFn = NTSTATUS(NTAPI*)(
+            HANDLE, PROCESSINFOCLASS, PVOID, ULONG, PULONG);
+
+        auto ntQueryInfo = reinterpret_cast<NtQueryInformationProcessFn>(
+            GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+
+        if (!ntQueryInfo) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"APT: Cannot resolve NtQueryInformationProcess");
+            return false;
+        }
+
+        NTSTATUS status = ntQueryInfo(hSelf, ProcessBasicInformation, &pbi, sizeof(pbi), &returnLength);
+        if (status != 0) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"APT: NtQueryInformationProcess failed: 0x%08X",
+                static_cast<uint32_t>(status));
+            return false;
+        }
+
+        parentPid = static_cast<DWORD>(reinterpret_cast<uintptr_t>(pbi.Reserved3));
+
+        // Validate parent is still alive (dead parent = possible re-parenting attack)
+        HANDLE hParent = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, parentPid);
+        if (!hParent) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"APT: Parent PID %u is not accessible — orphaned process (possible injection)",
+                parentPid);
+            return false;
+        }
+
+        // Get parent's image name
+        wchar_t parentImage[MAX_PATH]{};
+        DWORD parentImageLen = MAX_PATH;
+        bool parentValid = false;
+
+        if (QueryFullProcessImageNameW(hParent, 0, parentImage, &parentImageLen)) {
+            std::wstring_view parentName(parentImage, parentImageLen);
+
+            // Extract just the filename
+            auto lastSlash = parentName.find_last_of(L'\\');
+            auto parentFile = (lastSlash != std::wstring_view::npos)
+                ? parentName.substr(lastSlash + 1) : parentName;
+
+            // Expected parents for a Windows service: services.exe or svchost.exe
+            // For manual testing: also allow cmd.exe, powershell.exe, explorer.exe
+            static constexpr std::array<std::wstring_view, 5> validParents = {
+                L"services.exe", L"svchost.exe", L"wininit.exe",
+                L"cmd.exe", L"explorer.exe"
+            };
+
+            for (auto validParent : validParents) {
+                if (_wcsicmp(std::wstring(parentFile).c_str(),
+                             std::wstring(validParent).c_str()) == 0) {
+                    parentValid = true;
+                    break;
+                }
+            }
+
+            if (!parentValid) {
+                SS_LOG_ERROR(LOG_CATEGORY,
+                    L"APT: Unexpected parent process: %ls (PID %u) — possible process injection",
+                    parentImage, parentPid);
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"APT: Parent chain valid: %ls (PID %u)",
+                    parentImage, parentPid);
+            }
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"APT: Cannot query parent image name (PID %u)", parentPid);
+        }
+
+        CloseHandle(hParent);
+        return parentValid;
+    }
+
+    [[nodiscard]] uint32_t DetectHandleStripping() {
+        SS_LOG_INFO(LOG_CATEGORY, L"APT: Scanning for handle stripping attacks");
+        uint32_t strippedCount = 0;
+
+        DWORD ourPid = GetCurrentProcessId();
+
+        // Attempt to open ourselves with full access — if degraded,
+        // something stripped our token privileges or handle access
+        HANDLE hSelf = OpenProcess(
+            PROCESS_ALL_ACCESS, FALSE, ourPid);
+
+        if (!hSelf) {
+            DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"APT HANDLE STRIP: Cannot open self with PROCESS_ALL_ACCESS (err=%u) — "
+                L"handle table may be compromised", err);
+            strippedCount++;
+        } else {
+            CloseHandle(hSelf);
+        }
+
+        // Check we can still query our own token — APTs strip token handles
+        HANDLE hToken = nullptr;
+        if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY | TOKEN_ADJUST_PRIVILEGES, &hToken)) {
+            DWORD err = GetLastError();
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"APT HANDLE STRIP: Cannot open own process token (err=%u) — "
+                L"token handle possibly stripped", err);
+            strippedCount++;
+        } else {
+            // Verify our critical privileges are still present
+            TOKEN_PRIVILEGES tp{};
+            DWORD returnLen = 0;
+            DWORD bufSize = 0;
+
+            GetTokenInformation(hToken, TokenPrivileges, nullptr, 0, &bufSize);
+            if (bufSize > 0 && bufSize < 64 * 1024) {
+                auto privBuf = std::make_unique<uint8_t[]>(bufSize);
+                if (GetTokenInformation(hToken, TokenPrivileges, privBuf.get(), bufSize, &returnLen)) {
+                    auto* privileges = reinterpret_cast<TOKEN_PRIVILEGES*>(privBuf.get());
+
+                    // Check for SeDebugPrivilege — EDR critical privilege
+                    LUID debugLuid{};
+                    LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &debugLuid);
+
+                    bool hasDebug = false;
+                    for (DWORD i = 0; i < privileges->PrivilegeCount; ++i) {
+                        if (privileges->Privileges[i].Luid.LowPart == debugLuid.LowPart &&
+                            privileges->Privileges[i].Luid.HighPart == debugLuid.HighPart) {
+                            hasDebug = true;
+                            if (!(privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)) {
+                                SS_LOG_WARN(LOG_CATEGORY,
+                                    L"APT HANDLE STRIP: SeDebugPrivilege present but disabled — "
+                                    L"possible privilege degradation");
+                                strippedCount++;
+                            }
+                            break;
+                        }
+                    }
+
+                    if (!hasDebug) {
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"APT HANDLE STRIP: SeDebugPrivilege MISSING from token — "
+                            L"privilege stripped");
+                        strippedCount++;
+                    }
+                }
+            }
+
+            CloseHandle(hToken);
+        }
+
+        // Check our thread token hasn't been impersonated to low-priv
+        HANDLE hThreadToken = nullptr;
+        if (OpenThreadToken(GetCurrentThread(), TOKEN_QUERY, TRUE, &hThreadToken)) {
+            // Thread has an impersonation token — suspicious for a service
+            TOKEN_TYPE tokenType{};
+            DWORD retLen = 0;
+            if (GetTokenInformation(hThreadToken, TokenType, &tokenType, sizeof(tokenType), &retLen)) {
+                if (tokenType == TokenImpersonation) {
+                    SECURITY_IMPERSONATION_LEVEL level{};
+                    if (GetTokenInformation(hThreadToken, TokenImpersonationLevel,
+                                            &level, sizeof(level), &retLen)) {
+                        if (level < SecurityImpersonation) {
+                            SS_LOG_ERROR(LOG_CATEGORY,
+                                L"APT HANDLE STRIP: Thread impersonated at level %d — "
+                                L"possible privilege downgrade attack",
+                                static_cast<int>(level));
+                            strippedCount++;
+                        }
+                    }
+                }
+            }
+            CloseHandle(hThreadToken);
+        }
+
+        if (strippedCount > 0) {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"APT: Detected %u handle/privilege strip indicators", strippedCount);
+            m_stats.kernelTamperEvents.fetch_add(strippedCount, std::memory_order_relaxed);
+        } else {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"APT: Handle integrity check clean");
+        }
+
+        return strippedCount;
+    }
+
+    [[nodiscard]] bool RunAPTTamperSweep() {
+        SS_LOG_INFO(LOG_CATEGORY, L"APT: Running full tamper detection sweep");
+        auto sweepStart = Clock::now();
+
+        bool allClean = true;
+
+        // Phase 1: Inline hook detection
+        uint32_t hooks = ScanForInlineHooks();
+        if (hooks > 0) {
+            allClean = false;
+            RecordAPTEvent(TamperEventType::ProcessTampering, 10,
+                L"APT inline hooks detected",
+                "IAT/EAT integrity compromised: " + std::to_string(hooks) + " hooks found");
+        }
+
+        // Phase 2: Parent process validation
+        if (!ValidateParentProcessChain()) {
+            allClean = false;
+            RecordAPTEvent(TamperEventType::ProcessTampering, 8,
+                L"APT parent chain anomaly",
+                "Agent parent process chain is invalid — possible injection or re-parenting");
+        }
+
+        // Phase 3: Handle/privilege stripping
+        uint32_t stripped = DetectHandleStripping();
+        if (stripped > 0) {
+            allClean = false;
+            RecordAPTEvent(TamperEventType::ProcessTampering, 10,
+                L"APT handle stripping detected",
+                "Handle/privilege degradation: " + std::to_string(stripped) + " indicators");
+        }
+
+        // Phase 4: Standard file integrity check
+        ForceIntegrityCheck();
+
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            Clock::now() - sweepStart).count();
+
+        if (allClean) {
+            SS_LOG_INFO(LOG_CATEGORY, L"APT sweep CLEAN in %lldms", elapsed);
+        } else {
+            SS_LOG_ERROR(LOG_CATEGORY,
+                L"APT sweep DETECTED TAMPERING: %u hooks, parent=%ls, %u stripped (%lldms)",
+                hooks, allClean ? L"valid" : L"INVALID", stripped, elapsed);
+        }
+
+        return allClean;
+    }
+
+    // Helper to record APT detection events without requiring a full VerificationResult
+    void RecordAPTEvent(TamperEventType eventType, uint8_t severity,
+                        const std::wstring& resourcePath, const std::string& description) {
+        TamperEvent event;
+        event.eventId = GenerateEventId();
+        event.type = eventType;
+        event.resourceType = ProtectedResourceType::Process;
+        event.resourcePath = resourcePath;
+        event.timestamp = Clock::now();
+        event.sourceProcessId = GetCurrentProcessId();
+        event.severityLevel = severity;
+        event.changeDescription = description;
+        event.responseTaken = TamperResponse::Alert;
+
+        m_stats.totalTamperingDetected.fetch_add(1, std::memory_order_relaxed);
+
+        {
+            std::unique_lock lock(m_mutex);
+            m_eventHistory.push_back(event);
+            if (m_eventHistory.size() > TamperProtectionConstants::MAX_EVENT_HISTORY) {
+                m_eventHistory.pop_front();
+            }
+        }
+
+        InvokeEventCallbacks(event);
+    }
+
 private:
     // ========================================================================
     // PRIVATE HELPERS
     // ========================================================================
 
     [[nodiscard]] bool VerifyAuthToken(std::string_view token) const {
-        return !token.empty() && (token == m_internalAuthToken || IsValidTokenFormat(token));
+        // SECURITY: Only accept the exact internal token. Never accept arbitrary hex strings.
+        return !token.empty() && token == m_internalAuthToken;
     }
 
     [[nodiscard]] bool ComputeFileHashInternal(const std::wstring& filePath, Hash256& hashOut) {
@@ -1719,6 +2267,14 @@ private:
             HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
             if (hFile == INVALID_HANDLE_VALUE) {
+                return false;
+            }
+
+            // Cap file size to prevent OOM on huge files
+            LARGE_INTEGER fileSize{};
+            if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart > static_cast<LONGLONG>(512ULL * 1024 * 1024)) {
+                CloseHandle(hFile);
+                SS_LOG_WARN(LOG_CATEGORY, L"File too large for integrity hash: %ls", filePath.c_str());
                 return false;
             }
 
@@ -1770,10 +2326,71 @@ private:
     }
 
     [[nodiscard]] bool ComputeRegistryHashInternal(const std::wstring& keyPath, Hash256& hashOut) {
-        // Registry hash computation - hash key values
         hashOut.fill(0);
-        // Implementation would enumerate registry values and hash them
-        return true;
+
+        HKEY hKey = nullptr;
+        // Parse root key from path
+        HKEY rootKey = HKEY_LOCAL_MACHINE;
+        std::wstring subKeyPath = keyPath;
+        if (keyPath.starts_with(L"HKLM\\") || keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\")) {
+            rootKey = HKEY_LOCAL_MACHINE;
+            auto pos = keyPath.find(L'\\');
+            subKeyPath = keyPath.substr(pos + 1);
+        } else if (keyPath.starts_with(L"HKCU\\") || keyPath.starts_with(L"HKEY_CURRENT_USER\\")) {
+            rootKey = HKEY_CURRENT_USER;
+            auto pos = keyPath.find(L'\\');
+            subKeyPath = keyPath.substr(pos + 1);
+        }
+
+        LONG status = RegOpenKeyExW(rootKey, subKeyPath.c_str(), 0, KEY_READ, &hKey);
+        if (status != ERROR_SUCCESS) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Cannot open registry key for hash: %ls (error %ld)",
+                        keyPath.c_str(), status);
+            return false;
+        }
+
+        // Hash all values in the key using BCrypt SHA-256
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+        bool success = false;
+
+        do {
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) break;
+            if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) break;
+
+            constexpr DWORD maxValueNameLen = 16384;
+            constexpr DWORD maxValueDataLen = 1024 * 1024; // 1MB cap per value
+            auto valueName = std::make_unique<WCHAR[]>(maxValueNameLen);
+            auto valueData = std::make_unique<BYTE[]>(maxValueDataLen);
+
+            for (DWORD idx = 0; ; ++idx) {
+                DWORD nameLen = maxValueNameLen;
+                DWORD dataLen = maxValueDataLen;
+                DWORD valueType = 0;
+
+                status = RegEnumValueW(hKey, idx, valueName.get(), &nameLen,
+                                       nullptr, &valueType, valueData.get(), &dataLen);
+                if (status == ERROR_NO_MORE_ITEMS) break;
+                if (status != ERROR_SUCCESS) continue;
+
+                // Hash value name + type + data
+                BCryptHashData(hHash, reinterpret_cast<PUCHAR>(valueName.get()),
+                               nameLen * sizeof(WCHAR), 0);
+                BCryptHashData(hHash, reinterpret_cast<PUCHAR>(&valueType), sizeof(valueType), 0);
+                if (dataLen > 0) {
+                    BCryptHashData(hHash, valueData.get(), dataLen, 0);
+                }
+            }
+
+            if (BCryptFinishHash(hHash, hashOut.data(), static_cast<ULONG>(hashOut.size()), 0) == 0) {
+                success = true;
+            }
+        } while (false);
+
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
+        RegCloseKey(hKey);
+        return success;
     }
 
     [[nodiscard]] bool ComputeProcessHashInternal(uint32_t processId, Hash256& hashOut) {
@@ -1782,28 +2399,73 @@ private:
         HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
         if (!hProcess) return false;
 
-        // Get main module and hash its memory
-        HMODULE hMod = nullptr;
-        DWORD cbNeeded = 0;
-        if (EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded)) {
+        bool success = false;
+        BCRYPT_ALG_HANDLE hAlg = nullptr;
+        BCRYPT_HASH_HANDLE hHash = nullptr;
+
+        do {
+            HMODULE hMod = nullptr;
+            DWORD cbNeeded = 0;
+            if (!EnumProcessModules(hProcess, &hMod, sizeof(hMod), &cbNeeded)) break;
+
             MODULEINFO modInfo{};
-            if (GetModuleInformation(hProcess, hMod, &modInfo, sizeof(modInfo))) {
-                // Hash first page of module for quick integrity check
-                std::vector<uint8_t> buffer(4096);
-                SIZE_T bytesRead = 0;
-                if (ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, buffer.data(), buffer.size(), &bytesRead)) {
-                    // Simple hash for demo - would use proper SHA256
-                    uint64_t simpleHash = 0;
-                    for (size_t i = 0; i < bytesRead; ++i) {
-                        simpleHash = simpleHash * 31 + buffer[i];
+            if (!GetModuleInformation(hProcess, hMod, &modInfo, sizeof(modInfo))) break;
+
+            // Read the PE header to find code sections
+            constexpr size_t kHeaderSize = 4096;
+            std::vector<uint8_t> headerBuf(kHeaderSize);
+            SIZE_T bytesRead = 0;
+            if (!ReadProcessMemory(hProcess, modInfo.lpBaseOfDll, headerBuf.data(),
+                                   kHeaderSize, &bytesRead) || bytesRead < sizeof(IMAGE_DOS_HEADER)) {
+                break;
+            }
+
+            auto* dosHeader = reinterpret_cast<IMAGE_DOS_HEADER*>(headerBuf.data());
+            if (dosHeader->e_magic != IMAGE_DOS_SIGNATURE) break;
+            if (static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > bytesRead) break;
+
+            auto* ntHeaders = reinterpret_cast<IMAGE_NT_HEADERS64*>(headerBuf.data() + dosHeader->e_lfanew);
+            if (ntHeaders->Signature != IMAGE_NT_SIGNATURE) break;
+
+            if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) break;
+            if (BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0) != 0) break;
+
+            // Hash all executable sections (.text, etc.)
+            auto* section = IMAGE_FIRST_SECTION(ntHeaders);
+            WORD numSections = ntHeaders->FileHeader.NumberOfSections;
+            constexpr size_t kChunkSize = 65536;
+            std::vector<uint8_t> chunk(kChunkSize);
+
+            for (WORD i = 0; i < numSections; ++i) {
+                if (!(section[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+
+                auto sectionBase = reinterpret_cast<BYTE*>(modInfo.lpBaseOfDll) + section[i].VirtualAddress;
+                DWORD sectionSize = section[i].Misc.VirtualSize;
+                constexpr DWORD kMaxSectionHash = 64 * 1024 * 1024; // 64MB cap
+                if (sectionSize > kMaxSectionHash) sectionSize = kMaxSectionHash;
+
+                DWORD offset = 0;
+                while (offset < sectionSize) {
+                    SIZE_T toRead = (std::min)(static_cast<SIZE_T>(kChunkSize),
+                                               static_cast<SIZE_T>(sectionSize - offset));
+                    SIZE_T readBytes = 0;
+                    if (ReadProcessMemory(hProcess, sectionBase + offset, chunk.data(),
+                                          toRead, &readBytes) && readBytes > 0) {
+                        BCryptHashData(hHash, chunk.data(), static_cast<ULONG>(readBytes), 0);
                     }
-                    std::memcpy(hashOut.data(), &simpleHash, sizeof(simpleHash));
+                    offset += static_cast<DWORD>(toRead);
                 }
             }
-        }
 
+            if (BCryptFinishHash(hHash, hashOut.data(), static_cast<ULONG>(hashOut.size()), 0) == 0) {
+                success = true;
+            }
+        } while (false);
+
+        if (hHash) BCryptDestroyHash(hHash);
+        if (hAlg) BCryptCloseAlgorithmProvider(hAlg, 0);
         CloseHandle(hProcess);
-        return true;
+        return success;
     }
 
     [[nodiscard]] bool VerifyFileSignatureInternal(const std::wstring& filePath, std::wstring& signerName) {
@@ -1816,7 +2478,7 @@ private:
         WINTRUST_DATA trustData{};
         trustData.cbStruct = sizeof(trustData);
         trustData.dwUIChoice = WTD_UI_NONE;
-        trustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+        trustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
         trustData.dwUnionChoice = WTD_CHOICE_FILE;
         trustData.pFile = &fileInfo;
         trustData.dwStateAction = WTD_STATEACTION_VERIFY;
@@ -1882,7 +2544,7 @@ private:
             std::unique_lock lock(m_mutex);
             m_eventHistory.push_back(event);
             if (m_eventHistory.size() > TamperProtectionConstants::MAX_EVENT_HISTORY) {
-                m_eventHistory.erase(m_eventHistory.begin());
+                m_eventHistory.pop_front();
             }
         }
 
@@ -2007,8 +2669,12 @@ private:
     }
 
     void InvokeEventCallbacks(const TamperEvent& event) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_eventCallbacks) {
+        std::vector<TamperEventCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks = m_eventCallbacks;
+        }
+        for (const auto& callback : callbacks) {
             try {
                 callback(event);
             } catch (...) {
@@ -2018,8 +2684,12 @@ private:
     }
 
     void InvokeVerificationCallbacks(const VerificationResult& result) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_verificationCallbacks) {
+        std::vector<VerificationCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks = m_verificationCallbacks;
+        }
+        for (const auto& callback : callbacks) {
             try {
                 callback(result);
             } catch (...) {
@@ -2029,8 +2699,12 @@ private:
     }
 
     void InvokeRepairCallbacks(const RepairResult& result) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_repairCallbacks) {
+        std::vector<RepairCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks = m_repairCallbacks;
+        }
+        for (const auto& callback : callbacks) {
             try {
                 callback(result);
             } catch (...) {
@@ -2048,7 +2722,7 @@ private:
     std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
     std::atomic<bool> m_enabled{true};
     std::atomic<bool> m_paused{false};
-    TimePoint m_pauseEndTime;
+    TimePoint m_pauseEndTime;  // Protected by m_mutex
 
     TamperProtectionConfiguration m_config;
     std::string m_internalAuthToken;
@@ -2068,23 +2742,33 @@ private:
     // Whitelist
     std::map<std::wstring, std::string> m_whitelistedPaths;
 
-    // Event history
-    std::vector<TamperEvent> m_eventHistory;
+    // Event history — deque for O(1) front removal
+    std::deque<TamperEvent> m_eventHistory;
 
-    // Callbacks
+    // Callbacks — using correct HPP type aliases
     std::vector<TamperEventCallback> m_eventCallbacks;
-    std::vector<VerificationResultCallback> m_verificationCallbacks;
-    std::vector<RepairResultCallback> m_repairCallbacks;
-    std::vector<StatusChangeCallback> m_statusCallbacks;
-    TamperResponseHandler m_responseHandler;
+    std::vector<VerificationCallback> m_verificationCallbacks;
+    std::vector<RepairCallback> m_repairCallbacks;
+    std::vector<SubsystemStatusCallback> m_statusCallbacks;
+    ResponseHandler m_responseHandler;
 
     // Monitor thread
     std::atomic<bool> m_monitorRunning{false};
     std::thread m_monitorThread;
     std::condition_variable_any m_monitorCV;
 
-    // Statistics
-    TamperProtectionStatistics m_stats;
+    // Internal statistics — atomic for thread safety, snapshot via GetStatistics()
+    struct InternalStats {
+        std::atomic<uint64_t> totalResourcesMonitored{0};
+        std::atomic<uint64_t> totalIntegrityChecks{0};
+        std::atomic<uint64_t> totalTamperingDetected{0};
+        std::atomic<uint64_t> totalTamperingBlocked{0};
+        std::atomic<uint64_t> totalRepairsPerformed{0};
+        std::atomic<uint64_t> successfulRepairs{0};
+        std::atomic<uint64_t> kernelTamperEvents{0};
+        std::atomic<uint64_t> hookDetections{0};
+        TimePoint startTime = Clock::now();
+    } m_stats;
 };
 
 // ============================================================================
@@ -2360,19 +3044,19 @@ void TamperProtection::RegisterEventCallback(TamperEventCallback callback) {
     m_impl->RegisterEventCallback(std::move(callback));
 }
 
-void TamperProtection::RegisterVerificationCallback(VerificationResultCallback callback) {
+void TamperProtection::RegisterVerificationCallback(VerificationCallback callback) {
     m_impl->RegisterVerificationCallback(std::move(callback));
 }
 
-void TamperProtection::RegisterRepairCallback(RepairResultCallback callback) {
+void TamperProtection::RegisterRepairCallback(RepairCallback callback) {
     m_impl->RegisterRepairCallback(std::move(callback));
 }
 
-void TamperProtection::RegisterStatusCallback(StatusChangeCallback callback) {
+void TamperProtection::RegisterStatusCallback(SubsystemStatusCallback callback) {
     m_impl->RegisterStatusCallback(std::move(callback));
 }
 
-void TamperProtection::SetResponseHandler(TamperResponseHandler handler) {
+void TamperProtection::SetResponseHandler(ResponseHandler handler) {
     m_impl->SetResponseHandler(std::move(handler));
 }
 
@@ -2407,6 +3091,26 @@ void TamperProtection::ResetStatistics() {
         << TamperProtectionConstants::VERSION_MINOR << "."
         << TamperProtectionConstants::VERSION_PATCH;
     return oss.str();
+}
+
+// ============================================================================
+// APT DETECTION — PUBLIC WRAPPERS
+// ============================================================================
+
+uint32_t TamperProtection::ScanForInlineHooks() {
+    return m_impl->ScanForInlineHooks();
+}
+
+bool TamperProtection::ValidateParentProcessChain() {
+    return m_impl->ValidateParentProcessChain();
+}
+
+uint32_t TamperProtection::DetectHandleStripping() {
+    return m_impl->DetectHandleStripping();
+}
+
+bool TamperProtection::RunAPTTamperSweep() {
+    return m_impl->RunAPTTamperSweep();
 }
 
 // ============================================================================
