@@ -46,6 +46,7 @@
 // ============================================================================
 #include "../Security/TamperProtection.hpp"
 #include "../Security/ProcessProtection.hpp"
+#include "../Security/RegistryProtection.hpp"
 #include "../Security/CertificateValidator.hpp"
 #include "../Scripts/AMSIIntegration.hpp"
 #include "../RealTime/RealTimeProtection.hpp"
@@ -137,6 +138,20 @@ public:
                 // Initialize() already protects our own PID internally.
                 // Attempt PPL elevation via kernel driver for maximum protection.
                 (void)Security::ProcessProtection::Instance().ElevateToPPL();
+            }
+
+            // Registry Protection (initializes kernel registry callback handler
+            // and starts integrity monitoring before RealTimeProtection activates)
+            Security::RegistryProtectionConfiguration rpConfig;
+            rpConfig.mode = Security::RegistryProtectionMode::Rollback;
+            rpConfig.enableAutoRollback = true;
+            rpConfig.enableKernelCallbacks = true;
+            rpConfig.enableUserModePolling = true;
+            rpConfig.enableIntegrityMonitoring = true;
+            rpConfig.enableSnapshots = true;
+            if (!Security::RegistryProtection::Instance().Initialize(rpConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize RegistryProtection");
+                // Non-fatal: registry tamper detection degrades
             }
 
             // Real-Time Protection
@@ -242,6 +257,14 @@ public:
 
         RealTime::RealTimeProtection::Instance().Stop();
         RealTime::RealTimeProtection::Instance().Shutdown();
+
+        // RegistryProtection shutdown (before ProcessProtection so registry
+        // tamper detection is still active during process handle cleanup)
+        if (Security::RegistryProtection::HasInstance() &&
+            Security::RegistryProtection::Instance().IsInitialized()) {
+            Security::RegistryProtection::Instance().Shutdown(
+                Security::RegistryProtection::Instance().GenerateAuthorizationToken());
+        }
 
         // ProcessProtection shutdown (before TamperProtection so tamper hooks
         // are still active while we close protected handles)

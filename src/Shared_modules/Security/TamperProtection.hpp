@@ -487,10 +487,10 @@ enum class TamperSubsystem : uint8_t {
     SelfDefense         = 8
 };
 
+#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
 // ModuleStatus: canonical definition lives in SecurityEnums.hpp.
-// Kept behind __if_not_exists for TUs that include TamperProtection.hpp
-// without SecurityEnums.hpp (backward compatibility).
-__if_not_exists(ModuleStatus) {
+// Kept here with preprocessor guard for backward compatibility.
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -501,7 +501,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
-}
+#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
 
 /**
  * @brief Verification method

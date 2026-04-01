@@ -125,7 +125,6 @@
 #include <unordered_set>
 #include <set>
 #include <optional>
-#include <variant>
 #include <memory>
 #include <functional>
 #include <chrono>
@@ -133,12 +132,8 @@
 #include <mutex>
 #include <shared_mutex>
 #include <thread>
-#include <future>
-#include <span>
-#include <bitset>
 #include <queue>
-#include <any>
-#include <filesystem>
+#include <deque>
 
 // ============================================================================
 // WINDOWS SDK INCLUDES
@@ -594,7 +589,7 @@ struct ProtectedProcess {
     /// @brief Image hash for verification
     std::array<uint8_t, 32> imageHash{};
     
-    /// @brief Process handle (internal use)
+    /// @brief Process handle (managed internally — do NOT close externally)
     void* processHandle = nullptr;
     
     /// @brief Is this a ShadowStrike component
@@ -1533,6 +1528,23 @@ public:
      * @brief Get version string
      */
     [[nodiscard]] static std::string GetVersionString() noexcept;
+
+    // ========================================================================
+    // KERNEL BRIDGE (User ↔ Kernel self-protection sync)
+    // ========================================================================
+    
+    /**
+     * @brief Sync all protected processes to kernel driver
+     * @note Sends current protected PID list to kernel SelfProtect module
+     */
+    void SyncProtectedProcessesToKernel();
+    
+    /**
+     * @brief Handle incoming kernel self-protection alert
+     * @param data Raw alert payload
+     * @param size Payload size in bytes
+     */
+    void OnKernelSelfProtectEvent(const void* data, uint32_t size);
 
 private:
     // ========================================================================
