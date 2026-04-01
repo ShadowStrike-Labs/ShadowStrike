@@ -462,6 +462,8 @@ enum class ComponentHealth : uint8_t {
     Protected   = 5
 };
 
+#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
 /**
  * @brief Self-defense module status
  */
@@ -469,12 +471,13 @@ enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
-    PartiallyActive = 3,    ///< Some components failed
+    Degraded        = 3,    ///< Running with reduced functionality
     Paused          = 4,
     Stopping        = 5,
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
 
 /**
  * @brief Access request type
