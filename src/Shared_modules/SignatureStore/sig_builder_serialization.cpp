@@ -36,7 +36,9 @@ namespace SignatureStore {
         // ============================================================================
         constexpr int64_t DEFAULT_PERF_FREQUENCY = 1'000'000LL;  // 1MHz fallback
         
-        // Safe elapsed time calculation helper with division-by-zero protection
+        // Safe elapsed time calculation helper with division-by-zero AND overflow protection.
+        // Uses quotient+remainder decomposition to avoid int64_t overflow when
+        // diff * multiplier exceeds INT64_MAX (which happens after ~2.5 hours at 1GHz QPC).
         [[nodiscard]] inline uint64_t safeElapsedUs(
             const LARGE_INTEGER& start,
             const LARGE_INTEGER& end,
@@ -49,8 +51,11 @@ namespace SignatureStore {
             if (diff < 0) {
                 return 0;  // Timer wrapped or invalid
             }
-            // Use safe multiplication order to prevent overflow
-            return static_cast<uint64_t>((diff * 1'000'000LL) / freq.QuadPart);
+            // Decompose to avoid overflow: (diff / freq) * 1M + ((diff % freq) * 1M) / freq
+            const int64_t wholeSec = diff / freq.QuadPart;
+            const int64_t remainder = diff % freq.QuadPart;
+            return static_cast<uint64_t>(wholeSec) * 1'000'000ULL
+                 + static_cast<uint64_t>((remainder * 1'000'000LL) / freq.QuadPart);
         }
 
         [[nodiscard]] inline uint64_t safeElapsedMs(
@@ -65,7 +70,10 @@ namespace SignatureStore {
             if (diff < 0) {
                 return 0;
             }
-            return static_cast<uint64_t>((diff * 1'000LL) / freq.QuadPart);
+            const int64_t wholeSec = diff / freq.QuadPart;
+            const int64_t remainder = diff % freq.QuadPart;
+            return static_cast<uint64_t>(wholeSec) * 1'000ULL
+                 + static_cast<uint64_t>((remainder * 1'000LL) / freq.QuadPart);
         }
 
         // ============================================================================
@@ -112,9 +120,18 @@ namespace SignatureStore {
             bool m_committed;
         };
 
+        // 64-bit cache-line alignment helper. Format::AlignToCacheLine returns
+        // size_t which truncates on 32-bit builds; we need uint64_t for file offsets.
+        [[nodiscard]] constexpr uint64_t AlignToCacheLine64(uint64_t offset) noexcept {
+            constexpr uint64_t mask = CACHE_LINE_SIZE - 1;
+            return (offset + mask) & ~mask;
+        }
+
         // ============================================================================
         // CRC64 LOOKUP TABLE FOR 100x FASTER CHECKSUM COMPUTATION
         // ============================================================================
+        // NOTE: This is CRC64-ECMA (reflected), matching the public CRC64_POLY constant
+        // on SignatureBuilder (0x42F0E1EBA9EA3693 reflected = 0xC96C5795D7870F42).
         constexpr uint64_t CRC64_POLYNOMIAL = 0xC96C5795D7870F42ULL;
         
         constexpr std::array<uint64_t, 256> GenerateCRC64Table() noexcept {
@@ -154,7 +171,10 @@ namespace SignatureStore {
 
 
         StoreError SignatureBuilder::Serialize() noexcept {
-            m_currentStage = "Serialization";
+            {
+                std::unique_lock<std::shared_mutex> lock(m_stateMutex);
+                m_currentStage = "Serialization";
+            }
 
             LARGE_INTEGER startTime{};
             QueryPerformanceCounter(&startTime);
@@ -268,6 +288,22 @@ namespace SignatureStore {
             result = SerializeMetadata();
             if (result.code != SignatureStoreError::Success) {
                 return result;
+            }
+
+            // Back-fill header section offsets and sizes now that all sections are written.
+            // The header was written with hashIndexOffset set in SerializeHeader; the
+            // remaining fields are populated here with the actual offsets tracked during
+            // serialization of each section.
+            {
+                auto* hdr = static_cast<SignatureDatabaseHeader*>(m_outputBase);
+                // hashIndexOffset was already set in SerializeHeader
+                hdr->hashIndexSize   = m_statistics.hashIndexSize;
+                hdr->patternIndexOffset = m_sectionOffsets.patternStart;
+                hdr->patternIndexSize   = m_statistics.patternIndexSize;
+                hdr->yaraRulesOffset    = m_sectionOffsets.yaraStart;
+                hdr->yaraRulesSize      = m_statistics.yaraRulesSize;
+                hdr->metadataOffset     = m_sectionOffsets.metadataStart;
+                hdr->metadataSize       = m_statistics.metadataSize;
             }
 
             // Compute checksum while memory mapping is still active
@@ -406,13 +442,13 @@ namespace SignatureStore {
                 hashOffsets.push_back(currentOffset);
 
                 // Advance offset (hash + name + alignment)
-                currentOffset = Format::AlignToCacheLine(
+                currentOffset = AlignToCacheLine64(
                     nameOffset + nameStr.length()
                 );
             }
 
             // ========================================================================
-            // BUILD B+TREE INDEX FOR HASHES
+            // BUILD B+TREE LEAF CHAIN INDEX FOR HASHES
             // ========================================================================
             // Sort by fast-hash for optimal tree layout
             std::vector<std::pair<uint64_t, uint64_t>> sortedHashes;
@@ -427,35 +463,63 @@ namespace SignatureStore {
 
             std::sort(sortedHashes.begin(), sortedHashes.end());
 
-            // Write B+Tree nodes
+            // Build a chain of leaf nodes covering ALL entries (not just MAX_KEYS).
+            // Entries beyond MAX_KEYS are placed into additional leaf nodes linked
+            // via nextLeaf/prevLeaf forming a sorted linked list.
             uint64_t treeIndexOffset = currentOffset;
+            const size_t totalEntries = sortedHashes.size();
+            const size_t leafCapacity = BPlusTreeNode::MAX_KEYS;
+            const size_t leafCount = (totalEntries + leafCapacity - 1) / leafCapacity;
 
-            // Root node (simplified - would build proper B+Tree in production)
-            if (treeIndexOffset + sizeof(BPlusTreeNode) > m_outputSize) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"SerializeHashes: Insufficient space for B+Tree");
-                return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small" };
+            // Validate space for all leaf nodes
+            {
+                uint64_t requiredTreeBytes = leafCount * sizeof(BPlusTreeNode);
+                if (treeIndexOffset + requiredTreeBytes > m_outputSize) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializeHashes: Insufficient space for B+Tree (%zu leaves)",
+                        leafCount);
+                    return StoreError{ SignatureStoreError::TooLarge, 0, "Database too small for hash index" };
+                }
             }
 
-            BPlusTreeNode* rootNode = reinterpret_cast<BPlusTreeNode*>(
-                static_cast<uint8_t*>(m_outputBase) + treeIndexOffset
+            uint64_t prevLeafOffset = 0;
+            size_t entryIdx = 0;
+
+            for (size_t leafIdx = 0; leafIdx < leafCount; ++leafIdx) {
+                uint64_t leafOffset = treeIndexOffset + (leafIdx * sizeof(BPlusTreeNode));
+
+                BPlusTreeNode* leaf = reinterpret_cast<BPlusTreeNode*>(
+                    static_cast<uint8_t*>(m_outputBase) + leafOffset
                 );
 
-            std::memset(rootNode, 0, sizeof(BPlusTreeNode));
-            rootNode->isLeaf = true;
-            rootNode->keyCount = std::min(
-                static_cast<uint32_t>(sortedHashes.size()),
-                static_cast<uint32_t>(BPlusTreeNode::MAX_KEYS)
-            );
+                std::memset(leaf, 0, sizeof(BPlusTreeNode));
+                leaf->isLeaf = true;
 
-            // Populate root node with sorted hashes
-            for (uint32_t i = 0; i < rootNode->keyCount; ++i) {
-                rootNode->keys[i] = sortedHashes[i].first;
-                rootNode->children[i] = static_cast<uint32_t>(sortedHashes[i].second);
+                uint32_t keysInLeaf = static_cast<uint32_t>(
+                    std::min(leafCapacity, totalEntries - entryIdx));
+                leaf->keyCount = keysInLeaf;
+
+                for (uint32_t k = 0; k < keysInLeaf; ++k) {
+                    leaf->keys[k] = sortedHashes[entryIdx + k].first;
+                    leaf->children[k] = sortedHashes[entryIdx + k].second;
+                }
+
+                // Wire linked list
+                leaf->prevLeaf = prevLeafOffset;
+                if (leafIdx + 1 < leafCount) {
+                    leaf->nextLeaf = treeIndexOffset + ((leafIdx + 1) * sizeof(BPlusTreeNode));
+                } else {
+                    leaf->nextLeaf = 0;
+                }
+
+                // Back-patch previous leaf's nextLeaf (already done above via formula)
+                prevLeafOffset = leafOffset;
+                entryIdx += keysInLeaf;
             }
 
-            currentOffset = Format::AlignToPage(treeIndexOffset + sizeof(BPlusTreeNode));
+            currentOffset = Format::AlignToPage(treeIndexOffset + (leafCount * sizeof(BPlusTreeNode)));
 
-            m_statistics.hashIndexSize = currentOffset - treeIndexOffset;
+            m_statistics.hashIndexSize = currentOffset - m_currentOffset;
             m_statistics.optimizedSignatures += m_pendingHashes.size();
 
             // ========================================================================
@@ -516,12 +580,15 @@ namespace SignatureStore {
             SS_LOG_INFO(L"SignatureBuilder",
                 L"SerializePatterns: Processing %zu patterns", m_pendingPatterns.size());
 
+            // Record section start for header back-fill
+            m_sectionOffsets.patternStart = m_currentOffset;
+
             // ========================================================================
             // STEP 2: PRE-COMPILE ALL PATTERNS (SINGLE PASS - MAJOR OPTIMIZATION)
             // ========================================================================
             // FIX: Previously patterns were compiled 3 times (automaton, entropy, serialize)
             // Now we compile once and cache the results for O(n) instead of O(3n)
-            
+
             struct CompiledPatternCache {
                 std::vector<uint8_t> bytes;
                 std::vector<uint8_t> mask;
@@ -529,23 +596,23 @@ namespace SignatureStore {
                 float entropy;
                 bool valid;
             };
-            
+
             std::vector<CompiledPatternCache> compiledCache;
             compiledCache.reserve(m_pendingPatterns.size());
-            
+
             for (size_t patternIdx = 0; patternIdx < m_pendingPatterns.size(); ++patternIdx) {
                 const auto& pattern = m_pendingPatterns[patternIdx];
-                
+
                 CompiledPatternCache cache{};
                 cache.valid = false;
-                
-                auto compiledPattern = PatternCompiler::CompilePattern(
+
+                auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
                     pattern.patternString, cache.mode, cache.mask
                 );
                 
                 if (compiledPattern.has_value()) {
                     cache.bytes = std::move(*compiledPattern);
-                    cache.entropy = PatternCompiler::ComputeEntropy(cache.bytes);
+                    cache.entropy = PatternStore::PatternCompiler::ComputeEntropy(cache.bytes);
                     cache.valid = true;
                 } else {
                     SS_LOG_WARN(L"SignatureBuilder",
@@ -563,7 +630,7 @@ namespace SignatureStore {
             // ========================================================================
             // STEP 3: BUILD AHO-CORASICK AUTOMATON USING CACHED COMPILED PATTERNS
             // ========================================================================
-            AhoCorasickAutomaton automaton;
+            PatternStore::AhoCorasickAutomaton automaton;
 
             for (size_t patternIdx = 0; patternIdx < compiledCache.size(); ++patternIdx) {
                 const auto& cache = compiledCache[patternIdx];
@@ -673,7 +740,15 @@ namespace SignatureStore {
                 }
 
                 uint8_t* dataPtrDest = static_cast<uint8_t*>(m_outputBase) + dataOffset;
-                std::memcpy(dataPtrDest, cache.bytes.data(), patternLen);
+                if (patternLen > 0 && !cache.bytes.empty()) {
+                    std::memcpy(dataPtrDest, cache.bytes.data(), patternLen);
+                } else if (patternLen > 0) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializePatterns: Pattern data empty but length=%zu at pattern %zu",
+                        patternLen, processedPatterns);
+                    return StoreError{ SignatureStoreError::InvalidSignature, 0,
+                                      "Inconsistent pattern data" };
+                }
                 currentOffset += patternLen;
 
                 // Write pattern mask (for wildcard patterns) - use cached mask
@@ -692,12 +767,23 @@ namespace SignatureStore {
                     currentOffset += cache.mask.size();
                 }
 
-                // Alignment to cache line
-                currentOffset = Format::AlignToCacheLine(currentOffset);
+                // Alignment to cache line (use 64-bit-safe variant)
+                currentOffset = AlignToCacheLine64(currentOffset);
 
                 // Fill pattern entry structure - use cached values
                 entryPtr->mode = cache.mode;
                 entryPtr->patternLength = static_cast<uint32_t>(patternLen);
+
+                // Validate offsets fit in uint32_t before truncation to prevent
+                // silent data corruption on databases > 4GB
+                if (nameOffset > UINT32_MAX || dataOffset > UINT32_MAX) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializePatterns: Pattern offset exceeds uint32_t capacity at pattern %zu "
+                        L"(nameOffset: %llu, dataOffset: %llu)",
+                        processedPatterns, nameOffset, dataOffset);
+                    return StoreError{ SignatureStoreError::TooLarge, 0,
+                                      "Pattern offset exceeds 4GB limit" };
+                }
                 entryPtr->nameOffset = static_cast<uint32_t>(nameOffset);
                 entryPtr->dataOffset = static_cast<uint32_t>(dataOffset);
                 entryPtr->threatLevel = static_cast<uint32_t>(pattern.threatLevel);
@@ -705,7 +791,9 @@ namespace SignatureStore {
                 entryPtr->flags = 0;
                 entryPtr->entropy = entropy;
                 entryPtr->hitCount = 0;
-                entryPtr->lastUpdateTime = static_cast<uint32_t>(GetCurrentTimestamp());
+                // GetCurrentTimestamp returns ms; convert to seconds to fit uint32_t
+                // and remain consistent with Unix epoch convention used in the header.
+                entryPtr->lastUpdateTime = static_cast<uint32_t>(GetCurrentTimestamp() / 1000);
 
                 patternOffsets.push_back(entryOffset);
                 processedPatterns++;
@@ -908,6 +996,15 @@ namespace SignatureStore {
 
                     // Check if child for this byte exists
                     if (currentNode->childOffsets[byte] == 0) {
+                        // Cap trie depth to prevent overflow
+                        constexpr uint32_t MAX_TRIE_DEPTH = 16384;
+                        if (depth >= MAX_TRIE_DEPTH) {
+                            SS_LOG_WARN(L"SignatureBuilder",
+                                L"SerializeAhoCorasickToDisk: Pattern too deep (%u), truncating at pattern %zu",
+                                depth, patternIdx);
+                            break;
+                        }
+
                         // Create new child node
                         auto childNode = std::make_unique<TrieNodeMemory>();
                         childNode->depth = depth + 1;
@@ -1216,7 +1313,7 @@ namespace SignatureStore {
         // ============================================================================
 
         StoreError SignatureBuilder::BuildOutputPool(
-            uint64_t poolOffset
+            uint64_t& poolOffset
         ) noexcept {
             SS_LOG_DEBUG(L"SignatureBuilder",
                 L"BuildOutputPool: Starting at offset 0x%llX", poolOffset);
@@ -1255,7 +1352,12 @@ namespace SignatureStore {
                     (sizeof(uint64_t) * ESTIMATED_MATCHES_PER_PATTERN));
 
             // Add safety margin (50% overhead for variable-length outputs)
-            estimatedPoolSize = (estimatedPoolSize * 150) / 100;
+            // Use overflow-safe multiplication: check before multiplying
+            if (estimatedPoolSize > UINT64_MAX / 150ULL) {
+                estimatedPoolSize = UINT64_MAX;  // Cap at max on overflow
+            } else {
+                estimatedPoolSize = (estimatedPoolSize * 150) / 100;
+            }
 
             // Validate we have enough space
             if (poolOffset + estimatedPoolSize > m_outputSize) {
@@ -1447,8 +1549,8 @@ namespace SignatureStore {
                 return StoreError{ SignatureStoreError::TooLarge, 0, "Pool overflow" };
             }
 
-            // Update offset for next section
-            currentPoolOffset = Format::AlignToPage(currentPoolOffset);
+            // Update offset for next section -- propagate back to caller via reference
+            poolOffset = Format::AlignToPage(currentPoolOffset);
 
             ReportProgress("BuildOutputPool", outputLists.size(), outputLists.size());
 
@@ -1490,12 +1592,14 @@ namespace SignatureStore {
             YaraCompiler compiler;
 
             size_t compiledRules = 0;
+            size_t failedRules = 0;
             for (const auto& ruleInput : m_pendingYaraRules) {
                 StoreError err = compiler.AddString(ruleInput.ruleSource, ruleInput.namespace_);
                 if (err.IsSuccess()) {
                     compiledRules++;
                 }
                 else {
+                    failedRules++;
                     SS_LOG_WARN(L"SignatureBuilder",
                         L"SerializeYaraIndex: Failed to compile rule from %S: %S",
                         ruleInput.source.c_str(), err.message.c_str());
@@ -1507,8 +1611,15 @@ namespace SignatureStore {
                 return StoreError{ SignatureStoreError::InvalidSignature, 0, "Failed to compile any YARA rules" };
             }
 
+            if (failedRules > 0) {
+                SS_LOG_WARN(L"SignatureBuilder",
+                    L"SerializeYaraIndex: %zu/%zu rules failed to compile",
+                    failedRules, m_pendingYaraRules.size());
+            }
+
             SS_LOG_INFO(L"SignatureBuilder",
-                L"SerializeYaraIndex: Compiled %zu rules", compiledRules);
+                L"SerializeYaraIndex: Compiled %zu/%zu rules successfully",
+                compiledRules, m_pendingYaraRules.size());
 
             // ========================================================================
             // SAVE COMPILED RULES TO BUFFER
@@ -1556,6 +1667,15 @@ namespace SignatureStore {
 
                 YaraRuleEntry entry{};
                 entry.ruleId = std::hash<std::string>{}(ruleInput.ruleSource);
+
+                // Validate offsets fit in uint32_t before truncation
+                if (yaraOffset > UINT32_MAX || yaraDataSize > UINT32_MAX) {
+                    SS_LOG_ERROR(L"SignatureBuilder",
+                        L"SerializeYaraIndex: YARA data offset/size exceeds uint32_t capacity "
+                        L"(offset: %llu, size: %llu)", yaraOffset, yaraDataSize);
+                    return StoreError{ SignatureStoreError::TooLarge, 0,
+                                      "YARA data offset exceeds 4GB limit" };
+                }
                 entry.compiledOffset = static_cast<uint32_t>(yaraOffset);
                 entry.compiledSize = static_cast<uint32_t>(yaraDataSize);
                 entry.threatLevel = 50;  // Default medium threat
@@ -1718,22 +1838,36 @@ namespace SignatureStore {
             if (!m_outputBase || m_outputSize == 0) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "No output buffer" };
             }
-            
+
             // Validate minimum size for header
             if (m_outputSize < sizeof(SignatureDatabaseHeader)) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Output too small for header" };
             }
 
-            // Compute SHA-256 of entire database (excluding checksum field)
+            auto* header = static_cast<SignatureDatabaseHeader*>(m_outputBase);
+
+            // CRITICAL: Zero the checksum field BEFORE computing the hash, otherwise
+            // verification will fail because the hash input would include the non-zero
+            // checksum value that was just stored.
+            std::memset(header->sha256Checksum.data(), 0, header->sha256Checksum.size());
+
+            // Compute SHA-256 of entire database (checksum field is now zeroed)
             auto checksum = ComputeDatabaseChecksum();
-            
+
             // Validate checksum was computed
             if (checksum.empty()) {
                 return StoreError{ SignatureStoreError::Unknown, 0, "Checksum computation failed" };
             }
 
-            auto* header = static_cast<SignatureDatabaseHeader*>(m_outputBase);
-            
+            // Validate checksum result is not all-zeros (indicates hash failure)
+            bool allZero = true;
+            for (size_t i = 0; i < checksum.size() && allZero; ++i) {
+                if (checksum[i] != 0) allZero = false;
+            }
+            if (allZero) {
+                SS_LOG_WARN(L"SignatureBuilder", L"ComputeChecksum: checksum is all zeros");
+            }
+
             // Copy checksum with bounds check
             size_t copySize = std::min(checksum.size(), header->sha256Checksum.size());
             std::memcpy(header->sha256Checksum.data(), checksum.data(), copySize);
