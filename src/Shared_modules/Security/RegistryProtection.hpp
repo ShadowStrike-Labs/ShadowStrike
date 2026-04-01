@@ -154,6 +154,7 @@
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -179,7 +180,7 @@ namespace RegistryProtectionConstants {
     // ========================================================================
     
     inline constexpr uint32_t VERSION_MAJOR = 3;
-    inline constexpr uint32_t VERSION_MINOR = 0;
+    inline constexpr uint32_t VERSION_MINOR = 1;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
     // ========================================================================
@@ -339,9 +340,13 @@ enum class KeyProtectionType : uint8_t {
 };
 
 /**
- * @brief Integrity status
+ * @brief Registry-specific integrity status.
+ * 
+ * Distinct from TamperProtection::IntegrityStatus which carries different
+ * semantics (Unauthorized/Repaired/PendingVerify). Registry values track
+ * New (first seen) and Restored (rolled back from snapshot) states.
  */
-enum class IntegrityStatus : uint8_t {
+enum class RegistryIntegrityStatus : uint8_t {
     Unknown     = 0,
     Valid       = 1,
     Modified    = 2,
@@ -408,19 +413,7 @@ inline constexpr ProtectionResponse operator|(ProtectionResponse a, ProtectionRe
     return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition)
 
 // ============================================================================
 // STRUCTURES
@@ -515,7 +508,7 @@ struct ProtectedKey {
     std::vector<std::wstring> excludedValues;
     
     /// @brief Integrity status
-    IntegrityStatus integrity = IntegrityStatus::Unknown;
+    RegistryIntegrityStatus integrity = RegistryIntegrityStatus::Unknown;
     
     /// @brief Protection timestamp
     TimePoint protectedSince;
@@ -562,7 +555,7 @@ struct ProtectedValue {
     size_t dataSize = 0;
     
     /// @brief Integrity status
-    IntegrityStatus integrity = IntegrityStatus::Unknown;
+    RegistryIntegrityStatus integrity = RegistryIntegrityStatus::Unknown;
     
     /// @brief Protection timestamp
     TimePoint protectedSince;
@@ -1021,18 +1014,18 @@ public:
     /**
      * @brief Verify key integrity
      */
-    [[nodiscard]] IntegrityStatus VerifyKeyIntegrity(std::wstring_view keyPath);
+    [[nodiscard]] RegistryIntegrityStatus VerifyKeyIntegrity(std::wstring_view keyPath);
     
     /**
      * @brief Verify value integrity
      */
-    [[nodiscard]] IntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
+    [[nodiscard]] RegistryIntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
                                                        std::wstring_view valueName);
     
     /**
      * @brief Verify all protected keys
      */
-    [[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>> VerifyAllIntegrity();
+    [[nodiscard]] std::vector<std::pair<std::wstring, RegistryIntegrityStatus>> VerifyAllIntegrity();
     
     /**
      * @brief Update key baseline
@@ -1225,10 +1218,10 @@ public:
     /**
      * @brief Handle a registry event that arrived from the kernel driver.
      *
-     * Called by the IPCManager generic-handler dispatch when
+     * Called by the IPCManager RegistryHandler dispatch when
      * FilterMessageType_RegistryNotify is received.
      *
-     * @param data     Raw payload (SHADOWSTRIKE_REGISTRY_NOTIFICATION).
+     * @param data     Raw payload (RegistryOpRequest).
      * @param dataSize Payload size in bytes.
      */
     void OnKernelRegistryEvent(const void* data, size_t dataSize);
@@ -1276,7 +1269,7 @@ private:
 /**
  * @brief Get integrity status name
  */
-[[nodiscard]] std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept;
+[[nodiscard]] std::string_view GetIntegrityStatusName(RegistryIntegrityStatus status) noexcept;
 
 /**
  * @brief Get value type name

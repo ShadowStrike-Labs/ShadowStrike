@@ -392,9 +392,9 @@ enum class SignedFileType : uint8_t {
     CABArchive      = 11    ///< .cab
 };
 
-/**
- * @brief Module status
- */
+#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+// ModuleStatus: canonical definition lives in SecurityEnums.hpp.
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -405,6 +405,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 6,
     Error           = 7
 };
+#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES

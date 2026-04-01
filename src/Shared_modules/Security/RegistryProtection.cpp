@@ -38,7 +38,7 @@
  * - JSON serialization for diagnostics
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 3.1.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
  *
@@ -51,6 +51,8 @@
 #include "RegistryProtection.hpp"
 
 #include "../Communication/IPCManager.hpp"
+#include "../Communication/AlertSystem.hpp"
+#include "../Communication/TelemetryCollector.hpp"
 #include "DigitalSignatureValidator.hpp"
 
 #include <algorithm>
@@ -693,11 +695,11 @@ public:
         pv.keyPath = keyPath;
         pv.valueName = valueName;
         pv.protectedSince = Clock::now();
-        pv.integrity = IntegrityStatus::Unknown;
+        pv.integrity = RegistryIntegrityStatus::Unknown;
 
         // Registry I/O OUTSIDE lock to avoid blocking readers
         if (ReadValueAndComputeHash(pv)) {
-            pv.integrity = IntegrityStatus::Valid;
+            pv.integrity = RegistryIntegrityStatus::Valid;
         }
 
         const auto key = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
@@ -793,7 +795,7 @@ public:
         OperationDecisionResult result;
         result.decision = OperationDecision::Allow;
 
-        m_stats.totalOperations++;
+        m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
 
         // Check if protection is disabled
         if (m_mode == RegistryProtectionMode::Disabled) {
@@ -858,7 +860,7 @@ public:
                 result.shouldSnapshot = true;
             }
 
-            m_stats.totalBlocked++;
+            m_stats.totalBlocked.fetch_add(1, std::memory_order_relaxed);
 
             // Release lock before firing callbacks to avoid deadlock
             lock.unlock();
@@ -885,7 +887,7 @@ public:
     // INTEGRITY MANAGEMENT
     // ========================================================================
 
-    [[nodiscard]] IntegrityStatus VerifyKeyIntegrity(std::wstring_view keyPath) {
+    [[nodiscard]] RegistryIntegrityStatus VerifyKeyIntegrity(std::wstring_view keyPath) {
         const auto normalized = NormalizeKeyPath(keyPath);
 
         // Gather key info under shared lock, then do I/O outside
@@ -896,7 +898,7 @@ public:
             std::shared_lock lock(m_mutex);
             auto it = m_protectedKeys.find(normalized);
             if (it == m_protectedKeys.end()) {
-                return IntegrityStatus::Unknown;
+                return RegistryIntegrityStatus::Unknown;
             }
             found = true;
         }
@@ -908,9 +910,9 @@ public:
             std::unique_lock lock(m_mutex);
             auto it = m_protectedKeys.find(normalized);
             if (it != m_protectedKeys.end()) {
-                it->second.integrity = IntegrityStatus::Missing;
+                it->second.integrity = RegistryIntegrityStatus::Missing;
             }
-            return IntegrityStatus::Missing;
+            return RegistryIntegrityStatus::Missing;
         }
 
         Utils::RegistryUtils::RegistryKey regKey;
@@ -924,27 +926,27 @@ public:
                 std::unique_lock lock(m_mutex);
                 auto it = m_protectedKeys.find(normalized);
                 if (it != m_protectedKeys.end()) {
-                    it->second.integrity = IntegrityStatus::Missing;
+                    it->second.integrity = RegistryIntegrityStatus::Missing;
                     keyCopy = it->second;  // Copy BEFORE unlock
                 }
             }
             // Fire callback outside lock, using safe copy
             FireIntegrityCallback(keyCopy);
-            return IntegrityStatus::Missing;
+            return RegistryIntegrityStatus::Missing;
         }
 
         {
             std::unique_lock lock(m_mutex);
             auto it = m_protectedKeys.find(normalized);
             if (it != m_protectedKeys.end()) {
-                it->second.integrity = IntegrityStatus::Valid;
+                it->second.integrity = RegistryIntegrityStatus::Valid;
                 it->second.lastVerified = Clock::now();
             }
         }
-        return IntegrityStatus::Valid;
+        return RegistryIntegrityStatus::Valid;
     }
 
-    [[nodiscard]] IntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
+    [[nodiscard]] RegistryIntegrityStatus VerifyValueIntegrity(std::wstring_view keyPath,
                                                        std::wstring_view valueName) {
         const auto compositeKey = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
 
@@ -955,7 +957,7 @@ public:
             std::shared_lock lock(m_mutex);
             auto it = m_protectedValues.find(compositeKey);
             if (it == m_protectedValues.end()) {
-                return IntegrityStatus::Unknown;
+                return RegistryIntegrityStatus::Unknown;
             }
             snapshot = it->second;
             expectedHash = it->second.expectedHash;
@@ -970,10 +972,10 @@ public:
             std::unique_lock lock(m_mutex);
             auto it = m_protectedValues.find(compositeKey);
             if (it != m_protectedValues.end()) {
-                it->second.integrity = IntegrityStatus::Missing;
+                it->second.integrity = RegistryIntegrityStatus::Missing;
                 it->second.lastVerified = Clock::now();
             }
-            return IntegrityStatus::Missing;
+            return RegistryIntegrityStatus::Missing;
         }
 
         if (currentValue.currentHash != expectedHash) {
@@ -984,7 +986,7 @@ public:
                 std::unique_lock lock(m_mutex);
                 auto it = m_protectedValues.find(compositeKey);
                 if (it != m_protectedValues.end()) {
-                    it->second.integrity = IntegrityStatus::Modified;
+                    it->second.integrity = RegistryIntegrityStatus::Modified;
                     it->second.currentHash = currentValue.currentHash;
                     it->second.modificationCount++;
                     it->second.lastVerified = Clock::now();
@@ -994,22 +996,22 @@ public:
                 }
             }
             FireValueChangeCallback(valueCopy, oldData, newData);
-            return IntegrityStatus::Modified;
+            return RegistryIntegrityStatus::Modified;
         }
 
         {
             std::unique_lock lock(m_mutex);
             auto it = m_protectedValues.find(compositeKey);
             if (it != m_protectedValues.end()) {
-                it->second.integrity = IntegrityStatus::Valid;
+                it->second.integrity = RegistryIntegrityStatus::Valid;
                 it->second.lastVerified = Clock::now();
             }
         }
-        return IntegrityStatus::Valid;
+        return RegistryIntegrityStatus::Valid;
     }
 
-    [[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>> VerifyAllIntegrity() {
-        std::vector<std::pair<std::wstring, IntegrityStatus>> results;
+    [[nodiscard]] std::vector<std::pair<std::wstring, RegistryIntegrityStatus>> VerifyAllIntegrity() {
+        std::vector<std::pair<std::wstring, RegistryIntegrityStatus>> results;
 
         // Copy keys to avoid holding lock during verification
         std::vector<std::wstring> keyPaths;
@@ -1047,7 +1049,7 @@ public:
         // Create snapshot before updating baseline
         CreateSnapshotInternal(normalized);
 
-        it->second.integrity = IntegrityStatus::Valid;
+        it->second.integrity = RegistryIntegrityStatus::Valid;
         it->second.lastVerified = Clock::now();
 
         SS_LOG_INFO(LOG_CATEGORY, L"Key baseline updated: %ls", normalized.c_str());
@@ -1060,22 +1062,39 @@ public:
             return false;
         }
 
-        std::unique_lock lock(m_mutex);
-        const auto key = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
+        const auto compositeKey = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
 
-        auto it = m_protectedValues.find(key);
-        if (it == m_protectedValues.end()) {
+        // Phase 1: Get a copy of the ProtectedValue for registry I/O
+        ProtectedValue pvCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it == m_protectedValues.end()) {
+                return false;
+            }
+            pvCopy = it->second;
+        }
+
+        // Phase 2: Read current value from registry (no lock held)
+        if (!ReadValueAndComputeHash(pvCopy)) {
             return false;
         }
 
-        // Read current value as new baseline
-        if (!ReadValueAndComputeHash(it->second)) {
-            return false;
+        // Phase 3: Write updated baseline under exclusive lock
+        {
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it == m_protectedValues.end()) {
+                return false;
+            }
+            it->second.currentHash   = pvCopy.currentHash;
+            it->second.expectedHash  = pvCopy.currentHash;
+            it->second.expectedData  = std::move(pvCopy.expectedData);
+            it->second.valueType     = pvCopy.valueType;
+            it->second.dataSize      = pvCopy.dataSize;
+            it->second.integrity     = RegistryIntegrityStatus::Valid;
+            it->second.lastVerified  = Clock::now();
         }
-
-        it->second.expectedHash = it->second.currentHash;
-        it->second.integrity = IntegrityStatus::Valid;
-        it->second.lastVerified = Clock::now();
 
         SS_LOG_INFO(LOG_CATEGORY, L"Value baseline updated: %ls\\%ls",
             std::wstring(keyPath).c_str(), std::wstring(valueName).c_str());
@@ -1089,7 +1108,7 @@ public:
 
         size_t violations = 0;
         for (const auto& [path, status] : results) {
-            if (status != IntegrityStatus::Valid && status != IntegrityStatus::Unknown) {
+            if (status != RegistryIntegrityStatus::Valid && status != RegistryIntegrityStatus::Unknown) {
                 violations++;
                 SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation: %ls (status=%hs)",
                     path.c_str(), std::string(GetIntegrityStatusName(status)).c_str());
@@ -1110,38 +1129,63 @@ public:
     }
 
     [[nodiscard]] bool RestoreFromSnapshot(std::wstring_view keyPath, uint32_t version) {
-        std::unique_lock lock(m_mutex);
-        const auto normalized = NormalizeKeyPath(keyPath);
+        // Phase 1: Copy snapshot data under lock (avoid holding lock during I/O)
+        struct RestoreEntry {
+            std::wstring name;
+            std::vector<uint8_t> data;
+            RegistryValueType type;
+        };
+        std::vector<RestoreEntry> entriesToRestore;
+        std::wstring normalized;
+        uint32_t restoredVersion = 0;
+        {
+            std::shared_lock lock(m_mutex);
+            normalized = NormalizeKeyPath(keyPath);
 
-        auto it = m_snapshots.find(normalized);
-        if (it == m_snapshots.end() || it->second.empty()) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"No snapshots available for: %ls", normalized.c_str());
-            return false;
-        }
+            auto it = m_snapshots.find(normalized);
+            if (it == m_snapshots.end() || it->second.empty()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"No snapshots available for: %ls", normalized.c_str());
+                return false;
+            }
 
-        const auto& snapshots = it->second;
-        const KeySnapshot* snapshotToRestore = nullptr;
+            const auto& snapshots = it->second;
+            const KeySnapshot* snapshotToRestore = nullptr;
 
-        if (version == 0) {
-            // Use latest snapshot
-            snapshotToRestore = &snapshots.back();
-        } else {
-            // Find specific version
-            for (const auto& s : snapshots) {
-                if (s.version == version) {
-                    snapshotToRestore = &s;
-                    break;
+            if (version == 0) {
+                snapshotToRestore = &snapshots.back();
+            } else {
+                for (const auto& s : snapshots) {
+                    if (s.version == version) {
+                        snapshotToRestore = &s;
+                        break;
+                    }
                 }
             }
-        }
 
-        if (!snapshotToRestore) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Snapshot version %u not found for: %ls",
-                version, normalized.c_str());
-            return false;
-        }
+            if (!snapshotToRestore) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Snapshot version %u not found for: %ls",
+                    version, normalized.c_str());
+                return false;
+            }
 
-        // Restore values from snapshot
+            restoredVersion = snapshotToRestore->version;
+            entriesToRestore.reserve(snapshotToRestore->values.size());
+            for (size_t i = 0; i < snapshotToRestore->values.size(); ++i) {
+                if (i >= snapshotToRestore->valueTypes.size()) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Snapshot corrupt: valueTypes shorter than values at index %zu", i);
+                    return false;
+                }
+                RestoreEntry entry;
+                entry.name = snapshotToRestore->values[i].first;
+                entry.data = snapshotToRestore->values[i].second;
+                entry.type = snapshotToRestore->valueTypes[i].second;
+                entriesToRestore.push_back(std::move(entry));
+            }
+        }
+        // Lock released — safe to perform registry I/O
+
+        // Phase 2: Write to registry without holding lock
         HKEY rootKey = nullptr;
         std::wstring subKey;
         if (!Utils::RegistryUtils::SplitPath(normalized, rootKey, subKey)) {
@@ -1158,33 +1202,22 @@ public:
         }
 
         bool success = true;
-        for (size_t i = 0; i < snapshotToRestore->values.size(); ++i) {
-            const auto& [name, data] = snapshotToRestore->values[i];
-
-            // Bounds check: valueTypes must be parallel to values
-            if (i >= snapshotToRestore->valueTypes.size()) {
-                SS_LOG_ERROR(LOG_CATEGORY,
-                    L"Snapshot corrupt: valueTypes shorter than values at index %zu", i);
-                success = false;
-                break;
-            }
-
-            const auto type = snapshotToRestore->valueTypes[i].second;
-
-            const LSTATUS st = RegSetValueExW(regKey.Handle(), name.c_str(), 0,
-                static_cast<DWORD>(type), data.data(), static_cast<DWORD>(data.size()));
+        for (const auto& entry : entriesToRestore) {
+            const LSTATUS st = RegSetValueExW(regKey.Handle(), entry.name.c_str(), 0,
+                static_cast<DWORD>(entry.type), entry.data.data(),
+                static_cast<DWORD>(entry.data.size()));
 
             if (st != ERROR_SUCCESS) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to restore value: %ls (error=%lu)",
-                    name.c_str(), st);
+                    entry.name.c_str(), st);
                 success = false;
             }
         }
 
         if (success) {
-            m_stats.snapshotsRestored++;
+            m_stats.snapshotsRestored.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_INFO(LOG_CATEGORY, L"Snapshot restored for: %ls (version=%u)",
-                normalized.c_str(), snapshotToRestore->version);
+                normalized.c_str(), restoredVersion);
         }
 
         return success;
@@ -1206,23 +1239,40 @@ public:
     }
 
     [[nodiscard]] bool RollbackValue(std::wstring_view keyPath, std::wstring_view valueName) {
-        std::unique_lock lock(m_mutex);
-        const auto key = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
+        // Phase 1: Copy needed data under shared lock
+        std::wstring pvKeyPath;
+        std::wstring pvValueName;
+        std::vector<uint8_t> expectedData;
+        RegistryValueType valueType;
+        Hash256 expectedHash;
+        std::wstring compositeKey;
+        {
+            std::shared_lock lock(m_mutex);
+            compositeKey = std::wstring(keyPath) + L"\\" + std::wstring(valueName);
 
-        auto it = m_protectedValues.find(key);
-        if (it == m_protectedValues.end()) {
-            return false;
+            auto it = m_protectedValues.find(compositeKey);
+            if (it == m_protectedValues.end()) {
+                return false;
+            }
+
+            const auto& pv = it->second;
+            if (pv.expectedData.empty()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"No baseline data for value: %ls", compositeKey.c_str());
+                return false;
+            }
+
+            pvKeyPath    = pv.keyPath;
+            pvValueName  = pv.valueName;
+            expectedData = pv.expectedData;
+            valueType    = pv.valueType;
+            expectedHash = pv.expectedHash;
         }
+        // Lock released — safe for registry I/O
 
-        const auto& pv = it->second;
-        if (pv.expectedData.empty()) {
-            SS_LOG_WARN(LOG_CATEGORY, L"No baseline data for value: %ls", key.c_str());
-            return false;
-        }
-
+        // Phase 2: Write to registry without holding lock
         HKEY rootKey = nullptr;
         std::wstring subKey;
-        if (!Utils::RegistryUtils::SplitPath(pv.keyPath, rootKey, subKey)) {
+        if (!Utils::RegistryUtils::SplitPath(pvKeyPath, rootKey, subKey)) {
             return false;
         }
 
@@ -1234,21 +1284,28 @@ public:
             return false;
         }
 
-        const LSTATUS st = RegSetValueExW(regKey.Handle(), pv.valueName.c_str(), 0,
-            static_cast<DWORD>(pv.valueType), pv.expectedData.data(),
-            static_cast<DWORD>(pv.expectedData.size()));
+        const LSTATUS st = RegSetValueExW(regKey.Handle(), pvValueName.c_str(), 0,
+            static_cast<DWORD>(valueType), expectedData.data(),
+            static_cast<DWORD>(expectedData.size()));
 
         if (st != ERROR_SUCCESS) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to rollback value: %ls (error=%lu)",
-                key.c_str(), st);
+                compositeKey.c_str(), st);
             return false;
         }
 
-        m_stats.totalRollbacks++;
-        it->second.integrity = IntegrityStatus::Restored;
-        it->second.currentHash = it->second.expectedHash;
+        // Phase 3: Update state under exclusive lock
+        m_stats.totalRollbacks.fetch_add(1, std::memory_order_relaxed);
+        {
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedValues.find(compositeKey);
+            if (it != m_protectedValues.end()) {
+                it->second.integrity = RegistryIntegrityStatus::Restored;
+                it->second.currentHash = expectedHash;
+            }
+        }
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Value rolled back: %ls", key.c_str());
+        SS_LOG_INFO(LOG_CATEGORY, L"Value rolled back: %ls", compositeKey.c_str());
         return true;
     }
 
@@ -1608,7 +1665,7 @@ private:
         pk.type = type;
         pk.includeSubkeys = includeSubkeys;
         pk.protectedSince = Clock::now();
-        pk.integrity = IntegrityStatus::Unknown;
+        pk.integrity = RegistryIntegrityStatus::Unknown;
 
         // Set blocked operations based on protection type
         switch (type) {
@@ -1634,7 +1691,7 @@ private:
         }
 
         m_protectedKeys[normalized] = std::move(pk);
-        m_stats.totalProtectedKeys++;
+        m_stats.totalProtectedKeys.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_INFO(LOG_CATEGORY, L"Key protected: %ls (type=%hs, subkeys=%s)",
             normalized.c_str(), std::string(GetProtectionTypeName(type)).c_str(),
@@ -1716,7 +1773,7 @@ private:
 
         // Set version number using monotonic counter (survives pruning)
         auto& snapshots = m_snapshots[normalized];
-        snapshot.version = ++m_nextSnapshotVersion;
+        snapshot.version = m_nextSnapshotVersion.fetch_add(1, std::memory_order_relaxed) + 1;
 
         // Limit snapshot count
         while (snapshots.size() >= m_config.maxSnapshotsPerKey) {
@@ -1725,7 +1782,7 @@ private:
 
         const auto savedVersion = snapshot.version;
         snapshots.push_back(std::move(snapshot));
-        m_stats.snapshotsCreated++;
+        m_stats.snapshotsCreated.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_DEBUG(LOG_CATEGORY, L"Snapshot created for: %ls (version=%u)",
             normalized.c_str(), savedVersion);
@@ -1872,14 +1929,18 @@ private:
             return false;
         }
 
-        // Constant-time comparison to prevent timing side-channels
-        if (token.size() != expected.size()) {
-            return false;
+        // Constant-time comparison: XOR-fold both lengths into the accumulator
+        // to avoid early-exit length oracle that leaks expected token length.
+        const size_t maxLen = std::max(token.size(), expected.size());
+        volatile uint8_t accumulator = static_cast<uint8_t>(token.size() ^ expected.size());
+        for (size_t i = 0; i < maxLen; ++i) {
+            const uint8_t a = (i < token.size())
+                ? static_cast<uint8_t>(token[i]) : 0;
+            const uint8_t b = (i < expected.size())
+                ? static_cast<uint8_t>(expected[i]) : 0;
+            accumulator |= (a ^ b);
         }
-        return Utils::HashUtils::Equal(
-            reinterpret_cast<const uint8_t*>(token.data()),
-            reinterpret_cast<const uint8_t*>(expected.data()),
-            token.size());
+        return accumulator == 0;
     }
 
     [[nodiscard]] std::string ComputeAuthToken() const {
@@ -1974,7 +2035,7 @@ private:
             if (m_stopMonitoring) return;
 
             const auto status = VerifyKeyIntegrity(keyPath);
-            if (status != IntegrityStatus::Valid && status != IntegrityStatus::Unknown) {
+            if (status != RegistryIntegrityStatus::Valid && status != RegistryIntegrityStatus::Unknown) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation detected: %ls", keyPath.c_str());
 
                 // Auto-rollback if enabled
@@ -1991,7 +2052,7 @@ private:
             if (m_stopMonitoring) return;
 
             const auto status = VerifyValueIntegrity(keyPath, valueName);
-            if (status == IntegrityStatus::Modified || status == IntegrityStatus::Missing) {
+            if (status == RegistryIntegrityStatus::Modified || status == RegistryIntegrityStatus::Missing) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Value integrity violation: %ls\\%ls (status=%hs)",
                     keyPath.c_str(), valueName.c_str(),
                     std::string(GetIntegrityStatusName(status)).c_str());
@@ -2029,11 +2090,53 @@ private:
             while (m_eventHistory.size() > MAX_EVENT_HISTORY) {
                 m_eventHistory.pop_front();
             }
-            // Update lastEventTime under lock to avoid data race on TimePoint
             m_stats.lastEventTime = event.timestamp;
         }
 
-        // Fire callbacks
+        // === Communication wiring: AlertSystem ===
+        try {
+            if (Communication::AlertSystem::HasInstance()) {
+                auto& alertSys = Communication::AlertSystem::Instance();
+                const std::string opName(GetRegistryOperationName(event.operation));
+                const std::string keyNarrow = WideToNarrow(event.keyPath);
+                const std::string procNarrow = WideToNarrow(event.sourceProcessName);
+
+                const std::string subject = "Registry tampering blocked: " + opName
+                    + " on " + keyNarrow;
+                const std::string details = "PID=" + std::to_string(event.sourceProcessId)
+                    + " Process=" + procNarrow
+                    + " Key=" + keyNarrow
+                    + " Reason=" + event.description;
+
+                alertSys.RaiseAlert(
+                    Communication::AlertSeverity::High,
+                    Communication::AlertType::Security,
+                    subject, details, "RegistryProtection");
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem dispatch failed: %hs", e.what());
+        }
+
+        // === Communication wiring: TelemetryCollector ===
+        try {
+            if (Communication::TelemetryCollector::HasInstance()) {
+                auto& telemetry = Communication::TelemetryCollector::Instance();
+                std::map<std::string, std::string> fields;
+                fields["event_id"]    = std::to_string(event.eventId);
+                fields["operation"]   = std::string(GetRegistryOperationName(event.operation));
+                fields["key_path"]    = WideToNarrow(event.keyPath);
+                fields["value_name"]  = WideToNarrow(event.valueName);
+                fields["process_id"]  = std::to_string(event.sourceProcessId);
+                fields["process"]     = WideToNarrow(event.sourceProcessName);
+                fields["blocked"]     = "true";
+                fields["reason"]      = event.description;
+                telemetry.RecordCustom("RegistryProtection.OperationBlocked", fields);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"TelemetryCollector dispatch failed: %hs", e.what());
+        }
+
+        // Fire registered callbacks
         std::vector<RegistryEventCallback> callbacks;
         {
             std::shared_lock lock(m_mutex);
@@ -2053,6 +2156,40 @@ private:
     }
 
     void FireIntegrityCallback(const ProtectedKey& key) {
+        // === Communication wiring: AlertSystem for integrity violations ===
+        try {
+            if (Communication::AlertSystem::HasInstance()) {
+                auto& alertSys = Communication::AlertSystem::Instance();
+                const std::string keyNarrow = WideToNarrow(key.keyPath);
+                const std::string statusName(GetIntegrityStatusName(key.integrity));
+
+                alertSys.RaiseAlert(
+                    Communication::AlertSeverity::Critical,
+                    Communication::AlertType::Security,
+                    "Registry integrity violation: " + keyNarrow,
+                    "Key=" + keyNarrow + " Status=" + statusName
+                        + " Type=" + std::string(GetProtectionTypeName(key.type)),
+                    "RegistryProtection");
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem integrity dispatch failed: %hs", e.what());
+        }
+
+        // === Communication wiring: TelemetryCollector ===
+        try {
+            if (Communication::TelemetryCollector::HasInstance()) {
+                auto& telemetry = Communication::TelemetryCollector::Instance();
+                std::map<std::string, std::string> fields;
+                fields["key_path"]   = WideToNarrow(key.keyPath);
+                fields["status"]     = std::string(GetIntegrityStatusName(key.integrity));
+                fields["protection"] = std::string(GetProtectionTypeName(key.type));
+                telemetry.RecordCustom("RegistryProtection.IntegrityViolation", fields);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"TelemetryCollector integrity dispatch failed: %hs", e.what());
+        }
+
+        // Fire registered callbacks
         std::vector<IntegrityCallback> callbacks;
         {
             std::shared_lock lock(m_mutex);
@@ -2237,6 +2374,43 @@ public:
             m_stats.lastEventTime = event.timestamp;
         }
 
+        // === Communication wiring: AlertSystem for kernel-blocked events ===
+        try {
+            if (Communication::AlertSystem::HasInstance()) {
+                auto& alertSys = Communication::AlertSystem::Instance();
+                const std::string opName(GetRegistryOperationName(event.operation));
+                const std::string keyNarrow = WideToNarrow(event.keyPath);
+
+                alertSys.RaiseAlert(
+                    Communication::AlertSeverity::Critical,
+                    Communication::AlertType::Security,
+                    "Kernel blocked registry tampering: " + opName + " on " + keyNarrow,
+                    "PID=" + std::to_string(event.sourceProcessId)
+                        + " Key=" + keyNarrow
+                        + " Source=KernelCallback",
+                    "RegistryProtection");
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"AlertSystem kernel event dispatch failed: %hs", e.what());
+        }
+
+        // === Communication wiring: TelemetryCollector ===
+        try {
+            if (Communication::TelemetryCollector::HasInstance()) {
+                auto& telemetry = Communication::TelemetryCollector::Instance();
+                std::map<std::string, std::string> fields;
+                fields["operation"]   = std::string(GetRegistryOperationName(event.operation));
+                fields["key_path"]    = WideToNarrow(event.keyPath);
+                fields["value_name"]  = WideToNarrow(event.valueName);
+                fields["process_id"]  = std::to_string(event.sourceProcessId);
+                fields["blocked"]     = "true";
+                fields["source"]      = "kernel";
+                telemetry.RecordCustom("RegistryProtection.KernelBlock", fields);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"TelemetryCollector kernel event dispatch failed: %hs", e.what());
+        }
+
         // Fire callbacks outside lock
         std::vector<RegistryEventCallback> callbacks;
         {
@@ -2258,15 +2432,35 @@ public:
     void RegisterKernelHandler() {
         try {
             auto& ipc = Communication::IPCManager::Instance();
-            ipc.RegisterGenericHandler(
-                [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* data, size_t size) {
-                    if (msgType == FilterMessageType_RegistryNotify &&
-                        m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
-                        OnKernelRegistryEventInternal(data, size);
+            // Use the dedicated RegisterRegistryHandler (not RegisterGenericHandler)
+            // to avoid overwriting other modules' generic handlers.
+            // IPCManager dispatches FilterMessageType_RegistryNotify to this handler
+            // with validated RegistryOpRequest payload.
+            ipc.RegisterRegistryHandler(
+                [this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                    if (!m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
+                        return Verdict_Clean;
                     }
+                    OnKernelRegistryEventInternal(&req, sizeof(req)
+                        + req.keyPathLength + req.valueNameLength + req.dataSize);
+                    // Return Malicious verdict if the key is protected (blocked at kernel level)
+                    // The kernel will use this to deny the operation pre-notification
+                    std::wstring keyPath;
+                    if (req.keyPathLength > 0 && req.keyPathCharLen() > 0) {
+                        keyPath.assign(req.keyPathData(), req.keyPathCharLen());
+                    }
+                    if (!keyPath.empty() && IsKeyProtected(keyPath)) {
+                        auto operation = static_cast<RegistryOperation>(req.operation);
+                        // Only block write operations, not reads
+                        constexpr auto writeOps = static_cast<uint32_t>(RegistryOperation::AllWrite);
+                        if ((static_cast<uint32_t>(operation) & writeOps) != 0) {
+                            return Verdict_Malicious;
+                        }
+                    }
+                    return Verdict_Clean;
                 });
             m_kernelHandlerRegistered.store(true, std::memory_order_release);
-            SS_LOG_INFO(LOG_CATEGORY, L"Kernel registry handler registered");
+            SS_LOG_INFO(LOG_CATEGORY, L"Kernel registry handler registered via dedicated dispatch");
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to register kernel handler: %hs", e.what());
         }
@@ -2274,9 +2468,14 @@ public:
 
     void UnregisterKernelHandler() {
         if (m_kernelHandlerRegistered.load(std::memory_order_acquire)) {
-            // Atomically deactivate handler before any further cleanup.
-            // The registered lambda checks this flag and becomes a no-op.
             m_kernelHandlerRegistered.store(false, std::memory_order_release);
+            try {
+                // Clear the registry handler slot so IPCManager stops dispatching to us
+                auto& ipc = Communication::IPCManager::Instance();
+                ipc.RegisterRegistryHandler(nullptr);
+            } catch (...) {
+                // Best-effort during shutdown
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Kernel registry handler unregistered");
         }
     }
@@ -2325,7 +2524,7 @@ private:
     std::vector<uint8_t> m_sessionSecret;
 
     // Monotonic snapshot version counter (survives snapshot pruning)
-    uint32_t m_nextSnapshotVersion{0};
+    std::atomic<uint32_t> m_nextSnapshotVersion{0};
 
     // Kernel bridge state
     std::atomic<bool> m_kernelHandlerRegistered{false};
@@ -2476,16 +2675,16 @@ void RegistryProtection::ClearDecisionCallback() {
     m_impl->ClearDecisionCallback();
 }
 
-IntegrityStatus RegistryProtection::VerifyKeyIntegrity(std::wstring_view keyPath) {
+RegistryIntegrityStatus RegistryProtection::VerifyKeyIntegrity(std::wstring_view keyPath) {
     return m_impl->VerifyKeyIntegrity(keyPath);
 }
 
-IntegrityStatus RegistryProtection::VerifyValueIntegrity(std::wstring_view keyPath,
+RegistryIntegrityStatus RegistryProtection::VerifyValueIntegrity(std::wstring_view keyPath,
                                                          std::wstring_view valueName) {
     return m_impl->VerifyValueIntegrity(keyPath, valueName);
 }
 
-std::vector<std::pair<std::wstring, IntegrityStatus>> RegistryProtection::VerifyAllIntegrity() {
+std::vector<std::pair<std::wstring, RegistryIntegrityStatus>> RegistryProtection::VerifyAllIntegrity() {
     return m_impl->VerifyAllIntegrity();
 }
 
@@ -2799,15 +2998,15 @@ std::string_view GetProtectionTypeName(KeyProtectionType type) noexcept {
     }
 }
 
-std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept {
+std::string_view GetIntegrityStatusName(RegistryIntegrityStatus status) noexcept {
     switch (status) {
-        case IntegrityStatus::Unknown: return "Unknown";
-        case IntegrityStatus::Valid: return "Valid";
-        case IntegrityStatus::Modified: return "Modified";
-        case IntegrityStatus::Missing: return "Missing";
-        case IntegrityStatus::Corrupted: return "Corrupted";
-        case IntegrityStatus::New: return "New";
-        case IntegrityStatus::Restored: return "Restored";
+        case RegistryIntegrityStatus::Unknown: return "Unknown";
+        case RegistryIntegrityStatus::Valid: return "Valid";
+        case RegistryIntegrityStatus::Modified: return "Modified";
+        case RegistryIntegrityStatus::Missing: return "Missing";
+        case RegistryIntegrityStatus::Corrupted: return "Corrupted";
+        case RegistryIntegrityStatus::New: return "New";
+        case RegistryIntegrityStatus::Restored: return "Restored";
         default: return "Unknown";
     }
 }
