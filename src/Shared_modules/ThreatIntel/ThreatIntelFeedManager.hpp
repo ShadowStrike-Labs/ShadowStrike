@@ -233,6 +233,8 @@ struct RateLimitConfig {
     mutable std::atomic<uint32_t> currentDayCount{0};
     mutable std::atomic<uint64_t> lastRequestTime{0};
     mutable std::atomic<uint64_t> retryAfterTime{0};
+    mutable std::atomic<uint64_t> lastMinuteResetTime{0};
+    mutable std::atomic<uint64_t> lastHourResetTime{0};
     
     // Default constructor
     RateLimitConfig() = default;
@@ -250,7 +252,9 @@ struct RateLimitConfig {
         , currentHourCount(0)
         , currentDayCount(0)
         , lastRequestTime(0)
-        , retryAfterTime(0) {}
+        , retryAfterTime(0)
+        , lastMinuteResetTime(0)
+        , lastHourResetTime(0) {}
     
     // Copy assignment - copies config but resets runtime state
     RateLimitConfig& operator=(const RateLimitConfig& other) noexcept {
@@ -267,6 +271,8 @@ struct RateLimitConfig {
             currentDayCount.store(0, std::memory_order_relaxed);
             lastRequestTime.store(0, std::memory_order_relaxed);
             retryAfterTime.store(0, std::memory_order_relaxed);
+            lastMinuteResetTime.store(0, std::memory_order_relaxed);
+            lastHourResetTime.store(0, std::memory_order_relaxed);
         }
         return *this;
     }
@@ -284,7 +290,9 @@ struct RateLimitConfig {
         , currentHourCount(other.currentHourCount.load(std::memory_order_relaxed))
         , currentDayCount(other.currentDayCount.load(std::memory_order_relaxed))
         , lastRequestTime(other.lastRequestTime.load(std::memory_order_relaxed))
-        , retryAfterTime(other.retryAfterTime.load(std::memory_order_relaxed)) {}
+        , retryAfterTime(other.retryAfterTime.load(std::memory_order_relaxed))
+        , lastMinuteResetTime(other.lastMinuteResetTime.load(std::memory_order_relaxed))
+        , lastHourResetTime(other.lastHourResetTime.load(std::memory_order_relaxed)) {}
     
     // Move assignment
     RateLimitConfig& operator=(RateLimitConfig&& other) noexcept {
@@ -301,6 +309,8 @@ struct RateLimitConfig {
             currentDayCount.store(other.currentDayCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
             lastRequestTime.store(other.lastRequestTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
             retryAfterTime.store(other.retryAfterTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastMinuteResetTime.store(other.lastMinuteResetTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastHourResetTime.store(other.lastHourResetTime.load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         return *this;
     }
@@ -1753,6 +1763,9 @@ private:
     
     /// @brief Sync concurrency limiter mutex
     std::mutex m_syncLimiterMutex;
+    
+    /// @brief Serializes dedup+insert operations against ThreatIntelDatabase
+    std::mutex m_dbStoreMutex;
     
     /// @brief Sync concurrency condition variable
     std::condition_variable m_syncLimiterCv;

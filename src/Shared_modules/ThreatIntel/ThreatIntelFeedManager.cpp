@@ -3090,6 +3090,43 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
         return response;
     }
     
+    // SSRF protection: reject URLs targeting internal/private networks
+    {
+        // Extract hostname from URL (after "http://" or "https://")
+        const size_t schemeEnd = url.find("://");
+        if (schemeEnd == std::string::npos) {
+            response.error = "Malformed URL: missing scheme separator";
+            return response;
+        }
+        const size_t hostStart = schemeEnd + 3;
+        const size_t hostEnd = url.find_first_of(":/?#", hostStart);
+        const std::string host = url.substr(hostStart, 
+            (hostEnd != std::string::npos) ? (hostEnd - hostStart) : std::string::npos);
+        
+        // Block localhost variants
+        if (host == "localhost" || host.starts_with("127.") || host == "::1" ||
+            host == "0.0.0.0" || host == "[::1]") {
+            response.error = "SSRF blocked: localhost targets are not permitted";
+            return response;
+        }
+        
+        // Block private/reserved IPv4 ranges via simple prefix check
+        // Full resolution-based check is not feasible without DNS, but prefix filtering
+        // catches direct IP usage (the primary SSRF vector)
+        static constexpr std::string_view kBlockedPrefixes[] = {
+            "10.", "192.168.", "172.16.", "172.17.", "172.18.", "172.19.",
+            "172.20.", "172.21.", "172.22.", "172.23.", "172.24.", "172.25.",
+            "172.26.", "172.27.", "172.28.", "172.29.", "172.30.", "172.31.",
+            "169.254.", "100.64.", "198.18.", "198.19."
+        };
+        for (const auto& prefix : kBlockedPrefixes) {
+            if (host.starts_with(prefix)) {
+                response.error = "SSRF blocked: private/reserved IP range not permitted";
+                return response;
+            }
+        }
+    }
+    
     // ============================================================================
     // USE CUSTOM HTTP CLIENT IF PROVIDED (FOR TESTING/DEPENDENCY INJECTION)
     // ============================================================================
@@ -3397,6 +3434,22 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
     constexpr size_t MAX_RESPONSE_SIZE = 100 * 1024 * 1024;  // 100MB max
     constexpr size_t INITIAL_BUFFER_SIZE = 64 * 1024;  // 64KB initial
     constexpr size_t READ_CHUNK_SIZE = 8192;
+    
+    // Pre-flight Content-Length check to reject oversized responses early
+    {
+        DWORD contentLength = 0;
+        DWORD bufferLen = sizeof(contentLength);
+        DWORD headerIndex = 0;
+        if (HttpQueryInfoA(hRequest.get(), HTTP_QUERY_CONTENT_LENGTH | HTTP_QUERY_FLAG_NUMBER,
+                           &contentLength, &bufferLen, &headerIndex)) {
+            if (static_cast<size_t>(contentLength) > MAX_RESPONSE_SIZE) {
+                response.error = "Response Content-Length (" + std::to_string(contentLength) +
+                                 " bytes) exceeds " + std::to_string(MAX_RESPONSE_SIZE / 1024 / 1024) + "MB limit";
+                return response;
+            }
+        }
+        // If Content-Length is missing (chunked transfer), streaming check still applies below
+    }
     
     try {
         response.body.reserve(INITIAL_BUFFER_SIZE);
@@ -3804,50 +3857,53 @@ bool ThreatIntelFeedManager::StoreIOCs(
             }
             
             // Check for duplicate using database's dedup index
-            // Use the overloaded FindEntry that accepts IOCEntry directly
-            size_t existingIndex = database->FindEntry(entry);
-            
-            if (existingIndex != SIZE_MAX) {
-                // Entry exists - update it
-                IOCEntry* existingEntry = database->GetMutableEntry(existingIndex);
-                if (existingEntry) {
-                    // Update lastSeen timestamp
-                    existingEntry->lastSeen = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
-                    
-                    // Update other fields if new data is more recent or complete
-                    if (entry.confidence > existingEntry->confidence) {
-                        existingEntry->confidence = entry.confidence;
-                    }
-                    if (entry.reputation > existingEntry->reputation) {
-                        existingEntry->reputation = entry.reputation;
-                    }
-                    
-                    updatedCount++;
-                } else {
-                    errorCount++;
-                }
+            // Serialize FindEntry + update/insert to prevent concurrent race on same entry
+            size_t entryIndex = SIZE_MAX;
+            {
+                std::scoped_lock dbLock(m_dbStoreMutex);
                 
-                batchCounter++;
-                continue;
-            }
-            
-            // New entry - allocate slot
-            const size_t entryIndex = database->AllocateEntry();
-            if (entryIndex == SIZE_MAX) {
-                // Database full - try to extend
-                if (!database->ExtendBy(100 * 1024 * 1024)) {
-                    errorCount++;
+                size_t existingIndex = database->FindEntry(entry);
+                
+                if (existingIndex != SIZE_MAX) {
+                    // Entry exists - update it (safe: index stable under lock)
+                    IOCEntry* existingEntry = database->GetMutableEntry(existingIndex);
+                    if (existingEntry) {
+                        existingEntry->lastSeen = ShadowStrike::ThreatIntel_Util::GetCurrentTimestampImpl();
+                        
+                        if (entry.confidence > existingEntry->confidence) {
+                            existingEntry->confidence = entry.confidence;
+                        }
+                        if (entry.reputation > existingEntry->reputation) {
+                            existingEntry->reputation = entry.reputation;
+                        }
+                        
+                        updatedCount++;
+                    } else {
+                        errorCount++;
+                    }
+                    
                     batchCounter++;
                     continue;
                 }
                 
-                const size_t retryIndex = database->AllocateEntry();
-                if (retryIndex == SIZE_MAX) {
-                    errorCount++;
-                    batchCounter++;
-                    continue;
+                // New entry - allocate slot
+                entryIndex = database->AllocateEntry();
+                if (entryIndex == SIZE_MAX) {
+                    // Database full - try to extend
+                    if (!database->ExtendBy(100 * 1024 * 1024)) {
+                        errorCount++;
+                        batchCounter++;
+                        continue;
+                    }
+                    
+                    entryIndex = database->AllocateEntry();
+                    if (entryIndex == SIZE_MAX) {
+                        errorCount++;
+                        batchCounter++;
+                        continue;
+                    }
                 }
-            }
+            } // dbLock released
             
             // Get mutable entry pointer
             IOCEntry* dbEntry = database->GetMutableEntry(entryIndex);
@@ -4114,7 +4170,25 @@ bool ThreatIntelFeedManager::WaitForRateLimit(FeedContext& context) {
     
     rl.lastRequestTime.store(ShadowStrike::ThreatIntel_Util::GetCurrentTimestampMs(), std::memory_order_release);
     
-    // Prevent overflow on counter
+    // Reset rate limit counters on time window expiry (CAS to prevent double-reset)
+    constexpr uint64_t MINUTE_MS = 60000;
+    constexpr uint64_t HOUR_MS = 3600000;
+    uint64_t lastMinuteReset = rl.lastMinuteResetTime.load(std::memory_order_acquire);
+    if (now - lastMinuteReset >= MINUTE_MS) {
+        if (rl.lastMinuteResetTime.compare_exchange_strong(lastMinuteReset, now,
+                std::memory_order_release, std::memory_order_acquire)) {
+            rl.currentMinuteCount.store(0, std::memory_order_relaxed);
+        }
+    }
+    uint64_t lastHourReset = rl.lastHourResetTime.load(std::memory_order_acquire);
+    if (now - lastHourReset >= HOUR_MS) {
+        if (rl.lastHourResetTime.compare_exchange_strong(lastHourReset, now,
+                std::memory_order_release, std::memory_order_acquire)) {
+            rl.currentHourCount.store(0, std::memory_order_relaxed);
+        }
+    }
+    
+    // Increment counter with overflow protection
     const uint32_t currentCount = rl.currentMinuteCount.load(std::memory_order_relaxed);
     if (currentCount < UINT32_MAX) {
         rl.currentMinuteCount.fetch_add(1, std::memory_order_relaxed);
@@ -4132,6 +4206,18 @@ bool ThreatIntelFeedManager::PrepareAuthentication(FeedContext& context, HttpReq
     }
     
     try {
+        // Sanitize header values: strip CR/LF to prevent HTTP header injection
+        auto sanitizeHeaderValue = [](const std::string& value) -> std::string {
+            std::string sanitized;
+            sanitized.reserve(value.size());
+            for (char c : value) {
+                if (c != '\r' && c != '\n' && c != '\0') {
+                    sanitized += c;
+                }
+            }
+            return sanitized;
+        };
+        
         switch (auth.method) {
             case AuthMethod::ApiKey:
                 // Validate API key before use
@@ -4157,7 +4243,7 @@ bool ThreatIntelFeedManager::PrepareAuthentication(FeedContext& context, HttpReq
                     if (auth.apiKeyHeader.empty() || auth.apiKeyHeader.size() > 128) {
                         return false;
                     }
-                    request.headers[auth.apiKeyHeader] = auth.apiKey;
+                    request.headers[auth.apiKeyHeader] = sanitizeHeaderValue(auth.apiKey);
                 }
                 break;
                 
@@ -4176,7 +4262,7 @@ bool ThreatIntelFeedManager::PrepareAuthentication(FeedContext& context, HttpReq
                 if (auth.accessToken.empty()) {
                     return false;
                 }
-                request.headers["Authorization"] = "Bearer " + auth.accessToken;
+                request.headers["Authorization"] = "Bearer " + sanitizeHeaderValue(auth.accessToken);
                 break;
                 
             case AuthMethod::OAuth2:
@@ -4191,7 +4277,7 @@ bool ThreatIntelFeedManager::PrepareAuthentication(FeedContext& context, HttpReq
                         return false;
                     }
                 }
-                request.headers["Authorization"] = "Bearer " + auth.accessToken;
+                request.headers["Authorization"] = "Bearer " + sanitizeHeaderValue(auth.accessToken);
                 break;
                 
             case AuthMethod::None:
