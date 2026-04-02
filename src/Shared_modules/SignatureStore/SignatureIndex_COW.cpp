@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureIndex.hpp"
-#include"../../src/Utils/Logger.hpp"
+#include"../Utils/Logger.hpp"
 
 namespace ShadowStrike {
 	namespace SignatureStore {
@@ -76,7 +76,7 @@ namespace ShadowStrike {
             // STEP 1: VALIDATION & PRECONDITIONS
             // ========================================================================
 
-            if (!m_inCOWTransaction) {
+            if (!m_inCOWTransaction.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(L"SignatureIndex",
                     L"CommitCOW: Not in active COW transaction - ignoring commit");
                 return StoreError{ SignatureStoreError::Success };
@@ -253,21 +253,23 @@ namespace ShadowStrike {
                 L"CommitCOW: Updating internal pointers in %zu nodes BEFORE writing",
                 m_cowNodes.size());
 
-            // Helper lambda to find file offset for a truncated pointer value.
-            // Pointers are stored as uint32_t (truncated from 64-bit) and may represent either:
-            // - A truncated COW node address (lower 32 bits of in-memory pointer)
-            // - A file offset for a node that was cloned in this transaction
+            // Helper lambda to resolve pointer values stored in COW node fields
+            // (children[], parentOffset, nextLeaf, prevLeaf) to their final file offsets.
+            // During COW, these fields temporarily hold either:
+            // - Full 64-bit COW node address (in-memory pointer cast to uint64_t)
+            // - A file offset for a node cloned from the on-disk file
             //
-            // SECURITY NOTE: This truncation scheme has collision risk on 64-bit systems
-            // when multiple pointers share the same lower 32 bits. Consider redesigning
-            // to use full 64-bit addressing or pool indices in future versions.
-            auto findOffsetForTruncatedPointer = [this, &nodeOffsetMap](uint32_t pointerValue) -> std::optional<uint32_t> {
+            // SECURITY FIX (v1.2): Uses exact 64-bit lookup via FindCOWNodeByAddr,
+            // eliminating the collision risk of the previous truncated 32-bit scheme.
+            auto findOffsetForPointer = [this, &nodeOffsetMap](uint64_t pointerValue) -> std::optional<uint64_t> {
                 if (pointerValue == 0) {
                     return std::nullopt;
                 }
 
-                // First, remap known COW-node addresses using 64-bit safe lookup
-                BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(pointerValue);
+                // SECURITY FIX (v1.2): Use exact 64-bit lookup instead of truncated 32-bit.
+                // Since modification code now stores full pointer addresses, we can do
+                // a direct match without truncation-based collision risk.
+                BPlusTreeNode* cowNode = FindCOWNodeByAddr(pointerValue);
                 if (cowNode != nullptr) {
                     const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(cowNode));
                     if (offsetIt != nodeOffsetMap.end()) {
@@ -292,40 +294,34 @@ namespace ShadowStrike {
 
                 // Update parent pointer if not root
                 if (node->parentOffset != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->parentOffset);
+                    auto maybeOffset = findOffsetForPointer(node->parentOffset);
                     if (maybeOffset.has_value()) {
-                        SS_LOG_TRACE(L"SignatureIndex",
-                            L"CommitCOW: Updated parent pointer in node %zu "
-                            L"from 0x%X to file offset 0x%X", 
-                            i, node->parentOffset, maybeOffset.value());
                         node->parentOffset = maybeOffset.value();
                     }
-                    // If not found in map, it might already be a file offset - leave as is
                 }
 
                 // Update child pointers (internal nodes only)
                 if (!node->isLeaf) {
                     for (uint32_t j = 0; j <= node->keyCount; ++j) {
                         if (node->children[j] != 0) {
-                            auto maybeOffset = findOffsetForTruncatedPointer(node->children[j]);
+                            auto maybeOffset = findOffsetForPointer(node->children[j]);
                             if (maybeOffset.has_value()) {
                                 node->children[j] = maybeOffset.value();
                             }
-                            // If not found, it's already a file offset - leave as is
                         }
                     }
                 }
 
                 // Update leaf linked list pointers
                 if (node->nextLeaf != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->nextLeaf);
+                    auto maybeOffset = findOffsetForPointer(node->nextLeaf);
                     if (maybeOffset.has_value()) {
                         node->nextLeaf = maybeOffset.value();
                     }
                 }
 
                 if (node->prevLeaf != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->prevLeaf);
+                    auto maybeOffset = findOffsetForPointer(node->prevLeaf);
                     if (maybeOffset.has_value()) {
                         node->prevLeaf = maybeOffset.value();
                     }
@@ -401,8 +397,8 @@ namespace ShadowStrike {
 
             SS_LOG_TRACE(L"SignatureIndex", L"CommitCOW: Performing atomic root pointer update");
 
-            uint32_t oldRootOffset = m_rootOffset.load(std::memory_order_acquire);
-            uint32_t newRootOffset = oldRootOffset;
+            uint64_t oldRootOffset = m_rootOffset.load(std::memory_order_acquire);
+            uint64_t newRootOffset = oldRootOffset;
 
             // Prefer explicit COW root if available (correct even when root is not first in pool)
             if (m_cowRootNode) {
@@ -410,7 +406,7 @@ namespace ShadowStrike {
                 if (it != nodeOffsetMap.end()) {
                     newRootOffset = it->second;
                     SS_LOG_TRACE(L"SignatureIndex",
-                        L"CommitCOW: Root offset update: 0x%X → 0x%X",
+                        L"CommitCOW: Root offset update: 0x%llX → 0x%llX",
                         oldRootOffset, newRootOffset);
                 }
             }
@@ -422,13 +418,13 @@ namespace ShadowStrike {
                     if (it != nodeOffsetMap.end()) {
                         newRootOffset = it->second;
                         SS_LOG_TRACE(L"SignatureIndex",
-                            L"CommitCOW: Root offset update (fallback): 0x%X → 0x%X",
+                            L"CommitCOW: Root offset update (fallback): 0x%llX → 0x%llX",
                             oldRootOffset, newRootOffset);
                     }
                 }
             }
 
-            // Atomic CAS: guarantee atomicity of root pointer update
+            // Atomic store: root pointer update (under exclusive write lock)
             m_rootOffset.store(newRootOffset, std::memory_order_release);
 
             SS_LOG_TRACE(L"SignatureIndex",
@@ -471,13 +467,15 @@ namespace ShadowStrike {
             // STEP 11: CLEAR COW POOL AND INVALIDATE CACHE
             // ========================================================================
 
-            m_cowNodes.clear();
-            m_cowNodes.shrink_to_fit();
-
-            // CRITICAL FIX: Clear tracking maps to prevent stale references
+            // CRITICAL: Clear tracking maps BEFORE freeing nodes to prevent
+            // dangling pointer lookups via FindCOWNodeByAddr during the window
+            // between node deallocation and map clearing.
             m_fileOffsetToCOWNode.clear();
             m_ptrAddrToCOWNode.clear();
             m_cowRootNode = nullptr;
+
+            m_cowNodes.clear();
+            m_cowNodes.shrink_to_fit();
 
             // CRITICAL FIX: Invalidate node cache after commit
             // The cache may hold stale pointers to old node locations that have been
@@ -499,11 +497,20 @@ namespace ShadowStrike {
             LARGE_INTEGER commitEndTime;
             QueryPerformanceCounter(&commitEndTime);
 
-            // FIX: Division by zero protection
+            // FIX: Division by zero and overflow protection
             uint64_t commitTimeUs = 0;
             if (m_perfFrequency.QuadPart > 0) {
-                commitTimeUs = ((commitEndTime.QuadPart - commitStartTime.QuadPart) * 1000000ULL) /
-                    static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                const int64_t elapsed = commitEndTime.QuadPart - commitStartTime.QuadPart;
+                if (elapsed > 0) {
+                    const uint64_t elapsedU = static_cast<uint64_t>(elapsed);
+                    const uint64_t freqU = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                    // Overflow-safe: divide first if multiplication would overflow
+                    if (elapsedU > UINT64_MAX / 1000000ULL) {
+                        commitTimeUs = (elapsedU / freqU) * 1000000ULL;
+                    } else {
+                        commitTimeUs = (elapsedU * 1000000ULL) / freqU;
+                    }
+                }
             }
 
             // ========================================================================
@@ -651,10 +658,37 @@ namespace ShadowStrike {
             // STEP 4: ALLOCATE SPACE (MEMORY-MAPPED OR RAW BUFFER)
             // ========================================================================
 
-            uint64_t spaceNeeded = m_cowNodes.size() * sizeof(BPlusTreeNode);
+            // SECURITY: Check for integer overflow before multiplication
+            constexpr uint64_t MAX_SAFE_NODES = UINT64_MAX / sizeof(BPlusTreeNode);
+            if (m_cowNodes.size() > MAX_SAFE_NODES) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"CommitCOWInternal: COW pool size %zu would overflow space calculation",
+                    m_cowNodes.size());
+                RollbackCOW();
+                if (!keepTransactionOpen) {
+                    m_inCOWTransaction.store(false, std::memory_order_release);
+                }
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "COW pool size would overflow" };
+            }
+
+            uint64_t spaceNeeded = static_cast<uint64_t>(m_cowNodes.size()) * sizeof(BPlusTreeNode);
             // Use index size for raw buffer mode, file size for memory-mapped mode
             uint64_t totalSpace = hasRawBuffer ? m_indexSize : m_view->fileSize;
             uint64_t newOffset = m_currentOffset;
+
+            // SECURITY: Check for overflow in offset + size calculation
+            if (spaceNeeded > UINT64_MAX - newOffset) {
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"CommitCOWInternal: Offset + space would overflow (offset=0x%llX, space=0x%llX)",
+                    newOffset, spaceNeeded);
+                RollbackCOW();
+                if (!keepTransactionOpen) {
+                    m_inCOWTransaction.store(false, std::memory_order_release);
+                }
+                return StoreError{ SignatureStoreError::TooLarge, 0,
+                                  "Offset + space calculation overflow" };
+            }
 
             if (newOffset + spaceNeeded > totalSpace) {
                 SS_LOG_ERROR(L"SignatureIndex",
@@ -701,21 +735,20 @@ namespace ShadowStrike {
             // Update all internal pointers in COW nodes to use file offsets instead
             // of memory addresses BEFORE writing to file.
 
-            // Helper lambda to find file offset for a truncated pointer
-            // Since pointers are stored as uint32_t (truncated), we need to search
-            // the map by comparing the lower 32 bits of each key
+            // Helper lambda to find file offset for a pointer value stored in a COW node.
+            // Since node fields are uint64_t and COW callers now store full 64-bit
+            // pointer addresses, we perform exact matching for both COW node addresses
+            // and file offsets. No truncation is needed.
             //
-            // CRITICAL FIX: Check BOTH m_ptrAddrToCOWNode AND m_fileOffsetToCOWNode
-            // because pointers may be either:
-            // - Truncated memory addresses (for newly allocated COW nodes)
-            // - File offsets (for nodes cloned from the committed file)
-            auto findOffsetForTruncatedPointer = [this, &nodeOffsetMap](uint32_t pointerValue) -> std::optional<uint32_t> {
+            // SECURITY FIX (v1.2): Full 64-bit lookup eliminates collision risk
+            // that existed with the previous truncated 32-bit address scheme.
+            auto findOffsetForPointer = [this, &nodeOffsetMap](uint64_t pointerValue) -> std::optional<uint64_t> {
                 if (pointerValue == 0) {
                     return std::nullopt;
                 }
 
-                // First, check if this is a truncated COW-node memory address (64-bit safe)
-                BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(pointerValue);
+                // SECURITY FIX (v1.2): Use exact 64-bit lookup instead of truncated 32-bit
+                BPlusTreeNode* cowNode = FindCOWNodeByAddr(pointerValue);
                 if (cowNode != nullptr) {
                     const auto offsetIt = nodeOffsetMap.find(reinterpret_cast<uintptr_t>(cowNode));
                     if (offsetIt != nodeOffsetMap.end()) {
@@ -740,7 +773,7 @@ namespace ShadowStrike {
 
                 // Update parent pointer
                 if (node->parentOffset != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->parentOffset);
+                    auto maybeOffset = findOffsetForPointer(node->parentOffset);
                     if (maybeOffset.has_value()) {
                         node->parentOffset = maybeOffset.value();
                     }
@@ -750,7 +783,7 @@ namespace ShadowStrike {
                 if (!node->isLeaf) {
                     for (uint32_t j = 0; j <= node->keyCount; ++j) {
                         if (node->children[j] != 0) {
-                            auto maybeOffset = findOffsetForTruncatedPointer(node->children[j]);
+                            auto maybeOffset = findOffsetForPointer(node->children[j]);
                             if (maybeOffset.has_value()) {
                                 node->children[j] = maybeOffset.value();
                             }
@@ -760,13 +793,13 @@ namespace ShadowStrike {
 
                 // Update leaf linked list pointers
                 if (node->nextLeaf != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->nextLeaf);
+                    auto maybeOffset = findOffsetForPointer(node->nextLeaf);
                     if (maybeOffset.has_value()) {
                         node->nextLeaf = maybeOffset.value();
                     }
                 }
                 if (node->prevLeaf != 0) {
-                    auto maybeOffset = findOffsetForTruncatedPointer(node->prevLeaf);
+                    auto maybeOffset = findOffsetForPointer(node->prevLeaf);
                     if (maybeOffset.has_value()) {
                         node->prevLeaf = maybeOffset.value();
                     }
@@ -840,8 +873,8 @@ namespace ShadowStrike {
             // STEP 8: ATOMICALLY UPDATE ROOT POINTER
             // ========================================================================
 
-            uint32_t oldRootOffset = m_rootOffset.load(std::memory_order_acquire);
-            uint32_t newRootOffset = oldRootOffset;
+            uint64_t oldRootOffset = m_rootOffset.load(std::memory_order_acquire);
+            uint64_t newRootOffset = oldRootOffset;
 
             // Find root in COW pool (typically first node, but check all)
             // The root is the node with m_cowRootNode set
@@ -850,7 +883,7 @@ namespace ShadowStrike {
                 if (it != nodeOffsetMap.end()) {
                     newRootOffset = it->second;
                     SS_LOG_DEBUG(L"SignatureIndex",
-                        L"CommitCOWInternal: Root offset update: 0x%X → 0x%X",
+                        L"CommitCOWInternal: Root offset update: 0x%llX → 0x%llX",
                         oldRootOffset, newRootOffset);
                 }
             }
@@ -860,7 +893,7 @@ namespace ShadowStrike {
                 if (it != nodeOffsetMap.end() && m_cowNodes[0]->parentOffset == 0) {
                     newRootOffset = it->second;
                     SS_LOG_DEBUG(L"SignatureIndex",
-                        L"CommitCOWInternal: Root offset update (fallback): 0x%X → 0x%X",
+                        L"CommitCOWInternal: Root offset update (fallback): 0x%llX → 0x%llX",
                         oldRootOffset, newRootOffset);
                 }
             }
@@ -897,12 +930,13 @@ namespace ShadowStrike {
             // STEP 11: CLEAR COW POOL AND INVALIDATE CACHE
             // ========================================================================
 
-            m_cowNodes.clear();
-            // Also clear tracking maps to prevent stale references
+            // CRITICAL: Clear tracking maps BEFORE freeing nodes to prevent
+            // dangling pointer lookups via FindCOWNodeByAddr during the window
+            // between node deallocation and map clearing.
             m_fileOffsetToCOWNode.clear();
             m_ptrAddrToCOWNode.clear();
-            // Reset COW root pointer since it's now committed
             m_cowRootNode = nullptr;
+            m_cowNodes.clear();
 
             // CRITICAL FIX: Invalidate node cache after commit
             // The cache may hold stale pointers to old node locations that have been
@@ -936,8 +970,16 @@ namespace ShadowStrike {
 
             uint64_t commitTimeUs = 0;
             if (m_perfFrequency.QuadPart > 0) {
-                commitTimeUs = ((commitEndTime.QuadPart - commitStartTime.QuadPart) * 1000000ULL) /
-                    static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                const int64_t elapsed = commitEndTime.QuadPart - commitStartTime.QuadPart;
+                if (elapsed > 0) {
+                    const uint64_t elapsedU = static_cast<uint64_t>(elapsed);
+                    const uint64_t freqU = static_cast<uint64_t>(m_perfFrequency.QuadPart);
+                    if (elapsedU > UINT64_MAX / 1000000ULL) {
+                        commitTimeUs = (elapsedU / freqU) * 1000000ULL;
+                    } else {
+                        commitTimeUs = (elapsedU * 1000000ULL) / freqU;
+                    }
+                }
             }
 
             SS_LOG_DEBUG(L"SignatureIndex",

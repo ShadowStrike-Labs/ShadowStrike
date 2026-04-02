@@ -323,15 +323,103 @@ SignatureBuilder::SignatureBuilder(const BuildConfiguration& config)
 }
 
 SignatureBuilder::~SignatureBuilder() {
-    if (m_outputFile != INVALID_HANDLE_VALUE) {
-        CloseHandle(m_outputFile);
+    CleanupOutputHandles();
+}
+
+void SignatureBuilder::CleanupOutputHandles() noexcept {
+    // CRITICAL: Cleanup order must be unmap -> mapping -> file.
+    // Unmapping first ensures dirty pages are flushed before handles close.
+    if (m_outputBase) {
+        UnmapViewOfFile(m_outputBase);
+        m_outputBase = nullptr;
     }
     if (m_outputMapping != INVALID_HANDLE_VALUE) {
         CloseHandle(m_outputMapping);
+        m_outputMapping = INVALID_HANDLE_VALUE;
     }
-    if (m_outputBase) {
-        UnmapViewOfFile(m_outputBase);
+    if (m_outputFile != INVALID_HANDLE_VALUE) {
+        CloseHandle(m_outputFile);
+        m_outputFile = INVALID_HANDLE_VALUE;
     }
+}
+
+// ============================================================================
+// MOVE OPERATIONS (raw handles require manual nulling in source)
+// ============================================================================
+
+SignatureBuilder::SignatureBuilder(SignatureBuilder&& other) noexcept
+    : m_config(std::move(other.m_config))
+    , m_statistics(std::move(other.m_statistics))
+    , m_pendingHashes(std::move(other.m_pendingHashes))
+    , m_pendingPatterns(std::move(other.m_pendingPatterns))
+    , m_pendingYaraRules(std::move(other.m_pendingYaraRules))
+    , m_hashFingerprints(std::move(other.m_hashFingerprints))
+    , m_patternFingerprints(std::move(other.m_patternFingerprints))
+    , m_yaraRuleNames(std::move(other.m_yaraRuleNames))
+    , m_outputFile(other.m_outputFile)
+    , m_outputMapping(other.m_outputMapping)
+    , m_outputBase(other.m_outputBase)
+    , m_outputSize(other.m_outputSize)
+    , m_currentOffset(other.m_currentOffset)
+    , m_buildInProgress(other.m_buildInProgress.load(std::memory_order_relaxed))
+    , m_currentStage(std::move(other.m_currentStage))
+    , m_customDeduplication(std::move(other.m_customDeduplication))
+    , m_customOptimization(std::move(other.m_customOptimization))
+    , m_incrementalMode(other.m_incrementalMode)
+    , m_perfFrequency(other.m_perfFrequency)
+    , m_buildStartTime(other.m_buildStartTime)
+{
+    // Null out source to prevent double-free
+    other.m_outputFile = INVALID_HANDLE_VALUE;
+    other.m_outputMapping = INVALID_HANDLE_VALUE;
+    other.m_outputBase = nullptr;
+    other.m_outputSize = 0;
+    other.m_currentOffset = 0;
+}
+
+SignatureBuilder& SignatureBuilder::operator=(SignatureBuilder&& other) noexcept {
+    if (this != &other) {
+        // Clean up our existing resources first (correct order)
+        if (m_outputBase) {
+            UnmapViewOfFile(m_outputBase);
+        }
+        if (m_outputMapping != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_outputMapping);
+        }
+        if (m_outputFile != INVALID_HANDLE_VALUE) {
+            CloseHandle(m_outputFile);
+        }
+
+        // Transfer ownership
+        m_config = std::move(other.m_config);
+        m_statistics = std::move(other.m_statistics);
+        m_pendingHashes = std::move(other.m_pendingHashes);
+        m_pendingPatterns = std::move(other.m_pendingPatterns);
+        m_pendingYaraRules = std::move(other.m_pendingYaraRules);
+        m_hashFingerprints = std::move(other.m_hashFingerprints);
+        m_patternFingerprints = std::move(other.m_patternFingerprints);
+        m_yaraRuleNames = std::move(other.m_yaraRuleNames);
+        m_outputFile = other.m_outputFile;
+        m_outputMapping = other.m_outputMapping;
+        m_outputBase = other.m_outputBase;
+        m_outputSize = other.m_outputSize;
+        m_currentOffset = other.m_currentOffset;
+        m_buildInProgress.store(other.m_buildInProgress.load(std::memory_order_relaxed));
+        m_currentStage = std::move(other.m_currentStage);
+        m_customDeduplication = std::move(other.m_customDeduplication);
+        m_customOptimization = std::move(other.m_customOptimization);
+        m_incrementalMode = other.m_incrementalMode;
+        m_perfFrequency = other.m_perfFrequency;
+        m_buildStartTime = other.m_buildStartTime;
+
+        // Null out source
+        other.m_outputFile = INVALID_HANDLE_VALUE;
+        other.m_outputMapping = INVALID_HANDLE_VALUE;
+        other.m_outputBase = nullptr;
+        other.m_outputSize = 0;
+        other.m_currentOffset = 0;
+    }
+    return *this;
 }
 
 void SignatureBuilder::SetConfiguration(const BuildConfiguration& config) noexcept {
@@ -726,6 +814,7 @@ StoreError SignatureBuilder::Build() noexcept {
     ReportProgress("Validation", 0, 7);
     StoreError err = ValidateInputs();
     if (!err.IsSuccess()) {
+        CleanupOutputHandles();
         m_buildInProgress.store(false);
         return err;
     }
@@ -734,6 +823,7 @@ StoreError SignatureBuilder::Build() noexcept {
     ReportProgress("Deduplication", 1, 7);
     err = Deduplicate();
     if (!err.IsSuccess()) {
+        CleanupOutputHandles();
         m_buildInProgress.store(false);
         return err;
     }
@@ -742,6 +832,7 @@ StoreError SignatureBuilder::Build() noexcept {
     ReportProgress("Optimization", 2, 7);
     err = Optimize();
     if (!err.IsSuccess()) {
+        CleanupOutputHandles();
         m_buildInProgress.store(false);
         return err;
     }
@@ -750,6 +841,7 @@ StoreError SignatureBuilder::Build() noexcept {
     ReportProgress("Index Construction", 3, 7);
     err = BuildIndices();
     if (!err.IsSuccess()) {
+        CleanupOutputHandles();
         m_buildInProgress.store(false);
         return err;
     }
@@ -758,6 +850,7 @@ StoreError SignatureBuilder::Build() noexcept {
     ReportProgress("Serialization", 4, 7);
     err = Serialize();
     if (!err.IsSuccess()) {
+        CleanupOutputHandles();
         m_buildInProgress.store(false);
         return err;
     }
@@ -811,54 +904,71 @@ StoreError SignatureBuilder::ValidateInputs() noexcept {
 }
 
 StoreError SignatureBuilder::ValidateHashInputs() noexcept {
-    for (const auto& input : m_pendingHashes) {
-        if (input.name.empty()) {
-            m_statistics.invalidSignaturesSkipped++;
-            continue;
-        }
+    // Remove invalid hashes from the pending list rather than just logging.
+    // Invalid entries that persist through the pipeline will corrupt the database.
+    auto removeIt = std::remove_if(m_pendingHashes.begin(), m_pendingHashes.end(),
+        [this](const HashSignatureInput& input) {
+            if (input.name.empty()) {
+                m_statistics.invalidSignaturesSkipped++;
+                SS_LOG_WARN(L"SignatureBuilder", L"ValidateHashInputs: Empty name - removing");
+                return true;
+            }
 
-        // Validate hash length matches type
-        uint8_t expectedLen = 0;
-        switch (input.hash.type) {
-            case HashType::MD5:    expectedLen = 16; break;
-            case HashType::SHA1:   expectedLen = 20; break;
-            case HashType::SHA256: expectedLen = 32; break;
-            case HashType::SHA512: expectedLen = 64; break;
-            default: break;
-        }
+            uint8_t expectedLen = 0;
+            switch (input.hash.type) {
+                case HashType::MD5:    expectedLen = 16; break;
+                case HashType::SHA1:   expectedLen = 20; break;
+                case HashType::SHA256: expectedLen = 32; break;
+                case HashType::SHA512: expectedLen = 64; break;
+                default: break;
+            }
 
-        if (expectedLen != 0 && input.hash.length != expectedLen) {
-            m_statistics.invalidSignaturesSkipped++;
-            SS_LOG_WARN(L"SignatureBuilder", L"Invalid hash length for %S", input.name.c_str());
-        }
-    }
+            if (expectedLen != 0 && input.hash.length != expectedLen) {
+                m_statistics.invalidSignaturesSkipped++;
+                SS_LOG_WARN(L"SignatureBuilder", L"ValidateHashInputs: Invalid hash length for %S - removing",
+                    input.name.c_str());
+                return true;
+            }
+            return false;
+        });
 
+    m_pendingHashes.erase(removeIt, m_pendingHashes.end());
     return StoreError{SignatureStoreError::Success};
 }
 
 StoreError SignatureBuilder::ValidatePatternInputs() noexcept {
-    for (const auto& input : m_pendingPatterns) {
-        std::string errorMsg;
-        if (!PatternStore::PatternUtils::IsValidPatternString(input.patternString, errorMsg)) {
-            m_statistics.invalidSignaturesSkipped++;
-            SS_LOG_WARN(L"SignatureBuilder", L"Invalid pattern: %S", errorMsg.c_str());
-        }
-    }
+    auto removeIt = std::remove_if(m_pendingPatterns.begin(), m_pendingPatterns.end(),
+        [this](const PatternSignatureInput& input) {
+            std::string errorMsg;
+            if (!PatternStore::PatternUtils::IsValidPatternString(input.patternString, errorMsg)) {
+                m_statistics.invalidSignaturesSkipped++;
+                SS_LOG_WARN(L"SignatureBuilder", L"ValidatePatternInputs: Invalid pattern: %S - removing",
+                    errorMsg.c_str());
+                return true;
+            }
+            return false;
+        });
 
+    m_pendingPatterns.erase(removeIt, m_pendingPatterns.end());
     return StoreError{SignatureStoreError::Success};
 }
 
 StoreError SignatureBuilder::ValidateYaraInputs() noexcept {
-    for (const auto& input : m_pendingYaraRules) {
-        std::vector<std::string> errors;
-        if (!YaraUtils::ValidateRuleSyntax(input.ruleSource, errors)) {
-            m_statistics.invalidSignaturesSkipped++;
-            for (const auto& error : errors) {
-                SS_LOG_WARN(L"SignatureBuilder", L"YARA error: %S", error.c_str());
+    auto removeIt = std::remove_if(m_pendingYaraRules.begin(), m_pendingYaraRules.end(),
+        [this](const YaraRuleInput& input) {
+            std::vector<std::string> errors;
+            if (!YaraUtils::ValidateRuleSyntax(input.ruleSource, errors)) {
+                m_statistics.invalidSignaturesSkipped++;
+                for (const auto& error : errors) {
+                    SS_LOG_WARN(L"SignatureBuilder", L"ValidateYaraInputs: YARA error: %S - removing",
+                        error.c_str());
+                }
+                return true;
             }
-        }
-    }
+            return false;
+        });
 
+    m_pendingYaraRules.erase(removeIt, m_pendingYaraRules.end());
     return StoreError{SignatureStoreError::Success};
 }
 
@@ -870,27 +980,103 @@ bool SignatureBuilder::ValidateDatabaseChecksum(const std::wstring& databasePath
         return false;
     }
 
+    if (view.fileSize < sizeof(SignatureDatabaseHeader)) {
+        MemoryMapping::CloseView(view);
+        return false;
+    }
+
     const auto* header = view.GetAt<SignatureDatabaseHeader>(0);
     if (!header) {
         MemoryMapping::CloseView(view);
         return false;
     }
 
-    // Compute checksum and compare
-    std::span<const uint8_t> buffer(
-        static_cast<const uint8_t*>(view.baseAddress),
-        static_cast<size_t>(view.fileSize)
-    );
+    // Save the stored checksum, then zero the field in a local copy for hashing.
+    // The checksum was computed over the file with the checksum field zeroed,
+    // so we must replicate that to validate.
+    std::array<uint8_t, 32> storedChecksum{};
+    std::memcpy(storedChecksum.data(), header->sha256Checksum.data(), 32);
 
-    auto computedHash = ComputeBufferHash(buffer, HashType::SHA256);
+    // Compute hash of entire file with checksum field treated as zeros.
+    // We hash in two spans: [0, checksumFieldOffset) and [checksumFieldEnd, fileSize).
+    // Between them we feed 32 zero bytes.
+    const uint8_t* fileBase = static_cast<const uint8_t*>(view.baseAddress);
+    const size_t checksumFieldOffset = offsetof(SignatureDatabaseHeader, sha256Checksum);
+    const size_t checksumFieldEnd = checksumFieldOffset + 32;
 
-    MemoryMapping::CloseView(view);
-
-    if (!computedHash.has_value()) {
+    // Use CNG for streaming hash
+    BCRYPT_ALG_HANDLE hAlg = nullptr;
+    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        MemoryMapping::CloseView(view);
         return false;
     }
 
-    return std::memcmp(computedHash->data.data(), header->sha256Checksum.data(), 32) == 0;
+    BCRYPT_HASH_HANDLE hHash = nullptr;
+    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0, nullptr, 0, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        MemoryMapping::CloseView(view);
+        return false;
+    }
+
+    // Hash: [0, checksumFieldOffset)
+    if (checksumFieldOffset > 0) {
+        status = BCryptHashData(hHash, const_cast<PUCHAR>(fileBase),
+            static_cast<ULONG>(checksumFieldOffset), 0);
+        if (!BCRYPT_SUCCESS(status)) {
+            BCryptDestroyHash(hHash);
+            BCryptCloseAlgorithmProvider(hAlg, 0);
+            MemoryMapping::CloseView(view);
+            return false;
+        }
+    }
+
+    // Hash: 32 zero bytes in place of the checksum field
+    std::array<uint8_t, 32> zeroes{};
+    status = BCryptHashData(hHash, zeroes.data(), 32, 0);
+    if (!BCRYPT_SUCCESS(status)) {
+        BCryptDestroyHash(hHash);
+        BCryptCloseAlgorithmProvider(hAlg, 0);
+        MemoryMapping::CloseView(view);
+        return false;
+    }
+
+    // Hash: [checksumFieldEnd, fileSize)
+    if (checksumFieldEnd < static_cast<size_t>(view.fileSize)) {
+        size_t remaining = static_cast<size_t>(view.fileSize) - checksumFieldEnd;
+        // Process in 1MB chunks to stay within ULONG limits
+        size_t offset = checksumFieldEnd;
+        while (remaining > 0) {
+            ULONG chunk = static_cast<ULONG>(std::min(remaining, size_t(1024 * 1024)));
+            status = BCryptHashData(hHash, const_cast<PUCHAR>(fileBase + offset), chunk, 0);
+            if (!BCRYPT_SUCCESS(status)) {
+                BCryptDestroyHash(hHash);
+                BCryptCloseAlgorithmProvider(hAlg, 0);
+                MemoryMapping::CloseView(view);
+                return false;
+            }
+            offset += chunk;
+            remaining -= chunk;
+        }
+    }
+
+    std::array<uint8_t, 32> computedHash{};
+    status = BCryptFinishHash(hHash, computedHash.data(), 32, 0);
+    BCryptDestroyHash(hHash);
+    BCryptCloseAlgorithmProvider(hAlg, 0);
+    MemoryMapping::CloseView(view);
+
+    if (!BCRYPT_SUCCESS(status)) {
+        return false;
+    }
+
+    // Constant-time comparison
+    uint8_t diff = 0;
+    for (size_t i = 0; i < 32; ++i) {
+        diff |= (computedHash[i] ^ storedChecksum[i]);
+    }
+    return diff == 0;
 }
 
 // ============================================================================
@@ -1026,18 +1212,28 @@ StoreError SignatureBuilder::Optimize() noexcept {
     LARGE_INTEGER startTime;
     QueryPerformanceCounter(&startTime);
 
+    // Optimize hash layout for cache locality
+    StoreError err = OptimizeHashes();
+    if (!err.IsSuccess()) {
+        return err;
+    }
+
+    // Optimize patterns by entropy analysis
     if (m_config.enableEntropyOptimization) {
-        StoreError err = OptimizePatterns();
+        err = OptimizePatterns();
         if (!err.IsSuccess()) {
             return err;
         }
     }
+
+    // YARA rules optimized by compiler (no additional optimization needed)
+
     LARGE_INTEGER endTime;
     QueryPerformanceCounter(&endTime);
-    
+
     // HARDENED: Division-by-zero protection
     if (m_perfFrequency.QuadPart > 0) {
-        m_statistics.optimizationTimeMilliseconds = 
+        m_statistics.optimizationTimeMilliseconds =
             ((endTime.QuadPart - startTime.QuadPart) * 1000ULL) / m_perfFrequency.QuadPart;
     } else {
         m_statistics.optimizationTimeMilliseconds = 0;
@@ -1609,25 +1805,43 @@ std::string SignatureBuilder::GetCurrentStage() const noexcept {
 
 uint64_t SignatureBuilder::CalculateRequiredSize() const noexcept {
     uint64_t size = 0;
+    constexpr uint64_t MAX_SAFE_SIZE = UINT64_MAX / 2; // Overflow guard
 
     // Header
     size += sizeof(SignatureDatabaseHeader);
     size = Format::AlignToPage(size);
 
-    // Hash index (estimate)
-    size += m_pendingHashes.size() * 128; // Rough estimate
+    // Hash index (estimate) — safe multiply check
+    const uint64_t hashCount = static_cast<uint64_t>(m_pendingHashes.size());
+    if (hashCount > 0 && hashCount <= MAX_SAFE_SIZE / 128) {
+        size += hashCount * 128;
+    } else if (hashCount > 0) {
+        return m_config.initialDatabaseSize; // Overflow: fall back to default
+    }
     size = Format::AlignToPage(size);
 
     // Pattern index (estimate)
-    size += m_pendingPatterns.size() * 256;
+    const uint64_t patCount = static_cast<uint64_t>(m_pendingPatterns.size());
+    if (patCount > 0 && patCount <= MAX_SAFE_SIZE / 256) {
+        size += patCount * 256;
+    } else if (patCount > 0) {
+        return m_config.initialDatabaseSize;
+    }
     size = Format::AlignToPage(size);
 
     // YARA rules (estimate)
-    size += m_pendingYaraRules.size() * 1024;
+    const uint64_t yaraCount = static_cast<uint64_t>(m_pendingYaraRules.size());
+    if (yaraCount > 0 && yaraCount <= MAX_SAFE_SIZE / 1024) {
+        size += yaraCount * 1024;
+    } else if (yaraCount > 0) {
+        return m_config.initialDatabaseSize;
+    }
     size = Format::AlignToPage(size);
 
-    // Add 20% overhead
-    size = static_cast<uint64_t>(size * 1.2);
+    // Add 20% overhead (integer arithmetic, no float conversion)
+    if (size <= MAX_SAFE_SIZE / 6) {
+        size = size + size / 5;
+    }
 
     return std::max(size, m_config.initialDatabaseSize);
 }

@@ -261,12 +261,13 @@ private:
     // ========================================================================
 
     // Get node from cache or load from memory
+    // NOTE (v1.1): Parameter widened from uint32_t to uint64_t to support >4GB indices.
     [[nodiscard]] const BPlusTreeNode* GetNode(
-        uint32_t nodeOffset
+        uint64_t nodeOffset
     ) const noexcept;
 
     // Invalidate cache entry
-    void InvalidateCacheEntry(uint32_t nodeOffset) noexcept;
+    void InvalidateCacheEntry(uint64_t nodeOffset) noexcept;
 
     // Clear entire cache
     void ClearCache() noexcept;
@@ -389,22 +390,33 @@ private:
     // Maps file offset → COW node pointer (for updating parent children after clone)
     // When we clone a node from file offset X, we record m_fileOffsetToCOWNode[X] = cowNode
     // When we clone a parent, we can update its children[] to point to existing COW nodes
-    // NOTE: During COW, children[] temporarily stores pointer addresses (cast from 64-bit
-    // to 32-bit for storage). The full 64-bit address is tracked in m_ptrAddrToCOWNode.
-    std::unordered_map<uint32_t, BPlusTreeNode*> m_fileOffsetToCOWNode;
+    // NOTE (v1.1): Key type changed from uint32_t to uint64_t to support databases > 4GB.
+    // During COW, children[] stores full 64-bit pointer addresses since the field is now
+    // uint64_t in BPlusTreeNode. The full address is also tracked in m_ptrAddrToCOWNode.
+    std::unordered_map<uint64_t, BPlusTreeNode*> m_fileOffsetToCOWNode;
     
     // Maps memory address → COW node pointer (for COW tree traversal)
     // When we create a COW node and store its address in children[],
     // we need to resolve it back to the actual node during traversal.
-    // NOTE: Uses uintptr_t key to preserve full 64-bit pointer on x64 systems.
-    // The children[] array stores uint32_t offsets, but during COW we temporarily
-    // store full pointer addresses (cast to uint32_t for storage, but tracked here
-    // with full precision to avoid collision issues on 64-bit systems).
+    // NOTE (v1.1): Since BPlusTreeNode::children[] is now uint64_t, we store
+    // the FULL pointer address directly (no truncation needed). The map key
+    // uses uintptr_t which matches the stored value exactly on 64-bit systems.
     std::unordered_map<uintptr_t, BPlusTreeNode*> m_ptrAddrToCOWNode;
-    
-    // Helper: Find COW node by truncated address (lower 32 bits of pointer)
-    // Returns nullptr if not found. Handles 64-bit pointer lookup correctly.
-    // NOTE: Linear scan is acceptable as COW node count is small (<1000 per transaction)
+
+    // Helper: Find COW node by address stored in children[]/parentOffset/nextLeaf/prevLeaf.
+    // Since BPlusTreeNode fields are now uint64_t, we store full pointer addresses and
+    // perform exact lookup. Returns nullptr if not found.
+    [[nodiscard]] BPlusTreeNode* FindCOWNodeByAddr(uint64_t addr) const noexcept {
+        if (addr == 0) return nullptr;
+        auto it = m_ptrAddrToCOWNode.find(static_cast<uintptr_t>(addr));
+        if (it != m_ptrAddrToCOWNode.end()) {
+            return it->second;
+        }
+        return nullptr;
+    }
+
+    // DEPRECATED: Retained for backward compatibility during transition.
+    // Prefer FindCOWNodeByAddr() which does exact 64-bit lookup.
     [[nodiscard]] BPlusTreeNode* FindCOWNodeByTruncatedAddr(uint32_t truncatedAddr) const noexcept {
         for (const auto& [fullAddr, node] : m_ptrAddrToCOWNode) {
             if (static_cast<uint32_t>(fullAddr) == truncatedAddr) {
@@ -432,7 +444,8 @@ private:
     [[nodiscard]] static uint64_t GetCurrentTimeNs() noexcept;
 
     // Hash function for node cache
-    [[nodiscard]] static size_t HashNodeOffset(uint32_t offset) noexcept;
+    // NOTE (v1.1): Parameter widened from uint32_t to uint64_t to support >4GB indices.
+    [[nodiscard]] static size_t HashNodeOffset(uint64_t offset) noexcept;
 };
 
 // ============================================================================

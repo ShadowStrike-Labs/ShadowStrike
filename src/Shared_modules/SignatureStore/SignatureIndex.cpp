@@ -833,10 +833,11 @@ uint64_t SignatureIndex::GetCurrentTimeNs() noexcept {
  * 
  * Uses Knuth's multiplicative hash for good distribution.
  */
-size_t SignatureIndex::HashNodeOffset(uint32_t offset) noexcept {
+size_t SignatureIndex::HashNodeOffset(uint64_t offset) noexcept {
     // Knuth's multiplicative hash - provides good distribution
-    constexpr uint32_t KNUTH_MULTIPLIER = 2654435761u;
-    return static_cast<size_t>(offset) * KNUTH_MULTIPLIER;
+    // NOTE (v1.1): Uses 64-bit multiplier for full offset range support
+    constexpr uint64_t KNUTH_MULTIPLIER = 11400714819323198485ULL; // 2^64 / phi
+    return static_cast<size_t>(offset * KNUTH_MULTIPLIER);
 }
 
 // ============================================================================

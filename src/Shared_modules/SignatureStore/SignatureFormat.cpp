@@ -152,7 +152,7 @@ namespace Format {
     // HEADER VALIDATION (Enterprise-Grade with Overflow Protection)
     // ============================================================================
 
-    bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept {
+    bool ValidateHeader(const SignatureDatabaseHeader* header, uint64_t fileSize) noexcept {
         if (!header) {
             SS_LOG_ERROR(L"SignatureStore", L"ValidateHeader: null header pointer");
             return false;
@@ -242,6 +242,41 @@ namespace Format {
         if (!checkNoOverflow(header->yaraRulesOffset, header->yaraRulesSize, L"YARA rules")) return false;
         if (!checkNoOverflow(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
         if (!checkNoOverflow(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
+
+        // ========================================================================
+        // STEP 4.5: SECTION-WITHIN-FILE BOUNDS VALIDATION
+        // ========================================================================
+        // When fileSize is known (> 0), verify all section extents fit within the
+        // file. Without this, a crafted header with offsets past EOF passes
+        // validation and causes OOB reads on the memory-mapped region.
+
+        if (fileSize > 0) {
+            auto checkWithinFile = [fileSize](uint64_t offset, uint64_t size, const wchar_t* name) -> bool {
+                if (offset == 0 && size == 0) return true; // Empty section
+                if (offset > 0 && size > 0) {
+                    uint64_t end = offset + size; // Overflow excluded in Step 4
+                    if (end > fileSize) {
+                        SS_LOG_ERROR(L"SignatureStore",
+                            L"%s extends beyond file boundary: end 0x%llX > fileSize 0x%llX",
+                            name, end, fileSize);
+                        return false;
+                    }
+                }
+                // Non-zero offset with zero size (or vice versa) is suspicious
+                if ((offset > 0) != (size > 0)) {
+                    SS_LOG_WARN(L"SignatureStore",
+                        L"%s has mismatched offset/size: offset=0x%llX, size=0x%llX",
+                        name, offset, size);
+                }
+                return true;
+            };
+
+            if (!checkWithinFile(header->hashIndexOffset, header->hashIndexSize, L"Hash index")) return false;
+            if (!checkWithinFile(header->patternIndexOffset, header->patternIndexSize, L"Pattern index")) return false;
+            if (!checkWithinFile(header->yaraRulesOffset, header->yaraRulesSize, L"YARA rules")) return false;
+            if (!checkWithinFile(header->metadataOffset, header->metadataSize, L"Metadata")) return false;
+            if (!checkWithinFile(header->stringPoolOffset, header->stringPoolSize, L"String pool")) return false;
+        }
 
         // ========================================================================
         // STEP 5: SECTION OVERLAP DETECTION (with size consideration)
@@ -1047,7 +1082,7 @@ bool OpenView(const std::wstring& path, bool readOnly, MemoryMappedView& view, S
     // ========================================================================
 
     const auto* header = reinterpret_cast<const SignatureDatabaseHeader*>(viewGuard.Get());
-    if (!Format::ValidateHeader(header)) {
+    if (!Format::ValidateHeader(header, fileSize)) {
         error.code = SignatureStoreError::InvalidFormat;
         error.win32Error = 0;
         error.message = "Invalid database header";

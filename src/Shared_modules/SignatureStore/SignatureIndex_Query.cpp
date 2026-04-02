@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureIndex.hpp"
-#include"../../src/Utils/Logger.hpp"
+#include"../Utils/Logger.hpp"
 #include<unordered_set>
 
 namespace ShadowStrike {
