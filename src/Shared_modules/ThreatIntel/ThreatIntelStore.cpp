@@ -291,7 +291,8 @@ namespace {
     } else if (algorithm == "SHA256" || algorithm == "sha256" || algorithm == "SHA-256") {
         hash.algorithm = HashAlgorithm::SHA256;
     } else if (algorithm == "SHA384" || algorithm == "sha384" || algorithm == "SHA-384") {
-        hash.algorithm = HashAlgorithm::SHA256;  // Store as SHA256, closest match
+        // SHA384 has no matching enum — reject rather than silently misclassify
+        return std::nullopt;
     } else if (algorithm == "SHA512" || algorithm == "sha512" || algorithm == "SHA-512") {
         hash.algorithm = HashAlgorithm::SHA512;
     } else {
@@ -450,6 +451,9 @@ public:
     /// @brief Main read-write lock
     mutable std::shared_mutex rwLock;
 
+    /// @brief Flag indicating indexes need rebuild after IOC mutations
+    std::atomic<bool> indexDirty{false};
+
     // ========================================================================
     // Helper Methods
     // ========================================================================
@@ -532,9 +536,10 @@ public:
         
         // Map lookup tier depth based on cache settings
         if (!storeOpts.useCache) {
-            opts.maxLookupTiers = 4;  // Skip cache, go to index/database
+            opts.maxLookupTiers = 3;  // Skip cache tier
+            opts.cacheResult = false;
         } else {
-            opts.maxLookupTiers = 4;  // Use all local tiers
+            opts.maxLookupTiers = 4;  // Use all local tiers including cache
         }
         
         // Map confidence threshold
@@ -944,6 +949,8 @@ StoreLookupResult ThreatIntelStore::LookupHash(
     std::string_view hashValue,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -999,14 +1006,16 @@ StoreLookupResult ThreatIntelStore::LookupHash(
     uint64_t hashLow,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
 
-    // Convert to HashValue structure (assume SHA256 from 128-bit input)
+    // Convert to HashValue structure (128-bit input → 16 bytes of actual data)
     HashValue hash{};
     hash.algorithm = HashAlgorithm::SHA256;
-    hash.length = 32;
+    hash.length = 16;  // Only 128 bits of hash data available
     
     // Store as big-endian
     for (int i = 0; i < 8; ++i) {
@@ -1023,6 +1032,8 @@ StoreLookupResult ThreatIntelStore::LookupIPv4(
     std::string_view address,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1036,6 +1047,8 @@ StoreLookupResult ThreatIntelStore::LookupIPv4(
     uint32_t address,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1049,6 +1062,8 @@ StoreLookupResult ThreatIntelStore::LookupIPv6(
     std::string_view address,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1063,6 +1078,8 @@ StoreLookupResult ThreatIntelStore::LookupIPv6(
     uint64_t addressLow,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1085,6 +1102,8 @@ StoreLookupResult ThreatIntelStore::LookupDomain(
     std::string_view domain,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1098,6 +1117,8 @@ StoreLookupResult ThreatIntelStore::LookupURL(
     std::string_view url,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1111,6 +1132,8 @@ StoreLookupResult ThreatIntelStore::LookupEmail(
     std::string_view email,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1124,6 +1147,8 @@ StoreLookupResult ThreatIntelStore::LookupJA3(
     std::string_view fingerprint,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1137,6 +1162,8 @@ StoreLookupResult ThreatIntelStore::LookupCVE(
     std::string_view cveId,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1151,6 +1178,8 @@ StoreLookupResult ThreatIntelStore::LookupIOC(
     std::string_view value,
     const StoreLookupOptions& options
 ) noexcept {
+    std::shared_lock<std::shared_mutex> readLock(m_impl->rwLock);
+
     if (!IsInitialized() || !m_impl->lookup) {
         return StoreLookupResult{};
     }
@@ -1397,25 +1426,32 @@ bool ThreatIntelStore::AddIOC(const IOCEntry& entry) noexcept {
         return false;
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+    bool success = false;
+    StoreEvent event;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    IOCAddOptions addOpts;
-    addOpts.defaultTTL = DefaultConstants::DATABASE_IOC_TTL;
-    auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-    
-    if (opResult.success) {
-        m_impl->stats.totalImportedEntries.fetch_add(1, std::memory_order_relaxed);
+        IOCAddOptions addOpts;
+        addOpts.defaultTTL = DefaultConstants::DATABASE_IOC_TTL;
+        auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+        success = opResult.success;
         
-        // Fire event
-        StoreEvent event;
-        event.type = StoreEventType::IOCAdded;
-        event.timestamp = std::chrono::system_clock::now();
-        event.entry = entry;
-        event.iocType = entry.type;
+        if (success) {
+            m_impl->stats.totalImportedEntries.fetch_add(1, std::memory_order_relaxed);
+            m_impl->indexDirty.store(true, std::memory_order_relaxed);
+            
+            event.type = StoreEventType::IOCAdded;
+            event.timestamp = std::chrono::system_clock::now();
+            event.entry = entry;
+            event.iocType = entry.type;
+        }
+    } // rwLock released
+
+    if (success) {
         m_impl->FireEvent(event);
     }
 
-    return opResult.success;
+    return success;
 }
 
 bool ThreatIntelStore::AddIOC(
@@ -1479,21 +1515,47 @@ bool ThreatIntelStore::UpdateIOC(const IOCEntry& entry) noexcept {
         return false;
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+    bool success = false;
+    StoreEvent event;
+    IOCEntry entryCopy = entry;  // Copy for post-lock cache invalidation
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    auto opResult = m_impl->iocManager->UpdateIOC(entry);
-    
-    if (opResult.success) {
-        // Fire event
-        StoreEvent event;
-        event.type = StoreEventType::IOCUpdated;
-        event.timestamp = std::chrono::system_clock::now();
-        event.entry = entry;
-        event.iocType = entry.type;
+        auto opResult = m_impl->iocManager->UpdateIOC(entry);
+        success = opResult.success;
+        
+        if (success) {
+            m_impl->indexDirty.store(true, std::memory_order_relaxed);
+
+            event.type = StoreEventType::IOCUpdated;
+            event.timestamp = std::chrono::system_clock::now();
+            event.entry = entry;
+            event.iocType = entry.type;
+        }
+    } // rwLock released
+
+    if (success) {
+        // Invalidate stale cache entry
+        if (m_impl->cache) {
+            switch (entryCopy.type) {
+                case IOCType::FileHash:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.hash));
+                    break;
+                case IOCType::IPv4:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.ipv4));
+                    break;
+                case IOCType::IPv6:
+                    m_impl->cache->Remove(CacheKey(entryCopy.value.ipv6));
+                    break;
+                default:
+                    break;  // String-based types expire via TTL
+            }
+        }
+
         m_impl->FireEvent(event);
     }
 
-    return opResult.success;
+    return success;
 }
 
 bool ThreatIntelStore::RemoveIOC(IOCType type, std::string_view value) noexcept {
@@ -1501,21 +1563,34 @@ bool ThreatIntelStore::RemoveIOC(IOCType type, std::string_view value) noexcept 
         return false;
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+    bool success = false;
+    StoreEvent event;
+    std::string valueCopy(value);  // Copy for post-lock cache invalidation
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    // Call DeleteIOC with type and value
-    auto opResult = m_impl->iocManager->DeleteIOC(type, std::string(value));
-    
-    if (opResult.success) {
-        // Fire event
-        StoreEvent event;
-        event.type = StoreEventType::IOCRemoved;
-        event.timestamp = std::chrono::system_clock::now();
-        event.iocType = type;
+        auto opResult = m_impl->iocManager->DeleteIOC(type, std::string(value));
+        success = opResult.success;
+        
+        if (success) {
+            m_impl->indexDirty.store(true, std::memory_order_relaxed);
+
+            event.type = StoreEventType::IOCRemoved;
+            event.timestamp = std::chrono::system_clock::now();
+            event.iocType = type;
+        }
+    } // rwLock released
+
+    if (success) {
+        // Invalidate stale cache entry
+        if (m_impl->cache) {
+            m_impl->cache->Remove(CacheKey(type, valueCopy));
+        }
+
         m_impl->FireEvent(event);
     }
 
-    return opResult.success;
+    return success;
 }
 
 size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept {
@@ -1528,26 +1603,30 @@ size_t ThreatIntelStore::BulkAddIOCs(std::span<const IOCEntry> entries) noexcept
         return 0;
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
-
     size_t added = 0;
-    IOCAddOptions addOpts;
-    for (const auto& entry : entries) {
-        auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-        if (opResult.success) {
-            ++added;
-        }
-    }
+    StoreEvent event;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
 
-    // Update statistics atomically
+        IOCAddOptions addOpts;
+        for (const auto& entry : entries) {
+            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+            if (opResult.success) {
+                ++added;
+            }
+        }
+
+        if (added > 0) {
+            m_impl->stats.totalImportedEntries.fetch_add(added, std::memory_order_relaxed);
+            m_impl->indexDirty.store(true, std::memory_order_relaxed);
+            
+            event.type = StoreEventType::DataImported;
+            event.timestamp = std::chrono::system_clock::now();
+            event.iocType = std::nullopt;
+        }
+    } // rwLock released
+
     if (added > 0) {
-        m_impl->stats.totalImportedEntries.fetch_add(added, std::memory_order_relaxed);
-        
-        // Fire bulk event to notify listeners
-        StoreEvent event;
-        event.type = StoreEventType::DataImported;
-        event.timestamp = std::chrono::system_clock::now();
-        event.iocType = std::nullopt;  // Mixed types in bulk - no specific type
         m_impl->FireEvent(event);
     }
 
@@ -2167,6 +2246,13 @@ ImportResult ThreatIntelStore::ImportSTIX(
         result.bytesRead = std::filesystem::file_size(path);
     } catch (const std::filesystem::filesystem_error& e) {
         result.errorMessage = std::string("Filesystem error: ") + e.what();
+        return result;
+    }
+    
+    // Cap file size to prevent excessive memory allocation from hostile input
+    static constexpr size_t MAX_IMPORT_FILE_SIZE = 512 * 1024 * 1024; // 512 MB
+    if (static_cast<size_t>(result.bytesRead) > MAX_IMPORT_FILE_SIZE) {
+        result.errorMessage = "Import file exceeds maximum allowed size (512 MB)";
         return result;
     }
     
@@ -2813,6 +2899,13 @@ ImportResult ThreatIntelStore::ImportJSON(
         result.bytesRead = std::filesystem::file_size(path);
     } catch (const std::filesystem::filesystem_error& e) {
         result.errorMessage = std::string("Filesystem error: ") + e.what();
+        return result;
+    }
+    
+    // Cap file size to prevent excessive memory allocation from hostile input
+    static constexpr size_t MAX_IMPORT_FILE_SIZE = 512 * 1024 * 1024; // 512 MB
+    if (static_cast<size_t>(result.bytesRead) > MAX_IMPORT_FILE_SIZE) {
+        result.errorMessage = "Import file exceeds maximum allowed size (512 MB)";
         return result;
     }
     
