@@ -312,7 +312,7 @@ inline void FullMemoryBarrier() noexcept {
     // Fallback software implementation
     value = value - ((value >> 1) & 0x55555555);
     value = (value & 0x33333333) + ((value >> 2) & 0x33333333);
-    return ((value + (value >> 4) & 0x0F0F0F0F) * 0x01010101) >> 24;
+    return (((value + (value >> 4)) & 0x0F0F0F0F) * 0x01010101) >> 24;
 #endif
 }
 
@@ -666,7 +666,7 @@ template<typename T>
     
     uint32_t hash = 0;
     
-#if defined(_MSC_VER) && defined(__SSE4_2__)
+#if defined(_MSC_VER)
     // Use hardware CRC32 if available
     if (HasSSE42()) {
         hash = 0xFFFFFFFF;
@@ -706,18 +706,49 @@ template<typename T>
             return path.empty() ? true : false; // Empty is valid, too long is invalid
         }
         
+        // PI-2 fix: Resolve 8.3 short names to long names (NTFS evasion prevention)
+        std::wstring resolvedPath;
+        {
+            std::wstring tempPath(path.data(), path.size());
+            constexpr DWORD MAX_LONG_PATH = 32767;
+            resolvedPath.resize(MAX_LONG_PATH);
+            const DWORD longLen = GetLongPathNameW(
+                tempPath.c_str(), resolvedPath.data(),
+                static_cast<DWORD>(resolvedPath.size()));
+            if (longLen > 0 && longLen < resolvedPath.size()) {
+                resolvedPath.resize(longLen);
+            } else {
+                resolvedPath = std::move(tempPath);
+            }
+        }
+        
+        // PI-4 fix: Normalize Unicode to NFC form (prevent NFD evasion)
+        {
+            int nfcLen = NormalizeString(NormalizationC, resolvedPath.c_str(),
+                static_cast<int>(resolvedPath.length()), nullptr, 0);
+            if (nfcLen > 0) {
+                std::wstring nfcPath;
+                nfcPath.resize(static_cast<size_t>(nfcLen));
+                nfcLen = NormalizeString(NormalizationC, resolvedPath.c_str(),
+                    static_cast<int>(resolvedPath.length()), nfcPath.data(), nfcLen);
+                if (nfcLen > 0) {
+                    nfcPath.resize(static_cast<size_t>(nfcLen));
+                    resolvedPath = std::move(nfcPath);
+                }
+            }
+        }
+        
         // Reserve with overflow protection (check BEFORE multiplication)
         // Worst case UTF-8 expansion is 3x for BMP characters
-        if (path.length() > SIZE_MAX / 3) {
+        if (resolvedPath.length() > SIZE_MAX / 3) {
             return false; // Would overflow
         }
-        const size_t maxSize = path.length() * 3;
+        const size_t maxSize = resolvedPath.length() * 3;
         output.reserve(maxSize);
         
-        for (wchar_t wc : path) {
-            // Convert to lowercase for case-insensitive matching (Windows paths)
-            // Only ASCII letters need conversion for basic path normalization
-            wchar_t lower = (wc >= L'A' && wc <= L'Z') ? (wc + 32) : wc;
+        for (wchar_t wc : resolvedPath) {
+            // PI-5 fix: Full Unicode-aware case folding (not ASCII-only)
+            wchar_t lower = static_cast<wchar_t>(towlower(static_cast<wint_t>(wc)));
             
             // Normalize path separators (Windows to Unix style)
             if (lower == L'\\') {
@@ -743,6 +774,17 @@ template<typename T>
         // Remove trailing slashes (iterate safely)
         while (!output.empty() && output.back() == '/') {
             output.pop_back();
+        }
+        
+        // PI-3 fix: Strip NTFS Alternate Data Streams (:streamname)
+        // Skip drive letter colon (position 1, e.g., "c:")
+        for (size_t i = 2; i < output.size(); ++i) {
+            if (output[i] == ':') {
+                size_t segEnd = output.find('/', i);
+                if (segEnd == std::string::npos) segEnd = output.size();
+                output.erase(i, segEnd - i);
+                break;
+            }
         }
         
         // SECURITY FIX: Robust path traversal detection and normalization.
@@ -1443,7 +1485,11 @@ std::vector<uint64_t> PathIndex::Lookup(
                     // Check if queryPath (normalizedPath) ENDS WITH storedPattern
                     if (normalizedPath.length() >= storedPattern.length() &&
                         normalizedPath.substr(normalizedPath.length() - storedPattern.length()) == storedPattern) {
-                        results.push_back(node->entryOffset);
+                        // PI-7 fix: verify match at segment boundary to prevent partial matches
+                        size_t matchStart = normalizedPath.length() - storedPattern.length();
+                        if (matchStart == 0 || normalizedPath[matchStart - 1] == '/') {
+                            results.push_back(node->entryOffset);
+                        }
                     }
                 }
                 
@@ -1456,6 +1502,34 @@ std::vector<uint64_t> PathIndex::Lookup(
             
             std::vector<std::string> pathParts;
             traverse(m_heapRoot.get(), pathParts, 0);
+        }
+        
+        // ====================================================================
+        // CONTAINS MATCH - Substring pattern matching
+        // PI-1 fix: Contains mode was completely unimplemented
+        // ====================================================================
+        else if (mode == PathMatchMode::Contains) {
+            std::function<void(const HeapTrieNode*, std::string&, size_t)> traverse;
+            traverse = [&](const HeapTrieNode* node, std::string& accPath, size_t depth) {
+                if (!node || results.size() >= MAX_RESULTS || depth >= SAFE_MAX_TRIE_DEPTH) return;
+                
+                if (node->isTerminal && node->matchMode == PathMatchMode::Contains) {
+                    if (!accPath.empty() && normalizedPath.find(accPath) != std::string::npos) {
+                        results.push_back(node->entryOffset);
+                    }
+                }
+                
+                for (const auto& [segment, child] : node->children) {
+                    size_t prevLen = accPath.size();
+                    if (!accPath.empty()) accPath.push_back('/');
+                    accPath.append(segment);
+                    traverse(child.get(), accPath, depth + 1);
+                    accPath.resize(prevLen);
+                }
+            };
+            
+            std::string accPath;
+            traverse(m_heapRoot.get(), accPath, 0);
         }
         
         // ====================================================================
@@ -1779,7 +1853,7 @@ StoreError PathIndex::Insert(
             normalizedPath.reserve(path.length() * 3); // Worst case UTF-8
             for (wchar_t wc : path) {
                 // Convert to lowercase for case-insensitive matching
-                wchar_t lower = (wc >= L'A' && wc <= L'Z') ? (wc + 32) : wc;
+                wchar_t lower = static_cast<wchar_t>(towlower(static_cast<wint_t>(wc)));
                 
                 // UTF-8 encoding
                 if (lower < 0x80) {
@@ -1799,6 +1873,20 @@ StoreError PathIndex::Insert(
                 "Pattern conversion failed"
             );
         }
+        
+        // PI-8 fix: validate regex pattern is not a ReDoS bomb before storing
+        {
+            size_t nestingDepth = 0, maxNesting = 0, quantifierCount = 0;
+            for (char c : normalizedPath) {
+                if (c == '(') { ++nestingDepth; maxNesting = std::max(maxNesting, nestingDepth); }
+                if (c == ')') { if (nestingDepth > 0) --nestingDepth; }
+                if (c == '+' || c == '*') ++quantifierCount;
+            }
+            if (maxNesting > 5 || quantifierCount > 10) {
+                return StoreError::WithMessage(WhitelistStoreError::InvalidEntry,
+                    "Regex pattern rejected: potential ReDoS risk");
+            }
+        }
     } else if (mode == PathMatchMode::Glob) {
         // For Glob patterns, normalize backslash to forward slash (to match lookup)
         // but preserve wildcard characters (* and ?)
@@ -1808,7 +1896,7 @@ StoreError PathIndex::Insert(
                 // Convert backslash to forward slash for consistent path matching
                 wchar_t ch = (wc == L'\\') ? L'/' : wc;
                 // Convert to lowercase
-                wchar_t lower = (ch >= L'A' && ch <= L'Z') ? (ch + 32) : ch;
+                wchar_t lower = static_cast<wchar_t>(towlower(static_cast<wint_t>(ch)));
                 
                 // UTF-8 encoding
                 if (lower < 0x80) {
@@ -2033,13 +2121,37 @@ StoreError PathIndex::Remove(
         );
     }
     
-    // Normalize path
+    // PI-6 fix: Mode-specific normalization mirroring Insert() behavior
     std::string normalizedPath;
-    if (!NormalizePath(path, normalizedPath)) {
-        return StoreError::WithMessage(
-            WhitelistStoreError::InvalidEntry,
-            "Path normalization failed"
-        );
+    if (mode == PathMatchMode::Regex || mode == PathMatchMode::Glob) {
+        // For regex/glob, do simple lowercase + separator conversion (no path resolution)
+        try {
+            normalizedPath.reserve(path.length() * 3);
+            for (wchar_t wc : path) {
+                wchar_t lower = static_cast<wchar_t>(towlower(static_cast<wint_t>(wc)));
+                if (lower == L'\\') lower = L'/';
+                if (lower < 0x80) {
+                    normalizedPath.push_back(static_cast<char>(lower));
+                } else if (lower < 0x800) {
+                    normalizedPath.push_back(static_cast<char>(0xC0 | (lower >> 6)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                } else {
+                    normalizedPath.push_back(static_cast<char>(0xE0 | (lower >> 12)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | ((lower >> 6) & 0x3F)));
+                    normalizedPath.push_back(static_cast<char>(0x80 | (lower & 0x3F)));
+                }
+            }
+        } catch (...) {
+            return StoreError::WithMessage(WhitelistStoreError::AllocationFailed,
+                "Failed to normalize path for removal");
+        }
+    } else {
+        if (!NormalizePath(path, normalizedPath)) {
+            return StoreError::WithMessage(
+                WhitelistStoreError::InvalidEntry,
+                "Path normalization failed during removal"
+            );
+        }
     }
     
     if (normalizedPath.empty()) {
@@ -2085,8 +2197,8 @@ StoreError PathIndex::Remove(
             );
         }
         
-        // For exact mode matching, verify the mode (unless searching any mode)
-        if (mode != PathMatchMode::Exact && node->matchMode != mode) {
+        // For exact mode matching, verify the mode
+        if (node->matchMode != mode) {
             return StoreError::WithMessage(
                 WhitelistStoreError::EntryNotFound,
                 "Path found but match mode differs"
@@ -2873,7 +2985,16 @@ StoreError PathIndex::FlushRecordsToStorage() noexcept {
     constexpr uint64_t RECORDS_START_OFFSET = 80;           // Offset where records begin
     
     const size_t recordCount = m_pathRecords.size();
-    const uint64_t requiredSize = RECORDS_START_OFFSET + (recordCount * sizeof(PathEntryRecord));
+    // PI-10 fix: Overflow-checked arithmetic for record size calculation
+    uint64_t recordBytes = 0;
+    if (recordCount > 0 && sizeof(PathEntryRecord) > UINT64_MAX / recordCount) {
+        return StoreError::WithMessage(WhitelistStoreError::IndexFull, "Record size overflow");
+    }
+    recordBytes = static_cast<uint64_t>(recordCount) * static_cast<uint64_t>(sizeof(PathEntryRecord));
+    if (recordBytes > UINT64_MAX - RECORDS_START_OFFSET) {
+        return StoreError::WithMessage(WhitelistStoreError::IndexFull, "Total size overflow");
+    }
+    const uint64_t requiredSize = RECORDS_START_OFFSET + recordBytes;
     
     // Check if we have enough space
     if (requiredSize > m_indexSize) {
@@ -2886,7 +3007,8 @@ StoreError PathIndex::FlushRecordsToStorage() noexcept {
         );
     }
     
-    auto* basePtr = static_cast<uint8_t*>(m_baseAddress);
+    // PI-14 fix: Write to correct offset by adding m_indexOffset to base
+    auto* basePtr = static_cast<uint8_t*>(m_baseAddress) + m_indexOffset;
     
     try {
         // Write record count
@@ -2981,8 +3103,24 @@ StoreError PathIndex::LoadRecordsFromStorage() noexcept {
         return StoreError::Success();
     }
     
-    // Validate space for all records
-    const uint64_t requiredSize = RECORDS_START_OFFSET + (recordCount * sizeof(PathEntryRecord));
+    // PI-11 fix: Overflow-checked arithmetic for record size calculation
+    uint64_t recordBytes = 0;
+    if (recordCount > 0 && sizeof(PathEntryRecord) > UINT64_MAX / recordCount) {
+        SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage: record size overflow");
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Record size overflow"
+        );
+    }
+    recordBytes = static_cast<uint64_t>(recordCount) * static_cast<uint64_t>(sizeof(PathEntryRecord));
+    if (recordBytes > UINT64_MAX - RECORDS_START_OFFSET) {
+        SS_LOG_ERROR(L"Whitelist", L"LoadRecordsFromStorage: total size overflow");
+        return StoreError::WithMessage(
+            WhitelistStoreError::IndexCorrupted,
+            "Total size overflow"
+        );
+    }
+    const uint64_t requiredSize = RECORDS_START_OFFSET + recordBytes;
     if (requiredSize > m_indexSize) {
         SS_LOG_ERROR(L"Whitelist", 
             L"LoadRecordsFromStorage: insufficient data for %llu records", recordCount);
