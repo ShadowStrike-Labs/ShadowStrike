@@ -407,15 +407,15 @@ struct PinnedCertificate {
  * @brief Statistics
  */
 struct VerifierStatistics {
-    std::atomic<uint64_t> verificationsPerformed{0};
-    std::atomic<uint64_t> verificationsSucceeded{0};
-    std::atomic<uint64_t> verificationsFailed{0};
-    std::atomic<uint64_t> signatureVerifications{0};
-    std::atomic<uint64_t> hashVerifications{0};
-    std::atomic<uint64_t> chainValidations{0};
-    std::atomic<uint64_t> revocationChecks{0};
-    std::atomic<uint64_t> downgradeAttempts{0};
-    std::array<std::atomic<uint64_t>, 16> byStatus{};
+    uint64_t verificationsPerformed{0};
+    uint64_t verificationsSucceeded{0};
+    uint64_t verificationsFailed{0};
+    uint64_t signatureVerifications{0};
+    uint64_t hashVerifications{0};
+    uint64_t chainValidations{0};
+    uint64_t revocationChecks{0};
+    uint64_t downgradeAttempts{0};
+    std::array<uint64_t, 16> byStatus{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
