@@ -134,10 +134,24 @@ IndexBloomFilter& IndexBloomFilter::operator=(IndexBloomFilter&& other) noexcept
 }
 
 void IndexBloomFilter::Add(const IOCEntry& entry) noexcept {
-    // Compute hash from entry data
-    const uint64_t hash = HashString(std::string_view(
-        reinterpret_cast<const char*>(&entry), sizeof(entry)));
-    Add(hash);
+    // Hash only the discriminating fields (entryId + type + value) to avoid
+    // non-deterministic results from padding/reserved bytes
+    uint64_t h = 14695981039346656037ULL;  // FNV-1a offset basis
+    // Mix in entryId
+    const auto* idBytes = reinterpret_cast<const uint8_t*>(&entry.entryId);
+    for (size_t i = 0; i < sizeof(entry.entryId); ++i) {
+        h ^= static_cast<uint64_t>(idBytes[i]);
+        h *= 1099511628211ULL;
+    }
+    // Mix in type discriminator
+    h ^= static_cast<uint64_t>(static_cast<uint8_t>(entry.type));
+    h *= 1099511628211ULL;
+    // Mix in raw value bytes (the union, excluding padding)
+    for (size_t i = 0; i < sizeof(entry.value.raw); ++i) {
+        h ^= static_cast<uint64_t>(entry.value.raw[i]);
+        h *= 1099511628211ULL;
+    }
+    Add(h);
 }
 
 void IndexBloomFilter::Add(uint64_t hash) noexcept {
@@ -163,9 +177,20 @@ void IndexBloomFilter::BatchAdd(std::span<const IOCEntry> entries) noexcept {
 }
 
 bool IndexBloomFilter::MightContain(const IOCEntry& entry) const noexcept {
-    const uint64_t hash = HashString(std::string_view(
-        reinterpret_cast<const char*>(&entry), sizeof(entry)));
-    return MightContain(hash);
+    // Must use the same field-based hash as Add()
+    uint64_t h = 14695981039346656037ULL;
+    const auto* idBytes = reinterpret_cast<const uint8_t*>(&entry.entryId);
+    for (size_t i = 0; i < sizeof(entry.entryId); ++i) {
+        h ^= static_cast<uint64_t>(idBytes[i]);
+        h *= 1099511628211ULL;
+    }
+    h ^= static_cast<uint64_t>(static_cast<uint8_t>(entry.type));
+    h *= 1099511628211ULL;
+    for (size_t i = 0; i < sizeof(entry.value.raw); ++i) {
+        h ^= static_cast<uint64_t>(entry.value.raw[i]);
+        h *= 1099511628211ULL;
+    }
+    return MightContain(h);
 }
 
 bool IndexBloomFilter::MightContain(uint64_t hash) const noexcept {
@@ -423,9 +448,9 @@ namespace {
 
 // Get bit at position from IPv6 address (0 = MSB)
 [[nodiscard]] inline bool GetBit(const IPv6Address& addr, uint8_t pos) noexcept {
-    const uint8_t byteIdx = pos / 8;
-    const uint8_t bitIdx = 7 - (pos % 8);  // MSB first
-    return (addr.groups[byteIdx / 2] >> (8 * (1 - byteIdx % 2) + bitIdx)) & 1;
+    const uint8_t byteIdx = pos / 8;        // 0-15
+    const uint8_t bitIdx = 7 - (pos % 8);   // MSB first within byte
+    return (addr.address[byteIdx] >> bitIdx) & 1;
 }
 
 }// anonymous namespace

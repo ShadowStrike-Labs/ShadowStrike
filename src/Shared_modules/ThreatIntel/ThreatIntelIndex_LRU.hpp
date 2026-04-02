@@ -174,6 +174,9 @@ namespace ThreatIntel {
             void Clear() noexcept {
                 std::unique_lock<std::shared_mutex> lock(m_mutex);
 
+                // Clear map first to eliminate dangling pointer references
+                m_map.clear();
+
                 CacheNode* current = m_head;
                 while (current != nullptr) {
                     CacheNode* next = current->next;
@@ -183,7 +186,6 @@ namespace ThreatIntel {
 
                 m_head = nullptr;
                 m_tail = nullptr;
-                m_map.clear();
             }
 
             [[nodiscard]] size_t Size() const noexcept {

@@ -65,8 +65,7 @@ namespace ThreatIntel {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
 
-                        // Count bloom filter rejections as failed lookups for statistics
-                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        // Bloom rejection is an optimization, not a lookup failure
                         m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
@@ -691,11 +690,23 @@ namespace ThreatIntel {
                 const uint64_t* keys,
                 size_t count
             ) noexcept {
-                uint32_t resultMask = 0;
-                const size_t filterSizeMask = filterSize - 1;  // Assumes power of 2
+                // Validate filterSize is a power of 2 and non-zero
+                if (filterSize == 0 || (filterSize & (filterSize - 1)) != 0) {
+                    return 0;  // Invalid filter size - reject all
+                }
 
-                // Process up to 8 keys at a time
-                for (size_t i = 0; i < count && i < 32; ++i) {
+                const size_t filterWordCount = filterSize >> 6;  // filterSize / 64
+                if (filterWordCount == 0) {
+                    return 0;
+                }
+
+                uint32_t resultMask = 0;
+                const size_t filterSizeMask = filterSize - 1;
+
+                const size_t safeCount = (count < 32) ? count : 32;
+
+                // Process up to 32 keys
+                for (size_t i = 0; i < safeCount; ++i) {
                     // Compute multiple hash functions
                     uint64_t k = keys[i];
                     bool mightExist = true;
@@ -710,13 +721,14 @@ namespace ThreatIntel {
                         uint64_t wordIndex = bitPos >> 6;
                         uint64_t bitIndex = bitPos & 63;
 
-                        if ((filter[wordIndex] & (1ULL << bitIndex)) == 0) {
+                        if (wordIndex >= filterWordCount ||
+                            (filter[wordIndex] & (1ULL << bitIndex)) == 0) {
                             mightExist = false;
                         }
                     }
 
                     if (mightExist) {
-                        resultMask |= (1U << i);
+                        resultMask |= (1U << static_cast<uint32_t>(i));
                     }
                 }
 
@@ -1232,9 +1244,12 @@ namespace ThreatIntel {
                 }
             }
 
-            // Update statistics (note: Lookup already updates some stats, adjust accordingly)
+            // Update statistics for bloom-rejected entries only
+            // Note: Lookup() already updates totalLookups/successfulLookups/failedLookups
+            // for entries that pass the bloom filter, so we only track bloom rejects here
             if (bloomRejects > 0) {
                 m_impl->stats.bloomFilterRejects.fetch_add(bloomRejects, std::memory_order_relaxed);
+                m_impl->stats.totalLookups.fetch_add(bloomRejects, std::memory_order_relaxed);
             }
 
             if (options.collectStatistics && count > 0) {

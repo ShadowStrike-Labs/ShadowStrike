@@ -193,7 +193,7 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Domain:
-                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0) {
+                if (m_impl->domainIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
                     // Get domain string from view
                     std::string_view domain = m_impl->view->GetString(
                         entry.value.stringRef.stringOffset,
@@ -214,7 +214,7 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::URL:
-                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0) {
+                if (m_impl->urlIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
                     std::string_view url = m_impl->view->GetString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
@@ -234,7 +234,7 @@ namespace ThreatIntel {
                 break;
 
             case IOCType::Email:
-                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0) {
+                if (m_impl->emailIndex && entry.value.stringRef.stringOffset > 0 && m_impl->view) {
                     std::string_view email = m_impl->view->GetString(
                         entry.value.stringRef.stringOffset,
                         entry.value.stringRef.stringLength
@@ -258,7 +258,7 @@ namespace ThreatIntel {
                 if (m_impl->genericIndex) {
                     uint64_t key = 0;
 
-                    if (entry.value.stringRef.stringOffset > 0) {
+                    if (entry.value.stringRef.stringOffset > 0 && m_impl->view) {
                         std::string_view value = m_impl->view->GetString(
                             entry.value.stringRef.stringOffset,
                             entry.value.stringRef.stringLength
@@ -669,11 +669,82 @@ namespace ThreatIntel {
             }
 
             if (!insertSucceeded) {
-                // Rollback: Try to re-insert old entry (best effort)
-                // This is a simplified rollback - enterprise systems would use WAL
+                // Rollback: re-insert old entry to prevent data loss
+                bool rollbackOk = false;
+                IndexValue oldIndexValue(oldEntry.entryId, 0);  // offset=0 signals needs-resolution
+
+                switch (oldEntry.type) {
+                case IOCType::IPv4:
+                    if (m_impl->ipv4Index) {
+                        rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, oldIndexValue);
+                    }
+                    break;
+                case IOCType::IPv6:
+                    if (m_impl->ipv6Index) {
+                        rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, oldIndexValue);
+                    }
+                    break;
+                case IOCType::FileHash:
+                    if (!m_impl->hashIndexes.empty()) {
+                        size_t algoIndex = static_cast<size_t>(oldEntry.value.hash.algorithm);
+                        if (algoIndex < m_impl->hashIndexes.size() && m_impl->hashIndexes[algoIndex]) {
+                            rollbackOk = m_impl->hashIndexes[algoIndex]->Insert(oldEntry.value.hash, oldIndexValue);
+                        }
+                    }
+                    break;
+                case IOCType::Domain:
+                    if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        auto d = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                            oldEntry.value.stringRef.stringLength);
+                        rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                    }
+                    break;
+                case IOCType::URL:
+                    if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                            oldEntry.value.stringRef.stringLength);
+                        rollbackOk = m_impl->urlIndex->Insert(u, oldIndexValue);
+                    }
+                    break;
+                case IOCType::Email:
+                    if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                        auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                            oldEntry.value.stringRef.stringLength);
+                        rollbackOk = m_impl->emailIndex->Insert(e, oldIndexValue);
+                    }
+                    break;
+                default:
+                    if (m_impl->genericIndex && m_impl->view) {
+                        uint64_t key = 0;
+                        if (oldEntry.value.stringRef.stringOffset > 0) {
+                            auto v = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset,
+                                oldEntry.value.stringRef.stringLength);
+                            key = HashString(v);
+                        } else {
+                            std::memcpy(&key, oldEntry.value.raw, sizeof(uint64_t));
+                        }
+                        rollbackOk = m_impl->genericIndex->Insert(key, oldIndexValue);
+                    }
+                    break;
+                }
+
+                if (rollbackOk) {
+                    // Restore decremented stats from removal phase
+                    switch (oldEntry.type) {
+                    case IOCType::IPv4: ++m_impl->stats.ipv4Entries; break;
+                    case IOCType::IPv6: ++m_impl->stats.ipv6Entries; break;
+                    case IOCType::FileHash: ++m_impl->stats.hashEntries; break;
+                    case IOCType::Domain: ++m_impl->stats.domainEntries; break;
+                    case IOCType::URL: ++m_impl->stats.urlEntries; break;
+                    case IOCType::Email: ++m_impl->stats.emailEntries; break;
+                    default: ++m_impl->stats.otherEntries; break;
+                    }
+                }
+
                 return StoreError::WithMessage(
                     ThreatIntelError::IndexFull,
-                    "Failed to insert new entry during update"
+                    rollbackOk ? "Insert failed during update; old entry restored"
+                               : "Insert failed during update; rollback also failed - entry lost"
                 );
             }
 
@@ -968,6 +1039,60 @@ namespace ThreatIntel {
                     ++successCount;
                 }
                 else {
+                    // Insert failed after successful remove - attempt rollback
+                    bool rollbackOk = false;
+                    IndexValue oldIndexValue(oldEntry.entryId, 0);
+
+                    switch (oldEntry.type) {
+                    case IOCType::IPv4:
+                        if (m_impl->ipv4Index) rollbackOk = m_impl->ipv4Index->Insert(oldEntry.value.ipv4, oldIndexValue);
+                        break;
+                    case IOCType::IPv6:
+                        if (m_impl->ipv6Index) rollbackOk = m_impl->ipv6Index->Insert(oldEntry.value.ipv6, oldIndexValue);
+                        break;
+                    case IOCType::FileHash:
+                        if (!m_impl->hashIndexes.empty()) {
+                            size_t idx = static_cast<size_t>(oldEntry.value.hash.algorithm);
+                            if (idx < m_impl->hashIndexes.size() && m_impl->hashIndexes[idx])
+                                rollbackOk = m_impl->hashIndexes[idx]->Insert(oldEntry.value.hash, oldIndexValue);
+                        }
+                        break;
+                    case IOCType::Domain:
+                        if (m_impl->domainIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            auto d = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                            rollbackOk = m_impl->domainIndex->Insert(d, oldIndexValue);
+                        }
+                        break;
+                    case IOCType::URL:
+                        if (m_impl->urlIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            auto u = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                            rollbackOk = m_impl->urlIndex->Insert(u, oldIndexValue);
+                        }
+                        break;
+                    case IOCType::Email:
+                        if (m_impl->emailIndex && oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                            auto e = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                            rollbackOk = m_impl->emailIndex->Insert(e, oldIndexValue);
+                        }
+                        break;
+                    default:
+                        if (m_impl->genericIndex) {
+                            uint64_t key = 0;
+                            if (oldEntry.value.stringRef.stringOffset > 0 && m_impl->view) {
+                                auto v = m_impl->view->GetString(oldEntry.value.stringRef.stringOffset, oldEntry.value.stringRef.stringLength);
+                                key = HashString(v);
+                            } else {
+                                std::memcpy(&key, oldEntry.value.raw, sizeof(uint64_t));
+                            }
+                            rollbackOk = m_impl->genericIndex->Insert(key, oldIndexValue);
+                        }
+                        break;
+                    }
+
+                    if (!rollbackOk) {
+                        // Critical: entry permanently lost from index after failed update
+                        // Per-type stats unaffected (BatchUpdate doesn't modify type counters)
+                    }
                     ++failCount;
                 }
             }
