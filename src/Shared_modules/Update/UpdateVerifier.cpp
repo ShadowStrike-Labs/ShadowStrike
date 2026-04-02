@@ -106,7 +106,7 @@ public:
     void RecordStatus(VerificationStatus status) {
         const auto idx = static_cast<size_t>(status);
         if (idx < m_stats.byStatus.size()) {
-            m_stats.byStatus[idx].fetch_add(1, std::memory_order_relaxed);
+            m_stats.byStatus[idx]++;
         }
     }
 
@@ -296,16 +296,16 @@ std::string PinnedCertificate::ToJson() const {
 // --- VerifierStatistics ---
 
 void VerifierStatistics::Reset() noexcept {
-    verificationsPerformed.store(0, std::memory_order_relaxed);
-    verificationsSucceeded.store(0, std::memory_order_relaxed);
-    verificationsFailed.store(0, std::memory_order_relaxed);
-    signatureVerifications.store(0, std::memory_order_relaxed);
-    hashVerifications.store(0, std::memory_order_relaxed);
-    chainValidations.store(0, std::memory_order_relaxed);
-    revocationChecks.store(0, std::memory_order_relaxed);
-    downgradeAttempts.store(0, std::memory_order_relaxed);
+    verificationsPerformed = 0;
+    verificationsSucceeded = 0;
+    verificationsFailed = 0;
+    signatureVerifications = 0;
+    hashVerifications = 0;
+    chainValidations = 0;
+    revocationChecks = 0;
+    downgradeAttempts = 0;
     for (auto& s : byStatus) {
-        s.store(0, std::memory_order_relaxed);
+        s = 0;
     }
     startTime = Clock::now();
 }
@@ -313,21 +313,21 @@ void VerifierStatistics::Reset() noexcept {
 std::string VerifierStatistics::ToJson() const {
     std::ostringstream os;
     os << "{\"verificationsPerformed\":"
-       << verificationsPerformed.load(std::memory_order_relaxed)
+       << verificationsPerformed
        << ",\"verificationsSucceeded\":"
-       << verificationsSucceeded.load(std::memory_order_relaxed)
+       << verificationsSucceeded
        << ",\"verificationsFailed\":"
-       << verificationsFailed.load(std::memory_order_relaxed)
+       << verificationsFailed
        << ",\"signatureVerifications\":"
-       << signatureVerifications.load(std::memory_order_relaxed)
+       << signatureVerifications
        << ",\"hashVerifications\":"
-       << hashVerifications.load(std::memory_order_relaxed)
+       << hashVerifications
        << ",\"chainValidations\":"
-       << chainValidations.load(std::memory_order_relaxed)
+       << chainValidations
        << ",\"revocationChecks\":"
-       << revocationChecks.load(std::memory_order_relaxed)
+       << revocationChecks
        << ",\"downgradeAttempts\":"
-       << downgradeAttempts.load(std::memory_order_relaxed)
+       << downgradeAttempts
        << "}";
     return os.str();
 }
@@ -488,13 +488,13 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
         return result;
     }
 
-    m_impl->m_stats.verificationsPerformed.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.verificationsPerformed++;
 
     // --- Input validation ---
     if (filePath.empty()) {
         result.status = VerificationStatus::Unknown;
         result.errorMessage = "Empty file path";
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(result.status);
         m_impl->NotifyVerification(result);
         return result;
@@ -504,7 +504,7 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
         result.errorMessage = "Empty signature";
         SS_LOG_ERROR(kLogCategory, L"Empty signature provided for: %s",
             filePath.wstring().c_str());
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(result.status);
         m_impl->NotifyVerification(result);
         return result;
@@ -515,13 +515,13 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
     if (!hashOpt.has_value()) {
         result.status = VerificationStatus::HashMismatch;
         result.errorMessage = "Failed to compute file hash";
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(result.status);
         m_impl->NotifyVerification(result);
         return result;
     }
     result.actualHash = hashOpt.value();
-    m_impl->m_stats.hashVerifications.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.hashVerifications++;
 
     // --- Cryptographic signature verification ---
     {
@@ -534,7 +534,7 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
         {
             result.status = VerificationStatus::HashMismatch;
             result.errorMessage = "Failed to re-hash file for signature check";
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             return result;
@@ -577,7 +577,7 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
                 std::span<const uint8_t>(signature.data(), signature.size()));
         }
 
-        m_impl->m_stats.signatureVerifications.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.signatureVerifications++;
 
         if (!sigValid) {
             // Signature failed — but let's also try Authenticode if this is a PE.
@@ -598,7 +598,7 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
                 SS_LOG_ERROR(kLogCategory,
                     L"Signature verification failed for package: %s",
                     filePath.wstring().c_str());
-                m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+                m_impl->m_stats.verificationsFailed++;
                 m_impl->RecordStatus(result.status);
                 m_impl->NotifyVerification(result);
                 result.durationMs = static_cast<uint32_t>(
@@ -627,7 +627,7 @@ VerificationResult UpdateVerifier::VerifyPackageFull(
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - startTp).count());
 
-    m_impl->m_stats.verificationsSucceeded.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.verificationsSucceeded++;
     m_impl->RecordStatus(result.status);
     m_impl->NotifyVerification(result);
 
@@ -652,11 +652,11 @@ bool UpdateVerifier::VerifyHash(
         return false;
     }
 
-    m_impl->m_stats.hashVerifications.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.hashVerifications++;
 
     auto actualOpt = m_impl->HashFile(filePath);
     if (!actualOpt.has_value()) {
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         return false;
     }
 
@@ -666,7 +666,7 @@ bool UpdateVerifier::VerifyHash(
             L"Hash mismatch for %s (expected length=%zu, actual length=%zu)",
             filePath.wstring().c_str(),
             expectedHash.size(), actualOpt.value().size());
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(VerificationStatus::HashMismatch);
     }
 
@@ -684,7 +684,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
         return result;
     }
 
-    m_impl->m_stats.verificationsPerformed.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.verificationsPerformed++;
 
     // Validate manifest structure.
     if (!manifest.IsValid()) {
@@ -692,7 +692,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
         result.errorMessage = "Invalid manifest structure";
         SS_LOG_ERROR(kLogCategory, L"Invalid manifest for package: %S",
             manifest.packageId.c_str());
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(result.status);
         m_impl->NotifyVerification(result);
         return result;
@@ -706,7 +706,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             L"Manifest file count %zu exceeds cap %zu for package: %S",
             manifest.files.size(), kMaxManifestFiles,
             manifest.packageId.c_str());
-        m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.verificationsFailed++;
         m_impl->RecordStatus(result.status);
         m_impl->NotifyVerification(result);
         return result;
@@ -718,7 +718,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             result.status = VerificationStatus::VersionDowngrade;
             result.errorMessage = "Manifest version fails anti-downgrade check";
             result.versionString = manifest.version;
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             result.durationMs = static_cast<uint32_t>(
@@ -749,7 +749,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
         {
             result.status = VerificationStatus::Unknown;
             result.errorMessage = "Failed to hash manifest canonical form";
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             return result;
@@ -760,7 +760,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             std::span<const uint8_t>(digest.data(), digest.size()),
             std::span<const uint8_t>(manifest.signature.data(), manifest.signature.size()));
 
-        m_impl->m_stats.signatureVerifications.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.signatureVerifications++;
 
         if (!sigOk) {
             result.status = VerificationStatus::InvalidSignature;
@@ -768,7 +768,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             SS_LOG_ERROR(kLogCategory,
                 L"Manifest signature invalid for package: %S",
                 manifest.packageId.c_str());
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             result.durationMs = static_cast<uint32_t>(
@@ -787,7 +787,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
         if (!actualOpt.has_value()) {
             result.status = VerificationStatus::HashMismatch;
             result.errorMessage = "Failed to hash manifest file: " + relPath;
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             result.durationMs = static_cast<uint32_t>(
@@ -804,7 +804,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             SS_LOG_ERROR(kLogCategory,
                 L"Manifest hash mismatch for file: %S in package: %S",
                 relPath.c_str(), manifest.packageId.c_str());
-            m_impl->m_stats.verificationsFailed.fetch_add(1, std::memory_order_relaxed);
+            m_impl->m_stats.verificationsFailed++;
             m_impl->RecordStatus(result.status);
             m_impl->NotifyVerification(result);
             result.durationMs = static_cast<uint32_t>(
@@ -813,7 +813,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
             return result;
         }
 
-        m_impl->m_stats.hashVerifications.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.hashVerifications++;
 
         // Accumulate verified file sizes.
         std::error_code ec;
@@ -839,7 +839,7 @@ VerificationResult UpdateVerifier::VerifyManifest(const PackageManifest& manifes
         std::chrono::duration_cast<std::chrono::milliseconds>(
             Clock::now() - startTp).count());
 
-    m_impl->m_stats.verificationsSucceeded.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.verificationsSucceeded++;
     m_impl->RecordStatus(result.status);
     m_impl->NotifyVerification(result);
 
@@ -882,7 +882,7 @@ bool UpdateVerifier::ValidateVersionSequence(const std::string& newVersion) {
         SS_LOG_WARN(kLogCategory,
             L"Version downgrade rejected: %S < minimum %S",
             newVersion.c_str(), m_impl->m_minimumVersion.c_str());
-        m_impl->m_stats.downgradeAttempts.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.downgradeAttempts++;
         m_impl->RecordStatus(VerificationStatus::VersionDowngrade);
         return false;
     }
@@ -950,7 +950,7 @@ bool UpdateVerifier::VerifySignature(
         return false;
     }
 
-    m_impl->m_stats.signatureVerifications.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.signatureVerifications++;
 
     using namespace Utils::CryptoUtils;
 
@@ -1151,7 +1151,7 @@ bool UpdateVerifier::VerifyCertificateChain(const CertificateInfo& certificate) 
         return false;
     }
 
-    m_impl->m_stats.chainValidations.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.chainValidations++;
 
     // Basic validity checks.
     if (certificate.thumbprint.empty()) {
@@ -1213,7 +1213,7 @@ bool UpdateVerifier::CheckRevocation(const CertificateInfo& certificate) {
         return false;
     }
 
-    m_impl->m_stats.revocationChecks.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.revocationChecks++;
 
     if (m_impl->m_config.revocationMethod == RevocationCheckMethod::None) {
         // Revocation checking is disabled by policy — report as "not revoked".
@@ -1449,34 +1449,16 @@ VerifierStatistics UpdateVerifier::GetStatistics() const {
     std::shared_lock lock(m_impl->m_mutex);
 
     VerifierStatistics stats;
-    stats.verificationsPerformed.store(
-        m_impl->m_stats.verificationsPerformed.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.verificationsSucceeded.store(
-        m_impl->m_stats.verificationsSucceeded.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.verificationsFailed.store(
-        m_impl->m_stats.verificationsFailed.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.signatureVerifications.store(
-        m_impl->m_stats.signatureVerifications.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.hashVerifications.store(
-        m_impl->m_stats.hashVerifications.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.chainValidations.store(
-        m_impl->m_stats.chainValidations.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.revocationChecks.store(
-        m_impl->m_stats.revocationChecks.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    stats.downgradeAttempts.store(
-        m_impl->m_stats.downgradeAttempts.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
+    stats.verificationsPerformed = m_impl->m_stats.verificationsPerformed;
+    stats.verificationsSucceeded = m_impl->m_stats.verificationsSucceeded;
+    stats.verificationsFailed = m_impl->m_stats.verificationsFailed;
+    stats.signatureVerifications = m_impl->m_stats.signatureVerifications;
+    stats.hashVerifications = m_impl->m_stats.hashVerifications;
+    stats.chainValidations = m_impl->m_stats.chainValidations;
+    stats.revocationChecks = m_impl->m_stats.revocationChecks;
+    stats.downgradeAttempts = m_impl->m_stats.downgradeAttempts;
     for (size_t i = 0; i < m_impl->m_stats.byStatus.size(); ++i) {
-        stats.byStatus[i].store(
-            m_impl->m_stats.byStatus[i].load(std::memory_order_relaxed),
-            std::memory_order_relaxed);
+        stats.byStatus[i] = m_impl->m_stats.byStatus[i];
     }
     stats.startTime = m_impl->m_stats.startTime;
 
