@@ -503,11 +503,13 @@ public:
      * @param index Pointer to HashIndex (not owned)
      * @param leafOffset Offset of current leaf node
      * @param keyIndex Index within current leaf
+     * @param lock Shared lock on the index (moved in for HI-4 safety)
      */
     HashIndexIterator(
         const HashIndex* index,
         uint64_t leafOffset,
-        uint32_t keyIndex
+        uint32_t keyIndex,
+        std::shared_lock<std::shared_mutex> lock
     ) noexcept;
     
     /**
@@ -554,6 +556,8 @@ private:
     uint64_t m_leafOffset{0};             ///< Current leaf node offset
     uint32_t m_keyIndex{0};               ///< Current key index within leaf
     bool m_atEnd{true};                   ///< True if at end position
+    /// HI-4 fix: hold shared lock for duration of traversal
+    std::shared_lock<std::shared_mutex> m_lock;
 };
 
 // ============================================================================
@@ -1433,10 +1437,22 @@ struct alignas(ShadowStrike::Whitelist::CACHE_LINE_SIZE) CacheEntry {
      * @note Must be followed by EndWrite() even if write fails
      */
     void BeginWrite() noexcept {
-        // Increment to odd value (writer active)
-        seqlock.fetch_add(1, std::memory_order_release);
-        // Memory barrier to ensure visibility
-        std::atomic_thread_fence(std::memory_order_seq_cst);
+        // WS-2 fix: CAS loop provides mutual exclusion between concurrent writers.
+        // fetch_add allowed multiple writers to enter simultaneously, corrupting cache.
+        uint64_t expected = seqlock.load(std::memory_order_acquire);
+        while (true) {
+            if ((expected & 1) == 0) {
+                // Even value means no writer active — try to claim
+                if (seqlock.compare_exchange_weak(expected, expected + 1,
+                    std::memory_order_acq_rel, std::memory_order_acquire)) {
+                    break;
+                }
+            } else {
+                // Odd value means another writer is active — spin
+                expected = seqlock.load(std::memory_order_acquire);
+            }
+        }
+        std::atomic_thread_fence(std::memory_order_release);
     }
     
     /**
@@ -1925,6 +1941,10 @@ public:
     /// @brief Clear query cache - internal version that doesn't lock
     /// @note Caller MUST hold m_globalLock before calling
     void ClearCacheUnsafe() noexcept;
+    
+    /// @brief Close database - internal version that doesn't acquire m_globalLock
+    /// @note Caller MUST hold m_globalLock before calling (WS-6 TOCTOU fix)
+    void CloseInternal() noexcept;
     
     // ========================================================================
     // STATISTICS

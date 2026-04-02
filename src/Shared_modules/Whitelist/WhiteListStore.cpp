@@ -303,10 +303,13 @@ WhitelistStore& WhitelistStore::operator=(WhitelistStore&& other) noexcept {
         // Note: Mutexes cannot be moved - they are default-initialized
         // We don't need to move them since this object has its own mutexes
         
-        // Move callback
+        // WS-10 fix: Use std::lock for deadlock-safe mutex acquisition
+        // Previous code locked other then this — reverse order from any other
+        // call site would deadlock (ABBA pattern)
         {
-            std::lock_guard lockOther(other.m_callbackMutex);
-            std::lock_guard lockThis(m_callbackMutex);
+            std::lock(m_callbackMutex, other.m_callbackMutex);
+            std::lock_guard lg1(m_callbackMutex, std::adopt_lock);
+            std::lock_guard lg2(other.m_callbackMutex, std::adopt_lock);
             m_matchCallback = std::move(other.m_matchCallback);
         }
         
@@ -341,21 +344,10 @@ StoreError WhitelistStore::Load(const std::wstring& databasePath, bool readOnly)
         );
     }
     
-    // Close existing if initialized - handle potential race condition
+    // WS-6 fix: Use CloseInternal() which assumes m_globalLock is already held.
+    // Previous code dropped the lock to call Close() then re-acquired — TOCTOU race.
     if (m_initialized.load(std::memory_order_acquire)) {
-        // Release lock to avoid deadlock in Close()
-        lock.unlock();
-        Close();
-        lock.lock();
-        
-        // Re-check state after re-acquiring lock (TOCTOU protection)
-        // Another thread may have called Load/Create while we didn't hold the lock
-        if (m_initialized.load(std::memory_order_acquire)) {
-            return StoreError::WithMessage(
-                WhitelistStoreError::InvalidSection,
-                "Store was re-initialized by another thread during Load"
-            );
-        }
+        CloseInternal();
     }
     
     m_databasePath = databasePath;
@@ -514,8 +506,57 @@ void WhitelistStore::Close() noexcept {
     SS_LOG_INFO(L"Whitelist", L"Closed whitelist database");
 }
 
+// WS-6 fix: Lock-free close for use when m_globalLock is already held (e.g., from Load())
+void WhitelistStore::CloseInternal() noexcept {
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    // Flush if writable (best effort)
+    if (!m_readOnly.load(std::memory_order_acquire)) {
+        StoreError error;
+        if (!MemoryMapping::FlushView(m_mappedView, error)) {
+            SS_LOG_WARN(L"Whitelist", L"Failed to flush database on close: %S",
+                error.message.c_str());
+        }
+    }
+
+    // Clear indices (order matters for dependencies)
+    m_hashBloomFilter.reset();
+    m_pathBloomFilter.reset();
+    m_hashIndex.reset();
+    m_pathIndex.reset();
+    m_stringPool.reset();
+
+    // Clear cache (exception-safe)
+    try {
+        m_queryCache.clear();
+    } catch (...) {
+        // Ignore exceptions during cleanup
+    }
+
+    // Close memory mapping
+    MemoryMapping::CloseView(m_mappedView);
+
+    // Reset state atomically
+    m_initialized.store(false, std::memory_order_release);
+    m_databasePath.clear();
+
+    // Reset statistics
+    m_totalLookups.store(0, std::memory_order_relaxed);
+    m_totalHits.store(0, std::memory_order_relaxed);
+    m_totalMisses.store(0, std::memory_order_relaxed);
+    m_cacheHits.store(0, std::memory_order_relaxed);
+    m_cacheMisses.store(0, std::memory_order_relaxed);
+    m_bloomHits.store(0, std::memory_order_relaxed);
+    m_bloomRejects.store(0, std::memory_order_relaxed);
+
+    SS_LOG_INFO(L"Whitelist", L"Closed whitelist database (internal)");
+}
+
 StoreError WhitelistStore::Save() noexcept {
-    std::shared_lock lock(m_globalLock);
+    // WS-9 fix: Save() writes to mmap — requires exclusive lock, not shared
+    std::unique_lock lock(m_globalLock);
     
     // Validate state
     if (!m_initialized.load(std::memory_order_acquire)) {
@@ -843,6 +884,12 @@ StoreError WhitelistStore::InitializeIndices() noexcept {
         try {
             // Scan entry data section to rebuild bloom filter
             const uint64_t entryDataStart = header->entryDataOffset;
+            
+            // WS-4 fix: Overflow-checked addition for entry data bounds
+            if (header->entryDataOffset > UINT64_MAX - header->entryDataSize) {
+                SS_LOG_WARN(L"Whitelist", L"Entry data section overflow in bloom rebuild");
+                return StoreError::Success();
+            }
             const uint64_t entryDataEnd = header->entryDataOffset + header->entryDataSize;
             
             // Validate entry data bounds
@@ -1064,6 +1111,24 @@ LookupResult WhitelistStore::IsHashWhitelisted(
     if (!entry) {
         SS_LOG_WARN(L"Whitelist", L"IsHashWhitelisted: invalid entry offset %llu", *entryOffset);
         return result;
+    }
+    
+    // HI-1 fix: Verify actual hash bytes against queried hash (defense against FNV-1a collisions)
+    // The hash index uses truncated FNV-1a hashes — collisions are possible. Full byte
+    // comparison ensures only true matches pass through.
+    if (entry->hashLength != hash.length || entry->hashAlgorithm != hash.algorithm) {
+        return result;  // Hash metadata mismatch — index collision, not a true match
+    }
+    {
+        const uint8_t safeLen = static_cast<uint8_t>(
+            (std::min)(hash.length, static_cast<uint8_t>(entry->hashData.size())));
+        volatile uint8_t diff = 0;
+        for (uint8_t i = 0; i < safeLen; ++i) {
+            diff |= entry->hashData[i] ^ hash.data[i];
+        }
+        if (diff != 0) {
+            return result;  // Constant-time byte mismatch — index collision
+        }
     }
     
     // Validate entry type matches expected type (hash-based entry)
@@ -1343,7 +1408,12 @@ LookupResult WhitelistStore::IsPathWhitelisted(
         }
         
         m_totalHits.fetch_add(1, std::memory_order_relaxed);
-        const_cast<WhitelistEntry*>(entry)->IncrementHitCount();
+        
+        // WS-1 fix: Only mutate entry if database is writable
+        // In read-only mode, the entry resides in read-only mapped memory
+        if (!m_readOnly.load(std::memory_order_acquire)) {
+            const_cast<WhitelistEntry*>(entry)->IncrementHitCount();
+        }
         
         break; // First valid match wins
     }
@@ -2364,8 +2434,9 @@ StoreError WhitelistStore::BatchAdd(
     const uint64_t currentUsed = m_entryDataUsed.load(std::memory_order_relaxed);
     const uint64_t spaceNeeded = entries.size() * sizeof(WhitelistEntry);
     
-    // Overflow check
-    if (spaceNeeded > header->entryDataSize - currentUsed) {
+    // WS-3 fix: Guard against unsigned underflow when currentUsed > entryDataSize
+    if (currentUsed >= header->entryDataSize ||
+        spaceNeeded > header->entryDataSize - currentUsed) {
         return StoreError::WithMessage(
             WhitelistStoreError::IndexFull,
             "Insufficient space for batch entries"
@@ -2709,7 +2780,18 @@ StoreError WhitelistStore::UpdateEntryFlags(
 }
 
 StoreError WhitelistStore::RevokeEntry(uint64_t entryId) noexcept {
-    return UpdateEntryFlags(entryId, WhitelistFlags::Revoked);
+    // WS-11 fix: Preserve original flags — OR in Revoked and clear Enabled
+    // Previous code replaced all flags with just Revoked, losing audit metadata
+    auto existingEntry = GetEntry(entryId);
+    if (!existingEntry) {
+        return StoreError::WithMessage(
+            WhitelistStoreError::EntryNotFound,
+            "Entry not found for revocation");
+    }
+    auto newFlags = static_cast<WhitelistFlags>(
+        (static_cast<uint32_t>(existingEntry->flags) | static_cast<uint32_t>(WhitelistFlags::Revoked))
+        & ~static_cast<uint32_t>(WhitelistFlags::Enabled));
+    return UpdateEntryFlags(entryId, newFlags);
 }
 
 // ============================================================================
@@ -4500,6 +4582,21 @@ StoreError WhitelistStore::Compact() noexcept {
             }
         }
         
+        // WS-7 fix: Clear hash and path indices before re-insertion
+        // Without this, stale entries from pre-compaction remain in the indices
+        if (m_hashIndex) {
+            auto clearErr = m_hashIndex->Clear();
+            if (!clearErr.IsSuccess()) {
+                SS_LOG_ERROR(L"Whitelist", L"Failed to clear hash index during compact");
+            }
+        }
+        if (m_pathIndex) {
+            auto clearErr = m_pathIndex->Clear();
+            if (!clearErr.IsSuccess()) {
+                SS_LOG_ERROR(L"Whitelist", L"Failed to clear path index during compact");
+            }
+        }
+        
         // Phase 5: Write compacted entries back to entry data section
         offset = entryDataStart;
         for (const auto& entry : compactedEntries) {
@@ -4580,9 +4677,12 @@ StoreError WhitelistStore::Compact() noexcept {
         }
         
         // Phase 7: Update header statistics
-        // Note: No totalEntries field in header, only per-type counts
+        // WS-8 fix: Update ALL per-type counts, not just hash/path
         header->totalHashEntries = newHashCount;
         header->totalPathEntries = newPathCount;
+        header->totalCertEntries = newCertCount;
+        header->totalPublisherEntries = newPubCount;
+        header->totalOtherEntries = newProcessCount;
         
         // Update modification time
         auto now = std::chrono::system_clock::now();
