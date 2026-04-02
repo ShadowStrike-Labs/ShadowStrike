@@ -424,15 +424,7 @@ bool BloomFilter::Initialize(const void* data, size_t bitCount, size_t hashFunct
         return false;
     }
     
-    // Calculate required data size and validate memory region
-    const size_t wordCount = (bitCount + 63ULL) / 64ULL;
-    const size_t requiredBytes = wordCount * sizeof(uint64_t);
-    if (!ValidateMemoryRegion(data, requiredBytes)) {
-        SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: invalid memory region (size=%zu, alignment issue or exceeds limit)", requiredBytes);
-        return false;
-    }
-    
-    // Validate bit count is within allowed range
+    // Validate bit count before any arithmetic derived from it
     if (bitCount == 0) {
         SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: zero bit count");
         return false;
@@ -453,6 +445,14 @@ bool BloomFilter::Initialize(const void* data, size_t bitCount, size_t hashFunct
             SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: adjusted bit count is zero");
             return false;
         }
+    }
+    
+    // Now safe to compute sizes from validated bitCount
+    const size_t wordCount = (bitCount + 63ULL) / 64ULL;
+    const size_t requiredBytes = wordCount * sizeof(uint64_t);
+    if (!ValidateMemoryRegion(data, requiredBytes)) {
+        SS_LOG_ERROR(L"Whitelist", L"BloomFilter::Initialize: invalid memory region (size=%zu, alignment issue or exceeds limit)", requiredBytes);
+        return false;
     }
     
     // Validate hash function count
@@ -594,7 +594,11 @@ uint64_t BloomFilter::Hash(uint64_t value, size_t seed) const noexcept {
     
     // Enhanced double hashing with quadratic probing
     // h(i) = h1 + i * h2 + i^2
-    // Note: seed is guaranteed to be < MAX_BLOOM_HASHES (16) so i^2 is at most 225
+    // Defensive clamp in case caller passes out-of-range seed
+    if (seed >= MAX_BLOOM_HASHES) [[unlikely]] {
+        seed = seed % MAX_BLOOM_HASHES;
+    }
+    
     const uint64_t i = static_cast<uint64_t>(seed);
     const uint64_t iSquared = i * i;  // Safe: max value is 225
     
@@ -678,37 +682,57 @@ bool BloomFilter::MightContain(uint64_t hash) const noexcept {
      * ========================================================================
      */
     
-    // Get pointer to bit array
+    // Get pointer to bit array (mapped path only)
     const uint64_t* bits = nullptr;
     size_t wordCount = 0;
+    const bool isMapped = m_isMemoryMapped;
     
-    if (m_isMemoryMapped) {
+    if (isMapped) {
         bits = m_mappedBits;
         wordCount = (m_bitCount + 63ULL) / 64ULL;
     } else if (!m_bits.empty()) {
-        // Direct memory access to atomic storage for read-only operation
-        // This is safe because we only read, and atomic<T> has same layout as T
-        bits = reinterpret_cast<const uint64_t*>(m_bits.data());
+        // Non-mapped path: read via atomic loads (no reinterpret_cast)
         wordCount = m_bits.size();
     }
     
     // If not initialized, return true (conservative - assume might contain)
-    if (!bits || m_bitCount == 0 || m_numHashes == 0) [[unlikely]] {
+    if ((!isMapped && m_bits.empty()) || (isMapped && !bits) || m_bitCount == 0 || m_numHashes == 0) [[unlikely]] {
         return true;
     }
     
     const size_t bitCountLocal = m_bitCount;
     const size_t numHashesLocal = m_numHashes;
     
-    // Prefetch first likely word
-    const uint64_t firstH = Hash(hash, 0);
-    const size_t firstWordIdx = static_cast<size_t>((firstH % bitCountLocal) / 64ULL);
+    // Compute first hash (reused for prefetch and first check)
+    const uint64_t h0 = Hash(hash, 0);
+    const size_t firstBitIndex = static_cast<size_t>(h0 % bitCountLocal);
+    const size_t firstWordIdx = firstBitIndex / 64ULL;
+    
+    // Prefetch first word
     if (firstWordIdx < wordCount) {
-        PrefetchRead(&bits[firstWordIdx]);
+        if (isMapped) {
+            PrefetchRead(&bits[firstWordIdx]);
+        } else {
+            PrefetchRead(&m_bits[firstWordIdx]);
+        }
     }
     
-    // Check all hash positions with early termination
-    for (size_t i = 0; i < numHashesLocal; ++i) {
+    // Check first hash function (avoids recomputing Hash(hash, 0) in the loop)
+    {
+        if (firstWordIdx >= wordCount) [[unlikely]] {
+            return true;  // Corrupt state - conservative result
+        }
+        const uint64_t mask0 = 1ULL << (firstBitIndex % 64ULL);
+        const uint64_t word0 = isMapped
+            ? bits[firstWordIdx]
+            : m_bits[firstWordIdx].load(std::memory_order_relaxed);
+        if ((word0 & mask0) == 0) {
+            return false;  // Definitely not in set
+        }
+    }
+    
+    // Check remaining hash functions starting at i=1 with early termination
+    for (size_t i = 1; i < numHashesLocal; ++i) {
         const uint64_t h = Hash(hash, i);
         const size_t bitIndex = static_cast<size_t>(h % bitCountLocal);
         const size_t wordIndex = bitIndex / 64ULL;
@@ -725,12 +749,18 @@ bool BloomFilter::MightContain(uint64_t hash) const noexcept {
             const uint64_t nextH = Hash(hash, i + 1);
             const size_t nextWordIdx = static_cast<size_t>((nextH % bitCountLocal) / 64ULL);
             if (nextWordIdx < wordCount) {
-                PrefetchRead(&bits[nextWordIdx]);
+                if (isMapped) {
+                    PrefetchRead(&bits[nextWordIdx]);
+                } else {
+                    PrefetchRead(&m_bits[nextWordIdx]);
+                }
             }
         }
         
         const uint64_t mask = 1ULL << bitOffset;
-        const uint64_t word = bits[wordIndex];
+        const uint64_t word = isMapped
+            ? bits[wordIndex]
+            : m_bits[wordIndex].load(std::memory_order_relaxed);
         
         if ((word & mask) == 0) {
             return false;  // Definitely not in set
@@ -750,15 +780,12 @@ void BloomFilter::Clear() noexcept {
         return;
     }
     
-    // Zero all bits using atomic stores for thread-safety
-    // Note: We use relaxed ordering for performance since we issue a release fence below
+    // Zero all bits using atomic stores
+    // Note: Clear() requires external synchronization as documented in the class contract.
+    // Callers must ensure no concurrent Add()/MightContain() during Clear().
     for (auto& word : m_bits) {
         word.store(0, std::memory_order_relaxed);
     }
-    
-    // Memory barrier to ensure all atomic writes are visible before any subsequent reads
-    // This prevents reordering and ensures visibility across threads
-    std::atomic_thread_fence(std::memory_order_release);
     
     m_elementsAdded.store(0, std::memory_order_relaxed);
     
@@ -795,7 +822,6 @@ bool BloomFilter::Serialize(std::vector<uint8_t>& data) const {
         
         // Pre-allocate to avoid multiple reallocations
         data.clear();
-        data.reserve(static_cast<size_t>(byteCount));
         data.resize(static_cast<size_t>(byteCount));
         
         // Copy atomic values with memory barrier for consistency
@@ -925,6 +951,13 @@ size_t BloomFilter::BatchAdd(std::span<const uint64_t> hashes) noexcept {
         return 0;
     }
     
+    constexpr size_t MAX_BATCH_SIZE = 10'000'000;
+    if (hashes.size() > MAX_BATCH_SIZE) {
+        SS_LOG_WARN(L"Whitelist", L"BloomFilter::BatchAdd: batch size %zu exceeds limit %zu",
+            hashes.size(), MAX_BATCH_SIZE);
+        return 0;
+    }
+    
     const size_t count = hashes.size();
     const size_t wordCount = m_bits.size();
     const size_t bitCountLocal = m_bitCount;
@@ -975,20 +1008,28 @@ size_t BloomFilter::BatchQuery(
         return 0;
     }
     
-    // Get pointer to bit array
+    constexpr size_t MAX_BATCH_SIZE = 10'000'000;
+    if (hashes.size() > MAX_BATCH_SIZE) {
+        SS_LOG_WARN(L"Whitelist", L"BloomFilter::BatchQuery: batch size %zu exceeds limit %zu",
+            hashes.size(), MAX_BATCH_SIZE);
+        return 0;
+    }
+    
+    // Get pointer to bit array (mapped path only)
     const uint64_t* bits = nullptr;
     size_t wordCount = 0;
+    const bool isMapped = m_isMemoryMapped;
     
-    if (m_isMemoryMapped) {
+    if (isMapped) {
         bits = m_mappedBits;
         wordCount = (m_bitCount + 63ULL) / 64ULL;
     } else if (!m_bits.empty()) {
-        bits = reinterpret_cast<const uint64_t*>(m_bits.data());
+        // Non-mapped path: read via atomic loads (no reinterpret_cast)
         wordCount = m_bits.size();
     }
     
     // Uninitialized filter - all results are conservative true
-    if (!bits || m_bitCount == 0 || m_numHashes == 0) {
+    if ((!isMapped && m_bits.empty()) || (isMapped && !bits) || m_bitCount == 0 || m_numHashes == 0) {
         std::fill(results.begin(), results.end(), true);
         return hashes.size();
     }
@@ -1005,7 +1046,11 @@ size_t BloomFilter::BatchQuery(
             const uint64_t prefetchHash = Hash(hashes[idx + PREFETCH_DISTANCE], 0);
             const size_t prefetchWord = static_cast<size_t>((prefetchHash % bitCountLocal) / 64ULL);
             if (prefetchWord < wordCount) {
-                PrefetchRead(&bits[prefetchWord]);
+                if (isMapped) {
+                    PrefetchRead(&bits[prefetchWord]);
+                } else {
+                    PrefetchRead(&m_bits[prefetchWord]);
+                }
             }
         }
         
@@ -1019,11 +1064,13 @@ size_t BloomFilter::BatchQuery(
             const size_t wordIndex = bitIndex / 64ULL;
             
             if (wordIndex >= wordCount) {
-                continue;  // Treat as might contain for safety
+                break;  // Conservative: treat as might-contain (mightContain stays true)
             }
             
             const uint64_t mask = 1ULL << (bitIndex % 64ULL);
-            const uint64_t word = bits[wordIndex];
+            const uint64_t word = isMapped
+                ? bits[wordIndex]
+                : m_bits[wordIndex].load(std::memory_order_relaxed);
             
             if ((word & mask) == 0) {
                 mightContain = false;
