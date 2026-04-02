@@ -114,8 +114,6 @@ constexpr size_t MAX_NARROW_STRING_LENGTH = 65535;
 /// @brief Maximum string length for wide strings (chars, not bytes)
 constexpr size_t MAX_WIDE_STRING_LENGTH = 32767;
 
-/// @brief Header size in bytes
-constexpr uint64_t STRING_POOL_HEADER_SIZE = 32;
 
 } // anonymous namespace
 
@@ -224,7 +222,7 @@ StoreError StringPool::Initialize(
     }
     
     // Validate minimum size for header (usedSize + stringCount = 16 bytes minimum)
-    if (size < STRING_POOL_HEADER_SIZE) {
+    if (size < HEADER_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
             "String pool section too small for header"
@@ -249,18 +247,18 @@ StoreError StringPool::Initialize(
     if (usedPtr) {
         const uint64_t usedValue = *usedPtr;
         // Validate used size is within pool bounds and at least header size
-        if (usedValue >= STRING_POOL_HEADER_SIZE && usedValue <= size) {
+        if (usedValue >= HEADER_SIZE && usedValue <= size) {
             m_usedSize.store(usedValue, std::memory_order_relaxed);
         } else {
             SS_LOG_WARN(L"Whitelist", L"StringPool: corrupt usedSize %llu (valid range: %llu - %llu)",
-                usedValue, STRING_POOL_HEADER_SIZE, size);
+                usedValue, HEADER_SIZE, size);
             // Reset to header size - pool is effectively empty
-            m_usedSize.store(STRING_POOL_HEADER_SIZE, std::memory_order_relaxed);
+            m_usedSize.store(HEADER_SIZE, std::memory_order_relaxed);
         }
     } else {
         // Failed to read header - pool may be corrupt
         SS_LOG_WARN(L"Whitelist", L"StringPool: failed to read usedSize from header");
-        m_usedSize.store(STRING_POOL_HEADER_SIZE, std::memory_order_relaxed);
+        m_usedSize.store(HEADER_SIZE, std::memory_order_relaxed);
     }
     
     // Read string count from bytes 8-15 with validation
@@ -269,7 +267,7 @@ StoreError StringPool::Initialize(
         const uint64_t countValue = *countPtr;
         // Sanity check: string count should be reasonable for the pool size
         // At minimum, each string is 1 byte + null terminator
-        const uint64_t maxPossibleStrings = (size - STRING_POOL_HEADER_SIZE) / 2;
+        const uint64_t maxPossibleStrings = (size - HEADER_SIZE) / 2;
         if (countValue <= maxPossibleStrings) {
             m_stringCount.store(countValue, std::memory_order_relaxed);
         } else {
@@ -330,7 +328,7 @@ StoreError StringPool::CreateNew(
     }
     
     // Validate minimum size for header + at least some data space
-    if (availableSize < STRING_POOL_HEADER_SIZE) {
+    if (availableSize < HEADER_SIZE) {
         return StoreError::WithMessage(
             WhitelistStoreError::InvalidSection,
             "Insufficient space for string pool header"
@@ -352,20 +350,20 @@ StoreError StringPool::CreateNew(
     
     // Initialize header (zero-fill for security - prevents info leak)
     auto* header = static_cast<uint8_t*>(baseAddress);
-    std::memset(header, 0, static_cast<size_t>(STRING_POOL_HEADER_SIZE));
+    std::memset(header, 0, static_cast<size_t>(HEADER_SIZE));
     
     // Set initial used size to header size
-    m_usedSize.store(STRING_POOL_HEADER_SIZE, std::memory_order_relaxed);
+    m_usedSize.store(HEADER_SIZE, std::memory_order_relaxed);
     m_stringCount.store(0, std::memory_order_relaxed);
     
     // Write initial header values to memory
     auto* usedPtr = reinterpret_cast<uint64_t*>(header);
-    *usedPtr = STRING_POOL_HEADER_SIZE;
+    *usedPtr = HEADER_SIZE;
     
     auto* countPtr = reinterpret_cast<uint64_t*>(header + 8);
     *countPtr = 0;
     
-    usedSize = STRING_POOL_HEADER_SIZE;
+    usedSize = HEADER_SIZE;
     
     SS_LOG_DEBUG(L"Whitelist", L"StringPool created: %llu bytes available", availableSize);
     
@@ -391,7 +389,7 @@ std::string_view StringPool::GetString(uint32_t offset, uint16_t length) const n
     }
     
     // Validate offset is within data section (after header)
-    if (offset < STRING_POOL_HEADER_SIZE) {
+    if (offset < HEADER_SIZE) {
         return {};  // Offset points into header - invalid
     }
     
@@ -399,6 +397,12 @@ std::string_view StringPool::GetString(uint32_t offset, uint16_t length) const n
     uint64_t endPos = 0;
     if (!SafeAdd(static_cast<uint64_t>(offset), static_cast<uint64_t>(length), endPos)) {
         return {};  // Arithmetic overflow
+    }
+    
+    // SP-4: Validate against written data boundary, not total pool capacity
+    const uint64_t usedSize = m_usedSize.load(std::memory_order_acquire);
+    if (endPos > usedSize) {
+        return {};  // Offset beyond written data — would read uninitialized memory
     }
     
     if (m_view) {
@@ -456,7 +460,7 @@ std::wstring_view StringPool::GetWideString(uint32_t offset, uint16_t length) co
     }
     
     // Validate offset is within data section and aligned
-    if (offset < STRING_POOL_HEADER_SIZE) {
+    if (offset < HEADER_SIZE) {
         return {};  // Offset points into header - invalid
     }
     
@@ -468,6 +472,12 @@ std::wstring_view StringPool::GetWideString(uint32_t offset, uint16_t length) co
     uint64_t endPos = 0;
     if (!SafeAdd(static_cast<uint64_t>(offset), static_cast<uint64_t>(length), endPos)) {
         return {};
+    }
+    
+    // SP-4: Validate against written data boundary, not total pool capacity
+    const uint64_t usedSize = m_usedSize.load(std::memory_order_acquire);
+    if (endPos > usedSize) {
+        return {};  // Offset beyond written data — would read uninitialized memory
     }
     
     const wchar_t* ptr = nullptr;
@@ -537,6 +547,12 @@ std::optional<uint32_t> StringPool::AddString(std::string_view str) noexcept {
         return std::nullopt;
     }
     
+    // SP-9: Reject strings with embedded null bytes (path truncation attack vector)
+    if (str.find('\0') != std::string_view::npos) {
+        SS_LOG_WARN(L"Whitelist", L"StringPool: rejecting string with embedded null byte");
+        return std::nullopt;
+    }
+    
     // Compute FNV-1a hash for deduplication
     uint64_t strHash = FNV_OFFSET_BASIS;
     for (const char c : str) {
@@ -544,12 +560,26 @@ std::optional<uint32_t> StringPool::AddString(std::string_view str) noexcept {
         strHash *= FNV_PRIME;
     }
     
-    // Check for existing duplicate (hash collision is extremely rare with 64-bit FNV-1a)
+    // SP-3: XOR type tag to prevent cross-type collisions in shared dedup map
+    constexpr uint64_t NARROW_TAG = 0x4E41525257000000ULL;
+    const uint64_t dedupKey = strHash ^ NARROW_TAG;
+    
+    // Check for existing duplicate with content verification
     try {
-        auto it = m_deduplicationMap.find(strHash);
+        auto it = m_deduplicationMap.find(dedupKey);
         if (it != m_deduplicationMap.end()) {
-            // Found existing string - return its offset
-            return it->second;
+            // SP-1: Verify stored content matches byte-for-byte — hash alone is insufficient
+            const uint32_t existingOffset = it->second;
+            const auto* pool = static_cast<const uint8_t*>(m_baseAddress);
+            if (existingOffset + str.size() < m_totalSize) {
+                const char* existing = reinterpret_cast<const char*>(pool + existingOffset);
+                if (std::memcmp(existing, str.data(), str.size()) == 0 &&
+                    existing[str.size()] == '\0') {
+                    return existingOffset;
+                }
+            }
+            // Hash collision — fall through to insert as new string
+            SS_LOG_WARN(L"Whitelist", L"StringPool: FNV-1a hash collision detected for narrow string");
         }
     } catch (const std::exception& e) {
         // Map access failed (OOM?) - log and continue with insertion
@@ -598,7 +628,7 @@ std::optional<uint32_t> StringPool::AddString(std::string_view str) noexcept {
     
     // Add to deduplication map (best effort - failure doesn't affect correctness)
     try {
-        m_deduplicationMap.emplace(strHash, offset);
+        m_deduplicationMap.emplace(dedupKey, offset);
     } catch (const std::exception& e) {
         SS_LOG_DEBUG(L"Whitelist", L"StringPool: dedup map insert failed: %S", e.what());
         // String still added successfully, just won't be deduplicated in future
@@ -647,6 +677,12 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
         return std::nullopt;
     }
     
+    // SP-9: Reject wide strings with embedded null bytes (path truncation attack vector)
+    if (str.find(L'\0') != std::wstring_view::npos) {
+        SS_LOG_WARN(L"Whitelist", L"StringPool: rejecting wide string with embedded null");
+        return std::nullopt;
+    }
+    
     // Compute FNV-1a hash for deduplication (process each wchar_t)
     uint64_t strHash = FNV_OFFSET_BASIS;
     for (const wchar_t c : str) {
@@ -657,11 +693,27 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
         strHash *= FNV_PRIME;
     }
     
-    // Check for existing duplicate
+    // SP-3: XOR type tag to prevent cross-type collisions in shared dedup map
+    constexpr uint64_t WIDE_TAG = 0x5749444553000000ULL;
+    const uint64_t dedupKey = strHash ^ WIDE_TAG;
+    
+    // Check for existing duplicate with content verification
     try {
-        auto it = m_deduplicationMap.find(strHash);
+        auto it = m_deduplicationMap.find(dedupKey);
         if (it != m_deduplicationMap.end()) {
-            return it->second;  // Return existing offset
+            // SP-1: Verify stored content matches byte-for-byte — hash alone is insufficient
+            const uint32_t existingOffset = it->second;
+            const auto* pool = static_cast<const uint8_t*>(m_baseAddress);
+            const size_t byteLen = str.size() * sizeof(wchar_t);
+            if (existingOffset + byteLen + sizeof(wchar_t) <= m_totalSize) {
+                const wchar_t* existing = reinterpret_cast<const wchar_t*>(pool + existingOffset);
+                if (std::memcmp(existing, str.data(), byteLen) == 0 &&
+                    existing[str.size()] == L'\0') {
+                    return existingOffset;
+                }
+            }
+            // Hash collision — fall through to insert as new string
+            SS_LOG_WARN(L"Whitelist", L"StringPool: FNV-1a hash collision detected for wide string");
         }
     } catch (const std::exception& e) {
         SS_LOG_WARN(L"Whitelist", L"StringPool: dedup map lookup failed: %S", e.what());
@@ -690,6 +742,15 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
     if (alignedUsed < currentUsed) {
         SS_LOG_ERROR(L"Whitelist", L"StringPool: alignment overflow");
         return std::nullopt;
+    }
+    
+    // SP-5: Zero alignment padding to prevent uninitialized memory leak to disk
+    if (alignedUsed > currentUsed) {
+        std::memset(
+            static_cast<uint8_t*>(m_baseAddress) + static_cast<size_t>(currentUsed),
+            0,
+            static_cast<size_t>(alignedUsed - currentUsed)
+        );
     }
     
     // Check if we have space (with overflow protection)
@@ -725,7 +786,7 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
     
     // Add to deduplication map (best effort)
     try {
-        m_deduplicationMap.emplace(strHash, offset);
+        m_deduplicationMap.emplace(dedupKey, offset);
     } catch (const std::exception& e) {
         SS_LOG_DEBUG(L"Whitelist", L"StringPool: dedup map insert failed: %S", e.what());
     }
@@ -740,6 +801,22 @@ std::optional<uint32_t> StringPool::AddWideString(std::wstring_view str) noexcep
     *countPtr = m_stringCount.load(std::memory_order_relaxed);
     
     return offset;
+}
+
+// ============================================================================
+// SP-7: ComputeHash implementation (declared in WhiteListStore.hpp)
+// ============================================================================
+
+uint64_t StringPool::ComputeHash(const void* data, size_t length) noexcept {
+    constexpr uint64_t FNV_OFFSET_BASIS_LOCAL = 14695981039346656037ULL;
+    constexpr uint64_t FNV_PRIME_LOCAL = 1099511628211ULL;
+    uint64_t hash = FNV_OFFSET_BASIS_LOCAL;
+    const auto* bytes = static_cast<const uint8_t*>(data);
+    for (size_t i = 0; i < length; ++i) {
+        hash ^= bytes[i];
+        hash *= FNV_PRIME_LOCAL;
+    }
+    return hash;
 }
 
 } // namespace ShadowStrike::Whitelist
