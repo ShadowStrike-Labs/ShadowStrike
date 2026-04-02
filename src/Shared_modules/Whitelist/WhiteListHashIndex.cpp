@@ -583,12 +583,18 @@ template<typename ArrayType, typename KeyType>
         return false;
     }
     
-    // For leaf nodes, verify sorted order (optional strict mode)
+    // HI-6 fix: always check boundary ordering in release builds
+    if (node->isLeaf && node->keyCount > 1) {
+        if (node->keys[0] > node->keys[node->keyCount - 1]) {
+            return false;
+        }
+    }
+
+    // Full sort-order verification (debug only — O(n) per node)
 #ifndef NDEBUG
     if (node->isLeaf && node->keyCount > 1) {
         for (uint32_t i = 0; i + 1 < node->keyCount; ++i) {
             if (node->keys[i] >= node->keys[i + 1]) {
-                // Keys not in strictly ascending order (potential corruption)
                 return false;
             }
         }
@@ -1462,6 +1468,9 @@ StoreError HashIndex::SplitNode(BPlusTreeNode* node) noexcept {
         );
     }
     
+    // HI-8 fix: save allocation offset for rollback
+    const uint64_t savedNextOffset = m_nextNodeOffset;
+    
     // Allocate new sibling node
     BPlusTreeNode* sibling = AllocateNode();
     if (!sibling) {
@@ -1733,18 +1742,26 @@ StoreError HashIndex::SplitNode(BPlusTreeNode* node) noexcept {
         // Securely zero the sibling node (deallocate logically)
         SecureZeroMemoryRegion(sibling, sizeof(BPlusTreeNode));
         
+        // HI-8 fix: reclaim the allocated node space
+        m_nextNodeOffset = savedNextOffset;
+        
         // Rollback node count (we allocated sibling but now discard it)
-        // Note: We don't actually reclaim the space - that requires compaction
-        // The node is marked as unused (zeroed) and will be reclaimed on compact
         m_nodeCount.fetch_sub(1, std::memory_order_relaxed);
         
         // Update header to reflect rolled-back state
         constexpr uint64_t NODE_COUNT_POSITION = 8;
+        constexpr uint64_t NEXT_NODE_OFFSET_POSITION = 24;
         if (INDEX_HEADER_SIZE <= m_indexSize) {
             auto* nodeCountPtr = reinterpret_cast<uint64_t*>(
                 static_cast<uint8_t*>(m_baseAddress) + NODE_COUNT_POSITION
             );
             *nodeCountPtr = m_nodeCount.load(std::memory_order_relaxed);
+            
+            // HI-8 fix: restore next-node offset in header
+            auto* nextNodePtr = reinterpret_cast<uint64_t*>(
+                static_cast<uint8_t*>(m_baseAddress) + NEXT_NODE_OFFSET_POSITION
+            );
+            *nextNodePtr = m_nextNodeOffset;
         }
         
         SS_LOG_INFO(L"Whitelist", L"HashIndex::SplitNode: rollback completed successfully");
@@ -1813,11 +1830,11 @@ StoreError HashIndex::Insert(const HashValue& hash, uint64_t entryOffset) noexce
         );
     }
     
-    // Check for duplicate using binary search (more efficient for large nodes)
+    // HI-7 fix: FastHash collision possible — don't blindly overwrite.
+    // Return success if key already indexed. The caller (WhitelistStore)
+    // must verify full hash bytes before trusting the lookup result.
     uint32_t existingIdx = 0;
     if (BinarySearchExact(leaf->keys, leaf->keyCount, key, existingIdx)) {
-        // Update existing entry (upsert semantics)
-        leaf->children[existingIdx] = static_cast<uint32_t>(entryOffset);
         return StoreError::Success();
     }
     
@@ -2013,8 +2030,18 @@ StoreError HashIndex::Remove(const HashValue& hash) noexcept {
     // Memory barrier before updating statistics
     FullMemoryBarrier();
     
-    // Atomic decrement with acquire-release for proper ordering
-    const uint64_t newEntryCount = m_entryCount.fetch_sub(1, std::memory_order_acq_rel) - 1;
+    // HI-5 fix: CAS loop prevents underflow past zero
+    uint64_t prev = m_entryCount.load(std::memory_order_acquire);
+    while (prev > 0) {
+        if (m_entryCount.compare_exchange_weak(prev, prev - 1,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
+            break;
+        }
+    }
+    if (prev == 0) {
+        SS_LOG_ERROR(L"Whitelist", L"HashIndex::Remove: entry count underflow prevented");
+    }
+    const uint64_t newEntryCount = prev > 0 ? prev - 1 : 0;
     
     // Update header with proper bounds check
     constexpr uint64_t ENTRY_COUNT_OFFSET = 16;
@@ -3287,6 +3314,16 @@ StoreError HashIndex::Rebalance() noexcept {
                 // Clear merged sibling (security)
                 SecureZeroMemoryRegion(sibling, sizeof(BPlusTreeNode));
                 
+                // HI-2 fix: update parent to remove stale child pointer
+                const uint64_t sibOffset = reinterpret_cast<uintptr_t>(sibling) -
+                    reinterpret_cast<uintptr_t>(m_baseAddress);
+                auto parentResult = RemoveKeyFromParent(sibling, sibOffset, leaf);
+                if (!parentResult.IsSuccess()) {
+                    SS_LOG_WARN(L"Whitelist",
+                        L"Rebalance: RemoveKeyFromParent failed after merge - %S",
+                        parentResult.message.c_str());
+                }
+                
                 ++mergeCount;
                 // Don't advance - check if we can merge more
                 continue;
@@ -3908,12 +3945,14 @@ StoreError HashIndex::RemoveKeyFromParent(
 HashIndexIterator::HashIndexIterator(
     const HashIndex* index,
     uint64_t leafOffset,
-    uint32_t keyIndex
+    uint32_t keyIndex,
+    std::shared_lock<std::shared_mutex> lock
 ) noexcept
     : m_index(index)
     , m_leafOffset(leafOffset)
     , m_keyIndex(keyIndex)
     , m_atEnd(false)
+    , m_lock(std::move(lock))
 {
     // Validate initial position
     if (!m_index || leafOffset == 0) {
@@ -4044,7 +4083,9 @@ HashIndex::iterator HashIndex::begin() const noexcept {
         return end();
     }
     
-    return HashIndexIterator(this, firstLeafOffset, 0);
+    // HI-4 fix: transfer the shared lock to the iterator so it holds it
+    // for the entire duration of traversal
+    return HashIndexIterator(this, firstLeafOffset, 0, std::move(lock));
 }
 
 HashIndex::iterator HashIndex::end() const noexcept {
