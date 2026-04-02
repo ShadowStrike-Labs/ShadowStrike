@@ -355,14 +355,14 @@ struct alignas(8) CacheValue {
         return (now < expirationTime) ? (expirationTime - now) : 0;
     }
     
-    /// @brief Get age in seconds
+    /// @brief Get age in seconds (safe against clock adjustments)
     [[nodiscard]] uint32_t GetAge() const noexcept {
         auto now = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()
             ).count()
         );
-        return now - insertionTime;
+        return (now >= insertionTime) ? (now - insertionTime) : 0;
     }
 };
 
@@ -417,7 +417,7 @@ struct alignas(CacheConfig::CACHE_LINE_SIZE) CacheEntry {
     /// @brief Validate read operation (check if data changed during read)
     [[nodiscard]] bool ValidateRead(uint64_t seq) const noexcept {
         std::atomic_thread_fence(std::memory_order_acquire);
-        uint64_t current = seqlock.load(std::memory_order_relaxed);
+        uint64_t current = seqlock.load(std::memory_order_acquire);
         // Valid if sequence hasn't changed AND was even (no write in progress)
         return (current == seq) && ((seq & 1) == 0);
     }

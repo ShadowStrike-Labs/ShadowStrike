@@ -134,7 +134,9 @@ namespace ShadowStrike {
                     m_data[i].store(0, std::memory_order_relaxed);
                 }
             }
-            m_elementCount.store(0, std::memory_order_relaxed);
+            // Release fence ensures all cleared bits are visible before count reset
+            std::atomic_thread_fence(std::memory_order_release);
+            m_elementCount.store(0, std::memory_order_release);
         }
 
         double BloomFilter::EstimateFillRate() const noexcept {

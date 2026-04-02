@@ -1574,10 +1574,9 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
     // THREAD-SAFE COUNTER ACCESS (Windows Interlocked)
     // ========================================================================
     
-    /// @brief Get current hit count (thread-safe read)
+    /// @brief Get current hit count (thread-safe read via volatile access)
     [[nodiscard]] uint32_t GetHitCount() const noexcept {
-        return static_cast<uint32_t>(InterlockedOr(
-            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&hitCount)), 0));
+        return *reinterpret_cast<const volatile uint32_t*>(&hitCount);
     }
     
     /// @brief Set hit count (thread-safe write)
@@ -1586,10 +1585,9 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
                            static_cast<LONG>(value));
     }
     
-    /// @brief Get last hit time (thread-safe read)
+    /// @brief Get last hit time (thread-safe read via volatile access)
     [[nodiscard]] uint32_t GetLastHitTime() const noexcept {
-        return static_cast<uint32_t>(InterlockedOr(
-            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&lastHitTime)), 0));
+        return *reinterpret_cast<const volatile uint32_t*>(&lastHitTime);
     }
     
     /// @brief Set last hit time (thread-safe write)
@@ -1598,10 +1596,9 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
                            static_cast<LONG>(value));
     }
     
-    /// @brief Get false positive count (thread-safe read)
+    /// @brief Get false positive count (thread-safe read via volatile access)
     [[nodiscard]] uint32_t GetFalsePositiveCount() const noexcept {
-        return static_cast<uint32_t>(InterlockedOr(
-            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&falsePositiveCount)), 0));
+        return *reinterpret_cast<const volatile uint32_t*>(&falsePositiveCount);
     }
     
     /// @brief Increment false positive count (thread-safe)
@@ -1609,10 +1606,9 @@ struct alignas(CACHE_LINE_SIZE) IOCEntry {
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&falsePositiveCount));
     }
     
-    /// @brief Get true positive count (thread-safe read)
+    /// @brief Get true positive count (thread-safe read via volatile access)
     [[nodiscard]] uint32_t GetTruePositiveCount() const noexcept {
-        return static_cast<uint32_t>(InterlockedOr(
-            reinterpret_cast<volatile LONG*>(const_cast<uint32_t*>(&truePositiveCount)), 0));
+        return *reinterpret_cast<const volatile uint32_t*>(&truePositiveCount);
     }
     
     /// @brief Increment true positive count (thread-safe)
@@ -2347,11 +2343,16 @@ struct MemoryMappedView {
         );
     }
     
-    /// @brief Get array of items at offset
+    /// @brief Get array of items at offset (with overflow-safe bounds check)
     template<typename T>
     [[nodiscard]] std::span<const T> GetArray(uint64_t offset, size_t count) const noexcept {
-        size_t totalSize = count * sizeof(T);
-        if (offset + totalSize > fileSize) {
+        // Overflow-safe multiplication: reject if count * sizeof(T) would overflow
+        if (sizeof(T) > 0 && count > SIZE_MAX / sizeof(T)) {
+            return {};
+        }
+        const size_t totalSize = count * sizeof(T);
+        // Overflow-safe addition: reject if offset + totalSize would overflow
+        if (totalSize > fileSize || offset > fileSize - totalSize) {
             return {};
         }
         return std::span<const T>(

@@ -118,13 +118,17 @@ bool CacheShard::Lookup(const CacheKey& key, CacheValue& value) const noexcept {
         }
 
         CacheValue snapshot = entry.value;
+        const bool occupied = entry.occupied.load(std::memory_order_acquire);
         if (!entry.ValidateRead(seq)) {
             continue;
         }
 
-        if (!entry.occupied.load(std::memory_order_acquire) || snapshot.IsExpired()) {
+        if (!occupied || snapshot.IsExpired()) {
+            // Re-validate under write lock before freeing to prevent UAF
             std::scoped_lock lock(m_writeMutex);
-            const_cast<CacheShard*>(this)->FreeEntry(index);
+            if (!entry.occupied.load(std::memory_order_acquire) || entry.value.IsExpired()) {
+                const_cast<CacheShard*>(this)->FreeEntry(index);
+            }
             m_missCount.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -140,6 +144,7 @@ bool CacheShard::Lookup(const CacheKey& key, CacheValue& value) const noexcept {
         return true;
     }
 
+    // Seqlock retries exhausted — fall back to exclusive lock for safe access
     std::scoped_lock lock(m_writeMutex);
     if (!entry.occupied.load(std::memory_order_acquire) || entry.value.IsExpired()) {
         const_cast<CacheShard*>(this)->FreeEntry(index);
@@ -206,6 +211,7 @@ bool CacheShard::Insert(const CacheKey& key, const CacheValue& value) noexcept {
     }
     const size_t mask = m_hashTableSize - 1;
     size_t slot = GetHashSlot(key);
+    bool inserted = false;
     for (size_t probe = 0; probe < m_hashTableSize; ++probe) {
         // TITANIUM: Validate slot is in bounds before access
         if (slot >= m_hashTableSize) {
@@ -214,9 +220,16 @@ bool CacheShard::Insert(const CacheKey& key, const CacheValue& value) noexcept {
         const uint32_t current = m_hashTable[slot].load(std::memory_order_relaxed);
         if (current == kEmptySlot || current == kTombstoneSlot) {
             m_hashTable[slot].store(index, std::memory_order_release);
+            inserted = true;
             break;
         }
         slot = (slot + 1) & mask;
+    }
+
+    if (!inserted) {
+        // Hash table full — free allocated entry and reject insert
+        FreeEntry(index);
+        return false;
     }
 
     AddToLRUFront(index);

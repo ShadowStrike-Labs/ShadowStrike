@@ -4643,8 +4643,74 @@ bool ThreatIntelImporter::ValidateEntry(IOCEntry& entry, const ImportOptions& op
     return true;
 }
 
-void ThreatIntelImporter::NormalizeEntry(IOCEntry& entry, const ImportOptions& options, IStringPoolWriter* stringPool) {
-    // Normalization logic
+void ThreatIntelImporter::NormalizeEntry(IOCEntry& entry, const ImportOptions& options, IStringPoolWriter* /*stringPool*/) {
+    const auto flags = static_cast<uint32_t>(options.normalization);
+    
+    // Apply default metadata when entry fields are unset
+    if (entry.confidence == ConfidenceLevel::None && options.defaultConfidence != ConfidenceLevel::None) {
+        entry.confidence = options.defaultConfidence;
+    }
+    if (entry.reputation == ReputationLevel::Unknown && options.defaultReputation != ReputationLevel::Unknown) {
+        entry.reputation = options.defaultReputation;
+    }
+    if (entry.category == ThreatCategory::Unknown && options.defaultCategory != ThreatCategory::Unknown) {
+        entry.category = options.defaultCategory;
+    }
+    if (entry.source == ThreatIntelSource::Unknown && options.defaultSource != ThreatIntelSource::Unknown) {
+        entry.source = options.defaultSource;
+    }
+    
+    // Apply feed ID
+    if (entry.feedId == 0 && options.feedId != 0) {
+        entry.feedId = options.feedId;
+    }
+    
+    // Apply TTL-based expiration if entry has no expiration set
+    if (entry.expirationTime == 0 && options.defaultTTL > 0) {
+        const uint64_t now = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+        // Overflow-safe addition
+        if (now <= UINT64_MAX - options.defaultTTL) {
+            entry.expirationTime = now + options.defaultTTL;
+        }
+    }
+    
+    // Set creation timestamp if unset
+    if (entry.createdTime == 0) {
+        entry.createdTime = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::seconds>(
+                std::chrono::system_clock::now().time_since_epoch()
+            ).count()
+        );
+    }
+    
+    // Set firstSeen if unset
+    if (entry.firstSeen == 0) {
+        entry.firstSeen = entry.createdTime;
+    }
+    
+    // Hash normalization: ensure hash bytes are stored in canonical lowercase form
+    // (Raw byte storage is already canonical — this flag applies at parse time)
+    if ((flags & static_cast<uint32_t>(NormalizationFlags::ValidateHashLength)) != 0) {
+        if (entry.type == IOCType::FileHash) {
+            // Validate hash length matches algorithm expectations
+            const uint8_t expectedLen = [&]() -> uint8_t {
+                switch (entry.value.hash.algorithm) {
+                    case HashAlgorithm::MD5:    return 16;
+                    case HashAlgorithm::SHA1:   return 20;
+                    case HashAlgorithm::SHA256: return 32;
+                    case HashAlgorithm::SHA512: return 64;
+                    default: return entry.value.hash.length; // Accept as-is for fuzzy/custom
+                }
+            }();
+            if (entry.value.hash.length != expectedLen) {
+                entry.value.hash.length = expectedLen;
+            }
+        }
+    }
 }
 
 void ThreatIntelImporter::UpdateProgress(
