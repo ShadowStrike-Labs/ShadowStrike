@@ -3952,7 +3952,7 @@ HashIndexIterator::HashIndexIterator(
     , m_leafOffset(leafOffset)
     , m_keyIndex(keyIndex)
     , m_atEnd(false)
-    , m_lock(std::move(lock))
+    , m_lock(std::make_shared<std::shared_lock<std::shared_mutex>>(std::move(lock)))
 {
     // Validate initial position
     if (!m_index || leafOffset == 0) {

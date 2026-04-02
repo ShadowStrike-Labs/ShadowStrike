@@ -2142,7 +2142,7 @@ StoreError PathIndex::Remove(
                 }
             }
         } catch (...) {
-            return StoreError::WithMessage(WhitelistStoreError::AllocationFailed,
+            return StoreError::WithMessage(WhitelistStoreError::OutOfMemory,
                 "Failed to normalize path for removal");
         }
     } else {
