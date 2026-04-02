@@ -22,6 +22,9 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/Logger.hpp"
 
+#include <WinSock2.h>
+#pragma comment(lib, "ws2_32.lib")
+
 #include <algorithm>
 #include <charconv>
 #include <filesystem>
@@ -1014,7 +1017,7 @@ std::string RollbackManager::CreateSnapshot(
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_snapshots.insert(m_impl->m_snapshots.begin(), info);
     }
-    m_impl->m_stats.snapshotsCreated.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.snapshotsCreated++;
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         Clock::now() - startTime).count();
@@ -1105,7 +1108,7 @@ bool RollbackManager::DeleteSnapshot(const std::string& snapshotId) {
             snapshotDir.wstring().c_str());
     }
 
-    m_impl->m_stats.snapshotsDeleted.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.snapshotsDeleted++;
 
     SS_LOG_INFO(kLogCategory,
         L"Snapshot deleted: %S", snapshotId.c_str());
@@ -1326,7 +1329,7 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
         result.filesRestored = filesRestored;
         result.completionTime = std::chrono::system_clock::now();
 
-        m_impl->m_stats.rollbacksFailed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_stats.rollbacksFailed++;
         m_impl->m_rollbackInProgress.store(false, std::memory_order_release);
         {
             std::unique_lock lock(m_impl->m_mutex);
@@ -1407,7 +1410,7 @@ bool RollbackManager::RollbackTo(const std::string& snapshotId) {
         m_impl->m_lastKnownGoodId = snapshotId;
     }
 
-    m_impl->m_stats.rollbacksPerformed.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.rollbacksPerformed++;
     m_impl->m_rollbackInProgress.store(false, std::memory_order_release);
 
     {
@@ -1510,7 +1513,7 @@ bool RollbackManager::VerifyStability() {
 HealthCheckResult RollbackManager::PerformHealthCheck() {
     HealthCheckResult result;
     result.checkTime = std::chrono::system_clock::now();
-    m_impl->m_stats.healthChecks.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.healthChecks++;
 
     SS_LOG_DEBUG(kLogCategory, L"Performing health check");
 
@@ -1623,7 +1626,8 @@ HealthCheckResult RollbackManager::PerformHealthCheck() {
         if (!m_impl->m_recentCrashes.empty()) {
             // Convert steady_clock to system_clock approximation.
             auto latest = m_impl->m_recentCrashes.back();
-            auto offset = Clock::now() - latest;
+            auto offset = std::chrono::duration_cast<std::chrono::system_clock::duration>(
+                Clock::now() - latest);
             result.lastCrashTime = std::chrono::system_clock::now() - offset;
         }
     }
@@ -1708,7 +1712,7 @@ bool RollbackManager::IsBootLoopDetected() const {
 void RollbackManager::RecordBoot() {
     SS_LOG_DEBUG(kLogCategory, L"Recording boot event");
 
-    m_impl->m_bootCount.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_bootCount++;
 
     {
         std::unique_lock lock(m_impl->m_mutex);
@@ -1726,14 +1730,12 @@ void RollbackManager::RecordBoot() {
             L"BOOT LOOP DETECTED: %u crashes within %u minutes",
             m_impl->m_config.bootLoopThreshold,
             m_impl->m_config.bootLoopWindowMinutes);
-        m_impl->m_stats.bootLoopsDetected.fetch_add(1,
-            std::memory_order_relaxed);
+        m_impl->m_stats.bootLoopsDetected++;
 
         if (m_impl->m_config.autoRollbackOnBootLoop) {
             SS_LOG_WARN(kLogCategory,
                 L"Auto-rollback enabled, triggering rollback");
-            m_impl->m_stats.autoRollbacks.fetch_add(1,
-                std::memory_order_relaxed);
+            m_impl->m_stats.autoRollbacks++;
             TriggerRollback();
         }
     }
@@ -1742,7 +1744,7 @@ void RollbackManager::RecordBoot() {
 void RollbackManager::RecordCrash() {
     SS_LOG_WARN(kLogCategory, L"Recording crash event");
 
-    m_impl->m_crashCount.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_crashCount++;
 
     {
         std::unique_lock lock(m_impl->m_mutex);
@@ -1760,8 +1762,7 @@ void RollbackManager::RecordCrash() {
             L"BOOT LOOP DETECTED after crash: %u crashes within %u minutes",
             m_impl->m_config.bootLoopThreshold,
             m_impl->m_config.bootLoopWindowMinutes);
-        m_impl->m_stats.bootLoopsDetected.fetch_add(1,
-            std::memory_order_relaxed);
+        m_impl->m_stats.bootLoopsDetected++;
 
         {
             std::unique_lock lock(m_impl->m_mutex);
@@ -1772,8 +1773,7 @@ void RollbackManager::RecordCrash() {
         if (m_impl->m_config.autoRollbackOnBootLoop) {
             SS_LOG_WARN(kLogCategory,
                 L"Auto-rollback triggered due to boot loop");
-            m_impl->m_stats.autoRollbacks.fetch_add(1,
-                std::memory_order_relaxed);
+            m_impl->m_stats.autoRollbacks++;
             TriggerRollback();
         }
     }
@@ -1839,27 +1839,13 @@ void RollbackManager::UnregisterCallbacks() {
 
 RollbackStatistics RollbackManager::GetStatistics() const {
     RollbackStatistics copy;
-    copy.snapshotsCreated.store(
-        m_impl->m_stats.snapshotsCreated.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.snapshotsDeleted.store(
-        m_impl->m_stats.snapshotsDeleted.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.rollbacksPerformed.store(
-        m_impl->m_stats.rollbacksPerformed.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.rollbacksFailed.store(
-        m_impl->m_stats.rollbacksFailed.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.bootLoopsDetected.store(
-        m_impl->m_stats.bootLoopsDetected.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.autoRollbacks.store(
-        m_impl->m_stats.autoRollbacks.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
-    copy.healthChecks.store(
-        m_impl->m_stats.healthChecks.load(std::memory_order_relaxed),
-        std::memory_order_relaxed);
+    copy.snapshotsCreated = m_impl->m_stats.snapshotsCreated;
+    copy.snapshotsDeleted = m_impl->m_stats.snapshotsDeleted;
+    copy.rollbacksPerformed = m_impl->m_stats.rollbacksPerformed;
+    copy.rollbacksFailed = m_impl->m_stats.rollbacksFailed;
+    copy.bootLoopsDetected = m_impl->m_stats.bootLoopsDetected;
+    copy.autoRollbacks = m_impl->m_stats.autoRollbacks;
+    copy.healthChecks = m_impl->m_stats.healthChecks;
     copy.startTime = m_impl->m_stats.startTime;
     return copy;
 }
@@ -2017,13 +2003,13 @@ std::string RollbackResult::ToJson() const {
 }
 
 void RollbackStatistics::Reset() noexcept {
-    snapshotsCreated.store(0, std::memory_order_relaxed);
-    snapshotsDeleted.store(0, std::memory_order_relaxed);
-    rollbacksPerformed.store(0, std::memory_order_relaxed);
-    rollbacksFailed.store(0, std::memory_order_relaxed);
-    bootLoopsDetected.store(0, std::memory_order_relaxed);
-    autoRollbacks.store(0, std::memory_order_relaxed);
-    healthChecks.store(0, std::memory_order_relaxed);
+    snapshotsCreated = 0;
+    snapshotsDeleted = 0;
+    rollbacksPerformed = 0;
+    rollbacksFailed = 0;
+    bootLoopsDetected = 0;
+    autoRollbacks = 0;
+    healthChecks = 0;
     startTime = Clock::now();
 }
 
@@ -2032,13 +2018,13 @@ std::string RollbackStatistics::ToJson() const {
         Clock::now() - startTime).count();
     std::ostringstream js;
     js << "{"
-       << "\"snapshotsCreated\":" << snapshotsCreated.load(std::memory_order_relaxed) << ","
-       << "\"snapshotsDeleted\":" << snapshotsDeleted.load(std::memory_order_relaxed) << ","
-       << "\"rollbacksPerformed\":" << rollbacksPerformed.load(std::memory_order_relaxed) << ","
-       << "\"rollbacksFailed\":" << rollbacksFailed.load(std::memory_order_relaxed) << ","
-       << "\"bootLoopsDetected\":" << bootLoopsDetected.load(std::memory_order_relaxed) << ","
-       << "\"autoRollbacks\":" << autoRollbacks.load(std::memory_order_relaxed) << ","
-       << "\"healthChecks\":" << healthChecks.load(std::memory_order_relaxed) << ","
+       << "\"snapshotsCreated\":" << snapshotsCreated << ","
+       << "\"snapshotsDeleted\":" << snapshotsDeleted << ","
+       << "\"rollbacksPerformed\":" << rollbacksPerformed << ","
+       << "\"rollbacksFailed\":" << rollbacksFailed << ","
+       << "\"bootLoopsDetected\":" << bootLoopsDetected << ","
+       << "\"autoRollbacks\":" << autoRollbacks << ","
+       << "\"healthChecks\":" << healthChecks << ","
        << "\"uptimeSeconds\":" << uptimeSec
        << "}";
     return js.str();
