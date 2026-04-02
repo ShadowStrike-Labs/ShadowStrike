@@ -562,9 +562,15 @@ public:
                 inGroup = true;
                 ++currentGroupLen;
             } else if (c == '.') {
-                // Might be IPv4-mapped address at the end
-                // Just verify it's in the right position
-                continue;
+                // IPv4-mapped address detected — validate the IPv4 portion
+                size_t ipv4Start = ipv6.rfind(':', i);
+                if (ipv4Start == std::string_view::npos) {
+                    ipv4Start = 0;
+                } else {
+                    ipv4Start += 1;
+                }
+                std::string_view ipv4Part = ipv6.substr(ipv4Start);
+                return ValidateIPv4(ipv4Part);
             } else {
                 return ValidationResult::Invalid(
                     LookupErrorCode::InvalidIPv6Format,
@@ -1478,7 +1484,7 @@ private:
             now.time_since_epoch()
         ).count();
         
-        const uint64_t lastRefill = m_lastRefillTime.load(std::memory_order_relaxed);
+        uint64_t lastRefill = m_lastRefillTime.load(std::memory_order_relaxed);
         const uint64_t elapsedMicros = nowMicros - lastRefill;
         
         // Calculate tokens to add based on elapsed time
@@ -1488,7 +1494,7 @@ private:
         if (tokensToAdd > 0) {
             // Try to update last refill time atomically
             if (m_lastRefillTime.compare_exchange_strong(
-                    const_cast<uint64_t&>(lastRefill), nowMicros,
+                    lastRefill, nowMicros,
                     std::memory_order_acq_rel)) {
                 
                 // Add tokens up to capacity
@@ -3350,21 +3356,23 @@ public:
             m_threadLocalCacheSize = m_config.threadLocalCacheSize;
         }
         
-        m_initialized = true;
+        m_initialized.store(true, std::memory_order_release);
         
         return true;
     }
     
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_initialized;
+        return m_initialized.load(std::memory_order_acquire);
     }
     
     void Shutdown() noexcept {
         std::lock_guard lock(m_mutex);
         
-        if (!m_initialized) {
+        if (!m_initialized.load(std::memory_order_acquire)) {
             return;
         }
+        
+        m_initialized.store(false, std::memory_order_release);
         
         // Clear thread-local caches safely using unique_ptr transfer
         {
@@ -3378,8 +3386,6 @@ public:
         
         m_engine.reset();
         m_optimizer.reset();
-        
-        m_initialized = false;
     }
     
     [[nodiscard]] ThreatLookupResult ExecuteLookup(
@@ -3387,7 +3393,16 @@ public:
         std::string_view value,
         const LookupOptions& options
     ) noexcept {
-        if (UNLIKELY(!m_initialized)) {
+        if (UNLIKELY(!m_initialized.load(std::memory_order_acquire))) {
+            ThreatLookupResult result;
+            result.errorCode = static_cast<uint32_t>(LookupErrorCode::NotInitialized);
+            result.errorMessage = GetErrorDescription(LookupErrorCode::NotInitialized);
+            return result;
+        }
+        
+        // Acquire lock to prevent Shutdown from destroying m_engine while in use
+        std::lock_guard<std::mutex> lookupLock(m_mutex);
+        if (!m_initialized.load(std::memory_order_acquire)) {
             ThreatLookupResult result;
             result.errorCode = static_cast<uint32_t>(LookupErrorCode::NotInitialized);
             result.errorMessage = GetErrorDescription(LookupErrorCode::NotInitialized);
@@ -3555,7 +3570,7 @@ public:
         size_t total = sizeof(*this);
         
         // Add thread-local cache memory
-        std::lock_guard lock(m_mutex);
+        std::shared_lock lock(m_cacheMutex);
         total += m_threadLocalCaches.size() * m_threadLocalCacheSize * 256;  // Approximate
         
         return total;
@@ -3859,7 +3874,7 @@ private:
     
     // Synchronization
     mutable std::mutex m_mutex;
-    bool m_initialized{false};
+    std::atomic<bool> m_initialized{false};
 };
 
 // ============================================================================
@@ -4267,7 +4282,7 @@ void ThreatIntelLookup::InvalidateCacheEntry(IOCType type, std::string_view valu
     // Mark key as invalid in a shared invalidation set
     // Thread-local caches check this set before returning cached results
     
-    (void)key;  // Used in actual implementation
+    m_impl->InvalidateCacheEntry(key);
 }
 
 void ThreatIntelLookup::ClearAllCaches() noexcept {
@@ -4303,6 +4318,12 @@ void ThreatIntelLookup::ClearAllCaches() noexcept {
     // PHASE 3: Reset Statistics
     // =========================================================================
     // Optionally reset cache statistics for fresh baseline
+    
+    // =========================================================================
+    // PHASE 1+2: Clear All Caches
+    // =========================================================================
+    m_impl->ClearAllThreadLocalCaches();
+    m_impl->ClearSharedCache();
     
     // =========================================================================
     // PHASE 4: Force Garbage Collection
