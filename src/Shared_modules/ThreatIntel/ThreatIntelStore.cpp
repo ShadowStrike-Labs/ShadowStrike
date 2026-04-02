@@ -1649,59 +1649,66 @@ ThreatIntelStore::BulkAddStatsResult ThreatIntelStore::BulkAddIOCsWithStats(
         return result;
     }
     
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
-    
-    IOCAddOptions addOpts;
-    
-    for (const auto& entry : entries) {
-        // Validate entry before processing
-        if (entry.type == IOCType::Unknown || entry.type == IOCType::Reserved) {
-            ++result.skippedEntries;
-            continue;
+    bool shouldFireEvent = false;
+    StoreEvent event;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+        
+        IOCAddOptions addOpts;
+        
+        for (const auto& entry : entries) {
+            // Validate entry before processing
+            if (entry.type == IOCType::Unknown || entry.type == IOCType::Reserved) {
+                ++result.skippedEntries;
+                continue;
+            }
+            
+            // Check if entry already exists using lookup interface
+            StoreLookupOptions storeLookupOpts = StoreLookupOptions::FastLookup();
+            storeLookupOpts.updateCache = false;
+            storeLookupOpts.includeMetadata = false;
+            
+            // Convert to UnifiedLookupOptions for internal lookup
+            const auto lookupOpts = Impl::ConvertToUnifiedOptions(storeLookupOpts);
+            
+            auto lookupResult = m_impl->lookup->Lookup(entry.type,
+                ThreatIntelDatabase::FormatIOCValueForIndex(entry)
+                , lookupOpts);
+            
+            if (lookupResult.found) {
+                // Entry exists - try to update if newer
+                // For now, count as updated (actual update logic depends on IOCManager)
+                auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+                if (opResult.success) {
+                    ++result.updatedEntries;
+                } else {
+                    ++result.errorCount;
+                }
+            } else {
+                // New entry - add it
+                auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
+                if (opResult.success) {
+                    ++result.newEntries;
+                } else {
+                    ++result.errorCount;
+                }
+            }
         }
         
-        // Check if entry already exists using lookup interface
-        StoreLookupOptions storeLookupOpts = StoreLookupOptions::FastLookup();
-        storeLookupOpts.updateCache = false;
-        storeLookupOpts.includeMetadata = false;
-        
-        // Convert to UnifiedLookupOptions for internal lookup
-        const auto lookupOpts = Impl::ConvertToUnifiedOptions(storeLookupOpts);
-        
-        auto lookupResult = m_impl->lookup->Lookup(entry.type,
-            ThreatIntelDatabase::FormatIOCValueForIndex(entry)
-            , lookupOpts);
-        
-        if (lookupResult.found) {
-            // Entry exists - try to update if newer
-            // For now, count as updated (actual update logic depends on IOCManager)
-            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-            if (opResult.success) {
-                ++result.updatedEntries;
-            } else {
-                ++result.errorCount;
-            }
-        } else {
-            // New entry - add it
-            auto opResult = m_impl->iocManager->AddIOC(entry, addOpts);
-            if (opResult.success) {
-                ++result.newEntries;
-            } else {
-                ++result.errorCount;
-            }
+        // Update statistics atomically
+        const size_t totalAdded = result.newEntries + result.updatedEntries;
+        if (totalAdded > 0) {
+            m_impl->stats.totalImportedEntries.fetch_add(totalAdded, std::memory_order_relaxed);
+            m_impl->indexDirty.store(true, std::memory_order_release);
+            
+            shouldFireEvent = true;
+            event.type = StoreEventType::DataImported;
+            event.timestamp = std::chrono::system_clock::now();
+            event.iocType = std::nullopt;
         }
-    }
-    
-    // Update statistics atomically
-    const size_t totalAdded = result.newEntries + result.updatedEntries;
-    if (totalAdded > 0) {
-        m_impl->stats.totalImportedEntries.fetch_add(totalAdded, std::memory_order_relaxed);
-        
-        // Fire bulk event to notify listeners
-        StoreEvent event;
-        event.type = StoreEventType::DataImported;
-        event.timestamp = std::chrono::system_clock::now();
-        event.iocType = std::nullopt;
+    } // rwLock released
+
+    if (shouldFireEvent) {
         m_impl->FireEvent(event);
     }
     
@@ -2446,15 +2453,22 @@ ImportResult ThreatIntelStore::ImportSTIX(
         result.entriesPerSecond = static_cast<double>(result.totalImported) * 1000.0 / result.durationMs;
     }
     
-    // Update store statistics
+    // Capture event data while still under lock, then release before firing
+    bool shouldFireEvent = false;
+    StoreEvent event;
     if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
         
-        // Fire import completed event
-        StoreEvent event;
+        shouldFireEvent = true;
         event.type = StoreEventType::DataImported;
         event.timestamp = std::chrono::system_clock::now();
         event.entriesAffected = result.totalImported;
+    }
+
+    // Release rwLock before firing event to prevent deadlock
+    lock.unlock();
+
+    if (shouldFireEvent) {
         m_impl->FireEvent(event);
     }
     
@@ -2841,13 +2855,21 @@ ImportResult ThreatIntelStore::ImportCSV(
     }
     
     // Update store statistics
+    bool shouldFireEvent = false;
+    StoreEvent event;
     if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
         
-        StoreEvent event;
+        shouldFireEvent = true;
         event.type = StoreEventType::DataImported;
         event.timestamp = std::chrono::system_clock::now();
         event.entriesAffected = result.totalImported;
+    }
+
+    // Release rwLock before firing event to prevent deadlock
+    lock.unlock();
+
+    if (shouldFireEvent) {
         m_impl->FireEvent(event);
     }
     
@@ -3182,12 +3204,21 @@ ImportResult ThreatIntelStore::ImportJSON(
     
     if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
-        
-        StoreEvent event;
-        event.type = StoreEventType::DataImported;
-        event.timestamp = std::chrono::system_clock::now();
-        event.entriesAffected = result.totalImported;
-        m_impl->FireEvent(event);
+    }
+    
+    // Capture event data, then release rwLock before firing to prevent deadlock
+    bool shouldFireJsonEvent = (result.success && result.totalImported > 0);
+    StoreEvent jsonEvent;
+    if (shouldFireJsonEvent) {
+        jsonEvent.type = StoreEventType::DataImported;
+        jsonEvent.timestamp = std::chrono::system_clock::now();
+        jsonEvent.entriesAffected = result.totalImported;
+    }
+
+    lock.unlock();
+
+    if (shouldFireJsonEvent) {
+        m_impl->FireEvent(jsonEvent);
     }
     
     Utils::Logger::Instance().LogEx(
@@ -3440,12 +3471,21 @@ ImportResult ThreatIntelStore::ImportPlainText(
     
     if (result.success && result.totalImported > 0) {
         m_impl->stats.totalImportedEntries.fetch_add(result.totalImported, std::memory_order_relaxed);
-        
-        StoreEvent event;
-        event.type = StoreEventType::DataImported;
-        event.timestamp = std::chrono::system_clock::now();
-        event.entriesAffected = result.totalImported;
-        m_impl->FireEvent(event);
+    }
+    
+    // Capture event data, then release rwLock before firing to prevent deadlock
+    bool shouldFireTextEvent = (result.success && result.totalImported > 0);
+    StoreEvent textEvent;
+    if (shouldFireTextEvent) {
+        textEvent.type = StoreEventType::DataImported;
+        textEvent.timestamp = std::chrono::system_clock::now();
+        textEvent.entriesAffected = result.totalImported;
+    }
+
+    lock.unlock();
+
+    if (shouldFireTextEvent) {
+        m_impl->FireEvent(textEvent);
     }
     
     Utils::Logger::Instance().LogEx(
@@ -3824,11 +3864,13 @@ size_t ThreatIntelStore::Compact() noexcept {
         return 0;
     }
 
-    std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
-
-    const size_t reclaimedBytes = m_impl->database->Compact();
+    size_t reclaimedBytes = 0;
+    {
+        std::unique_lock<std::shared_mutex> lock(m_impl->rwLock);
+        reclaimedBytes = m_impl->database->Compact();
+    } // rwLock released
     
-    // Fire maintenance event if bytes were reclaimed
+    // Fire maintenance event outside lock to prevent deadlock
     if (reclaimedBytes > 0) {
         StoreEvent event;
         event.type = StoreEventType::DatabaseCompacted;

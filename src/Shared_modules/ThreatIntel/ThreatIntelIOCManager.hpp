@@ -160,7 +160,7 @@ struct IOCOperationResult {
     [[nodiscard]] static IOCOperationResult Error(
         ThreatIntelError code,
         std::string_view message
-    ) noexcept {
+    ) {
         IOCOperationResult result;
         result.success = false;
         result.errorCode = code;

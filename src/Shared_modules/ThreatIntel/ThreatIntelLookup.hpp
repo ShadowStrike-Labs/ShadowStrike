@@ -402,7 +402,7 @@ struct ThreatLookupResult {
     /// @brief External API results (if queried)
     struct ExternalResult {
         ThreatIntelSource source;
-        ReputationLevel reputation;
+        ReputationLevel reputation{ReputationLevel::Unknown};
         ConfidenceLevel confidence;
         uint8_t score;
         std::string details;
@@ -432,9 +432,10 @@ struct ThreatLookupResult {
      * @brief Check if IOC is safe
      */
     [[nodiscard]] bool IsSafe() const noexcept {
-        return found && (reputation == ReputationLevel::Safe ||
-                        reputation == ReputationLevel::Trusted ||
-                        threatScore < 20);
+        return found && threatScore < 70 &&
+               (reputation == ReputationLevel::Safe ||
+                reputation == ReputationLevel::Trusted ||
+                threatScore < 20);
     }
     
     /**

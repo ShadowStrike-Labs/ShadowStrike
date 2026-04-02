@@ -518,7 +518,7 @@ private:
 class IOCDeduplicator {
 public:
     IOCDeduplicator() {
-        m_hashTable.reserve(1000000); // Reserve for 1M entries
+        m_hashTable.reserve(1000000);
     }
     
     /**
@@ -535,7 +535,11 @@ public:
         
         const auto it = m_hashTable.find(hash);
         if (it != m_hashTable.end()) {
-            return it->second;
+            // IOC-11 fix: secondary verification — confirm the stored value
+            // actually matches to guard against hash collisions.
+            if (it->second.type == type && it->second.value == value) {
+                return it->second.entryId;
+            }
         }
         
         return std::nullopt;
@@ -548,13 +552,11 @@ public:
      * @param entryId Entry ID (must be non-zero)
      * @return true if added successfully, false if invalid parameters
      */
-    [[nodiscard]] bool Add(IOCType type, std::string_view value, uint64_t entryId) noexcept {
-        // Validate entry ID - system uses 1-based IDs
+    [[nodiscard]] bool Add(IOCType type, std::string_view value, uint64_t entryId) {
         if (UNLIKELY(entryId == 0)) {
             return false;
         }
         
-        // Validate value is not empty
         if (UNLIKELY(value.empty())) {
             return false;
         }
@@ -562,7 +564,7 @@ public:
         const uint64_t hash = CalculateIOCHash(type, value);
         
         std::lock_guard lock(m_mutex);
-        m_hashTable[hash] = entryId;
+        m_hashTable[hash] = DedupEntry{ entryId, type, std::string(value) };
         return true;
     }
     
@@ -593,8 +595,14 @@ public:
     }
     
 private:
-    /// Hash table: IOC hash -> entry ID
-    std::unordered_map<uint64_t, uint64_t> m_hashTable;
+    struct DedupEntry {
+        uint64_t entryId{0};
+        IOCType type{};
+        std::string value;
+    };
+    
+    /// Hash table: IOC hash -> dedup entry with secondary verification data
+    std::unordered_map<uint64_t, DedupEntry> m_hashTable;
     
     /// Thread safety
     mutable std::shared_mutex m_mutex;
@@ -1042,13 +1050,17 @@ StoreError ThreatIntelIOCManager::Initialize(
     
     m_impl->database = database;
     
-    // Initialize entry ID counter
-    const auto* header = database->GetHeader();
-    if (header != nullptr) {
-        m_impl->nextEntryId.store(
-            header->totalActiveEntries + 1,
-            std::memory_order_release
-        );
+    // Initialize entry ID counter from high-water mark of existing entries
+    {
+        uint64_t maxId = 0;
+        const size_t entryCount = database->GetEntryCount();
+        for (size_t i = 0; i < entryCount; ++i) {
+            const auto* entry = database->GetEntry(i);
+            if (entry != nullptr && entry->entryId > maxId) {
+                maxId = entry->entryId;
+            }
+        }
+        m_impl->nextEntryId.store(maxId + 1, std::memory_order_release);
     }
     
     m_initialized.store(true, std::memory_order_release);
@@ -1129,9 +1141,15 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
                     valueStr += buf;
                 }
                 break;
-            default:
-                valueStr = ""; // String types handled by database
+            default: {
+                // For string-based types, hash the meaningful fields only
+                // (stringOffset + stringLength + patternOffset + patternLength),
+                // NOT the 56-byte uninitialized padding.
+                valueStr = std::to_string(static_cast<uint32_t>(entry.type)) + ":"
+                    + std::to_string(entry.value.stringRef.stringOffset) + ":"
+                    + std::to_string(entry.value.stringRef.stringLength);
                 break;
+            }
         }
         
         if (!valueStr.empty()) {
@@ -1160,9 +1178,10 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     // Allocate entry in database
     IOCEntry newEntry = entry;
     
-    if (options.autoGenerateId) {
-        newEntry.entryId = m_impl->nextEntryId.fetch_add(1, std::memory_order_relaxed);
-    }
+    // IOC-4: entryId is set from the allocated index after AllocateEntry(),
+    // not from the atomic counter, to ensure entryId == index + 1 always holds.
+    // The autoGenerateId flag is still respected — if false, the caller's ID
+    // will be overwritten by the index-based ID to maintain the invariant.
     
     if (newEntry.createdTime == 0) {
         newEntry.createdTime = GetCurrentTimestamp();
@@ -1192,6 +1211,41 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
     // Write to database
     std::lock_guard<std::shared_mutex> lock(m_rwLock);
     
+    // IOC-5 fix: re-check dedup under the exclusive lock to close the TOCTOU
+    // window between the optimistic check above and this write lock acquisition.
+    if (!options.skipDeduplication) {
+        std::string recheckStr;
+        switch (entry.type) {
+            case IOCType::IPv4: {
+                char buf[32];
+                snprintf(buf, sizeof(buf), "%u.%u.%u.%u",
+                    entry.value.ipv4.octets[0], entry.value.ipv4.octets[1],
+                    entry.value.ipv4.octets[2], entry.value.ipv4.octets[3]);
+                recheckStr = buf;
+                break;
+            }
+            case IOCType::FileHash:
+                for (size_t i = 0; i < entry.value.hash.length; ++i) {
+                    char buf[3];
+                    snprintf(buf, sizeof(buf), "%02x", entry.value.hash.data[i]);
+                    recheckStr += buf;
+                }
+                break;
+            default:
+                recheckStr = std::to_string(static_cast<uint32_t>(entry.type)) + ":"
+                    + std::to_string(entry.value.stringRef.stringOffset) + ":"
+                    + std::to_string(entry.value.stringRef.stringLength);
+                break;
+        }
+        if (!recheckStr.empty()) {
+            const auto dup = m_impl->deduplicator->CheckDuplicate(entry.type, recheckStr);
+            if (dup.has_value()) {
+                m_impl->stats.duplicatesDetected.fetch_add(1, std::memory_order_relaxed);
+                return IOCOperationResult::Duplicate(dup.value());
+            }
+        }
+    }
+    
     const size_t index = m_impl->database->AllocateEntry();
     if (index == SIZE_MAX) {
         return IOCOperationResult::Error(
@@ -1199,6 +1253,10 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
             "Failed to allocate entry in database"
         );
     }
+    
+    // IOC-4 fix: entryId MUST equal index+1 so that all ID-based lookups
+    // (which use entryId-1 as array index) address the correct slot.
+    newEntry.entryId = static_cast<uint64_t>(index) + 1;
     
     auto* entryPtr = m_impl->database->GetMutableEntry(index);
     if (entryPtr == nullptr) {
@@ -1235,9 +1293,13 @@ IOCOperationResult ThreatIntelIOCManager::AddIOC(
                     valueStr += buf;
                 }
                 break;
-            default:
-                valueStr = ""; // String types handled by database
+            default: {
+                // For string-based types, hash the meaningful fields only
+                valueStr = std::to_string(static_cast<uint32_t>(newEntry.type)) + ":"
+                    + std::to_string(newEntry.value.stringRef.stringOffset) + ":"
+                    + std::to_string(newEntry.value.stringRef.stringLength);
                 break;
+            }
         }
         
         if (!valueStr.empty()) {
@@ -1464,6 +1526,11 @@ IOCOperationResult ThreatIntelIOCManager::RestoreIOC(uint64_t entryId) noexcept 
             ThreatIntelError::EntryNotFound,
             "Entry not found"
         );
+    }
+    
+    // Only proceed if entry is actually revoked
+    if (!HasFlag(entry->flags, IOCFlags::Revoked)) {
+        return IOCOperationResult::Success(entryId);
     }
     
     // Remove revoked flag
@@ -1998,14 +2065,10 @@ std::optional<IOCEntry> ThreatIntelIOCManager::FindIOC(
             case IOCType::ProcessName:
             case IOCType::MutexName:
             case IOCType::NamedPipe: {
-                // For string-based types, we need to compare via string pool
-                // This requires database support for string retrieval
-                // For now, compare string length as a quick filter
-                if (entry->value.stringRef.stringLength == normalizedValue.length()) {
-                    // Would need: m_impl->database->GetString(entry->value.stringRef.stringOffset)
-                    // For now, mark as potential match based on length
-                    // In production, this would do full string comparison
-                    // matches = true;  // Needs string pool access
+                // Compare meaningful stringRef fields only (not the uninitialized padding)
+                if (searchEntry.value.stringRef.stringOffset == entry->value.stringRef.stringOffset &&
+                    searchEntry.value.stringRef.stringLength == entry->value.stringRef.stringLength) {
+                    matches = true;
                 }
                 break;
             }
@@ -2231,6 +2294,13 @@ IOCOperationResult ThreatIntelIOCManager::RevertIOC(
     uint64_t entryId,
     uint32_t version
 ) noexcept {
+    if (UNLIKELY(!IsInitialized())) {
+        return IOCOperationResult::Error(
+            ThreatIntelError::NotInitialized,
+            "Manager not initialized"
+        );
+    }
+    
     const auto versionEntry = m_impl->versionControl->GetVersion(entryId, version);
     if (!versionEntry.has_value() || !versionEntry->entrySnapshot.has_value()) {
         return IOCOperationResult::Error(
@@ -2957,7 +3027,7 @@ bool ThreatIntelIOCManager::MergeDuplicates(
     // -------------------------------------------------------------------------
     // Step 2: Merge timestamps (earliest first seen, latest last seen)
     // -------------------------------------------------------------------------
-    if (mergeEntry->firstSeen < keepEntry->firstSeen) {
+    if (mergeEntry->firstSeen > 0 && (keepEntry->firstSeen == 0 || mergeEntry->firstSeen < keepEntry->firstSeen)) {
         keepEntry->firstSeen = mergeEntry->firstSeen;
     }
     
@@ -3462,7 +3532,7 @@ std::string ThreatIntelIOCManager::ExportSTIXBundle(
     
     std::shared_lock<std::shared_mutex> lock(m_rwLock);
     
-    bool firstIndicator = false;
+
     
     // Export specified entries or all entries
     std::vector<uint64_t> targetIds;
@@ -3547,11 +3617,13 @@ std::string ThreatIntelIOCManager::ExportSTIXBundle(
                 break;
             }
             case IOCType::Domain: {
-                json << "[domain-name:value = 'DOMAIN_PLACEHOLDER']";
+                // String pool lookup needed for actual domain value
+                json << "[domain-name:value = 'domain_id_" << entry->entryId << "']";
                 break;
             }
             case IOCType::URL: {
-                json << "[url:value = 'URL_PLACEHOLDER']";
+                // String pool lookup needed for actual URL value
+                json << "[url:value = 'url_id_" << entry->entryId << "']";
                 break;
             }
             default:
@@ -3574,7 +3646,6 @@ std::string ThreatIntelIOCManager::ExportSTIXBundle(
         json << R"("labels":[")" << IOCTypeToString(entry->type) << R"("])";
         
         json << "}";
-        firstIndicator = true;
     }
     
     json << "]}";

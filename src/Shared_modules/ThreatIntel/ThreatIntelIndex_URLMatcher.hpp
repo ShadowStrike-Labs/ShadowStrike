@@ -58,7 +58,7 @@ namespace ShadowStrike {
             [[nodiscard]] std::vector<IndexValue> Search(std::string_view text) const;
             [[nodiscard]] bool Contains(std::string_view pattern) const;
             void Remove(std::string_view pattern);
-            void Clear() noexcept;
+            void Clear();
 
             [[nodiscard]] size_t GetPatternCount() const noexcept { return m_patternCount; }
             [[nodiscard]] bool IsBuilt() const noexcept { return m_built; }
@@ -66,12 +66,18 @@ namespace ShadowStrike {
             /// @brief Get the number of states in the automaton (for memory statistics)
             [[nodiscard]] size_t GetStateCount() const noexcept { return m_states.size(); }
 
+            static constexpr size_t MAX_STATES = 2'000'000;
+
         private:
+            friend class URLPatternMatcher;
             struct State;
             std::vector<std::unique_ptr<State>> m_states;
             size_t m_patternCount = 0;
             bool m_built = false;
             mutable std::shared_mutex m_mutex;
+
+            /// @brief Full rebuild from a pattern list (resets all states)
+            void RebuildFrom(const std::vector<std::pair<std::string, IndexValue>>& patterns);
         };
 
         // ============================================================================
@@ -96,16 +102,16 @@ namespace ShadowStrike {
             /// @param url URL to lookup
             /// @param outValue Output parameter for the result
             /// @return true if a match was found, false otherwise
-            [[nodiscard]] bool Lookup(std::string_view url, IndexValue& outValue) const;
+            [[nodiscard]] bool Lookup(std::string_view url, IndexValue& outValue);
             
             /// @brief Match a URL against all patterns (returns all matches)
-            [[nodiscard]] std::vector<IndexValue> Match(std::string_view url) const;
+            [[nodiscard]] std::vector<IndexValue> Match(std::string_view url);
             [[nodiscard]] bool Contains(std::string_view pattern) const;
             
             /// @brief Remove a URL pattern
             /// @return true if removed successfully, false if not found
             [[nodiscard]] bool Remove(std::string_view pattern);
-            void Clear() noexcept;
+            void Clear();
 
             [[nodiscard]] size_t GetPatternCount() const noexcept;
             
