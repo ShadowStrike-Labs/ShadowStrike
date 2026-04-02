@@ -338,12 +338,12 @@ struct PatchResult {
  * @brief Statistics
  */
 struct DeltaStatistics {
-    std::atomic<uint64_t> patchesApplied{0};
-    std::atomic<uint64_t> patchesFailed{0};
-    std::atomic<uint64_t> bytesProcessed{0};
-    std::atomic<uint64_t> bytesSaved{0};
-    std::atomic<uint64_t> totalDurationMs{0};
-    std::array<std::atomic<uint64_t>, 8> byAlgorithm{};
+    uint64_t patchesApplied{0};
+    uint64_t patchesFailed{0};
+    uint64_t bytesProcessed{0};
+    uint64_t bytesSaved{0};
+    uint64_t totalDurationMs{0};
+    std::array<uint64_t, 8> byAlgorithm{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
