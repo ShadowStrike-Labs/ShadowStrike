@@ -380,13 +380,13 @@ struct RollbackResult {
  * @brief Statistics
  */
 struct RollbackStatistics {
-    std::atomic<uint64_t> snapshotsCreated{0};
-    std::atomic<uint64_t> snapshotsDeleted{0};
-    std::atomic<uint64_t> rollbacksPerformed{0};
-    std::atomic<uint64_t> rollbacksFailed{0};
-    std::atomic<uint64_t> bootLoopsDetected{0};
-    std::atomic<uint64_t> autoRollbacks{0};
-    std::atomic<uint64_t> healthChecks{0};
+    uint64_t snapshotsCreated{0};
+    uint64_t snapshotsDeleted{0};
+    uint64_t rollbacksPerformed{0};
+    uint64_t rollbacksFailed{0};
+    uint64_t bootLoopsDetected{0};
+    uint64_t autoRollbacks{0};
+    uint64_t healthChecks{0};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
