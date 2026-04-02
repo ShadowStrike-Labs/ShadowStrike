@@ -413,6 +413,8 @@ namespace ShadowStrike {
             ) const noexcept;
 
             // Incremental scanning (streaming)
+            // StreamScanner provides incremental scanning. Callers MUST ensure the
+            // parent SignatureStore outlives any StreamScanner obtained from it.
             class StreamScanner {
             public:
                 StreamScanner() = default;

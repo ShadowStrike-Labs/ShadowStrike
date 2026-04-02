@@ -26,7 +26,8 @@ namespace ShadowStrike {
         // ============================================================================
 
         std::optional<DetectionResult> SignatureStore::LookupHash(const HashValue& hash) const noexcept {
-            if (!m_hashStoreEnabled.load() || !m_hashStore) {
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+            if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
                 return std::nullopt;
             }
 
@@ -37,7 +38,8 @@ namespace ShadowStrike {
             const std::string& hashStr,
             HashType type
         ) const noexcept {
-            if (!m_hashStoreEnabled.load() || !m_hashStore) {
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+            if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
                 return std::nullopt;
             }
 
@@ -52,31 +54,26 @@ namespace ShadowStrike {
             // TITANIUM VALIDATION LAYER
             // ========================================================================
 
-            // VALIDATION 1: Component check
-            if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
-                return std::nullopt;
-            }
-
-            // VALIDATION 2: Path validation
+            // VALIDATION 1: Path validation (no lock needed)
             if (filePath.empty()) {
                 SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Empty file path");
                 return std::nullopt;
             }
 
-            // VALIDATION 3: Path length check
+            // VALIDATION 2: Path length check
             constexpr size_t MAX_PATH_LENGTH = 32767;
             if (filePath.length() > MAX_PATH_LENGTH) {
                 SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Path too long");
                 return std::nullopt;
             }
 
-            // VALIDATION 4: Null character injection check
+            // VALIDATION 3: Null character injection check
             if (filePath.find(L'\0') != std::wstring::npos) {
                 SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Path contains null character");
                 return std::nullopt;
             }
 
-            // VALIDATION 5: Hash type validation (check if hash length is valid for the type)
+            // VALIDATION 4: Hash type validation
             if (GetHashLengthForType(type) == 0) {
                 SS_LOG_ERROR(L"SignatureStore", L"LookupFileHash: Invalid hash type");
                 return std::nullopt;
@@ -85,13 +82,18 @@ namespace ShadowStrike {
             try {
                 ShadowStrike::SignatureStore::SignatureBuilder builder;
 
-                // Compute file hash
+                // Compute file hash (I/O-bound, no lock needed)
                 auto hash = builder.ComputeFileHash(filePath, type);
                 if (!hash.has_value()) {
                     SS_LOG_ERROR(L"SignatureStore", L"Failed to compute file hash for: %s", filePath.c_str());
                     return std::nullopt;
                 }
 
+                // Lock only for component access
+                std::shared_lock<std::shared_mutex> lock(m_globalLock);
+                if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
+                    return std::nullopt;
+                }
                 return m_hashStore->LookupHash(*hash);
             }
             catch (const std::exception& e) {
@@ -108,7 +110,8 @@ namespace ShadowStrike {
             std::span<const uint8_t> buffer,
             const QueryOptions& options
         ) const noexcept {
-            if (!m_patternStoreEnabled.load() || !m_patternStore) {
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+            if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
                 return {};
             }
 
@@ -119,7 +122,8 @@ namespace ShadowStrike {
             std::span<const uint8_t> buffer,
             const YaraScanOptions& options
         ) const noexcept {
-            if (!m_yaraStoreEnabled.load() || !m_yaraStore) {
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+            if (!m_yaraStoreEnabled.load(std::memory_order_acquire) || !m_yaraStore) {
                 return {};
             }
 

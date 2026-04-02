@@ -90,6 +90,7 @@ namespace YaraTitaniumLimits {
     // Rule and namespace limits
     constexpr size_t MAX_NAMESPACE_LENGTH = 128;
     constexpr size_t MAX_RULE_NAME_LENGTH = 256;
+    constexpr size_t MAX_RULE_SOURCES = 10000;
     constexpr size_t MAX_TAG_LENGTH = 64;
     constexpr size_t MAX_TAGS_PER_RULE = 100;
     

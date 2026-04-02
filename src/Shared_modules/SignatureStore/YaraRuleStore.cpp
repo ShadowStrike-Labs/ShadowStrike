@@ -1711,7 +1711,7 @@ std::vector<YaraMatch> YaraRuleStore::ScanProcess(
 
             ctx->matches->push_back(std::move(match));
 
-            // Update hit count (use fullName that includes namespace)
+            // Update best-effort hit statistics (const_cast safe: UpdateRuleHitCount uses try_to_lock)
             const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
         }
 
@@ -1954,8 +1954,8 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
         bool captureMatchData;
         LARGE_INTEGER perfFrequency;
         LARGE_INTEGER scanStartTime;
-        size_t totalMatchesAdded{0};          // Track total matches to prevent DoS
-        size_t maxTotalMatches;               // Max total matches allowed
+        size_t totalMatchesAdded{0};
+        size_t maxTotalMatches;
     };
 
     ScanCallbackContext ctx{};
@@ -2082,7 +2082,7 @@ std::vector<YaraMatch> YaraRuleStore::PerformScan(
             ctx->matches->push_back(std::move(match));
             ctx->totalMatchesAdded++;
 
-            // Update hit count (const_cast safe here - we own the mutex)
+            // Update best-effort hit statistics (const_cast safe: uses try_to_lock, non-critical)
             const_cast<YaraRuleStore*>(ctx->store)->UpdateRuleHitCount(fullName);
 
             return CALLBACK_CONTINUE;
@@ -2272,6 +2272,15 @@ StoreError YaraRuleStore::AddRulesFromSource(
     // STEP 4: EXTRACT METADATA FROM COMPILED RULES
     // ========================================================================
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
+
+    if (m_ruleSources.size() >= YaraTitaniumLimits::MAX_RULE_SOURCES) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"AddRulesFromSource: Rule source limit reached (%zu/%zu)",
+            m_ruleSources.size(), YaraTitaniumLimits::MAX_RULE_SOURCES);
+        yr_rules_destroy(compiledRules);
+        return StoreError{ SignatureStoreError::TooLarge, 0,
+                          "Maximum rule source count exceeded" };
+    }
 
     size_t rulesAdded = 0;
     size_t rulesSkipped = 0;
@@ -4085,14 +4094,42 @@ StoreError YaraRuleStore::Recompile() noexcept {
 
     std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
+    if (m_ruleSources.empty()) {
+        SS_LOG_WARN(L"YaraRuleStore", L"Recompile: No rule sources to compile");
+        return StoreError{ SignatureStoreError::Success };
+    }
+
     YaraCompiler compiler;
-    for (const auto& [name, metadata] : m_ruleMetadata) {
-        SS_LOG_DEBUG(L"YaraRuleStore", L"Recompiling rule: %S", name.c_str());
+    size_t sourcesCompiled = 0;
+
+    for (const auto& [key, source] : m_ruleSources) {
+        std::string ns = "default";
+        size_t delimPos = key.find("::");
+        if (delimPos != std::string::npos) {
+            ns = key.substr(0, delimPos);
+        }
+
+        StoreError addResult = compiler.AddString(source, ns);
+        if (!addResult.IsSuccess()) {
+            SS_LOG_WARN(L"YaraRuleStore",
+                L"Recompile: Failed to compile source '%S': %S",
+                key.c_str(), addResult.message.c_str());
+        } else {
+            sourcesCompiled++;
+        }
+    }
+
+    if (sourcesCompiled == 0) {
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"Recompile: All %zu sources failed compilation", m_ruleSources.size());
+        return StoreError{ SignatureStoreError::Unknown, 0, "All sources failed recompilation" };
     }
 
     YR_RULES* newRules = compiler.GetRules();
     if (!newRules) {
-        return StoreError{ SignatureStoreError::Unknown, 0, "Recompilation failed" };
+        SS_LOG_ERROR(L"YaraRuleStore",
+            L"Recompile: GetRules failed after %zu successful compilations", sourcesCompiled);
+        return StoreError{ SignatureStoreError::Unknown, 0, "Recompilation failed at GetRules" };
     }
 
     if (m_rules) {
@@ -4100,7 +4137,9 @@ StoreError YaraRuleStore::Recompile() noexcept {
     }
     m_rules = newRules;
 
-    SS_LOG_INFO(L"YaraRuleStore", L"Recompilation complete");
+    SS_LOG_INFO(L"YaraRuleStore",
+        L"Recompilation complete: %zu/%zu sources compiled",
+        sourcesCompiled, m_ruleSources.size());
     return StoreError{ SignatureStoreError::Success };
 }
 
