@@ -54,6 +54,8 @@
 #include <vector>
 #include <optional>
 #include <span>
+#include <cstring>
+#include <algorithm>
 
 #ifdef _WIN32
 #  ifndef NOMINMAX
@@ -117,16 +119,20 @@ struct alignas(8) HashValue {
     uint8_t padding[4];                                  // Pad to 72 bytes (8-byte aligned)
 
     // Zero-cost hash comparison (inlined, cache-friendly)
+    // SECURITY: Clamp length to data buffer size to prevent OOB read
+    // from corrupted memory-mapped structures where length may be untrusted
     [[nodiscard]] bool operator==(const HashValue& other) const noexcept {
-        return type == other.type && 
-               length == other.length && 
-               std::memcmp(data.data(), other.data.data(), length) == 0;
+        if (type != other.type || length != other.length) return false;
+        const size_t safeLen = std::min(static_cast<size_t>(length), data.size());
+        return std::memcmp(data.data(), other.data.data(), safeLen) == 0;
     }
 
     [[nodiscard]] uint64_t FastHash() const noexcept {
         // FNV-1a hash for hash table indexing (ironically)
+        // SECURITY: Clamp to data.size() - length is untrusted from mmap
         uint64_t h = 14695981039346656037ULL;
-        for (size_t i = 0; i < length; ++i) {
+        const size_t safeLen = std::min(static_cast<size_t>(length), data.size());
+        for (size_t i = 0; i < safeLen; ++i) {
             h ^= data[i];
             h *= 1099511628211ULL;
         }
@@ -424,7 +430,9 @@ struct MemoryMappedView {
     
     template<typename T>
     [[nodiscard]] const T* GetAt(uint64_t offset) const noexcept {
-        if (offset + sizeof(T) > fileSize) return nullptr;
+        // SECURITY: Two-step check prevents uint64_t overflow in (offset + sizeof(T)).
+        // A crafted offset near UINT64_MAX would wrap around and bypass a single add check.
+        if (offset > fileSize || sizeof(T) > fileSize - offset) return nullptr;
         return reinterpret_cast<const T*>(
             static_cast<const uint8_t*>(baseAddress) + offset
         );
@@ -432,28 +440,19 @@ struct MemoryMappedView {
     
     template<typename T>
     [[nodiscard]] T* GetAtMutable(uint64_t offset) noexcept {
-       
-        if (readOnly) {
-            
-            return nullptr;
-        }
+        if (!baseAddress) return nullptr;
+        if (readOnly) return nullptr;
+        // SECURITY: Two-step check prevents uint64_t overflow in (offset + sizeof(T))
+        if (offset > fileSize || sizeof(T) > fileSize - offset) return nullptr;
 
-        if (offset >= fileSize) {
-            return nullptr;
-        }
-
-        if (offset + sizeof(T) > fileSize) {
-            return nullptr;
-        }
-
-        
         return reinterpret_cast<T*>(
             static_cast<uint8_t*>(baseAddress) + offset
             );
     }
     
     [[nodiscard]] std::span<const uint8_t> GetSpan(uint64_t offset, size_t length) const noexcept {
-        if (offset + length > fileSize) return {};
+        // SECURITY: Two-step check prevents uint64_t overflow in (offset + length)
+        if (offset > fileSize || length > fileSize - offset) return {};
         return std::span<const uint8_t>(
             static_cast<const uint8_t*>(baseAddress) + offset, length
         );
@@ -553,8 +552,8 @@ struct StoreStatistics {
 
 namespace Format {
 
-// Validate database header integrity
-[[nodiscard]] bool ValidateHeader(const SignatureDatabaseHeader* header) noexcept;
+// Validate database header integrity (fileSize > 0 enables section-within-file bounds checks)
+[[nodiscard]] bool ValidateHeader(const SignatureDatabaseHeader* header, uint64_t fileSize = 0) noexcept;
 
 // Calculate optimal cache size based on database size
 [[nodiscard]] uint32_t CalculateOptimalCacheSize(uint64_t dbSizeBytes) noexcept;

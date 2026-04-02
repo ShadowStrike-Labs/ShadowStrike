@@ -183,8 +183,10 @@ public:
     // Disable copy, enable move
     SignatureBuilder(const SignatureBuilder&) = delete;
     SignatureBuilder& operator=(const SignatureBuilder&) = delete;
-    SignatureBuilder(SignatureBuilder&&) noexcept = default;
-    SignatureBuilder& operator=(SignatureBuilder&&) noexcept = default;
+
+    // Custom move: raw HANDLEs and void* must be nulled in source to prevent double-free
+    SignatureBuilder(SignatureBuilder&& other) noexcept;
+    SignatureBuilder& operator=(SignatureBuilder&& other) noexcept;
 
     // ========================================================================
     // CONFIGURATION
@@ -447,23 +449,23 @@ public:
         const HashValue& b
     ) const noexcept;
 
-    // Performance monitoring
+private:
+
+    // Performance monitoring (internal only)
     LARGE_INTEGER m_perfFrequency{};
     LARGE_INTEGER m_buildStartTime{};
 
   // ========================================================================
-  // HELPER METHODS
+  // HELPER METHODS (internal only)
   // ========================================================================
 
     [[nodiscard]] uint64_t CalculateRequiredSize() const noexcept;
     [[nodiscard]] std::array<uint8_t, 16> GenerateDatabaseUUID() const noexcept;
     [[nodiscard]] std::array<uint8_t, 32> ComputeDatabaseChecksum() const noexcept;
 
+    void CleanupOutputHandles() noexcept;
 
     [[nodiscard]] static uint64_t GetCurrentTimestamp() noexcept;
-
-
-private:
 
     // ========================================================================
    // TRIE SERIALIZATION HELPERS (Private)
@@ -491,7 +493,7 @@ private:
 
     // Build output pattern ID pool
     [[nodiscard]] StoreError BuildOutputPool(
-        uint64_t poolOffset
+        uint64_t& poolOffset
     ) noexcept;
     // ========================================================================
     // INTERNAL BUILD STAGES
@@ -547,6 +549,13 @@ private:
     uint64_t m_outputSize{0};
     uint64_t m_currentOffset{0};
 
+    // Section offset tracking for header back-fill after serialization
+    struct SectionOffsets {
+        uint64_t patternStart{0};
+        uint64_t yaraStart{0};
+        uint64_t metadataStart{0};
+    } m_sectionOffsets{};
+
     // Build state
     std::atomic<bool> m_buildInProgress{false};
     std::string m_currentStage;
@@ -558,6 +567,18 @@ private:
 
     // Configuration flags
     bool m_incrementalMode{false};
+
+    // Temporary compiled-pattern cache shared across serialization sub-stages.
+    // Populated by SerializePatterns, consumed by SerializeAhoCorasickToDisk and
+    // BuildOutputPool to avoid redundant recompilation (was compiled 4x before).
+    struct CompiledPatternCacheEntry {
+        std::vector<uint8_t> bytes;
+        std::vector<uint8_t> mask;
+        PatternMode mode{PatternMode::Exact};
+        float entropy{0.0f};
+        bool valid{false};
+    };
+    std::vector<CompiledPatternCacheEntry> m_compiledPatternCache;
 
 
 };
@@ -604,6 +625,7 @@ private:
     std::vector<std::wstring> m_sourceFiles;
     BatchProgress m_progress{};
     mutable std::mutex m_progressMutex;
+    std::atomic<bool> m_buildInProgress{false};
 };
 
 

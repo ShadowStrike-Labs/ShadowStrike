@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureStore.hpp"
-#include"../../src/Utils/FileUtils.hpp"
+#include"../Utils/FileUtils.hpp"
 
 namespace ShadowStrike {
 	namespace SignatureStore {

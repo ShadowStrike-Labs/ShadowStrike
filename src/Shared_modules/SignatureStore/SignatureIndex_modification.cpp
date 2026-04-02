@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureIndex.hpp"
-#include"../../src/Utils/Logger.hpp"
+#include"../Utils/Logger.hpp"
 #include<algorithm>
 #include<unordered_set>
 
@@ -117,14 +117,10 @@ namespace ShadowStrike {
                     return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Insert position out of bounds" };
                 }
 
-                // SECURITY: Validate signatureOffset fits in uint32_t if needed
-                if (signatureOffset > UINT32_MAX) {
-                    SS_LOG_WARN(L"SignatureIndex",
-                        L"InsertInternal: signatureOffset 0x%llX truncated to uint32_t", signatureOffset);
-                }
+                // children[] is uint64_t (v1.1) - store full 64-bit offset
 
                 leaf->keys[pos] = fastHash;
-                leaf->children[pos] = static_cast<uint32_t>(signatureOffset);
+                leaf->children[pos] = signatureOffset;
                 leaf->keyCount++;
 
                 m_totalEntries.fetch_add(1, std::memory_order_release);
@@ -189,7 +185,7 @@ namespace ShadowStrike {
                 }
 
                 targetLeaf->keys[insertPos] = fastHash;
-                targetLeaf->children[insertPos] = static_cast<uint32_t>(signatureOffset);
+                targetLeaf->children[insertPos] = signatureOffset;
                 targetLeaf->keyCount++;
 
                 m_totalEntries.fetch_add(1, std::memory_order_release);
@@ -299,14 +295,10 @@ namespace ShadowStrike {
                     return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Insert position out of bounds" };
                 }
 
-                // SECURITY: Validate signatureOffset fits in uint32_t
-                if (signatureOffset > UINT32_MAX) {
-                    SS_LOG_WARN(L"SignatureIndex",
-                        L"InsertInternalRaw: signatureOffset 0x%llX truncated to uint32_t", signatureOffset);
-                }
+                // children[] is uint64_t (v1.1) - store full 64-bit offset
 
                 leaf->keys[pos] = fastHash;
-                leaf->children[pos] = static_cast<uint32_t>(signatureOffset);
+                leaf->children[pos] = signatureOffset;
                 leaf->keyCount++;
 
                 m_totalEntries.fetch_add(1, std::memory_order_release);
@@ -371,7 +363,7 @@ namespace ShadowStrike {
                 }
 
                 targetLeaf->keys[insertPos] = fastHash;
-                targetLeaf->children[insertPos] = static_cast<uint32_t>(signatureOffset);
+                targetLeaf->children[insertPos] = signatureOffset;
                 targetLeaf->keyCount++;
 
                 m_totalEntries.fetch_add(1, std::memory_order_release);
@@ -457,14 +449,14 @@ namespace ShadowStrike {
                 newRoot->keyCount = 1;
                 newRoot->keys[0] = splitKey;
 
-                // Store truncated addresses as child pointers (converted to file offsets on commit)
-                newRoot->children[0] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leftChild));
-                newRoot->children[1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+                // Store full 64-bit addresses as child pointers (converted to file offsets on commit)
+                newRoot->children[0] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(leftChild));
+                newRoot->children[1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rightChild));
 
                 // Update children's parent pointers
-                uint32_t newRootTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(newRoot));
-                leftChild->parentOffset = newRootTruncAddr;
-                rightChild->parentOffset = newRootTruncAddr;
+                const uint64_t newRootAddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(newRoot));
+                leftChild->parentOffset = newRootAddr;
+                rightChild->parentOffset = newRootAddr;
 
                 // Mark new root as COW root for this transaction
                 m_cowRootNode = newRoot;
@@ -484,11 +476,11 @@ namespace ShadowStrike {
             // ========================================================================
 
             // Get parent (may be file offset or truncated COW address)
-            uint32_t parentAddr = leftChild->parentOffset;
+            uint64_t parentAddr = leftChild->parentOffset;
             BPlusTreeNode* parent = nullptr;
 
             // Check if parent is a COW node (using 64-bit safe lookup)
-            parent = FindCOWNodeByTruncatedAddr(parentAddr);
+            parent = FindCOWNodeByAddr(parentAddr);
             if (parent != nullptr) {
                 SS_LOG_TRACE(L"SignatureIndex",
                     L"InsertIntoParent: Found parent in COW pool (truncAddr=0x%X)", parentAddr);
@@ -536,11 +528,11 @@ namespace ShadowStrike {
             // ========================================================================
 
             // Find the index where leftChild's pointer is stored
-            uint32_t leftChildTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(leftChild));
+            const uint64_t leftChildAddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(leftChild));
             uint32_t childIdx = UINT32_MAX;
 
             for (uint32_t i = 0; i <= parent->keyCount; ++i) {
-                if (parent->children[i] == leftChildTruncAddr ||
+                if (parent->children[i] == leftChildAddr ||
                     parent->children[i] == leftChild->parentOffset) {
                     // Note: parent->children[i] might still have the old file offset
                     // We also check if it matches the original parent offset
@@ -592,15 +584,15 @@ namespace ShadowStrike {
 
                 // Insert split key and right child pointer
                 parent->keys[childIdx] = splitKey;
-                parent->children[childIdx + 1] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+                parent->children[childIdx + 1] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rightChild));
                 parent->keyCount++;
 
                 // Update leftChild's pointer in parent (in case it was a file offset)
-                parent->children[childIdx] = leftChildTruncAddr;
+                parent->children[childIdx] = leftChildAddr;
 
                 // Update rightChild's parent pointer
-                uint32_t parentTruncAddr = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent));
-                rightChild->parentOffset = parentTruncAddr;
+                const uint64_t parentAddr64 = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(parent));
+                rightChild->parentOffset = parentAddr64;
 
                 // If parent was root, update COW root
                 if (parent->parentOffset == 0) {
@@ -626,7 +618,7 @@ namespace ShadowStrike {
 
             // Create temporary arrays to hold keys and children including new entry
             std::array<uint64_t, BPlusTreeNode::MAX_KEYS + 1> tempKeys{};
-            std::array<uint32_t, BPlusTreeNode::MAX_CHILDREN + 1> tempChildren{};
+            std::array<uint64_t, BPlusTreeNode::MAX_CHILDREN + 1> tempChildren{};
 
             // Copy existing keys with new key inserted at correct position
             uint32_t keyInsertPos = childIdx;
@@ -644,12 +636,12 @@ namespace ShadowStrike {
             uint32_t childInsertPos = childIdx + 1;
             for (uint32_t i = 0, j = 0; j <= parent->keyCount + 1; ++i, ++j) {
                 if (i == childInsertPos) {
-                    tempChildren[i] = static_cast<uint32_t>(reinterpret_cast<uintptr_t>(rightChild));
+                    tempChildren[i] = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(rightChild));
                     j--;  // Don't advance source index
                 }
                 else if (i == childIdx) {
                     // Update leftChild pointer
-                    tempChildren[i] = leftChildTruncAddr;
+                    tempChildren[i] = leftChildAddr;
                 }
                 else if (j <= parent->keyCount) {
                     tempChildren[i] = parent->children[j];
@@ -692,20 +684,18 @@ namespace ShadowStrike {
             newParent->parentOffset = parent->parentOffset;
 
             // Update children's parent pointers for newParent's children
-            uintptr_t newParentPtrAddr = reinterpret_cast<uintptr_t>(newParent);
-            uint32_t newParentTruncAddr = static_cast<uint32_t>(newParentPtrAddr);
+            const uint64_t newParentAddr = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(newParent));
             for (uint32_t i = 0; i <= newParent->keyCount; ++i) {
-                uint32_t childAddr = newParent->children[i];
-                // Find the child node (may be COW or file node) using 64-bit safe lookup
-                BPlusTreeNode* childNode = FindCOWNodeByTruncatedAddr(childAddr);
+                uint64_t childAddrVal = newParent->children[i];
+                BPlusTreeNode* childNode = FindCOWNodeByAddr(childAddrVal);
                 if (childNode != nullptr) {
-                    childNode->parentOffset = newParentTruncAddr;
+                    childNode->parentOffset = newParentAddr;
                 }
             }
 
             // Also update rightChild's parent since it may have moved
             rightChild->parentOffset = (childInsertPos <= midPoint) ?
-                static_cast<uint32_t>(reinterpret_cast<uintptr_t>(parent)) : newParentTruncAddr;
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(parent)) : newParentAddr;
 
             // Clear remaining slots in original parent (for cleanliness)
             for (uint32_t i = midPoint; i < BPlusTreeNode::MAX_KEYS; ++i) {

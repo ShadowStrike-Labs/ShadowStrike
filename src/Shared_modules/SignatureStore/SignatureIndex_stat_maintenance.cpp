@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include"SignatureIndex.hpp"
-#include"../../src/Utils/Logger.hpp"
+#include"../Utils/Logger.hpp"
 #include<algorithm>
 #include<map>
 
@@ -730,6 +730,14 @@ namespace ShadowStrike {
                         for (size_t i = 1; i < childIndices.size(); ++i) {
                             const BPlusTreeNode* sibling = allNodes[childIndices[i]].node;
 
+                            // Defense-in-depth: abort merge if insertPos would exceed array
+                            if (insertPos >= BPlusTreeNode::MAX_KEYS) {
+                                SS_LOG_WARN(L"SignatureIndex",
+                                    L"Compact: insertPos %u reached MAX_KEYS during merge, aborting",
+                                    insertPos);
+                                break;
+                            }
+
                             // Add separator key from parent
                             uint32_t childPos = 0;
                             for (uint32_t j = 0; j < clonedParent->keyCount; ++j) {
@@ -743,6 +751,7 @@ namespace ShadowStrike {
 
                             // Merge sibling's keys and children
                             for (uint32_t j = 0; j < sibling->keyCount; ++j) {
+                                if (insertPos >= BPlusTreeNode::MAX_KEYS) break;
                                 mergedChild->keys[insertPos] = sibling->keys[j];
                                 if (!mergedChild->isLeaf) {
                                     mergedChild->children[insertPos] = sibling->children[j];

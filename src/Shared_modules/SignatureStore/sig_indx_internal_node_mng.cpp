@@ -22,9 +22,6 @@
 #include <algorithm>
 #include <cstring>
 #include <new>
-#include <map>
-#include <unordered_set>
-#include <iostream>
 
 
 namespace ShadowStrike {
@@ -61,7 +58,7 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
      * Security:
      * - Bounds checking on all array accesses
      * - Corruption detection (invalid pointers, offsets)
-     * - Infinite loop prevention
+     * - Infinite loop prevention via cycle detection
      *
      * Performance:
      * - Lock-free reads (no mutex acquisition)
@@ -75,16 +72,16 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
      // STEP 1: VALIDATE STATE & ACQUIRE ROOT
      // ========================================================================
 
-    uint32_t nodeOffset = m_rootOffset.load(std::memory_order_acquire);
+    uint64_t nodeOffset = m_rootOffset.load(std::memory_order_acquire);
 
     SS_LOG_TRACE(L"SignatureIndex",
-        L"FindLeaf: Starting search for fastHash=0x%llX from root offset=0x%X",
+        L"FindLeaf: Starting search for fastHash=0x%llX from root offset=0x%llX",
         fastHash, nodeOffset);
 
     // Validate root offset is within bounds
     if (nodeOffset >= m_indexSize) {
         SS_LOG_ERROR(L"SignatureIndex",
-            L"FindLeaf: Root offset 0x%X exceeds index size 0x%llX",
+            L"FindLeaf: Root offset 0x%llX exceeds index size 0x%llX",
             nodeOffset, m_indexSize);
         return nullptr;
     }
@@ -104,12 +101,11 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
     // ========================================================================
 
     // Infinite loop prevention (max tree height = 10 for 2^127 entries)
-    // HARDENED: Use constexpr for compile-time validation
     constexpr uint32_t MAX_TREE_DEPTH = 20;
     uint32_t depth = 0;
 
-    // HARDENED: Track visited offsets to detect cycles (corruption detection)
-    uint32_t visitedOffsets[MAX_TREE_DEPTH + 1] = { 0 };
+    // Track visited offsets to detect cycles (corruption detection)
+    uint64_t visitedOffsets[MAX_TREE_DEPTH + 1] = { 0 };
     visitedOffsets[0] = nodeOffset;
 
     while (node && !node->isLeaf) {
@@ -117,7 +113,6 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
         // DEPTH CHECK (Corruption/Loop Detection)
         // ====================================================================
 
-        // HARDENED: Pre-increment check to prevent overflow
         if (depth >= MAX_TREE_DEPTH) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"FindLeaf: Maximum tree depth exceeded (depth=%u, fastHash=0x%llX) - "
@@ -187,16 +182,16 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
         // Validate child offset is within index bounds
         if (nodeOffset >= m_indexSize) {
             SS_LOG_ERROR(L"SignatureIndex",
-                L"FindLeaf: Child offset 0x%X exceeds index size 0x%llX at depth %u",
+                L"FindLeaf: Child offset 0x%llX exceeds index size 0x%llX at depth %u",
                 nodeOffset, m_indexSize, depth);
             return nullptr;
         }
 
-        // HARDENED: Cycle detection - check if we've visited this offset before
+        // Cycle detection - check if we've visited this offset before
         for (uint32_t i = 0; i < depth; ++i) {
             if (visitedOffsets[i] == nodeOffset) {
                 SS_LOG_ERROR(L"SignatureIndex",
-                    L"FindLeaf: Cycle detected - offset 0x%X visited at depth %u, now at depth %u",
+                    L"FindLeaf: Cycle detected - offset 0x%llX visited at depth %u, now at depth %u",
                     nodeOffset, i, depth);
                 return nullptr;
             }
@@ -211,13 +206,13 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
 
         if (!node) {
             SS_LOG_ERROR(L"SignatureIndex",
-                L"FindLeaf: Failed to retrieve child node at offset 0x%X, depth %u",
+                L"FindLeaf: Failed to retrieve child node at offset 0x%llX, depth %u",
                 nodeOffset, depth);
             return nullptr;
         }
 
         SS_LOG_TRACE(L"SignatureIndex",
-            L"FindLeaf: Traversed to child at offset 0x%X, depth %u, keyCount=%u",
+            L"FindLeaf: Traversed to child at offset 0x%llX, depth %u, keyCount=%u",
             nodeOffset, depth, node->keyCount);
     }
 
@@ -245,19 +240,14 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
         return nullptr;
     }
 
-    // DEBUG: Log the leaf we found
-    SS_LOG_INFO(L"SignatureIndex",
-        L"FindLeaf: Found leaf at offset=0x%X, keyCount=%u, fastHash=0x%llX",
+    SS_LOG_TRACE(L"SignatureIndex",
+        L"FindLeaf: Found leaf at offset=0x%llX, keyCount=%u, fastHash=0x%llX",
         nodeOffset, node->keyCount, fastHash);
     if (node->keyCount > 0) {
-        SS_LOG_INFO(L"SignatureIndex",
+        SS_LOG_TRACE(L"SignatureIndex",
             L"FindLeaf: Leaf key[0]=0x%llX, key[last]=0x%llX",
             node->keys[0], node->keys[node->keyCount - 1]);
     }
-
-    SS_LOG_TRACE(L"SignatureIndex",
-        L"FindLeaf: Found leaf node - depth=%u, keyCount=%u, fastHash=0x%llX",
-        depth, node->keyCount, fastHash);
 
     return node;
 }
@@ -269,7 +259,7 @@ const BPlusTreeNode* SignatureIndex::FindLeaf(uint64_t fastHash) const noexcept 
 BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE COW-AWARE LEAF NODE TRAVERSAL WITH PATH COPYING
+     * COW-AWARE LEAF NODE TRAVERSAL WITH PATH COPYING
      * ========================================================================
      *
      * Purpose:
@@ -289,6 +279,11 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
      * 3. Update each parent's child pointer to point to cloned child
      * 4. Return the cloned leaf
      *
+     * NOTE (v1.1): All pointer addresses are stored as full 64-bit values in
+     * the node's uint64_t fields (children[], parentOffset, nextLeaf, prevLeaf).
+     * This eliminates the pointer truncation collision risk that existed when
+     * the fields were uint32_t. Lookup uses FindCOWNodeByAddr (exact match).
+     *
      * ========================================================================
      */
 
@@ -298,8 +293,8 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
 
     if (!m_cowRootNode) {
         // Clone the file root to start COW transaction
-        uint32_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
-        
+        uint64_t rootOffset = m_rootOffset.load(std::memory_order_acquire);
+
         // Check if root was already cloned in this transaction
         auto it = m_fileOffsetToCOWNode.find(rootOffset);
         if (it != m_fileOffsetToCOWNode.end()) {
@@ -309,31 +304,24 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
             // Clone root from file
             const BPlusTreeNode* fileRoot = GetNode(rootOffset);
             if (!fileRoot) {
-                SS_LOG_ERROR(L"SignatureIndex", 
-                    L"FindLeafForCOW: Failed to get root node at offset 0x%X", rootOffset);
+                SS_LOG_ERROR(L"SignatureIndex",
+                    L"FindLeafForCOW: Failed to get root node at offset 0x%llX", rootOffset);
                 return nullptr;
             }
-            
+
             BPlusTreeNode* clonedRoot = CloneNode(fileRoot);
             if (!clonedRoot) {
-                SS_LOG_ERROR(L"SignatureIndex", 
+                SS_LOG_ERROR(L"SignatureIndex",
                     L"FindLeafForCOW: Failed to clone root node");
                 return nullptr;
             }
-            
+
             // Register the cloned root
             m_fileOffsetToCOWNode[rootOffset] = clonedRoot;
             m_cowRootNode = clonedRoot;
-            
-            // Register pointer address for child pointer resolution (64-bit safe)
-            // NOTE: We store the full uintptr_t as map key to avoid 64-bit pointer collisions.
-            // The children[] array stores only lower 32-bits, but we track full address here.
-            uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(clonedRoot);
-            uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
-            m_ptrAddrToCOWNode[ptrAddr] = clonedRoot;
-            
+
             SS_LOG_TRACE(L"SignatureIndex",
-                L"FindLeafForCOW: Cloned file root at offset 0x%X", rootOffset);
+                L"FindLeafForCOW: Cloned file root at offset 0x%llX", rootOffset);
         }
     }
 
@@ -345,7 +333,7 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
         L"FindLeafForCOW: Traversing from COW root for fastHash=0x%llX", fastHash);
 
     BPlusTreeNode* node = m_cowRootNode;
-    
+
     // Infinite loop prevention
     constexpr uint32_t MAX_TREE_DEPTH = 20;
     uint32_t depth = 0;
@@ -369,7 +357,7 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
 
         // Binary search for child position
         uint32_t pos = BinarySearch(node->keys, node->keyCount, fastHash);
-        
+
         // Navigate to appropriate child
         if (pos < node->keyCount && fastHash >= node->keys[pos]) {
             pos++; // Go to right child
@@ -381,9 +369,9 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
             return nullptr;
         }
 
-        // Get child "offset" - which is actually a truncated pointer in COW tree
-        uint32_t childAddr = node->children[pos];
-        
+        // Get child value - may be a full pointer address (COW) or file offset
+        uint64_t childAddr = node->children[pos];
+
         if (childAddr == 0) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"FindLeafForCOW: Null child pointer at pos %u", pos);
@@ -393,15 +381,15 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
         // ================================================================
         // RESOLVE CHILD: Try COW node first, then file node
         // ================================================================
-        
-        // First check if this is a truncated address pointing to a COW node
-        // NOTE: Use helper that correctly handles 64-bit pointer lookup
-        BPlusTreeNode* cowNode = FindCOWNodeByTruncatedAddr(childAddr);
+
+        // Check if this is a COW node address (exact 64-bit lookup, no truncation)
+        BPlusTreeNode* cowNode = FindCOWNodeByAddr(childAddr);
         if (cowNode != nullptr) {
             // Found in COW node map - use COW node directly
             node = cowNode;
             SS_LOG_TRACE(L"SignatureIndex",
-                L"FindLeafForCOW: Resolved truncated addr 0x%X to COW node", childAddr);
+                L"FindLeafForCOW: Resolved addr 0x%llX to COW node",
+                static_cast<unsigned long long>(childAddr));
         }
         else {
             // Not a COW node address - must be a file offset
@@ -410,101 +398,88 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
             if (fileIt != m_fileOffsetToCOWNode.end()) {
                 node = fileIt->second;
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"FindLeafForCOW: Found existing COW clone for file offset 0x%X", childAddr);
+                    L"FindLeafForCOW: Found existing COW clone for file offset 0x%llX",
+                    static_cast<unsigned long long>(childAddr));
             }
             else {
                 // Load from file and clone
                 if (childAddr >= m_indexSize) {
                     SS_LOG_ERROR(L"SignatureIndex",
-                        L"FindLeafForCOW: Child offset 0x%X exceeds index size", childAddr);
+                        L"FindLeafForCOW: Child offset 0x%llX exceeds index size",
+                        static_cast<unsigned long long>(childAddr));
                     return nullptr;
                 }
-                
+
                 const BPlusTreeNode* fileNode = GetNode(childAddr);
                 if (!fileNode) {
                     SS_LOG_ERROR(L"SignatureIndex",
-                        L"FindLeafForCOW: Failed to get node at offset 0x%X", childAddr);
+                        L"FindLeafForCOW: Failed to get node at offset 0x%llX",
+                        static_cast<unsigned long long>(childAddr));
                     return nullptr;
                 }
-                
+
                 // Clone the file node
                 BPlusTreeNode* clonedNode = CloneNode(fileNode);
                 if (!clonedNode) {
                     SS_LOG_ERROR(L"SignatureIndex",
-                        L"FindLeafForCOW: Failed to clone node at offset 0x%X", childAddr);
+                        L"FindLeafForCOW: Failed to clone node at offset 0x%llX",
+                        static_cast<unsigned long long>(childAddr));
                     return nullptr;
                 }
-                
+
                 // Register the clone in file offset map
                 m_fileOffsetToCOWNode[childAddr] = clonedNode;
-                
-                // Update parent's child pointer to point to cloned node (64-bit safe)
-                // NOTE: Store full pointer in map, truncated value in children[] array
-                uintptr_t clonedPtrAddr = reinterpret_cast<uintptr_t>(clonedNode);
-                uint32_t clonedTruncAddr = static_cast<uint32_t>(clonedPtrAddr);
-                node->children[pos] = clonedTruncAddr;
-                
-                // CRITICAL FIX: Update cloned node's parentOffset to point to current parent
-                // The parentOffset copied from file may be stale (pointing to old root location).
-                // We need to update it to point to the current COW parent (node).
-                uintptr_t parentPtrAddr = reinterpret_cast<uintptr_t>(node);
-                uint32_t parentTruncAddr = static_cast<uint32_t>(parentPtrAddr);
-                clonedNode->parentOffset = parentTruncAddr;
-                
-                // CRITICAL FIX: Register full pointer address for child pointer resolution
-                // This enables 64-bit safe lookup during subsequent COW traversals.
-                // The map is keyed by full uintptr_t to avoid pointer collision issues.
-                m_ptrAddrToCOWNode[clonedPtrAddr] = clonedNode;
-                
+
+                // Update parent's child pointer to point to cloned node.
+                // NOTE (v1.1): Store FULL pointer address - children[] is uint64_t,
+                // so no truncation is needed. This eliminates collision risk.
+                const uint64_t clonedAddr = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(clonedNode));
+                node->children[pos] = clonedAddr;
+
+                // Update cloned node's parentOffset to point to current parent
+                const uint64_t parentAddr = static_cast<uint64_t>(
+                    reinterpret_cast<uintptr_t>(node));
+                clonedNode->parentOffset = parentAddr;
+
                 // ================================================================
-                // ENTERPRISE-GRADE LINKED LIST MAINTENANCE FOR LEAF NODES
+                // LINKED LIST MAINTENANCE FOR LEAF NODES
                 // ================================================================
                 // When we clone a leaf node, we MUST update the linked list pointers
                 // of adjacent leaves to maintain proper enumeration support.
                 //
-                // Without this fix:
+                // Without this:
                 // - ForEach() using linked list would see stale pointers
                 // - RangeQuery() would fail to traverse consecutive leaves
-                // - Enumeration would produce incorrect results
-                //
-                // The linked list must be:
-                //   [prevLeaf] <-> [clonedNode] <-> [nextLeaf]
-                //
-                // We need to:
-                // 1. Update prevLeaf->nextLeaf to point to clonedNode
-                // 2. Update nextLeaf->prevLeaf to point to clonedNode
-                // 3. Update clonedNode's prevLeaf/nextLeaf to use truncated addresses
                 // ================================================================
-                
+
                 if (clonedNode->isLeaf) {
-                    uint32_t prevLeafAddr = clonedNode->prevLeaf;
-                    uint32_t nextLeafAddr = clonedNode->nextLeaf;
-                    
+                    uint64_t prevLeafAddr = clonedNode->prevLeaf;
+                    uint64_t nextLeafAddr = clonedNode->nextLeaf;
+
                     SS_LOG_TRACE(L"SignatureIndex",
                         L"FindLeafForCOW: Maintaining linked list for cloned leaf "
-                        L"(prevLeaf=0x%X, nextLeaf=0x%X)", prevLeafAddr, nextLeafAddr);
-                    
+                        L"(prevLeaf=0x%llX, nextLeaf=0x%llX)",
+                        static_cast<unsigned long long>(prevLeafAddr),
+                        static_cast<unsigned long long>(nextLeafAddr));
+
                     // ============================================================
                     // UPDATE PREVIOUS LEAF'S NEXTLEAF POINTER
                     // ============================================================
                     if (prevLeafAddr != 0) {
                         BPlusTreeNode* prevLeafNode = nullptr;
-                        
-                        // Check if prevLeaf is already a COW node (using 64-bit safe lookup)
-                        prevLeafNode = FindCOWNodeByTruncatedAddr(prevLeafAddr);
+
+                        // Check if prevLeaf is already a COW node (exact 64-bit lookup)
+                        prevLeafNode = FindCOWNodeByAddr(prevLeafAddr);
                         if (prevLeafNode != nullptr) {
                             SS_LOG_TRACE(L"SignatureIndex",
-                                L"FindLeafForCOW: Found prevLeaf in COW pool at truncAddr 0x%X", 
-                                prevLeafAddr);
+                                L"FindLeafForCOW: Found prevLeaf in COW pool");
                         }
                         else if (prevLeafAddr < m_indexSize) {
                             // It's a file offset - check if we have a COW clone
                             auto prevFileIt = m_fileOffsetToCOWNode.find(prevLeafAddr);
                             if (prevFileIt != m_fileOffsetToCOWNode.end()) {
                                 prevLeafNode = prevFileIt->second;
-                                SS_LOG_TRACE(L"SignatureIndex",
-                                    L"FindLeafForCOW: Found existing COW clone for prevLeaf at offset 0x%X", 
-                                    prevLeafAddr);
                             }
                             else {
                                 // Need to clone the previous leaf
@@ -512,52 +487,40 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                                 if (prevLeafConst && prevLeafConst->isLeaf) {
                                     prevLeafNode = CloneNode(prevLeafConst);
                                     if (prevLeafNode) {
-                                        // Register the clone (64-bit safe)
                                         m_fileOffsetToCOWNode[prevLeafAddr] = prevLeafNode;
-                                        uintptr_t prevPtrAddr = reinterpret_cast<uintptr_t>(prevLeafNode);
-                                        uint32_t prevTruncAddr = static_cast<uint32_t>(prevPtrAddr);
-                                        m_ptrAddrToCOWNode[prevPtrAddr] = prevLeafNode;
-                                        
+
                                         // Update clonedNode's prevLeaf to point to cloned prev
-                                        clonedNode->prevLeaf = prevTruncAddr;
-                                        
-                                        SS_LOG_TRACE(L"SignatureIndex",
-                                            L"FindLeafForCOW: Cloned prevLeaf from offset 0x%X -> truncAddr 0x%X",
-                                            prevLeafAddr, prevTruncAddr);
+                                        const uint64_t prevAddr = static_cast<uint64_t>(
+                                            reinterpret_cast<uintptr_t>(prevLeafNode));
+                                        clonedNode->prevLeaf = prevAddr;
                                     }
                                 }
                             }
                         }
-                        
+
                         // Update prevLeaf's nextLeaf to point to our cloned node
                         if (prevLeafNode) {
-                            prevLeafNode->nextLeaf = clonedTruncAddr;
-                            SS_LOG_TRACE(L"SignatureIndex",
-                                L"FindLeafForCOW: Updated prevLeaf->nextLeaf to 0x%X", clonedTruncAddr);
+                            prevLeafNode->nextLeaf = clonedAddr;
                         }
                     }
-                    
+
                     // ============================================================
                     // UPDATE NEXT LEAF'S PREVLEAF POINTER
                     // ============================================================
                     if (nextLeafAddr != 0) {
                         BPlusTreeNode* nextLeafNode = nullptr;
-                        
-                        // Check if nextLeaf is already a COW node (using 64-bit safe lookup)
-                        nextLeafNode = FindCOWNodeByTruncatedAddr(nextLeafAddr);
+
+                        // Check if nextLeaf is already a COW node (exact 64-bit lookup)
+                        nextLeafNode = FindCOWNodeByAddr(nextLeafAddr);
                         if (nextLeafNode != nullptr) {
                             SS_LOG_TRACE(L"SignatureIndex",
-                                L"FindLeafForCOW: Found nextLeaf in COW pool at truncAddr 0x%X", 
-                                nextLeafAddr);
+                                L"FindLeafForCOW: Found nextLeaf in COW pool");
                         }
                         else if (nextLeafAddr < m_indexSize) {
                             // It's a file offset - check if we have a COW clone
                             auto nextFileIt = m_fileOffsetToCOWNode.find(nextLeafAddr);
                             if (nextFileIt != m_fileOffsetToCOWNode.end()) {
                                 nextLeafNode = nextFileIt->second;
-                                SS_LOG_TRACE(L"SignatureIndex",
-                                    L"FindLeafForCOW: Found existing COW clone for nextLeaf at offset 0x%X", 
-                                    nextLeafAddr);
                             }
                             else {
                                 // Need to clone the next leaf
@@ -565,36 +528,29 @@ BPlusTreeNode* SignatureIndex::FindLeafForCOW(uint64_t fastHash) noexcept {
                                 if (nextLeafConst && nextLeafConst->isLeaf) {
                                     nextLeafNode = CloneNode(nextLeafConst);
                                     if (nextLeafNode) {
-                                        // Register the clone (64-bit safe)
                                         m_fileOffsetToCOWNode[nextLeafAddr] = nextLeafNode;
-                                        uintptr_t nextPtrAddr = reinterpret_cast<uintptr_t>(nextLeafNode);
-                                        uint32_t nextTruncAddr = static_cast<uint32_t>(nextPtrAddr);
-                                        m_ptrAddrToCOWNode[nextPtrAddr] = nextLeafNode;
-                                        
+
                                         // Update clonedNode's nextLeaf to point to cloned next
-                                        clonedNode->nextLeaf = nextTruncAddr;
-                                        
-                                        SS_LOG_TRACE(L"SignatureIndex",
-                                            L"FindLeafForCOW: Cloned nextLeaf from offset 0x%X -> truncAddr 0x%X",
-                                            nextLeafAddr, nextTruncAddr);
+                                        const uint64_t nextAddr = static_cast<uint64_t>(
+                                            reinterpret_cast<uintptr_t>(nextLeafNode));
+                                        clonedNode->nextLeaf = nextAddr;
                                     }
                                 }
                             }
                         }
-                        
+
                         // Update nextLeaf's prevLeaf to point to our cloned node
                         if (nextLeafNode) {
-                            nextLeafNode->prevLeaf = clonedTruncAddr;
-                            SS_LOG_TRACE(L"SignatureIndex",
-                                L"FindLeafForCOW: Updated nextLeaf->prevLeaf to 0x%X", clonedTruncAddr);
+                            nextLeafNode->prevLeaf = clonedAddr;
                         }
                     }
                 }
-                
+
                 node = clonedNode;
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"FindLeafForCOW: Cloned file node at offset 0x%X -> truncAddr 0x%X", 
-                    childAddr, clonedTruncAddr);
+                    L"FindLeafForCOW: Cloned file node at offset 0x%llX -> COW addr 0x%llX",
+                    static_cast<unsigned long long>(childAddr),
+                    static_cast<unsigned long long>(clonedAddr));
             }
         }
     }
@@ -630,18 +586,14 @@ uint32_t SignatureIndex::FindInsertionPoint(
 ) const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE INSERTION POINT FINDER
+     * INSERTION POINT FINDER
      * ========================================================================
      *
      * Purpose:
      * - Find correct position to insert new key in sorted array
      * - Maintains B+Tree sorted key invariant
      *
-     * Algorithm:
-     * - Binary search in sorted key array
-     * - Returns position where key should be inserted
-     *
-     * Complexity: O(log K) where K = keys in node (typically 128)
+     * Complexity: O(log K) where K = keys in node
      *
      * Returns:
      * - Index where fastHash should be inserted (0 to keyCount)
@@ -698,7 +650,7 @@ StoreError SignatureIndex::SplitNode(
 ) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE B+TREE NODE SPLITTING
+     * B+TREE NODE SPLITTING
      * ========================================================================
      *
      * Purpose:
@@ -737,7 +689,6 @@ StoreError SignatureIndex::SplitNode(
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Null output pointer" };
     }
 
-    // Validate node is actually full (should be called only when keyCount == MAX_KEYS)
     if (node->keyCount == 0) {
         SS_LOG_ERROR(L"SignatureIndex", L"SplitNode: Cannot split empty node");
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Empty node" };
@@ -764,16 +715,12 @@ StoreError SignatureIndex::SplitNode(
         return StoreError{ SignatureStoreError::OutOfMemory, 0, "Node allocation failed" };
     }
 
-    SS_LOG_TRACE(L"SignatureIndex", L"SplitNode: New node allocated successfully");
-
     // ========================================================================
     // STEP 3: CALCULATE SPLIT POINT
     // ========================================================================
 
-    // Split at midpoint for balanced tree
     uint32_t midPoint = node->keyCount / 2;
 
-    // Ensure midpoint is valid
     if (midPoint == 0 || midPoint >= node->keyCount) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"SplitNode: Invalid midpoint %u (keyCount=%u)",
@@ -783,7 +730,6 @@ StoreError SignatureIndex::SplitNode(
         return StoreError{ SignatureStoreError::IndexCorrupted, 0, "Invalid midpoint" };
     }
 
-    // Extract split key (key that goes to parent)
     splitKey = node->keys[midPoint];
 
     SS_LOG_TRACE(L"SignatureIndex",
@@ -797,10 +743,8 @@ StoreError SignatureIndex::SplitNode(
     uint32_t keysToMove = 0;
 
     if (node->isLeaf) {
-        // Leaf split: splitKey stays in right node
         keysToMove = node->keyCount - midPoint;
 
-        // Validate we're not copying more than MAX_KEYS
         if (keysToMove > BPlusTreeNode::MAX_KEYS) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"SplitNode: Attempting to copy %u keys (max=%zu)",
@@ -812,7 +756,6 @@ StoreError SignatureIndex::SplitNode(
 
         (*newNode)->keyCount = keysToMove;
 
-        // Copy keys/children starting at midpoint
         for (uint32_t i = 0; i < keysToMove; ++i) {
             const uint32_t srcIdx = midPoint + i;
             if (srcIdx >= BPlusTreeNode::MAX_KEYS || i >= BPlusTreeNode::MAX_KEYS) {
@@ -863,7 +806,6 @@ StoreError SignatureIndex::SplitNode(
 
         (*newNode)->keyCount = keysToMove;
 
-        // Copy keys starting after midpoint
         for (uint32_t i = 0; i < keysToMove; ++i) {
             const uint32_t srcIdx = midPoint + 1 + i;
             if (srcIdx >= BPlusTreeNode::MAX_KEYS || i >= BPlusTreeNode::MAX_KEYS) {
@@ -877,7 +819,6 @@ StoreError SignatureIndex::SplitNode(
             (*newNode)->keys[i] = node->keys[srcIdx];
         }
 
-        // Copy children starting after midpoint (keysToMove + 1 children)
         for (uint32_t i = 0; i < keysToMove + 1; ++i) {
             const uint32_t srcIdx = midPoint + 1 + i;
             if (srcIdx >= BPlusTreeNode::MAX_CHILDREN || i >= BPlusTreeNode::MAX_CHILDREN) {
@@ -899,11 +840,8 @@ StoreError SignatureIndex::SplitNode(
     // STEP 5: UPDATE ORIGINAL NODE
     // ========================================================================
 
-    // HARDENED: Store original keyCount before modification for safe iteration
     const uint32_t originalKeyCount = node->keyCount;
-    
-    // Clear moved entries (good practice for debugging)
-    // HARDENED: bounds check each access
+
     if (node->isLeaf) {
         for (uint32_t i = midPoint; i < originalKeyCount; ++i) {
             if (i < BPlusTreeNode::MAX_KEYS) {
@@ -913,24 +851,19 @@ StoreError SignatureIndex::SplitNode(
                 node->children[i] = 0;
             }
         }
-
         node->keyCount = midPoint;
     }
     else {
-        // Internal node: clear keys from midpoint (splitKey promoted)
         for (uint32_t i = midPoint; i < originalKeyCount; ++i) {
             if (i < BPlusTreeNode::MAX_KEYS) {
                 node->keys[i] = 0;
             }
         }
-
-        // Clear children starting after midpoint
         for (uint32_t i = midPoint + 1; i <= originalKeyCount; ++i) {
             if (i < BPlusTreeNode::MAX_CHILDREN) {
                 node->children[i] = 0;
             }
         }
-
         node->keyCount = midPoint;
     }
 
@@ -942,55 +875,40 @@ StoreError SignatureIndex::SplitNode(
     // ========================================================================
 
     if (node->isLeaf) {
-        // Update leaf linked list pointers
         // Order: [prev] <-> [node] <-> [newNode] <-> [next]
 
-        uint32_t originalNext = node->nextLeaf;
+        uint64_t originalNext = node->nextLeaf;
 
-        // Get pointer addresses for COW node pointers (64-bit safe)
-        // Store full address in map, truncated value in linked list fields
-        uintptr_t newNodePtrAddr = reinterpret_cast<uintptr_t>(*newNode);
-        uintptr_t nodePtrAddr = reinterpret_cast<uintptr_t>(node);
-        uint32_t newNodeTruncated = static_cast<uint32_t>(newNodePtrAddr);
-        uint32_t nodeTruncated = static_cast<uint32_t>(nodePtrAddr);
+        // Store FULL pointer addresses (v1.1: fields are uint64_t, no truncation needed)
+        const uint64_t newNodeAddr = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(*newNode));
+        const uint64_t nodeAddr = static_cast<uint64_t>(
+            reinterpret_cast<uintptr_t>(node));
 
-        // Link node -> newNode (truncated address, converted to file offset on commit)
-        node->nextLeaf = newNodeTruncated;
+        // Link node -> newNode
+        node->nextLeaf = newNodeAddr;
 
-        // Link newNode -> original next (preserve file offset or truncated address)
+        // Link newNode -> original next
         (*newNode)->nextLeaf = originalNext;
 
-        // Link newNode <- node (backward pointer)
-        (*newNode)->prevLeaf = nodeTruncated;
+        // Link newNode <- node
+        (*newNode)->prevLeaf = nodeAddr;
 
         // ================================================================
-        // CRITICAL FIX: Update the original next leaf's prevLeaf pointer
-        // ================================================================
-        // If there was an original next leaf, its prevLeaf pointer currently
-        // points to 'node'. After split, it should point to 'newNode' since
-        // newNode is now between node and the original next leaf.
-        //
-        // This is required for proper bidirectional linked list traversal.
-        // Without this fix, backward traversal from the original next leaf
-        // would skip newNode entirely, causing enumeration bugs.
+        // Update the original next leaf's prevLeaf pointer
         // ================================================================
         if (originalNext != 0) {
-            // Check if originalNext is already a COW node (using 64-bit safe lookup)
-            BPlusTreeNode* nextLeafNode = FindCOWNodeByTruncatedAddr(originalNext);
-            
+            BPlusTreeNode* nextLeafNode = FindCOWNodeByAddr(originalNext);
+
             if (nextLeafNode != nullptr) {
-                // Already a COW node - use it directly
                 SS_LOG_TRACE(L"SignatureIndex",
-                    L"SplitNode: Found next leaf in COW pool at truncAddr 0x%X", originalNext);
+                    L"SplitNode: Found next leaf in COW pool");
             }
             else if (originalNext < m_indexSize) {
                 // It's a file offset - check if we already have a COW clone
                 auto fileIt = m_fileOffsetToCOWNode.find(originalNext);
                 if (fileIt != m_fileOffsetToCOWNode.end()) {
                     nextLeafNode = fileIt->second;
-                    SS_LOG_TRACE(L"SignatureIndex",
-                        L"SplitNode: Found existing COW clone for next leaf at offset 0x%X", 
-                        originalNext);
                 }
                 else {
                     // Need to clone the next leaf from file
@@ -998,61 +916,51 @@ StoreError SignatureIndex::SplitNode(
                     if (nextLeafConst && nextLeafConst->isLeaf) {
                         nextLeafNode = CloneNode(nextLeafConst);
                         if (nextLeafNode) {
-                            // Register the clone (64-bit safe)
                             m_fileOffsetToCOWNode[originalNext] = nextLeafNode;
-                            uintptr_t clonedPtrAddr = reinterpret_cast<uintptr_t>(nextLeafNode);
-                            uint32_t clonedTruncAddr = static_cast<uint32_t>(clonedPtrAddr);
-                            m_ptrAddrToCOWNode[clonedPtrAddr] = nextLeafNode;
-                            
+
                             // Update newNode's nextLeaf to point to cloned node
-                            (*newNode)->nextLeaf = clonedTruncAddr;
-                            
-                            SS_LOG_TRACE(L"SignatureIndex",
-                                L"SplitNode: Cloned next leaf from offset 0x%X -> truncAddr 0x%X",
-                                originalNext, clonedTruncAddr);
+                            const uint64_t clonedNextAddr = static_cast<uint64_t>(
+                                reinterpret_cast<uintptr_t>(nextLeafNode));
+                            (*newNode)->nextLeaf = clonedNextAddr;
                         }
                         else {
                             SS_LOG_WARN(L"SignatureIndex",
-                                L"SplitNode: Failed to clone next leaf at offset 0x%X", originalNext);
+                                L"SplitNode: Failed to clone next leaf at offset 0x%llX",
+                                static_cast<unsigned long long>(originalNext));
                         }
                     }
                     else {
                         SS_LOG_WARN(L"SignatureIndex",
-                            L"SplitNode: Next leaf at offset 0x%X is invalid or not a leaf", 
-                            originalNext);
+                            L"SplitNode: Next leaf at offset 0x%llX is invalid or not a leaf",
+                            static_cast<unsigned long long>(originalNext));
                     }
                 }
             }
-            
+
             // Update the next leaf's prevLeaf pointer to newNode
             if (nextLeafNode) {
-                nextLeafNode->prevLeaf = newNodeTruncated;
-                SS_LOG_TRACE(L"SignatureIndex",
-                    L"SplitNode: Updated next leaf's prevLeaf to 0x%X", newNodeTruncated);
+                nextLeafNode->prevLeaf = newNodeAddr;
             }
         }
 
         SS_LOG_TRACE(L"SignatureIndex",
-            L"SplitNode: Updated leaf linked list - node->nextLeaf=0x%X, newNode->prevLeaf=0x%X",
-            node->nextLeaf, (*newNode)->prevLeaf);
+            L"SplitNode: Updated leaf linked list");
     }
 
     // ========================================================================
     // STEP 7: SET PARENT POINTERS
     // ========================================================================
 
-    // New node inherits parent from original node
     (*newNode)->parentOffset = node->parentOffset;
 
     SS_LOG_TRACE(L"SignatureIndex",
-        L"SplitNode: Set parent offset 0x%X for new node",
-        (*newNode)->parentOffset);
+        L"SplitNode: Set parent offset 0x%llX for new node",
+        static_cast<unsigned long long>((*newNode)->parentOffset));
 
     // ========================================================================
     // STEP 8: VALIDATION & RETURN
     // ========================================================================
 
-    // Validate split was successful
     if (node->keyCount == 0 || (*newNode)->keyCount == 0) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"SplitNode: Split resulted in empty node (left=%u, right=%u)",
@@ -1066,13 +974,6 @@ StoreError SignatureIndex::SplitNode(
         L"SplitNode: Split complete - left=%u keys, right=%u keys, splitKey=0x%llX",
         node->keyCount, (*newNode)->keyCount, splitKey);
 
-    // DEBUG: Log details about both nodes after split
-    SS_LOG_DEBUG(L"SignatureIndex",
-        L"SplitNode: leftNode ptr=0x%p, isLeaf=%u, keyCount=%u, parentOffset=0x%X",
-        static_cast<void*>(node), node->isLeaf ? 1 : 0, node->keyCount, node->parentOffset);
-    SS_LOG_DEBUG(L"SignatureIndex",
-        L"SplitNode: rightNode ptr=0x%p, isLeaf=%u, keyCount=%u, parentOffset=0x%X",
-        static_cast<void*>(*newNode), (*newNode)->isLeaf ? 1 : 0, (*newNode)->keyCount, (*newNode)->parentOffset);
     if (node->keyCount > 0) {
         SS_LOG_DEBUG(L"SignatureIndex",
             L"SplitNode: leftNode key[0]=0x%llX, key[last]=0x%llX",
@@ -1094,7 +995,7 @@ StoreError SignatureIndex::SplitNode(
 BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE NODE ALLOCATION
+     * NODE ALLOCATION
      * ========================================================================
      *
      * Purpose:
@@ -1105,21 +1006,15 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
      * Memory Management:
      * - Allocated from COW pool (m_cowNodes)
      * - Freed automatically on transaction commit/rollback
-     * - No manual deallocation required
      *
      * Thread Safety:
      * - Called only under exclusive write lock
-     * - Not thread-safe (caller must hold lock)
      *
      * ========================================================================
      */
 
-     // ========================================================================
-     // STEP 1: ALLOCATE NODE
-     // ========================================================================
-
     try {
-        // HARDENED: Pre-check COW pool size before allocation to fail fast
+        // Pre-check COW pool size before allocation to fail fast
         constexpr size_t MAX_COW_NODES = 10000;
         if (m_cowNodes.size() >= MAX_COW_NODES) {
             SS_LOG_ERROR(L"SignatureIndex",
@@ -1129,52 +1024,32 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
         }
 
         auto node = std::make_unique<BPlusTreeNode>();
-
-        if (!node) {
-            SS_LOG_ERROR(L"SignatureIndex", L"AllocateNode: unique_ptr allocation failed");
-            return nullptr;
-        }
+        // Note: make_unique throws std::bad_alloc on failure, never returns null
 
         // ====================================================================
-        // STEP 2: INITIALIZE NODE TO SAFE DEFAULTS
+        // INITIALIZE NODE TO SAFE DEFAULTS
         // ====================================================================
 
-        // HARDENED: Use volatile write to ensure zeroing is not optimized away
-        // This prevents potential information leakage from uninitialized memory
-        volatile uint8_t* volatilePtr = reinterpret_cast<volatile uint8_t*>(node.get());
-        for (size_t i = 0; i < sizeof(BPlusTreeNode); ++i) {
-            volatilePtr[i] = 0;
-        }
+        // Use SecureZeroMemory to ensure zeroing is not optimized away.
+        // This prevents potential information leakage from uninitialized memory.
+        SecureZeroMemory(node.get(), sizeof(BPlusTreeNode));
 
-        // Set node type
         node->isLeaf = isLeaf;
-
-        // Initialize counts
         node->keyCount = 0;
-
-        // Initialize parent pointer
         node->parentOffset = 0;
-
-        // Initialize linked list pointers (leaf nodes only, but safe to set for all)
         node->nextLeaf = 0;
         node->prevLeaf = 0;
-
-        // Keys and children are already zeroed by volatile write above
 
         SS_LOG_TRACE(L"SignatureIndex",
             L"AllocateNode: Allocated %s node (size=%zu bytes)",
             isLeaf ? L"leaf" : L"internal", sizeof(BPlusTreeNode));
 
         // ====================================================================
-        // STEP 3: ADD TO COW POOL
+        // ADD TO COW POOL
         // ====================================================================
 
         BPlusTreeNode* ptr = node.get();
 
-        // HARDENED: Pre-check already done above, but verify again for defense-in-depth
-        // (Size check was done at function entry - this is a sanity check)
-        
-        // HARDENED: Wrap push_back in try-catch as it may throw
         try {
             m_cowNodes.push_back(std::move(node));
         } catch (const std::exception& pushEx) {
@@ -1188,19 +1063,17 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
             m_cowNodes.size());
 
         // ====================================================================
-        // STEP 4: REGISTER IN POINTER ADDRESS MAP (FOR COW TRAVERSAL)
+        // REGISTER IN POINTER ADDRESS MAP (FOR COW TRAVERSAL)
         // ====================================================================
         // Store mapping from full pointer address to COW node.
-        // This allows FindLeafForCOW to resolve children[] pointers back to COW nodes
-        // during tree traversal before commit.
-        // NOTE: Using full uintptr_t key for 64-bit safety (avoids pointer collisions)
+        // This allows FindCOWNodeByAddr to resolve children[] values back to
+        // COW nodes during tree traversal before commit.
         uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
-        uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
         m_ptrAddrToCOWNode[ptrAddr] = ptr;
-        
+
         SS_LOG_TRACE(L"SignatureIndex",
-            L"AllocateNode: Registered address 0x%llX (truncated 0x%X) → node ptr",
-            static_cast<unsigned long long>(ptrAddr), truncatedAddr);
+            L"AllocateNode: Registered address 0x%llX in COW map",
+            static_cast<unsigned long long>(ptrAddr));
 
         return ptr;
     }
@@ -1220,73 +1093,53 @@ BPlusTreeNode* SignatureIndex::AllocateNode(bool isLeaf) noexcept {
 }
 
 // ============================================================================
-// FREENODE - ENTERPRISE-GRADE IMPLEMENTATION
+// FREENODE - COW-MANAGED DEALLOCATION
 // ============================================================================
 
 void SignatureIndex::FreeNode(BPlusTreeNode* node) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE NODE DEALLOCATION
+     * NODE DEALLOCATION (COW-MANAGED)
      * ========================================================================
      *
-     * Purpose:
-     * - Free B+Tree node from COW pool
-     * - In COW system, nodes are managed by transaction lifecycle
+     * In the COW system, nodes are NOT freed immediately. They are owned by
+     * m_cowNodes (unique_ptr) and freed automatically when:
+     * 1. Transaction commits (CommitCOW clears m_cowNodes)
+     * 2. Transaction rolls back (RollbackCOW clears m_cowNodes)
+     * 3. SignatureIndex destructor runs
      *
-     * Memory Management:
-     * - Nodes are NOT freed immediately in COW system
-     * - Freed automatically when transaction commits/rollbacks
-     * - m_cowNodes vector owns all allocated nodes
-     *
-     * Design Rationale:
-     * - COW (Copy-On-Write) semantics require nodes to persist until
-     *   transaction commits
-     * - This allows atomic rollback on failure
-     * - Readers can still access old nodes during write transaction
-     *
-     * Thread Safety:
-     * - Called only under exclusive write lock
-     * - Not thread-safe (caller must hold lock)
+     * This is intentionally a no-op. Do NOT manually delete the node.
      *
      * ========================================================================
      */
 
     if (!node) {
-        // Null pointer is valid (no-op)
         return;
     }
 
-    // In COW system, nodes are owned by m_cowNodes vector
-    // They will be freed when:
-    // 1. Transaction commits (CommitCOW() clears m_cowNodes)
-    // 2. Transaction rolls back (RollbackCOW() clears m_cowNodes)
-    // 3. SignatureIndex destructor runs
-
-    // Do NOT manually delete the node here - it's owned by unique_ptr in m_cowNodes
-
     SS_LOG_TRACE(L"SignatureIndex",
         L"FreeNode: Node marked for deallocation (will be freed on transaction end)");
-
-    // No-op: Node lifecycle managed by COW transaction
 }
 
 
 
 // ============================================================================
-// GETNODE - ENTERPRISE-GRADE IMPLEMENTATION (ENHANCED)
+// GETNODE - ENTERPRISE-GRADE IMPLEMENTATION
 // ============================================================================
 
-
-const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept {
+const BPlusTreeNode* SignatureIndex::GetNode(uint64_t nodeOffset) const noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE NODE RETRIEVAL WITH THREAD-SAFE CACHING
+     * NODE RETRIEVAL WITH THREAD-SAFE CACHING
      * ========================================================================
      *
      * Thread Safety:
      * - Cache reads are protected by shared lock (multiple concurrent readers)
      * - Cache writes are protected by exclusive lock on m_cacheLock
      * - Atomic access counter prevents data races
+     *
+     * NOTE (v1.1): Parameter widened from uint32_t to uint64_t to support
+     * databases exceeding the 4GB boundary.
      *
      * ========================================================================
      */
@@ -1295,13 +1148,11 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // STEP 1: BOUNDS CHECKING
     // ========================================================================
 
-    // HARDENED: Check for null base address first
     if (!m_baseAddress) {
         SS_LOG_ERROR(L"SignatureIndex", L"GetNode: Base address is null");
         return nullptr;
     }
 
-    // HARDENED: Check for zero index size
     if (m_indexSize == 0) {
         SS_LOG_ERROR(L"SignatureIndex", L"GetNode: Index size is zero");
         return nullptr;
@@ -1309,66 +1160,55 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
 
     if (nodeOffset >= m_indexSize) {
         SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Offset 0x%X exceeds index size 0x%llX",
+            L"GetNode: Offset 0x%llX exceeds index size 0x%llX",
             nodeOffset, m_indexSize);
         return nullptr;
     }
 
-    // HARDENED: Integer overflow check before addition
-    if (static_cast<uint64_t>(nodeOffset) + sizeof(BPlusTreeNode) > m_indexSize) {
+    // Integer overflow check before addition
+    if (nodeOffset + sizeof(BPlusTreeNode) > m_indexSize) {
         SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Node at offset 0x%X would overflow index bounds",
+            L"GetNode: Node at offset 0x%llX would overflow index bounds",
             nodeOffset);
         return nullptr;
     }
 
-    // Validate offset is properly aligned - HARDENED: make this an error, not warning
+    // Validate alignment - misaligned access is undefined behavior
     constexpr size_t NODE_ALIGNMENT = alignof(BPlusTreeNode);
     if (NODE_ALIGNMENT > 1 && (nodeOffset % NODE_ALIGNMENT) != 0) {
         SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Offset 0x%X is not properly aligned (required alignment=%zu)",
+            L"GetNode: Offset 0x%llX is not properly aligned (required alignment=%zu)",
             nodeOffset, NODE_ALIGNMENT);
-        return nullptr;  // HARDENED: Changed from warning to error - misaligned access is UB
+        return nullptr;
     }
 
     // ========================================================================
     // STEP 2: CHECK CACHE (Thread-Safe Read)
     // ========================================================================
 
-    // HARDENED: Validate CACHE_SIZE > 0 at compile time
     static_assert(CACHE_SIZE > 0, "CACHE_SIZE must be positive");
     const size_t cacheIdx = HashNodeOffset(nodeOffset) % CACHE_SIZE;
-    
-    // Read cache entry under shared lock
+
     {
         std::shared_lock<std::shared_mutex> cacheLock(m_cacheLock);
-        
+
         const auto& cached = m_nodeCache[cacheIdx];
-        
+
         if (cached.node != nullptr) {
-            // Validate cached pointer is still within bounds
             const uint8_t* nodePtr = reinterpret_cast<const uint8_t*>(cached.node);
             const uint8_t* basePtr = static_cast<const uint8_t*>(m_baseAddress);
 
-            // Safety check: ensure cached pointer is within mapped region
-            bool inBounds = (nodePtr >= basePtr) && 
+            bool inBounds = (nodePtr >= basePtr) &&
                             ((nodePtr + sizeof(BPlusTreeNode)) <= (basePtr + m_indexSize));
 
             if (inBounds) {
                 const uint64_t actualOffset = static_cast<uint64_t>(nodePtr - basePtr);
 
                 if (actualOffset == nodeOffset) {
-                    // Cache hit!
                     m_cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    
-                    SS_LOG_TRACE(L"SignatureIndex",
-                        L"GetNode: Cache hit for offset 0x%X",
-                        nodeOffset);
-
                     return cached.node;
                 }
             }
-            // If out of bounds or wrong offset, fall through to cache miss
         }
     }
 
@@ -1378,10 +1218,6 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
 
     m_cacheMisses.fetch_add(1, std::memory_order_relaxed);
 
-    // HARDENED: Bounds check already performed at function entry, but kept as defense-in-depth
-    // (Note: This was checked above, but a second check here provides extra safety)
-
-    // Calculate node address
     const uint8_t* nodeAddr = static_cast<const uint8_t*>(m_baseAddress) + nodeOffset;
     const auto* node = reinterpret_cast<const BPlusTreeNode*>(nodeAddr);
 
@@ -1389,17 +1225,9 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // STEP 4: VALIDATE NODE STRUCTURE (Corruption Detection)
     // ========================================================================
 
-    // HARDENED: Null check after cast (should never happen, but defense-in-depth)
-    if (!node) {
-        SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Node pointer is null after address calculation at offset 0x%X",
-            nodeOffset);
-        return nullptr;
-    }
-
     if (node->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
-            L"GetNode: Retrieved node has invalid keyCount %u (max=%zu) at offset 0x%X",
+            L"GetNode: Retrieved node has invalid keyCount %u (max=%zu) at offset 0x%llX",
             node->keyCount, BPlusTreeNode::MAX_KEYS, nodeOffset);
         return nullptr;
     }
@@ -1408,59 +1236,49 @@ const BPlusTreeNode* SignatureIndex::GetNode(uint32_t nodeOffset) const noexcept
     // STEP 5: UPDATE CACHE (Thread-Safe Write)
     // ========================================================================
 
-    // HARDENED: Wrap cache update in try-catch for exception safety
     try {
         std::unique_lock<std::shared_mutex> cacheLock(m_cacheLock);
-        
+
         auto& cached = m_nodeCache[cacheIdx];
         cached.node = node;
         cached.accessCount = 1;
         cached.lastAccessTime = m_cacheAccessCounter.fetch_add(1, std::memory_order_relaxed);
     }
     catch (const std::exception& ex) {
-        // HARDENED: Cache update failure is non-fatal, log and continue
+        // Cache update failure is non-fatal
         SS_LOG_WARN(L"SignatureIndex",
-            L"GetNode: Cache update failed (offset=0x%X): %S - continuing without cache",
+            L"GetNode: Cache update failed (offset=0x%llX): %S - continuing without cache",
             nodeOffset, ex.what());
-        // Node is still valid, just not cached
     }
     catch (...) {
         SS_LOG_WARN(L"SignatureIndex",
-            L"GetNode: Cache update failed with unknown exception (offset=0x%X)",
+            L"GetNode: Cache update failed with unknown exception (offset=0x%llX)",
             nodeOffset);
     }
 
     SS_LOG_TRACE(L"SignatureIndex",
-        L"GetNode: Cache miss - loaded node from offset 0x%X (keyCount=%u, isLeaf=%d)",
+        L"GetNode: Cache miss - loaded node from offset 0x%llX (keyCount=%u, isLeaf=%d)",
         nodeOffset, node->keyCount, node->isLeaf);
 
     return node;
 }
 
 // ============================================================================
-// CLONENODE - ENTERPRISE-GRADE IMPLEMENTATION (ENHANCED)
+// CLONENODE - ENTERPRISE-GRADE IMPLEMENTATION
 // ============================================================================
 
 BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept {
     /*
      * ========================================================================
-     * ENTERPRISE-GRADE NODE CLONING FOR COW
-     * ========================================================================
-     *
-     * Enhanced with additional validation and error handling
+     * NODE CLONING FOR COW
      * ========================================================================
      */
-
-     // ========================================================================
-     // VALIDATION
-     // ========================================================================
 
     if (!original) {
         SS_LOG_ERROR(L"SignatureIndex", L"CloneNode: Null original pointer");
         return nullptr;
     }
 
-    // Validate original node structure before cloning
     if (original->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"CloneNode: Original node has invalid keyCount %u (max=%zu)",
@@ -1472,36 +1290,16 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
         L"CloneNode: Cloning node (keyCount=%u, isLeaf=%d)",
         original->keyCount, original->isLeaf);
 
-    // ========================================================================
-    // ALLOCATE CLONE
-    // ========================================================================
-
     try {
         auto clone = std::make_unique<BPlusTreeNode>();
-
-        if (!clone) {
-            SS_LOG_ERROR(L"SignatureIndex", L"CloneNode: Failed to allocate clone");
-            return nullptr;
-        }
-
-        // ====================================================================
-        // COPY NODE DATA
-        // ====================================================================
+        // Note: make_unique throws std::bad_alloc on failure, never returns null
 
         // Use memcpy for performance (entire struct copy)
         std::memcpy(clone.get(), original, sizeof(BPlusTreeNode));
 
-        SS_LOG_TRACE(L"SignatureIndex",
-            L"CloneNode: Node cloned successfully (%zu bytes copied)",
-            sizeof(BPlusTreeNode));
-
-        // ====================================================================
-        // ADD TO COW POOL
-        // ====================================================================
-
         BPlusTreeNode* ptr = clone.get();
 
-        // HARDENED: Pre-check COW pool size before push_back
+        // Pre-check COW pool size before push_back
         constexpr size_t MAX_COW_NODES = 10000;
         if (m_cowNodes.size() >= MAX_COW_NODES) {
             SS_LOG_ERROR(L"SignatureIndex",
@@ -1510,7 +1308,6 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
             return nullptr;
         }
 
-        // HARDENED: Wrap push_back in try-catch
         try {
             m_cowNodes.push_back(std::move(clone));
         } catch (const std::exception& pushEx) {
@@ -1519,24 +1316,13 @@ BPlusTreeNode* SignatureIndex::CloneNode(const BPlusTreeNode* original) noexcept
             return nullptr;
         }
 
-        SS_LOG_TRACE(L"SignatureIndex",
-            L"CloneNode: Added to COW pool (pool size=%zu)",
-            m_cowNodes.size());
-
-        // ====================================================================
-        // REGISTER IN POINTER ADDRESS MAP (FOR COW TRAVERSAL)
-        // ====================================================================
-        // Store mapping from full pointer address to COW node.
-        // This allows FindLeafForCOW to resolve children[] pointers back to COW nodes
-        // during tree traversal before commit.
-        // NOTE: Using full uintptr_t key for 64-bit safety (avoids pointer collisions)
+        // Register in pointer address map for COW traversal (exact 64-bit lookup)
         uintptr_t ptrAddr = reinterpret_cast<uintptr_t>(ptr);
-        uint32_t truncatedAddr = static_cast<uint32_t>(ptrAddr);
         m_ptrAddrToCOWNode[ptrAddr] = ptr;
-        
+
         SS_LOG_TRACE(L"SignatureIndex",
-            L"CloneNode: Registered address 0x%llX (truncated 0x%X) → cloned node ptr",
-            static_cast<unsigned long long>(ptrAddr), truncatedAddr);
+            L"CloneNode: Registered address 0x%llX in COW map (pool size=%zu)",
+            static_cast<unsigned long long>(ptrAddr), m_cowNodes.size());
 
         return ptr;
     }
@@ -1567,36 +1353,24 @@ StoreError SignatureIndex::MergeNodes(
 ) noexcept {
     /*
      * ========================================================================
-     * PRODUCTION-GRADE B+TREE NODE MERGE OPERATION
+     * B+TREE NODE MERGE OPERATION
      * ========================================================================
      *
      * Purpose:
-     * - Merge two B+Tree nodes (combine keys and children)
-     * - Called during deletion when nodes underflow
-     * - Maintains B+Tree invariants
+     * - Merge two B+Tree leaf nodes (combine keys and children)
+     * - Called during deletion when leaf nodes underflow
      *
-     * Algorithm:
-     * 1. Validate input nodes
-     * 2. Copy keys and children from right to left
-     * 3. Update linked list pointers (if leaf nodes)
-     * 4. Update parent pointers
-     * 5. Return merged node
+     * IMPORTANT: This function is ONLY correct for leaf node merges.
+     * Internal node merges require a separator key from the parent, which
+     * this function does not accept. The Remove() path currently does not
+     * perform rebalancing (it accepts underflow), so internal merge is not
+     * invoked. If rebalancing is added in the future, this function must be
+     * extended with a separatorKey parameter for internal nodes.
      *
      * Preconditions:
-     * - Both nodes are valid and non-null
+     * - Both nodes are valid, non-null, same type
      * - Left and right are adjacent siblings
      * - Caller holds exclusive write lock
-     * - Parent knows about both nodes
-     *
-     * Postconditions:
-     * - Left node contains all keys/children from both
-     * - Right node is no longer used
-     * - Linked list (if applicable) is updated
-     * - B+Tree invariants maintained
-     *
-     * Complexity:
-     * - Time: O(K) where K = keys in right node
-     * - Space: O(1) - in-place merge
      *
      * ========================================================================
      */
@@ -1604,7 +1378,7 @@ StoreError SignatureIndex::MergeNodes(
     SS_LOG_DEBUG(L"SignatureIndex", L"MergeNodes: Merging node structures");
 
     // ========================================================================
-    // STEP 1: COMPREHENSIVE INPUT VALIDATION
+    // STEP 1: INPUT VALIDATION
     // ========================================================================
 
     if (!left) {
@@ -1617,7 +1391,6 @@ StoreError SignatureIndex::MergeNodes(
         return StoreError{ SignatureStoreError::InvalidFormat, 0, "Right node is null" };
     }
 
-    // HARDENED: Validate node types match (can't merge leaf with internal)
     if (left->isLeaf != right->isLeaf) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"MergeNodes: Node type mismatch (left isLeaf=%d, right isLeaf=%d)",
@@ -1626,7 +1399,14 @@ StoreError SignatureIndex::MergeNodes(
                           "Cannot merge nodes of different types" };
     }
 
-    // Validate key counts
+    // Reject internal node merge - not supported without separator key
+    if (!left->isLeaf) {
+        SS_LOG_ERROR(L"SignatureIndex",
+            L"MergeNodes: Internal node merge not supported (requires separator key from parent)");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0,
+                          "Internal node merge requires separator key" };
+    }
+
     if (left->keyCount > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_ERROR(L"SignatureIndex",
             L"MergeNodes: Left node keyCount (%u) exceeds maximum (%zu)",
@@ -1643,8 +1423,7 @@ StoreError SignatureIndex::MergeNodes(
                           "Right node has invalid keyCount" };
     }
 
-    // HARDENED: Use safe addition to prevent overflow
-    const uint64_t combinedKeys = static_cast<uint64_t>(left->keyCount) + 
+    const uint64_t combinedKeys = static_cast<uint64_t>(left->keyCount) +
                                    static_cast<uint64_t>(right->keyCount);
     if (combinedKeys > BPlusTreeNode::MAX_KEYS) {
         SS_LOG_WARN(L"SignatureIndex",
@@ -1655,26 +1434,19 @@ StoreError SignatureIndex::MergeNodes(
     }
 
     // ========================================================================
-    // STEP 2: SAVE MERGE PARAMETERS FOR LOGGING
+    // STEP 2: COPY KEYS AND CHILDREN FROM RIGHT TO LEFT (LEAF MERGE)
     // ========================================================================
 
-    uint32_t originalLeftCount = left->keyCount;
-    uint32_t originalRightCount = right->keyCount;
-    bool bothLeaves = left->isLeaf && right->isLeaf;
+    const uint32_t originalLeftCount = left->keyCount;
+    const uint32_t originalRightCount = right->keyCount;
 
     SS_LOG_TRACE(L"SignatureIndex",
-        L"MergeNodes: Merging left(%u keys) + right(%u keys), isLeaf=%d",
-        originalLeftCount, originalRightCount, bothLeaves);
+        L"MergeNodes: Merging left(%u keys) + right(%u keys), isLeaf=true",
+        originalLeftCount, originalRightCount);
 
-    // ========================================================================
-    // STEP 3: COPY KEYS FROM RIGHT TO LEFT
-    // ========================================================================
-
-    // HARDENED: Store rightKeyCount to prevent TOCTOU issues if right is modified
     const uint32_t rightKeyCount = right->keyCount;
-    
+
     for (uint32_t i = 0; i < rightKeyCount; ++i) {
-        // HARDENED: Bounds check on left node before write
         if (left->keyCount >= BPlusTreeNode::MAX_KEYS) {
             SS_LOG_ERROR(L"SignatureIndex",
                 L"MergeNodes: Left node full during merge (keyCount=%u)",
@@ -1683,73 +1455,36 @@ StoreError SignatureIndex::MergeNodes(
                               "Left node overflowed during merge" };
         }
 
-        // HARDENED: Bounds check on children array (may differ from keys)
-        if (left->keyCount >= BPlusTreeNode::MAX_CHILDREN || i >= BPlusTreeNode::MAX_CHILDREN) {
+        if (i >= BPlusTreeNode::MAX_KEYS || left->keyCount >= BPlusTreeNode::MAX_CHILDREN ||
+            i >= BPlusTreeNode::MAX_CHILDREN) {
             SS_LOG_ERROR(L"SignatureIndex",
-                L"MergeNodes: Children index out of bounds (left=%u, right=%u, max=%zu)",
+                L"MergeNodes: Index out of bounds (left=%u, right=%u, max=%zu)",
                 left->keyCount, i, BPlusTreeNode::MAX_CHILDREN);
             return StoreError{ SignatureStoreError::IndexCorrupted, 0,
-                              "Children array bounds violation" };
+                              "Array bounds violation" };
         }
 
         left->keys[left->keyCount] = right->keys[i];
         left->children[left->keyCount] = right->children[i];
         left->keyCount++;
-
-        SS_LOG_TRACE(L"SignatureIndex",
-            L"MergeNodes: Copied key index %u (left now has %u keys)",
-            i, left->keyCount);
     }
 
     // ========================================================================
-    // STEP 4: COPY EXTRA CHILD POINTER FOR INTERNAL NODES
+    // STEP 3: UPDATE LINKED LIST POINTERS
     // ========================================================================
 
-    if (!left->isLeaf && !right->isLeaf) {
-        // Internal nodes have one more child pointer than keys
-        // HARDENED: Explicit bounds validation for both source and destination
-        if (rightKeyCount < BPlusTreeNode::MAX_CHILDREN && 
-            left->keyCount < BPlusTreeNode::MAX_CHILDREN) {
-            left->children[left->keyCount] = right->children[rightKeyCount];
-            SS_LOG_TRACE(L"SignatureIndex",
-                L"MergeNodes: Copied extra child pointer for internal nodes");
-        }
-        else {
-            SS_LOG_ERROR(L"SignatureIndex",
-                L"MergeNodes: Cannot copy extra child - index out of bounds (left=%u, right=%u)",
-                left->keyCount, rightKeyCount);
-            return StoreError{ SignatureStoreError::IndexCorrupted, 0,
-                              "Extra child pointer copy failed" };
-        }
-    }
+    // Update left's next pointer to point past right
+    left->nextLeaf = right->nextLeaf;
 
-    // ========================================================================
-    // STEP 5: UPDATE LINKED LIST POINTERS (FOR LEAF NODES)
-    // ========================================================================
-
-    if (bothLeaves) {
-        // Update left's next pointer to point past right
-        left->nextLeaf = right->nextLeaf;
-
-        // If right has a next leaf, would need to update its prevLeaf
-        // (In full COW implementation, would need to clone that node too)
-
-        SS_LOG_TRACE(L"SignatureIndex",
-            L"MergeNodes: Updated leaf linked list pointers");
-    }
-
-    // ========================================================================
-    // STEP 6: UPDATE PARENT POINTERS
-    // ========================================================================
-
-    // Right node's parent is same as left's
-    // (Caller will handle parent's pointer update)
+    // If right has a next leaf, its prevLeaf should be updated to point to left.
+    // In a full COW implementation, the next leaf would need to be cloned too.
+    // The caller is responsible for this if needed.
 
     SS_LOG_TRACE(L"SignatureIndex",
-        L"MergeNodes: Parent pointers configured");
+        L"MergeNodes: Updated leaf linked list pointers");
 
     // ========================================================================
-    // STEP 7: VALIDATION OF MERGE RESULT
+    // STEP 4: VALIDATION
     // ========================================================================
 
     if (left->keyCount != (originalLeftCount + originalRightCount)) {
@@ -1768,11 +1503,7 @@ StoreError SignatureIndex::MergeNodes(
                           "Merged node exceeds capacity" };
     }
 
-    // ========================================================================
-    // STEP 8: PERFORMANCE LOGGING
-    // ========================================================================
-
-    SS_LOG_INFO(L"SignatureIndex",
+    SS_LOG_DEBUG(L"SignatureIndex",
         L"MergeNodes: Merge successful - %u + %u = %u keys",
         originalLeftCount, originalRightCount, left->keyCount);
 
