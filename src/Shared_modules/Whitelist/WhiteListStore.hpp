@@ -556,8 +556,8 @@ private:
     uint64_t m_leafOffset{0};             ///< Current leaf node offset
     uint32_t m_keyIndex{0};               ///< Current key index within leaf
     bool m_atEnd{true};                   ///< True if at end position
-    /// HI-4 fix: hold shared lock for duration of traversal
-    std::shared_lock<std::shared_mutex> m_lock;
+    /// HI-4 fix: hold shared lock for duration of traversal (shared_ptr for copyability)
+    std::shared_ptr<std::shared_lock<std::shared_mutex>> m_lock;
 };
 
 // ============================================================================
