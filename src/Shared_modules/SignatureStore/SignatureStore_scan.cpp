@@ -100,14 +100,18 @@ namespace ShadowStrike {
                 m_queryCacheMisses.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Execute scan (parallel or sequential)
+            // Execute scan (parallel or sequential) under shared_lock to prevent Close() TOCTOU
             ScanResult result;
-            if (options.parallelExecution && options.threadCount > 1) {
-                result = ExecuteParallelScan(buffer, options);
+            {
+                std::shared_lock<std::shared_mutex> scanLock(m_globalLock);
+                if (options.parallelExecution && options.threadCount > 1) {
+                    result = ExecuteParallelScan(buffer, options);
+                }
+                else {
+                    result = ExecuteSequentialScan(buffer, options);
+                }
             }
-            else {
-                result = ExecuteSequentialScan(buffer, options);
-            }
+            // scanLock released — safe to acquire cacheLock in AddToQueryCache
 
             // Performance tracking
             LARGE_INTEGER endTime;
@@ -259,11 +263,19 @@ namespace ShadowStrike {
                 }
 
                 // VALIDATION 12: Cross-check mapped size with expected file size
+                // If size changed between stat and mmap, file was modified (possible TOCTOU attack)
                 if (fileView.fileSize != fileSize) {
                     SS_LOG_WARN(L"SignatureStore",
-                        L"ScanFile: Mapped size (%llu) differs from file size (%llu) - possible race condition",
+                        L"ScanFile: Mapped size (%llu) differs from stat size (%llu) - file modified during scan",
                         fileView.fileSize, fileSize);
-                    // Continue but log for audit - file might have been modified during mapping
+
+                    // Reject if mapped file exceeds our safety limit
+                    if (fileView.fileSize > MAX_FILE_SIZE) {
+                        SS_LOG_ERROR(L"SignatureStore",
+                            L"ScanFile: Mapped size exceeds limit after TOCTOU race, aborting scan");
+                        MemoryMapping::CloseView(fileView);
+                        return ScanResult{};
+                    }
                 }
 
                 // ====================================================================

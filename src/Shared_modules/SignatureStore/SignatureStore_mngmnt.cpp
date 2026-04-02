@@ -43,7 +43,11 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock to prevent Close()/Shutdown() from destroying
+            // component pointers between our null check and usage (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_hashStoreEnabled.load(std::memory_order_acquire) || !m_hashStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddHash: HashStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
@@ -118,7 +122,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_patternStore)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddPattern: PatternStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
@@ -171,7 +178,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_yaraStore)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_yaraStoreEnabled.load(std::memory_order_acquire) || !m_yaraStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"AddYaraRule: YaraStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
@@ -221,7 +231,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_hashStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveHash: HashStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
@@ -263,7 +276,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemovePattern: PatternStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
@@ -300,7 +316,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::AccessDenied, 0, "Cannot remove - read-only mode" };
             }
 
-            // VALIDATION 2: Component availability
+            // Acquire shared lock (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            // VALIDATION 2: Component availability (under lock)
             if (!m_yaraStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"RemoveYaraRule: YaraStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
@@ -354,6 +373,9 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
             }
 
+            // Acquire shared lock (TOCTOU fix: prevents Close() from destroying m_hashStore)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
             if (!m_hashStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
             }
@@ -385,6 +407,9 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"SignatureStore", L"ImportPatterns: Invalid path (contains null)");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
             }
+
+            // Acquire shared lock (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
             if (!m_patternStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
@@ -426,6 +451,9 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid namespace" };
             }
 
+            // Acquire shared lock (TOCTOU fix)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
             if (!m_yaraStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };
             }
@@ -460,6 +488,9 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
             }
 
+            // Acquire shared lock (TOCTOU fix: prevents Close() during export)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
             if (!m_hashStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "HashStore not available" };
             }
@@ -491,7 +522,10 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
             }
 
-            if (!m_patternStoreEnabled.load() || !m_patternStore) {
+            // Acquire shared lock (TOCTOU fix: prevents Close() during export)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
+
+            if (!m_patternStoreEnabled.load(std::memory_order_acquire) || !m_patternStore) {
                 SS_LOG_ERROR(L"SignatureStore", L"PatternStore not available");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "PatternStore not available" };
             }
@@ -543,6 +577,9 @@ namespace ShadowStrike {
                 SS_LOG_ERROR(L"SignatureStore", L"ExportYaraRules: Invalid path (contains null)");
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "Invalid path" };
             }
+
+            // Acquire shared lock (TOCTOU fix: prevents Close() during export)
+            std::shared_lock<std::shared_mutex> lock(m_globalLock);
 
             if (!m_yaraStore) {
                 return StoreError{ SignatureStoreError::InvalidFormat, 0, "YaraStore not available" };

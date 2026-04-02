@@ -202,16 +202,13 @@ StoreError SignatureStore::Initialize(
         return StoreError{SignatureStoreError::Success};
     }
 
-    // TITANIUM: Acquire exclusive lock with timeout protection
-    std::unique_lock<std::shared_mutex> lock(m_globalLock, std::try_to_lock);
-    if (!lock.owns_lock()) {
-        SS_LOG_ERROR(L"SignatureStore", L"Initialize: Failed to acquire lock (possible deadlock)");
-        return StoreError{SignatureStoreError::Unknown, 0, "Failed to acquire initialization lock"};
-    }
+    // TITANIUM: Acquire exclusive lock for initialization
+    // Use blocking lock (not try_to_lock) — concurrent callers should wait,
+    // not fail with spurious errors
+    std::unique_lock<std::shared_mutex> lock(m_globalLock);
 
     // Double-check initialization state under lock
     if (m_initialized.load(std::memory_order_acquire)) {
-        SS_LOG_WARN(L"SignatureStore", L"Already initialized (race condition detected)");
         return StoreError{SignatureStoreError::Success};
     }
 
@@ -455,6 +452,9 @@ void SignatureStore::Close() noexcept {
         SS_LOG_ERROR(L"SignatureStore", L"Close: YaraStore unknown exception");
     }
 
+    // Mark uninitialized BEFORE releasing lock to prevent new operations from starting
+    m_initialized.store(false, std::memory_order_release);
+
     // Clear caches (need to release global lock first, then acquire cache lock)
     lock.unlock();
     
@@ -464,8 +464,6 @@ void SignatureStore::Close() noexcept {
     catch (...) {
         SS_LOG_ERROR(L"SignatureStore", L"Close: ClearAllCaches exception");
     }
-
-    m_initialized.store(false, std::memory_order_release);
 
     SS_LOG_INFO(L"SignatureStore", L"Closed successfully");
 }
