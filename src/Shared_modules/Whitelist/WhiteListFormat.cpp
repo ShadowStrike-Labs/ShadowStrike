@@ -881,7 +881,8 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
         // Prefetch ahead for better cache utilization
         PrefetchRead(data + 64);
         
-        const uint64_t val = *reinterpret_cast<const uint64_t*>(data);
+        uint64_t val;
+        std::memcpy(&val, data, sizeof(val));
         crc = static_cast<uint32_t>(_mm_crc32_u64(crc, val));
         data += 8u;
         length -= 8u;
@@ -889,7 +890,8 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
     
     // Process remaining 4 bytes
     if (length >= 4u) {
-        const uint32_t val = *reinterpret_cast<const uint32_t*>(data);
+        uint32_t val;
+        std::memcpy(&val, data, sizeof(val));
         crc = _mm_crc32_u32(crc, val);
         data += 4u;
         length -= 4u;
@@ -897,7 +899,8 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
     
     // Process remaining 2 bytes
     if (length >= 2u) {
-        const uint16_t val = *reinterpret_cast<const uint16_t*>(data);
+        uint16_t val;
+        std::memcpy(&val, data, sizeof(val));
         crc = _mm_crc32_u16(crc, val);
         data += 2u;
         length -= 2u;
@@ -945,12 +948,12 @@ static_assert(CRC32_TABLE[255] == 0x2D02EF8Du, "CRC32 table[255] invalid");
     
     const auto* bytes = static_cast<const uint8_t*>(data);
     
-    // Use hardware acceleration if available
-    if (HasHardwareCRC32()) {
-        return ComputeCRC32_Hardware(bytes, length);
-    }
+    // FMT-4: Always use IEEE CRC32 for cross-platform consistency.
+    // Hardware CRC32C uses a different polynomial (Castagnoli) — cannot be mixed
+    // with the IEEE software table. Header integrity checks are small (~4KB),
+    // so the performance difference is negligible.
     
-    // Software fallback with prefetching for large buffers
+    // Software IEEE CRC32 with prefetching for large buffers
     uint32_t crc = 0xFFFFFFFFu;
     
     // Prefetch first cache line
@@ -1120,8 +1123,8 @@ public:
             std::shared_lock<std::shared_mutex> readLock(m_mutex);
             auto it = m_cache.find(patternKey);
             if (it != m_cache.end()) {
-                // Update LRU timestamp
-                it->second.lastAccess = std::chrono::steady_clock::now();
+                // FMT-9: Do NOT update lastAccess under shared_lock — data race.
+                // LRU is approximated via insertion time (safe under shared_lock).
                 *regex = &(it->second.compiledRegex);
                 return true;
             }
@@ -1856,6 +1859,56 @@ bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept {
 }
 
 /**
+ * @brief Validate that all header section offsets+sizes fit within the actual file.
+ *
+ * SECURITY: ValidateHeader checks alignment, size limits, overflow, and overlap
+ * but does NOT compare against the real file size. This function closes that gap.
+ * Must be called after ValidateHeader when the file size is known.
+ *
+ * @param header Pointer to validated database header
+ * @param fileSize Actual file size in bytes
+ * @return true if every section (offset+size) <= fileSize
+ */
+bool ValidateHeaderAgainstFileSize(
+    const WhitelistDatabaseHeader* header, uint64_t fileSize) noexcept {
+    if (header == nullptr || fileSize == 0u) [[unlikely]] {
+        SS_LOG_ERROR(L"Whitelist",
+            L"ValidateHeaderAgainstFileSize: null header or zero fileSize");
+        return false;
+    }
+
+    auto checkSection = [fileSize](uint64_t offset, uint64_t size,
+                                   const wchar_t* name) noexcept -> bool {
+        if (offset == 0u && size == 0u) return true;
+        if (offset > fileSize || size > fileSize - offset) {
+            SS_LOG_ERROR(L"Whitelist",
+                L"%s exceeds file bounds: offset 0x%llX + size 0x%llX > fileSize 0x%llX",
+                name,
+                static_cast<unsigned long long>(offset),
+                static_cast<unsigned long long>(size),
+                static_cast<unsigned long long>(fileSize));
+            return false;
+        }
+        return true;
+    };
+
+    if (!checkSection(header->hashIndexOffset,       header->hashIndexSize,       L"hashIndex"))       return false;
+    if (!checkSection(header->pathIndexOffset,        header->pathIndexSize,       L"pathIndex"))       return false;
+    if (!checkSection(header->bloomFilterOffset,      header->bloomFilterSize,     L"bloomFilter"))     return false;
+    if (!checkSection(header->entryDataOffset,        header->entryDataSize,       L"entryData"))       return false;
+    if (!checkSection(header->stringPoolOffset,       header->stringPoolSize,      L"stringPool"))      return false;
+    if (!checkSection(header->certIndexOffset,        header->certIndexSize,       L"certIndex"))       return false;
+    if (!checkSection(header->publisherIndexOffset,   header->publisherIndexSize,  L"publisherIndex"))  return false;
+    if (!checkSection(header->extendedHashOffset,     header->extendedHashSize,    L"extendedHash"))    return false;
+    if (!checkSection(header->metadataOffset,         header->metadataSize,        L"metadata"))        return false;
+    if (!checkSection(header->pathBloomOffset,        header->pathBloomSize,       L"pathBloom"))       return false;
+
+    SS_LOG_DEBUG(L"Whitelist", L"Header-vs-fileSize validation passed (fileSize=0x%llX)",
+        static_cast<unsigned long long>(fileSize));
+    return true;
+}
+
+/**
  * @brief Compute CRC32 checksum of database header.
  *
  * Computes CRC32 of the header up to (but not including) the headerCrc32 field.
@@ -2110,6 +2163,15 @@ bool VerifyIntegrity(const MemoryMappedView& view, StoreError& error) noexcept {
         error = StoreError::WithMessage(
             WhitelistStoreError::InvalidHeader,
             "Header validation failed - see log for details"
+        );
+        return false;
+    }
+    
+    // FMT-1: Validate section offsets against actual file size
+    if (!ValidateHeaderAgainstFileSize(header, view.fileSize)) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidHeader,
+            "Header section offsets exceed file size"
         );
         return false;
     }
@@ -3775,6 +3837,15 @@ bool OpenView(
         return false;
     }
     
+    // FMT-1: Validate section offsets against actual file size
+    if (!Format::ValidateHeaderAgainstFileSize(header, fileSize)) {
+        error = StoreError::WithMessage(
+            WhitelistStoreError::InvalidHeader,
+            "Header section offsets exceed file size"
+        );
+        return false;
+    }
+    
     // ========================================================================
     // SUCCESS - TRANSFER OWNERSHIP
     // ========================================================================
@@ -4245,7 +4316,7 @@ void CloseView(MemoryMappedView& view) noexcept {
             SS_LOG_DEBUG(L"Whitelist", L"CloseView: CloseHandle(mapping) failed (error %lu)",
                 static_cast<unsigned long>(::GetLastError()));
         }
-        view.mappingHandle = nullptr;
+        view.mappingHandle = INVALID_HANDLE_VALUE;
     }
     
     // Step 3: Close file handle
@@ -4424,9 +4495,9 @@ bool ExtendDatabase(
     }
     
     // Close mapping (required before extending file)
-    if (view.mappingHandle != nullptr) {
+    if (view.mappingHandle != nullptr && view.mappingHandle != INVALID_HANDLE_VALUE) {
         (void)::CloseHandle(view.mappingHandle);
-        view.mappingHandle = nullptr;
+        view.mappingHandle = INVALID_HANDLE_VALUE;
     }
     
     // ========================================================================

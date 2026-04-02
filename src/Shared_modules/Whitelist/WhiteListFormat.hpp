@@ -386,7 +386,12 @@ struct alignas(4) HashValue {
         if (safeLen == 0u) {
             return true; // Both empty
         }
-        return std::memcmp(data.data(), other.data.data(), safeLen) == 0;
+        // Constant-time comparison to prevent timing side-channel attacks
+        volatile uint8_t diff = 0;
+        for (uint8_t i = 0; i < safeLen; ++i) {
+            diff |= data[i] ^ other.data[i];
+        }
+        return diff == 0;
     }
     
     [[nodiscard]] bool operator!=(const HashValue& other) const noexcept {
@@ -604,25 +609,29 @@ static_assert(std::is_trivially_copyable_v<WhitelistEntry>,
 
 #pragma pack(push, 1)
 struct ExtendedHashEntry {
-    uint64_t entryId;                     ///< Links to WhitelistEntry.entryId
-    HashValue fullHash;                   ///< Complete hash value
-    uint8_t reserved[52];                 ///< Pad to 128 bytes
+    uint64_t entryId{0};                  ///< Links to WhitelistEntry.entryId
+    HashValue fullHash{};                 ///< Complete hash value
+    uint8_t reserved[52]{};               ///< Pad to 128 bytes
     
-    /// @brief Default constructor - zero-initialize
-    ExtendedHashEntry() noexcept 
-        : entryId(0u), fullHash{}, reserved{} {
-        std::memset(reserved, 0, sizeof(reserved));
-    }
+    ExtendedHashEntry() = default;
+    ExtendedHashEntry(const ExtendedHashEntry&) = default;
+    ExtendedHashEntry& operator=(const ExtendedHashEntry&) = default;
+    ExtendedHashEntry(ExtendedHashEntry&&) = default;
+    ExtendedHashEntry& operator=(ExtendedHashEntry&&) = default;
     
-    /// @brief Construct with entry ID and hash
-    ExtendedHashEntry(uint64_t id, const HashValue& hash) noexcept
-        : entryId(id), fullHash(hash), reserved{} {
-        std::memset(reserved, 0, sizeof(reserved));
+    /// @brief Factory: create with entry ID and hash
+    [[nodiscard]] static ExtendedHashEntry Create(uint64_t id, const HashValue& hash) noexcept {
+        ExtendedHashEntry entry{};
+        entry.entryId = id;
+        entry.fullHash = hash;
+        return entry;
     }
 };
 #pragma pack(pop)
 
 static_assert(sizeof(ExtendedHashEntry) == 128, "ExtendedHashEntry must be 128 bytes");
+static_assert(std::is_trivially_copyable_v<ExtendedHashEntry>,
+              "ExtendedHashEntry must be trivially copyable for memory-mapped storage");
 
 // ============================================================================
 // B+TREE INDEX NODE STRUCTURE
@@ -635,44 +644,36 @@ struct BPlusTreeNode {
     static constexpr size_t MAX_CHILDREN = ORDER;
     
     /// @brief Is this a leaf node?
-    bool isLeaf;
+    bool isLeaf{true};
     
     /// @brief Reserved for alignment
-    uint8_t reserved[7];
+    uint8_t reserved[7]{};
     
     /// @brief Number of keys in this node (capped at MAX_KEYS)
-    uint32_t keyCount;
+    uint32_t keyCount{0};
     
     /// @brief Offset to parent node (0 = root)
-    uint32_t parentOffset;
+    uint32_t parentOffset{0};
     
     /// @brief Keys: FastHash values for comparison
-    std::array<uint64_t, MAX_KEYS> keys;
+    std::array<uint64_t, MAX_KEYS> keys{};
     
     /// @brief Children/Values:
     /// - Internal nodes: offsets to child nodes
     /// - Leaf nodes: offsets to WhitelistEntry
-    std::array<uint32_t, MAX_CHILDREN> children;
+    std::array<uint32_t, MAX_CHILDREN> children{};
     
     /// @brief Next leaf in linked list (for range scans)
-    uint32_t nextLeaf;
+    uint32_t nextLeaf{0};
     
     /// @brief Previous leaf in linked list
-    uint32_t prevLeaf;
+    uint32_t prevLeaf{0};
     
-    /// @brief Default constructor - zero-initialize
-    BPlusTreeNode() noexcept
-        : isLeaf(true),
-          reserved{0, 0, 0, 0, 0, 0, 0},
-          keyCount(0u),
-          parentOffset(0u),
-          keys{},
-          children{},
-          nextLeaf(0u),
-          prevLeaf(0u) {
-        keys.fill(0u);
-        children.fill(0u);
-    }
+    BPlusTreeNode() = default;
+    BPlusTreeNode(const BPlusTreeNode&) = default;
+    BPlusTreeNode& operator=(const BPlusTreeNode&) = default;
+    BPlusTreeNode(BPlusTreeNode&&) = default;
+    BPlusTreeNode& operator=(BPlusTreeNode&&) = default;
     
     /// @brief Get valid key count (bounds-checked)
     [[nodiscard]] uint32_t GetKeyCount() const noexcept {
@@ -694,38 +695,31 @@ static_assert(sizeof(BPlusTreeNode) <= PAGE_SIZE, "BPlusTreeNode must fit in one
 
 #pragma pack(push, 1)
 struct BloomFilterHeader {
-    uint32_t magic;                       ///< 0x424C4F4D = 'BLOM'
-    uint32_t version;                     ///< Version 1
-    uint64_t bitCount;                    ///< Number of bits in filter
-    uint32_t hashFunctions;               ///< Number of hash functions
-    uint32_t reserved;
-    uint64_t elementCount;                ///< Estimated elements added
-    double falsePositiveRate;             ///< Target false positive rate
-    uint64_t dataOffset;                  ///< Offset to bit array
-    uint64_t dataSize;                    ///< Size of bit array in bytes
+    uint32_t magic{BLOOM_MAGIC};           ///< 0x424C4F4D = 'BLOM'
+    uint32_t version{1u};                 ///< Version 1
+    uint64_t bitCount{0};                 ///< Number of bits in filter
+    uint32_t hashFunctions{0};            ///< Number of hash functions
+    uint32_t reserved{0};
+    uint64_t elementCount{0};             ///< Estimated elements added
+    double falsePositiveRate{0.0};        ///< Target false positive rate
+    uint64_t dataOffset{0};               ///< Offset to bit array
+    uint64_t dataSize{0};                 ///< Size of bit array in bytes
     
     /// @brief Magic constant for bloom filter validation
     static constexpr uint32_t BLOOM_MAGIC = 0x424C4F4Du; // 'BLOM'
     
-    /// @brief Default constructor - zero-initialize
-    BloomFilterHeader() noexcept
-        : magic(BLOOM_MAGIC),
-          version(1u),
-          bitCount(0u),
-          hashFunctions(0u),
-          reserved(0u),
-          elementCount(0u),
-          falsePositiveRate(0.0),
-          dataOffset(0u),
-          dataSize(0u)
-    {}
+    BloomFilterHeader() = default;
+    BloomFilterHeader(const BloomFilterHeader&) = default;
+    BloomFilterHeader& operator=(const BloomFilterHeader&) = default;
+    BloomFilterHeader(BloomFilterHeader&&) = default;
+    BloomFilterHeader& operator=(BloomFilterHeader&&) = default;
     
     /// @brief Check if header is valid
     [[nodiscard]] bool IsValid() const noexcept {
         return magic == BLOOM_MAGIC && 
                version == 1u && 
                hashFunctions > 0u && 
-               hashFunctions <= 32u &&  // Reasonable limit
+               hashFunctions <= 16u &&  // Must match MAX_BLOOM_HASHES
                bitCount > 0u &&
                dataSize > 0u;
     }
@@ -1006,6 +1000,12 @@ struct MemoryMappedView {
         if (baseAddress == nullptr) {
             return nullptr;
         }
+        // FMT-7: Validate alignment before reinterpret_cast
+        if constexpr (alignof(T) > 1) {
+            if (offset % alignof(T) != 0) {
+                return nullptr;
+            }
+        }
         return reinterpret_cast<const T*>(
             static_cast<const uint8_t*>(baseAddress) + offset
         );
@@ -1027,6 +1027,12 @@ struct MemoryMappedView {
         }
         if (baseAddress == nullptr) {
             return nullptr;
+        }
+        // FMT-7: Validate alignment before reinterpret_cast
+        if constexpr (alignof(T) > 1) {
+            if (offset % alignof(T) != 0) {
+                return nullptr;
+            }
         }
         return reinterpret_cast<T*>(
             static_cast<uint8_t*>(baseAddress) + offset
@@ -1075,6 +1081,10 @@ struct MemoryMappedView {
     /// @param charCount Number of wide characters in string
     /// @return Wide string view or empty wstring_view if bounds check fails
     [[nodiscard]] std::wstring_view GetWideString(uint64_t offset, size_t charCount) const noexcept {
+        // FMT-8: Reject unaligned offsets for wchar_t
+        if (offset % alignof(wchar_t) != 0) {
+            return {};
+        }
         const size_t byteLen = charCount * sizeof(wchar_t);
         // Check for overflow in byte calculation
         if (charCount > 0u && byteLen / sizeof(wchar_t) != charCount) {
@@ -1263,6 +1273,10 @@ namespace Format {
 
 /// @brief Validate database header integrity
 [[nodiscard]] bool ValidateHeader(const WhitelistDatabaseHeader* header) noexcept;
+
+/// @brief Validate header section offsets fit within actual file size
+[[nodiscard]] bool ValidateHeaderAgainstFileSize(
+    const WhitelistDatabaseHeader* header, uint64_t fileSize) noexcept;
 
 /// @brief Compute CRC32 of header
 [[nodiscard]] uint32_t ComputeHeaderCRC32(const WhitelistDatabaseHeader* header) noexcept;
