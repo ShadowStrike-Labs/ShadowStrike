@@ -565,10 +565,13 @@ struct alignas(CACHE_LINE_SIZE) IPv4RadixNode {
     
     /// @brief Set child node offset
     void SetChild(uint8_t octet, uint32_t offset) noexcept {
+        const bool wasEmpty = (children[octet] == 0);
         children[octet] = offset;
         if (offset != 0) {
             flags |= HasChildren;
-            if (childCount < 256) childCount++;
+            if (wasEmpty && childCount < 256) childCount++;
+        } else if (!wasEmpty && childCount > 0) {
+            childCount--;
         }
     }
 };
