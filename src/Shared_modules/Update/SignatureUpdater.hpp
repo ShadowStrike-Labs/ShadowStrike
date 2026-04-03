@@ -392,14 +392,14 @@ struct SigUpdateResult {
  * @brief Statistics
  */
 struct SigUpdaterStatistics {
-    std::atomic<uint64_t> updatesApplied{0};
-    std::atomic<uint64_t> updatesFailed{0};
-    std::atomic<uint64_t> deltaPatchesApplied{0};
-    std::atomic<uint64_t> fullDownloads{0};
-    std::atomic<uint64_t> bytesDownloaded{0};
-    std::atomic<uint64_t> bytesSaved{0};  // vs full download
-    std::atomic<uint64_t> hotReloads{0};
-    std::array<std::atomic<uint64_t>, 16> byDatabaseType{};
+    uint64_t updatesApplied{0};
+    uint64_t updatesFailed{0};
+    uint64_t deltaPatchesApplied{0};
+    uint64_t fullDownloads{0};
+    uint64_t bytesDownloaded{0};
+    uint64_t bytesSaved{0};  // vs full download
+    uint64_t hotReloads{0};
+    std::array<uint64_t, 16> byDatabaseType{};
     TimePoint startTime = Clock::now();
     std::optional<SystemTimePoint> lastUpdateTime;
     
