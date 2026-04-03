@@ -88,9 +88,12 @@
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
-#include "../Security/DigitalSignatureValidator.hpp"
-#include "../Security/ProcessProtection.hpp"
-#include "../Security/TamperProtection.hpp"
+#include "../SelfProtection/DigitalSignatureValidator.hpp"
+#include "../SelfProtection/ProcessProtection.hpp"
+#include "../SelfProtection/TamperProtection.hpp"
+#include "../SelfProtection/SelfDefense.hpp"
+#include "../SelfProtection/AntiDebug.hpp"
+#include "../SelfProtection/CertificateValidator.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
@@ -1028,8 +1031,22 @@ public:
         if (m_config.enableBehaviorBlocking) {
             try {
                 auto& bb = BehaviorBlocker::Instance();
-                bb.Start();
-                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::RUNNING);
+                BehaviorBlockerConfig bbConfig = BehaviorBlockerConfig::CreateDefault();
+                if (!bb.Initialize(bbConfig)) {
+                    Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker::Initialize failed");
+                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
+                } else {
+                    bb.LoadDefaultRules();
+                    bb.Start();
+                    bb.PushRulesToKernel();
+                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::RUNNING);
+                    Utils::Logger::Info(L"RealTimeProtection: BehaviorBlocker initialized with {} default rules",
+                        bb.GetStatistics().activeRuleCount);
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker startup exception: {}",
+                    Utils::StringUtils::ToWide(ex.what()));
+                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
             }
@@ -1274,7 +1291,10 @@ public:
         try { MemoryProtection::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::STOPPED);
 
-        try { BehaviorBlocker::Instance().Stop(); } catch (...) {}
+        try {
+            BehaviorBlocker::Instance().Stop();
+            BehaviorBlocker::Instance().Shutdown();
+        } catch (...) {}
         SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::STOPPED);
 
         try { NetworkTrafficFilter::Instance().Stop(); } catch (...) {}
@@ -1531,6 +1551,39 @@ public:
 
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
         std::wstring commandLine(req.commandLineData(), req.commandLineCharLen());
+
+        // =====================================================================
+        // ANTI-DEBUG: Forward every process create/terminate to AntiDebug
+        // so it can detect hostile debugger launches (OllyDbg, x64dbg, etc.)
+        // before the process establishes a debug session.
+        // =====================================================================
+        if (Security::AntiDebug::HasInstance() &&
+            Security::AntiDebug::Instance().IsInitialized()) {
+            try {
+                Security::AntiDebug::Instance().OnKernelProcessNotify(
+                    req.processId, req.parentProcessId,
+                    imagePath, static_cast<bool>(req.isCreation));
+            } catch (const std::exception& e) {
+                Utils::Logger::Warn(L"RealTimeProtection: AntiDebug process notify exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
+            } catch (...) {}
+        }
+
+        // =====================================================================
+        // CERTIFICATE VALIDATOR: Validate process image certificate on creation
+        // to detect revoked/untrusted certificate chains before execution proceeds.
+        // =====================================================================
+        if (req.isCreation && !imagePath.empty() &&
+            Security::CertificateValidator::HasInstance() &&
+            Security::CertificateValidator::Instance().IsInitialized()) {
+            try {
+                Security::CertificateValidator::Instance().OnKernelProcessCreate(
+                    req.processId, req.parentProcessId, imagePath);
+            } catch (const std::exception& e) {
+                Utils::Logger::Warn(L"RealTimeProtection: CertificateValidator process create exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
+            } catch (...) {}
+        }
 
         // =====================================================================
         // KERNEL-ENRICHED CONTEXT ANALYSIS (uses full kernel data, not just PID)
@@ -1950,6 +2003,36 @@ public:
         std::wstring imagePath(req.imagePathData(), req.imagePathCharLen());
 
         // ================================================================
+        // ANTI-DEBUG: Detect hostile debugger DLLs being loaded into our
+        // process (dbghelp.dll, scyllahide.dll, etc.) for early interception.
+        // ================================================================
+        if (Security::AntiDebug::HasInstance() &&
+            Security::AntiDebug::Instance().IsInitialized()) {
+            try {
+                Security::AntiDebug::Instance().OnKernelImageLoad(
+                    req.processId, imagePath,
+                    static_cast<uintptr_t>(req.imageBase),
+                    static_cast<size_t>(req.imageSize));
+            } catch (...) {}
+        }
+
+        // ================================================================
+        // CERTIFICATE VALIDATOR: Validate module certificate chain on load —
+        // blocks DLLs/drivers signed with revoked or untrusted certificates
+        // BEFORE they execute any code in the target process.
+        // ================================================================
+        if (Security::CertificateValidator::HasInstance() &&
+            Security::CertificateValidator::Instance().IsInitialized()) {
+            try {
+                Security::CertificateValidator::Instance().OnKernelImageLoad(
+                    imagePath,
+                    static_cast<uintptr_t>(req.imageBase),
+                    static_cast<size_t>(req.imageSize),
+                    req.processId);
+            } catch (...) {}
+        }
+
+        // ================================================================
         // DIGITAL SIGNATURE VALIDATION (APT Hunting Gate)
         // ================================================================
         // Run full signature analysis + stolen cert detection + anomaly engine
@@ -2287,6 +2370,25 @@ public:
 
             case FilterMessageType_BehavioralAlert: {
                 Utils::Logger::Warn(L"RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
+                m_stats.threatsDetected++;
+
+                if (data && size > 0) {
+                    try {
+                        auto& bb = BehaviorBlocker::Instance();
+                        if (bb.IsRunning()) {
+                            auto payload = std::span<const std::byte>(
+                                static_cast<const std::byte*>(data), size);
+                            bb.OnKernelBehavioralAlert(
+                                static_cast<uint32_t>(FilterMessageType_BehavioralAlert),
+                                payload);
+                        }
+                    } catch (const std::exception& ex) {
+                        Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker alert handler exception: {}",
+                            Utils::StringUtils::ToWide(ex.what()));
+                    } catch (...) {
+                        Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker alert handler unknown exception");
+                    }
+                }
                 break;
             }
 
@@ -2375,6 +2477,16 @@ public:
                             L"integrity check + APT sweep triggered",
                             alertType, sourcePid, targetPid);
                     }
+                }
+
+                // Forward raw payload to SelfDefense for threat event recording,
+                // watchdog correlation, callback notification, and auto-recovery.
+                // SelfDefense parses the full wire format independently from
+                // TamperProtection's simplified view above.
+                if (Security::SelfDefense::HasInstance() &&
+                    Security::SelfDefense::Instance().IsInitialized()) {
+                    Security::SelfDefense::Instance().OnKernelSelfProtectEvent(
+                        data, static_cast<uint32_t>(size));
                 }
 
                 m_stats.threatsDetected++;
