@@ -446,13 +446,13 @@ struct UpdateHistoryEntry {
  * @brief Statistics
  */
 struct UpdateStatistics {
-    std::atomic<uint64_t> checksPerformed{0};
-    std::atomic<uint64_t> updatesApplied{0};
-    std::atomic<uint64_t> updatesFailed{0};
-    std::atomic<uint64_t> rollbacksPerformed{0};
-    std::atomic<uint64_t> bytesDownloaded{0};
-    std::atomic<uint64_t> deltaUpdates{0};
-    std::array<std::atomic<uint64_t>, 16> byUpdateType{};
+    uint64_t checksPerformed{0};
+    uint64_t updatesApplied{0};
+    uint64_t updatesFailed{0};
+    uint64_t rollbacksPerformed{0};
+    uint64_t bytesDownloaded{0};
+    uint64_t deltaUpdates{0};
+    std::array<uint64_t, 16> byUpdateType{};
     TimePoint startTime = Clock::now();
     std::optional<SystemTimePoint> lastCheckTime;
     std::optional<SystemTimePoint> lastUpdateTime;
@@ -550,8 +550,8 @@ public:
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] UpdateModuleStatus GetModuleStatus() const noexcept;
     
-    [[nodiscard]] bool UpdateConfiguration(const UpdateConfiguration& config);
-    [[nodiscard]] UpdateConfiguration GetConfiguration() const;
+    [[nodiscard]] bool UpdateConfiguration(const struct UpdateConfiguration& config);
+    [[nodiscard]] struct UpdateConfiguration GetConfiguration() const;
 
     // ========================================================================
     // UPDATE OPERATIONS
