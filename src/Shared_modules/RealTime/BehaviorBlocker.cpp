@@ -72,6 +72,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <fstream>
 #include <filesystem>
@@ -94,10 +95,11 @@ constexpr uint32_t       kIdlePid                  = 0;
 constexpr size_t         kDefaultMaxRules          = 1024;
 constexpr size_t         kDefaultMaxExclusions     = 512;
 constexpr size_t         kDefaultMaxHistory        = 10000;
-constexpr uint32_t       kDefaultAnalysisTimeoutMs = 5000;
+constexpr uint32_t       kDefaultAnalysisTimeoutMs = 5;
 constexpr uint32_t       kDefaultRegexMaxInput     = 32768;
 constexpr uint32_t       kDefaultChainTimeoutSec   = 300;
-constexpr float          kDefaultEscalationThresh  = 3.0f;
+constexpr float          kDefaultEscalationThresh  = 0.7f;
+constexpr int64_t        kBlockedPidTtlMs          = 600000; // 10 min TTL for stale PIDs
 constexpr size_t         kProcessKeyCacheMax       = 1024;
 constexpr float          kDecayLambda              = 0.01f;
 constexpr uint32_t       kChainAutoEscalateCount   = 3;
@@ -254,6 +256,7 @@ public:
     explicit ProcessKeyCache(size_t capacity) : m_capacity(capacity) {}
 
     std::optional<ProcessKey> Get(uint32_t pid) {
+        std::lock_guard lock(m_mutex);
         auto it = m_map.find(pid);
         if (it == m_map.end()) return std::nullopt;
         m_lru.splice(m_lru.begin(), m_lru, it->second.listIt);
@@ -261,6 +264,7 @@ public:
     }
 
     void Put(uint32_t pid, const ProcessKey& key) {
+        std::lock_guard lock(m_mutex);
         auto it = m_map.find(pid);
         if (it != m_map.end()) {
             it->second.key = key;
@@ -280,6 +284,7 @@ public:
     }
 
     void Invalidate(uint32_t pid) {
+        std::lock_guard lock(m_mutex);
         auto it = m_map.find(pid);
         if (it != m_map.end()) {
             m_lru.erase(it->second.listIt);
@@ -288,6 +293,7 @@ public:
     }
 
     void Clear() {
+        std::lock_guard lock(m_mutex);
         m_map.clear();
         m_lru.clear();
     }
@@ -297,6 +303,7 @@ private:
         ProcessKey key;
         std::list<uint32_t>::iterator listIt;
     };
+    mutable std::mutex m_mutex;
     size_t m_capacity;
     std::list<uint32_t> m_lru;
     std::unordered_map<uint32_t, CacheEntry> m_map;
@@ -349,6 +356,78 @@ struct InternalStats {
         return s;
     }
 };
+
+// ============================================================================
+// STRUCT MEMBER FUNCTION IMPLEMENTATIONS
+// ============================================================================
+
+std::string ProcessBehavior::ToJson() const {
+    try {
+        json j;
+        j["processId"]      = processId;
+        j["parentPid"]       = parentPid;
+        j["processPath"]     = Utils::StringUtils::ToNarrow(processPath);
+        j["commandLine"]     = Utils::StringUtils::ToNarrow(commandLine);
+        j["type"]            = static_cast<int>(type);
+        j["target"]          = Utils::StringUtils::ToNarrow(target);
+        j["risk"]            = static_cast<int>(risk);
+        j["sessionId"]       = sessionId;
+        j["integrityLevel"]  = integrityLevel;
+        j["correlationId"]   = correlationId;
+        j["timestamp"]       = timestamp;
+        return j.dump();
+    } catch (...) {
+        return "{}";
+    }
+}
+
+std::string BlockEvent::ToJson() const {
+    try {
+        json j;
+        j["timestamp"]       = timestamp;
+        j["processId"]       = processId;
+        j["processPath"]     = Utils::StringUtils::ToNarrow(processPath);
+        j["behaviorType"]    = static_cast<int>(behaviorType);
+        j["actionTaken"]     = static_cast<int>(actionTaken);
+        j["ruleId"]          = ruleId;
+        j["details"]         = details;
+        j["correlationId"]   = correlationId;
+        j["actionSucceeded"] = actionSucceeded;
+        return j.dump();
+    } catch (...) {
+        return "{}";
+    }
+}
+
+BehaviorBlockerConfig BehaviorBlockerConfig::CreateDefault() {
+    BehaviorBlockerConfig cfg;
+    cfg.enableBlocking            = true;
+    cfg.enableKernelIntegration   = true;
+    cfg.enableTemporalCorrelation = true;
+    cfg.maxRules                  = 1000;
+    cfg.maxExclusions             = 500;
+    cfg.maxHistoryEvents          = 10000;
+    cfg.analysisTimeoutMs         = 5;
+    cfg.regexMaxInputLength       = 32768;
+    cfg.behaviorChainTimeoutSec   = 300;
+    cfg.escalationThreshold       = 0.7f;
+    return cfg;
+}
+
+BehaviorBlockerConfig BehaviorBlockerConfig::CreateEnterprise() {
+    BehaviorBlockerConfig cfg;
+    cfg.enableBlocking            = true;
+    cfg.enableKernelIntegration   = true;
+    cfg.enableTemporalCorrelation = true;
+    cfg.maxRules                  = 5000;
+    cfg.maxExclusions             = 2000;
+    cfg.maxHistoryEvents          = 50000;
+    cfg.analysisTimeoutMs         = 3;
+    cfg.regexMaxInputLength       = 16384;
+    cfg.behaviorChainTimeoutSec   = 600;
+    cfg.escalationThreshold       = 0.5f;
+    return cfg;
+}
 
 // ============================================================================
 // IMPLEMENTATION CLASS (PIMPL)
@@ -536,6 +615,19 @@ public:
             return BlockAction::Allow;
         }
 
+        // Step 3: Fast path -- already blocked PID (with TTL to prevent PID reuse false positives)
+        // No heap allocations before this check per performance contract
+        {
+            std::shared_lock blockedLock(m_blockedMutex);
+            auto it = m_blockedPids.find(behavior.processId);
+            if (it != m_blockedPids.end() &&
+                (NowEpochMs() - it->second) <= kBlockedPidTtlMs) {
+                RecordAnalysisTime(startTime);
+                return BlockAction::TerminateProcess;
+            }
+        }
+
+        // Step 4: Prepare capped + narrowed strings for regex matching (deferred past fast paths)
         const uint32_t maxInput = m_config.regexMaxInputLength;
         std::wstring cappedPath = behavior.processPath;
         CapString(cappedPath, maxInput);
@@ -548,23 +640,14 @@ public:
         std::string narrowCmd    = Utils::StringUtils::ToNarrow(cappedCmdLine);
         std::string narrowTarget = Utils::StringUtils::ToNarrow(cappedTarget);
 
-        // Step 3: Fast path -- already blocked PID
-        {
-            std::shared_lock blockedLock(m_blockedMutex);
-            if (m_blockedPids.contains(behavior.processId)) {
-                RecordAnalysisTime(startTime);
-                return BlockAction::TerminateProcess;
-            }
-        }
-
-        // Step 4: Exclusion check
+        // Step 5: Exclusion check
         if (IsExcluded(behavior, narrowPath, narrowCmd, narrowTarget)) {
             m_stats.exclusionsMatched.fetch_add(1, std::memory_order_relaxed);
             RecordAnalysisTime(startTime);
             return BlockAction::Allow;
         }
 
-        // Step 5: Rule evaluation
+        // Step 6: Rule evaluation
         BlockAction resultAction = BlockAction::Allow;
         std::string matchingRuleId;
         std::string matchDetails;
@@ -705,7 +788,7 @@ public:
         SS_LOG_INFO(kLogCategory, L"Manual block for PID %u: %hs", pid, reason.c_str());
         {
             std::unique_lock blockedLock(m_blockedMutex);
-            m_blockedPids.insert(pid);
+            m_blockedPids[pid] = NowEpochMs();
         }
 
         BlockEvent evt{};
@@ -745,7 +828,9 @@ public:
 
     bool IsBlocked(uint32_t pid) const {
         std::shared_lock blockedLock(m_blockedMutex);
-        return m_blockedPids.contains(pid);
+        auto it = m_blockedPids.find(pid);
+        return it != m_blockedPids.end() &&
+               (NowEpochMs() - it->second) <= kBlockedPidTtlMs;
     }
 
     // ========================================================================
@@ -868,7 +953,7 @@ public:
                 }
             }
             SS_LOG_INFO(kLogCategory, L"Loaded %u rules from file (failed: %u): %ls", loaded, failed, filePath.c_str());
-            return failed == 0;
+            return loaded > 0;
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(kLogCategory, L"Exception loading rules: %hs", ex.what());
             return false;
@@ -1219,7 +1304,7 @@ private:
                 SS_LOG_INFO(kLogCategory, L"Terminated PID %u", pid);
                 {
                     std::unique_lock blockedLock(m_blockedMutex);
-                    m_blockedPids.insert(pid);
+                    m_blockedPids[pid] = NowEpochMs();
                 }
                 m_processKeyCache.Invalidate(pid);
                 return true;
@@ -1491,7 +1576,7 @@ private:
     std::unordered_map<uint32_t, ProcessBehaviorChain> m_behaviorChains;
 
     mutable std::shared_mutex       m_blockedMutex;
-    std::unordered_set<uint32_t>    m_blockedPids;
+    std::unordered_map<uint32_t, int64_t> m_blockedPids; // PID → block timestamp (epoch ms)
 
     mutable std::shared_mutex       m_historyMutex;
     std::deque<BlockEvent>          m_history;
@@ -1521,51 +1606,169 @@ BehaviorBlocker::~BehaviorBlocker() {
     SS_LOG_INFO(kLogCategory, L"BehaviorBlocker singleton destroyed");
 }
 
-bool BehaviorBlocker::Initialize(const BehaviorBlockerConfig& config) { return m_impl->Initialize(config); }
-bool BehaviorBlocker::Start() { return m_impl->Start(); }
-bool BehaviorBlocker::Stop() { return m_impl->Stop(); }
-bool BehaviorBlocker::Pause() { return m_impl->Pause(); }
-bool BehaviorBlocker::Resume() { return m_impl->Resume(); }
-void BehaviorBlocker::Shutdown() { m_impl->Shutdown(); }
-bool BehaviorBlocker::IsRunning() const { return m_impl->IsRunning(); }
-bool BehaviorBlocker::IsPaused() const { return m_impl->IsPaused(); }
-ComponentState BehaviorBlocker::GetState() const { return m_impl->GetState(); }
+// ---- Lifecycle ----
+
+bool BehaviorBlocker::Initialize(const BehaviorBlockerConfig& config) {
+    return m_impl->Initialize(config);
+}
+
+bool BehaviorBlocker::Start() {
+    return m_impl->Start();
+}
+
+void BehaviorBlocker::Stop() {
+    m_impl->Stop();
+}
+
+void BehaviorBlocker::Pause() {
+    m_impl->Pause();
+}
+
+void BehaviorBlocker::Resume() {
+    m_impl->Resume();
+}
+
+void BehaviorBlocker::Shutdown() {
+    m_impl->Shutdown();
+}
+
+bool BehaviorBlocker::IsRunning() const noexcept {
+    try { return m_impl->IsRunning(); }
+    catch (...) { return false; }
+}
+
+bool BehaviorBlocker::IsPaused() const noexcept {
+    try { return m_impl->IsPaused(); }
+    catch (...) { return false; }
+}
+
+ComponentState BehaviorBlocker::GetState() const noexcept {
+    try { return m_impl->GetState(); }
+    catch (...) { return ComponentState::Error; }
+}
+
+// ---- Core Analysis ----
 
 BlockAction BehaviorBlocker::AnalyzeBehavior(const ProcessBehavior& behavior) {
     return m_impl->AnalyzeBehavior(behavior);
 }
 
-BlockAction BehaviorBlocker::OnKernelBehavioralAlert(BehaviorType type, std::span<const uint8_t> payload) {
-    return m_impl->OnKernelBehavioralAlert(type, payload);
+// ---- Kernel Integration ----
+
+void BehaviorBlocker::OnKernelBehavioralAlert(uint32_t messageType,
+                                               std::span<const std::byte> payload) {
+    // Convert std::byte span to uint8_t span (guaranteed layout-compatible)
+    auto uint8Payload = std::span<const uint8_t>(
+        reinterpret_cast<const uint8_t*>(payload.data()), payload.size());
+
+    // Extract behavior type from payload (third uint32_t field)
+    BehaviorType type = BehaviorType::Unknown;
+    if (payload.size() >= sizeof(uint32_t) * 3) {
+        uint32_t typeValue = 0;
+        std::memcpy(&typeValue, payload.data() + sizeof(uint32_t) * 2, sizeof(uint32_t));
+        if (typeValue <= static_cast<uint32_t>(BehaviorType::Discovery)) {
+            type = static_cast<BehaviorType>(typeValue);
+        }
+    }
+
+    (void)messageType; // Already validated by caller (RTP dispatcher)
+    m_impl->OnKernelBehavioralAlert(type, uint8Payload);
 }
 
-bool BehaviorBlocker::BlockProcess(uint32_t pid, const std::string& reason) { return m_impl->BlockProcess(pid, reason); }
-bool BehaviorBlocker::TerminateProcess(uint32_t pid) { return m_impl->TerminateProcess(pid); }
-bool BehaviorBlocker::SuspendProcess(uint32_t pid) { return m_impl->SuspendProcess(pid); }
-bool BehaviorBlocker::IsBlocked(uint32_t pid) const { return m_impl->IsBlocked(pid); }
+// ---- Process Control ----
 
-bool BehaviorBlocker::AddRule(const BehaviorRule& rule) { return m_impl->AddRule(rule); }
-bool BehaviorBlocker::RemoveRule(const std::string& ruleId) { return m_impl->RemoveRule(ruleId); }
-bool BehaviorBlocker::EnableRule(const std::string& ruleId) { return m_impl->EnableRule(ruleId); }
-bool BehaviorBlocker::DisableRule(const std::string& ruleId) { return m_impl->DisableRule(ruleId); }
-void BehaviorBlocker::ClearRules() { m_impl->ClearRules(); }
-void BehaviorBlocker::LoadDefaultRules() { m_impl->LoadDefaultRules(); }
-bool BehaviorBlocker::LoadRulesFromFile(const std::filesystem::path& filePath) { return m_impl->LoadRulesFromFile(filePath); }
-bool BehaviorBlocker::PushRulesToKernel() { return m_impl->PushRulesToKernel(); }
-
-bool BehaviorBlocker::AddExclusion(const BehaviorExclusion& exclusion) { return m_impl->AddExclusion(exclusion); }
-bool BehaviorBlocker::RemoveExclusion(const std::string& exclusionId) { return m_impl->RemoveExclusion(exclusionId); }
-
-uint64_t BehaviorBlocker::RegisterBlockCallback(std::function<void(const BlockEvent&)> cb) {
-    return m_impl->RegisterBlockCallback(std::move(cb));
-}
-bool BehaviorBlocker::UnregisterBlockCallback(uint64_t callbackId) {
-    return m_impl->UnregisterBlockCallback(callbackId);
+bool BehaviorBlocker::BlockProcess(uint32_t pid, const std::wstring& reason) {
+    return m_impl->BlockProcess(pid, Utils::StringUtils::ToNarrow(reason));
 }
 
-std::vector<BlockEvent> BehaviorBlocker::GetRecentEvents(size_t limit) const { return m_impl->GetRecentEvents(limit); }
-BehaviorBlockerStats BehaviorBlocker::GetStatistics() const { return m_impl->GetStatistics(); }
-std::string BehaviorBlocker::GetStatisticsJson() const { return m_impl->GetStatisticsJson(); }
-bool BehaviorBlocker::SelfTest() { return m_impl->SelfTest(); }
+bool BehaviorBlocker::TerminateProcess(uint32_t pid) {
+    return m_impl->TerminateProcess(pid);
+}
+
+bool BehaviorBlocker::SuspendProcess(uint32_t pid) {
+    return m_impl->SuspendProcess(pid);
+}
+
+bool BehaviorBlocker::IsBlocked(uint32_t pid) const noexcept {
+    try { return m_impl->IsBlocked(pid); }
+    catch (...) { return false; }
+}
+
+// ---- Rule Management ----
+
+bool BehaviorBlocker::AddRule(const BehaviorRule& rule) {
+    return m_impl->AddRule(rule);
+}
+
+bool BehaviorBlocker::RemoveRule(const std::string& ruleId) {
+    return m_impl->RemoveRule(ruleId);
+}
+
+bool BehaviorBlocker::EnableRule(const std::string& ruleId) {
+    return m_impl->EnableRule(ruleId);
+}
+
+bool BehaviorBlocker::DisableRule(const std::string& ruleId) {
+    return m_impl->DisableRule(ruleId);
+}
+
+bool BehaviorBlocker::ClearRules() {
+    m_impl->ClearRules();
+    return true;
+}
+
+bool BehaviorBlocker::LoadDefaultRules() {
+    m_impl->LoadDefaultRules();
+    return true;
+}
+
+bool BehaviorBlocker::LoadRulesFromFile(const std::filesystem::path& path) {
+    return m_impl->LoadRulesFromFile(path);
+}
+
+bool BehaviorBlocker::PushRulesToKernel() {
+    return m_impl->PushRulesToKernel();
+}
+
+// ---- Exclusion Management ----
+
+bool BehaviorBlocker::AddExclusion(const BehaviorExclusion& exclusion) {
+    return m_impl->AddExclusion(exclusion);
+}
+
+bool BehaviorBlocker::RemoveExclusion(const std::string& exclusionId) {
+    return m_impl->RemoveExclusion(exclusionId);
+}
+
+// ---- Callback Management ----
+
+uint64_t BehaviorBlocker::RegisterBlockCallback(BlockEventCallback callback) {
+    return m_impl->RegisterBlockCallback(std::move(callback));
+}
+
+void BehaviorBlocker::UnregisterBlockCallback(uint64_t callbackId) {
+    m_impl->UnregisterBlockCallback(callbackId);
+}
+
+// ---- Monitoring & Statistics ----
+
+std::vector<BlockEvent> BehaviorBlocker::GetRecentEvents(size_t limit) const {
+    return m_impl->GetRecentEvents(limit);
+}
+
+BehaviorBlockerStats BehaviorBlocker::GetStatistics() const noexcept {
+    try { return m_impl->GetStatistics(); }
+    catch (...) { return BehaviorBlockerStats{}; }
+}
+
+std::string BehaviorBlocker::GetStatisticsJson() const {
+    return m_impl->GetStatisticsJson();
+}
+
+// ---- Diagnostics ----
+
+bool BehaviorBlocker::SelfTest() {
+    return m_impl->SelfTest();
+}
 
 } // namespace ShadowStrike::RealTime
