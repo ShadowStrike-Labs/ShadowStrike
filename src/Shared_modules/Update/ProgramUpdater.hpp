@@ -437,13 +437,13 @@ struct ProgUpdateResult {
  * @brief Statistics
  */
 struct ProgUpdaterStatistics {
-    std::atomic<uint64_t> updatesApplied{0};
-    std::atomic<uint64_t> updatesFailed{0};
-    std::atomic<uint64_t> rollbacksPerformed{0};
-    std::atomic<uint64_t> driverUpdates{0};
-    std::atomic<uint64_t> serviceRestarts{0};
-    std::atomic<uint64_t> rebootsScheduled{0};
-    std::atomic<uint64_t> bytesDownloaded{0};
+    uint64_t updatesApplied{0};
+    uint64_t updatesFailed{0};
+    uint64_t rollbacksPerformed{0};
+    uint64_t driverUpdates{0};
+    uint64_t serviceRestarts{0};
+    uint64_t rebootsScheduled{0};
+    uint64_t bytesDownloaded{0};
     TimePoint startTime = Clock::now();
     std::optional<SystemTimePoint> lastUpdateTime;
     
