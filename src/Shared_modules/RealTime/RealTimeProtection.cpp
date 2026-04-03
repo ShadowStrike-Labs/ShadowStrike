@@ -1068,8 +1068,11 @@ public:
         if (m_config.enableExploitPrevention) {
             try {
                 auto& ep = ExploitPrevention::Instance();
-                ep.Start();
-                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
+                if (ep.Start()) {
+                    SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
+                } else {
+                    SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                }
             } catch (...) {
                 SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
             }
