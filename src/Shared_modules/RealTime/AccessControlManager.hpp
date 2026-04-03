@@ -156,7 +156,6 @@
 #include <memory>
 #include <functional>
 #include <chrono>
-#include <atomic>
 #include <shared_mutex>
 #include <bitset>
 #include <span>
@@ -164,10 +163,9 @@
 // ============================================================================
 // WINDOWS INCLUDES (Forward declarations to minimize header pollution)
 // ============================================================================
-// Note: Implementation file will include full Windows headers
-struct _SID;
-struct _TOKEN_PRIVILEGES;
-struct _SECURITY_DESCRIPTOR;
+// Note: Implementation file will include full Windows headers.
+// Forward declarations removed — all Windows types are abstracted behind
+// SecurityIdentifier, TokenInfo, etc. within this header.
 
 namespace ShadowStrike {
 namespace RealTime {
@@ -189,7 +187,7 @@ namespace AccessControlConstants {
 
     // Permission system limits
     constexpr size_t MAX_PERMISSIONS = 256;
-    constexpr size_t MAX_ROLES = 64;
+    constexpr size_t MAX_ROLES = 128;  // Accommodates built-in roles + custom range 100-199
     constexpr size_t MAX_SESSIONS_PER_USER = 16;
     constexpr size_t MAX_GROUP_MEMBERSHIPS = 256;
     constexpr size_t MAX_PRIVILEGE_COUNT = 36;  // Windows privilege count
@@ -206,6 +204,10 @@ namespace AccessControlConstants {
     constexpr uint32_t MFA_CHALLENGE_TIMEOUT_MS = 300000;        // 5 minutes
     constexpr uint32_t CACHE_TTL_MS = 60000;                     // 1 minute
     constexpr uint32_t AD_SYNC_INTERVAL_MS = 300000;             // 5 minutes
+
+    // Role validation constants
+    constexpr size_t MAX_IP_RANGES = 64;
+    constexpr size_t MAX_TIME_RANGES = 32;
 
     // Integrity levels (Windows standard values)
     constexpr uint32_t INTEGRITY_UNTRUSTED = 0x0000;
@@ -422,8 +424,11 @@ enum class Permission : uint16_t {
     API_KEY_MANAGE = 224,            ///< Manage API keys
 
     // Special
-    PERMISSION_COUNT = 240,          ///< Total permission count
-    INVALID_PERMISSION = 255         ///< Invalid permission marker
+    PERMISSION_COUNT = 240,          ///< Total defined permission count
+    // NOTE: All bitset operations must check index < PERMISSION_COUNT.
+    // INVALID_PERMISSION is a sentinel outside the valid range but within the
+    // bitset width (MAX_PERMISSIONS=256). Never use it as a bitset index.
+    INVALID_PERMISSION = 255         ///< Invalid permission sentinel (do NOT use as bitset index)
 };
 
 /**
@@ -612,7 +617,10 @@ enum class MFAMethod : uint8_t {
  * @brief Wrapper for Windows SID with utility methods.
  */
 struct alignas(8) SecurityIdentifier {
-    std::vector<uint8_t> binarySid;     ///< Raw SID bytes
+    /// Maximum size of a Windows SID (SECURITY_MAX_SID_SIZE).
+    static constexpr size_t MAX_SID_SIZE = 68;
+
+    std::vector<uint8_t> binarySid;     ///< Raw SID bytes (must not exceed MAX_SID_SIZE)
     std::wstring stringSid;             ///< String representation (S-1-...)
     std::wstring accountName;           ///< Resolved account name
     std::wstring domainName;            ///< Domain if applicable
@@ -622,12 +630,20 @@ struct alignas(8) SecurityIdentifier {
 
     // Comparison operators for use in containers
     bool operator==(const SecurityIdentifier& other) const noexcept {
+        if (!isValid || !other.isValid) return false;
         return binarySid == other.binarySid;
     }
 
     bool operator<(const SecurityIdentifier& other) const noexcept {
         return binarySid < other.binarySid;
     }
+
+    /**
+     * @brief Factory: construct a SecurityIdentifier from raw binary SID bytes.
+     * @param sid Raw SID bytes (must not exceed MAX_SID_SIZE).
+     * @return A SecurityIdentifier with isValid set appropriately.
+     */
+    [[nodiscard]] static SecurityIdentifier FromBinary(std::span<const uint8_t> sid);
 
     // Hash function for unordered containers
     struct Hash {
@@ -636,10 +652,19 @@ struct alignas(8) SecurityIdentifier {
 };
 
 /**
+ * @brief Hash functor for Permission enum, for use in std::unordered_map/set.
+ */
+struct PermissionHash {
+    size_t operator()(Permission p) const noexcept {
+        return std::hash<uint16_t>{}(static_cast<uint16_t>(p));
+    }
+};
+
+/**
  * @struct RoleDefinition
  * @brief Complete definition of a role in the RBAC system.
  */
-struct alignas(64) RoleDefinition {
+struct RoleDefinition {
     // Identity
     uint32_t roleId{ 0 };
     RoleType type{ RoleType::INVALID };
@@ -647,7 +672,7 @@ struct alignas(64) RoleDefinition {
     std::wstring description;
 
     // Hierarchy
-    uint32_t parentRoleId{ 0 };         ///< Inherits from this role
+    std::optional<uint32_t> parentRoleId{ std::nullopt };  ///< Inherits from this role (nullopt = no parent)
     uint8_t hierarchyLevel{ 0 };        ///< Position in hierarchy (0 = highest)
 
     // Permissions
@@ -658,8 +683,8 @@ struct alignas(64) RoleDefinition {
     bool requiresMFA{ false };
     bool allowsElevation{ false };
     uint32_t maxSessionDurationMs{ AccessControlConstants::DEFAULT_SESSION_TIMEOUT_MS };
-    std::vector<std::wstring> allowedIPRanges;    ///< IP-based restrictions
-    std::vector<std::wstring> allowedTimeRanges;  ///< Time-based restrictions
+    std::vector<std::wstring> allowedIPRanges;    ///< IP-based restrictions (max AccessControlConstants::MAX_IP_RANGES)
+    std::vector<std::wstring> allowedTimeRanges;  ///< Time-based restrictions (max AccessControlConstants::MAX_TIME_RANGES)
 
     // Multi-tenant
     uint32_t tenantId{ 0 };             ///< 0 = global role
@@ -676,7 +701,7 @@ struct alignas(64) RoleDefinition {
  * @struct UserPrincipal
  * @brief Represents a user identity in the access control system.
  */
-struct alignas(64) UserPrincipal {
+struct UserPrincipal {
     // Identity
     SecurityIdentifier sid;
     std::wstring username;
@@ -718,6 +743,7 @@ struct alignas(64) UserPrincipal {
 struct alignas(64) AuthenticationSession {
     // Session identity
     uint64_t sessionId{ 0 };
+    /// @warning Security-sensitive: implementations must SecureZeroMemory before deallocation.
     std::wstring sessionToken;          ///< Secure random token
 
     // User reference
@@ -769,9 +795,12 @@ struct alignas(8) PrivilegeInfo {
  * @struct TokenInfo
  * @brief Comprehensive information about an access token.
  */
-struct alignas(64) TokenInfo {
+struct TokenInfo {
     // Token identity
-    uint64_t tokenHandle{ 0 };
+    /// Raw Windows HANDLE value. RAII: caller is responsible for closing via
+    /// CloseHandle when the handle is no longer needed. Prefer wrapping in a
+    /// unique_ptr with a custom deleter.
+    uintptr_t tokenHandle{ 0 };
     TokenType type{ TokenType::PRIMARY };
 
     // User
@@ -812,7 +841,7 @@ struct alignas(64) TokenInfo {
  * @struct ProcessRestrictionConfig
  * @brief Configuration for restricting a process.
  */
-struct alignas(64) ProcessRestrictionConfig {
+struct ProcessRestrictionConfig {
     // Target
     uint32_t targetPid{ 0 };
     uint64_t targetProcessUniqueId{ 0 };
@@ -860,7 +889,7 @@ struct alignas(64) ProcessRestrictionConfig {
  * @struct ProcessProtectionConfig
  * @brief Configuration for protecting ShadowStrike processes.
  */
-struct alignas(64) ProcessProtectionConfig {
+struct ProcessProtectionConfig {
     // Target
     uint32_t targetPid{ 0 };
     std::wstring processName;
@@ -870,7 +899,9 @@ struct alignas(64) ProcessProtectionConfig {
 
     // Handle protection
     bool protectHandles{ true };
-    uint32_t allowedAccessMask{ 0x1000 };  ///< PROCESS_QUERY_LIMITED_INFORMATION
+    /// PROCESS_QUERY_LIMITED_INFORMATION — the only access right permitted by default.
+    static constexpr uint32_t PROCESS_QUERY_LIMITED_INFO = 0x1000;
+    uint32_t allowedAccessMask{ PROCESS_QUERY_LIMITED_INFO };
 
     // Thread protection
     bool blockThreadCreation{ false };
@@ -902,7 +933,7 @@ struct alignas(64) ProcessProtectionConfig {
  * @struct AccessControlAuditEvent
  * @brief Audit event for access control decisions.
  */
-struct alignas(64) AccessControlAuditEvent {
+struct AccessControlAuditEvent {
     // Event identity
     uint64_t eventId{ 0 };
     AuditEventType type{ AuditEventType::PERMISSION_GRANTED };
@@ -937,7 +968,7 @@ struct alignas(64) AccessControlAuditEvent {
  * @struct RestrictionResult
  * @brief Result of a process restriction operation.
  */
-struct alignas(64) RestrictionResult {
+struct RestrictionResult {
     bool success{ false };
     uint32_t errorCode{ 0 };
     std::wstring errorMessage;
@@ -959,7 +990,7 @@ struct alignas(64) RestrictionResult {
  * @struct ProtectionResult
  * @brief Result of a process protection operation.
  */
-struct alignas(64) ProtectionResult {
+struct ProtectionResult {
     bool success{ false };
     uint32_t errorCode{ 0 };
     std::wstring errorMessage;
@@ -978,7 +1009,7 @@ struct alignas(64) ProtectionResult {
  * @struct MFAChallengeResult
  * @brief Result of an MFA challenge.
  */
-struct alignas(64) MFAChallengeResult {
+struct MFAChallengeResult {
     bool success{ false };
     MFAMethod methodUsed{ MFAMethod::NONE };
     std::wstring errorMessage;
@@ -996,7 +1027,7 @@ struct alignas(64) MFAChallengeResult {
  * @struct AccessControlManagerConfig
  * @brief Configuration for the AccessControlManager.
  */
-struct alignas(64) AccessControlManagerConfig {
+struct AccessControlManagerConfig {
     // RBAC settings
     bool enableRBAC{ true };
     bool inheritPermissions{ true };
@@ -1049,43 +1080,45 @@ struct alignas(64) AccessControlManagerConfig {
 /**
  * @struct AccessControlStatistics
  * @brief Runtime statistics for access control operations.
+ *
+ * // Thread safety: protected by m_statsMutex in implementation (no atomics needed)
  */
 struct alignas(64) AccessControlStatistics {
     // Permission checks
-    std::atomic<uint64_t> totalPermissionChecks{ 0 };
-    std::atomic<uint64_t> permissionsGranted{ 0 };
-    std::atomic<uint64_t> permissionsDenied{ 0 };
-    std::atomic<uint64_t> permissionsCached{ 0 };
+    uint64_t totalPermissionChecks{ 0 };
+    uint64_t permissionsGranted{ 0 };
+    uint64_t permissionsDenied{ 0 };
+    uint64_t permissionsCached{ 0 };
 
     // Sessions
-    std::atomic<uint64_t> sessionsCreated{ 0 };
-    std::atomic<uint64_t> sessionsExpired{ 0 };
-    std::atomic<uint64_t> sessionsRevoked{ 0 };
-    std::atomic<uint32_t> activeSessions{ 0 };
+    uint64_t sessionsCreated{ 0 };
+    uint64_t sessionsExpired{ 0 };
+    uint64_t sessionsRevoked{ 0 };
+    uint32_t activeSessions{ 0 };
 
     // MFA
-    std::atomic<uint64_t> mfaChallenges{ 0 };
-    std::atomic<uint64_t> mfaSuccesses{ 0 };
-    std::atomic<uint64_t> mfaFailures{ 0 };
+    uint64_t mfaChallenges{ 0 };
+    uint64_t mfaSuccesses{ 0 };
+    uint64_t mfaFailures{ 0 };
 
     // Privilege operations
-    std::atomic<uint64_t> privilegeStrips{ 0 };
-    std::atomic<uint64_t> integrityLowerings{ 0 };
-    std::atomic<uint64_t> processRestrictions{ 0 };
-    std::atomic<uint64_t> processProtections{ 0 };
+    uint64_t privilegeStrips{ 0 };
+    uint64_t integrityLowerings{ 0 };
+    uint64_t processRestrictions{ 0 };
+    uint64_t processProtections{ 0 };
 
     // Tampering
-    std::atomic<uint64_t> tamperAttempts{ 0 };
-    std::atomic<uint64_t> tamperBlocked{ 0 };
+    uint64_t tamperAttempts{ 0 };
+    uint64_t tamperBlocked{ 0 };
 
     // Errors
-    std::atomic<uint64_t> errorCount{ 0 };
-    std::atomic<uint64_t> cacheHits{ 0 };
-    std::atomic<uint64_t> cacheMisses{ 0 };
+    uint64_t errorCount{ 0 };
+    uint64_t cacheHits{ 0 };
+    uint64_t cacheMisses{ 0 };
 
     // Performance
-    std::atomic<uint64_t> totalCheckTimeUs{ 0 };
-    std::atomic<uint64_t> maxCheckTimeUs{ 0 };
+    uint64_t totalCheckTimeUs{ 0 };
+    uint64_t maxCheckTimeUs{ 0 };
 
     void Reset() noexcept;
 };
@@ -1100,6 +1133,7 @@ struct alignas(64) AccessControlStatistics {
  * @param permission The permission that was checked
  * @param userSid The user's SID
  * @param reason Explanation for the decision
+ * @warning Must NOT call AccessControlManager methods. Must complete within 1ms. Must not throw.
  */
 using PermissionCheckCallback = std::function<void(
     AccessDecision decision,
@@ -1114,6 +1148,7 @@ using PermissionCheckCallback = std::function<void(
  * @param oldState Previous session state
  * @param newState New session state
  * @param userSid The user's SID
+ * @warning Must NOT call AccessControlManager methods. Must complete within 1ms. Must not throw.
  */
 using SessionEventCallback = std::function<void(
     uint64_t sessionId,
@@ -1127,6 +1162,7 @@ using SessionEventCallback = std::function<void(
  * @param targetPid The protected process that was targeted
  * @param attackerPid The process that attempted tampering
  * @param attackType Description of the tampering attempt
+ * @warning Must NOT call AccessControlManager methods. Must complete within 1ms. Must not throw.
  */
 using TamperAttemptCallback = std::function<void(
     uint32_t targetPid,
@@ -1137,6 +1173,7 @@ using TamperAttemptCallback = std::function<void(
 /**
  * @brief Callback for audit events.
  * @param event The audit event details
+ * @warning Must NOT call AccessControlManager methods. Must complete within 1ms. Must not throw.
  */
 using AuditEventCallback = std::function<void(
     const AccessControlAuditEvent& event
@@ -1148,6 +1185,7 @@ using AuditEventCallback = std::function<void(
  * @param privilege The modified privilege
  * @param action The action taken
  * @param success Whether the operation succeeded
+ * @warning Must NOT call AccessControlManager methods. Must complete within 1ms. Must not throw.
  */
 using PrivilegeModificationCallback = std::function<void(
     uint32_t pid,
@@ -1175,6 +1213,10 @@ using PrivilegeModificationCallback = std::function<void(
  *
  * Thread Safety:
  * All public methods are thread-safe and can be called concurrently.
+ *
+ * LOCK ORDER (must acquire in this order to prevent deadlocks):
+ *   m_roleMutex → m_sessionMutex → m_mfaMutex → m_auditMutex → m_callbackMutex
+ * Callbacks are invoked with NO locks held (copy list, release, invoke).
  *
  * Usage Example:
  * @code
@@ -1219,7 +1261,7 @@ public:
      * @return True if initialization succeeded.
      * @note Must be called before any other operations.
      */
-    bool Initialize(const AccessControlManagerConfig& config);
+    [[nodiscard]] bool Initialize(const AccessControlManagerConfig& config);
 
     /**
      * @brief Shuts down the access control system gracefully.
@@ -1244,7 +1286,7 @@ public:
      * @param config New configuration settings.
      * @return True if configuration was updated successfully.
      */
-    bool UpdateConfig(const AccessControlManagerConfig& config);
+    [[nodiscard]] bool UpdateConfig(const AccessControlManagerConfig& config);
 
     // ========================================================================
     // PERMISSION MANAGEMENT
@@ -1284,7 +1326,7 @@ public:
      * @return Map of permission to access decision.
      * @note More efficient than individual checks for multiple permissions.
      */
-    [[nodiscard]] std::unordered_map<Permission, AccessDecision> CheckPermissions(
+    [[nodiscard]] std::unordered_map<Permission, AccessDecision, PermissionHash> CheckPermissions(
         const SecurityIdentifier& userSid,
         const std::vector<Permission>& permissions
     ) const;
@@ -1316,7 +1358,7 @@ public:
      * @param assignedBy SID of the administrator making the assignment.
      * @return True if assignment succeeded.
      */
-    bool AssignRole(
+    [[nodiscard]] bool AssignRole(
         const SecurityIdentifier& userSid,
         uint32_t roleId,
         const SecurityIdentifier& assignedBy
@@ -1329,7 +1371,7 @@ public:
      * @param revokedBy SID of the administrator making the revocation.
      * @return True if revocation succeeded.
      */
-    bool RevokeRole(
+    [[nodiscard]] bool RevokeRole(
         const SecurityIdentifier& userSid,
         uint32_t roleId,
         const SecurityIdentifier& revokedBy
@@ -1340,6 +1382,8 @@ public:
      * @param definition The role definition.
      * @param createdBy SID of the administrator creating the role.
      * @return The new role ID, or 0 on failure.
+     * @note Custom role permissions must be a subset of the creator's
+     *       effective permissions. Use ValidateRolePermissions() to pre-check.
      */
     [[nodiscard]] uint32_t CreateRole(
         const RoleDefinition& definition,
@@ -1353,7 +1397,7 @@ public:
      * @param modifiedBy SID of the administrator modifying the role.
      * @return True if modification succeeded.
      */
-    bool ModifyRole(
+    [[nodiscard]] bool ModifyRole(
         uint32_t roleId,
         const RoleDefinition& definition,
         const SecurityIdentifier& modifiedBy
@@ -1366,7 +1410,7 @@ public:
      * @return True if deletion succeeded.
      * @note Built-in roles cannot be deleted.
      */
-    bool DeleteRole(
+    [[nodiscard]] bool DeleteRole(
         uint32_t roleId,
         const SecurityIdentifier& deletedBy
     );
@@ -1436,16 +1480,16 @@ public:
      * @param sessionId The session ID.
      * @return True if refresh succeeded.
      */
-    bool RefreshSession(uint64_t sessionId);
+    [[nodiscard]] bool RefreshSession(uint64_t sessionId);
 
     /**
      * @brief Elevates a session to higher privileges.
      * @param sessionId The session ID.
      * @param targetRole Target role for elevation.
      * @param durationMs Duration of elevation in milliseconds.
-     * @return True if elevation succeeded (may require MFA).
+     * @return Access decision indicating result (ALLOW, DENY, REQUIRE_MFA, etc.).
      */
-    bool ElevateSession(
+    [[nodiscard]] AccessDecision ElevateSession(
         uint64_t sessionId,
         RoleType targetRole,
         uint32_t durationMs = AccessControlConstants::ELEVATED_SESSION_TIMEOUT_MS
@@ -1457,7 +1501,7 @@ public:
      * @param reason Reason for revocation.
      * @return True if revocation succeeded.
      */
-    bool RevokeSession(
+    [[nodiscard]] bool RevokeSession(
         uint64_t sessionId,
         std::wstring_view reason = L""
     );
@@ -1468,7 +1512,7 @@ public:
      * @param reason Reason for revocation.
      * @return Number of sessions revoked.
      */
-    uint32_t RevokeAllUserSessions(
+    [[nodiscard]] uint32_t RevokeAllUserSessions(
         const SecurityIdentifier& userSid,
         std::wstring_view reason = L""
     );
@@ -1504,7 +1548,7 @@ public:
      * @param response The user's response (OTP code, etc.).
      * @return True if verification succeeded.
      */
-    bool VerifyMFAResponse(
+    [[nodiscard]] bool VerifyMFAResponse(
         uint64_t sessionId,
         std::wstring_view challengeId,
         std::wstring_view response
@@ -1527,10 +1571,10 @@ public:
 
     /**
      * @brief Verifies if a user is in the administrators group.
-     * @param userSid The user's string SID.
+     * @param userSid The user's security identifier.
      * @return True if the user is an administrator.
      */
-    [[nodiscard]] bool IsAdmin(const std::wstring& userSid) const;
+    [[nodiscard]] bool IsAdmin(const SecurityIdentifier& userSid) const;
 
     /**
      * @brief Resolves a SID to a UserPrincipal with full information.
@@ -1594,8 +1638,10 @@ public:
     /**
      * @brief Convenience overload to restrict by PID with default settings.
      * @param pid Process ID to restrict.
+     * @return Result of the restriction operation.
+     * @note Internally delegates to the full overload with ProcessRestrictionConfig::CreateModerate().
      */
-    void RestrictProcess(uint32_t pid);
+    [[nodiscard]] RestrictionResult RestrictProcess(uint32_t pid);
 
     /**
      * @brief Gets the current token information for a process.
@@ -1618,7 +1664,7 @@ public:
      * @param action Action to take (enable/disable/remove).
      * @return True if modification succeeded.
      */
-    bool ModifyProcessPrivilege(
+    [[nodiscard]] bool ModifyProcessPrivilege(
         uint32_t pid,
         WindowsPrivilege privilege,
         PrivilegeAction action
@@ -1629,7 +1675,7 @@ public:
      * @param pid Process ID.
      * @return Number of privileges stripped.
      */
-    uint32_t StripDangerousPrivileges(uint32_t pid);
+    [[nodiscard]] uint32_t StripDangerousPrivileges(uint32_t pid);
 
     /**
      * @brief Lowers the integrity level of a process.
@@ -1637,21 +1683,22 @@ public:
      * @param targetLevel Target integrity level.
      * @return True if operation succeeded.
      */
-    bool LowerIntegrity(
+    [[nodiscard]] bool LowerIntegrity(
         uint32_t pid,
         IntegrityLevel targetLevel = IntegrityLevel::LOW
     );
 
     /**
      * @brief Creates a restricted token from an existing token.
-     * @param sourceToken Handle to source token.
+     * @param sourceToken Handle to source token (as uintptr_t).
      * @param disabledSids SIDs to disable (deny-only).
      * @param removedPrivileges Privileges to remove.
      * @param restrictedSids SIDs to add as restricting.
-     * @return Handle to new restricted token, or 0 on failure.
+     * @return Handle to new restricted token, or nullopt on failure.
+     * @note RAII: caller owns the returned handle and must close it via CloseHandle.
      */
-    [[nodiscard]] uint64_t CreateRestrictedToken(
-        uint64_t sourceToken,
+    [[nodiscard]] std::optional<uintptr_t> CreateRestrictedToken(
+        uintptr_t sourceToken,
         const std::vector<SecurityIdentifier>& disabledSids,
         const std::vector<WindowsPrivilege>& removedPrivileges,
         const std::vector<SecurityIdentifier>& restrictedSids
@@ -1675,7 +1722,7 @@ public:
      * @param pid Process ID.
      * @return True if protection was removed.
      */
-    bool UnprotectProcess(uint32_t pid);
+    [[nodiscard]] bool UnprotectProcess(uint32_t pid);
 
     /**
      * @brief Checks if a process is protected.
@@ -1689,7 +1736,7 @@ public:
      * @param level Protection level to apply.
      * @return Number of processes protected.
      */
-    uint32_t ProtectShadowStrikeProcesses(
+    [[nodiscard]] uint32_t ProtectShadowStrikeProcesses(
         ProcessProtectionLevel level = ProcessProtectionLevel::ELEVATED
     );
 
@@ -1716,9 +1763,10 @@ public:
      * @param memoryLimit Memory limit in bytes (0 = unlimited).
      * @param processLimit Maximum processes in job (0 = unlimited).
      * @param cpuRateLimit CPU rate limit percentage (0 = unlimited).
-     * @return Job object handle, or 0 on failure.
+     * @return Job object handle, or nullopt on failure.
+     * @note RAII: caller owns the returned handle and must close it via CloseHandle.
      */
-    [[nodiscard]] uint64_t CreateJobObject(
+    [[nodiscard]] std::optional<uintptr_t> CreateJobObject(
         std::wstring_view jobName,
         uint64_t memoryLimit = 0,
         uint32_t processLimit = 0,
@@ -1731,14 +1779,14 @@ public:
      * @param pid Process ID.
      * @return True if assignment succeeded.
      */
-    bool AssignProcessToJob(uint64_t jobHandle, uint32_t pid);
+    [[nodiscard]] bool AssignProcessToJob(uintptr_t jobHandle, uint32_t pid);
 
     /**
      * @brief Terminates all processes in a job object.
      * @param jobHandle Job object handle.
      * @return True if termination succeeded.
      */
-    bool TerminateJobObject(uint64_t jobHandle);
+    [[nodiscard]] bool TerminateJobObject(uintptr_t jobHandle);
 
     // ========================================================================
     // CALLBACK REGISTRATION
@@ -1794,7 +1842,7 @@ public:
      * @param callbackId The callback ID returned during registration.
      * @return True if unregistration succeeded.
      */
-    bool UnregisterCallback(uint64_t callbackId);
+    [[nodiscard]] bool UnregisterCallback(uint64_t callbackId);
 
     // ========================================================================
     // AUDITING
@@ -1815,13 +1863,16 @@ public:
 
     /**
      * @brief Exports audit events to a file.
-     * @param filePath Output file path.
+     * @param filePath Output file path. Must be an absolute path to a writable
+     *        location. The implementation must validate that the path does not
+     *        contain path traversal sequences (e.g. "..") and that the target
+     *        directory exists before writing.
      * @param startTime Start of time range.
      * @param endTime End of time range.
      * @param format Output format ("json", "csv", "xml").
      * @return True if export succeeded.
      */
-    bool ExportAuditLog(
+    [[nodiscard]] bool ExportAuditLog(
         const std::wstring& filePath,
         std::chrono::system_clock::time_point startTime,
         std::chrono::system_clock::time_point endTime,
@@ -1834,9 +1885,9 @@ public:
 
     /**
      * @brief Gets current runtime statistics.
-     * @return Reference to statistics structure.
+     * @return Copy of the statistics structure (thread-safe snapshot).
      */
-    [[nodiscard]] const AccessControlStatistics& GetStatistics() const noexcept;
+    [[nodiscard]] AccessControlStatistics GetStatistics() const noexcept;
 
     /**
      * @brief Resets all statistics counters.
@@ -1906,6 +1957,75 @@ public:
      * @return Current integrity level.
      */
     [[nodiscard]] static IntegrityLevel GetCurrentIntegrityLevel() noexcept;
+
+    // ========================================================================
+    // VALIDATION HELPERS
+    // ========================================================================
+
+    /**
+     * @brief Validates that a role's permissions are a subset of the creator's permissions.
+     * @param role The role definition to validate.
+     * @param creatorPermissions The permission bitset of the creating principal.
+     * @return True if the role's granted permissions are a subset of creatorPermissions.
+     */
+    [[nodiscard]] static bool ValidateRolePermissions(
+        const RoleDefinition& role,
+        const std::bitset<AccessControlConstants::MAX_PERMISSIONS>& creatorPermissions
+    );
+
+    /**
+     * @brief Checks whether a RoleType value is a valid, defined role type.
+     * @param role The role type to validate.
+     * @return True if the value corresponds to a defined RoleType enumerator.
+     */
+    [[nodiscard]] static bool IsValidRoleType(RoleType role) noexcept;
+
+    /**
+     * @brief Checks whether a Permission value is valid (< PERMISSION_COUNT).
+     * @param perm The permission to validate.
+     * @return True if the value is a usable permission index.
+     */
+    [[nodiscard]] static bool IsValidPermission(Permission perm) noexcept;
+
+    /**
+     * @brief Checks whether an IntegrityLevel value is valid.
+     * @param level The integrity level to validate.
+     * @return True if the value corresponds to a defined IntegrityLevel enumerator.
+     */
+    [[nodiscard]] static bool IsValidIntegrityLevel(IntegrityLevel level) noexcept;
+
+    // ========================================================================
+    // TOKEN IMPERSONATION DETECTION
+    // ========================================================================
+
+    /**
+     * @brief Detects whether any thread in a process is using an impersonation token.
+     * @param pid Process ID to inspect.
+     * @return True if impersonation tokens are detected.
+     */
+    [[nodiscard]] bool DetectTokenImpersonation(uint32_t pid) const;
+
+    /**
+     * @brief Finds all threads in a process that hold impersonation tokens.
+     * @param pid Process ID to inspect.
+     * @return Vector of thread IDs with active impersonation tokens.
+     */
+    [[nodiscard]] std::vector<uint32_t> FindImpersonatingThreads(uint32_t pid) const;
+
+    // ========================================================================
+    // APPCONTAINER SUPPORT
+    // ========================================================================
+
+    /**
+     * @brief Creates an AppContainer profile with the given capabilities.
+     * @param name Unique name for the AppContainer.
+     * @param capabilities Security identifiers representing granted capabilities.
+     * @return True if the AppContainer profile was created successfully.
+     */
+    [[nodiscard]] bool CreateAppContainerProfile(
+        std::wstring_view name,
+        std::span<const SecurityIdentifier> capabilities
+    );
 
 private:
     // ========================================================================
