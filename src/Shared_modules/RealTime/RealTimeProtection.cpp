@@ -1068,11 +1068,24 @@ public:
         if (m_config.enableExploitPrevention) {
             try {
                 auto& ep = ExploitPrevention::Instance();
-                if (ep.Start()) {
-                    SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
-                } else {
+                auto epConfig = ExploitPreventionConfig::CreateDefault();
+                if (!ep.Initialize(m_threadPool, epConfig)) {
+                    Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention::Initialize failed");
                     SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                } else {
+                    if (ep.Start()) {
+                        ep.PushMitigationsToKernel();
+                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
+                        Utils::Logger::Info(L"RealTimeProtection: ExploitPrevention initialized and running");
+                    } else {
+                        Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention::Start failed");
+                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                    }
                 }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention startup exception: {}",
+                    Utils::StringUtils::ToWide(ex.what()));
+                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
             }
@@ -1303,7 +1316,7 @@ public:
         try { NetworkTrafficFilter::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::STOPPED);
 
-        try { ExploitPrevention::Instance().Stop(); } catch (...) {}
+        try { ExploitPrevention::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::STOPPED);
 
         try { FileIntegrityMonitor::Instance().Stop(); } catch (...) {}
@@ -2396,7 +2409,24 @@ public:
             }
 
             case FilterMessageType_MemoryAlert: {
-                Utils::Logger::Warn(L"RealTimeProtection: Memory anomaly alert from kernel (payload {} bytes)", size);
+                // Route kernel memory anomaly alerts to ExploitPrevention for analysis
+                if (data && size > 0) {
+                    try {
+                        auto& ep = ExploitPrevention::Instance();
+                        if (ep.IsRunning()) {
+                            auto alertPayload = std::span<const std::byte>(
+                                static_cast<const std::byte*>(data), size);
+                            ep.OnKernelMemoryAlert(
+                                static_cast<uint32_t>(FilterMessageType_MemoryAlert),
+                                alertPayload);
+                        }
+                    } catch (const std::exception& ex) {
+                        Utils::Logger::Error(L"RealTimeProtection: MemoryAlert dispatch failed: {}",
+                            Utils::StringUtils::ToWide(ex.what()));
+                    } catch (...) {
+                        Utils::Logger::Error(L"RealTimeProtection: MemoryAlert dispatch unknown exception");
+                    }
+                }
                 break;
             }
 
