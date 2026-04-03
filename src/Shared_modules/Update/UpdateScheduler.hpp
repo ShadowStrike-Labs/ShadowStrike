@@ -392,14 +392,14 @@ struct ScheduleInfo {
  * @brief Statistics
  */
 struct SchedulerStatistics {
-    std::atomic<uint64_t> checksTriggered{0};
-    std::atomic<uint64_t> checksCompleted{0};
-    std::atomic<uint64_t> checksFailed{0};
-    std::atomic<uint64_t> checksDeferred{0};
-    std::atomic<uint64_t> updatesFound{0};
-    std::atomic<uint64_t> updatesApplied{0};
-    std::array<std::atomic<uint64_t>, 16> byDeferralReason{};
-    std::array<std::atomic<uint64_t>, 16> byTrigger{};
+    uint64_t checksTriggered{0};
+    uint64_t checksCompleted{0};
+    uint64_t checksFailed{0};
+    uint64_t checksDeferred{0};
+    uint64_t updatesFound{0};
+    uint64_t updatesApplied{0};
+    std::array<uint64_t, 16> byDeferralReason{};
+    std::array<uint64_t, 16> byTrigger{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
