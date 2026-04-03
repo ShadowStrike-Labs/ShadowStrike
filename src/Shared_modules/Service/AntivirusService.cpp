@@ -40,14 +40,21 @@
 #include "../Utils/ThreadPool.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Utils/FileUtils.hpp"
+#include "ServiceMonitor.hpp"
 
 // ============================================================================
 // SECURITY MODULE INCLUDES
 // ============================================================================
-#include "../Security/TamperProtection.hpp"
-#include "../Security/ProcessProtection.hpp"
-#include "../Security/RegistryProtection.hpp"
-#include "../Security/CertificateValidator.hpp"
+#include "../SelfProtection/CryptoManager.hpp"
+#include "../SelfProtection/AntiDebug.hpp"
+#include "../SelfProtection/MemoryProtection.hpp"
+#include "../SelfProtection/FileProtection.hpp"
+#include "../SelfProtection/TamperProtection.hpp"
+#include "../SelfProtection/ProcessProtection.hpp"
+#include "../SelfProtection/RegistryProtection.hpp"
+#include "../SelfProtection/CertificateValidator.hpp"
+#include "../SelfProtection/DigitalSignatureValidator.hpp"
+#include "../SelfProtection/SelfDefense.hpp"
 #include "../Scripts/AMSIIntegration.hpp"
 #include "../RealTime/RealTimeProtection.hpp"
 #include "../Communication/IPCManager.hpp"
@@ -57,7 +64,11 @@
 #include "../Communication/ReportGenerator.hpp"
 #include "../Communication/ServiceCommunication.hpp"
 #include "../Update/UpdateManager.hpp"
+#include "../Update/SignatureUpdater.hpp"
+#include "../Update/ProgramUpdater.hpp"
+#include "../Core/Engine/ScanEngine.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../Config/ConfigManager.hpp"
 
 // ============================================================================
 // WINDOWS SDK
@@ -65,6 +76,10 @@
 #include <tchar.h>
 #include <strsafe.h>
 #include <sddl.h>
+#include <thread>
+#include <condition_variable>
+#include <sstream>
+#include <iomanip>
 
 namespace ShadowStrike {
 namespace Service {
@@ -99,17 +114,27 @@ public:
 
         try {
             // 1. Initialize Logging
-            // In a real scenario, we'd read config to determine log level/path
             Utils::Logger::Instance().Initialize(L"ShadowStrikeService");
             SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
 
-            // 2. Initialize Infrastructure
+            // 2. Initialize ConfigManager (must be available before any module reads config)
+            if (!Config::ConfigManager::Instance().Initialize()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"ConfigManager initialization failed, using defaults");
+                // Non-fatal: modules will use hardcoded defaults
+            }
+
+            // 3. Initialize Infrastructure
             if (!Utils::ThreadPool::Instance().Initialize(4, 8)) {
                 SS_LOG_CRITICAL(LOG_CATEGORY, L"Failed to initialize ThreadPool");
                 return false;
             }
 
-            // 3. Initialize Security Subsystems
+            // 4. Configure Service Health Monitor (early, tracks init duration)
+            ServiceMonitor::Instance().SetMaxMemoryLimit(1024ULL * 1024ULL * 1024ULL); // 1 GB limit
+            ServiceMonitor::Instance().SetMaxCpuLimit(50.0);                           // 50% CPU limit
+            ServiceMonitor::Instance().SetHeartbeatTimeout(std::chrono::milliseconds(60000)); // 60s timeout
+
+            // 5. Initialize Security Subsystems
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing security subsystems...");
 
             // Threat Intel (Database)
@@ -117,6 +142,42 @@ public:
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelManager");
                 // Continue? Depending on policy. Critical failure usually.
                 return false;
+            }
+
+            // CryptoManager (foundation — used by ConfigManager, CertificateValidator,
+            // and secure IPC; must be available before other security modules)
+            Security::CryptoManagerConfiguration cryptoConfig;
+            cryptoConfig.enableHardwareAcceleration = true;
+            cryptoConfig.enableSecureMemory = true;
+            cryptoConfig.enableAuditLogging = true;
+            if (!Security::CryptoManager::Instance().Initialize(cryptoConfig)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize CryptoManager");
+                return false;
+            }
+
+            // Anti-Debug Protection (detect hostile analysis early, before
+            // other self-defense modules expose their initialization surface)
+            Security::AntiDebugConfiguration adConfig;
+            adConfig.protectionLevel = Security::AntiDebugProtectionLevel::Enhanced;
+            adConfig.monitoringMode = Security::MonitoringMode::Adaptive;
+            adConfig.enableCodeIntegrity = true;
+            adConfig.enableHookDetection = true;
+            if (!Security::AntiDebug::Instance().Initialize(adConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AntiDebug");
+                // Non-fatal: anti-debug degrades but service can continue
+            }
+
+            // Memory Protection (protect our process memory before tamper
+            // protection starts its integrity monitoring)
+            Security::MemoryProtectionConfiguration memConfig;
+            memConfig.level = Security::MemoryProtectionLevel::Enhanced;
+            memConfig.enableCodeIntegrity = true;
+            memConfig.enableHeapProtection = true;
+            memConfig.enableStackProtection = true;
+            memConfig.enableAntiDump = true;
+            if (!Security::MemoryProtection::Instance().Initialize(memConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize MemoryProtection");
+                // Non-fatal: memory protection degrades
             }
 
             // Tamper Protection (Critical - protect self first)
@@ -154,6 +215,48 @@ public:
                 // Non-fatal: registry tamper detection degrades
             }
 
+            // File Protection (protect installation directory and databases
+            // before Real-Time Protection opens its signature/pattern files)
+            Security::FileProtectionConfiguration fpConfig;
+            fpConfig.mode = Security::FileProtectionMode::Protect;
+            fpConfig.enableIntegrityMonitoring = true;
+            fpConfig.enableRansomwareProtection = true;
+            fpConfig.enableSignatureValidation = true;
+            if (!Security::FileProtection::Instance().Initialize(fpConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize FileProtection");
+                // Non-fatal: file tamper detection degrades
+            }
+
+            // Digital Signature Validator (used by RealTimeProtection and
+            // ProcessCreationMonitor for Authenticode verification)
+            Security::SignatureValidatorConfiguration dsvConfig;
+            dsvConfig.enableCache = true;
+            dsvConfig.enableCatalogValidation = true;
+            dsvConfig.enableTimestampValidation = true;
+            if (!Security::DigitalSignatureValidator::Instance().Initialize(dsvConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize DigitalSignatureValidator");
+                // Non-fatal: signature validation degrades
+            }
+
+            // Certificate Validator
+            Security::CertificateValidatorConfiguration certConfig;
+            if (!Security::CertificateValidator::Instance().Initialize(certConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize CertificateValidator");
+            }
+
+            // SelfDefense (central orchestrator — coordinates all protection
+            // modules, starts watchdog/heartbeat monitoring. Must be last in
+            // the self-protection chain so all subsystems are ready.)
+            Security::SelfDefenseConfiguration sdConfig;
+            sdConfig.level = Security::SelfDefenseLevel::Enhanced;
+            sdConfig.enableWatchdog = true;
+            sdConfig.enableHeartbeat = true;
+            sdConfig.enableAutoRecovery = true;
+            if (!Security::SelfDefense::Instance().Initialize(sdConfig)) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize SelfDefense orchestrator");
+                // Non-fatal: watchdog/heartbeat monitoring degrades
+            }
+
             // Real-Time Protection
             if (!RealTime::RealTimeProtection::Instance().Initialize()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize RealTimeProtection");
@@ -164,12 +267,6 @@ public:
             if (!Scripts::AMSIIntegration::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize AMSIIntegration");
                 // Warning only, service can run without AMSI
-            }
-
-            // Certificate Validator
-            Security::CertificateValidatorConfiguration certConfig;
-            if (!Security::CertificateValidator::Instance().Initialize(certConfig)) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize CertificateValidator");
             }
 
             // 4. Initialize Communication
@@ -198,6 +295,51 @@ public:
             // 5. Initialize Update Manager
             if (!Update::UpdateManager::Instance().Initialize()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize UpdateManager");
+            }
+
+            // 6. Wire Update callbacks for hot-reload and telemetry
+            if (Update::UpdateManager::Instance().IsInitialized()) {
+                // Hot-reload: when signatures are updated, trigger ScanEngine database reload
+                Update::SignatureUpdater::Instance().RegisterReloadCallback(
+                    [](Update::SignatureDatabaseType type) {
+                        SS_LOG_INFO(L"Service", L"Signature database %u updated — triggering ScanEngine reload",
+                            static_cast<unsigned>(type));
+                        if (Core::Engine::ScanEngine::Instance().IsInitialized()) {
+                            if (!Core::Engine::ScanEngine::Instance().ReloadDatabases()) {
+                                SS_LOG_ERROR(L"Service", L"ScanEngine database reload failed after signature update");
+                            }
+                        }
+                    });
+
+                // Signature update completion telemetry
+                Update::SignatureUpdater::Instance().RegisterCompletionCallback(
+                    [](const Update::SigUpdateResult& result) {
+                        if (result.success) {
+                            SS_LOG_INFO(L"Service", L"Signature update completed: %hs -> %hs",
+                                result.oldVersion.versionString.c_str(),
+                                result.newVersion.versionString.c_str());
+                        } else {
+                            SS_LOG_WARN(L"Service", L"Signature update failed: %hs",
+                                result.errorMessage.c_str());
+                        }
+                    });
+
+                // Program update completion — may require reboot for drivers
+                Update::ProgramUpdater::Instance().RegisterCompletionCallback(
+                    [](const Update::ProgUpdateResult& result) {
+                        if (result.success) {
+                            SS_LOG_INFO(L"Service", L"Program update applied: %hs -> %hs (reboot=%d)",
+                                result.oldVersion.ToString().c_str(),
+                                result.newVersion.ToString().c_str(),
+                                result.rebootRequired ? 1 : 0);
+                        } else {
+                            SS_LOG_WARN(L"Service", L"Program update failed: %hs (rollback=%d)",
+                                result.errorMessage.c_str(),
+                                result.wasRollback ? 1 : 0);
+                        }
+                    });
+
+                SS_LOG_INFO(LOG_CATEGORY, L"Update callbacks wired: hot-reload, completion telemetry");
             }
 
             m_initialized = true;
@@ -230,7 +372,24 @@ public:
         // Register AMSI provider
         Scripts::AMSIIntegration::Instance().RegisterProvider();
 
+        // Start health monitoring (all modules now initialized, heartbeat loop can begin)
+        if (!ServiceMonitor::Instance().StartMonitoring()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to start ServiceMonitor");
+        }
+        // Prime heartbeats so monitors don't immediately flag a hang
+        ServiceMonitor::Instance().UpdateHeartbeat();
+        if (Security::SelfDefense::HasInstance() &&
+            Security::SelfDefense::Instance().IsInitialized()) {
+            try {
+                Security::SelfDefense::Instance().SendHeartbeat("ServiceMain");
+            } catch (...) {}
+        }
+
         m_running = true;
+
+        // Start maintenance loop (heartbeat feeding, health monitoring, log flush)
+        m_maintenanceThread = std::thread(&AntivirusServiceImpl::MaintenanceLoop, this);
+
         SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service is RUNNING");
     }
 
@@ -239,6 +398,18 @@ public:
         if (!m_running) return;
 
         SS_LOG_INFO(LOG_CATEGORY, L"Stopping services...");
+
+        // Signal maintenance loop to exit and join before any module teardown
+        m_running = false;
+        m_shutdownCv.notify_all();
+        if (m_maintenanceThread.joinable()) {
+            lock.unlock();
+            m_maintenanceThread.join();
+            lock.lock();
+        }
+
+        // Stop health monitoring before module teardown to prevent false hang alarms
+        ServiceMonitor::Instance().StopMonitoring();
 
         // Shutdown in reverse order
 
@@ -252,11 +423,42 @@ public:
 
         Communication::IPCManager::Instance().StopListening();
 
+        // Shutdown UpdateManager (stop any pending downloads/installations)
+        if (Update::UpdateManager::HasInstance() &&
+            Update::UpdateManager::Instance().IsInitialized()) {
+            Update::UpdateManager::Instance().Shutdown();
+        }
+
         Scripts::AMSIIntegration::Instance().UnregisterProvider();
         Scripts::AMSIIntegration::Instance().Shutdown();
 
         RealTime::RealTimeProtection::Instance().Stop();
         RealTime::RealTimeProtection::Instance().Shutdown();
+
+        // SelfDefense shutdown (stops watchdog/heartbeat first so it
+        // doesn't trigger false recovery during orderly teardown)
+        if (Security::SelfDefense::HasInstance() &&
+            Security::SelfDefense::Instance().IsInitialized()) {
+            Security::SelfDefense::Instance().Shutdown();
+        }
+
+        // CertificateValidator shutdown
+        if (Security::CertificateValidator::HasInstance() &&
+            Security::CertificateValidator::Instance().IsInitialized()) {
+            Security::CertificateValidator::Instance().Shutdown();
+        }
+
+        // DigitalSignatureValidator shutdown
+        if (Security::DigitalSignatureValidator::HasInstance() &&
+            Security::DigitalSignatureValidator::Instance().IsInitialized()) {
+            Security::DigitalSignatureValidator::Instance().Shutdown();
+        }
+
+        // FileProtection shutdown
+        if (Security::FileProtection::HasInstance() &&
+            Security::FileProtection::Instance().IsInitialized()) {
+            Security::FileProtection::Instance().Shutdown();
+        }
 
         // RegistryProtection shutdown (before ProcessProtection so registry
         // tamper detection is still active during process handle cleanup)
@@ -276,13 +478,40 @@ public:
 
         Security::TamperProtection::Instance().Shutdown("INTERNAL_SHUTDOWN");
 
+        // MemoryProtection shutdown (after TamperProtection so integrity
+        // monitors are no longer checking our protected regions)
+        if (Security::MemoryProtection::HasInstance() &&
+            Security::MemoryProtection::Instance().IsInitialized()) {
+            Security::MemoryProtection::Instance().Shutdown();
+        }
+
+        // AntiDebug shutdown
+        if (Security::AntiDebug::HasInstance() &&
+            Security::AntiDebug::Instance().IsInitialized()) {
+            Security::AntiDebug::Instance().Shutdown();
+        }
+
+        // CryptoManager shutdown (last — other modules may need crypto
+        // during their own shutdown for secure memory wiping)
+        if (Security::CryptoManager::HasInstance() &&
+            Security::CryptoManager::Instance().IsInitialized()) {
+            Security::CryptoManager::Instance().Shutdown();
+        }
+
         ThreatIntel::ThreatIntelManager::Instance().Shutdown();
 
         Utils::ThreadPool::Instance().Shutdown();
 
-        m_running = false;
+        // ConfigManager shutdown (after all modules that read config are down)
+        if (Config::ConfigManager::HasInstance()) {
+            Config::ConfigManager::Instance().Shutdown();
+        }
+
         m_initialized = false;
         SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service STOPPED");
+
+        // Logger shutdown (last — flush all pending messages)
+        Utils::Logger::Instance().ShutDown();
     }
 
     void Pause() {
@@ -297,9 +526,72 @@ public:
     }
 
     [[nodiscard]] std::string GetStatusReport() const {
-        // Collect status from all modules
-        // In reality, use JSON library
-        return "{\"status\": \"running\"}";
+        std::stringstream ss;
+        ss << "{";
+        ss << "\"service\":\"ShadowStrike\",";
+        ss << "\"status\":\"" << (m_running ? "running" : (m_initialized ? "stopped" : "uninitialized")) << "\",";
+
+        // ServiceMonitor resource stats
+        auto stats = ServiceMonitor::Instance().GetCurrentStats();
+        ss << "\"health\":{";
+        ss << "\"isHealthy\":" << (stats.isHealthy ? "true" : "false") << ",";
+        ss << "\"cpuUsagePercent\":" << std::fixed << std::setprecision(1) << stats.cpuUsagePercent << ",";
+        ss << "\"memoryUsageMB\":" << (stats.memoryUsageBytes / (1024 * 1024)) << ",";
+        ss << "\"handleCount\":" << stats.handleCount << ",";
+        ss << "\"uptimeSeconds\":" << stats.uptimeSeconds << ",";
+        ss << "\"statusMessage\":\"" << stats.statusMessage << "\"";
+        ss << "},";
+
+        // Module status
+        ss << "\"modules\":{";
+
+        // Threat Intel
+        ss << "\"threatIntel\":" << (ThreatIntel::ThreatIntelManager::Instance().IsInitialized() ? "true" : "false") << ",";
+
+        // CryptoManager
+        if (Security::CryptoManager::HasInstance()) {
+            ss << "\"cryptoManager\":true,";
+        } else {
+            ss << "\"cryptoManager\":false,";
+        }
+
+        // TamperProtection
+        if (Security::TamperProtection::HasInstance()) {
+            ss << "\"tamperProtection\":true,";
+        } else {
+            ss << "\"tamperProtection\":false,";
+        }
+
+        // RealTimeProtection
+        ss << "\"realTimeProtection\":{";
+        ss << "\"active\":" << (RealTime::RealTimeProtection::Instance().IsActive() ? "true" : "false");
+        ss << "},";
+
+        // SelfDefense
+        if (Security::SelfDefense::HasInstance() &&
+            Security::SelfDefense::Instance().IsInitialized()) {
+            ss << "\"selfDefense\":true,";
+        } else {
+            ss << "\"selfDefense\":false,";
+        }
+
+        // IPCManager
+        if (Communication::IPCManager::HasInstance()) {
+            ss << "\"ipcManager\":true,";
+        } else {
+            ss << "\"ipcManager\":false,";
+        }
+
+        // ServiceCommunication
+        if (Communication::ServiceCommunication::HasInstance()) {
+            ss << "\"serviceCommunication\":" << (Communication::ServiceCommunication::Instance().IsRunning() ? "true" : "false");
+        } else {
+            ss << "\"serviceCommunication\":false";
+        }
+
+        ss << "}"; // modules
+        ss << "}"; // root
+        return ss.str();
     }
 
     // Service Installation Helpers
@@ -402,6 +694,48 @@ private:
     std::recursive_mutex m_mutex;
     bool m_initialized = false;
     bool m_running = false;
+    std::thread m_maintenanceThread;
+    std::mutex m_shutdownMutex;
+    std::condition_variable m_shutdownCv;
+
+    void MaintenanceLoop() {
+        SS_LOG_INFO(LOG_CATEGORY, L"Service maintenance loop started");
+
+        constexpr auto LOOP_INTERVAL = std::chrono::seconds(5);
+
+        while (m_running) {
+            // 1. Feed ServiceMonitor heartbeat
+            ServiceMonitor::Instance().UpdateHeartbeat();
+
+            // 2. Feed SelfDefense heartbeat (proves service is alive to watchdog)
+            if (Security::SelfDefense::HasInstance() &&
+                Security::SelfDefense::Instance().IsInitialized()) {
+                try {
+                    Security::SelfDefense::Instance().SendHeartbeat("ServiceMain");
+                } catch (...) {}
+            }
+
+            // 3. Check and log health degradation
+            if (!ServiceMonitor::Instance().IsHealthy()) {
+                auto stats = ServiceMonitor::Instance().GetCurrentStats();
+                SS_LOG_WARN(LOG_CATEGORY, L"Service health degraded: %hs",
+                            stats.statusMessage.c_str());
+            }
+
+            // 4. Periodic log flush
+            Utils::Logger::Instance().Flush();
+
+            // Sleep with cancellation support
+            {
+                std::unique_lock lock(m_shutdownMutex);
+                if (m_shutdownCv.wait_for(lock, LOOP_INTERVAL, [this] { return !m_running; })) {
+                    break;
+                }
+            }
+        }
+
+        SS_LOG_INFO(LOG_CATEGORY, L"Service maintenance loop exited");
+    }
 };
 
 // ============================================================================
@@ -545,13 +879,76 @@ void AntivirusService::OnShutdown() {
 void AntivirusService::OnSessionChange(DWORD eventType, WTSSESSION_NOTIFICATION* notification) {
     if (!notification) return;
 
-    // Notify IPC manager or other components about session changes
-    // This is important for GUI interactions (Tray Icon)
-    // Communication::IPCManager::Instance().BroadcastSessionChange(...)
+    const DWORD sessionId = notification->dwSessionId;
+    SS_LOG_INFO(LOG_CATEGORY, L"Session change event: type=%u sessionId=%u", eventType, sessionId);
+
+    // Broadcast session event to connected GUI/tray clients via ServiceCommunication
+    if (Communication::ServiceCommunication::HasInstance() &&
+        Communication::ServiceCommunication::Instance().IsRunning()) {
+
+        const char* eventName = "Unknown";
+        switch (eventType) {
+            case WTS_SESSION_LOGON:          eventName = "SessionLogon"; break;
+            case WTS_SESSION_LOGOFF:         eventName = "SessionLogoff"; break;
+            case WTS_SESSION_LOCK:           eventName = "SessionLock"; break;
+            case WTS_SESSION_UNLOCK:         eventName = "SessionUnlock"; break;
+            case WTS_SESSION_REMOTE_CONNECT: eventName = "RemoteConnect"; break;
+            case WTS_SESSION_REMOTE_DISCONNECT: eventName = "RemoteDisconnect"; break;
+            case WTS_CONSOLE_CONNECT:        eventName = "ConsoleConnect"; break;
+            case WTS_CONSOLE_DISCONNECT:     eventName = "ConsoleDisconnect"; break;
+            default: break;
+        }
+
+        try {
+            Communication::ServiceCommunication::Instance().SendSystemAlert(
+                "SessionChange",
+                std::string("{\"event\":\"") + eventName +
+                    "\",\"sessionId\":" + std::to_string(sessionId) + "}",
+                1); // severity 1 = informational
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Failed to broadcast session change: %hs", e.what());
+        }
+    }
 }
 
 void AntivirusService::OnPowerEvent(DWORD eventType, POWERBROADCAST_SETTING* setting) {
-    // Handle power events (e.g. disable heavy scans on battery)
+    (void)setting; // May be null for some event types
+
+    switch (eventType) {
+        case PBT_APMPOWERSTATUSCHANGE: {
+            SYSTEM_POWER_STATUS sps{};
+            if (GetSystemPowerStatus(&sps)) {
+                if (sps.ACLineStatus == 0) { // Battery
+                    SS_LOG_INFO(LOG_CATEGORY, L"Switched to battery power — reducing scan intensity");
+                    RealTime::RealTimeProtection::Instance().Pause(0, L"Battery power conservation");
+                } else { // AC power
+                    SS_LOG_INFO(LOG_CATEGORY, L"AC power restored — resuming full protection");
+                    RealTime::RealTimeProtection::Instance().Resume();
+                }
+            }
+            break;
+        }
+        case PBT_APMSUSPEND:
+            SS_LOG_INFO(LOG_CATEGORY, L"System entering sleep — flushing state");
+            Utils::Logger::Instance().Flush();
+            break;
+
+        case PBT_APMRESUMESUSPEND:
+        case PBT_APMRESUMEAUTOMATIC:
+            SS_LOG_INFO(LOG_CATEGORY, L"System resumed from sleep — re-priming heartbeats");
+            // Re-prime heartbeats after sleep to prevent false hang alarms
+            ServiceMonitor::Instance().UpdateHeartbeat();
+            if (Security::SelfDefense::HasInstance() &&
+                Security::SelfDefense::Instance().IsInitialized()) {
+                try {
+                    Security::SelfDefense::Instance().SendHeartbeat("ServiceMain");
+                } catch (...) {}
+            }
+            break;
+
+        default:
+            break;
+    }
 }
 
 void AntivirusService::SetServiceStatus(DWORD currentState, DWORD win32ExitCode, DWORD waitHint) {
@@ -589,8 +986,28 @@ std::string AntivirusService::GetStatusReport() const {
 }
 
 bool AntivirusService::IsHealthy() const noexcept {
-    // In a real impl, check all subsystems
-    return true;
+    try {
+        // Check ServiceMonitor resource health (CPU, memory, heartbeat)
+        if (!ServiceMonitor::Instance().IsHealthy()) return false;
+
+        // Check fatal-dependency modules (service cannot function without these)
+        if (!ThreatIntel::ThreatIntelManager::Instance().IsInitialized()) return false;
+
+        if (Security::CryptoManager::HasInstance() &&
+            !Security::CryptoManager::Instance().IsInitialized()) return false;
+
+        if (Security::TamperProtection::HasInstance() &&
+            !Security::TamperProtection::Instance().IsInitialized()) return false;
+
+        if (!RealTime::RealTimeProtection::Instance().IsActive()) return false;
+
+        if (Communication::IPCManager::HasInstance() &&
+            !Communication::IPCManager::Instance().IsInitialized()) return false;
+
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 } // namespace Service
