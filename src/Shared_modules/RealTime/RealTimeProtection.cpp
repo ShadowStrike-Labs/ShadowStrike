@@ -580,7 +580,7 @@ public:
 
         SetState(ProtectionState::PAUSED);
         Utils::Logger::Warn("RealTimeProtection: PAUSED - Reason: {}",
-            reason.empty() ? "User request" : reason);
+            reason.empty() ? "User request" : Utils::StringUtils::ToNarrow(reason));
 
         // Pause components
         FileSystemFilter::Instance().Pause();
@@ -1532,7 +1532,7 @@ public:
             if (pdErr.win32Code != 0) {
                 Utils::Logger::Warn(
                     "RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}",
-                    filePath.substr(0, 120), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
+                    Utils::StringUtils::ToNarrow(filePath.substr(0, 120)), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
             }
             if (packResult.isPacked) {
                 fileIsPacked = true;
@@ -1836,7 +1836,7 @@ public:
                                 Utils::Logger::Warn(
                                     "RealTimeProtection: PID {} VM evasion: {} "
                                     "(severity={:.1f} addr=0x{:X} active={})",
-                                    req.processId, tech.description.substr(0, 120),
+                                    req.processId, Utils::StringUtils::ToNarrow(tech.description.substr(0, 120)),
                                     tech.severity, tech.address,
                                     tech.isActive ? "yes" : "no");
                             }
@@ -2749,7 +2749,8 @@ public:
     bool AddPathExclusion(const std::wstring& path) {
         std::unique_lock lock(m_exclusionMutex);
         m_excludedPaths.push_back(path);
-        Utils::Logger::Info("RealTimeProtection: Added path exclusion: {}", path);
+        Utils::Logger::Info("RealTimeProtection: Added path exclusion: {}",
+            Utils::StringUtils::ToNarrow(path));
         return true;
     }
 
@@ -2766,7 +2767,8 @@ public:
     bool AddProcessExclusion(const std::wstring& processName) {
         std::unique_lock lock(m_exclusionMutex);
         m_excludedProcesses.push_back(processName);
-        Utils::Logger::Info("RealTimeProtection: Added process exclusion: {}", processName);
+        Utils::Logger::Info("RealTimeProtection: Added process exclusion: {}",
+            Utils::StringUtils::ToNarrow(processName));
         return true;
     }
 
@@ -2924,7 +2926,8 @@ public:
         }
 
         Utils::Logger::Warn("RealTimeProtection: THREAT DETECTED - {} in {} (PID: {})",
-            result.threatName, filePath, pid);
+            Utils::StringUtils::ToNarrow(result.threatName),
+            Utils::StringUtils::ToNarrow(filePath), pid);
     }
 
     void NotifyUser(NotificationSeverity severity, std::wstring_view title,
