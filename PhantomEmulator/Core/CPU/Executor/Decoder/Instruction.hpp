@@ -56,6 +56,8 @@ enum class RegType : uint8_t {
     FPU,         // x87 ST(i)
     XMM,         // SSE XMM0-XMM15
     YMM,         // AVX YMM0-YMM15 (256-bit)
+    ZMM,         // AVX-512 ZMM0-ZMM31 (512-bit)
+    KMask,       // AVX-512 opmask registers k0-k7
     Flags,       // RFLAGS
     IP,          // RIP
 };
@@ -139,12 +141,22 @@ struct InstructionPrefixes {
     uint8_t vexVVVV  = 0;      // Additional register operand (inverted, 0-15)
     bool    vexW     = false;   // Like REX.W for VEX-encoded instructions
 
+    // EVEX prefix (4-byte: 62h)
+    bool    hasEVEX     = false;
+    uint8_t evexZ       = 0;      // Zeroing-masking: 0=merge, 1=zero
+    uint8_t evexLL      = 0;      // Vector length: 0=128(XMM), 1=256(YMM), 2=512(ZMM), 3=reserved/rounding
+    uint8_t evexB       = 0;      // Broadcast/rounding/SAE control
+    uint8_t evexAAA     = 0;      // Opmask register k0-k7
+    uint8_t evexV2      = 0;      // High bit of VVVV (extends to 5 bits for ZMM16-31)
+    uint8_t evexR2      = 0;      // High bit of ModRM.reg extension (for ZMM16-31)
+    // Combined VVVV from EVEX: evexVVVV = (evexV2 << 4) | vexVVVV
+
     // Total prefix byte count (for instruction length calculation)
     uint8_t prefixCount = 0;
 
     [[nodiscard]] OperandSize EffectiveOperandSize(CPUMode mode) const noexcept {
         if (mode == CPUMode::Long64) {
-            if (rexW) return OperandSize::Size64;
+            if (rexW || (hasVEX && vexW) || (hasEVEX && vexW)) return OperandSize::Size64;
             if (hasOpSizeOverride) return OperandSize::Size16;
             return OperandSize::Size32;
         }

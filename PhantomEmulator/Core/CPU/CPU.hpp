@@ -9,8 +9,8 @@
 #pragma once
 
 #include "State/CPUState.hpp"
-#include "Decoder/InstructionDecoder.hpp"
-#include "Decoder/Instruction.hpp"
+#include "Executor/Decoder/InstructionDecoder.hpp"
+#include "Executor/Decoder/Instruction.hpp"
 #include "../Memory/VirtualMemory.hpp"
 #include "../Memory/MemoryTracker.hpp"
 #include "../../Common/Types.hpp"

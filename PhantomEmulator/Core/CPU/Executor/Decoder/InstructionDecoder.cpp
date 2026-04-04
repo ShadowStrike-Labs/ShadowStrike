@@ -64,6 +64,25 @@ ErrorCode InstructionDecoder::Decode(
         }
     }
 
+    // Phase 1c: EVEX prefix (0x62)
+    if (offset < bytes.size() && bytes[offset] == 0x62) {
+        err = DecodeEVEX(bytes, mode, out.prefixes, offset);
+        if (err != ErrorCode::Success) return err;
+
+        if (out.prefixes.hasEVEX) {
+            if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+            out.opcode = bytes[offset++];
+
+            switch (out.prefixes.vexMMMMM) {
+                case 1: out.opcodeMap = OpcodeMap::TwoByte;     break;
+                case 2: out.opcodeMap = OpcodeMap::ThreeByte38; break;
+                case 3: out.opcodeMap = OpcodeMap::ThreeByte3A; break;
+                default: return ErrorCode::InvalidPrefix;
+            }
+            goto vex_opcode_done;
+        }
+    }
+
     // Phase 2: Opcode
     err = DecodeOpcode(bytes, offset, out.opcodeMap, out.opcode);
     if (err != ErrorCode::Success) return err;
@@ -265,6 +284,7 @@ ErrorCode InstructionDecoder::DecodeVEX(
         offset += 2;
         prefixes.prefixCount += 2;
         prefixes.hasVEX = true;
+        prefixes.hasREX = true;
 
         // Byte 1: [R][vvvv][L][pp]
         // R is inverted: 0 in VEX means REX.R=1
@@ -308,6 +328,7 @@ ErrorCode InstructionDecoder::DecodeVEX(
         offset += 3;
         prefixes.prefixCount += 3;
         prefixes.hasVEX = true;
+        prefixes.hasREX = true;
 
         // Byte 1: [R][X][B][mmmmm]
         // R, X, B are inverted
@@ -340,6 +361,76 @@ ErrorCode InstructionDecoder::DecodeVEX(
     }
 
     // Not a VEX prefix byte — should not reach here
+    return ErrorCode::Success;
+}
+
+// ============================================================================
+// Phase 1c: EVEX Prefix Decoding
+// ============================================================================
+// EVEX (4-byte): [62] [R|X|B|R'|00|mm] [W|vvvv|1|pp] [z|L'L|b|V'|aaa]
+
+ErrorCode InstructionDecoder::DecodeEVEX(
+    std::span<const uint8_t> bytes,
+    CPUMode mode,
+    InstructionPrefixes& prefixes,
+    uint32_t& offset) noexcept
+{
+    // EVEX needs 4 bytes total (0x62 + 3 payload bytes)
+    if (offset + 3 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+
+    uint8_t p1 = bytes[offset + 1]; // R|X|B|R'|00|mm
+    uint8_t p2 = bytes[offset + 2]; // W|vvvv|1|pp
+    uint8_t p3 = bytes[offset + 3]; // z|L'L|b|V'|aaa
+
+    if (mode != CPUMode::Long64) {
+        // In 32-bit mode, distinguish EVEX from BOUND via the EVEX fixed bits.
+        if ((p1 & 0x0C) != 0x00) {
+            return ErrorCode::Success; // Not EVEX, treat as BOUND
+        }
+        if ((p2 & 0x04) == 0) {
+            return ErrorCode::Success;
+        }
+    }
+
+    // Consume 4 bytes
+    offset += 4;
+    prefixes.prefixCount += 4;
+    prefixes.hasEVEX = true;
+    prefixes.hasREX = true;
+
+    // P1: [R|X|B|R'|0|0|mm]
+    prefixes.rexR   = ((p1 >> 7) & 1) == 0;
+    prefixes.rexX   = ((p1 >> 6) & 1) == 0;
+    prefixes.rexB   = ((p1 >> 5) & 1) == 0;
+    prefixes.evexR2 = ((p1 >> 4) & 1) == 0;
+    prefixes.vexMMMMM = p1 & 0x03;
+
+    // P2: [W|vvvv|1|pp]
+    prefixes.vexW    = ((p2 >> 7) & 1) != 0;
+    prefixes.rexW    = prefixes.vexW;
+    prefixes.vexVVVV = static_cast<uint8_t>((~(p2 >> 3)) & 0x0F);
+    prefixes.vexPP   = p2 & 0x03;
+
+    // P3: [z|L'L|b|V'|aaa]
+    prefixes.evexZ   = (p3 >> 7) & 1;
+    prefixes.evexLL  = (p3 >> 5) & 0x03;
+    prefixes.evexB   = (p3 >> 4) & 1;
+    prefixes.evexV2  = ((p3 >> 3) & 1) == 0;
+    prefixes.evexAAA = p3 & 0x07;
+
+    // Map pp to implied legacy prefix flags
+    switch (prefixes.vexPP) {
+        case 1: prefixes.hasOpSizeOverride = true; break;
+        case 2: prefixes.hasRep = true;            break;
+        case 3: prefixes.hasRepNE = true;          break;
+        default: break;
+    }
+
+    // Validate map (only 1, 2, 3 defined for EVEX)
+    if (prefixes.vexMMMMM == 0 || prefixes.vexMMMMM > 3) {
+        return ErrorCode::InvalidPrefix;
+    }
+
     return ErrorCode::Success;
 }
 

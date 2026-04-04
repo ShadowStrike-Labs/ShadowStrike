@@ -1142,7 +1142,12 @@ struct EmulationSession::Impl {
 
     [[nodiscard]] bool OnPreInstruction(
         const CPUState& cpu,
-        [[maybe_unused]] const DecodedInstruction& instr) noexcept {
+        const DecodedInstruction& instr) noexcept {
+        if (instr.prefixes.hasEVEX) {
+            m_evasionDetector.OnInstructionProbe(
+                cpu.rip, cpu.instructionCount, "EVEX / AVX-512 prefixed instruction");
+        }
+
         // Only check every kAbortCheckMask instructions to amortise overhead
         if ((cpu.instructionCount & kAbortCheckMask) != 0) {
             return true;

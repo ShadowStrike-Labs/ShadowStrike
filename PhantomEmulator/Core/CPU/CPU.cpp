@@ -240,6 +240,8 @@ ErrorCode CPU::DispatchInstruction(
     // Track memory writes for W→X
     // (individual instruction handlers call WriteOperand which calls memory.Write)
 
+    const bool isEVEX = inst.prefixes.hasEVEX;
+
     if (inst.opcodeMap == OpcodeMap::OneByte) {
         uint8_t op = inst.opcode;
 
@@ -488,6 +490,14 @@ ErrorCode CPU::DispatchInstruction(
     } else if (inst.opcodeMap == OpcodeMap::TwoByte) {
         uint8_t op = inst.opcode;
 
+        if (isEVEX) {
+            auto err = ExecuteSSE2(inst, memory);
+            if (err == ErrorCode::Success) {
+                m_state.AdvanceRIP(inst.length);
+            }
+            return err;
+        }
+
         // === Jcc near (0x80-0x8F) ===
         if (op >= 0x80 && op <= 0x8F) {
             return ExecuteControlFlow(inst, memory);
@@ -614,6 +624,10 @@ ErrorCode CPU::DispatchInstruction(
         // === SSE/SSE2 (TwoByte map fallthrough) ===
         // Covers: MOVUPS/MOVAPS/MOVSS/MOVSD, XORPS/PXOR, packed arithmetic,
         // compares, shuffles, conversions, and all other 0F-prefixed SSE ops.
+        // EVEX reuses the 0F opcode map as VEX. Full AVX-512 execution still
+        // requires a 512-bit ZMM/opmask register file; for now we route EVEX
+        // forms through the existing vector handlers so the decoder can surface
+        // AVX-512 usage to higher-level anti-analysis heuristics.
         {
             auto err = ExecuteSSE2(inst, memory);
             if (err == ErrorCode::Success) {
@@ -631,6 +645,12 @@ ErrorCode CPU::DispatchInstruction(
     if (inst.opcodeMap == OpcodeMap::ThreeByte38) {
         uint8_t op = inst.opcode;
 
+        if (isEVEX) {
+            auto err = ExecuteSSE4(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
         // AES-NI instructions: 0xDB-0xDF with 66 prefix
         if (op >= 0xDB && op <= 0xDF && inst.prefixes.hasOpSizeOverride) {
             auto err = ExecuteAESNI(inst, memory);
@@ -638,7 +658,8 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
-        // SSE4 handles everything else in this map
+        // SSE4 handles everything else in this map, including EVEX forms
+        // that share the 0F 38 opcode map with VEX encodings.
         auto err = ExecuteSSE4(inst, memory);
         if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
         return err;
@@ -651,6 +672,12 @@ ErrorCode CPU::DispatchInstruction(
     if (inst.opcodeMap == OpcodeMap::ThreeByte3A) {
         uint8_t op = inst.opcode;
 
+        if (isEVEX) {
+            auto err = ExecuteSSE4(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
         // AES-NI: PCLMULQDQ (0x44) and AESKEYGENASSIST (0xDF) with 66 prefix
         if ((op == 0x44 || op == 0xDF) && inst.prefixes.hasOpSizeOverride) {
             auto err = ExecuteAESNI(inst, memory);
@@ -658,7 +685,8 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
-        // SSE4 handles everything else in this map
+        // SSE4 handles everything else in this map, including EVEX forms
+        // that share the 0F 3A opcode map with VEX encodings.
         auto err = ExecuteSSE4(inst, memory);
         if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
         return err;

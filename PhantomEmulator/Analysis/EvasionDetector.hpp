@@ -86,6 +86,7 @@ enum class EvasionTechnique : uint8_t {
     ModuleCheck_DbgHelp,
     WindowCheck_Filemon,
     ParentProcess_Check,
+    AVX512_EVEXInstruction,
 };
 
 // ============================================================================
@@ -142,6 +143,7 @@ public:
     void OnEnvironmentQuery(const std::string& queryType,
                             const std::string& detail) noexcept;
     void OnProcessEnumeration(const std::string& processName) noexcept;
+    void OnInstructionProbe(GuestAddress rip, uint64_t instrCount, const char* detail) noexcept;
 
     // --- Results ---
 
