@@ -1002,6 +1002,11 @@ public:
 
                 // Wire up scan engine
                 fsf.SetScanEngine(&Core::Engine::ScanEngine::Instance());
+
+                // Wire up hash store for known-malware lookups
+                if (m_sharedHashStore) {
+                    fsf.SetHashStore(m_sharedHashStore.get());
+                }
             }
         } catch (...) {
             SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::ERROR);
@@ -1312,7 +1317,7 @@ public:
     void StopComponents() {
         Utils::Logger::Info(L"RealTimeProtection: Stopping protection components...");
 
-        try { FileSystemFilter::Instance().Stop(); } catch (...) {}
+        try { FileSystemFilter::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::STOPPED);
 
         try { ProcessCreationMonitor::Instance().Stop(); } catch (...) {}
