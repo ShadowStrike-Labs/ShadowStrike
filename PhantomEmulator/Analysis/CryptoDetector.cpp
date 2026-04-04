@@ -50,7 +50,18 @@ static constexpr float    kConfidenceXorSingle     = 0.85f;
 static constexpr float    kConfidenceXorMulti      = 0.75f;
 static constexpr float    kConfidenceCryptoAPI     = 0.95f;
 static constexpr float    kConfidenceBlowfish      = 0.80f;
+static constexpr float    kConfidenceBlowfishFull  = 0.92f;
 static constexpr float    kConfidenceRSA           = 0.85f;
+static constexpr float    kConfidenceTwofish       = 0.90f;
+static constexpr float    kConfidenceSerpent       = 0.85f;
+static constexpr float    kConfidenceECC           = 0.92f;
+static constexpr float    kConfidenceBase64        = 0.80f;
+static constexpr float    kConfidenceBase32        = 0.80f;
+static constexpr float    kConfidenceHexEncoding   = 0.75f;
+static constexpr float    kConfidenceAPIHashing    = 0.90f;
+static constexpr float    kConfidenceStackString   = 0.75f;
+static constexpr float    kConfidenceJunkCode      = 0.70f;
+static constexpr float    kConfidenceRansomware    = 0.95f;
 static constexpr float    kConfidenceCustom        = 0.40f;
 
 // ============================================================================
@@ -264,11 +275,28 @@ static constexpr std::array<uint32_t, 64> kMd5T = {
 };
 
 // ============================================================================
-// Blowfish P-array initial values (first 4 for detection)
+// Blowfish P-array initial values (first 4 for quick detection)
 // ============================================================================
 
 static constexpr std::array<uint32_t, 4> kBlowfishPInit = {
     0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344,
+};
+
+// Full Blowfish P-array (18 entries — digits of pi)
+static constexpr std::array<uint32_t, 18> kBlowfishPFull = {
+    0x243F6A88, 0x85A308D3, 0x13198A2E, 0x03707344,
+    0xA4093822, 0x299F31D0, 0x082EFA98, 0xEC4E6C89,
+    0x452821E6, 0x38D01377, 0xBE5466CF, 0x34E90C6C,
+    0xC0AC29B7, 0xC97C50DD, 0x3F84D5B5, 0xB5470917,
+    0x9216D5D9, 0x8979FB1B,
+};
+
+// Blowfish S-box 0 initial values (first 16 of 256 entries)
+static constexpr std::array<uint32_t, 16> kBlowfishS0Head = {
+    0xD1310BA6, 0x98DFB5AC, 0x2FFD72DB, 0xD01ADFB7,
+    0xB8E1AFED, 0x6A267E96, 0xBA7C9045, 0xF12C7F99,
+    0x24A19947, 0xB3916CF7, 0x0801F2E2, 0x858EFC16,
+    0x636920D8, 0x71574E69, 0xA458FEA3, 0xF4933D7E,
 };
 
 // ============================================================================
@@ -327,6 +355,192 @@ consteval std::array<uint32_t, 256> GenerateCrc32Table() noexcept {
 static constexpr std::array<uint32_t, 256> kCrc32Table = detail::GenerateCrc32Table();
 
 // ============================================================================
+// Twofish Q-permutation tables (first 16 entries for fast fingerprinting)
+// ============================================================================
+
+static constexpr std::array<uint8_t, 16> kTwofishQ0Head = {
+    0xA9, 0x67, 0xB3, 0xE8, 0x04, 0xFD, 0xA3, 0x76,
+    0x9A, 0x92, 0x80, 0x78, 0xE4, 0xDD, 0xD1, 0x38,
+};
+
+static constexpr std::array<uint8_t, 16> kTwofishQ1Head = {
+    0x75, 0xF3, 0xC6, 0xF4, 0xDB, 0x7B, 0xFB, 0xC8,
+    0x4A, 0xD3, 0xE6, 0x6B, 0x45, 0x7D, 0xE8, 0x4B,
+};
+
+// Twofish MDS matrix (4×4 over GF(2^8), polynomial 0x169)
+static constexpr std::array<uint8_t, 16> kTwofishMDS = {
+    0x01, 0xEF, 0x5B, 0x5B,
+    0x5B, 0xEF, 0xEF, 0x01,
+    0xEF, 0x5B, 0x01, 0xEF,
+    0xEF, 0x01, 0xEF, 0x5B,
+};
+
+// Twofish RS (Reed-Solomon) matrix (4×8, used for key-dependent S-boxes)
+static constexpr std::array<uint8_t, 32> kTwofishRS = {
+    0x01, 0xA4, 0x55, 0x87, 0x5A, 0x58, 0xDB, 0x9E,
+    0xA4, 0x56, 0x82, 0xF3, 0x1E, 0xC6, 0x68, 0xE5,
+    0x02, 0xA1, 0xFC, 0xC1, 0x47, 0xAE, 0x3D, 0x19,
+    0xA4, 0x55, 0x87, 0x5A, 0x58, 0xDB, 0x9E, 0x03,
+};
+
+// ============================================================================
+// Serpent S-boxes (8 unique 4-bit permutations, 16 entries each)
+// ============================================================================
+
+static constexpr std::array<std::array<uint8_t, 16>, 8> kSerpentSboxes = {{
+    {{  3,  8, 15,  1, 10,  6,  5, 11, 14, 13,  4,  2,  7,  0,  9, 12 }},
+    {{ 15, 12,  2,  7,  9,  0,  5, 10,  1, 11, 14,  8,  6, 13,  3,  4 }},
+    {{  8,  6,  7,  9,  3, 12, 10, 15, 13,  1, 14,  4,  0, 11,  5,  2 }},
+    {{  0, 15, 11,  8, 12,  9,  6,  3, 13,  1,  2,  4, 10,  7,  5, 14 }},
+    {{  1, 15,  8,  3, 12,  0, 11,  6,  2,  5,  4, 10,  9, 14,  7, 13 }},
+    {{ 15,  5,  2, 11,  4, 10,  9, 12,  0,  3, 14,  8, 13,  6,  7,  1 }},
+    {{  7,  2, 12,  5,  8,  4,  6, 11, 14,  9,  1, 15, 13,  3, 10,  0 }},
+    {{  1, 13, 15,  0, 14,  8,  2, 11,  7,  4, 12, 10,  9,  3,  5,  6 }},
+}};
+
+// Serpent round constant (phi = 0x9E3779B9, the golden ratio fractional part)
+static constexpr uint32_t kSerpentPhi = 0x9E3779B9;
+
+// ============================================================================
+// Elliptic Curve Constants (ECDSA/ECDH — big-endian coordinates)
+// ============================================================================
+
+// secp256k1 generator point Gx (Bitcoin curve, used by some ransomware)
+static constexpr std::array<uint8_t, 32> kSecp256k1Gx = {
+    0x79, 0xBE, 0x66, 0x7E, 0xF9, 0xDC, 0xBB, 0xAC,
+    0x55, 0xA0, 0x62, 0x95, 0xCE, 0x87, 0x0B, 0x07,
+    0x02, 0x9B, 0xFC, 0xDB, 0x2D, 0xCE, 0x28, 0xD9,
+    0x59, 0xF2, 0x81, 0x5B, 0x16, 0xF8, 0x17, 0x98,
+};
+
+// secp256k1 generator point Gy
+static constexpr std::array<uint8_t, 32> kSecp256k1Gy = {
+    0x48, 0x3A, 0xDA, 0x77, 0x26, 0xA3, 0xC4, 0x65,
+    0x5D, 0xA4, 0xFB, 0xFC, 0x0E, 0x11, 0x08, 0xA8,
+    0xFD, 0x17, 0xB4, 0x48, 0xA6, 0x85, 0x54, 0x19,
+    0x9C, 0x47, 0xD0, 0x8F, 0xFB, 0x10, 0xD4, 0xB8,
+};
+
+// NIST P-256 (secp256r1) generator point Gx
+static constexpr std::array<uint8_t, 32> kP256Gx = {
+    0x6B, 0x17, 0xD1, 0xF2, 0xE1, 0x2C, 0x42, 0x47,
+    0xF8, 0xBC, 0xE6, 0xE5, 0x63, 0xA4, 0x40, 0xF2,
+    0x77, 0x03, 0x7D, 0x81, 0x2D, 0xEB, 0x33, 0xA0,
+    0xF4, 0xA1, 0x39, 0x45, 0xD8, 0x98, 0xC2, 0x96,
+};
+
+// NIST P-256 (secp256r1) generator point Gy
+static constexpr std::array<uint8_t, 32> kP256Gy = {
+    0x4F, 0xE3, 0x42, 0xE2, 0xFE, 0x1A, 0x7F, 0x9B,
+    0x8E, 0xE7, 0xEB, 0x4A, 0x7C, 0x0F, 0x9E, 0x16,
+    0x2B, 0xCE, 0x33, 0x57, 0x6B, 0x31, 0x5E, 0xCE,
+    0xCB, 0xB6, 0x40, 0x68, 0x37, 0xBF, 0x51, 0xF5,
+};
+
+// NIST P-256 order n (big-endian)
+static constexpr std::array<uint8_t, 32> kP256Order = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xBC, 0xE6, 0xFA, 0xAD, 0xA7, 0x17, 0x9E, 0x84,
+    0xF3, 0xB9, 0xCA, 0xC2, 0xFC, 0x63, 0x25, 0x51,
+};
+
+// Curve25519 prime p = 2^255 − 19 (little-endian, as used in NaCl/libsodium)
+static constexpr std::array<uint8_t, 32> kCurve25519Prime = {
+    0xED, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF,
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x7F,
+};
+
+// ============================================================================
+// Base64 / Base32 / Hex Encoding Alphabets
+// ============================================================================
+
+static constexpr std::array<uint8_t, 64> kBase64Alphabet = {
+    'A','B','C','D','E','F','G','H','I','J','K','L','M',
+    'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    'a','b','c','d','e','f','g','h','i','j','k','l','m',
+    'n','o','p','q','r','s','t','u','v','w','x','y','z',
+    '0','1','2','3','4','5','6','7','8','9','+','/',
+};
+
+static constexpr std::array<uint8_t, 32> kBase32Alphabet = {
+    'A','B','C','D','E','F','G','H','I','J','K','L','M',
+    'N','O','P','Q','R','S','T','U','V','W','X','Y','Z',
+    '2','3','4','5','6','7',
+};
+
+static constexpr std::array<uint8_t, 16> kHexAlphabetLower = {
+    '0','1','2','3','4','5','6','7','8','9','a','b','c','d','e','f',
+};
+
+static constexpr std::array<uint8_t, 16> kHexAlphabetUpper = {
+    '0','1','2','3','4','5','6','7','8','9','A','B','C','D','E','F',
+};
+
+// ============================================================================
+// Well-known API hash constants (ROR13, CRC32, djb2, FNV-1a)
+// Used by shellcode / packers to resolve imports without plaintext strings
+// ============================================================================
+
+struct APIHashEntry {
+    uint32_t    hash;
+    const char* apiName;
+    const char* hashAlgorithm;
+};
+
+static constexpr APIHashEntry kKnownAPIHashes[] = {
+    // ROR13 hashes (Metasploit block_api / shellcode convention)
+    { 0x0726774C, "LoadLibraryA",            "ror13" },
+    { 0x7C0DFCAA, "GetProcAddress",          "ror13" },
+    { 0x0E8AFE98, "VirtualAlloc",            "ror13" },
+    { 0x56A2B5F0, "kernel32.dll",            "ror13" },
+    { 0x9DBD95A6, "GetSystemDirectoryA",     "ror13" },
+    { 0x6F721347, "RtlExitUserThread",       "ror13" },
+    { 0x160D6838, "CreateFileA",             "ror13" },
+    { 0x4FDAF6DA, "CreateFileW",             "ror13" },
+    { 0xE553A458, "VirtualFree",             "ror13" },
+    { 0xE7BDD8C5, "VirtualProtect",          "ror13" },
+    { 0x5BAE572D, "WriteFile",               "ror13" },
+    { 0xBB5F9EAD, "ReadFile",               "ror13" },
+    { 0xE035F044, "Sleep",                   "ror13" },
+    { 0x006B8029, "WinExec",                "ror13" },
+    { 0x876F8B31, "WSAStartup",             "ror13" },
+    { 0x863FCC79, "CreateProcessA",          "ror13" },
+    { 0xE13BEC74, "CreateRemoteThread",      "ror13" },
+    { 0x528796C6, "CloseHandle",             "ror13" },
+    { 0x300F2F0B, "NtAllocateVirtualMemory", "ror13" },
+    { 0x0A2A1DE0, "ExitProcess",             "ror13" },
+    { 0x4C0297FA, "InternetOpenA",           "ror13" },
+    { 0x69B34E3B, "InternetOpenUrlA",        "ror13" },
+    { 0xC69F8957, "InternetConnectA",        "ror13" },
+    { 0x3B2E55EB, "HttpOpenRequestA",        "ror13" },
+    { 0x7B18062D, "HttpSendRequestA",        "ror13" },
+    // CRC32-based API hashes (APT32 / OceanLotus convention)
+    { 0xC8AC8026, "LoadLibraryA",            "crc32" },
+    { 0x1FC0EAEE, "GetProcAddress",          "crc32" },
+    { 0x697A6AFE, "VirtualAlloc",            "crc32" },
+    { 0x5B8ACA33, "VirtualProtect",          "crc32" },
+    { 0x4FD18963, "CreateThread",            "crc32" },
+    // djb2 API hashes
+    { 0x0B8029BD, "LoadLibraryA",            "djb2"  },
+    { 0x5FBFF0FB, "GetProcAddress",          "djb2"  },
+    { 0xEE0944B3, "VirtualAlloc",            "djb2"  },
+    // FNV-1a API hashes
+    { 0xCF31BB1F, "LoadLibraryA",            "fnv1a" },
+    { 0x735305AC, "GetProcAddress",          "fnv1a" },
+    { 0x85092E2B, "VirtualAlloc",            "fnv1a" },
+};
+
+static constexpr size_t kKnownAPIHashCount =
+    sizeof(kKnownAPIHashes) / sizeof(kKnownAPIHashes[0]);
+
+// Minimum API hashes found in a 256-byte window to flag as API hash resolution
+static constexpr uint32_t kMinAPIHashCluster = 2;
+
+// ============================================================================
 // Crypto API names to track
 // ============================================================================
 
@@ -350,6 +564,7 @@ static constexpr CryptoApiEntry kCryptoApis[] = {
     { "CryptDeriveKey",             CryptoAlgorithm::CustomSymmetric, false },
     { "CryptImportKey",             CryptoAlgorithm::CustomSymmetric, false },
     { "CryptGenRandom",             CryptoAlgorithm::Unknown,         false },
+    { "BCryptGenRandom",            CryptoAlgorithm::Unknown,         false },
 };
 
 static constexpr size_t kCryptoApiCount = sizeof(kCryptoApis) / sizeof(kCryptoApis[0]);
@@ -387,26 +602,36 @@ static constexpr size_t kCryptoApiCount = sizeof(kCryptoApis) / sizeof(kCryptoAp
 
 [[nodiscard]] const char* AlgorithmName(CryptoAlgorithm algo) noexcept {
     switch (algo) {
-        case CryptoAlgorithm::Unknown:         return "Unknown";
-        case CryptoAlgorithm::AES:             return "AES";
-        case CryptoAlgorithm::AES_Inv:         return "AES (Inverse/Decryption)";
-        case CryptoAlgorithm::RC4:             return "RC4";
-        case CryptoAlgorithm::XOR_Single:      return "XOR (Single-byte)";
-        case CryptoAlgorithm::XOR_Multi:       return "XOR (Multi-byte)";
-        case CryptoAlgorithm::RSA:             return "RSA";
-        case CryptoAlgorithm::DES:             return "DES";
-        case CryptoAlgorithm::TripleDES:       return "Triple DES";
-        case CryptoAlgorithm::ChaCha20:        return "ChaCha20";
-        case CryptoAlgorithm::Salsa20:         return "Salsa20";
-        case CryptoAlgorithm::Blowfish:        return "Blowfish";
-        case CryptoAlgorithm::CRC32:           return "CRC32";
-        case CryptoAlgorithm::MD5:             return "MD5";
-        case CryptoAlgorithm::SHA1:            return "SHA-1";
-        case CryptoAlgorithm::SHA256:          return "SHA-256";
-        case CryptoAlgorithm::SHA512:          return "SHA-512";
-        case CryptoAlgorithm::CustomSymmetric: return "Custom Symmetric";
-        case CryptoAlgorithm::CustomHash:      return "Custom Hash";
-        case CryptoAlgorithm::CustomStream:    return "Custom Stream";
+        case CryptoAlgorithm::Unknown:           return "Unknown";
+        case CryptoAlgorithm::AES:               return "AES";
+        case CryptoAlgorithm::AES_Inv:           return "AES (Inverse/Decryption)";
+        case CryptoAlgorithm::RC4:               return "RC4";
+        case CryptoAlgorithm::XOR_Single:        return "XOR (Single-byte)";
+        case CryptoAlgorithm::XOR_Multi:         return "XOR (Multi-byte)";
+        case CryptoAlgorithm::RSA:               return "RSA";
+        case CryptoAlgorithm::DES:               return "DES";
+        case CryptoAlgorithm::TripleDES:         return "Triple DES";
+        case CryptoAlgorithm::ChaCha20:          return "ChaCha20";
+        case CryptoAlgorithm::Salsa20:           return "Salsa20";
+        case CryptoAlgorithm::Blowfish:          return "Blowfish";
+        case CryptoAlgorithm::Twofish:           return "Twofish";
+        case CryptoAlgorithm::Serpent:           return "Serpent";
+        case CryptoAlgorithm::CRC32:             return "CRC32";
+        case CryptoAlgorithm::MD5:               return "MD5";
+        case CryptoAlgorithm::SHA1:              return "SHA-1";
+        case CryptoAlgorithm::SHA256:            return "SHA-256";
+        case CryptoAlgorithm::SHA512:            return "SHA-512";
+        case CryptoAlgorithm::ECC:               return "ECC (Elliptic Curve)";
+        case CryptoAlgorithm::Base64:            return "Base64 Encoding";
+        case CryptoAlgorithm::Base32:            return "Base32 Encoding";
+        case CryptoAlgorithm::HexEncoding:       return "Hex Encoding";
+        case CryptoAlgorithm::APIHashing:        return "API Hashing";
+        case CryptoAlgorithm::StackString:       return "Stack String Construction";
+        case CryptoAlgorithm::JunkCode:          return "Junk Code / NOP Sled";
+        case CryptoAlgorithm::RansomwarePattern: return "Ransomware Crypto Pattern";
+        case CryptoAlgorithm::CustomSymmetric:   return "Custom Symmetric";
+        case CryptoAlgorithm::CustomHash:        return "Custom Hash";
+        case CryptoAlgorithm::CustomStream:      return "Custom Stream";
     }
     return "Unknown";
 }
@@ -458,6 +683,7 @@ struct CryptoDetector::Impl {
     std::unordered_set<GuestAddress>              flaggedAddresses;
 
     bool hasNetworkActivity = false;
+    uint32_t cryptGenRandomCount = 0;  // Tracks CryptGenRandom/BCryptGenRandom calls
 
     mutable std::shared_mutex mutex;
 
@@ -511,6 +737,12 @@ struct CryptoDetector::Impl {
         ScanForCrc32Table(data, len, base);
         ScanForBlowfish(data, len, base);
         ScanForRSAHeaders(data, len, base);
+        ScanForTwofish(data, len, base);
+        ScanForSerpent(data, len, base);
+        ScanForECCConstants(data, len, base);
+        ScanForEncodingTables(data, len, base);
+        ScanForAPIHashes(data, len, base);
+        ScanForObfuscationPatterns(data, len, base);
         ScanForCustomCrypto(data, len, base);
     }
 
@@ -906,11 +1138,22 @@ struct CryptoDetector::Impl {
 
     [[nodiscard]] static float ConfidenceForAlgorithm(CryptoAlgorithm algo) noexcept {
         switch (algo) {
-            case CryptoAlgorithm::SHA256:  return kConfidenceSHA256;
-            case CryptoAlgorithm::SHA1:    return kConfidenceSHA1;
-            case CryptoAlgorithm::MD5:     return kConfidenceMD5;
-            case CryptoAlgorithm::SHA512:  return kConfidenceSHA256;
-            default:                       return 0.85f;
+            case CryptoAlgorithm::SHA256:           return kConfidenceSHA256;
+            case CryptoAlgorithm::SHA1:             return kConfidenceSHA1;
+            case CryptoAlgorithm::MD5:              return kConfidenceMD5;
+            case CryptoAlgorithm::SHA512:           return kConfidenceSHA256;
+            case CryptoAlgorithm::Twofish:          return kConfidenceTwofish;
+            case CryptoAlgorithm::Serpent:          return kConfidenceSerpent;
+            case CryptoAlgorithm::ECC:              return kConfidenceECC;
+            case CryptoAlgorithm::Blowfish:         return kConfidenceBlowfish;
+            case CryptoAlgorithm::Base64:           return kConfidenceBase64;
+            case CryptoAlgorithm::Base32:           return kConfidenceBase32;
+            case CryptoAlgorithm::HexEncoding:      return kConfidenceHexEncoding;
+            case CryptoAlgorithm::APIHashing:       return kConfidenceAPIHashing;
+            case CryptoAlgorithm::StackString:      return kConfidenceStackString;
+            case CryptoAlgorithm::JunkCode:         return kConfidenceJunkCode;
+            case CryptoAlgorithm::RansomwarePattern:return kConfidenceRansomware;
+            default:                                return 0.85f;
         }
     }
 
@@ -1037,16 +1280,73 @@ struct CryptoDetector::Impl {
     }
 
     // -----------------------------------------------------------------------
-    // 10. Blowfish P-array detection
+    // 10. Blowfish P-array + S-box detection (enhanced)
     // -----------------------------------------------------------------------
 
     void ScanForBlowfish(const uint8_t* data, size_t len, GuestAddress base) noexcept {
-        static constexpr size_t kBlowfishBytes = kBlowfishPInit.size() * sizeof(uint32_t);
-        if (len < kBlowfishBytes) return;
+        // Phase 1: Scan for full 18-entry P-array (72 bytes) — high confidence
+        static constexpr size_t kFullPBytes = kBlowfishPFull.size() * sizeof(uint32_t);
+        if (len >= kFullPBytes) {
+            ScanForBlowfishPFull(data, len, base);
+        }
 
-        // Build LE and BE reference
-        std::array<uint8_t, kBlowfishBytes> refLE{};
-        std::array<uint8_t, kBlowfishBytes> refBE{};
+        // Phase 2: Scan for partial 4-entry P-array head (16 bytes) — standard confidence
+        static constexpr size_t kHeadPBytes = kBlowfishPInit.size() * sizeof(uint32_t);
+        if (len >= kHeadPBytes) {
+            ScanForBlowfishPHead(data, len, base);
+        }
+
+        // Phase 3: Scan for S-box 0 initial values (64 bytes) — confirms Blowfish
+        static constexpr size_t kS0HeadBytes = kBlowfishS0Head.size() * sizeof(uint32_t);
+        if (len >= kS0HeadBytes) {
+            ScanForBlowfishSBox(data, len, base);
+        }
+    }
+
+    void ScanForBlowfishPFull(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        static constexpr size_t kBytes = kBlowfishPFull.size() * sizeof(uint32_t);
+
+        std::array<uint8_t, kBytes> refLE{};
+        std::array<uint8_t, kBytes> refBE{};
+        for (size_t k = 0; k < kBlowfishPFull.size(); ++k) {
+            const uint32_t leVal = kBlowfishPFull[k];
+            const uint32_t beVal = ByteSwap32(kBlowfishPFull[k]);
+            std::memcpy(refLE.data() + k * 4, &leVal, 4);
+            std::memcpy(refBE.data() + k * 4, &beVal, 4);
+        }
+
+        const size_t searchEnd = len - kBytes;
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
+            bool matchBE = (std::memcmp(data + i, refBE.data(), kBytes) == 0);
+
+            if (matchLE || matchBE) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Blowfish;
+                f.address      = addr;
+                f.size         = kBytes;
+                f.confidence   = kConfidenceBlowfishFull;
+                f.description  = matchLE
+                    ? "Blowfish full P-array detected (18 entries, little-endian) "
+                      "— indicates key schedule initialization"
+                    : "Blowfish full P-array detected (18 entries, big-endian) "
+                      "— indicates key schedule initialization";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kBytes - 1;
+            }
+        }
+    }
+
+    void ScanForBlowfishPHead(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        static constexpr size_t kBytes = kBlowfishPInit.size() * sizeof(uint32_t);
+
+        std::array<uint8_t, kBytes> refLE{};
+        std::array<uint8_t, kBytes> refBE{};
         for (size_t k = 0; k < kBlowfishPInit.size(); ++k) {
             const uint32_t leVal = kBlowfishPInit[k];
             const uint32_t beVal = ByteSwap32(kBlowfishPInit[k]);
@@ -1054,27 +1354,63 @@ struct CryptoDetector::Impl {
             std::memcpy(refBE.data() + k * 4, &beVal, 4);
         }
 
-        const size_t searchEnd = len - kBlowfishBytes;
+        const size_t searchEnd = len - kBytes;
         for (size_t i = 0; i <= searchEnd; ++i) {
             const GuestAddress addr = base + static_cast<GuestAddress>(i);
             if (IsAlreadyFlagged(addr)) continue;
 
-            bool matchLE = (std::memcmp(data + i, refLE.data(), kBlowfishBytes) == 0);
-            bool matchBE = (std::memcmp(data + i, refBE.data(), kBlowfishBytes) == 0);
+            bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
+            bool matchBE = (std::memcmp(data + i, refBE.data(), kBytes) == 0);
 
             if (matchLE || matchBE) {
                 MarkFlagged(addr);
                 CryptoFinding f;
                 f.algorithm    = CryptoAlgorithm::Blowfish;
                 f.address      = addr;
-                f.size         = kBlowfishBytes;
+                f.size         = kBytes;
                 f.confidence   = kConfidenceBlowfish;
                 f.description  = matchLE
                     ? "Blowfish P-array initial values detected (little-endian)"
                     : "Blowfish P-array initial values detected (big-endian)";
                 f.isEncryption = true;
                 AddFinding(std::move(f));
-                i += kBlowfishBytes - 1;
+                i += kBytes - 1;
+            }
+        }
+    }
+
+    void ScanForBlowfishSBox(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        static constexpr size_t kBytes = kBlowfishS0Head.size() * sizeof(uint32_t);
+
+        std::array<uint8_t, kBytes> refLE{};
+        std::array<uint8_t, kBytes> refBE{};
+        for (size_t k = 0; k < kBlowfishS0Head.size(); ++k) {
+            const uint32_t leVal = kBlowfishS0Head[k];
+            const uint32_t beVal = ByteSwap32(kBlowfishS0Head[k]);
+            std::memcpy(refLE.data() + k * 4, &leVal, 4);
+            std::memcpy(refBE.data() + k * 4, &beVal, 4);
+        }
+
+        const size_t searchEnd = len - kBytes;
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            bool matchLE = (std::memcmp(data + i, refLE.data(), kBytes) == 0);
+            bool matchBE = (std::memcmp(data + i, refBE.data(), kBytes) == 0);
+
+            if (matchLE || matchBE) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Blowfish;
+                f.address      = addr;
+                f.size         = kBytes;
+                f.confidence   = kConfidenceBlowfishFull;
+                f.description  = "Blowfish S-box 0 initial values detected "
+                                 "— confirms Blowfish key schedule present in memory";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kBytes - 1;
             }
         }
     }
@@ -1159,7 +1495,686 @@ struct CryptoDetector::Impl {
     }
 
     // -----------------------------------------------------------------------
-    // 12. Custom crypto heuristic (high entropy, unknown algorithm)
+    // 12. Twofish detection
+    // -----------------------------------------------------------------------
+
+    void ScanForTwofish(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        ScanForTwofishQTables(data, len, base);
+        ScanForTwofishMDS(data, len, base);
+        ScanForTwofishRS(data, len, base);
+    }
+
+    void ScanForTwofishQTables(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kTwofishQ0Head.size()) return;
+
+        const size_t searchEnd = len - kTwofishQ0Head.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            if (std::memcmp(data + i, kTwofishQ0Head.data(), kTwofishQ0Head.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Twofish;
+                f.address      = addr;
+                f.size         = 256; // Full Q0 table is 256 bytes
+                f.confidence   = kConfidenceTwofish;
+                f.description  = "Twofish Q0 permutation table detected "
+                                 "— key-dependent S-box construction";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kTwofishQ0Head.size() - 1;
+                continue;
+            }
+
+            if (std::memcmp(data + i, kTwofishQ1Head.data(), kTwofishQ1Head.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Twofish;
+                f.address      = addr;
+                f.size         = 256;
+                f.confidence   = kConfidenceTwofish;
+                f.description  = "Twofish Q1 permutation table detected "
+                                 "— key-dependent S-box construction";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kTwofishQ1Head.size() - 1;
+                continue;
+            }
+        }
+    }
+
+    void ScanForTwofishMDS(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kTwofishMDS.size()) return;
+
+        const size_t searchEnd = len - kTwofishMDS.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            if (std::memcmp(data + i, kTwofishMDS.data(), kTwofishMDS.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Twofish;
+                f.address      = addr;
+                f.size         = kTwofishMDS.size();
+                f.confidence   = kConfidenceTwofish * 0.9f;
+                f.description  = "Twofish MDS matrix constants detected";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kTwofishMDS.size() - 1;
+            }
+        }
+    }
+
+    void ScanForTwofishRS(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kTwofishRS.size()) return;
+
+        const size_t searchEnd = len - kTwofishRS.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            if (std::memcmp(data + i, kTwofishRS.data(), kTwofishRS.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Twofish;
+                f.address      = addr;
+                f.size         = kTwofishRS.size();
+                f.confidence   = kConfidenceTwofish;
+                f.description  = "Twofish Reed-Solomon matrix detected "
+                                 "— key-dependent S-box generation";
+                f.isEncryption = true;
+                AddFinding(std::move(f));
+                i += kTwofishRS.size() - 1;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 13. Serpent detection
+    // -----------------------------------------------------------------------
+
+    void ScanForSerpent(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        ScanForSerpentSboxes(data, len, base);
+        ScanForSerpentPhi(data, len, base);
+    }
+
+    void ScanForSerpentSboxes(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Each Serpent S-box is 16 bytes (values 0–15). Require at least 4
+        // consecutive S-boxes (64 bytes) to avoid false positives on small nibble tables.
+        static constexpr size_t kSingleSboxLen = 16;
+        static constexpr uint32_t kMinConsecutive = 4;
+        static constexpr size_t kMinMatchBytes = kSingleSboxLen * kMinConsecutive;
+        if (len < kMinMatchBytes) return;
+
+        const size_t searchEnd = len - kSingleSboxLen;
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            // Try to match the first S-box at this offset
+            uint32_t consecutiveMatched = 0;
+            for (uint32_t sboxIdx = 0; sboxIdx < 8; ++sboxIdx) {
+                const size_t offset = i + static_cast<size_t>(sboxIdx) * kSingleSboxLen;
+                if (offset + kSingleSboxLen > len) break;
+
+                if (std::memcmp(data + offset,
+                                kSerpentSboxes[sboxIdx].data(),
+                                kSingleSboxLen) == 0) {
+                    ++consecutiveMatched;
+                } else {
+                    break;
+                }
+            }
+
+            if (consecutiveMatched >= kMinConsecutive) {
+                MarkFlagged(addr);
+                const size_t matchSize = static_cast<size_t>(consecutiveMatched) * kSingleSboxLen;
+
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Serpent;
+                f.address      = addr;
+                f.size         = static_cast<GuestSize>(matchSize);
+                f.isEncryption = true;
+
+                if (consecutiveMatched == 8) {
+                    f.confidence  = kConfidenceSerpent;
+                    f.description = "Complete Serpent S-box array detected (all 8 S-boxes)";
+                } else {
+                    f.confidence  = kConfidenceSerpent * 0.85f;
+                    f.description = "Serpent S-box block detected (" +
+                                    std::to_string(consecutiveMatched) +
+                                    " of 8 consecutive S-boxes)";
+                }
+
+                AddFinding(std::move(f));
+                i += matchSize - 1;
+            }
+        }
+    }
+
+    void ScanForSerpentPhi(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Serpent uses phi = 0x9E3779B9 as a round constant in key schedule.
+        // This constant is also used by TEA/XTEA, so we flag with moderate confidence.
+        if (len < 4) return;
+
+        const uint32_t phiLE = kSerpentPhi;
+        const uint32_t phiBE = ByteSwap32(kSerpentPhi);
+
+        const size_t searchEnd = len - 4;
+        uint32_t phiCount = 0;
+        GuestAddress firstAddr = 0;
+
+        for (size_t i = 0; i <= searchEnd; i += 4) {
+            const uint32_t val = ReadU32LE(data + i);
+            if (val == phiLE || val == phiBE) {
+                if (phiCount == 0) {
+                    firstAddr = base + static_cast<GuestAddress>(i);
+                }
+                ++phiCount;
+            }
+        }
+
+        // Serpent key schedule uses phi in 132 subkey derivations.
+        // Finding multiple instances strongly suggests Serpent or TEA-family.
+        if (phiCount >= 4 && !IsAlreadyFlagged(firstAddr)) {
+            MarkFlagged(firstAddr);
+            CryptoFinding f;
+            f.algorithm    = CryptoAlgorithm::Serpent;
+            f.address      = firstAddr;
+            f.size         = 4;
+            f.confidence   = kConfidenceSerpent * 0.7f;
+            f.description  = "Golden ratio constant 0x9E3779B9 found " +
+                             std::to_string(phiCount) +
+                             " times — Serpent/TEA key schedule indicator";
+            f.isEncryption = true;
+            AddFinding(std::move(f));
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 14. Elliptic Curve (ECDSA/ECDH) constant detection
+    // -----------------------------------------------------------------------
+
+    void ScanForECCConstants(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < 32) return;
+
+        struct ECCConstant {
+            const uint8_t* data;
+            size_t         size;
+            const char*    curveName;
+            const char*    pointName;
+        };
+
+        const ECCConstant kECCConstants[] = {
+            { kSecp256k1Gx.data(), kSecp256k1Gx.size(), "secp256k1", "Gx" },
+            { kSecp256k1Gy.data(), kSecp256k1Gy.size(), "secp256k1", "Gy" },
+            { kP256Gx.data(),      kP256Gx.size(),      "P-256",     "Gx" },
+            { kP256Gy.data(),      kP256Gy.size(),      "P-256",     "Gy" },
+            { kP256Order.data(),   kP256Order.size(),    "P-256",     "order n" },
+            { kCurve25519Prime.data(), kCurve25519Prime.size(),
+              "Curve25519", "prime p=2^255-19" },
+        };
+
+        for (const auto& ecc : kECCConstants) {
+            if (len < ecc.size) continue;
+            const size_t searchEnd = len - ecc.size;
+
+            for (size_t i = 0; i <= searchEnd; ++i) {
+                const GuestAddress addr = base + static_cast<GuestAddress>(i);
+                if (IsAlreadyFlagged(addr)) continue;
+
+                if (std::memcmp(data + i, ecc.data, ecc.size) == 0) {
+                    MarkFlagged(addr);
+                    CryptoFinding f;
+                    f.algorithm    = CryptoAlgorithm::ECC;
+                    f.address      = addr;
+                    f.size         = static_cast<GuestSize>(ecc.size);
+                    f.confidence   = kConfidenceECC;
+                    f.description  = std::string("Elliptic curve constant detected: ") +
+                                     ecc.curveName + " " + ecc.pointName +
+                                     " — ECDSA/ECDH key exchange indicator";
+                    f.isEncryption = true;
+                    AddFinding(std::move(f));
+                    i += ecc.size - 1;
+                    break; // One match per constant per scan pass
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 15. Base64 / Base32 / Hex encoding table detection
+    // -----------------------------------------------------------------------
+
+    void ScanForEncodingTables(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        ScanForBase64Table(data, len, base);
+        ScanForBase32Table(data, len, base);
+        ScanForHexTable(data, len, base);
+    }
+
+    void ScanForBase64Table(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kBase64Alphabet.size()) return;
+
+        const size_t searchEnd = len - kBase64Alphabet.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            // Standard Base64 alphabet match
+            if (std::memcmp(data + i, kBase64Alphabet.data(),
+                            kBase64Alphabet.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Base64;
+                f.address      = addr;
+                f.size         = kBase64Alphabet.size();
+                f.confidence   = kConfidenceBase64;
+                f.description  = "Standard Base64 encoding alphabet detected "
+                                 "— data obfuscation/exfiltration indicator";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i += kBase64Alphabet.size() - 1;
+                continue;
+            }
+
+            // Custom Base64 alphabet heuristic: 64 consecutive printable ASCII chars
+            // where each char is unique and the set covers [A-Z], [a-z], [0-9]
+            if (IsCustomBase64Alphabet(data + i, len - i)) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Base64;
+                f.address      = addr;
+                f.size         = 64;
+                f.confidence   = kConfidenceBase64 * 0.75f;
+                f.description  = "Possible custom Base64 alphabet detected (64 unique "
+                                 "printable chars spanning alphanumeric ranges)";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i += 63;
+            }
+        }
+    }
+
+    [[nodiscard]] static bool IsCustomBase64Alphabet(
+        const uint8_t* data, size_t available) noexcept
+    {
+        if (available < 64) return false;
+
+        std::array<bool, 256> seen{};
+        bool hasUpper = false, hasLower = false, hasDigit = false;
+        uint32_t uniqueCount = 0;
+
+        for (size_t j = 0; j < 64; ++j) {
+            const uint8_t c = data[j];
+            // Must be printable ASCII (0x21–0x7E, excluding space)
+            if (c < 0x21 || c > 0x7E) return false;
+            if (seen[c]) return false; // Duplicates → not an alphabet
+            seen[c] = true;
+            ++uniqueCount;
+
+            if (c >= 'A' && c <= 'Z') hasUpper = true;
+            if (c >= 'a' && c <= 'z') hasLower = true;
+            if (c >= '0' && c <= '9') hasDigit = true;
+        }
+
+        // A genuine Base64 alphabet spans uppercase, lowercase, and digits
+        return uniqueCount == 64 && hasUpper && hasLower && hasDigit;
+    }
+
+    void ScanForBase32Table(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kBase32Alphabet.size()) return;
+
+        const size_t searchEnd = len - kBase32Alphabet.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            if (std::memcmp(data + i, kBase32Alphabet.data(),
+                            kBase32Alphabet.size()) == 0) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::Base32;
+                f.address      = addr;
+                f.size         = kBase32Alphabet.size();
+                f.confidence   = kConfidenceBase32;
+                f.description  = "Base32 encoding alphabet detected (RFC 4648)";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i += kBase32Alphabet.size() - 1;
+            }
+        }
+    }
+
+    void ScanForHexTable(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        if (len < kHexAlphabetLower.size()) return;
+
+        const size_t searchEnd = len - kHexAlphabetLower.size();
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            bool matchLower = (std::memcmp(data + i, kHexAlphabetLower.data(),
+                                           kHexAlphabetLower.size()) == 0);
+            bool matchUpper = (std::memcmp(data + i, kHexAlphabetUpper.data(),
+                                           kHexAlphabetUpper.size()) == 0);
+
+            if (matchLower || matchUpper) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::HexEncoding;
+                f.address      = addr;
+                f.size         = kHexAlphabetLower.size();
+                f.confidence   = kConfidenceHexEncoding;
+                f.description  = matchLower
+                    ? "Hex encoding lookup table detected (lowercase 0-9a-f)"
+                    : "Hex encoding lookup table detected (uppercase 0-9A-F)";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i += kHexAlphabetLower.size() - 1;
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 16. API hash constant detection
+    // -----------------------------------------------------------------------
+
+    void ScanForAPIHashes(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Scan for known API hash constants in memory. Shellcode and packers
+        // embed these as immediate operands or in lookup tables.
+        // Require a cluster of 2+ known hashes within 256 bytes to reduce FP.
+        if (len < 4) return;
+
+        struct HashHit {
+            size_t      offset;
+            size_t      entryIdx;
+        };
+
+        // Cap the number of hash hits we track to prevent excessive processing
+        static constexpr size_t kMaxHashHits = 1024;
+        std::vector<HashHit> hits;
+        hits.reserve(128);
+
+        const size_t searchEnd = len - 4;
+        for (size_t i = 0; i <= searchEnd && hits.size() < kMaxHashHits; i += 1) {
+            const uint32_t valLE = ReadU32LE(data + i);
+
+            for (size_t k = 0; k < kKnownAPIHashCount; ++k) {
+                if (valLE == kKnownAPIHashes[k].hash) {
+                    hits.push_back({ i, k });
+                    break;
+                }
+            }
+        }
+
+        if (hits.size() < kMinAPIHashCluster) return;
+
+        // Cluster hits: find groups within 256-byte windows
+        for (size_t h = 0; h < hits.size(); ++h) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(hits[h].offset);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            uint32_t clusterCount = 1;
+            size_t clusterEnd = h;
+
+            for (size_t j = h + 1; j < hits.size(); ++j) {
+                if (hits[j].offset - hits[h].offset <= 256) {
+                    ++clusterCount;
+                    clusterEnd = j;
+                } else {
+                    break;
+                }
+            }
+
+            if (clusterCount >= kMinAPIHashCluster) {
+                MarkFlagged(addr);
+
+                const auto& firstEntry = kKnownAPIHashes[hits[h].entryIdx];
+                const auto& lastEntry  = kKnownAPIHashes[hits[clusterEnd].entryIdx];
+                const size_t spanBytes = hits[clusterEnd].offset - hits[h].offset + 4;
+
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::APIHashing;
+                f.address      = addr;
+                f.size         = static_cast<GuestSize>(spanBytes);
+                f.confidence   = kConfidenceAPIHashing;
+                f.isEncryption = false;
+                f.description  = "API hash resolution detected: " +
+                                 std::to_string(clusterCount) + " known " +
+                                 std::string(firstEntry.hashAlgorithm) +
+                                 " hashes (e.g., " + firstEntry.apiName;
+                if (clusterCount > 1) {
+                    f.description += ", " + std::string(lastEntry.apiName);
+                }
+                f.description += ") — shellcode/packer import resolution";
+
+                AddFinding(std::move(f));
+                h = clusterEnd; // Skip past cluster
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 17. Code obfuscation pattern detection
+    // -----------------------------------------------------------------------
+
+    void ScanForObfuscationPatterns(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        ScanForNOPSleds(data, len, base);
+        ScanForStackStrings(data, len, base);
+        ScanForJunkCodePatterns(data, len, base);
+    }
+
+    void ScanForNOPSleds(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Detect NOP sleds: 32+ consecutive 0x90 bytes
+        static constexpr size_t kMinNOPSled = 32;
+        if (len < kMinNOPSled) return;
+
+        size_t runStart = 0;
+        size_t runLen   = 0;
+        bool   inRun    = false;
+
+        for (size_t i = 0; i < len; ++i) {
+            if (data[i] == 0x90) {
+                if (!inRun) {
+                    runStart = i;
+                    runLen = 0;
+                    inRun = true;
+                }
+                ++runLen;
+            } else {
+                if (inRun && runLen >= kMinNOPSled) {
+                    const GuestAddress addr = base + static_cast<GuestAddress>(runStart);
+                    if (!IsAlreadyFlagged(addr)) {
+                        MarkFlagged(addr);
+                        CryptoFinding f;
+                        f.algorithm    = CryptoAlgorithm::JunkCode;
+                        f.address      = addr;
+                        f.size         = static_cast<GuestSize>(runLen);
+                        f.confidence   = kConfidenceJunkCode;
+                        f.description  = "NOP sled detected (" +
+                                         std::to_string(runLen) +
+                                         " bytes) — shellcode landing pad or code obfuscation";
+                        f.isEncryption = false;
+                        AddFinding(std::move(f));
+                    }
+                }
+                inRun = false;
+                runLen = 0;
+            }
+        }
+
+        // Handle run at end of buffer
+        if (inRun && runLen >= kMinNOPSled) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(runStart);
+            if (!IsAlreadyFlagged(addr)) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::JunkCode;
+                f.address      = addr;
+                f.size         = static_cast<GuestSize>(runLen);
+                f.confidence   = kConfidenceJunkCode;
+                f.description  = "NOP sled detected (" +
+                                 std::to_string(runLen) +
+                                 " bytes) — shellcode landing pad or code obfuscation";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+            }
+        }
+    }
+
+    void ScanForStackStrings(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Detect stack string construction:
+        // Sequences of MOV [RSP+disp8], imm8 (opcode: C6 44 24 XX YY)
+        // or MOV [RBP-disp8], imm8 (opcode: C6 45 XX YY)
+        // occurring 6+ times within 64 bytes → building a string on the stack
+        static constexpr size_t  kMinStackMoves = 6;
+        static constexpr size_t  kWindowSize    = 64;
+        static constexpr uint8_t kMovByteRspOp  = 0xC6; // MOV r/m8, imm8
+
+        if (len < kWindowSize) return;
+
+        const size_t searchEnd = len - kWindowSize;
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            uint32_t stackMoveCount = 0;
+            size_t   windowEnd = std::min(i + kWindowSize, len);
+
+            for (size_t j = i; j + 4 < windowEnd; ++j) {
+                // MOV byte ptr [RSP+disp8], imm8: C6 44 24 XX YY
+                if (data[j] == kMovByteRspOp && data[j + 1] == 0x44 &&
+                    data[j + 2] == 0x24) {
+                    const uint8_t immVal = data[j + 4];
+                    // The immediate should be a printable ASCII character
+                    if (immVal >= 0x20 && immVal < 0x7F) {
+                        ++stackMoveCount;
+                    }
+                    j += 4; // Skip past this instruction
+                    continue;
+                }
+                // MOV byte ptr [RBP+disp8], imm8: C6 45 XX YY
+                if (data[j] == kMovByteRspOp && data[j + 1] == 0x45) {
+                    const uint8_t immVal = data[j + 3];
+                    if (immVal >= 0x20 && immVal < 0x7F) {
+                        ++stackMoveCount;
+                    }
+                    j += 3;
+                    continue;
+                }
+            }
+
+            if (stackMoveCount >= kMinStackMoves) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::StackString;
+                f.address      = addr;
+                f.size         = static_cast<GuestSize>(kWindowSize);
+                f.confidence   = kConfidenceStackString;
+                f.description  = "Stack string construction detected (" +
+                                 std::to_string(stackMoveCount) +
+                                 " MOV byte [RSP/RBP+X], imm8 instructions) "
+                                 "— anti-analysis string obfuscation";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i += kWindowSize - 1;
+            }
+        }
+    }
+
+    void ScanForJunkCodePatterns(const uint8_t* data, size_t len, GuestAddress base) noexcept {
+        // Detect junk code insertion patterns:
+        // 1. PUSH reg / POP same reg sequences (4+ consecutive pairs)
+        // 2. MOV reg, reg (self-move) sequences
+        static constexpr size_t kMinJunkPairs = 4;
+        if (len < kMinJunkPairs * 2) return;
+
+        const size_t searchEnd = len - (kMinJunkPairs * 2);
+        for (size_t i = 0; i <= searchEnd; ++i) {
+            const GuestAddress addr = base + static_cast<GuestAddress>(i);
+            if (IsAlreadyFlagged(addr)) continue;
+
+            // Pattern 1: PUSH reg (50-57) followed by POP same reg (58-5F)
+            uint32_t pushPopPairs = 0;
+            size_t scanPos = i;
+            while (scanPos + 1 < len) {
+                const uint8_t pushByte = data[scanPos];
+                const uint8_t popByte  = data[scanPos + 1];
+                // PUSH reg: 0x50-0x57 → POP same reg: 0x58-0x5F (diff = 8)
+                if (pushByte >= 0x50 && pushByte <= 0x57 &&
+                    popByte == pushByte + 8) {
+                    ++pushPopPairs;
+                    scanPos += 2;
+                } else {
+                    break;
+                }
+            }
+
+            if (pushPopPairs >= kMinJunkPairs) {
+                MarkFlagged(addr);
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::JunkCode;
+                f.address      = addr;
+                f.size         = static_cast<GuestSize>(pushPopPairs * 2);
+                f.confidence   = kConfidenceJunkCode;
+                f.description  = "Junk code detected: " +
+                                 std::to_string(pushPopPairs) +
+                                 " consecutive PUSH/POP register pairs "
+                                 "— packer/crypter obfuscation";
+                f.isEncryption = false;
+                AddFinding(std::move(f));
+                i = scanPos - 1;
+                continue;
+            }
+
+            // Pattern 2: Multi-byte NOP (0F 1F 00, 0F 1F 40 00, etc.)
+            if (i + 2 < len && data[i] == 0x0F && data[i + 1] == 0x1F) {
+                size_t nopLen = 0;
+                size_t pos = i;
+                while (pos + 2 < len && data[pos] == 0x0F && data[pos + 1] == 0x1F) {
+                    // Multi-byte NOP: 0F 1F /0 (3–9 bytes)
+                    if (data[pos + 2] == 0x00) {
+                        nopLen += 3;
+                        pos += 3;
+                    } else if (data[pos + 2] == 0x40 && pos + 3 < len) {
+                        nopLen += 4;
+                        pos += 4;
+                    } else if (data[pos + 2] == 0x44 && pos + 4 < len) {
+                        nopLen += 5;
+                        pos += 5;
+                    } else if (data[pos + 2] == 0x80 && pos + 6 < len) {
+                        nopLen += 7;
+                        pos += 7;
+                    } else if (data[pos + 2] == 0x84 && pos + 7 < len) {
+                        nopLen += 8;
+                        pos += 8;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (nopLen >= 16) { // 16+ bytes of multi-byte NOPs
+                    MarkFlagged(addr);
+                    CryptoFinding f;
+                    f.algorithm    = CryptoAlgorithm::JunkCode;
+                    f.address      = addr;
+                    f.size         = static_cast<GuestSize>(nopLen);
+                    f.confidence   = kConfidenceJunkCode;
+                    f.description  = "Multi-byte NOP sequence detected (" +
+                                     std::to_string(nopLen) +
+                                     " bytes) — code alignment or obfuscation";
+                    f.isEncryption = false;
+                    AddFinding(std::move(f));
+                    i = pos - 1;
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // 18. Custom crypto heuristic (high entropy, unknown algorithm)
     // -----------------------------------------------------------------------
 
     void ScanForCustomCrypto(const uint8_t* data, size_t len, GuestAddress base) noexcept {
@@ -1425,9 +2440,26 @@ struct CryptoDetector::Impl {
             isEncrypt = false;
         }
 
-        if (name == "CryptGenRandom") {
-            // Random number generation — often precedes key derivation
-            // Don't emit a standalone finding, but record it
+        if (name == "CryptGenRandom" || name == "BCryptGenRandom") {
+            // Track random number generation — precedes per-file key derivation
+            // in ransomware encryption chains
+            ++cryptGenRandomCount;
+
+            // Emit ransomware pattern finding after multiple CryptGenRandom calls
+            // interleaved with encryption API calls
+            if (cryptGenRandomCount >= 3 && HasEncryptionAPICalls()) {
+                CryptoFinding f;
+                f.algorithm    = CryptoAlgorithm::RansomwarePattern;
+                f.address      = 0;
+                f.size         = 0;
+                f.confidence   = kConfidenceRansomware;
+                f.isEncryption = true;
+                f.description  = "Ransomware per-file key generation pattern: " +
+                                 std::to_string(cryptGenRandomCount) +
+                                 " CryptGenRandom calls interleaved with encryption "
+                                 "— hybrid encryption lifecycle detected";
+                AddFinding(std::move(f));
+            }
             return;
         }
 
@@ -1450,6 +2482,20 @@ struct CryptoDetector::Impl {
     }
 
     // -----------------------------------------------------------------------
+    // Ransomware lifecycle helper
+    // -----------------------------------------------------------------------
+
+    [[nodiscard]] bool HasEncryptionAPICalls() const noexcept {
+        for (const auto& call : apiCallsSeen) {
+            if (call == "BCryptEncrypt" || call == "CryptEncrypt" ||
+                call == "BCryptDecrypt" || call == "CryptDecrypt") {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // -----------------------------------------------------------------------
     // Stats computation
     // -----------------------------------------------------------------------
 
@@ -1457,10 +2503,15 @@ struct CryptoDetector::Impl {
         CryptoStats stats;
         stats.totalFindings = static_cast<uint32_t>(findings.size());
 
-        bool hasAES      = false;
-        bool hasAESInv    = false;
-        bool hasRSA       = false;
-        bool hasSymmetric = false;
+        bool hasAES        = false;
+        bool hasAESInv     = false;
+        bool hasRSA        = false;
+        bool hasSymmetric  = false;
+        bool hasECC        = false;
+        bool hasEncoding   = false;
+        bool hasAPIHashing = false;
+        bool hasStackStr   = false;
+        bool hasJunkCode   = false;
 
         std::unordered_set<uint8_t> algoSeen;
 
@@ -1488,6 +2539,23 @@ struct CryptoDetector::Impl {
                 case CryptoAlgorithm::RSA:
                     hasRSA = true;
                     break;
+                case CryptoAlgorithm::ECC:
+                    hasECC = true;
+                    break;
+                case CryptoAlgorithm::Base64:
+                case CryptoAlgorithm::Base32:
+                case CryptoAlgorithm::HexEncoding:
+                    hasEncoding = true;
+                    break;
+                case CryptoAlgorithm::APIHashing:
+                    hasAPIHashing = true;
+                    break;
+                case CryptoAlgorithm::StackString:
+                    hasStackStr = true;
+                    break;
+                case CryptoAlgorithm::JunkCode:
+                    hasJunkCode = true;
+                    break;
                 case CryptoAlgorithm::RC4:
                 case CryptoAlgorithm::XOR_Single:
                 case CryptoAlgorithm::XOR_Multi:
@@ -1496,6 +2564,8 @@ struct CryptoDetector::Impl {
                 case CryptoAlgorithm::ChaCha20:
                 case CryptoAlgorithm::Salsa20:
                 case CryptoAlgorithm::Blowfish:
+                case CryptoAlgorithm::Twofish:
+                case CryptoAlgorithm::Serpent:
                 case CryptoAlgorithm::CustomSymmetric:
                 case CryptoAlgorithm::CustomStream:
                     hasSymmetric = true;
@@ -1510,6 +2580,18 @@ struct CryptoDetector::Impl {
 
         // C2 encryption indicator: any symmetric cipher + network activity
         stats.hasC2Encryption = hasSymmetric && hasNetworkActivity;
+
+        // Obfuscation indicator: API hashing, stack strings, or junk code
+        stats.hasObfuscationIndicator = hasAPIHashing || hasStackStr || hasJunkCode;
+
+        // Encoding indicator: data encoding tables detected
+        stats.hasEncodingIndicator = hasEncoding;
+
+        // ECC key exchange indicator
+        stats.hasECCKeyExchange = hasECC;
+
+        // Per-file key generation count from tracked CryptGenRandom calls
+        stats.perFileKeyGenCount = cryptGenRandomCount;
 
         return stats;
     }
@@ -1699,6 +2781,7 @@ void CryptoDetector::Reset() noexcept
     m_impl->apiCallsSeen.clear();
     m_impl->flaggedAddresses.clear();
     m_impl->hasNetworkActivity = false;
+    m_impl->cryptGenRandomCount = 0;
 }
 
 } // namespace Phantom

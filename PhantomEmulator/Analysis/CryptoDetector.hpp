@@ -37,11 +37,21 @@ enum class CryptoAlgorithm : uint8_t {
     ChaCha20,
     Salsa20,
     Blowfish,
+    Twofish,
+    Serpent,
     CRC32,
     MD5,
     SHA1,
     SHA256,
     SHA512,
+    ECC,
+    Base64,
+    Base32,
+    HexEncoding,
+    APIHashing,
+    StackString,
+    JunkCode,
+    RansomwarePattern,
     CustomSymmetric,
     CustomHash,
     CustomStream,
@@ -71,6 +81,10 @@ struct CryptoStats {
     uint32_t decryptionCount         = 0;
     bool     hasRansomwareIndicator  = false; // AES + RSA + file enumeration
     bool     hasC2Encryption         = false; // Symmetric + network activity
+    bool     hasObfuscationIndicator = false; // API hashing + stack strings + junk code
+    bool     hasEncodingIndicator    = false; // Base64/Base32/Hex encoding detected
+    bool     hasECCKeyExchange       = false; // Elliptic curve constants detected
+    uint32_t perFileKeyGenCount      = 0;     // CryptGenRandom calls tracked
     std::vector<CryptoAlgorithm> algorithmsFound;
 };
 
