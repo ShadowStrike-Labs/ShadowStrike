@@ -63,6 +63,86 @@ const char* PackerTypeName(PackerType type) noexcept {
         case PackerType::NSIS:              return "NSIS Installer";
         case PackerType::InnoSetup:         return "Inno Setup";
         case PackerType::PyInstaller:       return "PyInstaller";
+        // Commercial protectors
+        case PackerType::PELock:            return "PELock";
+        case PackerType::ACProtect:         return "ACProtect";
+        case PackerType::SafeEngine:        return "SafeEngine";
+        case PackerType::WinLicense:        return "WinLicense";
+        case PackerType::CodeWall:          return "CodeWall";
+        case PackerType::PrivateEXE:        return "PrivateEXE Protector";
+        case PackerType::PCGuard:           return "PC Guard";
+        case PackerType::GameGuard:         return "GameGuard";
+        case PackerType::Denuvo:            return "Denuvo";
+        case PackerType::VMProtect1x:       return "VMProtect 1.x";
+        case PackerType::VMProtect2x:       return "VMProtect 2.x";
+        case PackerType::ThemidaV1:         return "Themida v1";
+        case PackerType::ThemidaV2:         return "Themida v2";
+        // Packers
+        case PackerType::RLPack:            return "RLPack";
+        case PackerType::nPack:             return "nPack";
+        case PackerType::WinUpack:          return "WinUpack";
+        case PackerType::JDPack:            return "JDPack";
+        case PackerType::BeRoEXE:           return "BeRoEXE Packer";
+        case PackerType::Packman:           return "Packman";
+        case PackerType::YodaCrypt:         return "Yoda's Crypter";
+        case PackerType::PEBundle:          return "PEBundle";
+        case PackerType::DotFixNice:        return "DotFix NiceProtect";
+        case PackerType::PEX:               return "PEX";
+        case PackerType::AlexProtect:       return "Alex Protector";
+        case PackerType::AntiCrack:         return "AntiCrack Protector";
+        case PackerType::kkrunchy:          return "kkrunchy";
+        case PackerType::CrunchCexe:        return "Crunch/Cexe";
+        case PackerType::UPXModified:       return "UPX (Modified)";
+        // .NET / Managed
+        case PackerType::ConfuserEx:        return "ConfuserEx";
+        case PackerType::Dotfuscator:       return "Dotfuscator";
+        // Scripting
+        case PackerType::AutoHotkey:        return "AutoHotkey";
+        case PackerType::PyArmor:           return "PyArmor";
+        case PackerType::Cython:            return "Cython Compiled";
+        // Go
+        case PackerType::GoBinary:          return "Go Binary";
+        // Installer/SFX
+        case PackerType::SevenZipSFX:       return "7-Zip SFX";
+        case PackerType::WinRARSFX:         return "WinRAR SFX";
+        case PackerType::WinZipSFX:         return "WinZip SFX";
+        case PackerType::InstallShield:     return "InstallShield";
+        case PackerType::WiseInstaller:     return "Wise Installer";
+        // VM-based
+        case PackerType::TigerVMP:          return "TigerVMP";
+        case PackerType::ReWolf:            return "ReWolf";
+        // Additional
+        case PackerType::ExeCryptorV2:      return "ExeCryptor 2.x";
+        case PackerType::PECompactV3:       return "PECompact v3";
+        case PackerType::PetiteV21:         return "Petite 2.1";
+        case PackerType::PetiteV22:         return "Petite 2.2";
+        case PackerType::PetiteV23:         return "Petite 2.3";
+        case PackerType::NSISVariant:       return "NSIS (Variant)";
+        case PackerType::InnoSetupVariant:  return "Inno Setup (Variant)";
+        case PackerType::ElectronASAR:      return "Electron ASAR";
+        case PackerType::SmartAssembly:     return "SmartAssembly";
+        case PackerType::Eazfuscator:       return "Eazfuscator.NET";
+        case PackerType::BabelNet:          return "Babel .NET";
+        case PackerType::DNGuard:           return "DNGuard HVM";
+        case PackerType::NetReactor:        return ".NET Reactor";
+        case PackerType::MaxtoCode:         return "MaxtoCode";
+        case PackerType::Agile:             return "Agile.NET";
+        case PackerType::Xenocode:          return "Xenocode";
+        case PackerType::Spoon:             return "Spoon (Turbo)";
+        case PackerType::BoxedAppVariant:   return "BoxedApp (Variant)";
+        case PackerType::MoleBoxUltra:      return "MoleBox Ultra";
+        case PackerType::PECompactV2:       return "PECompact v2";
+        case PackerType::UPXScrambled:      return "UPX (Scrambled)";
+        case PackerType::ASPackV2:          return "ASPack v2";
+        case PackerType::NSPackV3:          return "NsPack v3";
+        case PackerType::MPRESSv2:          return "MPRESS v2";
+        case PackerType::FSGv2:             return "FSG v2";
+        case PackerType::MEWv11:            return "MEW v11";
+        case PackerType::PESpinV1:          return "PESpin v1";
+        case PackerType::tElockV098:        return "tElock v0.98";
+        case PackerType::ObsidiumV1:        return "Obsidium v1";
+        case PackerType::ArmadilloV9:       return "Armadillo v9";
+        case PackerType::ThemidaV3:         return "Themida v3";
     }
     return "Unknown";
 }
@@ -511,6 +591,450 @@ static constexpr uint8_t kEP_ExeCryptor_M[] = {
     0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
 };
 
+// ── Expanded EP byte patterns ────────────────────────────────────────────
+
+// Themida v3: pushad; mov ebx,[esp+24h]; ...
+static constexpr uint8_t kEP_ThemidaV3_B[] = {
+    0x60, 0x8B, 0x5C, 0x24, 0x24, 0x8B, 0x73, 0x00
+};
+static constexpr uint8_t kEP_ThemidaV3_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00
+};
+
+// Themida v1: push eax; push addr; jmp
+static constexpr uint8_t kEP_ThemidaV1_B[] = {
+    0xB8, 0x00, 0x00, 0x00, 0x00, 0x60, 0x0B, 0xC0
+};
+static constexpr uint8_t kEP_ThemidaV1_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// Themida v2: similar entry via high-entropy section
+static constexpr uint8_t kEP_ThemidaV2_B[] = {
+    0xB8, 0x00, 0x00, 0x00, 0x00, 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_ThemidaV2_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// VMProtect v3: push imm32; call rel32
+static constexpr uint8_t kEP_VMPv3_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_VMPv3_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// VMProtect 1.x: jmp rel32 to vmp section
+static constexpr uint8_t kEP_VMP1x_B[] = {
+    0xE9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_VMP1x_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+
+// VMProtect 2.x: push imm; call delta+5
+static constexpr uint8_t kEP_VMP2x_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x01, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_VMP2x_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00
+};
+
+// Enigma Protector: push ebp; mov ebp,esp; push -1; push addr
+static constexpr uint8_t kEP_Enigma_B[] = {
+    0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_Enigma_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// PELock: push [addr]; call rel32; pop ...
+static constexpr uint8_t kEP_PELock_B[] = {
+    0xFF, 0x35, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_PELock_M[] = {
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// Armadillo: push addr; push addr; call dword ptr
+static constexpr uint8_t kEP_Armadillo_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x15
+};
+static constexpr uint8_t kEP_Armadillo_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+};
+
+// ACProtect: push eax; pushfd; push addr
+static constexpr uint8_t kEP_ACProtect_B[] = {
+    0x50, 0x9C, 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8
+};
+static constexpr uint8_t kEP_ACProtect_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// ExeCryptor v2.x: E9 XX XX XX XX CC CC CC
+static constexpr uint8_t kEP_ExeCryptorV2_B[] = {
+    0xE9, 0x00, 0x00, 0x00, 0x00, 0xCC, 0xCC, 0xCC
+};
+static constexpr uint8_t kEP_ExeCryptorV2_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// SafeEngine: push esp; pop ebp; push addr; call
+static constexpr uint8_t kEP_SafeEngine_B[] = {
+    0x54, 0x5D, 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8
+};
+static constexpr uint8_t kEP_SafeEngine_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// WinLicense: same family as Themida — distinct EP variant
+static constexpr uint8_t kEP_WinLicense_B[] = {
+    0xEB, 0x00, 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x8B, 0x1C, 0x24
+};
+static constexpr uint8_t kEP_WinLicense_M[] = {
+    0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// CodeWall: push imm; mov eax,[addr]
+static constexpr uint8_t kEP_CodeWall_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xA1, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_CodeWall_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// PrivateEXE Protector: push ebp; mov ebp,esp; sub esp,0Ch
+static constexpr uint8_t kEP_PrivateEXE_B[] = {
+    0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x0C
+};
+static constexpr uint8_t kEP_PrivateEXE_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// PC Guard: push addr; ret; then encrypted blob
+static constexpr uint8_t kEP_PCGuard_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xC3, 0x00, 0x00
+};
+static constexpr uint8_t kEP_PCGuard_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00
+};
+
+// GameGuard: push imm; jmp rel32
+static constexpr uint8_t kEP_GameGuard_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE9, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_GameGuard_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// Denuvo: call rel; push imm
+static constexpr uint8_t kEP_Denuvo_B[] = {
+    0xE8, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_Denuvo_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// UPX modified: pushad; mov esi,[addr]; lea edi,[addr]
+static constexpr uint8_t kEP_UPXMod_B[] = {
+    0x60, 0x8B, 0x35, 0x00, 0x00, 0x00, 0x00, 0x8D, 0x3D, 0x00, 0x00
+};
+static constexpr uint8_t kEP_UPXMod_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00
+};
+
+// UPX scrambled: variant with xor-based delta decode before standard stub
+static constexpr uint8_t kEP_UPXScram_B[] = {
+    0xEB, 0x00, 0x60, 0xBE, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_UPXScram_M[] = {
+    0xFF, 0x00, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// PECompact v2: push imm; call rel
+static constexpr uint8_t kEP_PECompactV2_B[] = {
+    0xB8, 0x00, 0x00, 0x00, 0x00, 0x50, 0x64, 0xFF, 0x35, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_PECompactV2_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// PECompact v3: similar but with 64-bit awareness
+static constexpr uint8_t kEP_PECompactV3_B[] = {
+    0xB8, 0x00, 0x00, 0x00, 0x00, 0x50, 0x64, 0xFF, 0x35
+};
+static constexpr uint8_t kEP_PECompactV3_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// Petite v2.1: mov ecx,imm; push esi; mov esi,[esp+08]
+static constexpr uint8_t kEP_PetiteV21_B[] = {
+    0xB9, 0x00, 0x00, 0x00, 0x00, 0x56, 0x8B, 0x74, 0x24, 0x08
+};
+static constexpr uint8_t kEP_PetiteV21_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// Petite v2.2: push ebp; push esi; push imm
+static constexpr uint8_t kEP_PetiteV22_B[] = {
+    0x55, 0x56, 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8
+};
+static constexpr uint8_t kEP_PetiteV22_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// Petite v2.3: push imm; jmp
+static constexpr uint8_t kEP_PetiteV23_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0x64, 0xFF, 0x35
+};
+static constexpr uint8_t kEP_PetiteV23_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// kkrunchy: xor eax,eax; push eax; push imm
+static constexpr uint8_t kEP_kkrunchy_B[] = {
+    0x33, 0xC0, 0x50, 0x68, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_kkrunchy_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// Crunch/Cexe: push addr; push addr; ret
+static constexpr uint8_t kEP_CrunchCexe_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0x68, 0x00, 0x00, 0x00, 0x00, 0xC3
+};
+static constexpr uint8_t kEP_CrunchCexe_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// RLPack: push addr; call rel; pop ebx
+static constexpr uint8_t kEP_RLPack_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B
+};
+static constexpr uint8_t kEP_RLPack_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// nPack: push ebp; mov ebp,esp; push ecx
+static constexpr uint8_t kEP_nPack_B[] = {
+    0x55, 0x8B, 0xEC, 0x51, 0x53, 0x56, 0x57
+};
+static constexpr uint8_t kEP_nPack_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// WinUpack/Upack: push addr; jmp rel
+static constexpr uint8_t kEP_WinUpack_B[] = {
+    0xBE, 0x00, 0x00, 0x00, 0x00, 0xAD, 0x8B, 0xF8
+};
+static constexpr uint8_t kEP_WinUpack_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// JDPack: push addr; mov eax,addr; call eax
+static constexpr uint8_t kEP_JDPack_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xB8, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xD0
+};
+static constexpr uint8_t kEP_JDPack_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+};
+
+// BeRoEXE Packer: push imm; call rel32; sub [esp+4]
+static constexpr uint8_t kEP_BeRoEXE_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x83, 0x6C, 0x24
+};
+static constexpr uint8_t kEP_BeRoEXE_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF
+};
+
+// Packman: push ebp; push esi; call delta
+static constexpr uint8_t kEP_Packman_B[] = {
+    0x55, 0x56, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5E
+};
+static constexpr uint8_t kEP_Packman_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// YodaCrypt: pushad; xor edx,edx; call $+5; pop edx
+static constexpr uint8_t kEP_YodaCrypt_B[] = {
+    0x60, 0x33, 0xD2, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5A
+};
+static constexpr uint8_t kEP_YodaCrypt_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// PEBundle: push addr; call rel; add esp
+static constexpr uint8_t kEP_PEBundle_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x83, 0xC4
+};
+static constexpr uint8_t kEP_PEBundle_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+};
+
+// DotFix NiceProtect: push ebp; call forward
+static constexpr uint8_t kEP_DotFixNice_B[] = {
+    0x55, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D, 0x81, 0xED
+};
+static constexpr uint8_t kEP_DotFixNice_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// PEX: pushad; push imm; call $+5
+static constexpr uint8_t kEP_PEX_B[] = {
+    0x60, 0x68, 0x00, 0x00, 0x00, 0x00, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_PEX_M[] = {
+    0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// Alex Protector: push ebp; mov ebp,esp; sub esp
+static constexpr uint8_t kEP_AlexProtect_B[] = {
+    0x55, 0x8B, 0xEC, 0x83, 0xEC, 0x00, 0x60, 0xE8
+};
+static constexpr uint8_t kEP_AlexProtect_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF
+};
+
+// AntiCrack Protector: pushad; call $+5; pop ebx
+static constexpr uint8_t kEP_AntiCrack_B[] = {
+    0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B, 0x81, 0xEB
+};
+static constexpr uint8_t kEP_AntiCrack_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// TigerVMP: push rbp; mov rbp,rsp; push imm; jmp
+static constexpr uint8_t kEP_TigerVMP_B[] = {
+    0x55, 0x48, 0x89, 0xE5, 0x68, 0x00, 0x00, 0x00, 0x00, 0xE9
+};
+static constexpr uint8_t kEP_TigerVMP_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// ReWolf: push imm; pushad; call $+5
+static constexpr uint8_t kEP_ReWolf_B[] = {
+    0x68, 0x00, 0x00, 0x00, 0x00, 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_ReWolf_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// FinFisher VM entry: pushad; mov ebp,esp; sub esp,??; mov esi,[ebp+const]
+static constexpr uint8_t kEP_FinFisher_B[] = {
+    0x60, 0x8B, 0xEC, 0x83, 0xEC, 0x00, 0x8B, 0x75
+};
+static constexpr uint8_t kEP_FinFisher_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0xFF, 0xFF
+};
+
+// ASPack v2: pushad; call $+5; pop ebp; sub ebp,??
+static constexpr uint8_t kEP_ASPackV2_B[] = {
+    0x60, 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5D, 0x81, 0xED
+};
+static constexpr uint8_t kEP_ASPackV2_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// NsPack v3: pushfd; pushad; push eax; call $+5
+static constexpr uint8_t kEP_NSPackV3_B[] = {
+    0x9C, 0x60, 0x50, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_NSPackV3_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// MPRESS v2: pushad; mov esi,[addr]; lea edi,[esi+??]
+static constexpr uint8_t kEP_MPRESSv2_B[] = {
+    0x60, 0x8B, 0x35, 0x00, 0x00, 0x00, 0x00, 0x8D, 0x7E
+};
+static constexpr uint8_t kEP_MPRESSv2_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF
+};
+
+// FSG v2: xchg eax,[esp]; popad; mov eax,[addr]
+static constexpr uint8_t kEP_FSGv2_B[] = {
+    0x87, 0x04, 0x24, 0x61, 0xA1, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_FSGv2_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// MEW v11: push edi; push esi; mov esi,[addr]; lodsw
+static constexpr uint8_t kEP_MEWv11_B[] = {
+    0x57, 0x56, 0xBE, 0x00, 0x00, 0x00, 0x00, 0xAD
+};
+static constexpr uint8_t kEP_MEWv11_M[] = {
+    0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// PESpin v1: jmp short; junk; pushad; call
+static constexpr uint8_t kEP_PESpinV1_B[] = {
+    0xEB, 0x01, 0x68, 0x60, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_PESpinV1_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// tElock v0.98: jmp rel32; NUL-padding; then encrypted
+static constexpr uint8_t kEP_tElockV098_B[] = {
+    0xE9, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_tElockV098_M[] = {
+    0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF
+};
+
+// Obsidium v1: jmp short 2; trash; call $+5
+static constexpr uint8_t kEP_ObsidiumV1_B[] = {
+    0xEB, 0x02, 0xCD, 0x20, 0xE8, 0x00, 0x00, 0x00, 0x00
+};
+static constexpr uint8_t kEP_ObsidiumV1_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00
+};
+
+// Armadillo v9: push ebp; mov ebp,esp; push -1; push addr; push addr
+static constexpr uint8_t kEP_ArmadilloV9_B[] = {
+    0x55, 0x8B, 0xEC, 0x6A, 0xFF, 0x68, 0x00, 0x00, 0x00, 0x00, 0x68
+};
+static constexpr uint8_t kEP_ArmadilloV9_M[] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00, 0xFF
+};
+
+// ── VM dispatcher patterns (for AnalyzeVirtualMachine) ──────────────────
+
+// Dispatcher: MOVZX reg,BYTE PTR [ESI]; SHL reg,2; JMP [table+reg]
+static constexpr uint8_t kVMDisp_MovzxEsi_B[] = {
+    0x0F, 0xB6, 0x06
+};
+static constexpr uint8_t kVMDisp_MovzxEsi_M[] = {
+    0xFF, 0xFF, 0xFF
+};
+
+// Dispatcher: MOVZX reg,BYTE PTR [RSI]; (64-bit variant)
+static constexpr uint8_t kVMDisp_MovzxRsi_B[] = {
+    0x0F, 0xB6, 0x0E
+};
+static constexpr uint8_t kVMDisp_MovzxRsi_M[] = {
+    0xFF, 0xFF, 0xFF
+};
+
+// Indirect dispatch: JMP DWORD PTR [reg*4+base]
+static constexpr uint8_t kVMDisp_JmpTable32_B[] = {
+    0xFF, 0x24, 0x85
+};
+static constexpr uint8_t kVMDisp_JmpTable32_M[] = {
+    0xFF, 0xFF, 0xFF
+};
+
+// Indirect dispatch 64-bit: JMP QWORD PTR [reg*8+base]
+static constexpr uint8_t kVMDisp_JmpTable64_B[] = {
+    0xFF, 0x24, 0xC5
+};
+static constexpr uint8_t kVMDisp_JmpTable64_M[] = {
+    0xFF, 0xFF, 0xFF
+};
+
 // Standard function prologue (used for OEP detection, not packer detection)
 // push rbp; mov rbp, rsp (64-bit)
 static constexpr uint8_t kPrologue64_B[] = {
@@ -866,6 +1390,407 @@ static constexpr FuncDLLEntry kFuncDLLMap[] = {
     return false;
 }
 
+// --------------------------------------------------------------------------
+// VM Analysis constants
+// --------------------------------------------------------------------------
+
+static constexpr uint32_t kVMMaxHandlers       = 512;
+static constexpr uint32_t kVMMaxScanBytes      = 64u * 1024u;
+static constexpr uint32_t kVMMinHandlerInstrs  = 3;
+static constexpr uint32_t kVMMaxHandlerInstrs  = 2048;
+static constexpr uint32_t kVMMinHandlerCount   = 10;
+static constexpr uint32_t kVMTableScanWindow   = 4096;
+
+// Section-name to PackerType mapping for supplementary section-based detection
+struct SectionPackerMapping {
+    const char* sectionName;
+    PackerType  packerType;
+};
+
+static constexpr SectionPackerMapping kSectionPackerMap[] = {
+    {".vmp0",    PackerType::VMProtect},
+    {".vmp1",    PackerType::VMProtect},
+    {".vmp2",    PackerType::VMProtect},
+    {".themida", PackerType::Themida},
+    {".winlice", PackerType::Themida},
+    {"WinLice",  PackerType::WinLicense},
+    {".enigma1", PackerType::Enigma},
+    {".enigma2", PackerType::Enigma},
+    {".aspack",  PackerType::ASPack},
+    {".adata",   PackerType::ASProtect},
+    {".perplex", PackerType::PELock},
+    {".petite",  PackerType::Petite},
+    {".MPRESS1", PackerType::MPRESS},
+    {".MPRESS2", PackerType::MPRESS},
+    {".nsp0",    PackerType::NsPack},
+    {".nsp1",    PackerType::NsPack},
+    {".nsp2",    PackerType::NsPack},
+    {".packed",  PackerType::PackerCustom},
+    {".cv0",     PackerType::CodeVirtualizer},
+    {".cv1",     PackerType::CodeVirtualizer},
+    {".cvirt",   PackerType::CodeVirtualizer},
+    {".aspr",    PackerType::ASProtect},
+    {".pespin",  PackerType::PESpin},
+    {".taz",     PackerType::PESpin},
+    {".sforce",  PackerType::StarForce},
+    {".securom", PackerType::SecuROM},
+    {".srom",    PackerType::SecuROM},
+    {".bxpck",   PackerType::BoxedApp},
+    {".mole",    PackerType::MoleBox},
+    {".stxt",    PackerType::SafeDisc},
+    {".arma",    PackerType::Armadillo},
+    {".ndata",   PackerType::NSIS},
+    {".boot",    PackerType::Themida},
+    {".tiger",   PackerType::TigerVMP},
+    {".rwolf",   PackerType::ReWolf},
+};
+
+// Section-name to VMArch mapping for VM detection
+struct SectionVMMapping {
+    const char* sectionName;
+    VMArch      arch;
+    float       score;
+};
+
+static constexpr SectionVMMapping kSectionVMMap[] = {
+    {".vmp0",    VMArch::VMProtect,       0.40f},
+    {".vmp1",    VMArch::VMProtect,       0.40f},
+    {".vmp2",    VMArch::VMProtect,       0.25f},
+    {".themida", VMArch::Themida,         0.45f},
+    {".winlice", VMArch::Themida,         0.40f},
+    {".boot",    VMArch::Themida,         0.20f},
+    {".cv0",     VMArch::CodeVirtualizer, 0.40f},
+    {".cv1",     VMArch::CodeVirtualizer, 0.40f},
+    {".cvirt",   VMArch::CodeVirtualizer, 0.35f},
+    {".tiger",   VMArch::TigerVMP,        0.45f},
+    {".rwolf",   VMArch::ReWolf,          0.45f},
+};
+
+// --------------------------------------------------------------------------
+// VM bytecode fetch detection: scan for MOVZX fetches typical of VM dispatch
+// --------------------------------------------------------------------------
+
+[[nodiscard]] bool ScanForMovzxFetch(const VirtualMemory& memory,
+                                      GuestAddress base,
+                                      GuestSize size,
+                                      GuestAddress& outAddr) noexcept {
+    const GuestSize scanLimit = std::min(size, static_cast<GuestSize>(kVMMaxScanBytes));
+    uint8_t buf[16]{};
+
+    const BytePattern movzxEsi = {kVMDisp_MovzxEsi_B, kVMDisp_MovzxEsi_M, 3};
+    const BytePattern movzxRsi = {kVMDisp_MovzxRsi_B, kVMDisp_MovzxRsi_M, 3};
+
+    for (GuestSize off = 0; off + 16 <= scanLimit; ++off) {
+        if (!ReadGuestBytes(memory, base + off, buf, 16)) continue;
+
+        if (MatchPattern(buf, 16, movzxEsi) || MatchPattern(buf, 16, movzxRsi)) {
+            // Check if followed within next 13 bytes by a JMP [table] pattern
+            const BytePattern jmpTbl32 = {kVMDisp_JmpTable32_B, kVMDisp_JmpTable32_M, 3};
+            const BytePattern jmpTbl64 = {kVMDisp_JmpTable64_B, kVMDisp_JmpTable64_M, 3};
+
+            for (uint32_t ahead = 3; ahead + 3 <= 16; ++ahead) {
+                if (MatchPattern(buf + ahead, 16 - ahead, jmpTbl32) ||
+                    MatchPattern(buf + ahead, 16 - ahead, jmpTbl64))
+                {
+                    outAddr = base + off;
+                    return true;
+                }
+            }
+        }
+    }
+    return false;
+}
+
+// --------------------------------------------------------------------------
+// Scan for consecutive PUSH instructions (>8) followed by indirect JMP
+// Typical VM entry: save all registers then jump to dispatcher
+// --------------------------------------------------------------------------
+
+[[nodiscard]] bool ScanForVMEntryPushSequence(const VirtualMemory& memory,
+                                               GuestAddress base,
+                                               GuestSize size,
+                                               GuestAddress& outEntry) noexcept {
+    const GuestSize scanLimit = std::min(size, static_cast<GuestSize>(kVMMaxScanBytes));
+    uint8_t buf[32]{};
+
+    for (GuestSize off = 0; off + 32 <= scanLimit; ++off) {
+        if (!ReadGuestBytes(memory, base + off, buf, 32)) continue;
+
+        // Count consecutive PUSHes: 0x50-0x57, 0x60 (PUSHAD), 0x9C (PUSHFD)
+        uint32_t pushCount = 0;
+        uint32_t i = 0;
+        while (i < 24) {
+            if ((buf[i] >= 0x50 && buf[i] <= 0x57) ||
+                buf[i] == 0x60 || buf[i] == 0x9C)
+            {
+                pushCount += (buf[i] == 0x60) ? 8 : 1;
+                i += 1;
+            } else if (buf[i] == 0x68) {
+                // push imm32
+                pushCount += 1;
+                i += 5;
+            } else {
+                break;
+            }
+        }
+
+        if (pushCount >= 8 && i < 30) {
+            // Check for indirect JMP after push sequence
+            if (buf[i] == 0xFF &&
+                (buf[i + 1] == 0xE0 || buf[i + 1] == 0xE1 ||
+                 buf[i + 1] == 0xE2 || buf[i + 1] == 0xE3 ||
+                 buf[i + 1] == 0xE6 || buf[i + 1] == 0xE7 ||
+                 (buf[i + 1] & 0x38) == 0x20))
+            {
+                outEntry = base + off;
+                return true;
+            }
+            // Also check for JMP rel32 after push sequence
+            if (buf[i] == 0xE9) {
+                outEntry = base + off;
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+// --------------------------------------------------------------------------
+// Extract handler addresses from a jump table in guest memory
+// --------------------------------------------------------------------------
+
+[[nodiscard]] uint32_t ExtractHandlerTable(const VirtualMemory& memory,
+                                            GuestAddress tableBase,
+                                            GuestAddress imageBase,
+                                            GuestSize imageSize,
+                                            bool is64Bit,
+                                            std::vector<VMHandlerInfo>& handlers) noexcept {
+    const uint32_t entrySize = is64Bit ? 8 : 4;
+    const uint32_t maxEntries = std::min(static_cast<uint32_t>(kVMMaxHandlers),
+                                          kVMTableScanWindow / entrySize);
+    uint32_t validCount = 0;
+    uint32_t consecutive_invalid = 0;
+
+    handlers.clear();
+    handlers.reserve(256);
+
+    for (uint32_t i = 0; i < maxEntries && consecutive_invalid < 5; ++i) {
+        GuestAddress entry = 0;
+        if (is64Bit) {
+            uint64_t raw = 0;
+            if (!ReadGuestBytes(memory, tableBase + i * entrySize, &raw, 8)) break;
+            entry = raw;
+        } else {
+            uint32_t raw = 0;
+            if (!ReadGuestBytes(memory, tableBase + i * entrySize, &raw, 4)) break;
+            entry = raw;
+        }
+
+        // Validate: handler should be within the image
+        if (entry < imageBase || entry >= imageBase + imageSize) {
+            consecutive_invalid++;
+            continue;
+        }
+        consecutive_invalid = 0;
+
+        VMHandlerInfo info{};
+        info.address = entry;
+        info.opcodeValue = static_cast<uint8_t>(i);
+        info.instructionCount = 0;
+        info.handlerType = VMHandlerType::Unknown;
+        handlers.push_back(info);
+        validCount++;
+    }
+
+    return validCount;
+}
+
+// --------------------------------------------------------------------------
+// Classify a handler by scanning its x86 body
+// --------------------------------------------------------------------------
+
+[[nodiscard]] VMHandlerType ClassifyHandler(const VirtualMemory& memory,
+                                             GuestAddress handlerAddr,
+                                             uint16_t& outInstrCount) noexcept {
+    uint8_t buf[256]{};
+    if (!ReadGuestBytes(memory, handlerAddr, buf, sizeof(buf))) {
+        return VMHandlerType::Unknown;
+    }
+
+    outInstrCount = 0;
+
+    // Simple heuristic instruction scan: count opcodes and look for patterns
+    bool hasAdd = false, hasSub = false, hasMul = false, hasDiv = false;
+    bool hasAnd = false, hasOr = false, hasXor = false, hasNot = false;
+    bool hasShl = false, hasShr = false, hasRol = false, hasRor = false;
+    bool hasPush = false, hasPop = false;
+    bool hasMemLoad = false, hasMemStore = false;
+    bool hasCall = false, hasRet = false;
+    bool hasJmp = false, hasJcc = false;
+
+    uint32_t pos = 0;
+    while (pos < sizeof(buf) - 2 && outInstrCount < kVMMaxHandlerInstrs) {
+        const uint8_t op = buf[pos];
+        outInstrCount++;
+
+        // ADD patterns
+        if (op == 0x01 || op == 0x03 || (op >= 0x00 && op <= 0x05 && (op & 1)))
+            hasAdd = true;
+        // SUB patterns
+        if (op == 0x29 || op == 0x2B || op == 0x2D)
+            hasSub = true;
+        // AND/OR/XOR/NOT via group opcode
+        if (op == 0x21 || op == 0x23 || op == 0x25)
+            hasAnd = true;
+        if (op == 0x09 || op == 0x0B || op == 0x0D)
+            hasOr = true;
+        if (op == 0x31 || op == 0x33 || op == 0x35)
+            hasXor = true;
+        if (op == 0xF7 && pos + 1 < sizeof(buf) && (buf[pos + 1] & 0x38) == 0x10)
+            hasNot = true;
+        // IMUL
+        if (op == 0xF7 && pos + 1 < sizeof(buf) && (buf[pos + 1] & 0x38) == 0x28)
+            hasMul = true;
+        if (op == 0x0F && pos + 1 < sizeof(buf) && buf[pos + 1] == 0xAF)
+            hasMul = true;
+        // IDIV
+        if (op == 0xF7 && pos + 1 < sizeof(buf) && (buf[pos + 1] & 0x38) == 0x38)
+            hasDiv = true;
+        // Shift/Rotate
+        if (op == 0xC1 || op == 0xD1 || op == 0xD3) {
+            if (pos + 1 < sizeof(buf)) {
+                uint8_t modrm = buf[pos + 1];
+                uint8_t reg = (modrm >> 3) & 7;
+                if (reg == 4) hasShl = true;
+                if (reg == 5) hasShr = true;
+                if (reg == 0) hasRol = true;
+                if (reg == 1) hasRor = true;
+            }
+        }
+        // PUSH/POP
+        if ((op >= 0x50 && op <= 0x57) || op == 0x68 || op == 0x6A || op == 0x60)
+            hasPush = true;
+        if ((op >= 0x58 && op <= 0x5F) || op == 0x61)
+            hasPop = true;
+        // MOV mem->reg (load)
+        if (op == 0x8B)
+            hasMemLoad = true;
+        // MOV reg->mem (store)
+        if (op == 0x89)
+            hasMemStore = true;
+        // CALL
+        if (op == 0xE8 || (op == 0xFF && pos + 1 < sizeof(buf) &&
+                           (buf[pos + 1] & 0x38) == 0x10))
+            hasCall = true;
+        // RET
+        if (op == 0xC3 || op == 0xC2 || op == 0xCB) {
+            hasRet = true;
+            break; // End of handler
+        }
+        // JMP (unconditional) — could be return to dispatcher
+        if (op == 0xE9 || op == 0xEB || (op == 0xFF && pos + 1 < sizeof(buf) &&
+                                          (buf[pos + 1] & 0x38) == 0x20))
+        {
+            hasJmp = true;
+            break; // End of handler
+        }
+        // Jcc
+        if ((op >= 0x70 && op <= 0x7F) || (op == 0x0F && pos + 1 < sizeof(buf) &&
+                                             buf[pos + 1] >= 0x80 && buf[pos + 1] <= 0x8F))
+            hasJcc = true;
+
+        // Advance: simplified — single-byte advance for most opcodes
+        pos++;
+    }
+
+    // Classification priority: specific operations > generic
+    if (hasCall && !hasAdd && !hasSub && !hasAnd)
+        return VMHandlerType::VMSyscall;
+    if (hasRet && outInstrCount <= 5)
+        return VMHandlerType::VMRet;
+    if (hasAdd && !hasSub && !hasMul)
+        return VMHandlerType::VMAdd;
+    if (hasSub && !hasAdd && !hasMul)
+        return VMHandlerType::VMSub;
+    if (hasMul)
+        return VMHandlerType::VMMul;
+    if (hasDiv)
+        return VMHandlerType::VMDiv;
+    if (hasAnd && !hasOr && !hasXor)
+        return VMHandlerType::VMAnd;
+    if (hasOr && !hasAnd && !hasXor)
+        return VMHandlerType::VMOr;
+    if (hasXor && !hasAnd && !hasOr)
+        return VMHandlerType::VMXor;
+    if (hasNot)
+        return VMHandlerType::VMNot;
+    if (hasShl) return VMHandlerType::VMShl;
+    if (hasShr) return VMHandlerType::VMShr;
+    if (hasRol) return VMHandlerType::VMRol;
+    if (hasRor) return VMHandlerType::VMRor;
+    if (hasPush && !hasPop && !hasMemLoad && !hasMemStore)
+        return VMHandlerType::VMPush;
+    if (hasPop && !hasPush && !hasMemLoad && !hasMemStore)
+        return VMHandlerType::VMPop;
+    if (hasMemLoad && !hasMemStore)
+        return VMHandlerType::VMLoad;
+    if (hasMemStore && !hasMemLoad)
+        return VMHandlerType::VMStore;
+    if (hasJcc)
+        return VMHandlerType::VMJcc;
+    if (hasJmp && outInstrCount <= 3)
+        return VMHandlerType::VMJmp;
+    if (outInstrCount <= 2)
+        return VMHandlerType::VMNop;
+
+    return VMHandlerType::Unknown;
+}
+
+// --------------------------------------------------------------------------
+// Detect opaque predicates: always-true/false conditional branches
+// --------------------------------------------------------------------------
+
+[[nodiscard]] bool DetectOpaquePredicates(const VirtualMemory& memory,
+                                           GuestAddress base,
+                                           GuestSize size) noexcept {
+    const GuestSize scanLimit = std::min(size, static_cast<GuestSize>(kVMMaxScanBytes));
+    uint8_t buf[16]{};
+    uint32_t opaqueCount = 0;
+
+    for (GuestSize off = 0; off + 8 <= scanLimit; off += 4) {
+        if (!ReadGuestBytes(memory, base + off, buf, 8)) continue;
+
+        // Pattern: XOR reg,reg; JZ/JNZ (always zero → always jumps/never jumps)
+        if (buf[0] == 0x33 && (buf[1] & 0xC0) == 0xC0 &&
+            ((buf[1] >> 3) & 7) == (buf[1] & 7))
+        {
+            if (buf[2] == 0x74 || buf[2] == 0x75) {
+                opaqueCount++;
+            }
+        }
+
+        // Pattern: CMP reg,reg; JZ (always equal)
+        if (buf[0] == 0x3B && (buf[1] & 0xC0) == 0xC0 &&
+            ((buf[1] >> 3) & 7) == (buf[1] & 7))
+        {
+            if (buf[2] == 0x74 || buf[2] == 0x75) {
+                opaqueCount++;
+            }
+        }
+
+        // Pattern: PUSH imm; POP reg; TEST reg,reg; JZ (imm != 0 → never zero)
+        if (buf[0] == 0x6A && buf[1] != 0x00 &&
+            (buf[2] >= 0x58 && buf[2] <= 0x5F))
+        {
+            if (buf[3] == 0x85 && buf[5] == 0x74) {
+                opaqueCount++;
+            }
+        }
+    }
+
+    return opaqueCount >= 3;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -947,6 +1872,9 @@ struct UnpackingEngine::Impl {
 
     // Thread safety
     mutable std::shared_mutex mutex;
+
+    // VM analysis state
+    VMArch detectedVM = VMArch::Unknown;
 
     // --- Internal helpers ---
 
@@ -1528,7 +2456,7 @@ PackerType UnpackingEngine::DetectPacker(
         PackerType type   = PackerType::Unknown;
         float      score  = 0.0f;
     };
-    static constexpr uint32_t kMaxDetections = 32;
+    static constexpr uint32_t kMaxDetections = 128;
     std::array<Detection, kMaxDetections> dets{};
     uint32_t detCount = 0;
 
@@ -1930,6 +2858,614 @@ PackerType UnpackingEngine::DetectPacker(
         }
         if (highEntSections >= 2) AddScore(PackerType::PackerCustom, 0.20f);
     }
+
+    // =======================================================================
+    // 31. Section-name-based supplementary detection
+    // =======================================================================
+    for (const auto& mapping : kSectionPackerMap) {
+        if (HasSectionNamed(hdr.sections, mapping.sectionName)) {
+            AddScore(mapping.packerType, 0.30f);
+        }
+    }
+
+    // =======================================================================
+    // 32. Themida v3
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern thV3 = {kEP_ThemidaV3_B, kEP_ThemidaV3_M, sizeof(kEP_ThemidaV3_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, thV3))
+            AddScore(PackerType::ThemidaV3, 0.45f);
+    }
+    if (HasSectionNamed(hdr.sections, ".themida")) AddScore(PackerType::ThemidaV3, 0.30f);
+
+    // =======================================================================
+    // 33. Themida v1/v2
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern thV1 = {kEP_ThemidaV1_B, kEP_ThemidaV1_M, sizeof(kEP_ThemidaV1_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, thV1))
+            AddScore(PackerType::ThemidaV1, 0.40f);
+        const BytePattern thV2 = {kEP_ThemidaV2_B, kEP_ThemidaV2_M, sizeof(kEP_ThemidaV2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, thV2))
+            AddScore(PackerType::ThemidaV2, 0.40f);
+    }
+
+    // =======================================================================
+    // 34. VMProtect v3 / 1.x / 2.x
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern vmpV3 = {kEP_VMPv3_B, kEP_VMPv3_M, sizeof(kEP_VMPv3_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, vmpV3))
+            AddScore(PackerType::VMProtect, 0.40f);
+
+        const BytePattern vmp1x = {kEP_VMP1x_B, kEP_VMP1x_M, sizeof(kEP_VMP1x_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, vmp1x)) {
+            // VMP 1.x uses a simple JMP to vmp section
+            if (epSectionIdx >= 0 &&
+                std::strncmp(hdr.sections[static_cast<size_t>(epSectionIdx)].name, ".vmp", 4) == 0)
+                AddScore(PackerType::VMProtect1x, 0.55f);
+        }
+
+        const BytePattern vmp2x = {kEP_VMP2x_B, kEP_VMP2x_M, sizeof(kEP_VMP2x_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, vmp2x))
+            AddScore(PackerType::VMProtect2x, 0.45f);
+    }
+
+    // =======================================================================
+    // 35. Enigma Protector EP
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern enEP = {kEP_Enigma_B, kEP_Enigma_M, sizeof(kEP_Enigma_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, enEP))
+            AddScore(PackerType::Enigma, 0.35f);
+    }
+
+    // =======================================================================
+    // 36. PELock
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern plEP = {kEP_PELock_B, kEP_PELock_M, sizeof(kEP_PELock_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, plEP))
+            AddScore(PackerType::PELock, 0.40f);
+    }
+    if (HasSectionNamed(hdr.sections, ".perplex")) AddScore(PackerType::PELock, 0.45f);
+    if (FindStr(memory, imageBase, imageSize, "PELock"))
+        AddScore(PackerType::PELock, 0.40f);
+
+    // =======================================================================
+    // 37. Armadillo EP variant
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern armEP = {kEP_Armadillo_B, kEP_Armadillo_M, sizeof(kEP_Armadillo_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, armEP))
+            AddScore(PackerType::Armadillo, 0.40f);
+
+        const BytePattern armV9 = {kEP_ArmadilloV9_B, kEP_ArmadilloV9_M, sizeof(kEP_ArmadilloV9_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, armV9))
+            AddScore(PackerType::ArmadilloV9, 0.45f);
+    }
+
+    // =======================================================================
+    // 38. ACProtect
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern acEP = {kEP_ACProtect_B, kEP_ACProtect_M, sizeof(kEP_ACProtect_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, acEP))
+            AddScore(PackerType::ACProtect, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "ACProtect"))
+        AddScore(PackerType::ACProtect, 0.45f);
+
+    // =======================================================================
+    // 39. ExeCryptor v2.x
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern ecV2 = {kEP_ExeCryptorV2_B, kEP_ExeCryptorV2_M, sizeof(kEP_ExeCryptorV2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ecV2))
+            AddScore(PackerType::ExeCryptorV2, 0.40f);
+    }
+
+    // =======================================================================
+    // 40. SafeEngine
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern seEP = {kEP_SafeEngine_B, kEP_SafeEngine_M, sizeof(kEP_SafeEngine_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, seEP))
+            AddScore(PackerType::SafeEngine, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "SafeEngine"))
+        AddScore(PackerType::SafeEngine, 0.50f);
+
+    // =======================================================================
+    // 41. WinLicense
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern wlEP = {kEP_WinLicense_B, kEP_WinLicense_M, sizeof(kEP_WinLicense_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, wlEP))
+            AddScore(PackerType::WinLicense, 0.40f);
+    }
+    if (HasSectionNamed(hdr.sections, ".winlice")) AddScore(PackerType::WinLicense, 0.45f);
+
+    // =======================================================================
+    // 42. CodeWall
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern cwEP = {kEP_CodeWall_B, kEP_CodeWall_M, sizeof(kEP_CodeWall_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, cwEP))
+            AddScore(PackerType::CodeWall, 0.35f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "CodeWall"))
+        AddScore(PackerType::CodeWall, 0.50f);
+
+    // =======================================================================
+    // 43. PrivateEXE Protector
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern peEP = {kEP_PrivateEXE_B, kEP_PrivateEXE_M, sizeof(kEP_PrivateEXE_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, peEP))
+            AddScore(PackerType::PrivateEXE, 0.30f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "PrivateExe"))
+        AddScore(PackerType::PrivateEXE, 0.50f);
+
+    // =======================================================================
+    // 44. PC Guard
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern pgEP = {kEP_PCGuard_B, kEP_PCGuard_M, sizeof(kEP_PCGuard_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pgEP))
+            AddScore(PackerType::PCGuard, 0.35f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "PC Guard"))
+        AddScore(PackerType::PCGuard, 0.50f);
+
+    // =======================================================================
+    // 45. GameGuard
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern ggEP = {kEP_GameGuard_B, kEP_GameGuard_M, sizeof(kEP_GameGuard_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ggEP))
+            AddScore(PackerType::GameGuard, 0.30f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "GameGuard"))
+        AddScore(PackerType::GameGuard, 0.50f);
+    if (FindStr(memory, imageBase, imageSize, "nProtect"))
+        AddScore(PackerType::GameGuard, 0.40f);
+
+    // =======================================================================
+    // 46. Denuvo
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern dnEP = {kEP_Denuvo_B, kEP_Denuvo_M, sizeof(kEP_Denuvo_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, dnEP))
+            AddScore(PackerType::Denuvo, 0.25f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "denuvo"))
+        AddScore(PackerType::Denuvo, 0.45f);
+    if (FindStr(memory, imageBase, imageSize, "Denuvo"))
+        AddScore(PackerType::Denuvo, 0.45f);
+
+    // =======================================================================
+    // 47. UPX Modified / Scrambled
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern uxm = {kEP_UPXMod_B, kEP_UPXMod_M, sizeof(kEP_UPXMod_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, uxm))
+            AddScore(PackerType::UPXModified, 0.40f);
+        const BytePattern uxs = {kEP_UPXScram_B, kEP_UPXScram_M, sizeof(kEP_UPXScram_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, uxs))
+            AddScore(PackerType::UPXScrambled, 0.40f);
+    }
+    // Modified UPX: has UPX sections but no "UPX!" marker (stripped)
+    if (HasSectionNamed(hdr.sections, "UPX0") && HasSectionNamed(hdr.sections, "UPX1")) {
+        if (!FindStr(memory, imageBase, imageSize, "UPX!"))
+            AddScore(PackerType::UPXModified, 0.35f);
+    }
+
+    // =======================================================================
+    // 48. PECompact v2 / v3
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern pcV2 = {kEP_PECompactV2_B, kEP_PECompactV2_M, sizeof(kEP_PECompactV2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pcV2))
+            AddScore(PackerType::PECompactV2, 0.45f);
+        const BytePattern pcV3 = {kEP_PECompactV3_B, kEP_PECompactV3_M, sizeof(kEP_PECompactV3_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pcV3))
+            AddScore(PackerType::PECompactV3, 0.40f);
+    }
+
+    // =======================================================================
+    // 49. Petite versions
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern ptV21 = {kEP_PetiteV21_B, kEP_PetiteV21_M, sizeof(kEP_PetiteV21_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ptV21))
+            AddScore(PackerType::PetiteV21, 0.45f);
+        const BytePattern ptV22 = {kEP_PetiteV22_B, kEP_PetiteV22_M, sizeof(kEP_PetiteV22_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ptV22))
+            AddScore(PackerType::PetiteV22, 0.45f);
+        const BytePattern ptV23 = {kEP_PetiteV23_B, kEP_PetiteV23_M, sizeof(kEP_PetiteV23_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ptV23))
+            AddScore(PackerType::PetiteV23, 0.45f);
+    }
+
+    // =======================================================================
+    // 50. kkrunchy
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern kkEP = {kEP_kkrunchy_B, kEP_kkrunchy_M, sizeof(kEP_kkrunchy_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, kkEP))
+            AddScore(PackerType::kkrunchy, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "kkrunchy"))
+        AddScore(PackerType::kkrunchy, 0.50f);
+
+    // =======================================================================
+    // 51. Crunch/Cexe
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern crEP = {kEP_CrunchCexe_B, kEP_CrunchCexe_M, sizeof(kEP_CrunchCexe_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, crEP))
+            AddScore(PackerType::CrunchCexe, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "Cexe"))
+        AddScore(PackerType::CrunchCexe, 0.40f);
+
+    // =======================================================================
+    // 52. RLPack
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern rlEP = {kEP_RLPack_B, kEP_RLPack_M, sizeof(kEP_RLPack_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, rlEP))
+            AddScore(PackerType::RLPack, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "RLPack"))
+        AddScore(PackerType::RLPack, 0.45f);
+
+    // =======================================================================
+    // 53. nPack
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern npEP = {kEP_nPack_B, kEP_nPack_M, sizeof(kEP_nPack_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, npEP))
+            AddScore(PackerType::nPack, 0.35f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "nPack"))
+        AddScore(PackerType::nPack, 0.45f);
+
+    // =======================================================================
+    // 54. WinUpack/Upack
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern upEP = {kEP_WinUpack_B, kEP_WinUpack_M, sizeof(kEP_WinUpack_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, upEP))
+            AddScore(PackerType::WinUpack, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "Upack"))
+        AddScore(PackerType::WinUpack, 0.40f);
+    if (FindStr(memory, imageBase, imageSize, "WinUpack"))
+        AddScore(PackerType::WinUpack, 0.45f);
+
+    // =======================================================================
+    // 55. JDPack
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern jdEP = {kEP_JDPack_B, kEP_JDPack_M, sizeof(kEP_JDPack_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, jdEP))
+            AddScore(PackerType::JDPack, 0.40f);
+    }
+
+    // =======================================================================
+    // 56. BeRoEXE Packer
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern brEP = {kEP_BeRoEXE_B, kEP_BeRoEXE_M, sizeof(kEP_BeRoEXE_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, brEP))
+            AddScore(PackerType::BeRoEXE, 0.45f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "BeRoEXE"))
+        AddScore(PackerType::BeRoEXE, 0.45f);
+
+    // =======================================================================
+    // 57. Packman
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern pmEP = {kEP_Packman_B, kEP_Packman_M, sizeof(kEP_Packman_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pmEP))
+            AddScore(PackerType::Packman, 0.40f);
+    }
+
+    // =======================================================================
+    // 58. YodaCrypt
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern ycEP = {kEP_YodaCrypt_B, kEP_YodaCrypt_M, sizeof(kEP_YodaCrypt_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ycEP))
+            AddScore(PackerType::YodaCrypt, 0.45f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "Yoda"))
+        AddScore(PackerType::YodaCrypt, 0.35f);
+
+    // =======================================================================
+    // 59. PEBundle
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern pbEP = {kEP_PEBundle_B, kEP_PEBundle_M, sizeof(kEP_PEBundle_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pbEP))
+            AddScore(PackerType::PEBundle, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "PEBundle"))
+        AddScore(PackerType::PEBundle, 0.45f);
+
+    // =======================================================================
+    // 60. DotFix NiceProtect
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern dfEP = {kEP_DotFixNice_B, kEP_DotFixNice_M, sizeof(kEP_DotFixNice_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, dfEP))
+            AddScore(PackerType::DotFixNice, 0.40f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "NiceProtect"))
+        AddScore(PackerType::DotFixNice, 0.45f);
+
+    // =======================================================================
+    // 61. PEX
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern pxEP = {kEP_PEX_B, kEP_PEX_M, sizeof(kEP_PEX_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, pxEP))
+            AddScore(PackerType::PEX, 0.35f);
+    }
+
+    // =======================================================================
+    // 62. Alex Protector
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern axEP = {kEP_AlexProtect_B, kEP_AlexProtect_M, sizeof(kEP_AlexProtect_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, axEP))
+            AddScore(PackerType::AlexProtect, 0.35f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "AlexProtector"))
+        AddScore(PackerType::AlexProtect, 0.50f);
+
+    // =======================================================================
+    // 63. AntiCrack Protector
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern acrkEP = {kEP_AntiCrack_B, kEP_AntiCrack_M, sizeof(kEP_AntiCrack_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, acrkEP))
+            AddScore(PackerType::AntiCrack, 0.40f);
+    }
+
+    // =======================================================================
+    // 64. ConfuserEx (specific .NET detection)
+    // =======================================================================
+    if (hdr.numberOfRvaAndSizes > PE::kDirCLRRuntime &&
+        hdr.dataDirectories[PE::kDirCLRRuntime].VirtualAddress != 0)
+    {
+        if (FindStr(memory, imageBase, imageSize, "ConfuserEx"))
+            AddScore(PackerType::ConfuserEx, 0.60f);
+        if (FindStr(memory, imageBase, imageSize, "Confuser"))
+            AddScore(PackerType::ConfuserEx, 0.35f);
+    }
+
+    // =======================================================================
+    // 65. Dotfuscator
+    // =======================================================================
+    if (hdr.numberOfRvaAndSizes > PE::kDirCLRRuntime &&
+        hdr.dataDirectories[PE::kDirCLRRuntime].VirtualAddress != 0)
+    {
+        if (FindStr(memory, imageBase, imageSize, "Dotfuscator"))
+            AddScore(PackerType::Dotfuscator, 0.55f);
+    }
+
+    // =======================================================================
+    // 66. SmartAssembly / Eazfuscator / Babel / DNGuard / .NET Reactor
+    // =======================================================================
+    if (hdr.numberOfRvaAndSizes > PE::kDirCLRRuntime &&
+        hdr.dataDirectories[PE::kDirCLRRuntime].VirtualAddress != 0)
+    {
+        if (FindStr(memory, imageBase, imageSize, "SmartAssembly"))
+            AddScore(PackerType::SmartAssembly, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, "Eazfuscator"))
+            AddScore(PackerType::Eazfuscator, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, "Babel"))
+            AddScore(PackerType::BabelNet, 0.40f);
+        if (FindStr(memory, imageBase, imageSize, "DNGuard"))
+            AddScore(PackerType::DNGuard, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, ".NET Reactor"))
+            AddScore(PackerType::NetReactor, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, "NetReactor"))
+            AddScore(PackerType::NetReactor, 0.45f);
+        if (FindStr(memory, imageBase, imageSize, "MaxtoCode"))
+            AddScore(PackerType::MaxtoCode, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, "Agile.NET"))
+            AddScore(PackerType::Agile, 0.55f);
+        if (FindStr(memory, imageBase, imageSize, "Xenocode"))
+            AddScore(PackerType::Xenocode, 0.50f);
+    }
+
+    // =======================================================================
+    // 67. AutoHotkey compiled
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "AutoHotkey"))
+        AddScore(PackerType::AutoHotkey, 0.55f);
+    if (FindStr(memory, imageBase, imageSize, ">AUTOHOTKEY"))
+        AddScore(PackerType::AutoHotkey, 0.45f);
+
+    // =======================================================================
+    // 68. PyArmor
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "pyarmor"))
+        AddScore(PackerType::PyArmor, 0.55f);
+    if (FindStr(memory, imageBase, imageSize, "PyArmor"))
+        AddScore(PackerType::PyArmor, 0.55f);
+
+    // =======================================================================
+    // 69. Cython compiled
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "Cython"))
+        AddScore(PackerType::Cython, 0.40f);
+    if (FindStr(memory, imageBase, imageSize, "__pyx_"))
+        AddScore(PackerType::Cython, 0.35f);
+
+    // =======================================================================
+    // 70. Go binary
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "go.buildid"))
+        AddScore(PackerType::GoBinary, 0.55f);
+    if (FindStr(memory, imageBase, imageSize, "__go_buildinfo"))
+        AddScore(PackerType::GoBinary, 0.45f);
+    if (FindStr(memory, imageBase, imageSize, "runtime.main"))
+        AddScore(PackerType::GoBinary, 0.25f);
+    if (HasSectionNamed(hdr.sections, ".symtab"))
+        AddScore(PackerType::GoBinary, 0.15f);
+
+    // =======================================================================
+    // 71. 7-Zip SFX
+    // =======================================================================
+    {
+        static constexpr uint8_t k7zSig[] = {0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C};
+        static constexpr uint8_t k7zMask[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        const BytePattern szPat = {k7zSig, k7zMask, 6};
+        if (SearchPatternInRegion(memory, imageBase, imageSize, szPat))
+            AddScore(PackerType::SevenZipSFX, 0.55f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "7-Zip"))
+        AddScore(PackerType::SevenZipSFX, 0.30f);
+
+    // =======================================================================
+    // 72. WinRAR SFX
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "RAR!"))
+        AddScore(PackerType::WinRARSFX, 0.50f);
+    if (FindStr(memory, imageBase, imageSize, "WinRAR SFX"))
+        AddScore(PackerType::WinRARSFX, 0.45f);
+    {
+        static constexpr uint8_t kRarSig[] = {0x52, 0x61, 0x72, 0x21, 0x1A, 0x07};
+        static constexpr uint8_t kRarMask[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
+        const BytePattern rarPat = {kRarSig, kRarMask, 6};
+        if (SearchPatternInRegion(memory, imageBase, imageSize, rarPat))
+            AddScore(PackerType::WinRARSFX, 0.40f);
+    }
+
+    // =======================================================================
+    // 73. WinZip SFX
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "WinZip"))
+        AddScore(PackerType::WinZipSFX, 0.50f);
+    if (FindStr(memory, imageBase, imageSize, "WZSFX"))
+        AddScore(PackerType::WinZipSFX, 0.40f);
+
+    // =======================================================================
+    // 74. InstallShield
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "InstallShield"))
+        AddScore(PackerType::InstallShield, 0.55f);
+    if (FindStr(memory, imageBase, imageSize, "iKernel"))
+        AddScore(PackerType::InstallShield, 0.30f);
+
+    // =======================================================================
+    // 75. Wise Installer
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "Wise"))
+        AddScore(PackerType::WiseInstaller, 0.25f);
+    if (FindStr(memory, imageBase, imageSize, "WiseMain"))
+        AddScore(PackerType::WiseInstaller, 0.50f);
+
+    // =======================================================================
+    // 76. NSIS Variants
+    // =======================================================================
+    if (HasSectionNamed(hdr.sections, ".ndata"))  AddScore(PackerType::NSISVariant, 0.45f);
+    if (HasSectionNamed(hdr.sections, ".ndata2")) AddScore(PackerType::NSISVariant, 0.40f);
+
+    // =======================================================================
+    // 77. Inno Setup Variants
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "Inno Setup Setup Data"))
+        AddScore(PackerType::InnoSetupVariant, 0.60f);
+
+    // =======================================================================
+    // 78. Electron ASAR
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "electron.asar"))
+        AddScore(PackerType::ElectronASAR, 0.55f);
+    if (FindStr(memory, imageBase, imageSize, "app.asar"))
+        AddScore(PackerType::ElectronASAR, 0.35f);
+
+    // =======================================================================
+    // 79. TigerVMP
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern tvEP = {kEP_TigerVMP_B, kEP_TigerVMP_M, sizeof(kEP_TigerVMP_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, tvEP))
+            AddScore(PackerType::TigerVMP, 0.40f);
+    }
+    if (HasSectionNamed(hdr.sections, ".tiger"))  AddScore(PackerType::TigerVMP, 0.50f);
+
+    // =======================================================================
+    // 80. ReWolf
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern rwEP = {kEP_ReWolf_B, kEP_ReWolf_M, sizeof(kEP_ReWolf_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, rwEP))
+            AddScore(PackerType::ReWolf, 0.35f);
+    }
+    if (FindStr(memory, imageBase, imageSize, "ReWolf"))
+        AddScore(PackerType::ReWolf, 0.50f);
+
+    // =======================================================================
+    // 81-90. Version-specific EP patterns
+    // =======================================================================
+    if (haveEP) {
+        const BytePattern asV2 = {kEP_ASPackV2_B, kEP_ASPackV2_M, sizeof(kEP_ASPackV2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, asV2))
+            AddScore(PackerType::ASPackV2, 0.45f);
+
+        const BytePattern nsV3 = {kEP_NSPackV3_B, kEP_NSPackV3_M, sizeof(kEP_NSPackV3_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, nsV3))
+            AddScore(PackerType::NSPackV3, 0.45f);
+
+        const BytePattern mpV2 = {kEP_MPRESSv2_B, kEP_MPRESSv2_M, sizeof(kEP_MPRESSv2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, mpV2))
+            AddScore(PackerType::MPRESSv2, 0.45f);
+
+        const BytePattern fgV2 = {kEP_FSGv2_B, kEP_FSGv2_M, sizeof(kEP_FSGv2_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, fgV2))
+            AddScore(PackerType::FSGv2, 0.50f);
+
+        const BytePattern mwV11 = {kEP_MEWv11_B, kEP_MEWv11_M, sizeof(kEP_MEWv11_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, mwV11))
+            AddScore(PackerType::MEWv11, 0.45f);
+
+        const BytePattern psV1 = {kEP_PESpinV1_B, kEP_PESpinV1_M, sizeof(kEP_PESpinV1_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, psV1))
+            AddScore(PackerType::PESpinV1, 0.45f);
+
+        const BytePattern tlV098 = {kEP_tElockV098_B, kEP_tElockV098_M, sizeof(kEP_tElockV098_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, tlV098))
+            AddScore(PackerType::tElockV098, 0.40f);
+
+        const BytePattern obV1 = {kEP_ObsidiumV1_B, kEP_ObsidiumV1_M, sizeof(kEP_ObsidiumV1_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, obV1))
+            AddScore(PackerType::ObsidiumV1, 0.40f);
+
+        const BytePattern ffEP = {kEP_FinFisher_B, kEP_FinFisher_M, sizeof(kEP_FinFisher_B)};
+        if (MatchPattern(epBytes, kMaxEPReadBytes, ffEP))
+            AddScore(PackerType::PackerCustom, 0.35f);
+    }
+
+    // =======================================================================
+    // 91+. Spoon/Turbo, MoleBox Ultra, BoxedApp variant
+    // =======================================================================
+    if (FindStr(memory, imageBase, imageSize, "Spoon"))
+        AddScore(PackerType::Spoon, 0.35f);
+    if (FindStr(memory, imageBase, imageSize, "TurboStudio"))
+        AddScore(PackerType::Spoon, 0.45f);
+    if (FindStr(memory, imageBase, imageSize, "MoleBox Ultra"))
+        AddScore(PackerType::MoleBoxUltra, 0.50f);
+    if (FindStr(memory, imageBase, imageSize, "BoxedApp"))
+        AddScore(PackerType::BoxedAppVariant, 0.40f);
 
     // =======================================================================
     // Select best detection
@@ -2466,6 +4002,312 @@ void UnpackingEngine::Reset() noexcept {
     m_impl->cachedImageSize  = 0;
     m_impl->cachedEPRVA      = 0;
     m_impl->cachedIs64Bit    = false;
+    m_impl->detectedVM       = VMArch::Unknown;
+}
+
+// ============================================================================
+// VM Analysis — Detect virtualized code (FinFisher, Themida, VMProtect, etc.)
+// ============================================================================
+
+VMAnalysisResult UnpackingEngine::AnalyzeVirtualMachine(
+    const VirtualMemory& memory,
+    GuestAddress imageBase,
+    GuestSize imageSize) const noexcept
+{
+    VMAnalysisResult result{};
+
+    PEHeaderInfo hdr{};
+    if (!ReadPEHeaders(memory, imageBase, hdr)) return result;
+
+    // --- Phase 1: Section-name-based VM identification ---
+    struct VMScore {
+        VMArch arch;
+        float  score;
+    };
+    static constexpr uint32_t kMaxVMCandidates = 8;
+    std::array<VMScore, kMaxVMCandidates> vmScores{};
+    uint32_t vmCount = 0;
+
+    auto AddVMScore = [&](VMArch arch, float score) {
+        for (uint32_t i = 0; i < vmCount; ++i) {
+            if (vmScores[i].arch == arch) {
+                vmScores[i].score += score;
+                return;
+            }
+        }
+        if (vmCount < kMaxVMCandidates) {
+            vmScores[vmCount++] = {arch, score};
+        }
+    };
+
+    for (const auto& mapping : kSectionVMMap) {
+        if (HasSectionNamed(hdr.sections, mapping.sectionName)) {
+            AddVMScore(mapping.arch, mapping.score);
+        }
+    }
+
+    // String-based VM identification
+    if (FindStr(memory, imageBase, imageSize, "VMProtect"))
+        AddVMScore(VMArch::VMProtect, 0.30f);
+    if (FindStr(memory, imageBase, imageSize, "Themida"))
+        AddVMScore(VMArch::Themida, 0.30f);
+    if (FindStr(memory, imageBase, imageSize, "WinLicense"))
+        AddVMScore(VMArch::Themida, 0.25f);
+    if (FindStr(memory, imageBase, imageSize, "CodeVirtualizer"))
+        AddVMScore(VMArch::CodeVirtualizer, 0.30f);
+    if (FindStr(memory, imageBase, imageSize, "TigerVMP"))
+        AddVMScore(VMArch::TigerVMP, 0.30f);
+
+    // --- Phase 2: Scan executable sections for VM entry patterns ---
+    GuestAddress vmEntryAddr = 0;
+    GuestAddress dispatchAddr = 0;
+    bool foundDispatcher = false;
+    bool foundVMEntry = false;
+
+    for (const auto& sec : hdr.sections) {
+        if (!(sec.characteristics & PE::kSecMemExecute)) continue;
+
+        const GuestAddress secBase = imageBase + sec.virtualAddress;
+        const GuestSize secSize = std::min<GuestSize>(sec.virtualSize, kVMMaxScanBytes);
+
+        // Detect VM entry: multiple PUSHes followed by indirect JMP
+        if (!foundVMEntry) {
+            if (ScanForVMEntryPushSequence(memory, secBase, secSize, vmEntryAddr)) {
+                foundVMEntry = true;
+                result.vmEntryPoint = vmEntryAddr;
+                AddVMScore(VMArch::Custom, 0.15f);
+            }
+        }
+
+        // Detect dispatcher loop: MOVZX fetch + JMP [table]
+        if (!foundDispatcher) {
+            if (ScanForMovzxFetch(memory, secBase, secSize, dispatchAddr)) {
+                foundDispatcher = true;
+                result.vmDispatcher = dispatchAddr;
+                result.usesIndirectDispatch = true;
+                AddVMScore(VMArch::Custom, 0.20f);
+            }
+        }
+
+        // Check for FinFisher entry pattern
+        {
+            uint8_t buf[16]{};
+            const BytePattern ffPat = {kEP_FinFisher_B, kEP_FinFisher_M, sizeof(kEP_FinFisher_B)};
+            for (GuestSize off = 0; off + 16 <= std::min(secSize, static_cast<GuestSize>(4096)); off += 4) {
+                if (ReadGuestBytes(memory, secBase + off, buf, 16)) {
+                    if (MatchPattern(buf, 16, ffPat)) {
+                        AddVMScore(VMArch::FinFisher, 0.30f);
+                        result.virtualRegCount = 32;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Phase 3: EP-based VM detection ---
+    {
+        uint8_t epBytes[kMaxEPReadBytes]{};
+        const GuestAddress epAddr = imageBase + hdr.entryPointRVA;
+        if (ReadGuestBytes(memory, epAddr, epBytes, kMaxEPReadBytes)) {
+            // VMProtect: EP is JMP into .vmp section
+            if (epBytes[0] == 0xE9) {
+                const int32_t epSection = FindSectionByRVA(hdr.sections, hdr.entryPointRVA);
+                if (epSection >= 0) {
+                    int32_t rel = 0;
+                    std::memcpy(&rel, epBytes + 1, 4);
+                    const uint32_t targetRVA = hdr.entryPointRVA + 5 + static_cast<uint32_t>(rel);
+                    const int32_t targetSec = FindSectionByRVA(hdr.sections, targetRVA);
+                    if (targetSec >= 0 && targetSec != epSection &&
+                        std::strncmp(hdr.sections[static_cast<size_t>(targetSec)].name, ".vmp", 4) == 0)
+                    {
+                        AddVMScore(VMArch::VMProtect, 0.25f);
+                    }
+                }
+            }
+
+            // Themida: EP in high-entropy section with pushad or mov
+            const BytePattern thV3 = {kEP_ThemidaV3_B, kEP_ThemidaV3_M, sizeof(kEP_ThemidaV3_B)};
+            if (MatchPattern(epBytes, kMaxEPReadBytes, thV3)) {
+                AddVMScore(VMArch::Themida, 0.20f);
+            }
+        }
+    }
+
+    // --- Phase 4: Handler table extraction ---
+    if (foundDispatcher) {
+        // Read bytes at dispatcher to find the table base address
+        uint8_t dispBuf[32]{};
+        if (ReadGuestBytes(memory, dispatchAddr, dispBuf, 32)) {
+            // Scan forward in the dispatcher for JMP [reg*4+base] / JMP [reg*8+base]
+            for (uint32_t i = 0; i + 7 < 32; ++i) {
+                // FF 24 85 <addr32> — JMP DWORD PTR [EAX*4+base]
+                // FF 24 C5 <addr32> — JMP DWORD PTR [EAX*8+base]
+                if (dispBuf[i] == 0xFF &&
+                    (dispBuf[i + 1] == 0x24) &&
+                    (dispBuf[i + 2] == 0x85 || dispBuf[i + 2] == 0xC5 ||
+                     dispBuf[i + 2] == 0x8D || dispBuf[i + 2] == 0xCD))
+                {
+                    uint32_t tableAddr = 0;
+                    std::memcpy(&tableAddr, dispBuf + i + 3, 4);
+
+                    // For 32-bit: table address is absolute
+                    // For 64-bit: table address might be RIP-relative
+                    GuestAddress tableBase = tableAddr;
+                    if (hdr.is64Bit && tableAddr < 0x10000) {
+                        // RIP-relative addressing
+                        tableBase = dispatchAddr + i + 7 + static_cast<int32_t>(tableAddr);
+                    }
+
+                    if (tableBase >= imageBase && tableBase < imageBase + imageSize) {
+                        result.vmHandlerTable = tableBase;
+                        result.handlerCount = ExtractHandlerTable(
+                            memory, tableBase, imageBase, imageSize,
+                            hdr.is64Bit, result.handlers);
+                    }
+                    break;
+                }
+            }
+        }
+    }
+
+    // --- Phase 5: Handler classification ---
+    for (auto& handler : result.handlers) {
+        uint16_t instrCount = 0;
+        handler.handlerType = ClassifyHandler(memory, handler.address, instrCount);
+        handler.instructionCount = instrCount;
+    }
+
+    // --- Phase 6: Detect opaque predicates ---
+    for (const auto& sec : hdr.sections) {
+        if (!(sec.characteristics & PE::kSecMemExecute)) continue;
+        const GuestAddress secBase = imageBase + sec.virtualAddress;
+        const GuestSize secSize = std::min<GuestSize>(sec.virtualSize, kVMMaxScanBytes);
+        if (DetectOpaquePredicates(memory, secBase, secSize)) {
+            result.hasOpaquePredicates = true;
+            AddVMScore(VMArch::Custom, 0.10f);
+            break;
+        }
+    }
+
+    // --- Phase 7: Detect handler reordering ---
+    if (result.handlers.size() >= kVMMinHandlerCount) {
+        uint32_t outOfOrder = 0;
+        for (size_t i = 1; i < result.handlers.size(); ++i) {
+            if (result.handlers[i].address < result.handlers[i - 1].address) {
+                outOfOrder++;
+            }
+        }
+        if (outOfOrder > result.handlers.size() / 3) {
+            result.hasHandlerReordering = true;
+            AddVMScore(VMArch::Custom, 0.10f);
+        }
+    }
+
+    // --- Phase 8: Detect computed goto (threaded dispatch) ---
+    // Check if handlers end with fetch-next-opcode + JMP instead of JMP-back-to-dispatcher
+    if (result.handlers.size() >= kVMMinHandlerCount) {
+        uint32_t threadedCount = 0;
+        uint8_t tailBuf[16]{};
+        for (const auto& handler : result.handlers) {
+            if (handler.instructionCount < kVMMinHandlerInstrs) continue;
+            // Read tail of handler: look for MOVZX + JMP pattern at end
+            const GuestAddress tailAddr = handler.address +
+                std::min<uint32_t>(handler.instructionCount * 2, 128);
+            if (ReadGuestBytes(memory, tailAddr, tailBuf, 16)) {
+                for (uint32_t j = 0; j + 6 < 16; ++j) {
+                    if (tailBuf[j] == 0x0F && tailBuf[j + 1] == 0xB6) {
+                        threadedCount++;
+                        break;
+                    }
+                }
+            }
+        }
+        if (threadedCount > result.handlers.size() / 2) {
+            result.usesComputedGoto = true;
+            AddVMScore(VMArch::Custom, 0.10f);
+        }
+    }
+
+    // --- Phase 9: Virtual register count estimation ---
+    if (result.virtualRegCount == 0 && foundDispatcher) {
+        // Estimate from handler analysis: count distinct memory offset patterns
+        // FinFisher ~32, Themida ~16-32, VMProtect ~16
+        if (result.handlerCount >= 100) {
+            result.virtualRegCount = 32;
+        } else if (result.handlerCount >= 40) {
+            result.virtualRegCount = 16;
+        } else if (result.handlerCount >= 20) {
+            result.virtualRegCount = 8;
+        }
+    }
+
+    // --- Phase 10: Confidence scoring ---
+    // Handler table found with >20 entries: +0.3
+    if (result.handlerCount > 20)
+        AddVMScore(VMArch::Custom, 0.30f);
+    // Dispatcher loop with indirect dispatch: +0.2
+    if (result.usesIndirectDispatch)
+        AddVMScore(VMArch::Custom, 0.20f);
+    // Opaque predicates: +0.1
+    if (result.hasOpaquePredicates)
+        AddVMScore(VMArch::Custom, 0.10f);
+    // Handler reordering: +0.1
+    if (result.hasHandlerReordering)
+        AddVMScore(VMArch::Custom, 0.10f);
+
+    // --- Phase 11: Architecture-specific handler count refinement ---
+    for (uint32_t i = 0; i < vmCount; ++i) {
+        if (vmScores[i].arch == VMArch::FinFisher) {
+            if (result.handlerCount >= 60 && result.handlerCount <= 80)
+                vmScores[i].score += 0.15f;
+        } else if (vmScores[i].arch == VMArch::Themida) {
+            if (result.handlerCount >= 100 && result.handlerCount <= 120)
+                vmScores[i].score += 0.15f;
+        } else if (vmScores[i].arch == VMArch::VMProtect) {
+            if (result.handlerCount >= 40 && result.handlerCount <= 200)
+                vmScores[i].score += 0.10f;
+        } else if (vmScores[i].arch == VMArch::CodeVirtualizer) {
+            if (result.handlerCount >= 40 && result.handlerCount <= 60)
+                vmScores[i].score += 0.15f;
+        }
+    }
+
+    // --- Phase 12: Select best VM architecture ---
+    VMArch bestArch = VMArch::Unknown;
+    float  bestScore = 0.0f;
+
+    for (uint32_t i = 0; i < vmCount; ++i) {
+        if (vmScores[i].score > bestScore) {
+            bestScore = vmScores[i].score;
+            bestArch  = vmScores[i].arch;
+        }
+    }
+
+    // Minimum confidence threshold for positive VM detection
+    static constexpr float kVMConfidenceThreshold = 0.35f;
+
+    if (bestScore >= kVMConfidenceThreshold && bestArch != VMArch::Unknown) {
+        result.architecture = bestArch;
+        result.confidence = std::min(bestScore, 1.0f);
+    } else if (bestScore >= kVMConfidenceThreshold) {
+        // If only "Custom" scored high enough, report it
+        result.architecture = VMArch::Custom;
+        result.confidence = std::min(bestScore, 1.0f);
+    }
+
+    // Store detected VM in Impl for GetDetectedVM()
+    {
+        std::unique_lock lock(m_impl->mutex);
+        m_impl->detectedVM = result.architecture;
+    }
+
+    return result;
+}
+
+VMArch UnpackingEngine::GetDetectedVM() const noexcept {
+    std::shared_lock lock(m_impl->mutex);
+    return m_impl->detectedVM;
 }
 
 } // namespace Phantom
