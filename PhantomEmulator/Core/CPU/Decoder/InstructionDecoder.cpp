@@ -35,9 +35,40 @@ ErrorCode InstructionDecoder::Decode(
     auto err = DecodePrefixes(bytes, mode, out.prefixes, offset);
     if (err != ErrorCode::Success) return err;
 
+    // Phase 1b: VEX prefix (C4/C5)
+    // In 64-bit mode: C4/C5 are always VEX prefixes.
+    // In 32-bit mode: C4/C5 are VEX only if the next byte has bits [7:6] = 11b.
+    // Must check after legacy prefixes but before opcode decoding.
+    if (offset < bytes.size()) {
+        uint8_t b = bytes[offset];
+        if (b == Encoding::kVEX2Byte || b == Encoding::kVEX3Byte) {
+            err = DecodeVEX(bytes, mode, out.prefixes, offset);
+            if (err != ErrorCode::Success) return err;
+
+            if (out.prefixes.hasVEX) {
+                // VEX encodes the opcode map implicitly — read the opcode byte directly
+                if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+                out.opcode = bytes[offset++];
+
+                switch (out.prefixes.vexMMMMM) {
+                    case 1: out.opcodeMap = OpcodeMap::TwoByte;      break;
+                    case 2: out.opcodeMap = OpcodeMap::ThreeByte38;  break;
+                    case 3: out.opcodeMap = OpcodeMap::ThreeByte3A;  break;
+                    default:
+                        return ErrorCode::InvalidPrefix;
+                }
+
+                // Skip normal opcode decoding — jump to operand/address size resolution
+                goto vex_opcode_done;
+            }
+        }
+    }
+
     // Phase 2: Opcode
     err = DecodeOpcode(bytes, offset, out.opcodeMap, out.opcode);
     if (err != ErrorCode::Success) return err;
+
+vex_opcode_done:
 
     // Resolve effective operand and address sizes
     out.operandSize = out.prefixes.EffectiveOperandSize(mode);
@@ -193,6 +224,122 @@ ErrorCode InstructionDecoder::DecodePrefixes(
         offset++;
     }
 
+    return ErrorCode::Success;
+}
+
+// ============================================================================
+// Phase 1b: VEX Prefix Decoding
+// ============================================================================
+// VEX 2-byte (C5): [C5] [R|vvvv|L|pp]
+// VEX 3-byte (C4): [C4] [R|X|B|mmmmm] [W|vvvv|L|pp]
+//
+// In 64-bit mode C4/C5 are always VEX prefixes.
+// In 32-bit mode C4/C5 are VEX only if the byte following the lead byte
+// has bits [7:6] == 11b (otherwise they are LES/LDS).
+
+ErrorCode InstructionDecoder::DecodeVEX(
+    std::span<const uint8_t> bytes,
+    CPUMode mode,
+    InstructionPrefixes& prefixes,
+    uint32_t& offset) noexcept
+{
+    if (offset >= bytes.size()) return ErrorCode::TruncatedInstruction;
+
+    uint8_t lead = bytes[offset];
+
+    if (lead == Encoding::kVEX2Byte) {
+        // Need at least 1 more byte (payload byte)
+        if (offset + 1 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+
+        uint8_t byte1 = bytes[offset + 1];
+
+        // In non-64-bit modes, verify bits [7:6] == 11b to distinguish from LDS (C5)
+        if (mode != CPUMode::Long64) {
+            if ((byte1 & 0xC0) != 0xC0) {
+                // Not a VEX prefix — leave offset unchanged so normal decode proceeds
+                return ErrorCode::Success;
+            }
+        }
+
+        // Consume the 2-byte VEX prefix
+        offset += 2;
+        prefixes.prefixCount += 2;
+        prefixes.hasVEX = true;
+
+        // Byte 1: [R][vvvv][L][pp]
+        // R is inverted: 0 in VEX means REX.R=1
+        prefixes.rexR = ((byte1 >> 7) & 1) == 0;
+        // 2-byte VEX implies REX.X=0, REX.B=0 (non-inverted in REX terms)
+        prefixes.rexX = false;
+        prefixes.rexB = false;
+        prefixes.vexW = false;
+
+        prefixes.vexVVVV = (~(byte1 >> 3)) & 0x0F;
+        prefixes.vexL    = (byte1 >> 2) & 1;
+        prefixes.vexPP   = byte1 & 0x03;
+        // 2-byte VEX always implies map 0F
+        prefixes.vexMMMMM = 1;
+
+        // Map pp to implied legacy prefix flags
+        switch (prefixes.vexPP) {
+            case 1: prefixes.hasOpSizeOverride = true; break;   // 66
+            case 2: prefixes.hasRep = true;            break;   // F3
+            case 3: prefixes.hasRepNE = true;          break;   // F2
+            default: break;
+        }
+
+        return ErrorCode::Success;
+
+    } else if (lead == Encoding::kVEX3Byte) {
+        // Need at least 2 more bytes (payload bytes)
+        if (offset + 2 >= bytes.size()) return ErrorCode::TruncatedInstruction;
+
+        uint8_t byte1 = bytes[offset + 1];
+        uint8_t byte2 = bytes[offset + 2];
+
+        // In non-64-bit modes, verify byte1 bits [7:6] == 11b to distinguish from LES (C4)
+        if (mode != CPUMode::Long64) {
+            if ((byte1 & 0xC0) != 0xC0) {
+                return ErrorCode::Success;
+            }
+        }
+
+        // Consume the 3-byte VEX prefix
+        offset += 3;
+        prefixes.prefixCount += 3;
+        prefixes.hasVEX = true;
+
+        // Byte 1: [R][X][B][mmmmm]
+        // R, X, B are inverted
+        prefixes.rexR = ((byte1 >> 7) & 1) == 0;
+        prefixes.rexX = ((byte1 >> 6) & 1) == 0;
+        prefixes.rexB = ((byte1 >> 5) & 1) == 0;
+        prefixes.vexMMMMM = byte1 & 0x1F;
+
+        // Validate opcode map (only 1, 2, 3 are defined)
+        if (prefixes.vexMMMMM == 0 || prefixes.vexMMMMM > 3) {
+            return ErrorCode::InvalidPrefix;
+        }
+
+        // Byte 2: [W][vvvv][L][pp]
+        prefixes.vexW    = ((byte2 >> 7) & 1) != 0;
+        prefixes.rexW    = prefixes.vexW;
+        prefixes.vexVVVV = (~(byte2 >> 3)) & 0x0F;
+        prefixes.vexL    = (byte2 >> 2) & 1;
+        prefixes.vexPP   = byte2 & 0x03;
+
+        // Map pp to implied legacy prefix flags
+        switch (prefixes.vexPP) {
+            case 1: prefixes.hasOpSizeOverride = true; break;   // 66
+            case 2: prefixes.hasRep = true;            break;   // F3
+            case 3: prefixes.hasRepNE = true;          break;   // F2
+            default: break;
+        }
+
+        return ErrorCode::Success;
+    }
+
+    // Not a VEX prefix byte — should not reach here
     return ErrorCode::Success;
 }
 

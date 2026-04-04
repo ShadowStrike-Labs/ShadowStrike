@@ -55,6 +55,7 @@ enum class RegType : uint8_t {
     Debug,
     FPU,         // x87 ST(i)
     XMM,         // SSE XMM0-XMM15
+    YMM,         // AVX YMM0-YMM15 (256-bit)
     Flags,       // RFLAGS
     IP,          // RIP
 };
@@ -129,6 +130,14 @@ struct InstructionPrefixes {
     bool rexR     = false;     // ModRM.reg extension
     bool rexX     = false;     // SIB.index extension
     bool rexB     = false;     // ModRM.rm / SIB.base extension
+
+    // VEX prefix (2-byte C5 or 3-byte C4)
+    bool hasVEX      = false;
+    uint8_t vexL     = 0;      // Vector length: 0=128-bit (XMM), 1=256-bit (YMM)
+    uint8_t vexPP    = 0;      // Implied prefix: 0=none, 1=66, 2=F3, 3=F2
+    uint8_t vexMMMMM = 1;      // Opcode map: 1=0F, 2=0F38, 3=0F3A
+    uint8_t vexVVVV  = 0;      // Additional register operand (inverted, 0-15)
+    bool    vexW     = false;   // Like REX.W for VEX-encoded instructions
 
     // Total prefix byte count (for instruction length calculation)
     uint8_t prefixCount = 0;

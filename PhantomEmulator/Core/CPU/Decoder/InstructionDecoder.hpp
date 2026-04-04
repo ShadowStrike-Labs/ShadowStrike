@@ -58,6 +58,13 @@ private:
         InstructionPrefixes& prefixes,
         uint32_t& offset) noexcept;
 
+    // Phase 1b: Decode VEX prefix (C4/C5) if present
+    ErrorCode DecodeVEX(
+        std::span<const uint8_t> bytes,
+        CPUMode mode,
+        InstructionPrefixes& prefixes,
+        uint32_t& offset) noexcept;
+
     // Phase 2: Determine opcode map and primary opcode
     ErrorCode DecodeOpcode(
         std::span<const uint8_t> bytes,

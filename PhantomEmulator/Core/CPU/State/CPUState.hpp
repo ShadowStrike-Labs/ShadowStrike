@@ -213,6 +213,9 @@ public:
     uint64_t cr3 = 0;             // Page directory base
     uint64_t cr4 = 0x000406F8;   // PAE, PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
 
+    // Extended Control Register (for XGETBV support — bits: x87=1, SSE=2, AVX=4)
+    uint64_t xcr0 = 0x7;
+
     // ========================================================================
     // Debug Registers (for anti-evasion: malware checks DR0-DR3)
     // ========================================================================
@@ -278,6 +281,30 @@ public:
     }
     [[nodiscard]] const XMMReg& XMM(uint8_t index) const noexcept {
         return xmm[index & 0x0F];
+    }
+
+    // ========================================================================
+    // AVX State (YMM registers — upper 128 bits)
+    // ========================================================================
+    // YMM registers extend XMM: YMM[i] = { XMM[i] (low 128) | ymmHigh[i] (high 128) }
+    // The low 128 bits are stored in xmm[], the high 128 bits here.
+    std::array<XMMReg, 16> ymmHigh{};  // Upper halves of YMM0-YMM15
+
+    // Get pointer to full 256-bit YMM value (caller provides 32-byte aligned buffer)
+    void GetYMM(uint8_t index, void* dst32) const noexcept {
+        auto idx = index & 0x0F;
+        std::memcpy(dst32, xmm[idx].u8, 16);
+        std::memcpy(static_cast<uint8_t*>(dst32) + 16, ymmHigh[idx].u8, 16);
+    }
+    void SetYMM(uint8_t index, const void* src32) noexcept {
+        auto idx = index & 0x0F;
+        std::memcpy(xmm[idx].u8, src32, 16);
+        std::memcpy(ymmHigh[idx].u8, static_cast<const uint8_t*>(src32) + 16, 16);
+    }
+
+    // Clear upper halves (VEX-encoded 128-bit ops zero the upper YMM bits)
+    void ClearYMMHigh(uint8_t index) noexcept {
+        ymmHigh[index & 0x0F].Clear();
     }
 
     // ========================================================================
