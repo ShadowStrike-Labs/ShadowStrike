@@ -481,7 +481,38 @@ struct ProcessCreationMonitor::Impl {
             stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // 8. Update State (Process Tree)
+        // 8. Forward to BehaviorAnalyzer for cross-process correlation and APT hunting
+        if (localBehaviorAnalyzer && localBehaviorAnalyzer->IsInitialized()) {
+            try {
+                auto baEvent = Core::Engine::CreateProcessEvent(
+                    Core::Engine::BehaviorEventType::ProcessCreate,
+                    event.processId,
+                    event.parentProcessId);
+                baEvent.processName  = event.imagePath;
+                baEvent.processPath  = event.imagePath;
+                baEvent.commandLine  = event.commandLine;
+                baEvent.success      = true;
+
+                auto baVerdict = localBehaviorAnalyzer->ProcessEvent(baEvent);
+                if (baVerdict.has_value() &&
+                    baVerdict->RequiresImmediateAction() &&
+                    finalVerdict != ProcessVerdict::Block) {
+                    finalVerdict = ProcessVerdict::Block;
+                    stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"ProcessCreationMonitor",
+                        L"BehaviorAnalyzer escalated PID=%u to BLOCK (score=%.1f pattern=%hs)",
+                        event.processId,
+                        baVerdict->maliceScore,
+                        Core::Engine::BehaviorPatternTypeToString(baVerdict->primaryPattern));
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                    L"BA forwarding failed for PID=%u: %hs",
+                    event.processId, ex.what());
+            }
+        }
+
+        // 9. Update State (Process Tree)
         if (finalVerdict != ProcessVerdict::Block) {
             UpdateProcessState(event, finalVerdict, cfg);
         }
@@ -543,6 +574,26 @@ struct ProcessCreationMonitor::Impl {
 
     void HandleProcessTerminate(uint32_t pid, uint32_t exitCode) {
         stats.processTerminations.fetch_add(1, std::memory_order_relaxed);
+
+        // Forward termination to BehaviorAnalyzer for state cleanup (PID reuse protection)
+        {
+            Core::Engine::BehaviorAnalyzer* localBA = nullptr;
+            {
+                std::shared_lock intLock(integrationMutex);
+                localBA = behaviorAnalyzer;
+            }
+            if (localBA && localBA->IsInitialized()) {
+                try {
+                    auto baEvent = Core::Engine::CreateProcessEvent(
+                        Core::Engine::BehaviorEventType::ProcessTerminate,
+                        pid, 0);
+                    baEvent.success = true;
+                    (void)localBA->ProcessEvent(baEvent);
+                } catch (...) {
+                    // Termination forwarding must not block cleanup
+                }
+            }
+        }
 
         {
             std::unique_lock lock(processMutex);

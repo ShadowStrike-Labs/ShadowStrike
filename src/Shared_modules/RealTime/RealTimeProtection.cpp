@@ -83,7 +83,10 @@
 #include "../Communication/ThreatIntelPusher.hpp"
 #include "../Utils/CacheManager.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+#include "../Core/Engine/BehaviorAnalyzer.hpp"
+#include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/QuarantineManager.hpp"
+#include "../Core/Process/ProcessInjectionDetector.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
@@ -1182,6 +1185,46 @@ public:
             SetComponentState(ComponentType::ACCESS_CONTROL, ComponentState::ERROR);
         }
 
+        // BehaviorAnalyzer — central behavioral engine wired into TD, PCM, PID
+        try {
+            auto& ba = Core::Engine::BehaviorAnalyzer::Instance();
+            if (!ba.IsInitialized()) {
+                if (!ba.Initialize(m_threadPool)) {
+                    Utils::Logger::Error("RealTimeProtection: BehaviorAnalyzer::Initialize failed");
+                } else {
+                    Utils::Logger::Info("RealTimeProtection: BehaviorAnalyzer initialized");
+                }
+            }
+
+            if (ba.IsInitialized()) {
+                // Wire BA into ThreatDetector (TD uses BA for behavioral scoring during scans)
+                try {
+                    Core::Engine::ThreatDetector::Instance().SetBehaviorAnalyzer(&ba);
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error("RealTimeProtection: Failed to wire BA→ThreatDetector: {}", ex.what());
+                }
+
+                // Wire BA into ProcessCreationMonitor
+                try {
+                    ProcessCreationMonitor::Instance().SetBehaviorAnalyzer(&ba);
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error("RealTimeProtection: Failed to wire BA→PCM: {}", ex.what());
+                }
+
+                // Wire BA into ProcessInjectionDetector
+                try {
+                    auto& pid = Core::Process::ProcessInjectionDetector::Instance();
+                    pid.SetBehaviorAnalyzer(&ba);
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error("RealTimeProtection: Failed to wire BA→PID: {}", ex.what());
+                }
+            }
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("RealTimeProtection: BehaviorAnalyzer startup exception: {}", ex.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: BehaviorAnalyzer unknown startup exception");
+        }
+
         // ZeroHourProtection
         if (m_config.enableZeroHourProtection) {
             try {
@@ -1445,6 +1488,9 @@ public:
 
         try { ZeroHourProtection::Instance().Stop(); } catch (...) {}
         SetComponentState(ComponentType::ZERO_HOUR, ComponentState::STOPPED);
+
+        // BehaviorAnalyzer — shut down after event sources (PCM/PID/BB) but before exploit detectors
+        try { Core::Engine::BehaviorAnalyzer::Instance().Shutdown(); } catch (...) {}
 
         try { Exploits::StackPivotDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::BufferOverflowProtection::Instance().Shutdown(); } catch (...) {}
