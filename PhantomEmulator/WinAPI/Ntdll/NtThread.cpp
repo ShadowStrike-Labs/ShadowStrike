@@ -29,6 +29,7 @@
 
 #include <cstring>
 #include <iterator>
+#include <string_view>
 
 // Guest wide characters are always UTF-16LE (2 bytes).
 static_assert(sizeof(wchar_t) == 2,
@@ -148,6 +149,150 @@ static uint32_t GetThreadTID(APIContext& ctx, GuestHandle handle) noexcept {
     }
 
     return std::get<ThreadHandleData>(entry->data).tid;
+}
+
+// ============================================================================
+// Helper: Determine whether a thread handle belongs to a foreign process
+// ============================================================================
+
+static bool IsRemoteThreadHandle(APIContext& ctx, GuestHandle handle) noexcept {
+    if (handle == kCurrentThread) {
+        return false;
+    }
+
+    auto entry = ctx.Handles().Lookup(handle, HandleType::Thread);
+    if (!entry) {
+        return false;
+    }
+
+    const auto& td = std::get<ThreadHandleData>(entry->data);
+    return td.ownerPid != 0 && td.ownerPid != kEmulatedPID;
+}
+
+// ============================================================================
+// Helper: Case-insensitive suffix checks for APC DLL heuristics
+// ============================================================================
+
+static bool EndsWithIgnoreCase(std::string_view value,
+                               std::string_view suffix) noexcept {
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+
+    const size_t offset = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        char a = value[offset + i];
+        char b = suffix[i];
+        if (a >= 'A' && a <= 'Z') a = static_cast<char>(a - 'A' + 'a');
+        if (b >= 'A' && b <= 'Z') b = static_cast<char>(b - 'A' + 'a');
+        if (a != b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+static bool EndsWithIgnoreCase(std::wstring_view value,
+                               std::wstring_view suffix) noexcept {
+    if (value.size() < suffix.size()) {
+        return false;
+    }
+
+    const size_t offset = value.size() - suffix.size();
+    for (size_t i = 0; i < suffix.size(); ++i) {
+        wchar_t a = value[offset + i];
+        wchar_t b = suffix[i];
+        if (a >= L'A' && a <= L'Z') a = static_cast<wchar_t>(a - L'A' + L'a');
+        if (b >= L'A' && b <= L'Z') b = static_cast<wchar_t>(b - L'A' + L'a');
+        if (a != b) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Helper: Writable APC routine detection
+// ============================================================================
+
+static bool IsWritableRoutineAddress(APIContext& ctx,
+                                     GuestAddress routine) noexcept {
+    if (routine == 0) {
+        return false;
+    }
+
+    const auto protection = ctx.Memory().GetProtection(routine);
+    return protection.has_value() && HasProt(*protection, MemProt::Write);
+}
+
+// ============================================================================
+// Helper: LoadLibraryA/W APC routine detection
+// ============================================================================
+
+static bool IsLikelyDllPath(APIContext& ctx, GuestAddress argument) noexcept {
+    if (argument == 0) {
+        return false;
+    }
+
+    const std::string ansi = ctx.ReadAnsiString(argument, 260);
+    if (!ansi.empty() && EndsWithIgnoreCase(ansi, ".dll")) {
+        return true;
+    }
+
+    const std::wstring wide = ctx.ReadWideString(argument, 260);
+    return !wide.empty() && EndsWithIgnoreCase(wide, L".dll");
+}
+
+static bool IsLoadLibraryRoutine(APIContext& ctx, GuestAddress routine,
+                                 GuestAddress firstArgument) noexcept {
+    if (routine == 0) {
+        return false;
+    }
+
+    if (auto* dispatcher = ctx.Dispatcher()) {
+        if (const auto loadLibraryA = dispatcher->GetHookAddress("kernel32.dll", "LoadLibraryA");
+            loadLibraryA.has_value() && *loadLibraryA == routine) {
+            return true;
+        }
+        if (const auto loadLibraryW = dispatcher->GetHookAddress("kernel32.dll", "LoadLibraryW");
+            loadLibraryW.has_value() && *loadLibraryW == routine) {
+            return true;
+        }
+    }
+
+    return IsLikelyDllPath(ctx, firstArgument);
+}
+
+// ============================================================================
+// Helper: Apply APC behavioral flags to the current API context
+// ============================================================================
+
+static void ApplyApcBehaviorFlags(APIContext& ctx, GuestHandle threadHandle,
+                                  GuestAddress apcRoutine,
+                                  GuestAddress firstArgument,
+                                  bool specialUserApc) noexcept {
+    BehaviorFlag flags = BehaviorFlag::None;
+
+    if (IsRemoteThreadHandle(ctx, threadHandle)) {
+        flags = flags | BehaviorFlag::ProcessInjection;
+    }
+
+    if (IsWritableRoutineAddress(ctx, apcRoutine)) {
+        flags = flags | BehaviorFlag::CodeInjection;
+        flags = flags | BehaviorFlag::SuspiciousAPI;
+    }
+
+    if (IsLoadLibraryRoutine(ctx, apcRoutine, firstArgument)) {
+        flags = flags | BehaviorFlag::DLLInjection;
+    }
+
+    if (specialUserApc) {
+        flags = flags | BehaviorFlag::SuspiciousAPI;
+    }
+
+    ctx.AddBehaviorFlags(flags);
 }
 
 // ============================================================================
@@ -498,6 +643,86 @@ bool HandleNtQueryInformationThread(APIContext& ctx) {
 }
 
 // ============================================================================
+// NtQueueApcThread
+// ============================================================================
+// NTSTATUS NtQueueApcThread(
+//     IN HANDLE           ThreadHandle,   // arg 0
+//     IN PPS_APC_ROUTINE  ApcRoutine,     // arg 1
+//     IN PVOID            ApcArgument1,   // arg 2
+//     IN PVOID            ApcArgument2,   // arg 3
+//     IN PVOID            ApcArgument3    // arg 4
+// );
+//
+// Cross-process APC queueing is MITRE ATT&CK T1055.004. Writable APC
+// routines are treated as shellcode-style code injection. If the routine
+// resolves to LoadLibraryA/W (or the first argument clearly carries a DLL
+// path when the resolver hook is unavailable), we flag DLL injection.
+
+bool HandleNtQueueApcThread(APIContext& ctx) {
+    const GuestHandle threadHandle = static_cast<GuestHandle>(ctx.GetArg(0));
+    const GuestAddress apcRoutine  = ctx.GetArgPtr(1);
+    const GuestAddress apcArg1     = ctx.GetArgPtr(2);
+
+    if (threadHandle != kCurrentThread) {
+        auto entry = ctx.Handles().Lookup(threadHandle, HandleType::Thread);
+        if (!entry) {
+            ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
+            return true;
+        }
+    }
+
+    if (apcRoutine == 0) {
+        ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
+        return true;
+    }
+
+    ApplyApcBehaviorFlags(ctx, threadHandle, apcRoutine, apcArg1, false);
+    ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
+    return true;
+}
+
+// ============================================================================
+// NtQueueApcThreadEx
+// ============================================================================
+// NTSTATUS NtQueueApcThreadEx(
+//     IN HANDLE           ThreadHandle,     // arg 0
+//     IN HANDLE           UserApcReserve,   // arg 1
+//     IN PPS_APC_ROUTINE  ApcRoutine,       // arg 2
+//     IN PVOID            ApcArgument1,     // arg 3
+//     IN PVOID            ApcArgument2,     // arg 4
+//     IN PVOID            ApcArgument3      // arg 5
+// );
+//
+// A non-null UserApcReserve requests a special user APC, which executes
+// immediately and is therefore flagged as an additional suspicious signal.
+
+bool HandleNtQueueApcThreadEx(APIContext& ctx) {
+    const GuestHandle threadHandle   = static_cast<GuestHandle>(ctx.GetArg(0));
+    const GuestHandle userApcReserve = static_cast<GuestHandle>(ctx.GetArg(1));
+    const GuestAddress apcRoutine    = ctx.GetArgPtr(2);
+    const GuestAddress apcArg1       = ctx.GetArgPtr(3);
+    const bool specialUserApc        = userApcReserve != kNullHandle;
+
+    if (threadHandle != kCurrentThread) {
+        auto entry = ctx.Handles().Lookup(threadHandle, HandleType::Thread);
+        if (!entry) {
+            ctx.SetReturnNtStatus(NT::STATUS_INVALID_HANDLE);
+            return true;
+        }
+    }
+
+    if (apcRoutine == 0) {
+        ctx.SetReturnNtStatus(NT::STATUS_INVALID_PARAMETER);
+        return true;
+    }
+
+    ApplyApcBehaviorFlags(ctx, threadHandle, apcRoutine, apcArg1,
+                          specialUserApc);
+    ctx.SetReturnNtStatus(NT::STATUS_SUCCESS);
+    return true;
+}
+
+// ============================================================================
 // NtSetInformationThread
 // ============================================================================
 // NTSTATUS NtSetInformationThread(
@@ -549,6 +774,10 @@ void RegisterNtThread(APIDispatcher& dispatcher) noexcept {
           HandleNtQueryInformationThread,   5, true },
         { "ntdll.dll", "NtSetInformationThread",
           HandleNtSetInformationThread,     4, true },
+        { "ntdll.dll", "NtQueueApcThread",
+          HandleNtQueueApcThread,           5, true },
+        { "ntdll.dll", "NtQueueApcThreadEx",
+          HandleNtQueueApcThreadEx,         6, true },
     };
 
     dispatcher.RegisterBatch(regs, static_cast<uint32_t>(std::size(regs)));

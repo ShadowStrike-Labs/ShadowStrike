@@ -191,7 +191,7 @@ private:
                      uint64_t* outArgs) const noexcept;
 
     // Post-call behavioral flag detection
-    void DetectBehaviors(const HandlerEntry& entry, const APICallDetail& detail) noexcept;
+    void DetectBehaviors(const HandlerEntry& entry, APICallDetail& detail) noexcept;
 
     // === DLL Registration Helpers (called by RegisterAll) ===
     void RegisterNtdll() noexcept;

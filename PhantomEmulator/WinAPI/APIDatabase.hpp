@@ -87,6 +87,8 @@ namespace Syscall {
     static constexpr uint16_t NtQueryObject                = 0x0010;
     static constexpr uint16_t NtSetInformationFile         = 0x0027;
     static constexpr uint16_t NtQueryInformationFile       = 0x0011;
+    static constexpr uint16_t NtQueueApcThread             = 0x0045;
+    static constexpr uint16_t NtQueueApcThreadEx           = 0x00C4;
     static constexpr uint16_t NtQueryDirectoryFile         = 0x0035;
     static constexpr uint16_t NtDeviceIoControlFile        = 0x0007;
     static constexpr uint16_t NtOpenProcessToken           = 0x012A;
@@ -136,6 +138,8 @@ static constexpr KnownAPIEntry kKnownAPIs[] = {
     { "ntdll.dll", "NtTerminateThread",          2, APICategory::Thread,     BehaviorFlag::None,              Syscall::NtTerminateThread },
     { "ntdll.dll", "NtQueryInformationThread",   5, APICategory::Thread,     BehaviorFlag::None,              Syscall::NtQueryInformationThread },
     { "ntdll.dll", "NtSetInformationThread",     4, APICategory::Thread,     BehaviorFlag::AntiAnalysis,      Syscall::NtSetInformationThread },
+    { "ntdll.dll", "NtQueueApcThread",           5, APICategory::Thread,     BehaviorFlag::ProcessInjection,  Syscall::NtQueueApcThread },
+    { "ntdll.dll", "NtQueueApcThreadEx",         6, APICategory::Thread,     BehaviorFlag::ProcessInjection,  Syscall::NtQueueApcThreadEx },
 
     // === Ntdll: Registry ===
     { "ntdll.dll", "NtOpenKey",                  3, APICategory::Registry,   BehaviorFlag::None,              Syscall::NtOpenKey },

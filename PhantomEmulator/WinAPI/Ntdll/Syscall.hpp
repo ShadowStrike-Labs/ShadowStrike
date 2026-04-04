@@ -78,6 +78,7 @@ private:
 
     [[nodiscard]] bool IsFromNtdll(GuestAddress returnAddr) const noexcept;
 
+    APIDispatcher* m_dispatcher = nullptr;
     GuestAddress m_ntdllBase = 0;
     GuestSize    m_ntdllSize = 0;
 };

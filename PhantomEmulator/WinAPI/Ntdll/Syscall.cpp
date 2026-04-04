@@ -24,6 +24,11 @@
 #include "Syscall.hpp"
 #include "NtMemory.hpp"
 #include "NtFile.hpp"
+#include "NtThread.hpp"
+#include "NtProcess.hpp"
+#include "NtRegistry.hpp"
+#include "NtSystem.hpp"
+#include "NtToken.hpp"
 #include "../APIDispatcher.hpp"
 #include "../APIDatabase.hpp"
 #include "../HandleTable.hpp"
@@ -53,69 +58,74 @@ struct SyscallMapping {
 
 // The mappings below cover every Nt* function for which we have both a
 // syscall number (in APIDatabase.hpp  Syscall::) and a concrete handler.
-// Functions that are in the database but lack a handler (e.g. NtOpenProcess,
-// token/registry/sync stubs that may not yet be implemented) are mapped to
-// nullptr and will be treated as "unknown" at dispatch time until their
-// handlers land.
+// Entries that remain nullptr are limited to syscalls that still do not have
+// a concrete emulator implementation in the Nt* modules.
 
 static constexpr SyscallMapping kSyscallMap[] = {
     // Memory
-    { Syscall::NtAllocateVirtualMemory,  HandleNtAllocateVirtualMemory },
-    { Syscall::NtProtectVirtualMemory,   HandleNtProtectVirtualMemory  },
-    { Syscall::NtFreeVirtualMemory,      HandleNtFreeVirtualMemory     },
-    { Syscall::NtReadVirtualMemory,      HandleNtReadVirtualMemory     },
-    { Syscall::NtWriteVirtualMemory,     HandleNtWriteVirtualMemory    },
-    { Syscall::NtQueryVirtualMemory,     HandleNtQueryVirtualMemory    },
-    { Syscall::NtCreateSection,          HandleNtCreateSection         },
-    { Syscall::NtMapViewOfSection,       HandleNtMapViewOfSection      },
-    { Syscall::NtUnmapViewOfSection,     HandleNtUnmapViewOfSection    },
+    { Syscall::NtAllocateVirtualMemory,   HandleNtAllocateVirtualMemory  },
+    { Syscall::NtProtectVirtualMemory,    HandleNtProtectVirtualMemory   },
+    { Syscall::NtFreeVirtualMemory,       HandleNtFreeVirtualMemory      },
+    { Syscall::NtReadVirtualMemory,       HandleNtReadVirtualMemory      },
+    { Syscall::NtWriteVirtualMemory,      HandleNtWriteVirtualMemory     },
+    { Syscall::NtQueryVirtualMemory,      HandleNtQueryVirtualMemory     },
+    { Syscall::NtCreateSection,           HandleNtCreateSection          },
+    { Syscall::NtMapViewOfSection,        HandleNtMapViewOfSection       },
+    { Syscall::NtUnmapViewOfSection,      HandleNtUnmapViewOfSection     },
 
     // File / IO
-    { Syscall::NtCreateFile,             HandleNtCreateFile            },
-    { Syscall::NtReadFile,               HandleNtReadFile              },
-    { Syscall::NtWriteFile,              HandleNtWriteFile             },
-    { Syscall::NtClose,                  HandleNtClose                 },
-    { Syscall::NtSetInformationFile,     HandleNtSetInformationFile    },
-    { Syscall::NtQueryInformationFile,   HandleNtQueryInformationFile  },
-    { Syscall::NtQueryDirectoryFile,     HandleNtQueryDirectoryFile    },
-    { Syscall::NtDeviceIoControlFile,    HandleNtDeviceIoControlFile   },
+    { Syscall::NtCreateFile,              HandleNtCreateFile             },
+    { Syscall::NtReadFile,                HandleNtReadFile               },
+    { Syscall::NtWriteFile,               HandleNtWriteFile              },
+    { Syscall::NtClose,                   HandleNtClose                  },
+    { Syscall::NtSetInformationFile,      HandleNtSetInformationFile     },
+    { Syscall::NtQueryInformationFile,    HandleNtQueryInformationFile   },
+    { Syscall::NtQueryDirectoryFile,      HandleNtQueryDirectoryFile     },
+    { Syscall::NtDeviceIoControlFile,     HandleNtDeviceIoControlFile    },
 
-    // Stubs not yet implemented — nullptr lets Dispatch() handle them
-    // gracefully so that we still record the syscall number for analysis.
-    { Syscall::NtOpenProcess,            nullptr },
-    { Syscall::NtTerminateProcess,       nullptr },
-    { Syscall::NtQueryInformationProcess,nullptr },
-    { Syscall::NtCreateThreadEx,         nullptr },
-    { Syscall::NtResumeThread,           nullptr },
-    { Syscall::NtSuspendThread,          nullptr },
-    { Syscall::NtTerminateThread,        nullptr },
-    { Syscall::NtQueryInformationThread, nullptr },
-    { Syscall::NtSetInformationThread,   nullptr },
-    { Syscall::NtOpenKey,                nullptr },
-    { Syscall::NtCreateKey,              nullptr },
-    { Syscall::NtSetValueKey,            nullptr },
-    { Syscall::NtQueryValueKey,          nullptr },
-    { Syscall::NtDeleteKey,              nullptr },
-    { Syscall::NtDeleteValueKey,         nullptr },
-    { Syscall::NtEnumerateKey,           nullptr },
-    { Syscall::NtEnumerateValueKey,      nullptr },
-    { Syscall::NtQuerySystemInformation, nullptr },
-    { Syscall::NtQueryPerformanceCounter,nullptr },
-    { Syscall::NtDelayExecution,         nullptr },
-    { Syscall::NtWaitForSingleObject,    nullptr },
-    { Syscall::NtWaitForMultipleObjects, nullptr },
-    { Syscall::NtCreateEvent,            nullptr },
-    { Syscall::NtSetEvent,               nullptr },
-    { Syscall::NtCreateMutant,           nullptr },
-    { Syscall::NtOpenMutant,             nullptr },
-    { Syscall::NtQueryObject,            nullptr },
-    { Syscall::NtDuplicateObject,        nullptr },
-    { Syscall::NtOpenKeyEx,              nullptr },
-    { Syscall::NtOpenSection,            nullptr },
-    { Syscall::NtOpenProcessToken,       nullptr },
-    { Syscall::NtOpenThreadToken,        nullptr },
-    { Syscall::NtQueryInformationToken,  nullptr },
-    { Syscall::NtAdjustPrivilegesToken,  nullptr },
+    // Process / thread
+    { Syscall::NtOpenProcess,             HandleNtOpenProcess            },
+    { Syscall::NtTerminateProcess,        HandleNtTerminateProcess       },
+    { Syscall::NtQueryInformationProcess, HandleNtQueryInformationProcess },
+    { Syscall::NtCreateThreadEx,          HandleNtCreateThreadEx         },
+    { Syscall::NtResumeThread,            HandleNtResumeThread           },
+    { Syscall::NtSuspendThread,           HandleNtSuspendThread          },
+    { Syscall::NtTerminateThread,         HandleNtTerminateThread        },
+    { Syscall::NtQueryInformationThread,  HandleNtQueryInformationThread },
+    { Syscall::NtSetInformationThread,    HandleNtSetInformationThread   },
+    { Syscall::NtQueueApcThread,          HandleNtQueueApcThread         },
+    { Syscall::NtQueueApcThreadEx,        HandleNtQueueApcThreadEx       },
+
+    // Registry
+    { Syscall::NtOpenKey,                 HandleNtOpenKey                },
+    { Syscall::NtCreateKey,               HandleNtCreateKey              },
+    { Syscall::NtSetValueKey,             HandleNtSetValueKey            },
+    { Syscall::NtQueryValueKey,           HandleNtQueryValueKey          },
+    { Syscall::NtDeleteKey,               HandleNtDeleteKey              },
+    { Syscall::NtDeleteValueKey,          HandleNtDeleteValueKey         }, // Shares 0x0041 with NtAdjustPrivilegesToken in APIDatabase.
+    { Syscall::NtEnumerateKey,            HandleNtEnumerateKey           },
+    { Syscall::NtEnumerateValueKey,       HandleNtEnumerateValueKey      },
+    { Syscall::NtOpenKeyEx,               nullptr                        }, // No dedicated NtOpenKeyEx handler is implemented yet.
+
+    // System / timing / object
+    { Syscall::NtQuerySystemInformation,  HandleNtQuerySystemInformation },
+    { Syscall::NtQueryPerformanceCounter, HandleNtQueryPerformanceCounter },
+    { Syscall::NtDelayExecution,          HandleNtDelayExecution         },
+    { Syscall::NtWaitForSingleObject,     nullptr                        }, // Synchronization wait handler not implemented yet.
+    { Syscall::NtWaitForMultipleObjects,  nullptr                        }, // Synchronization wait handler not implemented yet.
+    { Syscall::NtCreateEvent,             nullptr                        }, // Event creation handler not implemented yet.
+    { Syscall::NtSetEvent,                nullptr                        }, // Event signaling handler not implemented yet.
+    { Syscall::NtCreateMutant,            nullptr                        }, // Mutant creation handler not implemented yet.
+    { Syscall::NtOpenMutant,              nullptr                        }, // NtOpenMutant handler not implemented yet.
+    { Syscall::NtQueryObject,             HandleNtQueryObject            },
+    { Syscall::NtDuplicateObject,         HandleNtDuplicateObject        },
+    { Syscall::NtOpenSection,             nullptr                        }, // NtOpenSection handler not implemented yet.
+
+    // Token / security
+    { Syscall::NtOpenProcessToken,        HandleNtOpenProcessToken       },
+    { Syscall::NtOpenThreadToken,         HandleNtOpenThreadToken        },
+    { Syscall::NtQueryInformationToken,   HandleNtQueryInformationToken  },
+    { Syscall::NtAdjustPrivilegesToken,   HandleNtAdjustPrivilegesToken  }, // Shares 0x0041 with NtDeleteValueKey in APIDatabase.
 };
 
 static constexpr uint32_t kSyscallMapCount =
@@ -147,7 +157,8 @@ SyscallDispatcher::SyscallDispatcher() noexcept {
 // Initialize — populate handler array from the static mapping table
 // ============================================================================
 
-void SyscallDispatcher::Initialize(APIDispatcher& /*dispatcher*/) noexcept {
+void SyscallDispatcher::Initialize(APIDispatcher& dispatcher) noexcept {
+    m_dispatcher = &dispatcher;
     m_handlers.fill(nullptr);
 
     for (uint32_t i = 0; i < kSyscallMapCount; ++i) {
@@ -271,7 +282,7 @@ bool SyscallDispatcher::Dispatch(CPUState& cpu, VirtualMemory& mem,
     }
 
     // ---- Build APIContext and invoke the handler -------------------------
-    APIContext ctx(cpu, mem, handles, config, tls);
+    APIContext ctx(cpu, mem, handles, config, tls, m_dispatcher);
     const bool continueExec = m_handlers[syscallNum](ctx);
 
     // ---- Simulate SYSRET / IRET -----------------------------------------
