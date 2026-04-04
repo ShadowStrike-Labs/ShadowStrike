@@ -47,6 +47,8 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+#include "../HashStore/HashStore.hpp"
+#include "../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -55,7 +57,7 @@
 #include <filesystem>
 #include <fstream>
 #include <deque>
-#include <regex>
+#include <list>
 #include <format>
 #include <nlohmann/json.hpp>
 
@@ -140,18 +142,77 @@ struct FileSystemFilter::Impl {
     // Exclusions
     std::vector<FilterExclusion> m_exclusions;
 
-    // Scan Cache: Path -> (Verdict, Expiry)
+    // Scan Cache: LRU — list front is most-recently-used
     struct CacheEntry {
+        std::wstring path;
         ScanVerdict verdict;
         std::chrono::system_clock::time_point expiry;
     };
-    std::unordered_map<std::wstring, CacheEntry> m_scanCache;
+    std::list<CacheEntry> m_cacheOrder;
+    std::unordered_map<std::wstring, std::list<CacheEntry>::iterator> m_scanCache;
 
     // Pending Requests: MessageId -> Event
     std::unordered_map<uint64_t, FileAccessEvent> m_pendingRequests;
 
-    // Statistics
-    FileSystemFilterStats m_stats;
+    // Statistics (internal atomics — snapshotted for public GetStats())
+    struct InternalStats {
+        std::atomic<uint64_t> totalScanRequests{ 0 };
+        std::atomic<uint64_t> scanRequestsCompleted{ 0 };
+        std::atomic<uint64_t> filesAllowed{ 0 };
+        std::atomic<uint64_t> filesBlocked{ 0 };
+        std::atomic<uint64_t> filesQuarantined{ 0 };
+        std::atomic<uint64_t> scanTimeouts{ 0 };
+        std::atomic<uint64_t> scanErrors{ 0 };
+        std::atomic<uint64_t> cacheHits{ 0 };
+        std::atomic<uint64_t> cacheMisses{ 0 };
+        std::atomic<uint64_t> notificationsReceived{ 0 };
+        std::atomic<uint64_t> exclusionsMatched{ 0 };
+        std::atomic<uint32_t> pendingRequests{ 0 };
+        std::atomic<uint32_t> peakPendingRequests{ 0 };
+        std::atomic<uint64_t> avgScanTimeUs{ 0 };
+        std::atomic<uint64_t> totalBytesScanned{ 0 };
+        std::atomic<uint32_t> driverReconnects{ 0 };
+
+        void Reset() noexcept {
+            totalScanRequests.store(0, std::memory_order_relaxed);
+            scanRequestsCompleted.store(0, std::memory_order_relaxed);
+            filesAllowed.store(0, std::memory_order_relaxed);
+            filesBlocked.store(0, std::memory_order_relaxed);
+            filesQuarantined.store(0, std::memory_order_relaxed);
+            scanTimeouts.store(0, std::memory_order_relaxed);
+            scanErrors.store(0, std::memory_order_relaxed);
+            cacheHits.store(0, std::memory_order_relaxed);
+            cacheMisses.store(0, std::memory_order_relaxed);
+            notificationsReceived.store(0, std::memory_order_relaxed);
+            exclusionsMatched.store(0, std::memory_order_relaxed);
+            pendingRequests.store(0, std::memory_order_relaxed);
+            peakPendingRequests.store(0, std::memory_order_relaxed);
+            avgScanTimeUs.store(0, std::memory_order_relaxed);
+            totalBytesScanned.store(0, std::memory_order_relaxed);
+            driverReconnects.store(0, std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] FileSystemFilterStats Snapshot() const noexcept {
+            FileSystemFilterStats s;
+            s.totalScanRequests = totalScanRequests.load(std::memory_order_relaxed);
+            s.scanRequestsCompleted = scanRequestsCompleted.load(std::memory_order_relaxed);
+            s.filesAllowed = filesAllowed.load(std::memory_order_relaxed);
+            s.filesBlocked = filesBlocked.load(std::memory_order_relaxed);
+            s.filesQuarantined = filesQuarantined.load(std::memory_order_relaxed);
+            s.scanTimeouts = scanTimeouts.load(std::memory_order_relaxed);
+            s.scanErrors = scanErrors.load(std::memory_order_relaxed);
+            s.cacheHits = cacheHits.load(std::memory_order_relaxed);
+            s.cacheMisses = cacheMisses.load(std::memory_order_relaxed);
+            s.notificationsReceived = notificationsReceived.load(std::memory_order_relaxed);
+            s.exclusionsMatched = exclusionsMatched.load(std::memory_order_relaxed);
+            s.pendingRequests = pendingRequests.load(std::memory_order_relaxed);
+            s.peakPendingRequests = peakPendingRequests.load(std::memory_order_relaxed);
+            s.avgScanTimeUs = avgScanTimeUs.load(std::memory_order_relaxed);
+            s.totalBytesScanned = totalBytesScanned.load(std::memory_order_relaxed);
+            s.driverReconnects = driverReconnects.load(std::memory_order_relaxed);
+            return s;
+        }
+    } m_stats;
 
     // Callbacks
     ScanRequestCallback m_scanCallback;
@@ -173,11 +234,11 @@ struct FileSystemFilter::Impl {
     bool Initialize(std::shared_ptr<Utils::ThreadPool> threadPool,
                     const FileSystemFilterConfig& config) {
         if (m_initialized.exchange(true)) {
-            Utils::Logger::Warn(L"FileSystemFilter: Already initialized");
+            Utils::Logger::Warn("FileSystemFilter: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"FileSystemFilter: Initializing...");
+        Utils::Logger::Info("FileSystemFilter: Initializing...");
         SetStatus(FilterStatus::Initializing);
 
         m_threadPool = threadPool;
@@ -191,14 +252,14 @@ struct FileSystemFilter::Impl {
         // (Config exclusions would be populated from policy)
 
         SetStatus(FilterStatus::Stopped);
-        Utils::Logger::Info(L"FileSystemFilter: Initialized successfully");
+        Utils::Logger::Info("FileSystemFilter: Initialized successfully");
         return true;
     }
 
     void Shutdown() {
         if (!m_initialized.exchange(false)) return;
 
-        Utils::Logger::Info(L"FileSystemFilter: Shutting down...");
+        Utils::Logger::Info("FileSystemFilter: Shutting down...");
 
         Stop();
 
@@ -211,6 +272,7 @@ struct FileSystemFilter::Impl {
         {
             std::unique_lock lock(m_cacheMutex);
             m_scanCache.clear();
+            m_cacheOrder.clear();
         }
 
         {
@@ -227,20 +289,20 @@ struct FileSystemFilter::Impl {
         }
 
         SetStatus(FilterStatus::NotInitialized);
-        Utils::Logger::Info(L"FileSystemFilter: Shutdown complete");
+        Utils::Logger::Info("FileSystemFilter: Shutdown complete");
     }
 
     bool Start() {
         if (m_running.exchange(true)) {
-            Utils::Logger::Warn(L"FileSystemFilter: Already running");
+            Utils::Logger::Warn("FileSystemFilter: Already running");
             return true;
         }
 
-        Utils::Logger::Info(L"FileSystemFilter: Starting...");
+        Utils::Logger::Info("FileSystemFilter: Starting...");
 
         // Attempt to connect to driver
         if (!ConnectToDriver()) {
-            Utils::Logger::Warn(L"FileSystemFilter: Driver not available. Running in user-mode only.");
+            Utils::Logger::Warn("FileSystemFilter: Driver not available. Running in user-mode only.");
             // Don't fail - we can still function without the driver for testing
         }
 
@@ -254,14 +316,14 @@ struct FileSystemFilter::Impl {
         }
 
         SetStatus(FilterStatus::Running);
-        Utils::Logger::Info(L"FileSystemFilter: Started successfully");
+        Utils::Logger::Info("FileSystemFilter: Started successfully");
         return true;
     }
 
     void Stop() {
         if (!m_running.exchange(false)) return;
 
-        Utils::Logger::Info(L"FileSystemFilter: Stopping...");
+        Utils::Logger::Info("FileSystemFilter: Stopping...");
 
         // Stop message threads
         m_stopMessageLoop = true;
@@ -278,20 +340,20 @@ struct FileSystemFilter::Impl {
         m_messageThreads.clear();
 
         SetStatus(FilterStatus::Stopped);
-        Utils::Logger::Info(L"FileSystemFilter: Stopped");
+        Utils::Logger::Info("FileSystemFilter: Stopped");
     }
 
     void Pause() {
         if (m_status == FilterStatus::Running) {
             SetStatus(FilterStatus::Paused);
-            Utils::Logger::Info(L"FileSystemFilter: Paused");
+            Utils::Logger::Info("FileSystemFilter: Paused");
         }
     }
 
     void Resume() {
         if (m_status == FilterStatus::Paused) {
             SetStatus(FilterStatus::Running);
-            Utils::Logger::Info(L"FileSystemFilter: Resumed");
+            Utils::Logger::Info("FileSystemFilter: Resumed");
         }
     }
 
@@ -301,7 +363,8 @@ struct FileSystemFilter::Impl {
 
     bool ConnectToDriver() {
 #ifdef _WIN32
-        Utils::Logger::Info(L"FileSystemFilter: Connecting to driver port: {}", m_portName);
+        Utils::Logger::Info("FileSystemFilter: Connecting to driver port: {}",
+            Utils::StringUtils::ToNarrow(m_portName));
 
         // Connect to the minifilter communication port
         HRESULT hr = FilterConnectCommunicationPort(
@@ -316,13 +379,13 @@ struct FileSystemFilter::Impl {
         if (FAILED(hr)) {
             DWORD err = HRESULT_CODE(hr);
             if (err == ERROR_FILE_NOT_FOUND) {
-                Utils::Logger::Warn(L"FileSystemFilter: Driver not installed (port not found)");
+                Utils::Logger::Warn("FileSystemFilter: Driver not installed (port not found)");
                 SetStatus(FilterStatus::DriverNotInstalled);
             } else if (err == ERROR_ACCESS_DENIED) {
-                Utils::Logger::Error(L"FileSystemFilter: Access denied connecting to driver");
+                Utils::Logger::Error("FileSystemFilter: Access denied connecting to driver");
                 SetStatus(FilterStatus::AccessDenied);
             } else {
-                Utils::Logger::Error(L"FileSystemFilter: Failed to connect to driver, HRESULT: 0x{:08X}", hr);
+                Utils::Logger::Error("FileSystemFilter: Failed to connect to driver, HRESULT: 0x{:08X}", hr);
                 SetStatus(FilterStatus::Error);
             }
             return false;
@@ -337,13 +400,13 @@ struct FileSystemFilter::Impl {
         );
 
         if (!m_hCompletionPort) {
-            Utils::Logger::Error(L"FileSystemFilter: Failed to create completion port");
+            Utils::Logger::Error("FileSystemFilter: Failed to create completion port");
             CloseHandle(m_hPort);
             m_hPort = INVALID_HANDLE_VALUE;
             return false;
         }
 
-        Utils::Logger::Info(L"FileSystemFilter: Connected to driver successfully");
+        Utils::Logger::Info("FileSystemFilter: Connected to driver successfully");
         m_stats.driverReconnects++;
         return true;
 #else
@@ -377,7 +440,7 @@ struct FileSystemFilter::Impl {
     // =========================================================================
 
     void MessageLoop() {
-        Utils::Logger::Info(L"FileSystemFilter: Message thread started");
+        Utils::Logger::Info("FileSystemFilter: Message thread started");
 
         // Allocate message buffer
         std::vector<uint8_t> buffer(m_config.messageBufferSize);
@@ -403,7 +466,7 @@ struct FileSystemFilter::Impl {
                     // Port closed, exit loop
                     break;
                 }
-                Utils::Logger::Error(L"FileSystemFilter: FilterGetMessage failed: 0x{:08X}", hr);
+                Utils::Logger::Error("FileSystemFilter: FilterGetMessage failed: 0x{:08X}", hr);
                 continue;
             }
 
@@ -412,14 +475,14 @@ struct FileSystemFilter::Impl {
             const FilterMessageHeader* header = static_cast<const FilterMessageHeader*>(data);
 
             if (header->magic != FilterConstants::MESSAGE_MAGIC) {
-                Utils::Logger::Warn(L"FileSystemFilter: Invalid message magic");
+                Utils::Logger::Warn("FileSystemFilter: Invalid message magic");
                 continue;
             }
 
             ProcessMessage(header, reinterpret_cast<const uint8_t*>(header) + sizeof(FilterMessageHeader));
         }
 
-        Utils::Logger::Info(L"FileSystemFilter: Message thread exiting");
+        Utils::Logger::Info("FileSystemFilter: Message thread exiting");
     }
 
     void ProcessMessage(const FilterMessageHeader* header, const void* data) {
@@ -440,7 +503,7 @@ struct FileSystemFilter::Impl {
                 break;
 
             default:
-                Utils::Logger::Warn(L"FileSystemFilter: Unknown message type: {}",
+                Utils::Logger::Warn("FileSystemFilter: Unknown message type: {}",
                     static_cast<uint16_t>(header->messageType));
                 break;
         }
@@ -564,8 +627,8 @@ struct FileSystemFilter::Impl {
             try {
                 return m_scanCallback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"FileSystemFilter: Scan callback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("FileSystemFilter: Scan callback exception: {}",
+                    e.what());
             }
         }
 
@@ -608,7 +671,7 @@ struct FileSystemFilter::Impl {
 
                     case Core::Engine::ScanVerdict::Infected:
                         InvokeThreatCallbacks(event,
-                            Utils::StringUtils::Utf8ToWide(result.threatName),
+                            Utils::StringUtils::ToWide(result.threatName),
                             result.threatScore);
                         return ScanVerdict::BlockAndQuarantine;
 
@@ -617,7 +680,7 @@ struct FileSystemFilter::Impl {
                     case Core::Engine::ScanVerdict::Adware:
                     case Core::Engine::ScanVerdict::Riskware:
                         InvokeThreatCallbacks(event,
-                            Utils::StringUtils::Utf8ToWide(result.threatName),
+                            Utils::StringUtils::ToWide(result.threatName),
                             result.threatScore);
                         return ScanVerdict::Block;
 
@@ -635,8 +698,8 @@ struct FileSystemFilter::Impl {
                 }
 
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"FileSystemFilter: ScanEngine exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("FileSystemFilter: ScanEngine exception: {}",
+                    e.what());
 
                 if (m_config.blockOnError) return ScanVerdict::Block;
             }
@@ -645,12 +708,33 @@ struct FileSystemFilter::Impl {
         // 3. Check hash store if available
         if (m_hashStore) {
             try {
-                // Calculate hash and check against known malware/whitelist
-                // auto hash = Utils::HashUtils::CalculateSHA256(event.filePath);
-                // if (m_hashStore->IsKnownMalware(hash)) return ScanVerdict::Block;
-                // if (m_hashStore->IsWhitelisted(hash)) return ScanVerdict::Allow;
-            } catch (...) {
-                // Hash calculation may fail for locked files
+                std::vector<uint8_t> hashBytes;
+                Utils::HashUtils::Error hashErr;
+                if (Utils::HashUtils::ComputeFile(
+                        Utils::HashUtils::Algorithm::SHA256,
+                        event.filePath, hashBytes, &hashErr)) {
+                    // Convert raw hash to hex string for lookup
+                    std::string hexHash;
+                    hexHash.reserve(hashBytes.size() * 2);
+                    for (uint8_t b : hashBytes) {
+                        char buf[3];
+                        std::snprintf(buf, sizeof(buf), "%02x", b);
+                        hexHash.append(buf, 2);
+                    }
+
+                    auto detection = m_hashStore->LookupHashString(
+                        hexHash, HashStore::HashType::SHA256);
+                    if (detection.has_value()) {
+                        Utils::Logger::Warn(
+                            "FileSystemFilter: Hash match — {} flagged as {}",
+                            Utils::StringUtils::ToNarrow(event.filePath),
+                            detection->signatureName);
+                        return ScanVerdict::Block;
+                    }
+                }
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("FileSystemFilter: Hash store check failed: {}",
+                    e.what());
             }
         }
 
@@ -685,7 +769,7 @@ struct FileSystemFilter::Impl {
         );
 
         if (FAILED(hr)) {
-            Utils::Logger::Error(L"FileSystemFilter: FilterReplyMessage failed: 0x{:08X}", hr);
+            Utils::Logger::Error("FileSystemFilter: FilterReplyMessage failed: 0x{:08X}", hr);
         }
     }
 
@@ -797,7 +881,8 @@ struct FileSystemFilter::Impl {
 
         // Also check whitelist store
         if (m_whitelistStore) {
-            // Would check: m_whitelistStore->IsWhitelisted(event.filePath);
+            auto result = m_whitelistStore->IsPathWhitelisted(event.filePath);
+            if (result.found) return true;
         }
 
         return false;
@@ -807,12 +892,13 @@ struct FileSystemFilter::Impl {
         std::unique_lock lock(m_exclusionMutex);
 
         if (m_exclusions.size() >= FilterConstants::MAX_EXCLUSION_PATHS) {
-            Utils::Logger::Error(L"FileSystemFilter: Maximum exclusions reached");
+            Utils::Logger::Error("FileSystemFilter: Maximum exclusions reached");
             return false;
         }
 
         m_exclusions.push_back(exclusion);
-        Utils::Logger::Info(L"FileSystemFilter: Added exclusion: {}", exclusion.pattern);
+        Utils::Logger::Info("FileSystemFilter: Added exclusion: {}",
+            Utils::StringUtils::ToNarrow(exclusion.pattern));
         return true;
     }
 
@@ -824,7 +910,8 @@ struct FileSystemFilter::Impl {
 
         if (it != m_exclusions.end()) {
             m_exclusions.erase(it, m_exclusions.end());
-            Utils::Logger::Info(L"FileSystemFilter: Removed exclusion: {}", pattern);
+            Utils::Logger::Info("FileSystemFilter: Removed exclusion: {}",
+                Utils::StringUtils::ToNarrow(pattern));
             return true;
         }
         return false;
@@ -833,7 +920,7 @@ struct FileSystemFilter::Impl {
     void ClearExclusions() {
         std::unique_lock lock(m_exclusionMutex);
         m_exclusions.clear();
-        Utils::Logger::Info(L"FileSystemFilter: Cleared all exclusions");
+        Utils::Logger::Info("FileSystemFilter: Cleared all exclusions");
     }
 
     std::vector<FilterExclusion> GetExclusions() const {
@@ -854,17 +941,26 @@ struct FileSystemFilter::Impl {
     std::optional<ScanVerdict> CheckCache(const std::wstring& path) {
         if (!m_config.enableCache) return std::nullopt;
 
-        std::shared_lock lock(m_cacheMutex);
+        std::unique_lock lock(m_cacheMutex);
 
         auto it = m_scanCache.find(path);
         if (it == m_scanCache.end()) return std::nullopt;
 
+        auto listIt = it->second;
+
         // Check expiry
-        if (Now() > it->second.expiry) {
+        if (Now() > listIt->expiry) {
+            m_cacheOrder.erase(listIt);
+            m_scanCache.erase(it);
             return std::nullopt;
         }
 
-        return it->second.verdict;
+        // Move to front (most-recently-used)
+        if (listIt != m_cacheOrder.begin()) {
+            m_cacheOrder.splice(m_cacheOrder.begin(), m_cacheOrder, listIt);
+        }
+
+        return listIt->verdict;
     }
 
     void UpdateCache(const std::wstring& path, ScanVerdict verdict) {
@@ -881,33 +977,50 @@ struct FileSystemFilter::Impl {
 
         std::unique_lock lock(m_cacheMutex);
 
-        // Evict if at capacity
-        if (m_scanCache.size() >= m_config.cacheCapacity) {
-            // Simple: remove first entry (could use LRU)
-            m_scanCache.erase(m_scanCache.begin());
+        auto existing = m_scanCache.find(path);
+        if (existing != m_scanCache.end()) {
+            // Update existing: move to front
+            existing->second->verdict = verdict;
+            existing->second->expiry = Now() + std::chrono::seconds(m_config.cacheTTLSeconds);
+            m_cacheOrder.splice(m_cacheOrder.begin(), m_cacheOrder, existing->second);
+            return;
+        }
+
+        // Evict LRU entry if at capacity
+        while (m_scanCache.size() >= m_config.cacheCapacity && !m_cacheOrder.empty()) {
+            auto& lru = m_cacheOrder.back();
+            m_scanCache.erase(lru.path);
+            m_cacheOrder.pop_back();
         }
 
         CacheEntry entry;
+        entry.path = path;
         entry.verdict = verdict;
         entry.expiry = Now() + std::chrono::seconds(m_config.cacheTTLSeconds);
 
-        m_scanCache[path] = entry;
+        m_cacheOrder.push_front(std::move(entry));
+        m_scanCache[path] = m_cacheOrder.begin();
     }
 
     void FlushCache() {
         std::unique_lock lock(m_cacheMutex);
         m_scanCache.clear();
-        Utils::Logger::Info(L"FileSystemFilter: Cache flushed");
+        m_cacheOrder.clear();
+        Utils::Logger::Info("FileSystemFilter: Cache flushed");
     }
 
     void InvalidateCacheEntry(const std::wstring& path) {
         std::unique_lock lock(m_cacheMutex);
-        m_scanCache.erase(path);
+        auto it = m_scanCache.find(path);
+        if (it != m_scanCache.end()) {
+            m_cacheOrder.erase(it->second);
+            m_scanCache.erase(it);
+        }
     }
 
     double GetCacheHitRate() const noexcept {
-        uint64_t hits = m_stats.cacheHits.load();
-        uint64_t misses = m_stats.cacheMisses.load();
+        uint64_t hits = m_stats.cacheHits.load(std::memory_order_relaxed);
+        uint64_t misses = m_stats.cacheMisses.load(std::memory_order_relaxed);
         uint64_t total = hits + misses;
         return total > 0 ? (static_cast<double>(hits) / total) * 100.0 : 0.0;
     }
@@ -938,9 +1051,32 @@ struct FileSystemFilter::Impl {
             m_config.cacheTTLSeconds = policy.cacheTTLSeconds;
         }
 
-        // TODO: Send policy to kernel driver if connected
+        // Forward policy to kernel driver if connected
+        if (m_hPort != INVALID_HANDLE_VALUE) {
+            struct PolicyMsg {
+                FilterMessageHeader fsfHeader;
+                PolicyUpdate payload;
+            };
+            PolicyMsg msg{};
+            msg.fsfHeader.magic = FilterConstants::MESSAGE_MAGIC;
+            msg.fsfHeader.version = FilterConstants::PROTOCOL_VERSION;
+            msg.fsfHeader.messageType = FilterMessageType::UpdatePolicy;
+            msg.fsfHeader.messageId = GenerateMessageId();
+            msg.fsfHeader.dataSize = static_cast<uint32_t>(sizeof(PolicyUpdate));
+            msg.payload = policy;
 
-        Utils::Logger::Info(L"FileSystemFilter: Policy updated");
+            DWORD bytesReturned = 0;
+            HRESULT hr = FilterSendMessage(
+                m_hPort, &msg, sizeof(msg),
+                nullptr, 0, &bytesReturned);
+            if (FAILED(hr)) {
+                Utils::Logger::Warn(
+                    "FileSystemFilter: Failed to forward policy to driver: 0x{:08X}",
+                    static_cast<uint32_t>(hr));
+            }
+        }
+
+        Utils::Logger::Info("FileSystemFilter: Policy updated");
         return true;
     }
 
@@ -955,22 +1091,21 @@ struct FileSystemFilter::Impl {
             return status;
         }
 
-        // TODO: Send query to driver and parse response
-        // For now, return placeholder values
-        status.versionMajor = 3;
-        status.versionMinor = 0;
-        status.versionBuild = 0;
+        // Populate from actual internal state
         status.filteringActive = m_running.load();
-        status.scanOnOpenEnabled = m_config.scanOnOpen;
-        status.scanOnExecuteEnabled = m_config.scanOnExecute;
-        status.scanOnWriteEnabled = m_config.scanOnWrite;
-        status.notificationsEnabled = m_config.enableNotifications;
-        status.totalFilesScanned = m_stats.totalScanRequests.load();
-        status.filesBlocked = m_stats.filesBlocked.load();
-        status.pendingRequests = m_stats.pendingRequests.load();
-        status.peakPendingRequests = m_stats.peakPendingRequests.load();
-        status.cacheHits = m_stats.cacheHits.load();
-        status.cacheMisses = m_stats.cacheMisses.load();
+        {
+            std::shared_lock lock(m_configMutex);
+            status.scanOnOpenEnabled = m_config.scanOnOpen;
+            status.scanOnExecuteEnabled = m_config.scanOnExecute;
+            status.scanOnWriteEnabled = m_config.scanOnWrite;
+            status.notificationsEnabled = m_config.enableNotifications;
+        }
+        status.totalFilesScanned = m_stats.totalScanRequests.load(std::memory_order_relaxed);
+        status.filesBlocked = m_stats.filesBlocked.load(std::memory_order_relaxed);
+        status.pendingRequests = m_stats.pendingRequests.load(std::memory_order_relaxed);
+        status.peakPendingRequests = m_stats.peakPendingRequests.load(std::memory_order_relaxed);
+        status.cacheHits = m_stats.cacheHits.load(std::memory_order_relaxed);
+        status.cacheMisses = m_stats.cacheMisses.load(std::memory_order_relaxed);
 
         return status;
     }
@@ -1040,8 +1175,8 @@ struct FileSystemFilter::Impl {
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"FileSystemFilter: Notification callback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("FileSystemFilter: Notification callback exception: {}",
+                    e.what());
             }
         }
     }
@@ -1052,8 +1187,8 @@ struct FileSystemFilter::Impl {
             try {
                 callback(status, message);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"FileSystemFilter: Status callback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("FileSystemFilter: Status callback exception: {}",
+                    e.what());
             }
         }
     }
@@ -1065,8 +1200,8 @@ struct FileSystemFilter::Impl {
             try {
                 callback(event, threatName, score);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"FileSystemFilter: Threat callback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("FileSystemFilter: Threat callback exception: {}",
+                    e.what());
             }
         }
     }
@@ -1155,7 +1290,7 @@ FilterStatus FileSystemFilter::GetStatus() const noexcept {
 void FileSystemFilter::UpdateConfig(const FileSystemFilterConfig& config) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"FileSystemFilter: Configuration updated");
+    Utils::Logger::Info("FileSystemFilter: Configuration updated");
 }
 
 FileSystemFilterConfig FileSystemFilter::GetConfig() const {
@@ -1245,8 +1380,52 @@ bool FileSystemFilter::IsProcessExcluded(const std::wstring& processName,
 }
 
 bool FileSystemFilter::SyncExclusionsToDriver() {
-    // TODO: Send exclusion list to kernel driver
-    Utils::Logger::Info(L"FileSystemFilter: Exclusions synced to driver");
+    if (m_impl->m_hPort == INVALID_HANDLE_VALUE) {
+        Utils::Logger::Warn("FileSystemFilter: Cannot sync exclusions — driver not connected");
+        return false;
+    }
+
+    std::shared_lock lock(m_impl->m_exclusionMutex);
+
+    // Serialize each exclusion and send to driver via FilterSendMessage
+    for (const auto& excl : m_impl->m_exclusions) {
+        if (excl.expiration.has_value() && Now() > excl.expiration.value()) continue;
+
+        struct ExclMsg {
+            FilterMessageHeader header;
+            uint32_t exclusionType;
+            uint16_t patternLength;
+            wchar_t pattern[260];
+        };
+        ExclMsg msg{};
+
+        msg.header.magic = FilterConstants::MESSAGE_MAGIC;
+        msg.header.version = FilterConstants::PROTOCOL_VERSION;
+        msg.header.messageType = FilterMessageType::UpdateExclusions;
+        msg.header.messageId = GenerateMessageId();
+        msg.exclusionType = static_cast<uint32_t>(excl.type);
+        size_t copyLen = (std::min)(excl.pattern.size(), static_cast<size_t>(259));
+        wcsncpy_s(msg.pattern, excl.pattern.c_str(), copyLen);
+        msg.patternLength = static_cast<uint16_t>(copyLen);
+        msg.header.dataSize = static_cast<uint32_t>(
+            sizeof(msg.exclusionType) + sizeof(msg.patternLength) +
+            (copyLen + 1) * sizeof(wchar_t));
+
+        DWORD bytesReturned = 0;
+        HRESULT hr = FilterSendMessage(
+            m_impl->m_hPort, &msg,
+            sizeof(msg.header) + msg.header.dataSize,
+            nullptr, 0, &bytesReturned);
+        if (FAILED(hr)) {
+            Utils::Logger::Error(
+                "FileSystemFilter: Failed to sync exclusion '{}' to driver: 0x{:08X}",
+                Utils::StringUtils::ToNarrow(excl.pattern), static_cast<uint32_t>(hr));
+            return false;
+        }
+    }
+
+    Utils::Logger::Info("FileSystemFilter: {} exclusions synced to driver",
+        m_impl->m_exclusions.size());
     return true;
 }
 
@@ -1278,8 +1457,38 @@ void FileSystemFilter::InvalidateCacheEntry(const std::wstring& path) {
 }
 
 void FileSystemFilter::InvalidateCacheEntryByHash(const std::string& hash) {
-    // Would need hash-to-path mapping for this
-    Utils::Logger::Warn(L"FileSystemFilter: InvalidateCacheEntryByHash not implemented");
+    if (hash.empty()) return;
+
+    std::unique_lock lock(m_impl->m_cacheMutex);
+
+    // Iterate cache entries and remove any whose file currently hashes to `hash`
+    // This is expensive (O(n) with file I/O) so should be called rarely
+    std::vector<std::wstring> keysToRemove;
+    for (const auto& [path, entry] : m_impl->m_scanCache) {
+        std::vector<uint8_t> hashBytes;
+        if (Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256, path, hashBytes)) {
+            std::string hexHash;
+            hexHash.reserve(hashBytes.size() * 2);
+            for (uint8_t b : hashBytes) {
+                char buf[3];
+                std::snprintf(buf, sizeof(buf), "%02x", b);
+                hexHash.append(buf, 2);
+            }
+            if (hexHash == hash) {
+                keysToRemove.push_back(path);
+            }
+        }
+    }
+
+    for (const auto& key : keysToRemove) {
+        m_impl->m_scanCache.erase(key);
+    }
+
+    if (!keysToRemove.empty()) {
+        Utils::Logger::Info("FileSystemFilter: Invalidated {} cache entries by hash",
+            keysToRemove.size());
+    }
 }
 
 double FileSystemFilter::GetCacheHitRate() const noexcept {
@@ -1311,7 +1520,7 @@ bool FileSystemFilter::Reconnect() {
 // ============================================================================
 
 FileSystemFilterStats FileSystemFilter::GetStats() const {
-    return m_impl->m_stats;
+    return m_impl->m_stats.Snapshot();
 }
 
 void FileSystemFilter::ResetStats() {
@@ -1356,22 +1565,27 @@ bool FileSystemFilter::UnregisterThreatCallback(uint64_t callbackId) {
 // ============================================================================
 
 void FileSystemFilter::SetScanEngine(Core::Engine::ScanEngine* engine) {
+    std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_scanEngine = engine;
 }
 
 void FileSystemFilter::SetThreatDetector(Core::Engine::ThreatDetector* detector) {
+    std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_threatDetector = detector;
 }
 
 void FileSystemFilter::SetWhitelistStore(Whitelist::WhitelistStore* store) {
+    std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_whitelistStore = store;
 }
 
 void FileSystemFilter::SetHashStore(HashStore::HashStore* store) {
+    std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_hashStore = store;
 }
 
 void FileSystemFilter::SetCacheManager(Utils::CacheManager* cache) {
+    std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_cacheManager = cache;
 }
 
@@ -1446,46 +1660,96 @@ std::wstring GetFileExtension(const std::wstring& path) noexcept {
 }
 
 std::wstring NormalizePath(const std::wstring& path) noexcept {
-    std::wstring result = path;
+    if (path.empty()) return {};
 
-    // Convert forward slashes to backslashes
-    std::replace(result.begin(), result.end(), L'/', L'\\');
+    std::wstring resolved;
 
-    // Remove trailing backslash
-    while (!result.empty() && result.back() == L'\\') {
-        result.pop_back();
+    // Resolve reparse points (junctions/symlinks) via GetFinalPathNameByHandleW
+    HANDLE hFile = CreateFileW(
+        path.c_str(),
+        0,  // No access needed
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_FLAG_BACKUP_SEMANTICS,
+        nullptr);
+
+    if (hFile != INVALID_HANDLE_VALUE) {
+        DWORD needed = GetFinalPathNameByHandleW(hFile, nullptr, 0, FILE_NAME_NORMALIZED);
+        if (needed > 0 && needed <= 32768) {
+            auto buf = std::make_unique<wchar_t[]>(needed);
+            DWORD written = GetFinalPathNameByHandleW(
+                hFile, buf.get(), needed, FILE_NAME_NORMALIZED);
+            if (written > 0 && written < needed) {
+                resolved.assign(buf.get(), written);
+                // Strip \\?\ prefix
+                if (resolved.starts_with(L"\\\\?\\")) {
+                    resolved = resolved.substr(4);
+                }
+            }
+        }
+        CloseHandle(hFile);
     }
 
-    // Convert to lowercase for comparison
-    std::transform(result.begin(), result.end(), result.begin(),
+    // Fallback to GetFullPathNameW for non-existent files
+    if (resolved.empty()) {
+        DWORD needed = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+        if (needed > 0 && needed <= 32768) {
+            auto buf = std::make_unique<wchar_t[]>(needed);
+            DWORD written = GetFullPathNameW(path.c_str(), needed, buf.get(), nullptr);
+            if (written > 0 && written < needed) {
+                resolved.assign(buf.get(), written);
+            } else {
+                resolved = path;
+            }
+        } else {
+            resolved = path;
+        }
+    }
+
+    // Convert forward slashes to backslashes
+    std::replace(resolved.begin(), resolved.end(), L'/', L'\\');
+
+    // Remove trailing backslash
+    while (resolved.size() > 3 && resolved.back() == L'\\') {
+        resolved.pop_back();
+    }
+
+    // Lowercase for comparison
+    std::transform(resolved.begin(), resolved.end(), resolved.begin(),
         [](wchar_t c) { return static_cast<wchar_t>(std::tolower(c)); });
 
-    return result;
+    return resolved;
 }
 
 bool PathMatchesPattern(const std::wstring& path, const std::wstring& pattern,
                         bool caseInsensitive) noexcept {
-    try {
-        std::wstring p = caseInsensitive ? ToLowerW(path) : path;
-        std::wstring pat = caseInsensitive ? ToLowerW(pattern) : pattern;
+    const std::wstring& p = caseInsensitive ? ToLowerW(path) : path;
+    const std::wstring& pat = caseInsensitive ? ToLowerW(pattern) : pattern;
 
-        // Convert wildcard pattern to regex
-        std::wstring regexPat;
-        for (wchar_t c : pat) {
-            switch (c) {
-                case L'*': regexPat += L".*"; break;
-                case L'?': regexPat += L"."; break;
-                case L'.': regexPat += L"\\."; break;
-                case L'\\': regexPat += L"\\\\"; break;
-                default: regexPat += c; break;
-            }
+    // O(n*m) worst-case wildcard matching without regex compilation
+    size_t pi = 0, si = 0;
+    size_t starIdx = std::wstring::npos, matchIdx = 0;
+
+    while (si < p.size()) {
+        if (pi < pat.size() && (pat[pi] == L'?' || pat[pi] == p[si])) {
+            ++pi;
+            ++si;
+        } else if (pi < pat.size() && pat[pi] == L'*') {
+            starIdx = pi;
+            matchIdx = si;
+            ++pi;
+        } else if (starIdx != std::wstring::npos) {
+            pi = starIdx + 1;
+            ++matchIdx;
+            si = matchIdx;
+        } else {
+            return false;
         }
-
-        std::wregex rx(regexPat);
-        return std::regex_match(p, rx);
-    } catch (...) {
-        return false;
     }
+
+    while (pi < pat.size() && pat[pi] == L'*') ++pi;
+    return pi == pat.size();
 }
 
 bool IsExecutableExtension(const std::wstring& extension) noexcept {
