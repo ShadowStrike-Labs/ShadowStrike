@@ -897,6 +897,9 @@ struct alignas(64) RTPStatistics {
     std::atomic<uint64_t> excludedByProcess{ 0 };
     std::atomic<uint64_t> excludedByHash{ 0 };
 
+    // Threat detection counter (unified across all detection methods)
+    std::atomic<uint64_t> threatsDetected{ 0 };
+
     // Performance metrics
     PerformanceMetrics performance;
 
