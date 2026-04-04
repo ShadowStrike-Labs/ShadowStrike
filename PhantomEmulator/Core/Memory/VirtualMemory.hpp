@@ -28,7 +28,7 @@ struct PageEntry {
     uint8_t*  hostPtr    = nullptr;    // Host-allocated backing memory (4KB)
     MemProt   protection = MemProt::None;
     bool      dirty      = false;       // Has been written
-    bool      accessed   = false;       // Has been read or executed
+    mutable bool accessed = false;      // Has been read or executed (mutable: set under shared lock)
     bool      present    = false;       // Is allocated
     bool      guardPage  = false;       // Guard page (one-shot exception)
 };

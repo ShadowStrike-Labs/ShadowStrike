@@ -67,7 +67,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
     }
 
     // === MOVAPS xmm, xmm/m128 (0F 28) ===
-    // === MOVAPS xmm/m128, xmm (0F 29) ===
+    // === MOVAPS xmm, xmm/m128 (0F 28) — requires 16-byte alignment ===
+    // === MOVAPS xmm/m128, xmm (0F 29) — requires 16-byte alignment ===
     if (op == 0x28 || op == 0x29) {
         if (op == 0x28) {
             // xmm ← xmm/m128
@@ -76,6 +77,7 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
                 m_state.XMM(dstIdx) = m_state.XMM(inst.Op(1).reg.regIndex);
             } else {
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
+                if (addr & 0xF) return ErrorCode::UnalignedAccess;
                 auto err = mem.Read(addr, m_state.XMM(dstIdx).u8, 16);
                 if (err != ErrorCode::Success) return err;
             }
@@ -86,6 +88,7 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
                 m_state.XMM(inst.Op(0).reg.regIndex) = m_state.XMM(srcIdx);
             } else {
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+                if (addr & 0xF) return ErrorCode::UnalignedAccess;
                 auto err = mem.Write(addr, m_state.XMM(srcIdx).u8, 16);
                 if (err != ErrorCode::Success) return err;
             }
@@ -118,8 +121,8 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
         return ErrorCode::Success;
     }
 
-    // === MOVDQA xmm, xmm/m128 (66 0F 6F) ===
-    // === MOVDQA xmm/m128, xmm (66 0F 7F) ===
+    // === MOVDQA xmm, xmm/m128 (66 0F 6F) — requires 16-byte alignment ===
+    // === MOVDQA xmm/m128, xmm (66 0F 7F) — requires 16-byte alignment ===
     if ((op == 0x6F || op == 0x7F) && has66) {
         if (op == 0x6F) {
             uint8_t dstIdx = inst.Op(0).reg.regIndex;
@@ -127,6 +130,7 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
                 m_state.XMM(dstIdx) = m_state.XMM(inst.Op(1).reg.regIndex);
             } else {
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
+                if (addr & 0xF) return ErrorCode::UnalignedAccess;
                 auto err = mem.Read(addr, m_state.XMM(dstIdx).u8, 16);
                 if (err != ErrorCode::Success) return err;
             }
@@ -136,6 +140,7 @@ ErrorCode CPU::ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) n
                 m_state.XMM(inst.Op(0).reg.regIndex) = m_state.XMM(srcIdx);
             } else {
                 GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+                if (addr & 0xF) return ErrorCode::UnalignedAccess;
                 auto err = mem.Write(addr, m_state.XMM(srcIdx).u8, 16);
                 if (err != ErrorCode::Success) return err;
             }

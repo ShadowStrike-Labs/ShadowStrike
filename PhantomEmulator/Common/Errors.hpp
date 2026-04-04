@@ -173,7 +173,7 @@ public:
 };
 
 class MemoryException : public EmulationException {
-    GuestAddress m_faultAddress;
+    GuestAddress m_faultAddress = 0;
 public:
     MemoryException(ErrorCode code, GuestAddress faultAddr, std::string_view detail = {})
         : EmulationException(code, detail)

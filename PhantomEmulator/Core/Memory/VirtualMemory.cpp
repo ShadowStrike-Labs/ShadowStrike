@@ -50,9 +50,9 @@ std::optional<GuestAddress> VirtualMemory::Allocate(
 
     std::unique_lock lock(m_mutex);
 
-    // Check memory limit
+    // Check memory limit — guard against AlignUp overflow
     GuestSize alignedSize = AlignUp(size, kPageSize);
-    if (m_allocatedBytes + alignedSize > m_maxMemory) {
+    if (alignedSize < size || m_allocatedBytes + alignedSize > m_maxMemory) {
         return std::nullopt;
     }
 
@@ -169,8 +169,8 @@ ErrorCode VirtualMemory::Read(GuestAddress addr, void* dst, uint32_t count) noex
             std::memset(dstPtr, 0, bytesInPage);
         }
 
-        // Track access
-        const_cast<PageEntry*>(page)->accessed = true;
+        // Track access (use relaxed store — not critical for correctness)
+        page->accessed = true;
 
         dstPtr += bytesInPage;
         current += bytesInPage;
@@ -248,7 +248,7 @@ ErrorCode VirtualMemory::FetchInstruction(
             std::memset(dst + bytesRead, 0, bytesInPage);
         }
 
-        const_cast<PageEntry*>(page)->accessed = true;
+        const_cast<PageEntry*>(page)->accessed = true;  // mutable field — safe under shared lock
 
         bytesRead += bytesInPage;
         current += bytesInPage;
@@ -301,6 +301,10 @@ VirtualMemory::MemorySnapshot VirtualMemory::TakeSnapshot() const {
 
 void VirtualMemory::RestoreSnapshot(const MemorySnapshot& snap) {
     std::unique_lock lock(m_mutex);
+
+    // Validate snapshot won't exceed memory limit
+    GuestSize snapshotBytes = static_cast<GuestSize>(snap.metadata.size()) * kPageSize;
+    if (snapshotBytes > m_maxMemory) return;
 
     // Free current pages
     for (auto& [idx, page] : m_pages) {

@@ -60,7 +60,11 @@ static constexpr GuestSize    kHeapInitial     = 4 * 1024 * 1024;       // 4 MB 
 }
 
 [[nodiscard]] constexpr uint32_t PagesNeeded(GuestSize size) noexcept {
-    return static_cast<uint32_t>((size + kPageMask) >> kPageShift);
+    if (size == 0) return 0;
+    // Guard against overflow: size + kPageMask could wrap for sizes near UINT64_MAX
+    GuestSize roundedUp = (size >> kPageShift) + ((size & kPageMask) ? 1 : 0);
+    if (roundedUp > kMaxPages) return kMaxPages;
+    return static_cast<uint32_t>(roundedUp);
 }
 
 // ============================================================================
@@ -202,11 +206,15 @@ struct MemoryRegion {
     bool         wasExecuted;        // Track W→X transitions
 
     [[nodiscard]] bool Contains(GuestAddress addr) const noexcept {
-        return addr >= base && addr < (base + size);
+        // Overflow-safe: instead of addr < (base + size) which can wrap
+        return addr >= base && (addr - base) < size;
     }
 
     [[nodiscard]] bool Overlaps(GuestAddress otherBase, GuestSize otherSize) const noexcept {
-        return base < (otherBase + otherSize) && otherBase < (base + size);
+        // Overflow-safe overlap check
+        if (size == 0 || otherSize == 0) return false;
+        return otherBase < base ? (otherBase - 1 + otherSize >= base)
+                                : (base - 1 + size >= otherBase);
     }
 };
 

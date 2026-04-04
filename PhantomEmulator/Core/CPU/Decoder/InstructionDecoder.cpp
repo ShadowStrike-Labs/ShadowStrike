@@ -633,6 +633,7 @@ uint8_t InstructionDecoder::OpcodeImmediateSize(
         switch (opcode) {
             case 0x70: case 0x71: case 0x72: case 0x73:
             case 0xC2: case 0xC4: case 0xC5: case 0xC6:
+            case 0xBA: // BT/BTS/BTR/BTC r/m, imm8
                 return 1;
             default:
                 return 0;

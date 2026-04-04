@@ -85,7 +85,7 @@ void CPUState::Reset32() noexcept {
     mxcsr = 0x1F80;
 
     instructionCount = 0;
-    tsc = 0x0000000100000000ULL;  // Start at a plausible value, not zero
+    tsc = 0x00000389A7C21E40ULL;  // ~3.9 trillion — realistic for a system booted ~17 minutes ago at 3.8GHz
     tscIncrement = 25;
 }
 

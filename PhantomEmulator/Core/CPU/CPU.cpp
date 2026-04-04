@@ -550,6 +550,7 @@ ErrorCode CPU::DispatchInstruction(
         // === SYSCALL (0x05) ===
         if (op == 0x05) {
             if (m_syscallCallback && m_syscallCallback(m_state, memory)) {
+                m_state.AdvanceRIP(inst.length);
                 return ErrorCode::Success;
             }
             return ErrorCode::InvalidSystemCall;
@@ -619,7 +620,8 @@ ErrorCode CPU::DispatchInstruction(
 
 bool CPU::IsAPIHookAddress(GuestAddress addr) const noexcept {
     if (m_apiHookSize == 0) return false;
-    return addr >= m_apiHookBase && addr < (m_apiHookBase + m_apiHookSize);
+    // Overflow-safe range check: avoid (base + size) wrapping
+    return addr >= m_apiHookBase && (addr - m_apiHookBase) < m_apiHookSize;
 }
 
 // ============================================================================
