@@ -282,7 +282,8 @@ struct ProcessCreationMonitor::Impl {
     mutable std::shared_mutex rulesMutex;
     std::vector<ProcessPolicyRule> rules;
 
-    // External Integrations
+    // External Integrations (guarded by integrationMutex)
+    mutable std::shared_mutex integrationMutex;
     Core::Engine::ScanEngine* scanEngine = nullptr;
     Core::Engine::ThreatDetector* threatDetector = nullptr;
     Core::Engine::BehaviorAnalyzer* behaviorAnalyzer = nullptr;
@@ -368,6 +369,23 @@ struct ProcessCreationMonitor::Impl {
             cfg = config;
         }
 
+        // Snapshot integration pointers under shared lock — Set* methods take unique_lock
+        Core::Engine::ScanEngine* localScanEngine = nullptr;
+        Core::Engine::ThreatDetector* localThreatDetector = nullptr;
+        Core::Engine::BehaviorAnalyzer* localBehaviorAnalyzer = nullptr;
+        Whitelist::WhitelistStore* localWhitelistStore = nullptr;
+        HashStore::HashStore* localHashStore = nullptr;
+        ThreatIntel::ThreatIntelIndex* localThreatIntelIndex = nullptr;
+        {
+            std::shared_lock intLock(integrationMutex);
+            localScanEngine       = scanEngine;
+            localThreatDetector   = threatDetector;
+            localBehaviorAnalyzer = behaviorAnalyzer;
+            localWhitelistStore   = whitelistStore;
+            localHashStore        = hashStore;
+            localThreatIntelIndex = threatIntelIndex;
+        }
+
         // 1. Basic Allow/Block based on config
         if (!cfg.enabled) {
             stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
@@ -375,19 +393,18 @@ struct ProcessCreationMonitor::Impl {
         }
 
         // 2. Check Whitelist
-        if (cfg.trustWhitelisted && whitelistStore) {
-            auto wlResult = whitelistStore->IsWhitelisted(event.imagePath);
+        if (cfg.trustWhitelisted && localWhitelistStore) {
+            auto wlResult = localWhitelistStore->IsWhitelisted(event.imagePath);
             if (wlResult.found) {
-                // Still update tree, but skip heavy scanning
-                UpdateProcessState(event, ProcessVerdict::Allow);
+                UpdateProcessState(event, ProcessVerdict::Allow, cfg);
                 stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
                 return ProcessVerdict::Allow;
             }
         }
 
         // 3. Hash Check
-        if (cfg.blockKnownMalicious && hashStore && !event.imageHash.empty()) {
-            auto detection = hashStore->LookupHashString(
+        if (cfg.blockKnownMalicious && localHashStore && !event.imageHash.empty()) {
+            auto detection = localHashStore->LookupHashString(
                 event.imageHash, HashStore::HashType::SHA256);
             if (detection.has_value()) {
                 stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -413,11 +430,17 @@ struct ProcessCreationMonitor::Impl {
                 stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
                 return ProcessVerdict::Block;
             }
+            if (*ruleVerdict == ProcessVerdict::Allow) {
+                // Explicit Allow rule — trusted process, skip further expensive checks
+                UpdateProcessState(event, ProcessVerdict::Allow, cfg);
+                stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
+                return ProcessVerdict::Allow;
+            }
         }
 
         // 6. Pre-Execution Scan (if enabled and not trusted)
         ProcessVerdict scanVerdict = ProcessVerdict::Allow;
-        if (cfg.preExecutionScan && scanEngine) {
+        if (cfg.preExecutionScan && localScanEngine) {
             // Check if we should scan (e.g. not Microsoft signed if trusted)
             bool shouldScan = true;
             if (cfg.trustMicrosoftSigned && event.isImageSigned &&
@@ -460,7 +483,7 @@ struct ProcessCreationMonitor::Impl {
 
         // 8. Update State (Process Tree)
         if (finalVerdict != ProcessVerdict::Block) {
-            UpdateProcessState(event, finalVerdict);
+            UpdateProcessState(event, finalVerdict, cfg);
         }
 
         // Update timing stats with atomic EMA (CAS loop prevents torn update)
@@ -482,8 +505,9 @@ struct ProcessCreationMonitor::Impl {
         return finalVerdict;
     }
 
-    void UpdateProcessState(const ProcessCreateEvent& event, ProcessVerdict verdict) {
-        if (!config.trackParentChild) return;
+    void UpdateProcessState(const ProcessCreateEvent& event, ProcessVerdict verdict,
+                            const ProcessMonitorConfig& cfg) {
+        if (!cfg.trackParentChild) return;
 
         std::unique_lock lock(processMutex);
 
@@ -497,7 +521,7 @@ struct ProcessCreationMonitor::Impl {
         stats.trackedProcesses.store(activeProcesses.size(), std::memory_order_relaxed);
 
         // Update Tree
-        if (config.buildProcessTree) {
+        if (cfg.buildProcessTree) {
             ProcessTreeNode node;
             node.process = info;
             node.parentPid = event.parentProcessId;
@@ -1432,26 +1456,32 @@ bool ProcessCreationMonitor::UnregisterSuspiciousCallback(uint64_t callbackId) {
 
 // Integration
 void ProcessCreationMonitor::SetScanEngine(Core::Engine::ScanEngine* engine) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->scanEngine = engine;
 }
 
 void ProcessCreationMonitor::SetThreatDetector(Core::Engine::ThreatDetector* detector) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->threatDetector = detector;
 }
 
 void ProcessCreationMonitor::SetBehaviorAnalyzer(Core::Engine::BehaviorAnalyzer* analyzer) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->behaviorAnalyzer = analyzer;
 }
 
 void ProcessCreationMonitor::SetWhitelistStore(Whitelist::WhitelistStore* store) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->whitelistStore = store;
 }
 
 void ProcessCreationMonitor::SetHashStore(HashStore::HashStore* store) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->hashStore = store;
 }
 
 void ProcessCreationMonitor::SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* index) {
+    std::unique_lock lock(m_impl->integrationMutex);
     m_impl->threatIntelIndex = index;
 }
 
