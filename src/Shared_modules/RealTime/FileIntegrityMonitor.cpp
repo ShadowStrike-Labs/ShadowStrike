@@ -322,17 +322,41 @@ namespace {
 std::wstring NormalizeFilePath(const std::wstring& path) noexcept {
     if (path.empty()) return {};
     try {
-        wchar_t buf[MAX_PATH_LEN]{};
-        DWORD len = ::GetFullPathNameW(path.c_str(), MAX_PATH_LEN, buf, nullptr);
+        // Resolve through reparse points (junctions/symlinks) via GetFinalPathNameByHandleW
+        HANDLE hFile = ::CreateFileW(path.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                     nullptr, OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (hFile != INVALID_HANDLE_VALUE) {
+            auto buf = std::make_unique<wchar_t[]>(MAX_PATH_LEN);
+            DWORD len = ::GetFinalPathNameByHandleW(hFile, buf.get(), MAX_PATH_LEN,
+                                                     FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+            ::CloseHandle(hFile);
+            if (len > 0 && len < MAX_PATH_LEN) {
+                std::wstring result(buf.get(), len);
+                // Strip \\?\ prefix if present
+                if (result.size() > 4 && result.compare(0, 4, L"\\\\?\\") == 0)
+                    result = result.substr(4);
+                std::transform(result.begin(), result.end(), result.begin(), ::towlower);
+                return result;
+            }
+        }
+        // Fallback for non-existent files: lexical normalization only
+        auto buf = std::make_unique<wchar_t[]>(MAX_PATH_LEN);
+        DWORD len = ::GetFullPathNameW(path.c_str(), MAX_PATH_LEN, buf.get(), nullptr);
         if (len == 0 || len >= MAX_PATH_LEN) {
             std::wstring result(path);
             std::transform(result.begin(), result.end(), result.begin(), ::towlower);
             return result;
         }
-        std::wstring result(buf, len);
+        std::wstring result(buf.get(), len);
         std::transform(result.begin(), result.end(), result.begin(), ::towlower);
         return result;
-    } catch (...) { return {}; }
+    } catch (const std::exception& ex) {
+        SS_LOG_WARN(L"FIM", L"NormalizeFilePath exception for '%s': %hs", path.c_str(), ex.what());
+        return {};
+    } catch (...) {
+        SS_LOG_WARN(L"FIM", L"NormalizeFilePath unknown exception for: %s", path.c_str());
+        return {};
+    }
 }
 
 bool PathMatchesPattern(const std::wstring& path, const std::wstring& pattern) noexcept {
@@ -590,6 +614,11 @@ struct FileIntegrityMonitor::Impl {
         if (!state.compare_exchange_strong(expected, State::Monitoring))
             return;
 
+        // Ensure any previous threads are fully joined before launching new ones
+        if (dirMonitorThread.joinable()) dirMonitorThread.join();
+        if (verifyThread.joinable())     verifyThread.join();
+        if (changeQueueThread.joinable()) changeQueueThread.join();
+
         stopFlag.store(false, std::memory_order_release);
 
         dirMonitorThread = std::thread([this] {
@@ -618,8 +647,9 @@ struct FileIntegrityMonitor::Impl {
     }
 
     void DoStop() noexcept {
-        state.store(State::Ready, std::memory_order_release);
+        // Signal threads to stop BEFORE changing state to prevent DoStart() re-entry race
         stopFlag.store(true, std::memory_order_release);
+        state.store(State::Ready, std::memory_order_release);
 
         changeQueueCV.notify_all();
 
@@ -693,10 +723,12 @@ struct FileIntegrityMonitor::Impl {
 
         HashAlgorithm algo;
         bool calcSecondary;
+        size_t maxFiles;
         {
             std::shared_lock lk(configMutex);
             algo = config.hashAlgorithm;
             calcSecondary = config.calculateSecondaryHash;
+            maxFiles = config.maxMonitoredFiles;
         }
 
         FileBaseline baseline{};
@@ -737,19 +769,21 @@ struct FileIntegrityMonitor::Impl {
 
         {
             std::unique_lock lk(baselineMutex);
-            if (baselines.size() >= config.maxMonitoredFiles) {
+            if (baselines.size() >= maxFiles) {
                 SS_LOG_WARN(L"FIM", L"Baseline limit reached (%zu), cannot add: %s",
-                            config.maxMonitoredFiles, normPath.c_str());
+                            maxFiles, normPath.c_str());
                 return false;
             }
-            auto [it, inserted] = baselines.emplace(normPath, std::move(baseline));
-            if (!inserted) {
+            auto it = baselines.find(normPath);
+            if (it != baselines.end()) {
                 it->second = std::move(baseline);
                 stats.baselinesUpdated.fetch_add(1, std::memory_order_relaxed);
+            } else {
+                baselines.emplace(normPath, std::move(baseline));
+                stats.baselinesCreated.fetch_add(1, std::memory_order_relaxed);
+                stats.monitoredFiles.fetch_add(1, std::memory_order_relaxed);
             }
         }
-        stats.baselinesCreated.fetch_add(1, std::memory_order_relaxed);
-        stats.monitoredFiles.fetch_add(1, std::memory_order_relaxed);
         return true;
     }
 
@@ -822,13 +856,8 @@ struct FileIntegrityMonitor::Impl {
             return result;
         }
 
-        // Hash check
-        HashAlgorithm algo;
-        {
-            std::shared_lock lk(configMutex);
-            algo = config.hashAlgorithm;
-        }
-        if (!ComputeFileHashHex(normPath, algo, result.currentHash)) {
+        // Hash check — always use SHA-256 to match the hashSHA256 baseline field
+        if (!ComputeFileHashHex(normPath, HashAlgorithm::SHA256, result.currentHash)) {
             result.status = VerificationStatus::Error;
             result.errorMessage = L"Hash computation failed";
             return result;
@@ -1003,13 +1032,8 @@ struct FileIntegrityMonitor::Impl {
         }
 
         if (hasBaseline && changeType != FileChangeType::Deleted) {
-            HashAlgorithm algo;
-            {
-                std::shared_lock lk(configMutex);
-                algo = config.hashAlgorithm;
-            }
             std::string currentHash;
-            if (ComputeFileHashHex(normPath, algo, currentHash)) {
+            if (ComputeFileHashHex(normPath, HashAlgorithm::SHA256, currentHash)) {
                 evt.oldHash = storedBaseline.hashSHA256;
                 evt.newHash = currentHash;
                 if (currentHash != storedBaseline.hashSHA256) {
@@ -1607,13 +1631,8 @@ bool FileIntegrityMonitor::QuickVerify(const std::wstring& filePath) {
         storedBaseline = it->second;
     }
 
-    HashAlgorithm algo;
-    {
-        std::shared_lock lk(m_impl->configMutex);
-        algo = m_impl->config.hashAlgorithm;
-    }
     std::string currentHash;
-    if (!ComputeFileHashHex(normPath, algo, currentHash)) return false;
+    if (!ComputeFileHashHex(normPath, HashAlgorithm::SHA256, currentHash)) return false;
     return currentHash == storedBaseline.hashSHA256;
 }
 
@@ -1650,18 +1669,68 @@ std::vector<FileChangeEvent> FileIntegrityMonitor::GetFileChanges(
 // ---- Remediation ----
 
 bool FileIntegrityMonitor::RestoreFile(const std::wstring& filePath) {
-    if (!m_impl->backupManager) {
-        SS_LOG_WARN(L"FIM", L"RestoreFile: no backup manager configured for: %s",
-                    filePath.c_str());
-        m_impl->stats.restoresFailed.fetch_add(1, std::memory_order_relaxed);
+    std::wstring normPath = NormalizeFilePath(filePath);
+    if (normPath.empty()) return false;
 
+    // Locate the baseline to find backup path and expected hash
+    std::wstring backupPath;
+    std::string expectedHash;
+    {
+        std::shared_lock lk(m_impl->baselineMutex);
+        auto it = m_impl->baselines.find(normPath);
+        if (it == m_impl->baselines.end()) {
+            SS_LOG_WARN(L"FIM", L"RestoreFile: no baseline for: %s", normPath.c_str());
+            m_impl->stats.restoresFailed.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
+        backupPath   = it->second.backupPath;
+        expectedHash = it->second.hashSHA256;
+    }
+
+    if (backupPath.empty()) {
+        SS_LOG_WARN(L"FIM", L"RestoreFile: no backup path in baseline for: %s", normPath.c_str());
+        m_impl->stats.restoresFailed.fetch_add(1, std::memory_order_relaxed);
         std::shared_lock lk(m_impl->callbackMutex);
         for (auto& cb : m_impl->restoreCallbacks) {
             try { if (cb.callback) cb.callback(filePath, false); } catch (...) {}
         }
         return false;
     }
+
+    // Perform the actual restore: copy backup over tampered file
+    if (!::CopyFileW(backupPath.c_str(), normPath.c_str(), FALSE)) {
+        DWORD err = ::GetLastError();
+        SS_LOG_ERROR(L"FIM", L"RestoreFile: CopyFileW failed (0x%08X) src=%s dst=%s",
+                     err, backupPath.c_str(), normPath.c_str());
+        m_impl->stats.restoresFailed.fetch_add(1, std::memory_order_relaxed);
+        std::shared_lock lk(m_impl->callbackMutex);
+        for (auto& cb : m_impl->restoreCallbacks) {
+            try { if (cb.callback) cb.callback(filePath, false); } catch (...) {}
+        }
+        return false;
+    }
+
+    // Post-restore integrity verification
+    std::string restoredHash;
+    bool verified = false;
+    if (ComputeFileHashHex(normPath, HashAlgorithm::SHA256, restoredHash)) {
+        verified = (restoredHash == expectedHash);
+        if (!verified) {
+            SS_LOG_ERROR(L"FIM", L"RestoreFile: post-restore hash mismatch for: %s", normPath.c_str());
+        }
+    }
+
+    if (!verified) {
+        m_impl->stats.restoresFailed.fetch_add(1, std::memory_order_relaxed);
+        std::shared_lock lk(m_impl->callbackMutex);
+        for (auto& cb : m_impl->restoreCallbacks) {
+            try { if (cb.callback) cb.callback(filePath, false); } catch (...) {}
+        }
+        return false;
+    }
+
     m_impl->stats.restoresPerformed.fetch_add(1, std::memory_order_relaxed);
+    SS_LOG_INFO(L"FIM", L"RestoreFile: successfully restored: %s", normPath.c_str());
 
     std::shared_lock lk(m_impl->callbackMutex);
     for (auto& cb : m_impl->restoreCallbacks) {
