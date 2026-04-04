@@ -168,6 +168,7 @@ private:
     ErrorCode ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
     ErrorCode ExecuteSSE2(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
     ErrorCode ExecuteSSE4(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
     ErrorCode ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
 
     // === Operand read/write helpers ===
