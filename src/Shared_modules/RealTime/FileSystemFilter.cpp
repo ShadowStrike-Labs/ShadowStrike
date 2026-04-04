@@ -214,6 +214,22 @@ struct FileSystemFilter::Impl {
         }
     } m_stats;
 
+    // Snapshot of config + integration pointers, captured under lock once per
+    // scan request so the hot path never races with Set* / UpdatePolicy.
+    struct ScanSnapshot {
+        Core::Engine::ScanEngine* scanEngine{ nullptr };
+        HashStore::HashStore* hashStore{ nullptr };
+        Whitelist::WhitelistStore* whitelistStore{ nullptr };
+        ScanRequestCallback scanCallback;
+        uint32_t scanTimeoutMs{ 0 };
+        bool blockOnTimeout{ false };
+        bool blockOnError{ false };
+        bool enableCache{ true };
+        bool cacheNegativeResults{ false };
+        uint32_t cacheTTLSeconds{ 300 };
+        size_t cacheCapacity{ 10000 };
+    };
+
     // Callbacks
     ScanRequestCallback m_scanCallback;
     std::unordered_map<uint64_t, FileNotificationCallback> m_notificationCallbacks;
@@ -528,8 +544,29 @@ struct FileSystemFilter::Impl {
         FileAccessEvent event = DecodeEvent(request, data);
         event.timestamp = Now();
 
+        // Snapshot config + integration pointers under lock — the scan hot path
+        // then operates lock-free against Set*/UpdatePolicy races.
+        ScanSnapshot snap;
+        {
+            std::shared_lock configLock(m_configMutex);
+            snap.scanEngine = m_scanEngine;
+            snap.hashStore = m_hashStore;
+            snap.whitelistStore = m_whitelistStore;
+            snap.scanTimeoutMs = m_config.scanTimeoutMs;
+            snap.blockOnTimeout = m_config.blockOnTimeout;
+            snap.blockOnError = m_config.blockOnError;
+            snap.enableCache = m_config.enableCache;
+            snap.cacheNegativeResults = m_config.cacheNegativeResults;
+            snap.cacheTTLSeconds = m_config.cacheTTLSeconds;
+            snap.cacheCapacity = m_config.cacheCapacity;
+        }
+        {
+            std::shared_lock cbLock(m_callbackMutex);
+            snap.scanCallback = m_scanCallback;
+        }
+
         // Check exclusions first
-        if (CheckExclusions(event)) {
+        if (CheckExclusions(event, snap)) {
             m_stats.exclusionsMatched++;
             SendVerdictReply(event.messageId, ScanVerdict::Allow, L"", true);
             m_stats.pendingRequests--;
@@ -538,7 +575,7 @@ struct FileSystemFilter::Impl {
         }
 
         // Check cache
-        auto cachedVerdict = CheckCache(event.filePath);
+        auto cachedVerdict = CheckCache(event.filePath, snap);
         if (cachedVerdict.has_value()) {
             m_stats.cacheHits++;
             ScanVerdict verdict = cachedVerdict.value();
@@ -554,10 +591,10 @@ struct FileSystemFilter::Impl {
         m_stats.cacheMisses++;
 
         // Perform scan
-        ScanVerdict verdict = PerformScan(event);
+        ScanVerdict verdict = PerformScan(event, snap);
 
         // Update cache
-        UpdateCache(event.filePath, verdict);
+        UpdateCache(event.filePath, verdict, snap);
 
         // Send verdict reply
         std::wstring threatName = event.handled ? L"" : L"";  // Would come from scan result
@@ -621,19 +658,19 @@ struct FileSystemFilter::Impl {
         return event;
     }
 
-    ScanVerdict PerformScan(const FileAccessEvent& event) {
-        // 1. Check custom scan callback first
-        if (m_scanCallback) {
+    ScanVerdict PerformScan(const FileAccessEvent& event, const ScanSnapshot& snap) {
+        // 1. Check custom scan callback first (snapshot — no callback lock needed)
+        if (snap.scanCallback) {
             try {
-                return m_scanCallback(event);
+                return snap.scanCallback(event);
             } catch (const std::exception& e) {
                 Utils::Logger::Error("FileSystemFilter: Scan callback exception: {}",
                     e.what());
             }
         }
 
-        // 2. Use integrated scan engine if available
-        if (m_scanEngine) {
+        // 2. Use integrated scan engine if available (snapshot pointer)
+        if (snap.scanEngine) {
             try {
                 Core::Engine::ScanContext context;
                 context.type = Core::Engine::ScanType::RealTime;
@@ -658,10 +695,10 @@ struct FileSystemFilter::Impl {
                 context.filePath = event.filePath;
                 context.isNetworkPath = event.isNetworkFile;
                 context.isRemovableMedia = event.isRemovableMedia;
-                context.timeout = std::chrono::milliseconds(m_config.scanTimeoutMs);
+                context.timeout = std::chrono::milliseconds(snap.scanTimeoutMs);
 
                 // Perform the scan
-                auto result = m_scanEngine->ScanFile(event.filePath, context);
+                auto result = snap.scanEngine->ScanFile(event.filePath, context);
 
                 // Handle results
                 switch (result.verdict) {
@@ -685,10 +722,10 @@ struct FileSystemFilter::Impl {
                         return ScanVerdict::Block;
 
                     case Core::Engine::ScanVerdict::Timeout:
-                        return m_config.blockOnTimeout ? ScanVerdict::Block : ScanVerdict::Timeout;
+                        return snap.blockOnTimeout ? ScanVerdict::Block : ScanVerdict::Timeout;
 
                     case Core::Engine::ScanVerdict::Error:
-                        return m_config.blockOnError ? ScanVerdict::Block : ScanVerdict::Error;
+                        return snap.blockOnError ? ScanVerdict::Block : ScanVerdict::Error;
 
                     case Core::Engine::ScanVerdict::Cancelled:
                         return ScanVerdict::Error;
@@ -701,12 +738,12 @@ struct FileSystemFilter::Impl {
                 Utils::Logger::Error("FileSystemFilter: ScanEngine exception: {}",
                     e.what());
 
-                if (m_config.blockOnError) return ScanVerdict::Block;
+                if (snap.blockOnError) return ScanVerdict::Block;
             }
         }
 
-        // 3. Check hash store if available
-        if (m_hashStore) {
+        // 3. Check hash store if available (snapshot pointer)
+        if (snap.hashStore) {
             try {
                 std::vector<uint8_t> hashBytes;
                 Utils::HashUtils::Error hashErr;
@@ -813,7 +850,7 @@ struct FileSystemFilter::Impl {
     // EXCLUSION MANAGEMENT
     // =========================================================================
 
-    bool CheckExclusions(const FileAccessEvent& event) {
+    bool CheckExclusions(const FileAccessEvent& event, const ScanSnapshot& snap) {
         std::shared_lock lock(m_exclusionMutex);
 
         std::wstring lowerPath = ToLowerW(event.filePath);
@@ -879,9 +916,9 @@ struct FileSystemFilter::Impl {
             }
         }
 
-        // Also check whitelist store
-        if (m_whitelistStore) {
-            auto result = m_whitelistStore->IsPathWhitelisted(event.filePath);
+        // Also check whitelist store (snapshot pointer — no config lock needed)
+        if (snap.whitelistStore) {
+            auto result = snap.whitelistStore->IsPathWhitelisted(event.filePath);
             if (result.found) return true;
         }
 
@@ -931,15 +968,20 @@ struct FileSystemFilter::Impl {
     bool IsPathExcluded(const std::wstring& path) const {
         FileAccessEvent event;
         event.filePath = path;
-        return const_cast<Impl*>(this)->CheckExclusions(event);
+        ScanSnapshot snap{};
+        {
+            std::shared_lock configLock(m_configMutex);
+            snap.whitelistStore = m_whitelistStore;
+        }
+        return const_cast<Impl*>(this)->CheckExclusions(event, snap);
     }
 
     // =========================================================================
     // CACHE MANAGEMENT
     // =========================================================================
 
-    std::optional<ScanVerdict> CheckCache(const std::wstring& path) {
-        if (!m_config.enableCache) return std::nullopt;
+    std::optional<ScanVerdict> CheckCache(const std::wstring& path, const ScanSnapshot& snap) {
+        if (!snap.enableCache) return std::nullopt;
 
         std::unique_lock lock(m_cacheMutex);
 
@@ -963,14 +1005,14 @@ struct FileSystemFilter::Impl {
         return listIt->verdict;
     }
 
-    void UpdateCache(const std::wstring& path, ScanVerdict verdict) {
-        if (!m_config.enableCache) return;
+    void UpdateCache(const std::wstring& path, ScanVerdict verdict, const ScanSnapshot& snap) {
+        if (!snap.enableCache) return;
 
         // Don't cache errors
         if (verdict == ScanVerdict::Error || verdict == ScanVerdict::Timeout) return;
 
         // Maybe don't cache blocks if configured
-        if (!m_config.cacheNegativeResults &&
+        if (!snap.cacheNegativeResults &&
             (verdict == ScanVerdict::Block || verdict == ScanVerdict::BlockAndQuarantine)) {
             return;
         }
@@ -981,13 +1023,13 @@ struct FileSystemFilter::Impl {
         if (existing != m_scanCache.end()) {
             // Update existing: move to front
             existing->second->verdict = verdict;
-            existing->second->expiry = Now() + std::chrono::seconds(m_config.cacheTTLSeconds);
+            existing->second->expiry = Now() + std::chrono::seconds(snap.cacheTTLSeconds);
             m_cacheOrder.splice(m_cacheOrder.begin(), m_cacheOrder, existing->second);
             return;
         }
 
         // Evict LRU entry if at capacity
-        while (m_scanCache.size() >= m_config.cacheCapacity && !m_cacheOrder.empty()) {
+        while (m_scanCache.size() >= snap.cacheCapacity && !m_cacheOrder.empty()) {
             auto& lru = m_cacheOrder.back();
             m_scanCache.erase(lru.path);
             m_cacheOrder.pop_back();
@@ -996,7 +1038,7 @@ struct FileSystemFilter::Impl {
         CacheEntry entry;
         entry.path = path;
         entry.verdict = verdict;
-        entry.expiry = Now() + std::chrono::seconds(m_config.cacheTTLSeconds);
+        entry.expiry = Now() + std::chrono::seconds(snap.cacheTTLSeconds);
 
         m_cacheOrder.push_front(std::move(entry));
         m_scanCache[path] = m_cacheOrder.begin();
@@ -1459,12 +1501,19 @@ void FileSystemFilter::InvalidateCacheEntry(const std::wstring& path) {
 void FileSystemFilter::InvalidateCacheEntryByHash(const std::string& hash) {
     if (hash.empty()) return;
 
-    std::unique_lock lock(m_impl->m_cacheMutex);
+    // Phase 1: Copy cache keys under shared lock (no file I/O under lock)
+    std::vector<std::wstring> cachedPaths;
+    {
+        std::shared_lock lock(m_impl->m_cacheMutex);
+        cachedPaths.reserve(m_impl->m_scanCache.size());
+        for (const auto& [path, _] : m_impl->m_scanCache) {
+            cachedPaths.push_back(path);
+        }
+    }
 
-    // Iterate cache entries and remove any whose file currently hashes to `hash`
-    // This is expensive (O(n) with file I/O) so should be called rarely
+    // Phase 2: Compute hashes lock-free (file I/O happens here)
     std::vector<std::wstring> keysToRemove;
-    for (const auto& [path, entry] : m_impl->m_scanCache) {
+    for (const auto& path : cachedPaths) {
         std::vector<uint8_t> hashBytes;
         if (Utils::HashUtils::ComputeFile(
                 Utils::HashUtils::Algorithm::SHA256, path, hashBytes)) {
@@ -1481,11 +1530,17 @@ void FileSystemFilter::InvalidateCacheEntryByHash(const std::string& hash) {
         }
     }
 
-    for (const auto& key : keysToRemove) {
-        m_impl->m_scanCache.erase(key);
-    }
-
+    // Phase 3: Re-acquire exclusive lock, erase from BOTH cache structures
     if (!keysToRemove.empty()) {
+        std::unique_lock lock(m_impl->m_cacheMutex);
+        for (const auto& key : keysToRemove) {
+            auto it = m_impl->m_scanCache.find(key);
+            if (it != m_impl->m_scanCache.end()) {
+                m_impl->m_cacheOrder.erase(it->second);
+                m_impl->m_scanCache.erase(it);
+            }
+        }
+
         Utils::Logger::Info("FileSystemFilter: Invalidated {} cache entries by hash",
             keysToRemove.size());
     }
