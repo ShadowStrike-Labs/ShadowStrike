@@ -1095,8 +1095,22 @@ public:
         if (m_config.enableFileIntegrity) {
             try {
                 auto& fim = FileIntegrityMonitor::Instance();
-                fim.Start();
-                SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::RUNNING);
+                auto fimConfig = FIMConfig::CreateDefault();
+                if (!fim.Initialize(m_threadPool, fimConfig)) {
+                    Utils::Logger::Error(L"RealTimeProtection: FileIntegrityMonitor::Initialize failed");
+                    SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
+                } else {
+                    fim.StartMonitoring();
+                    fim.CreateSystemBaselines();
+                    SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::RUNNING);
+                    auto fimStats = fim.GetStats();
+                    Utils::Logger::Info(L"RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
+                        fimStats.monitoredFiles, fimStats.monitoredDirectories);
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error(L"RealTimeProtection: FIM startup exception: {}",
+                    Utils::StringUtils::ToWide(ex.what()));
+                SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
             }
@@ -1319,7 +1333,10 @@ public:
         try { ExploitPrevention::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::STOPPED);
 
-        try { FileIntegrityMonitor::Instance().Stop(); } catch (...) {}
+        try {
+            FileIntegrityMonitor::Instance().StopMonitoring();
+            FileIntegrityMonitor::Instance().Shutdown();
+        } catch (...) {}
         SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::STOPPED);
 
         try { AccessControlManager::Instance().Shutdown(); } catch (...) {}
