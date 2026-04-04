@@ -150,6 +150,11 @@ public:
     std::unique_ptr<std::thread> m_holdMonitorThread;
     std::atomic<bool> m_stopMonitor{ false };
 
+    // Pending cloud query counter — incremented before dispatch, decremented on completion
+    std::atomic<uint32_t> m_pendingCloudQueries{ 0 };
+    std::mutex            m_cloudQueryMutex;
+    std::condition_variable m_cloudQueryCV;
+
     // Integration — raw non-owning pointers injected by RealTimeProtection
     ThreatIntel::ThreatIntelLookup* m_threatIntelLookup{ nullptr };
     Whitelist::WhitelistStore*      m_whitelistStore{ nullptr };
@@ -185,6 +190,17 @@ public:
         m_stopMonitor = true;
         if (m_holdMonitorThread && m_holdMonitorThread->joinable()) {
             m_holdMonitorThread->join();
+        }
+
+        // Wait for all pending cloud query threads to complete (bounded 10s)
+        {
+            std::unique_lock lock(m_cloudQueryMutex);
+            m_cloudQueryCV.wait_for(lock, std::chrono::seconds(10),
+                [this] { return m_pendingCloudQueries.load(std::memory_order_acquire) == 0; });
+            if (m_pendingCloudQueries.load(std::memory_order_acquire) > 0) {
+                Utils::Logger::Warn("ZeroHourProtection: {} cloud queries still pending at shutdown",
+                    m_pendingCloudQueries.load(std::memory_order_relaxed));
+            }
         }
 
         {
@@ -684,14 +700,24 @@ FileAnalysisResult ZeroHourProtection::AnalyzeFile(const FileAnalysisRequest& re
 
         m_impl->FireFileHoldCallback(held);
 
-        // Dispatch async cloud verdict query
-        // Capture impl pointer (safe: singleton lifetime >= thread lifetime)
+        // Dispatch async cloud verdict query with tracked counter
         ZeroHourProtectionImpl* impl = m_impl.get();
         const uint64_t holdId        = held.holdId;
         const FileHash  hashCopy     = held.hash;
         const uint32_t  timeoutMs    = request.timeoutMs;
 
+        impl->m_pendingCloudQueries.fetch_add(1, std::memory_order_acq_rel);
+
         std::thread([this, impl, holdId, hashCopy, timeoutMs]() noexcept {
+            // RAII guard: always decrement counter and notify on exit
+            struct CounterGuard {
+                ZeroHourProtectionImpl* p;
+                ~CounterGuard() {
+                    p->m_pendingCloudQueries.fetch_sub(1, std::memory_order_acq_rel);
+                    p->m_cloudQueryCV.notify_all();
+                }
+            } guard{ impl };
+
             try {
                 if (impl->m_isShutdown.load(std::memory_order_acquire)) return;
 
@@ -718,7 +744,6 @@ FileAnalysisResult ZeroHourProtection::AnalyzeFile(const FileAnalysisRequest& re
                         decision = HoldDecision::ALLOW;
                         break;
                     default: {
-                        // Unknown / error — consult fallback policy
                         std::shared_lock configLock(impl->m_configMutex);
                         decision = (impl->m_config.cloudConfig.fallbackPolicy ==
                                     FallbackPolicy::BLOCK_UNKNOWN)
@@ -732,7 +757,6 @@ FileAnalysisResult ZeroHourProtection::AnalyzeFile(const FileAnalysisRequest& re
                     L"Cloud verdict received: " + hashCopy.GetSHA256String());
 
             } catch (...) {
-                // Ensure hold is always released on failure
                 try {
                     std::shared_lock configLock(impl->m_configMutex);
                     const HoldDecision fallback =
