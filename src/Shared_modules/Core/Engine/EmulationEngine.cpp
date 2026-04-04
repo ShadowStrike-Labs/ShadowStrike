@@ -1,1713 +1,1350 @@
-/*
- * ShadowStrike - Enterprise NGAV/EDR Platform
- * Copyright (C) 2026 ShadowStrike Security
- *
- * This program is free software: you can redistribute it and/or modify
- * it under the terms of the GNU Affero General Public License as published
- * by the Free Software Foundation, either version 3 of the License, or
- * (at your option) any later version.
- *
- * This program is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
- * GNU Affero General Public License for more details.
- *
- * You should have received a copy of the GNU Affero General Public License
- * along with this program. If not, see <https://www.gnu.org/licenses/>.
- */
-/**
- * @file EmulationEngine.cpp
- * @brief Enterprise-grade hardware-accelerated code emulation using Windows Hypervisor Platform
- *
- * ShadowStrike Core Engine - Emulation Module
- * Copyright (c) 2026 ShadowStrike Security Suite. All rights reserved.
- *
- * This module provides comprehensive malware emulation capabilities using:
- * - Windows Hypervisor Platform (WHP) for hardware-accelerated execution
- * - Unicorn Engine fallback for software emulation
- * - Virtual OS layer for API interception
- * - Automatic unpacking with multi-layer support
- * - Memory scanning with YARA integration
- * - Behavioral analysis and threat scoring
- *
- * Implementation follows enterprise C++20 standards:
- * - PIMPL pattern for ABI stability
- * - Thread-safe with std::shared_mutex
- * - Exception-safe with comprehensive error handling
- * - Statistics tracking for all operations
- * - Memory-safe with smart pointers only
- * - Infrastructure reuse (Utils/, SignatureStore, PatternStore, HashStore, ThreatIntel)
- *
- * CRITICAL: This is user-mode code. Kernel components go in Drivers/ folder.
- */
-
 #include "pch.h"
 #include "EmulationEngine.hpp"
 
-// ============================================================================
-// STANDARD LIBRARY INCLUDES
-// ============================================================================
+#include "../../Utils/Logger.hpp"
+#include "../../Utils/StringUtils.hpp"
+#include "../../Utils/ThreadPool.hpp"
 
 #include <algorithm>
 #include <array>
 #include <atomic>
 #include <chrono>
 #include <cmath>
-#include <execution>
-#include <filesystem>
-#include <format>
-#include <fstream>
+#include <cctype>
+#include <cstdio>
 #include <memory>
 #include <mutex>
-#include <numeric>
-#include <optional>
-#include <queue>
-#include <random>
-#include <ranges>
-#include <set>
 #include <shared_mutex>
 #include <span>
 #include <sstream>
 #include <string>
 #include <string_view>
 #include <unordered_map>
-#include <unordered_set>
+#include <utility>
 #include <vector>
 
-// ============================================================================
-// WINDOWS SDK INCLUDES
-// ============================================================================
-
-#include <Windows.h>
-#include <WinHvPlatform.h>
-#include <WinHvEmulation.h>
-
-#pragma comment(lib, "WinHvPlatform.lib")
-#pragma comment(lib, "WinHvEmulation.lib")
-
-// ============================================================================
-// SHADOWSTRIKE INTERNAL INCLUDES
-// ============================================================================
-
-#include "../../Utils/Logger.hpp"
-#include "../../Utils/FileUtils.hpp"
-#include "../../Utils/ProcessUtils.hpp"
-#include "../../Utils/SystemUtils.hpp"
-#include "../../Utils/CryptoUtils.hpp"
-#include "../../Utils/StringUtils.hpp"
-#include "../../Utils/ThreadPool.hpp"
-#include "../../SignatureStore/SignatureStore.hpp"
-#include "../../PatternStore/PatternStore.hpp"
-#include "../../HashStore/HashStore.hpp"
-#include "../../ThreatIntel/ThreatIntelIndex.hpp"
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+#include "../../../../PhantomEmulator/Integration/EmulationSession.hpp"
+#include "../../../../PhantomEmulator/Integration/EmulationResult.hpp"
+#include "../../../../PhantomEmulator/Integration/ResultConverter.hpp"
+#endif
 
 namespace ShadowStrike::Core::Engine {
 
-    namespace fs = std::filesystem;
-    using namespace std::chrono_literals;
+namespace {
 
-    // ========================================================================
-    // HELPER FUNCTIONS
-    // ========================================================================
+constexpr const wchar_t* kLogCategory = L"EmulationEngine";
 
-    /**
-     * @brief Get display name for emulation backend
-     */
-    [[nodiscard]] const wchar_t* EmulationBackendToString(EmulationBackend backend) noexcept {
-        switch (backend) {
-        case EmulationBackend::Auto: return L"Auto";
-        case EmulationBackend::WindowsHypervisorPlatform: return L"Windows Hypervisor Platform";
-        case EmulationBackend::UnicornEngine: return L"Unicorn Engine";
-        case EmulationBackend::Disabled: return L"Disabled";
-        default: return L"Unknown";
-        }
+[[nodiscard]] std::string ToLowerAscii(std::string_view value) {
+    std::string lowered(value);
+    std::transform(lowered.begin(), lowered.end(), lowered.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return lowered;
+}
+
+[[nodiscard]] std::wstring ToWide(std::string_view value) {
+    return Utils::StringUtils::ToWide(value);
+}
+
+[[nodiscard]] EmulationStats SnapshotStats(const EmulationStats& stats) {
+    EmulationStats snapshot;
+    snapshot.totalSessions.store(stats.totalSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.successfulCompletions.store(stats.successfulCompletions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.timeouts.store(stats.timeouts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.errors.store(stats.errors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.malwareDetections.store(stats.malwareDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.successfulUnpacks.store(stats.successfulUnpacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.totalInstructions.store(stats.totalInstructions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.totalAPICalls.store(stats.totalAPICalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.totalFilesCaptured.store(stats.totalFilesCaptured.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.activeSessions.store(stats.activeSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.avgEmulationTimeUs.store(stats.avgEmulationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.phantomEmulatorAvailable = stats.phantomEmulatorAvailable;
+    return snapshot;
+}
+
+[[nodiscard]] std::optional<APICallRecord> HighestSeverityAPI(const std::vector<APICallRecord>& calls) {
+    if (calls.empty()) {
+        return std::nullopt;
     }
 
-    /**
-     * @brief Get display name for emulation state
-     */
-    [[nodiscard]] const wchar_t* EmulationStateToString(EmulationState state) noexcept {
-        switch (state) {
-        case EmulationState::NotStarted: return L"Not Started";
-        case EmulationState::Initializing: return L"Initializing";
-        case EmulationState::Running: return L"Running";
-        case EmulationState::Paused: return L"Paused";
-        case EmulationState::Completed: return L"Completed";
-        case EmulationState::Failed: return L"Failed";
-        case EmulationState::TimedOut: return L"Timed Out";
-        case EmulationState::Crashed: return L"Crashed";
-        default: return L"Unknown";
-        }
-    }
+    return *std::max_element(calls.begin(), calls.end(),
+        [](const APICallRecord& lhs, const APICallRecord& rhs) {
+            return static_cast<uint8_t>(lhs.severity) < static_cast<uint8_t>(rhs.severity);
+        });
+}
 
-    /**
-     * @brief Get display name for exit reason
-     */
-    [[nodiscard]] const wchar_t* EmulationExitReasonToString(EmulationExitReason reason) noexcept {
-        switch (reason) {
-        case EmulationExitReason::Unknown: return L"Unknown";
-        case EmulationExitReason::NormalExit: return L"Normal Exit";
-        case EmulationExitReason::Timeout: return L"Timeout";
-        case EmulationExitReason::MaxInstructions: return L"Max Instructions Reached";
-        case EmulationExitReason::Exception: return L"Exception";
-        case EmulationExitReason::InvalidOpcode: return L"Invalid Opcode";
-        case EmulationExitReason::AccessViolation: return L"Access Violation";
-        case EmulationExitReason::UnhandledAPI: return L"Unhandled API Call";
-        case EmulationExitReason::MaliciousDetected: return L"Malicious Behavior Detected";
-        case EmulationExitReason::UnpackCompleted: return L"Unpacking Completed";
-        default: return L"Unknown";
-        }
-    }
+[[nodiscard]] EmulationResult BuildInputErrorResult(uint64_t sessionId, std::wstring_view message, EmulationArch arch) {
+    EmulationResult result;
+    result.sessionId = sessionId;
+    result.backend = EmulationBackend::PhantomEmulator;
+    result.architecture = arch;
+    result.state = EmulationState::Error;
+    result.exitReason = EmulationExitReason::InternalError;
+    result.errorMessage.assign(message);
+    result.startTime = std::chrono::system_clock::now();
+    result.endTime = result.startTime;
+    return result;
+}
 
-    /**
-     * @brief Get display name for packer type
-     */
-    [[nodiscard]] const wchar_t* PackerTypeToString(PackerType packer) noexcept {
-        switch (packer) {
-        case PackerType::Unknown: return L"Unknown";
-        case PackerType::None: return L"None";
-        case PackerType::UPX: return L"UPX";
-        case PackerType::ASPack: return L"ASPack";
-        case PackerType::PECompact: return L"PECompact";
-        case PackerType::Themida: return L"Themida";
-        case PackerType::VMProtect: return L"VMProtect";
-        case PackerType::Enigma: return L"Enigma Protector";
-        case PackerType::Armadillo: return L"Armadillo";
-        case PackerType::ExeShield: return L"ExeShield";
-        case PackerType::PESpin: return L"PESpin";
-        case PackerType::FSG: return L"FSG";
-        case PackerType::Petite: return L"Petite";
-        case PackerType::WWPack: return L"WWPack";
-        case PackerType::NSPack: return L"NSPack";
-        case PackerType::MEW: return L"MEW";
-        case PackerType::Custom: return L"Custom/Unknown Packer";
-        default: return L"Unknown";
-        }
-    }
+} // namespace
 
-    // ========================================================================
-    // PIMPL IMPLEMENTATION CLASS
-    // ========================================================================
+class EmulationEngine::Impl {
+public:
+    mutable std::shared_mutex m_mutex;
+    std::atomic<bool> m_initialized{ false };
 
-    class EmulationEngine::Impl {
-    public:
-        // ====================================================================
-        // MEMBERS
-        // ====================================================================
+    std::shared_ptr<Utils::ThreadPool> m_threadPool;
+    SignatureStore::SignatureStore* m_signatureStore = nullptr;
+    PatternStore::PatternStore* m_patternStore = nullptr;
+    HashStore::HashStore* m_hashStore = nullptr;
+    ThreatIntel::ThreatIntelIndex* m_threatIntel = nullptr;
 
-        /// @brief Thread synchronization
-        mutable std::shared_mutex m_mutex;
+    EmulationStats m_stats;
+    EmulationConfig m_defaultConfig;
 
-        /// @brief Initialization state
-        std::atomic<bool> m_initialized{ false };
-
-        /// @brief Infrastructure dependencies
-        std::shared_ptr<Utils::ThreadPool> m_threadPool;
-        SignatureStore::SignatureStore* m_signatureStore = nullptr;
-        PatternStore::PatternStore* m_patternStore = nullptr;
-        HashStore::HashStore* m_hashStore = nullptr;
-        ThreatIntel::ThreatIntelIndex* m_threatIntel = nullptr;
-
-        /// @brief Statistics
-        EmulationStats m_stats;
-
-        /// @brief Default configuration
-        EmulationConfig m_defaultConfig;
-
-        /// @brief Backend availability
-        std::atomic<bool> m_whpAvailable{ false };
-        std::atomic<bool> m_unicornAvailable{ false };
-
-        /// @brief Active emulation sessions
-        struct EmulationSession {
-            uint64_t sessionId = 0;
-            EmulationState state = EmulationState::NotStarted;
-            EmulationBackend backend = EmulationBackend::Auto;
-            WHV_PARTITION_HANDLE whvPartition = nullptr;
-            void* unicornEngine = nullptr;
-            std::chrono::system_clock::time_point startTime;
-            std::atomic<uint64_t> instructionsExecuted{ 0 };
-            std::atomic<bool> shouldStop{ false };
-            EmulationResult result;
-        };
-
-        std::unordered_map<uint64_t, std::unique_ptr<EmulationSession>> m_sessions;
-        std::atomic<uint64_t> m_nextSessionId{ 1 };
-
-        /// @brief Virtual environment state
-        struct VirtualEnvironment {
-            VirtualFileSystem vfs;
-            VirtualRegistry vreg;
-            VirtualNetwork vnet;
-            VirtualEnvironmentVariables venv;
-            std::unordered_map<std::string, uint64_t> loadedDLLs;
-            std::unordered_map<uint64_t, std::string> apiAddresses;
-        };
-
-        /// @brief Memory layout
-        struct MemoryLayout {
-            uint64_t imageBase = 0x400000;
-            uint64_t stackBase = 0x100000;
-            size_t stackSize = 1024 * 1024; // 1 MB
-            uint64_t heapBase = 0x200000;
-            size_t heapSize = 16 * 1024 * 1024; // 16 MB
-            uint64_t pebBase = 0x7FFE0000;
-            uint64_t tebBase = 0x7FFD0000;
-        };
-
-        // ====================================================================
-        // METHODS
-        // ====================================================================
-
-        Impl() = default;
-        ~Impl() = default;
-
-        [[nodiscard]] bool Initialize(
-            std::shared_ptr<Utils::ThreadPool> threadPool,
-            SignatureStore::SignatureStore* signatureStore,
-            PatternStore::PatternStore* patternStore,
-            HashStore::HashStore* hashStore,
-            ThreatIntel::ThreatIntelIndex* threatIntel,
-            EmulationError* err
-        ) noexcept;
-
-        void Shutdown() noexcept;
-
-        // Backend detection
-        [[nodiscard]] bool DetectWHPAvailability() noexcept;
-        [[nodiscard]] bool DetectUnicornAvailability() noexcept;
-
-        // Session management
-        [[nodiscard]] uint64_t CreateSession(EmulationBackend backend) noexcept;
-        void DestroySession(uint64_t sessionId) noexcept;
-        [[nodiscard]] EmulationSession* GetSession(uint64_t sessionId) noexcept;
-
-        // WHP-specific
-        [[nodiscard]] bool InitializeWHPPartition(EmulationSession* session, size_t memorySize) noexcept;
-        [[nodiscard]] bool SetupWHPMemory(EmulationSession* session, const MemoryLayout& layout) noexcept;
-        [[nodiscard]] bool LoadPEIntoWHP(EmulationSession* session, const std::vector<uint8_t>& peData, const MemoryLayout& layout) noexcept;
-        [[nodiscard]] bool SetupWHPCPUState(EmulationSession* session, const MemoryLayout& layout, uint64_t entryPoint) noexcept;
-        [[nodiscard]] bool RunWHPEmulation(EmulationSession* session, const EmulationConfig& config) noexcept;
-        void CleanupWHPPartition(EmulationSession* session) noexcept;
-
-        // Unicorn-specific
-        [[nodiscard]] bool InitializeUnicornEngine(EmulationSession* session, bool is64Bit) noexcept;
-        [[nodiscard]] bool SetupUnicornMemory(EmulationSession* session, const MemoryLayout& layout) noexcept;
-        [[nodiscard]] bool LoadPEIntoUnicorn(EmulationSession* session, const std::vector<uint8_t>& peData, const MemoryLayout& layout) noexcept;
-        [[nodiscard]] bool RunUnicornEmulation(EmulationSession* session, const EmulationConfig& config) noexcept;
-        void CleanupUnicornEngine(EmulationSession* session) noexcept;
-
-        // PE parsing
-        [[nodiscard]] bool ParsePEHeaders(const std::vector<uint8_t>& peData, IMAGE_DOS_HEADER& dosHeader, IMAGE_NT_HEADERS64& ntHeaders) noexcept;
-        [[nodiscard]] uint64_t GetPEEntryPoint(const std::vector<uint8_t>& peData) noexcept;
-        [[nodiscard]] bool IsPE64(const std::vector<uint8_t>& peData) noexcept;
-
-        // Virtual environment
-        [[nodiscard]] VirtualEnvironment SetupVirtualEnvironment() noexcept;
-        [[nodiscard]] bool HandleAPICall(EmulationSession* session, VirtualEnvironment& venv, const std::string& apiName, CPUState& cpuState) noexcept;
-        void RecordAPICall(EmulationSession* session, const std::string& apiName, const std::vector<std::string>& args, const std::string& returnValue) noexcept;
-
-        // Memory scanning
-        [[nodiscard]] bool ScanMemoryWithYara(EmulationSession* session, const std::vector<uint8_t>& memory) noexcept;
-        [[nodiscard]] double CalculateEntropy(const std::vector<uint8_t>& data) noexcept;
-
-        // Unpacking
-        [[nodiscard]] PackerType DetectPackerInternal(const std::vector<uint8_t>& peData) noexcept;
-        [[nodiscard]] bool CheckUnpackCompletion(EmulationSession* session, const std::vector<uint8_t>& initialMemory, const std::vector<uint8_t>& currentMemory) noexcept;
-        [[nodiscard]] std::optional<uint64_t> FindOEP(EmulationSession* session, const std::vector<uint8_t>& memory) noexcept;
-
-        // Threat analysis
-        [[nodiscard]] float CalculateThreatScore(const EmulationResult& result) noexcept;
-        [[nodiscard]] bool AnalyzeBehavior(EmulationSession* session) noexcept;
+    struct ActiveSession {
+        uint64_t sessionId = 0;
+        EmulationConfig config;
+        std::atomic<EmulationState> state{ EmulationState::Uninitialized };
+        std::atomic<uint64_t> instructionCount{ 0 };
+        std::atomic<size_t> apiCallCount{ 0 };
+        EmulationBackend backend = EmulationBackend::PhantomEmulator;
+        std::chrono::steady_clock::time_point startTime;
+        std::atomic<bool> shouldStop{ false };
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+        std::unique_ptr<Phantom::EmulationSession> phantomSession;
+#endif
     };
 
-    // ========================================================================
-    // IMPL: INITIALIZATION
-    // ========================================================================
+    std::unordered_map<uint64_t, std::unique_ptr<ActiveSession>> m_sessions;
+    std::atomic<uint64_t> m_nextSessionId{ 1 };
 
-    bool EmulationEngine::Impl::Initialize(
-        std::shared_ptr<Utils::ThreadPool> threadPool,
-        SignatureStore::SignatureStore* signatureStore,
-        PatternStore::PatternStore* patternStore,
-        HashStore::HashStore* hashStore,
-        ThreatIntel::ThreatIntelIndex* threatIntel,
-        EmulationError* err
-    ) noexcept {
-        try {
-            if (m_initialized.exchange(true)) {
-                return true; // Already initialized
-            }
+    struct CallbackStore {
+        std::unordered_map<uint64_t, APICallCallback> apiCallbacks;
+        std::unordered_map<uint64_t, FileDropCallback> fileDropCallbacks;
+        std::unordered_map<uint64_t, NetworkActivityCallback> networkCallbacks;
+        std::unordered_map<uint64_t, UnpackLayerCallback> unpackCallbacks;
+        std::atomic<uint64_t> nextId{ 1 };
+    } m_callbacks;
 
-            Utils::Logger::Info(L"EmulationEngine: Initializing...");
+    bool Initialize(std::shared_ptr<Utils::ThreadPool> tp,
+                    SignatureStore::SignatureStore* ss,
+                    PatternStore::PatternStore* ps,
+                    HashStore::HashStore* hs,
+                    ThreatIntel::ThreatIntelIndex* ti) noexcept;
+    void Shutdown() noexcept;
 
-            // Validate dependencies
-            if (!threadPool) {
-                Utils::Logger::Error(L"EmulationEngine: ThreadPool is required");
-                if (err) {
-                    err->code = ERROR_INVALID_PARAMETER;
-                    err->message = L"ThreadPool is required";
-                }
-                m_initialized = false;
-                return false;
-            }
+    EmulationResult RunPE(std::span<const uint8_t> data, const EmulationConfig& config) noexcept;
+    EmulationResult RunShellcode(std::span<const uint8_t> data, bool is64, const EmulationConfig& config) noexcept;
+    EmulationResult RunBuffer(std::span<const uint8_t> data, uint64_t base, uint64_t entry, EmulationArch arch, const EmulationConfig& config) noexcept;
 
-            m_threadPool = threadPool;
-            m_signatureStore = signatureStore;
-            m_patternStore = patternStore;
-            m_hashStore = hashStore;
-            m_threatIntel = threatIntel;
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+    Phantom::EmulationConfig ConvertConfig(const EmulationConfig& cfg) const noexcept;
+    EmulationResult ConvertAndEnrich(const Phantom::PhantomEmulationResult& pr, uint64_t sessionId) noexcept;
+    void FireCallbacks(const EmulationResult& result) noexcept;
+#endif
 
-            // Detect available backends
-            m_whpAvailable = DetectWHPAvailability();
-            m_unicornAvailable = DetectUnicornAvailability();
+    uint64_t CreateSession(const EmulationConfig& config) noexcept;
+    void RemoveSession(uint64_t sessionId, bool revertCreate = false) noexcept;
+    ActiveSession* GetSessionEntry(uint64_t sessionId) noexcept;
+    void FinalizeSession(uint64_t sessionId, const EmulationResult& result) noexcept;
+    void UpdateAverageTime(uint64_t emulationTimeUs) noexcept;
+    EmulationResult RunPE(std::span<const uint8_t> data, const EmulationConfig& config, uint64_t sessionId) noexcept;
+    EmulationResult RunShellcode(std::span<const uint8_t> data, bool is64, const EmulationConfig& config, uint64_t sessionId) noexcept;
+    EmulationResult RunBuffer(std::span<const uint8_t> data, uint64_t base, uint64_t entry, EmulationArch arch, const EmulationConfig& config, uint64_t sessionId) noexcept;
+};
 
-            if (!m_whpAvailable && !m_unicornAvailable) {
-                Utils::Logger::Warn(L"EmulationEngine: No emulation backends available!");
-                Utils::Logger::Warn(L"  - Windows Hypervisor Platform: Not available (requires Windows 10 1803+ with Hyper-V)");
-                Utils::Logger::Warn(L"  - Unicorn Engine: Not available");
-            } else {
-                if (m_whpAvailable) {
-                    Utils::Logger::Info(L"EmulationEngine: Windows Hypervisor Platform available (hardware-accelerated)");
-                }
-                if (m_unicornAvailable) {
-                    Utils::Logger::Info(L"EmulationEngine: Unicorn Engine available (software emulation)");
-                }
-            }
+bool EmulationEngine::Impl::Initialize(std::shared_ptr<Utils::ThreadPool> tp,
+                                       SignatureStore::SignatureStore* ss,
+                                       PatternStore::PatternStore* ps,
+                                       HashStore::HashStore* hs,
+                                       ThreatIntel::ThreatIntelIndex* ti) noexcept {
+    try {
+        if (!tp) {
+            SS_LOG_ERROR(kLogCategory, L"Initialize: thread pool is required");
+            return false;
+        }
 
-            // Set default configuration
+        if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
+            return true;
+        }
+
+        {
+            std::unique_lock lock(m_mutex);
+            m_threadPool = std::move(tp);
+            m_signatureStore = ss;
+            m_patternStore = ps;
+            m_hashStore = hs;
+            m_threatIntel = ti;
             m_defaultConfig = EmulationConfig::CreateDefault();
-
-            Utils::Logger::Info(L"EmulationEngine: Initialized successfully");
-            return true;
-
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"EmulationEngine initialization failed: {}",
-                Utils::StringUtils::ToWideString(e.what()));
-
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Initialization failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
-            }
-
-            m_initialized = false;
-            return false;
-        } catch (...) {
-            Utils::Logger::Critical(L"EmulationEngine: Unknown initialization error");
-
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Unknown initialization error";
-            }
-
-            m_initialized = false;
-            return false;
+            m_stats.phantomEmulatorAvailable = true;
         }
-    }
 
-    void EmulationEngine::Impl::Shutdown() noexcept {
-        try {
+        SS_LOG_INFO(kLogCategory, L"Initialized with PhantomEmulator backend");
+        return true;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"Initialize exception: %ls", ToWide(ex.what()).c_str());
+        m_initialized.store(false, std::memory_order_release);
+        return false;
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"Initialize exception: unknown error");
+        m_initialized.store(false, std::memory_order_release);
+        return false;
+    }
+}
+
+void EmulationEngine::Impl::Shutdown() noexcept {
+    try {
+        if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
+            return;
+        }
+
+        std::vector<ActiveSession*> sessions;
+        {
+            std::shared_lock lock(m_mutex);
+            sessions.reserve(m_sessions.size());
+            for (const auto& [sessionId, session] : m_sessions) {
+                (void)sessionId;
+                sessions.push_back(session.get());
+            }
+        }
+
+        for (auto* session : sessions) {
+            session->shouldStop.store(true, std::memory_order_release);
+            session->state.store(EmulationState::Terminated, std::memory_order_release);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+            if (session->phantomSession) {
+                session->phantomSession->RequestAbort();
+            }
+#endif
+        }
+
+        {
             std::unique_lock lock(m_mutex);
-
-            if (!m_initialized.exchange(false)) {
-                return; // Already shutdown
-            }
-
-            Utils::Logger::Info(L"EmulationEngine: Shutting down...");
-
-            // Destroy all active sessions
-            for (auto& [sessionId, session] : m_sessions) {
-                session->shouldStop = true;
-
-                if (session->whvPartition) {
-                    CleanupWHPPartition(session.get());
-                }
-
-                if (session->unicornEngine) {
-                    CleanupUnicornEngine(session.get());
-                }
-            }
-
-            m_sessions.clear();
-
-            Utils::Logger::Info(L"EmulationEngine: Shutdown complete");
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during shutdown");
+            m_threadPool.reset();
+            m_signatureStore = nullptr;
+            m_patternStore = nullptr;
+            m_hashStore = nullptr;
+            m_threatIntel = nullptr;
         }
+
+        SS_LOG_INFO(kLogCategory, L"Shutdown requested");
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"Shutdown exception");
     }
+}
 
-    // ========================================================================
-    // IMPL: BACKEND DETECTION
-    // ========================================================================
+uint64_t EmulationEngine::Impl::CreateSession(const EmulationConfig& config) noexcept {
+    try {
+        auto session = std::make_unique<ActiveSession>();
+        const uint64_t sessionId = m_nextSessionId.fetch_add(1, std::memory_order_relaxed);
+        session->sessionId = sessionId;
+        session->config = config;
+        session->state.store(EmulationState::Ready, std::memory_order_relaxed);
+        session->startTime = std::chrono::steady_clock::now();
 
-    bool EmulationEngine::Impl::DetectWHPAvailability() noexcept {
-        try {
-            // Check if WHP capability is present
-            WHV_CAPABILITY capability = {};
-            WHV_CAPABILITY_CODE capabilityCode = WHvCapabilityCodeHypervisorPresent;
-            UINT32 writtenSizeInBytes = 0;
-
-            HRESULT hr = WHvGetCapability(
-                capabilityCode,
-                &capability,
-                sizeof(capability),
-                &writtenSizeInBytes
-            );
-
-            if (FAILED(hr)) {
-                Utils::Logger::Debug(L"EmulationEngine: WHvGetCapability failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                return false;
-            }
-
-            if (!capability.HypervisorPresent) {
-                Utils::Logger::Debug(L"EmulationEngine: Hypervisor not present");
-                return false;
-            }
-
-            // Try creating a test partition
-            WHV_PARTITION_HANDLE testPartition = nullptr;
-            hr = WHvCreatePartition(&testPartition);
-
-            if (FAILED(hr)) {
-                Utils::Logger::Debug(L"EmulationEngine: WHvCreatePartition test failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                return false;
-            }
-
-            // Cleanup test partition
-            if (testPartition) {
-                WHvDeletePartition(testPartition);
-            }
-
-            return true;
-
-        } catch (...) {
-            Utils::Logger::Debug(L"EmulationEngine: Exception during WHP detection");
-            return false;
-        }
-    }
-
-    bool EmulationEngine::Impl::DetectUnicornAvailability() noexcept {
-        try {
-            // Unicorn Engine detection would go here
-            // For now, return false as Unicorn is not integrated
-            return false;
-
-        } catch (...) {
-            Utils::Logger::Debug(L"EmulationEngine: Exception during Unicorn detection");
-            return false;
-        }
-    }
-
-    // ========================================================================
-    // IMPL: SESSION MANAGEMENT
-    // ========================================================================
-
-    uint64_t EmulationEngine::Impl::CreateSession(EmulationBackend backend) noexcept {
-        try {
+        {
             std::unique_lock lock(m_mutex);
+            m_sessions.emplace(sessionId, std::move(session));
+        }
 
-            const uint64_t sessionId = m_nextSessionId++;
+        m_stats.totalSessions.fetch_add(1, std::memory_order_relaxed);
+        m_stats.activeSessions.fetch_add(1, std::memory_order_relaxed);
+        return sessionId;
+    } catch (...) {
+        return 0;
+    }
+}
 
-            auto session = std::make_unique<EmulationSession>();
-            session->sessionId = sessionId;
-            session->backend = backend;
-            session->startTime = std::chrono::system_clock::now();
+void EmulationEngine::Impl::RemoveSession(uint64_t sessionId, bool revertCreate) noexcept {
+    std::unique_lock lock(m_mutex);
+    const auto erased = m_sessions.erase(sessionId);
+    lock.unlock();
 
-            m_sessions[sessionId] = std::move(session);
+    if (revertCreate && erased > 0) {
+        m_stats.totalSessions.fetch_sub(1, std::memory_order_relaxed);
+        m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
+    }
+}
 
-            return sessionId;
+EmulationEngine::Impl::ActiveSession* EmulationEngine::Impl::GetSessionEntry(uint64_t sessionId) noexcept {
+    std::shared_lock lock(m_mutex);
+    const auto it = m_sessions.find(sessionId);
+    return it != m_sessions.end() ? it->second.get() : nullptr;
+}
 
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Failed to create session");
-            return 0;
+void EmulationEngine::Impl::UpdateAverageTime(uint64_t emulationTimeUs) noexcept {
+    const uint64_t active = m_stats.activeSessions.load(std::memory_order_relaxed);
+    const uint64_t completed = m_stats.totalSessions.load(std::memory_order_relaxed) - active;
+    if (completed == 0) {
+        return;
+    }
+
+    const uint64_t previous = m_stats.avgEmulationTimeUs.load(std::memory_order_relaxed);
+    const uint64_t updated = previous + ((emulationTimeUs > previous)
+        ? (emulationTimeUs - previous) / completed
+        : -((previous - emulationTimeUs) / completed));
+    m_stats.avgEmulationTimeUs.store(updated, std::memory_order_relaxed);
+}
+
+void EmulationEngine::Impl::FinalizeSession(uint64_t sessionId, const EmulationResult& result) noexcept {
+    if (auto* session = GetSessionEntry(sessionId)) {
+        session->instructionCount.store(result.instructionsExecuted, std::memory_order_relaxed);
+        session->apiCallCount.store(result.apiCallCount, std::memory_order_relaxed);
+        session->state.store(result.state, std::memory_order_relaxed);
+    }
+
+    m_stats.activeSessions.fetch_sub(1, std::memory_order_relaxed);
+
+    if (result.exitReason == EmulationExitReason::Timeout || result.state == EmulationState::Timeout) {
+        m_stats.timeouts.fetch_add(1, std::memory_order_relaxed);
+    } else if (result.state == EmulationState::Error ||
+               result.exitReason == EmulationExitReason::InternalError ||
+               result.exitReason == EmulationExitReason::Exception ||
+               result.exitReason == EmulationExitReason::InvalidInstruction ||
+               result.exitReason == EmulationExitReason::AccessViolation ||
+               result.exitReason == EmulationExitReason::PrivilegedInstruction) {
+        m_stats.errors.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        m_stats.successfulCompletions.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    if (result.isMalicious) {
+        m_stats.malwareDetections.fetch_add(1, std::memory_order_relaxed);
+    }
+    if (result.unpackSuccessful) {
+        m_stats.successfulUnpacks.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    m_stats.totalInstructions.fetch_add(result.instructionsExecuted, std::memory_order_relaxed);
+    m_stats.totalAPICalls.fetch_add(static_cast<uint64_t>(result.apiCallCount), std::memory_order_relaxed);
+    m_stats.totalFilesCaptured.fetch_add(static_cast<uint64_t>(result.droppedFiles.size()), std::memory_order_relaxed);
+    UpdateAverageTime(result.emulationTimeMs * 1000ULL);
+}
+
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+Phantom::EmulationConfig EmulationEngine::Impl::ConvertConfig(const EmulationConfig& cfg) const noexcept {
+    Phantom::EmulationConfig converted;
+    converted.maxInstructions = cfg.maxInstructions;
+    converted.maxAPIcalls = static_cast<uint64_t>(cfg.maxAPICalls);
+    converted.maxWallTime = std::chrono::milliseconds(cfg.timeoutMs);
+    converted.maxGuestMemory = cfg.memoryLimit;
+    converted.maxUnpackLayers = cfg.maxUnpackLayers;
+    converted.enableFileSystem = cfg.enableFileSystemMonitoring;
+    converted.enableRegistry = cfg.enableRegistryMonitoring;
+    converted.enableNetwork = cfg.enableNetworkMonitoring && cfg.simulateNetwork;
+    converted.enableUnpacking = cfg.enableUnpacking;
+    converted.captureUnpackLayers = cfg.saveUnpackedPayload;
+    converted.enableTimingAcceleration = cfg.hookTimingAPIs;
+    converted.enableAntiDebugBypass = cfg.enableAntiEvasion;
+    converted.enableAntiVMBypass = cfg.hideEmulationArtifacts;
+    converted.enableAntiSandboxBypass = cfg.realisticEnvironment;
+    converted.enableBehaviorMonitor = true;
+    converted.enableAPISequenceAnalysis = true;
+    converted.enableMemoryForensics = cfg.enableMemoryScanning;
+    converted.enableMITREMapping = cfg.enableMitreMapping;
+    converted.enableIOCExtraction = true;
+    converted.enableAPITrace = cfg.enableAPITracing;
+    converted.enableInstructionTrace = cfg.instructionTracing;
+    converted.enableMemoryTrace = cfg.memoryAccessTracing;
+    converted.trackMemoryAccess = cfg.memoryAccessTracing;
+    converted.target = (cfg.targetArch == EmulationArch::X86 || cfg.force32Bit)
+        ? Phantom::EmulationTarget::PE32
+        : Phantom::EmulationTarget::PE64;
+    converted.cpuMode = (cfg.targetArch == EmulationArch::X86 || cfg.force32Bit)
+        ? Phantom::CPUMode::Protected32
+        : Phantom::CPUMode::Long64;
+    return converted;
+}
+
+EmulationResult EmulationEngine::Impl::ConvertAndEnrich(const Phantom::PhantomEmulationResult& pr,
+                                                        uint64_t sessionId) noexcept {
+    Phantom::Integration::PhantomEmulationResult bridge{};
+    bridge.stopReason = pr.execution.stopReason;
+    bridge.target = pr.execution.is64Bit ? Phantom::EmulationTarget::PE64 : Phantom::EmulationTarget::PE32;
+    bridge.instructionsExecuted = pr.execution.instructionsExecuted;
+    bridge.emulationTimeMs = pr.execution.wallTimeMs;
+    bridge.peakMemoryUsage = pr.execution.peakMemoryUsage;
+    bridge.contextSwitches = 0;
+    bridge.exceptionsHandled = 0;
+    bridge.verdict = const_cast<Phantom::ThreatVerdict*>(&pr.verdict);
+    bridge.apiCalls = pr.apiCalls;
+    bridge.behaviorAlerts = pr.behaviorAlerts;
+    bridge.mitreTechniques = pr.mitreTechniques;
+    bridge.unpackLayers = pr.unpacking.layers;
+    bridge.unpackedPayload = pr.unpacking.finalPayload;
+    bridge.unpackSuccessful = pr.unpacking.successful;
+    bridge.unpackedSha256.clear();
+    bridge.iocReport = &pr.iocReport;
+    bridge.memoryFindings = pr.memoryFindings;
+    bridge.memoryRegions = {};
+    bridge.networkConnections = pr.network.connections;
+    bridge.networkAlerts = pr.network.alerts;
+    bridge.evasionAttempts = pr.evasionAttempts;
+    bridge.evasionSummary = &pr.evasionSummary;
+    bridge.yaraMatches = {};
+    bridge.memoryYaraMatches = {};
+    bridge.patternMatches = {};
+    bridge.sessionId = sessionId;
+
+    auto result = Phantom::Integration::ResultConverter::Convert(bridge);
+    result.backend = EmulationBackend::PhantomEmulator;
+    result.sessionId = sessionId;
+    result.endTime = std::chrono::system_clock::now();
+    result.startTime = result.endTime - std::chrono::milliseconds(result.emulationTimeMs);
+
+    if (!pr.success) {
+        result.emulationComplete = false;
+        if (result.errorMessage.empty()) {
+            result.errorMessage = ToWide(pr.errorMessage);
+        }
+        if (result.state != EmulationState::Timeout && result.state != EmulationState::Terminated) {
+            result.state = EmulationState::Error;
+            result.exitReason = EmulationExitReason::InternalError;
         }
     }
 
-    void EmulationEngine::Impl::DestroySession(uint64_t sessionId) noexcept {
-        try {
-            std::unique_lock lock(m_mutex);
+    return result;
+}
 
-            auto it = m_sessions.find(sessionId);
-            if (it == m_sessions.end()) {
-                return;
-            }
+void EmulationEngine::Impl::FireCallbacks(const EmulationResult& result) noexcept {
+    std::vector<APICallCallback> apiCallbacks;
+    std::vector<FileDropCallback> fileCallbacks;
+    std::vector<NetworkActivityCallback> networkCallbacks;
+    std::vector<UnpackLayerCallback> unpackCallbacks;
 
-            auto& session = it->second;
+    {
+        std::shared_lock lock(m_mutex);
+        apiCallbacks.reserve(m_callbacks.apiCallbacks.size());
+        fileCallbacks.reserve(m_callbacks.fileDropCallbacks.size());
+        networkCallbacks.reserve(m_callbacks.networkCallbacks.size());
+        unpackCallbacks.reserve(m_callbacks.unpackCallbacks.size());
 
-            // Cleanup resources
-            if (session->whvPartition) {
-                CleanupWHPPartition(session.get());
-            }
-
-            if (session->unicornEngine) {
-                CleanupUnicornEngine(session.get());
-            }
-
-            m_sessions.erase(it);
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during session destruction");
+        for (const auto& [id, cb] : m_callbacks.apiCallbacks) {
+            (void)id;
+            apiCallbacks.push_back(cb);
+        }
+        for (const auto& [id, cb] : m_callbacks.fileDropCallbacks) {
+            (void)id;
+            fileCallbacks.push_back(cb);
+        }
+        for (const auto& [id, cb] : m_callbacks.networkCallbacks) {
+            (void)id;
+            networkCallbacks.push_back(cb);
+        }
+        for (const auto& [id, cb] : m_callbacks.unpackCallbacks) {
+            (void)id;
+            unpackCallbacks.push_back(cb);
         }
     }
 
-    EmulationEngine::Impl::EmulationSession* EmulationEngine::Impl::GetSession(uint64_t sessionId) noexcept {
-        auto it = m_sessions.find(sessionId);
-        if (it == m_sessions.end()) {
-            return nullptr;
-        }
-        return it->second.get();
-    }
-
-    // ========================================================================
-    // IMPL: WINDOWS HYPERVISOR PLATFORM
-    // ========================================================================
-
-    bool EmulationEngine::Impl::InitializeWHPPartition(EmulationSession* session, size_t memorySize) noexcept {
-        try {
-            if (!m_whpAvailable) {
-                Utils::Logger::Error(L"EmulationEngine: WHP not available");
-                return false;
-            }
-
-            // Create partition
-            HRESULT hr = WHvCreatePartition(&session->whvPartition);
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvCreatePartition failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                return false;
-            }
-
-            // Set processor count
-            WHV_PARTITION_PROPERTY property = {};
-            property.ProcessorCount = 1;
-
-            hr = WHvSetPartitionProperty(
-                session->whvPartition,
-                WHvPartitionPropertyCodeProcessorCount,
-                &property,
-                sizeof(property)
-            );
-
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvSetPartitionProperty failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                WHvDeletePartition(session->whvPartition);
-                session->whvPartition = nullptr;
-                return false;
-            }
-
-            // Setup partition
-            hr = WHvSetupPartition(session->whvPartition);
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvSetupPartition failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                WHvDeletePartition(session->whvPartition);
-                session->whvPartition = nullptr;
-                return false;
-            }
-
-            // Create virtual processor
-            hr = WHvCreateVirtualProcessor(session->whvPartition, 0, 0);
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvCreateVirtualProcessor failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                WHvDeletePartition(session->whvPartition);
-                session->whvPartition = nullptr;
-                return false;
-            }
-
-            return true;
-
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"EmulationEngine: WHP initialization exception: {}",
-                Utils::StringUtils::ToWideString(e.what()));
-            return false;
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Unknown WHP initialization error");
-            return false;
+    for (const auto& cb : apiCallbacks) {
+        for (const auto& call : result.apiCalls) {
+            try { cb(call); } catch (...) {}
         }
     }
-
-    bool EmulationEngine::Impl::SetupWHPMemory(EmulationSession* session, const MemoryLayout& layout) noexcept {
-        try {
-            if (!session->whvPartition) {
-                return false;
-            }
-
-            // Calculate total memory size
-            const size_t totalMemory = layout.stackSize + layout.heapSize + (16 * 1024 * 1024); // +16MB for image
-
-            // Allocate host memory
-            void* hostMemory = VirtualAlloc(nullptr, totalMemory, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            if (!hostMemory) {
-                Utils::Logger::Error(L"EmulationEngine: Failed to allocate host memory: {}", GetLastError());
-                return false;
-            }
-
-            // Map memory into guest physical address space
-            HRESULT hr = WHvMapGpaRange(
-                session->whvPartition,
-                hostMemory,
-                0, // Guest physical address 0
-                totalMemory,
-                WHvMapGpaRangeFlagRead | WHvMapGpaRangeFlagWrite | WHvMapGpaRangeFlagExecute
-            );
-
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvMapGpaRange failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                VirtualFree(hostMemory, 0, MEM_RELEASE);
-                return false;
-            }
-
-            return true;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during WHP memory setup");
-            return false;
+    for (const auto& cb : fileCallbacks) {
+        for (const auto& file : result.droppedFiles) {
+            try { cb(file); } catch (...) {}
         }
     }
-
-    bool EmulationEngine::Impl::LoadPEIntoWHP(EmulationSession* session, const std::vector<uint8_t>& peData, const MemoryLayout& layout) noexcept {
-        try {
-            // Parse PE headers
-            IMAGE_DOS_HEADER dosHeader = {};
-            IMAGE_NT_HEADERS64 ntHeaders = {};
-
-            if (!ParsePEHeaders(peData, dosHeader, ntHeaders)) {
-                Utils::Logger::Error(L"EmulationEngine: Invalid PE file");
-                return false;
-            }
-
-            // TODO: Full PE loading implementation
-            // - Copy headers to imageBase
-            // - Load sections with proper permissions
-            // - Apply relocations
-            // - Resolve imports
-            // - Setup TEB/PEB structures
-
-            return true;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during PE loading");
-            return false;
+    for (const auto& cb : networkCallbacks) {
+        for (const auto& net : result.networkActivities) {
+            try { cb(net); } catch (...) {}
         }
     }
-
-    bool EmulationEngine::Impl::SetupWHPCPUState(EmulationSession* session, const MemoryLayout& layout, uint64_t entryPoint) noexcept {
-        try {
-            if (!session->whvPartition) {
-                return false;
-            }
-
-            // Setup initial CPU state
-            std::array<WHV_REGISTER_NAME, 20> regNames = {
-                WHvX64RegisterRax, WHvX64RegisterRbx, WHvX64RegisterRcx, WHvX64RegisterRdx,
-                WHvX64RegisterRsi, WHvX64RegisterRdi, WHvX64RegisterRbp, WHvX64RegisterRsp,
-                WHvX64RegisterR8, WHvX64RegisterR9, WHvX64RegisterR10, WHvX64RegisterR11,
-                WHvX64RegisterR12, WHvX64RegisterR13, WHvX64RegisterR14, WHvX64RegisterR15,
-                WHvX64RegisterRip, WHvX64RegisterRflags, WHvX64RegisterCs, WHvX64RegisterDs
-            };
-
-            std::array<WHV_REGISTER_VALUE, 20> regValues = {};
-
-            // Set RIP to entry point
-            regValues[16].Reg64 = entryPoint;
-
-            // Set RSP to top of stack
-            regValues[7].Reg64 = layout.stackBase + layout.stackSize - 0x1000;
-
-            // Set RFLAGS (enable interrupts, clear direction flag)
-            regValues[17].Reg64 = 0x202;
-
-            // Set CS/DS to appropriate selectors
-            regValues[18].Segment.Selector = 0x33; // 64-bit user code
-            regValues[18].Segment.Base = 0;
-            regValues[18].Segment.Limit = 0xFFFFFFFF;
-            regValues[18].Segment.Attributes = 0xA09B; // Code, readable, 64-bit
-
-            regValues[19].Segment.Selector = 0x2B; // User data
-            regValues[19].Segment.Base = 0;
-            regValues[19].Segment.Limit = 0xFFFFFFFF;
-            regValues[19].Segment.Attributes = 0xC093; // Data, writable
-
-            HRESULT hr = WHvSetVirtualProcessorRegisters(
-                session->whvPartition,
-                0, // vCPU index
-                regNames.data(),
-                static_cast<UINT32>(regNames.size()),
-                regValues.data()
-            );
-
-            if (FAILED(hr)) {
-                Utils::Logger::Error(L"EmulationEngine: WHvSetVirtualProcessorRegisters failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                return false;
-            }
-
-            return true;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during CPU state setup");
-            return false;
+    for (const auto& cb : unpackCallbacks) {
+        for (const auto& layer : result.unpackLayers) {
+            try { cb(layer); } catch (...) {}
         }
     }
+}
+#endif
 
-    bool EmulationEngine::Impl::RunWHPEmulation(EmulationSession* session, const EmulationConfig& config) noexcept {
-        try {
-            if (!session->whvPartition) {
-                return false;
+EmulationResult EmulationEngine::Impl::RunPE(std::span<const uint8_t> data, const EmulationConfig& config) noexcept {
+    return RunPE(data, config, 0);
+}
+
+EmulationResult EmulationEngine::Impl::RunPE(std::span<const uint8_t> data,
+                                             const EmulationConfig& config,
+                                             uint64_t sessionId) noexcept {
+    EmulationResult result;
+    const uint64_t sid = sessionId != 0 ? sessionId : CreateSession(config);
+    if (sid == 0) {
+        return BuildInputErrorResult(0, L"Failed to create emulation session", EmulationArch::X64);
+    }
+
+    auto* active = GetSessionEntry(sid);
+    if (!active) {
+        return BuildInputErrorResult(sid, L"Failed to locate emulation session", EmulationArch::X64);
+    }
+
+    active->state.store(EmulationState::Running, std::memory_order_relaxed);
+    active->startTime = std::chrono::steady_clock::now();
+    active->config = config;
+
+    try {
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"EmulationEngine is not initialized", EmulationArch::X64);
+        } else if (data.empty()) {
+            result = BuildInputErrorResult(sid, L"PE input buffer is empty", EmulationArch::X64);
+        } else if (active->shouldStop.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"Session terminated before execution", EmulationArch::X64);
+            result.state = EmulationState::Terminated;
+            result.exitReason = EmulationExitReason::UserTerminated;
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+        } else {
+            const auto phantomConfig = ConvertConfig(config);
+            active->phantomSession = std::make_unique<Phantom::EmulationSession>(phantomConfig);
+            if (active->shouldStop.load(std::memory_order_acquire)) {
+                active->phantomSession->RequestAbort();
             }
 
-            session->state = EmulationState::Running;
-            const auto startTime = std::chrono::high_resolution_clock::now();
-            const auto timeoutTime = startTime + std::chrono::milliseconds(config.timeoutMs);
+            const auto phantomResult = active->phantomSession->EmulatePE(data);
+            result = ConvertAndEnrich(phantomResult, sid);
+#else
+        } else {
+            result = BuildInputErrorResult(sid, L"PhantomEmulator not available in this build", EmulationArch::X64);
+#endif
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"RunPE exception: %ls", ToWide(ex.what()).c_str());
+        result = BuildInputErrorResult(sid, L"PE emulation raised an exception", EmulationArch::X64);
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"RunPE exception: unknown error");
+        result = BuildInputErrorResult(sid, L"PE emulation raised an unknown exception", EmulationArch::X64);
+    }
 
-            WHV_RUN_VP_EXIT_CONTEXT exitContext = {};
+    result.sessionId = sid;
+    result.backend = EmulationBackend::PhantomEmulator;
+    result.inputSize = data.size();
+    if (result.endTime == std::chrono::system_clock::time_point{}) {
+        result.endTime = std::chrono::system_clock::now();
+    }
+    if (result.startTime == std::chrono::system_clock::time_point{}) {
+        result.startTime = result.endTime - std::chrono::milliseconds(result.emulationTimeMs);
+    }
+    if (result.architecture == EmulationArch::X64 && (config.force32Bit || config.targetArch == EmulationArch::X86)) {
+        result.architecture = EmulationArch::X86;
+    }
 
-            while (!session->shouldStop) {
-                // Check timeout
-                if (std::chrono::high_resolution_clock::now() >= timeoutTime) {
-                    session->state = EmulationState::TimedOut;
-                    session->result.exitReason = EmulationExitReason::Timeout;
-                    break;
+    FinalizeSession(sid, result);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+    FireCallbacks(result);
+#endif
+    RemoveSession(sid);
+    return result;
+}
+
+EmulationResult EmulationEngine::Impl::RunShellcode(std::span<const uint8_t> data,
+                                                    bool is64,
+                                                    const EmulationConfig& config) noexcept {
+    return RunShellcode(data, is64, config, 0);
+}
+
+EmulationResult EmulationEngine::Impl::RunShellcode(std::span<const uint8_t> data,
+                                                    bool is64,
+                                                    const EmulationConfig& config,
+                                                    uint64_t sessionId) noexcept {
+    EmulationConfig effectiveConfig = config;
+    effectiveConfig.mode = EmulationMode::Shellcode;
+    effectiveConfig.targetArch = is64 ? EmulationArch::X64 : EmulationArch::X86;
+    effectiveConfig.force32Bit = !is64;
+
+    EmulationResult result;
+    const uint64_t sid = sessionId != 0 ? sessionId : CreateSession(effectiveConfig);
+    if (sid == 0) {
+        return BuildInputErrorResult(0, L"Failed to create emulation session", effectiveConfig.targetArch);
+    }
+
+    auto* active = GetSessionEntry(sid);
+    if (!active) {
+        return BuildInputErrorResult(sid, L"Failed to locate emulation session", effectiveConfig.targetArch);
+    }
+
+    active->state.store(EmulationState::Running, std::memory_order_relaxed);
+    active->startTime = std::chrono::steady_clock::now();
+    active->config = effectiveConfig;
+
+    try {
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"EmulationEngine is not initialized", effectiveConfig.targetArch);
+        } else if (data.empty()) {
+            result = BuildInputErrorResult(sid, L"Shellcode input buffer is empty", effectiveConfig.targetArch);
+        } else if (active->shouldStop.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"Session terminated before execution", effectiveConfig.targetArch);
+            result.state = EmulationState::Terminated;
+            result.exitReason = EmulationExitReason::UserTerminated;
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+        } else {
+            auto phantomConfig = ConvertConfig(effectiveConfig);
+            phantomConfig.cpuMode = is64 ? Phantom::CPUMode::Long64 : Phantom::CPUMode::Protected32;
+            phantomConfig.target = is64 ? Phantom::EmulationTarget::Shellcode64 : Phantom::EmulationTarget::Shellcode32;
+            active->phantomSession = std::make_unique<Phantom::EmulationSession>(phantomConfig);
+            if (active->shouldStop.load(std::memory_order_acquire)) {
+                active->phantomSession->RequestAbort();
+            }
+
+            const auto phantomResult = active->phantomSession->EmulateShellcode(data, is64);
+            result = ConvertAndEnrich(phantomResult, sid);
+#else
+        } else {
+            result = BuildInputErrorResult(sid, L"PhantomEmulator not available in this build", effectiveConfig.targetArch);
+#endif
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"RunShellcode exception: %ls", ToWide(ex.what()).c_str());
+        result = BuildInputErrorResult(sid, L"Shellcode emulation raised an exception", effectiveConfig.targetArch);
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"RunShellcode exception: unknown error");
+        result = BuildInputErrorResult(sid, L"Shellcode emulation raised an unknown exception", effectiveConfig.targetArch);
+    }
+
+    result.sessionId = sid;
+    result.backend = EmulationBackend::PhantomEmulator;
+    result.architecture = effectiveConfig.targetArch;
+    result.inputSize = data.size();
+    if (result.endTime == std::chrono::system_clock::time_point{}) {
+        result.endTime = std::chrono::system_clock::now();
+    }
+    if (result.startTime == std::chrono::system_clock::time_point{}) {
+        result.startTime = result.endTime - std::chrono::milliseconds(result.emulationTimeMs);
+    }
+
+    FinalizeSession(sid, result);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+    FireCallbacks(result);
+#endif
+    RemoveSession(sid);
+    return result;
+}
+
+EmulationResult EmulationEngine::Impl::RunBuffer(std::span<const uint8_t> data,
+                                                 uint64_t base,
+                                                 uint64_t entry,
+                                                 EmulationArch arch,
+                                                 const EmulationConfig& config) noexcept {
+    return RunBuffer(data, base, entry, arch, config, 0);
+}
+
+EmulationResult EmulationEngine::Impl::RunBuffer(std::span<const uint8_t> data,
+                                                 uint64_t base,
+                                                 uint64_t entry,
+                                                 EmulationArch arch,
+                                                 const EmulationConfig& config,
+                                                 uint64_t sessionId) noexcept {
+    EmulationConfig effectiveConfig = config;
+    effectiveConfig.targetArch = arch;
+    effectiveConfig.force32Bit = arch == EmulationArch::X86;
+
+    EmulationResult result;
+    const uint64_t sid = sessionId != 0 ? sessionId : CreateSession(effectiveConfig);
+    if (sid == 0) {
+        return BuildInputErrorResult(0, L"Failed to create emulation session", arch);
+    }
+
+    auto* active = GetSessionEntry(sid);
+    if (!active) {
+        return BuildInputErrorResult(sid, L"Failed to locate emulation session", arch);
+    }
+
+    active->state.store(EmulationState::Running, std::memory_order_relaxed);
+    active->startTime = std::chrono::steady_clock::now();
+    active->config = effectiveConfig;
+
+    try {
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"EmulationEngine is not initialized", arch);
+        } else if (data.empty()) {
+            result = BuildInputErrorResult(sid, L"Buffer input is empty", arch);
+        } else if (active->shouldStop.load(std::memory_order_acquire)) {
+            result = BuildInputErrorResult(sid, L"Session terminated before execution", arch);
+            result.state = EmulationState::Terminated;
+            result.exitReason = EmulationExitReason::UserTerminated;
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+        } else {
+            auto phantomConfig = ConvertConfig(effectiveConfig);
+            phantomConfig.cpuMode = arch == EmulationArch::X86 ? Phantom::CPUMode::Protected32 : Phantom::CPUMode::Long64;
+            phantomConfig.target = arch == EmulationArch::X86 ? Phantom::EmulationTarget::Shellcode32 : Phantom::EmulationTarget::Shellcode64;
+            active->phantomSession = std::make_unique<Phantom::EmulationSession>(phantomConfig);
+            if (active->shouldStop.load(std::memory_order_acquire)) {
+                active->phantomSession->RequestAbort();
+            }
+
+            const auto phantomResult = active->phantomSession->EmulateBuffer(data, base, entry, arch == EmulationArch::X64);
+            result = ConvertAndEnrich(phantomResult, sid);
+#else
+        } else {
+            result = BuildInputErrorResult(sid, L"PhantomEmulator not available in this build", arch);
+#endif
+        }
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"RunBuffer exception: %ls", ToWide(ex.what()).c_str());
+        result = BuildInputErrorResult(sid, L"Buffer emulation raised an exception", arch);
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"RunBuffer exception: unknown error");
+        result = BuildInputErrorResult(sid, L"Buffer emulation raised an unknown exception", arch);
+    }
+
+    result.sessionId = sid;
+    result.backend = EmulationBackend::PhantomEmulator;
+    result.architecture = arch;
+    result.inputSize = data.size();
+    if (result.endTime == std::chrono::system_clock::time_point{}) {
+        result.endTime = std::chrono::system_clock::now();
+    }
+    if (result.startTime == std::chrono::system_clock::time_point{}) {
+        result.startTime = result.endTime - std::chrono::milliseconds(result.emulationTimeMs);
+    }
+
+    FinalizeSession(sid, result);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+    FireCallbacks(result);
+#endif
+    RemoveSession(sid);
+    return result;
+}
+
+uint32_t CPUState::GetReg32(const std::string& name) const noexcept {
+    return static_cast<uint32_t>(GetReg64(name) & 0xFFFFFFFFULL);
+}
+
+uint64_t CPUState::GetReg64(const std::string& name) const noexcept {
+    const auto reg = ToLowerAscii(name);
+    if (reg == "rax" || reg == "eax") return rax;
+    if (reg == "rbx" || reg == "ebx") return rbx;
+    if (reg == "rcx" || reg == "ecx") return rcx;
+    if (reg == "rdx" || reg == "edx") return rdx;
+    if (reg == "rsi" || reg == "esi") return rsi;
+    if (reg == "rdi" || reg == "edi") return rdi;
+    if (reg == "rbp" || reg == "ebp") return rbp;
+    if (reg == "rsp" || reg == "esp") return rsp;
+    if (reg == "rip" || reg == "eip") return rip;
+    if (reg == "r8") return r8;
+    if (reg == "r9") return r9;
+    if (reg == "r10") return r10;
+    if (reg == "r11") return r11;
+    if (reg == "r12") return r12;
+    if (reg == "r13") return r13;
+    if (reg == "r14") return r14;
+    if (reg == "r15") return r15;
+    if (reg == "rflags" || reg == "eflags") return rflags;
+    return 0;
+}
+
+void CPUState::SetReg(const std::string& name, uint64_t value) noexcept {
+    const auto reg = ToLowerAscii(name);
+    if (reg == "rax" || reg == "eax") rax = value;
+    else if (reg == "rbx" || reg == "ebx") rbx = value;
+    else if (reg == "rcx" || reg == "ecx") rcx = value;
+    else if (reg == "rdx" || reg == "edx") rdx = value;
+    else if (reg == "rsi" || reg == "esi") rsi = value;
+    else if (reg == "rdi" || reg == "edi") rdi = value;
+    else if (reg == "rbp" || reg == "ebp") rbp = value;
+    else if (reg == "rsp" || reg == "esp") rsp = value;
+    else if (reg == "rip" || reg == "eip") rip = value;
+    else if (reg == "r8") r8 = value;
+    else if (reg == "r9") r9 = value;
+    else if (reg == "r10") r10 = value;
+    else if (reg == "r11") r11 = value;
+    else if (reg == "r12") r12 = value;
+    else if (reg == "r13") r13 = value;
+    else if (reg == "r14") r14 = value;
+    else if (reg == "r15") r15 = value;
+    else if (reg == "rflags" || reg == "eflags") rflags = value;
+}
+
+std::string CPUState::ToString() const {
+    std::ostringstream stream;
+    stream << "RIP=0x" << std::hex << rip
+           << " RSP=0x" << rsp
+           << " RAX=0x" << rax
+           << " RBX=0x" << rbx
+           << " RCX=0x" << rcx
+           << " RDX=0x" << rdx;
+    return stream.str();
+}
+
+std::wstring EmulationResult::GetSummary() const {
+    std::wstringstream stream;
+    stream << L"Session " << sessionId
+           << L" | State=" << ToWide(EmulationStateToString(state))
+           << L" | Backend=" << ToWide(EmulationBackendToString(backend))
+           << L" | Instructions=" << instructionsExecuted
+           << L" | APIs=" << apiCallCount;
+
+    if (isMalicious) {
+        stream << L" | Verdict=Malicious";
+        if (!threatName.empty()) {
+            stream << L" (" << ToWide(threatName) << L")";
+        }
+    } else {
+        stream << L" | Verdict=Clean";
+    }
+
+    return stream.str();
+}
+
+std::optional<APICallRecord> EmulationResult::GetHighestSeverityAPI() const {
+    return HighestSeverityAPI(apiCalls);
+}
+
+void EmulationResult::Clear() noexcept {
+    *this = EmulationResult{};
+}
+
+EmulationEngine& EmulationEngine::Instance() {
+    static EmulationEngine instance;
+    return instance;
+}
+
+EmulationEngine::EmulationEngine()
+    : m_impl(std::make_unique<Impl>()) {
+}
+
+EmulationEngine::~EmulationEngine() {
+    if (m_impl) {
+        m_impl->Shutdown();
+    }
+}
+
+bool EmulationEngine::Initialize(std::shared_ptr<Utils::ThreadPool> threadPool) {
+    return m_impl->Initialize(std::move(threadPool), nullptr, nullptr, nullptr, nullptr);
+}
+
+bool EmulationEngine::Initialize(std::shared_ptr<Utils::ThreadPool> threadPool,
+                                 SignatureStore::SignatureStore* signatureStore,
+                                 PatternStore::PatternStore* patternStore,
+                                 HashStore::HashStore* hashStore,
+                                 ThreatIntel::ThreatIntelIndex* threatIntel) {
+    return m_impl->Initialize(std::move(threadPool), signatureStore, patternStore, hashStore, threatIntel);
+}
+
+void EmulationEngine::Shutdown() {
+    if (m_impl) {
+        m_impl->Shutdown();
+    }
+}
+
+bool EmulationEngine::IsInitialized() const noexcept {
+    return m_impl && m_impl->m_initialized.load(std::memory_order_acquire);
+}
+
+bool EmulationEngine::IsHardwareAccelerationAvailable() const noexcept {
+    return false;
+}
+
+std::vector<EmulationBackend> EmulationEngine::GetAvailableBackends() const {
+    return { EmulationBackend::PhantomEmulator };
+}
+
+EmulationResult EmulationEngine::EmulatePE(const std::vector<uint8_t>& fileData, const EmulationConfig& config) {
+    return m_impl->RunPE(std::span<const uint8_t>(fileData), config);
+}
+
+EmulationResult EmulationEngine::EmulatePE(std::span<const uint8_t> fileData, const EmulationConfig& config) {
+    return m_impl->RunPE(fileData, config);
+}
+
+uint64_t EmulationEngine::EmulatePEAsync(std::vector<uint8_t> fileData,
+                                         const EmulationConfig& config,
+                                         EmulationCompleteCallback callback) {
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire) || !m_impl->m_threadPool) {
+        return 0;
+    }
+
+    const uint64_t sessionId = m_impl->CreateSession(config);
+    if (sessionId == 0) {
+        return 0;
+    }
+
+    try {
+        auto* implPtr = m_impl.get();
+        m_impl->m_threadPool->Submit(
+            [implPtr, fileData = std::move(fileData), config, callback = std::move(callback), sessionId](const Utils::TaskContext&) mutable {
+                auto result = implPtr->RunPE(std::span<const uint8_t>(fileData), config, sessionId);
+                result.sessionId = sessionId;
+                if (callback) {
+                    try { callback(result); } catch (...) {}
                 }
+                return result.sessionId;
+            },
+            Utils::TaskPriority::Normal,
+            "EmulatePEAsync");
+        return sessionId;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"EmulatePEAsync submit failed: %ls", ToWide(ex.what()).c_str());
+        m_impl->RemoveSession(sessionId, true);
+        return 0;
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"EmulatePEAsync submit failed: unknown error");
+        m_impl->RemoveSession(sessionId, true);
+        return 0;
+    }
+}
 
-                // Check instruction limit
-                if (session->instructionsExecuted >= config.maxInstructions) {
-                    session->state = EmulationState::Completed;
-                    session->result.exitReason = EmulationExitReason::MaxInstructions;
-                    break;
-                }
+EmulationResult EmulationEngine::EmulatePE(const std::vector<uint8_t>& fileData,
+                                           uint32_t timeoutMs,
+                                           uint64_t maxInstructions) {
+    EmulationConfig config = GetDefaultConfig();
+    config.timeoutMs = timeoutMs;
+    config.maxInstructions = maxInstructions;
+    return m_impl->RunPE(std::span<const uint8_t>(fileData), config);
+}
 
-                // Run virtual processor
-                HRESULT hr = WHvRunVirtualProcessor(
-                    session->whvPartition,
-                    0, // vCPU index
-                    &exitContext,
-                    sizeof(exitContext)
-                );
+EmulationResult EmulationEngine::EmulateShellcode(const std::vector<uint8_t>& code,
+                                                  bool is64Bit,
+                                                  const EmulationConfig& config) {
+    return m_impl->RunShellcode(std::span<const uint8_t>(code), is64Bit, config);
+}
 
-                if (FAILED(hr)) {
-                    Utils::Logger::Error(L"EmulationEngine: WHvRunVirtualProcessor failed: 0x{:08X}", static_cast<uint32_t>(hr));
-                    session->state = EmulationState::Failed;
-                    session->result.exitReason = EmulationExitReason::Exception;
-                    break;
-                }
+EmulationResult EmulationEngine::EmulateShellcode(std::span<const uint8_t> code,
+                                                  bool is64Bit,
+                                                  const EmulationConfig& config) {
+    return m_impl->RunShellcode(code, is64Bit, config);
+}
 
-                session->instructionsExecuted++;
-
-                // Handle exit reason
-                switch (exitContext.ExitReason) {
-                case WHvRunVpExitReasonX64Halt:
-                    session->state = EmulationState::Completed;
-                    session->result.exitReason = EmulationExitReason::NormalExit;
-                    return true;
-
-                case WHvRunVpExitReasonX64IoPortAccess:
-                    // Handle I/O port access
-                    break;
-
-                case WHvRunVpExitReasonMemoryAccess:
-                    // Handle memory access violation
-                    session->state = EmulationState::Crashed;
-                    session->result.exitReason = EmulationExitReason::AccessViolation;
-                    return false;
-
-                case WHvRunVpExitReasonX64InterruptWindow:
-                    // Continue execution
-                    break;
-
-                case WHvRunVpExitReasonX64MsrAccess:
-                    // Handle MSR access
-                    break;
-
-                case WHvRunVpExitReasonX64Cpuid:
-                    // Handle CPUID instruction
-                    break;
-
-                case WHvRunVpExitReasonException:
-                    // Handle CPU exception
-                    session->state = EmulationState::Crashed;
-                    session->result.exitReason = EmulationExitReason::Exception;
-                    return false;
-
-                default:
-                    Utils::Logger::Warn(L"EmulationEngine: Unhandled exit reason: {}",
-                        static_cast<uint32_t>(exitContext.ExitReason));
-                    break;
-                }
-            }
-
-            return session->state == EmulationState::Completed;
-
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"EmulationEngine: WHP emulation exception: {}",
-                Utils::StringUtils::ToWideString(e.what()));
-            session->state = EmulationState::Failed;
-            return false;
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Unknown WHP emulation error");
-            session->state = EmulationState::Failed;
-            return false;
-        }
+uint64_t EmulationEngine::EmulateShellcodeAsync(std::vector<uint8_t> code,
+                                                bool is64Bit,
+                                                const EmulationConfig& config,
+                                                EmulationCompleteCallback callback) {
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire) || !m_impl->m_threadPool) {
+        return 0;
     }
 
-    void EmulationEngine::Impl::CleanupWHPPartition(EmulationSession* session) noexcept {
-        try {
-            if (!session->whvPartition) {
-                return;
-            }
+    EmulationConfig effectiveConfig = config;
+    effectiveConfig.mode = EmulationMode::Shellcode;
+    effectiveConfig.targetArch = is64Bit ? EmulationArch::X64 : EmulationArch::X86;
+    effectiveConfig.force32Bit = !is64Bit;
 
-            // Delete virtual processor (implicitly done by WHvDeletePartition)
-            // Unmap memory (implicitly done by WHvDeletePartition)
-
-            WHvDeletePartition(session->whvPartition);
-            session->whvPartition = nullptr;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during WHP cleanup");
-        }
+    const uint64_t sessionId = m_impl->CreateSession(effectiveConfig);
+    if (sessionId == 0) {
+        return 0;
     }
 
-    // ========================================================================
-    // IMPL: UNICORN ENGINE (STUB)
-    // ========================================================================
+    try {
+        auto* implPtr = m_impl.get();
+        m_impl->m_threadPool->Submit(
+            [implPtr, code = std::move(code), is64Bit, config = effectiveConfig, callback = std::move(callback), sessionId](const Utils::TaskContext&) mutable {
+                auto result = implPtr->RunShellcode(std::span<const uint8_t>(code), is64Bit, config, sessionId);
+                result.sessionId = sessionId;
+                if (callback) {
+                    try { callback(result); } catch (...) {}
+                }
+                return result.sessionId;
+            },
+            Utils::TaskPriority::Normal,
+            "EmulateShellcodeAsync");
+        return sessionId;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(kLogCategory, L"EmulateShellcodeAsync submit failed: %ls", ToWide(ex.what()).c_str());
+        m_impl->RemoveSession(sessionId, true);
+        return 0;
+    } catch (...) {
+        SS_LOG_ERROR(kLogCategory, L"EmulateShellcodeAsync submit failed: unknown error");
+        m_impl->RemoveSession(sessionId, true);
+        return 0;
+    }
+}
 
-    bool EmulationEngine::Impl::InitializeUnicornEngine(EmulationSession* session, bool is64Bit) noexcept {
-        // Unicorn Engine integration placeholder
-        Utils::Logger::Debug(L"EmulationEngine: Unicorn Engine not yet integrated");
+EmulationResult EmulationEngine::EmulateBuffer(std::span<const uint8_t> buffer,
+                                               uint64_t baseAddress,
+                                               uint64_t entryPoint,
+                                               EmulationArch arch,
+                                               const EmulationConfig& config) {
+    return m_impl->RunBuffer(buffer, baseAddress, entryPoint, arch, config);
+}
+
+EmulationResult EmulationEngine::UnpackPE(const std::vector<uint8_t>& fileData, const EmulationConfig& config) {
+    EmulationConfig unpackConfig = config;
+    unpackConfig.mode = EmulationMode::UnpackOnly;
+    unpackConfig.enableUnpacking = true;
+    return m_impl->RunPE(std::span<const uint8_t>(fileData), unpackConfig);
+}
+
+PackerType EmulationEngine::DetectPacker(const std::vector<uint8_t>& fileData) {
+    return DetectPackerDetailed(fileData).first;
+}
+
+std::pair<PackerType, std::string> EmulationEngine::DetectPackerDetailed(const std::vector<uint8_t>& fileData) {
+    EmulationConfig config = EmulationConfig::CreateFast();
+    config.mode = EmulationMode::UnpackOnly;
+    config.maxInstructions = 1'000'000;
+    config.timeoutMs = 2000;
+
+    const auto result = m_impl->RunPE(std::span<const uint8_t>(fileData), config);
+    if (!result.detectedPackers.empty()) {
+        return { result.detectedPackers.front(), result.packerName };
+    }
+
+    return { IsPELikelyPacked(std::span<const uint8_t>(fileData)) ? PackerType::CustomCrypter : PackerType::None, "" };
+}
+
+size_t EmulationEngine::GetActiveSessionCount() const noexcept {
+    if (!m_impl) {
+        return 0;
+    }
+
+    std::shared_lock lock(m_impl->m_mutex);
+    return m_impl->m_sessions.size();
+}
+
+std::optional<EmulationSession> EmulationEngine::GetSession(uint64_t sessionId) const {
+    if (!m_impl) {
+        return std::nullopt;
+    }
+
+    std::shared_lock lock(m_impl->m_mutex);
+    const auto it = m_impl->m_sessions.find(sessionId);
+    if (it == m_impl->m_sessions.end()) {
+        return std::nullopt;
+    }
+
+    EmulationSession snapshot;
+    snapshot.sessionId = it->second->sessionId;
+    snapshot.state.store(it->second->state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.config = it->second->config;
+    snapshot.startTime = it->second->startTime;
+    snapshot.instructionCount.store(it->second->instructionCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.apiCallCount.store(it->second->apiCallCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    snapshot.activeBackend = it->second->backend;
+    return snapshot;
+}
+
+bool EmulationEngine::TerminateSession(uint64_t sessionId) {
+    if (!m_impl) {
         return false;
     }
 
-    bool EmulationEngine::Impl::SetupUnicornMemory(EmulationSession* session, const MemoryLayout& layout) noexcept {
+    auto* session = m_impl->GetSessionEntry(sessionId);
+    if (!session) {
         return false;
     }
 
-    bool EmulationEngine::Impl::LoadPEIntoUnicorn(EmulationSession* session, const std::vector<uint8_t>& peData, const MemoryLayout& layout) noexcept {
+    session->shouldStop.store(true, std::memory_order_release);
+    session->state.store(EmulationState::Terminated, std::memory_order_release);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+    if (session->phantomSession) {
+        session->phantomSession->RequestAbort();
+    }
+#endif
+    return true;
+}
+
+void EmulationEngine::TerminateAllSessions() {
+    if (!m_impl) {
+        return;
+    }
+
+    std::vector<uint64_t> sessions;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        sessions.reserve(m_impl->m_sessions.size());
+        for (const auto& [sessionId, session] : m_impl->m_sessions) {
+            (void)session;
+            sessions.push_back(sessionId);
+        }
+    }
+
+    for (const auto sessionId : sessions) {
+        TerminateSession(sessionId);
+    }
+}
+
+bool EmulationEngine::PauseSession(uint64_t sessionId) {
+    (void)sessionId;
+    return false;
+}
+
+bool EmulationEngine::ResumeSession(uint64_t sessionId) {
+    (void)sessionId;
+    return false;
+}
+
+uint64_t EmulationEngine::RegisterAPICallback(APICallCallback callback) {
+    if (!m_impl || !callback) {
+        return 0;
+    }
+
+    const uint64_t callbackId = m_impl->m_callbacks.nextId.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_callbacks.apiCallbacks.emplace(callbackId, std::move(callback));
+    return callbackId;
+}
+
+bool EmulationEngine::UnregisterAPICallback(uint64_t callbackId) {
+    if (!m_impl) {
         return false;
     }
 
-    bool EmulationEngine::Impl::RunUnicornEmulation(EmulationSession* session, const EmulationConfig& config) noexcept {
+    std::unique_lock lock(m_impl->m_mutex);
+    return m_impl->m_callbacks.apiCallbacks.erase(callbackId) > 0;
+}
+
+uint64_t EmulationEngine::RegisterFileDropCallback(FileDropCallback callback) {
+    if (!m_impl || !callback) {
+        return 0;
+    }
+
+    const uint64_t callbackId = m_impl->m_callbacks.nextId.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_callbacks.fileDropCallbacks.emplace(callbackId, std::move(callback));
+    return callbackId;
+}
+
+bool EmulationEngine::UnregisterFileDropCallback(uint64_t callbackId) {
+    if (!m_impl) {
         return false;
     }
 
-    void EmulationEngine::Impl::CleanupUnicornEngine(EmulationSession* session) noexcept {
-        // Cleanup placeholder
+    std::unique_lock lock(m_impl->m_mutex);
+    return m_impl->m_callbacks.fileDropCallbacks.erase(callbackId) > 0;
+}
+
+uint64_t EmulationEngine::RegisterNetworkCallback(NetworkActivityCallback callback) {
+    if (!m_impl || !callback) {
+        return 0;
     }
 
-    // ========================================================================
-    // IMPL: PE PARSING
-    // ========================================================================
+    const uint64_t callbackId = m_impl->m_callbacks.nextId.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_callbacks.networkCallbacks.emplace(callbackId, std::move(callback));
+    return callbackId;
+}
 
-    bool EmulationEngine::Impl::ParsePEHeaders(
-        const std::vector<uint8_t>& peData,
-        IMAGE_DOS_HEADER& dosHeader,
-        IMAGE_NT_HEADERS64& ntHeaders
-    ) noexcept {
-        try {
-            if (peData.size() < sizeof(IMAGE_DOS_HEADER)) {
-                return false;
-            }
+bool EmulationEngine::UnregisterNetworkCallback(uint64_t callbackId) {
+    if (!m_impl) {
+        return false;
+    }
 
-            // Copy DOS header
-            std::memcpy(&dosHeader, peData.data(), sizeof(IMAGE_DOS_HEADER));
+    std::unique_lock lock(m_impl->m_mutex);
+    return m_impl->m_callbacks.networkCallbacks.erase(callbackId) > 0;
+}
 
-            // Validate DOS signature
-            if (dosHeader.e_magic != IMAGE_DOS_SIGNATURE) {
-                return false;
-            }
+uint64_t EmulationEngine::RegisterUnpackCallback(UnpackLayerCallback callback) {
+    if (!m_impl || !callback) {
+        return 0;
+    }
 
-            // Check NT headers offset
-            if (static_cast<size_t>(dosHeader.e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > peData.size()) {
-                return false;
-            }
+    const uint64_t callbackId = m_impl->m_callbacks.nextId.fetch_add(1, std::memory_order_relaxed);
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_callbacks.unpackCallbacks.emplace(callbackId, std::move(callback));
+    return callbackId;
+}
 
-            // Copy NT headers
-            std::memcpy(&ntHeaders, peData.data() + dosHeader.e_lfanew, sizeof(IMAGE_NT_HEADERS64));
+bool EmulationEngine::UnregisterUnpackCallback(uint64_t callbackId) {
+    if (!m_impl) {
+        return false;
+    }
 
-            // Validate PE signature
-            if (ntHeaders.Signature != IMAGE_NT_SIGNATURE) {
-                return false;
-            }
+    std::unique_lock lock(m_impl->m_mutex);
+    return m_impl->m_callbacks.unpackCallbacks.erase(callbackId) > 0;
+}
 
-            return true;
+EmulationStats EmulationEngine::GetStats() const {
+    if (!m_impl) {
+        return EmulationStats{};
+    }
 
-        } catch (...) {
-            return false;
+    return SnapshotStats(m_impl->m_stats);
+}
+
+void EmulationEngine::ResetStats() {
+    if (m_impl) {
+        m_impl->m_stats.Reset();
+        m_impl->m_stats.phantomEmulatorAvailable = true;
+    }
+}
+
+void EmulationEngine::SetDefaultConfig(const EmulationConfig& config) {
+    if (!m_impl) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_defaultConfig = config;
+}
+
+EmulationConfig EmulationEngine::GetDefaultConfig() const {
+    if (!m_impl) {
+        return EmulationConfig::CreateDefault();
+    }
+
+    std::shared_lock lock(m_impl->m_mutex);
+    return m_impl->m_defaultConfig;
+}
+
+void EmulationEngine::SetSignatureStore(SignatureStore::SignatureStore* store) {
+    if (!m_impl) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_signatureStore = store;
+}
+
+void EmulationEngine::SetPatternStore(PatternStore::PatternStore* store) {
+    if (!m_impl) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_patternStore = store;
+}
+
+void EmulationEngine::SetHashStore(HashStore::HashStore* store) {
+    if (!m_impl) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_hashStore = store;
+}
+
+void EmulationEngine::SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* index) {
+    if (!m_impl) {
+        return;
+    }
+
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_threatIntel = index;
+}
+
+bool IsWHPAvailable() noexcept {
+    return false;
+}
+
+bool IsHyperVEnabled() noexcept {
+    return false;
+}
+
+bool HasWHPPrivileges() noexcept {
+    return false;
+}
+
+double CalculateEntropy(const uint8_t* data, size_t size) noexcept {
+    if (!data || size == 0) {
+        return 0.0;
+    }
+
+    std::array<uint64_t, 256> frequencies{};
+    for (size_t i = 0; i < size; ++i) {
+        ++frequencies[data[i]];
+    }
+
+    double entropy = 0.0;
+    const double total = static_cast<double>(size);
+    for (const auto count : frequencies) {
+        if (count == 0) {
+            continue;
+        }
+
+        const double probability = static_cast<double>(count) / total;
+        entropy -= probability * std::log2(probability);
+    }
+
+    return entropy;
+}
+
+bool IsPELikelyPacked(std::span<const uint8_t> peData) noexcept {
+    if (peData.size() < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+
+    const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(peData.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE ||
+        dos->e_lfanew <= 0 ||
+        static_cast<size_t>(dos->e_lfanew) + sizeof(uint32_t) > peData.size()) {
+        return false;
+    }
+
+    const double entropy = CalculateEntropy(peData.data(), std::min<size_t>(peData.size(), 64 * 1024));
+    if (entropy >= EmulationConstants::PACKED_ENTROPY_THRESHOLD) {
+        return true;
+    }
+
+    const std::string data(reinterpret_cast<const char*>(peData.data()), peData.size());
+    return data.find("UPX!") != std::string::npos || data.find("MPRESS1") != std::string::npos;
+}
+
+uint64_t DetectOEP(std::span<const uint8_t> memoryDump, uint64_t imageBase) noexcept {
+    if (memoryDump.size() < 8) {
+        return 0;
+    }
+
+    for (size_t i = 0; i + 4 < memoryDump.size(); ++i) {
+        const uint8_t b0 = memoryDump[i];
+        const uint8_t b1 = memoryDump[i + 1];
+        const uint8_t b2 = memoryDump[i + 2];
+
+        const bool prologue32 = b0 == 0x55 && b1 == 0x8B && b2 == 0xEC;
+        const bool prologue64 = b0 == 0x48 && b1 == 0x89 && (b2 == 0x5C || b2 == 0xE5);
+        const bool stackFrame = b0 == 0x53 && b1 == 0x56 && b2 == 0x57;
+
+        if (prologue32 || prologue64 || stackFrame) {
+            return imageBase + i;
         }
     }
 
-    uint64_t EmulationEngine::Impl::GetPEEntryPoint(const std::vector<uint8_t>& peData) noexcept {
-        try {
-            IMAGE_DOS_HEADER dosHeader = {};
-            IMAGE_NT_HEADERS64 ntHeaders = {};
+    return 0;
+}
 
-            if (!ParsePEHeaders(peData, dosHeader, ntHeaders)) {
-                return 0;
-            }
+APICategory CategorizeAPI(std::string_view dllName, std::string_view funcName) noexcept {
+    const auto dll = ToLowerAscii(dllName);
+    const auto func = ToLowerAscii(funcName);
 
-            return ntHeaders.OptionalHeader.ImageBase + ntHeaders.OptionalHeader.AddressOfEntryPoint;
-
-        } catch (...) {
-            return 0;
-        }
+    if (dll.find("kernel32") != std::string::npos || func.find("file") != std::string::npos) {
+        return APICategory::FileSystem;
     }
-
-    bool EmulationEngine::Impl::IsPE64(const std::vector<uint8_t>& peData) noexcept {
-        try {
-            IMAGE_DOS_HEADER dosHeader = {};
-            IMAGE_NT_HEADERS64 ntHeaders = {};
-
-            if (!ParsePEHeaders(peData, dosHeader, ntHeaders)) {
-                return false;
-            }
-
-            return (ntHeaders.OptionalHeader.Magic == IMAGE_NT_OPTIONAL_HDR64_MAGIC);
-
-        } catch (...) {
-            return false;
-        }
+    if (dll.find("advapi32") != std::string::npos || func.find("reg") != std::string::npos) {
+        return APICategory::Registry;
     }
-
-    // ========================================================================
-    // IMPL: VIRTUAL ENVIRONMENT
-    // ========================================================================
-
-    EmulationEngine::Impl::VirtualEnvironment EmulationEngine::Impl::SetupVirtualEnvironment() noexcept {
-        VirtualEnvironment venv;
-
-        try {
-            // Setup virtual file system
-            venv.vfs.files[L"C:\\Windows\\System32\\kernel32.dll"] = VirtualFile{
-                L"kernel32.dll",
-                std::vector<uint8_t>(1024, 0),
-                0,
-                FILE_ATTRIBUTE_NORMAL
-            };
-
-            venv.vfs.files[L"C:\\Windows\\System32\\ntdll.dll"] = VirtualFile{
-                L"ntdll.dll",
-                std::vector<uint8_t>(1024, 0),
-                0,
-                FILE_ATTRIBUTE_NORMAL
-            };
-
-            // Setup virtual registry
-            venv.vreg.keys[L"HKEY_LOCAL_MACHINE\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion"] = VirtualRegistryKey{
-                std::unordered_map<std::wstring, std::wstring>{
-                    {L"ProgramFilesDir", L"C:\\Program Files"},
-                    {L"CommonFilesDir", L"C:\\Program Files\\Common Files"}
-                }
-            };
-
-            // Setup virtual environment variables
-            venv.venv.variables[L"PATH"] = L"C:\\Windows\\System32;C:\\Windows";
-            venv.venv.variables[L"SYSTEMROOT"] = L"C:\\Windows";
-            venv.venv.variables[L"TEMP"] = L"C:\\Users\\User\\AppData\\Local\\Temp";
-            venv.venv.variables[L"USERNAME"] = L"User";
-            venv.venv.variables[L"COMPUTERNAME"] = L"DESKTOP-ANALYSIS";
-
-            // Setup virtual network
-            venv.vnet.hasInternet = true;
-            venv.vnet.dns = L"8.8.8.8";
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during virtual environment setup");
-        }
-
-        return venv;
+    if (dll.find("ws2_32") != std::string::npos || dll.find("wininet") != std::string::npos ||
+        func.find("connect") != std::string::npos || func.find("send") != std::string::npos) {
+        return APICategory::Network;
     }
-
-    bool EmulationEngine::Impl::HandleAPICall(
-        EmulationSession* session,
-        VirtualEnvironment& venv,
-        const std::string& apiName,
-        CPUState& cpuState
-    ) noexcept {
-        try {
-            // Placeholder for API emulation
-            // Full implementation would handle kernel32, ntdll, ws2_32, etc.
-
-            if (apiName == "CreateFileW") {
-                // Emulate CreateFileW
-                RecordAPICall(session, "CreateFileW", {"path", "access", "shareMode"}, "HANDLE");
-                return true;
-            }
-
-            if (apiName == "WriteFile") {
-                // Emulate WriteFile
-                RecordAPICall(session, "WriteFile", {"handle", "buffer", "size"}, "TRUE");
-                return true;
-            }
-
-            if (apiName == "RegCreateKeyExW") {
-                // Emulate RegCreateKeyExW
-                RecordAPICall(session, "RegCreateKeyExW", {"key", "subkey"}, "ERROR_SUCCESS");
-                return true;
-            }
-
-            if (apiName == "connect") {
-                // Emulate network connection
-                RecordAPICall(session, "connect", {"socket", "address", "port"}, "0");
-                return true;
-            }
-
-            // Unhandled API
-            Utils::Logger::Debug(L"EmulationEngine: Unhandled API call: {}",
-                Utils::StringUtils::ToWideString(apiName));
-            return false;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during API call handling");
-            return false;
-        }
+    if (func.find("process") != std::string::npos || func.find("thread") != std::string::npos) {
+        return APICategory::Process;
     }
-
-    void EmulationEngine::Impl::RecordAPICall(
-        EmulationSession* session,
-        const std::string& apiName,
-        const std::vector<std::string>& args,
-        const std::string& returnValue
-    ) noexcept {
-        try {
-            APICallRecord record;
-            record.apiName = apiName;
-            record.moduleName = "kernel32.dll"; // Simplified
-            record.arguments = args;
-            record.returnValue = returnValue;
-            record.timestamp = std::chrono::system_clock::now();
-
-            session->result.apiCalls.push_back(std::move(record));
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during API call recording");
-        }
+    if (func.find("alloc") != std::string::npos || func.find("protect") != std::string::npos ||
+        func.find("memory") != std::string::npos) {
+        return APICategory::Memory;
     }
-
-    // ========================================================================
-    // IMPL: MEMORY SCANNING
-    // ========================================================================
-
-    bool EmulationEngine::Impl::ScanMemoryWithYara(EmulationSession* session, const std::vector<uint8_t>& memory) noexcept {
-        try {
-            if (!m_signatureStore) {
-                return false;
-            }
-
-            // Perform YARA scan on memory
-            // (Simplified - actual implementation would integrate with SignatureStore)
-
-            return false;
-
-        } catch (...) {
-            Utils::Logger::Error(L"EmulationEngine: Exception during YARA scanning");
-            return false;
-        }
+    if (func.find("debug") != std::string::npos || func.find("tick") != std::string::npos ||
+        func.find("sleep") != std::string::npos) {
+        return APICategory::AntiAnalysis;
     }
+    return APICategory::Unknown;
+}
 
-    double EmulationEngine::Impl::CalculateEntropy(const std::vector<uint8_t>& data) noexcept {
-        try {
-            if (data.empty()) {
-                return 0.0;
-            }
+APISeverity AssessAPISeverity(std::string_view dllName,
+                              std::string_view funcName,
+                              const std::vector<std::string>& args) noexcept {
+    const auto dll = ToLowerAscii(dllName);
+    const auto func = ToLowerAscii(funcName);
+    (void)args;
 
-            std::array<uint64_t, 256> counts = {};
-
-            for (const uint8_t byte : data) {
-                counts[byte]++;
-            }
-
-            double entropy = 0.0;
-            const double dataSize = static_cast<double>(data.size());
-
-            for (const uint64_t count : counts) {
-                if (count == 0) continue;
-
-                const double probability = static_cast<double>(count) / dataSize;
-                entropy -= probability * std::log2(probability);
-            }
-
-            return entropy;
-
-        } catch (...) {
-            return 0.0;
-        }
+    if (func.find("writeprocessmemory") != std::string::npos ||
+        func.find("createremotethread") != std::string::npos ||
+        func.find("ntmapviewofsection") != std::string::npos) {
+        return APISeverity::Critical;
     }
-
-    // ========================================================================
-    // IMPL: UNPACKING
-    // ========================================================================
-
-    PackerType EmulationEngine::Impl::DetectPackerInternal(const std::vector<uint8_t>& peData) noexcept {
-        try {
-            if (!m_patternStore) {
-                return PackerType::Unknown;
-            }
-
-            // Check for UPX signature
-            const std::string peDataStr(peData.begin(), peData.end());
-            if (peDataStr.find("UPX") != std::string::npos) {
-                return PackerType::UPX;
-            }
-
-            // Check for high entropy (possible packing/encryption)
-            const double entropy = CalculateEntropy(peData);
-            if (entropy > 7.5) {
-                // High entropy suggests packing
-                return PackerType::Custom;
-            }
-
-            // Check section names
-            IMAGE_DOS_HEADER dosHeader = {};
-            IMAGE_NT_HEADERS64 ntHeaders = {};
-
-            if (ParsePEHeaders(peData, dosHeader, ntHeaders)) {
-                // Check for suspicious section names
-                // (Full implementation would parse section table)
-            }
-
-            return PackerType::None;
-
-        } catch (...) {
-            return PackerType::Unknown;
-        }
+    if (func.find("virtualallocex") != std::string::npos ||
+        func.find("regsetvalue") != std::string::npos ||
+        func.find("createprocess") != std::string::npos) {
+        return APISeverity::High;
     }
-
-    bool EmulationEngine::Impl::CheckUnpackCompletion(
-        EmulationSession* session,
-        const std::vector<uint8_t>& initialMemory,
-        const std::vector<uint8_t>& currentMemory
-    ) noexcept {
-        try {
-            // Check if entropy dropped (indication of unpacking)
-            const double initialEntropy = CalculateEntropy(initialMemory);
-            const double currentEntropy = CalculateEntropy(currentMemory);
-
-            if (initialEntropy - currentEntropy > 1.0) {
-                // Significant entropy drop
-                return true;
-            }
-
-            // Check for OEP
-            const auto oep = FindOEP(session, currentMemory);
-            if (oep.has_value()) {
-                return true;
-            }
-
-            return false;
-
-        } catch (...) {
-            return false;
-        }
+    if (dll.find("wininet") != std::string::npos ||
+        func.find("connect") != std::string::npos ||
+        func.find("download") != std::string::npos) {
+        return APISeverity::Medium;
     }
-
-    std::optional<uint64_t> EmulationEngine::Impl::FindOEP(EmulationSession* session, const std::vector<uint8_t>& memory) noexcept {
-        try {
-            // OEP detection heuristics
-            // - Look for standard PE entry point patterns
-            // - Check for normal function prologue
-            // - Validate code region
-
-            // Simplified stub
-            return std::nullopt;
-
-        } catch (...) {
-            return std::nullopt;
-        }
+    if (func.find("createfile") != std::string::npos ||
+        func.find("writefile") != std::string::npos) {
+        return APISeverity::Low;
     }
-
-    // ========================================================================
-    // IMPL: THREAT ANALYSIS
-    // ========================================================================
-
-    float EmulationEngine::Impl::CalculateThreatScore(const EmulationResult& result) noexcept {
-        try {
-            float score = 0.0f;
-
-            // API call scoring
-            for (const auto& apiCall : result.apiCalls) {
-                if (apiCall.apiName == "CreateFileW" || apiCall.apiName == "WriteFile") {
-                    score += 5.0f; // File manipulation
-                }
-                if (apiCall.apiName == "RegSetValueExW" || apiCall.apiName == "RegCreateKeyExW") {
-                    score += 10.0f; // Registry modification
-                }
-                if (apiCall.apiName == "CreateProcessW") {
-                    score += 15.0f; // Process creation
-                }
-                if (apiCall.apiName == "VirtualAllocEx" || apiCall.apiName == "WriteProcessMemory") {
-                    score += 25.0f; // Process injection
-                }
-                if (apiCall.apiName == "connect" || apiCall.apiName == "send") {
-                    score += 20.0f; // Network activity
-                }
-            }
-
-            // Dropped files
-            score += static_cast<float>(result.droppedFiles.size()) * 10.0f;
-
-            // Network connections
-            score += static_cast<float>(result.networkActivities.size()) * 15.0f;
-
-            // Unpacking layers
-            score += static_cast<float>(result.unpackLayers.size()) * 20.0f;
-
-            // MITRE techniques
-            score += static_cast<float>(result.mitreTechniques.size()) * 30.0f;
-
-            return std::min(score, 100.0f);
-
-        } catch (...) {
-            return 0.0f;
-        }
-    }
-
-    bool EmulationEngine::Impl::AnalyzeBehavior(EmulationSession* session) noexcept {
-        try {
-            // Analyze collected behaviors
-            auto& result = session->result;
-
-            // Check for malicious patterns
-            bool hasFileWrite = false;
-            bool hasRegWrite = false;
-            bool hasNetworkActivity = false;
-            bool hasProcessInjection = false;
-
-            for (const auto& apiCall : result.apiCalls) {
-                if (apiCall.apiName == "WriteFile") hasFileWrite = true;
-                if (apiCall.apiName == "RegSetValueExW") hasRegWrite = true;
-                if (apiCall.apiName == "connect") hasNetworkActivity = true;
-                if (apiCall.apiName == "WriteProcessMemory") hasProcessInjection = true;
-            }
-
-            // Determine if malicious
-            if (hasProcessInjection) {
-                result.isMalicious = true;
-            }
-
-            if (hasFileWrite && hasRegWrite && hasNetworkActivity) {
-                result.isMalicious = true;
-            }
-
-            // Calculate threat score
-            result.threatScore = CalculateThreatScore(result);
-
-            return true;
-
-        } catch (...) {
-            return false;
-        }
-    }
-
-    // ========================================================================
-    // PUBLIC API IMPLEMENTATION
-    // ========================================================================
-
-    EmulationEngine& EmulationEngine::Instance() noexcept {
-        static EmulationEngine instance;
-        return instance;
-    }
-
-    EmulationEngine::EmulationEngine() noexcept
-        : m_impl(std::make_unique<Impl>()) {
-    }
-
-    EmulationEngine::~EmulationEngine() {
-        if (m_impl) {
-            m_impl->Shutdown();
-        }
-    }
-
-    bool EmulationEngine::Initialize(
-        std::shared_ptr<Utils::ThreadPool> threadPool,
-        SignatureStore::SignatureStore* signatureStore,
-        PatternStore::PatternStore* patternStore,
-        HashStore::HashStore* hashStore,
-        ThreatIntel::ThreatIntelIndex* threatIntel,
-        EmulationError* err
-    ) noexcept {
-        if (!m_impl) {
-            if (err) {
-                err->code = ERROR_INVALID_HANDLE;
-                err->message = L"Invalid engine instance";
-            }
-            return false;
-        }
-
-        return m_impl->Initialize(threadPool, signatureStore, patternStore, hashStore, threatIntel, err);
-    }
-
-    void EmulationEngine::Shutdown() noexcept {
-        if (m_impl) {
-            m_impl->Shutdown();
-        }
-    }
-
-    bool EmulationEngine::IsInitialized() const noexcept {
-        return m_impl && m_impl->m_initialized.load();
-    }
-
-    EmulationBackend EmulationEngine::GetAvailableBackend() const noexcept {
-        if (!m_impl) {
-            return EmulationBackend::Disabled;
-        }
-
-        if (m_impl->m_whpAvailable) {
-            return EmulationBackend::WindowsHypervisorPlatform;
-        }
-
-        if (m_impl->m_unicornAvailable) {
-            return EmulationBackend::UnicornEngine;
-        }
-
-        return EmulationBackend::Disabled;
-    }
-
-    bool EmulationEngine::IsBackendAvailable(EmulationBackend backend) const noexcept {
-        if (!m_impl) {
-            return false;
-        }
-
-        switch (backend) {
-        case EmulationBackend::WindowsHypervisorPlatform:
-            return m_impl->m_whpAvailable.load();
-        case EmulationBackend::UnicornEngine:
-            return m_impl->m_unicornAvailable.load();
-        default:
-            return false;
-        }
-    }
-
-    // ========================================================================
-    // EMULATION METHODS
-    // ========================================================================
-
-    EmulationResult EmulationEngine::EmulatePE(
-        const std::vector<uint8_t>& fileData,
-        const EmulationConfig& config,
-        EmulationError* err
-    ) noexcept {
-        EmulationResult result;
-
-        try {
-            if (!IsInitialized()) {
-                if (err) {
-                    err->code = ERROR_NOT_READY;
-                    err->message = L"Engine not initialized";
-                }
-                return result;
-            }
-
-            const auto startTime = std::chrono::high_resolution_clock::now();
-
-            // Determine backend
-            EmulationBackend backend = config.preferredBackend;
-            if (backend == EmulationBackend::Auto) {
-                backend = GetAvailableBackend();
-            }
-
-            if (backend == EmulationBackend::Disabled) {
-                if (err) {
-                    err->code = ERROR_NOT_SUPPORTED;
-                    err->message = L"No emulation backend available";
-                }
-                return result;
-            }
-
-            // Create session
-            const uint64_t sessionId = m_impl->CreateSession(backend);
-            if (sessionId == 0) {
-                if (err) {
-                    err->code = ERROR_INTERNAL_ERROR;
-                    err->message = L"Failed to create emulation session";
-                }
-                return result;
-            }
-
-            auto* session = m_impl->GetSession(sessionId);
-            if (!session) {
-                if (err) {
-                    err->code = ERROR_INVALID_HANDLE;
-                    err->message = L"Invalid session";
-                }
-                return result;
-            }
-
-            // Setup memory layout
-            Impl::MemoryLayout layout;
-
-            // Parse PE to get entry point
-            const uint64_t entryPoint = m_impl->GetPEEntryPoint(fileData);
-            if (entryPoint == 0) {
-                if (err) {
-                    err->code = ERROR_INVALID_DATA;
-                    err->message = L"Invalid PE file";
-                }
-                m_impl->DestroySession(sessionId);
-                return result;
-            }
-
-            // Initialize backend
-            bool initSuccess = false;
-            if (backend == EmulationBackend::WindowsHypervisorPlatform) {
-                initSuccess = m_impl->InitializeWHPPartition(session, config.memoryLimit);
-                if (initSuccess) {
-                    initSuccess = m_impl->SetupWHPMemory(session, layout);
-                    if (initSuccess) {
-                        initSuccess = m_impl->LoadPEIntoWHP(session, fileData, layout);
-                        if (initSuccess) {
-                            initSuccess = m_impl->SetupWHPCPUState(session, layout, entryPoint);
-                        }
-                    }
-                }
-            } else if (backend == EmulationBackend::UnicornEngine) {
-                const bool is64Bit = m_impl->IsPE64(fileData);
-                initSuccess = m_impl->InitializeUnicornEngine(session, is64Bit);
-                if (initSuccess) {
-                    initSuccess = m_impl->SetupUnicornMemory(session, layout);
-                    if (initSuccess) {
-                        initSuccess = m_impl->LoadPEIntoUnicorn(session, fileData, layout);
-                    }
-                }
-            }
-
-            if (!initSuccess) {
-                if (err) {
-                    err->code = ERROR_INTERNAL_ERROR;
-                    err->message = L"Failed to initialize emulation backend";
-                }
-                m_impl->DestroySession(sessionId);
-                return result;
-            }
-
-            // Run emulation
-            bool runSuccess = false;
-            if (backend == EmulationBackend::WindowsHypervisorPlatform) {
-                runSuccess = m_impl->RunWHPEmulation(session, config);
-            } else if (backend == EmulationBackend::UnicornEngine) {
-                runSuccess = m_impl->RunUnicornEmulation(session, config);
-            }
-
-            // Analyze behavior
-            m_impl->AnalyzeBehavior(session);
-
-            // Copy result
-            result = session->result;
-            result.state = session->state;
-            result.instructionsExecuted = session->instructionsExecuted.load();
-
-            const auto endTime = std::chrono::high_resolution_clock::now();
-            const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
-            result.emulationTimeMs = duration.count();
-
-            // Update statistics
-            m_impl->m_stats.totalEmulations++;
-            m_impl->m_stats.totalEmulationTimeUs += std::chrono::duration_cast<std::chrono::microseconds>(duration).count();
-            m_impl->m_stats.totalInstructionsEmulated += result.instructionsExecuted;
-
-            if (result.isMalicious) {
-                m_impl->m_stats.maliciousSamplesDetected++;
-            }
-
-            // Cleanup session
-            m_impl->DestroySession(sessionId);
-
-            return result;
-
-        } catch (const std::exception& e) {
-            Utils::Logger::Error(L"EmulationEngine: EmulatePE exception: {}",
-                Utils::StringUtils::ToWideString(e.what()));
-
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Emulation failed";
-                err->context = Utils::StringUtils::ToWideString(e.what());
-            }
-
-            return result;
-        } catch (...) {
-            Utils::Logger::Critical(L"EmulationEngine: Unknown EmulatePE error");
-
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Unknown emulation error";
-            }
-
-            return result;
-        }
-    }
-
-    EmulationResult EmulationEngine::EmulateShellcode(
-        const std::vector<uint8_t>& code,
-        bool is64Bit,
-        const EmulationConfig& config,
-        EmulationError* err
-    ) noexcept {
-        EmulationResult result;
-
-        try {
-            if (!IsInitialized()) {
-                if (err) {
-                    err->code = ERROR_NOT_READY;
-                    err->message = L"Engine not initialized";
-                }
-                return result;
-            }
-
-            // Shellcode emulation implementation
-            // (Simplified stub - full implementation would setup shellcode execution environment)
-
-            Utils::Logger::Debug(L"EmulationEngine: Shellcode emulation not fully implemented");
-
-            m_impl->m_stats.totalEmulations++;
-
-            return result;
-
-        } catch (...) {
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Shellcode emulation failed";
-            }
-            return result;
-        }
-    }
-
-    EmulationResult EmulationEngine::UnpackPE(
-        const std::vector<uint8_t>& fileData,
-        const EmulationConfig& config,
-        EmulationError* err
-    ) noexcept {
-        EmulationResult result;
-
-        try {
-            if (!IsInitialized()) {
-                if (err) {
-                    err->code = ERROR_NOT_READY;
-                    err->message = L"Engine not initialized";
-                }
-                return result;
-            }
-
-            // Detect packer
-            const PackerType packer = m_impl->DetectPackerInternal(fileData);
-
-            Utils::Logger::Info(L"EmulationEngine: Detected packer: {}", PackerTypeToString(packer));
-
-            if (packer == PackerType::None) {
-                // Not packed
-                return result;
-            }
-
-            // Emulate until unpacking completes
-            // (Full implementation would monitor for OEP and dump unpacked code)
-
-            m_impl->m_stats.totalUnpackings++;
-
-            return result;
-
-        } catch (...) {
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Unpacking failed";
-            }
-            return result;
-        }
-    }
-
-    PackerType EmulationEngine::DetectPacker(
-        const std::vector<uint8_t>& fileData,
-        EmulationError* err
-    ) noexcept {
-        try {
-            if (!IsInitialized()) {
-                if (err) {
-                    err->code = ERROR_NOT_READY;
-                    err->message = L"Engine not initialized";
-                }
-                return PackerType::Unknown;
-            }
-
-            return m_impl->DetectPackerInternal(fileData);
-
-        } catch (...) {
-            if (err) {
-                err->code = ERROR_INTERNAL_ERROR;
-                err->message = L"Packer detection failed";
-            }
-            return PackerType::Unknown;
-        }
-    }
-
-    // ========================================================================
-    // STATISTICS
-    // ========================================================================
-
-    const EmulationStats& EmulationEngine::GetStatistics() const noexcept {
-        static EmulationStats emptyStats;
-        if (!m_impl) {
-            return emptyStats;
-        }
-        return m_impl->m_stats;
-    }
-
-    void EmulationEngine::ResetStatistics() noexcept {
-        if (m_impl) {
-            m_impl->m_stats.Reset();
-        }
-    }
-
-    // ========================================================================
-    // CONFIGURATION DEFAULTS
-    // ========================================================================
-
-    EmulationConfig EmulationConfig::CreateDefault() noexcept {
-        EmulationConfig config;
-        config.preferredBackend = EmulationBackend::Auto;
-        config.timeoutMs = 30000; // 30 seconds
-        config.maxInstructions = 100'000'000; // 100 million
-        config.memoryLimit = 512 * 1024 * 1024; // 512 MB
-        config.enableUnpacking = true;
-        config.enableAPITracing = true;
-        config.enableMemoryScanning = true;
-        config.enableNetworkSimulation = true;
-        config.enableAntiEvasion = true;
-        config.memoryScanIntervalMs = 1000; // 1 second
-        return config;
-    }
-
-    EmulationConfig EmulationConfig::CreateShellcode() noexcept {
-        EmulationConfig config = CreateDefault();
-        config.timeoutMs = 10000; // 10 seconds
-        config.maxInstructions = 10'000'000; // 10 million
-        config.memoryLimit = 64 * 1024 * 1024; // 64 MB
-        config.enableUnpacking = false;
-        return config;
-    }
-
-    EmulationConfig EmulationConfig::CreateUnpackOnly() noexcept {
-        EmulationConfig config = CreateDefault();
-        config.timeoutMs = 60000; // 60 seconds
-        config.enableUnpacking = true;
-        config.enableAPITracing = false;
-        config.enableNetworkSimulation = false;
-        return config;
-    }
-
-    // ========================================================================
-    // STATISTICS RESET
-    // ========================================================================
-
-    void EmulationStats::Reset() noexcept {
-        totalEmulations = 0;
-        maliciousSamplesDetected = 0;
-        totalUnpackings = 0;
-        totalAPICallsTraced = 0;
-        totalMemoryScans = 0;
-        totalInstructionsEmulated = 0;
-        totalEmulationTimeUs = 0;
-        whpEmulations = 0;
-        unicornEmulations = 0;
-    }
-
-    double EmulationStats::GetAverageEmulationTimeMs() const noexcept {
-        const uint64_t total = totalEmulations.load();
-        if (total == 0) return 0.0;
-        return static_cast<double>(totalEmulationTimeUs.load()) / (total * 1000.0);
-    }
+    return APISeverity::Benign;
+}
 
 } // namespace ShadowStrike::Core::Engine
