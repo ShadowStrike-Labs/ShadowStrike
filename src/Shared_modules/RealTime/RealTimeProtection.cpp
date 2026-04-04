@@ -1508,7 +1508,7 @@ public:
                 Utils::Logger::Warn(
                     "RealTimeProtection: Blocked metamorphic threat: {} "
                     "[score={:.1f} severity={} detections={} family={}]",
-                    filePath,
+                    Utils::StringUtils::ToNarrow(filePath),
                     metaResult.mutationScore,
                     static_cast<int>(metaResult.maxSeverity),
                     metaResult.totalDetections,
@@ -1541,7 +1541,7 @@ public:
                 Utils::Logger::Info(
                     "RealTimeProtection: Packed file: {} [packer={} confidence={:.1f}% "
                     "severity={} category={} layers={} entropy={:.2f}]",
-                    filePath, Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
+                    Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
                     static_cast<int>(packResult.severity),
                     static_cast<int>(packResult.packerCategory),
                     packResult.layerCount,
@@ -1644,7 +1644,7 @@ public:
 
             case Core::Engine::ScanVerdict::Suspicious:
                 m_stats.suspiciousFiles++;
-                if (m_config.mode >= ProtectionMode::BLOCK_SUSPICIOUS) {
+                if (m_mode.load(std::memory_order_acquire) >= ProtectionMode::BLOCK_SUSPICIOUS) {
                     m_stats.filesBlocked++;
                     return Communication::KernelVerdict::Block;
                 }
@@ -1652,7 +1652,7 @@ public:
 
             case Core::Engine::ScanVerdict::PUA:
                 m_stats.puaFiles++;
-                if (m_config.mode == ProtectionMode::BLOCK_UNKNOWN) {
+                if (m_mode.load(std::memory_order_acquire) == ProtectionMode::BLOCK_UNKNOWN) {
                     m_stats.filesBlocked++;
                     return Communication::KernelVerdict::Block;
                 }
@@ -2260,7 +2260,7 @@ public:
                         Utils::Logger::Warn(
                             "RealTimeProtection: Blocked malware-packed module in PID {}: {} "
                             "[packer={} severity={} confidence={:.1f}% matches={}]",
-                            req.processId, imagePath, packResult.packerName,
+                            req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(packResult.packerName),
                             static_cast<int>(packResult.severity),
                             packResult.packingConfidence * 100.0,
                             packResult.packerMatches.size());
@@ -2271,7 +2271,7 @@ public:
                         Utils::Logger::Warn(
                             "RealTimeProtection: Packed module loaded in PID {}: {} "
                             "[packer={} confidence={:.1f}% severity={} category={} entropy={:.2f}]",
-                            req.processId, imagePath, Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
+                            req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
                             static_cast<int>(packResult.severity),
                             static_cast<int>(packResult.packerCategory),
                             packResult.fileEntropy);
@@ -2280,7 +2280,7 @@ public:
                             if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                                 Utils::Logger::Warn(
                                     "RealTimeProtection: High-severity packer in PID {} module {}: {} (confidence={:.2f})",
-                                    req.processId, imagePath, match.packerName, match.confidence);
+                                    req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(match.packerName), match.confidence);
                             }
                         }
                     }
@@ -2309,7 +2309,7 @@ public:
                             Utils::Logger::Error(
                                 "RealTimeProtection: BLOCKED vulnerable driver in PID {}: {} "
                                 "[LOLDriver={} MSBlocked={} sha256={}]",
-                                req.processId, imagePath,
+                                req.processId, Utils::StringUtils::ToNarrow(imagePath),
                                 driverInfo.isLOLDriver ? "YES" : "NO",
                                 driverInfo.isMicrosoftBlocked ? "YES" : "NO",
                                 driverInfo.sha256.substr(0, 16));
@@ -2335,11 +2335,12 @@ public:
 
                         // Check unsigned drivers in strict mode
                         if (driverInfo.signatureStatus == Exploits::DriverSignatureStatus::Unsigned) {
-                            if (m_config.mode == ProtectionMode::BLOCK_UNKNOWN ||
-                                m_config.mode == ProtectionMode::BLOCK_SUSPICIOUS) {
+                            auto currentMode = m_mode.load(std::memory_order_acquire);
+                            if (currentMode == ProtectionMode::BLOCK_UNKNOWN ||
+                                currentMode == ProtectionMode::BLOCK_SUSPICIOUS) {
                                 Utils::Logger::Warn(
                                     "RealTimeProtection: Blocked unsigned driver in PID {}: {}",
-                                    req.processId, imagePath);
+                                    req.processId, Utils::StringUtils::ToNarrow(imagePath));
                                 m_stats.threatsDetected++;
                                 return Communication::KernelVerdict::Block;
                             }
@@ -2410,7 +2411,7 @@ public:
         for (const auto& persistKey : kPersistenceKeys) {
             if (lowerKeyPath.find(persistKey) != std::wstring::npos) {
                 Utils::Logger::Warn("RealTimeProtection: Persistence registry modification detected: {} -> {}",
-                    keyPath, valueName);
+                    Utils::StringUtils::ToNarrow(keyPath), Utils::StringUtils::ToNarrow(valueName));
                 // Don't block — forward to behavioral engine for correlation.
                 // Blocking here would break legitimate software installations.
                 break;
@@ -2428,7 +2429,7 @@ public:
         for (const auto& defenseKey : kDefenseEvasionKeys) {
             if (lowerKeyPath.find(defenseKey) != std::wstring::npos) {
                 Utils::Logger::Warn("RealTimeProtection: Defense evasion registry modification: {} -> {}",
-                    keyPath, valueName);
+                    Utils::StringUtils::ToNarrow(keyPath), Utils::StringUtils::ToNarrow(valueName));
                 break;
             }
         }
@@ -2550,7 +2551,7 @@ public:
                     } catch (...) {
                         Utils::Logger::Error("RealTimeProtection: MemoryAlert dispatch unknown exception");
                     }
-                }
+
                     // Also route to MemoryProtection for memory violation correlation
                     try {
                         auto& mp = MemoryProtection::Instance();
@@ -2562,6 +2563,7 @@ public:
                         Utils::Logger::Error("RealTimeProtection: MemoryProtection alert dispatch failed: {}",
                             ex.what());
                     } catch (...) {}
+                }
                 break;
             }
 
@@ -3174,7 +3176,7 @@ public:
                 sr.action = RemediationAction::BLOCKED;
                 break;
             case Core::Engine::ScanVerdict::Suspicious:
-                sr.verdict = (m_config.mode >= ProtectionMode::BLOCK_SUSPICIOUS) ?
+                sr.verdict = (m_mode.load(std::memory_order_acquire) >= ProtectionMode::BLOCK_SUSPICIOUS) ?
                              KernelVerdict::BLOCK : KernelVerdict::MONITOR;
                 break;
             case Core::Engine::ScanVerdict::PUA:
@@ -3485,7 +3487,8 @@ RTPConfig RealTimeProtection::GetConfig() const {
 }
 
 void RealTimeProtection::SetProtectionMode(ProtectionMode mode) {
-    m_impl->m_mode = mode;
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_mode.store(mode, std::memory_order_release);
     m_impl->m_config.mode = mode;
 }
 
