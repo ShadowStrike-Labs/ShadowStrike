@@ -622,17 +622,91 @@ enum class SuspiciousPattern : uint16_t {
 /**
  * @brief Get string for ProcessVerdict.
  */
-[[nodiscard]] constexpr const char* ProcessVerdictToString(ProcessVerdict verdict) noexcept;
+[[nodiscard]] inline const char* ProcessVerdictToString(ProcessVerdict verdict) noexcept {
+    switch (verdict) {
+        case ProcessVerdict::Allow:           return "Allow";
+        case ProcessVerdict::Block:           return "Block";
+        case ProcessVerdict::AllowMonitored:  return "AllowMonitored";
+        case ProcessVerdict::AllowSuspicious: return "AllowSuspicious";
+        case ProcessVerdict::Timeout:         return "Timeout";
+        case ProcessVerdict::Error:           return "Error";
+        default:                              return "Unknown";
+    }
+}
 
 /**
  * @brief Get string for LOLBASType.
  */
-[[nodiscard]] constexpr const char* LOLBASTypeToString(LOLBASType type) noexcept;
+[[nodiscard]] inline const char* LOLBASTypeToString(LOLBASType type) noexcept {
+    switch (type) {
+        case LOLBASType::None:             return "None";
+        case LOLBASType::Cmd:              return "Cmd";
+        case LOLBASType::PowerShell:       return "PowerShell";
+        case LOLBASType::WSH:              return "WSH";
+        case LOLBASType::Mshta:            return "Mshta";
+        case LOLBASType::Regsvr32:         return "Regsvr32";
+        case LOLBASType::Rundll32:         return "Rundll32";
+        case LOLBASType::Certutil:         return "Certutil";
+        case LOLBASType::Bitsadmin:        return "Bitsadmin";
+        case LOLBASType::Wmic:             return "Wmic";
+        case LOLBASType::Msiexec:          return "Msiexec";
+        case LOLBASType::Expand:           return "Expand";
+        case LOLBASType::Esentutl:         return "Esentutl";
+        case LOLBASType::InstallUtil:      return "InstallUtil";
+        case LOLBASType::MSBuild:          return "MSBuild";
+        case LOLBASType::ODBCConf:         return "ODBCConf";
+        case LOLBASType::RegAsm:           return "RegAsm";
+        case LOLBASType::RegSvcs:          return "RegSvcs";
+        case LOLBASType::XWizard:          return "XWizard";
+        case LOLBASType::ForFiles:         return "ForFiles";
+        case LOLBASType::PcaLua:           return "PcaLua";
+        case LOLBASType::SyncAppv:         return "SyncAppv";
+        case LOLBASType::Control:          return "Control";
+        case LOLBASType::Cmstp:            return "Cmstp";
+        case LOLBASType::PresentationHost: return "PresentationHost";
+        case LOLBASType::WSL:              return "WSL";
+        default:                           return "Unknown";
+    }
+}
 
 /**
- * @brief Get MITRE ATT&CK technique for pattern.
+ * @brief Get MITRE ATT&CK technique ID for a detected SuspiciousPattern.
  */
-[[nodiscard]] constexpr const char* SuspiciousPatternToMitre(SuspiciousPattern pattern) noexcept;
+[[nodiscard]] inline const char* SuspiciousPatternToMitre(SuspiciousPattern pattern) noexcept {
+    switch (pattern) {
+        case SuspiciousPattern::OfficeSpawnsScript:      return "T1059";
+        case SuspiciousPattern::OfficeSpawnsShell:       return "T1059";
+        case SuspiciousPattern::BrowserSpawnsExe:        return "T1204";
+        case SuspiciousPattern::ServicesSpawnsShell:     return "T1569";
+        case SuspiciousPattern::SvchostSpawnsUnexpected: return "T1055";
+        case SuspiciousPattern::WmiSpawnsProcess:        return "T1047";
+        case SuspiciousPattern::ScriptSpawnsExe:         return "T1059";
+        case SuspiciousPattern::MshtaSpawnsProcess:      return "T1218.005";
+        case SuspiciousPattern::EncodedPowerShell:       return "T1059.001";
+        case SuspiciousPattern::ObfuscatedCmdLine:       return "T1027";
+        case SuspiciousPattern::DownloadCommand:         return "T1105";
+        case SuspiciousPattern::BypassExecutionPolicy:   return "T1059.001";
+        case SuspiciousPattern::HiddenWindowExecution:   return "T1564.003";
+        case SuspiciousPattern::ReflectionLoad:          return "T1620";
+        case SuspiciousPattern::COMScripting:            return "T1559";
+        case SuspiciousPattern::ScheduledTaskCreation:   return "T1053";
+        case SuspiciousPattern::ServiceCreation:         return "T1543";
+        case SuspiciousPattern::RegistryModification:    return "T1547";
+        case SuspiciousPattern::TempFolderExecution:     return "T1074";
+        case SuspiciousPattern::DownloadsFolderExecution: return "T1074";
+        case SuspiciousPattern::UserProfileExecution:    return "T1036";
+        case SuspiciousPattern::RecycleBinExecution:     return "T1036";
+        case SuspiciousPattern::NetworkShareExecution:   return "T1021";
+        case SuspiciousPattern::ArchiveExecution:        return "T1140";
+        case SuspiciousPattern::DoubleExtension:         return "T1036.007";
+        case SuspiciousPattern::ProcessMasquerading:     return "T1036.005";
+        case SuspiciousPattern::ProcessHollowing:        return "T1055.012";
+        case SuspiciousPattern::ProcessDoppelgang:       return "T1055.013";
+        case SuspiciousPattern::ProcessHerpadering:      return "T1055.002";
+        case SuspiciousPattern::ProcessGhosting:         return "T1055";
+        default:                                          return "T1000";
+    }
+}
 
 // ============================================================================
 // DATA STRUCTURES
@@ -1160,65 +1234,44 @@ struct ProcessMonitorConfig {
 };
 
 /**
- * @brief Statistics for process creation monitor.
+ * @brief Copyable statistics snapshot for process creation monitor.
+ *
+ * Public API uses plain POD fields (copyable/returnable by value).
+ * The internal PIMPL implementation uses atomics; Snapshot() bridges them.
  */
 struct ProcessMonitorStats {
     /// @brief Total process creations observed
-    std::atomic<uint64_t> totalProcessCreations{ 0 };
-    
+    uint64_t totalProcessCreations    = 0;
     /// @brief Processes allowed
-    std::atomic<uint64_t> processesAllowed{ 0 };
-    
+    uint64_t processesAllowed         = 0;
     /// @brief Processes blocked
-    std::atomic<uint64_t> processesBlocked{ 0 };
-    
+    uint64_t processesBlocked         = 0;
     /// @brief Processes flagged suspicious
-    std::atomic<uint64_t> processesSuspicious{ 0 };
-    
+    uint64_t processesSuspicious      = 0;
     /// @brief Pre-execution scans performed
-    std::atomic<uint64_t> scansPerformed{ 0 };
-    
+    uint64_t scansPerformed           = 0;
     /// @brief Scan timeouts
-    std::atomic<uint64_t> scanTimeouts{ 0 };
-    
+    uint64_t scanTimeouts             = 0;
     /// @brief LOLBAS abuse detected
-    std::atomic<uint64_t> lolbasDetections{ 0 };
-    
+    uint64_t lolbasDetections         = 0;
     /// @brief Suspicious parent-child detected
-    std::atomic<uint64_t> parentChildDetections{ 0 };
-    
+    uint64_t parentChildDetections    = 0;
     /// @brief Encoded commands detected
-    std::atomic<uint64_t> encodedCommandDetections{ 0 };
-    
+    uint64_t encodedCommandDetections = 0;
     /// @brief Process masquerading detected
-    std::atomic<uint64_t> masqueradingDetections{ 0 };
-    
+    uint64_t masqueradingDetections   = 0;
     /// @brief Currently tracked processes
-    std::atomic<size_t> trackedProcesses{ 0 };
-    
+    size_t   trackedProcesses         = 0;
     /// @brief Process terminations observed
-    std::atomic<uint64_t> processTerminations{ 0 };
-    
+    uint64_t processTerminations      = 0;
     /// @brief Average decision time (microseconds)
-    std::atomic<uint64_t> avgDecisionTimeUs{ 0 };
-    
+    uint64_t avgDecisionTimeUs        = 0;
+
     /**
-     * @brief Reset all statistics.
+     * @brief Zero all counters.
      */
     void Reset() noexcept {
-        totalProcessCreations.store(0, std::memory_order_relaxed);
-        processesAllowed.store(0, std::memory_order_relaxed);
-        processesBlocked.store(0, std::memory_order_relaxed);
-        processesSuspicious.store(0, std::memory_order_relaxed);
-        scansPerformed.store(0, std::memory_order_relaxed);
-        scanTimeouts.store(0, std::memory_order_relaxed);
-        lolbasDetections.store(0, std::memory_order_relaxed);
-        parentChildDetections.store(0, std::memory_order_relaxed);
-        encodedCommandDetections.store(0, std::memory_order_relaxed);
-        masqueradingDetections.store(0, std::memory_order_relaxed);
-        trackedProcesses.store(0, std::memory_order_relaxed);
-        processTerminations.store(0, std::memory_order_relaxed);
-        avgDecisionTimeUs.store(0, std::memory_order_relaxed);
+        *this = ProcessMonitorStats{};
     }
 };
 
@@ -1339,6 +1392,16 @@ public:
      * @brief Stop monitoring.
      */
     void Stop();
+
+    /**
+     * @brief Pause monitoring temporarily (protection suspended while keeping state).
+     */
+    void Pause();
+
+    /**
+     * @brief Resume monitoring after a pause.
+     */
+    void Resume();
 
     /**
      * @brief Check if monitor is running.
@@ -1600,11 +1663,12 @@ public:
 
 private:
     // =========================================================================
-    // Private Constructor (Singleton)
+    // Private Constructor / Destructor (Singleton)
     // =========================================================================
 
     ProcessCreationMonitor();
     ~ProcessCreationMonitor();
+
 
     // =========================================================================
     // Internal Methods
