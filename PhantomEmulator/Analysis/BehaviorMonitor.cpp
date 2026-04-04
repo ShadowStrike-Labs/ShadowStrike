@@ -4,7 +4,7 @@
  *
  * BehaviorMonitor.cpp — Behavioral analysis engine implementation
  *
- * Implements 50 behavioral detection rules as state machines, covering:
+ * Implements 150 behavioral detection rules as state machines, covering:
  *   - Process injection (classic, APC, NtMap, atom bombing, early bird, hijack)
  *   - Process hollowing (classic, transacted, doppelganging)
  *   - DLL injection (LoadLibrary, manual map, reflective)
@@ -55,7 +55,7 @@ constexpr uint8_t  kMaxEvidencePerMachine  = 16;
 constexpr uint32_t kMaxEvidencePerAlert    = 32;
 
 // Total number of rules
-constexpr uint32_t kRuleCount              = 50;
+constexpr uint32_t kRuleCount              = 150;
 
 // ----------------------------------------------------------------------------
 // Case-insensitive string comparison (no locale, ASCII only)
@@ -159,7 +159,7 @@ struct RuleInfo {
     bool             crossThread;
 };
 
-// Indexed by ruleId - 1. All 50 rules.
+// Indexed by ruleId - 1. All 150 rules.
 static const RuleInfo kRuleTable[kRuleCount] = {
     // --- Process Injection (Rules 1-6) ---
     /*  1 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.95f,
@@ -323,6 +323,313 @@ static const RuleInfo kRuleTable[kRuleCount] = {
     /* 50 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.85f,
                "PowerShell cradle: CreateProcess with powershell.exe -enc / IEX / DownloadString",
                "T1059.001", 0, 0, false },
+    // --- Fileless Attacks (Rules 51-65) ---
+    /* 51 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.90f,
+               "PowerShell encoded command: CreateProcess with powershell -enc/-encodedcommand",
+               "T1059.001", 0, 0, false },
+    /* 52 */ { BehaviorCategory::Execution, AlertSeverity::Critical, 0.92f,
+               "PowerShell download cradle: IEX + DownloadString execution",
+               "T1059.001", 0, 0, false },
+    /* 53 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.88f,
+               "PowerShell reflective Assembly::Load execution",
+               "T1620", 0, 0, false },
+    /* 54 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.82f,
+               "Script host network activity: WScript/CScript followed by connect/send",
+               "T1059.005", 2, 300'000, false },
+    /* 55 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.86f,
+               "MSHTA inline script execution via javascript:/vbscript:",
+               "T1218.005", 0, 0, false },
+    /* 56 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Critical, 0.90f,
+               "Regsvr32 Squiblydoo: regsvr32 scrobj.dll proxy execution",
+               "T1218.010", 0, 0, false },
+    /* 57 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.82f,
+               "Rundll32 unusual DLL entry execution",
+               "T1218.011", 0, 0, false },
+    /* 58 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.86f,
+               "WMIC process call create execution",
+               "T1047", 0, 0, false },
+    /* 59 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.84f,
+               "WMIC XSL script execution via /format",
+               "T1220", 0, 0, false },
+    /* 60 */ { BehaviorCategory::Downloader, AlertSeverity::High, 0.82f,
+               "BitsAdmin transfer download",
+               "T1197", 0, 0, false },
+    /* 61 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.84f,
+               "Certutil download/decode via urlcache or -decode",
+               "T1140", 0, 0, false },
+    /* 62 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.82f,
+               "InstallUtil proxy execution bypass",
+               "T1218.004", 0, 0, false },
+    /* 63 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.84f,
+               "MSBuild inline task execution",
+               "T1127.001", 0, 0, false },
+    /* 64 */ { BehaviorCategory::PrivilegeEscalation, AlertSeverity::High, 0.82f,
+               "CMSTP proxy execution and UAC bypass",
+               "T1218.003", 0, 0, false },
+    /* 65 */ { BehaviorCategory::Execution, AlertSeverity::Medium, 0.76f,
+               "Forfiles command execution proxy",
+               "T1202", 0, 0, false },
+    // --- Living-off-the-Land (Rules 66-80) ---
+    /* 66 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.86f,
+               "Schtasks persistent payload creation",
+               "T1053.005", 0, 0, false },
+    /* 67 */ { BehaviorCategory::Persistence, AlertSeverity::Medium, 0.76f,
+               "At.exe job creation",
+               "T1053.002", 0, 0, false },
+    /* 68 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.88f,
+               "Service creation via sc.exe binPath",
+               "T1543.003", 0, 0, false },
+    /* 69 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.86f,
+               "Netsh firewall configuration modification",
+               "T1562.004", 0, 0, false },
+    /* 70 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.82f,
+               "Netsh helper DLL registration",
+               "T1546.007", 0, 0, false },
+    /* 71 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.90f,
+               "Reg.exe Run key persistence",
+               "T1547.001", 0, 0, false },
+    /* 72 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.90f,
+               "Event log clearing via wevtutil",
+               "T1070.001", 0, 0, false },
+    /* 73 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.90f,
+               "Bcdedit disable recovery / boot failover",
+               "T1490", 0, 0, false },
+    /* 74 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.95f,
+               "Vssadmin delete shadows",
+               "T1490", 0, 0, false },
+    /* 75 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.72f,
+               "Icacls permission grant / ACL weakening",
+               "T1222.001", 0, 0, false },
+    /* 76 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.72f,
+               "Takeown ownership acquisition",
+               "T1222.001", 0, 0, false },
+    /* 77 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.78f,
+               "Diskshadow script execution",
+               "T1218", 0, 0, false },
+    /* 78 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.82f,
+               "Msiexec remote package installation",
+               "T1218.007", 0, 0, false },
+    /* 79 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.86f,
+               "Mavinject DLL injection",
+               "T1218.013", 0, 0, false },
+    /* 80 */ { BehaviorCategory::Execution, AlertSeverity::Medium, 0.76f,
+               "Pcalua proxy execution",
+               "T1202", 0, 0, false },
+    // --- WMI & Lateral Movement (Rules 81-95) ---
+    /* 81 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.90f,
+               "WMI event subscription chain: WbemLocator->ConnectServer->ExecMethod",
+               "T1546.003", 3, 400'000, false },
+    /* 82 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.86f,
+               "WMI process creation via Win32_Process.Create",
+               "T1047", 2, 300'000, false },
+    /* 83 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.84f,
+               "Remote WMI over DCOM",
+               "T1021.003", 2, 300'000, false },
+    /* 84 */ { BehaviorCategory::Persistence, AlertSeverity::High, 0.86f,
+               "COM object hijack: CLSID registry change followed by activation",
+               "T1546.015", 2, 500'000, false },
+    /* 85 */ { BehaviorCategory::Execution, AlertSeverity::High, 0.82f,
+               "COM script engine instantiation",
+               "T1059.007", 0, 0, false },
+    /* 86 */ { BehaviorCategory::LateralMovement, AlertSeverity::Critical, 0.92f,
+               "PsExec-style remote service execution",
+               "T1021.002", 3, 400'000, false },
+    /* 87 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.84f,
+               "WinRM remote execution chain",
+               "T1021.006", 2, 300'000, false },
+    /* 88 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.82f,
+               "DCOM lateral movement via MMC20 activation",
+               "T1021.003", 2, 300'000, false },
+    /* 89 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.82f,
+               "SMB named pipe lateral movement",
+               "T1021.002", 2, 300'000, false },
+    /* 90 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.82f,
+               "Pass-the-hash authentication replay",
+               "T1550.002", 2, 300'000, false },
+    /* 91 */ { BehaviorCategory::LateralMovement, AlertSeverity::High, 0.82f,
+               "Pass-the-ticket Kerberos replay",
+               "T1550.003", 2, 300'000, false },
+    /* 92 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.82f,
+               "Kerberoasting request and ticket extraction",
+               "T1558.003", 2, 300'000, false },
+    /* 93 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.82f,
+               "AS-REP roasting without preauthentication",
+               "T1558.004", 2, 300'000, false },
+    /* 94 */ { BehaviorCategory::PrivilegeEscalation, AlertSeverity::Critical, 0.95f,
+               "Golden ticket creation and use",
+               "T1558.001", 3, 500'000, false },
+    /* 95 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Critical, 0.90f,
+               "DCSync replication request",
+               "T1003.006", 2, 300'000, false },
+    // --- Advanced Injection (Rules 96-110) ---
+    /* 96 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.90f,
+               "KernelCallbackTable hijack: OpenProcess->WriteProcessMemory->SetWindowLong",
+               "T1574", 3, 400'000, true },
+    /* 97 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.86f,
+               "PROPagate injection via SetProp callback chain",
+               "T1055", 3, 400'000, false },
+    /* 98 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.90f,
+               "Ghostwriting remote injection",
+               "T1055", 3, 400'000, true },
+    /* 99 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.86f,
+               "Ctrl-Inject via NtQueueApcThread control handler",
+               "T1055.004", 2, 300'000, true },
+    /* 100 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.90f,
+                "Mockingjay RWX section abuse",
+                "T1055", 3, 400'000, false },
+    /* 101 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.95f,
+                "Process ghosting: file write->section->delete->process create",
+                "T1055", 5, 700'000, false },
+    /* 102 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.95f,
+                "Process herpaderping: file write->section->modify->process create",
+                "T1055", 5, 700'000, false },
+    /* 103 */ { BehaviorCategory::DLLInjection, AlertSeverity::Critical, 0.90f,
+                "Phantom DLL hollowing sequence",
+                "T1574.002", 3, 500'000, false },
+    /* 104 */ { BehaviorCategory::ProcessInjection, AlertSeverity::Critical, 0.86f,
+                "Module stomping: LoadLibrary->VirtualProtect->shellcode copy",
+                "T1055.001", 3, 400'000, false },
+    /* 105 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.82f,
+                "Thread pool work injection",
+                "T1055", 3, 300'000, false },
+    /* 106 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.82f,
+                "Fiber-based execution chain",
+                "T1055", 3, 300'000, false },
+    /* 107 */ { BehaviorCategory::ProcessInjection, AlertSeverity::High, 0.82f,
+                "Callback injection via EnumWindows",
+                "T1055", 2, 300'000, true },
+    /* 108 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.86f,
+                "ETW patching via EtwEventWrite overwrite",
+                "T1562.006", 2, 300'000, false },
+    /* 109 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.76f,
+                "Heaven's Gate 32-bit to 64-bit transition",
+                "T1106", 0, 0, false },
+    /* 110 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.82f,
+                "Direct syscall stub construction / SysWhispers / HellsGate",
+                "T1106", 0, 0, false },
+    // --- Credential Access (Rules 111-125) ---
+    /* 111 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Critical, 0.95f,
+                "LSASS credential scraping: OpenProcess->ReadProcessMemory->credential dump",
+                "T1003.001", 3, 400'000, false },
+    /* 112 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.86f,
+                "Credential API enumeration and read",
+                "T1555", 2, 200'000, false },
+    /* 113 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.82f,
+                "Browser credential database access",
+                "T1555.003", 0, 0, false },
+    /* 114 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.84f,
+                "Windows Credential Manager access",
+                "T1555", 2, 250'000, false },
+    /* 115 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.82f,
+                "DPAPI master key extraction",
+                "T1555", 2, 300'000, false },
+    /* 116 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.90f,
+                "SAM hive export via reg save",
+                "T1003.002", 0, 0, false },
+    /* 117 */ { BehaviorCategory::CredentialAccess, AlertSeverity::High, 0.90f,
+                "SECURITY hive export via reg save",
+                "T1003.004", 0, 0, false },
+    /* 118 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Critical, 0.95f,
+                "NTDS.dit extraction via shadow copy",
+                "T1003.003", 3, 700'000, false },
+    /* 119 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Medium, 0.76f,
+                "Certificate store access",
+                "T1552.004", 2, 250'000, false },
+    /* 120 */ { BehaviorCategory::PrivilegeEscalation, AlertSeverity::High, 0.86f,
+                "Token impersonation chain",
+                "T1134.001", 3, 300'000, false },
+    /* 121 */ { BehaviorCategory::PrivilegeEscalation, AlertSeverity::High, 0.86f,
+                "Named pipe client impersonation",
+                "T1134.001", 3, 300'000, false },
+    /* 122 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Medium, 0.72f,
+                "Clipboard monitoring loop",
+                "T1115", 0, 0, false },
+    /* 123 */ { BehaviorCategory::Persistence, AlertSeverity::Medium, 0.74f,
+                "Browser extension installation",
+                "T1176", 2, 400'000, false },
+    /* 124 */ { BehaviorCategory::CredentialAccess, AlertSeverity::Medium, 0.78f,
+                "Email collection via MAPI harvest",
+                "T1114.001", 2, 300'000, false },
+    /* 125 */ { BehaviorCategory::Discovery, AlertSeverity::Low, 0.68f,
+                "Network share enumeration",
+                "T1135", 0, 0, false },
+    // --- Evasion (Rules 126-140) ---
+    /* 126 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Critical, 0.95f,
+                "AMSI patch: GetProcAddress(AmsiScanBuffer)->WriteMemory(RET)",
+                "T1562.001", 2, 250'000, false },
+    /* 127 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Critical, 0.92f,
+                "ETW blind: patch EtwEventWrite",
+                "T1562.006", 2, 250'000, false },
+    /* 128 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Critical, 0.90f,
+                "ntdll unhooking from disk",
+                "T1562.001", 3, 500'000, false },
+    /* 129 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.82f,
+                "Manual syscall stub construction in writable memory",
+                "T1106", 0, 0, false },
+    /* 130 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.82f,
+                "CFG bypass preparation",
+                "T1562", 2, 300'000, false },
+    /* 131 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.76f,
+                "PEB BeingDebugged anti-debug check",
+                "T1497.001", 0, 0, false },
+    /* 132 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.76f,
+                "Heap flag anti-debug check",
+                "T1497.001", 0, 0, false },
+    /* 133 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.82f,
+                "Hardware breakpoint detection via debug registers",
+                "T1497.001", 0, 0, false },
+    /* 134 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.82f,
+                "TLS callback anti-debug chain",
+                "T1622", 2, 300'000, false },
+    /* 135 */ { BehaviorCategory::PrivilegeEscalation, AlertSeverity::High, 0.86f,
+                "Parent PID spoofing via process attributes",
+                "T1134.004", 2, 300'000, false },
+    /* 136 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.86f,
+                "Argument spoofing via suspended process PEB rewrite",
+                "T1564.010", 4, 500'000, false },
+    /* 137 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::High, 0.86f,
+                "PE header stomping",
+                "T1027.002", 2, 250'000, false },
+    /* 138 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.72f,
+                "Entropy reduction / junk encoding behavior",
+                "T1027", 0, 0, false },
+    /* 139 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.76f,
+                "Execution guardrails based on host identity",
+                "T1480.001", 2, 250'000, false },
+    /* 140 */ { BehaviorCategory::DefenseEvasion, AlertSeverity::Medium, 0.76f,
+                "Time-based evasion before malicious action",
+                "T1497.003", 0, 0, false },
+    // --- Ransomware & Destructive (Rules 141-150) ---
+    /* 141 */ { BehaviorCategory::Ransomware, AlertSeverity::Critical, 0.95f,
+                "File encryption cascade: enumerate->read->encrypt->write/rename",
+                "T1486", 4, 1'500'000, false },
+    /* 142 */ { BehaviorCategory::Ransomware, AlertSeverity::Critical, 0.90f,
+                "Recursive directory encryption",
+                "T1486", 3, 1'000'000, false },
+    /* 143 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.90f,
+                "Recovery partition deletion via diskpart",
+                "T1561", 0, 0, false },
+    /* 144 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.90f,
+                "Boot configuration tampering via bcdedit",
+                "T1490", 0, 0, false },
+    /* 145 */ { BehaviorCategory::Ransomware, AlertSeverity::High, 0.86f,
+                "Backup process termination",
+                "T1489", 0, 0, false },
+    /* 146 */ { BehaviorCategory::Ransomware, AlertSeverity::High, 0.86f,
+                "Database process termination prior to encryption",
+                "T1489", 0, 0, false },
+    /* 147 */ { BehaviorCategory::Ransomware, AlertSeverity::Critical, 0.95f,
+                "Network share encryption",
+                "T1486", 3, 1'500'000, false },
+    /* 148 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.90f,
+                "Wiper-style sequential overwrite",
+                "T1485", 2, 800'000, false },
+    /* 149 */ { BehaviorCategory::FileManipulation, AlertSeverity::Critical, 0.95f,
+                "MBR ransomware overwrite",
+                "T1561.002", 2, 200'000, false },
+    /* 150 */ { BehaviorCategory::Ransomware, AlertSeverity::Critical, 0.95f,
+                "Double extortion: encryption activity combined with data exfiltration",
+                "T1486/T1041", 0, 0, false },
 };
 
 [[nodiscard]] const RuleInfo& GetRule(uint32_t ruleId) noexcept {
@@ -777,6 +1084,296 @@ void BehaviorMonitor::Impl::StartNewMachines(
         if (retVal != 0) {
             StartMachine(49, call, callIndex, retVal);
         }
+    }
+
+    // ---- Rule 54: Script host network activity ----
+    if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                   "CreateProcessInternalW", "NtCreateUserProcess")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI) ||
+            call.category == APICategory::Process) {
+            StartMachine(54, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rules 81, 83, 88: WMI / DCOM via COM activation ----
+    if (FuncIs(call, "CoCreateInstance")) {
+        if (call.category == APICategory::COM ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::WMIExecution) ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(81, call, callIndex, retVal);
+            StartMachine(83, call, callIndex, retVal);
+            StartMachine(88, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 82: WMI process creation ----
+    if (ContainsCI(call.funcName, "ConnectServer")) {
+        StartMachine(82, call, callIndex, retVal);
+    }
+
+    // ---- Rule 84: COM object hijack ----
+    if (FuncIsAny4(call, "RegSetValueExA", "RegSetValueExW",
+                   "RegSetValueA", "RegSetValueW")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::RegistryPersistence) ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(84, call, callIndex, call.args[0]);
+        }
+    }
+
+    // ---- Rule 86: PsExec-style remote service execution ----
+    if (FuncIsAny(call, "OpenSCManagerA", "OpenSCManagerW")) {
+        if (retVal != 0) {
+            StartMachine(86, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 87: WinRM remote execution ----
+    if (ContainsCI(call.funcName, "WSManCreateSession") ||
+        FuncIs(call, "WinHttpOpen")) {
+        if (retVal != 0 || FuncIs(call, "WinHttpOpen")) {
+            StartMachine(87, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 89: SMB named pipe lateral movement ----
+    if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
+        if (retVal != 0 && HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(89, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rules 90-94: Authentication / Kerberos abuse ----
+    if (FuncIsAny(call, "AcquireCredentialsHandleA", "AcquireCredentialsHandleW") ||
+        FuncIsAny3(call, "LogonUserA", "LogonUserW", "LogonUserExExW") ||
+        FuncIs(call, "LsaCallAuthenticationPackage")) {
+        StartMachine(90, call, callIndex, retVal);
+        StartMachine(91, call, callIndex, retVal);
+        StartMachine(92, call, callIndex, retVal);
+        StartMachine(93, call, callIndex, retVal);
+        StartMachine(94, call, callIndex, retVal);
+    }
+
+    // ---- Rule 95: DCSync / replication abuse ----
+    if (ContainsCI(call.funcName, "DRSBind") || ContainsCI(call.funcName, "DsBind")) {
+        StartMachine(95, call, callIndex, retVal);
+    }
+
+    // ---- Rules 96, 98: OpenProcess for advanced injection ----
+    if (FuncIs(call, "OpenProcess")) {
+        uint32_t access = static_cast<uint32_t>(call.args[0]);
+        uint32_t pid    = static_cast<uint32_t>(call.args[2]);
+        if (IsInjectionAccess(access) && pid != 0 && retVal != 0) {
+            StartMachine(96, call, callIndex, retVal);
+            StartMachine(98, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 97: PROPagate ----
+    if (FuncIsAny3(call, "SetPropA", "SetPropW", "SetProp")) {
+        StartMachine(97, call, callIndex, call.args[0], call.args[2]);
+    }
+
+    // ---- Rule 99: Ctrl-Inject ----
+    if (FuncIsAny(call, "OpenThread", "NtOpenThread")) {
+        if (retVal != 0) {
+            StartMachine(99, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 100: Mockingjay ----
+    if (FuncIsAny3(call, "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA")) {
+        if (retVal != 0) {
+            StartMachine(100, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rules 101, 102, 148, 149: File-backed destructive execution ----
+    if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
+        if (retVal != 0 && retVal != static_cast<uint64_t>(-1)) {
+            StartMachine(101, call, callIndex, retVal);
+            StartMachine(102, call, callIndex, retVal);
+            StartMachine(148, call, callIndex, retVal);
+            if (HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI) &&
+                (static_cast<uint32_t>(call.args[1]) & kGenericWrite)) {
+                StartMachine(149, call, callIndex, retVal);
+            }
+        }
+    }
+
+    // ---- Rule 103: Phantom DLL hollowing ----
+    if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                   "CreateProcessInternalW", "NtCreateUserProcess")) {
+        uint32_t flags = static_cast<uint32_t>(call.args[5]);
+        if (flags & kCreateSuspended) {
+            StartMachine(103, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 104: Module stomping ----
+    if (FuncIsAny3(call, "LoadLibraryA", "LoadLibraryW", "LoadLibraryExA")) {
+        if (retVal != 0) {
+            StartMachine(104, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 105: Thread pool injection ----
+    if (ContainsCI(call.funcName, "TpAllocWork")) {
+        StartMachine(105, call, callIndex, retVal);
+    }
+
+    // ---- Rule 106: Fiber-based execution ----
+    if (FuncIsAny(call, "ConvertThreadToFiber", "ConvertThreadToFiberEx")) {
+        if (retVal != 0) {
+            StartMachine(106, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 107: Callback injection via EnumWindows ----
+    if (FuncIs(call, "VirtualAllocEx") && call.returnValue != 0) {
+        StartMachine(107, call, callIndex, call.args[0], call.returnValue);
+    }
+
+    // ---- Rule 108: ETW patching ----
+    if (FuncIsAny(call, "GetProcAddress", "LdrGetProcedureAddress")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(108, call, callIndex, call.args[0], retVal);
+        }
+    }
+
+    // ---- Rule 111: LSASS credential scraping ----
+    if (FuncIs(call, "OpenProcess")) {
+        uint32_t access = static_cast<uint32_t>(call.args[0]);
+        if ((access == kProcessAllAccess || (access & kProcessVMOperation)) &&
+            HasFlag(call.behaviorFlags, BehaviorFlag::CredentialAccess)) {
+            StartMachine(111, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 112: CredEnumerate -> CredRead ----
+    if (FuncIsAny(call, "CredEnumerateA", "CredEnumerateW")) {
+        StartMachine(112, call, callIndex, retVal);
+    }
+
+    // ---- Rule 114: Windows Credential Manager ----
+    if (FuncIsAny(call, "CredReadA", "CredReadW")) {
+        StartMachine(114, call, callIndex, retVal);
+    }
+
+    // ---- Rule 115: DPAPI master key extraction ----
+    if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::CredentialAccess)) {
+            StartMachine(115, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 118: NTDS.dit extraction ----
+    if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                   "CreateProcessInternalW", "NtCreateUserProcess")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(118, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 119: Certificate store access ----
+    if (FuncIsAny(call, "CertOpenStore", "PFXImportCertStore")) {
+        StartMachine(119, call, callIndex, retVal);
+    }
+
+    // ---- Rule 120: Token impersonation chain ----
+    if (FuncIsAny3(call, "LogonUserA", "LogonUserW", "LogonUserExExW")) {
+        StartMachine(120, call, callIndex, retVal);
+    }
+
+    // ---- Rule 121: Named pipe impersonation ----
+    if (FuncIsAny(call, "CreateNamedPipeA", "CreateNamedPipeW")) {
+        if (retVal != 0) {
+            StartMachine(121, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 123: Browser extension install ----
+    if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped)) {
+            StartMachine(123, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 124: Email MAPI harvest ----
+    if (ContainsCI(call.funcName, "MAPILogon") || ContainsCI(call.funcName, "MAPIInitialize")) {
+        StartMachine(124, call, callIndex, retVal);
+    }
+
+    // ---- Rules 126, 127: AMSI / ETW patch ----
+    if (FuncIsAny(call, "GetProcAddress", "LdrGetProcedureAddress")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+            StartMachine(126, call, callIndex, call.args[0], retVal);
+            StartMachine(127, call, callIndex, call.args[0], retVal);
+        }
+    }
+
+    // ---- Rule 128: ntdll unhooking ----
+    if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
+        if (retVal != 0) {
+            StartMachine(128, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 130: CFG bypass ----
+    if (ContainsCI(call.funcName, "SetProcessValidCallTargets") ||
+        ContainsCI(call.funcName, "NtSetInformationVirtualMemory")) {
+        StartMachine(130, call, callIndex, retVal);
+    }
+
+    // ---- Rule 134: TLS callback anti-debug ----
+    if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                   "CreateProcessInternalW", "NtCreateUserProcess")) {
+        uint32_t flags = static_cast<uint32_t>(call.args[5]);
+        if (flags & kCreateSuspended) {
+            StartMachine(134, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 135: Parent PID spoofing ----
+    if (ContainsCI(call.funcName, "InitializeProcThreadAttributeList")) {
+        StartMachine(135, call, callIndex, retVal);
+    }
+
+    // ---- Rule 136: Argument spoofing ----
+    if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                   "CreateProcessInternalW", "NtCreateUserProcess")) {
+        uint32_t flags = static_cast<uint32_t>(call.args[5]);
+        if (flags & kCreateSuspended) {
+            StartMachine(136, call, callIndex, retVal);
+        }
+    }
+
+    // ---- Rule 137: PE header stomping ----
+    if (FuncIsAny(call, "VirtualProtect", "NtProtectVirtualMemory")) {
+        if (call.succeeded) {
+            StartMachine(137, call, callIndex, call.args[0], call.args[0]);
+        }
+    }
+
+    // ---- Rule 139: Execution guardrails ----
+    if (FuncIsAny(call, "GetComputerNameA", "GetComputerNameW") ||
+        FuncIsAny3(call, "GetUserNameA", "GetUserNameW", "GetUserNameExW")) {
+        StartMachine(139, call, callIndex, retVal);
+    }
+
+    // ---- Rules 141, 142: Ransomware encryption chains ----
+    if (FuncIsAny4(call, "FindFirstFileA", "FindFirstFileW",
+                   "FindFirstFileExA", "FindFirstFileExW")) {
+        StartMachine(141, call, callIndex, retVal);
+        StartMachine(142, call, callIndex, retVal);
+    }
+
+    // ---- Rule 147: Network share encryption ----
+    if (FuncIsAny(call, "NetShareEnum", "WNetEnumResourceW") ||
+        FuncIs(call, "WNetEnumResourceA")) {
+        StartMachine(147, call, callIndex, retVal);
     }
 }
 
@@ -1259,6 +1856,694 @@ bool BehaviorMonitor::Impl::TryTransition(
                 break;
         } break;
 
+    // ======================================================================
+    // Rule 54: Script host network activity
+    //   CreateProcess(done) → connect/send
+    // ======================================================================
+    case 54:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "connect", "WSAConnect", "send", "WSASend") ||
+                FuncIsAny(call, "sendto", "WSASendTo"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 81: WMI event subscription chain
+    //   CoCreateInstance(done) → ConnectServer → ExecMethod
+    // ======================================================================
+    case 81:
+        switch (sm.currentState) {
+        case 1: if (ContainsCI(call.funcName, "ConnectServer"))
+                    matched = true;
+                break;
+        case 2: if (ContainsCI(call.funcName, "ExecMethod") ||
+                    ContainsCI(call.funcName, "PutInstance"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 82: WMI process create
+    //   ConnectServer(done) → ExecMethod
+    // ======================================================================
+    case 82:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "ExecMethod"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 83: Remote WMI via DCOM
+    //   CoCreateInstance(done) → ConnectServer / CoSetProxyBlanket
+    // ======================================================================
+    case 83:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "ConnectServer") ||
+                ContainsCI(call.funcName, "CoSetProxyBlanket"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 84: COM object hijack
+    //   RegSetValue(done) → CoCreateInstance
+    // ======================================================================
+    case 84:
+        if (sm.currentState == 1) {
+            if (FuncIs(call, "CoCreateInstance"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 86: PsExec-style remote service execution
+    //   OpenSCManager(done) → CreateService → StartService
+    // ======================================================================
+    case 86:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "CreateServiceA", "CreateServiceW")) {
+                    sm.capturedHandle2 = call.returnValue;
+                    matched = true;
+                } break;
+        case 2: if (FuncIsAny(call, "StartServiceA", "StartServiceW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 87: WinRM remote execution
+    //   WSManCreateSession/WinHttpOpen(done) → send/request
+    // ======================================================================
+    case 87:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "WSMan") ||
+                FuncIsAny3(call, "WinHttpConnect", "WinHttpSendRequest",
+                           "WinHttpReceiveResponse"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 88: DCOM lateral movement
+    //   CoCreateInstance(done) → CreateProcess / ShellExecute
+    // ======================================================================
+    case 88:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                           "ShellExecuteA", "ShellExecuteW") ||
+                FuncIsAny(call, "ShellExecuteExA", "ShellExecuteExW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 89: SMB named pipe lateral movement
+    //   CreateFile(done) → WriteFile
+    // ======================================================================
+    case 89:
+        if (sm.currentState == 1) {
+            if (FuncIs(call, "WriteFile") && call.succeeded)
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 90: Pass-the-hash
+    //   AcquireCredentials/LogonUser(done) → Impersonate / CreateProcessWithLogon
+    // ======================================================================
+    case 90:
+        if (sm.currentState == 1) {
+            if (FuncIsAny3(call, "ImpersonateLoggedOnUser", "SetThreadToken",
+                           "CreateProcessWithLogonW") ||
+                FuncIsAny(call, "CreateProcessWithTokenW", "CreateProcessAsUserW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 91: Pass-the-ticket
+    //   Kerberos auth setup(done) → Impersonate / CreateProcessWithTokenW
+    // ======================================================================
+    case 91:
+        if (sm.currentState == 1) {
+            if (FuncIsAny3(call, "CreateProcessWithTokenW", "SetThreadToken",
+                           "ImpersonateLoggedOnUser"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 92: Kerberoasting
+    //   Kerberos auth setup(done) → ticket read/write
+    // ======================================================================
+    case 92:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "ReadFile", "WriteFile", "InternetReadFile",
+                           "HttpSendRequestA") ||
+                FuncIs(call, "HttpSendRequestW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 93: AS-REP roasting
+    //   Kerberos auth setup(done) → write/receive response
+    // ======================================================================
+    case 93:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "WriteFile", "ReadFile", "recv", "WSARecv") ||
+                FuncIsAny(call, "InternetReadFile", "WinHttpReceiveResponse"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 94: Golden ticket
+    //   Kerberos auth setup(done) → impersonate → process spawn
+    // ======================================================================
+    case 94:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny3(call, "ImpersonateLoggedOnUser", "SetThreadToken",
+                               "DuplicateTokenEx"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny3(call, "CreateProcessAsUserA", "CreateProcessAsUserW",
+                               "CreateProcessWithTokenW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 95: DCSync
+    //   DRSBind(done) → DRSGetNCChanges
+    // ======================================================================
+    case 95:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "DRSGetNCChanges"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 96: KernelCallbackTable hijack
+    //   OpenProcess(done) → WriteProcessMemory → SetWindowLong
+    // ======================================================================
+    case 96:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "WriteProcessMemory") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "SetWindowLongA", "SetWindowLongW",
+                               "SetWindowLongPtrA", "SetWindowLongPtrW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 97: PROPagate injection
+    //   SetProp(done) → Get/dispatch message → SetWindowLong/CallWindowProc
+    // ======================================================================
+    case 97:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny4(call, "GetMessageA", "GetMessageW",
+                               "PeekMessageA", "PeekMessageW") ||
+                    FuncIs(call, "DispatchMessageW"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "SetWindowLongA", "SetWindowLongW",
+                               "CallWindowProcA", "CallWindowProcW") ||
+                    FuncIsAny(call, "DispatchMessageA", "DispatchMessageW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 98: Ghostwriting
+    //   OpenProcess(done) → WriteProcessMemory → SendMessage/PostMessage
+    // ======================================================================
+    case 98:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "WriteProcessMemory") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "SendMessageA", "SendMessageW",
+                               "PostMessageA", "PostMessageW") ||
+                    FuncIsAny(call, "SendNotifyMessageA", "SendNotifyMessageW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 99: Ctrl-Inject
+    //   OpenThread(done) → NtQueueApcThread / QueueUserAPC
+    // ======================================================================
+    case 99:
+        if (sm.currentState == 1) {
+            if (FuncIsAny(call, "NtQueueApcThread", "QueueUserAPC"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 100: Mockingjay
+    //   LoadLibrary(done) → VirtualProtect(exec) → memory copy
+    // ======================================================================
+    case 100:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "VirtualProtect", "NtProtectVirtualMemory")) {
+                    uint32_t newProt = static_cast<uint32_t>(call.args[2]);
+                    if (ProtHasExec(newProt))
+                        matched = true;
+                } break;
+        case 2: if (FuncIsAny4(call, "WriteProcessMemory", "RtlMoveMemory",
+                               "RtlCopyMemory", "CopyMemory") ||
+                    FuncIs(call, "memcpy"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 101: Process ghosting
+    //   CreateFile(done) → WriteFile → NtCreateSection → DeleteFile → CreateProcess
+    // ======================================================================
+    case 101:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "WriteFile") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny(call, "NtCreateSection", "ZwCreateSection"))
+                    matched = true;
+                break;
+        case 3: if (FuncIsAny4(call, "DeleteFileA", "DeleteFileW",
+                               "NtSetInformationFile", "SetFileInformationByHandle"))
+                    matched = true;
+                break;
+        case 4: if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                               "CreateProcessInternalW", "NtCreateUserProcess"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 102: Process herpaderping
+    //   CreateFile(done) → WriteFile → NtCreateSection → modify file → CreateProcess
+    // ======================================================================
+    case 102:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "WriteFile") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny(call, "NtCreateSection", "ZwCreateSection"))
+                    matched = true;
+                break;
+        case 3: if (FuncIsAny4(call, "WriteFile", "SetEndOfFile",
+                               "FlushFileBuffers", "NtSetInformationFile"))
+                    matched = true;
+                break;
+        case 4: if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                               "CreateProcessInternalW", "NtCreateUserProcess"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 103: Phantom DLL hollowing
+    //   CreateProcess(SUSPENDED)(done) → WriteProcessMemory → ResumeThread
+    // ======================================================================
+    case 103:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "WriteProcessMemory") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny(call, "ResumeThread", "NtResumeThread"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 104: Module stomping
+    //   LoadLibrary(done) → VirtualProtect(exec) → memory copy
+    // ======================================================================
+    case 104:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "VirtualProtect", "NtProtectVirtualMemory")) {
+                    uint32_t newProt = static_cast<uint32_t>(call.args[2]);
+                    if (ProtHasExec(newProt))
+                        matched = true;
+                } break;
+        case 2: if (FuncIsAny4(call, "WriteProcessMemory", "RtlMoveMemory",
+                               "RtlCopyMemory", "CopyMemory") ||
+                    FuncIs(call, "memcpy"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 105: Thread pool injection
+    //   TpAllocWork(done) → TpPostWork → TpReleaseWork
+    // ======================================================================
+    case 105:
+        switch (sm.currentState) {
+        case 1: if (ContainsCI(call.funcName, "TpPostWork"))
+                    matched = true;
+                break;
+        case 2: if (ContainsCI(call.funcName, "TpReleaseWork"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 106: Fiber-based execution
+    //   ConvertThreadToFiber(done) → CreateFiber → SwitchToFiber
+    // ======================================================================
+    case 106:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "CreateFiber", "CreateFiberEx"))
+                    matched = true;
+                break;
+        case 2: if (FuncIs(call, "SwitchToFiber"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 107: Callback injection via EnumWindows
+    //   VirtualAllocEx(done) → EnumWindows/EnumChildWindows
+    // ======================================================================
+    case 107:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "EnumWindows", "EnumChildWindows",
+                           "EnumThreadWindows", "EnumDesktopWindows"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 108: ETW patching
+    //   GetProcAddress(done) → WriteProcessMemory / VirtualProtect
+    // ======================================================================
+    case 108:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "WriteProcessMemory", "VirtualProtect",
+                           "NtProtectVirtualMemory", "RtlMoveMemory"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 111: LSASS credential scraping
+    //   OpenProcess(done) → ReadProcessMemory → dump/write
+    // ======================================================================
+    case 111:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "ReadProcessMemory", "NtReadVirtualMemory"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "MiniDumpWriteDump", "WriteFile",
+                               "CreateFileA", "CreateFileW") ||
+                    FuncIsAny(call, "CryptUnprotectData", "BCryptDecrypt"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 112: Credential API enumeration and read
+    //   CredEnumerate(done) → CredRead
+    // ======================================================================
+    case 112:
+        if (sm.currentState == 1) {
+            if (FuncIsAny(call, "CredReadA", "CredReadW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 114: Windows Credential Manager
+    //   CredRead(done) → CryptUnprotectData / CredEnumerate
+    // ======================================================================
+    case 114:
+        if (sm.currentState == 1) {
+            if (FuncIsAny3(call, "CryptUnprotectData", "CredEnumerateA",
+                           "CredEnumerateW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 115: DPAPI master key extraction
+    //   CreateFile(done) → CryptUnprotectData
+    // ======================================================================
+    case 115:
+        if (sm.currentState == 1) {
+            if (FuncIs(call, "CryptUnprotectData"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 118: NTDS.dit extraction
+    //   CreateProcess(done) → CreateFile → ReadFile
+    // ======================================================================
+    case 118:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "CreateFileA", "CreateFileW"))
+                    matched = true;
+                break;
+        case 2: if (FuncIs(call, "ReadFile") && call.succeeded)
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 119: Certificate store access
+    //   CertOpenStore(done) → CertEnumCertificatesInStore / CertFindCertificate
+    // ======================================================================
+    case 119:
+        if (sm.currentState == 1) {
+            if (FuncIsAny(call, "CertEnumCertificatesInStore", "CertFindCertificateInStore"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 120: Token impersonation chain
+    //   LogonUser(done) → ImpersonateLoggedOnUser → action
+    // ======================================================================
+    case 120:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny3(call, "ImpersonateLoggedOnUser", "SetThreadToken",
+                               "NtSetInformationThread"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                               "CreateFileA", "CreateFileW") ||
+                    FuncIsAny(call, "RegOpenKeyExA", "RegOpenKeyExW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 121: Named pipe client impersonation
+    //   CreateNamedPipe(done) → ConnectNamedPipe → ImpersonateNamedPipeClient
+    // ======================================================================
+    case 121:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "ConnectNamedPipe"))
+                    matched = true;
+                break;
+        case 2: if (FuncIs(call, "ImpersonateNamedPipeClient"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 123: Browser extension install
+    //   CreateFile(done) → WriteFile / RegSetValue
+    // ======================================================================
+    case 123:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "WriteFile", "CopyFileA", "CopyFileW",
+                           "RegSetValueExA") ||
+                FuncIs(call, "RegSetValueExW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 124: Email MAPI harvest
+    //   MAPI logon(done) → OpenEntry / QueryRows
+    // ======================================================================
+    case 124:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "OpenEntry") ||
+                ContainsCI(call.funcName, "QueryRows") ||
+                ContainsCI(call.funcName, "ReadMail"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 126: AMSI patch
+    //   GetProcAddress(done) → patch write
+    // ======================================================================
+    case 126:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "WriteProcessMemory", "VirtualProtect",
+                           "NtProtectVirtualMemory", "RtlMoveMemory"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 127: ETW blind
+    //   GetProcAddress(done) → patch write
+    // ======================================================================
+    case 127:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "WriteProcessMemory", "VirtualProtect",
+                           "NtProtectVirtualMemory", "RtlMoveMemory"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 128: ntdll unhooking from disk
+    //   CreateFile(done) → ReadFile → WriteProcessMemory
+    // ======================================================================
+    case 128:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "ReadFile") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "WriteProcessMemory", "NtWriteVirtualMemory",
+                               "RtlMoveMemory", "CopyMemory"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 130: CFG bypass
+    //   SetProcessValidCallTargets(done) → thread execution
+    // ======================================================================
+    case 130:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "CreateRemoteThread", "NtCreateThreadEx",
+                           "SetThreadContext", "NtContinue") ||
+                FuncIsAny(call, "ResumeThread", "NtResumeThread"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 134: TLS callback anti-debug
+    //   CreateProcess(SUSPENDED)(done) → ResumeThread
+    // ======================================================================
+    case 134:
+        if (sm.currentState == 1) {
+            if (FuncIsAny(call, "ResumeThread", "NtResumeThread"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 135: Parent PID spoofing
+    //   InitializeProcThreadAttributeList(done) → UpdateProcThreadAttribute
+    // ======================================================================
+    case 135:
+        if (sm.currentState == 1) {
+            if (ContainsCI(call.funcName, "UpdateProcThreadAttribute"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 136: Argument spoofing
+    //   CreateProcess(SUSPENDED)(done) → ReadProcessMemory → WriteProcessMemory → ResumeThread
+    // ======================================================================
+    case 136:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "ReadProcessMemory", "NtReadVirtualMemory"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny(call, "WriteProcessMemory", "NtWriteVirtualMemory"))
+                    matched = true;
+                break;
+        case 3: if (FuncIsAny(call, "ResumeThread", "NtResumeThread"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 137: PE header stomping
+    //   VirtualProtect(done) → ZeroMemory / memset / RtlZeroMemory
+    // ======================================================================
+    case 137:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "ZeroMemory", "RtlZeroMemory", "memset",
+                           "WriteProcessMemory") ||
+                FuncIs(call, "NtWriteVirtualMemory"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 139: Execution guardrails
+    //   GetComputerName/GetUserName(done) → sensitive action
+    // ======================================================================
+    case 139:
+        if (sm.currentState == 1) {
+            if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
+                           "ShellExecuteA", "ShellExecuteW") ||
+                FuncIsAny(call, "WinExec", "RegSetValueExW"))
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 141: File encryption cascade
+    //   FindFirstFile(done) → ReadFile → CryptEncrypt → WriteFile/rename
+    // ======================================================================
+    case 141:
+        switch (sm.currentState) {
+        case 1: if (FuncIs(call, "ReadFile") && call.succeeded)
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny(call, "CryptEncrypt", "BCryptEncrypt"))
+                    matched = true;
+                break;
+        case 3: if (FuncIsAny4(call, "WriteFile", "MoveFileA",
+                               "MoveFileW", "MoveFileExA") ||
+                    FuncIsAny(call, "MoveFileExW", "SetFileInformationByHandle"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 142: Recursive directory encryption
+    //   FindFirstFile(done) → CryptEncrypt → WriteFile/rename
+    // ======================================================================
+    case 142:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "CryptEncrypt", "BCryptEncrypt"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "WriteFile", "MoveFileA",
+                               "MoveFileW", "MoveFileExA") ||
+                    FuncIs(call, "MoveFileExW"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 147: Network share encryption
+    //   NetShareEnum(done) → CreateFile → CryptEncrypt/WriteFile
+    // ======================================================================
+    case 147:
+        switch (sm.currentState) {
+        case 1: if (FuncIsAny(call, "CreateFileA", "CreateFileW"))
+                    matched = true;
+                break;
+        case 2: if (FuncIsAny4(call, "CryptEncrypt", "BCryptEncrypt",
+                               "WriteFile", "MoveFileExW") ||
+                    FuncIsAny(call, "MoveFileExA", "SetFileInformationByHandle"))
+                    matched = true;
+                break;
+        } break;
+
+    // ======================================================================
+    // Rule 148: Wiper sequential overwrite
+    //   CreateFile(done) → WriteFile
+    // ======================================================================
+    case 148:
+        if (sm.currentState == 1) {
+            if (FuncIs(call, "WriteFile") && call.succeeded)
+                matched = true;
+        } break;
+
+    // ======================================================================
+    // Rule 149: MBR ransomware overwrite
+    //   CreateFile(done) → WriteFile
+    // ======================================================================
+    case 149:
+        if (sm.currentState == 1) {
+            if (FuncIs(call, "WriteFile") && call.succeeded)
+                matched = true;
+        } break;
+
     default:
         break;
     }
@@ -1311,10 +2596,23 @@ void BehaviorMonitor::Impl::CheckInlineRules(
     // ========================================================================
     if (FuncIsAny4(call, "CreateProcessA", "CreateProcessW",
                    "CreateProcessInternalW", "NtCreateUserProcess")) {
+        const bool hasSuspicious = HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI);
+        const bool hasDefense    = HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion);
+        const bool hasService    = HasFlag(call.behaviorFlags, BehaviorFlag::ServiceManipulation);
+        const bool hasRegistry   = HasFlag(call.behaviorFlags, BehaviorFlag::RegistryPersistence);
+        const bool hasPowerShell = HasFlag(call.behaviorFlags, BehaviorFlag::PowershellExecution);
+        const bool hasFileDrop   = HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped) ||
+                                   HasFlag(accumulatedFlags, BehaviorFlag::FileDropped);
+        const bool sawNetwork    = HasFlag(accumulatedFlags, BehaviorFlag::NetworkC2);
+        const bool sawInjection  = HasFlag(accumulatedFlags, BehaviorFlag::CodeInjection) ||
+                                   HasFlag(accumulatedFlags, BehaviorFlag::DLLInjection) ||
+                                   HasFlag(accumulatedFlags, BehaviorFlag::ProcessInjection);
+        const bool sawPrivEsc    = HasFlag(accumulatedFlags, BehaviorFlag::PrivilegeEscalation);
+
         // ---- Rule 18: Scheduled task via schtasks ----
         // The dispatcher tags schtasks-related CreateProcess with
         // ServiceManipulation (service/task creation behavior).
-        if (HasFlag(call.behaviorFlags, BehaviorFlag::ServiceManipulation)) {
+        if (hasService) {
             EmitAlert(18, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::ServiceManipulation);
@@ -1323,10 +2621,10 @@ void BehaviorMonitor::Impl::CheckInlineRules(
         // ---- Rule 26: Shadow copy delete via vssadmin / wmic ----
         // The dispatcher flags vssadmin/wmic shadow-delete commands with
         // SuspiciousAPI. We combine with FileDropped to reduce false positives.
-        if (HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+        if (hasSuspicious) {
             // Strong signal: SuspiciousAPI + a file-manipulation indicator
             if (HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped) ||
-                HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion)) {
+                hasDefense) {
                 EmitAlert(26, { callIndex }, instrN, tid);
             }
         }
@@ -1334,10 +2632,77 @@ void BehaviorMonitor::Impl::CheckInlineRules(
         // ---- Rule 50: PowerShell cradle ----
         // The dispatcher flags powershell.exe -enc / -e / IEX / DownloadString
         // with PowershellExecution.
-        if (HasFlag(call.behaviorFlags, BehaviorFlag::PowershellExecution)) {
+        if (hasPowerShell) {
             EmitAlert(50, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::PowershellExecution);
+        }
+
+        // ---- Rules 51-53: PowerShell fileless execution variants ----
+        if (hasPowerShell) {
+            EmitAlert(51, { callIndex }, instrN, tid);
+            if (sawNetwork || hasSuspicious) {
+                EmitAlert(52, { callIndex }, instrN, tid);
+            }
+            if (sawInjection || HasFlag(accumulatedFlags, BehaviorFlag::MemoryManipulation)) {
+                EmitAlert(53, { callIndex }, instrN, tid);
+            }
+        }
+
+        // ---- Rules 55-65: LOLBin / proxy execution ----
+        if (hasSuspicious && !hasPowerShell) {
+            EmitAlert(55, { callIndex }, instrN, tid);
+            if (sawInjection || HasFlag(accumulatedFlags, BehaviorFlag::DLLInjection)) {
+                EmitAlert(56, { callIndex }, instrN, tid);
+                EmitAlert(57, { callIndex }, instrN, tid);
+                EmitAlert(62, { callIndex }, instrN, tid);
+                EmitAlert(63, { callIndex }, instrN, tid);
+                EmitAlert(79, { callIndex }, instrN, tid);
+            }
+            if (HasFlag(call.behaviorFlags, BehaviorFlag::WMIExecution) || sawNetwork) {
+                EmitAlert(58, { callIndex }, instrN, tid);
+                EmitAlert(59, { callIndex }, instrN, tid);
+            }
+            if (sawNetwork && hasFileDrop) {
+                EmitAlert(60, { callIndex }, instrN, tid);
+                EmitAlert(78, { callIndex }, instrN, tid);
+            }
+            if (hasFileDrop || hasDefense) {
+                EmitAlert(61, { callIndex }, instrN, tid);
+                EmitAlert(77, { callIndex }, instrN, tid);
+            }
+            if (sawPrivEsc || hasDefense) {
+                EmitAlert(64, { callIndex }, instrN, tid);
+                EmitAlert(80, { callIndex }, instrN, tid);
+            }
+            EmitAlert(65, { callIndex }, instrN, tid);
+        }
+
+        // ---- Rules 66-80: Living-off-the-land binaries ----
+        if (hasService) {
+            EmitAlert(66, { callIndex }, instrN, tid);
+            if (hasSuspicious) {
+                EmitAlert(67, { callIndex }, instrN, tid);
+                EmitAlert(68, { callIndex }, instrN, tid);
+            }
+        }
+        if (hasDefense && hasSuspicious) {
+            EmitAlert(69, { callIndex }, instrN, tid);
+            EmitAlert(72, { callIndex }, instrN, tid);
+            EmitAlert(73, { callIndex }, instrN, tid);
+            EmitAlert(74, { callIndex }, instrN, tid);
+            EmitAlert(75, { callIndex }, instrN, tid);
+            EmitAlert(76, { callIndex }, instrN, tid);
+            EmitAlert(144, { callIndex }, instrN, tid);
+        }
+        if (hasRegistry) {
+            EmitAlert(71, { callIndex }, instrN, tid);
+        }
+        if (HasFlag(accumulatedFlags, BehaviorFlag::DLLInjection) && hasDefense) {
+            EmitAlert(70, { callIndex }, instrN, tid);
+        }
+        if (hasSuspicious && HasFlag(accumulatedFlags, BehaviorFlag::MemoryManipulation)) {
+            EmitAlert(143, { callIndex }, instrN, tid);
         }
     }
 
@@ -1346,10 +2711,13 @@ void BehaviorMonitor::Impl::CheckInlineRules(
     // ========================================================================
     if (FuncIsAny(call, "CreateFileA", "CreateFileW")) {
         uint32_t access = static_cast<uint32_t>(call.args[1]);
+        const bool hasSuspicious = HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI);
+        const bool hasCreds      = HasFlag(call.behaviorFlags, BehaviorFlag::CredentialAccess);
+        const bool hasFileDrop   = HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped);
 
         // ---- Rule 20: DLL search order hijacking ----
         // Creating a DLL file flagged as potential injection vector
-        if (HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped) &&
+        if (hasFileDrop &&
             HasFlag(call.behaviorFlags, BehaviorFlag::DLLInjection)) {
             EmitAlert(20, { callIndex }, instrN, tid);
         }
@@ -1357,16 +2725,14 @@ void BehaviorMonitor::Impl::CheckInlineRules(
         // ---- Rule 27: Direct volume / physical drive access ----
         // Writing to \\.\PhysicalDrive or \\.\C: — the dispatcher flags
         // these low-level device paths with SuspiciousAPI.
-        if ((access & kGenericWrite) &&
-            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+        if ((access & kGenericWrite) && hasSuspicious) {
             EmitAlert(27, { callIndex }, instrN, tid);
         }
 
         // ---- Rule 28: Ransom note drop ----
         // FileDropped + SuspiciousAPI on common ransom note patterns
         // (README.txt, DECRYPT_*.txt, HOW_TO_*.txt, etc.)
-        if (HasFlag(call.behaviorFlags, BehaviorFlag::FileDropped) &&
-            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+        if (hasFileDrop && hasSuspicious) {
             // Only fire if not already covered by rule 27 (device access)
             if (!(access & kGenericWrite)) {
                 EmitAlert(28, { callIndex }, instrN, tid);
@@ -1377,8 +2743,7 @@ void BehaviorMonitor::Impl::CheckInlineRules(
         // Direct physical drive write access — critical severity.
         // Differentiated from rule 27 by the GENERIC_WRITE requirement
         // and the specific MBR/VBR context from the dispatcher.
-        if ((access & kGenericWrite) &&
-            HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI)) {
+        if ((access & kGenericWrite) && hasSuspicious) {
             // If the access also indicates a physical device (not just a volume),
             // the dispatcher sets both SuspiciousAPI and MemoryManipulation.
             if (HasFlag(call.behaviorFlags, BehaviorFlag::MemoryManipulation)) {
@@ -1386,6 +2751,22 @@ void BehaviorMonitor::Impl::CheckInlineRules(
                 accumulatedFlags = CombineFlags(accumulatedFlags,
                     BehaviorFlag::SuspiciousAPI);
             }
+        }
+
+        // ---- Rule 113: Browser credential database access ----
+        if (hasCreds || (hasFileDrop && HasFlag(accumulatedFlags, BehaviorFlag::CredentialAccess))) {
+            EmitAlert(113, { callIndex }, instrN, tid);
+        }
+
+        // ---- Rule 115: DPAPI master key access path ----
+        if (hasCreds && !(access & kGenericWrite)) {
+            EmitAlert(115, { callIndex }, instrN, tid);
+        }
+
+        // ---- Rule 143: Recovery partition deletion staging ----
+        if ((access & kGenericWrite) && hasSuspicious &&
+            HasFlag(accumulatedFlags, BehaviorFlag::DefenseEvasion)) {
+            EmitAlert(143, { callIndex }, instrN, tid);
         }
     }
 
@@ -1398,6 +2779,12 @@ void BehaviorMonitor::Impl::CheckInlineRules(
             EmitAlert(21, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::WMIExecution);
+        }
+
+        // ---- Rule 85: COM script engine ----
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::SuspiciousAPI) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::PowershellExecution)) {
+            EmitAlert(85, { callIndex }, instrN, tid);
         }
     }
 
@@ -1430,6 +2817,15 @@ void BehaviorMonitor::Impl::CheckInlineRules(
             EmitAlert(23, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::CredentialAccess);
+        }
+    }
+
+    if (FuncIsAny4(call, "RegSaveKeyA", "RegSaveKeyW",
+                   "RegSaveKeyExA", "RegSaveKeyExW")) {
+        if (HasFlag(call.behaviorFlags, BehaviorFlag::CredentialAccess) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::CredentialAccess)) {
+            EmitAlert(116, { callIndex }, instrN, tid);
+            EmitAlert(117, { callIndex }, instrN, tid);
         }
     }
 
@@ -1470,12 +2866,64 @@ void BehaviorMonitor::Impl::CheckInlineRules(
             BehaviorFlag::AntiAnalysis);
     }
 
+    // ---- Rule 109: Heaven's Gate heuristic ----
+    if (FuncIsAny3(call, "Wow64GetThreadContext", "Wow64SetThreadContext",
+                   "NtContinue")) {
+        EmitAlert(109, { callIndex }, instrN, tid);
+    }
+
+    // ---- Rule 110: Direct syscall / HellsGate heuristic ----
+    if (call.dllName && StrEqCI(call.dllName, "ntdll.dll") &&
+        call.funcName[0] == 'N' && call.funcName[1] == 't') {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::SuspiciousAPI) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::CodeInjection)) {
+            EmitAlert(110, { callIndex }, instrN, tid);
+        }
+    }
+
     // ---- Rule 32: Timestomping ----
     if (FuncIsAny(call, "SetFileTime", "NtSetInformationFile")) {
         if (HasFlag(call.behaviorFlags, BehaviorFlag::DefenseEvasion)) {
             EmitAlert(32, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::DefenseEvasion);
+        }
+    }
+
+    // ---- Rule 131: PEB BeingDebugged anti-debug ----
+    if (FuncIs(call, "NtQueryInformationProcess")) {
+        uint32_t infoClass = static_cast<uint32_t>(call.args[1]);
+        if (infoClass == 7 || infoClass == 30 || infoClass == 31) {
+            EmitAlert(131, { callIndex }, instrN, tid);
+        }
+    }
+
+    // ---- Rule 132: Heap flag anti-debug ----
+    if (FuncIsAny3(call, "HeapWalk", "HeapQueryInformation",
+                   "RtlQueryProcessHeapInformation")) {
+        EmitAlert(132, { callIndex }, instrN, tid);
+    }
+
+    // ---- Rule 133: Hardware breakpoint detection ----
+    if (FuncIsAny3(call, "GetThreadContext", "Wow64GetThreadContext",
+                   "NtGetContextThread")) {
+        EmitAlert(133, { callIndex }, instrN, tid);
+    }
+
+    // ---- Rule 138: Entropy reduction encoding heuristic ----
+    if (FuncIsAny(call, "CryptEncrypt", "BCryptEncrypt")) {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::SuspiciousAPI)) {
+            EmitAlert(138, { callIndex }, instrN, tid);
+        }
+    }
+
+    // ---- Rule 140: Time-based evasion ----
+    if (FuncIsAny4(call, "GetTickCount", "GetTickCount64",
+                   "QueryPerformanceCounter", "GetSystemTimeAsFileTime")) {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::SuspiciousAPI)) {
+            EmitAlert(140, { callIndex }, instrN, tid);
         }
     }
 
@@ -1490,6 +2938,50 @@ void BehaviorMonitor::Impl::CheckInlineRules(
             EmitAlert(45, { callIndex }, instrN, tid);
             accumulatedFlags = CombineFlags(accumulatedFlags,
                 BehaviorFlag::Keylogging);
+        }
+    }
+
+    // ========================================================================
+    // Generic credential, discovery, evasion, and destructive inline rules
+    // ========================================================================
+
+    // ---- Rule 122: Clipboard monitoring ----
+    if (FuncIs(call, "GetClipboardData")) {
+        EmitAlert(122, { callIndex }, instrN, tid);
+    }
+
+    // ---- Rule 125: Network share enumeration ----
+    if (FuncIsAny4(call, "NetShareEnum", "WNetEnumResourceA",
+                   "WNetEnumResourceW", "NetServerEnum")) {
+        EmitAlert(125, { callIndex }, instrN, tid);
+    }
+
+    // ---- Rule 129: Manual syscall stub construction heuristic ----
+    if (FuncIsAny(call, "VirtualAlloc", "NtAllocateVirtualMemory") ||
+        FuncIsAny(call, "VirtualProtect", "NtProtectVirtualMemory")) {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::MemoryManipulation) &&
+            HasFlag(accumulatedFlags, BehaviorFlag::DefenseEvasion)) {
+            EmitAlert(129, { callIndex }, instrN, tid);
+        }
+    }
+
+    // ---- Rules 145-146: Pre-encryption process kill sets ----
+    if (FuncIsAny(call, "TerminateProcess", "NtTerminateProcess")) {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::DefenseEvasion) ||
+            HasFlag(accumulatedFlags, BehaviorFlag::SuspiciousAPI)) {
+            EmitAlert(145, { callIndex }, instrN, tid);
+            EmitAlert(146, { callIndex }, instrN, tid);
+        }
+    }
+
+    // ---- Rule 150: Double extortion heuristic ----
+    if (FuncIsAny4(call, "CryptEncrypt", "BCryptEncrypt", "HttpSendRequestA",
+                   "HttpSendRequestW") ||
+        FuncIsAny4(call, "WinHttpSendRequest", "send", "WSASend", "InternetWriteFile")) {
+        if (HasFlag(accumulatedFlags, BehaviorFlag::NetworkC2) &&
+            (HasFlag(accumulatedFlags, BehaviorFlag::FileDropped) ||
+             HasFlag(accumulatedFlags, BehaviorFlag::CredentialAccess))) {
+            EmitAlert(150, { callIndex }, instrN, tid);
         }
     }
 }
