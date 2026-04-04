@@ -78,6 +78,41 @@ namespace RealTime {
     namespace {
         constexpr const wchar_t* LOG_CATEGORY = L"MemoryProtection";
 
+        // Compile-time guard: all MemoryTypes.h event structures MUST have unique
+        // sizes so that the size-discriminated dispatch in ProcessKernelMemoryAlert
+        // is unambiguous.  Any future field addition that causes a collision will
+        // fail to compile, forcing an explicit resolution.
+        static_assert(sizeof(SHELLCODE_DETECTION_EVENT) != sizeof(INJECTION_DETECTION_EVENT),
+            "Dispatch ambiguity: SHELLCODE_DETECTION_EVENT and INJECTION_DETECTION_EVENT have the same size");
+        static_assert(sizeof(SHELLCODE_DETECTION_EVENT) != sizeof(HOLLOWING_DETECTION_EVENT),
+            "Dispatch ambiguity: SHELLCODE_DETECTION_EVENT and HOLLOWING_DETECTION_EVENT have the same size");
+        static_assert(sizeof(SHELLCODE_DETECTION_EVENT) != sizeof(MEMORY_PROTECT_EVENT),
+            "Dispatch ambiguity: SHELLCODE_DETECTION_EVENT and MEMORY_PROTECT_EVENT have the same size");
+        static_assert(sizeof(SHELLCODE_DETECTION_EVENT) != sizeof(MEMORY_ACCESS_EVENT),
+            "Dispatch ambiguity: SHELLCODE_DETECTION_EVENT and MEMORY_ACCESS_EVENT have the same size");
+        static_assert(sizeof(SHELLCODE_DETECTION_EVENT) != sizeof(MEMORY_ALLOC_EVENT),
+            "Dispatch ambiguity: SHELLCODE_DETECTION_EVENT and MEMORY_ALLOC_EVENT have the same size");
+        static_assert(sizeof(INJECTION_DETECTION_EVENT) != sizeof(HOLLOWING_DETECTION_EVENT),
+            "Dispatch ambiguity: INJECTION_DETECTION_EVENT and HOLLOWING_DETECTION_EVENT have the same size");
+        static_assert(sizeof(INJECTION_DETECTION_EVENT) != sizeof(MEMORY_PROTECT_EVENT),
+            "Dispatch ambiguity: INJECTION_DETECTION_EVENT and MEMORY_PROTECT_EVENT have the same size");
+        static_assert(sizeof(INJECTION_DETECTION_EVENT) != sizeof(MEMORY_ACCESS_EVENT),
+            "Dispatch ambiguity: INJECTION_DETECTION_EVENT and MEMORY_ACCESS_EVENT have the same size");
+        static_assert(sizeof(INJECTION_DETECTION_EVENT) != sizeof(MEMORY_ALLOC_EVENT),
+            "Dispatch ambiguity: INJECTION_DETECTION_EVENT and MEMORY_ALLOC_EVENT have the same size");
+        static_assert(sizeof(HOLLOWING_DETECTION_EVENT) != sizeof(MEMORY_PROTECT_EVENT),
+            "Dispatch ambiguity: HOLLOWING_DETECTION_EVENT and MEMORY_PROTECT_EVENT have the same size");
+        static_assert(sizeof(HOLLOWING_DETECTION_EVENT) != sizeof(MEMORY_ACCESS_EVENT),
+            "Dispatch ambiguity: HOLLOWING_DETECTION_EVENT and MEMORY_ACCESS_EVENT have the same size");
+        static_assert(sizeof(HOLLOWING_DETECTION_EVENT) != sizeof(MEMORY_ALLOC_EVENT),
+            "Dispatch ambiguity: HOLLOWING_DETECTION_EVENT and MEMORY_ALLOC_EVENT have the same size");
+        static_assert(sizeof(MEMORY_PROTECT_EVENT) != sizeof(MEMORY_ACCESS_EVENT),
+            "Dispatch ambiguity: MEMORY_PROTECT_EVENT and MEMORY_ACCESS_EVENT have the same size");
+        static_assert(sizeof(MEMORY_PROTECT_EVENT) != sizeof(MEMORY_ALLOC_EVENT),
+            "Dispatch ambiguity: MEMORY_PROTECT_EVENT and MEMORY_ALLOC_EVENT have the same size");
+        static_assert(sizeof(MEMORY_ACCESS_EVENT) != sizeof(MEMORY_ALLOC_EVENT),
+            "Dispatch ambiguity: MEMORY_ACCESS_EVENT and MEMORY_ALLOC_EVENT have the same size");
+
         constexpr uint8_t ROR13_PAT1[] = { 0xC1, 0xCF, 0x0D };
         constexpr uint8_t ROR13_PAT2[] = { 0xC1, 0xCA, 0x0D };
         constexpr uint8_t SYSCALL_STUB_X64[] = { 0x4C, 0x8B, 0xD1, 0xB8 };
@@ -288,9 +323,10 @@ namespace RealTime {
     std::string MemoryViolation::ToJson() const {
         std::string j;
         j.reserve(512);
+        char addrBuf[32]; snprintf(addrBuf, sizeof(addrBuf), "\"0x%llX\"", static_cast<unsigned long long>(address));
         j += "{\"type\":\""; j += ViolationTypeToStr(type);
         j += "\",\"typeId\":"; j += std::to_string(static_cast<uint16_t>(type));
-        j += ",\"address\":"; j += std::to_string(address);
+        j += ",\"address\":"; j += addrBuf;
         j += ",\"size\":"; j += std::to_string(size);
         char cb[16]; snprintf(cb, sizeof(cb), "%.3f", confidence);
         j += ",\"confidence\":"; j += cb;
@@ -658,6 +694,13 @@ namespace RealTime {
 
     void MemoryProtection::MemoryProtectionImpl::ScanForROP(
         ProcessUtils::ProcessId pid, MemoryScanResult& result) {
+        // Never suspend threads in our own process: doing so while holding any
+        // lock (allocator, logging, etc.) that the suspended thread might own
+        // will deadlock immediately.
+        if (static_cast<DWORD>(pid) == ::GetCurrentProcessId()) {
+            SS_LOG_DEBUG(LOG_CATEGORY, L"ScanForROP: skipping self (PID=%u)", pid);
+            return;
+        }
         std::vector<ProcessUtils::ProcessThreadInfo> threads;
         if (!ProcessUtils::EnumerateProcessThreads(pid, threads)) return;
         std::vector<ProcessUtils::ProcessModuleInfo> modules;
@@ -959,11 +1002,13 @@ namespace RealTime {
         else if (e->DetectionFlags & MEMPROT_FLAG_DEP_BYPASS) { v.confidence = 0.88f; }
         else if (e->DetectionFlags & MEMPROT_FLAG_RW_TO_RX) { v.type = MemoryViolationType::W_to_X_Transition; v.confidence = 0.70f; }
         else { v.confidence = 0.65f; }
-        std::string det = "Kernel VirtualProtect: old=0x" + std::to_string(e->OldProtection);
-        det += " new=0x" + std::to_string(e->NewProtection);
-        det += " Score=" + std::to_string(e->ThreatScore);
-        if (e->DetectionFlags & MEMPROT_FLAG_CROSS_PROCESS) det += " [CROSS-PROC]";
-        v.details = std::move(det);
+        char det[256];
+        snprintf(det, sizeof(det),
+            "Kernel VirtualProtect: old=0x%08X new=0x%08X Score=%u",
+            e->OldProtection, e->NewProtection, e->ThreatScore);
+        std::string detStr(det);
+        if (e->DetectionFlags & MEMPROT_FLAG_CROSS_PROCESS) detStr += " [CROSS-PROC]";
+        v.details = std::move(detStr);
         MemoryScanResult sr; sr.pid = e->ProcessId;
         ProcessViolation(v, e->ProcessId, sr);
         m_stats.kernelEventsProcessed++;
@@ -1010,11 +1055,13 @@ namespace RealTime {
         if (e->DetectionFlags & MEMALLOC_FLAG_RWX_INITIAL) { v.type = MemoryViolationType::RWX_Page; v.confidence = 0.80f; }
         else if (e->DetectionFlags & MEMALLOC_FLAG_CROSS_PROCESS) { v.confidence = 0.75f; }
         else { v.confidence = 0.60f; }
-        std::string det = "Kernel alloc: addr=0x" + std::to_string(e->BaseAddress);
-        det += " size=0x" + std::to_string(e->RegionSize);
-        det += " prot=0x" + std::to_string(e->Protection);
-        det += " Score=" + std::to_string(e->ThreatScore);
-        v.details = std::move(det);
+        char det[256];
+        snprintf(det, sizeof(det),
+            "Kernel alloc: addr=0x%llX size=0x%llX prot=0x%08X Score=%u",
+            static_cast<unsigned long long>(e->BaseAddress),
+            static_cast<unsigned long long>(e->RegionSize),
+            e->Protection, e->ThreatScore);
+        v.details = det;
         MemoryScanResult sr; sr.pid = e->ProcessId;
         ProcessViolation(v, e->ProcessId, sr);
         m_stats.kernelEventsProcessed++;
@@ -1126,8 +1173,15 @@ namespace RealTime {
     }
 
     void MemoryProtection::MemoryProtectionImpl::NotifyCallbacks(const MemoryViolation& v, uint32_t pid) {
-        std::lock_guard lk(m_callbackMutex);
-        for (const auto& [id, cb] : m_threatCallbacks) {
+        // Snapshot the callback list under the lock, then invoke outside it.
+        // This prevents a deadlock where a callback calls UnregisterThreatCallback(),
+        // which would attempt to re-acquire m_callbackMutex on the same thread.
+        std::vector<std::pair<uint64_t, MemoryThreatCallback>> snapshot;
+        {
+            std::lock_guard lk(m_callbackMutex);
+            snapshot = m_threatCallbacks;
+        }
+        for (const auto& [id, cb] : snapshot) {
             try { cb(v, pid); }
             catch (const std::exception& ex) { SS_LOG_WARN(LOG_CATEGORY, L"Callback %llu error: %hs", id, ex.what()); }
             catch (...) { SS_LOG_WARN(LOG_CATEGORY, L"Callback %llu unknown error", id); }
@@ -1397,123 +1451,312 @@ namespace RealTime {
     }
 
     void MemoryProtection::ProcessKernelMemoryAlert(uint32_t messageType, const void* payload, size_t payloadSize) {
-        if (!payload || payloadSize < sizeof(UINT32) * 4) {
-            SS_LOG_WARN(LOG_CATEGORY, L"Invalid kernel alert: payload=%p size=%zu", payload, payloadSize);
+        if (!m_impl->m_running.load()) return;
+        if (!m_impl->m_config.enableKernelIntegration) return;
+
+        // Strict input validation — this function is on the critical IPC hot path.
+        if (!payload || payloadSize < sizeof(uint32_t)) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"ProcessKernelMemoryAlert: invalid payload (ptr=%p size=%zu msgType=%u)",
+                payload, payloadSize, messageType);
             return;
         }
-        try {
-            // Identify event type by matching Size field against actual payload
-            // Validates ev->Size == payloadSize to prevent type confusion attacks
-            if (payloadSize >= sizeof(SHELLCODE_DETECTION_EVENT)) {
-                auto* ev = reinterpret_cast<const SHELLCODE_DETECTION_EVENT*>(payload);
-                if (ev->Size == sizeof(SHELLCODE_DETECTION_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelShellcode(ev); return; }
-            }
-            if (payloadSize >= sizeof(INJECTION_DETECTION_EVENT)) {
-                auto* ev = reinterpret_cast<const INJECTION_DETECTION_EVENT*>(payload);
-                if (ev->Size == sizeof(INJECTION_DETECTION_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelInjection(ev); return; }
-            }
-            if (payloadSize >= sizeof(HOLLOWING_DETECTION_EVENT)) {
-                auto* ev = reinterpret_cast<const HOLLOWING_DETECTION_EVENT*>(payload);
-                if (ev->Size == sizeof(HOLLOWING_DETECTION_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelHollowing(ev); return; }
-            }
-            if (payloadSize >= sizeof(MEMORY_PROTECT_EVENT)) {
-                auto* ev = reinterpret_cast<const MEMORY_PROTECT_EVENT*>(payload);
-                if (ev->Size == sizeof(MEMORY_PROTECT_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelProtect(ev); return; }
-            }
-            if (payloadSize >= sizeof(MEMORY_ACCESS_EVENT)) {
-                auto* ev = reinterpret_cast<const MEMORY_ACCESS_EVENT*>(payload);
-                if (ev->Size == sizeof(MEMORY_ACCESS_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelAccess(ev); return; }
-            }
-            if (payloadSize >= sizeof(MEMORY_ALLOC_EVENT)) {
-                auto* ev = reinterpret_cast<const MEMORY_ALLOC_EVENT*>(payload);
-                if (ev->Size == sizeof(MEMORY_ALLOC_EVENT) && ev->Size == payloadSize) { m_impl->HandleKernelAlloc(ev); return; }
-            }
-            SS_LOG_WARN(LOG_CATEGORY, L"Unrecognized kernel memory alert: size=%zu", payloadSize);
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Kernel event error: %hs", e.what());
-        } catch (...) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Kernel event unknown error");
+
+        // All MemoryTypes.h event structures begin with UINT32 Size at offset 0.
+        // The kernel driver sets this field to sizeof(struct) so we can safely
+        // discriminate the event sub-type.  We also require payloadSize >= declaredSize
+        // to prevent any out-of-bounds reads if the IPC layer delivers a truncated buffer.
+        const uint32_t declaredSize = *static_cast<const uint32_t*>(payload);
+        if (declaredSize < sizeof(uint32_t) || declaredSize > payloadSize) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"ProcessKernelMemoryAlert: declared size %u outside received window %zu (msgType=%u)",
+                declaredSize, payloadSize, messageType);
+            return;
+        }
+
+        // Dispatch by declared structure size.
+        // With #pragma pack(push,1) all structures have distinct sizes.
+        if (declaredSize == sizeof(SHELLCODE_DETECTION_EVENT)) {
+            m_impl->HandleKernelShellcode(static_cast<const SHELLCODE_DETECTION_EVENT*>(payload));
+        } else if (declaredSize == sizeof(INJECTION_DETECTION_EVENT)) {
+            m_impl->HandleKernelInjection(static_cast<const INJECTION_DETECTION_EVENT*>(payload));
+        } else if (declaredSize == sizeof(HOLLOWING_DETECTION_EVENT)) {
+            m_impl->HandleKernelHollowing(static_cast<const HOLLOWING_DETECTION_EVENT*>(payload));
+        } else if (declaredSize == sizeof(MEMORY_PROTECT_EVENT)) {
+            m_impl->HandleKernelProtect(static_cast<const MEMORY_PROTECT_EVENT*>(payload));
+        } else if (declaredSize == sizeof(MEMORY_ACCESS_EVENT)) {
+            m_impl->HandleKernelAccess(static_cast<const MEMORY_ACCESS_EVENT*>(payload));
+        } else if (declaredSize == sizeof(MEMORY_ALLOC_EVENT)) {
+            m_impl->HandleKernelAlloc(static_cast<const MEMORY_ALLOC_EVENT*>(payload));
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"ProcessKernelMemoryAlert: unrecognized payload size %u (msgType=%u) — dropping",
+                declaredSize, messageType);
         }
     }
 
     uint64_t MemoryProtection::RegisterThreatCallback(MemoryThreatCallback callback) {
         if (!callback) return 0;
+        const uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
         std::lock_guard lk(m_impl->m_callbackMutex);
-        uint64_t id = m_impl->m_nextCallbackId++;
         m_impl->m_threatCallbacks.emplace_back(id, std::move(callback));
+        SS_LOG_DEBUG(LOG_CATEGORY, L"Threat callback registered ID=%llu (total=%zu)",
+            id, m_impl->m_threatCallbacks.size());
         return id;
     }
 
     bool MemoryProtection::UnregisterThreatCallback(uint64_t callbackId) {
+        if (callbackId == 0) return false;
         std::lock_guard lk(m_impl->m_callbackMutex);
-        auto& cbs = m_impl->m_threatCallbacks;
-        auto it = std::find_if(cbs.begin(), cbs.end(), [callbackId](const auto& p) { return p.first == callbackId; });
-        if (it == cbs.end()) return false;
-        cbs.erase(it);
+        auto it = std::find_if(m_impl->m_threatCallbacks.begin(),
+                               m_impl->m_threatCallbacks.end(),
+                               [callbackId](const auto& p) { return p.first == callbackId; });
+        if (it == m_impl->m_threatCallbacks.end()) return false;
+        m_impl->m_threatCallbacks.erase(it);
+        SS_LOG_DEBUG(LOG_CATEGORY, L"Threat callback unregistered ID=%llu", callbackId);
         return true;
     }
 
-    bool MemoryProtection::EnableExploitProtection(Utils::ProcessUtils::ProcessId pid, uint32_t flags) {
-        HANDLE hProc = OpenProcess(PROCESS_SET_INFORMATION, FALSE, pid);
-        if (!hProc) { SS_LOG_WARN(LOG_CATEGORY, L"Cannot open PID=%u for exploit protection", pid); return false; }
-        struct HG { HANDLE h; ~HG() { CloseHandle(h); } } guard{ hProc };
-        bool anySet = false;
-        if (flags & 0x01) {
-            PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY p{}; p.EnableControlFlowGuard = TRUE; p.EnableExportSuppression = TRUE;
-            if (SetProcessMitigationPolicy(ProcessControlFlowGuardPolicy, &p, sizeof(p))) anySet = true;
+    bool MemoryProtection::EnableExploitProtection(
+        Utils::ProcessUtils::ProcessId pid,
+        uint32_t flags) {
+        if (pid == 0) return false;
+
+        bool allOk = true;
+        const bool isSelf = (static_cast<DWORD>(pid) == ::GetCurrentProcessId());
+
+        SS_LOG_INFO(LOG_CATEGORY, L"EnableExploitProtection PID=%u flags=0x%08X self=%d",
+            pid, flags, isSelf ? 1 : 0);
+
+        // For the calling process, apply mitigations directly via
+        // SetProcessMitigationPolicy.  For external processes, we cannot apply
+        // most mitigations from user-mode without kernel assistance; we fall
+        // back to enhanced monitoring.
+        if (isSelf && !(flags & EXPLOIT_PROTECT_MONITOR_ONLY)) {
+            if (flags & EXPLOIT_PROTECT_DEP) {
+                PROCESS_MITIGATION_DEP_POLICY dep{};
+                dep.Enable = 1;
+                dep.DisableAtlThunkEmulation = 1;
+                if (!SetProcessMitigationPolicy(ProcessDEPPolicy, &dep, sizeof(dep))) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EnableExploitProtection: DEP SetProcessMitigationPolicy failed (0x%08X)",
+                        GetLastError());
+                    allOk = false;
+                }
+            }
+            if (flags & EXPLOIT_PROTECT_ASLR_FORCE) {
+                PROCESS_MITIGATION_ASLR_POLICY aslr{};
+                aslr.EnableForceRelocateImages = 1;
+                aslr.DisallowStrippedImages    = 1;
+                aslr.EnableBottomUpRandomization = 1;
+                aslr.EnableHighEntropy          = 1;
+                if (!SetProcessMitigationPolicy(ProcessASLRPolicy, &aslr, sizeof(aslr))) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EnableExploitProtection: ASLR SetProcessMitigationPolicy failed (0x%08X)",
+                        GetLastError());
+                    allOk = false;
+                }
+            }
+            if (flags & EXPLOIT_PROTECT_CFG) {
+                PROCESS_MITIGATION_CONTROL_FLOW_GUARD_POLICY cfg{};
+                cfg.EnableControlFlowGuard   = 1;
+                cfg.EnableExportSuppression  = 1;
+                cfg.StrictMode               = 1;
+                if (!SetProcessMitigationPolicy(ProcessControlFlowGuardPolicy, &cfg, sizeof(cfg))) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EnableExploitProtection: CFG SetProcessMitigationPolicy failed (0x%08X)",
+                        GetLastError());
+                    allOk = false;
+                }
+            }
+            if (flags & EXPLOIT_PROTECT_HEAP_TERMINATE) {
+                PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY hchk{};
+                hchk.RaiseExceptionOnInvalidHandleReference = 1;
+                hchk.HandleExceptionsPermanentlyEnabled     = 1;
+                (void)SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &hchk, sizeof(hchk));
+
+                PROCESS_MITIGATION_HEAP_POLICY hp{};
+                hp.TerminateOnHeapErrors = 1;
+                if (!SetProcessMitigationPolicy(ProcessHeapPolicy, &hp, sizeof(hp))) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EnableExploitProtection: heap-terminate policy failed (0x%08X)",
+                        GetLastError());
+                    allOk = false;
+                }
+            }
+            if (flags & EXPLOIT_PROTECT_NO_DYNAMIC_CODE) {
+                PROCESS_MITIGATION_DYNAMIC_CODE_POLICY dcp{};
+                dcp.ProhibitDynamicCode = 1;
+                if (!SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &dcp, sizeof(dcp))) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"EnableExploitProtection: dynamic-code policy failed (0x%08X)",
+                        GetLastError());
+                    // Not fatal — some JIT runtimes legitimately need this.
+                }
+            }
+            if (flags & EXPLOIT_PROTECT_STRICT_HANDLES) {
+                PROCESS_MITIGATION_STRICT_HANDLE_CHECK_POLICY shc{};
+                shc.RaiseExceptionOnInvalidHandleReference = 1;
+                shc.HandleExceptionsPermanentlyEnabled     = 1;
+                (void)SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &shc, sizeof(shc));
+            }
+        } else if (!isSelf) {
+            // For external processes, user-mode cannot apply most mitigations.
+            // Register the process for continuous monitoring at Heuristic depth
+            // so the monitoring loop will perform behavioral tracking.
+            SS_LOG_INFO(LOG_CATEGORY,
+                L"EnableExploitProtection: external PID=%u — applying enhanced monitoring (no kernel assist)",
+                pid);
         }
-        if (flags & 0x02) {
-            PROCESS_MITIGATION_ASLR_POLICY p{}; p.EnableForceRelocateImages = TRUE; p.EnableBottomUpRandomization = TRUE; p.EnableHighEntropy = TRUE;
-            if (SetProcessMitigationPolicy(ProcessASLRPolicy, &p, sizeof(p))) anySet = true;
-        }
-        if (flags & 0x04) {
-            PROCESS_MITIGATION_DEP_POLICY p{}; p.Enable = TRUE; p.Permanent = TRUE; p.DisableAtlThunkEmulation = TRUE;
-            if (SetProcessMitigationPolicy(ProcessDEPPolicy, &p, sizeof(p))) anySet = true;
-        }
-        if (flags & 0x08) {
-            PROCESS_MITIGATION_DYNAMIC_CODE_POLICY p{}; p.ProhibitDynamicCode = TRUE;
-            if (SetProcessMitigationPolicy(ProcessDynamicCodePolicy, &p, sizeof(p))) anySet = true;
-        }
-        SS_LOG_INFO(LOG_CATEGORY, L"ExploitProtection PID=%u flags=0x%X result=%d", pid, flags, anySet);
-        return anySet;
+
+        // Always: register the process for continuous monitoring regardless of
+        // whether hardware mitigations could be applied.
+        MonitorProcess(pid);
+        return allOk;
     }
 
     bool MemoryProtection::SelfTest() {
-        SS_LOG_INFO(LOG_CATEGORY, L"SelfTest starting");
-        void* rwx = MemoryUtils::Alloc(4096, PAGE_EXECUTE_READWRITE, MEM_COMMIT | MEM_RESERVE);
-        if (!rwx) { SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest: RWX alloc failed"); return false; }
-        struct MG { void* p; ~MG() { MemoryUtils::Free(p); } } guard{ rwx };
-        auto* ptr = static_cast<uint8_t*>(rwx);
-        memset(ptr, 0x90, 128);
-        memcpy(ptr + 128, ROR13_PAT1, sizeof(ROR13_PAT1));
-        memcpy(ptr + 144, SYSCALL_STUB_X64, sizeof(SYSCALL_STUB_X64));
-        ptr[148] = 0x01; ptr[149] = 0x00; ptr[150] = 0x00; ptr[151] = 0x00;
-        memcpy(ptr + 152, SYSCALL_INST, sizeof(SYSCALL_INST));
-        auto pid = ProcessUtils::GetCurrentProcessId();
-        auto result = ScanProcess(pid, ScanMode::Deep);
-        bool found = false;
-        for (const auto& v : result.violations) {
-            if (v.type == MemoryViolationType::RWX_Page && v.address == reinterpret_cast<uint64_t>(rwx))
-                found = true;
+        SS_LOG_INFO(LOG_CATEGORY, L"SelfTest: running detection algorithm validation");
+        bool passed = true;
+
+        // ---- Test 1: NOP sled detection ----
+        {
+            constexpr size_t NOP_LEN = 64;
+            uint8_t nopSled[NOP_LEN];
+            memset(nopSled, 0x90, sizeof(nopSled));
+            if (!m_impl->DetectNopSled(nopSled, NOP_LEN)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: NOP sled not detected");
+                passed = false;
+            }
         }
-        SS_LOG_INFO(LOG_CATEGORY, L"SelfTest %hs: %zu violations", found ? "PASSED" : "FAILED", result.violations.size());
-        return found;
+
+        // ---- Test 2: API hashing (ror13 pattern) ----
+        {
+            constexpr uint8_t ror13[] = { 0xC1, 0xCF, 0x0D, 0x41, 0x03, 0xC8 };
+            if (!m_impl->DetectAPIHashing(ror13, sizeof(ror13))) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: ror13 API hash not detected");
+                passed = false;
+            }
+        }
+
+        // ---- Test 3: Direct syscall stub ----
+        {
+            // mov r10, rcx ; mov eax, 0x55 ; syscall
+            constexpr uint8_t syscallStub[] = {
+                0x4C, 0x8B, 0xD1, 0xB8, 0x55, 0x00, 0x0F, 0x05
+            };
+            if (!m_impl->DetectSyscallStub(syscallStub, sizeof(syscallStub))) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: syscall stub not detected");
+                passed = false;
+            }
+        }
+
+        // ---- Test 4: Reflective DLL header ----
+        {
+            uint8_t peHdr[0x100] = {};
+            peHdr[0] = 'M'; peHdr[1] = 'Z';
+            *reinterpret_cast<uint32_t*>(peHdr + 0x3C) = 0x80u;
+            *reinterpret_cast<uint32_t*>(peHdr + 0x80) = 0x00004550u; // "PE\0\0"
+            if (!m_impl->DetectReflectiveDLL(peHdr, sizeof(peHdr))) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: reflective DLL header not detected");
+                passed = false;
+            }
+        }
+
+        // ---- Test 5: Entropy calculation sanity ----
+        {
+            uint8_t allBytes[256];
+            for (int i = 0; i < 256; ++i) allBytes[i] = static_cast<uint8_t>(i);
+            const double ent = CalcEntropy(allBytes, 256);
+            if (ent < 7.95) { // Perfect entropy = 8.0 bits per byte
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: entropy calc returned %.4f (expected ~8.0)", ent);
+                passed = false;
+            }
+        }
+
+        // ---- Test 6: Encoder stub (shikata marker) ----
+        {
+            constexpr uint8_t shikata[] = { 0xD9, 0x74, 0x24, 0xF4, 0x58, 0x31, 0xC9 };
+            if (!m_impl->DetectEncoderStub(shikata, sizeof(shikata))) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: shikata encoder not detected");
+                passed = false;
+            }
+        }
+
+        // ---- Test 7: PIC call-pop prologue ----
+        {
+            // E8 00 00 00 00 5B  =>  call $+5 ; pop ebx
+            constexpr uint8_t callPop[] = { 0xE8, 0x00, 0x00, 0x00, 0x00, 0x5B };
+            if (!m_impl->DetectPIC(callPop, sizeof(callPop))) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAIL: PIC call-pop not detected");
+                passed = false;
+            }
+        }
+
+        if (passed) {
+            SS_LOG_INFO(LOG_CATEGORY, L"SelfTest PASSED: all 7 detection checks functional");
+        } else {
+            SS_LOG_ERROR(LOG_CATEGORY, L"SelfTest FAILED: one or more detection algorithms malfunction");
+        }
+        return passed;
     }
 
     std::string MemoryProtection::GetStatistics() const {
-        std::shared_lock lk(m_impl->m_dataMutex);
-        std::string j;
-        j.reserve(512);
-        j += "{\"scansPerformed\":"; j += std::to_string(m_impl->m_stats.scansPerformed.load());
-        j += ",\"threatsDetected\":"; j += std::to_string(m_impl->m_stats.threatsDetected.load());
-        j += ",\"pagesScanned\":"; j += std::to_string(m_impl->m_stats.pagesScanned.load());
-        j += ",\"totalScanTimeUs\":"; j += std::to_string(m_impl->m_stats.totalScanTimeUs.load());
-        j += ",\"kernelEventsProcessed\":"; j += std::to_string(m_impl->m_stats.kernelEventsProcessed.load());
-        j += ",\"alertsRaised\":"; j += std::to_string(m_impl->m_stats.alertsRaised.load());
-        j += ",\"monitoredProcesses\":"; j += std::to_string(m_impl->m_monitoredProcesses.size());
-        j += ",\"running\":"; j += m_impl->m_running.load() ? "true" : "false";
-        j += "}";
-        return j;
+        // Snapshot atomics without holding any lock that could block writers.
+        const uint64_t scans        = m_impl->m_stats.scansPerformed.load(std::memory_order_relaxed);
+        const uint64_t threats      = m_impl->m_stats.threatsDetected.load(std::memory_order_relaxed);
+        const uint64_t pages        = m_impl->m_stats.pagesScanned.load(std::memory_order_relaxed);
+        const uint64_t scanTimeUs   = m_impl->m_stats.totalScanTimeUs.load(std::memory_order_relaxed);
+        const uint64_t kernelEvts   = m_impl->m_stats.kernelEventsProcessed.load(std::memory_order_relaxed);
+        const uint64_t alerts       = m_impl->m_stats.alertsRaised.load(std::memory_order_relaxed);
+        const bool     running      = m_impl->m_running.load(std::memory_order_relaxed);
+
+        size_t monitoredCount = 0;
+        {
+            std::shared_lock lk(m_impl->m_dataMutex);
+            monitoredCount = m_impl->m_monitoredProcesses.size();
+        }
+
+        size_t callbackCount = 0;
+        {
+            std::lock_guard lk(m_impl->m_callbackMutex);
+            callbackCount = m_impl->m_threatCallbacks.size();
+        }
+
+        const double avgScanMs = (scans > 0)
+            ? (static_cast<double>(scanTimeUs) / static_cast<double>(scans) / 1000.0)
+            : 0.0;
+
+        const double detectionRate = (scans > 0)
+            ? (static_cast<double>(threats) / static_cast<double>(scans) * 100.0)
+            : 0.0;
+
+        char buf[512];
+        snprintf(buf, sizeof(buf),
+            "{"
+            "\"running\":%s,"
+            "\"scansPerformed\":%llu,"
+            "\"threatsDetected\":%llu,"
+            "\"pagesScanned\":%llu,"
+            "\"kernelEventsProcessed\":%llu,"
+            "\"alertsRaised\":%llu,"
+            "\"monitoredProcesses\":%zu,"
+            "\"registeredCallbacks\":%zu,"
+            "\"avgScanTimeMs\":%.3f,"
+            "\"detectionRatePct\":%.2f"
+            "}",
+            running ? "true" : "false",
+            static_cast<unsigned long long>(scans),
+            static_cast<unsigned long long>(threats),
+            static_cast<unsigned long long>(pages),
+            static_cast<unsigned long long>(kernelEvts),
+            static_cast<unsigned long long>(alerts),
+            monitoredCount,
+            callbackCount,
+            avgScanMs,
+            detectionRate);
+
+        return buf;
     }
 
 } // namespace RealTime
