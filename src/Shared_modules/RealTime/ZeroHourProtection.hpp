@@ -249,6 +249,9 @@ enum class ThreatLevel : uint8_t {
  * @enum CloudVerdict
  * @brief Verdict returned from cloud analysis.
  */
+// Suppress the Windows SDK `ERROR` macro that conflicts with the enum member name
+#pragma push_macro("ERROR")
+#undef ERROR
 enum class CloudVerdict : uint8_t {
     UNKNOWN = 0,             ///< Never seen before
     CLEAN = 1,               ///< Known good
@@ -257,10 +260,11 @@ enum class CloudVerdict : uint8_t {
     PUA = 4,                 ///< Potentially Unwanted Application
     RISKWARE = 5,            ///< Legal but risky software
     PENDING = 6,             ///< Analysis in progress
-    ERROR = 7,               ///< Lookup failed
+    LOOKUP_FAILED = 7,       ///< Lookup failed (replaces ERROR to avoid WinSDK macro conflict)
     WHITELISTED = 8,         ///< Explicitly trusted
     BLACKLISTED = 9          ///< Explicitly blocked
 };
+#pragma pop_macro("ERROR")
 
 /**
  * @enum HoldReason
@@ -281,6 +285,9 @@ enum class HoldReason : uint8_t {
  * @enum HoldDecision
  * @brief Decision for a held file after analysis.
  */
+// Suppress Windows SDK `DELETE` macro (0x00010000L) conflict with enum member name
+#pragma push_macro("DELETE")
+#undef DELETE
 enum class HoldDecision : uint8_t {
     ALLOW = 0,               ///< File is safe, release hold
     BLOCK = 1,               ///< File is malicious, deny execution
@@ -291,6 +298,7 @@ enum class HoldDecision : uint8_t {
     USER_OVERRIDE = 6,       ///< User requested override
     ADMIN_RELEASE = 7        ///< Administrator released
 };
+#pragma pop_macro("DELETE")
 
 /**
  * @enum OutbreakType
@@ -967,6 +975,20 @@ public:
     void Shutdown() noexcept;
 
     /**
+     * @brief Starts zero-hour protection with a default enterprise configuration.
+     *        If already initialized, this is a no-op and returns true.
+     * @return True if started (or already running) successfully.
+     * @note Called by RealTimeProtection orchestrator — idempotent.
+     */
+    [[nodiscard]] bool Start() noexcept;
+
+    /**
+     * @brief Stops zero-hour protection. Equivalent to Shutdown().
+     * @note Called by RealTimeProtection orchestrator.
+     */
+    void Stop() noexcept;
+
+    /**
      * @brief Checks if the system is initialized.
      * @return True if initialized and ready.
      */
@@ -984,6 +1006,25 @@ public:
      * @return True if update succeeded.
      */
     bool UpdateConfig(const ZeroHourProtectionConfig& config);
+
+    // ========================================================================
+    // INTEGRATION SETTERS
+    // ========================================================================
+
+    /**
+     * @brief Injects the ThreatIntelLookup engine for cloud/local hash lookups.
+     * @param lookup Pointer to an initialized ThreatIntelLookup. Lifetime must
+     *               exceed that of this ZeroHourProtection instance.
+     * @note Must be called before AnalyzeFile() for cloud verdict lookups.
+     */
+    void SetThreatIntelLookup(ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
+    /**
+     * @brief Injects the WhitelistStore for known-good file checks.
+     * @param store Pointer to an initialized WhitelistStore. Lifetime must
+     *              exceed that of this ZeroHourProtection instance.
+     */
+    void SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept;
 
     // ========================================================================
     // OUTBREAK MODE CONTROL
