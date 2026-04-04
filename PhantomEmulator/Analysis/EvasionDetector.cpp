@@ -33,8 +33,9 @@ static constexpr uint32_t kMaxTimingRIPs            = 4'096;
 static constexpr uint32_t kMaxProcessNames          = 4'096;
 static constexpr uint32_t kMaxRegistryPaths         = 4'096;
 static constexpr uint32_t kMaxFilePaths             = 4'096;
+static constexpr uint32_t kMaxInstructionProbeRIPs  = 4'096;
 static constexpr uint32_t kMaxDescriptionLength     = 512;
-static constexpr float    kTotalTechniques          = 60.0f;
+static constexpr float    kTotalTechniques          = 61.0f;
 
 // ============================================================================
 // Evasion Category Classification
@@ -378,6 +379,7 @@ struct EvasionDetector::Impl {
 
     // --- File query tracking ---
     std::set<std::string> filePathsSeen;
+    std::unordered_set<GuestAddress> instructionProbeRIPs;
 
     // --- SetLastError / GetLastError pairing ---
     bool     lastCallWasSetLastError = false;
@@ -2191,6 +2193,48 @@ void EvasionDetector::OnProcessEnumeration(const std::string& processName) noexc
 }
 
 // ============================================================================
+// OnInstructionProbe — Called for suspicious decoded instruction patterns
+// ============================================================================
+
+void EvasionDetector::OnInstructionProbe(
+    GuestAddress rip, uint64_t instrCount, const char* detail) noexcept
+{
+    if (!m_impl) return;
+    if (!detail || *detail == '\0') return;
+
+    if (instrCount > m_impl->instrCounter) {
+        m_impl->instrCounter = instrCount;
+    }
+
+    const bool isEVEXProbe =
+        CaseInsensitiveContains(detail, "evex") ||
+        CaseInsensitiveContains(detail, "avx-512") ||
+        CaseInsensitiveContains(detail, "avx512") ||
+        CaseInsensitiveContains(detail, "zmm");
+    if (!isEVEXProbe) {
+        return;
+    }
+
+    if (m_impl->instructionProbeRIPs.size() >= kMaxInstructionProbeRIPs &&
+        m_impl->instructionProbeRIPs.find(rip) == m_impl->instructionProbeRIPs.end()) {
+        return;
+    }
+
+    try {
+        if (!m_impl->instructionProbeRIPs.insert(rip).second) {
+            return;
+        }
+    } catch (...) {
+        return;
+    }
+
+    m_impl->RecordAttempt(
+        EvasionTechnique::AVX512_EVEXInstruction,
+        "EVEX / AVX-512 instruction executed — potential emulator or analyst capability probe",
+        rip, instrCount, 0.55f);
+}
+
+// ============================================================================
 // Results — Read-only accessors
 // ============================================================================
 
@@ -2280,6 +2324,7 @@ void EvasionDetector::Reset() noexcept {
     m_impl->processNamesSeen.clear();
     m_impl->registryPathsSeen.clear();
     m_impl->filePathsSeen.clear();
+    m_impl->instructionProbeRIPs.clear();
     m_impl->lastCallWasSetLastError  = false;
     m_impl->setLastErrorInstrNum     = 0;
     m_impl->instrCounter             = 0;
