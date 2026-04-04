@@ -449,7 +449,7 @@ struct ProcessCreationMonitor::Impl {
             }
 
             if (shouldScan) {
-                scanVerdict = PerformScan(event);
+                scanVerdict = PerformScan(event, localScanEngine);
                 if (scanVerdict == ProcessVerdict::Block) {
                     stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
                     return ProcessVerdict::Block;
@@ -631,7 +631,8 @@ struct ProcessCreationMonitor::Impl {
         return result;
     }
 
-    ProcessVerdict PerformScan(const ProcessCreateEvent& event) {
+    ProcessVerdict PerformScan(const ProcessCreateEvent& event,
+                              Core::Engine::ScanEngine* localScanEngine) {
         stats.scansPerformed.fetch_add(1, std::memory_order_relaxed);
 
         // ================================================================
@@ -680,10 +681,10 @@ struct ProcessCreationMonitor::Impl {
         // ================================================================
         // CONTENT-BASED SCAN via ScanEngine
         // ================================================================
-        if (!scanEngine) return ProcessVerdict::Allow;
+        if (!localScanEngine) return ProcessVerdict::Allow;
 
         try {
-            auto scanResult = scanEngine->QuickScanFile(event.imagePath);
+            auto scanResult = localScanEngine->QuickScanFile(event.imagePath);
 
             if (scanResult.verdict == Core::Engine::ScanVerdict::Infected) {
                 SS_LOG_ERROR(L"ProcessCreationMonitor",
