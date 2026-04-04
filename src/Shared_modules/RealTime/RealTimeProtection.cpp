@@ -207,8 +207,8 @@ namespace {
                 std::string details = std::format(
                     "Detector: {}, Image: {}, Source: {}",
                     detectorName,
-                    Utils::StringUtils::WideToUtf8(imagePath.substr(0, 260)),
-                    Utils::StringUtils::WideToUtf8(detectionSource.substr(0, 300)));
+                    Utils::StringUtils::ToNarrow(imagePath.substr(0, 260)),
+                    Utils::StringUtils::ToNarrow(detectionSource.substr(0, 300)));
 
                 (void)Communication::AlertSystem::Instance().RaiseAlert(
                     severity,
@@ -334,6 +334,10 @@ public:
     RTPStatistics m_stats;
     PerformanceMetrics m_performanceMetrics;
 
+    // Rate calculation state (member vars instead of static locals for thread safety)
+    uint64_t m_lastTotalScansForRate{ 0 };
+    std::chrono::system_clock::time_point m_lastRateCalcTime{ std::chrono::system_clock::now() };
+
     // Callbacks
     std::unordered_map<uint64_t, FileScanCallback> m_fileScanCallbacks;
     std::unordered_map<uint64_t, ProcessCreateCallback> m_processCreateCallbacks;
@@ -362,8 +366,8 @@ public:
             m_sharedPatternStore = std::make_shared<PatternStore::PatternStore>();
             m_sharedThreatIntelStore = std::make_shared<ThreatIntel::ThreatIntelStore>();
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to create shared ThreatIntel stores: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            Utils::Logger::Error("Failed to create shared ThreatIntel stores: {}",
+                e.what());
         }
 
         // Create Anti-Evasion Detectors (non-singleton, owned)
@@ -376,7 +380,7 @@ public:
             m_environmentDetector = std::make_unique<ShadowStrike::AntiEvasion::EnvironmentEvasionDetector>();
             m_packerDetector = std::make_unique<ShadowStrike::AntiEvasion::PackerDetector>();
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"Failed to create Anti-Evasion detectors: {}", Utils::StringUtils::ToWideString(e.what()));
+            Utils::Logger::Error("Failed to create Anti-Evasion detectors: {}", e.what());
         }
 
         // Initialize component status array
@@ -396,11 +400,11 @@ public:
 
     bool Start() {
         if (m_state == ProtectionState::ACTIVE) {
-            Utils::Logger::Warn(L"RealTimeProtection: Already active");
+            Utils::Logger::Warn("RealTimeProtection: Already active");
             return true;
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Starting orchestrator service...");
+        Utils::Logger::Info("RealTimeProtection: Starting orchestrator service...");
         SetState(ProtectionState::INITIALIZING);
 
         try {
@@ -418,15 +422,15 @@ public:
                     256 * 1024 * 1024,  // 256 MB limit
                     std::chrono::minutes(1)
                 );
-                Utils::Logger::Info(L"RealTimeProtection: CacheManager initialized");
+                Utils::Logger::Info("RealTimeProtection: CacheManager initialized");
             }
             catch (const std::exception& ex) {
-                Utils::Logger::Warn(L"RealTimeProtection: CacheManager init failed, continuing without cache");
+                Utils::Logger::Warn("RealTimeProtection: CacheManager init failed, continuing without cache");
             }
 
             // 2. Initialize Scan Engine
             if (!InitializeScanEngine()) {
-                Utils::Logger::Error(L"RealTimeProtection: Failed to initialize ScanEngine");
+                Utils::Logger::Error("RealTimeProtection: Failed to initialize ScanEngine");
                 // Continue in degraded mode
                 SetComponentState(ComponentType::SCAN_ENGINE, ComponentState::ERROR);
             } else {
@@ -435,7 +439,7 @@ public:
 
             // 3. Initialize IPC Manager and connect to kernel driver
             if (!InitializeIPCManager()) {
-                Utils::Logger::Warn(L"RealTimeProtection: IPC Manager not available. Running in user-mode only.");
+                Utils::Logger::Warn("RealTimeProtection: IPC Manager not available. Running in user-mode only.");
                 SetComponentState(ComponentType::IPC_MANAGER, ComponentState::ERROR);
                 m_protectionStatus.driverConnected = false;
             } else {
@@ -448,7 +452,7 @@ public:
 
             // 4. Initialize Quarantine Manager
             if (!InitializeQuarantineManager()) {
-                Utils::Logger::Warn(L"RealTimeProtection: QuarantineManager initialization failed");
+                Utils::Logger::Warn("RealTimeProtection: QuarantineManager initialization failed");
                 SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::ERROR);
             } else {
                 SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::RUNNING);
@@ -498,12 +502,12 @@ public:
             InitializeAntiEvasionDetectors();
 
             SetState(ProtectionState::ACTIVE);
-            Utils::Logger::Info(L"RealTimeProtection: Started successfully");
+            Utils::Logger::Info("RealTimeProtection: Started successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Critical(L"RealTimeProtection: Exception during startup: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("RealTimeProtection: Exception during startup: {}",
+                e.what());
             SetState(ProtectionState::ERROR);
             return false;
         }
@@ -515,7 +519,7 @@ public:
             return;
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Stopping orchestrator service...");
+        Utils::Logger::Info("RealTimeProtection: Stopping orchestrator service...");
         SetState(ProtectionState::SHUTTING_DOWN);
 
         // 1. Stop background threads
@@ -565,18 +569,18 @@ public:
         ShutdownAntiEvasionDetectors();
 
         SetState(ProtectionState::UNINITIALIZED);
-        Utils::Logger::Info(L"RealTimeProtection: Stopped");
+        Utils::Logger::Info("RealTimeProtection: Stopped");
     }
 
     bool Pause(uint32_t durationMs, std::wstring_view reason) {
         if (m_state != ProtectionState::ACTIVE) {
-            Utils::Logger::Warn(L"RealTimeProtection: Cannot pause - not active");
+            Utils::Logger::Warn("RealTimeProtection: Cannot pause - not active");
             return false;
         }
 
         SetState(ProtectionState::PAUSED);
-        Utils::Logger::Warn(L"RealTimeProtection: PAUSED - Reason: {}",
-            reason.empty() ? L"User request" : reason);
+        Utils::Logger::Warn("RealTimeProtection: PAUSED - Reason: {}",
+            reason.empty() ? "User request" : reason);
 
         // Pause components
         FileSystemFilter::Instance().Pause();
@@ -604,7 +608,7 @@ public:
             return false;
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Resuming protection...");
+        Utils::Logger::Info("RealTimeProtection: Resuming protection...");
 
         // Resume components
         FileSystemFilter::Instance().Resume();
@@ -615,7 +619,7 @@ public:
         m_protectionStatus.isProtected = true;
         SetState(ProtectionState::ACTIVE);
 
-        Utils::Logger::Info(L"RealTimeProtection: Resumed");
+        Utils::Logger::Info("RealTimeProtection: Resumed");
         return true;
     }
 
@@ -636,8 +640,8 @@ public:
 
             return true;
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: ScanEngine init exception: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("RealTimeProtection: ScanEngine init exception: {}",
+                e.what());
             return false;
         }
     }
@@ -679,7 +683,7 @@ public:
             }
 
             if (!ipc.ConnectFilterPort()) {
-                Utils::Logger::Warn(L"RealTimeProtection: Failed to connect to filter port (driver may not be loaded)");
+                Utils::Logger::Warn("RealTimeProtection: Failed to connect to filter port (driver may not be loaded)");
                 return false;
             }
 
@@ -689,8 +693,8 @@ public:
 
             return true;
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: IPCManager init exception: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("RealTimeProtection: IPCManager init exception: {}",
+                e.what());
             return false;
         }
     }
@@ -704,11 +708,11 @@ public:
             if (!Communication::IPCManager::HasInstance()) return;
             auto* pusher = Communication::IPCManager::Instance().GetPusher();
             if (!pusher) {
-                Utils::Logger::Warn(L"RealTimeProtection: ThreatIntelPusher unavailable — kernel IOC sync skipped");
+                Utils::Logger::Warn("RealTimeProtection: ThreatIntelPusher unavailable  -  kernel IOC sync skipped");
                 return;
             }
 
-            Utils::Logger::Info(L"RealTimeProtection: Synchronizing threat intelligence to kernel...");
+            Utils::Logger::Info("RealTimeProtection: Synchronizing threat intelligence to kernel...");
 
             // Push hash database entries to kernel IOCMatcher
             // HashStore uses Bloom filter internally — enumerate from ThreatIntelStore instead
@@ -720,8 +724,8 @@ public:
                 auto stats = m_sharedThreatIntelStore->GetStatistics();
                 const size_t totalEntries = stats.totalIOCEntries + stats.totalHashEntries +
                     stats.totalIPEntries + stats.totalDomainEntries + stats.totalURLEntries;
-                Utils::Logger::Info(L"RealTimeProtection: ThreatIntelStore has {} entries — "
-                    L"kernel push ready when enumeration API is available",
+                Utils::Logger::Info("RealTimeProtection: ThreatIntelStore has {} entries  -  "
+                    "kernel push ready when enumeration API is available",
                     totalEntries);
             }
 
@@ -729,18 +733,19 @@ public:
             // Requires Whitelist module to expose enumerable entries
             // Wire point: Whitelist::GetEntries() → WhitelistPushEntry → pusher->PushWhitelist()
 
-            Utils::Logger::Info(L"RealTimeProtection: Kernel threat intel sync complete (pusher wired)");
+            Utils::Logger::Info("RealTimeProtection: Kernel threat intel sync complete (pusher wired)");
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: Kernel ThreatIntel sync failed: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("RealTimeProtection: Kernel ThreatIntel sync failed: {}",
+                e.what());
         }
     }
 
     bool InitializeQuarantineManager() {
         try {
-            // QuarantineManager would be initialized here
-            // Core::Engine::QuarantineManager::Instance().Initialize();
-            return true;
+            return Core::Engine::QuarantineManager::Instance().Initialize();
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("RealTimeProtection: QuarantineManager init exception: {}", ex.what());
+            return false;
         } catch (...) {
             return false;
         }
@@ -751,12 +756,12 @@ public:
     // =========================================================================
 
     void InitializeAntiEvasionDetectors() {
-        Utils::Logger::Info(L"RealTimeProtection: Initializing Anti-Evasion detectors...");
+        Utils::Logger::Info("RealTimeProtection: Initializing Anti-Evasion detectors...");
 
         // Non-singleton detectors: Initialize() on owned instances
         if (m_debuggerDetector) {
             if (!m_debuggerDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: DebuggerEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: DebuggerEvasionDetector Initialize failed");
             } else {
                 // Wire ThreatIntel stores for IOC-enriched anti-debug detection
                 if (m_sharedSignatureStore) m_debuggerDetector->SetSignatureStore(m_sharedSignatureStore);
@@ -766,8 +771,8 @@ public:
                     [](uint32_t pid, const ShadowStrike::AntiEvasion::DetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::EvasionSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[DED-CB] PID={} technique={} confidence={:.2f} severity={}",
-                                pid, detection.description,
+                                "[DED-CB] PID={} technique={} confidence={:.2f} severity={}",
+                                pid, Utils::StringUtils::ToNarrow(detection.description),
                                 detection.confidence,
                                 static_cast<int>(detection.severity));
                         }
@@ -776,25 +781,25 @@ public:
         }
         if (m_processDetector) {
             if (!m_processDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: ProcessEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: ProcessEvasionDetector Initialize failed");
             } else {
                 // Wire detection callback for per-technique SOC/SIEM telemetry
                 m_processDetector->SetDetectionCallback(
                     [](uint32_t pid, const ShadowStrike::AntiEvasion::DetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[PED-CB] PID={} technique={} confidence={:.2f} severity={} details={}",
-                                pid, detection.description,
+                                "[PED-CB] PID={} technique={} confidence={:.2f} severity={} details={}",
+                                pid, Utils::StringUtils::ToNarrow(detection.description),
                                 detection.confidence,
                                 static_cast<int>(detection.severity),
-                                detection.technicalDetails.substr(0, 200));
+                                Utils::StringUtils::ToNarrow(detection.technicalDetails.substr(0, 200)));
                         }
                     });
             }
         }
         if (m_metamorphicDetector) {
             if (!m_metamorphicDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: MetamorphicDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: MetamorphicDetector Initialize failed");
             } else {
                 // Wire ThreatIntel stores for IOC-enriched detection
                 if (m_sharedSignatureStore) m_metamorphicDetector->SetSignatureStore(m_sharedSignatureStore);
@@ -805,8 +810,8 @@ public:
                     [](const std::wstring& file, const ShadowStrike::AntiEvasion::MetamorphicDetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::MetamorphicSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[META-CB] file={} technique={} confidence={:.2f} severity={}",
-                                file, detection.description,
+                                "[META-CB] file={} technique={} confidence={:.2f} severity={}",
+                                Utils::StringUtils::ToNarrow(file), Utils::StringUtils::ToNarrow(detection.description),
                                 detection.confidence,
                                 static_cast<int>(detection.severity));
                         }
@@ -815,7 +820,7 @@ public:
         }
         if (m_networkDetector) {
             if (!m_networkDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: NetworkBasedEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: NetworkBasedEvasionDetector Initialize failed");
             } else {
                 // Wire ThreatIntel store for C2/DGA/IOC correlation
                 if (m_sharedThreatIntelStore) m_networkDetector->SetThreatIntelStore(m_sharedThreatIntelStore);
@@ -823,18 +828,18 @@ public:
                     [](uint32_t pid, const ShadowStrike::AntiEvasion::NetworkDetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[NBED-CB] PID={} technique={} confidence={:.2f} severity={} mitre={}",
-                                pid, detection.description,
+                                "[NBED-CB] PID={} technique={} confidence={:.2f} severity={} mitre={}",
+                                pid, Utils::StringUtils::ToNarrow(detection.description),
                                 detection.confidence,
                                 static_cast<int>(detection.severity),
-                                detection.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(detection.mitreId));
+                                detection.mitreId.empty() ? "N/A" : detection.mitreId);
                         }
                     });
             }
         }
         if (m_environmentDetector) {
             if (!m_environmentDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: EnvironmentEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: EnvironmentEvasionDetector Initialize failed");
             } else {
                 // Wire ThreatIntel store for IOC-enriched environment evasion detection
                 if (m_sharedThreatIntelStore) m_environmentDetector->SetThreatIntelStore(m_sharedThreatIntelStore);
@@ -843,8 +848,8 @@ public:
                     [](uint32_t pid, const ShadowStrike::AntiEvasion::EnvironmentDetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::EnvironmentEvasionSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[EED-CB] PID={} technique={} confidence={:.2f} severity={}",
-                                pid, detection.description,
+                                "[EED-CB] PID={} technique={} confidence={:.2f} severity={}",
+                                pid, Utils::StringUtils::ToNarrow(detection.description),
                                 detection.confidence,
                                 static_cast<int>(detection.severity));
                         }
@@ -853,7 +858,7 @@ public:
         }
         if (m_packerDetector) {
             if (!m_packerDetector->Initialize()) {
-                Utils::Logger::Warn(L"RealTimeProtection: PackerDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: PackerDetector Initialize failed");
             } else {
                 // Wire ThreatIntel stores for packer signature/hash/pattern correlation
                 if (m_sharedSignatureStore) m_packerDetector->SetSignatureStore(m_sharedSignatureStore);
@@ -863,12 +868,12 @@ public:
                     [](const std::wstring& file, const ShadowStrike::AntiEvasion::PackerMatch& match) {
                         if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                             Utils::Logger::Warn(
-                                L"[PD-CB] file={} packer={} confidence={:.2f} severity={} method={} mitre={}",
-                                file.substr(0, 120), match.packerName,
+                                "[PD-CB] file={} packer={} confidence={:.2f} severity={} method={} mitre={}",
+                                Utils::StringUtils::ToNarrow(file.substr(0, 120)), match.packerName,
                                 match.confidence,
                                 static_cast<int>(match.severity),
                                 static_cast<int>(match.method),
-                                match.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(match.mitreId));
+                                match.mitreId.empty() ? "N/A" : match.mitreId);
                         }
                     });
             }
@@ -886,22 +891,22 @@ public:
                     [](const ShadowStrike::AntiEvasion::SandboxEvasionResult& result) {
                         if (result.isSandboxLikely) {
                             Utils::Logger::Warn(
-                                L"[SED-CB] Sandbox detected — probability={:.1f}% confidence={:.1f}% "
-                                L"definitive={} product={} indicators={}",
+                                "[SED-CB] Sandbox detected  -  probability={:.1f}% confidence={:.1f}% "
+                                "definitive={} product={} indicators={}",
                                 result.probability, result.confidence,
-                                result.isDefinitive ? L"YES" : L"NO",
-                                result.sandboxName.empty() ? L"Unknown" : result.sandboxName.c_str(),
+                                result.isDefinitive ? "YES" : "NO",
+                                result.sandboxName.empty() ? std::string("Unknown") : Utils::StringUtils::ToNarrow(result.sandboxName),
                                 result.indicators.size());
 
                             // Log critical/high indicators for forensic correlation
                             for (const auto& ind : result.indicators) {
                                 if (ind.severity >= ShadowStrike::AntiEvasion::SandboxIndicatorSeverity::High) {
                                     Utils::Logger::Warn(
-                                        L"[SED-CB] indicator={} severity={} confidence={:.1f} {}",
-                                        ind.description.substr(0, 100),
+                                        "[SED-CB] indicator={} severity={} confidence={:.1f} {}",
+                                        Utils::StringUtils::ToNarrow(ind.description.substr(0, 100)),
                                         static_cast<int>(ind.severity),
                                         ind.confidence,
-                                        ind.technicalDetails.substr(0, 150));
+                                        Utils::StringUtils::ToNarrow(ind.technicalDetails.substr(0, 150)));
                                 }
                             }
                         }
@@ -911,16 +916,16 @@ public:
                 auto hwProfile = sandbox.AnalyzeHardware();
                 auto envResult = sandbox.AnalyzeEnvironment();
                 if (hwProfile.isSandboxLike || envResult.suspicionScore >= 50.0f) {
-                    Utils::Logger::Warn(L"RealTimeProtection: Sandbox environment detected — "
-                        L"hardware={:.1f}% env={:.1f}% — endpoint may be under malware analysis",
+                    Utils::Logger::Warn("RealTimeProtection: Sandbox environment detected  -  "
+                        "hardware={:.1f}% env={:.1f}%  -  endpoint may be under malware analysis",
                         hwProfile.suspicionScore, envResult.suspicionScore);
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: SandboxEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: SandboxEvasionDetector Initialize failed");
             }
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: SandboxEvasionDetector exception: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            Utils::Logger::Error("RealTimeProtection: SandboxEvasionDetector exception: {}",
+                e.what());
         }
 
         try {
@@ -933,19 +938,19 @@ public:
                     [](const ShadowStrike::AntiEvasion::TimingEvasionResult& result) {
                         if (result.isEvasive) {
                             Utils::Logger::Warn(
-                                L"[TED-CB] PID={} threat={:.1f} confidence={:.1f} severity={} "
-                                L"findings={} process={}",
+                                "[TED-CB] PID={} threat={:.1f} confidence={:.1f} severity={} "
+                                "findings={} process={}",
                                 result.processId, result.threatScore,
                                 result.confidence,
                                 static_cast<int>(result.severity),
                                 result.findings.size(),
-                                result.processName.substr(0, 80));
+                                Utils::StringUtils::ToNarrow(result.processName.substr(0, 80)));
 
                             for (const auto& finding : result.findings) {
                                 if (finding.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::High) {
                                     Utils::Logger::Warn(
-                                        L"[TED-CB] PID={} finding={} confidence={:.1f} severity={}",
-                                        result.processId, finding.description.substr(0, 120),
+                                        "[TED-CB] PID={} finding={} confidence={:.1f} severity={}",
+                                        result.processId, Utils::StringUtils::ToNarrow(finding.description.substr(0, 120)),
                                         finding.confidence,
                                         static_cast<int>(finding.severity));
                                 }
@@ -953,18 +958,18 @@ public:
                         }
                     });
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: TimeBasedEvasionDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: TimeBasedEvasionDetector Initialize failed");
             }
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: TimeBasedEvasionDetector exception: {}",
-                Utils::StringUtils::ToWideString(e.what()));
+            Utils::Logger::Error("RealTimeProtection: TimeBasedEvasionDetector exception: {}",
+                e.what());
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Anti-Evasion detectors initialized");
+        Utils::Logger::Info("RealTimeProtection: Anti-Evasion detectors initialized");
     }
 
     void ShutdownAntiEvasionDetectors() {
-        Utils::Logger::Info(L"RealTimeProtection: Shutting down Anti-Evasion detectors...");
+        Utils::Logger::Info("RealTimeProtection: Shutting down Anti-Evasion detectors...");
 
         // Singleton detectors: Shutdown via Instance()
         if (m_timeBasedDetectorInitialized.exchange(false)) {
@@ -987,11 +992,11 @@ public:
         if (m_debuggerDetector) { m_debuggerDetector->Shutdown(); m_debuggerDetector.reset(); }
         m_vmDetector.reset();
 
-        Utils::Logger::Info(L"RealTimeProtection: Anti-Evasion detectors shut down");
+        Utils::Logger::Info("RealTimeProtection: Anti-Evasion detectors shut down");
     }
 
     void StartComponents() {
-        Utils::Logger::Info(L"RealTimeProtection: Starting protection components...");
+        Utils::Logger::Info("RealTimeProtection: Starting protection components...");
 
         // FileSystemFilter
         try {
@@ -1015,8 +1020,34 @@ public:
         // ProcessCreationMonitor
         try {
             auto& pcm = ProcessCreationMonitor::Instance();
-            pcm.Start();
-            SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::RUNNING);
+            ProcessMonitorConfig pcmCfg;
+            pcmCfg.enabled = true;
+            pcmCfg.preExecutionScan = true;
+            pcmCfg.analyzeCommandLine = true;
+            pcmCfg.detectLOLBAS = true;
+            pcmCfg.detectSuspiciousParentChild = true;
+            pcmCfg.trackParentChild = true;
+            pcmCfg.detectEncodedCommands = true;
+            pcmCfg.detectMasquerading = true;
+            pcmCfg.trustMicrosoftSigned = true;
+            pcmCfg.blockOnTimeout = false;
+            pcmCfg.blockThreshold = 80.0;
+            pcmCfg.alertThreshold = 40.0;
+            if (!pcm.Initialize(m_threadPool, pcmCfg)) {
+                Utils::Logger::Error("RealTimeProtection: ProcessCreationMonitor::Initialize failed");
+                SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
+            } else {
+                pcm.SetScanEngine(&Core::Engine::ScanEngine::Instance());
+                if (m_sharedHashStore) {
+                    pcm.SetHashStore(m_sharedHashStore.get());
+                }
+                pcm.Start();
+                SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::RUNNING);
+                Utils::Logger::Info("RealTimeProtection: ProcessCreationMonitor initialized and started");
+            }
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("RealTimeProtection: ProcessCreationMonitor startup exception: {}", ex.what());
+            SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
         } catch (...) {
             SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
         }
@@ -1025,8 +1056,20 @@ public:
         if (m_config.monitorMemoryAllocation) {
             try {
                 auto& mp = MemoryProtection::Instance();
+                MemoryProtection::MemoryProtectionConfig mpConfig;
+                mpConfig.enableKernelIntegration = true;
+                mpConfig.enableContinuousMonitoring = m_config.monitorMemoryAllocation;
+                mpConfig.enableAPTHunting = m_config.enableExploitPrevention;
+                mpConfig.enableAlertSystem = true;
+                mpConfig.enableTelemetry = true;
+                mpConfig.enableBehaviorFeedback = true;
+                mp.Configure(mpConfig);
                 mp.Start();
                 SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::RUNNING);
+                Utils::Logger::Info("RealTimeProtection: MemoryProtection configured and started");
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: MemoryProtection startup exception: {}", ex.what());
+                SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::ERROR);
             }
@@ -1038,19 +1081,19 @@ public:
                 auto& bb = BehaviorBlocker::Instance();
                 BehaviorBlockerConfig bbConfig = BehaviorBlockerConfig::CreateDefault();
                 if (!bb.Initialize(bbConfig)) {
-                    Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker::Initialize failed");
+                    Utils::Logger::Error("RealTimeProtection: BehaviorBlocker::Initialize failed");
                     SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
                 } else {
                     bb.LoadDefaultRules();
                     bb.Start();
                     bb.PushRulesToKernel();
                     SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::RUNNING);
-                    Utils::Logger::Info(L"RealTimeProtection: BehaviorBlocker initialized with {} default rules",
+                    Utils::Logger::Info("RealTimeProtection: BehaviorBlocker initialized with {} default rules",
                         bb.GetStatistics().activeRuleCount);
                 }
             } catch (const std::exception& ex) {
-                Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker startup exception: {}",
-                    Utils::StringUtils::ToWide(ex.what()));
+                Utils::Logger::Error("RealTimeProtection: BehaviorBlocker startup exception: {}",
+                    ex.what());
                 SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
@@ -1061,9 +1104,18 @@ public:
         if (m_config.filterNetworkTraffic) {
             try {
                 auto& ntf = NetworkTrafficFilter::Instance();
-                ntf.Initialize(m_threadPool);
-                ntf.Start();
-                SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::RUNNING);
+                if (!ntf.Initialize(m_threadPool, NetworkFilterConfig::CreateDefault())) {
+                    Utils::Logger::Error("RealTimeProtection: NetworkTrafficFilter::Initialize failed");
+                    SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
+                } else {
+                    ntf.Start();
+                    ntf.LoadBlockListFromFile(L"data/ip_blocklist.txt");
+                    SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::RUNNING);
+                    Utils::Logger::Info("RealTimeProtection: NetworkTrafficFilter initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: NetworkTrafficFilter startup exception: {}", ex.what());
+                SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
             }
@@ -1075,21 +1127,21 @@ public:
                 auto& ep = ExploitPrevention::Instance();
                 auto epConfig = ExploitPreventionConfig::CreateDefault();
                 if (!ep.Initialize(m_threadPool, epConfig)) {
-                    Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention::Initialize failed");
+                    Utils::Logger::Error("RealTimeProtection: ExploitPrevention::Initialize failed");
                     SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
                 } else {
                     if (ep.Start()) {
                         ep.PushMitigationsToKernel();
                         SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
-                        Utils::Logger::Info(L"RealTimeProtection: ExploitPrevention initialized and running");
+                        Utils::Logger::Info("RealTimeProtection: ExploitPrevention initialized and running");
                     } else {
-                        Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention::Start failed");
+                        Utils::Logger::Error("RealTimeProtection: ExploitPrevention::Start failed");
                         SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
                     }
                 }
             } catch (const std::exception& ex) {
-                Utils::Logger::Error(L"RealTimeProtection: ExploitPrevention startup exception: {}",
-                    Utils::StringUtils::ToWide(ex.what()));
+                Utils::Logger::Error("RealTimeProtection: ExploitPrevention startup exception: {}",
+                    ex.what());
                 SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
@@ -1102,19 +1154,19 @@ public:
                 auto& fim = FileIntegrityMonitor::Instance();
                 auto fimConfig = FIMConfig::CreateDefault();
                 if (!fim.Initialize(m_threadPool, fimConfig)) {
-                    Utils::Logger::Error(L"RealTimeProtection: FileIntegrityMonitor::Initialize failed");
+                    Utils::Logger::Error("RealTimeProtection: FileIntegrityMonitor::Initialize failed");
                     SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
                 } else {
                     fim.StartMonitoring();
                     fim.CreateSystemBaselines();
                     SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::RUNNING);
                     auto fimStats = fim.GetStats();
-                    Utils::Logger::Info(L"RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
+                    Utils::Logger::Info("RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
                         fimStats.monitoredFiles, fimStats.monitoredDirectories);
                 }
             } catch (const std::exception& ex) {
-                Utils::Logger::Error(L"RealTimeProtection: FIM startup exception: {}",
-                    Utils::StringUtils::ToWide(ex.what()));
+                Utils::Logger::Error("RealTimeProtection: FIM startup exception: {}",
+                    ex.what());
                 SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
@@ -1134,8 +1186,52 @@ public:
         if (m_config.enableZeroHourProtection) {
             try {
                 auto& zhp = ZeroHourProtection::Instance();
-                zhp.Start();
-                SetComponentState(ComponentType::ZERO_HOUR, ComponentState::RUNNING);
+                if (!zhp.Start()) {
+                    Utils::Logger::Error("RealTimeProtection: ZeroHourProtection::Start failed");
+                    SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
+                } else {
+                    // Register verdict callback for SOC/SIEM integration
+                    zhp.RegisterVerdictCallback(
+                        [](const std::wstring& filePath, const ZeroHourProtection::FileAnalysisResult& result) {
+                            if (result.verdict != ZeroHourProtection::CloudVerdict::CLEAN) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: [ZHP] Verdict for {}: threat={} (source={})",
+                                    Utils::StringUtils::ToNarrow(filePath),
+                                    Utils::StringUtils::ToNarrow(result.threatName),
+                                    static_cast<int>(result.source));
+                            }
+                        });
+                    // Register outbreak callback for rapid response
+                    zhp.RegisterOutbreakCallback(
+                        [](const ZeroHourProtection::OutbreakInfo& outbreak, bool isNew) {
+                            Utils::Logger::Error(
+                                "RealTimeProtection: [ZHP] OUTBREAK {}: {} "
+                                "(severity={} globalVictims={} localVictims={})",
+                                isNew ? "DETECTED" : "UPDATED",
+                                Utils::StringUtils::ToNarrow(outbreak.name),
+                                outbreak.severity,
+                                outbreak.globalVictimCount,
+                                outbreak.localVictimCount);
+                        });
+                    // Register signature update callback
+                    zhp.RegisterSignatureUpdateCallback(
+                        [](const ZeroHourProtection::MicroSigUpdatePackage& package, bool success) {
+                            Utils::Logger::Info(
+                                "RealTimeProtection: [ZHP] Signature update {}: "
+                                "v{} -> v{} (additions={} removals={} emergency={})",
+                                success ? "applied" : "FAILED",
+                                package.baseVersion,
+                                package.targetVersion,
+                                package.additions.size(),
+                                package.removals.size(),
+                                package.isEmergency ? "yes" : "no");
+                        });
+                    SetComponentState(ComponentType::ZERO_HOUR, ComponentState::RUNNING);
+                    Utils::Logger::Info("RealTimeProtection: ZeroHourProtection started with callbacks registered");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: ZeroHourProtection startup exception: {}", ex.what());
+                SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
             } catch (...) {
                 SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
             }
@@ -1146,10 +1242,10 @@ public:
             auto& hsd = Exploits::HeapSprayDetector::Instance();
             if (hsd.Initialize()) {
                 if (!hsd.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: HeapSprayDetector Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: HeapSprayDetector Start failed");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: HeapSprayDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: HeapSprayDetector Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: HeapSprayDetector exception: {}", e.what());
@@ -1162,10 +1258,10 @@ public:
             auto& jsd = Exploits::JITSprayDetector::Instance();
             if (jsd.Initialize()) {
                 if (!jsd.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: JITSprayDetector Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: JITSprayDetector Start failed");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: JITSprayDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: JITSprayDetector Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: JITSprayDetector exception: {}", e.what());
@@ -1178,10 +1274,10 @@ public:
             auto& bop = Exploits::BufferOverflowProtection::Instance();
             if (bop.Initialize()) {
                 if (!bop.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: BufferOverflowProtection Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: BufferOverflowProtection Start failed");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: BufferOverflowProtection Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: BufferOverflowProtection Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: BufferOverflowProtection exception: {}", e.what());
@@ -1194,10 +1290,10 @@ public:
             auto& spd = Exploits::StackPivotDetector::Instance();
             if (spd.Initialize()) {
                 if (!spd.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: StackPivotDetector Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: StackPivotDetector Start failed");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: StackPivotDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: StackPivotDetector Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: StackPivotDetector exception: {}", e.what());
@@ -1220,18 +1316,18 @@ public:
 
             if (ked.Initialize(kedConfig)) {
                 if (!ked.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: KernelExploitDetector Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: KernelExploitDetector Start failed");
                 } else {
                     // Wire exploit detection callback for SOC alerting
                     ked.RegisterKernelExploitCallback(
                         [](const Exploits::KernelExploitEvent& event) {
                             auto typeName = Exploits::GetKernelThreatTypeName(event.threatType);
                             Utils::Logger::Warn(
-                                L"[KED-CB] Kernel exploit detected: {} (PID={}, confidence={:.1f}, blocked={})",
-                                Utils::StringUtils::Utf8ToWide(typeName.data()),
+                                "[KED-CB] Kernel exploit detected: {} (PID={}, confidence={:.1f}, blocked={})",
+                                typeName.data(),
                                 event.sourceProcessId,
                                 event.confidence,
-                                event.wasBlocked ? L"YES" : L"NO");
+                                event.wasBlocked ? "YES" : "NO");
                         });
 
                     // Wire driver load callback for telemetry
@@ -1239,12 +1335,12 @@ public:
                         [](const Exploits::DriverInfo& info, Exploits::DetectionAction action) {
                             if (info.isVulnerable || info.isMicrosoftBlocked || info.isLOLDriver) {
                                 Utils::Logger::Error(
-                                    L"[KED-CB] Vulnerable driver: {} (SHA256: {}, "
-                                    L"LOLDriver={}, MSBlocked={}, Action={})",
+                                    "[KED-CB] Vulnerable driver: {} (SHA256: {}, "
+                                    "LOLDriver={}, MSBlocked={}, Action={})",
                                     info.fileName,
-                                    Utils::StringUtils::Utf8ToWide(info.sha256.substr(0, 16)),
-                                    info.isLOLDriver ? L"YES" : L"NO",
-                                    info.isMicrosoftBlocked ? L"YES" : L"NO",
+                                    info.sha256.substr(0, 16),
+                                    info.isLOLDriver ? "YES" : "NO",
+                                    info.isMicrosoftBlocked ? "YES" : "NO",
                                     static_cast<int>(action));
                             }
                         });
@@ -1255,10 +1351,10 @@ public:
                             Utils::Logger::Error("[KED-ERR] {} (code={})", message, code);
                         });
 
-                    Utils::Logger::Info(L"RealTimeProtection: KernelExploitDetector initialized and started");
+                    Utils::Logger::Info("RealTimeProtection: KernelExploitDetector initialized and started");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: KernelExploitDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: KernelExploitDetector Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: KernelExploitDetector exception: {}", e.what());
@@ -1280,18 +1376,18 @@ public:
 
             if (ped.Initialize(pedConfig)) {
                 if (!ped.Start()) {
-                    Utils::Logger::Warn(L"RealTimeProtection: PrivilegeEscalationDetector Start failed");
+                    Utils::Logger::Warn("RealTimeProtection: PrivilegeEscalationDetector Start failed");
                 } else {
                     // Wire LPE detection callback for SOC alerting and threat correlation
                     ped.RegisterLpeCallback(
                         [](const Exploits::LpeEvent& event) {
                             auto techniqueName = Exploits::GetLpeTechniqueName(event.technique);
                             Utils::Logger::Warn(
-                                L"[PED-CB] Privilege escalation detected: {} (PID={}, confidence={:.1f}, blocked={})",
-                                Utils::StringUtils::Utf8ToWide(techniqueName),
+                                "[PED-CB] Privilege escalation detected: {} (PID={}, confidence={:.1f}, blocked={})",
+                                techniqueName,
                                 event.processId,
                                 event.confidenceScore,
-                                event.wasBlocked ? L"YES" : L"NO");
+                                event.wasBlocked ? "YES" : "NO");
                         });
 
                     // Wire error callback
@@ -1300,10 +1396,10 @@ public:
                             Utils::Logger::Error("[PED-ERR] {} (code={})", message, code);
                         });
 
-                    Utils::Logger::Info(L"RealTimeProtection: PrivilegeEscalationDetector initialized and started");
+                    Utils::Logger::Info("RealTimeProtection: PrivilegeEscalationDetector initialized and started");
                 }
             } else {
-                Utils::Logger::Warn(L"RealTimeProtection: PrivilegeEscalationDetector Initialize failed");
+                Utils::Logger::Warn("RealTimeProtection: PrivilegeEscalationDetector Initialize failed");
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error("RealTimeProtection: PrivilegeEscalationDetector exception: {}", e.what());
@@ -1311,11 +1407,11 @@ public:
             Utils::Logger::Error("RealTimeProtection: PrivilegeEscalationDetector unknown exception");
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Components started");
+        Utils::Logger::Info("RealTimeProtection: Components started");
     }
 
     void StopComponents() {
-        Utils::Logger::Info(L"RealTimeProtection: Stopping protection components...");
+        Utils::Logger::Info("RealTimeProtection: Stopping protection components...");
 
         try { FileSystemFilter::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::STOPPED);
@@ -1332,7 +1428,7 @@ public:
         } catch (...) {}
         SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::STOPPED);
 
-        try { NetworkTrafficFilter::Instance().Stop(); } catch (...) {}
+        try { NetworkTrafficFilter::Instance().Stop(); NetworkTrafficFilter::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::STOPPED);
 
         try { ExploitPrevention::Instance().Shutdown(); } catch (...) {}
@@ -1357,7 +1453,7 @@ public:
         try { Exploits::KernelExploitDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::PrivilegeEscalationDetector::Instance().Shutdown(); } catch (...) {}
 
-        Utils::Logger::Info(L"RealTimeProtection: Components stopped");
+        Utils::Logger::Info("RealTimeProtection: Components stopped");
     }
 
     // =========================================================================
@@ -1410,13 +1506,13 @@ public:
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
             if (metaResult.isMetamorphic) {
                 Utils::Logger::Warn(
-                    L"RealTimeProtection: Blocked metamorphic threat: {} "
-                    L"[score={:.1f} severity={} detections={} family={}]",
+                    "RealTimeProtection: Blocked metamorphic threat: {} "
+                    "[score={:.1f} severity={} detections={} family={}]",
                     filePath,
                     metaResult.mutationScore,
                     static_cast<int>(metaResult.maxSeverity),
                     metaResult.totalDetections,
-                    metaResult.familyName.empty() ? L"unknown" : metaResult.familyName);
+                    metaResult.familyName.empty() ? "unknown" : metaResult.familyName);
                 m_stats.threatsDetected++;
                 return Communication::KernelVerdict::Block;
             }
@@ -1435,18 +1531,17 @@ public:
             auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
             if (pdErr.win32Code != 0) {
                 Utils::Logger::Warn(
-                    L"RealTimeProtection: PackerDetector analysis failed for {} — error={} {}",
-                    filePath.substr(0, 120), pdErr.win32Code, pdErr.message);
+                    "RealTimeProtection: PackerDetector analysis failed for {}  -  error={} {}",
+                    filePath.substr(0, 120), pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
             }
             if (packResult.isPacked) {
                 fileIsPacked = true;
                 packingConfidence = packResult.packingConfidence;
 
                 Utils::Logger::Info(
-                    L"RealTimeProtection: Packed file: {} [packer={} confidence={:.1f}% "
-                    L"severity={} category={} layers={} entropy={:.2f}]",
-                    filePath, packResult.packerName,
-                    packResult.packingConfidence * 100.0,
+                    "RealTimeProtection: Packed file: {} [packer={} confidence={:.1f}% "
+                    "severity={} category={} layers={} entropy={:.2f}]",
+                    filePath, Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
                     static_cast<int>(packResult.severity),
                     static_cast<int>(packResult.packerCategory),
                     packResult.layerCount,
@@ -1455,8 +1550,7 @@ public:
                 // Critical/High severity packer = malware-specific packer → block immediately
                 if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
                     Utils::Logger::Warn(
-                        L"RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",
-                        filePath, packResult.packerName, packResult.packerMatches.size());
+                        "RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",\n                        Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName), packResult.packerMatches.size());
                     m_stats.threatsDetected++;
                     return Communication::KernelVerdict::Block;
                 }
@@ -1464,8 +1558,7 @@ public:
                 for (const auto& match : packResult.packerMatches) {
                     if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                         Utils::Logger::Warn(
-                            L"RealTimeProtection: High-severity packer match in {}: {} (confidence={:.2f}, method={})",
-                            filePath, match.packerName, match.confidence,
+                            "RealTimeProtection: High-severity packer match in {}: {} (confidence={:.2f}, method={})",\n                            Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(match.packerName), match.confidence,
                             static_cast<int>(match.method));
                     }
                 }
@@ -1486,8 +1579,8 @@ public:
         try {
             engineResult = Core::Engine::ScanEngine::Instance().ScanFile(filePath, context);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"RealTimeProtection: Scan exception: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("RealTimeProtection: Scan exception: {}",
+                e.what());
             m_stats.scanErrors++;
 
             // Apply failure policy
@@ -1602,8 +1695,8 @@ public:
                     req.processId, req.parentProcessId,
                     imagePath, static_cast<bool>(req.isCreation));
             } catch (const std::exception& e) {
-                Utils::Logger::Warn(L"RealTimeProtection: AntiDebug process notify exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Warn("RealTimeProtection: AntiDebug process notify exception: {}",
+                    e.what());
             } catch (...) {}
         }
 
@@ -1618,8 +1711,8 @@ public:
                 Security::CertificateValidator::Instance().OnKernelProcessCreate(
                     req.processId, req.parentProcessId, imagePath);
             } catch (const std::exception& e) {
-                Utils::Logger::Warn(L"RealTimeProtection: CertificateValidator process create exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Warn("RealTimeProtection: CertificateValidator process create exception: {}",
+                    e.what());
             } catch (...) {}
         }
 
@@ -1640,8 +1733,8 @@ public:
                 if (lowerCmd.find(L"-enc") != std::wstring::npos ||
                     lowerCmd.find(L"-encodedcommand") != std::wstring::npos ||
                     lowerCmd.find(L"frombase64string") != std::wstring::npos) {
-                    Utils::Logger::Warn(L"RealTimeProtection: Encoded PowerShell detected — PID: {}, Parent: {}, Cmd: {}",
-                        req.processId, req.parentProcessId, commandLine.substr(0, 200));
+                    Utils::Logger::Warn("RealTimeProtection: Encoded PowerShell detected  -  PID: {}, Parent: {}, Cmd: {}",
+                        req.processId, req.parentProcessId, Utils::StringUtils::ToNarrow(commandLine.substr(0, 200)));
                 }
 
                 // Download cradles (certutil, bitsadmin, mshta, regsvr32)
@@ -1654,9 +1747,9 @@ public:
                     if (lowerImage.find(cradle) != std::wstring::npos &&
                         (lowerCmd.find(L"http") != std::wstring::npos ||
                          lowerCmd.find(L"\\\\") != std::wstring::npos)) {
-                        Utils::Logger::Warn(L"RealTimeProtection: LOLBin download cradle detected — "
-                            L"PID: {}, Binary: {}, Cmd: {}",
-                            req.processId, imagePath, commandLine.substr(0, 200));
+                        Utils::Logger::Warn("RealTimeProtection: LOLBin download cradle detected  -  "
+                            "PID: {}, Binary: {}, Cmd: {}",
+                            req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(commandLine.substr(0, 200)));
                         break;
                     }
                 }
@@ -1698,8 +1791,8 @@ public:
                     // Log technique details for SOC/SIEM correlation
                     for (const auto& tech : result.detectedTechniques) {
                         if (tech.severity >= ShadowStrike::AntiEvasion::EvasionSeverity::High) {
-                            Utils::Logger::Warn(L"RealTimeProtection: Anti-debug technique in PID {}: {} (confidence={:.2f})",
-                                req.processId, tech.description, tech.confidence);
+                            Utils::Logger::Warn("RealTimeProtection: Anti-debug technique in PID {}: {} (confidence={:.2f})",
+                                req.processId, Utils::StringUtils::ToNarrow(tech.description), tech.confidence);
                         }
                     }
 
@@ -1741,22 +1834,22 @@ public:
                         for (const auto& tech : vmResult.techniqueDetails) {
                             if (tech.severity >= 60.0f) {
                                 Utils::Logger::Warn(
-                                    L"RealTimeProtection: PID {} VM evasion: {} "
-                                    L"(severity={:.1f} addr=0x{:X} active={})",
+                                    "RealTimeProtection: PID {} VM evasion: {} "
+                                    "(severity={:.1f} addr=0x{:X} active={})",
                                     req.processId, tech.description.substr(0, 120),
                                     tech.severity, tech.address,
-                                    tech.isActive ? L"yes" : L"no");
+                                    tech.isActive ? "yes" : "no");
                             }
                         }
 
                         // High evasion score → immediate SOC alert
                         if (vmResult.evasionScore >= 80.0f) {
                             Utils::Logger::Error(
-                                L"RealTimeProtection: CRITICAL VM evasion in PID {} — "
-                                L"score={:.1f} techniques={} image={}",
+                                "RealTimeProtection: CRITICAL VM evasion in PID {}  -  "
+                                "score={:.1f} techniques={} image={}",
                                 req.processId, vmResult.evasionScore,
                                 vmResult.GetTechniqueCount(),
-                                imagePath.substr(0, 120));
+                                Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                         }
 
                         EmitEvasionTelemetry(req.processId, imagePath,
@@ -1796,9 +1889,9 @@ public:
                     for (const auto& tech : result.detectedTechniques) {
                         if (tech.severity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::High) {
                             Utils::Logger::Warn(
-                                L"RealTimeProtection: PID {} process evasion: {} "
-                                L"(confidence={:.2f} severity={})",
-                                req.processId, tech.description,
+                                "RealTimeProtection: PID {} process evasion: {} "
+                                "(confidence={:.2f} severity={})",
+                                req.processId, Utils::StringUtils::ToNarrow(tech.description),
                                 tech.confidence, static_cast<int>(tech.severity));
                         }
                     }
@@ -1806,10 +1899,10 @@ public:
                     // Critical severity → immediate block (APT-grade process evasion)
                     if (result.maxSeverity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::Critical) {
                         Utils::Logger::Error(
-                            L"RealTimeProtection: CRITICAL process evasion in PID {} — "
-                            L"score={:.1f} detections={} image={}",
+                            "RealTimeProtection: CRITICAL process evasion in PID {}  -  "
+                            "score={:.1f} detections={} image={}",
                             req.processId, result.evasionScore,
-                            result.totalDetections, imagePath.substr(0, 120));
+                            result.totalDetections, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                     }
 
                     EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
@@ -1836,9 +1929,9 @@ public:
                         for (const auto& finding : result.findings) {
                             if (finding.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::High) {
                                 Utils::Logger::Warn(
-                                    L"RealTimeProtection: PID {} timing evasion: {} "
-                                    L"(confidence={:.1f} severity={})",
-                                    req.processId, finding.description.substr(0, 120),
+                                    "RealTimeProtection: PID {} timing evasion: {} "
+                                    "(confidence={:.1f} severity={})",
+                                    req.processId, Utils::StringUtils::ToNarrow(finding.description.substr(0, 120)),
                                     finding.confidence,
                                     static_cast<int>(finding.severity));
                             }
@@ -1847,10 +1940,10 @@ public:
                         // Critical severity → immediate SOC alert
                         if (result.severity >= ShadowStrike::AntiEvasion::TimingEvasionSeverity::Critical) {
                             Utils::Logger::Error(
-                                L"RealTimeProtection: CRITICAL timing evasion in PID {} — "
-                                L"threat={:.1f} findings={} image={}",
+                                "RealTimeProtection: CRITICAL timing evasion in PID {}  -  "
+                                "threat={:.1f} findings={} image={}",
                                 req.processId, result.threatScore,
-                                result.findings.size(), imagePath.substr(0, 120));
+                                result.findings.size(), Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)));
                         }
 
                         EmitEvasionTelemetry(req.processId, imagePath, detectionSource,
@@ -1891,9 +1984,9 @@ public:
                         for (const auto& tech : result.detectedTechniques) {
                             if (tech.severity >= ShadowStrike::AntiEvasion::NetworkEvasionSeverity::High) {
                                 Utils::Logger::Warn(
-                                    L"RealTimeProtection: Network evasion in PID {}: {} (confidence={:.2f}, mitre={})",
-                                    req.processId, tech.description, tech.confidence,
-                                    tech.mitreId.empty() ? std::wstring(L"N/A") : Utils::StringUtils::Utf8ToWide(tech.mitreId));
+                                    "RealTimeProtection: Network evasion in PID {}: {} (confidence={:.2f}, mitre={})",
+                                    req.processId, Utils::StringUtils::ToNarrow(tech.description), tech.confidence,
+                                    tech.mitreId.empty() ? "N/A" : tech.mitreId);
                             }
                         }
 
@@ -1903,10 +1996,10 @@ public:
                             result.totalDetections, true);
                     }
                 } catch (const std::exception& ex) {
-                    Utils::Logger::Error(L"RealTimeProtection: NetworkBasedEvasionDetector exception for PID {}: {}",
-                        req.processId, Utils::StringUtils::Utf8ToWide(ex.what()));
+                    Utils::Logger::Error("RealTimeProtection: NetworkBasedEvasionDetector exception for PID {}: {}",
+                        req.processId, ex.what());
                 } catch (...) {
-                    Utils::Logger::Error(L"RealTimeProtection: NetworkBasedEvasionDetector unknown exception for PID {}",
+                    Utils::Logger::Error("RealTimeProtection: NetworkBasedEvasionDetector unknown exception for PID {}",
                         req.processId);
                 }
             }
@@ -1934,8 +2027,8 @@ public:
 
                     for (const auto& tech : result.detectedTechniques) {
                         if (tech.severity >= ShadowStrike::AntiEvasion::EnvironmentEvasionSeverity::High) {
-                            Utils::Logger::Warn(L"RealTimeProtection: Env evasion in PID {}: {} (confidence={:.2f})",
-                                req.processId, tech.description, tech.confidence);
+                            Utils::Logger::Warn("RealTimeProtection: Env evasion in PID {}: {} (confidence={:.2f})",
+                                req.processId, Utils::StringUtils::ToNarrow(tech.description), tech.confidence);
                         }
                     }
 
@@ -1946,13 +2039,13 @@ public:
             }
 
             if (evasionDetected) {
-                Utils::Logger::Warn(L"RealTimeProtection: Blocked evasion attempt: {} (PID: {}, Source: {})", 
-                    imagePath, req.processId, detectionSource);
+                Utils::Logger::Warn("RealTimeProtection: Blocked evasion attempt: {} (PID: {}, Source: {})", 
+                    Utils::StringUtils::ToNarrow(imagePath), req.processId, Utils::StringUtils::ToNarrow(detectionSource));
                 m_stats.processesBlocked++;
 
                 // Emit consolidated SOC alert for blocked evasion
                 EmitEvasionAlert(req.processId, imagePath, detectionSource,
-                    Utils::StringUtils::WideToUtf8(detectionSource.substr(0, 80)),
+                    Utils::StringUtils::ToNarrow(detectionSource.substr(0, 80)),
                     Communication::AlertSeverity::High);
 
                 return Communication::KernelVerdict::Block;
@@ -1978,6 +2071,16 @@ public:
             } catch (...) {}
         }
 
+        // Register new processes with MemoryProtection for continuous monitoring
+        if (req.isCreation && m_config.monitorMemoryAllocation) {
+            try {
+                auto& mp = MemoryProtection::Instance();
+                if (mp.IsRunning()) {
+                    mp.MonitorProcess(req.processId);
+                }
+            } catch (...) {}
+        }
+
         // Invoke process creation callbacks
         bool shouldBlock = false;
         {
@@ -1998,8 +2101,8 @@ public:
 
         if (shouldBlock) {
             m_stats.processesBlocked++;
-            Utils::Logger::Warn(L"RealTimeProtection: Blocked process creation: {} (PID: {})",
-                imagePath, req.processId);
+            Utils::Logger::Warn("RealTimeProtection: Blocked process creation: {} (PID: {})",
+                Utils::StringUtils::ToNarrow(imagePath), req.processId);
             return Communication::KernelVerdict::Block;
         }
 
@@ -2085,10 +2188,10 @@ public:
             // Stolen certificate or critical anomaly → immediate block
             if (sigAnalysis.isStolenCert || sigAnalysis.riskScore >= 90) {
                 Utils::Logger::Error(
-                    L"RealTimeProtection: BLOCKED APT-signed module in PID {}: {} "
-                    L"[stolenCert={} riskScore={} anomalies={}]",
-                    req.processId, imagePath.substr(0, 120),
-                    sigAnalysis.isStolenCert ? L"YES" : L"NO",
+                    "RealTimeProtection: BLOCKED APT-signed module in PID {}: {} "
+                    "[stolenCert={} riskScore={} anomalies={}]",
+                    req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
+                    sigAnalysis.isStolenCert ? "YES" : "NO",
                     sigAnalysis.riskScore,
                     sigAnalysis.anomalies.size());
 
@@ -2110,9 +2213,9 @@ public:
             // High-risk anomalies (but not critical) → log and flag for deeper scan
             if (sigAnalysis.riskScore >= 60) {
                 Utils::Logger::Warn(
-                    L"RealTimeProtection: High-risk signature on module in PID {}: {} "
-                    L"[riskScore={} anomalies={}]",
-                    req.processId, imagePath.substr(0, 120),
+                    "RealTimeProtection: High-risk signature on module in PID {}: {} "
+                    "[riskScore={} anomalies={}]",
+                    req.processId, Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)),
                     sigAnalysis.riskScore, sigAnalysis.anomalies.size());
             }
 
@@ -2123,11 +2226,11 @@ public:
             }
         } catch (const std::exception& e) {
             Utils::Logger::Error(
-                L"RealTimeProtection: DSV exception on image load PID {}: {}",
-                req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+                "RealTimeProtection: DSV exception on image load PID {}: {}",
+                req.processId, e.what());
         } catch (...) {
             Utils::Logger::Error(
-                L"RealTimeProtection: DSV unknown exception on image load PID {}",
+                "RealTimeProtection: DSV unknown exception on image load PID {}",
                 req.processId);
         }
 
@@ -2148,15 +2251,15 @@ public:
                 auto packResult = m_packerDetector->AnalyzeFile(imagePath, pdConfig, &pdErr);
                 if (pdErr.win32Code != 0) {
                     Utils::Logger::Warn(
-                        L"RealTimeProtection: PackerDetector analysis failed for DLL {} in PID {} — error={} {}",
-                        imagePath.substr(0, 120), req.processId, pdErr.win32Code, pdErr.message);
+                        "RealTimeProtection: PackerDetector analysis failed for DLL {} in PID {}  -  error={} {}",
+                        Utils::StringUtils::ToNarrow(imagePath.substr(0, 120)), req.processId, pdErr.win32Code, Utils::StringUtils::ToNarrow(pdErr.message));
                 }
                 if (packResult.isPacked) {
                     // Malware-specific packer on DLL load = immediate block
                     if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
                         Utils::Logger::Warn(
-                            L"RealTimeProtection: Blocked malware-packed module in PID {}: {} "
-                            L"[packer={} severity={} confidence={:.1f}% matches={}]",
+                            "RealTimeProtection: Blocked malware-packed module in PID {}: {} "
+                            "[packer={} severity={} confidence={:.1f}% matches={}]",
                             req.processId, imagePath, packResult.packerName,
                             static_cast<int>(packResult.severity),
                             packResult.packingConfidence * 100.0,
@@ -2166,10 +2269,9 @@ public:
 
                     if (packResult.packingConfidence > 0.7) {
                         Utils::Logger::Warn(
-                            L"RealTimeProtection: Packed module loaded in PID {}: {} "
-                            L"[packer={} confidence={:.1f}% severity={} category={} entropy={:.2f}]",
-                            req.processId, imagePath, packResult.packerName,
-                            packResult.packingConfidence * 100.0,
+                            "RealTimeProtection: Packed module loaded in PID {}: {} "
+                            "[packer={} confidence={:.1f}% severity={} category={} entropy={:.2f}]",
+                            req.processId, imagePath, Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
                             static_cast<int>(packResult.severity),
                             static_cast<int>(packResult.packerCategory),
                             packResult.fileEntropy);
@@ -2177,17 +2279,17 @@ public:
                         for (const auto& match : packResult.packerMatches) {
                             if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                                 Utils::Logger::Warn(
-                                    L"RealTimeProtection: High-severity packer in PID {} module {}: {} (confidence={:.2f})",
+                                    "RealTimeProtection: High-severity packer in PID {} module {}: {} (confidence={:.2f})",
                                     req.processId, imagePath, match.packerName, match.confidence);
                             }
                         }
                     }
                 }
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"RealTimeProtection: PackerDetector exception on image load PID {}: {}",
-                    req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("RealTimeProtection: PackerDetector exception on image load PID {}: {}",
+                    req.processId, e.what());
             } catch (...) {
-                Utils::Logger::Error(L"RealTimeProtection: PackerDetector unknown exception on image load PID {}",
+                Utils::Logger::Error("RealTimeProtection: PackerDetector unknown exception on image load PID {}",
                     req.processId);
             }
         }
@@ -2205,12 +2307,12 @@ public:
                         auto driverInfo = ked.ScanDriver(imagePath);
                         if (driverInfo.isVulnerable || driverInfo.isMicrosoftBlocked || driverInfo.isLOLDriver) {
                             Utils::Logger::Error(
-                                L"RealTimeProtection: BLOCKED vulnerable driver in PID {}: {} "
-                                L"[LOLDriver={} MSBlocked={} sha256={}]",
+                                "RealTimeProtection: BLOCKED vulnerable driver in PID {}: {} "
+                                "[LOLDriver={} MSBlocked={} sha256={}]",
                                 req.processId, imagePath,
-                                driverInfo.isLOLDriver ? L"YES" : L"NO",
-                                driverInfo.isMicrosoftBlocked ? L"YES" : L"NO",
-                                Utils::StringUtils::Utf8ToWide(driverInfo.sha256.substr(0, 16)));
+                                driverInfo.isLOLDriver ? "YES" : "NO",
+                                driverInfo.isMicrosoftBlocked ? "YES" : "NO",
+                                driverInfo.sha256.substr(0, 16));
 
                             // Emit telemetry for SOC
                             if (Communication::TelemetryCollector::HasInstance()) {
@@ -2236,7 +2338,7 @@ public:
                             if (m_config.mode == ProtectionMode::BLOCK_UNKNOWN ||
                                 m_config.mode == ProtectionMode::BLOCK_SUSPICIOUS) {
                                 Utils::Logger::Warn(
-                                    L"RealTimeProtection: Blocked unsigned driver in PID {}: {}",
+                                    "RealTimeProtection: Blocked unsigned driver in PID {}: {}",
                                     req.processId, imagePath);
                                 m_stats.threatsDetected++;
                                 return Communication::KernelVerdict::Block;
@@ -2244,11 +2346,11 @@ public:
                         }
                     }
                 } catch (const std::exception& e) {
-                    Utils::Logger::Error(L"RealTimeProtection: KernelExploitDetector scan failed for {} in PID {}: {}",
-                        imagePath, req.processId, Utils::StringUtils::Utf8ToWide(e.what()));
+                    Utils::Logger::Error("RealTimeProtection: KernelExploitDetector scan failed for {} in PID {}: {}",
+                        Utils::StringUtils::ToNarrow(imagePath), req.processId, e.what());
                 } catch (...) {
-                    Utils::Logger::Error(L"RealTimeProtection: KernelExploitDetector unknown exception for {} in PID {}",
-                        imagePath, req.processId);
+                    Utils::Logger::Error("RealTimeProtection: KernelExploitDetector unknown exception for {} in PID {}",
+                        Utils::StringUtils::ToNarrow(imagePath), req.processId);
                 }
             }
         }
@@ -2264,8 +2366,8 @@ public:
 
                 auto result = Core::Engine::ScanEngine::Instance().ScanFile(imagePath, context);
                 if (result.verdict == Core::Engine::ScanVerdict::Infected) {
-                    Utils::Logger::Warn(L"RealTimeProtection: Blocked malicious image load in PID {}: {}",
-                        req.processId, imagePath);
+                    Utils::Logger::Warn("RealTimeProtection: Blocked malicious image load in PID {}: {}",
+                        req.processId, Utils::StringUtils::ToNarrow(imagePath));
                     m_stats.threatsDetected++;
                     return Communication::KernelVerdict::Block;
                 }
@@ -2307,7 +2409,7 @@ public:
 
         for (const auto& persistKey : kPersistenceKeys) {
             if (lowerKeyPath.find(persistKey) != std::wstring::npos) {
-                Utils::Logger::Warn(L"RealTimeProtection: Persistence registry modification detected: {} -> {}",
+                Utils::Logger::Warn("RealTimeProtection: Persistence registry modification detected: {} -> {}",
                     keyPath, valueName);
                 // Don't block — forward to behavioral engine for correlation.
                 // Blocking here would break legitimate software installations.
@@ -2325,7 +2427,7 @@ public:
 
         for (const auto& defenseKey : kDefenseEvasionKeys) {
             if (lowerKeyPath.find(defenseKey) != std::wstring::npos) {
-                Utils::Logger::Warn(L"RealTimeProtection: Defense evasion registry modification: {} -> {}",
+                Utils::Logger::Warn("RealTimeProtection: Defense evasion registry modification: {} -> {}",
                     keyPath, valueName);
                 break;
             }
@@ -2367,8 +2469,8 @@ public:
                     auto* notif = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);
                     // Remote thread injection detection (MITRE T1055.003)
                     if (notif->IsRemote) {
-                        Utils::Logger::Warn(L"RealTimeProtection: Remote thread detected — "
-                            L"Source PID: {} -> Target PID: {}, TID: {}",
+                        Utils::Logger::Warn("RealTimeProtection: Remote thread detected  -  "
+                            "Source PID: {} -> Target PID: {}, TID: {}",
                             notif->CreatorProcessId, notif->ProcessId, notif->ThreadId);
                     }
                 }
@@ -2379,8 +2481,8 @@ public:
                 if (size >= sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION)) {
                     auto* alert = static_cast<const SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION*>(data);
                     if (alert->SuspicionScore >= 70) {
-                        Utils::Logger::Warn(L"RealTimeProtection: Suspicious handle operation — "
-                            L"Source PID: {} -> Target PID: {}, Score: {}, Access: 0x{:08X}",
+                        Utils::Logger::Warn("RealTimeProtection: Suspicious handle operation  -  "
+                            "Source PID: {} -> Target PID: {}, Score: {}, Access: 0x{:08X}",
                             alert->SourceProcessId, alert->TargetProcessId,
                             alert->SuspicionScore, alert->RequestedAccess);
                     }
@@ -2401,13 +2503,13 @@ public:
             }
 
             case FilterMessageType_RansomwareAlert: {
-                Utils::Logger::Error(L"RealTimeProtection: RANSOMWARE ALERT from kernel (payload {} bytes)", size);
+                Utils::Logger::Error("RealTimeProtection: RANSOMWARE ALERT from kernel (payload {} bytes)", size);
                 m_stats.threatsDetected++;
                 break;
             }
 
             case FilterMessageType_BehavioralAlert: {
-                Utils::Logger::Warn(L"RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
+                Utils::Logger::Warn("RealTimeProtection: Behavioral alert from kernel (payload {} bytes)", size);
                 m_stats.threatsDetected++;
 
                 if (data && size > 0) {
@@ -2421,10 +2523,10 @@ public:
                                 payload);
                         }
                     } catch (const std::exception& ex) {
-                        Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker alert handler exception: {}",
-                            Utils::StringUtils::ToWide(ex.what()));
+                        Utils::Logger::Error("RealTimeProtection: BehaviorBlocker alert handler exception: {}",
+                            ex.what());
                     } catch (...) {
-                        Utils::Logger::Error(L"RealTimeProtection: BehaviorBlocker alert handler unknown exception");
+                        Utils::Logger::Error("RealTimeProtection: BehaviorBlocker alert handler unknown exception");
                     }
                 }
                 break;
@@ -2443,19 +2545,30 @@ public:
                                 alertPayload);
                         }
                     } catch (const std::exception& ex) {
-                        Utils::Logger::Error(L"RealTimeProtection: MemoryAlert dispatch failed: {}",
-                            Utils::StringUtils::ToWide(ex.what()));
+                        Utils::Logger::Error("RealTimeProtection: MemoryAlert dispatch failed: {}",
+                            ex.what());
                     } catch (...) {
-                        Utils::Logger::Error(L"RealTimeProtection: MemoryAlert dispatch unknown exception");
+                        Utils::Logger::Error("RealTimeProtection: MemoryAlert dispatch unknown exception");
                     }
                 }
+                    // Also route to MemoryProtection for memory violation correlation
+                    try {
+                        auto& mp = MemoryProtection::Instance();
+                        if (mp.IsRunning()) {
+                            mp.ProcessKernelMemoryAlert(
+                                static_cast<uint32_t>(FilterMessageType_MemoryAlert), data, size);
+                        }
+                    } catch (const std::exception& ex) {
+                        Utils::Logger::Error("RealTimeProtection: MemoryProtection alert dispatch failed: {}",
+                            ex.what());
+                    } catch (...) {}
                 break;
             }
 
             case FilterMessageType_NetworkAlert: {
                 // Kernel network threat intelligence (C2 beaconing, suspicious DNS, etc.)
                 // Forward to NetworkBasedEvasionDetector for domain/IP correlation
-                Utils::Logger::Warn(L"RealTimeProtection: Network threat alert from kernel (payload {} bytes)", size);
+                Utils::Logger::Warn("RealTimeProtection: Network threat alert from kernel (payload {} bytes)", size);
                 // NOTE: When kernel NetworkFilter starts sending structured NetworkAlert
                 // messages, parse the payload here and feed to m_networkDetector->AnalyzeDomain()
                 // for DGA/C2/DNS tunneling correlation against ThreatIntel store.
@@ -2464,7 +2577,7 @@ public:
 
             case FilterMessageType_SyscallAlert: {
                 // Route syscall anomalies to KernelExploitDetector for IOCTL abuse correlation
-                if (size >= sizeof(uint32_t) * 3) && data) {
+                if (size >= sizeof(uint32_t) * 3 && data) {
                     try {
                         auto& ked = Exploits::KernelExploitDetector::Instance();
                         if (ked.IsInitialized()) {
@@ -2499,7 +2612,7 @@ public:
                         }
                     } catch (...) {}
                 }
-                Utils::Logger::Warn(L"RealTimeProtection: Syscall anomaly alert from kernel (payload {} bytes)", size);
+                Utils::Logger::Warn("RealTimeProtection: Syscall anomaly alert from kernel (payload {} bytes)", size);
                 break;
             }
 
@@ -2551,19 +2664,19 @@ public:
             case FilterMessageType_AlpcSuspiciousAccess:
             case FilterMessageType_AlpcImpersonation:
             case FilterMessageType_AlpcSandboxEscape: {
-                Utils::Logger::Warn(L"RealTimeProtection: ALPC security alert type {} (payload {} bytes)",
+                Utils::Logger::Warn("RealTimeProtection: ALPC security alert type {} (payload {} bytes)",
                     static_cast<uint16_t>(type), size);
                 break;
             }
 
             case FilterMessageType_ThreatScoreNotify: {
                 // Kernel ThreatScoring engine crossed threshold — log for correlation
-                Utils::Logger::Info(L"RealTimeProtection: Kernel threat score notification (payload {} bytes)", size);
+                Utils::Logger::Info("RealTimeProtection: Kernel threat score notification (payload {} bytes)", size);
                 break;
             }
 
             default:
-                Utils::Logger::Debug(L"RealTimeProtection: Unhandled generic kernel event type {} ({} bytes)",
+                Utils::Logger::Debug("RealTimeProtection: Unhandled generic kernel event type {} ({} bytes)",
                     static_cast<uint16_t>(type), size);
                 break;
         }
@@ -2634,7 +2747,7 @@ public:
     bool AddPathExclusion(const std::wstring& path) {
         std::unique_lock lock(m_exclusionMutex);
         m_excludedPaths.push_back(path);
-        Utils::Logger::Info(L"RealTimeProtection: Added path exclusion: {}", path);
+        Utils::Logger::Info("RealTimeProtection: Added path exclusion: {}", path);
         return true;
     }
 
@@ -2651,7 +2764,7 @@ public:
     bool AddProcessExclusion(const std::wstring& processName) {
         std::unique_lock lock(m_exclusionMutex);
         m_excludedProcesses.push_back(processName);
-        Utils::Logger::Info(L"RealTimeProtection: Added process exclusion: {}", processName);
+        Utils::Logger::Info("RealTimeProtection: Added process exclusion: {}", processName);
         return true;
     }
 
@@ -2694,7 +2807,7 @@ public:
         m_excludedProcesses.clear();
         m_excludedHashes.clear();
         m_tempPidExclusions.clear();
-        Utils::Logger::Info(L"RealTimeProtection: Cleared all exclusions");
+        Utils::Logger::Info("RealTimeProtection: Cleared all exclusions");
     }
 
     // =========================================================================
@@ -2748,7 +2861,7 @@ public:
         std::unique_lock lock(m_cacheMutex);
         m_verdictCache.clear();
         m_performanceMetrics.cacheSize = 0;
-        Utils::Logger::Info(L"RealTimeProtection: Verdict cache cleared");
+        Utils::Logger::Info("RealTimeProtection: Verdict cache cleared");
     }
 
     // =========================================================================
@@ -2808,7 +2921,7 @@ public:
                 event);
         }
 
-        Utils::Logger::Warn(L"RealTimeProtection: THREAT DETECTED - {} in {} (PID: {})",
+        Utils::Logger::Warn("RealTimeProtection: THREAT DETECTED - {} in {} (PID: {})",
             result.threatName, filePath, pid);
     }
 
@@ -2842,7 +2955,7 @@ public:
         } catch (const std::exception& e) {
             result.verdict = KernelVerdict::ERROR;
             result.errorCode = 1;
-            result.errorMessage = Utils::StringUtils::Utf8ToWide(e.what());
+            result.errorMessage = Utils::StringUtils::ToWide(e.what());
         }
 
         return result;
@@ -2855,7 +2968,7 @@ public:
         } catch (const std::exception& e) {
             ScanResult result;
             result.verdict = KernelVerdict::ERROR;
-            result.errorMessage = Utils::StringUtils::Utf8ToWide(e.what());
+            result.errorMessage = Utils::StringUtils::ToWide(e.what());
             return result;
         }
     }
@@ -2864,7 +2977,7 @@ public:
         if (terminate) {
             if (Utils::ProcessUtils::TerminateProcess(pid)) {
                 m_stats.processesTerminated++;
-                Utils::Logger::Info(L"RealTimeProtection: Terminated process PID {}", pid);
+                Utils::Logger::Info("RealTimeProtection: Terminated process PID {}", pid);
                 return true;
             }
         }
@@ -2873,11 +2986,20 @@ public:
 
     bool QuarantineFile(const std::wstring& filePath, std::wstring_view threatName) {
         try {
-            // Would call QuarantineManager
-            // return Core::Engine::QuarantineManager::Instance().Quarantine(filePath, threatName);
-            m_stats.filesQuarantined++;
-            Utils::Logger::Info(L"RealTimeProtection: Quarantined file: {}", filePath);
-            return true;
+            auto result = Core::Engine::QuarantineManager::Instance().Quarantine(filePath, threatName);
+            if (result) {
+                m_stats.filesQuarantined++;
+                Utils::Logger::Info("RealTimeProtection: Quarantined file: {}",
+                    Utils::StringUtils::ToNarrow(filePath));
+            } else {
+                Utils::Logger::Error("RealTimeProtection: QuarantineManager failed to quarantine: {}",
+                    Utils::StringUtils::ToNarrow(filePath));
+            }
+            return result;
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("RealTimeProtection: Quarantine exception for {}: {}",
+                Utils::StringUtils::ToNarrow(filePath), ex.what());
+            return false;
         } catch (...) {
             return false;
         }
@@ -2886,7 +3008,7 @@ public:
     bool BlockNetworkAddress(const std::wstring& address, uint16_t port, uint32_t durationMs) {
         try {
             auto& ntf = NetworkTrafficFilter::Instance();
-            ntf.BlockIP(Utils::StringUtils::WideToUtf8(address));
+            ntf.BlockIP(Utils::StringUtils::ToNarrow(address));
             m_stats.connectionsBlocked++;
             return true;
         } catch (...) {
@@ -2899,7 +3021,7 @@ public:
     // =========================================================================
 
     void HealthCheckLoop() {
-        Utils::Logger::Info(L"RealTimeProtection: Health check thread started");
+        Utils::Logger::Info("RealTimeProtection: Health check thread started");
 
         while (!m_stopThreads) {
             std::this_thread::sleep_for(
@@ -2910,11 +3032,11 @@ public:
             PerformHealthCheck();
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Health check thread exiting");
+        Utils::Logger::Info("RealTimeProtection: Health check thread exiting");
     }
 
     void StatsUpdateLoop() {
-        Utils::Logger::Info(L"RealTimeProtection: Stats update thread started");
+        Utils::Logger::Info("RealTimeProtection: Stats update thread started");
 
         while (!m_stopThreads) {
             std::this_thread::sleep_for(
@@ -2925,7 +3047,7 @@ public:
             UpdatePerformanceMetrics();
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Stats update thread exiting");
+        Utils::Logger::Info("RealTimeProtection: Stats update thread exiting");
     }
 
     bool PerformHealthCheck() {
@@ -2969,16 +3091,13 @@ public:
         m_performanceMetrics.memoryUsageBytes = 0; // Would query actual usage
 
         // Update scans per second
-        static uint64_t lastTotalScans = 0;
-        static auto lastTime = Now();
-
         auto now = Now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - lastTime).count();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_lastRateCalcTime).count();
         if (elapsed > 0) {
             uint64_t currentScans = m_performanceMetrics.totalScans.load();
-            m_performanceMetrics.scansPerSecond = (currentScans - lastTotalScans) / elapsed;
-            lastTotalScans = currentScans;
-            lastTime = now;
+            m_performanceMetrics.scansPerSecond = (currentScans - m_lastTotalScansForRate) / static_cast<uint64_t>(elapsed);
+            m_lastTotalScansForRate = currentScans;
+            m_lastRateCalcTime = now;
         }
 
         // Update protection status
@@ -3008,9 +3127,9 @@ public:
                 } catch (...) {}
             }
 
-            Utils::Logger::Info(L"RealTimeProtection: State changed from {} to {}",
-                Utils::StringUtils::Utf8ToWide(ProtectionStateToString(oldState)),
-                Utils::StringUtils::Utf8ToWide(ProtectionStateToString(newState)));
+            Utils::Logger::Info("RealTimeProtection: State changed from {} to {}",
+                ProtectionStateToString(oldState),
+                ProtectionStateToString(newState));
         }
     }
 
@@ -3041,7 +3160,7 @@ public:
         ScanResult sr;
         sr.isThreat = (er.verdict == Core::Engine::ScanVerdict::Infected ||
                        er.verdict == Core::Engine::ScanVerdict::Suspicious);
-        sr.threatName = Utils::StringUtils::Utf8ToWide(er.threatName);
+        sr.threatName = Utils::StringUtils::ToWide(er.threatName);
         sr.confidence = er.confidence;
         sr.severity = er.severity;
 
@@ -3092,45 +3211,45 @@ public:
     // =========================================================================
 
     bool PerformDiagnostics() const {
-        Utils::Logger::Info(L"RealTimeProtection: Starting diagnostics...");
+        Utils::Logger::Info("RealTimeProtection: Starting diagnostics...");
 
         bool passed = true;
 
         // Check state
         if (m_state != ProtectionState::ACTIVE) {
-            Utils::Logger::Warn(L"RealTimeProtection: Not in ACTIVE state");
+            Utils::Logger::Warn("RealTimeProtection: Not in ACTIVE state");
             passed = false;
         }
 
         // Check components
         for (const auto& status : m_componentStatus) {
             if (status.state == ComponentState::ERROR) {
-                Utils::Logger::Warn(L"RealTimeProtection: Component {} in ERROR state",
-                    Utils::StringUtils::Utf8ToWide(ComponentTypeToString(status.type)));
+                Utils::Logger::Warn("RealTimeProtection: Component {} in ERROR state",
+                    ComponentTypeToString(status.type));
                 passed = false;
             }
         }
 
         // Check driver connection
         if (!m_protectionStatus.driverConnected) {
-            Utils::Logger::Warn(L"RealTimeProtection: Kernel driver not connected");
+            Utils::Logger::Warn("RealTimeProtection: Kernel driver not connected");
         }
 
-        Utils::Logger::Info(L"RealTimeProtection: Diagnostics {}",
-            passed ? L"PASSED" : L"FAILED");
+        Utils::Logger::Info("RealTimeProtection: Diagnostics {}",
+            passed ? "PASSED" : "FAILED");
         return passed;
     }
 
     std::wstring GetDiagnosticSummary() const {
         std::wostringstream oss;
         oss << L"=== RealTimeProtection Diagnostic Summary ===\n";
-        oss << L"State: " << Utils::StringUtils::Utf8ToWide(ProtectionStateToString(m_state.load())) << L"\n";
+        oss << L"State: " << Utils::StringUtils::ToWide(ProtectionStateToString(m_state.load())) << L"\n";
         oss << L"Protected: " << (m_protectionStatus.isProtected ? L"Yes" : L"No") << L"\n";
         oss << L"Driver Connected: " << (m_protectionStatus.driverConnected ? L"Yes" : L"No") << L"\n";
         oss << L"\n=== Components ===\n";
 
         for (const auto& status : m_componentStatus) {
-            oss << Utils::StringUtils::Utf8ToWide(ComponentTypeToString(status.type))
+            oss << Utils::StringUtils::ToWide(ComponentTypeToString(status.type))
                 << L": " << (status.isHealthy ? L"Healthy" : L"Unhealthy") << L"\n";
         }
 
@@ -3206,6 +3325,7 @@ void RTPStatistics::Reset() noexcept {
     excludedByExtension = 0;
     excludedByProcess = 0;
     excludedByHash = 0;
+    threatsDetected = 0;
     performance.Reset();
     lastReset = std::chrono::system_clock::now();
 }
@@ -3355,7 +3475,7 @@ bool RealTimeProtection::UpdateConfig(const RTPConfig& config) {
         FileSystemFilter::Instance().SetScanOnWrite(config.scanOnWrite);
     } catch (...) {}
 
-    Utils::Logger::Info(L"RealTimeProtection: Configuration updated");
+    Utils::Logger::Info("RealTimeProtection: Configuration updated");
     return true;
 }
 
@@ -3658,3 +3778,7 @@ ZeroHourProtection& RealTimeProtection::GetZeroHourProtection() {
 
 } // namespace RealTime
 } // namespace ShadowStrike
+
+
+
+
