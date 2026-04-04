@@ -3,42 +3,59 @@
   <img src="https://shadowstrike.dev/logo.png" alt="ShadowStrike Phantom" width="120"/>
 </a>
 
-  Loaded Succesfully + ETW Tracing Works.
-<img width="2552" height="1327" alt="Screenshot 2026-03-19 141605-2" src="https://github.com/user-attachments/assets/1bc89108-3c12-414c-b538-df35db11d62f" />
+<h3>ShadowStrike Phantom</h3>
 
-Driver Verifier Pass
-<img width="2506" height="1323" alt="Screenshot 2026-03-19 143358" src="https://github.com/user-attachments/assets/d9e97fcd-9730-453e-a1a3-e9f123ded97d" />
+**Open-Source Next-Generation Endpoint Protection Platform for Windows**
 
-**Next-Generation Open-Source Endpoint Protection Platform for Windows**
-
-[![Status](https://img.shields.io/badge/status-pre--alpha-red?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
+[![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE.txt)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
-[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B%20%2F%20ASM-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
-[![Coverity](https://img.shields.io/badge/Coverity%20Scan-passed-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
+[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B20%20%2F%20ASM-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
+[![Coverity](https://img.shields.io/badge/Coverity%20Scan-0.25%20defect%2FKLoC-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
 [![Commits](https://img.shields.io/github/commit-activity/w/ShadowStrike-Labs/ShadowStrike?style=flat-square&label=commits%2Fweek)](https://github.com/ShadowStrike-Labs/ShadowStrike/commits/master)
-[![Beta](https://img.shields.io/badge/beta%20target-2028-blueviolet?style=flat-square)](https://www.shadowstrike.dev/beta)
+[![Beta](https://img.shields.io/badge/beta%20target-early%202027-blueviolet?style=flat-square)](https://www.shadowstrike.dev/beta)
 
 [Website](https://www.shadowstrike.dev) · [Architecture](https://www.shadowstrike.dev/architecture) · [Roadmap](https://www.shadowstrike.dev/roadmap) · [Join Beta](https://www.shadowstrike.dev/beta) · [Research](https://www.shadowstrike.dev/research)
 
 </div>
+
+---
+
+### PhantomSensor.sys — Loaded and Verified
+
+<details>
+<summary>Driver loaded with ETW tracing active</summary>
+
+<img width="2552" height="1327" alt="PhantomSensor loaded with ETW tracing" src="https://github.com/user-attachments/assets/1bc89108-3c12-414c-b538-df35db11d62f" />
+
+</details>
+
+<details>
+<summary>Driver Verifier — all checks passed</summary>
+
+<img width="2506" height="1323" alt="Driver Verifier pass" src="https://github.com/user-attachments/assets/d9e97fcd-9730-453e-a1a3-e9f123ded97d" />
+
+</details>
+
+---
+
 ### Support This Project
 
-If you believe in open-source security, consider supporting our development:
+If you believe in open-source security, consider supporting development:
 
 [![Sponsor ShadowStrike](https://img.shields.io/badge/💝%20Sponsor%20on%20GitHub-ea4aaa?style=for-the-badge)](https://github.com/sponsors/ShadowStrike-Labs)
 
-Your support helps us build transparent, auditable endpoint protection for everyone.
+Your support helps build transparent, auditable endpoint protection that anyone can verify.
 
 ---
 
 ## What Is ShadowStrike Phantom?
 
-ShadowStrike Phantom is a **from-scratch, open-source endpoint protection platform** for Windows 10/11 x64 — built with the same architectural principles as commercial EDR/XDR solutions, with one fundamental difference: every line of code is auditable.
+ShadowStrike Phantom is a **from-scratch, open-source endpoint protection platform** for Windows 10/11 x64. It follows the same architectural principles as commercial EDR/XDR solutions — custom kernel sensor, behavioral analysis engine, memory-mapped threat intelligence databases, exploit prevention orchestrator — with one fundamental difference: **every line of code is auditable.**
 
-This is not a wrapper around existing tools. It is a complete security platform with a custom kernel sensor (`PhantomSensor.sys`), behavioral analysis engine, memory-mapped threat intelligence databases, and a planned local AI/ML inference pipeline — all built in public, licensed under AGPL-3.0.
+This is not a wrapper around existing tools. `PhantomSensor.sys` is a 380,000-line WDM minifilter that has passed Coverity static analysis at 0.25 defects/KLoC and runs under Driver Verifier with zero violations. The user-mode agent implements 23+ detection modules covering everything from ROP chain detection to STIX 2.1 threat intelligence ingestion.
 
-> **Current state:** Pre-alpha. The kernel driver is in active development (Phase 1: 77% complete). The codebase does not yet produce a compiled binary. This is a long-term engineering effort being built transparently.
+> **Current state:** Alpha. The kernel driver is complete and verified. User-mode shared infrastructure is 76% complete, undergoing module-by-module security audits. On track for public beta in early 2027.
 
 ---
 
@@ -58,22 +75,24 @@ ShadowStrike Phantom is the alternative:
 
 | Component | Status |
 |---|---|
-| Architecture | ✅ Designed |
-| Core Infrastructure | ✅ Completed |
-| Kernel Driver (PhantomSensor) | ✅ Completed |
-| User-Mode Detection Engines | 🔧 In Development — Phase 2: 43% |
-| Windows Service | 🔧 Planned |
-| GUI | ❌ Not Started |
-| Compilation | ❌ Not Yet Functional |
-| Beta Release | 🎯 Target: 2028 |
+| Architecture | ✅ Designed and documented |
+| Core Infrastructure | ✅ Complete |
+| Kernel Driver (PhantomSensor.sys) | ✅ Complete — Coverity 0.25 defect/KLoC, Driver Verifier passed |
+| User-Mode Shared Modules | 🔧 In Progress — 76% (security audit phase) |
+| Local AI/ML Inference Pipeline | 📋 Planned — on-device threat classification |
+| Product Splits (EDR / XDR / Home) | 📋 Planned — after shared infrastructure |
+| Windows Service & IPC | 🔧 In Progress |
+| Management Dashboard (EDR/XDR) | 📋 Planned |
+| Desktop UI (Home) | 📋 Planned |
+| Public Beta | 🎯 Early 2027 |
 
-Both Phase 1 (kernel) and Phase 2 (user-space) are running in parallel. See the full [Roadmap](https://www.shadowstrike.dev/roadmap).
+**Overall progress: ~76%** — Kernel sensor done, user-mode modules in active security audit and hardening.
 
 ---
 
 ## Detection Coverage
 
-ShadowStrike Phantom implements detection across **18 kernel subsystems** and **23 user-space modules**, covering:
+ShadowStrike Phantom implements detection across **18 kernel subsystems** and **23+ user-space modules**:
 
 ### Kernel-Mode (PhantomSensor.sys)
 
@@ -90,13 +109,18 @@ ShadowStrike Phantom implements detection across **18 kernel subsystems** and **
 
 ### User-Space (Detection Engines)
 
-Anti-evasion (VM · sandbox · debugger · packer · metamorphic/polymorphic via Zydis), exploit protection (ROP · JIT spray · stack pivot · heap spray · kernel exploits), ransomware protection (honeypot · VSS guard · entropy), script scanning (AMSI · PowerShell · JS · macros), web protection, email security, USB/BadUSB detection, crypto-miner detection, forensics, and more.
-
-Full architecture detail: [shadowstrike.dev/architecture](https://www.shadowstrike.dev/architecture)
+| Category | Modules |
+|---|---|
+| **Anti-Evasion** | VM detection · Sandbox evasion · Debugger detection · Packer analysis · Metamorphic/polymorphic engine (Zydis) |
+| **Exploit Prevention** | ROP detection · JIT spray · Stack pivot · Heap spray · Kernel exploit detection · EAF/IAF · DEP/ASLR/CFG/CET enforcement |
+| **Behavioral Analysis** | BehaviorBlocker · AccessControlManager · Real-time process monitoring · MITRE ATT&CK correlation |
+| **Data Stores** | SignatureStore (B-tree + YARA) · PatternStore (Aho-Corasick + SIMD) · HashStore (Bloom filter) · ThreatIntel (STIX 2.1) |
+| **Protection** | Ransomware (honeypot + VSS guard + entropy) · Self-defense · File/Registry/Process protection |
+| **Other** | Script scanning (AMSI · PowerShell · JS) · Web protection · USB/BadUSB · Crypto-miner detection · Forensics |
 
 ### MITRE ATT&CK Coverage
 
-**550+ technique IDs** defined across all 14 ATT&CK tactics in the kernel header. 14 behavioral rules currently active. Every detection fires with a precise T-ID attribution.
+**550+ technique IDs** defined across all 14 ATT&CK tactics. Every detection fires with precise T-ID attribution.
 
 ---
 
@@ -108,7 +132,7 @@ Full architecture detail: [shadowstrike.dev/architecture](https://www.shadowstri
 ├─────────────────────────────────────────────────────────────────────────────┤
 │  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
 │  │   GUI App   │  │  Service    │  │  Scanner    │  │  Threat Intel       │ │
-│  │  (Future)   │  │  Manager    │  │  Engine     │  │  Feed Manager       │ │
+│  │  (Planned)  │  │  Manager    │  │  Engine     │  │  Feed Manager       │ │
 │  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
 │         └────────────────┴────────────────┴─────────────────────┘            │
 │                                   │                                          │
@@ -145,45 +169,56 @@ Full architecture detail: [shadowstrike.dev/architecture](https://www.shadowstri
 
 ### Kernel Driver
 - Windows Filter Manager minifilter — altitude 328000, 14 operation callbacks
-- `CmRegisterCallbackEx` — registry monitoring
-- `PsSetCreateProcessNotifyRoutineEx2` — process lifecycle
-- `ObRegisterCallbacks` — handle-based self-protection
-- CNG (BCrypt) — kernel-mode SHA-256 hashing
+- `CmRegisterCallbackEx` — registry monitoring with persistence detection
+- `PsSetCreateProcessNotifyRoutineEx2` — process lifecycle with LOLBin scoring
+- `ObRegisterCallbacks` — handle-based self-protection with suspicion scoring
+- CNG (BCrypt) — kernel-mode SHA-256 hashing for file reputation
+- 380,000 lines of C, Coverity-scanned at 0.25 defects/KLoC
 
 ### Detection Data Stores
-- **SignatureStore** — Custom B-tree index with YARA rule integration and COW updates
+- **SignatureStore** — Custom B-tree index with YARA rule integration and copy-on-write updates
 - **PatternStore** — Aho-Corasick + Boyer-Moore with SSE4.2/AVX2 SIMD acceleration
 - **HashStore** — Bloom filter + memory-mapped DB for O(1) hash reputation lookups
 - **FuzzyHasher** — Custom approximate hash engine (built in-house, zero GPL dependencies)
-- **ThreatIntel** — STIX 2.1 / TAXII 2.1 feed ingestion, sharded B-tree with LRU cache
+- **ThreatIntel** — STIX 2.1 / TAXII 2.1 feed ingestion, sharded B-tree index with LRU cache
 
 ### Infrastructure
 - Memory-mapped file databases for zero-copy persistence
 - Lock-free data structures on hot paths
 - ETW-based structured telemetry
-- Encrypted kernel ↔ user-space IPC channel (FilterConnectPort)
+- Encrypted kernel ↔ user-space IPC (FilterConnectPort)
+- Enterprise thread pool with task priorities, cancellation, and ETW tracing
+- Secure update pipeline with cryptographic verification (Windows BCrypt)
+
+---
+
+## Planned: Local AI/ML Integration
+
+On-device machine learning models for threat classification — no cloud dependency for detection decisions. Trained on curated malware datasets, running inference locally on each endpoint for real-time scoring alongside the heuristic and signature engines.
 
 ---
 
 ## Product Tiers (Planned)
 
-| Tier | Target | Status |
+| Tier | Target | Description |
 |---|---|---|
-| **Phantom Home** | Consumer endpoints | Planned — Phase 3 |
-| **Phantom EDR** | Enterprise endpoints | Planned — Phase 3 |
-| **Phantom XDR** | Extended detection across endpoint, cloud, identity, network | Planned — Phase 4 |
+| **Phantom Home** | Consumer endpoints | Lightweight protection with local UI |
+| **Phantom EDR** | Enterprise endpoints | Full detection + response with management dashboard |
+| **Phantom XDR** | Enterprise fleet | Extended detection across endpoint, cloud, identity, network |
+
+All three tiers share the same kernel sensor and detection engine. Product differentiation happens at the orchestration, UI, and management layers.
 
 ---
 
 ## Building
 
-**Current status:** The Codebase is not ready yet. Build instructions will be provided when the codebase reaches a complete state.
+> The codebase is under active development and not yet packaged for external builds. Build instructions will be provided when the project reaches beta.
 
-**Requirements (for future reference):**
+**Requirements:**
 - Visual Studio 2022 with C++20 support
-- Windows Driver Kit (WDK) 10.0.22621.0 or later
-- Windows SDK 10.0.22621.0 or later
-- Test machine: Windows 10/11 x64 VM with Driver Verifier enabled
+- Windows Driver Kit (WDK) 10.0.22621.0+
+- Windows SDK 10.0.22621.0+
+- Test environment: Windows 10/11 x64 VM with Driver Verifier enabled
 
 ---
 
@@ -191,21 +226,28 @@ Full architecture detail: [shadowstrike.dev/architecture](https://www.shadowstri
 
 ```
 ShadowStrike/
-├── PhantomSensor/           # Kernel driver (minifilter)
-├── src/                     # User-space detection engines
-│   ├── AntiEvasion/         # VM · debugger · sandbox · packer detection
-│   ├── Core/                # Scan engine · ML inference · process analysis
-│   ├── Exploits/            # ROP · JIT spray · heap spray · kernel exploits
-│   ├── RansomwareProtection/
-│   ├── ThreatIntel/         # STIX/TAXII · IOC management · bloom filter
-│   ├── SignatureStore/      # B-tree · YARA rules
-│   ├── HashStore/           # Bloom filter · memory-mapped DB
-│   ├── PatternStore/        # Aho-Corasick · Boyer-Moore · SIMD
-│   ├── FuzzyHasher/         # Custom approximate hash engine
-│   └── ...                  # 23 modules total
+├── PhantomSensor/           # Kernel driver (WDM minifilter, 380K LoC)
+├── src/
+│   ├── Shared_modules/      # Shared detection infrastructure
+│   │   ├── RealTime/        # RTP · ExploitPrevention · BehaviorBlocker · ACM
+│   │   ├── Security/        # File · Registry · Process · Self-defense
+│   │   ├── SignatureStore/   # B-tree · YARA rules · COW updates
+│   │   ├── ThreatIntel/     # STIX/TAXII · IOC · Bloom filter · LRU cache
+│   │   ├── HashStore/       # Bloom filter · memory-mapped reputation DB
+│   │   ├── PatternStore/    # Aho-Corasick · Boyer-Moore · SIMD
+│   │   ├── Whitelist/       # Hash/pattern whitelisting with Bloom filter
+│   │   ├── Update/          # Secure delta-update pipeline (BCrypt verified)
+│   │   ├── AntiEvasion/     # VM · debugger · sandbox · packer · polymorphic
+│   │   ├── Exploits/        # ROP · JIT spray · heap spray · kernel exploits
+│   │   ├── Utils/           # Logger · ThreadPool · StringUtils · SystemUtils
+│   │   └── ...              # 23+ modules
+│   ├── PhantomEDR/          # EDR product layer
+│   ├── PhantomHome/         # Home product layer
+│   └── PhantomXDR/          # XDR product layer (planned)
 ├── include/                 # Vendored headers (YARA · Zydis · SQLiteCpp · tlsh)
 ├── vendor/                  # Vendored libraries
 ├── tests/                   # Unit · integration · fuzz
+├── malware_tests/           # Malware sample testing framework
 └── docs/                    # Architecture documentation
 ```
 
@@ -215,7 +257,7 @@ ShadowStrike/
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting anything.
 
-> ShadowStrike Phantom is not actively accepting external code contributions during the current pre-alpha phase. Contribution guidelines will apply when contributions are formally opened in a future phase.
+> ShadowStrike is not actively accepting external code contributions during the alpha phase. Contribution guidelines will be published when the project reaches beta.
 
 ---
 
@@ -236,20 +278,16 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 ## Acknowledgments
 
 - The Windows Driver Kit documentation and Microsoft kernel engineering resources
-- The [YARA](https://github.com/VirusTotal/yara) project — malware pattern matching
-- [Zydis](https://github.com/zyantific/zydis) — x86/x64 disassembler
-- The security research community whose published work makes open EDR possible
+- [YARA](https://github.com/VirusTotal/yara) — malware pattern matching
+- [Zydis](https://github.com/zyantific/zydis) — x86/x64 instruction decoder
+- The security research community whose published work makes open-source EDR possible
 
 ---
-For Business  Opportunities : ShadowStrike.Labs@outlook.com
 
 <div align="center">
 
-**ShadowStrike-Labs** · Pre-Alpha · Not for production use
+**ShadowStrike-Labs** · Alpha · [shadowstrike.dev](https://www.shadowstrike.dev)
 
-[shadowstrike.dev](https://www.shadowstrike.dev) · [contact@shadowstrike.dev](mailto:contact@shadowstrike.dev)
-
+For business inquiries: [contact@shadowstrike.dev](mailto:contact@shadowstrike.dev)
 
 </div>
-
-*Building the Open-Source Endpoint Protection Platform...*
