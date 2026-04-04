@@ -137,10 +137,11 @@ public:
 
     // 8-bit high access (AH=4, CH=5, DH=6, BH=7) — legacy, no REX prefix
     [[nodiscard]] uint8_t GetReg8High(uint8_t hiReg) const noexcept {
-        // hiReg: 4=AH(from RAX), 5=CH(from RCX), 6=DH(from RDX), 7=BH(from RBX)
+        if (hiReg < 4 || hiReg > 7) return 0;
         return static_cast<uint8_t>(gpr[hiReg - 4] >> 8);
     }
     void SetReg8High(uint8_t hiReg, uint8_t value) noexcept {
+        if (hiReg < 4 || hiReg > 7) return;
         auto& r = gpr[hiReg - 4];
         r = (r & ~0xFF00ULL) | (static_cast<uint64_t>(value) << 8);
     }
@@ -241,15 +242,26 @@ public:
     }
 
     void FPUPush(long double value) noexcept {
-        fpuTop = (fpuTop - 1) & 7;
+        uint8_t newTop = (fpuTop - 1) & 7;
+        // Check for stack overflow (register not empty → C1=1, IE=1 in status)
+        if (((fpuTag >> (newTop * 2)) & 3) != 3) {
+            fpuStatus |= (1 << 9);   // C1 = 1 (stack overflow)
+            fpuStatus |= (1 << 6);   // Stack Fault
+            fpuStatus |= (1 << 0);   // Invalid Exception
+        }
+        fpuTop = newTop;
         fpuStack[fpuTop].value = value;
-        // Mark register as valid in tag word
         fpuTag &= ~(3 << (fpuTop * 2));
     }
 
     [[nodiscard]] long double FPUPop() noexcept {
+        // Check for stack underflow (register empty → C1=0, IE=1)
+        if (((fpuTag >> (fpuTop * 2)) & 3) == 3) {
+            fpuStatus &= ~(1 << 9);  // C1 = 0 (stack underflow)
+            fpuStatus |= (1 << 6);   // Stack Fault
+            fpuStatus |= (1 << 0);   // Invalid Exception
+        }
         long double val = fpuStack[fpuTop].value;
-        // Mark register as empty
         fpuTag |= (3 << (fpuTop * 2));
         fpuTop = (fpuTop + 1) & 7;
         return val;

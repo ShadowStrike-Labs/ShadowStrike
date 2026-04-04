@@ -61,8 +61,8 @@ public:
     // Record an RWX allocation (always suspicious)
     void RecordRWXAllocation(GuestAddress base, GuestSize size) noexcept;
 
-    // Get all RWX allocations
-    [[nodiscard]] const std::vector<std::pair<GuestAddress, GuestSize>>& GetRWXAllocations() const noexcept;
+    // Get all RWX allocations (returns copy under lock for thread safety)
+    [[nodiscard]] std::vector<std::pair<GuestAddress, GuestSize>> GetRWXAllocations() const;
 
     // Track unique pages written (for heap spray detection)
     [[nodiscard]] uint32_t GetUniqueWrittenPages() const noexcept;
@@ -70,7 +70,7 @@ public:
     // === Full access log (optional, expensive) ===
     void SetFullTracing(bool enable) noexcept { m_fullTracing = enable; }
     void RecordAccess(const MemoryAccessRecord& record);
-    [[nodiscard]] const std::vector<MemoryAccessRecord>& GetAccessLog() const noexcept;
+    [[nodiscard]] std::vector<MemoryAccessRecord> GetAccessLog() const;
 
 private:
     std::unordered_set<GuestAddress> m_writtenPages;

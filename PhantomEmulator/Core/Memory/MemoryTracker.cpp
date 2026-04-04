@@ -62,7 +62,8 @@ void MemoryTracker::RecordRWXAllocation(GuestAddress base, GuestSize size) noexc
     }
 }
 
-const std::vector<std::pair<GuestAddress, GuestSize>>& MemoryTracker::GetRWXAllocations() const noexcept {
+std::vector<std::pair<GuestAddress, GuestSize>> MemoryTracker::GetRWXAllocations() const {
+    std::shared_lock lock(m_mutex);
     return m_rwxAllocations;
 }
 
@@ -80,7 +81,8 @@ void MemoryTracker::RecordAccess(const MemoryAccessRecord& record) {
     }
 }
 
-const std::vector<MemoryAccessRecord>& MemoryTracker::GetAccessLog() const noexcept {
+std::vector<MemoryAccessRecord> MemoryTracker::GetAccessLog() const {
+    std::shared_lock lock(m_mutex);
     return m_accessLog;
 }
 

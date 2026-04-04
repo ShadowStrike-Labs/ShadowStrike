@@ -157,29 +157,60 @@ ErrorCode CPU::ExecuteBitManip(const DecodedInstruction& inst, VirtualMemory& me
     }
 
     if (isBTGroup) {
-        uint64_t val = 0;
-        auto err = ReadOperand(inst.Op(0), inst, mem, val);
-        if (err != ErrorCode::Success) return err;
-
         uint64_t bitIdx = 0;
-        err = ReadOperand(inst.Op(1), inst, mem, bitIdx);
+        auto err = ReadOperand(inst.Op(1), inst, mem, bitIdx);
         if (err != ErrorCode::Success) return err;
 
         uint8_t bits = static_cast<uint8_t>(size) * 8;
-        bitIdx &= (bits - 1); // Mask to operand size
 
-        // Set CF = selected bit
-        m_state.eflags.SetCF(((val >> bitIdx) & 1) != 0);
+        if (inst.Op(0).IsMemory() && op != 0xBA) {
+            // Memory operand with register bit index: bit index is NOT masked.
+            // The full signed bit offset addresses into adjacent memory bytes.
+            int64_t signedBitIdx = static_cast<int64_t>(bitIdx);
+            if (bits == 16) signedBitIdx = static_cast<int16_t>(bitIdx);
+            else if (bits == 32) signedBitIdx = static_cast<int32_t>(bitIdx);
 
-        uint64_t mask = 1ULL << bitIdx;
-        switch (btOp) {
-            case BTOp::BT:  return ErrorCode::Success; // Just test, no modify
-            case BTOp::BTS: val |= mask; break;
-            case BTOp::BTR: val &= ~mask; break;
-            case BTOp::BTC: val ^= mask; break;
+            GuestAddress baseAddr = CalculateEffectiveAddress(inst.Op(0), inst);
+            int64_t byteOffset = signedBitIdx >> 3;        // Divide by 8 (arithmetic shift)
+            uint8_t bitInByte = static_cast<uint8_t>(signedBitIdx & 7);
+            if (bitInByte < 0) { bitInByte += 8; byteOffset--; }
+
+            GuestAddress effectiveAddr = baseAddr + static_cast<uint64_t>(byteOffset);
+            uint8_t byte = 0;
+            err = mem.Read(effectiveAddr, &byte, 1);
+            if (err != ErrorCode::Success) return err;
+
+            m_state.eflags.SetCF(((byte >> bitInByte) & 1) != 0);
+
+            uint8_t mask = static_cast<uint8_t>(1 << bitInByte);
+            switch (btOp) {
+                case BTOp::BT:  return ErrorCode::Success;
+                case BTOp::BTS: byte |= mask; break;
+                case BTOp::BTR: byte &= ~mask; break;
+                case BTOp::BTC: byte ^= mask; break;
+            }
+
+            return mem.Write(effectiveAddr, &byte, 1);
+        } else {
+            // Register operand or immediate form: bit index IS masked to operand size
+            uint64_t val = 0;
+            err = ReadOperand(inst.Op(0), inst, mem, val);
+            if (err != ErrorCode::Success) return err;
+
+            bitIdx &= (bits - 1);
+
+            m_state.eflags.SetCF(((val >> bitIdx) & 1) != 0);
+
+            uint64_t mask = 1ULL << bitIdx;
+            switch (btOp) {
+                case BTOp::BT:  return ErrorCode::Success;
+                case BTOp::BTS: val |= mask; break;
+                case BTOp::BTR: val &= ~mask; break;
+                case BTOp::BTC: val ^= mask; break;
+            }
+
+            return WriteOperand(inst.Op(0), inst, mem, val);
         }
-
-        return WriteOperand(inst.Op(0), inst, mem, val);
     }
 
     return ErrorCode::UnimplementedOpcode;

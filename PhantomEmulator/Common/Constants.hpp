@@ -137,37 +137,64 @@ namespace CPUID {
     static constexpr uint32_t kVendorECX = 0x6C65746E; // "ntel"
     static constexpr uint32_t kMaxBasicLeaf = 0x16;
 
-    // Leaf 1: Version info (fake: Core i7-10700K)
-    static constexpr uint32_t kVersionInfo = 0x000A0671;
-    // Feature flags (leaf 1 ECX) — standard features
+    // Leaf 1: Version info (Core i7-10700K, Comet Lake-S)
+    // Family=6, ExtModel=0xA, Model=0x5, Stepping=5 → DisplayModel=0xA5
+    static constexpr uint32_t kVersionInfo = 0x000A0655;
+    // Feature flags (leaf 1 ECX) — match real Comet Lake hardware
     static constexpr uint32_t kFeatureECX =
         (1 << 0)  | // SSE3
         (1 << 1)  | // PCLMULQDQ
+        (1 << 2)  | // DTES64
+        (1 << 3)  | // MONITOR
+        (1 << 4)  | // DS-CPL
         (1 << 9)  | // SSSE3
         (1 << 12) | // FMA
         (1 << 13) | // CMPXCHG16B
+        (1 << 14) | // xTPR Update Control
+        (1 << 15) | // PDCM
+        (1 << 17) | // PCID
         (1 << 19) | // SSE4.1
         (1 << 20) | // SSE4.2
+        (1 << 21) | // x2APIC
+        (1 << 22) | // MOVBE
         (1 << 23) | // POPCNT
         (1 << 25) | // AES-NI
         (1 << 26) | // XSAVE
         (1 << 27) | // OSXSAVE
-        (1 << 28);  // AVX
+        (1 << 28) | // AVX
+        (1 << 29) | // F16C
+        (1 << 30);  // RDRAND
     // NOTE: Bit 31 (hypervisor) is intentionally NOT set — anti-evasion
 
-    // Feature flags (leaf 1 EDX) — legacy features
+    // Feature flags (leaf 1 EDX) — match real Comet Lake hardware
     static constexpr uint32_t kFeatureEDX =
         (1 << 0)  | // FPU
+        (1 << 1)  | // VME
+        (1 << 2)  | // DE (Debugging Extensions)
+        (1 << 3)  | // PSE (Page Size Extension)
         (1 << 4)  | // TSC
         (1 << 5)  | // MSR
+        (1 << 6)  | // PAE
+        (1 << 7)  | // MCE
         (1 << 8)  | // CMPXCHG8B
+        (1 << 9)  | // APIC
         (1 << 11) | // SEP (SYSENTER/SYSEXIT)
+        (1 << 12) | // MTRR
+        (1 << 13) | // PGE
+        (1 << 14) | // MCA
         (1 << 15) | // CMOV
+        (1 << 16) | // PAT
+        (1 << 17) | // PSE-36
         (1 << 19) | // CLFLUSH
+        (1 << 21) | // DS (Debug Store)
+        (1 << 22) | // ACPI
         (1 << 23) | // MMX
         (1 << 24) | // FXSR
         (1 << 25) | // SSE
-        (1 << 26);  // SSE2
+        (1 << 26) | // SSE2
+        (1 << 27) | // SS (Self Snoop)
+        (1 << 28) | // HTT (Hyper-Threading)
+        (1 << 29);  // TM (Thermal Monitor)
 
     // Leaf 0x80000000: Extended CPUID max leaf
     static constexpr uint32_t kMaxExtLeaf = 0x80000008;
