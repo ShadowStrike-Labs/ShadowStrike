@@ -1134,66 +1134,25 @@ struct FIMConfig {
 };
 
 /**
- * @brief FIM statistics.
+ * @brief FIM statistics snapshot (plain, copyable — no atomics).
+ *
+ * The PIMPL uses std::atomic internally; this struct captures a
+ * point-in-time snapshot for the public API.
  */
 struct FIMStats {
-    /// @brief Total files monitored
-    std::atomic<size_t> monitoredFiles{ 0 };
-    
-    /// @brief Total directories monitored
-    std::atomic<size_t> monitoredDirectories{ 0 };
-    
-    /// @brief Total changes detected
-    std::atomic<uint64_t> changesDetected{ 0 };
-    
-    /// @brief Total violations
-    std::atomic<uint64_t> violations{ 0 };
-    
-    /// @brief Violations remediated
-    std::atomic<uint64_t> violationsRemediated{ 0 };
-    
-    /// @brief Verifications performed
-    std::atomic<uint64_t> verificationsPerformed{ 0 };
-    
-    /// @brief Verifications passed
-    std::atomic<uint64_t> verificationsPassed{ 0 };
-    
-    /// @brief Verifications failed
-    std::atomic<uint64_t> verificationsFailed{ 0 };
-    
-    /// @brief Baselines created
-    std::atomic<uint64_t> baselinesCreated{ 0 };
-    
-    /// @brief Baselines updated
-    std::atomic<uint64_t> baselinesUpdated{ 0 };
-    
-    /// @brief Restores performed
-    std::atomic<uint64_t> restoresPerformed{ 0 };
-    
-    /// @brief Restores failed
-    std::atomic<uint64_t> restoresFailed{ 0 };
-    
-    /// @brief Average verification time (ms)
-    std::atomic<uint64_t> avgVerificationTimeMs{ 0 };
-    
-    /**
-     * @brief Reset all statistics.
-     */
-    void Reset() noexcept {
-        monitoredFiles.store(0, std::memory_order_relaxed);
-        monitoredDirectories.store(0, std::memory_order_relaxed);
-        changesDetected.store(0, std::memory_order_relaxed);
-        violations.store(0, std::memory_order_relaxed);
-        violationsRemediated.store(0, std::memory_order_relaxed);
-        verificationsPerformed.store(0, std::memory_order_relaxed);
-        verificationsPassed.store(0, std::memory_order_relaxed);
-        verificationsFailed.store(0, std::memory_order_relaxed);
-        baselinesCreated.store(0, std::memory_order_relaxed);
-        baselinesUpdated.store(0, std::memory_order_relaxed);
-        restoresPerformed.store(0, std::memory_order_relaxed);
-        restoresFailed.store(0, std::memory_order_relaxed);
-        avgVerificationTimeMs.store(0, std::memory_order_relaxed);
-    }
+    uint64_t monitoredFiles         = 0;
+    uint64_t monitoredDirectories   = 0;
+    uint64_t changesDetected        = 0;
+    uint64_t violations             = 0;
+    uint64_t violationsRemediated   = 0;
+    uint64_t verificationsPerformed = 0;
+    uint64_t verificationsPassed    = 0;
+    uint64_t verificationsFailed    = 0;
+    uint64_t baselinesCreated       = 0;
+    uint64_t baselinesUpdated       = 0;
+    uint64_t restoresPerformed      = 0;
+    uint64_t restoresFailed         = 0;
+    uint64_t avgVerificationTimeMs  = 0;
 };
 
 /**
@@ -1268,7 +1227,7 @@ public:
     /**
      * @brief Get the singleton instance.
      */
-    [[nodiscard]] static FileIntegrityMonitor& Instance();
+    [[nodiscard]] static FileIntegrityMonitor& Instance() noexcept;
 
     // Non-copyable, non-movable
     FileIntegrityMonitor(const FileIntegrityMonitor&) = delete;
@@ -1301,7 +1260,7 @@ public:
     /**
      * @brief Shutdown the monitor.
      */
-    void Shutdown();
+    void Shutdown() noexcept;
 
     /**
      * @brief Start monitoring.
@@ -1557,9 +1516,9 @@ public:
     ) const;
 
     /**
-     * @brief Get file attributes.
+     * @brief Get file attributes (named to avoid Windows GetFileAttributes macro).
      */
-    [[nodiscard]] std::optional<FileAttributes> GetFileAttributes(const std::wstring& filePath) const;
+    [[nodiscard]] std::optional<FileAttributes> QueryFileAttributes(const std::wstring& filePath) const;
 
     /**
      * @brief Get file signature info.
