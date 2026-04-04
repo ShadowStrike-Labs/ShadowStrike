@@ -145,7 +145,7 @@ ShadowStrike Phantom implements detection across **18 kernel subsystems** and **
 ├───────────────────────────────────┼─────────────────────────────────────────┤
 │                    ┌──────────────┴──────────────┐                           │
 │                    │       PhantomSensor.sys     │                           │
-│                    │    (Minifilter · Alt. 328000)│                          │
+│                    │    (Minifilter · Alt. 385210)│                          │
 │                    └──────────────┬──────────────┘                           │
 │    ┌──────────────────────────────┼──────────────────────────────┐           │
 │    ▼                              ▼                              ▼           │
@@ -168,7 +168,7 @@ ShadowStrike Phantom implements detection across **18 kernel subsystems** and **
 ## Core Technologies
 
 ### Kernel Driver
-- Windows Filter Manager minifilter — altitude 328000, 14 operation callbacks
+- Windows Filter Manager minifilter — altitude 385210, 14 operation callbacks
 - `CmRegisterCallbackEx` — registry monitoring with persistence detection
 - `PsSetCreateProcessNotifyRoutineEx2` — process lifecycle with LOLBin scoring
 - `ObRegisterCallbacks` — handle-based self-protection with suspicion scoring
