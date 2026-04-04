@@ -6,13 +6,14 @@
  *
  * Detects and extracts packed/encrypted malware payloads through:
  *   - W→X transition monitoring (write to memory, then execute it)
- *   - Known packer signature detection (30+ packers)
+ *   - Known packer signature detection (100+ packers)
  *   - Multi-layer unpacking (e.g. UPX wrapped in Themida)
  *   - Original Entry Point (OEP) detection via scored heuristic fusion
  *   - Memory snapshot management per unpack layer
  *   - Import Address Table reconstruction from API call traces
  *   - Shannon entropy tracking as an unpacking progress indicator
  *   - Clean PE file extraction from emulated guest memory
+ *   - VM deobfuscation engine (FinFisher, Themida, VMProtect, etc.)
  *
  * Copyright (C) 2025-2026 ShadowStrike Labs
  * AGPL-3.0 License
@@ -41,6 +42,7 @@ class MemoryTracker;
 
 enum class PackerType : uint8_t {
     Unknown = 0,
+    // --- Original packers (1–30) ---
     UPX,
     ASPack,
     PECompact,
@@ -71,10 +73,159 @@ enum class PackerType : uint8_t {
     NSIS,
     InnoSetup,
     PyInstaller,
+
+    // --- Commercial protectors ---
+    PELock,
+    ACProtect,
+    SafeEngine,
+    WinLicense,
+    CodeWall,
+    PrivateEXE,
+    PCGuard,
+    GameGuard,
+    Denuvo,
+
+    // --- VMProtect/Themida version variants ---
+    VMProtect1x,
+    VMProtect2x,
+    ThemidaV1,
+    ThemidaV2,
+
+    // --- Packers ---
+    RLPack,
+    nPack,
+    WinUpack,
+    JDPack,
+    BeRoEXE,
+    Packman,
+    YodaCrypt,
+    PEBundle,
+    DotFixNice,
+    PEX,
+    AlexProtect,
+    AntiCrack,
+    kkrunchy,
+    CrunchCexe,
+    UPXModified,
+
+    // --- .NET / Managed ---
+    ConfuserEx,
+    Dotfuscator,
+
+    // --- Scripting languages ---
+    AutoHotkey,
+    PyArmor,
+    Cython,
+
+    // --- Go binary ---
+    GoBinary,
+
+    // --- Installer / SFX ---
+    SevenZipSFX,
+    WinRARSFX,
+    WinZipSFX,
+    InstallShield,
+    WiseInstaller,
+
+    // --- VM-based protectors ---
+    TigerVMP,
+    ReWolf,
+
+    // --- Additional protectors ---
+    ExeCryptorV2,
+    PECompactV3,
+    PetiteV21,
+    PetiteV22,
+    PetiteV23,
+    NSISVariant,
+    InnoSetupVariant,
+    ElectronASAR,
+    SmartAssembly,
+    Eazfuscator,
+    BabelNet,
+    DNGuard,
+    NetReactor,
+    MaxtoCode,
+    Agile,
+    Xenocode,
+    Spoon,
+    BoxedAppVariant,
+    MoleBoxUltra,
+    PECompactV2,
+    UPXScrambled,
+    ASPackV2,
+    NSPackV3,
+    MPRESSv2,
+    FSGv2,
+    MEWv11,
+    PESpinV1,
+    tElockV098,
+    ObsidiumV1,
+    ArmadilloV9,
+    ThemidaV3,
 };
 
 /// Human-readable name for a packer type.
 [[nodiscard]] const char* PackerTypeName(PackerType type) noexcept;
+
+// ============================================================================
+// VM Architecture Identifiers (for virtualized/obfuscated code)
+// ============================================================================
+
+enum class VMArch : uint8_t {
+    Unknown = 0,
+    FinFisher,        ///< Complex: 32 virtual registers, stack-based
+    Themida,          ///< CISC-like VM with ~120 handlers
+    VMProtect,        ///< RISC-like VM, variable handler count
+    CodeVirtualizer,  ///< Oreans (same family as Themida)
+    TigerVMP,         ///< Chinese packer, register-based VM
+    ReWolf,           ///< Open-source VM protector
+    Custom,           ///< Unknown/custom VM detected by heuristics
+};
+
+// ============================================================================
+// VM Handler Classification
+// ============================================================================
+
+enum class VMHandlerType : uint8_t {
+    Unknown = 0,
+    VMAdd, VMSub, VMMul, VMDiv,
+    VMAnd, VMOr, VMXor, VMNot, VMShl, VMShr, VMRol, VMRor,
+    VMPush, VMPop, VMLoad, VMStore,
+    VMJmp, VMJcc, VMCall, VMRet,
+    VMNop, VMVmExit, VMVmEntry,
+    VMSyscall, VMObfuscated,
+};
+
+// ============================================================================
+// VM Handler Info — describes a single virtual instruction handler
+// ============================================================================
+
+struct VMHandlerInfo {
+    GuestAddress address;            ///< Handler entry address
+    uint8_t      opcodeValue;        ///< Virtual opcode this handler processes
+    uint16_t     instructionCount;   ///< x86 instructions in handler body
+    VMHandlerType handlerType;       ///< Classified type
+};
+
+// ============================================================================
+// VM Analysis Result — aggregate output from AnalyzeVirtualMachine()
+// ============================================================================
+
+struct VMAnalysisResult {
+    VMArch       architecture       = VMArch::Unknown;
+    float        confidence         = 0.0f;       ///< 0.0-1.0
+    GuestAddress vmEntryPoint       = 0;           ///< Where native code enters the VM
+    GuestAddress vmDispatcher       = 0;           ///< The main dispatcher loop
+    GuestAddress vmHandlerTable     = 0;           ///< Base of handler pointer array
+    uint32_t     handlerCount       = 0;           ///< Number of detected handlers
+    uint32_t     virtualRegCount    = 0;           ///< Detected virtual register count
+    bool         usesIndirectDispatch = false;      ///< JMP [table + index*8] pattern
+    bool         usesComputedGoto    = false;       ///< ADD reg, offset; JMP reg pattern
+    bool         hasOpaquePredicates = false;       ///< Anti-analysis: always-true/false
+    bool         hasHandlerReordering = false;      ///< Handlers not sequential
+    std::vector<VMHandlerInfo> handlers;
+};
 
 // ============================================================================
 // OEP Detection Method
@@ -190,6 +341,19 @@ public:
     [[nodiscard]] PackerType DetectPacker(const VirtualMemory& memory,
                                           GuestAddress imageBase,
                                           GuestSize imageSize) const noexcept;
+
+    // === VM Analysis =======================================================
+
+    /// Detect if the binary contains virtualized code (FinFisher, Themida,
+    /// VMProtect, CodeVirtualizer, etc.) by locating VM entry points,
+    /// dispatcher loops, and handler tables.
+    [[nodiscard]] VMAnalysisResult AnalyzeVirtualMachine(
+        const VirtualMemory& memory,
+        GuestAddress imageBase,
+        GuestSize imageSize) const noexcept;
+
+    /// Get the detected VM architecture from the most recent analysis.
+    [[nodiscard]] VMArch GetDetectedVM() const noexcept;
 
     // === PE Dumping ========================================================
 
