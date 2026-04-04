@@ -62,6 +62,7 @@
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
+#include "../Engine/BehaviorAnalyzer.hpp"
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
@@ -1326,6 +1327,39 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
                     tgtState.hasBeenInjected = true;
                     tgtState.incomingInjectionIds.push_back(injectionEvent->eventId);
                     tgtState.totalInjectionsAsTarget++;
+                }
+
+                // Forward injection event to BehaviorAnalyzer for attack chain correlation
+                if (m_impl->m_behaviorAnalyzer && m_impl->m_behaviorAnalyzer->IsInitialized()) {
+                    try {
+                        auto baEvent = Engine::CreateProcessEvent(
+                            Engine::BehaviorEventType::ProcessInject,
+                            injectionEvent->sourceProcessId,
+                            injectionEvent->targetProcessId);
+                        baEvent.processName = injectionEvent->sourceProcessName;
+                        baEvent.targetPath  = injectionEvent->targetProcessName;
+                        baEvent.accessMask  = static_cast<uint32_t>(injectionEvent->injectionType);
+                        baEvent.details     = L"confidence=" + std::to_wstring(injectionEvent->confidence);
+                        baEvent.success     = true;
+
+                        auto baVerdict = m_impl->m_behaviorAnalyzer->ProcessEvent(baEvent);
+                        if (baVerdict.has_value() &&
+                            baVerdict->RequiresImmediateAction() &&
+                            !m_impl->m_config.blockInjections) {
+                            // BA escalated — override config to block this injection
+                            injectionEvent->blocked = true;
+                            m_impl->m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
+                            Utils::Logger::Warn(
+                                "ProcessInjectionDetector: BA escalated injection {}->{} to BLOCK (score={:.1f})",
+                                Utils::StringUtils::ToNarrow(injectionEvent->sourceProcessName),
+                                Utils::StringUtils::ToNarrow(injectionEvent->targetProcessName),
+                                baVerdict->maliceScore);
+                            return false;
+                        }
+                    } catch (const std::exception& ex) {
+                        Utils::Logger::Error(
+                            "ProcessInjectionDetector: BA forwarding failed: {}", ex.what());
+                    }
                 }
 
                 // Generate alert if confidence meets threshold
