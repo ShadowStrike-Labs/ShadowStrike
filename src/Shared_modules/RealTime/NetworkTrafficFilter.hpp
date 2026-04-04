@@ -942,8 +942,8 @@ struct FilterRule {
     /// @brief Hit count (atomic so rule evaluation threads don't contend on a lock)
     mutable std::atomic<uint64_t> hitCount{ 0 };
 
-    /// @brief Last hit time (mutable to allow update under shared_lock)
-    mutable std::chrono::system_clock::time_point lastHit{};
+    /// @brief Last hit time as epoch nanoseconds (atomic for shared_lock safety)
+    mutable std::atomic<int64_t> lastHitNs{ 0 };
 
     /// @brief Created time
     std::chrono::system_clock::time_point created{};
@@ -964,7 +964,7 @@ struct FilterRule {
           timeStart(o.timeStart), timeEnd(o.timeEnd),
           blockedCountries(o.blockedCountries), mitreTechniques(o.mitreTechniques),
           hitCount(o.hitCount.load(std::memory_order_relaxed)),
-          lastHit(o.lastHit), created(o.created) {}
+          lastHitNs(o.lastHitNs.load(std::memory_order_relaxed)), created(o.created) {}
 
     FilterRule& operator=(const FilterRule& o) {
         if (this != &o) {
@@ -978,7 +978,9 @@ struct FilterRule {
             blockedCountries = o.blockedCountries; mitreTechniques = o.mitreTechniques;
             hitCount.store(o.hitCount.load(std::memory_order_relaxed),
                            std::memory_order_relaxed);
-            lastHit = o.lastHit; created = o.created;
+            lastHitNs.store(o.lastHitNs.load(std::memory_order_relaxed),
+                            std::memory_order_relaxed);
+            created = o.created;
         }
         return *this;
     }

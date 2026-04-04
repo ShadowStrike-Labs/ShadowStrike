@@ -374,8 +374,26 @@ struct NetworkTrafficFilter::Impl {
         }
 
         // Evaluate and respond
-        // We build a dummy NetworkConnection for rule evaluation then send verdict
-        FilterAction action = EvaluateRules(conn);
+        // First check blocklists (bypassed in original path — CRITICAL)
+        FilterAction action = FilterAction::Allow;
+        {
+            std::shared_lock lock(m_blocklistMutex);
+            if (m_blockedIPs.count(conn.tuple.remote.address.ToString())) {
+                action = FilterAction::Block;
+            }
+            if (action != FilterAction::Block && !conn.domainName.empty()) {
+                std::string lower = conn.domainName;
+                for (auto& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+                if (m_blockedDomains.count(lower)) {
+                    action = FilterAction::Block;
+                }
+            }
+        }
+
+        // Then evaluate rules if blocklist didn't block
+        if (action != FilterAction::Block) {
+            action = EvaluateRules(conn);
+        }
 
         // Send verdict back
         struct {
@@ -474,9 +492,11 @@ struct NetworkTrafficFilter::Impl {
             highestPrio  = rule.priority;
             matched      = true;
 
-            // hitCount is mutable atomic — safe under shared_lock
             rule.hitCount.fetch_add(1, std::memory_order_relaxed);
-            rule.lastHit = Now();
+            rule.lastHitNs.store(
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    Now().time_since_epoch()).count(),
+                std::memory_order_relaxed);
         }
 
         return result;
@@ -762,27 +782,21 @@ FilterAction NetworkTrafficFilter::OnConnectionAttempt(const NetworkConnection& 
             m_impl->m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
             return FilterAction::Block;
         }
-        if (!connection.domainName.empty() &&
-            m_impl->m_blockedDomains.count(connection.domainName)) {
-            m_impl->m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-            return FilterAction::Block;
+        if (!connection.domainName.empty()) {
+            std::string lower = connection.domainName;
+            for (auto& c : lower) c = static_cast<char>(::tolower(static_cast<unsigned char>(c)));
+            if (m_impl->m_blockedDomains.count(lower)) {
+                m_impl->m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
+                return FilterAction::Block;
+            }
         }
     }
 
     // --- Rule evaluation ---
     FilterAction action = m_impl->EvaluateRules(connection);
 
-    // --- Record or block ---
-    if (action != FilterAction::Block) {
-        std::unique_lock lock(m_impl->m_connectionMutex);
-        m_impl->m_connections[connection.connectionId] = connection;
-        m_impl->m_statConnectionsAllowed.fetch_add(1, std::memory_order_relaxed);
-        m_impl->m_statActiveConnections.fetch_add(1, std::memory_order_relaxed);
-    } else {
-        m_impl->m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-    }
-
-    // --- Invoke connection callbacks (outside locks) ---
+    // --- Invoke connection callbacks BEFORE recording (outside locks) ---
+    // Callbacks may override verdict to Block; we must not record blocked connections as active
     {
         std::vector<ConnectionCallback> callbacks;
         {
@@ -797,6 +811,16 @@ FilterAction NetworkTrafficFilter::OnConnectionAttempt(const NetworkConnection& 
                     action = FilterAction::Block;
             } catch (...) {}
         }
+    }
+
+    // --- Record or block (after final verdict is known) ---
+    if (action != FilterAction::Block) {
+        std::unique_lock lock(m_impl->m_connectionMutex);
+        m_impl->m_connections[connection.connectionId] = connection;
+        m_impl->m_statConnectionsAllowed.fetch_add(1, std::memory_order_relaxed);
+        m_impl->m_statActiveConnections.fetch_add(1, std::memory_order_relaxed);
+    } else {
+        m_impl->m_statConnectionsBlocked.fetch_add(1, std::memory_order_relaxed);
     }
 
     return action;
@@ -942,15 +966,20 @@ bool NetworkTrafficFilter::KillConnection(uint64_t connectionId) {
     if (it == m_impl->m_connections.end()) return false;
 
     if (it->second.tuple.protocol == NetworkProtocol::TCP) {
-        MIB_TCPROW row{};
-        row.dwState       = MIB_TCP_STATE_DELETE_TCB;
-        row.dwLocalAddr   = it->second.tuple.local.address.ipv4;
-        row.dwLocalPort   = htons(it->second.tuple.local.port);
-        row.dwRemoteAddr  = it->second.tuple.remote.address.ipv4;
-        row.dwRemotePort  = htons(it->second.tuple.remote.port);
-        const DWORD err = SetTcpEntry(&row);
-        if (err != NO_ERROR && err != ERROR_MR_MID_NOT_FOUND) {
-            Utils::Logger::Warn("NetworkTrafficFilter: SetTcpEntry failed for connId {} ({})", connectionId, err);
+        if (it->second.tuple.remote.address.version == IPVersion::IPv6) {
+            Utils::Logger::Warn("NetworkTrafficFilter: KillConnection for IPv6 TCP (connId {}) "
+                "— SetTcpEntry only supports IPv4; removing from tracker only.", connectionId);
+        } else {
+            MIB_TCPROW row{};
+            row.dwState       = MIB_TCP_STATE_DELETE_TCB;
+            row.dwLocalAddr   = it->second.tuple.local.address.ipv4;
+            row.dwLocalPort   = htons(it->second.tuple.local.port);
+            row.dwRemoteAddr  = it->second.tuple.remote.address.ipv4;
+            row.dwRemotePort  = htons(it->second.tuple.remote.port);
+            const DWORD err = SetTcpEntry(&row);
+            if (err != NO_ERROR && err != ERROR_MR_MID_NOT_FOUND) {
+                Utils::Logger::Warn("NetworkTrafficFilter: SetTcpEntry failed for connId {} ({})", connectionId, err);
+            }
         }
     }
 
@@ -1274,8 +1303,6 @@ FilterAction NetworkTrafficFilter::OnDNSQuery(const DNSQueryEvent& query) {
         }
     }
 
-    blocked = (action == FilterAction::Block);
-
     // Invoke DNS callbacks (outside any lock)
     {
         std::vector<DNSCallback> callbacks;
@@ -1291,6 +1318,9 @@ FilterAction NetworkTrafficFilter::OnDNSQuery(const DNSQueryEvent& query) {
             } catch (...) {}
         }
     }
+
+    // Compute blocked status AFTER callbacks have had a chance to override verdict
+    blocked = (action == FilterAction::Block);
 
     // Store in DNS history
     DNSQueryEvent stored = query;
