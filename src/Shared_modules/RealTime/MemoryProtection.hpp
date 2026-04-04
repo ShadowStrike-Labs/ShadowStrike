@@ -186,6 +186,29 @@ namespace RealTime {
     using MemoryThreatCallback = std::function<void(const MemoryViolation&, uint32_t /*pid*/)>;
 
     // =========================================================================
+    // Exploit Protection Flags (for EnableExploitProtection)
+    // =========================================================================
+
+    /// Apply Data Execution Prevention to the target process.
+    constexpr uint32_t EXPLOIT_PROTECT_DEP            = 0x00000001;
+    /// Force bottom-up ASLR randomization on all mappings.
+    constexpr uint32_t EXPLOIT_PROTECT_ASLR_FORCE     = 0x00000002;
+    /// Enable Control Flow Guard enforcement.
+    constexpr uint32_t EXPLOIT_PROTECT_CFG             = 0x00000004;
+    /// Terminate process on heap corruption detection.
+    constexpr uint32_t EXPLOIT_PROTECT_HEAP_TERMINATE  = 0x00000008;
+    /// Enable Structured Exception Handler Overwrite Protection.
+    constexpr uint32_t EXPLOIT_PROTECT_SEHOP           = 0x00000010;
+    /// Block dynamic code generation (unsigned code execution).
+    constexpr uint32_t EXPLOIT_PROTECT_NO_DYNAMIC_CODE = 0x00000020;
+    /// Enforce strict handle checks (raise on bad handle access).
+    constexpr uint32_t EXPLOIT_PROTECT_STRICT_HANDLES  = 0x00000040;
+    /// Apply all available mitigations (use with caution on 3rd-party processes).
+    constexpr uint32_t EXPLOIT_PROTECT_ALL             = 0x0000007F;
+    /// Enhanced monitoring only — no active mitigation applied.
+    constexpr uint32_t EXPLOIT_PROTECT_MONITOR_ONLY    = 0x00001000;
+
+    // =========================================================================
     // Memory Protection Engine
     // =========================================================================
 
