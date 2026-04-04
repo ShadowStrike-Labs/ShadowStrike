@@ -936,17 +936,22 @@ bool NetworkTrafficFilter::KillConnection(uint32_t pid, const std::string& remot
             it->second.tuple.remote.port == remotePort &&
             it->second.tuple.protocol == NetworkProtocol::TCP) {
 
-            // Attempt to RST the TCP connection via SetTcpEntry (requires SeImpersonatePrivilege or admin)
-            MIB_TCPROW row{};
-            row.dwState       = MIB_TCP_STATE_DELETE_TCB;
-            row.dwLocalAddr   = it->second.tuple.local.address.ipv4;
-            row.dwLocalPort   = htons(it->second.tuple.local.port);
-            row.dwRemoteAddr  = it->second.tuple.remote.address.ipv4;
-            row.dwRemotePort  = htons(it->second.tuple.remote.port);
+            // Only use SetTcpEntry for IPv4 — it doesn't support IPv6
+            if (it->second.tuple.remote.address.version == IPVersion::IPv6) {
+                Utils::Logger::Warn("NetworkTrafficFilter: KillConnection for IPv6 TCP (PID {} → {}:{})"
+                    " — removing from tracker only.", pid, remoteIP, remotePort);
+            } else {
+                MIB_TCPROW row{};
+                row.dwState       = MIB_TCP_STATE_DELETE_TCB;
+                row.dwLocalAddr   = it->second.tuple.local.address.ipv4;
+                row.dwLocalPort   = htons(it->second.tuple.local.port);
+                row.dwRemoteAddr  = it->second.tuple.remote.address.ipv4;
+                row.dwRemotePort  = htons(it->second.tuple.remote.port);
 
-            const DWORD err = SetTcpEntry(&row);
-            if (err != NO_ERROR && err != ERROR_MR_MID_NOT_FOUND) {
-                Utils::Logger::Warn("NetworkTrafficFilter: SetTcpEntry failed ({}); removing from tracker only.", err);
+                const DWORD err = SetTcpEntry(&row);
+                if (err != NO_ERROR && err != ERROR_MR_MID_NOT_FOUND) {
+                    Utils::Logger::Warn("NetworkTrafficFilter: SetTcpEntry failed ({}); removing from tracker only.", err);
+                }
             }
 
             it->second.state = ConnectionState::Closed;
@@ -995,7 +1000,8 @@ size_t NetworkTrafficFilter::KillProcessConnections(uint32_t pid) {
     size_t killed = 0;
     for (auto it = m_impl->m_connections.begin(); it != m_impl->m_connections.end(); ) {
         if (it->second.processId == pid) {
-            if (it->second.tuple.protocol == NetworkProtocol::TCP) {
+            if (it->second.tuple.protocol == NetworkProtocol::TCP &&
+                it->second.tuple.remote.address.version != IPVersion::IPv6) {
                 MIB_TCPROW row{};
                 row.dwState       = MIB_TCP_STATE_DELETE_TCB;
                 row.dwLocalAddr   = it->second.tuple.local.address.ipv4;
