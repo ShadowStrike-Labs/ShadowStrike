@@ -1233,6 +1233,9 @@ struct ProcessBehaviorState {
     
     /// @brief Evasion attempts
     uint32_t evasionAttempts = 0;
+
+    /// @brief Whether cumulative exfiltration threshold already scored
+    bool exfilThresholdTriggered = false;
     
     // -------------------------------------------------------------------------
     // Ransomware-Specific
@@ -1724,6 +1727,50 @@ struct BehaviorAnalyzerStats {
     /// @brief Events dropped (queue overflow)
     std::atomic<uint64_t> eventsDropped{ 0 };
     
+    // Explicit copy/move — std::atomic is non-copyable, but stats must be returnable by value
+    BehaviorAnalyzerStats() noexcept = default;
+
+    BehaviorAnalyzerStats(const BehaviorAnalyzerStats& o) noexcept {
+        totalEventsProcessed.store(o.totalEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < eventsByCategory.size(); ++i)
+            eventsByCategory[i].store(o.eventsByCategory[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalVerdicts.store(o.totalVerdicts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < verdictsByType.size(); ++i)
+            verdictsByType[i].store(o.verdictsByType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        trackedProcesses.store(o.trackedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        peakTrackedProcesses.store(o.peakTrackedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        activeAttackChains.store(o.activeAttackChains.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        ransomwareDetections.store(o.ransomwareDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        injectionDetections.store(o.injectionDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        persistenceDetections.store(o.persistenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        credentialTheftDetections.store(o.credentialTheftDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        avgProcessingTimeUs.store(o.avgProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        eventsDropped.store(o.eventsDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    BehaviorAnalyzerStats& operator=(const BehaviorAnalyzerStats& o) noexcept {
+        if (this != &o) {
+            totalEventsProcessed.store(o.totalEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < eventsByCategory.size(); ++i)
+                eventsByCategory[i].store(o.eventsByCategory[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalVerdicts.store(o.totalVerdicts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < verdictsByType.size(); ++i)
+                verdictsByType[i].store(o.verdictsByType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            trackedProcesses.store(o.trackedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            peakTrackedProcesses.store(o.peakTrackedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeAttackChains.store(o.activeAttackChains.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ransomwareDetections.store(o.ransomwareDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            injectionDetections.store(o.injectionDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            persistenceDetections.store(o.persistenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            credentialTheftDetections.store(o.credentialTheftDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            avgProcessingTimeUs.store(o.avgProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            eventsDropped.store(o.eventsDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset all statistics.
      */
@@ -2173,6 +2220,7 @@ private:
      * @brief Apply score decay to process state.
      */
     void ApplyScoreDecay(ProcessBehaviorState& state);
+    void ApplyScoreDecay(ProcessBehaviorState& state, const BehaviorAnalyzerConfig& config);
 
     /**
      * @brief Check if event triggers detection threshold.

@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -17,292 +17,304 @@
  */
 /**
  * ============================================================================
- * ShadowStrike NGAV - BEHAVIOR ANALYZER MODULE
+ * ShadowStrike Core Engine - BEHAVIOR ANALYZER IMPLEMENTATION
  * ============================================================================
  *
  * @file BehaviorAnalyzer.cpp
- * @brief Enterprise-grade runtime behavioral analysis engine implementation
- *
- * Production-level implementation of dynamic behavior monitoring and attack
- * chain correlation. Competes with enterprise-grade enterprise-grade EDR, enterprise-grade EDR,
- * and enterprise-grade GravityZone behavioral detection.
- *
- * IMPLEMENTATION FEATURES:
- * ========================
- *
- * - PIMPL pattern for ABI stability
- * - Thread-safe with std::shared_mutex for concurrent access
- * - Per-process state machines tracking malice scores
- * - Statistics tracking with std::atomic counters
- * - Comprehensive error handling with try-catch blocks
- * - Event processing (file, registry, network, process, memory operations)
- * - Ransomware detection (file encryption, shadow copy deletion, mass modifications)
- * - Process injection detection (remote threads, memory writes, DLL injection)
- * - Persistence detection (registry run keys, scheduled tasks, services)
- * - Credential theft detection (LSASS access, SAM database reading)
- * - Evasion technique detection (process hollowing, APC injection)
- * - Attack chain correlation across multiple processes
- * - MITRE ATT&CK technique mapping
- * - Verdict generation with recommended actions
- * - Integration with ThreatIntel, SignatureStore, PatternStore
+ * @brief Enterprise-grade behavioral analysis engine for detecting malicious
+ *        activity patterns including ransomware, injection, credential theft,
+ *        lateral movement, C2 communication, and multi-stage attack chains.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
- * @date 2026
- * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- *
- * LICENSE: Proprietary - ShadowStrike Enterprise License
+ * @copyright (c) 2026 ShadowStrike Security. AGPL-3.0 License.
  * ============================================================================
  */
 
 #include "pch.h"
 #include "BehaviorAnalyzer.hpp"
 #include "../../Utils/StringUtils.hpp"
-#include "../../Utils/ProcessUtils.hpp"
-#include "../../Utils/FileUtils.hpp"
-#include "../../Utils/RegistryUtils.hpp"
-#include "../../Utils/NetworkUtils.hpp"
-#include "../../ThreatIntel/ThreatIntelStore.hpp"
-#include "../../SignatureStore/SignatureStore.hpp"
-#include "../../PatternStore/PatternStore.hpp"
+#include "../../Utils/Logger.hpp"
+#include "../../Utils/ThreadPool.hpp"
+#include "../../ThreatIntel/ThreatIntelIndex.hpp"
 
 #include <algorithm>
 #include <numeric>
 #include <cmath>
-#include <sstream>
-#include <iomanip>
-#include <Windows.h>
-#include <tlhelp32.h>
-#include <psapi.h>
-
-#pragma comment(lib, "psapi.lib")
+#include <cwctype>
 
 namespace ShadowStrike {
 namespace Core {
 namespace Engine {
 
 // ============================================================================
+// Internal Helpers
+// ============================================================================
+
+static std::wstring ToLowerCase(std::wstring_view input) {
+    std::wstring result(input);
+    for (auto& ch : result) ch = std::towlower(ch);
+    return result;
+}
+
+static bool ContainsCaseInsensitive(std::wstring_view haystack, std::wstring_view needle) {
+    if (needle.size() > haystack.size()) return false;
+    auto lower_h = ToLowerCase(haystack);
+    auto lower_n = ToLowerCase(needle);
+    return lower_h.find(lower_n) != std::wstring::npos;
+}
+
+// ============================================================================
 // PIMPL Implementation
 // ============================================================================
 
 struct BehaviorAnalyzer::Impl {
-    // Thread synchronization
-    mutable std::shared_mutex m_mutex;
+    // Lifecycle
+    std::atomic<bool> m_initialized{false};
+    std::shared_ptr<Utils::ThreadPool> m_threadPool;
 
     // Configuration
-    BehaviorConfiguration m_config;
+    mutable std::shared_mutex m_configMutex;
+    BehaviorAnalyzerConfig m_config;
 
-    // External integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
-    std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
-    std::shared_ptr<ShadowStrike::PatternStore::PatternStore> m_patternStore;
+    // External dependencies (non-owning)
+    ThreatIntel::ThreatIntelIndex* m_threatIntel{nullptr};
+    Whitelist::WhitelistStore* m_whitelist{nullptr};
+    SignatureStore::SignatureStore* m_signatureStore{nullptr};
 
-    // Per-process state tracking
-    std::unordered_map<uint32_t, ProcessBehaviorState> m_processStates;
+    // Process states
     mutable std::shared_mutex m_statesMutex;
+    std::unordered_map<uint32_t, ProcessBehaviorState> m_processStates;
 
-    // Event queue for correlation
-    std::deque<BehaviorEvent> m_eventQueue;
-    std::mutex m_queueMutex;
+    // Attack chains
+    mutable std::shared_mutex m_chainsMutex;
+    std::vector<AttackChain> m_attackChains;
+    std::atomic<uint64_t> m_nextChainId{1};
 
-    // Attack chain tracking
-    std::vector<AttackChain> m_detectedChains;
-    std::mutex m_chainsMutex;
-
-    // Known suspicious patterns
-    std::unordered_set<std::wstring> m_knownRansomwareExtensions;
-    std::unordered_set<std::wstring> m_knownPersistenceLocations;
-    std::unordered_set<std::wstring> m_knownCredentialTargets;
-
-    // Statistics
-    BehaviorStatistics m_statistics;
-
-    // Initialization flag
-    std::atomic<bool> m_initialized{false};
+    // Canary files
+    mutable std::shared_mutex m_canaryMutex;
+    std::unordered_set<std::wstring> m_canaryFiles;
 
     // Callbacks
-    EventCallback m_eventCallback;
-    VerdictCallback m_verdictCallback;
-    ChainDetectedCallback m_chainCallback;
+    mutable std::shared_mutex m_callbackMutex;
+    std::unordered_map<uint64_t, BehaviorVerdictCallback> m_verdictCallbacks;
+    std::unordered_map<uint64_t, AttackChainCallback> m_chainCallbacks;
+    ProcessTerminateCallback m_terminationCallback;
+    std::atomic<uint64_t> m_nextCallbackId{1};
 
-    // Constructor
+    // Statistics
+    BehaviorAnalyzerStats m_stats;
+
+    // Event ID generator
+    std::atomic<uint64_t> m_nextEventId{1};
+
+    // Cleanup tracking (atomic to avoid data race in ProcessEvent hot path)
+    std::atomic<int64_t> m_lastCleanupTimeRep{
+        std::chrono::steady_clock::now().time_since_epoch().count()};
+
+    // Known attack patterns (populated during initialization)
+    std::unordered_set<std::wstring> m_ransomwareExtensions;
+    std::unordered_set<std::wstring> m_persistenceRegistryPaths;
+    std::unordered_set<std::wstring> m_credentialTargets;
+    std::unordered_set<std::wstring> m_ransomNotePatterns;
+    std::unordered_set<std::wstring> m_documentApps;
+    std::unordered_set<std::wstring> m_scriptInterpreters;
+
     Impl() {
         InitializeKnownPatterns();
     }
 
     void InitializeKnownPatterns() {
-        // Ransomware file extensions
-        m_knownRansomwareExtensions.insert(L".encrypted");
-        m_knownRansomwareExtensions.insert(L".locked");
-        m_knownRansomwareExtensions.insert(L".crypto");
-        m_knownRansomwareExtensions.insert(L".locky");
-        m_knownRansomwareExtensions.insert(L".cerber");
-        m_knownRansomwareExtensions.insert(L".zepto");
-        m_knownRansomwareExtensions.insert(L".osiris");
-        m_knownRansomwareExtensions.insert(L".zzzzz");
-        m_knownRansomwareExtensions.insert(L".cryptolocker");
-        m_knownRansomwareExtensions.insert(L".wannacry");
+        m_ransomwareExtensions = {
+            L".encrypted", L".locked", L".crypto", L".crypt", L".locky",
+            L".cerber", L".zepto", L".thor", L".aesir", L".osiris",
+            L".zzzzz", L".micro", L".mp3", L".vvv", L".ccc",
+            L".abc", L".xxx", L".ttt", L".ecc", L".ezz",
+            L".aaa", L".xtbl", L".crysis", L".cryp1", L".crypz",
+            L".wallet", L".petya", L".golden", L".dharma", L".arena",
+            L".bip", L".combo", L".gamma", L".hese",
+            L".gero", L".mado", L".peta", L".pedro", L".nesa",
+            L".coot", L".derp", L".meka", L".toec", L".mosk",
+            L".lotep", L".grod", L".nols", L".werd", L".bora",
+            L".reco", L".kuub", L".mmnn", L".ooss", L".noos",
+            L".karl", L".shadow", L".djvu", L".stop", L".puma"
+        };
 
-        // Persistence registry locations
-        m_knownPersistenceLocations.insert(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run");
-        m_knownPersistenceLocations.insert(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce");
-        m_knownPersistenceLocations.insert(L"SOFTWARE\\WOW6432Node\\Microsoft\\Windows\\CurrentVersion\\Run");
-        m_knownPersistenceLocations.insert(L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders");
-        m_knownPersistenceLocations.insert(L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon");
+        m_persistenceRegistryPaths = {
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Run",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunOnce",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\RunServices",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Policies\\Explorer\\Run",
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon",
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Windows\\Load",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Explorer\\Shell Folders",
+            L"SOFTWARE\\Microsoft\\Active Setup\\Installed Components",
+            L"SYSTEM\\CurrentControlSet\\Services",
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options",
+            L"SOFTWARE\\Classes\\CLSID",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\ShellServiceObjectDelayLoad",
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\SilentProcessExit",
+            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\AppCompatFlags\\Custom",
+            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\App Paths"
+        };
 
-        // Credential theft targets
-        m_knownCredentialTargets.insert(L"lsass.exe");
-        m_knownCredentialTargets.insert(L"C:\\Windows\\System32\\config\\SAM");
-        m_knownCredentialTargets.insert(L"C:\\Windows\\System32\\config\\SYSTEM");
-        m_knownCredentialTargets.insert(L"C:\\Windows\\System32\\config\\SECURITY");
+        m_credentialTargets = {
+            L"lsass.exe", L"csrss.exe", L"winlogon.exe", L"services.exe",
+            L"svchost.exe", L"wininit.exe", L"lsaiso.exe"
+        };
 
-        Utils::Logger::Info(L"BehaviorAnalyzer: Initialized known patterns - {} ransomware extensions, {} persistence locations, {} credential targets",
-                          m_knownRansomwareExtensions.size(),
-                          m_knownPersistenceLocations.size(),
-                          m_knownCredentialTargets.size());
-    }
+        m_ransomNotePatterns = {
+            L"readme", L"how_to_decrypt", L"how_to_recover",
+            L"restore_files", L"decrypt_instructions", L"help_decrypt",
+            L"payment", L"ransom", L"your_files", L"recovery_key",
+            L"important_read_me", L"attention", L"warning"
+        };
 
-    // Get or create process state
-    ProcessBehaviorState& GetProcessState(uint32_t processId) {
-        std::unique_lock<std::shared_mutex> lock(m_statesMutex);
+        m_documentApps = {
+            L"winword.exe", L"excel.exe", L"powerpnt.exe", L"outlook.exe",
+            L"onenote.exe", L"msaccess.exe", L"acrord32.exe",
+            L"acrobat.exe", L"foxitreader.exe", L"visio.exe"
+        };
 
-        auto it = m_processStates.find(processId);
-        if (it == m_processStates.end()) {
-            // Create new state
-            ProcessBehaviorState newState;
-            newState.processId = processId;
-            newState.startTime = std::chrono::system_clock::now();
-            newState.maliceScore = 0.0;
-
-            // Get process info
-            try {
-                auto procInfo = Utils::ProcessUtils::GetProcessInfo(processId);
-                if (procInfo.has_value()) {
-                    newState.processName = procInfo->processName;
-                    newState.executablePath = procInfo->executablePath;
-                }
-            } catch (...) {
-                // Process may have exited
-            }
-
-            m_processStates[processId] = newState;
-            return m_processStates[processId];
-        }
-
-        return it->second;
+        m_scriptInterpreters = {
+            L"powershell.exe", L"pwsh.exe", L"cmd.exe", L"wscript.exe",
+            L"cscript.exe", L"mshta.exe", L"regsvr32.exe", L"rundll32.exe",
+            L"msiexec.exe", L"certutil.exe", L"bitsadmin.exe",
+            L"wmic.exe", L"bash.exe", L"python.exe", L"python3.exe",
+            L"perl.exe", L"ruby.exe", L"node.exe"
+        };
     }
 };
 
 // ============================================================================
-// Singleton Implementation
+// Singleton
 // ============================================================================
 
-std::atomic<bool> BehaviorAnalyzer::s_instanceCreated{false};
-
-BehaviorAnalyzer& BehaviorAnalyzer::Instance() noexcept {
+BehaviorAnalyzer& BehaviorAnalyzer::Instance() {
     static BehaviorAnalyzer instance;
-    s_instanceCreated.store(true, std::memory_order_release);
     return instance;
 }
 
-bool BehaviorAnalyzer::HasInstance() noexcept {
-    return s_instanceCreated.load(std::memory_order_acquire);
+BehaviorAnalyzer::BehaviorAnalyzer()
+    : m_impl(std::make_unique<Impl>()) {}
+
+BehaviorAnalyzer::~BehaviorAnalyzer() {
+    if (m_impl && m_impl->m_initialized.load(std::memory_order_acquire)) {
+        Shutdown();
+    }
 }
 
 // ============================================================================
 // Lifecycle
 // ============================================================================
 
-BehaviorAnalyzer::BehaviorAnalyzer()
-    : m_impl(std::make_unique<Impl>())
+bool BehaviorAnalyzer::Initialize(std::shared_ptr<Utils::ThreadPool> threadPool) {
+    return Initialize(std::move(threadPool), BehaviorAnalyzerConfig::CreateDefault(), nullptr, nullptr);
+}
+
+bool BehaviorAnalyzer::Initialize(
+    std::shared_ptr<Utils::ThreadPool> threadPool,
+    const BehaviorAnalyzerConfig& config)
 {
-    Utils::Logger::Info(L"BehaviorAnalyzer: Constructor called");
+    return Initialize(std::move(threadPool), config, nullptr, nullptr);
 }
 
-BehaviorAnalyzer::~BehaviorAnalyzer() {
-    Shutdown();
-    Utils::Logger::Info(L"BehaviorAnalyzer: Destructor called");
-}
-
-bool BehaviorAnalyzer::Initialize(const BehaviorConfiguration& config) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-
+bool BehaviorAnalyzer::Initialize(
+    std::shared_ptr<Utils::ThreadPool> threadPool,
+    const BehaviorAnalyzerConfig& config,
+    ThreatIntel::ThreatIntelIndex* threatIntel,
+    Whitelist::WhitelistStore* whitelist)
+{
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"BehaviorAnalyzer: Already initialized");
+        SS_LOG_WARN(L"BehaviorAnalyzer", L"Already initialized, ignoring duplicate call");
         return true;
     }
 
     try {
+        std::unique_lock configLock(m_impl->m_configMutex);
         m_impl->m_config = config;
+        m_impl->m_threadPool = std::move(threadPool);
+        m_impl->m_threatIntel = threatIntel;
+        m_impl->m_whitelist = whitelist;
+        configLock.unlock();
 
-        // Validate configuration
-        if (!config.enabled) {
-            Utils::Logger::Info(L"BehaviorAnalyzer: Disabled via configuration");
-            return false;
+        // Populate canary files from config
+        if (!config.canaryFilePaths.empty()) {
+            std::unique_lock canaryLock(m_impl->m_canaryMutex);
+            for (const auto& path : config.canaryFilePaths) {
+                m_impl->m_canaryFiles.insert(ToLowerCase(path));
+            }
         }
 
-        // Initialize external stores
-        if (config.useThreatIntel) {
-            m_impl->m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
-        }
-
-        if (config.useSignatureStore) {
-            m_impl->m_signatureStore = std::make_shared<SignatureStore::SignatureStore>();
-        }
-
-        if (config.usePatternStore) {
-            m_impl->m_patternStore = std::make_shared<PatternStore::PatternStore>();
-        }
-
-        m_impl->m_statistics.startTime = Clock::now();
+        m_impl->m_stats.Reset();
+        m_impl->m_lastCleanupTimeRep.store(
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"BehaviorAnalyzer: Initialized successfully");
-        return true;
+        SS_LOG_INFO(L"BehaviorAnalyzer", L"Initialized - ransomware=%s injection=%s persistence=%s "
+            L"credTheft=%s evasion=%s exfil=%s lateral=%s c2=%s chains=%s",
+            config.detectRansomware ? L"ON" : L"OFF",
+            config.detectProcessInjection ? L"ON" : L"OFF",
+            config.detectPersistence ? L"ON" : L"OFF",
+            config.detectCredentialTheft ? L"ON" : L"OFF",
+            config.detectEvasion ? L"ON" : L"OFF",
+            config.detectExfiltration ? L"ON" : L"OFF",
+            config.detectLateralMovement ? L"ON" : L"OFF",
+            config.detectC2 ? L"ON" : L"OFF",
+            config.enableAttackChains ? L"ON" : L"OFF");
 
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        return true;
+    }
+    catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"Initialization failed: %S", ex.what());
         return false;
     }
 }
 
 void BehaviorAnalyzer::Shutdown() {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-
-    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl->m_initialized.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
     try {
-        // Clear all tracking data
+        // Clear callbacks first to prevent notifications during teardown
         {
-            std::unique_lock<std::shared_mutex> stateLock(m_impl->m_statesMutex);
+            std::unique_lock cbLock(m_impl->m_callbackMutex);
+            m_impl->m_verdictCallbacks.clear();
+            m_impl->m_chainCallbacks.clear();
+            m_impl->m_terminationCallback = nullptr;
+        }
+
+        {
+            std::unique_lock stateLock(m_impl->m_statesMutex);
             m_impl->m_processStates.clear();
         }
 
         {
-            std::lock_guard<std::mutex> queueLock(m_impl->m_queueMutex);
-            m_impl->m_eventQueue.clear();
+            std::unique_lock chainLock(m_impl->m_chainsMutex);
+            m_impl->m_attackChains.clear();
         }
 
         {
-            std::lock_guard<std::mutex> chainLock(m_impl->m_chainsMutex);
-            m_impl->m_detectedChains.clear();
+            std::unique_lock canaryLock(m_impl->m_canaryMutex);
+            m_impl->m_canaryFiles.clear();
         }
 
-        // Release external stores
-        m_impl->m_threatIntel.reset();
-        m_impl->m_signatureStore.reset();
-        m_impl->m_patternStore.reset();
+        {
+            std::unique_lock configLock(m_impl->m_configMutex);
+            m_impl->m_threadPool.reset();
+            m_impl->m_threatIntel = nullptr;
+            m_impl->m_whitelist = nullptr;
+            m_impl->m_signatureStore = nullptr;
+        }
 
-        m_impl->m_initialized.store(false, std::memory_order_release);
-
-        Utils::Logger::Info(L"BehaviorAnalyzer: Shutdown complete");
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_INFO(L"BehaviorAnalyzer", L"Shutdown complete - processed %llu events, %llu verdicts",
+            m_impl->m_stats.totalEventsProcessed.load(std::memory_order_relaxed),
+            m_impl->m_stats.totalVerdicts.load(std::memory_order_relaxed));
+    }
+    catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"Error during shutdown: %S", ex.what());
     }
 }
 
@@ -310,727 +322,2309 @@ bool BehaviorAnalyzer::IsInitialized() const noexcept {
     return m_impl->m_initialized.load(std::memory_order_acquire);
 }
 
-BehaviorStatus BehaviorAnalyzer::GetStatus() const noexcept {
-    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        return BehaviorStatus::Uninitialized;
+void BehaviorAnalyzer::UpdateConfig(const BehaviorAnalyzerConfig& config) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_config = config;
+
+    if (!config.canaryFilePaths.empty()) {
+        std::unique_lock canaryLock(m_impl->m_canaryMutex);
+        m_impl->m_canaryFiles.clear();
+        for (const auto& p : config.canaryFilePaths) {
+            m_impl->m_canaryFiles.insert(ToLowerCase(p));
+        }
     }
 
-    return BehaviorStatus::Running;
+    SS_LOG_DEBUG(L"BehaviorAnalyzer", L"Configuration updated at runtime");
 }
 
+BehaviorAnalyzerConfig BehaviorAnalyzer::GetConfig() const {
+    std::shared_lock lock(m_impl->m_configMutex);
+    return m_impl->m_config;
+}
 // ============================================================================
-// Event Processing - Primary API
+// Event Processing
 // ============================================================================
 
-bool BehaviorAnalyzer::ProcessEvent(const BehaviorEvent& event) {
-    const auto startTime = Clock::now();
-    m_impl->m_statistics.eventsProcessed.fetch_add(1, std::memory_order_relaxed);
+std::optional<BehaviorVerdict> BehaviorAnalyzer::ProcessEvent(const BehaviorEvent& event) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return std::nullopt;
+    }
+
+    auto startTime = std::chrono::steady_clock::now();
 
     try {
-        std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
-
-        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn(L"BehaviorAnalyzer: Not initialized");
-            return false;
+        // Snapshot config (lock-free after snapshot)
+        BehaviorAnalyzerConfig config;
+        {
+            std::shared_lock cfgLock(m_impl->m_configMutex);
+            config = m_impl->m_config;
         }
 
-        // Add to event queue for correlation
-        {
-            std::lock_guard<std::mutex> queueLock(m_impl->m_queueMutex);
-            m_impl->m_eventQueue.push_back(event);
+        if (!config.enabled) return std::nullopt;
 
-            // Limit queue size
-            if (m_impl->m_eventQueue.size() > m_impl->m_config.maxEventQueueSize) {
-                m_impl->m_eventQueue.pop_front();
+        // Update statistics
+        m_impl->m_stats.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
+        auto catIdx = static_cast<size_t>(event.category);
+        if (catIdx < m_impl->m_stats.eventsByCategory.size()) {
+            m_impl->m_stats.eventsByCategory[catIdx].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Whitelist check (early exit)
+        if (config.applyWhitelist && event.isWhitelisted) {
+            return std::nullopt;
+        }
+
+        std::optional<BehaviorVerdict> verdict;
+        BehaviorEvent enrichedEvent = event;
+        if (enrichedEvent.eventId == 0) {
+            enrichedEvent.eventId = m_impl->m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (enrichedEvent.timestamp == std::chrono::steady_clock::time_point{}) {
+            enrichedEvent.timestamp = std::chrono::steady_clock::now();
+        }
+        if (enrichedEvent.systemTime == std::chrono::system_clock::time_point{}) {
+            enrichedEvent.systemTime = std::chrono::system_clock::now();
+        }
+
+        // Whitelist store check for process path
+        if (config.applyWhitelist && m_impl->m_whitelist && !enrichedEvent.processPath.empty()) {
+            auto wlResult = m_impl->m_whitelist->IsPathWhitelisted(enrichedEvent.processPath);
+            if (wlResult.found) {
+                return std::nullopt;
             }
         }
 
-        // Get process state
-        auto& state = m_impl->GetProcessState(event.processId);
+        // All state mutations under unique lock
+        {
+            std::unique_lock stateLock(m_impl->m_statesMutex);
 
-        // Update last activity
-        state.lastActivityTime = std::chrono::system_clock::now();
-        state.eventCount++;
+            // Fast path: ProcessTerminate clears state to prevent PID reuse contamination
+            if (enrichedEvent.eventType == BehaviorEventType::ProcessTerminate) {
+                m_impl->m_processStates.erase(enrichedEvent.processId);
+                m_impl->m_stats.trackedProcesses.store(m_impl->m_processStates.size(),
+                                                        std::memory_order_relaxed);
+                stateLock.unlock();
+                return std::nullopt;
+            }
 
-        // Route to appropriate handler based on event type
-        double scoreContribution = 0.0;
-        std::string mitreId;
+            auto& state = GetOrCreateState(enrichedEvent.processId, enrichedEvent);
+            state.lastUpdateTime = std::chrono::steady_clock::now();
+            state.totalEventsProcessed++;
 
-        switch (event.eventType) {
-            case BehaviorEventType::FileCreated:
-            case BehaviorEventType::FileModified:
-            case BehaviorEventType::FileDeleted:
-            case BehaviorEventType::FileRenamed:
-                scoreContribution = AnalyzeFileEvent(event, state, mitreId);
-                break;
+            // Add event to history ring buffer
+            state.recentEvents.push_back(enrichedEvent);
+            if (state.recentEvents.size() > config.maxEventsPerProcess) {
+                state.recentEvents.pop_front();
+            }
 
-            case BehaviorEventType::RegistryKeyCreated:
-            case BehaviorEventType::RegistryValueSet:
-            case BehaviorEventType::RegistryKeyDeleted:
-                scoreContribution = AnalyzeRegistryEvent(event, state, mitreId);
-                break;
+            // Apply score decay before adding new score (pass config snapshot to avoid lock-order violation)
+            ApplyScoreDecay(state, config);
 
-            case BehaviorEventType::ProcessCreated:
-            case BehaviorEventType::ProcessTerminated:
-                scoreContribution = AnalyzeProcessEvent(event, state, mitreId);
-                break;
+            // Route to specialized detection engines based on event category
+            switch (enrichedEvent.category) {
+                case BehaviorEventCategory::FileSystem:
+                    state.fileOperationCount++;
+                    if (config.detectRansomware) UpdateRansomwareScore(state, enrichedEvent);
+                    break;
 
-            case BehaviorEventType::ThreadCreated:
-            case BehaviorEventType::RemoteThreadCreated:
-                scoreContribution = AnalyzeThreadEvent(event, state, mitreId);
-                break;
+                case BehaviorEventCategory::Registry:
+                    state.registryModifications++;
+                    if (config.detectPersistence) UpdatePersistenceScore(state, enrichedEvent);
+                    break;
 
-            case BehaviorEventType::MemoryAllocated:
-            case BehaviorEventType::MemoryProtected:
-            case BehaviorEventType::MemoryWritten:
-                scoreContribution = AnalyzeMemoryEvent(event, state, mitreId);
-                break;
+                case BehaviorEventCategory::Process:
+                    if (config.detectProcessInjection) UpdateInjectionScore(state, enrichedEvent);
+                    if (config.detectLateralMovement) UpdateLateralMovementScore(state, enrichedEvent);
+                    break;
 
-            case BehaviorEventType::NetworkConnection:
-            case BehaviorEventType::DNSQuery:
-                scoreContribution = AnalyzeNetworkEvent(event, state, mitreId);
-                break;
+                case BehaviorEventCategory::Thread:
+                    if (config.detectProcessInjection) UpdateInjectionScore(state, enrichedEvent);
+                    break;
 
-            default:
-                scoreContribution = 0.0;
-                break;
+                case BehaviorEventCategory::Memory:
+                    if (config.detectProcessInjection) UpdateInjectionScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::Network:
+                    state.networkConnections++;
+                    if (config.detectExfiltration) UpdateExfiltrationScore(state, enrichedEvent);
+                    if (config.detectC2) UpdateC2Score(state, enrichedEvent);
+                    if (config.detectLateralMovement) UpdateLateralMovementScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::Handle:
+                    if (config.detectCredentialTheft) UpdateCredentialScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::Service:
+                    if (config.detectPersistence) UpdatePersistenceScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::WMI:
+                    if (config.detectPersistence) UpdatePersistenceScore(state, enrichedEvent);
+                    if (config.detectLateralMovement) UpdateLateralMovementScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::Script:
+                    if (config.detectEvasion) UpdateEvasionScore(state, enrichedEvent);
+                    break;
+
+                case BehaviorEventCategory::System:
+                    if (config.detectRansomware) UpdateRansomwareScore(state, enrichedEvent);
+                    if (config.detectEvasion) UpdateEvasionScore(state, enrichedEvent);
+                    break;
+
+                default:
+                    break;
+            }
+
+            // Evasion detection for specific event types NOT already handled by category routing
+            if (config.detectEvasion) {
+                auto eType = enrichedEvent.eventType;
+                bool alreadyEvasionScored =
+                    (enrichedEvent.category == BehaviorEventCategory::Script ||
+                     enrichedEvent.category == BehaviorEventCategory::System);
+                if (!alreadyEvasionScored &&
+                    (eType == BehaviorEventType::AntiDebugAttempt ||
+                     eType == BehaviorEventType::VMDetectionAttempt ||
+                     eType == BehaviorEventType::SandboxDetectionAttempt ||
+                     eType == BehaviorEventType::LogClear ||
+                     eType == BehaviorEventType::Timestomp ||
+                     eType == BehaviorEventType::SecurityDisable)) {
+                    UpdateEvasionScore(state, enrichedEvent);
+                }
+            }
+
+            // Clamp malice score (modifier factored into threshold, NOT cumulated per event)
+            state.maliceScore = std::clamp(state.maliceScore,
+                                            0.0, BehaviorConstants::MAX_MALICE_SCORE);
+            if (state.maliceScore > state.peakMaliceScore) {
+                state.peakMaliceScore = state.maliceScore;
+            }
+
+            // MITRE mapping for any matched pattern
+            if (enrichedEvent.matchedPattern != BehaviorPatternType::Unknown) {
+                AddMitreMapping(state, enrichedEvent.matchedPattern);
+            }
+
+            // Check thresholds for verdict generation
+            verdict = CheckThresholds(state, enrichedEvent);
+
+            // Update tracked process count
+            m_impl->m_stats.trackedProcesses.store(m_impl->m_processStates.size(),
+                                                    std::memory_order_relaxed);
+            auto peak = m_impl->m_stats.peakTrackedProcesses.load(std::memory_order_relaxed);
+            if (m_impl->m_processStates.size() > peak) {
+                m_impl->m_stats.peakTrackedProcesses.store(m_impl->m_processStates.size(),
+                                                            std::memory_order_relaxed);
+            }
+        }
+        // stateLock released here
+
+        // Attack chain correlation — re-acquire statesMutex (lock order: states→chains OK)
+        if (config.enableAttackChains) {
+            std::unique_lock chainStateLock(m_impl->m_statesMutex);
+            auto chainIt = m_impl->m_processStates.find(enrichedEvent.processId);
+            if (chainIt != m_impl->m_processStates.end()) {
+                CorrelateWithAttackChains(enrichedEvent, chainIt->second);
+            }
         }
 
-        // Update process malice score
-        state.maliceScore += scoreContribution;
-        state.maliceScore = std::min(state.maliceScore, 100.0);
+        // Invoke callbacks outside all locks
+        if (verdict.has_value()) {
+            InvokeVerdictCallbacks(*verdict);
 
-        // Check for pattern matches
-        DetectBehaviorPatterns(state);
-
-        // Generate verdict if threshold exceeded
-        if (state.maliceScore >= m_impl->m_config.maliciousThreshold) {
-            GenerateVerdict(state);
+            // Auto-action if configured
+            if (config.autoTerminateOnCritical &&
+                verdict->severity == BehaviorSeverity::Critical) {
+                PerformAction(*verdict);
+            }
+            else if (config.autoSuspendOnBlock &&
+                     verdict->action >= RecommendedAction::Suspend) {
+                PerformAction(*verdict);
+            }
         }
 
-        // Invoke callback
-        if (m_impl->m_eventCallback) {
-            m_impl->m_eventCallback(event, state.maliceScore);
+        // Periodic cleanup (atomic time_point to avoid data race)
+        auto now = std::chrono::steady_clock::now();
+        auto lastCleanup = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(
+                m_impl->m_lastCleanupTimeRep.load(std::memory_order_relaxed)));
+        if (now - lastCleanup > BehaviorConstants::CLEANUP_INTERVAL) {
+            m_impl->m_lastCleanupTimeRep.store(
+                now.time_since_epoch().count(), std::memory_order_relaxed);
+            if (m_impl->m_threadPool) {
+                try {
+                    (void)m_impl->m_threadPool->Submit(
+                        [this](const Utils::TaskContext&) { PerformCleanup(); },
+                        Utils::TaskPriority::Low, "BA-Cleanup");
+                } catch (...) {
+                    PerformCleanup();
+                }
+            }
         }
 
-        // Update statistics
-        const auto endTime = Clock::now();
-        const auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
-        m_impl->m_statistics.totalProcessingTimeUs.fetch_add(durationUs, std::memory_order_relaxed);
+        // Update processing time (exponential moving average, α=1/8)
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - startTime).count();
+        uint64_t prev = m_impl->m_stats.avgProcessingTimeUs.load(std::memory_order_relaxed);
+        uint64_t ema = (prev * 7 + static_cast<uint64_t>(elapsed)) / 8;
+        m_impl->m_stats.avgProcessingTimeUs.store(ema, std::memory_order_relaxed);
 
+        return verdict;
+    }
+    catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"ProcessEvent exception for PID %u: %S",
+                     event.processId, ex.what());
+        return std::nullopt;
+    }
+}
+
+std::vector<BehaviorVerdict> BehaviorAnalyzer::ProcessEventBatch(
+    const std::vector<BehaviorEvent>& events)
+{
+    std::vector<BehaviorVerdict> verdicts;
+    verdicts.reserve(events.size() / 10);  // typically ~10% generate verdicts
+
+    for (const auto& event : events) {
+        auto verdict = ProcessEvent(event);
+        if (verdict.has_value()) {
+            verdicts.push_back(std::move(*verdict));
+        }
+    }
+
+    return verdicts;
+}
+
+bool BehaviorAnalyzer::ProcessEventAsync(BehaviorEvent event) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) return false;
+
+    std::shared_lock cfgLock(m_impl->m_configMutex);
+    auto tp = m_impl->m_threadPool;
+    cfgLock.unlock();
+
+    if (!tp) return false;
+
+    try {
+        (void)tp->Submit(
+            [this, ev = std::move(event)](const Utils::TaskContext&) mutable {
+                (void)ProcessEvent(ev);
+            },
+            Utils::TaskPriority::Normal, "BA-AsyncEvent");
         return true;
-
-    } catch (const std::exception& e) {
-        m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"BehaviorAnalyzer: Event processing failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+    }
+    catch (const std::exception&) {
+        m_impl->m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
         return false;
     }
 }
 
+BehaviorVerdict BehaviorAnalyzer::EvaluateProcess(uint32_t processId) {
+    std::shared_lock stateLock(m_impl->m_statesMutex);
+    auto it = m_impl->m_processStates.find(processId);
+    if (it == m_impl->m_processStates.end()) {
+        BehaviorVerdict v;
+        v.processId = processId;
+        v.verdictType = BehaviorVerdictType::Clean;
+        v.severity = BehaviorSeverity::Info;
+        v.timestamp = std::chrono::system_clock::now();
+        return v;
+    }
+
+    BehaviorEvent dummyEvent;
+    dummyEvent.processId = processId;
+    dummyEvent.timestamp = std::chrono::steady_clock::now();
+    dummyEvent.systemTime = std::chrono::system_clock::now();
+    return GenerateVerdict(it->second, dummyEvent);
+}
 // ============================================================================
-// Event Analysis Methods
+// Internal: GetOrCreateState (MUST be called under unique m_statesMutex lock)
 // ============================================================================
 
-double BehaviorAnalyzer::AnalyzeFileEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
+ProcessBehaviorState& BehaviorAnalyzer::GetOrCreateState(
+    uint32_t processId, const BehaviorEvent& event)
 {
-    double score = 0.0;
-
-    try {
-        std::wstring targetPath = event.targetPath;
-        std::transform(targetPath.begin(), targetPath.end(), targetPath.begin(), ::towlower);
-
-        // Check for ransomware indicators
-        if (event.eventType == BehaviorEventType::FileRenamed) {
-            // Check for ransomware extension
-            for (const auto& ext : m_impl->m_knownRansomwareExtensions) {
-                if (targetPath.ends_with(ext)) {
-                    score += 20.0;
-                    state.filesEncrypted++;
-                    mitreId = "T1486";  // Data Encrypted for Impact
-                    Utils::Logger::Warn(L"BehaviorAnalyzer: Ransomware extension detected - PID {} - {}",
-                                      event.processId, targetPath);
-                    break;
-                }
-            }
-
-            state.filesModified++;
-        }
-
-        // Check for mass file modifications (ransomware behavior)
-        if (event.eventType == BehaviorEventType::FileModified ||
-            event.eventType == BehaviorEventType::FileRenamed) {
-
-            const auto timeSinceStart = std::chrono::duration_cast<std::chrono::seconds>(
-                std::chrono::system_clock::now() - state.startTime
-            ).count();
-
-            if (timeSinceStart > 0) {
-                double modificationRate = static_cast<double>(state.filesModified) / static_cast<double>(timeSinceStart);
-
-                if (modificationRate > 10.0) {  // More than 10 files per second
-                    score += 15.0;
-                    mitreId = "T1486";
-                    Utils::Logger::Warn(L"BehaviorAnalyzer: High file modification rate - PID {} - {:.1f} files/sec",
-                                      event.processId, modificationRate);
-                }
-            }
-        }
-
-        // Check for shadow copy deletion
-        if (targetPath.find(L"shadow") != std::wstring::npos &&
-            event.eventType == BehaviorEventType::FileDeleted) {
-            score += 25.0;
-            state.shadowCopiesDeleted++;
-            mitreId = "T1490";  // Inhibit System Recovery
-            Utils::Logger::Warn(L"BehaviorAnalyzer: Shadow copy deletion - PID {}", event.processId);
-        }
-
-        // Check for system file modifications
-        if (targetPath.find(L"\\windows\\system32\\") != std::wstring::npos ||
-            targetPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) {
-            score += 10.0;
-            mitreId = "T1005";  // Data from Local System
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: File event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-double BehaviorAnalyzer::AnalyzeRegistryEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
-{
-    double score = 0.0;
-
-    try {
-        std::wstring targetPath = event.targetPath;
-        std::transform(targetPath.begin(), targetPath.end(), targetPath.begin(), ::towlower);
-
-        // Check for persistence mechanisms
-        for (const auto& persistLoc : m_impl->m_knownPersistenceLocations) {
-            std::wstring persistLocLower = persistLoc;
-            std::transform(persistLocLower.begin(), persistLocLower.end(), persistLocLower.begin(), ::towlower);
-
-            if (targetPath.find(persistLocLower) != std::wstring::npos) {
-                score += 20.0;
-                state.registryKeysModified++;
-                mitreId = "T1547";  // Boot or Logon Autostart Execution
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Persistence registry key modified - PID {} - {}",
-                                  event.processId, targetPath);
-                break;
-            }
-        }
-
-        // Check for service modifications
-        if (targetPath.find(L"\\services\\") != std::wstring::npos ||
-            targetPath.find(L"\\currentcontrolset\\services\\") != std::wstring::npos) {
-            score += 15.0;
-            mitreId = "T1543.003";  // Create or Modify System Process: Windows Service
-        }
-
-        // Check for scheduled task modifications
-        if (targetPath.find(L"\\schedule\\taskcache\\") != std::wstring::npos) {
-            score += 15.0;
-            mitreId = "T1053.005";  // Scheduled Task
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Registry event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-double BehaviorAnalyzer::AnalyzeProcessEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
-{
-    double score = 0.0;
-
-    try {
-        if (event.eventType == BehaviorEventType::ProcessCreated) {
-            state.childProcessesCreated++;
-
-            // Check for suspicious process creation patterns
-            std::wstring targetPath = event.targetPath;
-            std::transform(targetPath.begin(), targetPath.end(), targetPath.begin(), ::towlower);
-
-            // Command shell spawning
-            if (targetPath.find(L"cmd.exe") != std::wstring::npos ||
-                targetPath.find(L"powershell.exe") != std::wstring::npos ||
-                targetPath.find(L"wscript.exe") != std::wstring::npos) {
-                score += 5.0;
-                mitreId = "T1059";  // Command and Scripting Interpreter
-            }
-
-            // Suspicious process chains
-            if (state.childProcessesCreated > 5) {
-                score += 10.0;
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Multiple child processes - PID {} - {} children",
-                                  event.processId, state.childProcessesCreated);
-            }
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Process event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-double BehaviorAnalyzer::AnalyzeThreadEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
-{
-    double score = 0.0;
-
-    try {
-        if (event.eventType == BehaviorEventType::RemoteThreadCreated) {
-            state.remoteThreadCount++;
-            score += 25.0;
-            mitreId = "T1055.002";  // Process Injection: Portable Executable Injection
-
-            Utils::Logger::Warn(L"BehaviorAnalyzer: Remote thread creation detected - PID {} - Total: {}",
-                              event.processId, state.remoteThreadCount);
-
-            // Multiple remote threads is highly suspicious
-            if (state.remoteThreadCount > 3) {
-                score += 20.0;
-            }
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Thread event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-double BehaviorAnalyzer::AnalyzeMemoryEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
-{
-    double score = 0.0;
-
-    try {
-        if (event.eventType == BehaviorEventType::MemoryWritten) {
-            state.remoteMemoryWrites++;
-            score += 15.0;
-            mitreId = "T1055";  // Process Injection
-
-            if (state.remoteMemoryWrites > 5) {
-                score += 15.0;
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Multiple remote memory writes - PID {} - Total: {}",
-                                  event.processId, state.remoteMemoryWrites);
-            }
-        }
-
-        if (event.eventType == BehaviorEventType::MemoryProtected) {
-            // Changing memory protection (RWX) is suspicious
-            score += 10.0;
-            mitreId = "T1055";
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Memory event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-double BehaviorAnalyzer::AnalyzeNetworkEvent(
-    const BehaviorEvent& event,
-    ProcessBehaviorState& state,
-    std::string& mitreId)
-{
-    double score = 0.0;
-
-    try {
-        if (event.eventType == BehaviorEventType::NetworkConnection) {
-            state.networkConnections++;
-
-            // Check with ThreatIntel for known malicious IPs/domains
-            if (m_impl->m_threatIntel) {
-                // ThreatIntel integration would go here
-            }
-
-            // Multiple network connections could indicate C2 communication
-            if (state.networkConnections > 10) {
-                score += 5.0;
-                mitreId = "T1071";  // Application Layer Protocol
-            }
-        }
-
-        return score;
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Network event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return 0.0;
-    }
-}
-
-// ============================================================================
-// Pattern Detection
-// ============================================================================
-
-void BehaviorAnalyzer::DetectBehaviorPatterns(ProcessBehaviorState& state) {
-    try {
-        // Ransomware pattern detection
-        if (state.filesEncrypted > 10 || state.shadowCopiesDeleted > 0) {
-            if (std::find(state.detectedPatterns.begin(), state.detectedPatterns.end(),
-                         BehaviorPatternType::Ransomware) == state.detectedPatterns.end()) {
-                state.detectedPatterns.push_back(BehaviorPatternType::Ransomware);
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Ransomware pattern detected - PID {}", state.processId);
-            }
-        }
-
-        // Process injection pattern
-        if (state.remoteThreadCount > 0 || state.remoteMemoryWrites > 3) {
-            if (std::find(state.detectedPatterns.begin(), state.detectedPatterns.end(),
-                         BehaviorPatternType::ProcessInjection) == state.detectedPatterns.end()) {
-                state.detectedPatterns.push_back(BehaviorPatternType::ProcessInjection);
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Process injection pattern detected - PID {}", state.processId);
-            }
-        }
-
-        // Persistence pattern
-        if (state.registryKeysModified > 0) {
-            if (std::find(state.detectedPatterns.begin(), state.detectedPatterns.end(),
-                         BehaviorPatternType::Persistence) == state.detectedPatterns.end()) {
-                state.detectedPatterns.push_back(BehaviorPatternType::Persistence);
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Persistence pattern detected - PID {}", state.processId);
-            }
-        }
-
-        // Credential theft pattern
-        if (state.lsassAccessAttempts > 0) {
-            if (std::find(state.detectedPatterns.begin(), state.detectedPatterns.end(),
-                         BehaviorPatternType::CredentialTheft) == state.detectedPatterns.end()) {
-                state.detectedPatterns.push_back(BehaviorPatternType::CredentialTheft);
-                Utils::Logger::Warn(L"BehaviorAnalyzer: Credential theft pattern detected - PID {}", state.processId);
-            }
-        }
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Pattern detection failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-    }
-}
-
-// ============================================================================
-// Verdict Generation
-// ============================================================================
-
-void BehaviorAnalyzer::GenerateVerdict(const ProcessBehaviorState& state) {
-    try {
-        BehaviorVerdict verdict;
-        verdict.processId = state.processId;
-        verdict.processName = state.processName;
-        verdict.executablePath = state.executablePath;
-        verdict.maliceScore = state.maliceScore;
-        verdict.confidenceLevel = CalculateConfidenceLevel(state.maliceScore);
-        verdict.detectedPatterns = state.detectedPatterns;
-        verdict.verdictTime = std::chrono::system_clock::now();
-
-        // Determine severity
-        if (state.maliceScore >= 80.0) {
-            verdict.severity = ThreatSeverity::Critical;
-            verdict.isMalicious = true;
-        } else if (state.maliceScore >= 60.0) {
-            verdict.severity = ThreatSeverity::High;
-            verdict.isMalicious = true;
-        } else if (state.maliceScore >= 40.0) {
-            verdict.severity = ThreatSeverity::Medium;
-            verdict.isMalicious = true;
-        } else {
-            verdict.severity = ThreatSeverity::Low;
-            verdict.isMalicious = false;
-        }
-
-        // Determine recommended action
-        if (state.maliceScore >= 80.0) {
-            verdict.recommendedAction = ResponseAction::TerminateProcess;
-        } else if (state.maliceScore >= 60.0) {
-            verdict.recommendedAction = ResponseAction::QuarantineFile;
-        } else if (state.maliceScore >= 40.0) {
-            verdict.recommendedAction = ResponseAction::BlockNetwork;
-        } else {
-            verdict.recommendedAction = ResponseAction::Alert;
-        }
-
-        // Add evidence
-        verdict.evidence.push_back(L"Files encrypted: " + std::to_wstring(state.filesEncrypted));
-        verdict.evidence.push_back(L"Files modified: " + std::to_wstring(state.filesModified));
-        verdict.evidence.push_back(L"Registry keys modified: " + std::to_wstring(state.registryKeysModified));
-        verdict.evidence.push_back(L"Remote threads: " + std::to_wstring(state.remoteThreadCount));
-        verdict.evidence.push_back(L"Remote memory writes: " + std::to_wstring(state.remoteMemoryWrites));
-        verdict.evidence.push_back(L"Child processes: " + std::to_wstring(state.childProcessesCreated));
-
-        // Invoke callback
-        if (m_impl->m_verdictCallback) {
-            m_impl->m_verdictCallback(verdict);
-        }
-
-        // Update statistics
-        m_impl->m_statistics.verdictsGenerated.fetch_add(1, std::memory_order_relaxed);
-        if (verdict.isMalicious) {
-            m_impl->m_statistics.maliciousProcesses.fetch_add(1, std::memory_order_relaxed);
-        }
-
-        Utils::Logger::Warn(L"BehaviorAnalyzer: Verdict generated - PID {} - {} - Score: {:.1f} - Action: {}",
-                          state.processId,
-                          state.processName,
-                          state.maliceScore,
-                          static_cast<int>(verdict.recommendedAction));
-
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Verdict generation failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
-    }
-}
-
-ConfidenceLevel BehaviorAnalyzer::CalculateConfidenceLevel(double maliceScore) const noexcept {
-    if (maliceScore >= 90.0) return ConfidenceLevel::VeryHigh;
-    if (maliceScore >= 70.0) return ConfidenceLevel::High;
-    if (maliceScore >= 50.0) return ConfidenceLevel::Medium;
-    if (maliceScore >= 30.0) return ConfidenceLevel::Low;
-    return ConfidenceLevel::VeryLow;
-}
-
-// ============================================================================
-// Process State Queries
-// ============================================================================
-
-std::optional<ProcessBehaviorState> BehaviorAnalyzer::GetProcessState(uint32_t processId) const {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_statesMutex);
-
     auto it = m_impl->m_processStates.find(processId);
     if (it != m_impl->m_processStates.end()) {
         return it->second;
     }
 
-    return std::nullopt;
-}
+    // Enforce tracked process cap
+    if (m_impl->m_processStates.size() >= BehaviorConstants::MAX_TRACKED_PROCESSES) {
+        // Evict oldest low-score process
+        uint32_t evictPid = 0;
+        double lowestScore = BehaviorConstants::MAX_MALICE_SCORE + 1.0;
+        auto oldestTime = std::chrono::steady_clock::now();
 
-std::vector<ProcessBehaviorState> BehaviorAnalyzer::GetAllProcessStates() const {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_statesMutex);
-
-    std::vector<ProcessBehaviorState> states;
-    states.reserve(m_impl->m_processStates.size());
-
-    for (const auto& [pid, state] : m_impl->m_processStates) {
-        states.push_back(state);
-    }
-
-    return states;
-}
-
-std::vector<ProcessBehaviorState> BehaviorAnalyzer::GetSuspiciousProcesses(double threshold) const {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_statesMutex);
-
-    std::vector<ProcessBehaviorState> suspicious;
-
-    for (const auto& [pid, state] : m_impl->m_processStates) {
-        if (state.maliceScore >= threshold) {
-            suspicious.push_back(state);
+        for (const auto& [pid, st] : m_impl->m_processStates) {
+            if (st.maliceScore < lowestScore ||
+                (st.maliceScore == lowestScore && st.lastUpdateTime < oldestTime)) {
+                lowestScore = st.maliceScore;
+                oldestTime = st.lastUpdateTime;
+                evictPid = pid;
+            }
+        }
+        if (evictPid != 0) {
+            m_impl->m_processStates.erase(evictPid);
         }
     }
 
-    // Sort by malice score (descending)
-    std::sort(suspicious.begin(), suspicious.end(),
-             [](const ProcessBehaviorState& a, const ProcessBehaviorState& b) {
-                 return a.maliceScore > b.maliceScore;
-             });
+    auto& state = m_impl->m_processStates[processId];
+    state.processId = processId;
+    state.parentProcessId = event.parentProcessId;
+    state.processName = event.processName;
+    state.processPath = event.processPath;
+    state.commandLine = event.commandLine;
+    state.userSid = event.userSid;
+    state.stateCreatedAt = std::chrono::steady_clock::now();
+    state.lastUpdateTime = state.stateCreatedAt;
+    state.creationTime = event.systemTime;
 
-    return suspicious;
-}
-
-void BehaviorAnalyzer::ClearProcessState(uint32_t processId) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_statesMutex);
-    m_impl->m_processStates.erase(processId);
-}
-
-void BehaviorAnalyzer::ClearAllStates() {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_statesMutex);
-    m_impl->m_processStates.clear();
-}
-
-// ============================================================================
-// Attack Chain Correlation
-// ============================================================================
-
-std::vector<AttackChain> BehaviorAnalyzer::CorrelateAttackChains() {
-    std::lock_guard<std::mutex> queueLock(m_impl->m_queueMutex);
-    std::lock_guard<std::mutex> chainLock(m_impl->m_chainsMutex);
-
-    std::vector<AttackChain> newChains;
-
-    // Simple correlation: group events by process and time proximity
-    std::unordered_map<uint32_t, std::vector<BehaviorEvent>> eventsByProcess;
-
-    for (const auto& event : m_impl->m_eventQueue) {
-        eventsByProcess[event.processId].push_back(event);
-    }
-
-    // Look for attack patterns
-    for (const auto& [pid, events] : eventsByProcess) {
-        if (events.size() >= 3) {  // Minimum chain length
-            AttackChain chain;
-            chain.chainId = static_cast<uint32_t>(m_impl->m_detectedChains.size() + newChains.size() + 1);
-            chain.startTime = events.front().timestamp;
-            chain.endTime = events.back().timestamp;
-            chain.involvedProcesses.push_back(pid);
-            chain.events = events;
-
-            // Calculate severity based on event types
-            chain.severity = ThreatSeverity::Medium;
-            chain.confidence = CalculateConfidenceLevel(50.0);  // Basic confidence
-
-            newChains.push_back(chain);
-        }
-    }
-
-    // Add to detected chains
-    m_impl->m_detectedChains.insert(m_impl->m_detectedChains.end(), newChains.begin(), newChains.end());
-
-    return newChains;
-}
-
-std::vector<AttackChain> BehaviorAnalyzer::GetDetectedChains() const {
-    std::lock_guard<std::mutex> lock(m_impl->m_chainsMutex);
-    return m_impl->m_detectedChains;
-}
-
-// ============================================================================
-// Configuration and Statistics
-// ============================================================================
-
-BehaviorConfiguration BehaviorAnalyzer::GetConfiguration() const {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    return m_impl->m_config;
-}
-
-void BehaviorAnalyzer::SetConfiguration(const BehaviorConfiguration& config) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    m_impl->m_config = config;
-}
-
-BehaviorStatistics BehaviorAnalyzer::GetStatistics() const {
-    return m_impl->m_statistics;
-}
-
-void BehaviorAnalyzer::ResetStatistics() {
-    m_impl->m_statistics.Reset();
-}
-
-void BehaviorStatistics::Reset() noexcept {
-    eventsProcessed.store(0, std::memory_order_relaxed);
-    verdictsGenerated.store(0, std::memory_order_relaxed);
-    maliciousProcesses.store(0, std::memory_order_relaxed);
-    ransomwareDetections.store(0, std::memory_order_relaxed);
-    injectionDetections.store(0, std::memory_order_relaxed);
-    persistenceDetections.store(0, std::memory_order_relaxed);
-    credentialTheftDetections.store(0, std::memory_order_relaxed);
-    attackChainsDetected.store(0, std::memory_order_relaxed);
-    errors.store(0, std::memory_order_relaxed);
-    totalProcessingTimeUs.store(0, std::memory_order_relaxed);
-
-    for (auto& counter : byPattern) {
-        counter.store(0, std::memory_order_relaxed);
-    }
-}
-
-double BehaviorStatistics::GetAverageProcessingTimeMs() const noexcept {
-    const uint64_t total = eventsProcessed.load(std::memory_order_relaxed);
-    if (total == 0) return 0.0;
-
-    const uint64_t totalUs = totalProcessingTimeUs.load(std::memory_order_relaxed);
-    return (static_cast<double>(totalUs) / static_cast<double>(total)) / 1000.0;
-}
-
-// ============================================================================
-// Callbacks
-// ============================================================================
-
-void BehaviorAnalyzer::RegisterEventCallback(EventCallback callback) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    m_impl->m_eventCallback = std::move(callback);
-}
-
-void BehaviorAnalyzer::RegisterVerdictCallback(VerdictCallback callback) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    m_impl->m_verdictCallback = std::move(callback);
-}
-
-void BehaviorAnalyzer::RegisterChainDetectedCallback(ChainDetectedCallback callback) {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    m_impl->m_chainCallback = std::move(callback);
-}
-
-void BehaviorAnalyzer::UnregisterCallbacks() {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-    m_impl->m_eventCallback = nullptr;
-    m_impl->m_verdictCallback = nullptr;
-    m_impl->m_chainCallback = nullptr;
-}
-
-// ============================================================================
-// Self-Test
-// ============================================================================
-
-bool BehaviorAnalyzer::SelfTest() {
+    // Enrich from ProcessUtils if available
     try {
-        Utils::Logger::Info(L"BehaviorAnalyzer: Starting self-test");
+        auto procName = Utils::ProcessUtils::GetProcessName(processId);
+        if (procName.has_value() && state.processName.empty()) {
+            state.processName = *procName;
+        }
+        auto procPath = Utils::ProcessUtils::GetProcessPath(processId);
+        if (procPath.has_value() && state.processPath.empty()) {
+            state.processPath = *procPath;
+        }
+    } catch (...) {}
 
-        // Test event processing
-        BehaviorEvent testEvent;
-        testEvent.eventType = BehaviorEventType::FileModified;
-        testEvent.processId = 1234;
-        testEvent.targetPath = L"C:\\test\\file.txt";
-        testEvent.timestamp = std::chrono::system_clock::now();
+    // Set trust flags based on process name
+    auto lowerName = ToLowerCase(state.processName);
+    if (lowerName == L"system" || lowerName == L"idle" ||
+        lowerName == L"smss.exe" || lowerName == L"csrss.exe" ||
+        lowerName == L"wininit.exe" || lowerName == L"services.exe") {
+        state.isSystemProcess = true;
+    }
+    if (m_impl->m_documentApps.count(lowerName) > 0) {
+        state.hasDocumentParent = true;
+    }
+    if (m_impl->m_scriptInterpreters.count(lowerName) > 0) {
+        state.hasScriptParent = true;
+    }
 
-        bool result = ProcessEvent(testEvent);
-        if (!result && !IsInitialized()) {
-            Utils::Logger::Info(L"BehaviorAnalyzer: Self-test passed (not initialized, expected behavior)");
-            return true;
+    return state;
+}
+
+// ============================================================================
+// Detection Engine: Ransomware
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateRansomwareScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::FileWrite:
+        case BehaviorEventType::FileCreate: {
+            state.filesModified++;
+
+            // High entropy write detection
+            if (event.fileEntropy >= BehaviorConstants::ENCRYPTION_ENTROPY_THRESHOLD) {
+                state.highEntropyWrites++;
+                state.filesEncrypted++;
+                scoreAdd += 3.0;
+
+                if (state.highEntropyWrites >= BehaviorConstants::RANSOMWARE_FILE_THRESHOLD) {
+                    scoreAdd += 20.0;
+                    AddMitreMapping(state, BehaviorPatternType::RansomwareEncryption);
+                    m_impl->m_stats.ransomwareDetections.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Canary file check
+            if (!event.targetPath.empty()) {
+                auto lowerTarget = ToLowerCase(event.targetPath);
+                std::shared_lock canaryLock(m_impl->m_canaryMutex);
+                if (m_impl->m_canaryFiles.count(lowerTarget) > 0) {
+                    state.canaryFilesTouched++;
+                    scoreAdd += BehaviorConstants::CANARY_FILE_SCORE;
+                    AddMitreMapping(state, BehaviorPatternType::RansomwareCanaryTouch);
+                }
+            }
+
+            // Ransom note detection
+            if (IsRansomNotePattern(event.targetPath)) {
+                state.ransomNoteIndicators++;
+                scoreAdd += BehaviorConstants::RANSOM_NOTE_SCORE;
+                AddMitreMapping(state, BehaviorPatternType::RansomwareNote);
+            }
+
+            // File modification rate tracking
+            auto now = std::chrono::steady_clock::now();
+            if (state.lastFileModTime != std::chrono::steady_clock::time_point{}) {
+                auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
+                    now - state.lastFileModTime).count();
+                if (elapsedMs > 0) {
+                    state.fileModificationRate = 1000.0 / static_cast<double>(elapsedMs);
+                    if (state.fileModificationRate > BehaviorConstants::RANSOMWARE_RATE_THRESHOLD) {
+                        scoreAdd += 5.0;
+                    }
+                }
+            }
+            state.lastFileModTime = now;
+            break;
         }
 
-        Utils::Logger::Info(L"BehaviorAnalyzer: Self-test passed");
-        return true;
+        case BehaviorEventType::FileRename: {
+            state.fileRenames++;
+            auto lowerExt = ToLowerCase(event.fileExtension);
+            if (!lowerExt.empty() && m_impl->m_ransomwareExtensions.count(lowerExt) > 0) {
+                state.extensionChanges++;
+                scoreAdd += 8.0;
+                AddMitreMapping(state, BehaviorPatternType::RansomwareExtensionChange);
+            }
+            break;
+        }
 
-    } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BehaviorAnalyzer: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        case BehaviorEventType::FileDelete: {
+            state.filesDeleted++;
+            if (state.filesDeleted > BehaviorConstants::RANSOMWARE_FILE_THRESHOLD) {
+                scoreAdd += 5.0;
+                AddMitreMapping(state, BehaviorPatternType::RansomwareMassDelete);
+            }
+            break;
+        }
+
+        case BehaviorEventType::ShadowCopyDelete: {
+            state.shadowCopyOperations++;
+            scoreAdd += BehaviorConstants::SHADOW_COPY_DELETE_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::RansomwareShadowDelete);
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Process Injection
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateInjectionScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::ThreadRemoteCreate:
+            state.remoteThreadCount++;
+            if (event.targetProcessId != 0) {
+                state.targetedProcessIds.insert(event.targetProcessId);
+            }
+            scoreAdd += BehaviorConstants::REMOTE_THREAD_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::InjectionRemoteThread);
+            m_impl->m_stats.injectionDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::MemoryRemoteAllocate:
+            if (event.targetProcessId != 0) {
+                state.targetedProcessIds.insert(event.targetProcessId);
+                state.remoteAllocations.emplace_back(event.targetProcessId, event.targetAddress);
+            }
+            scoreAdd += BehaviorConstants::REMOTE_ALLOC_SCORE;
+            break;
+
+        case BehaviorEventType::MemoryRemoteWrite:
+            state.crossProcessWrites++;
+            if (event.targetProcessId != 0) {
+                state.targetedProcessIds.insert(event.targetProcessId);
+            }
+            scoreAdd += BehaviorConstants::WRITE_PROCESS_MEMORY_SCORE;
+            break;
+
+        case BehaviorEventType::ProcessHollow:
+            scoreAdd += BehaviorConstants::PROCESS_HOLLOWING_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::InjectionHollowing);
+            m_impl->m_stats.injectionDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::ProcessInject:
+            scoreAdd += BehaviorConstants::DLL_INJECTION_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::InjectionDLL);
+            if (!event.targetPath.empty()) {
+                state.injectedDLLs.push_back(event.targetPath);
+            }
+            m_impl->m_stats.injectionDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::ThreadQueueAPC:
+            scoreAdd += BehaviorConstants::APC_INJECTION_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::InjectionAPC);
+            m_impl->m_stats.injectionDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::ThreadHijack:
+            scoreAdd += BehaviorConstants::DLL_INJECTION_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::InjectionThreadHijack);
+            break;
+
+        // Compound pattern: remote alloc + remote write to same target = injection
+        case BehaviorEventType::MemoryRemoteProtect:
+            if (state.crossProcessWrites > 0 && state.remoteAllocations.size() > 0) {
+                scoreAdd += 15.0;
+                AddMitreMapping(state, BehaviorPatternType::InjectionReflective);
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Persistence
+// ============================================================================
+
+void BehaviorAnalyzer::UpdatePersistenceScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::RegistrySetValue:
+        case BehaviorEventType::RegistryCreateKey: {
+            if (IsPersistenceRegistryPath(event.targetPath)) {
+                scoreAdd += BehaviorConstants::REG_RUN_KEY_SCORE;
+                state.persistenceLocations.push_back(event.targetPath);
+                AddMitreMapping(state, BehaviorPatternType::PersistenceRunKey);
+                m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
+
+                // IFEO hijack is especially suspicious
+                if (ContainsCaseInsensitive(event.targetPath,
+                        L"Image File Execution Options")) {
+                    scoreAdd += 15.0;
+                    AddMitreMapping(state, BehaviorPatternType::PersistenceIFEO);
+                }
+
+                // AppInit DLLs
+                if (ContainsCaseInsensitive(event.targetPath, L"AppInit_DLLs")) {
+                    scoreAdd += 10.0;
+                    AddMitreMapping(state, BehaviorPatternType::PersistenceAppInit);
+                }
+            }
+            break;
+        }
+
+        case BehaviorEventType::TaskCreate:
+            scoreAdd += BehaviorConstants::SCHEDULED_TASK_SCORE;
+            state.createdTasks.push_back(event.targetPath);
+            AddMitreMapping(state, BehaviorPatternType::PersistenceScheduledTask);
+            m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::ServiceInstall:
+            scoreAdd += BehaviorConstants::SERVICE_INSTALL_SCORE;
+            state.createdServices.push_back(event.targetPath);
+            AddMitreMapping(state, BehaviorPatternType::PersistenceService);
+            m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::WMISubscription:
+            scoreAdd += BehaviorConstants::WMI_PERSISTENCE_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::PersistenceWMI);
+            m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        case BehaviorEventType::BootConfigModify:
+            scoreAdd += BehaviorConstants::BOOT_CONFIG_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::PersistenceBootConfig);
+            m_impl->m_stats.persistenceDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Credential Theft
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateCredentialScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::LSASSAccess: {
+            state.credentialAccessAttempts++;
+            scoreAdd += BehaviorConstants::LSASS_ACCESS_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::CredentialLSASSDump);
+            m_impl->m_stats.credentialTheftDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+
+        case BehaviorEventType::SAMAccess: {
+            state.credentialAccessAttempts++;
+            scoreAdd += BehaviorConstants::SAM_ACCESS_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::CredentialSAMAccess);
+            m_impl->m_stats.credentialTheftDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+
+        case BehaviorEventType::CredentialAccess:
+        case BehaviorEventType::CredentialDump: {
+            state.credentialAccessAttempts++;
+            scoreAdd += BehaviorConstants::CREDENTIAL_STORE_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::CredentialStoreAccess);
+            m_impl->m_stats.credentialTheftDetections.fetch_add(1, std::memory_order_relaxed);
+            break;
+        }
+
+        case BehaviorEventType::TokenSteal:
+        case BehaviorEventType::TokenDuplicate: {
+            state.credentialAccessAttempts++;
+            scoreAdd += 20.0;
+            AddMitreMapping(state, BehaviorPatternType::CredentialTokenManip);
+            break;
+        }
+
+        // Handle-based detection: process opening LSASS with suspicious access
+        case BehaviorEventType::ProcessOpen: {
+            if (event.targetProcessId != 0) {
+                // Resolve TARGET process name — we detect WHO is being opened, not the opener
+                std::wstring targetName;
+                auto targetNameOpt = Utils::ProcessUtils::GetProcessName(event.targetProcessId);
+                if (targetNameOpt.has_value()) {
+                    targetName = ToLowerCase(*targetNameOpt);
+                }
+                if (m_impl->m_credentialTargets.count(targetName) > 0 ||
+                    IsLSASSProcess(targetName)) {
+                    if (event.accessMask & (PROCESS_VM_READ | PROCESS_QUERY_INFORMATION)) {
+                        state.credentialAccessAttempts++;
+                        scoreAdd += BehaviorConstants::LSASS_ACCESS_SCORE;
+                        AddMitreMapping(state, BehaviorPatternType::CredentialLSASSDump);
+                    }
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+// ============================================================================
+// Detection Engine: Evasion
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateEvasionScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::AntiDebugAttempt:
+            state.evasionAttempts++;
+            scoreAdd += BehaviorConstants::ANTI_DEBUG_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::EvasionMasquerade);
+            break;
+
+        case BehaviorEventType::VMDetectionAttempt:
+        case BehaviorEventType::SandboxDetectionAttempt:
+            state.evasionAttempts++;
+            scoreAdd += BehaviorConstants::ANTI_DEBUG_SCORE;
+            break;
+
+        case BehaviorEventType::LogClear:
+            state.evasionAttempts++;
+            scoreAdd += BehaviorConstants::LOG_TAMPERING_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::EvasionLogClear);
+            break;
+
+        case BehaviorEventType::Timestomp:
+            state.evasionAttempts++;
+            scoreAdd += BehaviorConstants::TIMESTOMPING_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::EvasionTimestomp);
+            break;
+
+        case BehaviorEventType::SecurityDisable:
+            state.evasionAttempts++;
+            scoreAdd += BehaviorConstants::SECURITY_INTERFERENCE_SCORE;
+            AddMitreMapping(state, BehaviorPatternType::EvasionSecurityDisable);
+            break;
+
+        // Process masquerading: script interpreters spawning with suspicious args
+        case BehaviorEventType::ProcessCreate:
+            if (state.hasScriptParent && !state.processPath.empty()) {
+                auto lowerPath = ToLowerCase(state.processPath);
+                if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
+                    lowerPath.find(L"\\appdata\\") != std::wstring::npos) {
+                    state.evasionAttempts++;
+                    scoreAdd += 10.0;
+                    AddMitreMapping(state, BehaviorPatternType::EvasionMasquerade);
+                }
+            }
+            break;
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Exfiltration
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateExfiltrationScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::NetworkSend:
+        case BehaviorEventType::NetworkUpload: {
+            state.outboundBytes += event.bytesSent;
+
+            // Large single transfer (>10MB)
+            if (event.bytesSent > 10 * 1024 * 1024) {
+                scoreAdd += 10.0;
+                AddMitreMapping(state, BehaviorPatternType::ExfilLargeTransfer);
+            }
+
+            // Cumulative large transfer (>100MB total) — score only once
+            if (state.outboundBytes > 100ULL * 1024 * 1024 &&
+                !state.exfilThresholdTriggered) {
+                state.exfilThresholdTriggered = true;
+                scoreAdd += 15.0;
+                AddMitreMapping(state, BehaviorPatternType::ExfilLargeTransfer);
+            }
+            break;
+        }
+
+        case BehaviorEventType::NetworkDNSQuery: {
+            state.dnsQueryCount++;
+
+            // DNS tunneling: unusually long subdomain labels
+            if (!event.remoteHostname.empty() && event.remoteHostname.size() > 50) {
+                scoreAdd += 12.0;
+                AddMitreMapping(state, BehaviorPatternType::ExfilDNSTunnel);
+            }
+
+            // High DNS query rate (>100 queries from a single process is suspicious)
+            if (state.dnsQueryCount > 100) {
+                scoreAdd += 5.0;
+            }
+            break;
+        }
+
+        case BehaviorEventType::FileCreate: {
+            // Archive creation before transfer
+            auto lowerPath = ToLowerCase(event.targetPath);
+            if (lowerPath.ends_with(L".zip") || lowerPath.ends_with(L".rar") ||
+                lowerPath.ends_with(L".7z") || lowerPath.ends_with(L".tar") ||
+                lowerPath.ends_with(L".gz")) {
+                if (state.outboundBytes > 1024 * 1024) {
+                    scoreAdd += 8.0;
+                    AddMitreMapping(state, BehaviorPatternType::ExfilArchiveCreate);
+                }
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Lateral Movement
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateLateralMovementScore(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    switch (event.eventType) {
+        case BehaviorEventType::ServiceInstall:
+            // Remote service creation is a lateral movement indicator
+            if (event.targetProcessId != 0 && event.targetProcessId != event.processId) {
+                scoreAdd += 20.0;
+                AddMitreMapping(state, BehaviorPatternType::LateralService);
+            }
+            break;
+
+        case BehaviorEventType::WMIExec:
+            scoreAdd += 15.0;
+            AddMitreMapping(state, BehaviorPatternType::LateralWMI);
+            break;
+
+        case BehaviorEventType::NetworkConnect: {
+            // SMB connections to port 445
+            if (event.remotePort == 445) {
+                scoreAdd += 8.0;
+                AddMitreMapping(state, BehaviorPatternType::LateralSMB);
+            }
+            // RDP connections to port 3389
+            if (event.remotePort == 3389) {
+                scoreAdd += 10.0;
+                AddMitreMapping(state, BehaviorPatternType::LateralRDP);
+            }
+            // WinRM / PSRemoting
+            if (event.remotePort == 5985 || event.remotePort == 5986) {
+                scoreAdd += 12.0;
+                AddMitreMapping(state, BehaviorPatternType::LateralPSExec);
+            }
+            break;
+        }
+
+        default:
+            break;
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+
+// ============================================================================
+// Detection Engine: Command & Control
+// ============================================================================
+
+void BehaviorAnalyzer::UpdateC2Score(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    double scoreAdd = 0.0;
+
+    if (event.eventType == BehaviorEventType::NetworkConnect ||
+        event.eventType == BehaviorEventType::NetworkSend ||
+        event.eventType == BehaviorEventType::NetworkHTTPRequest ||
+        event.eventType == BehaviorEventType::NetworkHTTPSRequest) {
+
+        // Track contacted destinations
+        if (!event.remoteIP.empty()) {
+            state.contactedIPs.insert(event.remoteIP);
+        }
+        if (!event.remoteHostname.empty()) {
+            state.contactedDomains.insert(event.remoteHostname);
+        }
+
+        // ThreatIntel lookup for network destinations
+        if (m_impl->m_threatIntel) {
+            if (!event.remoteHostname.empty()) {
+                auto result = m_impl->m_threatIntel->LookupDomain(event.remoteHostname);
+                if (result.found) {
+                    state.c2Indicators++;
+                    scoreAdd += 30.0;
+                    AddMitreMapping(state, BehaviorPatternType::C2KnownProtocol);
+                    SS_LOG_WARN(L"BehaviorAnalyzer", L"PID %u contacted known-bad domain: %S",
+                                state.processId, event.remoteHostname.c_str());
+                }
+            }
+        }
+
+        // Beaconing detection: regular interval connections
+        if (state.recentEvents.size() >= 5) {
+            size_t networkEventCount = 0;
+            std::vector<int64_t> intervals;
+            std::chrono::steady_clock::time_point lastNetTime{};
+
+            for (auto it = state.recentEvents.rbegin();
+                 it != state.recentEvents.rend() && networkEventCount < 20; ++it) {
+                if (it->category == BehaviorEventCategory::Network) {
+                    if (lastNetTime != std::chrono::steady_clock::time_point{}) {
+                        auto interval = std::chrono::duration_cast<std::chrono::seconds>(
+                            lastNetTime - it->timestamp).count();
+                        if (interval > 0) intervals.push_back(interval);
+                    }
+                    lastNetTime = it->timestamp;
+                    networkEventCount++;
+                }
+            }
+
+            // Check for regular intervals (low coefficient of variation)
+            if (intervals.size() >= 4) {
+                double mean = 0.0;
+                for (auto iv : intervals) mean += static_cast<double>(iv);
+                mean /= static_cast<double>(intervals.size());
+
+                if (mean > 1.0) {
+                    double variance = 0.0;
+                    for (auto iv : intervals) {
+                        double diff = static_cast<double>(iv) - mean;
+                        variance += diff * diff;
+                    }
+                    variance /= static_cast<double>(intervals.size());
+                    double stddev = std::sqrt(variance);
+                    double cv = stddev / mean;
+
+                    // CV < 0.3 indicates regular beaconing
+                    if (cv < 0.3) {
+                        state.c2Indicators++;
+                        scoreAdd += 20.0;
+                        AddMitreMapping(state, BehaviorPatternType::C2Beacon);
+                    }
+                }
+            }
+        }
+
+        // DGA detection: high-entropy domain names
+        if (!event.remoteHostname.empty()) {
+            // Count unique characters / total length as entropy proxy
+            std::unordered_set<char> uniqueChars(event.remoteHostname.begin(),
+                                                  event.remoteHostname.end());
+            double entropyRatio = static_cast<double>(uniqueChars.size()) /
+                                  static_cast<double>(event.remoteHostname.size());
+
+            // DGA domains tend to have high unique character ratio with length > 15
+            if (event.remoteHostname.size() > 15 && entropyRatio > 0.7) {
+                state.c2Indicators++;
+                scoreAdd += 10.0;
+                AddMitreMapping(state, BehaviorPatternType::C2DGA);
+            }
+        }
+    }
+
+    state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
+}
+// ============================================================================
+// Internal: Score Decay
+// ============================================================================
+
+void BehaviorAnalyzer::ApplyScoreDecay(ProcessBehaviorState& state) {
+    // Default overload: snapshot config internally (only safe when statesMutex NOT held)
+    BehaviorAnalyzerConfig config;
+    {
+        std::shared_lock cfgLock(m_impl->m_configMutex);
+        config = m_impl->m_config;
+    }
+    ApplyScoreDecay(state, config);
+}
+
+void BehaviorAnalyzer::ApplyScoreDecay(
+    ProcessBehaviorState& state, const BehaviorAnalyzerConfig& config)
+{
+    auto now = std::chrono::steady_clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::minutes>(
+        now - state.lastUpdateTime);
+
+    if (elapsed.count() > 0 && state.maliceScore > 0.0) {
+        if (config.enableScoreDecay) {
+            double decay = config.scoreDecayRate * static_cast<double>(elapsed.count());
+            state.maliceScore = std::max(0.0, state.maliceScore - decay);
+        }
+    }
+}
+
+// ============================================================================
+// Internal: Threshold Check & Verdict Generation
+// ============================================================================
+
+std::optional<BehaviorVerdict> BehaviorAnalyzer::CheckThresholds(
+    ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    BehaviorAnalyzerConfig config;
+    {
+        std::shared_lock cfgLock(m_impl->m_configMutex);
+        config = m_impl->m_config;
+    }
+
+    // Determine verdict type based on score
+    BehaviorVerdictType newVerdict = BehaviorVerdictType::Clean;
+    RecommendedAction action = RecommendedAction::None;
+
+    if (state.maliceScore >= config.criticalThreshold) {
+        newVerdict = BehaviorVerdictType::ConfirmedThreat;
+        action = RecommendedAction::Terminate;
+
+        // Special ransomware verdict
+        if (state.HasRansomwareBehavior()) {
+            newVerdict = BehaviorVerdictType::Ransomware;
+            action = RecommendedAction::BlockAndQuarantine;
+        }
+
+        // Active multi-process attack
+        if (!state.targetedProcessIds.empty() && state.targetedProcessIds.size() >= 3) {
+            newVerdict = BehaviorVerdictType::ActiveAttack;
+            action = RecommendedAction::IsolateEndpoint;
+        }
+    }
+    else if (state.maliceScore >= config.blockThreshold) {
+        newVerdict = BehaviorVerdictType::Malicious;
+        action = RecommendedAction::Suspend;
+    }
+    else if (state.maliceScore >= config.alertThreshold) {
+        newVerdict = BehaviorVerdictType::Suspicious;
+        action = RecommendedAction::Alert;
+    }
+    else if (state.maliceScore >= config.warningThreshold) {
+        newVerdict = BehaviorVerdictType::Suspicious;
+        action = RecommendedAction::Log;
+    }
+
+    // Only generate verdict if it escalated from the current level
+    if (newVerdict <= state.currentVerdict && state.hasBeenReported) {
+        return std::nullopt;
+    }
+
+    if (newVerdict == BehaviorVerdictType::Clean) {
+        return std::nullopt;
+    }
+
+    state.currentVerdict = newVerdict;
+    state.recommendedAction = action;
+    state.hasBeenReported = true;
+
+    m_impl->m_stats.totalVerdicts.fetch_add(1, std::memory_order_relaxed);
+    auto vtIdx = static_cast<size_t>(newVerdict);
+    if (vtIdx < m_impl->m_stats.verdictsByType.size()) {
+        m_impl->m_stats.verdictsByType[vtIdx].fetch_add(1, std::memory_order_relaxed);
+    }
+
+    return GenerateVerdict(state, event);
+}
+
+BehaviorVerdict BehaviorAnalyzer::GenerateVerdict(
+    const ProcessBehaviorState& state, const BehaviorEvent& event)
+{
+    BehaviorVerdict verdict;
+    verdict.processId = state.processId;
+    verdict.verdictType = state.currentVerdict;
+    verdict.severity = state.GetSeverity();
+    verdict.maliceScore = state.maliceScore;
+    verdict.action = state.recommendedAction;
+    verdict.triggeringEventId = event.eventId;
+    verdict.timestamp = std::chrono::system_clock::now();
+    verdict.detectedPatterns = state.detectedPatterns;
+    verdict.mitreTechniques = state.triggeredMitreTechniques;
+
+    // Calculate confidence based on evidence breadth
+    double evidenceCount = static_cast<double>(state.detectedPatterns.size());
+    double eventCount = static_cast<double>(state.totalEventsProcessed);
+    verdict.confidence = std::clamp(
+        (evidenceCount * 0.15) + (std::min(eventCount, 100.0) * 0.005) +
+        (state.maliceScore / BehaviorConstants::MAX_MALICE_SCORE * 0.3),
+        0.0, 1.0);
+
+    // Primary pattern is the most recent high-severity pattern
+    if (!state.detectedPatterns.empty()) {
+        verdict.primaryPattern = state.detectedPatterns.back();
+    }
+
+    // Generate threat name
+    switch (state.currentVerdict) {
+        case BehaviorVerdictType::Ransomware:
+            verdict.threatName = L"Behavior:Win32/Ransomware";
+            verdict.threatFamily = L"Ransomware";
+            break;
+        case BehaviorVerdictType::ActiveAttack:
+            verdict.threatName = L"Behavior:Win32/ActiveAttack";
+            verdict.threatFamily = L"APT";
+            break;
+        case BehaviorVerdictType::ConfirmedThreat:
+            verdict.threatName = L"Behavior:Win32/Malicious";
+            verdict.threatFamily = L"Generic";
+            break;
+        case BehaviorVerdictType::Malicious:
+            verdict.threatName = L"Behavior:Win32/Suspicious.High";
+            verdict.threatFamily = L"Suspicious";
+            break;
+        default:
+            verdict.threatName = L"Behavior:Win32/Suspicious";
+            verdict.threatFamily = L"Suspicious";
+            break;
+    }
+
+    // Generate findings
+    if (state.HasRansomwareBehavior()) {
+        verdict.findings.push_back(L"Ransomware behavior: " +
+            std::to_wstring(state.filesEncrypted) + L" files encrypted, " +
+            std::to_wstring(state.shadowCopyOperations) + L" shadow copy ops");
+    }
+    if (state.HasInjectionBehavior()) {
+        verdict.findings.push_back(L"Process injection: " +
+            std::to_wstring(state.remoteThreadCount) + L" remote threads, " +
+            std::to_wstring(state.crossProcessWrites) + L" cross-process writes");
+    }
+    if (state.credentialAccessAttempts > 0) {
+        verdict.findings.push_back(L"Credential access: " +
+            std::to_wstring(state.credentialAccessAttempts) + L" attempts");
+    }
+    if (state.evasionAttempts > 0) {
+        verdict.findings.push_back(L"Evasion techniques: " +
+            std::to_wstring(state.evasionAttempts) + L" attempts detected");
+    }
+    if (state.c2Indicators > 0) {
+        verdict.findings.push_back(L"C2 indicators: " +
+            std::to_wstring(state.c2Indicators) + L" matches");
+    }
+
+    // Related events (last N event IDs)
+    for (auto it = state.recentEvents.rbegin();
+         it != state.recentEvents.rend() && verdict.relatedEventIds.size() < 20; ++it) {
+        verdict.relatedEventIds.push_back(it->eventId);
+    }
+
+    // Build description
+    verdict.description = verdict.threatName + L" detected in " +
+        state.processName + L" (PID " + std::to_wstring(state.processId) +
+        L") - Score: " + std::to_wstring(static_cast<int>(state.maliceScore)) +
+        L"/100, Confidence: " + std::to_wstring(static_cast<int>(verdict.confidence * 100)) + L"%";
+
+    return verdict;
+}
+
+// ============================================================================
+// Internal: Attack Chain Correlation
+// ============================================================================
+
+void BehaviorAnalyzer::CorrelateWithAttackChains(
+    const BehaviorEvent& event, ProcessBehaviorState& state)
+{
+    std::unique_lock chainLock(m_impl->m_chainsMutex);
+
+    // Check if this process is already part of an existing chain
+    bool foundExisting = false;
+    for (auto& chain : m_impl->m_attackChains) {
+        if (!chain.isActive) continue;
+
+        for (auto pid : chain.involvedProcessIds) {
+            if (pid == event.processId) {
+                // Extend existing chain
+                chain.events.push_back(event);
+                chain.lastUpdateTime = std::chrono::system_clock::now();
+
+                // Cap events per chain
+                if (chain.events.size() > BehaviorConstants::MAX_EVENTS_PER_PROCESS) {
+                    chain.events.erase(chain.events.begin());
+                }
+
+                // Recalculate confidence
+                double eventDiv = static_cast<double>(chain.events.size());
+                double pidDiv = static_cast<double>(chain.involvedProcessIds.size());
+                chain.confidence = std::clamp(
+                    0.3 + (eventDiv * 0.02) + (pidDiv * 0.1), 0.0, 1.0);
+
+                foundExisting = true;
+                break;
+            }
+        }
+        if (foundExisting) break;
+
+        // Cross-process correlation: check if this event targets a process in the chain
+        if (event.targetProcessId != 0) {
+            for (auto pid : chain.involvedProcessIds) {
+                if (pid == event.targetProcessId) {
+                    chain.involvedProcessIds.push_back(event.processId);
+                    chain.events.push_back(event);
+                    chain.lastUpdateTime = std::chrono::system_clock::now();
+                    foundExisting = true;
+                    break;
+                }
+            }
+        }
+        if (foundExisting) break;
+    }
+
+    // Start new chain if process has multi-category suspicious behavior
+    if (!foundExisting && state.maliceScore >= BehaviorConstants::WARNING_THRESHOLD) {
+        // Count distinct attack categories
+        std::unordered_set<uint16_t> categories;
+        for (auto pattern : state.detectedPatterns) {
+            categories.insert(static_cast<uint16_t>(pattern) / 50);
+        }
+
+        // Need at least 2 distinct attack categories for a chain
+        if (categories.size() >= 2) {
+            if (m_impl->m_attackChains.size() < BehaviorConstants::MAX_ATTACK_CHAINS) {
+                AttackChain newChain;
+                newChain.chainId = m_impl->m_nextChainId.fetch_add(1, std::memory_order_relaxed);
+                newChain.creationTime = std::chrono::system_clock::now();
+                newChain.lastUpdateTime = newChain.creationTime;
+                newChain.involvedProcessIds.push_back(event.processId);
+                newChain.events.push_back(event);
+                newChain.isActive = true;
+                newChain.confidence = 0.3 + (static_cast<double>(categories.size()) * 0.15);
+
+                // Determine primary pattern (highest scoring category)
+                if (!state.detectedPatterns.empty()) {
+                    newChain.primaryPattern = state.detectedPatterns.back();
+                }
+
+                // Copy MITRE techniques
+                newChain.mitreTechniques = state.triggeredMitreTechniques;
+
+                newChain.description = L"Multi-stage attack chain from " +
+                    state.processName + L" (PID " + std::to_wstring(state.processId) + L")";
+
+                m_impl->m_attackChains.push_back(std::move(newChain));
+
+                m_impl->m_stats.activeAttackChains.store(
+                    std::count_if(m_impl->m_attackChains.begin(),
+                                  m_impl->m_attackChains.end(),
+                                  [](const AttackChain& c) { return c.isActive; }),
+                    std::memory_order_relaxed);
+
+                // Copy chain to invoke callbacks outside lock (vector may reallocate)
+                AttackChain chainCopy = m_impl->m_attackChains.back();
+                chainLock.unlock();
+                InvokeAttackChainCallbacks(chainCopy);
+                return;
+            }
+        }
+    }
+}
+
+// ============================================================================
+// Internal: Actions
+// ============================================================================
+
+void BehaviorAnalyzer::PerformAction(const BehaviorVerdict& verdict) {
+    switch (verdict.action) {
+        case RecommendedAction::Terminate:
+        case RecommendedAction::BlockAndQuarantine:
+        case RecommendedAction::IsolateEndpoint: {
+            std::shared_lock cbLock(m_impl->m_callbackMutex);
+            auto terminateCb = m_impl->m_terminationCallback;
+            cbLock.unlock();
+
+            if (terminateCb) {
+                bool terminated = terminateCb(verdict.processId, verdict.description);
+                if (terminated) {
+                    m_impl->m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"BehaviorAnalyzer", L"Process %u terminated: %ls",
+                                verdict.processId, verdict.threatName.c_str());
+
+                    std::unique_lock stateLock(m_impl->m_statesMutex);
+                    auto it = m_impl->m_processStates.find(verdict.processId);
+                    if (it != m_impl->m_processStates.end()) {
+                        it->second.hasBeenTerminated = true;
+                    }
+                }
+            } else {
+                SS_LOG_WARN(L"BehaviorAnalyzer", L"No termination callback for PID %u (action=%u)",
+                            verdict.processId, static_cast<uint32_t>(verdict.action));
+            }
+            break;
+        }
+
+        case RecommendedAction::Suspend: {
+            std::shared_lock cbLock(m_impl->m_callbackMutex);
+            auto terminateCb = m_impl->m_terminationCallback;
+            cbLock.unlock();
+
+            if (terminateCb) {
+                terminateCb(verdict.processId,
+                    L"Suspended: " + verdict.threatName);
+            }
+            break;
+        }
+
+        case RecommendedAction::Alert:
+            SS_LOG_WARN(L"BehaviorAnalyzer", L"ALERT: %ls (PID %u, score %.1f)",
+                        verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
+            break;
+
+        case RecommendedAction::Log:
+            SS_LOG_INFO(L"BehaviorAnalyzer", L"Suspicious: %ls (PID %u, score %.1f)",
+                        verdict.threatName.c_str(), verdict.processId, verdict.maliceScore);
+            break;
+
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// Internal: MITRE ATT&CK Mapping
+// ============================================================================
+
+void BehaviorAnalyzer::AddMitreMapping(
+    ProcessBehaviorState& state, BehaviorPatternType pattern)
+{
+    // Deduplicate patterns
+    if (std::find(state.detectedPatterns.begin(), state.detectedPatterns.end(), pattern)
+        == state.detectedPatterns.end()) {
+        state.detectedPatterns.push_back(pattern);
+
+        // Cap pattern list
+        if (state.detectedPatterns.size() > BehaviorConstants::MAX_RULES_PER_PROCESS) {
+            state.detectedPatterns.erase(state.detectedPatterns.begin());
+        }
+    }
+
+    // Track pattern counts
+    state.patternCounts[pattern]++;
+
+    // Map to MITRE technique ID
+    const char* mitreId = BehaviorPatternToMitre(pattern);
+    if (mitreId && mitreId[0] != '\0') {
+        std::string id(mitreId);
+        if (std::find(state.triggeredMitreTechniques.begin(),
+                      state.triggeredMitreTechniques.end(), id)
+            == state.triggeredMitreTechniques.end()) {
+            state.triggeredMitreTechniques.push_back(std::move(id));
+        }
+    }
+}
+
+// ============================================================================
+// Internal: Trust & Sensitivity Checks
+// ============================================================================
+
+bool BehaviorAnalyzer::IsSensitiveTarget(const BehaviorEvent& event) const {
+    if (event.targetPath.empty()) return false;
+    auto lowerPath = ToLowerCase(event.targetPath);
+
+    // System directories
+    if (lowerPath.find(L"\\windows\\system32\\") != std::wstring::npos) return true;
+    if (lowerPath.find(L"\\windows\\syswow64\\") != std::wstring::npos) return true;
+
+    // Security databases (use exact hive paths to avoid false positives)
+    if (lowerPath.find(L"\\config\\sam") != std::wstring::npos) return true;
+    if (lowerPath.find(L"\\config\\security") != std::wstring::npos) return true;
+    if (lowerPath.find(L"\\ntds.dit") != std::wstring::npos) return true;
+
+    // Credential stores
+    if (lowerPath.find(L"\\credentials\\") != std::wstring::npos) return true;
+    if (lowerPath.find(L"\\vault\\") != std::wstring::npos) return true;
+
+    return false;
+}
+
+bool BehaviorAnalyzer::IsProcessTrusted(const ProcessBehaviorState& state) const {
+    if (state.isWhitelisted) return true;
+
+    std::shared_lock cfgLock(m_impl->m_configMutex);
+    if (m_impl->m_config.trustMicrosoftSigned && state.isSignedByMicrosoft) return true;
+    if (m_impl->m_config.trustVendorSigned && state.isSignedByTrustedVendor) return true;
+
+    return state.isSystemProcess;
+}
+// ============================================================================
+// Internal: Callbacks
+// ============================================================================
+
+void BehaviorAnalyzer::InvokeVerdictCallbacks(const BehaviorVerdict& verdict) {
+    std::vector<BehaviorVerdictCallback> callbacks;
+    {
+        std::shared_lock cbLock(m_impl->m_callbackMutex);
+        callbacks.reserve(m_impl->m_verdictCallbacks.size());
+        for (const auto& [id, cb] : m_impl->m_verdictCallbacks) {
+            callbacks.push_back(cb);
+        }
+    }
+
+    for (const auto& cb : callbacks) {
+        try {
+            cb(verdict);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"BehaviorAnalyzer", L"Verdict callback exception: %S", ex.what());
+        }
+    }
+}
+
+void BehaviorAnalyzer::InvokeAttackChainCallbacks(const AttackChain& chain) {
+    std::vector<AttackChainCallback> callbacks;
+    {
+        std::shared_lock cbLock(m_impl->m_callbackMutex);
+        callbacks.reserve(m_impl->m_chainCallbacks.size());
+        for (const auto& [id, cb] : m_impl->m_chainCallbacks) {
+            callbacks.push_back(cb);
+        }
+    }
+
+    for (const auto& cb : callbacks) {
+        try {
+            cb(chain);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"BehaviorAnalyzer", L"Chain callback exception: %S", ex.what());
+        }
+    }
+}
+
+// ============================================================================
+// Internal: Cleanup
+// ============================================================================
+
+void BehaviorAnalyzer::PerformCleanup() {
+    try {
+        auto now = std::chrono::steady_clock::now();
+
+        // Snapshot config BEFORE acquiring statesMutex (lock order: config→states)
+        std::chrono::hours retention;
+        {
+            std::shared_lock cfgLock(m_impl->m_configMutex);
+            retention = m_impl->m_config.eventRetentionPeriod;
+        }
+
+        // Cleanup old process states
+        {
+            std::unique_lock stateLock(m_impl->m_statesMutex);
+
+            auto it = m_impl->m_processStates.begin();
+            while (it != m_impl->m_processStates.end()) {
+                auto stateAge = std::chrono::duration_cast<std::chrono::hours>(
+                    now - it->second.lastUpdateTime);
+                // Remove if: score is zero AND state is old AND not terminated
+                if (it->second.maliceScore < 1.0 &&
+                    stateAge >= retention &&
+                    !it->second.hasBeenTerminated) {
+                    it = m_impl->m_processStates.erase(it);
+                } else {
+                    // Trim old events from history
+                    while (!it->second.recentEvents.empty()) {
+                        auto eventAge = std::chrono::duration_cast<std::chrono::hours>(
+                            now - it->second.recentEvents.front().timestamp);
+                        if (eventAge >= retention) {
+                            it->second.recentEvents.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    ++it;
+                }
+            }
+
+            m_impl->m_stats.trackedProcesses.store(
+                m_impl->m_processStates.size(), std::memory_order_relaxed);
+        }
+
+        // Cleanup old attack chains
+        {
+            std::unique_lock chainLock(m_impl->m_chainsMutex);
+            m_impl->m_attackChains.erase(
+                std::remove_if(m_impl->m_attackChains.begin(),
+                               m_impl->m_attackChains.end(),
+                               [&now](const AttackChain& chain) {
+                                   if (!chain.isActive) {
+                                       auto age = std::chrono::duration_cast<std::chrono::hours>(
+                                           std::chrono::system_clock::now() - chain.lastUpdateTime);
+                                       return age.count() > 24;
+                                   }
+                                   return false;
+                               }),
+                m_impl->m_attackChains.end());
+
+            m_impl->m_stats.activeAttackChains.store(
+                std::count_if(m_impl->m_attackChains.begin(),
+                              m_impl->m_attackChains.end(),
+                              [](const AttackChain& c) { return c.isActive; }),
+                std::memory_order_relaxed);
+        }
+    }
+    catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"BehaviorAnalyzer", L"Cleanup exception: %S", ex.what());
+    }
+}
+
+// ============================================================================
+// Public: State Management
+// ============================================================================
+
+ProcessBehaviorState BehaviorAnalyzer::GetProcessState(uint32_t processId) const {
+    std::shared_lock lock(m_impl->m_statesMutex);
+    auto it = m_impl->m_processStates.find(processId);
+    if (it != m_impl->m_processStates.end()) {
+        return it->second;  // Return copy
+    }
+    return ProcessBehaviorState{};
+}
+
+bool BehaviorAnalyzer::IsProcessTracked(uint32_t processId) const noexcept {
+    try {
+        std::shared_lock lock(m_impl->m_statesMutex);
+        return m_impl->m_processStates.count(processId) > 0;
+    } catch (...) {
         return false;
     }
 }
 
-std::string BehaviorAnalyzer::GetVersionString() noexcept {
-    return std::to_string(BehaviorConstants::VERSION_MAJOR) + "." +
-           std::to_string(BehaviorConstants::VERSION_MINOR) + "." +
-           std::to_string(BehaviorConstants::VERSION_PATCH);
+double BehaviorAnalyzer::GetMaliceScore(uint32_t processId) const noexcept {
+    try {
+        std::shared_lock lock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(processId);
+        if (it != m_impl->m_processStates.end()) {
+            return it->second.maliceScore;
+        }
+    } catch (...) {}
+    return 0.0;
+}
+
+void BehaviorAnalyzer::ResetProcessState(uint32_t processId) {
+    std::unique_lock lock(m_impl->m_statesMutex);
+    m_impl->m_processStates.erase(processId);
+}
+
+void BehaviorAnalyzer::ClearAllStates() {
+    std::unique_lock lock(m_impl->m_statesMutex);
+    m_impl->m_processStates.clear();
+    m_impl->m_stats.trackedProcesses.store(0, std::memory_order_relaxed);
+}
+
+std::vector<uint32_t> BehaviorAnalyzer::GetTrackedProcessIds() const {
+    std::shared_lock lock(m_impl->m_statesMutex);
+    std::vector<uint32_t> pids;
+    pids.reserve(m_impl->m_processStates.size());
+    for (const auto& [pid, _] : m_impl->m_processStates) {
+        pids.push_back(pid);
+    }
+    return pids;
+}
+
+std::vector<std::pair<uint32_t, double>> BehaviorAnalyzer::GetProcessesAboveThreshold(
+    double threshold) const
+{
+    std::shared_lock lock(m_impl->m_statesMutex);
+    std::vector<std::pair<uint32_t, double>> results;
+    for (const auto& [pid, state] : m_impl->m_processStates) {
+        if (state.maliceScore >= threshold) {
+            results.emplace_back(pid, state.maliceScore);
+        }
+    }
+    // Sort descending by score
+    std::sort(results.begin(), results.end(),
+              [](const auto& a, const auto& b) { return a.second > b.second; });
+    return results;
+}
+
+// ============================================================================
+// Public: Attack Chain Management
+// ============================================================================
+
+std::vector<AttackChain> BehaviorAnalyzer::GetActiveAttackChains() const {
+    std::shared_lock lock(m_impl->m_chainsMutex);
+    std::vector<AttackChain> active;
+    for (const auto& chain : m_impl->m_attackChains) {
+        if (chain.isActive) {
+            active.push_back(chain);
+        }
+    }
+    return active;
+}
+
+std::optional<AttackChain> BehaviorAnalyzer::GetAttackChain(uint64_t chainId) const {
+    std::shared_lock lock(m_impl->m_chainsMutex);
+    for (const auto& chain : m_impl->m_attackChains) {
+        if (chain.chainId == chainId) {
+            return chain;
+        }
+    }
+    return std::nullopt;
+}
+
+std::vector<AttackChain> BehaviorAnalyzer::GetAttackChainsForProcess(uint32_t processId) const {
+    std::shared_lock lock(m_impl->m_chainsMutex);
+    std::vector<AttackChain> results;
+    for (const auto& chain : m_impl->m_attackChains) {
+        for (auto pid : chain.involvedProcessIds) {
+            if (pid == processId) {
+                results.push_back(chain);
+                break;
+            }
+        }
+    }
+    return results;
+}
+
+// ============================================================================
+// Public: Process Operations
+// ============================================================================
+
+void BehaviorAnalyzer::WhitelistProcess(uint32_t processId) {
+    std::unique_lock lock(m_impl->m_statesMutex);
+    auto it = m_impl->m_processStates.find(processId);
+    if (it != m_impl->m_processStates.end()) {
+        it->second.isWhitelisted = true;
+        it->second.maliceScore = 0.0;
+        SS_LOG_INFO(L"BehaviorAnalyzer", L"PID %u whitelisted", processId);
+    }
+}
+
+void BehaviorAnalyzer::UnwhitelistProcess(uint32_t processId) {
+    std::unique_lock lock(m_impl->m_statesMutex);
+    auto it = m_impl->m_processStates.find(processId);
+    if (it != m_impl->m_processStates.end()) {
+        it->second.isWhitelisted = false;
+    }
+}
+
+void BehaviorAnalyzer::SetProcessScoreModifier(uint32_t processId, double modifier) {
+    modifier = std::clamp(modifier, -100.0, 100.0);
+    std::unique_lock lock(m_impl->m_statesMutex);
+    auto it = m_impl->m_processStates.find(processId);
+    if (it != m_impl->m_processStates.end()) {
+        it->second.baseScoreModifier = modifier;
+    }
+}
+
+// ============================================================================
+// Public: Canary File Management
+// ============================================================================
+
+void BehaviorAnalyzer::AddCanaryFile(const std::wstring& path) {
+    std::unique_lock lock(m_impl->m_canaryMutex);
+    m_impl->m_canaryFiles.insert(ToLowerCase(path));
+    SS_LOG_DEBUG(L"BehaviorAnalyzer", L"Canary file added: %ls", path.c_str());
+}
+
+void BehaviorAnalyzer::RemoveCanaryFile(const std::wstring& path) {
+    std::unique_lock lock(m_impl->m_canaryMutex);
+    m_impl->m_canaryFiles.erase(ToLowerCase(path));
+}
+
+std::vector<std::wstring> BehaviorAnalyzer::GetCanaryFiles() const {
+    std::shared_lock lock(m_impl->m_canaryMutex);
+    return std::vector<std::wstring>(m_impl->m_canaryFiles.begin(),
+                                      m_impl->m_canaryFiles.end());
+}
+
+bool BehaviorAnalyzer::IsCanaryFile(const std::wstring& path) const {
+    std::shared_lock lock(m_impl->m_canaryMutex);
+    return m_impl->m_canaryFiles.count(ToLowerCase(path)) > 0;
+}
+// ============================================================================
+// Public: Callbacks
+// ============================================================================
+
+uint64_t BehaviorAnalyzer::RegisterVerdictCallback(BehaviorVerdictCallback callback) {
+    if (!callback) return 0;
+    std::unique_lock lock(m_impl->m_callbackMutex);
+    uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_verdictCallbacks.emplace(id, std::move(callback));
+    return id;
+}
+
+bool BehaviorAnalyzer::UnregisterVerdictCallback(uint64_t callbackId) {
+    std::unique_lock lock(m_impl->m_callbackMutex);
+    return m_impl->m_verdictCallbacks.erase(callbackId) > 0;
+}
+
+uint64_t BehaviorAnalyzer::RegisterAttackChainCallback(AttackChainCallback callback) {
+    if (!callback) return 0;
+    std::unique_lock lock(m_impl->m_callbackMutex);
+    uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_chainCallbacks.emplace(id, std::move(callback));
+    return id;
+}
+
+bool BehaviorAnalyzer::UnregisterAttackChainCallback(uint64_t callbackId) {
+    std::unique_lock lock(m_impl->m_callbackMutex);
+    return m_impl->m_chainCallbacks.erase(callbackId) > 0;
+}
+
+void BehaviorAnalyzer::SetTerminationCallback(ProcessTerminateCallback callback) {
+    std::unique_lock lock(m_impl->m_callbackMutex);
+    m_impl->m_terminationCallback = std::move(callback);
+}
+
+// ============================================================================
+// Public: Statistics
+// ============================================================================
+
+BehaviorAnalyzerStats BehaviorAnalyzer::GetStats() const {
+    // Copy constructor handles atomic load/store internally
+    return BehaviorAnalyzerStats(m_impl->m_stats);
+}
+
+void BehaviorAnalyzer::ResetStats() {
+    m_impl->m_stats.Reset();
+}
+
+// ============================================================================
+// Public: External Store Integration
+// ============================================================================
+
+void BehaviorAnalyzer::SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* index) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_threatIntel = index;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"ThreatIntelIndex %s",
+                index ? L"connected" : L"disconnected");
+}
+
+void BehaviorAnalyzer::SetWhitelistStore(Whitelist::WhitelistStore* store) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_whitelist = store;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"WhitelistStore %s",
+                store ? L"connected" : L"disconnected");
+}
+
+void BehaviorAnalyzer::SetSignatureStore(SignatureStore::SignatureStore* store) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_signatureStore = store;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"SignatureStore %s",
+                store ? L"connected" : L"disconnected");
+}
+
+// ============================================================================
+// ProcessBehaviorState::Clear
+// ============================================================================
+
+void ProcessBehaviorState::Clear() noexcept {
+    processId = 0;
+    parentProcessId = 0;
+    processName.clear();
+    processPath.clear();
+    commandLine.clear();
+    userSid.clear();
+    creationTime = {};
+    stateCreatedAt = {};
+    lastUpdateTime = {};
+
+    maliceScore = 0.0;
+    peakMaliceScore = 0.0;
+    confidence = 0.0;
+    baseScoreModifier = 0.0;
+
+    triggeredMitreTechniques.clear();
+    detectedPatterns.clear();
+    patternCounts.clear();
+
+    fileOperationCount = 0;
+    filesModified = 0;
+    filesCreated = 0;
+    filesDeleted = 0;
+    filesEncrypted = 0;
+    canaryFilesTouched = 0;
+    registryModifications = 0;
+    networkConnections = 0;
+    outboundBytes = 0;
+    childProcessCount = 0;
+    remoteThreadCount = 0;
+    crossProcessWrites = 0;
+    credentialAccessAttempts = 0;
+    evasionAttempts = 0;
+
+    highEntropyWrites = 0;
+    fileRenames = 0;
+    extensionChanges = 0;
+    shadowCopyOperations = 0;
+    ransomNoteIndicators = 0;
+    fileModificationRate = 0.0;
+    lastFileModTime = {};
+
+    targetedProcessIds.clear();
+    injectedDLLs.clear();
+    remoteAllocations.clear();
+
+    persistenceLocations.clear();
+    createdServices.clear();
+    createdTasks.clear();
+
+    contactedDomains.clear();
+    contactedIPs.clear();
+    c2Indicators = 0;
+    dnsQueryCount = 0;
+
+    isSignedByMicrosoft = false;
+    isSignedByTrustedVendor = false;
+    isWhitelisted = false;
+    isSystemProcess = false;
+    hasDocumentParent = false;
+    hasScriptParent = false;
+    isNetworkDownloaded = false;
+
+    recentEvents.clear();
+    totalEventsProcessed = 0;
+
+    currentVerdict = BehaviorVerdictType::Clean;
+    recommendedAction = RecommendedAction::None;
+    hasBeenReported = false;
+    hasBeenTerminated = false;
+}
+// ============================================================================
+// Free Functions: Constexpr Helpers
+// ============================================================================
+
+constexpr const char* BehaviorEventTypeToString(BehaviorEventType type) noexcept {
+    switch (type) {
+        case BehaviorEventType::Unknown: return "Unknown";
+        case BehaviorEventType::ProcessCreate: return "ProcessCreate";
+        case BehaviorEventType::ProcessTerminate: return "ProcessTerminate";
+        case BehaviorEventType::ProcessOpen: return "ProcessOpen";
+        case BehaviorEventType::ProcessDuplicate: return "ProcessDuplicate";
+        case BehaviorEventType::ProcessSuspend: return "ProcessSuspend";
+        case BehaviorEventType::ProcessResume: return "ProcessResume";
+        case BehaviorEventType::ProcessInject: return "ProcessInject";
+        case BehaviorEventType::ProcessHollow: return "ProcessHollow";
+        case BehaviorEventType::ThreadCreate: return "ThreadCreate";
+        case BehaviorEventType::ThreadTerminate: return "ThreadTerminate";
+        case BehaviorEventType::ThreadRemoteCreate: return "ThreadRemoteCreate";
+        case BehaviorEventType::ThreadSetContext: return "ThreadSetContext";
+        case BehaviorEventType::ThreadSuspend: return "ThreadSuspend";
+        case BehaviorEventType::ThreadResume: return "ThreadResume";
+        case BehaviorEventType::ThreadQueueAPC: return "ThreadQueueAPC";
+        case BehaviorEventType::ThreadHijack: return "ThreadHijack";
+        case BehaviorEventType::MemoryAllocate: return "MemoryAllocate";
+        case BehaviorEventType::MemoryFree: return "MemoryFree";
+        case BehaviorEventType::MemoryProtect: return "MemoryProtect";
+        case BehaviorEventType::MemoryWrite: return "MemoryWrite";
+        case BehaviorEventType::MemoryRead: return "MemoryRead";
+        case BehaviorEventType::MemoryRemoteAllocate: return "MemoryRemoteAllocate";
+        case BehaviorEventType::MemoryRemoteWrite: return "MemoryRemoteWrite";
+        case BehaviorEventType::MemoryRemoteProtect: return "MemoryRemoteProtect";
+        case BehaviorEventType::MemoryMap: return "MemoryMap";
+        case BehaviorEventType::MemoryUnmap: return "MemoryUnmap";
+        case BehaviorEventType::FileCreate: return "FileCreate";
+        case BehaviorEventType::FileOpen: return "FileOpen";
+        case BehaviorEventType::FileRead: return "FileRead";
+        case BehaviorEventType::FileWrite: return "FileWrite";
+        case BehaviorEventType::FileDelete: return "FileDelete";
+        case BehaviorEventType::FileRename: return "FileRename";
+        case BehaviorEventType::FileSetAttributes: return "FileSetAttributes";
+        case BehaviorEventType::FileSetSecurity: return "FileSetSecurity";
+        case BehaviorEventType::FileLock: return "FileLock";
+        case BehaviorEventType::FileUnlock: return "FileUnlock";
+        case BehaviorEventType::FileEncrypt: return "FileEncrypt";
+        case BehaviorEventType::FileDecrypt: return "FileDecrypt";
+        case BehaviorEventType::DirectoryCreate: return "DirectoryCreate";
+        case BehaviorEventType::DirectoryDelete: return "DirectoryDelete";
+        case BehaviorEventType::DirectoryEnumerate: return "DirectoryEnumerate";
+        case BehaviorEventType::RegistryCreateKey: return "RegistryCreateKey";
+        case BehaviorEventType::RegistryDeleteKey: return "RegistryDeleteKey";
+        case BehaviorEventType::RegistrySetValue: return "RegistrySetValue";
+        case BehaviorEventType::RegistryDeleteValue: return "RegistryDeleteValue";
+        case BehaviorEventType::RegistryQueryValue: return "RegistryQueryValue";
+        case BehaviorEventType::RegistryEnumKey: return "RegistryEnumKey";
+        case BehaviorEventType::RegistryEnumValue: return "RegistryEnumValue";
+        case BehaviorEventType::RegistryLoadHive: return "RegistryLoadHive";
+        case BehaviorEventType::RegistryUnloadHive: return "RegistryUnloadHive";
+        case BehaviorEventType::RegistryRenameKey: return "RegistryRenameKey";
+        case BehaviorEventType::NetworkConnect: return "NetworkConnect";
+        case BehaviorEventType::NetworkListen: return "NetworkListen";
+        case BehaviorEventType::NetworkAccept: return "NetworkAccept";
+        case BehaviorEventType::NetworkSend: return "NetworkSend";
+        case BehaviorEventType::NetworkReceive: return "NetworkReceive";
+        case BehaviorEventType::NetworkDNSQuery: return "NetworkDNSQuery";
+        case BehaviorEventType::NetworkHTTPRequest: return "NetworkHTTPRequest";
+        case BehaviorEventType::NetworkHTTPSRequest: return "NetworkHTTPSRequest";
+        case BehaviorEventType::NetworkDownload: return "NetworkDownload";
+        case BehaviorEventType::NetworkUpload: return "NetworkUpload";
+        case BehaviorEventType::ServiceInstall: return "ServiceInstall";
+        case BehaviorEventType::ServiceStart: return "ServiceStart";
+        case BehaviorEventType::ServiceStop: return "ServiceStop";
+        case BehaviorEventType::ServiceDelete: return "ServiceDelete";
+        case BehaviorEventType::ServiceModify: return "ServiceModify";
+        case BehaviorEventType::TaskCreate: return "TaskCreate";
+        case BehaviorEventType::TaskDelete: return "TaskDelete";
+        case BehaviorEventType::TaskModify: return "TaskModify";
+        case BehaviorEventType::TaskRun: return "TaskRun";
+        case BehaviorEventType::WMIQuery: return "WMIQuery";
+        case BehaviorEventType::WMISubscription: return "WMISubscription";
+        case BehaviorEventType::WMIExec: return "WMIExec";
+        case BehaviorEventType::WMIConsumer: return "WMIConsumer";
+        case BehaviorEventType::ScriptExecute: return "ScriptExecute";
+        case BehaviorEventType::PowerShellCommand: return "PowerShellCommand";
+        case BehaviorEventType::PowerShellScript: return "PowerShellScript";
+        case BehaviorEventType::VBScriptExecute: return "VBScriptExecute";
+        case BehaviorEventType::JScriptExecute: return "JScriptExecute";
+        case BehaviorEventType::BatchExecute: return "BatchExecute";
+        case BehaviorEventType::CredentialAccess: return "CredentialAccess";
+        case BehaviorEventType::LSASSAccess: return "LSASSAccess";
+        case BehaviorEventType::SAMAccess: return "SAMAccess";
+        case BehaviorEventType::CredentialDump: return "CredentialDump";
+        case BehaviorEventType::TokenSteal: return "TokenSteal";
+        case BehaviorEventType::TokenDuplicate: return "TokenDuplicate";
+        case BehaviorEventType::AntiDebugAttempt: return "AntiDebugAttempt";
+        case BehaviorEventType::VMDetectionAttempt: return "VMDetectionAttempt";
+        case BehaviorEventType::SandboxDetectionAttempt: return "SandboxDetectionAttempt";
+        case BehaviorEventType::LogClear: return "LogClear";
+        case BehaviorEventType::Timestomp: return "Timestomp";
+        case BehaviorEventType::SecurityDisable: return "SecurityDisable";
+        case BehaviorEventType::SystemShutdown: return "SystemShutdown";
+        case BehaviorEventType::SystemReboot: return "SystemReboot";
+        case BehaviorEventType::DriverLoad: return "DriverLoad";
+        case BehaviorEventType::DriverUnload: return "DriverUnload";
+        case BehaviorEventType::ShadowCopyDelete: return "ShadowCopyDelete";
+        case BehaviorEventType::BootConfigModify: return "BootConfigModify";
+        case BehaviorEventType::CryptoKeyGenerate: return "CryptoKeyGenerate";
+        case BehaviorEventType::CryptoKeyImport: return "CryptoKeyImport";
+        case BehaviorEventType::CryptoEncrypt: return "CryptoEncrypt";
+        case BehaviorEventType::CryptoDecrypt: return "CryptoDecrypt";
+        case BehaviorEventType::CryptoSign: return "CryptoSign";
+        case BehaviorEventType::CryptoHash: return "CryptoHash";
+        default: return "Unknown";
+    }
+}
+
+constexpr const char* BehaviorPatternToMitre(BehaviorPatternType pattern) noexcept {
+    switch (pattern) {
+        // Ransomware
+        case BehaviorPatternType::RansomwareEncryption: return "T1486";
+        case BehaviorPatternType::RansomwareShadowDelete: return "T1490";
+        case BehaviorPatternType::RansomwareNote: return "T1486";
+        case BehaviorPatternType::RansomwareExtensionChange: return "T1486";
+        case BehaviorPatternType::RansomwareCanaryTouch: return "T1486";
+        case BehaviorPatternType::RansomwareMassDelete: return "T1485";
+        case BehaviorPatternType::RansomwareBackupDestroy: return "T1490";
+        // Injection
+        case BehaviorPatternType::InjectionDLL: return "T1055.001";
+        case BehaviorPatternType::InjectionHollowing: return "T1055.012";
+        case BehaviorPatternType::InjectionRemoteThread: return "T1055.002";
+        case BehaviorPatternType::InjectionAPC: return "T1055.004";
+        case BehaviorPatternType::InjectionAtomBomb: return "T1055.011";
+        case BehaviorPatternType::InjectionThreadHijack: return "T1055.003";
+        case BehaviorPatternType::InjectionReflective: return "T1055.001";
+        case BehaviorPatternType::InjectionDoppelgang: return "T1055.013";
+        // Persistence
+        case BehaviorPatternType::PersistenceRunKey: return "T1547.001";
+        case BehaviorPatternType::PersistenceScheduledTask: return "T1053.005";
+        case BehaviorPatternType::PersistenceService: return "T1543.003";
+        case BehaviorPatternType::PersistenceWMI: return "T1546.003";
+        case BehaviorPatternType::PersistenceStartupFolder: return "T1547.001";
+        case BehaviorPatternType::PersistenceBootConfig: return "T1542";
+        case BehaviorPatternType::PersistenceDLLHijack: return "T1574.001";
+        case BehaviorPatternType::PersistenceCOMHijack: return "T1546.015";
+        case BehaviorPatternType::PersistenceAppInit: return "T1546.010";
+        case BehaviorPatternType::PersistenceIFEO: return "T1546.012";
+        // Credential Access
+        case BehaviorPatternType::CredentialLSASSDump: return "T1003.001";
+        case BehaviorPatternType::CredentialSAMAccess: return "T1003.002";
+        case BehaviorPatternType::CredentialMimikatz: return "T1003";
+        case BehaviorPatternType::CredentialStoreAccess: return "T1555";
+        case BehaviorPatternType::CredentialKeylogger: return "T1056.001";
+        case BehaviorPatternType::CredentialBrowserTheft: return "T1555.003";
+        case BehaviorPatternType::CredentialTokenManip: return "T1134";
+        // Evasion
+        case BehaviorPatternType::EvasionLogClear: return "T1070.001";
+        case BehaviorPatternType::EvasionSecurityDisable: return "T1562.001";
+        case BehaviorPatternType::EvasionTimestomp: return "T1070.006";
+        case BehaviorPatternType::EvasionFileHide: return "T1564.001";
+        case BehaviorPatternType::EvasionMasquerade: return "T1036";
+        case BehaviorPatternType::EvasionRootkit: return "T1014";
+        case BehaviorPatternType::EvasionAMSIBypass: return "T1562.001";
+        case BehaviorPatternType::EvasionETWTamper: return "T1562.006";
+        // Exfiltration
+        case BehaviorPatternType::ExfilLargeTransfer: return "T1048";
+        case BehaviorPatternType::ExfilArchiveCreate: return "T1560.001";
+        case BehaviorPatternType::ExfilDNSTunnel: return "T1048.003";
+        case BehaviorPatternType::ExfilCloudUpload: return "T1567";
+        case BehaviorPatternType::ExfilEmail: return "T1048.002";
+        case BehaviorPatternType::ExfilClipboard: return "T1115";
+        case BehaviorPatternType::ExfilScreenshot: return "T1113";
+        // Lateral Movement
+        case BehaviorPatternType::LateralService: return "T1021.002";
+        case BehaviorPatternType::LateralWMI: return "T1047";
+        case BehaviorPatternType::LateralPSExec: return "T1569.002";
+        case BehaviorPatternType::LateralRemoteRegistry: return "T1021.001";
+        case BehaviorPatternType::LateralRDP: return "T1021.001";
+        case BehaviorPatternType::LateralSMB: return "T1021.002";
+        // C2
+        case BehaviorPatternType::C2Beacon: return "T1071";
+        case BehaviorPatternType::C2KnownProtocol: return "T1071.001";
+        case BehaviorPatternType::C2Encrypted: return "T1573";
+        case BehaviorPatternType::C2DGA: return "T1568.002";
+        case BehaviorPatternType::C2FastFlux: return "T1568.001";
+        default: return "";
+    }
+}
+
+constexpr const char* BehaviorPatternTypeToString(BehaviorPatternType pattern) noexcept {
+    switch (pattern) {
+        case BehaviorPatternType::Unknown: return "Unknown";
+        case BehaviorPatternType::RansomwareEncryption: return "RansomwareEncryption";
+        case BehaviorPatternType::RansomwareShadowDelete: return "RansomwareShadowDelete";
+        case BehaviorPatternType::RansomwareNote: return "RansomwareNote";
+        case BehaviorPatternType::RansomwareExtensionChange: return "RansomwareExtensionChange";
+        case BehaviorPatternType::RansomwareCanaryTouch: return "RansomwareCanaryTouch";
+        case BehaviorPatternType::RansomwareMassDelete: return "RansomwareMassDelete";
+        case BehaviorPatternType::RansomwareBackupDestroy: return "RansomwareBackupDestroy";
+        case BehaviorPatternType::InjectionDLL: return "InjectionDLL";
+        case BehaviorPatternType::InjectionHollowing: return "InjectionHollowing";
+        case BehaviorPatternType::InjectionRemoteThread: return "InjectionRemoteThread";
+        case BehaviorPatternType::InjectionAPC: return "InjectionAPC";
+        case BehaviorPatternType::InjectionAtomBomb: return "InjectionAtomBomb";
+        case BehaviorPatternType::InjectionThreadHijack: return "InjectionThreadHijack";
+        case BehaviorPatternType::InjectionReflective: return "InjectionReflective";
+        case BehaviorPatternType::InjectionDoppelgang: return "InjectionDoppelgang";
+        case BehaviorPatternType::PersistenceRunKey: return "PersistenceRunKey";
+        case BehaviorPatternType::PersistenceScheduledTask: return "PersistenceScheduledTask";
+        case BehaviorPatternType::PersistenceService: return "PersistenceService";
+        case BehaviorPatternType::PersistenceWMI: return "PersistenceWMI";
+        case BehaviorPatternType::PersistenceStartupFolder: return "PersistenceStartupFolder";
+        case BehaviorPatternType::PersistenceBootConfig: return "PersistenceBootConfig";
+        case BehaviorPatternType::PersistenceDLLHijack: return "PersistenceDLLHijack";
+        case BehaviorPatternType::PersistenceCOMHijack: return "PersistenceCOMHijack";
+        case BehaviorPatternType::PersistenceAppInit: return "PersistenceAppInit";
+        case BehaviorPatternType::PersistenceIFEO: return "PersistenceIFEO";
+        case BehaviorPatternType::CredentialLSASSDump: return "CredentialLSASSDump";
+        case BehaviorPatternType::CredentialSAMAccess: return "CredentialSAMAccess";
+        case BehaviorPatternType::CredentialMimikatz: return "CredentialMimikatz";
+        case BehaviorPatternType::CredentialStoreAccess: return "CredentialStoreAccess";
+        case BehaviorPatternType::CredentialKeylogger: return "CredentialKeylogger";
+        case BehaviorPatternType::CredentialBrowserTheft: return "CredentialBrowserTheft";
+        case BehaviorPatternType::CredentialTokenManip: return "CredentialTokenManip";
+        case BehaviorPatternType::EvasionLogClear: return "EvasionLogClear";
+        case BehaviorPatternType::EvasionSecurityDisable: return "EvasionSecurityDisable";
+        case BehaviorPatternType::EvasionTimestomp: return "EvasionTimestomp";
+        case BehaviorPatternType::EvasionFileHide: return "EvasionFileHide";
+        case BehaviorPatternType::EvasionMasquerade: return "EvasionMasquerade";
+        case BehaviorPatternType::EvasionRootkit: return "EvasionRootkit";
+        case BehaviorPatternType::EvasionAMSIBypass: return "EvasionAMSIBypass";
+        case BehaviorPatternType::EvasionETWTamper: return "EvasionETWTamper";
+        case BehaviorPatternType::ExfilLargeTransfer: return "ExfilLargeTransfer";
+        case BehaviorPatternType::ExfilArchiveCreate: return "ExfilArchiveCreate";
+        case BehaviorPatternType::ExfilDNSTunnel: return "ExfilDNSTunnel";
+        case BehaviorPatternType::ExfilCloudUpload: return "ExfilCloudUpload";
+        case BehaviorPatternType::ExfilEmail: return "ExfilEmail";
+        case BehaviorPatternType::ExfilClipboard: return "ExfilClipboard";
+        case BehaviorPatternType::ExfilScreenshot: return "ExfilScreenshot";
+        case BehaviorPatternType::LateralService: return "LateralService";
+        case BehaviorPatternType::LateralWMI: return "LateralWMI";
+        case BehaviorPatternType::LateralPSExec: return "LateralPSExec";
+        case BehaviorPatternType::LateralRemoteRegistry: return "LateralRemoteRegistry";
+        case BehaviorPatternType::LateralRDP: return "LateralRDP";
+        case BehaviorPatternType::LateralSMB: return "LateralSMB";
+        case BehaviorPatternType::C2Beacon: return "C2Beacon";
+        case BehaviorPatternType::C2KnownProtocol: return "C2KnownProtocol";
+        case BehaviorPatternType::C2Encrypted: return "C2Encrypted";
+        case BehaviorPatternType::C2DGA: return "C2DGA";
+        case BehaviorPatternType::C2FastFlux: return "C2FastFlux";
+        default: return "Unknown";
+    }
+}
+// ============================================================================
+// Free Functions: Event Factory Helpers
+// ============================================================================
+
+BehaviorEvent CreateFileEvent(
+    BehaviorEventType type,
+    uint32_t processId,
+    const std::wstring& path,
+    bool success) noexcept
+{
+    BehaviorEvent event;
+    event.eventType = type;
+    event.category = BehaviorEventCategory::FileSystem;
+    event.processId = processId;
+    event.targetPath = path;
+    event.success = success;
+    event.timestamp = std::chrono::steady_clock::now();
+    event.systemTime = std::chrono::system_clock::now();
+
+    // Extract extension
+    auto dotPos = path.rfind(L'.');
+    if (dotPos != std::wstring::npos) {
+        event.fileExtension = path.substr(dotPos);
+    }
+
+    return event;
+}
+
+BehaviorEvent CreateRegistryEvent(
+    BehaviorEventType type,
+    uint32_t processId,
+    const std::wstring& keyPath,
+    const std::wstring& valueName,
+    bool success) noexcept
+{
+    BehaviorEvent event;
+    event.eventType = type;
+    event.category = BehaviorEventCategory::Registry;
+    event.processId = processId;
+    event.targetPath = keyPath;
+    event.valueName = valueName;
+    event.success = success;
+    event.timestamp = std::chrono::steady_clock::now();
+    event.systemTime = std::chrono::system_clock::now();
+    return event;
+}
+
+BehaviorEvent CreateNetworkEvent(
+    BehaviorEventType type,
+    uint32_t processId,
+    const std::string& remoteHost,
+    uint16_t remotePort,
+    const std::string& protocol) noexcept
+{
+    BehaviorEvent event;
+    event.eventType = type;
+    event.category = BehaviorEventCategory::Network;
+    event.processId = processId;
+    event.remoteHostname = remoteHost;
+    event.remotePort = remotePort;
+    event.protocol = protocol;
+    event.timestamp = std::chrono::steady_clock::now();
+    event.systemTime = std::chrono::system_clock::now();
+
+    // Parse IP from hostname if it looks like an address
+    if (!remoteHost.empty() && (std::isdigit(static_cast<unsigned char>(remoteHost[0])) ||
+                                 remoteHost.find(':') != std::string::npos)) {
+        event.remoteIP = remoteHost;
+    }
+
+    return event;
+}
+
+BehaviorEvent CreateProcessEvent(
+    BehaviorEventType type,
+    uint32_t sourceProcessId,
+    uint32_t targetProcessId) noexcept
+{
+    BehaviorEvent event;
+    event.eventType = type;
+    event.category = BehaviorEventCategory::Process;
+    event.processId = sourceProcessId;
+    event.targetProcessId = targetProcessId;
+    event.timestamp = std::chrono::steady_clock::now();
+    event.systemTime = std::chrono::system_clock::now();
+    return event;
+}
+
+// ============================================================================
+// Free Functions: Analysis Helpers
+// ============================================================================
+
+double CalculateFileEntropy(const std::wstring& filePath) noexcept {
+    try {
+        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+        if (hFile == INVALID_HANDLE_VALUE) return 0.0;
+
+        // Read first 64KB for entropy calculation
+        constexpr size_t SAMPLE_SIZE = 65536;
+        std::vector<uint8_t> buffer(SAMPLE_SIZE);
+        DWORD bytesRead = 0;
+        BOOL ok = ReadFile(hFile, buffer.data(), static_cast<DWORD>(SAMPLE_SIZE),
+                           &bytesRead, nullptr);
+        CloseHandle(hFile);
+
+        if (!ok || bytesRead == 0) return 0.0;
+
+        // Shannon entropy calculation
+        std::array<uint64_t, 256> freq{};
+        for (DWORD i = 0; i < bytesRead; ++i) {
+            freq[buffer[i]]++;
+        }
+
+        double entropy = 0.0;
+        double total = static_cast<double>(bytesRead);
+        for (auto count : freq) {
+            if (count > 0) {
+                double p = static_cast<double>(count) / total;
+                entropy -= p * std::log2(p);
+            }
+        }
+
+        return entropy;
+    }
+    catch (...) {
+        return 0.0;
+    }
+}
+
+bool IsRansomNotePattern(const std::wstring& path) noexcept {
+    if (path.empty()) return false;
+
+    auto lowerPath = ToLowerCase(path);
+
+    // Extract filename from path
+    auto lastSlash = lowerPath.rfind(L'\\');
+    std::wstring filename = (lastSlash != std::wstring::npos)
+        ? lowerPath.substr(lastSlash + 1) : lowerPath;
+
+    // Known ransom note patterns
+    static const std::wstring patterns[] = {
+        L"readme", L"how_to_decrypt", L"how_to_recover",
+        L"restore_files", L"decrypt_instructions", L"help_decrypt",
+        L"ransom", L"your_files", L"recovery_key",
+        L"important_read_me", L"attention", L"_readme",
+        L"decrypt_info", L"#decrypt", L"recover_files",
+        L"all_files_encrypted"
+    };
+
+    for (const auto& pattern : patterns) {
+        if (filename.find(pattern) != std::wstring::npos) {
+            return true;
+        }
+    }
+
+    // Check for common ransom note extensions
+    if (filename.ends_with(L".hta") || filename.ends_with(L".html") ||
+        filename.ends_with(L".txt")) {
+        for (const auto& pattern : patterns) {
+            if (filename.find(pattern) != std::wstring::npos) {
+                return true;
+            }
+        }
+    }
+
+    return false;
+}
+
+bool IsPersistenceRegistryPath(const std::wstring& path) noexcept {
+    if (path.empty()) return false;
+    auto lowerPath = ToLowerCase(path);
+
+    static const std::wstring keys[] = {
+        L"\\currentversion\\run",
+        L"\\currentversion\\runonce",
+        L"\\currentversion\\runservices",
+        L"\\currentversion\\policies\\explorer\\run",
+        L"\\winlogon\\",
+        L"\\currentversion\\explorer\\shell folders",
+        L"\\active setup\\installed components",
+        L"\\currentcontrolset\\services",
+        L"\\image file execution options",
+        L"\\silentprocessexit",
+        L"\\appcompat",
+        L"\\app paths",
+        L"\\shellserviceobjectdelayload",
+        L"\\appinit_dlls",
+        L"\\clsid",
+        L"\\shellex",
+    };
+
+    for (const auto& key : keys) {
+        if (lowerPath.find(key) != std::wstring::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
+bool IsLSASSProcess(const std::wstring& processName) noexcept {
+    if (processName.empty()) return false;
+    auto lower = ToLowerCase(processName);
+    return lower == L"lsass.exe" || lower == L"lsass" || lower == L"lsaiso.exe";
+}
+
+bool IsDocumentApplication(const std::wstring& processName) noexcept {
+    if (processName.empty()) return false;
+    auto lower = ToLowerCase(processName);
+    static const std::wstring apps[] = {
+        L"winword.exe", L"excel.exe", L"powerpnt.exe", L"outlook.exe",
+        L"onenote.exe", L"msaccess.exe", L"acrord32.exe",
+        L"acrobat.exe", L"foxitreader.exe", L"visio.exe",
+        L"mspub.exe", L"wordpad.exe"
+    };
+    for (const auto& app : apps) {
+        if (lower == app) return true;
+    }
+    return false;
+}
+
+bool IsScriptInterpreter(const std::wstring& processName) noexcept {
+    if (processName.empty()) return false;
+    auto lower = ToLowerCase(processName);
+    static const std::wstring interpreters[] = {
+        L"powershell.exe", L"pwsh.exe", L"cmd.exe", L"wscript.exe",
+        L"cscript.exe", L"mshta.exe", L"regsvr32.exe", L"rundll32.exe",
+        L"msiexec.exe", L"certutil.exe", L"bitsadmin.exe",
+        L"wmic.exe", L"bash.exe", L"python.exe", L"python3.exe",
+        L"perl.exe", L"ruby.exe", L"node.exe"
+    };
+    for (const auto& interp : interpreters) {
+        if (lower == interp) return true;
+    }
+    return false;
 }
 
 }  // namespace Engine
