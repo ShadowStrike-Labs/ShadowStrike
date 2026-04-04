@@ -601,6 +601,67 @@ ErrorCode CPU::DispatchInstruction(
             if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
             return err;
         }
+
+        // === SYSENTER (0F 34) — 32-bit syscall entry ===
+        if (op == 0x34) {
+            if (m_syscallCallback && m_syscallCallback(m_state, memory)) {
+                m_state.AdvanceRIP(inst.length);
+                return ErrorCode::Success;
+            }
+            return ErrorCode::InvalidSystemCall;
+        }
+
+        // === SSE/SSE2 (TwoByte map fallthrough) ===
+        // Covers: MOVUPS/MOVAPS/MOVSS/MOVSD, XORPS/PXOR, packed arithmetic,
+        // compares, shuffles, conversions, and all other 0F-prefixed SSE ops.
+        {
+            auto err = ExecuteSSE2(inst, memory);
+            if (err == ErrorCode::Success) {
+                m_state.AdvanceRIP(inst.length);
+                return ErrorCode::Success;
+            }
+            // If SSE2 doesn't handle it, fall through to UnsupportedOpcode
+        }
+    }
+
+    // ====================================================================
+    // ThreeByte38 map (0F 38 xx) — SSE4.1/4.2 + AES-NI
+    // ====================================================================
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38) {
+        uint8_t op = inst.opcode;
+
+        // AES-NI instructions: 0xDB-0xDF with 66 prefix
+        if (op >= 0xDB && op <= 0xDF && inst.prefixes.hasOpSizeOverride) {
+            auto err = ExecuteAESNI(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // SSE4 handles everything else in this map
+        auto err = ExecuteSSE4(inst, memory);
+        if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+        return err;
+    }
+
+    // ====================================================================
+    // ThreeByte3A map (0F 3A xx) — SSE4.1/4.2 + PCLMULQDQ + AESKEYGENASSIST
+    // ====================================================================
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte3A) {
+        uint8_t op = inst.opcode;
+
+        // AES-NI: PCLMULQDQ (0x44) and AESKEYGENASSIST (0xDF) with 66 prefix
+        if ((op == 0x44 || op == 0xDF) && inst.prefixes.hasOpSizeOverride) {
+            auto err = ExecuteAESNI(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // SSE4 handles everything else in this map
+        auto err = ExecuteSSE4(inst, memory);
+        if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+        return err;
     }
 
     // FPU (0xD8-0xDF)
@@ -795,6 +856,8 @@ uint64_t CPU::SignExtendToSize(uint64_t value, OperandSize fromSize, OperandSize
 // - Executor/FlagOps.cpp       → ExecuteFlag
 // - Executor/SystemOps.cpp     → ExecuteSystem
 // - Executor/SSE2Ops.cpp       → ExecuteSSE2
+// - Executor/SSE4Ops.cpp       → ExecuteSSE4
+// - Executor/AESNIOps.cpp      → ExecuteAESNI
 // - Executor/FPUOps.cpp        → ExecuteFPU
 // ============================================================================
 
