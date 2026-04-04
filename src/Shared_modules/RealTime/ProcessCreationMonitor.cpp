@@ -42,10 +42,13 @@
 #include "../Security/DigitalSignatureValidator.hpp"
 
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 #include <regex>
 #include <sstream>
 #include <thread>
 #include <future>
+#include <nlohmann/json.hpp>
 
 namespace ShadowStrike {
 namespace RealTime {
@@ -64,6 +67,61 @@ namespace RealTime {
 
 namespace {
 
+    // -------------------------------------------------------------------------
+    // INTERNAL ATOMIC STATS (bridges atomic writes → public copyable snapshot)
+    // -------------------------------------------------------------------------
+    struct ProcessMonitorStatsInternal {
+        std::atomic<uint64_t> totalProcessCreations{0};
+        std::atomic<uint64_t> processesAllowed{0};
+        std::atomic<uint64_t> processesBlocked{0};
+        std::atomic<uint64_t> processesSuspicious{0};
+        std::atomic<uint64_t> scansPerformed{0};
+        std::atomic<uint64_t> scanTimeouts{0};
+        std::atomic<uint64_t> lolbasDetections{0};
+        std::atomic<uint64_t> parentChildDetections{0};
+        std::atomic<uint64_t> encodedCommandDetections{0};
+        std::atomic<uint64_t> masqueradingDetections{0};
+        std::atomic<size_t>   trackedProcesses{0};
+        std::atomic<uint64_t> processTerminations{0};
+        std::atomic<uint64_t> avgDecisionTimeUs{0};
+
+        void Reset() noexcept {
+            totalProcessCreations.store(0,    std::memory_order_relaxed);
+            processesAllowed.store(0,         std::memory_order_relaxed);
+            processesBlocked.store(0,         std::memory_order_relaxed);
+            processesSuspicious.store(0,      std::memory_order_relaxed);
+            scansPerformed.store(0,           std::memory_order_relaxed);
+            scanTimeouts.store(0,             std::memory_order_relaxed);
+            lolbasDetections.store(0,         std::memory_order_relaxed);
+            parentChildDetections.store(0,    std::memory_order_relaxed);
+            encodedCommandDetections.store(0, std::memory_order_relaxed);
+            masqueradingDetections.store(0,   std::memory_order_relaxed);
+            trackedProcesses.store(0,         std::memory_order_relaxed);
+            processTerminations.store(0,      std::memory_order_relaxed);
+            avgDecisionTimeUs.store(0,        std::memory_order_relaxed);
+        }
+
+        [[nodiscard]] ProcessMonitorStats Snapshot() const noexcept {
+            ProcessMonitorStats s;
+            s.totalProcessCreations    = totalProcessCreations.load(std::memory_order_relaxed);
+            s.processesAllowed         = processesAllowed.load(std::memory_order_relaxed);
+            s.processesBlocked         = processesBlocked.load(std::memory_order_relaxed);
+            s.processesSuspicious      = processesSuspicious.load(std::memory_order_relaxed);
+            s.scansPerformed           = scansPerformed.load(std::memory_order_relaxed);
+            s.scanTimeouts             = scanTimeouts.load(std::memory_order_relaxed);
+            s.lolbasDetections         = lolbasDetections.load(std::memory_order_relaxed);
+            s.parentChildDetections    = parentChildDetections.load(std::memory_order_relaxed);
+            s.encodedCommandDetections = encodedCommandDetections.load(std::memory_order_relaxed);
+            s.masqueradingDetections   = masqueradingDetections.load(std::memory_order_relaxed);
+            s.trackedProcesses         = trackedProcesses.load(std::memory_order_relaxed);
+            s.processTerminations      = processTerminations.load(std::memory_order_relaxed);
+            s.avgDecisionTimeUs        = avgDecisionTimeUs.load(std::memory_order_relaxed);
+            return s;
+        }
+    };
+
+    // -------------------------------------------------------------------------
+
     /// @brief Generate a unique process ID key (PID + CreationTime) to handle PID reuse
     std::string GenerateProcessKey(uint32_t pid, const std::chrono::system_clock::time_point& creationTime) {
         auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(creationTime.time_since_epoch()).count();
@@ -76,7 +134,8 @@ namespace {
             str.begin(), str.end(),
             sub.begin(), sub.end(),
             [](wchar_t ch1, wchar_t ch2) {
-                return std::towlower(ch1) == std::towlower(ch2);
+                return ::towlower(static_cast<wint_t>(ch1)) ==
+                       ::towlower(static_cast<wint_t>(ch2));
             }
         );
         return it != str.end();
@@ -119,6 +178,80 @@ namespace {
         }
     }
 
+    /// @brief Detect a run of Base64-valid characters long enough to be encoded content
+    bool ContainsBase64Blob(std::wstring_view str) noexcept {
+        constexpr size_t kMinRun = ProcessMonitorConstants::ENCODED_CMDLINE_THRESHOLD;
+        size_t runLen = 0;
+        for (wchar_t ch : str) {
+            if ((ch >= L'A' && ch <= L'Z') || (ch >= L'a' && ch <= L'z') ||
+                (ch >= L'0' && ch <= L'9') || ch == L'+' || ch == L'/' || ch == L'=') {
+                if (++runLen >= kMinRun) return true;
+            } else {
+                runLen = 0;
+            }
+        }
+        return false;
+    }
+
+    /// @brief Case-insensitive wildcard path match (supports * glob token)
+    bool PathMatchesPattern(const std::wstring& path, const std::wstring& pattern) noexcept {
+        if (pattern.empty() || pattern == L"*") return true;
+
+        // Build lower-case copies via ::towlower to avoid string allocation in hot path
+        std::wstring lPath(path.size(), L'\0');
+        std::wstring lPat(pattern.size(), L'\0');
+        std::transform(path.begin(),    path.end(),    lPath.begin(),
+                       [](wchar_t c){ return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c))); });
+        std::transform(pattern.begin(), pattern.end(), lPat.begin(),
+                       [](wchar_t c){ return static_cast<wchar_t>(::towlower(static_cast<wint_t>(c))); });
+
+        if (lPat.find(L'*') == std::wstring::npos)
+            return lPath == lPat;
+
+        // Segment-by-segment wildcard matching
+        size_t patPos = 0;
+        size_t strPos = 0;
+        bool   first  = true;
+
+        while (patPos <= lPat.size()) {
+            size_t starPos = lPat.find(L'*', patPos);
+            std::wstring seg = (starPos == std::wstring::npos)
+                               ? lPat.substr(patPos)
+                               : lPat.substr(patPos, starPos - patPos);
+            patPos = (starPos == std::wstring::npos) ? lPat.size() + 1 : starPos + 1;
+
+            if (seg.empty()) { first = false; continue; }
+
+            size_t found = lPath.find(seg, strPos);
+            if (found == std::wstring::npos) return false;
+            if (first && found != 0)         return false;
+            first  = false;
+            strPos = found + seg.size();
+        }
+
+        return (lPat.back() == L'*') || (strPos == lPath.size());
+    }
+
+    /// @brief Extract http/https/ftp URLs from a command line string
+    std::vector<std::string> ExtractURLsFromCmdLine(const std::wstring& cmdLine) noexcept {
+        std::vector<std::string> urls;
+        try {
+            static const std::wregex urlRegex(
+                LR"((https?|ftp)://[^\s\x00-\x1F"'<>\\]{4,2048})",
+                std::regex_constants::icase | std::regex_constants::optimize);
+
+            auto begin = std::wsregex_iterator(cmdLine.begin(), cmdLine.end(), urlRegex);
+            const std::wsregex_iterator end{};
+
+            urls.reserve(4);
+            for (auto it = begin; it != end && urls.size() < 16; ++it) {
+                std::wstring m = (*it)[0].str();
+                urls.push_back(Utils::StringUtils::ToNarrow(m));
+            }
+        } catch (...) {}
+        return urls;
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -132,7 +265,8 @@ struct ProcessCreationMonitor::Impl {
 
     // Configuration & State
     ProcessMonitorConfig config;
-    ProcessMonitorStats stats;
+    mutable std::shared_mutex configMutex;
+    ProcessMonitorStatsInternal stats;
     std::atomic<bool> isRunning{false};
     std::atomic<bool> isInitialized{false};
 
@@ -172,15 +306,16 @@ struct ProcessCreationMonitor::Impl {
     }
 
     bool Initialize(std::shared_ptr<Utils::ThreadPool> tp, const ProcessMonitorConfig& cfg) {
-        if (isInitialized) return false;
+        if (isInitialized.load(std::memory_order_acquire)) return false;
 
         threadPool = tp;
-        config = cfg;
+        {
+            std::unique_lock cfgLock(configMutex);
+            config = cfg;
+        }
 
-        // Load default rules if none exist
-        // In a real implementation, we would load from disk/DB
-
-        isInitialized = true;
+        stats.Reset();
+        isInitialized.store(true, std::memory_order_release);
         Utils::Logger::Info("ProcessCreationMonitor initialized");
         return true;
     }
@@ -223,37 +358,51 @@ struct ProcessCreationMonitor::Impl {
     // -------------------------------------------------------------------------
 
     ProcessVerdict HandleProcessCreate(const ProcessCreateEvent& event) {
-        stats.totalProcessCreations++;
+        stats.totalProcessCreations.fetch_add(1, std::memory_order_relaxed);
         auto startTime = std::chrono::high_resolution_clock::now();
 
+        // Snapshot config once under shared lock to avoid racing with UpdateConfig
+        ProcessMonitorConfig cfg;
+        {
+            std::shared_lock cfgLock(configMutex);
+            cfg = config;
+        }
+
         // 1. Basic Allow/Block based on config
-        if (!config.enabled) {
-            stats.processesAllowed++;
+        if (!cfg.enabled) {
+            stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
             return ProcessVerdict::Allow;
         }
 
         // 2. Check Whitelist
-        if (config.trustWhitelisted && whitelistStore) {
-            if (whitelistStore->IsWhitelisted(event.imagePath)) {
+        if (cfg.trustWhitelisted && whitelistStore) {
+            auto wlResult = whitelistStore->IsWhitelisted(event.imagePath);
+            if (wlResult.found) {
                 // Still update tree, but skip heavy scanning
                 UpdateProcessState(event, ProcessVerdict::Allow);
-                stats.processesAllowed++;
+                stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
                 return ProcessVerdict::Allow;
             }
         }
 
         // 3. Hash Check
-        if (config.blockKnownMalicious && hashStore) {
-            if (hashStore->IsKnownMalware(event.imageHash)) {
-                stats.processesBlocked++;
-                // Log and alert
+        if (cfg.blockKnownMalicious && hashStore && !event.imageHash.empty()) {
+            auto detection = hashStore->LookupHashString(
+                event.imageHash, HashStore::HashType::SHA256);
+            if (detection.has_value()) {
+                stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(L"ProcessCreationMonitor",
+                    L"BLOCKED known malware hash: PID=%u Path=%ls Signature=%hs ThreatLevel=%u",
+                    event.processId, event.imagePath.c_str(),
+                    detection->signatureName.c_str(),
+                    static_cast<uint32_t>(detection->threatLevel));
                 return ProcessVerdict::Block;
             }
         }
 
         // 4. Command Line Analysis
         CommandLineAnalysis cmdAnalysis;
-        if (config.analyzeCommandLine) {
+        if (cfg.analyzeCommandLine) {
             cmdAnalysis = AnalyzeCommandLine(event.commandLine);
         }
 
@@ -261,41 +410,42 @@ struct ProcessCreationMonitor::Impl {
         auto ruleVerdict = EvaluateRules(event, cmdAnalysis);
         if (ruleVerdict.has_value()) {
             if (*ruleVerdict == ProcessVerdict::Block) {
-                stats.processesBlocked++;
+                stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
                 return ProcessVerdict::Block;
             }
         }
 
         // 6. Pre-Execution Scan (if enabled and not trusted)
         ProcessVerdict scanVerdict = ProcessVerdict::Allow;
-        if (config.preExecutionScan && scanEngine) {
+        if (cfg.preExecutionScan && scanEngine) {
             // Check if we should scan (e.g. not Microsoft signed if trusted)
             bool shouldScan = true;
-            if (config.trustMicrosoftSigned && event.isImageSigned && event.imageSigner.find(L"Microsoft") != std::string::npos) {
+            if (cfg.trustMicrosoftSigned && event.isImageSigned &&
+                event.imageSigner.find(L"Microsoft") != std::wstring::npos) {
                 shouldScan = false;
             }
 
             if (shouldScan) {
                 scanVerdict = PerformScan(event);
                 if (scanVerdict == ProcessVerdict::Block) {
-                    stats.processesBlocked++;
+                    stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
                     return ProcessVerdict::Block;
                 }
             }
         }
 
-        // 7. Behavioral/Heuristic Checks (Parent-Child, LOLBAS)
+        // 7. Behavioral/Heuristic Checks (Parent-Child, LOLBAS, Masquerading)
         std::vector<SuspiciousPattern> patterns;
         double riskScore = CalculateRiskScore(event, cmdAnalysis, patterns);
 
         ProcessVerdict finalVerdict = ProcessVerdict::Allow;
 
-        if (riskScore >= config.blockThreshold) {
+        if (riskScore >= cfg.blockThreshold) {
             finalVerdict = ProcessVerdict::Block;
-            stats.processesBlocked++;
-        } else if (riskScore >= config.alertThreshold) {
-            finalVerdict = ProcessVerdict::AllowMonitored; // Or AllowSuspicious
-            stats.processesSuspicious++;
+            stats.processesBlocked.fetch_add(1, std::memory_order_relaxed);
+        } else if (riskScore >= cfg.alertThreshold) {
+            finalVerdict = ProcessVerdict::AllowMonitored;
+            stats.processesSuspicious.fetch_add(1, std::memory_order_relaxed);
 
             // Create ProcessInfo for callback
             ProcessInfo info = CreateProcessInfoFromEvent(event);
@@ -305,7 +455,7 @@ struct ProcessCreationMonitor::Impl {
             NotifySuspicious(info, patterns);
         } else {
             finalVerdict = ProcessVerdict::Allow;
-            stats.processesAllowed++;
+            stats.processesAllowed.fetch_add(1, std::memory_order_relaxed);
         }
 
         // 8. Update State (Process Tree)
@@ -313,10 +463,18 @@ struct ProcessCreationMonitor::Impl {
             UpdateProcessState(event, finalVerdict);
         }
 
-        // Update timing stats
-        auto endTime = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
-        stats.avgDecisionTimeUs = (stats.avgDecisionTimeUs * 9 + duration) / 10; // Simple moving average
+        // Update timing stats with atomic EMA (CAS loop prevents torn update)
+        auto endTime  = std::chrono::high_resolution_clock::now();
+        auto duration = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count());
+        {
+            uint64_t prev = stats.avgDecisionTimeUs.load(std::memory_order_relaxed);
+            uint64_t next;
+            do {
+                next = (prev == 0) ? duration : (prev * 9 + duration) / 10;
+            } while (!stats.avgDecisionTimeUs.compare_exchange_weak(
+                prev, next, std::memory_order_relaxed, std::memory_order_relaxed));
+        }
 
         // Notify callbacks
         NotifyCreate(event, finalVerdict);
@@ -336,7 +494,7 @@ struct ProcessCreationMonitor::Impl {
 
         // Add to active processes
         activeProcesses[event.processId] = info;
-        stats.trackedProcesses = activeProcesses.size();
+        stats.trackedProcesses.store(activeProcesses.size(), std::memory_order_relaxed);
 
         // Update Tree
         if (config.buildProcessTree) {
@@ -360,7 +518,7 @@ struct ProcessCreationMonitor::Impl {
     }
 
     void HandleProcessTerminate(uint32_t pid, uint32_t exitCode) {
-        stats.processTerminations++;
+        stats.processTerminations.fetch_add(1, std::memory_order_relaxed);
 
         {
             std::unique_lock lock(processMutex);
@@ -386,44 +544,57 @@ struct ProcessCreationMonitor::Impl {
         CommandLineAnalysis result;
         result.originalCommandLine = cmdLine;
 
-        // Parse arguments (simplified)
-        result.arguments = Utils::StringUtils::SplitArgs(cmdLine);
+        // Local config snapshot to avoid races with UpdateConfig
+        ProcessMonitorConfig cfg;
+        {
+            std::shared_lock cfgLock(configMutex);
+            cfg = config;
+        }
+
+        // Parse arguments
+        result.arguments = Utils::StringUtils::Split(cmdLine, L" ");
         if (!result.arguments.empty()) {
             result.executablePath = result.arguments[0];
         }
 
         // Check for indicators
         // 1. Base64 / Encoded
-        if (config.detectEncodedCommands && Utils::StringUtils::ContainsBase64(cmdLine)) {
+        if (cfg.detectEncodedCommands && ContainsBase64Blob(cmdLine)) {
             result.hasEncodedContent = true;
             result.encodingType = "Base64";
             result.patterns.push_back(SuspiciousPattern::EncodedPowerShell);
             result.riskScore += ProcessMonitorConstants::ENCODED_COMMAND_SCORE;
+            stats.encodedCommandDetections.fetch_add(1, std::memory_order_relaxed);
         }
 
         // 2. URLs
-        result.extractedURLs = ExtractURLsFromCommandLine(cmdLine);
+        result.extractedURLs = ExtractURLsFromCmdLine(cmdLine);
         if (!result.extractedURLs.empty()) {
             result.hasURLs = true;
-            if (result.extractedURLs.size() > ProcessMonitorConstants::URL_COUNT_THRESHOLD) {
+            if (result.extractedURLs.size() >= ProcessMonitorConstants::URL_COUNT_THRESHOLD) {
                 result.riskScore += ProcessMonitorConstants::DOWNLOAD_COMMAND_SCORE;
                 result.patterns.push_back(SuspiciousPattern::DownloadCommand);
             }
         }
 
-        // 3. Suspicious Keywords (Obfuscation, bypass)
+        // 3. Suspicious Keywords (Obfuscation, bypass, download)
         static const std::vector<std::wstring> suspiciousKeywords = {
             L"-enc", L"-encodedcommand", L"bypass", L"hidden", L"downloadstring",
-            L"iex", L"invoke-expression", L"invoke-webrequest"
+            L"iex", L"invoke-expression", L"invoke-webrequest", L"webclient",
+            L"urldownloadtofile", L"bitsadmin", L"certutil", L"regsvr32",
+            L"mshta", L"wscript", L"cscript", L"rundll32"
         };
 
         for (const auto& keyword : suspiciousKeywords) {
             if (ContainsCaseInsensitive(cmdLine, keyword)) {
-                result.suspiciousKeywords.push_back(Utils::StringUtils::WideToUtf8(keyword));
+                result.suspiciousKeywords.push_back(Utils::StringUtils::ToNarrow(keyword));
                 result.riskScore += 10.0;
 
                 if (keyword == L"bypass") result.patterns.push_back(SuspiciousPattern::BypassExecutionPolicy);
                 if (keyword == L"hidden") result.patterns.push_back(SuspiciousPattern::HiddenWindowExecution);
+                if (keyword == L"downloadstring" || keyword == L"urldownloadtofile" ||
+                    keyword == L"invoke-webrequest") result.patterns.push_back(SuspiciousPattern::DownloadCommand);
+                if (keyword == L"iex" || keyword == L"invoke-expression") result.patterns.push_back(SuspiciousPattern::ReflectionLoad);
             }
         }
 
@@ -437,7 +608,7 @@ struct ProcessCreationMonitor::Impl {
     }
 
     ProcessVerdict PerformScan(const ProcessCreateEvent& event) {
-        stats.scansPerformed++;
+        stats.scansPerformed.fetch_add(1, std::memory_order_relaxed);
 
         // ================================================================
         // DIGITAL SIGNATURE VALIDATION (Pre-Execution Gate)
@@ -482,8 +653,51 @@ struct ProcessCreationMonitor::Impl {
                 event.processId);
         }
 
-        // Fall through to ScanEngine for content-based analysis
+        // ================================================================
+        // CONTENT-BASED SCAN via ScanEngine
+        // ================================================================
         if (!scanEngine) return ProcessVerdict::Allow;
+
+        try {
+            auto scanResult = scanEngine->QuickScanFile(event.imagePath);
+
+            if (scanResult.verdict == Core::Engine::ScanVerdict::Infected) {
+                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                    L"BLOCKED malware image: PID=%u Path=%ls Threat=%hs Score=%.1f",
+                    event.processId, event.imagePath.c_str(),
+                    scanResult.threatName.c_str(), scanResult.threatScore);
+                return ProcessVerdict::Block;
+            }
+
+            if (scanResult.verdict == Core::Engine::ScanVerdict::Suspicious) {
+                SS_LOG_WARN(L"ProcessCreationMonitor",
+                    L"Suspicious image detected: PID=%u Path=%ls Threat=%hs Score=%.1f",
+                    event.processId, event.imagePath.c_str(),
+                    scanResult.threatName.c_str(), scanResult.threatScore);
+                return ProcessVerdict::AllowMonitored;
+            }
+
+            if (scanResult.verdict == Core::Engine::ScanVerdict::Timeout) {
+                stats.scanTimeouts.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(L"ProcessCreationMonitor",
+                    L"Pre-execution scan timeout: PID=%u Path=%ls",
+                    event.processId, event.imagePath.c_str());
+                ProcessMonitorConfig cfgSnap;
+                {
+                    std::shared_lock cl(configMutex);
+                    cfgSnap = config;
+                }
+                return cfgSnap.blockOnTimeout ? ProcessVerdict::Block : ProcessVerdict::Allow;
+            }
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"ScanEngine exception in pre-exec scan PID=%u: %hs",
+                event.processId, ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"ScanEngine unknown exception in pre-exec scan PID=%u",
+                event.processId);
+        }
 
         return ProcessVerdict::Allow;
     }
@@ -520,8 +734,15 @@ struct ProcessCreationMonitor::Impl {
         double score = cmd.riskScore;
         patterns.insert(patterns.end(), cmd.patterns.begin(), cmd.patterns.end());
 
+        // Local config snapshot
+        ProcessMonitorConfig cfg;
+        {
+            std::shared_lock cfgLock(configMutex);
+            cfg = config;
+        }
+
         // Parent-Child Analysis
-        if (config.detectSuspiciousParentChild && config.trackParentChild) {
+        if (cfg.detectSuspiciousParentChild && cfg.trackParentChild) {
             std::shared_lock lock(processMutex);
             auto parentIt = activeProcesses.find(event.parentProcessId);
             if (parentIt != activeProcesses.end()) {
@@ -529,17 +750,19 @@ struct ProcessCreationMonitor::Impl {
                 if (!pcPatterns.empty()) {
                     patterns.insert(patterns.end(), pcPatterns.begin(), pcPatterns.end());
                     score += ProcessMonitorConstants::SUSPICIOUS_PARENT_CHILD_SCORE * pcPatterns.size();
+                    stats.parentChildDetections.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
 
         // LOLBAS
-        if (config.detectLOLBAS) {
+        if (cfg.detectLOLBAS) {
             LOLBASType type = ClassifyLOLBAS(event.imageFileName);
             if (type != LOLBASType::None) {
                 // Check if arguments look malicious for this LOLBAS
                 if (cmd.hasURLs || cmd.hasEncodedContent || !cmd.suspiciousKeywords.empty()) {
                     score += ProcessMonitorConstants::LOLBAS_ABUSE_SCORE;
+                    stats.lolbasDetections.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
@@ -552,13 +775,38 @@ struct ProcessCreationMonitor::Impl {
 
         if (IsNetworkPath(event.imagePath)) {
             patterns.push_back(SuspiciousPattern::NetworkShareExecution);
-            if (config.blockFromNetwork) score += 100.0;
+            if (cfg.blockFromNetwork) score += 100.0;
+        }
+
+        // Masquerading check: system binary in wrong path
+        if (cfg.detectMasquerading) {
+            static const std::pair<const wchar_t*, const wchar_t*> kSystemBinaries[] = {
+                { L"svchost.exe",  L"\\Windows\\System32\\" },
+                { L"lsass.exe",    L"\\Windows\\System32\\" },
+                { L"csrss.exe",    L"\\Windows\\System32\\" },
+                { L"winlogon.exe", L"\\Windows\\System32\\" },
+                { L"explorer.exe", L"\\Windows\\" },
+            };
+            for (const auto& [name, expectedPath] : kSystemBinaries) {
+                if (Utils::StringUtils::IEquals(event.imageFileName, name)) {
+                    if (!Utils::StringUtils::IContains(event.imagePath, expectedPath)) {
+                        patterns.push_back(SuspiciousPattern::ProcessMasquerading);
+                        score += 60.0;
+                        stats.masqueradingDetections.fetch_add(1, std::memory_order_relaxed);
+                        SS_LOG_WARN(L"ProcessCreationMonitor",
+                            L"Process masquerading detected: PID=%u Image=%ls Path=%ls",
+                            event.processId, event.imageFileName.c_str(),
+                            event.imagePath.c_str());
+                    }
+                    break;
+                }
+            }
         }
 
         // Signature
         if (!event.isImageSigned) {
             score += ProcessMonitorConstants::UNSIGNED_EXECUTABLE_SCORE;
-            if (config.blockUnsigned) score += 100.0;
+            if (cfg.blockUnsigned) score += 100.0;
         }
 
         return score;
@@ -577,7 +825,7 @@ struct ProcessCreationMonitor::Impl {
         }
 
         // 2. Services -> Shell (often web shell or exploit)
-        if (Utils::StringUtils::EqualsCaseInsensitive(parent.imageName, L"services.exe")) {
+        if (Utils::StringUtils::IEquals(parent.imageName, L"services.exe")) {
              if (ClassifyLOLBAS(child.imageFileName) == LOLBASType::Cmd ||
                 ClassifyLOLBAS(child.imageFileName) == LOLBASType::PowerShell) {
                 patterns.push_back(SuspiciousPattern::ServicesSpawnsShell);
@@ -585,7 +833,7 @@ struct ProcessCreationMonitor::Impl {
         }
 
         // 3. Svchost -> Non-Service
-        if (Utils::StringUtils::EqualsCaseInsensitive(parent.imageName, L"svchost.exe")) {
+        if (Utils::StringUtils::IEquals(parent.imageName, L"svchost.exe")) {
             // Svchost normally spawns other system services or COM providers
             // Spawning cmd.exe is very suspicious
             if (ClassifyLOLBAS(child.imageFileName) != LOLBASType::None) {
@@ -630,17 +878,31 @@ struct ProcessCreationMonitor::Impl {
     }
 
     LOLBASType ClassifyLOLBAS(const std::wstring& imageName) const {
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"cmd.exe")) return LOLBASType::Cmd;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"powershell.exe")) return LOLBASType::PowerShell;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"pwsh.exe")) return LOLBASType::PowerShell;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"wscript.exe")) return LOLBASType::WSH;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"cscript.exe")) return LOLBASType::WSH;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"mshta.exe")) return LOLBASType::Mshta;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"regsvr32.exe")) return LOLBASType::Regsvr32;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"rundll32.exe")) return LOLBASType::Rundll32;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"certutil.exe")) return LOLBASType::Certutil;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"bitsadmin.exe")) return LOLBASType::Bitsadmin;
-        if (Utils::StringUtils::EqualsCaseInsensitive(imageName, L"wmic.exe")) return LOLBASType::Wmic;
+        if (Utils::StringUtils::IEquals(imageName, L"cmd.exe"))        return LOLBASType::Cmd;
+        if (Utils::StringUtils::IEquals(imageName, L"powershell.exe")) return LOLBASType::PowerShell;
+        if (Utils::StringUtils::IEquals(imageName, L"pwsh.exe"))       return LOLBASType::PowerShell;
+        if (Utils::StringUtils::IEquals(imageName, L"wscript.exe"))    return LOLBASType::WSH;
+        if (Utils::StringUtils::IEquals(imageName, L"cscript.exe"))    return LOLBASType::WSH;
+        if (Utils::StringUtils::IEquals(imageName, L"mshta.exe"))      return LOLBASType::Mshta;
+        if (Utils::StringUtils::IEquals(imageName, L"regsvr32.exe"))   return LOLBASType::Regsvr32;
+        if (Utils::StringUtils::IEquals(imageName, L"rundll32.exe"))   return LOLBASType::Rundll32;
+        if (Utils::StringUtils::IEquals(imageName, L"certutil.exe"))   return LOLBASType::Certutil;
+        if (Utils::StringUtils::IEquals(imageName, L"bitsadmin.exe"))  return LOLBASType::Bitsadmin;
+        if (Utils::StringUtils::IEquals(imageName, L"wmic.exe"))       return LOLBASType::Wmic;
+        if (Utils::StringUtils::IEquals(imageName, L"msiexec.exe"))    return LOLBASType::Msiexec;
+        if (Utils::StringUtils::IEquals(imageName, L"expand.exe"))     return LOLBASType::Expand;
+        if (Utils::StringUtils::IEquals(imageName, L"esentutl.exe"))   return LOLBASType::Esentutl;
+        if (Utils::StringUtils::IEquals(imageName, L"installutil.exe")) return LOLBASType::InstallUtil;
+        if (Utils::StringUtils::IEquals(imageName, L"msbuild.exe"))    return LOLBASType::MSBuild;
+        if (Utils::StringUtils::IEquals(imageName, L"odbcconf.exe"))   return LOLBASType::ODBCConf;
+        if (Utils::StringUtils::IEquals(imageName, L"regasm.exe"))     return LOLBASType::RegAsm;
+        if (Utils::StringUtils::IEquals(imageName, L"regsvcs.exe"))    return LOLBASType::RegSvcs;
+        if (Utils::StringUtils::IEquals(imageName, L"xwizard.exe"))    return LOLBASType::XWizard;
+        if (Utils::StringUtils::IEquals(imageName, L"forfiles.exe"))   return LOLBASType::ForFiles;
+        if (Utils::StringUtils::IEquals(imageName, L"pcalua.exe"))     return LOLBASType::PcaLua;
+        if (Utils::StringUtils::IEquals(imageName, L"cmstp.exe"))      return LOLBASType::Cmstp;
+        if (Utils::StringUtils::IEquals(imageName, L"bash.exe"))       return LOLBASType::WSL;
+        if (Utils::StringUtils::IEquals(imageName, L"wsl.exe"))        return LOLBASType::WSL;
         return LOLBASType::None;
     }
 
@@ -650,24 +912,35 @@ struct ProcessCreationMonitor::Impl {
     }
 
     bool IsOfficeApplication(const std::wstring& imageName) const {
-        return Utils::StringUtils::EqualsCaseInsensitive(imageName, L"winword.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"excel.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"powerpnt.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"outlook.exe");
+        return Utils::StringUtils::IEquals(imageName, L"winword.exe")  ||
+               Utils::StringUtils::IEquals(imageName, L"excel.exe")    ||
+               Utils::StringUtils::IEquals(imageName, L"powerpnt.exe") ||
+               Utils::StringUtils::IEquals(imageName, L"outlook.exe")  ||
+               Utils::StringUtils::IEquals(imageName, L"onenote.exe")  ||
+               Utils::StringUtils::IEquals(imageName, L"access.exe")   ||
+               Utils::StringUtils::IEquals(imageName, L"msaccess.exe") ||
+               Utils::StringUtils::IEquals(imageName, L"mspub.exe");
     }
 
     bool IsBrowser(const std::wstring& imageName) const {
-        return Utils::StringUtils::EqualsCaseInsensitive(imageName, L"chrome.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"firefox.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"msedge.exe") ||
-               Utils::StringUtils::EqualsCaseInsensitive(imageName, L"iexplore.exe");
+        return Utils::StringUtils::IEquals(imageName, L"chrome.exe")    ||
+               Utils::StringUtils::IEquals(imageName, L"firefox.exe")   ||
+               Utils::StringUtils::IEquals(imageName, L"msedge.exe")    ||
+               Utils::StringUtils::IEquals(imageName, L"iexplore.exe")  ||
+               Utils::StringUtils::IEquals(imageName, L"opera.exe")     ||
+               Utils::StringUtils::IEquals(imageName, L"brave.exe");
     }
 
     ProcessType ClassifyProcessType(const ProcessInfo& info) const {
         if (info.isScriptInterpreter) return ProcessType::ScriptInterpreter;
-        if (info.isBrowser) return ProcessType::Browser;
-        if (info.isOfficeApp) return ProcessType::Office;
-        if (Utils::StringUtils::EqualsCaseInsensitive(info.imageName, L"svchost.exe")) return ProcessType::Service;
+        if (info.isBrowser)           return ProcessType::Browser;
+        if (info.isOfficeApp)         return ProcessType::Office;
+        if (Utils::StringUtils::IEquals(info.imageName, L"svchost.exe"))  return ProcessType::Service;
+        if (Utils::StringUtils::IEquals(info.imageName, L"services.exe")) return ProcessType::Service;
+        if (Utils::StringUtils::IEquals(info.imageName, L"lsass.exe"))    return ProcessType::System;
+        if (Utils::StringUtils::IEquals(info.imageName, L"csrss.exe"))    return ProcessType::System;
+        if (Utils::StringUtils::IEquals(info.imageName, L"wininit.exe"))  return ProcessType::System;
+        if (Utils::StringUtils::IEquals(info.imageName, L"winlogon.exe")) return ProcessType::System;
         return ProcessType::Unknown;
     }
 
@@ -746,10 +1019,12 @@ bool ProcessCreationMonitor::IsRunning() const noexcept {
 }
 
 void ProcessCreationMonitor::UpdateConfig(const ProcessMonitorConfig& config) {
+    std::unique_lock lock(m_impl->configMutex);
     m_impl->config = config;
 }
 
 ProcessMonitorConfig ProcessCreationMonitor::GetConfig() const {
+    std::shared_lock lock(m_impl->configMutex);
     return m_impl->config;
 }
 
@@ -855,7 +1130,7 @@ std::vector<ProcessInfo> ProcessCreationMonitor::GetProcessesByUser(const std::w
     std::vector<ProcessInfo> result;
     std::shared_lock lock(m_impl->processMutex);
     for (const auto& [pid, info] : m_impl->activeProcesses) {
-        if (Utils::StringUtils::EqualsCaseInsensitive(info.userName, userName)) {
+        if (Utils::StringUtils::IEquals(info.userName, userName)) {
             result.push_back(info);
         }
     }
@@ -866,7 +1141,7 @@ std::vector<ProcessInfo> ProcessCreationMonitor::GetProcessesByImage(const std::
     std::vector<ProcessInfo> result;
     std::shared_lock lock(m_impl->processMutex);
     for (const auto& [pid, info] : m_impl->activeProcesses) {
-        if (Utils::StringUtils::EqualsCaseInsensitive(info.imageName, imageName)) {
+        if (Utils::StringUtils::IEquals(info.imageName, imageName)) {
             result.push_back(info);
         }
     }
@@ -884,8 +1159,51 @@ bool ProcessCreationMonitor::IsCommandLineSuspicious(const std::wstring& command
 }
 
 std::wstring ProcessCreationMonitor::DecodeEncodedContent(const std::wstring& content) const {
-    // Basic base64 decode for illustration
-    return Utils::StringUtils::Base64DecodeW(content);
+    // Base64 decode: input is a wide string of Base64-ASCII chars
+    static constexpr std::string_view kB64Chars =
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    std::string narrow;
+    narrow.reserve(content.size());
+    for (wchar_t wc : content) {
+        if (wc < 0x7F && wc > 0x20) narrow.push_back(static_cast<char>(wc));
+    }
+
+    // Remove padding
+    while (!narrow.empty() && narrow.back() == '=') narrow.pop_back();
+
+    std::vector<uint8_t> decoded;
+    decoded.reserve((narrow.size() * 3) / 4);
+
+    uint32_t val = 0;
+    int      valb = -8;
+    for (char c : narrow) {
+        size_t pos = kB64Chars.find(c);
+        if (pos == std::string_view::npos) continue;
+        val = (val << 6) | static_cast<uint32_t>(pos);
+        valb += 6;
+        if (valb >= 0) {
+            decoded.push_back(static_cast<uint8_t>((val >> valb) & 0xFF));
+            valb -= 8;
+        }
+    }
+
+    // Interpret decoded bytes as UTF-16LE (common for PowerShell -EncodedCommand)
+    if (decoded.size() >= 2 && decoded.size() % 2 == 0) {
+        std::wstring result;
+        result.reserve(decoded.size() / 2);
+        for (size_t i = 0; i + 1 < decoded.size(); i += 2) {
+            wchar_t wc = static_cast<wchar_t>(
+                static_cast<uint16_t>(decoded[i]) |
+                (static_cast<uint16_t>(decoded[i + 1]) << 8));
+            result.push_back(wc);
+        }
+        return result;
+    }
+
+    // Fall back: interpret as UTF-8
+    return Utils::StringUtils::ToWide(
+        std::string(decoded.begin(), decoded.end()));
 }
 
 LOLBASType ProcessCreationMonitor::ClassifyLOLBAS(const std::wstring& imageName) const {
@@ -941,18 +1259,134 @@ std::vector<ProcessPolicyRule> ProcessCreationMonitor::GetRules() const {
 }
 
 bool ProcessCreationMonitor::LoadRulesFromFile(const std::wstring& filePath) {
-    // In production: JSON load
-    return false;
+    try {
+        std::ifstream file(filePath);
+        if (!file.is_open()) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"Failed to open rules file for reading: %ls", filePath.c_str());
+            return false;
+        }
+
+        nlohmann::json j;
+        file >> j;
+
+        if (!j.is_array()) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"Rules file root must be a JSON array: %ls", filePath.c_str());
+            return false;
+        }
+
+        std::vector<ProcessPolicyRule> loaded;
+        loaded.reserve(j.size());
+
+        for (const auto& item : j) {
+            if (!item.is_object()) continue;
+
+            ProcessPolicyRule rule;
+            rule.ruleId   = item.value("ruleId",   std::string{});
+            rule.name     = Utils::StringUtils::ToWide(item.value("name",    std::string{}));
+            rule.enabled  = item.value("enabled",  true);
+            rule.priority = item.value("priority", 0u);
+
+            const std::string action = item.value("action", "Block");
+            if      (action == "Allow")      rule.action = ProcessVerdict::Allow;
+            else if (action == "Monitor")    rule.action = ProcessVerdict::AllowMonitored;
+            else if (action == "Suspicious") rule.action = ProcessVerdict::AllowSuspicious;
+            else                             rule.action = ProcessVerdict::Block;
+
+            if (item.contains("imagePathPattern") && item["imagePathPattern"].is_string())
+                rule.imagePathPattern = Utils::StringUtils::ToWide(item["imagePathPattern"].get<std::string>());
+            if (item.contains("imageHash") && item["imageHash"].is_string())
+                rule.imageHash = item["imageHash"].get<std::string>();
+            if (item.contains("imageNamePattern") && item["imageNamePattern"].is_string())
+                rule.imageNamePattern = Utils::StringUtils::ToWide(item["imageNamePattern"].get<std::string>());
+            if (item.contains("commandLinePattern") && item["commandLinePattern"].is_string())
+                rule.commandLinePattern = Utils::StringUtils::ToWide(item["commandLinePattern"].get<std::string>());
+
+            if (!rule.ruleId.empty())
+                loaded.push_back(std::move(rule));
+        }
+
+        {
+            std::unique_lock lock(m_impl->rulesMutex);
+            m_impl->rules = std::move(loaded);
+            std::sort(m_impl->rules.begin(), m_impl->rules.end(),
+                [](const auto& a, const auto& b) { return a.priority > b.priority; });
+        }
+
+        SS_LOG_INFO(L"ProcessCreationMonitor",
+            L"Loaded %zu policy rules from: %ls",
+            m_impl->rules.size(), filePath.c_str());
+        return true;
+
+    } catch (const nlohmann::json::exception& ex) {
+        SS_LOG_ERROR(L"ProcessCreationMonitor",
+            L"JSON parse error loading rules from %ls: %hs", filePath.c_str(), ex.what());
+        return false;
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"ProcessCreationMonitor",
+            L"Exception loading rules from %ls: %hs", filePath.c_str(), ex.what());
+        return false;
+    }
 }
 
 bool ProcessCreationMonitor::SaveRulesToFile(const std::wstring& filePath) const {
-    // In production: JSON save
-    return false;
+    try {
+        nlohmann::json j = nlohmann::json::array();
+
+        {
+            std::shared_lock lock(m_impl->rulesMutex);
+            for (const auto& rule : m_impl->rules) {
+                std::string action;
+                switch (rule.action) {
+                    case ProcessVerdict::Allow:           action = "Allow";      break;
+                    case ProcessVerdict::AllowMonitored:  action = "Monitor";    break;
+                    case ProcessVerdict::AllowSuspicious: action = "Suspicious"; break;
+                    default:                              action = "Block";      break;
+                }
+                nlohmann::json item;
+                item["ruleId"]   = rule.ruleId;
+                item["name"]     = Utils::StringUtils::ToNarrow(rule.name);
+                item["enabled"]  = rule.enabled;
+                item["priority"] = rule.priority;
+                item["action"]   = action;
+
+                if (rule.imagePathPattern)
+                    item["imagePathPattern"]   = Utils::StringUtils::ToNarrow(*rule.imagePathPattern);
+                if (rule.imageHash)
+                    item["imageHash"]          = *rule.imageHash;
+                if (rule.imageNamePattern)
+                    item["imageNamePattern"]   = Utils::StringUtils::ToNarrow(*rule.imageNamePattern);
+                if (rule.commandLinePattern)
+                    item["commandLinePattern"] = Utils::StringUtils::ToNarrow(*rule.commandLinePattern);
+
+                j.push_back(std::move(item));
+            }
+        }
+
+        std::ofstream file(filePath);
+        if (!file.is_open()) {
+            SS_LOG_ERROR(L"ProcessCreationMonitor",
+                L"Failed to open rules file for writing: %ls", filePath.c_str());
+            return false;
+        }
+        file << j.dump(2);
+
+        SS_LOG_INFO(L"ProcessCreationMonitor",
+            L"Saved %zu policy rules to: %ls",
+            m_impl->rules.size(), filePath.c_str());
+        return true;
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"ProcessCreationMonitor",
+            L"Exception saving rules to %ls: %hs", filePath.c_str(), ex.what());
+        return false;
+    }
 }
 
 // Stats
 ProcessMonitorStats ProcessCreationMonitor::GetStats() const {
-    return m_impl->stats;
+    return m_impl->stats.Snapshot();
 }
 
 void ProcessCreationMonitor::ResetStats() {
@@ -1022,26 +1456,43 @@ void ProcessCreationMonitor::SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* 
 }
 
 // Utility Implementations
-std::wstring GetProcessImageName(const std::wstring& imagePath) {
-    std::filesystem::path p(imagePath);
-    return p.filename().wstring();
+std::wstring GetProcessImageName(const std::wstring& imagePath) noexcept {
+    try {
+        std::filesystem::path p(imagePath);
+        return p.filename().wstring();
+    } catch (...) {
+        return {};
+    }
 }
 
 bool IsScriptInterpreter(const std::wstring& imageName) noexcept {
-    return ProcessCreationMonitor::Instance().m_impl->IsScriptInterpreter(imageName);
+    LOLBASType t = ProcessCreationMonitor::Instance().ClassifyLOLBAS(imageName);
+    return t == LOLBASType::PowerShell || t == LOLBASType::WSH ||
+           t == LOLBASType::Mshta      || t == LOLBASType::Cmd;
 }
 
 bool IsBrowser(const std::wstring& imageName) noexcept {
-    return ProcessCreationMonitor::Instance().m_impl->IsBrowser(imageName);
+    return Utils::StringUtils::IEquals(imageName, L"chrome.exe")   ||
+           Utils::StringUtils::IEquals(imageName, L"firefox.exe")  ||
+           Utils::StringUtils::IEquals(imageName, L"msedge.exe")   ||
+           Utils::StringUtils::IEquals(imageName, L"iexplore.exe") ||
+           Utils::StringUtils::IEquals(imageName, L"brave.exe")    ||
+           Utils::StringUtils::IEquals(imageName, L"opera.exe");
 }
 
 bool IsOfficeApplication(const std::wstring& imageName) noexcept {
-    return ProcessCreationMonitor::Instance().m_impl->IsOfficeApplication(imageName);
+    return Utils::StringUtils::IEquals(imageName, L"winword.exe")  ||
+           Utils::StringUtils::IEquals(imageName, L"excel.exe")    ||
+           Utils::StringUtils::IEquals(imageName, L"powerpnt.exe") ||
+           Utils::StringUtils::IEquals(imageName, L"outlook.exe")  ||
+           Utils::StringUtils::IEquals(imageName, L"onenote.exe");
 }
 
 bool IsInTempFolder(const std::wstring& path) noexcept {
     return ContainsCaseInsensitive(path, L"\\AppData\\Local\\Temp") ||
-           ContainsCaseInsensitive(path, L"\\Windows\\Temp");
+           ContainsCaseInsensitive(path, L"\\Windows\\Temp")        ||
+           ContainsCaseInsensitive(path, L"\\Temp\\")               ||
+           ContainsCaseInsensitive(path, L"/tmp/");
 }
 
 bool IsInDownloadsFolder(const std::wstring& path) noexcept {
@@ -1049,46 +1500,48 @@ bool IsInDownloadsFolder(const std::wstring& path) noexcept {
 }
 
 bool IsNetworkPath(const std::wstring& path) noexcept {
-    return path.starts_with(L"\\\\");
+    return path.starts_with(L"\\\\") || path.starts_with(L"//");
 }
 
 bool ContainsBase64(const std::wstring& str) noexcept {
-    return Utils::StringUtils::ContainsBase64(str);
+    return ContainsBase64Blob(str);
 }
 
 std::vector<std::string> ExtractURLsFromCommandLine(const std::wstring& cmdLine) noexcept {
-    // Simplified URL extraction
-    // In production use proper regex
-    return {};
+    return ExtractURLsFromCmdLine(cmdLine);
 }
 
-// Utility string functions
-constexpr const char* ProcessVerdictToString(ProcessVerdict verdict) noexcept {
-    switch (verdict) {
-        case ProcessVerdict::Allow: return "Allow";
-        case ProcessVerdict::Block: return "Block";
-        case ProcessVerdict::AllowMonitored: return "AllowMonitored";
-        case ProcessVerdict::AllowSuspicious: return "AllowSuspicious";
-        case ProcessVerdict::Timeout: return "Timeout";
-        case ProcessVerdict::Error: return "Error";
-        default: return "Unknown";
+// GetProcessChainString implementation
+std::wstring ProcessTreeNode::GetProcessChainString() const {
+    std::wstring result;
+    result.reserve(ancestorPath.size() * 10 + 32);
+    for (uint32_t pid : ancestorPath) {
+        result += std::to_wstring(pid);
+        result += L" -> ";
+    }
+    result += std::to_wstring(process.processId);
+    if (!process.imageName.empty()) {
+        result += L" (";
+        result += process.imageName;
+        result += L")";
+    }
+    return result;
+}
+
+// Pause / Resume
+void ProcessCreationMonitor::Pause() {
+    const bool wasRunning = m_impl->isRunning.exchange(false, std::memory_order_acq_rel);
+    if (wasRunning) {
+        SS_LOG_INFO(L"ProcessCreationMonitor", L"Monitoring paused");
     }
 }
 
-constexpr const char* LOLBASTypeToString(LOLBASType type) noexcept {
-    switch (type) {
-        case LOLBASType::Cmd: return "Cmd";
-        case LOLBASType::PowerShell: return "PowerShell";
-        case LOLBASType::WSH: return "WSH";
-        case LOLBASType::Mshta: return "Mshta";
-        case LOLBASType::Regsvr32: return "Regsvr32";
-        default: return "Other/None";
+void ProcessCreationMonitor::Resume() {
+    if (!m_impl->isInitialized.load(std::memory_order_acquire)) return;
+    const bool wasPaused = !m_impl->isRunning.exchange(true, std::memory_order_acq_rel);
+    if (wasPaused) {
+        SS_LOG_INFO(L"ProcessCreationMonitor", L"Monitoring resumed");
     }
-}
-
-constexpr const char* SuspiciousPatternToString(SuspiciousPattern pattern) noexcept {
-    // See internal helper
-    return "SuspiciousPattern";
 }
 
 } // namespace RealTime
