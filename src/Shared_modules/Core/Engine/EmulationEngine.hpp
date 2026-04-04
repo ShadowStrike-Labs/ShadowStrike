@@ -162,9 +162,6 @@
  * - Resource limits to prevent DoS (CPU time, memory, instructions)
  * - Automatic cleanup on timeout or crash
  *
- * @note Requires Windows 10 1803+ with Hyper-V enabled
- * @note Falls back to Unicorn Engine if WHP unavailable
- *
  * @see SignatureStore for YARA rule integration
  * @see PatternStore for packer detection patterns
  * @see HashStore for payload hash comparison
@@ -399,23 +396,11 @@ namespace EmulationConstants {
  * @brief Emulation backend type.
  */
 enum class EmulationBackend : uint8_t {
-    /// @brief Automatic selection based on availability
+    /// @brief Automatic selection (always uses PhantomEmulator)
     Auto = 0,
     
-    /// @brief Windows Hypervisor Platform (hardware-accelerated)
-    WHP = 1,
-    
-    /// @brief Hyper-V direct (requires admin)
-    HyperV = 2,
-    
-    /// @brief Unicorn Engine (software emulation)
-    Unicorn = 3,
-    
-    /// @brief QEMU KVM (Linux only)
-    KVM = 4,
-    
-    /// @brief Intel HAXM
-    HAXM = 5
+    /// @brief PhantomEmulator custom x86/x64 software emulation (always available)
+    PhantomEmulator = 1,
 };
 
 /**
@@ -707,13 +692,9 @@ enum class PackerType : uint16_t {
  */
 [[nodiscard]] constexpr const char* EmulationBackendToString(EmulationBackend backend) noexcept {
     switch (backend) {
-        case EmulationBackend::Auto:    return "Auto";
-        case EmulationBackend::WHP:     return "Windows Hypervisor Platform";
-        case EmulationBackend::HyperV:  return "Hyper-V";
-        case EmulationBackend::Unicorn: return "Unicorn Engine";
-        case EmulationBackend::KVM:     return "KVM";
-        case EmulationBackend::HAXM:    return "Intel HAXM";
-        default:                        return "Unknown";
+        case EmulationBackend::Auto:             return "Auto";
+        case EmulationBackend::PhantomEmulator:  return "PhantomEmulator";
+        default:                                 return "Unknown";
     }
 }
 
@@ -1659,6 +1640,32 @@ struct EmulationSession {
     
     /// @brief Backend being used
     EmulationBackend activeBackend = EmulationBackend::Auto;
+
+    EmulationSession() = default;
+
+    EmulationSession(const EmulationSession& other)
+        : sessionId(other.sessionId)
+        , state(other.state.load(std::memory_order_relaxed))
+        , config(other.config)
+        , startTime(other.startTime)
+        , instructionCount(other.instructionCount.load(std::memory_order_relaxed))
+        , apiCallCount(other.apiCallCount.load(std::memory_order_relaxed))
+        , activeBackend(other.activeBackend) {
+    }
+
+    EmulationSession& operator=(const EmulationSession& other) {
+        if (this != &other) {
+            sessionId = other.sessionId;
+            state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            config = other.config;
+            startTime = other.startTime;
+            instructionCount.store(other.instructionCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apiCallCount.store(other.apiCallCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeBackend = other.activeBackend;
+        }
+
+        return *this;
+    }
 };
 
 /**
@@ -1698,11 +1705,44 @@ struct EmulationStats {
     /// @brief Average emulation time (microseconds)
     std::atomic<uint64_t> avgEmulationTimeUs{ 0 };
     
-    /// @brief WHP backend available
-    bool whpAvailable = false;
-    
-    /// @brief Unicorn backend available
-    bool unicornAvailable = false;
+    /// @brief PhantomEmulator backend available (always true)
+    bool phantomEmulatorAvailable = true;
+
+    EmulationStats() = default;
+
+    EmulationStats(const EmulationStats& other)
+        : totalSessions(other.totalSessions.load(std::memory_order_relaxed))
+        , successfulCompletions(other.successfulCompletions.load(std::memory_order_relaxed))
+        , timeouts(other.timeouts.load(std::memory_order_relaxed))
+        , errors(other.errors.load(std::memory_order_relaxed))
+        , malwareDetections(other.malwareDetections.load(std::memory_order_relaxed))
+        , successfulUnpacks(other.successfulUnpacks.load(std::memory_order_relaxed))
+        , totalInstructions(other.totalInstructions.load(std::memory_order_relaxed))
+        , totalAPICalls(other.totalAPICalls.load(std::memory_order_relaxed))
+        , totalFilesCaptured(other.totalFilesCaptured.load(std::memory_order_relaxed))
+        , activeSessions(other.activeSessions.load(std::memory_order_relaxed))
+        , avgEmulationTimeUs(other.avgEmulationTimeUs.load(std::memory_order_relaxed))
+        , phantomEmulatorAvailable(other.phantomEmulatorAvailable) {
+    }
+
+    EmulationStats& operator=(const EmulationStats& other) {
+        if (this != &other) {
+            totalSessions.store(other.totalSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            successfulCompletions.store(other.successfulCompletions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            timeouts.store(other.timeouts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            errors.store(other.errors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            malwareDetections.store(other.malwareDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            successfulUnpacks.store(other.successfulUnpacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalInstructions.store(other.totalInstructions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAPICalls.store(other.totalAPICalls.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalFilesCaptured.store(other.totalFilesCaptured.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeSessions.store(other.activeSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            avgEmulationTimeUs.store(other.avgEmulationTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            phantomEmulatorAvailable = other.phantomEmulatorAvailable;
+        }
+
+        return *this;
+    }
     
     /**
      * @brief Reset all statistics.
@@ -1737,11 +1777,11 @@ using InstructionCallback = std::function<bool(uint64_t address, const uint8_t* 
 // ============================================================================
 
 /**
- * @brief Enterprise-grade code emulation engine using Windows Hypervisor Platform.
+ * @brief Enterprise-grade code emulation engine using PhantomEmulator.
  *
- * Provides hardware-accelerated code emulation for safe execution and analysis
- * of potentially malicious code. Uses Hyper-V/WHP for near-native performance
- * with complete isolation.
+ * Provides software-based custom x86/x64 emulation for safe execution and
+ * analysis of potentially malicious code. Uses PhantomEmulator to create
+ * isolated execution environments with complete behavioral visibility.
  *
  * Thread Safety: All public methods are thread-safe. Multiple emulation sessions
  * can run concurrently up to MAX_CONCURRENT_SESSIONS.
@@ -1805,7 +1845,7 @@ public:
      * @brief Initialize the emulation engine.
      * @param threadPool Thread pool for async operations.
      * @return true on success.
-     * @note Detects available backends (WHP, Unicorn) automatically.
+     * @note Initializes the PhantomEmulator-backed execution pipeline.
      */
     [[nodiscard]] bool Initialize(std::shared_ptr<Utils::ThreadPool> threadPool);
 
@@ -2101,122 +2141,10 @@ public:
     void SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* index);
 
 private:
-    // =========================================================================
-    // Private Constructor (Singleton)
-    // =========================================================================
-
     EmulationEngine();
     ~EmulationEngine();
 
-    // =========================================================================
-    // Internal Methods
-    // =========================================================================
-
-    /**
-     * @brief Detect and initialize available backends.
-     */
-    void DetectBackends();
-
-    /**
-     * @brief Setup virtual Windows environment.
-     */
-    void SetupVirtualEnvironment(EmulationSession& session);
-
-    /**
-     * @brief Mock file system for emulation.
-     */
-    void MockFileSystem(EmulationSession& session);
-
-    /**
-     * @brief Mock registry for emulation.
-     */
-    void MockRegistry(EmulationSession& session);
-
-    /**
-     * @brief Mock network for emulation.
-     */
-    void MockNetwork(EmulationSession& session);
-
-    /**
-     * @brief Handle API call during emulation.
-     */
-    void OnApiCall(
-        EmulationSession& session,
-        const std::string& dll,
-        const std::string& func,
-        const std::vector<uint64_t>& args
-    );
-
-    /**
-     * @brief Handle memory access during emulation.
-     */
-    void OnMemoryAccess(
-        EmulationSession& session,
-        uint64_t address,
-        size_t size,
-        bool isWrite
-    );
-
-    /**
-     * @brief Handle instruction execution.
-     */
-    bool OnInstruction(
-        EmulationSession& session,
-        uint64_t address,
-        const uint8_t* bytes,
-        size_t size
-    );
-
-    /**
-     * @brief Perform YARA scan on emulated memory.
-     */
-    void ScanMemoryWithYara(EmulationSession& session, EmulationResult& result);
-
-    /**
-     * @brief Check for unpacking completion.
-     */
-    bool CheckUnpackCompletion(EmulationSession& session, EmulationResult& result);
-
-    /**
-     * @brief Calculate threat score from emulation results.
-     */
-    void CalculateThreatScore(EmulationResult& result);
-
-    /**
-     * @brief Add MITRE ATT&CK mappings.
-     */
-    void AddMitreMappings(EmulationResult& result);
-
-    /**
-     * @brief Create new session.
-     */
-    [[nodiscard]] uint64_t CreateSession(const EmulationConfig& config);
-
-    /**
-     * @brief Destroy session.
-     */
-    void DestroySession(uint64_t sessionId);
-
-    /**
-     * @brief Invoke API callbacks.
-     */
-    void InvokeAPICallbacks(const APICallRecord& record);
-
-    /**
-     * @brief Invoke file drop callbacks.
-     */
-    void InvokeFileDropCallbacks(const DroppedFile& file);
-
-    /**
-     * @brief Invoke network callbacks.
-     */
-    void InvokeNetworkCallbacks(const NetworkActivity& activity);
-
-    // =========================================================================
-    // Internal Data (PIMPL)
-    // =========================================================================
-
-    struct Impl;
+    class Impl;
     std::unique_ptr<Impl> m_impl;
 };
 
