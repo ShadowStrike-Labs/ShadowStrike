@@ -184,8 +184,6 @@
 
 #pragma once
 
-#pragma once
-
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
@@ -201,6 +199,7 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -940,14 +939,52 @@ struct FilterRule {
     /// @brief MITRE techniques
     std::vector<std::string> mitreTechniques;
     
-    /// @brief Hit count
-    std::atomic<uint64_t> hitCount{ 0 };
-    
-    /// @brief Last hit time
-    std::chrono::system_clock::time_point lastHit{};
-    
+    /// @brief Hit count (atomic so rule evaluation threads don't contend on a lock)
+    mutable std::atomic<uint64_t> hitCount{ 0 };
+
+    /// @brief Last hit time (mutable to allow update under shared_lock)
+    mutable std::chrono::system_clock::time_point lastHit{};
+
     /// @brief Created time
     std::chrono::system_clock::time_point created{};
+
+    // -------------------------------------------------------------------------
+    // Copy / Move – required because std::atomic is not copyable by default
+    // -------------------------------------------------------------------------
+    FilterRule() = default;
+    ~FilterRule() = default;
+
+    FilterRule(const FilterRule& o)
+        : ruleId(o.ruleId), name(o.name), description(o.description),
+          enabled(o.enabled), priority(o.priority), action(o.action),
+          direction(o.direction), protocol(o.protocol), remoteIP(o.remoteIP),
+          remoteSubnetBits(o.remoteSubnetBits), remotePort(o.remotePort),
+          remotePortEnd(o.remotePortEnd), domainPattern(o.domainPattern),
+          processPattern(o.processPattern), processPathPattern(o.processPathPattern),
+          timeStart(o.timeStart), timeEnd(o.timeEnd),
+          blockedCountries(o.blockedCountries), mitreTechniques(o.mitreTechniques),
+          hitCount(o.hitCount.load(std::memory_order_relaxed)),
+          lastHit(o.lastHit), created(o.created) {}
+
+    FilterRule& operator=(const FilterRule& o) {
+        if (this != &o) {
+            ruleId = o.ruleId; name = o.name; description = o.description;
+            enabled = o.enabled; priority = o.priority; action = o.action;
+            direction = o.direction; protocol = o.protocol; remoteIP = o.remoteIP;
+            remoteSubnetBits = o.remoteSubnetBits; remotePort = o.remotePort;
+            remotePortEnd = o.remotePortEnd; domainPattern = o.domainPattern;
+            processPattern = o.processPattern; processPathPattern = o.processPathPattern;
+            timeStart = o.timeStart; timeEnd = o.timeEnd;
+            blockedCountries = o.blockedCountries; mitreTechniques = o.mitreTechniques;
+            hitCount.store(o.hitCount.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+            lastHit = o.lastHit; created = o.created;
+        }
+        return *this;
+    }
+
+    FilterRule(FilterRule&&) noexcept = default;
+    FilterRule& operator=(FilterRule&&) noexcept = default;
 };
 
 /**
@@ -1069,70 +1106,53 @@ struct NetworkFilterConfig {
 };
 
 /**
- * @brief Network filter statistics.
+ * @brief Network filter statistics snapshot (copyable, public API).
+ *
+ * Per codebase convention, the public API uses plain uint64_t values.
+ * Atomics live in the PIMPL and are snapshot'd by GetStats().
  */
 struct NetworkFilterStats {
     /// @brief Total connections tracked
-    std::atomic<uint64_t> totalConnections{ 0 };
-    
+    uint64_t totalConnections = 0;
+
     /// @brief Connections blocked
-    std::atomic<uint64_t> connectionsBlocked{ 0 };
-    
+    uint64_t connectionsBlocked = 0;
+
     /// @brief Connections allowed
-    std::atomic<uint64_t> connectionsAllowed{ 0 };
-    
+    uint64_t connectionsAllowed = 0;
+
     /// @brief Connections terminated
-    std::atomic<uint64_t> connectionsTerminated{ 0 };
-    
+    uint64_t connectionsTerminated = 0;
+
     /// @brief Bytes transferred (outbound)
-    std::atomic<uint64_t> bytesOutbound{ 0 };
-    
+    uint64_t bytesOutbound = 0;
+
     /// @brief Bytes transferred (inbound)
-    std::atomic<uint64_t> bytesInbound{ 0 };
-    
+    uint64_t bytesInbound = 0;
+
     /// @brief DNS queries
-    std::atomic<uint64_t> dnsQueries{ 0 };
-    
+    uint64_t dnsQueries = 0;
+
     /// @brief DNS queries blocked
-    std::atomic<uint64_t> dnsBlocked{ 0 };
-    
+    uint64_t dnsBlocked = 0;
+
     /// @brief C2 beacons detected
-    std::atomic<uint64_t> c2Detected{ 0 };
-    
+    uint64_t c2Detected = 0;
+
     /// @brief DGA domains detected
-    std::atomic<uint64_t> dgaDetected{ 0 };
-    
+    uint64_t dgaDetected = 0;
+
     /// @brief Exfiltration attempts detected
-    std::atomic<uint64_t> exfiltrationDetected{ 0 };
-    
+    uint64_t exfiltrationDetected = 0;
+
     /// @brief Deep inspections performed
-    std::atomic<uint64_t> deepInspections{ 0 };
-    
+    uint64_t deepInspections = 0;
+
     /// @brief Rules evaluated
-    std::atomic<uint64_t> rulesEvaluated{ 0 };
-    
+    uint64_t rulesEvaluated = 0;
+
     /// @brief Current active connections
-    std::atomic<size_t> activeConnections{ 0 };
-    
-    /**
-     * @brief Reset all statistics.
-     */
-    void Reset() noexcept {
-        totalConnections.store(0, std::memory_order_relaxed);
-        connectionsBlocked.store(0, std::memory_order_relaxed);
-        connectionsAllowed.store(0, std::memory_order_relaxed);
-        connectionsTerminated.store(0, std::memory_order_relaxed);
-        bytesOutbound.store(0, std::memory_order_relaxed);
-        bytesInbound.store(0, std::memory_order_relaxed);
-        dnsQueries.store(0, std::memory_order_relaxed);
-        dnsBlocked.store(0, std::memory_order_relaxed);
-        c2Detected.store(0, std::memory_order_relaxed);
-        dgaDetected.store(0, std::memory_order_relaxed);
-        exfiltrationDetected.store(0, std::memory_order_relaxed);
-        deepInspections.store(0, std::memory_order_relaxed);
-        rulesEvaluated.store(0, std::memory_order_relaxed);
-        activeConnections.store(0, std::memory_order_relaxed);
-    }
+    uint64_t activeConnections = 0;
 };
 
 /**
@@ -1446,7 +1466,7 @@ public:
     /**
      * @brief Check for data exfiltration.
      */
-    [[nodiscard]] bool CheckExfiltration(uint32_t pid);
+    bool CheckExfiltration(uint32_t pid);
 
     // =========================================================================
     // Query
@@ -1554,30 +1574,27 @@ public:
      * @brief Unregister exfiltration callback.
      */
     bool UnregisterExfiltrationCallback(uint64_t callbackId);
-
-    // =========================================================================
-    // External Integration
     // =========================================================================
 
     /**
      * @brief Set threat intel index.
      */
-    void SetThreatIntelIndex(ThreatIntel::ThreatIntelIndex* index);
+    void SetThreatIntelIndex(ShadowStrike::ThreatIntel::ThreatIntelIndex* index);
 
     /**
      * @brief Set pattern index.
      */
-    void SetPatternIndex(PatternStore::PatternIndex* index);
+    void SetPatternIndex(ShadowStrike::PatternStore::PatternIndex* index);
 
     /**
      * @brief Set behavior analyzer.
      */
-    void SetBehaviorAnalyzer(Core::Engine::BehaviorAnalyzer* analyzer);
+    void SetBehaviorAnalyzer(ShadowStrike::Core::Engine::BehaviorAnalyzer* analyzer);
 
     /**
      * @brief Set threat detector.
      */
-    void SetThreatDetector(Core::Engine::ThreatDetector* detector);
+    void SetThreatDetector(ShadowStrike::Core::Engine::ThreatDetector* detector);
 
 private:
     // =========================================================================
@@ -1687,6 +1704,39 @@ private:
  * @brief Check if domain matches pattern (supports wildcards).
  */
 [[nodiscard]] bool DomainMatchesPattern(const std::string& domain, const std::string& pattern) noexcept;
+
+// ============================================================================
+// CONSTEXPR FUNCTION DEFINITIONS
+// ============================================================================
+
+[[nodiscard]] constexpr const char* FilterActionToString(FilterAction action) noexcept {
+    switch (action) {
+        case FilterAction::Allow:     return "Allow";
+        case FilterAction::Block:     return "Block";
+        case FilterAction::LogOnly:   return "LogOnly";
+        case FilterAction::Inspect:   return "Inspect";
+        case FilterAction::RateLimit: return "RateLimit";
+        case FilterAction::Redirect:  return "Redirect";
+        case FilterAction::Terminate: return "Terminate";
+        default:                      return "Unknown";
+    }
+}
+
+[[nodiscard]] constexpr const char* NetworkDetectionToMitre(NetworkDetectionType type) noexcept {
+    switch (type) {
+        case NetworkDetectionType::C2Beacon:        return "T1071";
+        case NetworkDetectionType::DGADomain:       return "T1568";
+        case NetworkDetectionType::DNSTunneling:    return "T1572";
+        case NetworkDetectionType::HTTPTunneling:   return "T1572";
+        case NetworkDetectionType::Exfiltration:    return "T1048";
+        case NetworkDetectionType::FastFlux:        return "T1568";
+        case NetworkDetectionType::PortScan:        return "T1046";
+        case NetworkDetectionType::LateralMovement: return "T1021";
+        case NetworkDetectionType::Cryptomining:    return "T1496";
+        case NetworkDetectionType::MalwareTraffic:  return "T1071";
+        default:                                    return "T1071";
+    }
+}
 
 } // namespace RealTime
 } // namespace ShadowStrike
