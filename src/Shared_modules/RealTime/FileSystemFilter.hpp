@@ -1107,75 +1107,22 @@ struct FileSystemFilterConfig {
  * @brief Statistics for file system filter.
  */
 struct FileSystemFilterStats {
-    /// @brief Total scan requests received
-    std::atomic<uint64_t> totalScanRequests{ 0 };
-    
-    /// @brief Scan requests completed
-    std::atomic<uint64_t> scanRequestsCompleted{ 0 };
-    
-    /// @brief Files allowed
-    std::atomic<uint64_t> filesAllowed{ 0 };
-    
-    /// @brief Files blocked
-    std::atomic<uint64_t> filesBlocked{ 0 };
-    
-    /// @brief Files quarantined
-    std::atomic<uint64_t> filesQuarantined{ 0 };
-    
-    /// @brief Scan timeouts
-    std::atomic<uint64_t> scanTimeouts{ 0 };
-    
-    /// @brief Scan errors
-    std::atomic<uint64_t> scanErrors{ 0 };
-    
-    /// @brief Cache hits
-    std::atomic<uint64_t> cacheHits{ 0 };
-    
-    /// @brief Cache misses
-    std::atomic<uint64_t> cacheMisses{ 0 };
-    
-    /// @brief Notifications received
-    std::atomic<uint64_t> notificationsReceived{ 0 };
-    
-    /// @brief Exclusions matched
-    std::atomic<uint64_t> exclusionsMatched{ 0 };
-    
-    /// @brief Current pending requests
-    std::atomic<uint32_t> pendingRequests{ 0 };
-    
-    /// @brief Peak pending requests
-    std::atomic<uint32_t> peakPendingRequests{ 0 };
-    
-    /// @brief Average scan time (microseconds)
-    std::atomic<uint64_t> avgScanTimeUs{ 0 };
-    
-    /// @brief Total bytes scanned
-    std::atomic<uint64_t> totalBytesScanned{ 0 };
-    
-    /// @brief Driver connection count
-    std::atomic<uint32_t> driverReconnects{ 0 };
-    
-    /**
-     * @brief Reset all statistics.
-     */
-    void Reset() noexcept {
-        totalScanRequests.store(0, std::memory_order_relaxed);
-        scanRequestsCompleted.store(0, std::memory_order_relaxed);
-        filesAllowed.store(0, std::memory_order_relaxed);
-        filesBlocked.store(0, std::memory_order_relaxed);
-        filesQuarantined.store(0, std::memory_order_relaxed);
-        scanTimeouts.store(0, std::memory_order_relaxed);
-        scanErrors.store(0, std::memory_order_relaxed);
-        cacheHits.store(0, std::memory_order_relaxed);
-        cacheMisses.store(0, std::memory_order_relaxed);
-        notificationsReceived.store(0, std::memory_order_relaxed);
-        exclusionsMatched.store(0, std::memory_order_relaxed);
-        pendingRequests.store(0, std::memory_order_relaxed);
-        peakPendingRequests.store(0, std::memory_order_relaxed);
-        avgScanTimeUs.store(0, std::memory_order_relaxed);
-        totalBytesScanned.store(0, std::memory_order_relaxed);
-        driverReconnects.store(0, std::memory_order_relaxed);
-    }
+    uint64_t totalScanRequests = 0;
+    uint64_t scanRequestsCompleted = 0;
+    uint64_t filesAllowed = 0;
+    uint64_t filesBlocked = 0;
+    uint64_t filesQuarantined = 0;
+    uint64_t scanTimeouts = 0;
+    uint64_t scanErrors = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    uint64_t notificationsReceived = 0;
+    uint64_t exclusionsMatched = 0;
+    uint32_t pendingRequests = 0;
+    uint32_t peakPendingRequests = 0;
+    uint64_t avgScanTimeUs = 0;
+    uint64_t totalBytesScanned = 0;
+    uint32_t driverReconnects = 0;
 };
 
 /**
@@ -1718,8 +1665,8 @@ private:
  * @brief Get minifilter altitude for registration.
  */
 [[nodiscard]] constexpr const wchar_t* GetFilterAltitude() noexcept {
-    // Altitude 320000-329999 is for AV file system filter drivers
-    return L"328451";
+    // Must match SHADOWSTRIKE_ALTITUDE_W in PhantomSensor/Shared/SharedDefs.h
+    return L"385210";
 }
 
 } // namespace RealTime
