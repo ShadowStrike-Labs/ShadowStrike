@@ -12,6 +12,7 @@
 
 #include "../CPU.hpp"
 #include <cmath>
+#include <limits>
 
 namespace Phantom {
 
@@ -97,6 +98,148 @@ ErrorCode CPU::ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) no
                 case 0xEE: // FLDZ: push 0.0
                     m_state.FPUPush(0.0L);
                     return ErrorCode::Success;
+
+                // =============================================================
+                // FPU Constant Loads
+                // =============================================================
+                case 0xE9: // FLDL2T: push log2(10)
+                    m_state.FPUPush(3.3219280948873623478703194294893901758648L);
+                    return ErrorCode::Success;
+                case 0xEA: // FLDL2E: push log2(e)
+                    m_state.FPUPush(1.4426950408889634073599246810018921374266L);
+                    return ErrorCode::Success;
+                case 0xEB: // FLDPI: push π
+                    m_state.FPUPush(3.1415926535897932384626433832795028841972L);
+                    return ErrorCode::Success;
+                case 0xEC: // FLDLN2: push ln(2)
+                    m_state.FPUPush(0.6931471805599453094172321214581765680755L);
+                    return ErrorCode::Success;
+                case 0xED: // FLDLG2: push log10(2)
+                    m_state.FPUPush(0.3010299957316530025827020393288018568396L);
+                    return ErrorCode::Success;
+
+                // =============================================================
+                // Transcendental & Arithmetic Functions
+                // =============================================================
+                case 0xF0: { // F2XM1: ST(0) = 2^ST(0) - 1  (valid for |ST(0)| <= 1)
+                    long double x = m_state.FPU_ST(0).value;
+                    m_state.FPU_ST(0).value = std::exp2l(x) - 1.0L;
+                    return ErrorCode::Success;
+                }
+                case 0xF1: { // FYL2X: ST(1) = ST(1) * log2(ST(0)), pop ST(0)
+                    long double x = m_state.FPU_ST(0).value;
+                    long double y = m_state.FPU_ST(1).value;
+                    if (x <= 0.0L) {
+                        m_state.fpuStatus |= (1 << 0); // Invalid operation
+                        m_state.FPUPop();
+                        return ErrorCode::Success;
+                    }
+                    m_state.FPU_ST(1).value = y * std::log2l(x);
+                    m_state.FPUPop();
+                    return ErrorCode::Success;
+                }
+                case 0xF2: { // FPTAN: ST(0) = tan(ST(0)), push 1.0
+                    long double x = m_state.FPU_ST(0).value;
+                    m_state.FPU_ST(0).value = std::tanl(x);
+                    m_state.FPUPush(1.0L);
+                    return ErrorCode::Success;
+                }
+                case 0xF3: { // FPATAN: ST(1) = atan2(ST(1), ST(0)), pop ST(0)
+                    long double x = m_state.FPU_ST(0).value;
+                    long double y = m_state.FPU_ST(1).value;
+                    m_state.FPU_ST(1).value = std::atan2l(y, x);
+                    m_state.FPUPop();
+                    return ErrorCode::Success;
+                }
+                case 0xF4: { // FXTRACT: extract exponent and significand
+                    long double val = m_state.FPU_ST(0).value;
+                    if (val == 0.0L) {
+                        m_state.FPU_ST(0).value = 0.0L;
+                        m_state.FPUPush(-std::numeric_limits<long double>::infinity());
+                    } else {
+                        int exp = 0;
+                        long double sig = std::frexpl(val, &exp);
+                        // frexp returns sig in [0.5, 1.0), x87 FXTRACT returns sig in [1.0, 2.0)
+                        sig *= 2.0L;
+                        exp -= 1;
+                        m_state.FPU_ST(0).value = static_cast<long double>(exp);
+                        m_state.FPUPush(sig);
+                    }
+                    return ErrorCode::Success;
+                }
+                case 0xF5: { // FPREM1: IEEE partial remainder ST(0) = ST(0) mod ST(1)
+                    long double dividend = m_state.FPU_ST(0).value;
+                    long double divisor = m_state.FPU_ST(1).value;
+                    if (divisor == 0.0L) {
+                        m_state.fpuStatus |= (1 << 0); // Invalid
+                        return ErrorCode::Success;
+                    }
+                    m_state.FPU_ST(0).value = std::remainderl(dividend, divisor);
+                    m_state.fpuStatus &= ~(1 << 10); // Clear C2 (reduction complete)
+                    return ErrorCode::Success;
+                }
+                case 0xF8: { // FPREM: partial remainder (8087-compatible)
+                    long double dividend = m_state.FPU_ST(0).value;
+                    long double divisor = m_state.FPU_ST(1).value;
+                    if (divisor == 0.0L) {
+                        m_state.fpuStatus |= (1 << 0);
+                        return ErrorCode::Success;
+                    }
+                    m_state.FPU_ST(0).value = std::fmodl(dividend, divisor);
+                    m_state.fpuStatus &= ~(1 << 10); // Clear C2 (reduction complete)
+                    return ErrorCode::Success;
+                }
+                case 0xF9: { // FYL2XP1: ST(1) = ST(1) * log2(ST(0) + 1), pop ST(0)
+                    long double x = m_state.FPU_ST(0).value;
+                    long double y = m_state.FPU_ST(1).value;
+                    m_state.FPU_ST(1).value = y * std::log2l(x + 1.0L);
+                    m_state.FPUPop();
+                    return ErrorCode::Success;
+                }
+                case 0xFA: { // FSQRT: ST(0) = sqrt(ST(0))
+                    long double val = m_state.FPU_ST(0).value;
+                    if (val < 0.0L) {
+                        m_state.fpuStatus |= (1 << 0); // Invalid
+                        return ErrorCode::Success;
+                    }
+                    m_state.FPU_ST(0).value = std::sqrtl(val);
+                    return ErrorCode::Success;
+                }
+                case 0xFB: { // FSINCOS: push cos, ST(1) = sin (original ST(0))
+                    long double x = m_state.FPU_ST(0).value;
+                    long double sinVal = std::sinl(x);
+                    long double cosVal = std::cosl(x);
+                    m_state.FPU_ST(0).value = sinVal;
+                    m_state.FPUPush(cosVal);
+                    return ErrorCode::Success;
+                }
+                case 0xFC: { // FRNDINT: ST(0) = round to integer
+                    long double val = m_state.FPU_ST(0).value;
+                    uint16_t rc = (m_state.fpuControl >> 10) & 3;
+                    switch (rc) {
+                        case 0: m_state.FPU_ST(0).value = std::nearbyintl(val); break;
+                        case 1: m_state.FPU_ST(0).value = std::floorl(val); break;
+                        case 2: m_state.FPU_ST(0).value = std::ceill(val); break;
+                        case 3: m_state.FPU_ST(0).value = std::truncl(val); break;
+                    }
+                    return ErrorCode::Success;
+                }
+                case 0xFD: { // FSCALE: ST(0) = ST(0) * 2^trunc(ST(1))
+                    long double sig = m_state.FPU_ST(0).value;
+                    long double exp = m_state.FPU_ST(1).value;
+                    m_state.FPU_ST(0).value = std::ldexpl(sig, static_cast<int>(std::truncl(exp)));
+                    return ErrorCode::Success;
+                }
+                case 0xFE: { // FSIN: ST(0) = sin(ST(0))
+                    m_state.FPU_ST(0).value = std::sinl(m_state.FPU_ST(0).value);
+                    m_state.fpuStatus &= ~(1 << 10); // Clear C2 (reduction complete)
+                    return ErrorCode::Success;
+                }
+                case 0xFF: { // FCOS: ST(0) = cos(ST(0))
+                    m_state.FPU_ST(0).value = std::cosl(m_state.FPU_ST(0).value);
+                    m_state.fpuStatus &= ~(1 << 10); // Clear C2 (reduction complete)
+                    return ErrorCode::Success;
+                }
                 default: return ErrorCode::UnimplementedOpcode;
             }
         }
