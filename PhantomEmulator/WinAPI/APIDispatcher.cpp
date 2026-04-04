@@ -19,6 +19,14 @@
 
 #include "APIDispatcher.hpp"
 #include "APIDatabase.hpp"
+#include "Ntdll\Ldr.hpp"
+#include "Ntdll\NtFile.hpp"
+#include "Ntdll\NtMemory.hpp"
+#include "Ntdll\NtProcess.hpp"
+#include "Ntdll\NtRegistry.hpp"
+#include "Ntdll\NtSystem.hpp"
+#include "Ntdll\NtThread.hpp"
+#include "Ntdll\NtToken.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -165,7 +173,16 @@ void APIDispatcher::RegisterAll() noexcept {
 }
 
 // DLL registration stubs — will be filled by DLL handler modules.
-void APIDispatcher::RegisterNtdll()    noexcept {}
+void APIDispatcher::RegisterNtdll() noexcept {
+    WinAPI::Ntdll::RegisterNtMemory(*this);
+    WinAPI::Ntdll::RegisterNtFile(*this);
+    WinAPI::Ntdll::RegisterNtProcess(*this);
+    WinAPI::Ntdll::RegisterNtThread(*this);
+    WinAPI::Ntdll::RegisterNtRegistry(*this);
+    WinAPI::Ntdll::RegisterNtSystem(*this);
+    WinAPI::Ntdll::RegisterNtToken(*this);
+    WinAPI::Ntdll::RegisterLdrHandlers(*this);
+}
 void APIDispatcher::RegisterKernel32() noexcept {}
 void APIDispatcher::RegisterAdvapi32() noexcept {}
 void APIDispatcher::RegisterWs2_32()   noexcept {}
@@ -294,7 +311,7 @@ bool APIDispatcher::Dispatch(CPUState& cpu, VirtualMemory& mem,
 
     // Build the API context.
     ThreadLocalState& tls = GetThreadState(0);
-    APIContext ctx(cpu, mem, m_handleTable, m_config, tls);
+    APIContext ctx(cpu, mem, m_handleTable, m_config, tls, this);
 
     // Call the handler.
     bool continueExec = entry.handler(ctx);
@@ -340,6 +357,7 @@ bool APIDispatcher::Dispatch(CPUState& cpu, VirtualMemory& mem,
         for (uint32_t i = 0; i < captureCount; ++i) {
             last.args[i] = capturedArgs[i];
         }
+        last.behaviorFlags = ctx.GetBehaviorFlags();
         DetectBehaviors(entry, last);
     }
 
@@ -371,7 +389,7 @@ bool APIDispatcher::DispatchSyscall(CPUState& cpu, VirtualMemory& mem) noexcept 
 
     // Build the context.
     ThreadLocalState& tls = GetThreadState(0);
-    APIContext ctx(cpu, mem, m_handleTable, m_config, tls);
+    APIContext ctx(cpu, mem, m_handleTable, m_config, tls, this);
 
     if (entry->isBlocked) {
         cpu.SetReg32(GPR::RAX, static_cast<uint32_t>(kStatusNotImplemented));
@@ -397,6 +415,7 @@ bool APIDispatcher::DispatchSyscall(CPUState& cpu, VirtualMemory& mem) noexcept 
         for (uint32_t i = 0; i < captureCount; ++i) {
             last.args[i] = capturedArgs[i];
         }
+        last.behaviorFlags = ctx.GetBehaviorFlags();
         DetectBehaviors(*entry, last);
     }
 
@@ -479,12 +498,12 @@ void APIDispatcher::CaptureArgs(const CPUState& cpu, bool is64,
 // ============================================================================
 
 void APIDispatcher::DetectBehaviors(const HandlerEntry& entry,
-                                    const APICallDetail& detail) noexcept {
+                                    APICallDetail& detail) noexcept {
     if (!detail.succeeded && !detail.wasBlocked) {
         return;
     }
 
-    BehaviorFlag flags = BehaviorFlag::None;
+    BehaviorFlag flags = detail.behaviorFlags;
 
     // Apply the static flag from the KnownAPI database entry.
     const KnownAPIEntry* known =
@@ -583,18 +602,9 @@ void APIDispatcher::DetectBehaviors(const HandlerEntry& entry,
         flags = flags | BehaviorFlag::Keylogging;
     }
 
-    // Accumulate into session-wide flags and into the detail record.
+    // Accumulate into session-wide flags and update the current call detail.
     m_behaviorFlags = m_behaviorFlags | flags;
-
-    // Update the call detail in the log (it was just pushed).
-    if (!m_callLog.empty()) {
-        uint32_t idx = (m_callCount > 0) ? (m_callCount - 1) : 0;
-        if (idx < m_callLog.size()) {
-            m_callLog[idx].behaviorFlags = flags;
-        } else {
-            m_callLog[idx % kMaxAPICallLog].behaviorFlags = flags;
-        }
-    }
+    detail.behaviorFlags = flags;
 }
 
 // ============================================================================

@@ -33,8 +33,10 @@ namespace Phantom {
 class VirtualMemory;
 class CPUState;
 class HandleTable;
+class APIDispatcher;
 class ExportResolver;
 class ImportResolver;
+enum class BehaviorFlag : uint32_t;
 
 // ============================================================================
 // Guest-side Win32/NT Primitive Types
@@ -399,8 +401,10 @@ struct ThreadLocalState {
 class APIContext {
 public:
     APIContext(CPUState& cpu, VirtualMemory& mem, HandleTable& handles,
-              const EmulationConfig& config, ThreadLocalState& tls) noexcept
-        : m_cpu(cpu), m_mem(mem), m_handles(handles), m_config(config), m_tls(tls) {}
+              const EmulationConfig& config, ThreadLocalState& tls,
+              APIDispatcher* dispatcher = nullptr) noexcept
+        : m_cpu(cpu), m_mem(mem), m_handles(handles), m_config(config),
+          m_tls(tls), m_dispatcher(dispatcher) {}
 
     // === Register Access ===
     [[nodiscard]] CPUState&       CPU()     noexcept { return m_cpu; }
@@ -409,6 +413,7 @@ public:
     [[nodiscard]] HandleTable&    Handles() noexcept { return m_handles; }
     [[nodiscard]] const EmulationConfig& Config() const noexcept { return m_config; }
     [[nodiscard]] ThreadLocalState& TLS()   noexcept { return m_tls; }
+    [[nodiscard]] APIDispatcher*   Dispatcher() const noexcept { return m_dispatcher; }
 
     // === Argument Extraction (calling-convention-aware) ===
     // x64 Windows: RCX, RDX, R8, R9, then stack (RSP+0x28, RSP+0x30, ...)
@@ -451,12 +456,25 @@ public:
     // === Mode queries ===
     [[nodiscard]] bool Is64Bit() const noexcept;
 
+    // === Per-call behavioral annotations ===
+    void AddBehaviorFlag(BehaviorFlag flag) noexcept {
+        m_behaviorFlags |= static_cast<uint32_t>(flag);
+    }
+    void AddBehaviorFlags(BehaviorFlag flags) noexcept {
+        m_behaviorFlags |= static_cast<uint32_t>(flags);
+    }
+    [[nodiscard]] BehaviorFlag GetBehaviorFlags() const noexcept {
+        return static_cast<BehaviorFlag>(m_behaviorFlags);
+    }
+
 private:
     CPUState&              m_cpu;
     VirtualMemory&         m_mem;
     HandleTable&           m_handles;
     const EmulationConfig& m_config;
     ThreadLocalState&      m_tls;
+    APIDispatcher*         m_dispatcher = nullptr;
+    uint32_t               m_behaviorFlags = 0;
 };
 
 // ============================================================================
