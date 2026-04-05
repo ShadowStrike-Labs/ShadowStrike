@@ -461,11 +461,11 @@ public:
 bool ThreadHijackDetector::ThreadHijackDetectorImpl::Initialize(const ThreadHijackConfig& config) {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"ThreadHijackDetector: Already initialized");
+            SS_LOG_WARN(L"ThreadHijack", L"Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Initializing...");
+        SS_LOG_INFO(L"ThreadHijack", L"Initializing...");
 
         m_config = config;
 
@@ -478,12 +478,11 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::Initialize(const ThreadHija
         m_stopCleanup.store(false, std::memory_order_release);
         m_cleanupThread = std::thread([this]() { CleanupThreadWorker(); });
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Initialized successfully");
+        SS_LOG_INFO(L"ThreadHijack", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
@@ -495,7 +494,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::Shutdown() {
             return;
         }
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Shutting down...");
+        SS_LOG_INFO(L"ThreadHijack", L"Shutting down...");
 
         StopMonitoring();
 
@@ -528,27 +527,27 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::Shutdown() {
             m_validationCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Shutdown complete");
+        SS_LOG_INFO(L"ThreadHijack", L"Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Exception during shutdown");
+        SS_LOG_ERROR(L"ThreadHijack", L"Exception during shutdown");
     }
 }
 
 bool ThreadHijackDetector::ThreadHijackDetectorImpl::StartMonitoring() {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Not initialized");
+            SS_LOG_ERROR(L"ThreadHijack", L"Not initialized");
             return false;
         }
 
         if (m_monitoring.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"ThreadHijackDetector: Already monitoring");
+            SS_LOG_WARN(L"ThreadHijack", L"Already monitoring");
             return true;
         }
 
         if (!m_config.enableRealTimeMonitoring) {
-            Utils::Logger::Warn(L"ThreadHijackDetector: Real-time monitoring disabled in config");
+            SS_LOG_WARN(L"ThreadHijack", L"Real-time monitoring disabled in config");
             m_monitoring.store(false, std::memory_order_release);
             return false;
         }
@@ -557,12 +556,11 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::StartMonitoring() {
         m_stopMonitoring.store(false, std::memory_order_release);
         m_monitorThread = std::thread([this]() { MonitoringThreadWorker(); });
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Monitoring started");
+        SS_LOG_INFO(L"ThreadHijack", L"Monitoring started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Failed to start monitoring - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Failed to start monitoring - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         m_monitoring.store(false, std::memory_order_release);
         return false;
     }
@@ -578,7 +576,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::StopMonitoring() {
         m_monitorThread.join();
     }
 
-    Utils::Logger::Info(L"ThreadHijackDetector: Monitoring stopped");
+    SS_LOG_INFO(L"ThreadHijack", L"Monitoring stopped");
 }
 
 // ============================================================================
@@ -695,8 +693,7 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
         InvokeValidationCallbacks(validation);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Thread validation failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Thread validation failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -855,8 +852,7 @@ ThreadContext64 ThreadHijackDetector::ThreadHijackDetectorImpl::GetThreadContext
         CloseHandle(hThread);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: GetThreadContext failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"GetThreadContext failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return result;
@@ -926,8 +922,7 @@ std::vector<ContextChange> ThreadHijackDetector::ThreadHijackDetectorImpl::Compa
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Context comparison failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Context comparison failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return changes;
@@ -1060,8 +1055,7 @@ std::optional<HijackEvent> ThreadHijackDetector::ThreadHijackDetectorImpl::Detec
         return event;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Hijack detection failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Hijack detection failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -1161,8 +1155,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadSuspendInternal(
         state.isSuspended = true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: OnThreadSuspend failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadSuspend failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1184,8 +1177,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadResumeInternal(
             ).count();
 
             if (duration > m_config.suspendDurationThresholdMs) {
-                Utils::Logger::Warn(L"ThreadHijackDetector: Long suspend duration {}ms for TID {}",
-                                  duration, targetTid);
+                SS_LOG_WARN(L"ThreadHijack", L"Long suspend duration %.2fms for TID %u", duration, targetTid);
 
                 // Validate thread after long suspend
                 if (m_config.enableRealTimeMonitoring) {
@@ -1195,8 +1187,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadResumeInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: OnThreadResume failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadResume failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1217,8 +1208,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnContextChangeInternal(
         if (modifierPid != ownerPid) {
             m_statistics.crossProcessChanges.fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Warn(L"ThreadHijackDetector: Cross-process context change - TID {} by PID {}",
-                              targetTid, modifierPid);
+            SS_LOG_WARN(L"ThreadHijack", L"Cross-process context change - TID %u by PID %u", targetTid, modifierPid);
 
             // Validate thread
             if (m_config.detectCrossProcessModification) {
@@ -1227,8 +1217,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnContextChangeInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: OnContextChange failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnContextChange failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1263,8 +1252,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnSetContextThreadInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: OnSetContextThread failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnSetContextThread failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1279,8 +1267,7 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::BlockContextChangeInternal(
     try {
         m_statistics.changesBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Warn(L"ThreadHijackDetector: Blocked context change - TID {} by PID {}",
-                          targetTid, modifierPid);
+        SS_LOG_WARN(L"ThreadHijack", L"Blocked context change - TID %u by PID %u", targetTid, modifierPid);
 
         // Real implementation would use kernel driver to block SetThreadContext
         return true;
@@ -1301,7 +1288,7 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::RestoreContextInternal(uint
         // Real implementation would call SetThreadContext with baseline
         m_statistics.contextsRestored.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"ThreadHijackDetector: Restored context for TID {}", tid);
+        SS_LOG_INFO(L"ThreadHijack", L"Restored context for TID %u", tid);
         return true;
 
     } catch (...) {
@@ -1322,8 +1309,7 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::TerminateAttackerInternal(c
         if (result) {
             m_statistics.attackersTerminated.fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Warn(L"ThreadHijackDetector: Terminated attacker PID {} ({})",
-                              event.attackerPid, event.attackerProcessName);
+            SS_LOG_WARN(L"ThreadHijack", L"Terminated attacker PID %u (%ls)", event.attackerPid, event.attackerProcessName);
         }
 
         return result != FALSE;
@@ -1364,8 +1350,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::EstablishBaselineInternal(u
         m_statistics.threadsMonitored.fetch_add(1, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreadHijackDetector: Baseline establishment failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Baseline establishment failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1395,7 +1380,7 @@ std::optional<ThreadContext64> ThreadHijackDetector::ThreadHijackDetectorImpl::G
 // ============================================================================
 
 void ThreadHijackDetector::ThreadHijackDetectorImpl::MonitoringThreadWorker() {
-    Utils::Logger::Info(L"ThreadHijackDetector: Monitoring thread started");
+    SS_LOG_INFO(L"ThreadHijack", L"Monitoring thread started");
 
     while (!m_stopMonitoring.load(std::memory_order_acquire)) {
         try {
@@ -1417,16 +1402,15 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::MonitoringThreadWorker() {
             std::this_thread::sleep_for(std::chrono::seconds(5));
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Monitoring thread error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Monitoring thread error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
-    Utils::Logger::Info(L"ThreadHijackDetector: Monitoring thread stopped");
+    SS_LOG_INFO(L"ThreadHijack", L"Monitoring thread stopped");
 }
 
 void ThreadHijackDetector::ThreadHijackDetectorImpl::CleanupThreadWorker() {
-    Utils::Logger::Info(L"ThreadHijackDetector: Cleanup thread started");
+    SS_LOG_INFO(L"ThreadHijack", L"Cleanup thread started");
 
     while (!m_stopCleanup.load(std::memory_order_acquire)) {
         try {
@@ -1460,12 +1444,11 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::CleanupThreadWorker() {
             std::this_thread::sleep_for(std::chrono::minutes(5));
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Cleanup thread error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Cleanup thread error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
-    Utils::Logger::Info(L"ThreadHijackDetector: Cleanup thread stopped");
+    SS_LOG_INFO(L"ThreadHijack", L"Cleanup thread stopped");
 }
 
 // ============================================================================
@@ -1478,8 +1461,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeHijackCallbacks(const
         try {
             callback(event);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Hijack callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Hijack callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 }
@@ -1493,8 +1475,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeContextCallbacks(
         try {
             callback(tid, change);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Context callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Context callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 }
@@ -1505,8 +1486,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeValidationCallbacks(c
         try {
             callback(validation);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ThreadHijackDetector: Validation callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Validation callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 }
@@ -1543,14 +1523,14 @@ ThreadHijackDetector& ThreadHijackDetector::Instance() {
 ThreadHijackDetector::ThreadHijackDetector()
     : m_impl(std::make_unique<ThreadHijackDetectorImpl>())
 {
-    Utils::Logger::Info(L"ThreadHijackDetector: Constructor called");
+    SS_LOG_INFO(L"ThreadHijack", L"Constructor called");
 }
 
 ThreadHijackDetector::~ThreadHijackDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"ThreadHijackDetector: Destructor called");
+    SS_LOG_INFO(L"ThreadHijack", L"Destructor called");
 }
 
 // ============================================================================

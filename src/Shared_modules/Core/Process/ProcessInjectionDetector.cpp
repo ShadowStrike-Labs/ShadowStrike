@@ -434,11 +434,11 @@ bool ProcessInjectionDetector::Impl::Initialize(
 {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"ProcessInjectionDetector: Already initialized");
+            SS_LOG_WARN(L"InjectionDetector", L"Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"ProcessInjectionDetector: Initializing...");
+        SS_LOG_INFO(L"InjectionDetector", L"Initializing...");
 
         m_config = config;
         m_threadPool = threadPool;
@@ -447,12 +447,11 @@ bool ProcessInjectionDetector::Impl::Initialize(
         m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
         m_patternStore = std::make_shared<PatternStore::PatternStore>();
 
-        Utils::Logger::Info(L"ProcessInjectionDetector: Initialized successfully");
+        SS_LOG_INFO(L"InjectionDetector", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
@@ -464,7 +463,7 @@ void ProcessInjectionDetector::Impl::Shutdown() {
             return;
         }
 
-        Utils::Logger::Info(L"ProcessInjectionDetector: Shutting down...");
+        SS_LOG_INFO(L"InjectionDetector", L"Shutting down...");
 
         Stop();
 
@@ -512,21 +511,21 @@ void ProcessInjectionDetector::Impl::Shutdown() {
             m_handleCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"ProcessInjectionDetector: Shutdown complete");
+        SS_LOG_INFO(L"InjectionDetector", L"Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Exception during shutdown");
+        SS_LOG_ERROR(L"InjectionDetector", L"Exception during shutdown");
     }
 }
 
 void ProcessInjectionDetector::Impl::Start() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Not initialized");
+        SS_LOG_ERROR(L"InjectionDetector", L"Not initialized");
         return;
     }
 
     if (m_running.exchange(true, std::memory_order_acq_rel)) {
-        Utils::Logger::Warn(L"ProcessInjectionDetector: Already running");
+        SS_LOG_WARN(L"InjectionDetector", L"Already running");
         return;
     }
 
@@ -534,7 +533,7 @@ void ProcessInjectionDetector::Impl::Start() {
     m_stopCleanup.store(false, std::memory_order_release);
     m_cleanupThread = std::thread([this]() { CleanupThread(); });
 
-    Utils::Logger::Info(L"ProcessInjectionDetector: Started");
+    SS_LOG_INFO(L"InjectionDetector", L"Started");
 }
 
 void ProcessInjectionDetector::Impl::Stop() {
@@ -548,7 +547,7 @@ void ProcessInjectionDetector::Impl::Stop() {
         m_cleanupThread.join();
     }
 
-    Utils::Logger::Info(L"ProcessInjectionDetector: Stopped");
+    SS_LOG_INFO(L"InjectionDetector", L"Stopped");
 }
 
 // ============================================================================
@@ -685,8 +684,7 @@ std::optional<InjectionEvent> ProcessInjectionDetector::Impl::CorrelateEvents(
         return event;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Event correlation failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Event correlation failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -1063,8 +1061,7 @@ std::optional<InjectionChain> ProcessInjectionDetector::Impl::DetectChain(uint32
         return chain;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Chain detection failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Chain detection failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -1074,19 +1071,18 @@ std::optional<InjectionChain> ProcessInjectionDetector::Impl::DetectChain(uint32
 // ============================================================================
 
 void ProcessInjectionDetector::Impl::CleanupThread() {
-    Utils::Logger::Info(L"ProcessInjectionDetector: Cleanup thread started");
+    SS_LOG_INFO(L"InjectionDetector", L"Cleanup thread started");
 
     while (!m_stopCleanup.load(std::memory_order_acquire)) {
         try {
             PurgeOldEvents();
             std::this_thread::sleep_for(std::chrono::minutes(5));
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ProcessInjectionDetector: Cleanup error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Cleanup error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
-    Utils::Logger::Info(L"ProcessInjectionDetector: Cleanup thread stopped");
+    SS_LOG_INFO(L"InjectionDetector", L"Cleanup thread stopped");
 }
 
 void ProcessInjectionDetector::Impl::PurgeOldEvents() {
@@ -1138,7 +1134,7 @@ void ProcessInjectionDetector::Impl::PurgeOldEvents() {
     }
 
     if (purged > 0) {
-        Utils::Logger::Debug(L"ProcessInjectionDetector: Purged {} old events", purged);
+        SS_LOG_DEBUG(L"InjectionDetector", L"Purged %ls old events", purged);
     }
 }
 
@@ -1158,8 +1154,7 @@ InjectionVerdict ProcessInjectionDetector::Impl::InvokeInjectionCallbacks(const 
                 verdict = callbackVerdict;
             }
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ProcessInjectionDetector: Injection callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Injection callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
@@ -1172,8 +1167,7 @@ void ProcessInjectionDetector::Impl::InvokeAlertCallbacks(const InjectionAlert& 
         try {
             callback(alert);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ProcessInjectionDetector: Alert callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Alert callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 }
@@ -1184,8 +1178,7 @@ void ProcessInjectionDetector::Impl::InvokeChainCallbacks(const InjectionChain& 
         try {
             callback(chain);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"ProcessInjectionDetector: Chain callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Chain callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 }
@@ -1202,14 +1195,14 @@ ProcessInjectionDetector& ProcessInjectionDetector::Instance() {
 ProcessInjectionDetector::ProcessInjectionDetector()
     : m_impl(std::make_unique<Impl>())
 {
-    Utils::Logger::Info(L"ProcessInjectionDetector: Constructor called");
+    SS_LOG_INFO(L"InjectionDetector", L"Constructor called");
 }
 
 ProcessInjectionDetector::~ProcessInjectionDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"ProcessInjectionDetector: Destructor called");
+    SS_LOG_INFO(L"InjectionDetector", L"Destructor called");
 }
 
 // ============================================================================
@@ -1349,16 +1342,11 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
                             // BA escalated — override config to block this injection
                             injectionEvent->blocked = true;
                             m_impl->m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-                            Utils::Logger::Warn(
-                                "ProcessInjectionDetector: BA escalated injection {}->{} to BLOCK (score={:.1f})",
-                                Utils::StringUtils::ToNarrow(injectionEvent->sourceProcessName),
-                                Utils::StringUtils::ToNarrow(injectionEvent->targetProcessName),
-                                baVerdict->maliceScore);
+                            SS_LOG_WARN(L"InjectionDetector", L"BA escalated injection %S->%ls to BLOCK (score=%.1f)", Utils::StringUtils::ToNarrow(injectionEvent->sourceProcessName), Utils::StringUtils::ToNarrow(injectionEvent->targetProcessName), baVerdict->maliceScore);
                             return false;
                         }
                     } catch (const std::exception& ex) {
-                        Utils::Logger::Error(
-                            "ProcessInjectionDetector: BA forwarding failed: {}", ex.what());
+                        SS_LOG_ERROR(L"InjectionDetector", L"BA forwarding failed: %S", ex.what());
                     }
                 }
 
@@ -1386,10 +1374,7 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
                     injectionEvent->blocked = true;
                     m_impl->m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-                    Utils::Logger::Warn(L"ProcessInjectionDetector: Blocked injection {} → {} ({})",
-                                      injectionEvent->sourceProcessName,
-                                      injectionEvent->targetProcessName,
-                                      Utils::StringUtils::Utf8ToWide(InjectionTypeToString(injectionEvent->injectionType)));
+                    SS_LOG_WARN(L"InjectionDetector", L"Blocked injection %S → %ls (%ls)", injectionEvent->sourceProcessName, injectionEvent->targetProcessName, Utils::StringUtils::Utf8ToWide(InjectionTypeToString(injectionEvent->injectionType)));
                     return false;  // Block
                 }
             }
@@ -1398,8 +1383,7 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
         return true;  // Allow
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Handle access handler failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Handle access handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return true;  // Allow on error
     }
 }
@@ -1434,8 +1418,7 @@ void ProcessInjectionDetector::OnMemoryOperation(const MemoryOperationEvent& eve
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Memory operation handler failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Memory operation handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -1476,8 +1459,7 @@ bool ProcessInjectionDetector::OnThreadOperation(const ThreadOperationEvent& eve
         return true;  // Allow
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessInjectionDetector: Thread operation handler failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Thread operation handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return true;  // Allow on error
     }
 }

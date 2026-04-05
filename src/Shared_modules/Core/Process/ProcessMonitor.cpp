@@ -485,12 +485,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("ProcessMonitor::Impl already initialized");
+            SS_LOG_WARN(L"ProcessMonitor", L"Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("ProcessMonitor::Impl: Initializing");
+            SS_LOG_INFO(L"ProcessMonitor", L"Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -500,7 +500,7 @@ public:
 
             // Perform initial snapshot
             if (!TakeInitialSnapshot()) {
-                Logger::Error("ProcessMonitor: Failed to take initial snapshot");
+                SS_LOG_ERROR(L"ProcessMonitor", L"Failed to take initial snapshot");
                 return false;
             }
 
@@ -508,13 +508,12 @@ public:
             StartWorkerThreads();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("ProcessMonitor::Impl: Initialization complete - {} processes tracked",
-                m_processCache.size());
+            SS_LOG_INFO(L"ProcessMonitor", L"Impl: Initialization complete - %zu processes tracked", m_processCache.size());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessMonitor::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessMonitor", L"Impl: Initialization exception: %S", e.what());
             return false;
         }
     }
@@ -526,7 +525,7 @@ public:
             return;
         }
 
-        Logger::Info("ProcessMonitor::Impl: Shutting down");
+        SS_LOG_INFO(L"ProcessMonitor", L"Impl: Shutting down");
 
         m_shuttingDown.store(true, std::memory_order_release);
 
@@ -561,7 +560,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("ProcessMonitor::Impl: Shutdown complete");
+        SS_LOG_INFO(L"ProcessMonitor", L"Impl: Shutdown complete");
     }
 
     // ========================================================================
@@ -570,7 +569,7 @@ public:
 
     [[nodiscard]] bool TakeInitialSnapshot() {
         try {
-            Logger::Info("ProcessMonitor: Taking initial system snapshot");
+            SS_LOG_INFO(L"ProcessMonitor", L"Taking initial system snapshot");
 
             // KERNEL DRIVER INTEGRATION WILL COME HERE
             // For enterprise-grade visibility, we would use NtQuerySystemInformation
@@ -579,8 +578,7 @@ public:
 
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
-                Logger::Error("ProcessMonitor: CreateToolhelp32Snapshot failed: {}",
-                    GetLastError());
+                SS_LOG_ERROR(L"ProcessMonitor", L"CreateToolhelp32Snapshot failed: %lu", GetLastError());
                 return false;
             }
 
@@ -609,11 +607,11 @@ public:
             m_stats.currentActiveProcesses.store(processCount, std::memory_order_relaxed);
             m_stats.processesDiscoveredBySnapshot.store(processCount, std::memory_order_relaxed);
 
-            Logger::Info("ProcessMonitor: Initial snapshot complete - {} processes", processCount);
+            SS_LOG_INFO(L"ProcessMonitor", L"Initial snapshot complete - %zu processes", processCount);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessMonitor: Initial snapshot exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessMonitor", L"Initial snapshot exception: %S", e.what());
             return false;
         }
     }
@@ -853,7 +851,7 @@ public:
         while (currentPid != 0 && depth < maxDepth) {
             // Cycle detection
             if (visitedPids.count(currentPid)) {
-                Logger::Warn("ProcessMonitor: Cycle detected in ancestry for PID {}", pid);
+                SS_LOG_WARN(L"ProcessMonitor", L"Cycle detected in ancestry for PID %u", pid);
                 chain.hasOrphan = true;
                 chain.orphanAtDepth = depth;
                 break;
@@ -915,7 +913,7 @@ public:
 
         // Check if parent was created AFTER child (impossible naturally)
         if (parentInfo->createTime > processInfo->createTime) {
-            Logger::Warn("ProcessMonitor: PPID spoofing detected - PID {} claims parent {} "
+            SS_LOG_WARN(L"ProcessMonitor", L"PPID spoofing detected - PID %u claims parent %u "
                         "created after child", pid, processInfo->parentPid);
             m_stats.ppidSpoofingDetected.fetch_add(1, std::memory_order_relaxed);
 
@@ -978,8 +976,7 @@ public:
             m_stats.currentActiveProcesses.fetch_add(1, std::memory_order_relaxed);
             m_stats.totalProcessesTracked.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Info("ProcessMonitor: Process created - PID {} ({})",
-                info.uniqueId.pid, StringUtils::WideToUtf8(info.processName));
+            SS_LOG_INFO(L"ProcessMonitor", L"Process created - PID %u (%S)", info.uniqueId.pid, StringUtils::WideToUtf8(info.processName));
 
             // Invoke callbacks
             InvokeProcessCallbacks(info, true);
@@ -991,7 +988,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessMonitor: OnProcessCreate exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessMonitor", L"OnProcessCreate exception: %S", e.what());
             m_stats.eventProcessingErrors.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -1005,7 +1002,7 @@ public:
             // Find process in cache
             auto pidIt = m_pidToUniqueId.find(pid);
             if (pidIt == m_pidToUniqueId.end()) {
-                Logger::Debug("ProcessMonitor: Terminate event for unknown PID {}", pid);
+                SS_LOG_DEBUG(L"ProcessMonitor", L"Terminate event for unknown PID %u", pid);
                 return;
             }
 
@@ -1020,8 +1017,7 @@ public:
             info.exitCode = exitCode;
             info.exitTime = system_clock::now();
 
-            Logger::Info("ProcessMonitor: Process terminated - PID {} ({}) exitCode: {}",
-                pid, StringUtils::WideToUtf8(info.processName), exitCode);
+            SS_LOG_INFO(L"ProcessMonitor", L"Process terminated - PID %u (%S) exitCode: %ls", pid, StringUtils::WideToUtf8(info.processName), exitCode);
 
             // Move to historical storage if configured
             if (m_config.enableHistoricalTracking) {
@@ -1046,7 +1042,7 @@ public:
             m_stats.currentActiveProcesses.fetch_sub(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessMonitor: OnProcessTerminate exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessMonitor", L"OnProcessTerminate exception: %S", e.what());
             m_stats.eventProcessingErrors.fetch_add(1, std::memory_order_relaxed);
         }
     }
@@ -1073,11 +1069,11 @@ public:
             CleanupThread(stoken);
         });
 
-        Logger::Info("ProcessMonitor: {} worker threads started", m_workerThreads.size());
+        SS_LOG_INFO(L"ProcessMonitor", L"%zu worker threads started", m_workerThreads.size());
     }
 
     void EventProcessingThread(std::stop_token stoken) {
-        Logger::Debug("ProcessMonitor: Event processing thread started");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Event processing thread started");
 
         while (!stoken.stop_requested() && !m_shuttingDown.load(std::memory_order_acquire)) {
             try {
@@ -1113,11 +1109,11 @@ public:
                 m_stats.eventsProcessed.fetch_add(batchSize, std::memory_order_relaxed);
 
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Event processing thread exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Event processing thread exception: %S", e.what());
             }
         }
 
-        Logger::Debug("ProcessMonitor: Event processing thread stopped");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Event processing thread stopped");
     }
 
     void ProcessEventImpl(const ProcessEvent& event) {
@@ -1135,7 +1131,7 @@ public:
     }
 
     void SnapshotThread(std::stop_token stoken) {
-        Logger::Debug("ProcessMonitor: Snapshot thread started");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Snapshot thread started");
 
         while (!stoken.stop_requested() && !m_shuttingDown.load(std::memory_order_acquire)) {
             try {
@@ -1146,15 +1142,15 @@ public:
                 RefreshSnapshotImpl();
 
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Snapshot thread exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Snapshot thread exception: %S", e.what());
             }
         }
 
-        Logger::Debug("ProcessMonitor: Snapshot thread stopped");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Snapshot thread stopped");
     }
 
     void CleanupThread(std::stop_token stoken) {
-        Logger::Debug("ProcessMonitor: Cleanup thread started");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Cleanup thread started");
 
         while (!stoken.stop_requested() && !m_shuttingDown.load(std::memory_order_acquire)) {
             try {
@@ -1167,11 +1163,11 @@ public:
                 CleanupDeadProcesses();
 
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Cleanup thread exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Cleanup thread exception: %S", e.what());
             }
         }
 
-        Logger::Debug("ProcessMonitor: Cleanup thread stopped");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Cleanup thread stopped");
     }
 
     void CleanupDeadProcesses() {
@@ -1196,12 +1192,12 @@ public:
         }
 
         if (!toRemove.empty()) {
-            Logger::Debug("ProcessMonitor: Cleaned up {} dead processes", toRemove.size());
+            SS_LOG_DEBUG(L"ProcessMonitor", L"Cleaned up %zu dead processes", toRemove.size());
         }
     }
 
     bool RefreshSnapshotImpl() {
-        Logger::Debug("ProcessMonitor: Refreshing process snapshot");
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Refreshing process snapshot");
 
         try {
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1232,8 +1228,7 @@ public:
                             m_stats.processesDiscoveredBySnapshot.fetch_add(1,
                                 std::memory_order_relaxed);
 
-                            Logger::Info("ProcessMonitor: Discovered process via snapshot - PID {}",
-                                info.uniqueId.pid);
+                            SS_LOG_INFO(L"ProcessMonitor", L"Discovered process via snapshot - PID %u", info.uniqueId.pid);
                         }
                     }
 
@@ -1263,7 +1258,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessMonitor: Snapshot refresh exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessMonitor", L"Snapshot refresh exception: %S", e.what());
             return false;
         }
     }
@@ -1280,7 +1275,7 @@ public:
                 callback(info, created);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Process callback exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Process callback exception: %S", e.what());
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -1294,7 +1289,7 @@ public:
                 callback(event);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Event callback exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Event callback exception: %S", e.what());
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -1311,7 +1306,7 @@ public:
                 callback(processId, description);
                 m_stats.callbacksInvoked.fetch_add(1, std::memory_order_relaxed);
             } catch (const std::exception& e) {
-                Logger::Error("ProcessMonitor: Suspicious callback exception: {}", e.what());
+                SS_LOG_ERROR(L"ProcessMonitor", L"Suspicious callback exception: %S", e.what());
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
@@ -1334,14 +1329,14 @@ ProcessMonitor& ProcessMonitor::Instance() {
 ProcessMonitor::ProcessMonitor()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("ProcessMonitor: Constructor called");
+    SS_LOG_INFO(L"ProcessMonitor", L"Constructor called");
 }
 
 ProcessMonitor::~ProcessMonitor() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("ProcessMonitor: Destructor called");
+    SS_LOG_INFO(L"ProcessMonitor", L"Destructor called");
 }
 
 // ============================================================================
@@ -1350,7 +1345,7 @@ ProcessMonitor::~ProcessMonitor() {
 
 bool ProcessMonitor::Initialize(const MonitorConfig& config) {
     if (!m_impl) {
-        Logger::Critical("ProcessMonitor: Implementation is null");
+        SS_LOG_ERROR(L"ProcessMonitor", L"Implementation is null");
         return false;
     }
 
@@ -1373,7 +1368,7 @@ bool ProcessMonitor::UpdateConfig(const MonitorConfig& config) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
 
-    Logger::Info("ProcessMonitor: Configuration updated");
+    SS_LOG_INFO(L"ProcessMonitor", L"Configuration updated");
     return true;
 }
 
@@ -1698,7 +1693,7 @@ void ProcessMonitor::OnProcessCreate(const ProcessEvent& event) {
 
         if (m_impl->m_eventQueue.size() >= m_impl->m_config.eventQueueSize) {
             m_impl->m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
-            Logger::Warn("ProcessMonitor: Event queue full, dropping event");
+            SS_LOG_WARN(L"ProcessMonitor", L"Event queue full, dropping event");
             return;
         }
 
@@ -1736,8 +1731,7 @@ void ProcessMonitor::OnModuleLoad(
     size_t moduleSize
 ) {
     // Module tracking would be implemented here
-    Logger::Debug("ProcessMonitor: Module loaded - PID {} module {}",
-        pid, StringUtils::WideToUtf8(modulePath));
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Module loaded - PID %u module %S", pid, StringUtils::WideToUtf8(modulePath));
 }
 
 void ProcessMonitor::SubmitEvents(std::vector<ProcessEvent> events) {
@@ -1839,7 +1833,7 @@ uint64_t ProcessMonitor::RegisterCallback(ProcessCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_processCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ProcessMonitor: Registered process callback {}", id);
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Registered process callback %llu", id);
     return id;
 }
 
@@ -1851,7 +1845,7 @@ uint64_t ProcessMonitor::RegisterEventCallback(ProcessEventCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_eventCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ProcessMonitor: Registered event callback {}", id);
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Registered event callback %llu", id);
     return id;
 }
 
@@ -1863,7 +1857,7 @@ uint64_t ProcessMonitor::RegisterSuspiciousCallback(SuspiciousActivityCallback c
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_suspiciousCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ProcessMonitor: Registered suspicious callback {}", id);
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Registered suspicious callback %llu", id);
     return id;
 }
 
@@ -1875,7 +1869,7 @@ uint64_t ProcessMonitor::RegisterAncestryCallback(AncestryAnomalyCallback callba
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_ancestryCallbacks[id] = std::move(callback);
 
-    Logger::Debug("ProcessMonitor: Registered ancestry callback {}", id);
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Registered ancestry callback %llu", id);
     return id;
 }
 
@@ -1891,7 +1885,7 @@ void ProcessMonitor::UnregisterCallback(uint64_t callbackId) {
     removed |= m_impl->m_ancestryCallbacks.erase(callbackId) > 0;
 
     if (removed) {
-        Logger::Debug("ProcessMonitor: Unregistered callback {}", callbackId);
+        SS_LOG_DEBUG(L"ProcessMonitor", L"Unregistered callback %llu", callbackId);
     }
 }
 
@@ -1919,11 +1913,11 @@ void ProcessMonitor::ClearCache(bool keepRunning) {
             m_impl->m_pidToUniqueId.erase(uniqueId.pid);
         }
 
-        Logger::Info("ProcessMonitor: Cleared {} terminated entries", toRemove.size());
+        SS_LOG_INFO(L"ProcessMonitor", L"Cleared %zu terminated entries", toRemove.size());
     } else {
         m_impl->m_processCache.clear();
         m_impl->m_pidToUniqueId.clear();
-        Logger::Info("ProcessMonitor: Cache cleared completely");
+        SS_LOG_INFO(L"ProcessMonitor", L"Cache cleared completely");
     }
 }
 
@@ -1994,7 +1988,7 @@ std::optional<ExtendedProcessInfo> ProcessMonitor::RefreshCacheEntry(uint32_t pi
 void ProcessMonitor::ResetStatistics() {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("ProcessMonitor: Statistics reset");
+        SS_LOG_INFO(L"ProcessMonitor", L"Statistics reset");
     }
 }
 

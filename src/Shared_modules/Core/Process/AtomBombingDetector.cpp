@@ -334,12 +334,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("AtomBombingDetector::Impl already initialized");
+            SS_LOG_WARN(L"AtomBombing", L"Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("AtomBombingDetector::Impl: Initializing");
+            SS_LOG_INFO(L"AtomBombing", L"Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -351,12 +351,12 @@ public:
             InitializeKnownSafeAtoms();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("AtomBombingDetector::Impl: Initialization complete");
+            SS_LOG_INFO(L"AtomBombing", L"Impl: Initialization complete");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Impl: Initialization exception: %S", e.what());
             return false;
         }
     }
@@ -368,7 +368,7 @@ public:
             return;
         }
 
-        Logger::Info("AtomBombingDetector::Impl: Shutting down");
+        SS_LOG_INFO(L"AtomBombing", L"Impl: Shutting down");
 
         // Stop monitoring
         StopMonitoringImpl();
@@ -400,7 +400,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("AtomBombingDetector::Impl: Shutdown complete");
+        SS_LOG_INFO(L"AtomBombing", L"Impl: Shutdown complete");
     }
 
     void InitializeKnownSafeAtoms() {
@@ -421,7 +421,7 @@ public:
             result.scanTime = system_clock::now();
             result.systemWideScan = true;
 
-            Logger::Info("AtomBombingDetector: Starting atom table scan");
+            SS_LOG_INFO(L"AtomBombing", L"Starting atom table scan");
 
             // Enumerate all global atoms
             auto atoms = EnumerateAtomsImpl();
@@ -469,14 +469,12 @@ public:
             m_stats.scansPerformed.fetch_add(1, std::memory_order_relaxed);
             m_stats.totalScanTimeMs.fetch_add(result.scanDurationMs, std::memory_order_relaxed);
 
-            Logger::Info("AtomBombingDetector: Scan complete - {} atoms, {} suspicious, {} attacks, {} ms",
-                result.totalAtomsAnalyzed, result.suspiciousAtomsFound,
-                result.detectedAttacks.size(), result.scanDurationMs);
+            SS_LOG_INFO(L"AtomBombing", L"Scan complete - %d atoms, %d suspicious, %zu attacks, %.2f ms", result.totalAtomsAnalyzed, result.suspiciousAtomsFound, result.detectedAttacks.size(), result.scanDurationMs);
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: Scan exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Scan exception: %S", e.what());
             result.scanError = StringUtils::Utf8ToWide(e.what());
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
@@ -518,7 +516,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: Enumeration exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Enumeration exception: %S", e.what());
         }
 
         return atoms;
@@ -590,7 +588,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: Atom analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Atom analysis exception: %S", e.what());
         }
 
         return atom;
@@ -710,7 +708,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: APC analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"APC analysis exception: %S", e.what());
         }
 
         return event;
@@ -801,7 +799,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: Correlation exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Correlation exception: %S", e.what());
         }
 
         return attacks;
@@ -869,9 +867,7 @@ public:
             m_stats.payloadsExtracted.fetch_add(1, std::memory_order_relaxed);
         }
 
-        Logger::Warn("AtomBombingDetector: Attack detected - PID {} -> PID {}, Confidence: {}, Risk: {}",
-            attack.attackerPid, attack.victimPid,
-            static_cast<int>(attack.confidence), attack.riskScore);
+        SS_LOG_WARN(L"AtomBombing", L"Attack detected - PID %u -> PID %u, Confidence: %.2f, Risk: %.2f", attack.attackerPid, attack.victimPid, static_cast<int>(attack.confidence), attack.riskScore);
 
         return attack;
     }
@@ -882,23 +878,23 @@ public:
 
     bool StartMonitoringImpl() {
         if (m_monitoring.exchange(true, std::memory_order_acquire)) {
-            Logger::Warn("AtomBombingDetector: Already monitoring");
+            SS_LOG_WARN(L"AtomBombing", L"Already monitoring");
             return true;
         }
 
         try {
-            Logger::Info("AtomBombingDetector: Starting real-time monitoring");
+            SS_LOG_INFO(L"AtomBombing", L"Starting real-time monitoring");
 
             // Start monitoring thread
             m_workerThreads.emplace_back([this](std::stop_token stoken) {
                 MonitoringThread(stoken);
             });
 
-            Logger::Info("AtomBombingDetector: Monitoring started");
+            SS_LOG_INFO(L"AtomBombing", L"Monitoring started");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: Start monitoring exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"Start monitoring exception: %S", e.what());
             m_monitoring.store(false, std::memory_order_release);
             return false;
         }
@@ -909,16 +905,16 @@ public:
             return;
         }
 
-        Logger::Info("AtomBombingDetector: Stopping monitoring");
+        SS_LOG_INFO(L"AtomBombing", L"Stopping monitoring");
 
         // Stop worker threads
         m_workerThreads.clear();
 
-        Logger::Info("AtomBombingDetector: Monitoring stopped");
+        SS_LOG_INFO(L"AtomBombing", L"Monitoring stopped");
     }
 
     void MonitoringThread(std::stop_token stoken) {
-        Logger::Debug("AtomBombingDetector: Monitoring thread started");
+        SS_LOG_DEBUG(L"AtomBombing", L"Monitoring thread started");
 
         while (!stoken.stop_requested()) {
             try {
@@ -936,11 +932,11 @@ public:
                 std::this_thread::sleep_for(seconds(5));
 
             } catch (const std::exception& e) {
-                Logger::Error("AtomBombingDetector: Monitoring thread exception: {}", e.what());
+                SS_LOG_ERROR(L"AtomBombing", L"Monitoring thread exception: %S", e.what());
             }
         }
 
-        Logger::Debug("AtomBombingDetector: Monitoring thread stopped");
+        SS_LOG_DEBUG(L"AtomBombing", L"Monitoring thread stopped");
     }
 
     // ========================================================================
@@ -972,12 +968,10 @@ public:
                 CloseHandle(hProcess);
             }
 
-            Logger::Debug("AtomBombingDetector: Atom {} created by PID {} ({}), Suspicion: {}",
-                atomValue, creatorPid, StringUtils::WideToUtf8(atom.creatorProcessName),
-                static_cast<int>(atom.suspicionLevel));
+            SS_LOG_DEBUG(L"AtomBombing", L"Atom %ls created by PID %u (%S), Suspicion: %d", atomValue, creatorPid, StringUtils::WideToUtf8(atom.creatorProcessName), static_cast<int>(atom.suspicionLevel));
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: OnAtomCreate exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"OnAtomCreate exception: %S", e.what());
         }
     }
 
@@ -1012,13 +1006,12 @@ public:
                 if (m_config.mode == MonitoringMode::Active ||
                     m_config.mode == MonitoringMode::Aggressive) {
                     // In real implementation, would actually block the APC
-                    Logger::Warn("AtomBombingDetector: Would block suspicious APC from PID {} to PID {}",
-                        sourcePid, targetPid);
+                    SS_LOG_WARN(L"AtomBombing", L"Would block suspicious APC from PID %u to PID %u", sourcePid, targetPid);
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AtomBombingDetector: OnAPCQueue exception: {}", e.what());
+            SS_LOG_ERROR(L"AtomBombing", L"OnAPCQueue exception: %S", e.what());
         }
     }
 
@@ -1033,7 +1026,7 @@ public:
             try {
                 callback(attack);
             } catch (const std::exception& e) {
-                Logger::Error("AtomBombingDetector: Attack callback exception: {}", e.what());
+                SS_LOG_ERROR(L"AtomBombing", L"Attack callback exception: %S", e.what());
             }
         }
     }
@@ -1045,7 +1038,7 @@ public:
             try {
                 callback(atom);
             } catch (const std::exception& e) {
-                Logger::Error("AtomBombingDetector: Atom callback exception: {}", e.what());
+                SS_LOG_ERROR(L"AtomBombing", L"Atom callback exception: %S", e.what());
             }
         }
     }
@@ -1057,7 +1050,7 @@ public:
             try {
                 callback(apc);
             } catch (const std::exception& e) {
-                Logger::Error("AtomBombingDetector: APC callback exception: {}", e.what());
+                SS_LOG_ERROR(L"AtomBombing", L"APC callback exception: %S", e.what());
             }
         }
     }
@@ -1079,14 +1072,14 @@ AtomBombingDetector& AtomBombingDetector::Instance() {
 AtomBombingDetector::AtomBombingDetector()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("AtomBombingDetector: Constructor called");
+    SS_LOG_INFO(L"AtomBombing", L"Constructor called");
 }
 
 AtomBombingDetector::~AtomBombingDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("AtomBombingDetector: Destructor called");
+    SS_LOG_INFO(L"AtomBombing", L"Destructor called");
 }
 
 // ============================================================================
@@ -1095,7 +1088,7 @@ AtomBombingDetector::~AtomBombingDetector() {
 
 bool AtomBombingDetector::Initialize(const AtomBombingConfig& config) {
     if (!m_impl) {
-        Logger::Critical("AtomBombingDetector: Implementation is null");
+        SS_LOG_ERROR(L"AtomBombing", L"Implementation is null");
         return false;
     }
 
@@ -1118,7 +1111,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
 
-    Logger::Info("AtomBombingDetector: Configuration updated");
+    SS_LOG_INFO(L"AtomBombing", L"Configuration updated");
     return true;
 }
 
@@ -1135,7 +1128,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] ScanResult AtomBombingDetector::ScanAtomTable() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return ScanResult{};
     }
 
@@ -1144,7 +1137,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] AtomInfo AtomBombingDetector::AnalyzeAtom(uint16_t atomValue) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return AtomInfo{};
     }
 
@@ -1153,7 +1146,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] std::vector<AtomInfo> AtomBombingDetector::EnumerateAtoms() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return {};
     }
 
@@ -1162,7 +1155,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] std::vector<AtomInfo> AtomBombingDetector::FindSuspiciousAtoms() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return {};
     }
 
@@ -1208,7 +1201,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
     uintptr_t apcRoutine
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return APCEvent{};
     }
 
@@ -1239,7 +1232,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] std::vector<AtomBombingAttack> AtomBombingDetector::CorrelateEvents() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return {};
     }
 
@@ -1265,7 +1258,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 [[nodiscard]] ScanResult AtomBombingDetector::ScanProcess(uint32_t pid) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return ScanResult{};
     }
 
@@ -1294,7 +1287,7 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 
 bool AtomBombingDetector::StartMonitoring() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("AtomBombingDetector: Not initialized");
+        SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
         return false;
     }
 
@@ -1317,7 +1310,7 @@ void AtomBombingDetector::SetMonitoringMode(MonitoringMode mode) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config.mode = mode;
 
-    Logger::Info("AtomBombingDetector: Monitoring mode set to {}", static_cast<int>(mode));
+    SS_LOG_INFO(L"AtomBombing", L"Monitoring mode set to %d", static_cast<int>(mode));
 }
 
 [[nodiscard]] MonitoringMode AtomBombingDetector::GetMonitoringMode() const noexcept {
@@ -1370,8 +1363,7 @@ bool AtomBombingDetector::BlockAPC(const APCEvent& apc) {
         return false;
     }
 
-    Logger::Info("AtomBombingDetector: Blocking APC from PID {} to PID {}",
-        apc.sourcePid, apc.targetPid);
+    SS_LOG_INFO(L"AtomBombing", L"Blocking APC from PID %u to PID %u", apc.sourcePid, apc.targetPid);
 
     // In real implementation, would use kernel driver to block APC
     m_impl->m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -1385,16 +1377,15 @@ bool AtomBombingDetector::RemoveMaliciousAtom(uint16_t atomValue) {
 
     try {
         if (GlobalDeleteAtom(static_cast<ATOM>(atomValue)) == 0) {
-            Logger::Info("AtomBombingDetector: Removed malicious atom {}", atomValue);
+            SS_LOG_INFO(L"AtomBombing", L"Removed malicious atom %ls", atomValue);
             return true;
         } else {
             DWORD error = GetLastError();
-            Logger::Error("AtomBombingDetector: Failed to delete atom {}: error {}",
-                atomValue, error);
+            SS_LOG_ERROR(L"AtomBombing", L"Failed to delete atom %ls: error %ls", atomValue, error);
             return false;
         }
     } catch (const std::exception& e) {
-        Logger::Error("AtomBombingDetector: RemoveMaliciousAtom exception: {}", e.what());
+        SS_LOG_ERROR(L"AtomBombing", L"RemoveMaliciousAtom exception: %S", e.what());
         return false;
     }
 }
@@ -1405,7 +1396,7 @@ bool AtomBombingDetector::TerminateAttacker(const AtomBombingAttack& attack) {
     }
 
     if (!m_impl->m_config.terminateAttacker) {
-        Logger::Warn("AtomBombingDetector: Termination disabled in config");
+        SS_LOG_WARN(L"AtomBombing", L"Termination disabled in config");
         return false;
     }
 
@@ -1413,20 +1404,18 @@ bool AtomBombingDetector::TerminateAttacker(const AtomBombingAttack& attack) {
         HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, attack.attackerPid);
         if (hProcess) {
             if (TerminateProcess(hProcess, 1)) {
-                Logger::Warn("AtomBombingDetector: Terminated attacker process PID {}",
-                    attack.attackerPid);
+                SS_LOG_WARN(L"AtomBombing", L"Terminated attacker process PID %u", attack.attackerPid);
                 CloseHandle(hProcess);
                 return true;
             }
             CloseHandle(hProcess);
         }
 
-        Logger::Error("AtomBombingDetector: Failed to terminate attacker PID {}",
-            attack.attackerPid);
+        SS_LOG_ERROR(L"AtomBombing", L"Failed to terminate attacker PID %u", attack.attackerPid);
         return false;
 
     } catch (const std::exception& e) {
-        Logger::Error("AtomBombingDetector: TerminateAttacker exception: {}", e.what());
+        SS_LOG_ERROR(L"AtomBombing", L"TerminateAttacker exception: %S", e.what());
         return false;
     }
 }
@@ -1443,7 +1432,7 @@ uint64_t AtomBombingDetector::RegisterAttackCallback(AttackDetectedCallback call
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_attackCallbacks[id] = std::move(callback);
 
-    Logger::Debug("AtomBombingDetector: Registered attack callback {}", id);
+    SS_LOG_DEBUG(L"AtomBombing", L"Registered attack callback %llu", id);
     return id;
 }
 
@@ -1455,7 +1444,7 @@ uint64_t AtomBombingDetector::RegisterAtomCallback(SuspiciousAtomCallback callba
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_atomCallbacks[id] = std::move(callback);
 
-    Logger::Debug("AtomBombingDetector: Registered atom callback {}", id);
+    SS_LOG_DEBUG(L"AtomBombing", L"Registered atom callback %llu", id);
     return id;
 }
 
@@ -1467,7 +1456,7 @@ uint64_t AtomBombingDetector::RegisterAPCCallback(SuspiciousAPCCallback callback
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_apcCallbacks[id] = std::move(callback);
 
-    Logger::Debug("AtomBombingDetector: Registered APC callback {}", id);
+    SS_LOG_DEBUG(L"AtomBombing", L"Registered APC callback %llu", id);
     return id;
 }
 
@@ -1482,7 +1471,7 @@ void AtomBombingDetector::UnregisterCallback(uint64_t callbackId) {
     removed |= m_impl->m_apcCallbacks.erase(callbackId) > 0;
 
     if (removed) {
-        Logger::Debug("AtomBombingDetector: Unregistered callback {}", callbackId);
+        SS_LOG_DEBUG(L"AtomBombing", L"Unregistered callback %llu", callbackId);
     }
 }
 
@@ -1498,7 +1487,7 @@ void AtomBombingDetector::UnregisterCallback(uint64_t callbackId) {
 void AtomBombingDetector::ResetStatistics() {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("AtomBombingDetector: Statistics reset");
+        SS_LOG_INFO(L"AtomBombing", L"Statistics reset");
     }
 }
 

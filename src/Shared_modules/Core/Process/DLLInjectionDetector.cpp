@@ -475,7 +475,7 @@ public:
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Logger::Error("InjectionCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"DLLInjection", L"InjectionCallback exception: %S", e.what());
             }
         }
     }
@@ -486,7 +486,7 @@ public:
             try {
                 callback(dllInfo);
             } catch (const std::exception& e) {
-                Logger::Error("ModuleCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"DLLInjection", L"ModuleCallback exception: %S", e.what());
             }
         }
     }
@@ -501,7 +501,7 @@ public:
                     return false;
                 }
             } catch (const std::exception& e) {
-                Logger::Error("DecisionCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"DLLInjection", L"DecisionCallback exception: %S", e.what());
                 return false; // Block on exception for safety
             }
         }
@@ -515,7 +515,7 @@ public:
             try {
                 callback(hookInfo);
             } catch (const std::exception& e) {
-                Logger::Error("HookCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"DLLInjection", L"HookCallback exception: %S", e.what());
             }
         }
     }
@@ -737,7 +737,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("DLLInjectionDetector: Initializing...");
+            SS_LOG_INFO(L"DLLInjection", L"Initializing...");
 
             m_config = config;
 
@@ -749,20 +749,20 @@ public:
             // Initialize infrastructure
             if (!HashStore::HashStore::Instance().Initialize(
                 HashStore::HashStoreConfig::CreateDefault())) {
-                Logger::Warn("DLLInjectionDetector: HashStore initialization warning");
+                SS_LOG_WARN(L"DLLInjection", L"HashStore initialization warning");
             }
 
             if (!Whitelist::WhitelistStore::Instance().Initialize(
                 Whitelist::WhitelistStoreConfig::CreateDefault())) {
-                Logger::Warn("DLLInjectionDetector: WhitelistStore initialization warning");
+                SS_LOG_WARN(L"DLLInjection", L"WhitelistStore initialization warning");
             }
 
             m_initialized = true;
-            Logger::Info("DLLInjectionDetector: Initialized successfully");
+            SS_LOG_INFO(L"DLLInjection", L"Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"Initialization failed: %S", e.what());
             return false;
         }
     }
@@ -777,7 +777,7 @@ public:
             // Clear tracked modules
         }
 
-        Logger::Info("DLLInjectionDetector: Shutdown complete");
+        SS_LOG_INFO(L"DLLInjection", L"Shutdown complete");
     }
 
     bool IsInitialized() const noexcept {
@@ -788,7 +788,7 @@ public:
     bool UpdateConfig(const DLLInjectionConfig& config) {
         std::unique_lock lock(m_mutex);
         m_config = config;
-        Logger::Info("DLLInjectionDetector: Configuration updated");
+        SS_LOG_INFO(L"DLLInjection", L"Configuration updated");
         return true;
     }
 
@@ -898,13 +898,10 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeModule(info);
 
-            Logger::Info("DLLInjectionDetector: Analyzed {} - Trust: {}, Risk: {}",
-                Utils::StringUtils::WideToUtf8(info.dllName),
-                static_cast<int>(info.trustLevel),
-                info.riskScore);
+            SS_LOG_INFO(L"DLLInjection", L"Analyzed %S - Trust: %d, Risk: %.2f", Utils::StringUtils::WideToUtf8(info.dllName), static_cast<int>(info.trustLevel), info.riskScore);
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::AnalyzeLoad: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"AnalyzeLoad: %S", e.what());
             m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1005,11 +1002,10 @@ public:
                 std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count()
             );
 
-            Logger::Info("DLLInjectionDetector: Process {} analysis complete - {} modules, {} suspicious, {} injected",
-                pid, result.totalModules, result.suspiciousModules, result.injectedModules);
+            SS_LOG_INFO(L"DLLInjection", L"Process %u analysis complete - %d modules, %d suspicious, %d injected", pid, result.totalModules, result.suspiciousModules, result.injectedModules);
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::AnalyzeProcess: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"AnalyzeProcess: %S", e.what());
             result.analysisError = Utils::StringUtils::Utf8ToWide(e.what());
             m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1084,10 +1080,10 @@ public:
                 events.insert(events.end(), searchEvents.begin(), searchEvents.end());
             }
 
-            Logger::Info("DLLInjectionDetector: Process {} - {} injections detected", pid, events.size());
+            SS_LOG_INFO(L"DLLInjection", L"Process %u - %zu injections detected", pid, events.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::DetectInjections: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"DetectInjections: %S", e.what());
         }
 
         return events;
@@ -1171,8 +1167,7 @@ public:
                 // Invoke callbacks
                 m_callbackManager->InvokeInjection(event);
 
-                Logger::Warn("DLLInjectionDetector: CreateRemoteThread injection detected - PID {} injected by PID {}",
-                    pid, threadEvent->creatorPid);
+                SS_LOG_WARN(L"DLLInjection", L"CreateRemoteThread injection detected - PID %u injected by PID %u", pid, threadEvent->creatorPid);
             }
         }
 
@@ -1214,8 +1209,7 @@ public:
 
             m_callbackManager->InvokeInjection(event);
 
-            Logger::Warn("DLLInjectionDetector: QueueUserAPC injection detected - PID {} injected by PID {}",
-                pid, apcEvent->queuedBy);
+            SS_LOG_WARN(L"DLLInjection", L"QueueUserAPC injection detected - PID %u injected by PID %ls", pid, apcEvent->queuedBy);
         }
 
         return events;
@@ -1232,7 +1226,7 @@ public:
         // This would require integration with ETW or kernel driver
         // Simplified implementation
 
-        Logger::Info("DLLInjectionDetector: Hook enumeration not fully implemented");
+        SS_LOG_INFO(L"DLLInjection", L"Hook enumeration not fully implemented");
 
         return hooks;
     }
@@ -1317,12 +1311,11 @@ public:
 
                 m_stats.appInitInjections.fetch_add(1, std::memory_order_relaxed);
 
-                Logger::Warn("DLLInjectionDetector: AppInit_DLLs detected: {}",
-                    Utils::StringUtils::WideToUtf8(value));
+                SS_LOG_WARN(L"DLLInjection", L"AppInit_DLLs detected: %S", Utils::StringUtils::WideToUtf8(value));
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::CheckAppInitDLLs: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"CheckAppInitDLLs: %S", e.what());
         }
 
         return vectors;
@@ -1360,14 +1353,12 @@ public:
 
                     vectors.push_back(vector);
 
-                    Logger::Warn("DLLInjectionDetector: IFEO debugger detected for {}: {}",
-                        Utils::StringUtils::WideToUtf8(subkey),
-                        Utils::StringUtils::WideToUtf8(debugger));
+                    SS_LOG_WARN(L"DLLInjection", L"IFEO debugger detected for %S: %S", Utils::StringUtils::WideToUtf8(subkey), Utils::StringUtils::WideToUtf8(debugger));
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::CheckIFEO: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"CheckIFEO: %S", e.what());
         }
 
         return vectors;
@@ -1423,17 +1414,14 @@ public:
 
                             m_stats.sideLoadingDetected.fetch_add(1, std::memory_order_relaxed);
 
-                            Logger::Warn("DLLInjectionDetector: Side-loading detected - {} loaded {} from {}",
-                                Utils::StringUtils::WideToUtf8(processName),
-                                Utils::StringUtils::WideToUtf8(pair.dllName),
-                                Utils::StringUtils::WideToUtf8(module.dllPath));
+                            SS_LOG_WARN(L"DLLInjection", L"Side-loading detected - %S loaded %S from %S", Utils::StringUtils::WideToUtf8(processName), Utils::StringUtils::WideToUtf8(pair.dllName), Utils::StringUtils::WideToUtf8(module.dllPath));
                         }
                     }
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::DetectSideLoading: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"DetectSideLoading: %S", e.what());
         }
 
         return sideLoads;
@@ -1487,9 +1475,7 @@ public:
 
                 m_callbackManager->InvokeInjection(event);
 
-                Logger::Critical("DLLInjectionDetector: Search order hijacking detected - {} loaded from {}",
-                    Utils::StringUtils::WideToUtf8(module.dllName),
-                    Utils::StringUtils::WideToUtf8(module.dllPath));
+                SS_LOG_ERROR(L"DLLInjection", L"Search order hijacking detected - %S loaded from %S", Utils::StringUtils::WideToUtf8(module.dllName), Utils::StringUtils::WideToUtf8(module.dllPath));
             }
         }
 
@@ -1504,17 +1490,17 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("DLLInjectionDetector: Not initialized");
+            SS_LOG_ERROR(L"DLLInjection", L"Not initialized");
             return false;
         }
 
         if (m_monitoring) {
-            Logger::Warn("DLLInjectionDetector: Already monitoring");
+            SS_LOG_WARN(L"DLLInjection", L"Already monitoring");
             return true;
         }
 
         m_monitoring = true;
-        Logger::Info("DLLInjectionDetector: Real-time monitoring started");
+        SS_LOG_INFO(L"DLLInjection", L"Real-time monitoring started");
         return true;
     }
 
@@ -1524,7 +1510,7 @@ public:
         if (!m_monitoring) return;
 
         m_monitoring = false;
-        Logger::Info("DLLInjectionDetector: Real-time monitoring stopped");
+        SS_LOG_INFO(L"DLLInjection", L"Real-time monitoring stopped");
     }
 
     bool IsMonitoring() const noexcept {
@@ -1535,7 +1521,7 @@ public:
     void SetMonitoringMode(MonitoringMode mode) {
         std::unique_lock lock(m_mutex);
         m_config.mode = mode;
-        Logger::Info("DLLInjectionDetector: Monitoring mode set to {}", static_cast<int>(mode));
+        SS_LOG_INFO(L"DLLInjection", L"Monitoring mode set to %d", static_cast<int>(mode));
     }
 
     MonitoringMode GetMonitoringMode() const noexcept {
@@ -1563,19 +1549,17 @@ public:
 
                 if (!allow || ShouldBlock(dllInfo)) {
                     m_stats.loadsBlocked.fetch_add(1, std::memory_order_relaxed);
-                    Logger::Warn("DLLInjectionDetector: Blocked load of {} in PID {}",
-                        Utils::StringUtils::WideToUtf8(dllPath), pid);
+                    SS_LOG_WARN(L"DLLInjection", L"Blocked load of %S in PID %u", Utils::StringUtils::WideToUtf8(dllPath), pid);
 
                     // In real implementation, would signal driver to block
                     return;
                 }
             }
 
-            Logger::Info("DLLInjectionDetector: Module loaded - PID {}: {}",
-                pid, Utils::StringUtils::WideToUtf8(dllPath));
+            SS_LOG_INFO(L"DLLInjection", L"Module loaded - PID %u: %S", pid, Utils::StringUtils::WideToUtf8(dllPath));
 
         } catch (const std::exception& e) {
-            Logger::Error("DLLInjectionDetector::OnModuleLoad: {}", e.what());
+            SS_LOG_ERROR(L"DLLInjection", L"OnModuleLoad: %S", e.what());
         }
     }
 
@@ -1585,8 +1569,7 @@ public:
         // Record for correlation
         m_correlator->RecordThreadCreate(targetPid, creatorPid, startAddress);
 
-        Logger::Info("DLLInjectionDetector: Thread created - Target PID {}, Creator PID {}, Start: 0x{:X}",
-            targetPid, creatorPid, startAddress);
+        SS_LOG_INFO(L"DLLInjection", L"Thread created - Target PID %u, Creator PID %u, Start: 0x%X", targetPid, creatorPid, startAddress);
     }
 
     void OnAPCQueue(uint32_t targetPid, uint32_t targetTid, uint32_t queuedBy, uintptr_t apcRoutine) {
@@ -1595,8 +1578,7 @@ public:
         // Record for correlation
         m_correlator->RecordAPCQueue(targetPid, targetTid, queuedBy, apcRoutine);
 
-        Logger::Info("DLLInjectionDetector: APC queued - Target PID {}, Queued by PID {}, Routine: 0x{:X}",
-            targetPid, queuedBy, apcRoutine);
+        SS_LOG_INFO(L"DLLInjection", L"APC queued - Target PID %u, Queued by PID %ls, Routine: 0x%X", targetPid, queuedBy, apcRoutine);
     }
 
     void OnHookInstall(int hookType, uint32_t threadId, uintptr_t hookProc, uint32_t installerPid) {
@@ -1619,8 +1601,7 @@ public:
 
         m_callbackManager->InvokeHook(info);
 
-        Logger::Info("DLLInjectionDetector: Hook installed - Type {}, Global: {}, Installer PID {}",
-            hookType, info.isGlobal, installerPid);
+        SS_LOG_INFO(L"DLLInjection", L"Hook installed - Type %ls, Global: %ls, Installer PID %u", hookType, info.isGlobal, installerPid);
     }
 
     // ========================================================================
@@ -1655,14 +1636,12 @@ public:
         Whitelist::WhitelistStore::Instance().AddEntry(
             Whitelist::WhitelistEntry::CreateFile(Utils::StringUtils::WideToUtf8(dllPath))
         );
-        Logger::Info("DLLInjectionDetector: Added to whitelist: {}",
-            Utils::StringUtils::WideToUtf8(dllPath));
+        SS_LOG_INFO(L"DLLInjection", L"Added to whitelist: %S", Utils::StringUtils::WideToUtf8(dllPath));
     }
 
     void RemoveFromWhitelist(const std::wstring& dllPath) {
         // WhitelistStore doesn't have Remove, would need to add
-        Logger::Info("DLLInjectionDetector: Removed from whitelist: {}",
-            Utils::StringUtils::WideToUtf8(dllPath));
+        SS_LOG_INFO(L"DLLInjection", L"Removed from whitelist: %S", Utils::StringUtils::WideToUtf8(dllPath));
     }
 
     bool IsWhitelisted(const std::wstring& dllPath) const {
@@ -1674,8 +1653,7 @@ public:
     void ExcludeProcess(const std::wstring& processName) {
         std::unique_lock lock(m_mutex);
         m_config.excludedProcesses.push_back(processName);
-        Logger::Info("DLLInjectionDetector: Excluded process: {}",
-            Utils::StringUtils::WideToUtf8(processName));
+        SS_LOG_INFO(L"DLLInjection", L"Excluded process: %S", Utils::StringUtils::WideToUtf8(processName));
     }
 
     void IncludeProcess(const std::wstring& processName) {
@@ -2080,7 +2058,7 @@ std::vector<RegistryInjectionVector> DLLInjectionDetector::CheckAllRegistryVecto
 bool DLLInjectionDetector::MonitorRegistryVectors(
     std::function<void(const RegistryInjectionVector&)> callback) {
     // Registry monitoring would require separate thread
-    Logger::Warn("DLLInjectionDetector::MonitorRegistryVectors not fully implemented");
+    SS_LOG_WARN(L"DLLInjection", L"MonitorRegistryVectors not fully implemented");
     return false;
 }
 

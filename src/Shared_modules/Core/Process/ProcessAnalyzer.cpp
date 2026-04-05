@@ -492,11 +492,11 @@ public:
 bool ProcessAnalyzer::ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"ProcessAnalyzer: Already initialized");
+            SS_LOG_WARN(L"ProcessAnalyzer", L"Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"ProcessAnalyzer: Initializing...");
+        SS_LOG_INFO(L"ProcessAnalyzer", L"Initializing...");
 
         m_config = config;
 
@@ -510,12 +510,11 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& conf
         auto& injectionDetector = ProcessInjectionDetector::Instance();
         auto& threadHijackDetector = ThreadHijackDetector::Instance();
 
-        Utils::Logger::Info(L"ProcessAnalyzer: Initialized successfully");
+        SS_LOG_INFO(L"ProcessAnalyzer", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
@@ -527,7 +526,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::Shutdown() {
             return;
         }
 
-        Utils::Logger::Info(L"ProcessAnalyzer: Shutting down...");
+        SS_LOG_INFO(L"ProcessAnalyzer", L"Shutting down...");
 
         {
             std::unique_lock lock(m_cacheMutex);
@@ -546,10 +545,10 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::Shutdown() {
             m_moduleCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"ProcessAnalyzer: Shutdown complete");
+        SS_LOG_INFO(L"ProcessAnalyzer", L"Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Exception during shutdown");
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Exception during shutdown");
     }
 }
 
@@ -779,8 +778,7 @@ ProcessAnalysisResult ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeProcessIntern
     } catch (const std::exception& e) {
         result.analysisError = Utils::StringUtils::Utf8ToWide(e.what());
         m_statistics.analysisErrors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"ProcessAnalyzer: Analysis failed for PID {} - {}",
-                           pid, result.analysisError);
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Analysis failed for PID %u - %d", pid, result.analysisError);
     }
 
     const auto endTime = Clock::now();
@@ -875,8 +873,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetLoadedModulesIn
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Failed to get modules for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Failed to get modules for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return modules;
@@ -922,8 +919,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindSuspiciousModu
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Failed to find suspicious modules for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Failed to find suspicious modules for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return suspiciousModules;
@@ -947,8 +943,7 @@ ModuleInfo ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeModuleInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Failed to analyze module at 0x{:X} in PID {} - {}",
-                           moduleBase, pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Failed to analyze module at 0x%X in PID %u - %S", moduleBase, pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return modInfo;
@@ -970,8 +965,7 @@ HandleSummary ProcessAnalyzer::ProcessAnalyzerImpl::EnumerateHandlesInternal(uin
         m_statistics.handlesEnumerated.fetch_add(summary.totalHandles, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Failed to enumerate handles for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Failed to enumerate handles for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return summary;
@@ -1056,8 +1050,7 @@ MemorySummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32
         CloseHandle(hProcess);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Memory analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Memory analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return summary;
@@ -1111,8 +1104,7 @@ ThreadSummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeThreadsInternal(uint3
         CloseHandle(hSnapshot);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Thread analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Thread analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return summary;
@@ -1212,8 +1204,7 @@ SignatureInfo ProcessAnalyzer::ProcessAnalyzerImpl::VerifyFileSignatureInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Signature verification failed for {} - {}",
-                           filePath, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Signature verification failed for %ls - %S", filePath, Utils::StringUtils::Utf8ToWide(e.what()));
         sigInfo.status = SignatureStatus::Unknown;
     }
 
@@ -1270,8 +1261,7 @@ SecurityContext ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeSecurityContextInte
         CloseHandle(hProcess);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Security context analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Security context analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return context;
@@ -1285,8 +1275,7 @@ std::vector<std::pair<std::wstring, bool>> ProcessAnalyzer::ProcessAnalyzerImpl:
         // Simplified implementation - production would enumerate all privileges
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Privilege enumeration failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Privilege enumeration failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return privileges;
@@ -1338,8 +1327,7 @@ ParentChildAnalysis ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeParentChildInte
         analysis.isPPIDSpoofed = DetectPPIDSpoofingInternal(pid);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Parent-child analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Parent-child analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return analysis;
@@ -1389,8 +1377,7 @@ NetworkFootprint ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeNetworkFootprintIn
         footprint.hasNetworkModules = (footprint.hasWs2_32 || footprint.hasWinInet || footprint.hasWinHttp);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Network analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Network analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return footprint;
@@ -1418,8 +1405,7 @@ BehavioralIndicators ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeBehaviorIntern
         // Integration with ThreadHijackDetector would happen here
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Behavioral analysis failed for PID {} - {}",
-                           pid, Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Behavioral analysis failed for PID %u - %S", pid, Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
     return indicators;
@@ -1554,7 +1540,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::PurgeExpiredCacheEntries() {
         }
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: Cache purge failed");
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"Cache purge failed");
     }
 }
 
@@ -1620,14 +1606,14 @@ ProcessAnalyzer& ProcessAnalyzer::Instance() {
 ProcessAnalyzer::ProcessAnalyzer()
     : m_impl(std::make_unique<ProcessAnalyzerImpl>())
 {
-    Utils::Logger::Info(L"ProcessAnalyzer: Constructor called");
+    SS_LOG_INFO(L"ProcessAnalyzer", L"Constructor called");
 }
 
 ProcessAnalyzer::~ProcessAnalyzer() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"ProcessAnalyzer: Destructor called");
+    SS_LOG_INFO(L"ProcessAnalyzer", L"Destructor called");
 }
 
 // ============================================================================
@@ -1689,7 +1675,7 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeByPath(
         }
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: AnalyzeByPath failed for {}", processPath);
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByPath failed for %ls", processPath);
     }
 
     return results;
@@ -1712,7 +1698,7 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeByName(
         }
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: AnalyzeByName failed for {}", processName);
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeByName failed for %ls", processName);
     }
 
     return results;
@@ -1741,7 +1727,7 @@ std::vector<ProcessAnalysisResult> ProcessAnalyzer::AnalyzeMultiple(
             });
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: AnalyzeMultiple failed");
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"AnalyzeMultiple failed");
     }
 
     return results;
@@ -2026,7 +2012,7 @@ std::vector<Utils::ProcessUtils::ProcessBasicInfo> ProcessAnalyzer::GetAncestry(
         }
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: GetAncestry failed for PID {}", pid);
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"GetAncestry failed for PID %u", pid);
     }
 
     return ancestry;
@@ -2050,7 +2036,7 @@ std::vector<Utils::ProcessUtils::ProcessBasicInfo> ProcessAnalyzer::GetChildren(
         }
 
     } catch (...) {
-        Utils::Logger::Error(L"ProcessAnalyzer: GetChildren failed for PID {}", pid);
+        SS_LOG_ERROR(L"ProcessAnalyzer", L"GetChildren failed for PID %u", pid);
     }
 
     return children;

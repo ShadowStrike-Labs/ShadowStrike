@@ -427,15 +427,12 @@ struct MemoryScanner::Impl {
             m_config = config;
             m_initialized = true;
 
-            Logger::Info("MemoryScanner initialized (mode={}, YARA={}, patterns={})",
-                static_cast<int>(config.defaultMode),
-                config.enableYARA,
-                config.enablePatternMatching);
+            SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner initialized (mode=%d, YARA=%ls, patterns=%ls)", static_cast<int>(config.defaultMode), config.enableYARA, config.enablePatternMatching);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("MemoryScanner initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"MemoryScanner initialization failed: %S", e.what());
             return false;
         }
     }
@@ -455,7 +452,7 @@ struct MemoryScanner::Impl {
 
             m_initialized = false;
 
-            Logger::Info("MemoryScanner shutdown complete");
+            SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions
@@ -472,7 +469,7 @@ struct MemoryScanner::Impl {
         try {
             HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
             if (!hProcess) {
-                Logger::Error("Failed to open process {} for enumeration", pid);
+                SS_LOG_ERROR(L"MemoryScanner", L"Failed to open process %u for enumeration", pid);
                 return regions;
             }
 
@@ -525,7 +522,7 @@ struct MemoryScanner::Impl {
             CloseHandle(hProcess);
 
         } catch (const std::exception& e) {
-            Logger::Error("EnumerateRegions - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"EnumerateRegions - Exception: %S", e.what());
         }
 
         return regions;
@@ -663,7 +660,7 @@ struct MemoryScanner::Impl {
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ScanRegionInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"ScanRegionInternal - Exception: %S", e.what());
             result.scanned = false;
             result.skipReason = std::string("Exception: ") + e.what();
         }
@@ -834,7 +831,7 @@ struct MemoryScanner::Impl {
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectShellcode - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"DetectShellcode - Exception: %S", e.what());
         }
 
         return threats;
@@ -958,8 +955,7 @@ struct MemoryScanner::Impl {
         // For now, just check if we have rules loaded
         if (!m_yaraRules.empty()) {
             // Simulate YARA matching
-            Logger::Debug("YARA scan on {} bytes ({} rules loaded)",
-                data.size(), m_yaraRules.size());
+            SS_LOG_DEBUG(L"MemoryScanner", L"YARA scan on %zu bytes (%zu rules loaded)", data.size(), m_yaraRules.size());
         }
 
         return matches;
@@ -975,10 +971,10 @@ struct MemoryScanner::Impl {
 
             // Use PatternStore for pattern matching
             // Placeholder: Real implementation would call m_patternIndex->Match()
-            Logger::Debug("Pattern scan on {} bytes", data.size());
+            SS_LOG_DEBUG(L"MemoryScanner", L"Pattern scan on %zu bytes", data.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("ScanWithPatterns - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"ScanWithPatterns - Exception: %S", e.what());
         }
 
         return matches;
@@ -1009,7 +1005,7 @@ struct MemoryScanner::Impl {
             if (!hProcess) {
                 result.completed = false;
                 result.errorMessage = L"Failed to open process";
-                Logger::Error("Failed to open process {} for scanning", pid);
+                SS_LOG_ERROR(L"MemoryScanner", L"Failed to open process %u for scanning", pid);
                 return result;
             }
 
@@ -1017,8 +1013,7 @@ struct MemoryScanner::Impl {
             auto regions = EnumerateRegions(pid);
             result.totalRegions = regions.size();
 
-            Logger::Info("Scanning process {} ({} regions, mode={})",
-                pid, regions.size(), static_cast<int>(mode));
+            SS_LOG_INFO(L"MemoryScanner", L"Scanning process %u (%zu regions, mode=%d)", pid, regions.size(), static_cast<int>(mode));
 
             // Scan regions
             size_t scannedCount = 0;
@@ -1081,7 +1076,7 @@ struct MemoryScanner::Impl {
             result.completed = true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ScanProcessMemory - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"ScanProcessMemory - Exception: %S", e.what());
             result.completed = false;
             result.errorMessage = StringUtils::Utf8ToWide(e.what());
             m_stats.scanErrors++;
@@ -1101,8 +1096,7 @@ struct MemoryScanner::Impl {
         // Invoke complete callbacks
         InvokeCompleteCallbacks(result);
 
-        Logger::Info("Process {} scan complete: {} threats found in {} regions ({} ms)",
-            pid, result.threatsFound, result.regionsScanned, result.totalScanTimeMs);
+        SS_LOG_INFO(L"MemoryScanner", L"Process %u scan complete: %d threats found in %d regions (%d ms)", pid, result.threatsFound, result.regionsScanned, result.totalScanTimeMs);
 
         return result;
     }
@@ -1140,7 +1134,7 @@ struct MemoryScanner::Impl {
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeThreatCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"InvokeThreatCallbacks - Exception: %S", e.what());
         }
     }
 
@@ -1154,7 +1148,7 @@ struct MemoryScanner::Impl {
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeProgressCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"InvokeProgressCallbacks - Exception: %S", e.what());
         }
     }
 
@@ -1168,7 +1162,7 @@ struct MemoryScanner::Impl {
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeCompleteCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"InvokeCompleteCallbacks - Exception: %S", e.what());
         }
     }
 
@@ -1237,7 +1231,7 @@ struct MemoryScanner::Impl {
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeForShellcode - Exception: {}", e.what());
+            SS_LOG_ERROR(L"MemoryScanner", L"AnalyzeForShellcode - Exception: %S", e.what());
         }
 
         return analysis;
@@ -1259,14 +1253,14 @@ MemoryScanner& MemoryScanner::Instance() {
 
 MemoryScanner::MemoryScanner()
     : m_impl(std::make_unique<Impl>()) {
-    Logger::Info("MemoryScanner instance created");
+    SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner instance created");
 }
 
 MemoryScanner::~MemoryScanner() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("MemoryScanner instance destroyed");
+    SS_LOG_INFO(L"MemoryScanner", L"MemoryScanner instance destroyed");
 }
 
 // ============================================================================
@@ -1346,7 +1340,7 @@ std::vector<MemoryScanResult> MemoryScanner::ScanAllProcesses() {
 
     try {
         auto pids = ProcessUtils::EnumerateProcesses();
-        Logger::Info("Scanning {} processes", pids.size());
+        SS_LOG_INFO(L"MemoryScanner", L"Scanning %u processes", pids.size());
 
         for (uint32_t pid : pids) {
             if (pid == 0 || pid == 4) continue;  // Skip System/Idle
@@ -1354,7 +1348,7 @@ std::vector<MemoryScanResult> MemoryScanner::ScanAllProcesses() {
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("ScanAllProcesses - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"ScanAllProcesses - Exception: %S", e.what());
     }
 
     return results;
@@ -1380,7 +1374,7 @@ bool MemoryScanner::ScanRegion(uint32_t pid, uintptr_t baseAddress, size_t size)
         return !result.threats.empty();
 
     } catch (const std::exception& e) {
-        Logger::Error("ScanRegion - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"ScanRegion - Exception: %S", e.what());
         return false;
     }
 }
@@ -1410,7 +1404,7 @@ RegionScanResult MemoryScanner::ScanRegionDetailed(
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("ScanRegionDetailed - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"ScanRegionDetailed - Exception: %S", e.what());
         RegionScanResult result;
         result.scanned = false;
         result.skipReason = e.what();
@@ -1441,7 +1435,7 @@ std::vector<MemoryThreat> MemoryScanner::ScanBuffer(
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("ScanBuffer - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"ScanBuffer - Exception: %S", e.what());
     }
 
     return threats;
@@ -1546,7 +1540,7 @@ std::vector<uint8_t> MemoryScanner::ReadMemory(
     try {
         HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
         if (!hProcess) {
-            Logger::Error("Failed to open process {} for reading", pid);
+            SS_LOG_ERROR(L"MemoryScanner", L"Failed to open process %u for reading", pid);
             return buffer;
         }
 
@@ -1554,7 +1548,7 @@ std::vector<uint8_t> MemoryScanner::ReadMemory(
         CloseHandle(hProcess);
 
     } catch (const std::exception& e) {
-        Logger::Error("ReadMemory - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"ReadMemory - Exception: %S", e.what());
     }
 
     return buffer;
@@ -1573,7 +1567,7 @@ std::vector<uint8_t> MemoryScanner::ReadMemory(
                           buffer.data(),
                           buffer.size(),
                           &bytesRead)) {
-        Logger::Error("ReadProcessMemory failed at 0x{:X}", address);
+        SS_LOG_ERROR(L"MemoryScanner", L"ReadProcessMemory failed at 0x%X", address);
         return {};
     }
 
@@ -1593,28 +1587,26 @@ bool MemoryScanner::DumpRegion(
 
         std::ofstream outFile(outputPath, std::ios::binary);
         if (!outFile) {
-            Logger::Error("Failed to create dump file: {}",
-                StringUtils::WideToUtf8(outputPath));
+            SS_LOG_ERROR(L"MemoryScanner", L"Failed to create dump file: %S", StringUtils::WideToUtf8(outputPath));
             return false;
         }
 
         outFile.write(reinterpret_cast<const char*>(data.data()), data.size());
         outFile.close();
 
-        Logger::Info("Dumped region 0x{:X} ({} bytes) to {}",
-            address, size, StringUtils::WideToUtf8(outputPath));
+        SS_LOG_INFO(L"MemoryScanner", L"Dumped region 0x%X (%ls bytes) to %S", address, size, StringUtils::WideToUtf8(outputPath));
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("DumpRegion - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"DumpRegion - Exception: %S", e.what());
         return false;
     }
 }
 
 bool MemoryScanner::CreateMemoryDump(uint32_t pid, const std::wstring& outputPath) const {
     try {
-        Logger::Info("Creating full memory dump for process {}", pid);
+        SS_LOG_INFO(L"MemoryScanner", L"Creating full memory dump for process %u", pid);
 
         auto regions = EnumerateRegions(pid);
         std::ofstream outFile(outputPath, std::ios::binary);
@@ -1633,13 +1625,12 @@ bool MemoryScanner::CreateMemoryDump(uint32_t pid, const std::wstring& outputPat
 
         outFile.close();
 
-        Logger::Info("Memory dump complete: {} bytes written to {}",
-            totalDumped, StringUtils::WideToUtf8(outputPath));
+        SS_LOG_INFO(L"MemoryScanner", L"Memory dump complete: %ls bytes written to %S", totalDumped, StringUtils::WideToUtf8(outputPath));
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("CreateMemoryDump - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"CreateMemoryDump - Exception: %S", e.what());
         return false;
     }
 }
@@ -1653,14 +1644,14 @@ bool MemoryScanner::LoadYARARules(const std::wstring& rulesPath) {
 
     try {
         // Placeholder: Real implementation would use libyara
-        Logger::Info("Loading YARA rules from: {}", StringUtils::WideToUtf8(rulesPath));
+        SS_LOG_INFO(L"MemoryScanner", L"Loading YARA rules from: %S", StringUtils::WideToUtf8(rulesPath));
 
         m_impl->m_yaraRules.push_back("placeholder_rule");
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("LoadYARARules - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"LoadYARARules - Exception: %S", e.what());
         return false;
     }
 }
@@ -1674,7 +1665,7 @@ bool MemoryScanner::LoadYARARulesFromString(const std::string& rules) {
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("LoadYARARulesFromString - Exception: {}", e.what());
+        SS_LOG_ERROR(L"MemoryScanner", L"LoadYARARulesFromString - Exception: %S", e.what());
         return false;
     }
 }
