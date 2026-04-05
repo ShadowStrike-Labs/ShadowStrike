@@ -37,7 +37,7 @@ import numpy as np
 import optuna
 import pandas as pd
 from numpy.typing import NDArray
-from sklearn.calibration import CalibratedClassifierCV
+from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import (
     accuracy_score,
     auc,
@@ -59,6 +59,29 @@ logger = logging.getLogger("PhantomCortex.StaticTrainer")
 EMBER_FEATURE_COUNT: int = 2381
 DEFAULT_SEED: int = 42
 MAX_OPTUNA_PARALLELISM: int = 4
+
+
+# ---------------------------------------------------------------------------
+# Platt calibrator (module-level for pickle compatibility)
+# ---------------------------------------------------------------------------
+
+
+class PlattCalibrator:
+    """Platt scaling via logistic regression on raw LightGBM scores."""
+
+    def __init__(self) -> None:
+        self._lr = LogisticRegression(
+            C=1e10, solver="lbfgs", max_iter=5000
+        )
+
+    def fit(
+        self, scores: NDArray, labels: NDArray
+    ) -> "PlattCalibrator":
+        self._lr.fit(scores.reshape(-1, 1), labels)
+        return self
+
+    def predict_proba(self, X: NDArray) -> NDArray:
+        return self._lr.predict_proba(X.reshape(-1, 1))
 
 
 # ---------------------------------------------------------------------------
@@ -117,7 +140,7 @@ class LGBMModel:
     """Wrapper around a trained LightGBM model with metadata."""
 
     booster: lgb.Booster
-    calibrator: Optional[CalibratedClassifierCV]
+    calibrator: Optional[Any]
     params: dict[str, Any]
     feature_count: int
     training_metrics: Optional[MetricsReport]
@@ -328,7 +351,7 @@ class CortexStaticTrainer:
         )
 
         # Calibration via Platt scaling on validation set
-        calibrator: Optional[CalibratedClassifierCV] = None
+        calibrator: Optional[Any] = None
         if calibrate:
             calibrator = self._calibrate(booster, X_val, y_val, best_iter)
 
@@ -370,34 +393,17 @@ class CortexStaticTrainer:
         X_cal: NDArray[np.float32],
         y_cal: NDArray[np.int32],
         num_iterations: int,
-    ) -> CalibratedClassifierCV:
-        """Fit Platt scaling calibrator on raw booster output."""
+    ) -> Any:
+        """Fit Platt scaling calibrator on raw booster output.
+
+        Uses LogisticRegression on raw scores (sigmoid link) to produce
+        well-calibrated probability estimates. This replaces the deprecated
+        CalibratedClassifierCV(cv='prefit') from sklearn < 1.4.
+        """
         raw_scores = booster.predict(X_cal, num_iteration=num_iterations)
 
-        class _ScorePassthrough:
-            """Minimal estimator wrapper that passes precomputed scores."""
-
-            def fit(self, X: NDArray, y: NDArray) -> "_ScorePassthrough":
-                return self
-
-            def predict_proba(self, X: NDArray) -> NDArray:
-                scores = X.ravel()
-                return np.column_stack([1.0 - scores, scores])
-
-            def predict(self, X: NDArray) -> NDArray:
-                return (X.ravel() >= 0.5).astype(np.int32)
-
-            def get_params(self, deep: bool = True) -> dict:
-                return {}
-
-            def set_params(self, **params: Any) -> "_ScorePassthrough":
-                return self
-
-        base = _ScorePassthrough()
-        calibrator = CalibratedClassifierCV(
-            estimator=base, method="sigmoid", cv="prefit"
-        )
-        calibrator.fit(raw_scores.reshape(-1, 1), y_cal)
+        calibrator = PlattCalibrator()
+        calibrator.fit(raw_scores, y_cal)
         logger.info("Platt scaling calibrator fitted on %d samples", len(y_cal))
         return calibrator
 
