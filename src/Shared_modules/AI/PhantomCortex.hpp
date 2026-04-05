@@ -244,7 +244,8 @@ public:
      * At least one verdict must be provided. Models that produced no
      * verdict are excluded from the ensemble weight calculation.
      *
-     * Thread Safety: Pure computation — no shared mutable state.
+     * Thread Safety: Acquires a shared lock to read the ensemble
+     * threshold from the stored config. Safe for concurrent calls.
      */
     [[nodiscard]] CortexEnsembleVerdict EnsembleVerdict(
         std::optional<CortexVerdict> staticV,
@@ -285,12 +286,11 @@ public:
     // ================================================================
 
     /**
-     * @brief Aggregate statistics counters for the PhantomCortex engine.
+     * @brief Point-in-time snapshot of engine statistics counters.
      *
-     * All counters are std::atomic for lock-free concurrent updates.
-     *
-     * @note This struct is NOT copyable or movable due to atomic members.
-     *       Use GetStats() which returns a snapshot copy.
+     * This is a plain POD returned by GetStats(). The underlying
+     * counters inside Impl use std::atomic; this struct captures
+     * their values as regular uint64_t for easy copying and logging.
      */
     struct CortexStats {
         uint64_t totalInferences            = 0;
@@ -310,7 +310,7 @@ public:
     [[nodiscard]] CortexStats GetStats() const noexcept;
 
 private:
-    PhantomCortex() = default;
+    PhantomCortex();
     ~PhantomCortex();
 
     /// @brief Opaque implementation — hides orchestration state and locks.

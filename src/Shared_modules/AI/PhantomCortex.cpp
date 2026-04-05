@@ -50,7 +50,7 @@
  *   - Analyze*() methods acquire shared lock on operationalMutex
  *   - Initialize/Shutdown/UpdateModels acquire exclusive lock
  *   - Statistics use lock-free std::atomic counters
- *   - EnsembleVerdict is a pure function with no shared state
+ *   - EnsembleVerdict acquires a shared lock to read config thresholds
  *
  * @author ShadowStrike Security Team
  * @version 1.0.0
@@ -147,9 +147,9 @@ namespace {
         return v;
     }
 
-    /// @brief Clamp a float to [0.0, 1.0]
+    /// @brief Clamp a float to [0.0, 1.0], treating NaN as 0.0
     [[nodiscard]] constexpr float ClampProbability(float p) noexcept {
-        if (p < 0.0f) return 0.0f;
+        if (std::isnan(p) || p < 0.0f) return 0.0f;
         if (p > 1.0f) return 1.0f;
         return p;
     }
@@ -192,7 +192,6 @@ struct PhantomCortex::Impl {
     std::atomic<uint64_t> totalSuspicious{0};
     std::atomic<uint64_t> totalBenign{0};
     std::atomic<uint64_t> totalInferenceTimeUs{0};
-    std::atomic<uint64_t> inferenceCount{0};
     std::atomic<uint64_t> modelLoadErrors{0};
 
     // Ensemble weights indexed by CortexModelType ordinal.
@@ -212,7 +211,6 @@ struct PhantomCortex::Impl {
         std::chrono::microseconds elapsed) noexcept
     {
         totalInferences.fetch_add(1, std::memory_order_relaxed);
-        inferenceCount.fetch_add(1, std::memory_order_relaxed);
         totalInferenceTimeUs.fetch_add(
             static_cast<uint64_t>(elapsed.count()),
             std::memory_order_relaxed);
@@ -236,6 +234,11 @@ struct PhantomCortex::Impl {
 // SINGLETON & LIFECYCLE
 // ============================================================================
 
+PhantomCortex::PhantomCortex()
+    : m_impl(std::make_unique<Impl>())
+{
+}
+
 PhantomCortex& PhantomCortex::Instance() noexcept {
     static PhantomCortex instance;
     return instance;
@@ -247,10 +250,6 @@ PhantomCortex::~PhantomCortex() {
 
 bool PhantomCortex::Initialize(const CortexConfig& config) noexcept {
     try {
-        if (!m_impl) {
-            m_impl = std::make_unique<Impl>();
-        }
-
         std::unique_lock lock(m_impl->operationalMutex);
 
         if (m_impl->operational) {
@@ -380,7 +379,7 @@ void PhantomCortex::Shutdown() noexcept {
         SS_LOG_INFO(LOG_CATEGORY, L"Shutting down PhantomCortex AI/ML detection engine");
 
         // Log final statistics before teardown
-        const auto count = m_impl->inferenceCount.load(std::memory_order_relaxed);
+        const auto count = m_impl->totalInferences.load(std::memory_order_relaxed);
         const auto totalUs = m_impl->totalInferenceTimeUs.load(std::memory_order_relaxed);
         const uint64_t avgUs = (count > 0) ? (totalUs / count) : 0;
 
@@ -421,16 +420,14 @@ CortexVerdict PhantomCortex::AnalyzeFile(
 {
     constexpr auto kSource = CortexModelType::Static;
 
-    // ---- Operational guard ----
+    // ---- Operational guard (held for entire method to prevent Shutdown race) ----
     if (!m_impl) {
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
-    {
-        std::shared_lock lock(m_impl->operationalMutex);
-        if (!m_impl->operational) {
-            return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
-        }
+    std::shared_lock lock(m_impl->operationalMutex);
+    if (!m_impl->operational) {
+        return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
     }
 
     // ---- Input validation ----
@@ -524,14 +521,13 @@ CortexVerdict PhantomCortex::AnalyzeBehavior(
     constexpr auto kSource = CortexModelType::Behavioral;
 
     if (!m_impl) {
+    if (!m_impl) {
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
-    {
-        std::shared_lock lock(m_impl->operationalMutex);
-        if (!m_impl->operational) {
-            return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
-        }
+    std::shared_lock lock(m_impl->operationalMutex);
+    if (!m_impl->operational) {
+        return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
     }
 
     if (apiCalls.empty()) {
@@ -625,14 +621,13 @@ CortexVerdict PhantomCortex::AnalyzeMemory(
     constexpr auto kSource = CortexModelType::Memory;
 
     if (!m_impl) {
+    if (!m_impl) {
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
-    {
-        std::shared_lock lock(m_impl->operationalMutex);
-        if (!m_impl->operational) {
-            return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
-        }
+    std::shared_lock lock(m_impl->operationalMutex);
+    if (!m_impl->operational) {
+        return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
     }
 
     if (region.data.empty()) {
@@ -737,11 +732,9 @@ CortexVerdict PhantomCortex::AnalyzeNetwork(
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
-    {
-        std::shared_lock lock(m_impl->operationalMutex);
-        if (!m_impl->operational) {
-            return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
-        }
+    std::shared_lock lock(m_impl->operationalMutex);
+    if (!m_impl->operational) {
+        return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
     }
 
     const auto startTime = std::chrono::steady_clock::now();
@@ -838,11 +831,9 @@ CortexVerdict PhantomCortex::AnalyzeEmulationTrace(
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
-    {
-        std::shared_lock lock(m_impl->operationalMutex);
-        if (!m_impl->operational) {
-            return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
-        }
+    std::shared_lock lock(m_impl->operationalMutex);
+    if (!m_impl->operational) {
+        return MakeErrorVerdict(kSource, L"PhantomCortex not operational");
     }
 
     if (events.empty()) {
@@ -1186,7 +1177,7 @@ PhantomCortex::CortexStats PhantomCortex::GetStats() const noexcept
     stats.totalBenignClassifications = m_impl->totalBenign.load(std::memory_order_relaxed);
     stats.modelLoadErrors            = m_impl->modelLoadErrors.load(std::memory_order_relaxed);
 
-    const auto count = m_impl->inferenceCount.load(std::memory_order_relaxed);
+    const auto count = m_impl->totalInferences.load(std::memory_order_relaxed);
     if (count > 0) {
         stats.averageInferenceTimeUs =
             m_impl->totalInferenceTimeUs.load(std::memory_order_relaxed) / count;
