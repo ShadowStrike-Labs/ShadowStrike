@@ -43,6 +43,7 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
 #include "HeuristicAnalyzer.hpp"
+#include "../FileSystem/ExecutableAnalyzer.hpp"
 #include "BehaviorAnalyzer.hpp"
 #include "MachineLearningDetector.hpp"
 #include "PackerUnpacker.hpp"
@@ -50,6 +51,7 @@
 #include "SandboxAnalyzer.hpp"
 #include "EmulationEngine.hpp"
 #include "ZeroDayDetector.hpp"
+#include "../FileSystem/ArchiveExtractor.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -362,6 +364,16 @@ public:
                 SS_LOG_INFO(L"ScanEngine", L"HeuristicAnalyzer initialized");
             }
 
+            // Initialize ExecutableAnalyzer (Singleton)
+            {
+                auto& ea = FileSystem::ExecutableAnalyzer::Instance();
+                if (!ea.Initialize()) {
+                    SS_LOG_WARN(L"ScanEngine", L"ExecutableAnalyzer initialization failed (non-fatal)");
+                } else {
+                    SS_LOG_INFO(L"ScanEngine", L"ExecutableAnalyzer initialized");
+                }
+            }
+
             // Initialize BehaviorAnalyzer (optional)
             if (m_config.enableBehaviorAnalysis) {
                 SS_LOG_INFO(L"ScanEngine", L"BehaviorAnalyzer will be initialized on demand");
@@ -518,6 +530,9 @@ public:
             m_heuristicAnalyzer->Shutdown();
             m_heuristicAnalyzer.reset();
         }
+
+        // Shutdown ExecutableAnalyzer singleton
+        FileSystem::ExecutableAnalyzer::Instance().Shutdown();
 
         if (m_threatIntelDB) {
             m_threatIntelDB->Close();
@@ -1199,6 +1214,93 @@ EngineResult ScanEngine::ScanFile(
                 duration_cast<microseconds>(stage5End - stage5Start).count(),
                 std::memory_order_relaxed
             );
+        }
+
+        // ====================================================================
+        // STAGE 5.5: EXECUTABLE ANALYZER (Deep PE/Binary Analysis)
+        // ====================================================================
+        //
+        // ExecutableAnalyzer performs deep structural analysis of PE binaries:
+        // imports, exports, resources, Rich header, packer detection, anomalies.
+        // Its risk score and anomaly detection complement HeuristicAnalyzer.
+
+        {
+            auto& execAnalyzer = FileSystem::ExecutableAnalyzer::Instance();
+            if (execAnalyzer.IsPE(filePath)) {
+                const auto stageEAStart = steady_clock::now();
+
+                auto opts = FileSystem::AnalysisOptions::CreateFull();
+                auto execInfo = execAnalyzer.Analyze(filePath, opts);
+
+                if (execInfo.riskScore >= 75) {
+                    m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+
+                    result.verdict = ScanVerdict::Suspicious;
+                    result.threatName = "Heur:PE.Suspicious";
+                    result.threatScore = static_cast<float>(execInfo.riskScore);
+                    result.detectionSource = "ExecutableAnalyzer";
+                    result.sha256 = fileHash;
+                    result.threatCategory = "Heuristic";
+
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"ExecutableAnalyzer detection - Risk: %u, Anomalies: %zu",
+                        static_cast<unsigned>(execInfo.riskScore),
+                        execInfo.anomalies.size());
+
+                    m_impl->InvokeDetectionCallbacks(result);
+                    goto finalize_scan;
+                }
+
+                // Route packed executables to EmulationEngine for unpacking
+                if (execInfo.packer.isPacked && m_impl->m_emulationEngine &&
+                    m_impl->m_emulationEngine->IsInitialized()) {
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"Packed PE detected (%hs), routing to EmulationEngine",
+                        execInfo.packer.name.c_str());
+
+                    // Read file data for emulation
+                    std::vector<std::byte> emulFileBytes;
+                    if (Utils::FileUtils::ReadAllBytes(filePath, emulFileBytes) && !emulFileBytes.empty()) {
+                        std::vector<uint8_t> peData(
+                            reinterpret_cast<const uint8_t*>(emulFileBytes.data()),
+                            reinterpret_cast<const uint8_t*>(emulFileBytes.data()) + emulFileBytes.size()
+                        );
+
+                        EmulationConfig emulCfg = EmulationConfig::CreateDefault();
+                        auto emulResult = m_impl->m_emulationEngine->EmulatePE(peData, emulCfg);
+
+                        if (emulResult.isMalicious) {
+                            m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+
+                            result.verdict = ScanVerdict::Infected;
+                            result.threatName = emulResult.threatName.empty()
+                                ? "Packed.Malware"
+                                : emulResult.threatName;
+                            result.threatScore = emulResult.threatScore;
+                            result.detectionSource = "EmulationEngine+ExecutableAnalyzer";
+                            result.sha256 = fileHash;
+
+                            m_impl->InvokeDetectionCallbacks(result);
+                            goto finalize_scan;
+                        }
+                    }
+                }
+
+                // Extract ML features for PhantomCortex if available
+                if (m_impl->m_mlDetector) {
+                    auto mlFeatures = execAnalyzer.ExtractMLFeatures(execInfo);
+                    if (mlFeatures.has_value()) {
+                        SS_LOG_DEBUG(L"ScanEngine",
+                            L"Extracted %zu ML features from ExecutableAnalyzer",
+                            mlFeatures->size());
+                    }
+                }
+
+                const auto stageEAEnd = steady_clock::now();
+                SS_LOG_TRACE(L"ScanEngine",
+                    L"ExecutableAnalyzer stage completed in %llu μs",
+                    static_cast<uint64_t>(duration_cast<microseconds>(stageEAEnd - stageEAStart).count()));
+            }
         }
 
         // ====================================================================
@@ -2004,7 +2106,7 @@ EngineResult ScanEngine::ScanProcessMemoryDeep(
 }
 
 // ============================================================================
-// ARCHIVE SCANNING
+// ARCHIVE SCANNING (wired through ArchiveExtractor)
 // ============================================================================
 
 BatchScanResult ScanEngine::ScanArchive(
@@ -2020,59 +2122,146 @@ BatchScanResult ScanEngine::ScanArchive(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine: Scanning archive", L" %ls",
-            StringUtils::ToNarrow(archivePath));
+        SS_LOG_INFO(L"ScanEngine", L"Scanning archive '%ls'",
+            archivePath.c_str());
 
         m_impl->m_stats.archivesScanned.fetch_add(1, std::memory_order_relaxed);
 
         // Check archive size
-        auto archiveSize = fs::file_size(archivePath);
+        std::error_code ec;
+        auto archiveSize = fs::file_size(archivePath, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"ScanEngine", L"Cannot stat archive '%ls'",
+                archivePath.c_str());
+            return result;
+        }
         if (archiveSize > options.maxArchiveSize) {
-            SS_LOG_WARN(L"ScanEngine: Archive too large", L" %ls bytes", archiveSize);
+            SS_LOG_WARN(L"ScanEngine", L"Archive too large: %llu bytes (limit %llu)",
+                archiveSize, options.maxArchiveSize);
             return result;
         }
 
-        // Extract and scan
-        if (m_impl->m_packerUnpacker) {
-            auto extractedPaths = m_impl->m_packerUnpacker->ExtractArchive(
-                archivePath, options.maxNestingDepth
-            );
+        // Use ArchiveExtractor for secure, real archive scanning
+        auto& extractor = FileSystem::ArchiveExtractor::Instance();
 
-            m_impl->m_stats.archiveFilesScanned.fetch_add(
-                extractedPaths.size(), std::memory_order_relaxed
-            );
+        // Quick security pre-check (< 5ms)
+        auto secFlags = extractor.QuickSecurityCheck(archivePath, archiveSize);
+        if (FileSystem::HasFlag(secFlags, FileSystem::SecurityFlag::ZipBombSuspected)) {
+            SS_LOG_WARN(L"ScanEngine", L"Zip bomb detected in '%ls' — blocking",
+                archivePath.c_str());
 
-            // Convert fs::path to wstring for batch scan
-            std::vector<std::wstring> extractedFiles;
-            extractedFiles.reserve(extractedPaths.size());
-            for (const auto& p : extractedPaths) {
-                extractedFiles.push_back(p.wstring());
-            }
-
-            // Scan extracted files
-            BatchScanRequest batchReq{};
-            batchReq.filePaths = extractedFiles;
-            batchReq.context = context;
-
-            result = ScanBatch(batchReq);
+            EngineResult bombResult{};
+            bombResult.verdict = ScanVerdict::Infected;
+            bombResult.threatName = "Archive.ZipBomb";
+            bombResult.threatCategory = "Malware";
+            bombResult.confidence = 95.0f;
+            bombResult.detectionSource = "ArchiveExtractor";
+            result.results.push_back(std::move(bombResult));
+            return result;
         }
+
+        // Configure extraction options
+        FileSystem::ExtractionOptions extractOpts;
+        extractOpts.mode = FileSystem::ExtractionMode::InMemory;
+        extractOpts.maxNestingDepth = options.maxNestingDepth;
+        extractOpts.maxTotalSize = options.maxExtractedSize;
+        extractOpts.maxEntrySize = options.maxArchiveSize;
+        extractOpts.maxEntries = options.maxFilesInArchive;
+        extractOpts.maxCompressionRatio = 200.0;
+        extractOpts.extractNestedArchives = true;
+        extractOpts.skipEncrypted = !options.scanPasswordProtected;
+        extractOpts.stopOnError = false;
+
+        // Scan each extracted entry through the full scan pipeline
+        auto summary = extractor.ScanArchive(archivePath,
+            [&](const FileSystem::ArchiveEntry& entry,
+                const std::vector<uint8_t>& data) {
+
+                if (entry.isDirectory || data.empty()) return;
+
+                m_impl->m_stats.archiveFilesScanned.fetch_add(
+                    1, std::memory_order_relaxed);
+
+                // Run the entry through our scan pipeline
+                EngineResult entryResult{};
+                entryResult.sha256 = entry.sha256;
+
+                // Check for path traversal in results
+                if (FileSystem::HasFlag(entry.securityFlags,
+                    FileSystem::SecurityFlag::PathTraversalAttempt)) {
+                    entryResult.verdict = ScanVerdict::Suspicious;
+                    entryResult.threatName = "Archive.PathTraversal";
+                    entryResult.detectionSource = "ArchiveExtractor";
+                    entryResult.confidence = 85.0f;
+                    entryResult.indicators.push_back(
+                        "Path traversal attempt: " +
+                        Utils::StringUtils::ToNarrow(entry.path));
+                    result.results.push_back(std::move(entryResult));
+                    return;
+                }
+
+                // Scan the entry data through hash/signature pipeline
+                if (m_impl->m_signatureStore) {
+                    auto sigResult = m_impl->m_signatureStore->ScanBuffer(
+                        std::span<const uint8_t>(data.data(), data.size()));
+                    if (sigResult.matched) {
+                        entryResult.verdict = ScanVerdict::Infected;
+                        entryResult.threatName = sigResult.threatName;
+                        entryResult.threatFamily = sigResult.family;
+                        entryResult.confidence = sigResult.confidence;
+                        entryResult.detectionSource = "SignatureStore";
+                        result.results.push_back(std::move(entryResult));
+                        return;
+                    }
+                }
+
+                // Heuristic scan on PE entries
+                if (entry.isPE && m_impl->m_heuristicAnalyzer && data.size() > 64) {
+                    // Check entropy for packed/encrypted content
+                    if (entry.entropy > 7.5) {
+                        entryResult.verdict = ScanVerdict::Suspicious;
+                        entryResult.threatName = "Archive.HighEntropyPE";
+                        entryResult.confidence = 60.0f;
+                        entryResult.detectionSource = "Heuristic";
+                        entryResult.indicators.push_back(
+                            "High entropy PE in archive: " +
+                            std::to_string(entry.entropy));
+                        result.results.push_back(std::move(entryResult));
+                    }
+                }
+            },
+            extractOpts);
+
+        // Log summary
+        SS_LOG_INFO(L"ScanEngine",
+            L"Archive scan complete: '%ls' — %u entries, %u extracted, %llu bytes, %lldms",
+            archivePath.c_str(),
+            summary.entriesProcessed, summary.entriesExtracted,
+            summary.bytesExtracted,
+            summary.duration.count());
 
         return result;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ScanEngine: Archive scan exception", L" %ls", e.what());
+        SS_LOG_ERROR(L"ScanEngine", L"Archive scan exception for '%ls': %hs",
+            archivePath.c_str(), e.what());
         return result;
     }
 }
 
 bool ScanEngine::IsArchive(const std::wstring& filePath) const {
-    return m_impl && m_impl->IsArchiveExtension(filePath);
+    if (!m_impl) return false;
+    // Use ArchiveExtractor for reliable magic-byte detection
+    auto& extractor = FileSystem::ArchiveExtractor::Instance();
+    return extractor.IsArchive(filePath);
 }
 
 std::vector<std::wstring> ScanEngine::GetSupportedArchiveFormats() const {
     return {
         L".zip", L".rar", L".7z", L".tar", L".gz", L".bz2",
-        L".cab", L".iso", L".img", L".arj", L".lzh", L".ace"
+        L".xz", L".zst", L".cab", L".iso", L".img", L".arj",
+        L".lzh", L".ace", L".msi", L".wim", L".vhd", L".vhdx",
+        L".cpio", L".rpm", L".deb"
     };
 }
 

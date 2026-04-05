@@ -89,6 +89,7 @@
 #include "../Communication/ThreatIntelPusher.hpp"
 #include "../Utils/CacheManager.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+#include "../Core/FileSystem/ExecutableAnalyzer.hpp"
 #include "../Core/Engine/BehaviorAnalyzer.hpp"
 #include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/QuarantineManager.hpp"
@@ -1646,6 +1647,30 @@ public:
                             static_cast<int>(match.method));
                     }
                 }
+            }
+        }
+
+        // 2.5. Rapid PE Analysis via ExecutableAnalyzer (Kernel Fast Path)
+        // This runs quick structural analysis before the full scan pipeline
+        // to catch obvious malware indicators and feed kernel callback
+        {
+            auto& execAnalyzer = Core::FileSystem::ExecutableAnalyzer::Instance();
+            auto quickInfo = execAnalyzer.AnalyzeForKernel(
+                filePath,
+                req.header.processId,
+                req.fileSize
+            );
+
+            // If risk score is extremely high, block immediately without full scan
+            if (quickInfo.riskScore >= 95) {
+                SS_LOG_WARN(L"RealTimeProtection",
+                    L"ExecutableAnalyzer rapid block: risk=%u, anomalies=%zu, PID=%u",
+                    static_cast<unsigned>(quickInfo.riskScore),
+                    quickInfo.anomalies.size(),
+                    req.header.processId);
+
+                m_stats.blockedThreats++;
+                return Communication::KernelVerdict::Block;
             }
         }
 
