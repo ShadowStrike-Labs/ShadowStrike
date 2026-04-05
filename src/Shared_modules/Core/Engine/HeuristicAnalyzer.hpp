@@ -654,59 +654,62 @@ enum class PEAnomaly : uint16_t {
     /// @brief Invalid PE signature
     InvalidPESignature = 2,
     
+    /// @brief Invalid PE offset in DOS header
+    InvalidPEOffset = 3,
+    
     /// @brief Invalid optional header magic
-    InvalidOptionalMagic = 3,
+    InvalidOptionalMagic = 4,
     
     /// @brief Invalid machine type
-    InvalidMachine = 4,
+    InvalidMachine = 5,
     
     /// @brief Zero sections
-    ZeroSections = 5,
+    ZeroSections = 6,
     
     /// @brief Too many sections
-    TooManySections = 6,
+    TooManySections = 7,
     
     /// @brief Invalid timestamp
-    InvalidTimestamp = 7,
+    InvalidTimestamp = 8,
     
     /// @brief Future timestamp
-    FutureTimestamp = 8,
+    FutureTimestamp = 9,
     
     /// @brief Zeroed timestamp
-    ZeroedTimestamp = 9,
+    ZeroedTimestamp = 10,
     
     /// @brief Invalid entry point
-    InvalidEntryPoint = 10,
+    InvalidEntryPoint = 11,
     
     /// @brief Entry point in header
-    EntryPointInHeader = 11,
+    EntryPointInHeader = 12,
     
     /// @brief Entry point in overlay
-    EntryPointInOverlay = 12,
+    EntryPointInOverlay = 13,
     
     /// @brief Entry point outside sections
-    EntryPointOutsideSections = 13,
+    EntryPointOutsideSections = 14,
     
     /// @brief Invalid size of optional header
-    InvalidOptionalHeaderSize = 14,
+    InvalidOptionalHeaderSize = 15,
     
     /// @brief Zero image base
-    ZeroImageBase = 15,
+    ZeroImageBase = 16,
     
     /// @brief Invalid section alignment
-    InvalidSectionAlignment = 16,
+    InvalidSectionAlignment = 17,
     
     /// @brief Invalid file alignment
-    InvalidFileAlignment = 17,
+    InvalidFileAlignment = 18,
     
     /// @brief Checksum mismatch
-    ChecksumMismatch = 18,
+    ChecksumMismatch = 19,
     
     /// @brief Zero subsystem
-    ZeroSubsystem = 19,
+    ZeroSubsystem = 20,
     
     /// @brief Invalid subsystem
-    InvalidSubsystem = 20,
+    InvalidSubsystem = 21,
     
     // -------------------------------------------------------------------------
     // Section Anomalies (50-99)
@@ -2027,6 +2030,50 @@ struct HeuristicAnalyzerStats {
     /// @brief Total bytes analyzed
     std::atomic<uint64_t> totalBytesAnalyzed{ 0 };
     
+    // Delete copy constructor and assignment to prevent accidental copying
+    HeuristicAnalyzerStats(const HeuristicAnalyzerStats&) = delete;
+    HeuristicAnalyzerStats& operator=(const HeuristicAnalyzerStats&) = delete;
+    
+    // Default constructor
+    HeuristicAnalyzerStats() = default;
+    
+    // Move constructor
+    HeuristicAnalyzerStats(HeuristicAnalyzerStats&& other) noexcept {
+        totalFilesAnalyzed.store(other.totalFilesAnalyzed.load());
+        for (size_t i = 0; i < filesByType.size(); ++i) {
+            filesByType[i].store(other.filesByType[i].load());
+        }
+        cleanFiles.store(other.cleanFiles.load());
+        suspiciousFiles.store(other.suspiciousFiles.load());
+        maliciousFiles.store(other.maliciousFiles.load());
+        packedFiles.store(other.packedFiles.load());
+        fuzzyMatches.store(other.fuzzyMatches.load());
+        analysisFailures.store(other.analysisFailures.load());
+        timeouts.store(other.timeouts.load());
+        avgAnalysisTimeUs.store(other.avgAnalysisTimeUs.load());
+        totalBytesAnalyzed.store(other.totalBytesAnalyzed.load());
+    }
+    
+    // Move assignment
+    HeuristicAnalyzerStats& operator=(HeuristicAnalyzerStats&& other) noexcept {
+        if (this != &other) {
+            totalFilesAnalyzed.store(other.totalFilesAnalyzed.load());
+            for (size_t i = 0; i < filesByType.size(); ++i) {
+                filesByType[i].store(other.filesByType[i].load());
+            }
+            cleanFiles.store(other.cleanFiles.load());
+            suspiciousFiles.store(other.suspiciousFiles.load());
+            maliciousFiles.store(other.maliciousFiles.load());
+            packedFiles.store(other.packedFiles.load());
+            fuzzyMatches.store(other.fuzzyMatches.load());
+            analysisFailures.store(other.analysisFailures.load());
+            timeouts.store(other.timeouts.load());
+            avgAnalysisTimeUs.store(other.avgAnalysisTimeUs.load());
+            totalBytesAnalyzed.store(other.totalBytesAnalyzed.load());
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset all statistics.
      */
