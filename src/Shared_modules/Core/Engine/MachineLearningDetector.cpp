@@ -371,7 +371,7 @@ struct MachineLearningDetector::Impl {
             m_featureNames.push_back("metadata_" + std::to_string(i));
         }
 
-        Utils::Logger::Info(L"MachineLearningDetector: Initialized {} feature names", m_featureNames.size());
+        SS_LOG_INFO(L"MachineLearning", L"Initialized %zu feature names", m_featureNames.size());
     }
 
     // ----------------------------------------------------------------
@@ -575,19 +575,19 @@ bool MachineLearningDetector::HasInstance() noexcept {
 MachineLearningDetector::MachineLearningDetector()
     : m_impl(std::make_unique<Impl>())
 {
-    Utils::Logger::Info(L"MachineLearningDetector: Constructor called");
+    SS_LOG_INFO(L"MachineLearning", L"Constructor called");
 }
 
 MachineLearningDetector::~MachineLearningDetector() {
     Shutdown();
-    Utils::Logger::Info(L"MachineLearningDetector: Destructor called");
+    SS_LOG_INFO(L"MachineLearning", L"Destructor called");
 }
 
 bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"MachineLearningDetector: Already initialized");
+        SS_LOG_WARN(L"MachineLearning", L"Already initialized");
         return true;
     }
 
@@ -596,12 +596,12 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"MachineLearningDetector: Invalid configuration");
+            SS_LOG_ERROR(L"MachineLearning", L"Invalid configuration");
             return false;
         }
 
         if (!config.enabled) {
-            Utils::Logger::Info(L"MachineLearningDetector: Disabled via configuration");
+            SS_LOG_INFO(L"MachineLearning", L"Disabled via configuration");
             return false;
         }
 
@@ -615,7 +615,7 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
         // Load primary model if configured
         if (!config.useEnsemble && config.primaryModel.IsValid()) {
             if (!LoadModel(config.primaryModel)) {
-                Utils::Logger::Error(L"MachineLearningDetector: Failed to load primary model");
+                SS_LOG_ERROR(L"MachineLearning", L"Failed to load primary model");
                 return false;
             }
         }
@@ -629,7 +629,7 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
             }
 
             if (m_impl->m_loadedModels.empty()) {
-                Utils::Logger::Error(L"MachineLearningDetector: No ensemble models loaded");
+                SS_LOG_ERROR(L"MachineLearning", L"No ensemble models loaded");
                 return false;
             }
         }
@@ -637,13 +637,13 @@ bool MachineLearningDetector::Initialize(const MachineLearningConfiguration& con
         m_impl->m_statistics.startTime = Clock::now();
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"MachineLearningDetector: Initialized successfully with {} loaded models",
-                          m_impl->m_loadedModels.size());
+        SS_LOG_INFO(L"MachineLearning", L"Initialized successfully with %zu loaded models",
+                      m_impl->m_loadedModels.size());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Initialization failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -693,11 +693,11 @@ void MachineLearningDetector::Shutdown() {
 
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"MachineLearningDetector: Shutdown complete");
+        SS_LOG_INFO(L"MachineLearning", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Shutdown error - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -727,34 +727,40 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
         std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
         if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn(L"MachineLearningDetector: Not initialized");
+            SS_LOG_WARN(L"MachineLearning", L"Not initialized");
             return result;
         }
 
         // Validate file exists
         if (!fs::exists(filePath)) {
-            Utils::Logger::Warn(L"MachineLearningDetector: File not found - {}", filePath.wstring());
+            SS_LOG_WARN(L"MachineLearning", L"File not found - %ls", filePath.wstring().c_str());
             return result;
         }
 
         // Read file bytes
-        auto fileData = Utils::FileUtils::ReadFile(filePath);
-        if (fileData.empty()) {
-            Utils::Logger::Warn(L"MachineLearningDetector: Failed to read file - {}", filePath.wstring());
+        std::vector<std::byte> rawBytes;
+        if (!Utils::FileUtils::ReadAllBytes(filePath.wstring(), rawBytes) || rawBytes.empty()) {
+            SS_LOG_WARN(L"MachineLearning", L"Failed to read file - %ls", filePath.wstring().c_str());
             return result;
         }
+        std::vector<uint8_t> fileData(reinterpret_cast<const uint8_t*>(rawBytes.data()),
+                                      reinterpret_cast<const uint8_t*>(rawBytes.data()) + rawBytes.size());
 
-        auto fileHash = Utils::HashUtils::CalculateSHA256(fileData);
+        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+        std::string fileHash;
+        if (hasher.Init() && hasher.Update(fileData.data(), fileData.size())) {
+            hasher.FinalHex(fileHash);
+        }
 
         // Check whitelist
         if (m_impl->m_config.skipWhitelisted && m_impl->m_whitelist) {
-            if (m_impl->m_whitelist->IsWhitelisted(filePath)) {
+            if (m_impl->m_whitelist->IsWhitelisted(filePath.wstring()).found) {
                 result.isMalicious = false;
                 result.classification = Classification::Benign;
                 result.probability = 0.0f;
                 result.confidence = 1.0f;
                 result.modelName = "Whitelist";
-                Utils::Logger::Info(L"MachineLearningDetector: File is whitelisted - {}", filePath.wstring());
+                SS_LOG_INFO(L"MachineLearning", L"File is whitelisted - %ls", filePath.wstring().c_str());
                 return result;
             }
         }
@@ -767,7 +773,7 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
                 m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
                 result = it->second.result;
                 result.fromCache = true;
-                Utils::Logger::Info(L"MachineLearningDetector: Cache hit - {}", filePath.wstring());
+                SS_LOG_INFO(L"MachineLearning", L"Cache hit - %ls", filePath.wstring().c_str());
                 return result;
             }
         }
@@ -787,7 +793,7 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
 
             m_impl->m_statistics.modelInferences.fetch_add(1, std::memory_order_relaxed);
         } else {
-            Utils::Logger::Warn(L"MachineLearningDetector: PhantomCortex not operational, extracting features for fallback");
+            SS_LOG_WARN(L"MachineLearning", L"PhantomCortex not operational, extracting features for fallback");
             auto features = ExtractFeatures(filePath);
             features.fileHash = fileHash;
             result = Analyze(features);
@@ -819,15 +825,16 @@ PredictionResult MachineLearningDetector::Analyze(const fs::path& filePath) {
             m_impl->m_predictionCallback(filePath, result);
         }
 
-        Utils::Logger::Info(L"MachineLearningDetector: Analysis complete - {} (malicious: {}, prob: {:.2f}%, time: {}us)",
-                          filePath.wstring(), result.isMalicious, result.probability * 100.0f, durationUs);
+        SS_LOG_INFO(L"MachineLearning", L"Analysis complete - %ls (malicious: %d, prob: %.2f%%, time: %lldus)",
+                      filePath.wstring().c_str(), result.isMalicious ? 1 : 0,
+                      static_cast<double>(result.probability * 100.0f), durationUs);
 
         return result;
 
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"MachineLearningDetector: Analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Analysis failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return result;
     }
 }
@@ -862,7 +869,7 @@ PredictionResult MachineLearningDetector::Analyze(const ExtractedFeatures& featu
         std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
         if (features.features.empty()) {
-            Utils::Logger::Warn(L"MachineLearningDetector: Empty feature vector");
+            SS_LOG_WARN(L"MachineLearning", L"Empty feature vector");
             return result;
         }
 
@@ -964,8 +971,8 @@ PredictionResult MachineLearningDetector::Analyze(const ExtractedFeatures& featu
 
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"MachineLearningDetector: Inference failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Inference failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return result;
     }
 }
@@ -1039,7 +1046,7 @@ EnsemblePrediction MachineLearningDetector::AnalyzeWithEnsemble(const ExtractedF
         auto& cortex = AI::PhantomCortex::Instance();
 
         if (!cortex.IsOperational()) {
-            Utils::Logger::Warn(L"MachineLearningDetector: PhantomCortex not operational for ensemble");
+            SS_LOG_WARN(L"MachineLearning", L"PhantomCortex not operational for ensemble");
             // Fall back to single-model analysis
             ensembleResult.finalResult = Analyze(features);
             ensembleResult.modelResults.push_back(ensembleResult.finalResult);
@@ -1098,16 +1105,16 @@ EnsemblePrediction MachineLearningDetector::AnalyzeWithEnsemble(const ExtractedF
         ensembleResult.totalInferenceTimeMs = static_cast<uint32_t>(
             std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count());
 
-        Utils::Logger::Info(L"MachineLearningDetector: Ensemble prediction - malicious: {}, agreement: {:.1f}%",
-                          ensembleResult.finalResult.isMalicious,
-                          ensembleResult.modelAgreement * 100.0f);
+        SS_LOG_INFO(L"MachineLearning", L"Ensemble prediction - malicious: %d, agreement: %.1f%%",
+                      ensembleResult.finalResult.isMalicious ? 1 : 0,
+                      static_cast<double>(ensembleResult.modelAgreement * 100.0f));
 
         return ensembleResult;
 
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"MachineLearningDetector: Ensemble analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Ensemble analysis failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return ensembleResult;
     }
 }
@@ -1123,12 +1130,18 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
     ExtractedFeatures result;
 
     try {
-        auto fileData = Utils::FileUtils::ReadFile(filePath);
-        if (fileData.empty()) {
+        std::vector<std::byte> rawBytes;
+        if (!Utils::FileUtils::ReadAllBytes(filePath.wstring(), rawBytes) || rawBytes.empty()) {
             return result;
         }
+        std::vector<uint8_t> fileData(reinterpret_cast<const uint8_t*>(rawBytes.data()),
+                                      reinterpret_cast<const uint8_t*>(rawBytes.data()) + rawBytes.size());
 
-        auto fileHash = Utils::HashUtils::CalculateSHA256(fileData);
+        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+        std::string fileHash;
+        if (hasher.Init() && hasher.Update(fileData.data(), fileData.size())) {
+            hasher.FinalHex(fileHash);
+        }
         result.fileHash = fileHash;
 
         // Cache the raw bytes for later PhantomCortex inference
@@ -1191,8 +1204,8 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
         return result;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Feature extraction failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Feature extraction failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return result;
     }
 }
@@ -1225,8 +1238,8 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const FileSystem::Exe
                     result.categoryRanges[FeatureCategory::Resources] = {1982, 2182};
                     result.categoryRanges[FeatureCategory::ControlFlow] = {2182, 2381};
 
-                    Utils::Logger::Info(L"MachineLearningDetector: Extracted {} features via FeatureExtractor",
-                                      result.features.size());
+                    SS_LOG_INFO(L"MachineLearning", L"Extracted %zu features via FeatureExtractor",
+                                  result.features.size());
                     return result;
                 }
             }
@@ -1326,14 +1339,14 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const FileSystem::Exe
         result.categoryRanges[FeatureCategory::ControlFlow] = {1800, 1950};
         result.categoryRanges[FeatureCategory::Metadata] = {1950, 2000};
 
-        Utils::Logger::Info(L"MachineLearningDetector: Extracted {} features from ExecutableInfo fallback",
-                          result.features.size());
+        SS_LOG_INFO(L"MachineLearning", L"Extracted %zu features from ExecutableInfo fallback",
+                      result.features.size());
 
         return result;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Feature extraction from ExecutableInfo failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Feature extraction from ExecutableInfo failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return result;
     }
 }
@@ -1357,24 +1370,25 @@ bool MachineLearningDetector::LoadModel(const ModelConfig& config) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_modelsMutex);
 
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"MachineLearningDetector: Invalid model config");
+            SS_LOG_ERROR(L"MachineLearning", L"Invalid model config");
             return false;
         }
 
         // Check if model already loaded
         if (m_impl->m_loadedModels.count(config.modelName) > 0) {
-            Utils::Logger::Warn(L"MachineLearningDetector: Model already loaded - {}",
-                              Utils::StringUtils::Utf8ToWide(config.modelName));
+            SS_LOG_WARN(L"MachineLearning", L"Model already loaded - %ls",
+                          Utils::StringUtils::ToWide(config.modelName).c_str());
             return true;
         }
 
         // Verify PhantomCortex is operational for ONNX inference
         auto& cortex = AI::PhantomCortex::Instance();
         if (!cortex.IsOperational()) {
-            Utils::Logger::Warn(
-                L"MachineLearningDetector: PhantomCortex not yet operational; "
-                L"model metadata registered but inference will initialize on first use - {}",
-                Utils::StringUtils::Utf8ToWide(config.modelName));
+            SS_LOG_WARN(
+                L"MachineLearning",
+                L"PhantomCortex not yet operational; "
+                L"model metadata registered but inference will initialize on first use - %ls",
+                Utils::StringUtils::ToWide(config.modelName).c_str());
         }
 
         // Create loaded model entry with metadata
@@ -1397,9 +1411,9 @@ bool MachineLearningDetector::LoadModel(const ModelConfig& config) {
 
         m_impl->m_loadedModels[config.modelName] = std::move(loadedModel);
 
-        Utils::Logger::Info(L"MachineLearningDetector: Model loaded - {} (PhantomCortex operational: {})",
-                          Utils::StringUtils::Utf8ToWide(config.modelName),
-                          cortex.IsOperational());
+        SS_LOG_INFO(L"MachineLearning", L"Model loaded - %ls (PhantomCortex operational: %d)",
+                      Utils::StringUtils::ToWide(config.modelName).c_str(),
+                      cortex.IsOperational() ? 1 : 0);
 
         // Invoke callback
         if (m_impl->m_modelUpdateCallback) {
@@ -1409,8 +1423,8 @@ bool MachineLearningDetector::LoadModel(const ModelConfig& config) {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Failed to load model - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Failed to load model - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1421,20 +1435,20 @@ bool MachineLearningDetector::UnloadModel(const std::string& modelName) {
 
         auto it = m_impl->m_loadedModels.find(modelName);
         if (it == m_impl->m_loadedModels.end()) {
-            Utils::Logger::Warn(L"MachineLearningDetector: Model not found - {}",
-                              Utils::StringUtils::Utf8ToWide(modelName));
+            SS_LOG_WARN(L"MachineLearning", L"Model not found - %ls",
+                          Utils::StringUtils::ToWide(modelName).c_str());
             return false;
         }
 
         m_impl->m_loadedModels.erase(it);
 
-        Utils::Logger::Info(L"MachineLearningDetector: Model unloaded - {}",
-                          Utils::StringUtils::Utf8ToWide(modelName));
+        SS_LOG_INFO(L"MachineLearning", L"Model unloaded - %ls",
+                      Utils::StringUtils::ToWide(modelName).c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Failed to unload model - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Failed to unload model - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1472,7 +1486,7 @@ bool MachineLearningDetector::UpdateModel(const ModelConfig& newConfig) {
 void MachineLearningDetector::SetDefaultThreshold(float threshold) {
     if (threshold >= 0.0f && threshold <= 1.0f) {
         m_impl->m_defaultThreshold.store(threshold, std::memory_order_relaxed);
-        Utils::Logger::Info(L"MachineLearningDetector: Default threshold set to {:.2f}", threshold);
+        SS_LOG_INFO(L"MachineLearning", L"Default threshold set to %.2f", static_cast<double>(threshold));
     }
 }
 
@@ -1539,13 +1553,13 @@ std::vector<FeatureImportance> MachineLearningDetector::ExplainPrediction(
             importances.resize(topN);
         }
 
-        Utils::Logger::Info(L"MachineLearningDetector: Explained prediction with {} top features", importances.size());
+        SS_LOG_INFO(L"MachineLearning", L"Explained prediction with %zu top features", importances.size());
 
         return importances;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Explainability failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Explainability failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return importances;
     }
 }
@@ -1611,7 +1625,7 @@ void MachineLearningDetector::ClearCache() {
         m_impl->m_featureCache.clear();
     }
 
-    Utils::Logger::Info(L"MachineLearningDetector: Cache cleared");
+    SS_LOG_INFO(L"MachineLearning", L"Cache cleared");
 }
 
 std::pair<size_t, size_t> MachineLearningDetector::GetCacheStats() const {
@@ -1659,7 +1673,7 @@ void MachineLearningDetector::SetConfiguration(const MachineLearningConfiguratio
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
     ClearCache();
-    Utils::Logger::Info(L"MachineLearningDetector: Configuration updated");
+    SS_LOG_INFO(L"MachineLearning", L"Configuration updated");
 }
 
 // ============================================================================
@@ -1672,7 +1686,7 @@ MLStatistics MachineLearningDetector::GetStatistics() const {
 
 void MachineLearningDetector::ResetStatistics() {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"MachineLearningDetector: Statistics reset");
+    SS_LOG_INFO(L"MachineLearning", L"Statistics reset");
 }
 
 // ============================================================================
@@ -1681,20 +1695,20 @@ void MachineLearningDetector::ResetStatistics() {
 
 bool MachineLearningDetector::SelfTest() {
     try {
-        Utils::Logger::Info(L"MachineLearningDetector: Starting self-test");
+        SS_LOG_INFO(L"MachineLearning", L"Starting self-test");
 
         // Verify PhantomCortex is reachable
         auto& cortex = AI::PhantomCortex::Instance();
         if (!cortex.IsOperational()) {
-            Utils::Logger::Warn(
-                L"MachineLearningDetector: Self-test warning - PhantomCortex not operational");
+            SS_LOG_WARN(
+                L"MachineLearning", L"Self-test warning - PhantomCortex not operational");
         }
 
         // Verify FeatureExtractor is reachable
         auto& fe = AI::FeatureExtractor::Instance();
         if (!fe.Initialize()) {
-            Utils::Logger::Warn(
-                L"MachineLearningDetector: Self-test warning - FeatureExtractor init failed");
+            SS_LOG_WARN(
+                L"MachineLearning", L"Self-test warning - FeatureExtractor init failed");
         }
 
         // Test feature-based inference path
@@ -1706,17 +1720,17 @@ bool MachineLearningDetector::SelfTest() {
         auto result = Analyze(testFeatures);
 
         if (result.probability < 0.0f || result.probability > 1.0f) {
-            Utils::Logger::Error(L"MachineLearningDetector: Self-test failed - probability out of range");
+            SS_LOG_ERROR(L"MachineLearning", L"Self-test failed - probability out of range");
             return false;
         }
 
-        Utils::Logger::Info(L"MachineLearningDetector: Self-test passed (PhantomCortex: {})",
-                          cortex.IsOperational());
+        SS_LOG_INFO(L"MachineLearning", L"Self-test passed (PhantomCortex: %d)",
+                      cortex.IsOperational() ? 1 : 0);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MachineLearningDetector: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"MachineLearning", L"Self-test failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
