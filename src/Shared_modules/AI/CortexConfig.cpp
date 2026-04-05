@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <string>
 #include <cmath>
+#include <charconv>
 
 #include "../Utils/Logger.hpp"
 #include "../Utils/JSONUtils.hpp"
@@ -130,6 +131,12 @@ namespace {
                 CortexConstants::DEFAULT_INFERENCE_TIMEOUT_MS);
             cfg.inferenceTimeoutMs = CortexConstants::DEFAULT_INFERENCE_TIMEOUT_MS;
         }
+        if (cfg.inferenceTimeoutMs > CortexConstants::MAX_INFERENCE_TIMEOUT_MS) {
+            SS_LOG_WARN(kLogCategory,
+                L"inferenceTimeoutMs (%u) exceeds maximum (%u); capping",
+                cfg.inferenceTimeoutMs, CortexConstants::MAX_INFERENCE_TIMEOUT_MS);
+            cfg.inferenceTimeoutMs = CortexConstants::MAX_INFERENCE_TIMEOUT_MS;
+        }
 
         // Validate model directory exists (if set)
         if (!cfg.modelDirectory.empty()) {
@@ -165,9 +172,14 @@ namespace {
         try {
             const std::string narrow = Utils::StringUtils::ToNarrow(str);
             if (narrow.empty()) return false;
-            size_t pos = 0;
-            out = std::stof(narrow, &pos);
-            return pos > 0;
+            float result = 0.0f;
+            const auto [ptr, ec] = std::from_chars(
+                narrow.data(), narrow.data() + narrow.size(), result);
+            if (ec != std::errc{} || ptr != narrow.data() + narrow.size()) {
+                return false;
+            }
+            out = result;
+            return true;
         }
         catch (...) {
             return false;
@@ -196,13 +208,22 @@ CortexConfigManager& CortexConfigManager::Instance() noexcept {
 }
 
 // ============================================================================
+// Constructor / Destructor
+// ============================================================================
+
+CortexConfigManager::CortexConfigManager()
+    : m_impl(std::make_unique<Impl>())
+{
+}
+
+CortexConfigManager::~CortexConfigManager() = default;
+
+// ============================================================================
 // GetConfig
 // ============================================================================
 
-const CortexConfig& CortexConfigManager::GetConfig() const noexcept {
-    // Static fallback in case Impl is not yet constructed
-    static const CortexConfig kDefault{};
-    if (!m_impl) return kDefault;
+CortexConfig CortexConfigManager::GetConfig() const noexcept {
+    if (!m_impl) return CortexConfig{};
 
     std::shared_lock lock(m_impl->configMutex);
     return m_impl->config;
@@ -226,16 +247,10 @@ bool CortexConfigManager::LoadConfig(const std::filesystem::path& configPath) no
             return false;
         }
 
-        // Lazy-construct Impl
         if (!m_impl) {
-            try {
-                m_impl = std::make_unique<Impl>();
-            }
-            catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(kLogCategory,
-                    L"Failed to allocate CortexConfigManager::Impl");
-                return false;
-            }
+            SS_LOG_ERROR(kLogCategory,
+                L"CortexConfigManager::Impl not initialized");
+            return false;
         }
 
         // Check file existence
@@ -342,16 +357,10 @@ bool CortexConfigManager::LoadConfig(const std::filesystem::path& configPath) no
 
 bool CortexConfigManager::LoadFromRegistry() noexcept {
     try {
-        // Lazy-construct Impl
         if (!m_impl) {
-            try {
-                m_impl = std::make_unique<Impl>();
-            }
-            catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(kLogCategory,
-                    L"Failed to allocate CortexConfigManager::Impl");
-                return false;
-            }
+            SS_LOG_ERROR(kLogCategory,
+                L"CortexConfigManager::Impl not initialized");
+            return false;
         }
 
         Utils::RegistryUtils::RegistryKey key;

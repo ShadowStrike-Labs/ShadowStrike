@@ -113,6 +113,9 @@ namespace CortexConstants {
     /// @brief Default inference timeout in milliseconds
     inline constexpr uint32_t DEFAULT_INFERENCE_TIMEOUT_MS = 100;
 
+    /// @brief Maximum allowed inference timeout in milliseconds (30 seconds)
+    inline constexpr uint32_t MAX_INFERENCE_TIMEOUT_MS = 30000;
+
 }  // namespace CortexConstants
 
 // ============================================================================
