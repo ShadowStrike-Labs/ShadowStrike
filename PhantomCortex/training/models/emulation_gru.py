@@ -375,6 +375,7 @@ class CortexEmulationTrainer:
         best_state: Optional[dict[str, Any]] = None
         patience = 15
         patience_counter = 0
+        min_delta = 1e-5  # ignore floating-point noise improvements
 
         if checkpoint_dir is not None:
             Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
@@ -433,7 +434,7 @@ class CortexEmulationTrainer:
                     val_acc,
                 )
 
-            if val_loss < best_val_loss:
+            if val_loss < best_val_loss - min_delta:
                 best_val_loss = val_loss
                 best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
                 patience_counter = 0

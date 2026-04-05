@@ -1,0 +1,38 @@
+{
+  "cortex_behavioral": {
+    "original_size_mb": 2.209,
+    "quantized_size_mb": 0.6728,
+    "size_reduction_pct": 69.54,
+    "quantization_method": "dynamic",
+    "weight_type": "QInt8",
+    "success": true,
+    "error_message": null
+  },
+  "cortex_memory": {
+    "original_size_mb": 1.8154,
+    "quantized_size_mb": 0.4889,
+    "size_reduction_pct": 73.07,
+    "quantization_method": "dynamic",
+    "weight_type": "QInt8",
+    "success": true,
+    "error_message": null
+  },
+  "cortex_network": {
+    "original_size_mb": 0.1793,
+    "quantized_size_mb": 0.0752,
+    "size_reduction_pct": 58.07,
+    "quantization_method": "dynamic",
+    "weight_type": "QInt8",
+    "success": true,
+    "error_message": null
+  },
+  "cortex_emulation": {
+    "original_size_mb": 8.3581,
+    "quantized_size_mb": 7.4834,
+    "size_reduction_pct": 10.47,
+    "quantization_method": "dynamic",
+    "weight_type": "QInt8",
+    "success": true,
+    "error_message": null
+  }
+}
