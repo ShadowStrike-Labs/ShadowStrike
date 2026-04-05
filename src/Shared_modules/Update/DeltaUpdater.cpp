@@ -147,7 +147,8 @@ struct NtdllCompress {
     FnCompress   pCompress     = nullptr;
     FnDecompress pDecompressEx = nullptr;
     FnGetWsSize  pGetWsSize    = nullptr;
-    std::atomic<bool> resolved{false};
+    std::once_flag resolveOnce;
+    bool resolveResult = false;
 
     static NtdllCompress& Get() noexcept {
         static NtdllCompress s;
@@ -155,19 +156,19 @@ struct NtdllCompress {
     }
 
     bool Resolve() noexcept {
-        if (resolved.load(std::memory_order_acquire))
-            return pCompress && pDecompressEx && pGetWsSize;
-        HMODULE h = ::GetModuleHandleW(L"ntdll.dll");
-        if (h) {
-            pCompress     = reinterpret_cast<FnCompress>(
-                                ::GetProcAddress(h, "RtlCompressBuffer"));
-            pDecompressEx = reinterpret_cast<FnDecompress>(
-                                ::GetProcAddress(h, "RtlDecompressBufferEx"));
-            pGetWsSize    = reinterpret_cast<FnGetWsSize>(
-                                ::GetProcAddress(h, "RtlGetCompressionWorkSpaceSize"));
-        }
-        resolved.store(true, std::memory_order_release);
-        return pCompress && pDecompressEx && pGetWsSize;
+        std::call_once(resolveOnce, [this]() {
+            HMODULE h = ::GetModuleHandleW(L"ntdll.dll");
+            if (h) {
+                pCompress     = reinterpret_cast<FnCompress>(
+                                    ::GetProcAddress(h, "RtlCompressBuffer"));
+                pDecompressEx = reinterpret_cast<FnDecompress>(
+                                    ::GetProcAddress(h, "RtlDecompressBufferEx"));
+                pGetWsSize    = reinterpret_cast<FnGetWsSize>(
+                                    ::GetProcAddress(h, "RtlGetCompressionWorkSpaceSize"));
+            }
+            resolveResult = pCompress && pDecompressEx && pGetWsSize;
+        });
+        return resolveResult;
     }
 };
 

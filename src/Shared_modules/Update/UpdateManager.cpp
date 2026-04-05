@@ -263,7 +263,7 @@ public:
     [[nodiscard]] bool InitializeSubModules() {
         // Init order: Verifier -> Delta -> Rollback -> Scheduler -> Sig -> Prog
         SS_LOG_INFO(kLogCategory, L"Initializing UpdateVerifier sub-module");
-        if (UpdateVerifier::HasInstance() || true) {
+        if (UpdateVerifier::HasInstance()) {
             auto& verifier = UpdateVerifier::Instance();
             if (!verifier.IsInitialized()) {
                 if (!verifier.Initialize()) {
@@ -559,6 +559,21 @@ public:
                 std::string(GetUpdateTypeName(package.type)).c_str());
 
             std::error_code ec;
+
+            // SECURITY: Reject packageId containing path separators or
+            // traversal sequences to prevent zip-slip / path traversal.
+            if (package.packageId.find('/') != std::string::npos ||
+                package.packageId.find('\\') != std::string::npos ||
+                package.packageId.find("..") != std::string::npos ||
+                package.packageId.empty())
+            {
+                result.errorMessage = "Invalid packageId (path traversal rejected): "
+                                      + package.packageId;
+                SS_LOG_ERROR(kLogCategory,
+                    L"SECURITY: Rejected packageId with path traversal: '%S'",
+                    package.packageId.c_str());
+            }
+            else {
             auto stagingPath = m_config.stagingDirectory / package.packageId;
             if (fs::exists(stagingPath, ec) && !ec) {
                 // Verify if verifier is available
@@ -576,10 +591,15 @@ public:
                     }
                 }
                 else {
-                    // No verifier or no signature — accept staged package
-                    applySuccess = true;
-                    SS_LOG_WARN(kLogCategory,
-                        L"Accepting staged package '%S' without cryptographic verification",
+                    // SECURITY: Refuse to install unverified packages.
+                    // A missing verifier or absent signature is a supply-chain risk.
+                    applySuccess = false;
+                    result.errorMessage =
+                        "Package rejected: cryptographic verification unavailable for "
+                        + package.packageId;
+                    SS_LOG_ERROR(kLogCategory,
+                        L"SECURITY: Rejecting staged package '%S' — "
+                        L"no verifier or no signature available",
                         package.packageId.c_str());
                 }
             }
@@ -589,6 +609,7 @@ public:
                     L"Staged package '%S' not found in staging directory",
                     package.packageId.c_str());
             }
+            } // end path-traversal-safe else
         }
 
         auto endTime = Clock::now();
