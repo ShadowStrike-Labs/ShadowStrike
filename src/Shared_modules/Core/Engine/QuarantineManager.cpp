@@ -42,6 +42,7 @@
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
 #include "../../Database/QuarantineDB.hpp"
+#include "../FileSystem/FileLockManager.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -1196,10 +1197,34 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         }
 
         // ====================================================================
-        // STAGE 3: PROCESS NEUTRALIZATION
+        // STAGE 3: PROCESS NEUTRALIZATION (enhanced with FileLockManager)
         // ====================================================================
 
         auto lockingProcesses = m_impl->GetLockingProcessesImpl(request.filePath);
+
+        // Enhanced: Use FileLockManager for APT-grade threat correlation on locks
+        auto& flm = ShadowStrike::Core::FileSystem::FileLockManager::Instance();
+        auto lockInfo = flm.GetLockInfo(request.filePath);
+        if (lockInfo.threatAssessment.requiresImmediateAction) {
+            SS_LOG_WARN(L"QuarantineManager", L"FileLockManager: HIGH threat score %.1f on %s (pattern=%u)",
+                lockInfo.threatAssessment.overallThreatScore, request.filePath.c_str(),
+                static_cast<unsigned>(lockInfo.threatAssessment.dominantPattern));
+        }
+
+        // Merge FileLockManager handle-level owners not found by RM
+        for (const auto& flmOwner : lockInfo.owners) {
+            bool found = false;
+            for (const auto& lp : lockingProcesses) {
+                if (lp.processId == flmOwner.pid) { found = true; break; }
+            }
+            if (!found && flmOwner.pid != 0) {
+                LockingProcess lp;
+                lp.processId = flmOwner.pid;
+                lp.processName = flmOwner.processName;
+                lp.processPath = flmOwner.processPath;
+                lockingProcesses.push_back(std::move(lp));
+            }
+        }
 
         if (!lockingProcesses.empty()) {
             SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File locked by %zu processes", lockingProcesses.size());
@@ -1209,11 +1234,24 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 result.processesTerminated = terminated;
 
                 if (terminated.size() < lockingProcesses.size()) {
-                    SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Not all processes terminated");
-                    result.status = QuarantineStatus::ProcessKillFailed;
-                    result.message = L"Failed to terminate all locking processes";
-                    result.rebootRequired = true;
-                    return result;
+                    // Escalate: try FileLockManager kernel-mode force-close
+                    SS_LOG_WARN(L"QuarantineManager", L"Not all processes terminated, escalating to FileLockManager");
+                    auto unlockResult = flm.ForceUnlockFile(request.filePath);
+                    if (unlockResult.result == ShadowStrike::Core::FileSystem::UnlockResult::Success) {
+                        SS_LOG_INFO(L"QuarantineManager", L"FileLockManager force-unlock succeeded");
+                    } else if (unlockResult.result == ShadowStrike::Core::FileSystem::UnlockResult::RequiresReboot) {
+                        SS_LOG_WARN(L"QuarantineManager", L"File scheduled for delete on reboot via FileLockManager");
+                        result.status = QuarantineStatus::ProcessKillFailed;
+                        result.message = L"File scheduled for reboot cleanup";
+                        result.rebootRequired = true;
+                        return result;
+                    } else {
+                        SS_LOG_WARN(L"QuarantineManager", L"FileLockManager force-unlock also failed");
+                        result.status = QuarantineStatus::ProcessKillFailed;
+                        result.message = L"Failed to terminate all locking processes";
+                        result.rebootRequired = true;
+                        return result;
+                    }
                 }
             } else {
                 SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: File in use, auto-terminate disabled");

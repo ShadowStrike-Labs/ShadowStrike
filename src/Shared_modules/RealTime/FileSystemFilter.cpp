@@ -47,6 +47,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+#include "../Core/FileSystem/FileLockManager.hpp"
 #include "../AI/PhantomCortex.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
@@ -697,6 +698,17 @@ struct FileSystemFilter::Impl {
                 context.isNetworkPath = event.isNetworkFile;
                 context.isRemovableMedia = event.isRemovableMedia;
                 context.timeout = std::chrono::milliseconds(snap.scanTimeoutMs);
+
+                // Perform lock-aware threat detection before scan
+                auto& fileLockMgr = Core::FileSystem::FileLockManager::Instance();
+                auto lockInfo = fileLockMgr.GetLockInfo(event.filePath);
+                if (lockInfo.threatAssessment.requiresImmediateAction) {
+                    SS_LOG_WARN(L"FileSystemFilter", L"Pre-scan lock threat: %s (score=%.1f, pattern=%u)",
+                        event.filePath.c_str(), lockInfo.threatAssessment.overallThreatScore,
+                        static_cast<unsigned>(lockInfo.threatAssessment.dominantPattern));
+                    InvokeThreatCallbacks(event, L"SuspiciousLockPattern",
+                        lockInfo.threatAssessment.overallThreatScore);
+                }
 
                 // Perform the scan
                 auto result = snap.scanEngine->ScanFile(event.filePath, context);
