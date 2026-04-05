@@ -586,7 +586,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] PolyStatistics GetStatistics() const;
+    [[nodiscard]] const PolyStatistics& GetStatistics() const noexcept;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
