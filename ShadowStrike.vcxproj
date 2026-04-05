@@ -190,7 +190,6 @@
     <ClCompile Include="src\Shared_modules\Core\Engine\QuarantineManager.cpp" />
     <ClCompile Include="src\Shared_modules\Core\Engine\SandboxAnalyzer.cpp" />
     <ClCompile Include="src\Shared_modules\Core\Engine\ScanEngine.cpp" />
-    <ClCompile Include="src\Shared_modules\Core\Engine\SignatureDatabase_Manager.cpp" />
     <ClCompile Include="src\Shared_modules\Core\Engine\ThreatDetector.cpp" />
     <ClCompile Include="src\Shared_modules\Core\Engine\ZeroDayDetector.cpp" />
     <ClCompile Include="src\Shared_modules\Core\FileSystem\ArchiveExtractor.cpp" />
