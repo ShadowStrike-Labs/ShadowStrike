@@ -374,13 +374,12 @@ public:
 
             m_initialized = true;
 
-            Logger::Info("ProcessKiller initialized (debugPriv={}, killPriv={}, kernel={})",
-                m_hasDebugPrivilege, m_hasKillPrivilege, m_kernelDriverAvailable);
+            SS_LOG_INFO(L"ProcessKiller", L"ProcessKiller initialized (debugPriv=%d, killPriv=%d, kernel=%d)", m_hasDebugPrivilege, m_hasKillPrivilege, m_kernelDriverAvailable);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ProcessKiller initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"ProcessKiller initialization failed: %S", e.what());
             return false;
         }
     }
@@ -396,7 +395,7 @@ public:
 
             m_initialized = false;
 
-            Logger::Info("ProcessKiller shutdown complete");
+            SS_LOG_INFO(L"ProcessKiller", L"ProcessKiller shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions
@@ -444,8 +443,7 @@ public:
                 info.result = KillResult::Critical;
                 info.errorMessage = L"Process is critical to system stability";
                 m_stats.criticalProcessesBlocked++;
-                Logger::Warn("Blocked termination of critical process: {} (pid={})",
-                    StringUtils::WideToUtf8(info.processName), pid);
+                SS_LOG_WARN(L"ProcessKiller", L"Blocked termination of critical process: %S (pid=%u)", StringUtils::WideToUtf8(info.processName), pid);
                 return info;
             }
 
@@ -453,8 +451,7 @@ public:
             if (WhiteListStore::Instance().IsProcessWhitelisted(info.processPath)) {
                 info.result = KillResult::Blocked;
                 info.errorMessage = L"Process is whitelisted";
-                Logger::Warn("Blocked termination of whitelisted process: {}",
-                    StringUtils::WideToUtf8(info.processPath));
+                SS_LOG_WARN(L"ProcessKiller", L"Blocked termination of whitelisted process: %S", StringUtils::WideToUtf8(info.processPath));
                 return info;
             }
 
@@ -510,7 +507,7 @@ public:
             InvokePostKillCallbacks(info);
 
         } catch (const std::exception& e) {
-            Logger::Error("TerminateEx - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"TerminateEx - Exception: %S", e.what());
             info.result = KillResult::Failed;
             info.errorMessage = StringUtils::Utf8ToWide(e.what());
             m_stats.failedKills++;
@@ -540,9 +537,7 @@ public:
                 return treeInfo;
             }
 
-            Logger::Info("Killing process tree: root={} (pid={}), processes={}, strategy={}",
-                StringUtils::WideToUtf8(treeInfo.rootName), rootPid, tree.size(),
-                static_cast<int>(options.treeStrategy));
+            SS_LOG_INFO(L"ProcessKiller", L"Killing process tree: root=%S (pid=%u), processes=%zu, strategy=%.2f", StringUtils::WideToUtf8(treeInfo.rootName), rootPid, tree.size(), static_cast<int>(options.treeStrategy));
 
             // Order processes based on strategy
             std::vector<uint32_t> killOrder;
@@ -605,7 +600,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("TerminateTreeEx - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"TerminateTreeEx - Exception: %S", e.what());
             treeInfo.overallResult = KillResult::Failed;
             treeInfo.errors.push_back(StringUtils::Utf8ToWide(e.what()));
         }
@@ -649,7 +644,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("SuspendProcessEx - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"SuspendProcessEx - Exception: %S", e.what());
             return SuspendResult::Failed;
         }
     }
@@ -676,7 +671,7 @@ public:
             return resumedCount > 0;
 
         } catch (const std::exception& e) {
-            Logger::Error("ResumeProcessEx - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"ResumeProcessEx - Exception: %S", e.what());
             return false;
         }
     }
@@ -692,7 +687,7 @@ public:
             return NT_SUCCESS(status);
 
         } catch (const std::exception& e) {
-            Logger::Error("FreezeProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"FreezeProcess - Exception: %S", e.what());
             return false;
         }
     }
@@ -708,7 +703,7 @@ public:
             return NT_SUCCESS(status);
 
         } catch (const std::exception& e) {
-            Logger::Error("ThawProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"ThawProcess - Exception: %S", e.what());
             return false;
         }
     }
@@ -724,7 +719,7 @@ public:
         try {
             BuildTreeRecursive(rootPid, tree, visited, 0, maxDepth);
         } catch (const std::exception& e) {
-            Logger::Error("GetProcessTreeInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"GetProcessTreeInternal - Exception: %S", e.what());
         }
 
         return tree;
@@ -798,7 +793,7 @@ public:
             // In production, would enumerate handles and check for cross-process handles
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectWatchdogs - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"DetectWatchdogs - Exception: %S", e.what());
         }
 
         return watchdogs;
@@ -836,7 +831,7 @@ public:
             CloseHandle(hProcess);
 
         } catch (const std::exception& e) {
-            Logger::Error("GetProtectionInfoInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"GetProtectionInfoInternal - Exception: %S", e.what());
         }
 
         return info;
@@ -889,7 +884,7 @@ public:
         if (!options.escalateOnFailure) return result;
 
         m_stats.escalatedKills++;
-        Logger::Info("Escalating kill for pid {}", pid);
+        SS_LOG_INFO(L"ProcessKiller", L"Escalating kill for pid %u", pid);
 
         // Level 2: Privileged
         result = KillWithMethod(pid, KillMethod::Privileged, options, info);
@@ -953,14 +948,14 @@ public:
 
             if (success) {
                 m_stats.standardKills++;
-                Logger::Info("Process {} terminated (standard method)", pid);
+                SS_LOG_INFO(L"ProcessKiller", L"Process %u terminated (standard method)", pid);
                 return KillResult::Success;
             }
 
             return KillResult::Failed;
 
         } catch (const std::exception& e) {
-            Logger::Error("KillStandard - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"KillStandard - Exception: %S", e.what());
             return KillResult::Failed;
         }
     }
@@ -981,14 +976,14 @@ public:
 
             if (success) {
                 m_stats.privilegedKills++;
-                Logger::Info("Process {} terminated (privileged method)", pid);
+                SS_LOG_INFO(L"ProcessKiller", L"Process %u terminated (privileged method)", pid);
                 return KillResult::Success;
             }
 
             return KillResult::Failed;
 
         } catch (const std::exception& e) {
-            Logger::Error("KillPrivileged - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"KillPrivileged - Exception: %S", e.what());
             return KillResult::Failed;
         }
     }
@@ -1019,14 +1014,14 @@ public:
 
             if (success) {
                 m_stats.freezeKills++;
-                Logger::Info("Process {} terminated (freeze method)", pid);
+                SS_LOG_INFO(L"ProcessKiller", L"Process %u terminated (freeze method)", pid);
                 return KillResult::Success;
             }
 
             return KillResult::Failed;
 
         } catch (const std::exception& e) {
-            Logger::Error("KillFreeze - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"KillFreeze - Exception: %S", e.what());
             return KillResult::Failed;
         }
     }
@@ -1066,11 +1061,11 @@ public:
             CloseHandle(hJob);
 
             m_stats.jobObjectKills++;
-            Logger::Info("Process {} terminated (job object method)", pid);
+            SS_LOG_INFO(L"ProcessKiller", L"Process %u terminated (job object method)", pid);
             return KillResult::Success;
 
         } catch (const std::exception& e) {
-            Logger::Error("KillJobObject - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"KillJobObject - Exception: %S", e.what());
             return KillResult::Failed;
         }
     }
@@ -1128,7 +1123,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokePreKillCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"InvokePreKillCallbacks - Exception: %S", e.what());
         }
 
         return true;
@@ -1144,7 +1139,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokePostKillCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"InvokePostKillCallbacks - Exception: %S", e.what());
         }
     }
 
@@ -1158,7 +1153,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeTreeProgressCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"ProcessKiller", L"InvokeTreeProgressCallbacks - Exception: %S", e.what());
         }
     }
 
@@ -1245,14 +1240,14 @@ ProcessKiller& ProcessKiller::Instance() {
 
 ProcessKiller::ProcessKiller()
     : m_impl(std::make_unique<ProcessKillerImpl>()) {
-    Logger::Info("ProcessKiller instance created");
+    SS_LOG_INFO(L"ProcessKiller", L"ProcessKiller instance created");
 }
 
 ProcessKiller::~ProcessKiller() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("ProcessKiller instance destroyed");
+    SS_LOG_INFO(L"ProcessKiller", L"ProcessKiller instance destroyed");
 }
 
 // ============================================================================
@@ -1350,7 +1345,7 @@ std::vector<ProcessKillInfo> ProcessKiller::TerminateByName(
             results.push_back(m_impl->TerminateEx(pid, options));
         }
     } catch (const std::exception& e) {
-        Logger::Error("TerminateByName - Exception: {}", e.what());
+        SS_LOG_ERROR(L"ProcessKiller", L"TerminateByName - Exception: %S", e.what());
     }
 
     return results;
@@ -1368,7 +1363,7 @@ std::vector<ProcessKillInfo> ProcessKiller::TerminateByPath(
             results.push_back(m_impl->TerminateEx(pid, options));
         }
     } catch (const std::exception& e) {
-        Logger::Error("TerminateByPath - Exception: {}", e.what());
+        SS_LOG_ERROR(L"ProcessKiller", L"TerminateByPath - Exception: %S", e.what());
     }
 
     return results;

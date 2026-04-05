@@ -461,7 +461,7 @@ public:
             try {
                 callback(detection);
             } catch (const std::exception& e) {
-                Logger::Error("DetectionCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"ReflectiveDLL", L"DetectionCallback exception: %S", e.what());
             }
         }
     }
@@ -472,7 +472,7 @@ public:
             try {
                 callback(pid, scanned, total);
             } catch (const std::exception& e) {
-                Logger::Error("ProgressCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"ReflectiveDLL", L"ProgressCallback exception: %S", e.what());
             }
         }
     }
@@ -483,7 +483,7 @@ public:
             try {
                 callback(pid, candidate);
             } catch (const std::exception& e) {
-                Logger::Error("CandidateCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"ReflectiveDLL", L"CandidateCallback exception: %S", e.what());
             }
         }
     }
@@ -592,7 +592,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("ReflectiveDLLDetector: Initializing...");
+            SS_LOG_INFO(L"ReflectiveDLL", L"Initializing...");
 
             m_config = config;
 
@@ -603,20 +603,20 @@ public:
             // Verify infrastructure
             if (!PatternStore::PatternStore::Instance().Initialize(
                 PatternStore::PatternStoreConfig::CreateDefault())) {
-                Logger::Warn("ReflectiveDLLDetector: PatternStore initialization warning");
+                SS_LOG_WARN(L"ReflectiveDLL", L"PatternStore initialization warning");
             }
 
             if (!HashStore::HashStore::Instance().Initialize(
                 HashStore::HashStoreConfig::CreateDefault())) {
-                Logger::Warn("ReflectiveDLLDetector: HashStore initialization warning");
+                SS_LOG_WARN(L"ReflectiveDLL", L"HashStore initialization warning");
             }
 
             m_initialized = true;
-            Logger::Info("ReflectiveDLLDetector: Initialized successfully");
+            SS_LOG_INFO(L"ReflectiveDLL", L"Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"Initialization failed: %S", e.what());
             return false;
         }
     }
@@ -627,7 +627,7 @@ public:
         std::unique_lock lock(m_mutex);
         m_initialized = false;
 
-        Logger::Info("ReflectiveDLLDetector: Shutdown complete");
+        SS_LOG_INFO(L"ReflectiveDLL", L"Shutdown complete");
     }
 
     bool IsInitialized() const noexcept {
@@ -638,7 +638,7 @@ public:
     bool UpdateConfig(const ReflectiveConfig& config) {
         std::unique_lock lock(m_mutex);
         m_config = config;
-        Logger::Info("ReflectiveDLLDetector: Configuration updated");
+        SS_LOG_INFO(L"ReflectiveDLL", L"Configuration updated");
         return true;
     }
 
@@ -663,9 +663,7 @@ public:
             // Get process name
             result.processName = GetProcessName(pid);
 
-            Logger::Info("ReflectiveDLLDetector: Scanning PID {} ({}) in {} mode",
-                pid, Utils::StringUtils::WideToUtf8(result.processName),
-                static_cast<int>(mode));
+            SS_LOG_INFO(L"ReflectiveDLL", L"Scanning PID %u (%S) in %d mode", pid, Utils::StringUtils::WideToUtf8(result.processName), static_cast<int>(mode));
 
             // Update statistics
             m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
@@ -704,8 +702,7 @@ public:
                     // Invoke detection callback
                     m_callbackManager->InvokeDetection(*detection);
 
-                    Logger::Warn("ReflectiveDLLDetector: Reflective DLL detected at 0x{:X} in PID {}",
-                        candidate.baseAddress, pid);
+                    SS_LOG_WARN(L"ReflectiveDLL", L"Reflective DLL detected at 0x%X in PID %u", candidate.baseAddress, pid);
                 }
             }
 
@@ -732,11 +729,10 @@ public:
             const uint64_t avgTime = m_stats.avgScanTimeMs.load(std::memory_order_relaxed);
             m_stats.avgScanTimeMs.store((avgTime + result.scanDurationMs) / 2, std::memory_order_relaxed);
 
-            Logger::Info("ReflectiveDLLDetector: Scan complete - {} PE candidates, {} reflective DLLs, {}ms",
-                result.peCandidatesFound, result.reflectiveDLLsDetected, result.scanDurationMs);
+            SS_LOG_INFO(L"ReflectiveDLL", L"Scan complete - %llu PE candidates, %d reflective DLLs, %.2fms", result.peCandidatesFound, result.reflectiveDLLsDetected, result.scanDurationMs);
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::Scan: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"Scan: %S", e.what());
             result.scanError = Utils::StringUtils::Utf8ToWide(e.what());
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
         }
@@ -766,7 +762,7 @@ public:
         try {
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
-                Logger::Error("ReflectiveDLLDetector: Failed to create process snapshot");
+                SS_LOG_ERROR(L"ReflectiveDLL", L"Failed to create process snapshot");
                 return results;
             }
 
@@ -789,7 +785,7 @@ public:
             CloseHandle(hSnapshot);
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::ScanAllProcesses: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"ScanAllProcesses: %S", e.what());
         }
 
         return results;
@@ -805,7 +801,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::ScanByName: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"ScanByName: %S", e.what());
         }
 
         return results;
@@ -832,7 +828,7 @@ public:
         try {
             ValidatePEImpl(hProcess, candidate);
         } catch (...) {
-            Logger::Error("ReflectiveDLLDetector::ValidatePE: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"ValidatePE: Exception");
         }
 
         CloseHandle(hProcess);
@@ -876,7 +872,7 @@ public:
             }
 
         } catch (...) {
-            Logger::Error("ReflectiveDLLDetector::FindRWXRegions: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindRWXRegions: Exception");
         }
 
         CloseHandle(hProcess);
@@ -906,7 +902,7 @@ public:
             }
 
         } catch (...) {
-            Logger::Error("ReflectiveDLLDetector::FindUnbackedExecutable: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindUnbackedExecutable: Exception");
         }
 
         CloseHandle(hProcess);
@@ -950,11 +946,10 @@ public:
                 }
             }
 
-            Logger::Info("ReflectiveDLLDetector: Found {} hidden modules in PID {}",
-                hiddenModules.size(), pid);
+            SS_LOG_INFO(L"ReflectiveDLL", L"Found %zu hidden modules in PID %u", hiddenModules.size(), pid);
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::FindHiddenModules: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindHiddenModules: %S", e.what());
         }
 
         return hiddenModules;
@@ -1013,7 +1008,7 @@ public:
             CloseHandle(hSnapshot);
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::FindSuspiciousThreads: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindSuspiciousThreads: %S", e.what());
         }
 
         return suspiciousThreads;
@@ -1101,7 +1096,7 @@ public:
         std::vector<uint8_t> payload;
 
         if (!m_config.extractPayloads) {
-            Logger::Warn("ReflectiveDLLDetector: Payload extraction disabled");
+            SS_LOG_WARN(L"ReflectiveDLL", L"Payload extraction disabled");
             return payload;
         }
 
@@ -1118,14 +1113,13 @@ public:
                 candidate.sizeOfImage > 0 ? candidate.sizeOfImage : candidate.regionSize)) {
                 m_stats.payloadsExtracted.fetch_add(1, std::memory_order_relaxed);
 
-                Logger::Info("ReflectiveDLLDetector: Extracted payload from 0x{:X} ({} bytes)",
-                    candidate.baseAddress, payload.size());
+                SS_LOG_INFO(L"ReflectiveDLL", L"Extracted payload from 0x%X (%zu bytes)", candidate.baseAddress, payload.size());
             } else {
                 m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::ExtractPayload: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"ExtractPayload: %S", e.what());
             m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1144,12 +1138,11 @@ public:
             ofs.write(reinterpret_cast<const char*>(payload.data()), payload.size());
             ofs.close();
 
-            Logger::Info("ReflectiveDLLDetector: Dumped PE to {}",
-                Utils::StringUtils::WideToUtf8(outputPath));
+            SS_LOG_INFO(L"ReflectiveDLL", L"Dumped PE to %S", Utils::StringUtils::WideToUtf8(outputPath));
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::DumpPE: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"DumpPE: %S", e.what());
             return false;
         }
     }
@@ -1172,17 +1165,17 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("ReflectiveDLLDetector: Not initialized");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"Not initialized");
             return false;
         }
 
         if (m_monitoring) {
-            Logger::Warn("ReflectiveDLLDetector: Already monitoring");
+            SS_LOG_WARN(L"ReflectiveDLL", L"Already monitoring");
             return true;
         }
 
         m_monitoring = true;
-        Logger::Info("ReflectiveDLLDetector: Real-time monitoring started");
+        SS_LOG_INFO(L"ReflectiveDLL", L"Real-time monitoring started");
         return true;
     }
 
@@ -1192,7 +1185,7 @@ public:
         if (!m_monitoring) return;
 
         m_monitoring = false;
-        Logger::Info("ReflectiveDLLDetector: Real-time monitoring stopped");
+        SS_LOG_INFO(L"ReflectiveDLL", L"Real-time monitoring stopped");
     }
 
     bool IsMonitoring() const noexcept {
@@ -1205,8 +1198,7 @@ public:
 
         // Check if suspicious allocation (RWX, large size, etc.)
         if (IsRWX(protection)) {
-            Logger::Warn("ReflectiveDLLDetector: RWX allocation detected - PID {}, Address 0x{:X}, Size {}",
-                pid, address, size);
+            SS_LOG_WARN(L"ReflectiveDLL", L"RWX allocation detected - PID %u, Address 0x%X, Size %ls", pid, address, size);
 
             // Trigger scan if enabled
             if (m_config.enableRealTimeMonitoring) {
@@ -1221,13 +1213,11 @@ public:
 
         // Detect RW->RX transitions (common in reflective loading)
         if (IsWritable(oldProtection) && IsExecutable(newProtection)) {
-            Logger::Warn("ReflectiveDLLDetector: Suspicious protection change - PID {}, Address 0x{:X}, RW->RX",
-                pid, address);
+            SS_LOG_WARN(L"ReflectiveDLL", L"Suspicious protection change - PID %u, Address 0x%X, RW->RX", pid, address);
 
             // Check for PE structure at this address
             if (ContainsPE(pid, address, 4096)) {
-                Logger::Critical("ReflectiveDLLDetector: PE structure found after RW->RX transition - PID {}, Address 0x{:X}",
-                    pid, address);
+                SS_LOG_ERROR(L"ReflectiveDLL", L"PE structure found after RW->RX transition - PID %u, Address 0x%X", pid, address);
             }
         }
     }
@@ -1354,12 +1344,12 @@ private:
 
                 // Check limits
                 if (candidates.size() >= m_config.maxPECandidates) {
-                    Logger::Warn("ReflectiveDLLDetector: Max PE candidates reached");
+                    SS_LOG_WARN(L"ReflectiveDLL", L"Max PE candidates reached");
                     break;
                 }
 
                 if (regionsScanned >= m_config.maxRegionsToScan) {
-                    Logger::Warn("ReflectiveDLLDetector: Max regions scanned reached");
+                    SS_LOG_WARN(L"ReflectiveDLL", L"Max regions scanned reached");
                     break;
                 }
 
@@ -1401,7 +1391,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ReflectiveDLLDetector::FindPECandidatesImpl: {}", e.what());
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindPECandidatesImpl: %S", e.what());
         }
 
         CloseHandle(hProcess);
@@ -1500,7 +1490,7 @@ private:
             }
 
         } catch (...) {
-            Logger::Error("ReflectiveDLLDetector::GetPEBModulesImpl: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"GetPEBModulesImpl: Exception");
         }
 
         CloseHandle(hProcess);

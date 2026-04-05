@@ -652,8 +652,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"ProcessHollowingDetector: Detection callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Detection callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -664,8 +663,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(pid, pattern);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"ProcessHollowingDetector: Creation callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Creation callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -676,8 +674,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(pid, stage, percent);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"ProcessHollowingDetector: Progress callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Progress callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -728,8 +725,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
 
         m_statistics.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Warn(L"ProcessHollowingDetector: Alert {} - {} (PID: {}, Risk: {})",
-                          alert.alertId, alert.description, result.processId, result.riskScore);
+        SS_LOG_WARN(L"Hollowing", L"Alert %u - %ls (PID: %u, Risk: %.2f)", alert.alertId, alert.description, result.processId, result.riskScore);
     }
 };
 
@@ -756,19 +752,19 @@ bool ProcessHollowingDetector::HasInstance() noexcept {
 ProcessHollowingDetector::ProcessHollowingDetector()
     : m_impl(std::make_unique<ProcessHollowingDetectorImpl>())
 {
-    Utils::Logger::Info(L"ProcessHollowingDetector: Constructor called");
+    SS_LOG_INFO(L"Hollowing", L"Constructor called");
 }
 
 ProcessHollowingDetector::~ProcessHollowingDetector() {
     Shutdown();
-    Utils::Logger::Info(L"ProcessHollowingDetector: Destructor called");
+    SS_LOG_INFO(L"Hollowing", L"Destructor called");
 }
 
 bool ProcessHollowingDetector::Initialize(const HollowingDetectorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"ProcessHollowingDetector: Already initialized");
+        SS_LOG_WARN(L"Hollowing", L"Already initialized");
         return true;
     }
 
@@ -781,12 +777,11 @@ bool ProcessHollowingDetector::Initialize(const HollowingDetectorConfig& config)
 
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"ProcessHollowingDetector: Initialized successfully");
+        SS_LOG_INFO(L"Hollowing", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessHollowingDetector: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
 }
@@ -821,11 +816,10 @@ void ProcessHollowingDetector::Shutdown() noexcept {
 
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"ProcessHollowingDetector: Shutdown complete");
+        SS_LOG_INFO(L"Hollowing", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessHollowingDetector: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Shutdown error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
 
@@ -836,7 +830,7 @@ bool ProcessHollowingDetector::IsInitialized() const noexcept {
 bool ProcessHollowingDetector::UpdateConfig(const HollowingDetectorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"ProcessHollowingDetector: Configuration updated");
+    SS_LOG_INFO(L"Hollowing", L"Configuration updated");
     return true;
 }
 
@@ -976,8 +970,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
         result.scanComplete = false;
         m_impl->m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Error(L"ProcessHollowingDetector: Scan failed for PID {} - {}",
-                            pid, result.scanError);
+        SS_LOG_ERROR(L"Hollowing", L"Scan failed for PID %u - %d", pid, result.scanError);
     }
 
     // Update timing statistics
@@ -1267,8 +1260,7 @@ void ProcessHollowingDetector::OnProcessCreated(
 
     m_impl->m_creationEvents[pid] = event;
 
-    Utils::Logger::Debug(L"ProcessHollowingDetector: Process created - PID {} by {} (Suspended: {})",
-                        pid, creatorPid, createdSuspended);
+    SS_LOG_DEBUG(L"Hollowing", L"Process created - PID %u by %u (Suspended: %ls)", pid, creatorPid, createdSuspended);
 }
 
 void ProcessHollowingDetector::OnProcessResumed(uint32_t pid) {
@@ -1308,13 +1300,13 @@ bool ProcessHollowingDetector::StartMonitoring() {
     }
 
     m_impl->m_monitoring.store(true, std::memory_order_release);
-    Utils::Logger::Info(L"ProcessHollowingDetector: Monitoring started");
+    SS_LOG_INFO(L"Hollowing", L"Monitoring started");
     return true;
 }
 
 void ProcessHollowingDetector::StopMonitoring() {
     m_impl->m_monitoring.store(false, std::memory_order_release);
-    Utils::Logger::Info(L"ProcessHollowingDetector: Monitoring stopped");
+    SS_LOG_INFO(L"Hollowing", L"Monitoring stopped");
 }
 
 bool ProcessHollowingDetector::IsMonitoring() const noexcept {
@@ -1382,8 +1374,7 @@ void ProcessHollowingDetector::ClearAlerts() {
 
 void ProcessHollowingDetector::ReportFalsePositive(uint64_t alertId, const std::wstring& reason) {
     m_impl->m_statistics.falsePositivesReported.fetch_add(1, std::memory_order_relaxed);
-    Utils::Logger::Info(L"ProcessHollowingDetector: False positive reported - Alert {}: {}",
-                       alertId, reason);
+    SS_LOG_INFO(L"Hollowing", L"False positive reported - Alert %u: %ls", alertId, reason);
 }
 
 // ============================================================================
@@ -1463,7 +1454,7 @@ const HollowingStatistics& ProcessHollowingDetector::GetStatistics() const noexc
 
 void ProcessHollowingDetector::ResetStatistics() noexcept {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"ProcessHollowingDetector: Statistics reset");
+    SS_LOG_INFO(L"Hollowing", L"Statistics reset");
 }
 
 std::string ProcessHollowingDetector::GetVersionString() noexcept {
@@ -1474,7 +1465,7 @@ std::string ProcessHollowingDetector::GetVersionString() noexcept {
 
 bool ProcessHollowingDetector::SelfTest() {
     try {
-        Utils::Logger::Info(L"ProcessHollowingDetector: Starting self-test");
+        SS_LOG_INFO(L"Hollowing", L"Starting self-test");
 
         // Test PE parsing
         PEHeaderInfo testHeader;
@@ -1483,7 +1474,7 @@ bool ProcessHollowingDetector::SelfTest() {
         testHeader.hasPeHeader = true;
 
         if (!ValidatePEHeader(testHeader)) {
-            Utils::Logger::Error(L"ProcessHollowingDetector: PE validation test failed");
+            SS_LOG_ERROR(L"Hollowing", L"PE validation test failed");
             return false;
         }
 
@@ -1497,16 +1488,15 @@ bool ProcessHollowingDetector::SelfTest() {
             !paranoidConfig.enablePayloadExtraction ||
             !perfConfig.enableCaching ||
             !forensicConfig.quarantinePayload) {
-            Utils::Logger::Error(L"ProcessHollowingDetector: Config factory test failed");
+            SS_LOG_ERROR(L"Hollowing", L"Config factory test failed");
             return false;
         }
 
-        Utils::Logger::Info(L"ProcessHollowingDetector: Self-test passed");
+        SS_LOG_INFO(L"Hollowing", L"Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ProcessHollowingDetector: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Self-test failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
 }
