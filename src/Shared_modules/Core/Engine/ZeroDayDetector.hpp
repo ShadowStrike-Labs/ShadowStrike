@@ -121,14 +121,6 @@
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 
-// ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-
-namespace ShadowStrike::Core::Engine {
-    class ZeroDayDetectorImpl;
-}
-
 namespace ShadowStrike {
 namespace Core {
 namespace Engine {
@@ -520,6 +512,45 @@ struct ZeroDayStatistics {
     std::atomic<uint64_t> falsePositives{0};
     std::array<std::atomic<uint64_t>, 32> byExploitType{};
     TimePoint startTime = Clock::now();
+
+    ZeroDayStatistics() noexcept = default;
+
+    /// @brief Snapshot copy — loads all atomics with relaxed ordering
+    ZeroDayStatistics(const ZeroDayStatistics& o) noexcept
+        : totalAnalyses(o.totalAnalyses.load(std::memory_order_relaxed))
+        , exploitsDetected(o.exploitsDetected.load(std::memory_order_relaxed))
+        , shellcodeDetected(o.shellcodeDetected.load(std::memory_order_relaxed))
+        , ropChainsDetected(o.ropChainsDetected.load(std::memory_order_relaxed))
+        , heapSpraysDetected(o.heapSpraysDetected.load(std::memory_order_relaxed))
+        , corruptionsDetected(o.corruptionsDetected.load(std::memory_order_relaxed))
+        , cveMatches(o.cveMatches.load(std::memory_order_relaxed))
+        , falsePositives(o.falsePositives.load(std::memory_order_relaxed))
+        , startTime(o.startTime)
+    {
+        for (size_t i = 0; i < byExploitType.size(); ++i)
+            byExploitType[i].store(
+                o.byExploitType[i].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+    }
+
+    ZeroDayStatistics& operator=(const ZeroDayStatistics& o) noexcept {
+        if (this != &o) {
+            totalAnalyses.store(o.totalAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            exploitsDetected.store(o.exploitsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            shellcodeDetected.store(o.shellcodeDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ropChainsDetected.store(o.ropChainsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            heapSpraysDetected.store(o.heapSpraysDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            corruptionsDetected.store(o.corruptionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cveMatches.store(o.cveMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            falsePositives.store(o.falsePositives.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = o.startTime;
+            for (size_t i = 0; i < byExploitType.size(); ++i)
+                byExploitType[i].store(
+                    o.byExploitType[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+        }
+        return *this;
+    }
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
@@ -679,11 +710,8 @@ private:
     ZeroDayDetector();
     ~ZeroDayDetector();
     
-    bool IsNopSledInternal(const std::vector<uint8_t>& buffer);
-    bool HasGetPCInternal(const std::vector<uint8_t>& buffer);
-    
-    std::unique_ptr<ZeroDayDetectorImpl> m_impl;
-    static std::atomic<bool> s_instanceCreated;
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 // ============================================================================
