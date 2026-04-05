@@ -514,6 +514,31 @@ struct MLStatistics {
     [[nodiscard]] std::string ToJson() const;
 };
 
+/// @brief Copyable snapshot of MLStatistics (no atomics — safe for public API returns)
+struct MLStatisticsSnapshot {
+    uint64_t totalPredictions = 0;
+    uint64_t maliciousDetections = 0;
+    uint64_t benignClassifications = 0;
+    uint64_t featureExtractions = 0;
+    uint64_t cacheHits = 0;
+    uint64_t cacheMisses = 0;
+    uint64_t modelInferences = 0;
+    uint64_t gpuInferences = 0;
+    uint64_t cpuInferences = 0;
+    uint64_t timeouts = 0;
+    uint64_t errors = 0;
+    std::array<uint64_t, 16> byClassification{};
+    uint64_t totalInferenceTimeUs = 0;
+    uint64_t totalFeatureExtractionTimeUs = 0;
+    TimePoint startTime;
+    
+    [[nodiscard]] double GetAverageInferenceTimeMs() const noexcept {
+        return (modelInferences > 0) 
+            ? static_cast<double>(totalInferenceTimeUs) / static_cast<double>(modelInferences) / 1000.0
+            : 0.0;
+    }
+};
+
 /**
  * @brief Configuration
  */
@@ -570,7 +595,7 @@ struct MachineLearningConfiguration {
 using PredictionCallback = std::function<void(const fs::path& filePath, const PredictionResult& result)>;
 using BatchPredictionCallback = std::function<void(const std::vector<std::pair<fs::path, PredictionResult>>& results)>;
 using ModelUpdateCallback = std::function<void(const ModelInfo& newModel)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using MLErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // MACHINE LEARNING DETECTOR CLASS
@@ -714,7 +739,7 @@ public:
     
     void RegisterPredictionCallback(PredictionCallback callback);
     void RegisterModelUpdateCallback(ModelUpdateCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterErrorCallback(MLErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
@@ -731,7 +756,7 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] MLStatistics GetStatistics() const;
+    [[nodiscard]] MLStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
 
     [[nodiscard]] bool SelfTest();
