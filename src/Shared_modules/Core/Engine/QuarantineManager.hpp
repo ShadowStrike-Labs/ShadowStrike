@@ -1413,7 +1413,7 @@ public:
     [[nodiscard]] QuarantineResult QuarantineFile(const QuarantineRequest& request);
 
     /**
-     * @brief Quarantine a file (simplified).
+     * @brief Quarantine a file.
      * @param filePath Path to file.
      * @param threatName Threat name.
      * @param relatedPid Related process ID.
@@ -1457,7 +1457,7 @@ public:
     [[nodiscard]] RestoreResult RestoreFile(const RestoreRequest& request);
 
     /**
-     * @brief Restore a file (simplified).
+     * @brief Restore a file.
      * @param entryId Entry ID.
      * @param restorePath Optional custom path.
      * @return Restore result.
