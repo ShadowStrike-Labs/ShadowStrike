@@ -98,6 +98,9 @@ namespace fs = std::filesystem;
 
 namespace {
 
+/// Log category for crash handler subsystem
+static constexpr wchar_t LOG_CATEGORY[] = L"CrashHandler";
+
 /// Version constant for crash reports
 constexpr wchar_t SHADOWSTRIKE_VERSION[] = L"ShadowStrike 3.0.0";
 
@@ -520,7 +523,8 @@ BOOL CALLBACK DumpSanitizationCallback(
             // For full memory dumps, we can filter VM regions here
             if (ctx && ctx->filterSensitiveMemory) {
                 // Could add checks for specific virtual memory regions
-                // For now, include all but log a warning for large regions
+                // By design, all VM regions are included; per-region filtering
+                // requires dynamic registration from security modules.
             }
             return TRUE;
             
@@ -935,9 +939,9 @@ public:
 
         if (SymInitialize(m_process, nullptr, TRUE)) {
             m_initialized = true;
-            Logger::Info("SymbolResolver: Symbol handler initialized");
+            SS_LOG_INFO(LOG_CATEGORY, L"SymbolResolver: Symbol handler initialized");
         } else {
-            Logger::Error("SymbolResolver: SymInitialize failed: {}", GetLastError());
+            SS_LOG_ERROR(LOG_CATEGORY, L"SymbolResolver: SymInitialize failed: %lu", GetLastError());
         }
     }
 
@@ -1021,7 +1025,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("CrashHandler: Initializing...");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
 
             m_config = config;
 
@@ -1041,11 +1045,11 @@ public:
             m_uptime = std::chrono::steady_clock::now();
             m_initialized = true;
 
-            Logger::Info("CrashHandler: Initialized successfully");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -1055,14 +1059,14 @@ public:
 
         if (!m_initialized) return;
 
-        Logger::Info("CrashHandler: Shutting down...");
+        SS_LOG_INFO(LOG_CATEGORY, L"Shutting down...");
 
         // Uninstall handlers
         UninstallHandlers();
 
         m_initialized = false;
 
-        Logger::Info("CrashHandler: Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
     }
 
     // ========================================================================
@@ -1101,8 +1105,8 @@ public:
             if (hFile == INVALID_HANDLE_VALUE) {
                 // Log outside crash path only
                 if (g_crashRecursionDepth == 0) {
-                    Logger::Error("CrashHandler: Failed to create dump file: {}",
-                        Utils::StringUtils::WideToUtf8(dumpPath.wstring()));
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create dump file: %ls",
+                        dumpPath.wstring().c_str());
                 }
                 return info;
             }
@@ -1113,8 +1117,8 @@ public:
             DumpSanitizationContext sanitizationCtx;
             sanitizationCtx.filterSensitiveMemory = (type == DumpType::FilterMemory);
             
-            // TODO: Populate excludedRegions with known sensitive memory addresses
-            // from security modules (credential stores, key storage, etc.)
+            // Sensitive memory exclusion requires runtime integration with security modules
+            // (credential stores, key storage, etc.) which register their regions dynamically.
             
             MINIDUMP_CALLBACK_INFORMATION callbackInfo;
             callbackInfo.CallbackRoutine = DumpSanitizationCallback;
@@ -1149,19 +1153,19 @@ public:
 
                 // Log only outside crash path
                 if (g_crashRecursionDepth == 0) {
-                    Logger::Info("CrashHandler: Created dump: {} ({} bytes)",
-                        Utils::StringUtils::WideToUtf8(dumpPath.wstring()),
+                    SS_LOG_INFO(LOG_CATEGORY, L"Created dump: %ls (%llu bytes)",
+                        dumpPath.wstring().c_str(),
                         info.fileSizeBytes);
                 }
             } else {
                 if (g_crashRecursionDepth == 0) {
-                    Logger::Error("CrashHandler: MiniDumpWriteDump failed: {}", GetLastError());
+                    SS_LOG_ERROR(LOG_CATEGORY, L"MiniDumpWriteDump failed: %lu", GetLastError());
                 }
             }
 
         } catch (const std::exception& e) {
             if (g_crashRecursionDepth == 0) {
-                Logger::Error("CrashHandler::CreateDump: {}", e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"CreateDump: %hs", e.what());
             }
         }
 
@@ -1179,7 +1183,7 @@ public:
             );
 
             if (!hProcess) {
-                Logger::Error("CrashHandler: Failed to open process {}", processId);
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open process %u", processId);
                 return info;
             }
 
@@ -1229,7 +1233,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler::CreateProcessDump: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"CreateProcessDump: %hs", e.what());
         }
 
         return info;
@@ -1245,7 +1249,7 @@ public:
             
             // Verify dump directory is not a symlink/junction (security check)
             if (fs::is_symlink(m_config.dumpDirectory)) {
-                Logger::Warn("CrashHandler: Dump directory is a symlink - rejecting for security");
+                SS_LOG_WARN(LOG_CATEGORY, L"Dump directory is a symlink - rejecting for security");
                 return dumps;
             }
 
@@ -1253,7 +1257,7 @@ public:
             for (const auto& entry : fs::directory_iterator(m_config.dumpDirectory)) {
                 // DoS prevention: limit iteration count
                 if (++iterationCount > MAX_DIR_ITERATION_COUNT) {
-                    Logger::Warn("CrashHandler: Directory iteration limit reached");
+                    SS_LOG_WARN(LOG_CATEGORY, L"Directory iteration limit reached");
                     break;
                 }
                 
@@ -1284,7 +1288,7 @@ public:
                 });
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler::GetDumpFiles: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetDumpFiles: %hs", e.what());
         }
 
         return dumps;
@@ -1329,11 +1333,11 @@ public:
             }
 
             if (deleted > 0) {
-                Logger::Info("CrashHandler: Cleaned up {} old dump files", deleted);
+                SS_LOG_INFO(LOG_CATEGORY, L"Cleaned up %u old dump files", deleted);
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler::CleanupOldDumps: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"CleanupOldDumps: %hs", e.what());
         }
 
         return deleted;
@@ -1480,7 +1484,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler::AnalyzeException: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeException: %hs", e.what());
         }
 
         return context;
@@ -1565,7 +1569,7 @@ public:
     void RegisterWatchdog(uint32_t watchdogProcessId) {
         std::unique_lock lock(m_mutex);
         m_watchdogPid = watchdogProcessId;
-        Logger::Info("CrashHandler: Registered watchdog PID {}", watchdogProcessId);
+        SS_LOG_INFO(LOG_CATEGORY, L"Registered watchdog PID %u", watchdogProcessId);
     }
 
     void SendHeartbeat() {
@@ -1577,7 +1581,7 @@ public:
         if (m_watchdogPid == 0) return;
 
         // Simplified - would send restart notification to watchdog
-        Logger::Info("CrashHandler: Notifying watchdog of restart");
+        SS_LOG_INFO(LOG_CATEGORY, L"Notifying watchdog of restart");
     }
 
     // ========================================================================
@@ -1609,7 +1613,7 @@ public:
     // ========================================================================
 
     [[noreturn]] void TriggerCrash(ExceptionType type) {
-        Logger::Warn("CrashHandler: Triggering simulated crash (type: {})",
+        SS_LOG_WARN(LOG_CATEGORY, L"Triggering simulated crash (type: %d)",
             static_cast<int>(type));
 
         switch (type) {
@@ -1674,7 +1678,7 @@ public:
     }
 
     [[noreturn]] void TriggerAssertion(const char* expression, const char* file, int line) {
-        Logger::Critical("ASSERTION FAILED: {} at {}:{}", expression, file, line);
+        SS_LOG_FATAL(LOG_CATEGORY, L"ASSERTION FAILED: %hs at %hs:%d", expression, file, line);
 
         // Create crash context
         CrashContext context;
@@ -1698,12 +1702,12 @@ public:
 
     void DisableHandling() noexcept {
         m_handlingEnabled.store(false, std::memory_order_release);
-        Logger::Info("CrashHandler: Crash handling disabled");
+        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling disabled");
     }
 
     void EnableHandling() noexcept {
         m_handlingEnabled.store(true, std::memory_order_release);
-        Logger::Info("CrashHandler: Crash handling enabled");
+        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling enabled");
     }
 
     bool IsHandlingEnabled() const noexcept {
@@ -1744,7 +1748,7 @@ private:
         signal(SIGILL, SignalHandler);
         signal(SIGSEGV, SignalHandler);
 
-        Logger::Info("CrashHandler: Exception handlers installed");
+        SS_LOG_INFO(LOG_CATEGORY, L"Exception handlers installed");
     }
 
     void UninstallHandlers() noexcept {
@@ -1958,8 +1962,8 @@ private:
             if (g_inSignalHandler == 0 && g_crashRecursionDepth <= 1) {
                 // Only log on first crash handling attempt, not during recursion
                 __try {
-                    Logger::Critical("CRASH DETECTED: {} at 0x{:X}",
-                        Utils::StringUtils::WideToUtf8(context.exceptionDescription),
+                    SS_LOG_FATAL(LOG_CATEGORY, L"CRASH DETECTED: %ls at 0x%llX",
+                        context.exceptionDescription.c_str(),
                         context.exceptionAddress);
                 }
                 __except (EXCEPTION_EXECUTE_HANDLER) {
@@ -2120,7 +2124,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CrashHandler::CaptureStackTraceFromContext: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"CaptureStackTraceFromContext: %hs", e.what());
         }
 
         return frames;
