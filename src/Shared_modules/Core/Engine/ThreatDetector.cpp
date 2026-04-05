@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -86,6 +86,7 @@
 #include <map>
 #include <set>
 #include <deque>
+#include <filesystem>
 #include <Windows.h>
 
 namespace ShadowStrike {
@@ -265,10 +266,10 @@ struct ThreatDetector::Impl {
             // Check whitelist
             if (m_whitelist) {
                 if (!event.processPath.empty()) {
-                    event.isWhitelisted = m_whitelist->IsWhitelisted(fs::path(event.processPath));
+                    event.isWhitelisted = m_whitelist->IsWhitelisted(std::filesystem::path(event.processPath));
                 }
                 if (!event.isWhitelisted && !event.targetPath.empty()) {
-                    event.isWhitelisted = m_whitelist->IsWhitelisted(fs::path(event.targetPath));
+                    event.isWhitelisted = m_whitelist->IsWhitelisted(std::filesystem::path(event.targetPath));
                 }
                 if (!event.isWhitelisted && !event.fileHash.empty()) {
                     event.isWhitelisted = m_whitelist->IsHashWhitelisted(event.fileHash);
@@ -277,7 +278,7 @@ struct ThreatDetector::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"ThreatDetector: Event enrichment failed - {}",
-                                Utils::StringUtils::Utf8ToWide(e.what()));
+                                Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -374,8 +375,8 @@ struct ThreatDetector::Impl {
         // Populate threat context
         verdict.context.eventType = GetEventTypeName(event.eventType);
         verdict.context.eventCategory = GetEventCategoryName(event.category);
-        verdict.context.processName = fs::path(event.processPath).filename().wstring();
-        verdict.context.targetName = fs::path(event.targetPath).filename().wstring();
+        verdict.context.processName = std::filesystem::path(event.processPath).filename().wstring();
+        verdict.context.targetName = std::filesystem::path(event.targetPath).filename().wstring();
 
         return verdict;
     }
@@ -394,6 +395,14 @@ struct ThreatDetector::Impl {
                 return ThreatDetectorConstants::THREATINTEL_WEIGHT;
             case DetectionSource::MachineLearning:
                 return ThreatDetectorConstants::ML_WEIGHT;
+            case DetectionSource::PackerDetection:
+                return 1.0;
+            case DetectionSource::PolymorphicDetection:
+                return 1.3;
+            case DetectionSource::ZeroDayDetection:
+                return 1.8;
+            case DetectionSource::SandboxAnalysis:
+                return 1.5;
             default:
                 return 0.5;
         }
@@ -486,7 +495,7 @@ struct ThreatDetector::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"ThreatDetector: Attack chain correlation failed - {}",
-                                Utils::StringUtils::Utf8ToWide(e.what()));
+                                Utils::StringUtils::ToWide(e.what()));
         }
     }
 };
@@ -514,12 +523,12 @@ bool ThreatDetector::HasInstance() noexcept {
 ThreatDetector::ThreatDetector()
     : m_impl(std::make_unique<Impl>())
 {
-    Utils::Logger::Info(L"ThreatDetector: Constructor called");
+    SS_LOG_INFO(L"ThreatDetector", L"Constructor called");
 }
 
 ThreatDetector::~ThreatDetector() {
     Shutdown();
-    Utils::Logger::Info(L"ThreatDetector: Destructor called");
+    SS_LOG_INFO(L"ThreatDetector", L"Destructor called");
 }
 
 bool ThreatDetector::Initialize(
@@ -539,12 +548,12 @@ bool ThreatDetector::Initialize(
 
         // Validate configuration
         if (!config.enabled) {
-            Utils::Logger::Info(L"ThreatDetector: Disabled via configuration");
+            SS_LOG_INFO(L"ThreatDetector", L"Disabled via configuration");
             return false;
         }
 
         if (!threadPool) {
-            Utils::Logger::Error(L"ThreatDetector: Thread pool is required");
+            SS_LOG_ERROR(L"ThreatDetector", L"Thread pool is required");
             return false;
         }
 
@@ -556,13 +565,13 @@ bool ThreatDetector::Initialize(
         m_impl->m_status.store(ThreatDetectorStatus::Initialized, std::memory_order_release);
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"ThreatDetector: Initialized successfully");
+        SS_LOG_INFO(L"ThreatDetector", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
         m_impl->m_status.store(ThreatDetectorStatus::Error, std::memory_order_release);
         Utils::Logger::Error(L"ThreatDetector: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -621,11 +630,11 @@ void ThreatDetector::Shutdown() {
         m_impl->m_status.store(ThreatDetectorStatus::Stopped, std::memory_order_release);
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"ThreatDetector: Shutdown complete");
+        SS_LOG_INFO(L"ThreatDetector", L"Shutdown complete");
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -633,7 +642,7 @@ bool ThreatDetector::Start() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Error(L"ThreatDetector: Not initialized");
+        SS_LOG_ERROR(L"ThreatDetector", L"Not initialized");
         return false;
     }
 
@@ -646,13 +655,13 @@ bool ThreatDetector::Start() {
         m_impl->m_running.store(true, std::memory_order_release);
         m_impl->m_status.store(ThreatDetectorStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"ThreatDetector: Started successfully");
+        SS_LOG_INFO(L"ThreatDetector", L"Started successfully");
         return true;
 
     } catch (const std::exception& e) {
         m_impl->m_status.store(ThreatDetectorStatus::Error, std::memory_order_release);
         Utils::Logger::Error(L"ThreatDetector: Start failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -667,11 +676,11 @@ void ThreatDetector::Stop() {
         m_impl->m_running.store(false, std::memory_order_release);
         m_impl->m_status.store(ThreatDetectorStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"ThreatDetector: Stopped");
+        SS_LOG_INFO(L"ThreatDetector", L"Stopped");
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Stop error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -742,7 +751,7 @@ bool ThreatDetector::SubmitEvent(SystemEvent event) {
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
         Utils::Logger::Error(L"ThreatDetector: Event submission failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -816,6 +825,46 @@ std::optional<ThreatVerdict> ThreatDetector::AnalyzeEvent(const SystemEvent& eve
             }
         }
 
+        // EmulationEngine
+        if (m_impl->m_emulationEngine && m_impl->m_config.enableEmulationEngine) {
+            auto emulationResult = AnalyzeWithEmulationEngine(enrichedEvent);
+            if (emulationResult.has_value()) {
+                detections.push_back(emulationResult.value());
+            }
+        }
+
+        // PackerUnpacker
+        if (m_impl->m_packerUnpacker && m_impl->m_config.enablePackerDetection) {
+            auto packerResult = AnalyzeWithPackerUnpacker(enrichedEvent);
+            if (packerResult.has_value()) {
+                detections.push_back(packerResult.value());
+            }
+        }
+
+        // PolymorphicDetector
+        if (m_impl->m_polymorphicDetector && m_impl->m_config.enablePolymorphicDetection) {
+            auto polymorphicResult = AnalyzeWithPolymorphicDetector(enrichedEvent);
+            if (polymorphicResult.has_value()) {
+                detections.push_back(polymorphicResult.value());
+            }
+        }
+
+        // ZeroDayDetector
+        if (m_impl->m_zeroDayDetector && m_impl->m_config.enableZeroDayDetection) {
+            auto zeroDayResult = AnalyzeWithZeroDayDetector(enrichedEvent);
+            if (zeroDayResult.has_value()) {
+                detections.push_back(zeroDayResult.value());
+            }
+        }
+
+        // SandboxAnalyzer
+        if (m_impl->m_sandboxAnalyzer && m_impl->m_config.enableSandboxAnalysis) {
+            auto sandboxResult = AnalyzeWithSandboxAnalyzer(enrichedEvent);
+            if (sandboxResult.has_value()) {
+                detections.push_back(sandboxResult.value());
+            }
+        }
+
         // Aggregate verdicts
         if (!detections.empty()) {
             auto verdict = m_impl->AggregateEngineDetections(enrichedEvent, detections);
@@ -846,7 +895,7 @@ std::optional<ThreatVerdict> ThreatDetector::AnalyzeEvent(const SystemEvent& eve
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Event analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -899,7 +948,7 @@ void ThreatDetector::ProcessEventInternal(const SystemEvent& event) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Internal event processing failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -949,7 +998,7 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithBehaviorEngine(const S
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Behavior engine analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -961,7 +1010,7 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithHeuristicEngine(const 
             return std::nullopt;
         }
 
-        auto result = m_impl->m_heuristicAnalyzer->AnalyzeFile(fs::path(event.targetPath));
+        auto result = m_impl->m_heuristicAnalyzer->AnalyzeFile(std::filesystem::path(event.targetPath));
 
         if (result.riskScore >= 50.0) {
             EngineDetection detection;
@@ -973,7 +1022,7 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithHeuristicEngine(const 
             // Add indicators as MITRE techniques
             for (const auto& indicator : result.indicators) {
                 if (!indicator.category.empty()) {
-                    detection.mitreTechniques.push_back(Utils::StringUtils::WideToUtf8(indicator.category));
+                    detection.mitreTechniques.push_back(Utils::StringUtils::ToNarrow(indicator.category));
                 }
             }
 
@@ -984,7 +1033,7 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithHeuristicEngine(const 
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Heuristic engine analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return std::nullopt;
     }
 }
@@ -996,38 +1045,77 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithSignatureEngine(const 
             return std::nullopt;
         }
 
-        // Simplified signature check (real implementation would use SignatureStore)
-        // For now, just demonstrate the pattern
+        // Query signature store for hash match
+        if (!m_impl->m_signatureStore) {
+            return std::nullopt;
+        }
 
-        EngineDetection detection;
-        detection.source = DetectionSource::SignatureEngine;
-        detection.confidence = 100.0;
-        detection.category = ThreatCategory::Malware;
-        detection.description = L"File hash matches known malware signature";
+        auto result = m_impl->m_signatureStore->CheckHash(event.fileHash);
+        if (result.has_value() && result->isMalicious) {
+            EngineDetection detection;
+            detection.source = DetectionSource::SignatureEngine;
+            detection.confidence = 100.0;
+            detection.category = result->category;
+            detection.description = L"File hash matches known malware signature: " + Utils::StringUtils::ToWide(result->signatureName);
+            detection.mitreTechniques = result->mitreTechniques;
+            return detection;
+        }
 
-        return std::nullopt;  // Return nullopt for now (no signature match in demo)
+        return std::nullopt;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreatDetector: Signature engine analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreatDetector", L"Signature engine analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
         return std::nullopt;
     }
 }
 
 std::optional<EngineDetection> ThreatDetector::AnalyzeWithThreatIntel(const SystemEvent& event) {
     try {
-        // Check IOCs (IP addresses, domains, file hashes)
-        EngineDetection detection;
-        detection.source = DetectionSource::ThreatIntel;
-        detection.confidence = 90.0;
-        detection.category = ThreatCategory::Malware;
-        detection.description = L"Threat intelligence match";
+        if (!m_impl->m_threatIntel) {
+            return std::nullopt;
+        }
 
-        return std::nullopt;  // Return nullopt for now (no IOC match in demo)
+        // Check file hash, IP addresses, domains against threat intel
+        ThreatIntel::IOC ioc;
+        
+        // Check file hash
+        if (!event.fileHash.empty()) {
+            ioc.type = ThreatIntel::IOCType::FileHash;
+            ioc.value = event.fileHash;
+            auto result = m_impl->m_threatIntel->CheckIOC(ioc);
+            if (result.has_value() && result->isMalicious) {
+                EngineDetection detection;
+                detection.source = DetectionSource::ThreatIntel;
+                detection.confidence = result->confidence;
+                detection.category = result->category;
+                detection.description = L"Threat intelligence match: " + Utils::StringUtils::ToWide(result->description);
+                detection.mitreTechniques = result->techniques;
+                return detection;
+            }
+        }
+
+        // Check network indicators
+        if (!event.remoteAddress.empty()) {
+            ioc.type = ThreatIntel::IOCType::IPAddress;
+            ioc.value = event.remoteAddress;
+            auto result = m_impl->m_threatIntel->CheckIOC(ioc);
+            if (result.has_value() && result->isMalicious) {
+                EngineDetection detection;
+                detection.source = DetectionSource::ThreatIntel;
+                detection.confidence = result->confidence;
+                detection.category = result->category;
+                detection.description = L"Malicious IP detected: " + Utils::StringUtils::ToWide(event.remoteAddress);
+                detection.mitreTechniques = result->techniques;
+                return detection;
+            }
+        }
+
+        return std::nullopt;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreatDetector: Threat intel analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreatDetector", L"Threat intel analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
         return std::nullopt;
     }
 }
@@ -1039,7 +1127,7 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithMLEngine(const SystemE
             return std::nullopt;
         }
 
-        auto result = m_impl->m_mlDetector->Analyze(fs::path(event.targetPath));
+        auto result = m_impl->m_mlDetector->Analyze(std::filesystem::path(event.targetPath));
 
         if (result.isMalicious) {
             EngineDetection detection;
@@ -1054,8 +1142,158 @@ std::optional<EngineDetection> ThreatDetector::AnalyzeWithMLEngine(const SystemE
         return std::nullopt;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ThreatDetector: ML engine analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreatDetector", L"ML engine analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
+        return std::nullopt;
+    }
+}
+
+std::optional<EngineDetection> ThreatDetector::AnalyzeWithEmulationEngine(const SystemEvent& event) {
+    try {
+        // Only analyze file events for emulation
+        if (event.category != EventCategory::File || event.targetPath.empty()) {
+            return std::nullopt;
+        }
+
+        auto result = m_impl->m_emulationEngine->EmulateFile(std::filesystem::path(event.targetPath));
+        
+        if (result.isMalicious) {
+            EngineDetection detection;
+            detection.source = DetectionSource::EmulationEngine;
+            detection.confidence = result.confidence;
+            detection.category = result.category;
+            detection.description = L"Emulation detected malicious behavior: " + Utils::StringUtils::ToWide(result.description);
+            detection.mitreTechniques = result.techniques;
+            
+            return detection;
+        }
+
+        return std::nullopt;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"ThreatDetector", L"Emulation engine analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
+        return std::nullopt;
+    }
+}
+
+std::optional<EngineDetection> ThreatDetector::AnalyzeWithPackerUnpacker(const SystemEvent& event) {
+    try {
+        // Only analyze file events
+        if (event.category != EventCategory::File || event.targetPath.empty()) {
+            return std::nullopt;
+        }
+
+        auto result = m_impl->m_packerUnpacker->AnalyzeFile(std::filesystem::path(event.targetPath));
+        
+        if (result.isPacked && result.riskScore >= 50.0) {
+            EngineDetection detection;
+            detection.source = DetectionSource::PackerDetection;
+            detection.confidence = result.riskScore;
+            detection.category = ThreatCategory::Malware;
+            detection.description = L"Packed executable detected: " + Utils::StringUtils::ToWide(result.packerName);
+            
+            // Map packing techniques to MITRE
+            if (!result.packerName.empty()) {
+                detection.mitreTechniques.push_back("T1027");  // Obfuscated Files or Information
+            }
+            
+            return detection;
+        }
+
+        return std::nullopt;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"ThreatDetector", L"Packer analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
+        return std::nullopt;
+    }
+}
+
+std::optional<EngineDetection> ThreatDetector::AnalyzeWithPolymorphicDetector(const SystemEvent& event) {
+    try {
+        // Only analyze file events
+        if (event.category != EventCategory::File || event.targetPath.empty()) {
+            return std::nullopt;
+        }
+
+        auto result = m_impl->m_polymorphicDetector->AnalyzeFile(std::filesystem::path(event.targetPath));
+        
+        if (result.isPolymorphic && result.confidence >= 70.0) {
+            EngineDetection detection;
+            detection.source = DetectionSource::PolymorphicDetection;
+            detection.confidence = result.confidence;
+            detection.category = ThreatCategory::Malware;
+            detection.description = L"Polymorphic malware detected: " + Utils::StringUtils::ToWide(result.technique);
+            
+            // Map polymorphic techniques to MITRE
+            detection.mitreTechniques.push_back("T1027.002");  // Polymorphic Code
+            if (result.hasCodeCaves) {
+                detection.mitreTechniques.push_back("T1055");  // Process Injection
+            }
+            
+            return detection;
+        }
+
+        return std::nullopt;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"ThreatDetector", L"Polymorphic detector analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
+        return std::nullopt;
+    }
+}
+
+std::optional<EngineDetection> ThreatDetector::AnalyzeWithZeroDayDetector(const SystemEvent& event) {
+    try {
+        // Analyze both file and behavior events
+        auto result = m_impl->m_zeroDayDetector->AnalyzeEvent(event);
+        
+        if (result.isZeroDay && result.confidence >= 80.0) {
+            EngineDetection detection;
+            detection.source = DetectionSource::ZeroDayDetection;
+            detection.confidence = result.confidence;
+            detection.category = ThreatCategory::ZeroDay;
+            detection.description = L"Zero-day exploit detected: " + Utils::StringUtils::ToWide(result.exploitType);
+            detection.mitreTechniques = result.techniques;
+            
+            return detection;
+        }
+
+        return std::nullopt;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"ThreatDetector", L"Zero-day detector analysis failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
+        return std::nullopt;
+    }
+}
+
+std::optional<EngineDetection> ThreatDetector::AnalyzeWithSandboxAnalyzer(const SystemEvent& event) {
+    try {
+        // Only analyze file events for sandboxing
+        if (event.category != EventCategory::File || event.targetPath.empty()) {
+            return std::nullopt;
+        }
+
+        auto result = m_impl->m_sandboxAnalyzer->AnalyzeFile(std::filesystem::path(event.targetPath));
+        
+        if (result.isMalicious && result.riskScore >= 60.0) {
+            EngineDetection detection;
+            detection.source = DetectionSource::SandboxAnalysis;
+            detection.confidence = result.riskScore;
+            detection.category = result.category;
+            detection.description = L"Sandbox analysis detected malicious behavior";
+            detection.mitreTechniques = result.techniques;
+            
+            return detection;
+        }
+
+        return std::nullopt;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"ThreatDetector", L"Sandbox analyzer failed - %ls",
+                    Utils::StringUtils::ToWide(e.what()).c_str());
         return std::nullopt;
     }
 }
@@ -1301,18 +1539,18 @@ bool ThreatDetector::AddRule(const DetectionRule& rule) {
 
         if (m_impl->m_rules.count(rule.ruleId) > 0) {
             Utils::Logger::Warn(L"ThreatDetector: Rule already exists - {}",
-                              Utils::StringUtils::Utf8ToWide(rule.ruleId));
+                              Utils::StringUtils::ToWide(rule.ruleId));
             return false;
         }
 
         m_impl->m_rules[rule.ruleId] = rule;
         Utils::Logger::Info(L"ThreatDetector: Rule added - {}",
-                          Utils::StringUtils::Utf8ToWide(rule.ruleId));
+                          Utils::StringUtils::ToWide(rule.ruleId));
         return true;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Failed to add rule - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1323,7 +1561,7 @@ bool ThreatDetector::RemoveRule(const std::string& ruleId) {
     auto removed = m_impl->m_rules.erase(ruleId);
     if (removed > 0) {
         Utils::Logger::Info(L"ThreatDetector: Rule removed - {}",
-                          Utils::StringUtils::Utf8ToWide(ruleId));
+                          Utils::StringUtils::ToWide(ruleId));
         return true;
     }
 
@@ -1419,7 +1657,7 @@ bool ThreatDetector::ExecuteAction(uint64_t verdictId, ResponseAction action) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Action execution failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1441,7 +1679,7 @@ void ThreatDetector::ReportFalsePositive(uint64_t verdictId, const std::wstring&
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Failed to report false positive - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1499,61 +1737,61 @@ void ThreatDetector::UnregisterAllCallbacks() {
 void ThreatDetector::SetBehaviorAnalyzer(BehaviorAnalyzer* analyzer) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_behaviorAnalyzer = analyzer;
-    Utils::Logger::Info(L"ThreatDetector: BehaviorAnalyzer registered");
+    SS_LOG_INFO(L"ThreatDetector", L"BehaviorAnalyzer registered");
 }
 
 void ThreatDetector::SetHeuristicAnalyzer(HeuristicAnalyzer* analyzer) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_heuristicAnalyzer = analyzer;
-    Utils::Logger::Info(L"ThreatDetector: HeuristicAnalyzer registered");
+    SS_LOG_INFO(L"ThreatDetector", L"HeuristicAnalyzer registered");
 }
 
 void ThreatDetector::SetEmulationEngine(EmulationEngine* engine) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_emulationEngine = engine;
-    Utils::Logger::Info(L"ThreatDetector: EmulationEngine registered");
+    SS_LOG_INFO(L"ThreatDetector", L"EmulationEngine registered");
 }
 
 void ThreatDetector::SetSignatureStore(SignatureStore::SignatureStore* store) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_signatureStore = store;
-    Utils::Logger::Info(L"ThreatDetector: SignatureStore registered");
+    SS_LOG_INFO(L"ThreatDetector", L"SignatureStore registered");
 }
 
 void ThreatDetector::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_threatIntel = store;
-    Utils::Logger::Info(L"ThreatDetector: ThreatIntelStore registered");
+    SS_LOG_INFO(L"ThreatDetector", L"ThreatIntelStore registered");
 }
 
 void ThreatDetector::SetMachineLearningDetector(MachineLearningDetector* detector) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_mlDetector = detector;
-    Utils::Logger::Info(L"ThreatDetector: MachineLearningDetector registered");
+    SS_LOG_INFO(L"ThreatDetector", L"MachineLearningDetector registered");
 }
 
 void ThreatDetector::SetPackerUnpacker(PackerUnpacker* unpacker) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_packerUnpacker = unpacker;
-    Utils::Logger::Info(L"ThreatDetector: PackerUnpacker registered");
+    SS_LOG_INFO(L"ThreatDetector", L"PackerUnpacker registered");
 }
 
 void ThreatDetector::SetPolymorphicDetector(PolymorphicDetector* detector) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_polymorphicDetector = detector;
-    Utils::Logger::Info(L"ThreatDetector: PolymorphicDetector registered");
+    SS_LOG_INFO(L"ThreatDetector", L"PolymorphicDetector registered");
 }
 
 void ThreatDetector::SetZeroDayDetector(ZeroDayDetector* detector) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_zeroDayDetector = detector;
-    Utils::Logger::Info(L"ThreatDetector: ZeroDayDetector registered");
+    SS_LOG_INFO(L"ThreatDetector", L"ZeroDayDetector registered");
 }
 
 void ThreatDetector::SetSandboxAnalyzer(SandboxAnalyzer* analyzer) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_sandboxAnalyzer = analyzer;
-    Utils::Logger::Info(L"ThreatDetector: SandboxAnalyzer registered");
+    SS_LOG_INFO(L"ThreatDetector", L"SandboxAnalyzer registered");
 }
 
 // ============================================================================
@@ -1568,7 +1806,7 @@ ThreatDetectorConfig ThreatDetector::GetConfiguration() const {
 void ThreatDetector::SetConfiguration(const ThreatDetectorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"ThreatDetector: Configuration updated");
+    SS_LOG_INFO(L"ThreatDetector", L"Configuration updated");
 }
 
 ThreatDetectorStatistics ThreatDetector::GetStatistics() const {
@@ -1577,7 +1815,7 @@ ThreatDetectorStatistics ThreatDetector::GetStatistics() const {
 
 void ThreatDetector::ResetStatistics() {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"ThreatDetector: Statistics reset");
+    SS_LOG_INFO(L"ThreatDetector", L"Statistics reset");
 }
 
 size_t ThreatDetector::GetQueueSize() const noexcept {
@@ -1591,7 +1829,7 @@ size_t ThreatDetector::GetQueueSize() const noexcept {
 
 bool ThreatDetector::SelfTest() {
     try {
-        Utils::Logger::Info(L"ThreatDetector: Starting self-test");
+        SS_LOG_INFO(L"ThreatDetector", L"Starting self-test");
 
         // Test event submission
         SystemEvent testEvent;
@@ -1603,16 +1841,16 @@ bool ThreatDetector::SelfTest() {
 
         bool result = SubmitEvent(testEvent);
         if (!result && !IsRunning()) {
-            Utils::Logger::Info(L"ThreatDetector: Self-test passed (not running, expected behavior)");
+            SS_LOG_INFO(L"ThreatDetector", L"Self-test passed (not running, expected behavior)");
             return true;
         }
 
-        Utils::Logger::Info(L"ThreatDetector: Self-test passed");
+        SS_LOG_INFO(L"ThreatDetector", L"Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ThreatDetector: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }

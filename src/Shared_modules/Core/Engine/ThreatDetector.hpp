@@ -643,7 +643,16 @@ enum class ThreatCategory : uint8_t {
     HackTool = 21,
     
     /// @brief Suspicious behavior
-    SuspiciousBehavior = 22
+    SuspiciousBehavior = 22,
+    
+    /// @brief Supply chain attack
+    SupplyChain = 23,
+    
+    /// @brief Zero-day exploit
+    ZeroDay = 24,
+    
+    /// @brief Policy violation (not necessarily malicious)
+    PolicyViolation = 25
 };
 
 /**
@@ -660,7 +669,11 @@ enum class DetectionSource : uint8_t {
     YARARule = 7,
     ManualRule = 8,
     Correlation = 9,
-    UserReport = 10
+    UserReport = 10,
+    PackerDetection = 11,
+    PolymorphicDetection = 12,
+    ZeroDayDetection = 13,
+    SandboxAnalysis = 14
 };
 
 /**
@@ -1318,6 +1331,30 @@ struct ThreatDetectorConfig {
     
     /// @brief Enable emulation engine
     bool enableEmulationEngine = true;
+    
+    /// @brief Enable machine learning detection
+    bool enableMLDetection = true;
+    
+    /// @brief Enable packer detection
+    bool enablePackerDetection = true;
+    
+    /// @brief Enable polymorphic detection
+    bool enablePolymorphicDetection = true;
+    
+    /// @brief Enable zero-day detection
+    bool enableZeroDayDetection = true;
+    
+    /// @brief Enable sandbox analysis
+    bool enableSandboxAnalysis = true;
+    
+    /// @brief Enable signature matching
+    bool enableSignatureMatching = true;
+    
+    /// @brief Enable behavior analysis
+    bool enableBehaviorAnalysis = true;
+    
+    /// @brief Enable heuristic analysis
+    bool enableHeuristicAnalysis = true;
     
     /// @brief Enable ThreatIntel correlation
     bool enableThreatIntel = true;
@@ -1996,6 +2033,20 @@ private:
      * @brief Apply custom rules.
      */
     void ApplyRules(const SystemEvent& event, std::vector<EngineDetection>& detections);
+
+    /**
+     * @brief Engine Analysis Methods.
+     */
+    std::optional<EngineDetection> AnalyzeWithBehaviorEngine(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithHeuristicEngine(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithSignatureEngine(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithThreatIntel(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithMLEngine(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithEmulationEngine(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithPackerUnpacker(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithPolymorphicDetector(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithZeroDayDetector(const SystemEvent& event);
+    std::optional<EngineDetection> AnalyzeWithSandboxAnalyzer(const SystemEvent& event);
 
     /**
      * @brief Check whitelist.
