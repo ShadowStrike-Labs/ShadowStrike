@@ -101,8 +101,8 @@ class ThreatFoxFeed(BaseFeed):
                 ),
             )
 
-            # If the IOC is a file hash, also record it in downloads table
-            if ioc_type in ("md5_hash", "sha256_hash") and len(ioc_value) == 64:
+            # If the IOC is a SHA-256 file hash, cross-reference in downloads table
+            if ioc_type == "sha256_hash" and len(ioc_value) == 64:
                 if not self._tracker.has_download(ioc_value, self.get_feed_name()):
                     self._tracker.record_download(
                         ioc_value,

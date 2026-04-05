@@ -560,6 +560,9 @@ class PhantomCortexPipeline:
             self._run_steps(steps)
         finally:
             self._lock.release()
+
+        all_ok = all(r.success for r in self._results)
+        if all_ok and not self._interrupted:
             _clear_checkpoint()
 
         self._print_summary()
