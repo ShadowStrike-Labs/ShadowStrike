@@ -403,13 +403,13 @@ public:
             m_config = config;
             m_initialized = true;
 
-            Logger::Info("P2PMonitor initialized (policy={}, detectBT={}, detectDHT={})",
+            SS_LOG_INFO(L"Network", L"P2PMonitor initialized (policy={}, detectBT={}, detectDHT={})",
                 static_cast<int>(config.policy), config.detectBitTorrent, config.detectDHT);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("P2PMonitor initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor initialization failed: {}", e.what());
             return false;
         }
     }
@@ -419,12 +419,12 @@ public:
 
         try {
             if (!m_initialized) {
-                Logger::Error("P2PMonitor: Cannot start - not initialized");
+                SS_LOG_ERROR(L"Network", L"P2PMonitor: Cannot start - not initialized");
                 return false;
             }
 
             if (m_running) {
-                Logger::Warn("P2PMonitor: Already running");
+                SS_LOG_WARN(L"Network", L"P2PMonitor: Already running");
                 return true;
             }
 
@@ -433,11 +433,11 @@ public:
             // Start monitoring thread
             m_monitorThread = std::thread([this]() { MonitoringLoop(); });
 
-            Logger::Info("P2PMonitor started");
+            SS_LOG_INFO(L"Network", L"P2PMonitor started");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("P2PMonitor start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor start failed: {}", e.what());
             m_running = false;
             return false;
         }
@@ -460,10 +460,10 @@ public:
                 m_monitorThread.join();
             }
 
-            Logger::Info("P2PMonitor stopped");
+            SS_LOG_INFO(L"Network", L"P2PMonitor stopped");
 
         } catch (const std::exception& e) {
-            Logger::Error("P2PMonitor stop failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor stop failed: {}", e.what());
         }
     }
 
@@ -487,7 +487,7 @@ public:
 
             m_initialized = false;
 
-            Logger::Info("P2PMonitor shutdown complete");
+            SS_LOG_INFO(L"Network", L"P2PMonitor shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -519,7 +519,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("IsP2PTraffic - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"IsP2PTraffic - Exception: {}", e.what());
             return false;
         }
     }
@@ -536,7 +536,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetP2PConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetP2PConnections - Exception: {}", e.what());
         }
 
         return result;
@@ -555,7 +555,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetAllP2PConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetAllP2PConnections - Exception: {}", e.what());
         }
 
         return result;
@@ -619,7 +619,7 @@ public:
             return P2PProtocol::UNKNOWN;
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectProtocol - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectProtocol - Exception: {}", e.what());
             return P2PProtocol::UNKNOWN;
         }
     }
@@ -639,7 +639,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetActiveSwarms - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetActiveSwarms - Exception: {}", e.what());
         }
 
         return result;
@@ -655,7 +655,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetSwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetSwarm - Exception: {}", e.what());
         }
 
         return std::nullopt;
@@ -673,7 +673,7 @@ public:
             return GetSwarm(ih);
 
         } catch (const std::exception& e) {
-            Logger::Error("GetSwarm(hex) - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetSwarm(hex) - Exception: {}", e.what());
             return std::nullopt;
         }
     }
@@ -697,7 +697,7 @@ public:
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            Logger::Error("LookupTorrent - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"LookupTorrent - Exception: {}", e.what());
             return std::nullopt;
         }
     }
@@ -719,7 +719,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("IsKnownMalicious - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"IsKnownMalicious - Exception: {}", e.what());
             return false;
         }
     }
@@ -736,7 +736,7 @@ public:
             m_stats.maliciousTorrents++;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddMaliciousHash - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddMaliciousHash - Exception: {}", e.what());
         }
     }
 
@@ -754,7 +754,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetDHTInfo - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetDHTInfo - Exception: {}", e.what());
         }
 
         return std::nullopt;
@@ -811,7 +811,7 @@ public:
             NotifyDetection(conn);
 
         } catch (const std::exception& e) {
-            Logger::Error("FeedPacket - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FeedPacket - Exception: {}", e.what());
         }
     }
 
@@ -835,18 +835,18 @@ public:
             for (auto& [connId, conn] : m_connections) {
                 if (conn.processId == pid) {
                     // In production, would terminate actual network connections
-                    Logger::Info("Blocked P2P connection: pid={}, protocol={}",
+                    SS_LOG_INFO(L"Network", L"Blocked P2P connection: pid={}, protocol={}",
                         pid, static_cast<int>(conn.protocol));
                 }
             }
 
             m_stats.connectionsBlocked++;
-            Logger::Info("Blocked P2P for process: {}", pid);
+            SS_LOG_INFO(L"Network", L"Blocked P2P for process: {}", pid);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("BlockProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"BlockProcess - Exception: {}", e.what());
             return false;
         }
     }
@@ -856,11 +856,11 @@ public:
 
         try {
             m_blockedProcesses.erase(pid);
-            Logger::Info("Unblocked P2P for process: {}", pid);
+            SS_LOG_INFO(L"Network", L"Unblocked P2P for process: {}", pid);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("UnblockProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UnblockProcess - Exception: {}", e.what());
             return false;
         }
     }
@@ -871,14 +871,14 @@ public:
         try {
             m_throttledProcesses[pid] = limitBps;
 
-            Logger::Info("Throttled P2P for process {} to {} bytes/sec", pid, limitBps);
+            SS_LOG_INFO(L"Network", L"Throttled P2P for process {} to {} bytes/sec", pid, limitBps);
 
             m_stats.connectionsThrottled++;
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ThrottleProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ThrottleProcess - Exception: {}", e.what());
             return false;
         }
     }
@@ -886,7 +886,7 @@ public:
     void SetPolicy(P2PPolicy policy) {
         std::unique_lock lock(m_mutex);
         m_config.policy = policy;
-        Logger::Info("P2P policy changed to: {}", static_cast<int>(policy));
+        SS_LOG_INFO(L"Network", L"P2P policy changed to: {}", static_cast<int>(policy));
     }
 
     [[nodiscard]] P2PPolicy GetPolicy() const noexcept {
@@ -966,24 +966,24 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            Logger::Info("=== P2PMonitor Diagnostics ===");
-            Logger::Info("Initialized: {}", m_initialized);
-            Logger::Info("Running: {}", m_running);
-            Logger::Info("Active connections: {}", m_connections.size());
-            Logger::Info("Active swarms: {}", m_swarms.size());
-            Logger::Info("Tracked peers: {}", m_peers.size());
-            Logger::Info("DHT nodes: {}", m_dhtNodes.size());
-            Logger::Info("Malicious hashes: {}", m_maliciousHashes.size());
-            Logger::Info("Blocked processes: {}", m_blockedProcesses.size());
-            Logger::Info("Throttled processes: {}", m_throttledProcesses.size());
-            Logger::Info("Total P2P detected: {}", m_stats.p2pConnectionsDetected.load());
-            Logger::Info("BitTorrent connections: {}", m_stats.bittorrentConnections.load());
-            Logger::Info("Malicious torrents: {}", m_stats.maliciousTorrents.load());
+            SS_LOG_INFO(L"Network", L"=== P2PMonitor Diagnostics ===");
+            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
+            SS_LOG_INFO(L"Network", L"Running: {}", m_running);
+            SS_LOG_INFO(L"Network", L"Active connections: {}", m_connections.size());
+            SS_LOG_INFO(L"Network", L"Active swarms: {}", m_swarms.size());
+            SS_LOG_INFO(L"Network", L"Tracked peers: {}", m_peers.size());
+            SS_LOG_INFO(L"Network", L"DHT nodes: {}", m_dhtNodes.size());
+            SS_LOG_INFO(L"Network", L"Malicious hashes: {}", m_maliciousHashes.size());
+            SS_LOG_INFO(L"Network", L"Blocked processes: {}", m_blockedProcesses.size());
+            SS_LOG_INFO(L"Network", L"Throttled processes: {}", m_throttledProcesses.size());
+            SS_LOG_INFO(L"Network", L"Total P2P detected: {}", m_stats.p2pConnectionsDetected.load());
+            SS_LOG_INFO(L"Network", L"BitTorrent connections: {}", m_stats.bittorrentConnections.load());
+            SS_LOG_INFO(L"Network", L"Malicious torrents: {}", m_stats.maliciousTorrents.load());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
             return false;
         }
     }
@@ -993,11 +993,11 @@ public:
 
         try {
             // In production, would write comprehensive diagnostics to file
-            Logger::Info("Exported diagnostics to: {}", StringUtils::WideToUtf8(outputPath));
+            SS_LOG_INFO(L"Network", L"Exported diagnostics to: {}", StringUtils::WideToUtf8(outputPath));
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ExportDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
             return false;
         }
     }
@@ -1008,7 +1008,7 @@ private:
     // ========================================================================
 
     void MonitoringLoop() {
-        Logger::Info("P2PMonitor: Monitoring thread started");
+        SS_LOG_INFO(L"Network", L"P2PMonitor: Monitoring thread started");
 
         try {
             while (m_running) {
@@ -1025,10 +1025,10 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("P2PMonitor monitoring loop exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor monitoring loop exception: {}", e.what());
         }
 
-        Logger::Info("P2PMonitor: Monitoring thread stopped");
+        SS_LOG_INFO(L"Network", L"P2PMonitor: Monitoring thread stopped");
     }
 
     void CleanupStaleConnections() {
@@ -1051,7 +1051,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CleanupStaleConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CleanupStaleConnections - Exception: {}", e.what());
         }
     }
 
@@ -1077,7 +1077,7 @@ private:
             m_stats.activeSwarms = static_cast<uint32_t>(m_swarms.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("CleanupStaleSwarms - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CleanupStaleSwarms - Exception: {}", e.what());
         }
     }
 
@@ -1089,7 +1089,7 @@ private:
             m_stats.uniqueInfoHashes = static_cast<uint64_t>(m_swarms.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("UpdateStatistics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UpdateStatistics - Exception: {}", e.what());
         }
     }
 
@@ -1113,7 +1113,7 @@ private:
             NotifySwarm(swarm);
 
         } catch (const std::exception& e) {
-            Logger::Error("TrackSwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrackSwarm - Exception: {}", e.what());
         }
     }
 
@@ -1167,7 +1167,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("HandleMaliciousDetection - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"HandleMaliciousDetection - Exception: {}", e.what());
         }
     }
 
@@ -1193,7 +1193,7 @@ private:
             NotifyAlert(alert);
 
         } catch (const std::exception& e) {
-            Logger::Error("GenerateAlert - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GenerateAlert - Exception: {}", e.what());
         }
     }
 
@@ -1205,7 +1205,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyDetection - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyDetection - Exception: {}", e.what());
         }
     }
 
@@ -1217,7 +1217,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyAlert - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyAlert - Exception: {}", e.what());
         }
     }
 
@@ -1229,7 +1229,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifySwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifySwarm - Exception: {}", e.what());
         }
     }
 
@@ -1283,14 +1283,14 @@ P2PMonitor& P2PMonitor::Instance() {
 
 P2PMonitor::P2PMonitor()
     : m_impl(std::make_unique<P2PMonitorImpl>()) {
-    Logger::Info("P2PMonitor instance created");
+    SS_LOG_INFO(L"Network", L"P2PMonitor instance created");
 }
 
 P2PMonitor::~P2PMonitor() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("P2PMonitor instance destroyed");
+    SS_LOG_INFO(L"Network", L"P2PMonitor instance destroyed");
 }
 
 // ============================================================================

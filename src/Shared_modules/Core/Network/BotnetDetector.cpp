@@ -418,11 +418,11 @@ public:
 bool BotnetDetector::BotnetDetectorImpl::Initialize(const BotnetDetectorConfig& config) noexcept {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"BotnetDetector: Already initialized");
+            SS_LOG_WARN(L"Network", L"BotnetDetector: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"BotnetDetector: Initializing...");
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Initializing...");
 
         m_config = config;
 
@@ -435,12 +435,12 @@ bool BotnetDetector::BotnetDetectorImpl::Initialize(const BotnetDetectorConfig& 
         // Initialize default signatures
         InitializeDefaultSignatures();
 
-        Utils::Logger::Info(L"BotnetDetector: Initialized successfully with {} signatures",
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Initialized successfully with {} signatures",
                           m_signatures.size());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Initialization failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Initialization failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
@@ -453,7 +453,7 @@ void BotnetDetector::BotnetDetectorImpl::Shutdown() noexcept {
             return;
         }
 
-        Utils::Logger::Info(L"BotnetDetector: Shutting down...");
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Shutting down...");
 
         Stop();
 
@@ -486,30 +486,30 @@ void BotnetDetector::BotnetDetectorImpl::Shutdown() noexcept {
             m_familyCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"BotnetDetector: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"BotnetDetector: Exception during shutdown");
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Exception during shutdown");
     }
 }
 
 bool BotnetDetector::BotnetDetectorImpl::Start() noexcept {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Error(L"BotnetDetector: Not initialized");
+            SS_LOG_ERROR(L"Network", L"BotnetDetector: Not initialized");
             return false;
         }
 
         if (m_running.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"BotnetDetector: Already running");
+            SS_LOG_WARN(L"Network", L"BotnetDetector: Already running");
             return true;
         }
 
-        Utils::Logger::Info(L"BotnetDetector: Started");
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Start failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Start failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -517,7 +517,7 @@ bool BotnetDetector::BotnetDetectorImpl::Start() noexcept {
 
 void BotnetDetector::BotnetDetectorImpl::Stop() noexcept {
     if (m_running.exchange(false, std::memory_order_acq_rel)) {
-        Utils::Logger::Info(L"BotnetDetector: Stopped");
+        SS_LOG_INFO(L"Network", L"BotnetDetector: Stopped");
     }
 }
 
@@ -560,7 +560,7 @@ void BotnetDetector::BotnetDetectorImpl::InitializeDefaultSignatures() {
         m_signatures[meterpreter.signatureId] = meterpreter;
 
     } catch (...) {
-        Utils::Logger::Error(L"BotnetDetector: Failed to initialize default signatures");
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Failed to initialize default signatures");
     }
 }
 
@@ -619,7 +619,7 @@ void BotnetDetector::BotnetDetectorImpl::RecordConnectionEventInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Failed to record connection event - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Failed to record connection event - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -722,7 +722,7 @@ BeaconAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeBeaconingInternal(
             if (analysis.confidence >= m_config.beaconConfidenceThreshold) {
                 m_statistics.beaconingDetected.fetch_add(1, std::memory_order_relaxed);
 
-                Utils::Logger::Warn(L"BotnetDetector: Beaconing detected - PID: {}, IP: {}, "
+                SS_LOG_WARN(L"Network", L"BotnetDetector: Beaconing detected - PID: {}, IP: {}, "
                                   L"Avg Interval: {:.1f}ms, Jitter: {:.2f}%, Confidence: {:.2f}",
                                   pid, Utils::StringUtils::Utf8ToWide(remoteIP),
                                   avgInterval, analysis.jitterPercent, analysis.confidence);
@@ -733,7 +733,7 @@ BeaconAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeBeaconingInternal(
         analysis.beaconTimes = std::move(allTimestamps);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Beacon analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Beacon analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -888,14 +888,14 @@ DGAAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeDGAInternal(const std::st
         if (analysis.isDGA) {
             m_statistics.dgaDomainsDetected.fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Warn(L"BotnetDetector: DGA domain detected - Domain: {}, "
+            SS_LOG_WARN(L"Network", L"BotnetDetector: DGA domain detected - Domain: {}, "
                               L"Entropy: {:.2f}, Confidence: {:.2f}",
                               Utils::StringUtils::Utf8ToWide(domain),
                               analysis.entropy, analysis.confidence);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: DGA analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: DGA analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1068,7 +1068,7 @@ C2Detection BotnetDetector::BotnetDetectorImpl::DetectC2Internal(uint64_t connec
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: C2 detection failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: C2 detection failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1097,13 +1097,13 @@ C2Detection BotnetDetector::BotnetDetectorImpl::AnalyzePayloadForC2Internal(
                 detection.severity = sig.severity;
                 detection.matchedSignatures.push_back(sig.name);
 
-                Utils::Logger::Warn(L"BotnetDetector: C2 signature matched - {}",
+                SS_LOG_WARN(L"Network", L"BotnetDetector: C2 signature matched - {}",
                                   Utils::StringUtils::Utf8ToWide(sig.name));
             }
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Payload analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Payload analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1191,7 +1191,7 @@ std::pair<BotnetFamily, double> BotnetDetector::BotnetDetectorImpl::IdentifyFami
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Family identification failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Family identification failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1293,12 +1293,12 @@ P2PBotnetInfo BotnetDetector::BotnetDetectorImpl::DetectP2PBotnetInternal(uint32
 
             m_statistics.p2pBotnetsDetected.fetch_add(1, std::memory_order_relaxed);
 
-            Utils::Logger::Warn(L"BotnetDetector: P2P botnet detected - PID: {}, Unique Peers: {}",
+            SS_LOG_WARN(L"Network", L"BotnetDetector: P2P botnet detected - PID: {}, Unique Peers: {}",
                               pid, info.uniquePeerCount);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: P2P detection failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: P2P detection failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1388,7 +1388,7 @@ void BotnetDetector::BotnetDetectorImpl::GenerateAlert(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Failed to generate alert - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Failed to generate alert - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1419,11 +1419,11 @@ void BotnetDetector::BotnetDetectorImpl::PurgeOldConnectionsInternal(uint32_t ma
         }
 
         if (purged > 0) {
-            Utils::Logger::Debug(L"BotnetDetector: Purged {} old connections", purged);
+            SS_LOG_DEBUG(L"Network", L"BotnetDetector: Purged {} old connections", purged);
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"BotnetDetector: Connection purge failed - {}",
+        SS_LOG_ERROR(L"Network", L"BotnetDetector: Connection purge failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1441,14 +1441,14 @@ BotnetDetector& BotnetDetector::Instance() {
 BotnetDetector::BotnetDetector()
     : m_impl(std::make_unique<BotnetDetectorImpl>())
 {
-    Utils::Logger::Info(L"BotnetDetector: Constructor called");
+    SS_LOG_INFO(L"Network", L"BotnetDetector: Constructor called");
 }
 
 BotnetDetector::~BotnetDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"BotnetDetector: Destructor called");
+    SS_LOG_INFO(L"Network", L"BotnetDetector: Destructor called");
 }
 
 // Lifecycle
@@ -1690,7 +1690,7 @@ bool BotnetDetector::BlockConnection(uint64_t connectionId) {
     if (!m_impl) return false;
 
     m_impl->m_statistics.connectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-    Utils::Logger::Info(L"BotnetDetector: Connection {} blocked", connectionId);
+    SS_LOG_INFO(L"Network", L"BotnetDetector: Connection {} blocked", connectionId);
     return true;
 }
 
@@ -1698,7 +1698,7 @@ bool BotnetDetector::IsolateHost(const std::string& hostname) {
     if (!m_impl) return false;
 
     m_impl->m_statistics.hostsIsolated.fetch_add(1, std::memory_order_relaxed);
-    Utils::Logger::Warn(L"BotnetDetector: Host isolated - {}",
+    SS_LOG_WARN(L"Network", L"BotnetDetector: Host isolated - {}",
                        Utils::StringUtils::Utf8ToWide(hostname));
     return true;
 }
@@ -1707,7 +1707,7 @@ bool BotnetDetector::TerminateProcess(uint32_t pid, bool force) {
     if (!m_impl) return false;
 
     m_impl->m_statistics.processesTerminated.fetch_add(1, std::memory_order_relaxed);
-    Utils::Logger::Warn(L"BotnetDetector: Process {} terminated (force: {})", pid, force);
+    SS_LOG_WARN(L"Network", L"BotnetDetector: Process {} terminated (force: {})", pid, force);
     return true;
 }
 
@@ -1788,14 +1788,14 @@ void BotnetDetector::ResetStatistics() noexcept {
 bool BotnetDetector::PerformDiagnostics() const {
     if (!m_impl) return false;
 
-    Utils::Logger::Info(L"BotnetDetector: Diagnostics");
-    Utils::Logger::Info(L"  Initialized: {}", m_impl->m_initialized.load());
-    Utils::Logger::Info(L"  Running: {}", m_impl->m_running.load());
-    Utils::Logger::Info(L"  Active Connections: {}", m_impl->m_statistics.activeConnections.load());
-    Utils::Logger::Info(L"  Beaconing Detected: {}", m_impl->m_statistics.beaconingDetected.load());
-    Utils::Logger::Info(L"  DGA Domains: {}", m_impl->m_statistics.dgaDomainsDetected.load());
-    Utils::Logger::Info(L"  C2 Detected: {}", m_impl->m_statistics.c2Detected.load());
-    Utils::Logger::Info(L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
+    SS_LOG_INFO(L"Network", L"BotnetDetector: Diagnostics");
+    SS_LOG_INFO(L"Network", L"  Initialized: {}", m_impl->m_initialized.load());
+    SS_LOG_INFO(L"Network", L"  Running: {}", m_impl->m_running.load());
+    SS_LOG_INFO(L"Network", L"  Active Connections: {}", m_impl->m_statistics.activeConnections.load());
+    SS_LOG_INFO(L"Network", L"  Beaconing Detected: {}", m_impl->m_statistics.beaconingDetected.load());
+    SS_LOG_INFO(L"Network", L"  DGA Domains: {}", m_impl->m_statistics.dgaDomainsDetected.load());
+    SS_LOG_INFO(L"Network", L"  C2 Detected: {}", m_impl->m_statistics.c2Detected.load());
+    SS_LOG_INFO(L"Network", L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
 
     return true;
 }

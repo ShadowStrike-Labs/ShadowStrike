@@ -457,7 +457,7 @@ public:
             try {
                 callback(analysis);
             } catch (const std::exception& e) {
-                Logger::Error("EmailScanner: Analysis callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Analysis callback exception: {}", e.what());
             }
         }
     }
@@ -468,7 +468,7 @@ public:
             try {
                 callback(alert);
             } catch (const std::exception& e) {
-                Logger::Error("EmailScanner: Alert callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Alert callback exception: {}", e.what());
             }
         }
     }
@@ -479,7 +479,7 @@ public:
             try {
                 callback(emailId, attachment);
             } catch (const std::exception& e) {
-                Logger::Error("EmailScanner: Attachment callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Attachment callback exception: {}", e.what());
             }
         }
     }
@@ -490,7 +490,7 @@ public:
             try {
                 callback(emailId, analysis);
             } catch (const std::exception& e) {
-                Logger::Error("EmailScanner: Phishing callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Phishing callback exception: {}", e.what());
             }
         }
     }
@@ -501,7 +501,7 @@ public:
             try {
                 callback(emailId, threat, signature);
             } catch (const std::exception& e) {
-                Logger::Error("EmailScanner: Malware callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Malware callback exception: {}", e.what());
             }
         }
     }
@@ -539,7 +539,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("EmailScanner: Initializing...");
+            SS_LOG_INFO(L"Network", L"EmailScanner: Initializing...");
 
             m_config = config;
 
@@ -549,19 +549,19 @@ public:
             // Verify infrastructure
             if (!FileSystem::FileTypeAnalyzer::Instance().Initialize(
                 FileSystem::FileTypeAnalyzerConfig::CreateDefault())) {
-                Logger::Warn("EmailScanner: FileTypeAnalyzer initialization warning");
+                SS_LOG_WARN(L"Network", L"EmailScanner: FileTypeAnalyzer initialization warning");
             }
 
             if (!FileSystem::ExecutableAnalyzer::Instance().Initialize()) {
-                Logger::Warn("EmailScanner: ExecutableAnalyzer initialization warning");
+                SS_LOG_WARN(L"Network", L"EmailScanner: ExecutableAnalyzer initialization warning");
             }
 
             m_initialized = true;
-            Logger::Info("EmailScanner: Initialized successfully");
+            SS_LOG_INFO(L"Network", L"EmailScanner: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner: Initialization failed: {}", e.what());
             return false;
         }
     }
@@ -570,12 +570,12 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("EmailScanner: Not initialized");
+            SS_LOG_ERROR(L"Network", L"EmailScanner: Not initialized");
             return false;
         }
 
         if (m_running) {
-            Logger::Warn("EmailScanner: Already running");
+            SS_LOG_WARN(L"Network", L"EmailScanner: Already running");
             return true;
         }
 
@@ -587,11 +587,11 @@ public:
                 m_workers.emplace_back([this]() { WorkerThread(); });
             }
 
-            Logger::Info("EmailScanner: Started with {} worker threads", m_config.workerThreads);
+            SS_LOG_INFO(L"Network", L"EmailScanner: Started with {} worker threads", m_config.workerThreads);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner: Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner: Start failed: {}", e.what());
             m_running = false;
             return false;
         }
@@ -602,7 +602,7 @@ public:
             std::unique_lock lock(m_mutex);
             if (!m_running) return;
 
-            Logger::Info("EmailScanner: Stopping...");
+            SS_LOG_INFO(L"Network", L"EmailScanner: Stopping...");
             m_running = false;
         }
 
@@ -616,7 +616,7 @@ public:
         }
         m_workers.clear();
 
-        Logger::Info("EmailScanner: Stopped");
+        SS_LOG_INFO(L"Network", L"EmailScanner: Stopped");
     }
 
     void Shutdown() noexcept {
@@ -624,7 +624,7 @@ public:
         std::unique_lock lock(m_mutex);
         m_initialized = false;
         m_sessions.clear();
-        Logger::Info("EmailScanner: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"EmailScanner: Shutdown complete");
     }
 
     bool IsRunning() const noexcept {
@@ -704,7 +704,7 @@ public:
             ProcessSessionBuffer(session);
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::FeedPacket: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::FeedPacket: {}", e.what());
         }
     }
 
@@ -816,14 +816,14 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeAnalysis(analysis);
 
-            Logger::Info("EmailScanner: Scanned email {} - Score: {}, Result: {}, Action: {}",
+            SS_LOG_INFO(L"Network", L"EmailScanner: Scanned email {} - Score: {}, Result: {}, Action: {}",
                 analysis.messageId, analysis.threatScore,
                 static_cast<int>(analysis.result), static_cast<int>(analysis.action));
 
             return analysis;
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ScanEmail: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmail: {}", e.what());
             analysis.result = ScanResult::ERROR;
             return analysis;
         }
@@ -833,14 +833,14 @@ public:
         try {
             auto fileData = Utils::FileUtils::ReadFileBytes(emlPath);
             if (fileData.empty()) {
-                Logger::Error("EmailScanner: Failed to read email file");
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Failed to read email file");
                 return EmailAnalysis{};
             }
 
             return ScanEmail(std::span<const uint8_t>(fileData.data(), fileData.size()));
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ScanEmailFile: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmailFile: {}", e.what());
             return EmailAnalysis{};
         }
     }
@@ -1017,12 +1017,12 @@ public:
     // ========================================================================
 
     bool PerformDiagnostics() const {
-        Logger::Info("EmailScanner Diagnostics:");
-        Logger::Info("  Initialized: {}", m_initialized);
-        Logger::Info("  Running: {}", m_running.load());
-        Logger::Info("  Active Sessions: {}", m_stats.activeSessions.load());
-        Logger::Info("  Emails Scanned: {}", m_stats.totalEmailsScanned.load());
-        Logger::Info("  Threats Detected: {}",
+        SS_LOG_INFO(L"Network", L"EmailScanner Diagnostics:");
+        SS_LOG_INFO(L"Network", L"  Initialized: {}", m_initialized);
+        SS_LOG_INFO(L"Network", L"  Running: {}", m_running.load());
+        SS_LOG_INFO(L"Network", L"  Active Sessions: {}", m_stats.activeSessions.load());
+        SS_LOG_INFO(L"Network", L"  Emails Scanned: {}", m_stats.totalEmailsScanned.load());
+        SS_LOG_INFO(L"Network", L"  Threats Detected: {}",
             m_stats.malwareDetected.load() + m_stats.phishingDetected.load());
         return true;
     }
@@ -1038,7 +1038,7 @@ private:
     // ========================================================================
 
     void WorkerThread() {
-        Logger::Info("EmailScanner: Worker thread started");
+        SS_LOG_INFO(L"Network", L"EmailScanner: Worker thread started");
 
         while (m_running.load(std::memory_order_acquire)) {
             std::unique_lock lock(m_mutex);
@@ -1048,7 +1048,7 @@ private:
             CleanupTimedOutSessions();
         }
 
-        Logger::Info("EmailScanner: Worker thread exited");
+        SS_LOG_INFO(L"Network", L"EmailScanner: Worker thread exited");
     }
 
     void CleanupTimedOutSessions() {
@@ -1194,7 +1194,7 @@ private:
             processHeader();
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ParseHeadersImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseHeadersImpl: {}", e.what());
         }
 
         return header;
@@ -1220,7 +1220,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ParseBody: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseBody: {}", e.what());
         }
     }
 
@@ -1412,7 +1412,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ScanAttachmentImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanAttachmentImpl: {}", e.what());
             attachment.scanResult = ScanResult::ERROR;
         }
     }
@@ -1450,7 +1450,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::AnalyzeURLsImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeURLsImpl: {}", e.what());
         }
 
         return urls;
@@ -1584,7 +1584,7 @@ private:
             phishing.isPhishing = (phishing.confidence >= m_config.phishingThreshold);
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::AnalyzePhishingImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzePhishingImpl: {}", e.what());
         }
 
         return phishing;
@@ -1639,7 +1639,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::AnalyzeSpam: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeSpam: {}", e.what());
         }
     }
 
@@ -1703,7 +1703,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::AnalyzeBEC: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeBEC: {}", e.what());
         }
     }
 
@@ -1745,7 +1745,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::AnalyzeDLP: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeDLP: {}", e.what());
         }
     }
 
@@ -1793,7 +1793,7 @@ private:
             results.anyFail = !results.failures.empty();
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::ParseAuthenticationResults: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseAuthenticationResults: {}", e.what());
         }
 
         return results;
@@ -1939,7 +1939,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EmailScanner::CreateAlerts: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::CreateAlerts: {}", e.what());
         }
     }
 

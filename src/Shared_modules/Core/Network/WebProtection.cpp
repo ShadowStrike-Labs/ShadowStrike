@@ -526,11 +526,11 @@ public:
 bool WebProtection::WebProtectionImpl::Initialize(const WebProtectionConfig& config) noexcept {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"WebProtection: Already initialized");
+            SS_LOG_WARN(L"Network", L"WebProtection: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"WebProtection: Initializing...");
+        SS_LOG_INFO(L"Network", L"WebProtection: Initializing...");
 
         m_config = config;
 
@@ -551,11 +551,11 @@ bool WebProtection::WebProtectionImpl::Initialize(const WebProtectionConfig& con
             }
         }
 
-        Utils::Logger::Info(L"WebProtection: Initialized successfully");
+        SS_LOG_INFO(L"Network", L"WebProtection: Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Initialization failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Initialization failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
@@ -568,7 +568,7 @@ void WebProtection::WebProtectionImpl::Shutdown() noexcept {
             return;
         }
 
-        Utils::Logger::Info(L"WebProtection: Shutting down...");
+        SS_LOG_INFO(L"Network", L"WebProtection: Shutting down...");
 
         Stop();
 
@@ -607,30 +607,30 @@ void WebProtection::WebProtectionImpl::Shutdown() noexcept {
             m_xssCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"WebProtection: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"WebProtection: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"WebProtection: Exception during shutdown");
+        SS_LOG_ERROR(L"Network", L"WebProtection: Exception during shutdown");
     }
 }
 
 bool WebProtection::WebProtectionImpl::Start() noexcept {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Error(L"WebProtection: Not initialized");
+            SS_LOG_ERROR(L"Network", L"WebProtection: Not initialized");
             return false;
         }
 
         if (m_running.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"WebProtection: Already running");
+            SS_LOG_WARN(L"Network", L"WebProtection: Already running");
             return true;
         }
 
-        Utils::Logger::Info(L"WebProtection: Started");
+        SS_LOG_INFO(L"Network", L"WebProtection: Started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Start failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Start failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -638,7 +638,7 @@ bool WebProtection::WebProtectionImpl::Start() noexcept {
 
 void WebProtection::WebProtectionImpl::Stop() noexcept {
     if (m_running.exchange(false, std::memory_order_acq_rel)) {
-        Utils::Logger::Info(L"WebProtection: Stopped");
+        SS_LOG_INFO(L"Network", L"WebProtection: Stopped");
     }
 }
 
@@ -739,7 +739,7 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Content analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Content analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -850,7 +850,7 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Script analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Script analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -902,14 +902,14 @@ bool WebProtection::WebProtectionImpl::SanitizeResponseInternal(
 
         if (sanitized) {
             m_statistics.scriptsSanitized.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Info(L"WebProtection: Sanitized content from {}",
+            SS_LOG_INFO(L"Network", L"WebProtection: Sanitized content from {}",
                               Utils::StringUtils::Utf8ToWide(host));
         }
 
         return sanitized;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Sanitization failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Sanitization failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -933,14 +933,87 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
             return validation;
         }
 
-        // Basic validation (simplified - real implementation would use OpenSSL)
+        // Parse leaf certificate to extract CN, expiration, and chain validity
         validation.commonName = host;
         validation.chainLength = static_cast<uint32_t>(certChain.size());
-        validation.chainValid = true;  // Assume valid for now
 
-        // Check expiration (simplified)
-        validation.notBefore = Clock::now() - std::chrono::hours(24 * 365);
-        validation.notAfter = Clock::now() + std::chrono::hours(24 * 365);
+        // Validate chain: each cert must be non-empty and properly structured
+        validation.chainValid = true;
+        for (size_t i = 0; i < certChain.size(); ++i) {
+            if (certChain[i].empty()) {
+                validation.chainValid = false;
+                validation.issues.push_back(
+                    "Empty certificate at chain position " + std::to_string(i));
+                break;
+            }
+            // Minimum DER-encoded X.509 certificate is ~200 bytes
+            if (certChain[i].size() < 200) {
+                validation.chainValid = false;
+                validation.issues.push_back(
+                    "Certificate too small at chain position " + std::to_string(i) +
+                    " (" + std::to_string(certChain[i].size()) + " bytes)");
+                break;
+            }
+            // Verify DER ASN.1 SEQUENCE tag (0x30) at start
+            if (certChain[i][0] != 0x30) {
+                validation.chainValid = false;
+                validation.issues.push_back(
+                    "Invalid ASN.1 structure at chain position " + std::to_string(i));
+                break;
+            }
+        }
+
+        if (!validation.chainValid) {
+            validation.status = CertificateStatus::CHAIN_ERROR;
+            validation.isValid = false;
+            m_statistics.certificateErrors.fetch_add(1, std::memory_order_relaxed);
+            return validation;
+        }
+
+        // Use Windows CryptoAPI (CRYPT32) for certificate time validation
+        // Parse notBefore/notAfter from the leaf certificate's DER encoding
+        const auto& leafCert = certChain[0];
+        PCCERT_CONTEXT pCert = CertCreateCertificateContext(
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            leafCert.data(),
+            static_cast<DWORD>(leafCert.size()));
+
+        if (pCert) {
+            // Extract validity period from the parsed certificate
+            FILETIME ftNow;
+            GetSystemTimeAsFileTime(&ftNow);
+
+            auto FileTimeToTimePoint = [](const FILETIME& ft) -> Clock::time_point {
+                ULARGE_INTEGER uli;
+                uli.LowPart = ft.dwLowDateTime;
+                uli.HighPart = ft.dwHighDateTime;
+                // FILETIME epoch is 1601-01-01; convert to system_clock epoch
+                constexpr uint64_t kEpochDiff = 116444736000000000ULL;
+                const auto duration100ns = uli.QuadPart - kEpochDiff;
+                return Clock::time_point(std::chrono::duration_cast<Clock::duration>(
+                    std::chrono::nanoseconds(duration100ns * 100)));
+            };
+
+            validation.notBefore = FileTimeToTimePoint(pCert->pCertInfo->NotBefore);
+            validation.notAfter  = FileTimeToTimePoint(pCert->pCertInfo->NotAfter);
+
+            // Extract subject CN
+            char cnBuf[256] = {};
+            CertGetNameStringA(pCert, CERT_NAME_ATTR_TYPE, 0, (void*)szOID_COMMON_NAME,
+                               cnBuf, sizeof(cnBuf));
+            if (cnBuf[0] != '\0') {
+                validation.commonName = cnBuf;
+            }
+
+            CertFreeCertificateContext(pCert);
+        } else {
+            // Fallback: certificate couldn't be parsed — treat as untrusted
+            validation.status = CertificateStatus::CHAIN_ERROR;
+            validation.isValid = false;
+            validation.issues.push_back("Failed to parse leaf certificate via CryptoAPI");
+            m_statistics.certificateErrors.fetch_add(1, std::memory_order_relaxed);
+            return validation;
+        }
 
         const auto now = Clock::now();
         if (now < validation.notBefore) {
@@ -989,7 +1062,7 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Certificate validation failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Certificate validation failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         validation.status = CertificateStatus::CHAIN_ERROR;
         validation.isValid = false;
@@ -1054,7 +1127,7 @@ bool WebProtection::WebProtectionImpl::CheckCertificatePin(
         return false;  // No match found
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Pin check failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Pin check failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return true;  // On error, don't block
     }
@@ -1163,7 +1236,7 @@ FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
         m_statistics.formsProtected.fetch_add(1, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Form analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Form analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1240,7 +1313,7 @@ ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Exploit analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Exploit analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1323,7 +1396,7 @@ PrivacyAnalysis WebProtection::WebProtectionImpl::AnalyzePrivacyInternal(
         if (analysis.webrtcLeak) analysis.privacyScore -= 15;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Privacy analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Privacy analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1375,11 +1448,11 @@ void WebProtection::WebProtectionImpl::GenerateAlert(
             }
         }
 
-        Utils::Logger::Warn(L"WebProtection: Alert generated - ID: {}, URL: {}, Severity: {}",
+        SS_LOG_WARN(L"Network", L"WebProtection: Alert generated - ID: {}, URL: {}, Severity: {}",
                           alert.alertId, Utils::StringUtils::Utf8ToWide(url), severity);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Failed to generate alert - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to generate alert - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1459,14 +1532,14 @@ WebProtection& WebProtection::Instance() {
 WebProtection::WebProtection()
     : m_impl(std::make_unique<WebProtectionImpl>())
 {
-    Utils::Logger::Info(L"WebProtection: Constructor called");
+    SS_LOG_INFO(L"Network", L"WebProtection: Constructor called");
 }
 
 WebProtection::~WebProtection() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"WebProtection: Destructor called");
+    SS_LOG_INFO(L"Network", L"WebProtection: Destructor called");
 }
 
 // Lifecycle
@@ -1529,12 +1602,12 @@ bool WebProtection::AddCertificatePin(const CertificatePin& pin) {
         std::unique_lock lock(m_impl->m_pinsMutex);
         m_impl->m_pins[pin.domain] = pin;
 
-        Utils::Logger::Info(L"WebProtection: Added certificate pin for {}",
+        SS_LOG_INFO(L"Network", L"WebProtection: Added certificate pin for {}",
                           Utils::StringUtils::Utf8ToWide(pin.domain));
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Failed to add pin - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to add pin - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1590,7 +1663,7 @@ bool WebProtection::CheckCredentialTheft(
 
             // Password field detected - check if over HTTPS
             if (url.find("https://") != 0) {
-                Utils::Logger::Warn(L"WebProtection: Credential theft risk - password over HTTP");
+                SS_LOG_WARN(L"Network", L"WebProtection: Credential theft risk - password over HTTP");
                 return true;
             }
         }
@@ -1598,7 +1671,7 @@ bool WebProtection::CheckCredentialTheft(
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Credential theft check failed - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Credential theft check failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1646,12 +1719,12 @@ uint64_t WebProtection::ProtectBrowser(uint32_t processId, BrowserType browser) 
         m_impl->m_statistics.activeSessions.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_statistics.totalSessions.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"WebProtection: Browser protected - Session: {}, PID: {}",
+        SS_LOG_INFO(L"Network", L"WebProtection: Browser protected - Session: {}, PID: {}",
                           sessionId, processId);
         return sessionId;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebProtection: Failed to protect browser - {}",
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to protect browser - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return 0;
     }
@@ -1663,7 +1736,7 @@ void WebProtection::UnprotectBrowser(uint64_t sessionId) {
     std::unique_lock lock(m_impl->m_sessionsMutex);
     if (m_impl->m_sessions.erase(sessionId) > 0) {
         m_impl->m_statistics.activeSessions.fetch_sub(1, std::memory_order_relaxed);
-        Utils::Logger::Info(L"WebProtection: Browser unprotected - Session: {}", sessionId);
+        SS_LOG_INFO(L"Network", L"WebProtection: Browser unprotected - Session: {}", sessionId);
     }
 }
 
@@ -1689,7 +1762,7 @@ bool WebProtection::BlockDomain(const std::string& domain) {
     std::unique_lock lock(m_impl->m_domainsMutex);
     m_impl->m_blockedDomains.insert(domain);
 
-    Utils::Logger::Info(L"WebProtection: Domain blocked - {}",
+    SS_LOG_INFO(L"Network", L"WebProtection: Domain blocked - {}",
                       Utils::StringUtils::Utf8ToWide(domain));
     return true;
 }
@@ -1707,7 +1780,7 @@ bool WebProtection::AllowDomain(const std::string& domain) {
     std::unique_lock lock(m_impl->m_domainsMutex);
     m_impl->m_allowedDomains.insert(domain);
 
-    Utils::Logger::Info(L"WebProtection: Domain allowed - {}",
+    SS_LOG_INFO(L"Network", L"WebProtection: Domain allowed - {}",
                       Utils::StringUtils::Utf8ToWide(domain));
     return true;
 }
@@ -1796,16 +1869,16 @@ void WebProtection::ResetStatistics() noexcept {
 bool WebProtection::PerformDiagnostics() const {
     if (!m_impl) return false;
 
-    Utils::Logger::Info(L"WebProtection: Diagnostics");
-    Utils::Logger::Info(L"  Initialized: {}", m_impl->m_initialized.load());
-    Utils::Logger::Info(L"  Running: {}", m_impl->m_running.load());
-    Utils::Logger::Info(L"  Total Requests: {}", m_impl->m_statistics.totalRequests.load());
-    Utils::Logger::Info(L"  XSS Blocked: {}", m_impl->m_statistics.xssBlocked.load());
-    Utils::Logger::Info(L"  Exploits Blocked: {}", m_impl->m_statistics.exploitsBlocked.load());
-    Utils::Logger::Info(L"  Scripts Sanitized: {}", m_impl->m_statistics.scriptsSanitized.load());
-    Utils::Logger::Info(L"  Active Sessions: {}", m_impl->m_statistics.activeSessions.load());
-    Utils::Logger::Info(L"  Trackers Blocked: {}", m_impl->m_statistics.trackersBlocked.load());
-    Utils::Logger::Info(L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
+    SS_LOG_INFO(L"Network", L"WebProtection: Diagnostics");
+    SS_LOG_INFO(L"Network", L"  Initialized: {}", m_impl->m_initialized.load());
+    SS_LOG_INFO(L"Network", L"  Running: {}", m_impl->m_running.load());
+    SS_LOG_INFO(L"Network", L"  Total Requests: {}", m_impl->m_statistics.totalRequests.load());
+    SS_LOG_INFO(L"Network", L"  XSS Blocked: {}", m_impl->m_statistics.xssBlocked.load());
+    SS_LOG_INFO(L"Network", L"  Exploits Blocked: {}", m_impl->m_statistics.exploitsBlocked.load());
+    SS_LOG_INFO(L"Network", L"  Scripts Sanitized: {}", m_impl->m_statistics.scriptsSanitized.load());
+    SS_LOG_INFO(L"Network", L"  Active Sessions: {}", m_impl->m_statistics.activeSessions.load());
+    SS_LOG_INFO(L"Network", L"  Trackers Blocked: {}", m_impl->m_statistics.trackersBlocked.load());
+    SS_LOG_INFO(L"Network", L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
 
     return true;
 }

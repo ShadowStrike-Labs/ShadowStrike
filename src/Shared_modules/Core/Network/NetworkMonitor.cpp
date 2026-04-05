@@ -427,7 +427,7 @@ bool ConnectionFilter::Matches(const ConnectionInfo& conn) const {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Filter matching failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Filter matching failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -750,7 +750,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             analysis.isLikelyBeaconing = beaconScore >= 2;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkMonitor: Beaconing analysis failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Beaconing analysis failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
 
@@ -800,7 +800,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             analysis.isLikelyExfiltration = exfilScore >= 2;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkMonitor: Exfiltration analysis failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Exfiltration analysis failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
 
@@ -847,7 +847,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             analysis.isLikelyScan = scanScore >= 2;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkMonitor: Port scan analysis failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Port scan analysis failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
 
@@ -898,7 +898,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
                 m_statistics.portScansDetected.fetch_add(1, std::memory_order_relaxed);
                 m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                Utils::Logger::Warn(L"NetworkMonitor: Port scan detected from {} - {} ports in {} seconds",
+                SS_LOG_WARN(L"Network", L"NetworkMonitor: Port scan detected from {} - {} ports in {} seconds",
                                   sourceIp.ToWString(), tracker.scannedPorts.size(), duration.count());
             }
         }
@@ -928,7 +928,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
                 m_statistics.exfiltrationDetected.fetch_add(1, std::memory_order_relaxed);
                 m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                Utils::Logger::Warn(L"NetworkMonitor: Data exfiltration detected - PID {} sent {} bytes",
+                SS_LOG_WARN(L"Network", L"NetworkMonitor: Data exfiltration detected - PID {} sent {} bytes",
                                   pid, tracker.totalBytesSent);
             }
         }
@@ -974,7 +974,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
 
             InvokeEventCallbacks(event);
 
-            Utils::Logger::Info(L"NetworkMonitor: Connection opened - {} [{}] by {} (PID {})",
+            SS_LOG_INFO(L"Network", L"NetworkMonitor: Connection opened - {} [{}] by {} (PID {})",
                               Utils::StringUtils::Utf8ToWide(conn.tuple.ToString()),
                               GetAppProtocolName(conn.appProtocol),
                               conn.processContext.processName,
@@ -982,7 +982,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
 
         } catch (const std::exception& e) {
             m_statistics.errorCount.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Error(L"NetworkMonitor: Process new connection failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Process new connection failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
@@ -994,7 +994,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             try {
                 callback(conn);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"NetworkMonitor: Connection callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"NetworkMonitor: Connection callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -1006,7 +1006,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             try {
                 callback(connId, oldState, newState);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"NetworkMonitor: State change callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"NetworkMonitor: State change callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -1018,7 +1018,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"NetworkMonitor: Event callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"NetworkMonitor: Event callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -1031,7 +1031,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             try {
                 callback(connId, indicator, analysis);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"NetworkMonitor: Threat callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"NetworkMonitor: Threat callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -1043,7 +1043,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
         if (!pThis) return 1;
 
         try {
-            Utils::Logger::Info(L"NetworkMonitor: Monitor thread started");
+            SS_LOG_INFO(L"Network", L"NetworkMonitor: Monitor thread started");
 
             // Main monitoring loop
             while (pThis->m_running.load(std::memory_order_acquire)) {
@@ -1056,11 +1056,11 @@ struct NetworkMonitor::NetworkMonitorImpl {
                 pThis->PerformCleanup();
             }
 
-            Utils::Logger::Info(L"NetworkMonitor: Monitor thread stopped");
+            SS_LOG_INFO(L"Network", L"NetworkMonitor: Monitor thread stopped");
             return 0;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkMonitor: Monitor thread failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Monitor thread failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
             return 1;
         }
@@ -1118,7 +1118,7 @@ struct NetworkMonitor::NetworkMonitorImpl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"NetworkMonitor: Cleanup failed - {}",
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Cleanup failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
@@ -1147,19 +1147,19 @@ bool NetworkMonitor::HasInstance() noexcept {
 NetworkMonitor::NetworkMonitor()
     : m_impl(std::make_unique<NetworkMonitorImpl>())
 {
-    Utils::Logger::Info(L"NetworkMonitor: Constructor called");
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Constructor called");
 }
 
 NetworkMonitor::~NetworkMonitor() {
     Shutdown();
-    Utils::Logger::Info(L"NetworkMonitor: Destructor called");
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Destructor called");
 }
 
 bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"NetworkMonitor: Already initialized");
+        SS_LOG_WARN(L"Network", L"NetworkMonitor: Already initialized");
         return true;
     }
 
@@ -1173,7 +1173,7 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
         // Initialize Winsock
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            Utils::Logger::Error(L"NetworkMonitor: WSAStartup failed");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: WSAStartup failed");
             return false;
         }
 
@@ -1182,11 +1182,11 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
 
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"NetworkMonitor: Initialized successfully");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Initialization failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Initialization failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1196,12 +1196,12 @@ bool NetworkMonitor::Start() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Error(L"NetworkMonitor: Not initialized");
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Not initialized");
         return false;
     }
 
     if (m_impl->m_running.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"NetworkMonitor: Already running");
+        SS_LOG_WARN(L"Network", L"NetworkMonitor: Already running");
         return true;
     }
 
@@ -1209,7 +1209,7 @@ bool NetworkMonitor::Start() {
         // Create stop event
         m_impl->m_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!m_impl->m_hStopEvent) {
-            Utils::Logger::Error(L"NetworkMonitor: Failed to create stop event");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Failed to create stop event");
             return false;
         }
 
@@ -1229,15 +1229,15 @@ bool NetworkMonitor::Start() {
             m_impl->m_running.store(false, std::memory_order_release);
             CloseHandle(m_impl->m_hStopEvent);
             m_impl->m_hStopEvent = nullptr;
-            Utils::Logger::Error(L"NetworkMonitor: Failed to create monitor thread");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Failed to create monitor thread");
             return false;
         }
 
-        Utils::Logger::Info(L"NetworkMonitor: Started successfully");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Started successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Start failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Start failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1252,10 +1252,10 @@ void NetworkMonitor::Stop() {
         m_impl->m_running.store(false, std::memory_order_release);
         m_impl->StopMonitoring();
 
-        Utils::Logger::Info(L"NetworkMonitor: Stopped");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Stopped");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Stop failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Stop failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1314,10 +1314,10 @@ void NetworkMonitor::Shutdown() noexcept {
 
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"NetworkMonitor: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Shutdown error - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Shutdown error - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1338,7 +1338,7 @@ NetworkMonitorConfig NetworkMonitor::GetConfig() const {
 bool NetworkMonitor::UpdateConfig(const NetworkMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"NetworkMonitor: Configuration updated");
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Configuration updated");
     return true;
 }
 
@@ -1464,14 +1464,14 @@ bool NetworkMonitor::TerminateConnection(uint64_t connectionId) {
             it->second.state = ConnectionState::CLOSED;
             it->second.closeTime = std::chrono::system_clock::now();
 
-            Utils::Logger::Info(L"NetworkMonitor: Connection {} terminated", connectionId);
+            SS_LOG_INFO(L"Network", L"NetworkMonitor: Connection {} terminated", connectionId);
             return true;
         }
 
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Terminate connection failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Terminate connection failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1487,12 +1487,12 @@ bool NetworkMonitor::BlockIP(const IPAddress& ip, BlockReason reason, uint32_t d
         m_impl->m_blockedIPs.insert(ip);
         m_impl->m_statistics.ipsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"NetworkMonitor: IP {} blocked - Reason: {}",
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: IP {} blocked - Reason: {}",
                           ip.ToWString(), GetBlockReasonName(reason));
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Block IP failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Block IP failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1507,11 +1507,11 @@ bool NetworkMonitor::UnblockIP(const IPAddress& ip) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
         m_impl->m_blockedIPs.erase(ip);
 
-        Utils::Logger::Info(L"NetworkMonitor: IP {} unblocked", ip.ToWString());
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: IP {} unblocked", ip.ToWString());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Unblock IP failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Unblock IP failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1519,7 +1519,7 @@ bool NetworkMonitor::UnblockIP(const IPAddress& ip) {
 
 bool NetworkMonitor::BlockIPRange(const IPRange& range, BlockReason reason) {
     // Simplified - would implement range blocking in real implementation
-    Utils::Logger::Info(L"NetworkMonitor: IP range {} blocked",
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: IP range {} blocked",
                       Utils::StringUtils::Utf8ToWide(range.ToString()));
     return true;
 }
@@ -1530,12 +1530,12 @@ bool NetworkMonitor::BlockPort(uint16_t port, ProtocolType protocol, BlockReason
         m_impl->m_blockedPorts[port] = protocol;
         m_impl->m_statistics.portsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"NetworkMonitor: Port {} ({}) blocked",
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Port {} ({}) blocked",
                           port, GetProtocolTypeName(protocol));
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Block port failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Block port failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1546,12 +1546,12 @@ bool NetworkMonitor::UnblockPort(uint16_t port, ProtocolType protocol) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
         m_impl->m_blockedPorts.erase(port);
 
-        Utils::Logger::Info(L"NetworkMonitor: Port {} ({}) unblocked",
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Port {} ({}) unblocked",
                           port, GetProtocolTypeName(protocol));
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Unblock port failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Unblock port failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1563,11 +1563,11 @@ bool NetworkMonitor::BlockDomain(const std::wstring& domain, BlockReason reason)
         m_impl->m_blockedDomains.insert(domain);
         m_impl->m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"NetworkMonitor: Domain {} blocked", domain);
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain {} blocked", domain);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Block domain failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Block domain failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1578,11 +1578,11 @@ bool NetworkMonitor::UnblockDomain(const std::wstring& domain) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
         m_impl->m_blockedDomains.erase(domain);
 
-        Utils::Logger::Info(L"NetworkMonitor: Domain {} unblocked", domain);
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Domain {} unblocked", domain);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Unblock domain failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Unblock domain failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1593,11 +1593,11 @@ bool NetworkMonitor::BlockProcess(uint32_t pid, BlockReason reason) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
         m_impl->m_blockedProcesses.insert(pid);
 
-        Utils::Logger::Info(L"NetworkMonitor: Process {} blocked", pid);
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Process {} blocked", pid);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Block process failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Block process failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1608,11 +1608,11 @@ bool NetworkMonitor::UnblockProcess(uint32_t pid) {
         std::unique_lock<std::shared_mutex> lock(m_impl->m_blocklistMutex);
         m_impl->m_blockedProcesses.erase(pid);
 
-        Utils::Logger::Info(L"NetworkMonitor: Process {} unblocked", pid);
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Process {} unblocked", pid);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Unblock process failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Unblock process failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1630,7 +1630,7 @@ uint64_t NetworkMonitor::AddFilter(const ConnectionFilter& filter) {
     uint64_t key = static_cast<uint64_t>(newFilter.priority) * 1000000 + filterId;
     m_impl->m_filters[key] = newFilter;
 
-    Utils::Logger::Info(L"NetworkMonitor: Filter added - ID: {}, Name: {}",
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Filter added - ID: {}, Name: {}",
                       filterId, filter.name);
 
     return filterId;
@@ -1642,7 +1642,7 @@ bool NetworkMonitor::RemoveFilter(uint64_t filterId) {
     for (auto it = m_impl->m_filters.begin(); it != m_impl->m_filters.end(); ++it) {
         if (it->second.filterId == filterId) {
             m_impl->m_filters.erase(it);
-            Utils::Logger::Info(L"NetworkMonitor: Filter removed - ID: {}", filterId);
+            SS_LOG_INFO(L"Network", L"NetworkMonitor: Filter removed - ID: {}", filterId);
             return true;
         }
     }
@@ -1683,7 +1683,7 @@ std::vector<IPAddress> NetworkMonitor::GetBlockedIPs() const {
 
 void NetworkMonitor::ClearTemporaryBlocks() {
     // Would clear temporary blocks in real implementation
-    Utils::Logger::Info(L"NetworkMonitor: Temporary blocks cleared");
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Temporary blocks cleared");
 }
 
 // ============================================================================
@@ -1792,7 +1792,7 @@ const NetworkMonitorStatistics& NetworkMonitor::GetStatistics() const noexcept {
 
 void NetworkMonitor::ResetStatistics() noexcept {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"NetworkMonitor: Statistics reset");
+    SS_LOG_INFO(L"Network", L"NetworkMonitor: Statistics reset");
 }
 
 BandwidthStats NetworkMonitor::GetProcessBandwidth(uint32_t pid) const {
@@ -1827,25 +1827,25 @@ BandwidthStats NetworkMonitor::GetSystemBandwidth() const {
 
 bool NetworkMonitor::PerformDiagnostics() const {
     try {
-        Utils::Logger::Info(L"NetworkMonitor: Running diagnostics");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Running diagnostics");
 
         // Check initialization
         if (!IsInitialized()) {
-            Utils::Logger::Error(L"NetworkMonitor: Not initialized");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: Not initialized");
             return false;
         }
 
         // Check infrastructure
         if (!m_impl->m_threatIntel) {
-            Utils::Logger::Error(L"NetworkMonitor: ThreatIntel not initialized");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: ThreatIntel not initialized");
             return false;
         }
 
-        Utils::Logger::Info(L"NetworkMonitor: Diagnostics passed");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Diagnostics passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Diagnostics failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Diagnostics failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1879,19 +1879,19 @@ bool NetworkMonitor::ExportDiagnostics(const std::wstring& outputPath) const {
 
 bool NetworkMonitor::SelfTest() {
     try {
-        Utils::Logger::Info(L"NetworkMonitor: Starting self-test");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Starting self-test");
 
         // Test IP address operations
         IPAddress testIp(0x7F000001);  // 127.0.0.1
         if (!testIp.IsLoopback()) {
-            Utils::Logger::Error(L"NetworkMonitor: IP classification test failed");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: IP classification test failed");
             return false;
         }
 
         // Test IP blocking
         BlockIP(IPAddress(0xC0A80101), BlockReason::MANUAL_BLOCK);  // 192.168.1.1
         if (!IsIPBlocked(IPAddress(0xC0A80101))) {
-            Utils::Logger::Error(L"NetworkMonitor: IP blocking test failed");
+            SS_LOG_ERROR(L"Network", L"NetworkMonitor: IP blocking test failed");
             return false;
         }
         UnblockIP(IPAddress(0xC0A80101));
@@ -1904,11 +1904,11 @@ bool NetworkMonitor::SelfTest() {
         BlockDomain(L"evil.com", BlockReason::MALICIOUS_DOMAIN);
         UnblockDomain(L"evil.com");
 
-        Utils::Logger::Info(L"NetworkMonitor: Self-test passed");
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"NetworkMonitor: Self-test failed - {}",
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: Self-test failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
