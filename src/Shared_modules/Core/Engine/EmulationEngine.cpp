@@ -200,36 +200,45 @@ void EmulationEngine::Impl::Shutdown() noexcept {
             return;
         }
 
-        std::vector<ActiveSession*> sessions;
-        {
-            std::shared_lock lock(m_mutex);
-            sessions.reserve(m_sessions.size());
-            for (const auto& [sessionId, session] : m_sessions) {
-                (void)sessionId;
-                sessions.push_back(session.get());
-            }
-        }
-
-        for (auto* session : sessions) {
-            session->shouldStop.store(true, std::memory_order_release);
-            session->state.store(EmulationState::Terminated, std::memory_order_release);
-#ifdef PHANTOM_EMULATOR_AVAILABLE
-            if (session->phantomSession) {
-                session->phantomSession->RequestAbort();
-            }
-#endif
-        }
-
+        // Phase 1: Signal every active session to abort under exclusive lock.
+        // Holding the lock prevents new sessions from being inserted while we
+        // iterate, and avoids dangling-pointer races with concurrent RemoveSession.
         {
             std::unique_lock lock(m_mutex);
-            m_threadPool.reset();
+            for (auto& [id, session] : m_sessions) {
+                (void)id;
+                session->shouldStop.store(true, std::memory_order_release);
+                session->state.store(EmulationState::Terminated, std::memory_order_release);
+#ifdef PHANTOM_EMULATOR_AVAILABLE
+                if (session->phantomSession) {
+                    session->phantomSession->RequestAbort();
+                }
+#endif
+            }
+        }
+
+        // Phase 2: Drain the thread pool OUTSIDE the mutex so worker threads
+        // that acquire the mutex (FinalizeSession, RemoveSession) can complete
+        // without deadlocking.
+        std::shared_ptr<Utils::ThreadPool> pool;
+        {
+            std::unique_lock lock(m_mutex);
+            pool = std::move(m_threadPool);
+        }
+        pool.reset();
+
+        // Phase 3: Clear remaining state under exclusive lock.
+        {
+            std::unique_lock lock(m_mutex);
+            m_sessions.clear();
             m_signatureStore = nullptr;
             m_patternStore = nullptr;
             m_hashStore = nullptr;
             m_threatIntel = nullptr;
+            m_stats.activeSessions.store(0, std::memory_order_relaxed);
         }
 
-        SS_LOG_INFO(kLogCategory, L"Shutdown requested");
+        SS_LOG_INFO(kLogCategory, L"Shutdown complete");
     } catch (...) {
         SS_LOG_ERROR(kLogCategory, L"Shutdown exception");
     }
@@ -237,6 +246,14 @@ void EmulationEngine::Impl::Shutdown() noexcept {
 
 uint64_t EmulationEngine::Impl::CreateSession(const EmulationConfig& config) noexcept {
     try {
+        const size_t active = m_stats.activeSessions.load(std::memory_order_acquire);
+        if (active >= EmulationConstants::MAX_CONCURRENT_SESSIONS) {
+            SS_LOG_WARN(kLogCategory,
+                L"CreateSession: concurrent session limit reached (%zu / %zu)",
+                active, EmulationConstants::MAX_CONCURRENT_SESSIONS);
+            return 0;
+        }
+
         auto session = std::make_unique<ActiveSession>();
         const uint64_t sessionId = m_nextSessionId.fetch_add(1, std::memory_order_relaxed);
         session->sessionId = sessionId;
@@ -275,16 +292,21 @@ EmulationEngine::Impl::ActiveSession* EmulationEngine::Impl::GetSessionEntry(uin
 }
 
 void EmulationEngine::Impl::UpdateAverageTime(uint64_t emulationTimeUs) noexcept {
-    const uint64_t active = m_stats.activeSessions.load(std::memory_order_relaxed);
-    const uint64_t completed = m_stats.totalSessions.load(std::memory_order_relaxed) - active;
-    if (completed == 0) {
+    const uint64_t completedTotal =
+        m_stats.successfulCompletions.load(std::memory_order_relaxed) +
+        m_stats.timeouts.load(std::memory_order_relaxed) +
+        m_stats.errors.load(std::memory_order_relaxed);
+    if (completedTotal == 0) {
+        m_stats.avgEmulationTimeUs.store(emulationTimeUs, std::memory_order_relaxed);
         return;
     }
 
     const uint64_t previous = m_stats.avgEmulationTimeUs.load(std::memory_order_relaxed);
-    const uint64_t updated = previous + ((emulationTimeUs > previous)
-        ? (emulationTimeUs - previous) / completed
-        : -((previous - emulationTimeUs) / completed));
+    // Incremental mean: avg_n = avg_{n-1} + (x_n - avg_{n-1}) / n
+    // Signed delta avoids unsigned wrap-around ambiguity.
+    const auto delta = static_cast<int64_t>(emulationTimeUs) - static_cast<int64_t>(previous);
+    const auto adjustment = delta / static_cast<int64_t>(completedTotal + 1);
+    const uint64_t updated = static_cast<uint64_t>(static_cast<int64_t>(previous) + adjustment);
     m_stats.avgEmulationTimeUs.store(updated, std::memory_order_relaxed);
 }
 
@@ -888,8 +910,10 @@ EmulationResult EmulationEngine::EmulatePE(const std::vector<uint8_t>& fileData,
                                            uint32_t timeoutMs,
                                            uint64_t maxInstructions) {
     EmulationConfig config = GetDefaultConfig();
-    config.timeoutMs = timeoutMs;
-    config.maxInstructions = maxInstructions;
+    config.timeoutMs = std::clamp(timeoutMs,
+        EmulationConstants::MIN_TIMEOUT_MS, EmulationConstants::MAX_TIMEOUT_MS);
+    config.maxInstructions = std::clamp(maxInstructions,
+        EmulationConstants::MIN_INSTRUCTIONS, EmulationConstants::MAX_INSTRUCTIONS);
     return m_impl->RunPE(std::span<const uint8_t>(fileData), config);
 }
 
@@ -1053,12 +1077,43 @@ void EmulationEngine::TerminateAllSessions() {
 }
 
 bool EmulationEngine::PauseSession(uint64_t sessionId) {
-    (void)sessionId;
+    if (!m_impl) {
+        return false;
+    }
+
+    auto* session = m_impl->GetSessionEntry(sessionId);
+    if (!session) {
+        SS_LOG_WARN(kLogCategory, L"PauseSession: session %llu not found",
+                    static_cast<unsigned long long>(sessionId));
+        return false;
+    }
+
+    // PhantomEmulator sessions are single-threaded and non-reentrant;
+    // the only cross-thread signal is RequestAbort(). Cooperative pause
+    // would require checkpoint support in the CPU emulation loop.
+    SS_LOG_WARN(kLogCategory,
+        L"PauseSession: cooperative pause not supported by PhantomEmulator (session %llu)",
+        static_cast<unsigned long long>(sessionId));
     return false;
 }
 
 bool EmulationEngine::ResumeSession(uint64_t sessionId) {
-    (void)sessionId;
+    if (!m_impl) {
+        return false;
+    }
+
+    auto* session = m_impl->GetSessionEntry(sessionId);
+    if (!session) {
+        SS_LOG_WARN(kLogCategory, L"ResumeSession: session %llu not found",
+                    static_cast<unsigned long long>(sessionId));
+        return false;
+    }
+
+    // PhantomEmulator sessions are consumed after a single Emulate* call;
+    // resume requires snapshot/restore support not yet implemented.
+    SS_LOG_WARN(kLogCategory,
+        L"ResumeSession: resume not supported by PhantomEmulator (session %llu)",
+        static_cast<unsigned long long>(sessionId));
     return false;
 }
 
@@ -1264,8 +1319,15 @@ bool IsPELikelyPacked(std::span<const uint8_t> peData) noexcept {
         return true;
     }
 
-    const std::string data(reinterpret_cast<const char*>(peData.data()), peData.size());
-    return data.find("UPX!") != std::string::npos || data.find("MPRESS1") != std::string::npos;
+    // Search for packer signatures without copying the entire buffer into a string
+    // (the old std::string copy was an O(n) allocation and potential OOM on large files).
+    constexpr std::array<uint8_t, 4> kUpxSig = { 'U', 'P', 'X', '!' };
+    constexpr std::array<uint8_t, 7> kMpressSig = { 'M', 'P', 'R', 'E', 'S', 'S', '1' };
+
+    if (std::search(peData.begin(), peData.end(), kUpxSig.begin(), kUpxSig.end()) != peData.end()) {
+        return true;
+    }
+    return std::search(peData.begin(), peData.end(), kMpressSig.begin(), kMpressSig.end()) != peData.end();
 }
 
 uint64_t DetectOEP(std::span<const uint8_t> memoryDump, uint64_t imageBase) noexcept {
@@ -1273,7 +1335,9 @@ uint64_t DetectOEP(std::span<const uint8_t> memoryDump, uint64_t imageBase) noex
         return 0;
     }
 
-    for (size_t i = 0; i + 4 < memoryDump.size(); ++i) {
+    // Cap the linear scan to 1 MB to bound cost on very large dumps.
+    const size_t scanLimit = std::min<size_t>(memoryDump.size(), 1024 * 1024);
+    for (size_t i = 0; i + 4 < scanLimit; ++i) {
         const uint8_t b0 = memoryDump[i];
         const uint8_t b1 = memoryDump[i + 1];
         const uint8_t b2 = memoryDump[i + 2];
@@ -1291,60 +1355,185 @@ uint64_t DetectOEP(std::span<const uint8_t> memoryDump, uint64_t imageBase) noex
 }
 
 APICategory CategorizeAPI(std::string_view dllName, std::string_view funcName) noexcept {
-    const auto dll = ToLowerAscii(dllName);
-    const auto func = ToLowerAscii(funcName);
+    try {
+        const auto dll = ToLowerAscii(dllName);
+        const auto func = ToLowerAscii(funcName);
 
-    if (dll.find("kernel32") != std::string::npos || func.find("file") != std::string::npos) {
-        return APICategory::FileSystem;
+        // Injection (highest priority — must be checked first)
+        if (func.find("writeprocessmemory") != std::string::npos ||
+            func.find("createremotethread") != std::string::npos ||
+            func.find("ntmapviewofsection") != std::string::npos ||
+            func.find("queueuserapc") != std::string::npos ||
+            func.find("setthreadcontext") != std::string::npos) {
+            return APICategory::Injection;
+        }
+
+        // Anti-analysis / evasion
+        if (func.find("isdebuggerpresent") != std::string::npos ||
+            func.find("checkremotedebuggerpresent") != std::string::npos ||
+            func.find("ntqueryinformationprocess") != std::string::npos ||
+            func.find("gettickcount") != std::string::npos ||
+            func.find("queryperformancecounter") != std::string::npos ||
+            func == "sleep" || func == "sleepex") {
+            return APICategory::AntiAnalysis;
+        }
+
+        // Network
+        if (dll.find("ws2_32") != std::string::npos ||
+            dll.find("wininet") != std::string::npos ||
+            dll.find("winhttp") != std::string::npos ||
+            func.find("urldownload") != std::string::npos ||
+            func.find("internetopen") != std::string::npos ||
+            func.find("httpopen") != std::string::npos) {
+            return APICategory::Network;
+        }
+        if ((func.find("connect") != std::string::npos ||
+             func.find("send") != std::string::npos ||
+             func.find("recv") != std::string::npos) &&
+            (dll.find("ws2_32") != std::string::npos ||
+             dll.find("wininet") != std::string::npos ||
+             dll.find("winhttp") != std::string::npos)) {
+            return APICategory::Network;
+        }
+
+        // Dynamic code loading
+        if (func.find("loadlibrary") != std::string::npos ||
+            func.find("getprocaddress") != std::string::npos ||
+            func.find("ldrloaddll") != std::string::npos) {
+            return APICategory::DynamicCode;
+        }
+
+        // Process / thread management
+        if (func.find("createprocess") != std::string::npos ||
+            func.find("openprocess") != std::string::npos ||
+            func.find("terminateprocess") != std::string::npos ||
+            func.find("createthread") != std::string::npos ||
+            func.find("exitprocess") != std::string::npos) {
+            return APICategory::Process;
+        }
+
+        // Memory
+        if (func.find("virtualalloc") != std::string::npos ||
+            func.find("virtualprotect") != std::string::npos ||
+            func.find("heapalloc") != std::string::npos ||
+            func.find("ntallocatevirtualmemory") != std::string::npos) {
+            return APICategory::Memory;
+        }
+
+        // Registry
+        if (func.find("regopen") != std::string::npos ||
+            func.find("regset") != std::string::npos ||
+            func.find("regcreate") != std::string::npos ||
+            func.find("regquery") != std::string::npos ||
+            func.find("regdelete") != std::string::npos) {
+            return APICategory::Registry;
+        }
+
+        // File system
+        if (func.find("createfile") != std::string::npos ||
+            func.find("writefile") != std::string::npos ||
+            func.find("readfile") != std::string::npos ||
+            func.find("deletefile") != std::string::npos ||
+            func.find("movefile") != std::string::npos ||
+            func.find("copyfile") != std::string::npos) {
+            return APICategory::FileSystem;
+        }
+
+        // Crypto
+        if (dll.find("crypt32") != std::string::npos ||
+            dll.find("bcrypt") != std::string::npos ||
+            func.find("crypt") != std::string::npos) {
+            return APICategory::Crypto;
+        }
+
+        // Service control
+        if (func.find("openscmanager") != std::string::npos ||
+            func.find("createservice") != std::string::npos ||
+            func.find("startservice") != std::string::npos) {
+            return APICategory::Service;
+        }
+
+        // Security / privileges
+        if (func.find("adjusttokenprivileges") != std::string::npos ||
+            func.find("openprocesstoken") != std::string::npos ||
+            func.find("lookupprivilege") != std::string::npos) {
+            return APICategory::Security;
+        }
+
+        // System info
+        if (func.find("getsysteminfo") != std::string::npos ||
+            func.find("getcomputername") != std::string::npos ||
+            func.find("getusername") != std::string::npos ||
+            func.find("getversion") != std::string::npos) {
+            return APICategory::SystemInfo;
+        }
+
+        return APICategory::Unknown;
+    } catch (...) {
+        return APICategory::Unknown;
     }
-    if (dll.find("advapi32") != std::string::npos || func.find("reg") != std::string::npos) {
-        return APICategory::Registry;
-    }
-    if (dll.find("ws2_32") != std::string::npos || dll.find("wininet") != std::string::npos ||
-        func.find("connect") != std::string::npos || func.find("send") != std::string::npos) {
-        return APICategory::Network;
-    }
-    if (func.find("process") != std::string::npos || func.find("thread") != std::string::npos) {
-        return APICategory::Process;
-    }
-    if (func.find("alloc") != std::string::npos || func.find("protect") != std::string::npos ||
-        func.find("memory") != std::string::npos) {
-        return APICategory::Memory;
-    }
-    if (func.find("debug") != std::string::npos || func.find("tick") != std::string::npos ||
-        func.find("sleep") != std::string::npos) {
-        return APICategory::AntiAnalysis;
-    }
-    return APICategory::Unknown;
 }
 
 APISeverity AssessAPISeverity(std::string_view dllName,
                               std::string_view funcName,
                               const std::vector<std::string>& args) noexcept {
-    const auto dll = ToLowerAscii(dllName);
-    const auto func = ToLowerAscii(funcName);
-    (void)args;
+    try {
+        const auto dll = ToLowerAscii(dllName);
+        const auto func = ToLowerAscii(funcName);
 
-    if (func.find("writeprocessmemory") != std::string::npos ||
-        func.find("createremotethread") != std::string::npos ||
-        func.find("ntmapviewofsection") != std::string::npos) {
-        return APISeverity::Critical;
+        // Critical: remote code injection primitives
+        if (func.find("writeprocessmemory") != std::string::npos ||
+            func.find("createremotethread") != std::string::npos ||
+            func.find("ntmapviewofsection") != std::string::npos ||
+            func.find("queueuserapc") != std::string::npos ||
+            func.find("setthreadcontext") != std::string::npos) {
+            return APISeverity::Critical;
+        }
+
+        // High: persistence, remote alloc, process creation
+        if (func.find("virtualallocex") != std::string::npos ||
+            func.find("regsetvalue") != std::string::npos ||
+            func.find("createprocess") != std::string::npos ||
+            func.find("createservice") != std::string::npos ||
+            func.find("shellexecute") != std::string::npos) {
+            return APISeverity::High;
+        }
+
+        // VirtualProtect with PAGE_EXECUTE_READWRITE (0x40) is high severity
+        if (func.find("virtualprotect") != std::string::npos) {
+            for (const auto& arg : args) {
+                const auto lower = ToLowerAscii(arg);
+                if (lower.find("0x40") != std::string::npos ||
+                    lower.find("page_execute_readwrite") != std::string::npos) {
+                    return APISeverity::High;
+                }
+            }
+            return APISeverity::Medium;
+        }
+
+        // Medium: network, downloads
+        if (dll.find("wininet") != std::string::npos ||
+            dll.find("winhttp") != std::string::npos ||
+            func.find("urldownload") != std::string::npos ||
+            func.find("internetopen") != std::string::npos) {
+            return APISeverity::Medium;
+        }
+        if (dll.find("ws2_32") != std::string::npos &&
+            (func.find("connect") != std::string::npos ||
+             func.find("send") != std::string::npos)) {
+            return APISeverity::Medium;
+        }
+
+        // Low: file I/O
+        if (func.find("createfile") != std::string::npos ||
+            func.find("writefile") != std::string::npos) {
+            return APISeverity::Low;
+        }
+
+        return APISeverity::Benign;
+    } catch (...) {
+        return APISeverity::Benign;
     }
-    if (func.find("virtualallocex") != std::string::npos ||
-        func.find("regsetvalue") != std::string::npos ||
-        func.find("createprocess") != std::string::npos) {
-        return APISeverity::High;
-    }
-    if (dll.find("wininet") != std::string::npos ||
-        func.find("connect") != std::string::npos ||
-        func.find("download") != std::string::npos) {
-        return APISeverity::Medium;
-    }
-    if (func.find("createfile") != std::string::npos ||
-        func.find("writefile") != std::string::npos) {
-        return APISeverity::Low;
-    }
-    return APISeverity::Benign;
 }
 
 } // namespace ShadowStrike::Core::Engine

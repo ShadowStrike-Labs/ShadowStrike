@@ -781,7 +781,7 @@ struct alignas(64) CPUState {
     uint64_t dr0 = 0, dr1 = 0, dr2 = 0, dr3 = 0;
     uint64_t dr6 = 0, dr7 = 0;
     
-    // FPU state (simplified)
+    // FPU / SSE state stored in FXSAVE 512-byte format
     bool fpuInitialized = false;
     std::array<uint8_t, 512> fpuState{};  // FXSAVE format
     
