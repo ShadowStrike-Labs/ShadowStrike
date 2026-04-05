@@ -25,7 +25,7 @@
  *
  * Production-level implementation of intelligent directory monitoring with
  * automatic critical path discovery, dynamic path detection, and security-
- * focused filtering. Competes with enterprise-grade enterprise-grade, enterprise-grade, enterprise-grade.
+ * focused filtering for enterprise endpoint protection.
  *
  * IMPLEMENTATION FEATURES:
  * ========================
@@ -413,7 +413,7 @@ struct DirectoryMonitor::Impl {
         // Check whitelist
         if (m_whitelist) {
             std::wstring fullPath = event.path + L"\\" + event.filename;
-            if (m_whitelist->IsWhitelisted(fs::path(fullPath))) {
+            if (m_whitelist->IsWhitelisted(fullPath).found) {
                 return true;
             }
         }
@@ -460,8 +460,9 @@ struct DirectoryMonitor::Impl {
             event.category = monitor->path.category;
             event.timestamp = std::chrono::system_clock::now();
 
-            // Extract filename
-            if (fni->FileNameLength > 0) {
+            // Extract filename (capped at max Windows path length)
+            constexpr DWORD kMaxFileNameBytes = 32767 * sizeof(wchar_t);
+            if (fni->FileNameLength > 0 && fni->FileNameLength <= kMaxFileNameBytes) {
                 event.filename.assign(fni->FileName, fni->FileNameLength / sizeof(wchar_t));
             }
 
@@ -515,8 +516,7 @@ struct DirectoryMonitor::Impl {
                         m_eventCallback(event);
                         m_statistics.callbackInvocations.fetch_add(1, std::memory_order_relaxed);
                     } catch (const std::exception& e) {
-                        Utils::Logger::Error(L"DirectoryMonitor: Event callback failed - {}",
-                                           Utils::StringUtils::ToWide(e.what()));
+                        SS_LOG_ERROR(L"DirectoryMonitor", L"Event callback failed: %hs", e.what());
                     }
                 }
             }
@@ -527,8 +527,7 @@ struct DirectoryMonitor::Impl {
 
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Error(L"DirectoryMonitor: Failed to process notification - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to process notification: %hs", e.what());
         }
     }
 
@@ -564,8 +563,8 @@ struct DirectoryMonitor::Impl {
             );
 
             if (!success && GetLastError() != ERROR_IO_PENDING) {
-                Utils::Logger::Error(L"DirectoryMonitor: ReadDirectoryChangesW failed for {} - Error: {}",
-                                   monitor->path.path, GetLastError());
+                SS_LOG_ERROR(L"DirectoryMonitor", L"ReadDirectoryChangesW failed for %ls - Error: %lu",
+                                   monitor->path.path.c_str(), GetLastError());
                 monitor->pImpl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
                 break;
             }
@@ -583,7 +582,7 @@ struct DirectoryMonitor::Impl {
                 if (!GetOverlappedResult(monitor->hDirectory, &monitor->overlapped, &bytesReturned, FALSE)) {
                     DWORD error = GetLastError();
                     if (error != ERROR_OPERATION_ABORTED) {
-                        Utils::Logger::Error(L"DirectoryMonitor: GetOverlappedResult failed - Error: {}", error);
+                        SS_LOG_ERROR(L"DirectoryMonitor", L"GetOverlappedResult failed - Error: %lu", error);
                         monitor->pImpl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
                     }
                     continue;
@@ -594,11 +593,25 @@ struct DirectoryMonitor::Impl {
                     continue;
                 }
 
-                // Process notifications
+                // Process notifications with buffer bounds validation
                 if (bytesReturned > 0) {
-                    FILE_NOTIFY_INFORMATION* fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(monitor->buffer.data());
+                    const uint8_t* bufferStart = monitor->buffer.data();
+                    const uint8_t* bufferEnd = bufferStart + bytesReturned;
+                    auto* fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(monitor->buffer.data());
 
                     while (true) {
+                        const auto* fniBytes = reinterpret_cast<const uint8_t*>(fni);
+
+                        // Validate FNI header fits within returned data
+                        if (fniBytes + offsetof(FILE_NOTIFY_INFORMATION, FileName) > bufferEnd) {
+                            break;
+                        }
+
+                        // Validate filename payload fits within returned data
+                        if (fniBytes + offsetof(FILE_NOTIFY_INFORMATION, FileName) + fni->FileNameLength > bufferEnd) {
+                            break;
+                        }
+
                         monitor->pImpl->ProcessNotification(monitor, fni);
                         monitor->path.eventsReceived.fetch_add(1, std::memory_order_relaxed);
                         monitor->path.lastEvent = Clock::now();
@@ -607,9 +620,15 @@ struct DirectoryMonitor::Impl {
                             break;
                         }
 
-                        fni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
+                        // Validate NextEntryOffset stays within buffer bounds
+                        auto* nextFni = reinterpret_cast<FILE_NOTIFY_INFORMATION*>(
                             reinterpret_cast<uint8_t*>(fni) + fni->NextEntryOffset
                         );
+                        const auto* nextBytes = reinterpret_cast<const uint8_t*>(nextFni);
+                        if (nextBytes < bufferStart || nextBytes >= bufferEnd) {
+                            break;
+                        }
+                        fni = nextFni;
                     }
                 }
             }
@@ -644,19 +663,19 @@ bool DirectoryMonitor::HasInstance() noexcept {
 DirectoryMonitor::DirectoryMonitor()
     : m_impl(std::make_unique<Impl>())
 {
-    Utils::Logger::Info(L"DirectoryMonitor: Constructor called");
+    SS_LOG_INFO(L"DirectoryMonitor", L"Constructor called");
 }
 
 DirectoryMonitor::~DirectoryMonitor() {
     Shutdown();
-    Utils::Logger::Info(L"DirectoryMonitor: Destructor called");
+    SS_LOG_INFO(L"DirectoryMonitor", L"Destructor called");
 }
 
 bool DirectoryMonitor::Initialize(const DirectoryMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"DirectoryMonitor: Already initialized");
+        SS_LOG_WARN(L"DirectoryMonitor", L"Already initialized");
         return true;
     }
 
@@ -665,12 +684,12 @@ bool DirectoryMonitor::Initialize(const DirectoryMonitorConfig& config) {
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"DirectoryMonitor: Invalid configuration");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Invalid configuration");
             return false;
         }
 
         if (!config.enabled) {
-            Utils::Logger::Info(L"DirectoryMonitor: Disabled via configuration");
+            SS_LOG_INFO(L"DirectoryMonitor", L"Disabled via configuration");
             return false;
         }
 
@@ -681,13 +700,12 @@ bool DirectoryMonitor::Initialize(const DirectoryMonitorConfig& config) {
         m_impl->m_status.store(DirectoryMonitorStatus::Running, std::memory_order_release);
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"DirectoryMonitor: Initialized successfully");
+        SS_LOG_INFO(L"DirectoryMonitor", L"Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
         m_impl->m_status.store(DirectoryMonitorStatus::Error, std::memory_order_release);
-        Utils::Logger::Error(L"DirectoryMonitor: Initialization failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Initialization failed: %hs", e.what());
         return false;
     }
 }
@@ -719,11 +737,10 @@ void DirectoryMonitor::Shutdown() noexcept {
         m_impl->m_status.store(DirectoryMonitorStatus::Stopped, std::memory_order_release);
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"DirectoryMonitor: Shutdown complete");
+        SS_LOG_INFO(L"DirectoryMonitor", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DirectoryMonitor: Shutdown error - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Shutdown error: %hs", e.what());
     }
 }
 
@@ -744,7 +761,7 @@ void DirectoryMonitor::MonitorCriticalPaths() {
         std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
         if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn(L"DirectoryMonitor: Not initialized");
+            SS_LOG_WARN(L"DirectoryMonitor", L"Not initialized");
             return;
         }
 
@@ -781,11 +798,10 @@ void DirectoryMonitor::MonitorCriticalPaths() {
             }
         }
 
-        Utils::Logger::Info(L"DirectoryMonitor: Critical paths monitoring started");
+        SS_LOG_INFO(L"DirectoryMonitor", L"Critical paths monitoring started");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DirectoryMonitor: Failed to monitor critical paths - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to monitor critical paths: %hs", e.what());
     }
 }
 
@@ -796,39 +812,55 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
     const auto startTime = Clock::now();
 
     try {
+        // Validate input path
+        if (path.empty()) {
+            SS_LOG_WARN(L"DirectoryMonitor", L"Empty path provided");
+            return 0;
+        }
+
+        // Canonicalize path to resolve traversal sequences (e.g., "..")
+        wchar_t canonicalBuf[MAX_PATH];
+        DWORD canonLen = GetFullPathNameW(path.c_str(), MAX_PATH, canonicalBuf, nullptr);
+        if (canonLen == 0 || canonLen >= MAX_PATH) {
+            SS_LOG_WARN(L"DirectoryMonitor", L"Failed to canonicalize path or path too long: %ls", path.c_str());
+            return 0;
+        }
+        const std::wstring canonicalPath(canonicalBuf, canonLen);
+
         std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
 
-        // Check if already monitored
+        // Check if already monitored (using canonical path)
         for (const auto& [id, monitor] : m_impl->m_monitors) {
-            if (_wcsicmp(monitor.path.path.c_str(), path.c_str()) == 0) {
-                Utils::Logger::Info(L"DirectoryMonitor: Path already monitored - {}", path);
+            if (_wcsicmp(monitor.path.path.c_str(), canonicalPath.c_str()) == 0) {
+                SS_LOG_INFO(L"DirectoryMonitor", L"Path already monitored: %ls", canonicalPath.c_str());
                 return monitor.path.monitorId;
             }
         }
 
         // Check max monitors
         if (m_impl->m_monitors.size() >= m_impl->m_config.maxConcurrentMonitors) {
-            Utils::Logger::Error(L"DirectoryMonitor: Maximum concurrent monitors reached");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Maximum concurrent monitors reached");
             return 0;
         }
 
-        // Check if path exists
-        if (!fs::exists(path)) {
-            Utils::Logger::Warn(L"DirectoryMonitor: Path does not exist - {}", path);
+        // Check if canonical path exists (use canonical form for all operations)
+        if (!fs::exists(canonicalPath)) {
+            SS_LOG_WARN(L"DirectoryMonitor", L"Path does not exist: %ls", canonicalPath.c_str());
             return 0;
         }
 
-        // Check if excluded
-        if (std::find(m_impl->m_config.excludedPaths.begin(),
-                     m_impl->m_config.excludedPaths.end(), path) != m_impl->m_config.excludedPaths.end()) {
-            Utils::Logger::Info(L"DirectoryMonitor: Path is excluded - {}", path);
-            return 0;
+        // Check if excluded (case-insensitive comparison against canonical path)
+        for (const auto& excluded : m_impl->m_config.excludedPaths) {
+            if (_wcsicmp(excluded.c_str(), canonicalPath.c_str()) == 0) {
+                SS_LOG_INFO(L"DirectoryMonitor", L"Path is excluded: %ls", canonicalPath.c_str());
+                return 0;
+            }
         }
 
         // Create monitor
         Impl::MonitorInfo monitor;
         monitor.path.monitorId = m_impl->m_nextMonitorId.fetch_add(1, std::memory_order_relaxed);
-        monitor.path.path = path;
+        monitor.path.path = canonicalPath;
         monitor.path.category = category;
         monitor.path.recursive = recursive;
         monitor.path.createdTime = Clock::now();
@@ -837,7 +869,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
 
         // Open directory handle
         monitor.hDirectory = CreateFileW(
-            path.c_str(),
+            canonicalPath.c_str(),
             FILE_LIST_DIRECTORY,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
             nullptr,
@@ -847,8 +879,8 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
         );
 
         if (monitor.hDirectory == INVALID_HANDLE_VALUE) {
-            Utils::Logger::Error(L"DirectoryMonitor: Failed to open directory {} - Error: {}",
-                               path, GetLastError());
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to open directory %ls - Error: %lu",
+                               canonicalPath.c_str(), GetLastError());
             m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
@@ -857,7 +889,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
         monitor.hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!monitor.hStopEvent) {
             CloseHandle(monitor.hDirectory);
-            Utils::Logger::Error(L"DirectoryMonitor: Failed to create stop event - Error: {}", GetLastError());
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to create stop event - Error: %lu", GetLastError());
             return 0;
         }
 
@@ -866,7 +898,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
         if (!monitor.overlapped.hEvent) {
             CloseHandle(monitor.hDirectory);
             CloseHandle(monitor.hStopEvent);
-            Utils::Logger::Error(L"DirectoryMonitor: Failed to create IO event - Error: {}", GetLastError());
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to create IO event - Error: %lu", GetLastError());
             return 0;
         }
 
@@ -887,7 +919,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
         if (!m_impl->m_monitors[monitorId].hThread) {
             m_impl->StopMonitor(m_impl->m_monitors[monitorId]);
             m_impl->m_monitors.erase(monitorId);
-            Utils::Logger::Error(L"DirectoryMonitor: Failed to create worker thread - Error: {}", GetLastError());
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to create worker thread - Error: %lu", GetLastError());
             return 0;
         }
 
@@ -906,8 +938,8 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
         const auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
         m_impl->m_statistics.totalProcessingTimeUs.fetch_add(durationUs, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"DirectoryMonitor: Monitor added - ID: {}, Path: {}, Category: {}",
-                          monitorId, path, static_cast<int>(category));
+        SS_LOG_INFO(L"DirectoryMonitor", L"Monitor added - ID: %u, Path: %ls, Category: %d",
+                          monitorId, canonicalPath.c_str(), static_cast<int>(category));
 
         // Invoke status callback
         {
@@ -923,8 +955,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
 
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-        Utils::Logger::Error(L"DirectoryMonitor: Failed to add monitor - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to add monitor: %hs", e.what());
         return 0;
     }
 }
@@ -935,7 +966,7 @@ void DirectoryMonitor::RemoveMonitor(uint32_t monitorId) {
 
         auto it = m_impl->m_monitors.find(monitorId);
         if (it == m_impl->m_monitors.end()) {
-            Utils::Logger::Warn(L"DirectoryMonitor: Monitor not found - ID: {}", monitorId);
+            SS_LOG_WARN(L"DirectoryMonitor", L"Monitor not found - ID: %u", monitorId);
             return;
         }
 
@@ -944,7 +975,7 @@ void DirectoryMonitor::RemoveMonitor(uint32_t monitorId) {
 
         m_impl->m_statistics.activeMonitors.fetch_sub(1, std::memory_order_relaxed);
 
-        Utils::Logger::Info(L"DirectoryMonitor: Monitor removed - ID: {}", monitorId);
+        SS_LOG_INFO(L"DirectoryMonitor", L"Monitor removed - ID: %u", monitorId);
 
         // Invoke status callback
         {
@@ -957,15 +988,14 @@ void DirectoryMonitor::RemoveMonitor(uint32_t monitorId) {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DirectoryMonitor: Failed to remove monitor - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Failed to remove monitor: %hs", e.what());
     }
 }
 
 void DirectoryMonitor::RemoveAllMonitors() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
     m_impl->StopAllMonitors();
-    Utils::Logger::Info(L"DirectoryMonitor: All monitors removed");
+    SS_LOG_INFO(L"DirectoryMonitor", L"All monitors removed");
 }
 
 bool DirectoryMonitor::IsMonitored(const std::wstring& path) const {
@@ -1013,44 +1043,44 @@ size_t DirectoryMonitor::GetActiveMonitorCount() const noexcept {
 // ============================================================================
 
 void DirectoryMonitor::PauseAll() noexcept {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
+    std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
 
     for (auto& [id, monitor] : m_impl->m_monitors) {
         monitor.isPaused = true;
     }
 
     m_impl->m_status.store(DirectoryMonitorStatus::Paused, std::memory_order_release);
-    Utils::Logger::Info(L"DirectoryMonitor: All monitors paused");
+    SS_LOG_INFO(L"DirectoryMonitor", L"All monitors paused");
 }
 
 void DirectoryMonitor::ResumeAll() noexcept {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
+    std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
 
     for (auto& [id, monitor] : m_impl->m_monitors) {
         monitor.isPaused = false;
     }
 
     m_impl->m_status.store(DirectoryMonitorStatus::Running, std::memory_order_release);
-    Utils::Logger::Info(L"DirectoryMonitor: All monitors resumed");
+    SS_LOG_INFO(L"DirectoryMonitor", L"All monitors resumed");
 }
 
 void DirectoryMonitor::PauseMonitor(uint32_t monitorId) noexcept {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
+    std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
 
     auto it = m_impl->m_monitors.find(monitorId);
     if (it != m_impl->m_monitors.end()) {
         it->second.isPaused = true;
-        Utils::Logger::Info(L"DirectoryMonitor: Monitor paused - ID: {}", monitorId);
+        SS_LOG_INFO(L"DirectoryMonitor", L"Monitor paused - ID: %u", monitorId);
     }
 }
 
 void DirectoryMonitor::ResumeMonitor(uint32_t monitorId) noexcept {
-    std::shared_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
+    std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
 
     auto it = m_impl->m_monitors.find(monitorId);
     if (it != m_impl->m_monitors.end()) {
         it->second.isPaused = false;
-        Utils::Logger::Info(L"DirectoryMonitor: Monitor resumed - ID: {}", monitorId);
+        SS_LOG_INFO(L"DirectoryMonitor", L"Monitor resumed - ID: %u", monitorId);
     }
 }
 
@@ -1092,7 +1122,7 @@ DirectoryMonitorConfig DirectoryMonitor::GetConfiguration() const {
 void DirectoryMonitor::SetConfiguration(const DirectoryMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"DirectoryMonitor: Configuration updated");
+    SS_LOG_INFO(L"DirectoryMonitor", L"Configuration updated");
 }
 
 // ============================================================================
@@ -1105,7 +1135,7 @@ const DirectoryMonitorStatistics& DirectoryMonitor::GetStatistics() const noexce
 
 void DirectoryMonitor::ResetStatistics() noexcept {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"DirectoryMonitor: Statistics reset");
+    SS_LOG_INFO(L"DirectoryMonitor", L"Statistics reset");
 }
 
 // ============================================================================
@@ -1114,24 +1144,24 @@ void DirectoryMonitor::ResetStatistics() noexcept {
 
 bool DirectoryMonitor::SelfTest() {
     try {
-        Utils::Logger::Info(L"DirectoryMonitor: Starting self-test");
+        SS_LOG_INFO(L"DirectoryMonitor", L"Starting self-test");
 
         // Test adding monitor
         wchar_t tempPath[MAX_PATH];
         if (!GetTempPathW(MAX_PATH, tempPath)) {
-            Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - Cannot get temp path");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Self-test failed - Cannot get temp path");
             return false;
         }
 
         uint32_t monitorId = AddMonitor(tempPath, PathCategory::Temporary, false);
         if (monitorId == 0) {
-            Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - Cannot add monitor");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Self-test failed - Cannot add monitor");
             return false;
         }
 
         // Test IsMonitored
         if (!IsMonitored(tempPath)) {
-            Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - IsMonitored check failed");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Self-test failed - IsMonitored check failed");
             RemoveMonitor(monitorId);
             return false;
         }
@@ -1143,16 +1173,15 @@ bool DirectoryMonitor::SelfTest() {
         // Test removal
         RemoveMonitor(monitorId);
         if (IsMonitored(tempPath)) {
-            Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - Monitor still active after removal");
+            SS_LOG_ERROR(L"DirectoryMonitor", L"Self-test failed - Monitor still active after removal");
             return false;
         }
 
-        Utils::Logger::Info(L"DirectoryMonitor: Self-test passed");
+        SS_LOG_INFO(L"DirectoryMonitor", L"Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"DirectoryMonitor", L"Self-test failed: %hs", e.what());
         return false;
     }
 }

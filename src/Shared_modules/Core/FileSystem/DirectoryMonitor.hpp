@@ -196,6 +196,58 @@ struct alignas(64) MonitoredPath {
     TimePoint lastEvent;
     TimePoint createdTime;
 
+    MonitoredPath() = default;
+
+    MonitoredPath(const MonitoredPath& other)
+        : monitorId(other.monitorId)
+        , path(other.path)
+        , category(other.category)
+        , recursive(other.recursive)
+        , isActive(other.isActive)
+        , eventsReceived(other.eventsReceived.load(std::memory_order_relaxed))
+        , lastEvent(other.lastEvent)
+        , createdTime(other.createdTime) {}
+
+    MonitoredPath& operator=(const MonitoredPath& other) {
+        if (this != &other) {
+            monitorId = other.monitorId;
+            path = other.path;
+            category = other.category;
+            recursive = other.recursive;
+            isActive = other.isActive;
+            eventsReceived.store(other.eventsReceived.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+            lastEvent = other.lastEvent;
+            createdTime = other.createdTime;
+        }
+        return *this;
+    }
+
+    MonitoredPath(MonitoredPath&& other) noexcept
+        : monitorId(other.monitorId)
+        , path(std::move(other.path))
+        , category(other.category)
+        , recursive(other.recursive)
+        , isActive(other.isActive)
+        , eventsReceived(other.eventsReceived.load(std::memory_order_relaxed))
+        , lastEvent(other.lastEvent)
+        , createdTime(other.createdTime) {}
+
+    MonitoredPath& operator=(MonitoredPath&& other) noexcept {
+        if (this != &other) {
+            monitorId = other.monitorId;
+            path = std::move(other.path);
+            category = other.category;
+            recursive = other.recursive;
+            isActive = other.isActive;
+            eventsReceived.store(other.eventsReceived.load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+            lastEvent = other.lastEvent;
+            createdTime = other.createdTime;
+        }
+        return *this;
+    }
+
     [[nodiscard]] std::string ToJson() const;
 };
 
