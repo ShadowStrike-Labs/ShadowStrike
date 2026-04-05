@@ -40,6 +40,7 @@
 #include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/BehaviorAnalyzer.hpp"
 #include "../Security/DigitalSignatureValidator.hpp"
+#include "../AI/PhantomCortex.hpp"
 
 #include <algorithm>
 #include <filesystem>
@@ -773,6 +774,50 @@ struct ProcessCreationMonitor::Impl {
             SS_LOG_ERROR(L"ProcessCreationMonitor",
                 L"ScanEngine unknown exception in pre-exec scan PID=%u",
                 event.processId);
+        }
+
+        // ================================================================
+        // PhantomCortex AI/ML zero-day detection (additive — never downgrades)
+        // ================================================================
+        if (ShadowStrike::AI::PhantomCortex::Instance().IsOperational()) {
+            try {
+                std::ifstream ifs(event.imagePath, std::ios::binary | std::ios::ate);
+                if (ifs.is_open()) {
+                    const auto fileSize = ifs.tellg();
+                    if (fileSize > 0 &&
+                        static_cast<size_t>(fileSize) <= ShadowStrike::AI::CortexConstants::MAX_PE_FILE_SIZE) {
+                        ifs.seekg(0, std::ios::beg);
+                        std::vector<uint8_t> fileBytes(static_cast<size_t>(fileSize));
+                        if (ifs.read(reinterpret_cast<char*>(fileBytes.data()),
+                                     static_cast<std::streamsize>(fileSize))) {
+                            auto mlVerdict = ShadowStrike::AI::PhantomCortex::Instance().AnalyzeFile(
+                                std::span<const uint8_t>(fileBytes));
+
+                            if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Malicious) {
+                                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                                    L"PhantomCortex ML BLOCKED zero-day threat: PID=%u Path=%ls confidence=%.2f",
+                                    event.processId, event.imagePath.c_str(), mlVerdict.confidence);
+                                return ProcessVerdict::Block;
+                            }
+
+                            if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Suspicious) {
+                                SS_LOG_WARN(L"ProcessCreationMonitor",
+                                    L"PhantomCortex ML flagged suspicious process: PID=%u Path=%ls confidence=%.2f",
+                                    event.processId, event.imagePath.c_str(), mlVerdict.confidence);
+                                return ProcessVerdict::AllowMonitored;
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                    L"PhantomCortex ML analysis failed PID=%u: %hs",
+                    event.processId, ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"ProcessCreationMonitor",
+                    L"PhantomCortex ML unknown exception PID=%u",
+                    event.processId);
+            }
         }
 
         return ProcessVerdict::Allow;

@@ -75,6 +75,12 @@
 #include "../AntiEvasion/PackerDetector.hpp"
 
 // ============================================================================
+// AI/ML ENGINE INCLUDES
+// ============================================================================
+#include "../AI/PhantomCortex.hpp"
+#include "../AI/CortexConfig.hpp"
+
+// ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
 #include "../Communication/IPCManager.hpp"
@@ -504,6 +510,31 @@ public:
             // 8. Initialize Anti-Evasion Detectors
             InitializeAntiEvasionDetectors();
 
+            // 9. Initialize PhantomCortex AI/ML engine
+            try {
+                ShadowStrike::AI::CortexConfigManager::Instance().LoadFromRegistry();
+                ShadowStrike::AI::CortexConfig cortexConfig =
+                    ShadowStrike::AI::CortexConfigManager::Instance().GetConfig();
+
+                if (cortexConfig.modelDirectory.empty()) {
+                    cortexConfig.modelDirectory = L"C:\\ProgramData\\ShadowStrike\\Models";
+                }
+
+                if (!ShadowStrike::AI::PhantomCortex::Instance().Initialize(cortexConfig)) {
+                    SS_LOG_WARN(L"RealTimeProtection",
+                        L"PhantomCortex AI engine failed to initialize — ML detection disabled");
+                } else {
+                    SS_LOG_INFO(L"RealTimeProtection",
+                        L"PhantomCortex AI engine initialized successfully");
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_WARN(L"RealTimeProtection",
+                    L"PhantomCortex init exception: %hs — ML detection disabled", ex.what());
+            } catch (...) {
+                SS_LOG_WARN(L"RealTimeProtection",
+                    L"PhantomCortex init unknown exception — ML detection disabled");
+            }
+
             SetState(ProtectionState::ACTIVE);
             Utils::Logger::Info("RealTimeProtection: Started successfully");
             return true;
@@ -550,6 +581,13 @@ public:
         // 4. Shutdown scan engine
         Core::Engine::ScanEngine::Instance().Shutdown();
         SetComponentState(ComponentType::SCAN_ENGINE, ComponentState::STOPPED);
+
+        // 4.5. Shutdown PhantomCortex AI/ML engine
+        try {
+            ShadowStrike::AI::PhantomCortex::Instance().Shutdown();
+        } catch (...) {
+            // PhantomCortex shutdown must not prevent remaining cleanup
+        }
 
         // 5. Clear caches
         {
@@ -3007,6 +3045,58 @@ public:
             result.verdict = KernelVerdict::ERROR;
             result.errorCode = 1;
             result.errorMessage = Utils::StringUtils::ToWide(e.what());
+        }
+
+        // ================================================================
+        // PhantomCortex AI/ML analysis (additive — never downgrades)
+        // ================================================================
+        if (ShadowStrike::AI::PhantomCortex::Instance().IsOperational()) {
+            try {
+                std::vector<std::byte> rawBytes;
+                Utils::FileUtils::Error fileErr;
+                if (Utils::FileUtils::ReadAllBytes(filePath, rawBytes, &fileErr) &&
+                    !rawBytes.empty()) {
+                    auto mlVerdict = ShadowStrike::AI::PhantomCortex::Instance().AnalyzeFile(
+                        std::span<const uint8_t>(
+                            reinterpret_cast<const uint8_t*>(rawBytes.data()),
+                            rawBytes.size()));
+
+                    if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Malicious) {
+                        if (result.verdict == KernelVerdict::ALLOW ||
+                            result.verdict == KernelVerdict::MONITOR) {
+                            SS_LOG_WARN(L"RealTimeProtection",
+                                L"PhantomCortex ML detected threat in %s (confidence: %.2f, scan engine: clean)",
+                                filePath.c_str(), mlVerdict.confidence);
+                            result.verdict = KernelVerdict::BLOCK;
+                            result.isThreat = true;
+                            result.threatName = L"ML/PhantomCortex." + mlVerdict.details;
+                            result.confidence = static_cast<uint8_t>(
+                                std::clamp(mlVerdict.confidence * 100.0f, 0.0f, 100.0f));
+                            result.detectedByML = true;
+                            result.action = RemediationAction::BLOCKED;
+                        }
+                    } else if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Suspicious &&
+                               result.verdict == KernelVerdict::ALLOW) {
+                        SS_LOG_INFO(L"RealTimeProtection",
+                            L"PhantomCortex ML flagged %s as suspicious (confidence: %.2f)",
+                            filePath.c_str(), mlVerdict.confidence);
+                        result.verdict = KernelVerdict::MONITOR;
+                        result.isThreat = true;
+                        result.threatName = L"ML/PhantomCortex.Suspicious";
+                        result.confidence = static_cast<uint8_t>(
+                            std::clamp(mlVerdict.confidence * 100.0f, 0.0f, 100.0f));
+                        result.detectedByML = true;
+                    }
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"RealTimeProtection",
+                    L"PhantomCortex ML analysis failed for %s: %hs",
+                    filePath.c_str(), ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"RealTimeProtection",
+                    L"PhantomCortex ML analysis unknown exception for %s",
+                    filePath.c_str());
+            }
         }
 
         return result;
