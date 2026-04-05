@@ -144,6 +144,20 @@ namespace FileLockManagerConstants {
     constexpr uint32_t DEFAULT_RETRY_COUNT = 3;
     constexpr uint32_t DEFAULT_RETRY_DELAY_MS = 500;
 
+    // Handle enumeration limits
+    constexpr uint32_t HANDLE_ENUM_INITIAL_BUFFER_MB = 4;
+    constexpr uint32_t HANDLE_ENUM_MAX_BUFFER_MB = 256;
+    constexpr uint32_t HANDLE_QUERY_TIMEOUT_MS = 200;
+
+    // Kernel communication
+    constexpr uint32_t KERNEL_MESSAGE_TIMEOUT_MS = 3000;
+    constexpr uint32_t KERNEL_CONNECT_RETRY_COUNT = 3;
+    constexpr uint32_t KERNEL_CONNECT_RETRY_DELAY_MS = 1000;
+
+    // APT threat correlation
+    constexpr uint32_t SUSPICIOUS_LOCK_COUNT_THRESHOLD = 50;
+    constexpr double HIGH_THREAT_SCORE_THRESHOLD = 0.75;
+
 }  // namespace FileLockManagerConstants
 
 // ============================================================================
@@ -164,6 +178,21 @@ enum class LockType : uint8_t {
     Mapping = 6,                   // Memory-mapped file
     Section = 7,                   // Section object
     Module = 8                     // Loaded as DLL/EXE
+};
+
+/**
+ * @enum LockPattern
+ * @brief Detected lock behavior pattern for APT/threat correlation.
+ */
+enum class LockPattern : uint8_t {
+    Normal = 0,
+    Ransomware = 1,                // Mass file locking + encryption indicators
+    LateralMovement = 2,           // Remote process locking system files
+    Persistence = 3,               // Locking startup/service binaries
+    DataExfiltration = 4,          // Staged file access before network activity
+    DefenseEvasion = 5,            // Locking AV/EDR-related files
+    PrivilegeEscalation = 6,       // Locking privileged service binaries
+    ProcessInjection = 7           // Lock held by hollowed/injected process
 };
 
 /**
@@ -246,12 +275,38 @@ struct alignas(128) LockOwner {
     // Timestamps
     std::chrono::system_clock::time_point processStart;
     std::chrono::system_clock::time_point handleCreated;
+
+    // APT threat indicators
+    double threatScore{ 0.0 };
+    bool isSuspicious{ false };
+    bool isUntrustedSigner{ false };
+    bool isInjectedProcess{ false };
+    bool isRemoteProcess{ false };
+    LockPattern lockPattern{ LockPattern::Normal };
+    std::wstring moduleHash;
 };
 
 /**
  * @struct FileLockInfo
  * @brief Complete file lock information.
  */
+/**
+ * @struct ThreatAssessment
+ * @brief APT-grade threat analysis of file lock context.
+ */
+struct alignas(64) ThreatAssessment {
+    double overallThreatScore{ 0.0 };
+    LockPattern dominantPattern{ LockPattern::Normal };
+    bool requiresImmediateAction{ false };
+    bool isSuspiciousActivity{ false };
+    uint32_t untrustedLockCount{ 0 };
+    uint32_t injectedProcessCount{ 0 };
+    uint32_t remoteLockCount{ 0 };
+    uint32_t unsignedProcessCount{ 0 };
+    std::vector<std::string> indicators;
+    std::wstring recommendedAction;
+};
+
 struct alignas(64) FileLockInfo {
     std::wstring filePath;
     bool isLocked{ false };
@@ -268,6 +323,10 @@ struct alignas(64) FileLockInfo {
     uint64_t fileSize{ 0 };
     bool fileExists{ true };
     bool isDirectory{ false };
+
+    // APT threat assessment
+    ThreatAssessment threatAssessment;
+    std::chrono::microseconds detectionDuration{ 0 };
 };
 
 /**
@@ -337,13 +396,16 @@ struct alignas(32) FileLockManagerConfig {
  * @struct FileLockManagerStatistics
  * @brief Runtime statistics.
  */
-struct alignas(128) FileLockManagerStatistics {
-    std::atomic<uint64_t> locksDetected{ 0 };
-    std::atomic<uint64_t> successfulUnlocks{ 0 };
-    std::atomic<uint64_t> failedUnlocks{ 0 };
-    std::atomic<uint64_t> processesTerminated{ 0 };
-    std::atomic<uint64_t> handlesClosed{ 0 };
-    std::atomic<uint64_t> rebootScheduled{ 0 };
+struct alignas(64) FileLockManagerStatistics {
+    uint64_t locksDetected{ 0 };
+    uint64_t successfulUnlocks{ 0 };
+    uint64_t failedUnlocks{ 0 };
+    uint64_t processesTerminated{ 0 };
+    uint64_t handlesClosed{ 0 };
+    uint64_t rebootScheduled{ 0 };
+    uint64_t kernelUnlocks{ 0 };
+    uint64_t handleEnumerations{ 0 };
+    uint64_t threatsDetected{ 0 };
 
     void Reset() noexcept;
 };
@@ -361,6 +423,11 @@ using TerminateCallback = std::function<bool(const LockOwner& owner)>;
  * @brief Callback for unlock progress.
  */
 using UnlockProgressCallback = std::function<void(const std::wstring& status, uint32_t percent)>;
+
+/**
+ * @brief Callback for real-time lock events from kernel.
+ */
+using LockEventCallback = std::function<void(const FileLockInfo& lockInfo)>;
 
 // ============================================================================
 // MAIN CLASS DEFINITION
@@ -569,12 +636,42 @@ public:
      */
     [[nodiscard]] bool IsKernelDriverAvailable() const noexcept;
 
+    /**
+     * @brief Connects to the PhantomSensor kernel driver for file lock ops.
+     * @return True if connection established.
+     */
+    bool ConnectKernelDriver();
+
+    /**
+     * @brief Disconnects from the kernel driver.
+     */
+    void DisconnectKernelDriver() noexcept;
+
+    // ========================================================================
+    // APT THREAT ANALYSIS
+    // ========================================================================
+
+    /**
+     * @brief Performs APT-grade threat assessment on file lock context.
+     * @param lockInfo Lock information to analyze.
+     * @return Threat assessment result.
+     */
+    [[nodiscard]] ThreatAssessment AnalyzeThreat(const FileLockInfo& lockInfo) const;
+
+    /**
+     * @brief Full handle-level enumeration for deep forensic analysis.
+     * @param filePath Path to file.
+     * @return Vector of all handle-level lock owners.
+     */
+    [[nodiscard]] std::vector<LockOwner> EnumerateHandles(const std::wstring& filePath) const;
+
     // ========================================================================
     // CALLBACKS
     // ========================================================================
 
     void SetTerminateCallback(TerminateCallback callback);
     void SetProgressCallback(UnlockProgressCallback callback);
+    void SetLockEventCallback(LockEventCallback callback);
 
     // ========================================================================
     // CONFIGURATION
@@ -587,7 +684,7 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] const FileLockManagerStatistics& GetStatistics() const noexcept;
+    [[nodiscard]] FileLockManagerStatistics GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
 
 private:

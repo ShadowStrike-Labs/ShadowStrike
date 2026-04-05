@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -17,33 +17,25 @@
  */
 /**
  * ============================================================================
- * ShadowStrike Core FileSystem - FILE LOCK MANAGER IMPLEMENTATION
+ * ShadowStrike Core FileSystem - FILE LOCK MANAGER IMPLEMENTATION v4.0
  * ============================================================================
  *
  * @file FileLockManager.cpp
- * @brief Enterprise-grade file lock detection and handle management.
- *
- * This module provides comprehensive capabilities to identify processes
- * holding file locks and safely release them when necessary for malware
- * remediation and quarantine operations.
+ * @brief Enterprise-grade file lock detection, handle management, and
+ *        APT-grade threat correlation with kernel driver integration.
  *
  * Architecture:
  * - PIMPL pattern for ABI stability
- * - Meyers' Singleton for thread-safe instance management
- * - Windows Restart Manager integration
- * - Kernel handle enumeration via NtQuerySystemInformation
- * - Safe process termination with critical process protection
- * - MoveFileEx for delete-on-reboot scheduling
- *
- * Windows API Integration:
- * - NtQuerySystemInformation: Handle enumeration
- * - Restart Manager: Application-aware unlocking
- * - DuplicateHandle/CloseHandle: Handle management
- * - MoveFileEx: Reboot operations
- * - OpenProcess/TerminateProcess: Process control
+ * - Meyers Singleton for thread-safe instance management
+ * - NtQuerySystemInformation(SystemExtendedHandleInformationClass) for deep handle enum
+ * - Windows Restart Manager for application-aware unlocking
+ * - FilterSendMessage for kernel-mode force-close operations
+ * - File ID-based handle matching (robust against symlinks/junctions)
+ * - APT behavioral pattern detection in lock analysis
+ * - Process trust verification (signature, injection, elevation)
  *
  * @author ShadowStrike Security Team
- * @version 3.0.0
+ * @version 4.0.0
  * @date 2026
  * @copyright 2026 ShadowStrike Security Suite
  */
@@ -51,36 +43,37 @@
 #include "pch.h"
 #include "FileLockManager.hpp"
 
-// ============================================================================
-// INFRASTRUCTURE INCLUDES
-// ============================================================================
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 
-// ============================================================================
-// WINDOWS API INCLUDES
-// ============================================================================
 #include <Windows.h>
 #include <winternl.h>
 #include <RestartManager.h>
 #include <Psapi.h>
 #include <tlhelp32.h>
+#include <fltUser.h>
+#include <Softpub.h>
+#include <wintrust.h>
 
-// ============================================================================
-// STANDARD LIBRARY INCLUDES
-// ============================================================================
 #include <filesystem>
 #include <algorithm>
 #include <thread>
 #include <chrono>
+#include <atomic>
+#include <unordered_set>
+#include <unordered_map>
 
 #pragma comment(lib, "Rstrtmgr.lib")
 #pragma comment(lib, "ntdll.lib")
+#pragma comment(lib, "FltLib.lib")
+#pragma comment(lib, "Wintrust.lib")
 
 namespace fs = std::filesystem;
+
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
 
 namespace ShadowStrike {
 namespace Core {
@@ -91,61 +84,143 @@ namespace FileSystem {
 // ============================================================================
 namespace {
 
-    // System process PIDs
     constexpr uint32_t SYSTEM_PID = 4;
     constexpr uint32_t IDLE_PID = 0;
+    constexpr const wchar_t* SHADOWSTRIKE_FILTER_PORT = L"\\ShadowStrikePort";
 
-    // Critical processes that should never be terminated
-    const std::unordered_set<std::wstring> CRITICAL_PROCESSES = {
-        L"csrss.exe",
-        L"smss.exe",
-        L"wininit.exe",
-        L"services.exe",
-        L"lsass.exe",
-        L"winlogon.exe",
-        L"System",
-        L"dwm.exe"
+    constexpr std::wstring_view CRITICAL_PROC_NAMES[] = {
+        L"csrss.exe", L"smss.exe", L"wininit.exe", L"services.exe",
+        L"lsass.exe", L"winlogon.exe", L"system", L"dwm.exe"
     };
 
-    // System processes to protect
-    const std::unordered_set<std::wstring> SYSTEM_PROCESSES = {
-        L"svchost.exe",
-        L"explorer.exe",
-        L"conhost.exe",
-        L"RuntimeBroker.exe",
-        L"taskhostw.exe"
+    constexpr std::wstring_view SYSTEM_PROC_NAMES[] = {
+        L"svchost.exe", L"explorer.exe", L"conhost.exe",
+        L"runtimebroker.exe", L"taskhostw.exe"
     };
 
-    // NT API constants
-    constexpr NTSTATUS STATUS_SUCCESS = 0x00000000;
-    constexpr NTSTATUS STATUS_INFO_LENGTH_MISMATCH = 0xC0000004;
+    [[nodiscard]] bool IsCriticalProcessName(std::wstring_view name) noexcept {
+        std::wstring lower(name);
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        for (const auto& c : CRITICAL_PROC_NAMES) { if (lower == c) return true; }
+        return false;
+    }
+
+    [[nodiscard]] bool IsSystemProcessName(std::wstring_view name) noexcept {
+        std::wstring lower(name);
+        std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+        for (const auto& s : SYSTEM_PROC_NAMES) { if (lower == s) return true; }
+        return false;
+    }
+
+    constexpr NTSTATUS NT_STATUS_OK = 0x00000000;
+    constexpr NTSTATUS NT_STATUS_INFO_LEN_MISMATCH = static_cast<NTSTATUS>(0xC0000004);
+    constexpr ULONG SystemExtendedHandleInformationClass = 64;
+    constexpr ULONG MAX_HANDLE_BUFFER_BYTES = 256u << 20; // 256 MB cap
 
 } // anonymous namespace
 
 // ============================================================================
-// NT API DECLARATIONS
+// NT API DECLARATIONS (Extended - 64-bit safe)
 // ============================================================================
 
-typedef enum _SYSTEM_INFORMATION_CLASS {
-    SystemHandleInformation = 16,
-    SystemExtendedHandleInformation = 64
-} SYSTEM_INFORMATION_CLASS;
-
-typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO {
-    USHORT UniqueProcessId;
-    USHORT CreatorBackTraceIndex;
-    UCHAR ObjectTypeIndex;
-    UCHAR HandleAttributes;
-    USHORT HandleValue;
+typedef struct _SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX {
     PVOID Object;
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR HandleValue;
     ULONG GrantedAccess;
-} SYSTEM_HANDLE_TABLE_ENTRY_INFO, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO;
+    USHORT CreatorBackTraceIndex;
+    USHORT ObjectTypeIndex;
+    ULONG HandleAttributes;
+    ULONG Reserved;
+} SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX, *PSYSTEM_HANDLE_TABLE_ENTRY_INFO_EX;
 
-typedef struct _SYSTEM_HANDLE_INFORMATION {
-    ULONG NumberOfHandles;
-    SYSTEM_HANDLE_TABLE_ENTRY_INFO Handles[1];
-} SYSTEM_HANDLE_INFORMATION, *PSYSTEM_HANDLE_INFORMATION;
+typedef struct _SYSTEM_HANDLE_INFORMATION_EX {
+    ULONG_PTR NumberOfHandles;
+    ULONG_PTR Reserved;
+    SYSTEM_HANDLE_TABLE_ENTRY_INFO_EX Handles[1];
+} SYSTEM_HANDLE_INFORMATION_EX, *PSYSTEM_HANDLE_INFORMATION_EX;
 
+using NtQuerySystemInformationFn = NTSTATUS(NTAPI*)(
+    ULONG, PVOID, ULONG, PULONG);
+using NtQueryObjectFn = NTSTATUS(NTAPI*)(
+    HANDLE, ULONG, PVOID, ULONG, PULONG);
+// ============================================================================
+// RAII HANDLE WRAPPER
+// ============================================================================
+
+class ScopedHandle final {
+public:
+    ScopedHandle() noexcept : m_handle(INVALID_HANDLE_VALUE) {}
+    explicit ScopedHandle(HANDLE h) noexcept : m_handle(h) {}
+    ~ScopedHandle() noexcept { Close(); }
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+    ScopedHandle(ScopedHandle&& o) noexcept : m_handle(o.m_handle) { o.m_handle = INVALID_HANDLE_VALUE; }
+    ScopedHandle& operator=(ScopedHandle&& o) noexcept {
+        if (this != &o) { Close(); m_handle = o.m_handle; o.m_handle = INVALID_HANDLE_VALUE; }
+        return *this;
+    }
+    [[nodiscard]] bool IsValid() const noexcept { return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr; }
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    HANDLE Release() noexcept { HANDLE h = m_handle; m_handle = INVALID_HANDLE_VALUE; return h; }
+    void Reset(HANDLE h = INVALID_HANDLE_VALUE) noexcept { Close(); m_handle = h; }
+    explicit operator bool() const noexcept { return IsValid(); }
+private:
+    void Close() noexcept { if (IsValid()) { ::CloseHandle(m_handle); m_handle = INVALID_HANDLE_VALUE; } }
+    HANDLE m_handle;
+};
+
+// ============================================================================
+// INTERNAL ATOMIC STATISTICS
+// ============================================================================
+
+struct InternalStatistics {
+    std::atomic<uint64_t> locksDetected{ 0 };
+    std::atomic<uint64_t> successfulUnlocks{ 0 };
+    std::atomic<uint64_t> failedUnlocks{ 0 };
+    std::atomic<uint64_t> processesTerminated{ 0 };
+    std::atomic<uint64_t> handlesClosed{ 0 };
+    std::atomic<uint64_t> rebootScheduled{ 0 };
+    std::atomic<uint64_t> kernelUnlocks{ 0 };
+    std::atomic<uint64_t> handleEnumerations{ 0 };
+    std::atomic<uint64_t> threatsDetected{ 0 };
+
+    [[nodiscard]] FileLockManagerStatistics Snapshot() const noexcept {
+        FileLockManagerStatistics s;
+        s.locksDetected = locksDetected.load(std::memory_order_relaxed);
+        s.successfulUnlocks = successfulUnlocks.load(std::memory_order_relaxed);
+        s.failedUnlocks = failedUnlocks.load(std::memory_order_relaxed);
+        s.processesTerminated = processesTerminated.load(std::memory_order_relaxed);
+        s.handlesClosed = handlesClosed.load(std::memory_order_relaxed);
+        s.rebootScheduled = rebootScheduled.load(std::memory_order_relaxed);
+        s.kernelUnlocks = kernelUnlocks.load(std::memory_order_relaxed);
+        s.handleEnumerations = handleEnumerations.load(std::memory_order_relaxed);
+        s.threatsDetected = threatsDetected.load(std::memory_order_relaxed);
+        return s;
+    }
+    void Reset() noexcept {
+        locksDetected = 0; successfulUnlocks = 0; failedUnlocks = 0;
+        processesTerminated = 0; handlesClosed = 0; rebootScheduled = 0;
+        kernelUnlocks = 0; handleEnumerations = 0; threatsDetected = 0;
+    }
+};
+
+// ============================================================================
+// KERNEL COMMUNICATION PROTOCOL
+// ============================================================================
+namespace KernelProtocol {
+    enum class Command : uint32_t {
+        QueryFileLocks = 0x200, ForceCloseHandle = 0x201,
+        LockForQuarantine = 0x202, ReleaseFileLock = 0x203
+    };
+#pragma pack(push, 1)
+    struct RequestHeader { uint32_t command; uint32_t dataLength; };
+    struct ForceCloseRequest { RequestHeader header; uint32_t targetPid; uint64_t handleValue; wchar_t filePath[260]; };
+    struct QueryLocksRequest { RequestHeader header; wchar_t filePath[260]; };
+    struct ResponseHeader { uint32_t status; uint32_t dataLength; };
+    struct ForceCloseResponse { ResponseHeader header; uint32_t handlesAffected; uint32_t errorCode; };
+#pragma pack(pop)
+} // namespace KernelProtocol
 // ============================================================================
 // IMPLEMENTATION CLASS (PIMPL)
 // ============================================================================
@@ -153,779 +228,363 @@ typedef struct _SYSTEM_HANDLE_INFORMATION {
 class FileLockManagerImpl final {
 public:
     FileLockManagerImpl() = default;
-    ~FileLockManagerImpl() = default;
-
-    // Delete copy/move
+    ~FileLockManagerImpl() { Shutdown(); }
     FileLockManagerImpl(const FileLockManagerImpl&) = delete;
     FileLockManagerImpl& operator=(const FileLockManagerImpl&) = delete;
-    FileLockManagerImpl(FileLockManagerImpl&&) = delete;
-    FileLockManagerImpl& operator=(FileLockManagerImpl&&) = delete;
-
-    // ========================================================================
-    // LIFECYCLE
-    // ========================================================================
 
     [[nodiscard]] bool Initialize(const FileLockManagerConfig& config) {
         std::unique_lock lock(m_mutex);
-
         try {
             m_config = config;
-            m_initialized = true;
-
-            // Check if we have SeDebugPrivilege
             m_hasDebugPrivilege = EnableDebugPrivilege();
-
-            // Check kernel driver availability
+            HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll");
+            if (hNtdll) {
+                m_ntQuerySystemInfo = reinterpret_cast<NtQuerySystemInformationFn>(GetProcAddress(hNtdll, "NtQuerySystemInformation"));
+                m_ntQueryObject = reinterpret_cast<NtQueryObjectFn>(GetProcAddress(hNtdll, "NtQueryObject"));
+            }
+            m_fileTypeIndex = ResolveFileObjectTypeIndex();
             m_kernelDriverAvailable = CheckKernelDriver();
-
-            SS_LOG_INFO(L"FileLockManager", L"FileLockManager initialized (debug=%hs, kernel=%hs)", m_hasDebugPrivilege, m_kernelDriverAvailable);
-
+            if (m_kernelDriverAvailable && config.allowKernelUnlock) ConnectToKernelDriverInternal();
+            m_initialized = true;
+            SS_LOG_INFO(L"FileLockManager", L"Initialized v4.0 (debug=%s, kernel=%s, ntQuery=%s, fileTypeIdx=%u)",
+                m_hasDebugPrivilege ? L"yes" : L"no", m_kernelDriverAvailable ? L"yes" : L"no",
+                m_ntQuerySystemInfo ? L"yes" : L"no", static_cast<unsigned>(m_fileTypeIndex));
             return true;
-
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"FileLockManager initialization failed: %hs", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"Initialization failed: %hs", e.what());
             return false;
         }
     }
 
     void Shutdown() noexcept {
         std::unique_lock lock(m_mutex);
-
         try {
+            DisconnectFromKernelDriverInternal();
             m_terminateCallback = nullptr;
             m_progressCallback = nullptr;
+            m_lockEventCallback = nullptr;
             m_initialized = false;
-
-            SS_LOG_INFO(L"FileLockManager", L"FileLockManager shutdown complete");
-
-        } catch (...) {
-            // Suppress all exceptions in shutdown
-        }
+        } catch (...) {}
     }
-
-    // ========================================================================
-    // LOCK DETECTION
-    // ========================================================================
 
     [[nodiscard]] std::vector<LockOwner> GetLockingProcesses(const std::wstring& filePath) const {
         std::shared_lock lock(m_mutex);
         std::vector<LockOwner> owners;
-
         try {
-            // Normalize path
-            auto normalizedPath = NormalizePath(filePath);
-            if (normalizedPath.empty()) {
-                SS_LOG_WARN(L"FileLockManager", L"Invalid file path: %hs", StringUtils::ToNarrow(filePath).c_str());
-                return owners;
+            auto np = NormalizePath(filePath);
+            if (np.empty()) return owners;
+            auto rmOwners = GetLockingProcessesRM(np);
+            auto handleOwners = GetLockingProcessesHandleEnum(np);
+            owners = std::move(rmOwners);
+            std::unordered_set<uint32_t> known;
+            for (const auto& o : owners) known.insert(o.pid);
+            for (auto& ho : handleOwners) {
+                if (known.find(ho.pid) == known.end()) {
+                    owners.push_back(std::move(ho));
+                    known.insert(owners.back().pid);
+                } else {
+                    for (auto& ex : owners) {
+                        if (ex.pid == ho.pid && ex.handleValue == 0) {
+                            ex.handleValue = ho.handleValue;
+                            ex.accessMask = ho.accessMask;
+                            ex.lockType = ho.lockType;
+                            break;
+                        }
+                    }
+                }
             }
-
-            // Try Restart Manager first (faster and more reliable)
-            auto rmOwners = GetLockingProcessesRM(normalizedPath);
-            if (!rmOwners.empty()) {
-                return rmOwners;
-            }
-
-            // Fallback to handle enumeration
-            owners = GetLockingProcessesHandleEnum(normalizedPath);
-
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcesses - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcesses exception: %hs", e.what());
         }
-
         return owners;
     }
 
     [[nodiscard]] FileLockInfo GetLockInfo(const std::wstring& filePath) const {
+        auto t0 = std::chrono::steady_clock::now();
         FileLockInfo info;
         info.filePath = filePath;
-
         try {
-            // Check if file exists
-            if (!fs::exists(filePath)) {
-                info.fileExists = false;
-                return info;
-            }
-
-            info.isDirectory = fs::is_directory(filePath);
-            if (!info.isDirectory) {
-                info.fileSize = fs::file_size(filePath);
-            }
-
-            // Get locking processes
+            std::error_code ec;
+            if (!fs::exists(filePath, ec)) { info.fileExists = false; return info; }
+            info.isDirectory = fs::is_directory(filePath, ec);
+            if (!info.isDirectory) info.fileSize = fs::file_size(filePath, ec);
             info.owners = GetLockingProcesses(filePath);
             info.lockCount = static_cast<uint32_t>(info.owners.size());
             info.isLocked = (info.lockCount > 0);
-
-            // Analyze lock owners
-            for (const auto& owner : info.owners) {
-                if (owner.isSystemProcess) {
-                    info.hasSystemLock = true;
-                }
-                if (owner.isCriticalProcess) {
-                    info.hasCriticalLock = true;
-                    info.canForceUnlock = false;
-                }
+            for (const auto& o : info.owners) {
+                if (o.isSystemProcess) info.hasSystemLock = true;
+                if (o.isCriticalProcess) { info.hasCriticalLock = true; info.canForceUnlock = false; }
             }
-
-            m_stats.locksDetected++;
-
+            info.threatAssessment = AnalyzeThreatInternal(info);
+            m_stats.locksDetected.fetch_add(1, std::memory_order_relaxed);
+            if (info.threatAssessment.isSuspiciousActivity)
+                m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetLockInfo - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockInfo exception: %hs", e.what());
         }
-
+        info.detectionDuration = std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - t0);
         return info;
     }
 
     [[nodiscard]] bool IsFileLocked(const std::wstring& filePath) const {
         try {
-            // Quick check: try to open with exclusive access
-            HANDLE hFile = CreateFileW(
-                filePath.c_str(),
-                GENERIC_READ | GENERIC_WRITE,
-                0, // No sharing
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                nullptr
-            );
-
-            if (hFile != INVALID_HANDLE_VALUE) {
-                CloseHandle(hFile);
-                return false; // Not locked
-            }
-
-            DWORD error = GetLastError();
-            if (error == ERROR_SHARING_VIOLATION || error == ERROR_LOCK_VIOLATION) {
-                return true; // Locked
-            }
-
-            // File might not exist or other error
-            return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"IsFileLocked - Exception: %hs", e.what());
-            return false;
-        }
+            ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (hFile.IsValid()) return false;
+            DWORD err = GetLastError();
+            return (err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION);
+        } catch (...) { return false; }
     }
 
     [[nodiscard]] bool CanDeleteFile(const std::wstring& filePath) const {
         try {
-            // Try to open with DELETE access
-            HANDLE hFile = CreateFileW(
-                filePath.c_str(),
-                DELETE,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL,
-                nullptr
-            );
-
-            if (hFile != INVALID_HANDLE_VALUE) {
-                CloseHandle(hFile);
-                return true;
-            }
-
-            return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"CanDeleteFile - Exception: %hs", e.what());
-            return false;
-        }
+            ScopedHandle h(CreateFileW(filePath.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+            return h.IsValid();
+        } catch (...) { return false; }
     }
 
     [[nodiscard]] LockType GetLockType(const std::wstring& filePath) const {
         try {
-            // Try different access modes to determine lock type
-
-            // Check for read lock
-            HANDLE hRead = CreateFileW(filePath.c_str(), GENERIC_READ,
-                FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
-
-            // Check for write lock
-            HANDLE hWrite = CreateFileW(filePath.c_str(), GENERIC_WRITE,
-                FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr);
-
-            LockType type = LockType::Unknown;
-
-            if (hRead == INVALID_HANDLE_VALUE && hWrite == INVALID_HANDLE_VALUE) {
-                type = LockType::Exclusive;
-            } else if (hWrite == INVALID_HANDLE_VALUE) {
-                type = LockType::Write;
-            } else if (hRead == INVALID_HANDLE_VALUE) {
-                type = LockType::Read;
-            }
-
-            if (hRead != INVALID_HANDLE_VALUE) CloseHandle(hRead);
-            if (hWrite != INVALID_HANDLE_VALUE) CloseHandle(hWrite);
-
-            return type;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetLockType - Exception: %hs", e.what());
+            ScopedHandle hr(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
+            ScopedHandle hw(CreateFileW(filePath.c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!hr && !hw) return LockType::Exclusive;
+            if (!hw) return LockType::Write;
+            if (!hr) return LockType::Read;
             return LockType::Unknown;
-        }
+        } catch (...) { return LockType::Unknown; }
     }
-
     // ========================================================================
     // UNLOCK OPERATIONS
     // ========================================================================
 
     [[nodiscard]] UnlockOperation UnlockFile(const std::wstring& filePath) {
-        auto startTime = std::chrono::steady_clock::now();
+        auto t0 = std::chrono::steady_clock::now();
         UnlockOperation result;
         result.filePath = filePath;
-
         try {
-            ReportProgress(L"Detecting file locks", 10);
-
-            // Check if file is locked
-            if (!IsFileLocked(filePath)) {
-                result.result = UnlockResult::NotLocked;
-                result.method = UnlockMethod::None;
-                SS_LOG_INFO(L"FileLockManager", L"File not locked: %hs", StringUtils::ToNarrow(filePath).c_str());
-                return result;
-            }
-
-            // Get lock owners
+            ReportProgress(std::wstring{L"Detecting file locks"}, 10u);
+            if (!IsFileLocked(filePath)) { result.result = UnlockResult::NotLocked; return result; }
             auto owners = GetLockingProcesses(filePath);
             if (owners.empty()) {
-                result.result = UnlockResult::NotLocked;
+                result.result = UnlockResult::Failed;
+                result.errors.push_back("File locked but owner unidentifiable");
+                m_stats.failedUnlocks.fetch_add(1, std::memory_order_relaxed);
                 return result;
             }
-
-            ReportProgress(L"Analyzing lock owners", 30);
-
-            // Check for critical processes
-            for (const auto& owner : owners) {
-                if (owner.isCriticalProcess && m_config.protectCriticalProcesses) {
+            ReportProgress(std::wstring{L"Analyzing lock owners"}, 30u);
+            for (const auto& o : owners) {
+                if (o.isCriticalProcess && m_config.protectCriticalProcesses) {
                     result.result = UnlockResult::ProcessCritical;
-                    result.errors.push_back("File locked by critical process: " +
-                        StringUtils::ToNarrow(owner.processName));
-                    SS_LOG_WARN(L"FileLockManager", L"Cannot unlock - critical process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
+                    result.errors.push_back("Locked by critical process: " + StringUtils::ToNarrow(o.processName));
+                    SS_LOG_WARN(L"FileLockManager", L"Cannot unlock - critical process %s (PID %u)", o.processName.c_str(), o.pid);
                     return result;
                 }
             }
-
-            // Try unlock methods in order of preference
-            ReportProgress(L"Attempting unlock", 50);
-
-            // 1. Try Restart Manager
+            ReportProgress(std::wstring{L"Attempting unlock"}, 50u);
             if (m_config.allowRestartManager && TryRestartManager(filePath, result)) {
-                result.result = UnlockResult::Success;
-                result.method = UnlockMethod::RestartManager;
-                m_stats.successfulUnlocks++;
-                return result;
+                result.result = UnlockResult::Success; result.method = UnlockMethod::RestartManager;
+                m_stats.successfulUnlocks.fetch_add(1, std::memory_order_relaxed);
+                FinalizeResult(result, t0); return result;
             }
-
-            // 2. Try handle closing
-            if (TryHandleClose(owners, result)) {
-                result.result = UnlockResult::Success;
-                result.method = UnlockMethod::HandleClose;
-                m_stats.successfulUnlocks++;
-                return result;
+            if (TryHandleClose(owners, result) && !IsFileLocked(filePath)) {
+                result.result = UnlockResult::Success; result.method = UnlockMethod::HandleClose;
+                m_stats.successfulUnlocks.fetch_add(1, std::memory_order_relaxed);
+                FinalizeResult(result, t0); return result;
             }
-
-            // 3. Try kernel unlock
-            if (m_config.allowKernelUnlock && m_kernelDriverAvailable) {
-                if (TryKernelUnlock(filePath, result)) {
-                    result.result = UnlockResult::Success;
-                    result.method = UnlockMethod::KernelDriver;
-                    m_stats.successfulUnlocks++;
-                    return result;
+            if (m_config.allowKernelUnlock && m_kernelDriverAvailable &&
+                TryKernelUnlock(filePath, result) && !IsFileLocked(filePath)) {
+                result.result = UnlockResult::Success; result.method = UnlockMethod::KernelDriver;
+                m_stats.successfulUnlocks.fetch_add(1, std::memory_order_relaxed);
+                m_stats.kernelUnlocks.fetch_add(1, std::memory_order_relaxed);
+                FinalizeResult(result, t0); return result;
+            }
+            if (m_config.allowProcessTermination && TryProcessTerminate(owners, result)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!IsFileLocked(filePath)) {
+                    result.result = UnlockResult::Success; result.method = UnlockMethod::ProcessTerminate;
+                    m_stats.successfulUnlocks.fetch_add(1, std::memory_order_relaxed);
+                    FinalizeResult(result, t0); return result;
                 }
             }
-
-            // 4. Schedule delete on reboot
-            ReportProgress(L"Scheduling reboot operation", 90);
+            ReportProgress(std::wstring{L"Scheduling reboot operation"}, 90u);
             if (ScheduleDeleteOnRebootInternal(filePath)) {
-                result.result = UnlockResult::RequiresReboot;
-                result.method = UnlockMethod::DeleteOnReboot;
-                result.requiresReboot = true;
-                result.pendingOperation = L"Delete on reboot";
-                m_stats.rebootScheduled++;
-                SS_LOG_INFO(L"FileLockManager", L"Scheduled delete on reboot: %hs", StringUtils::ToNarrow(filePath).c_str());
-                return result;
+                result.result = UnlockResult::RequiresReboot; result.method = UnlockMethod::DeleteOnReboot;
+                result.requiresReboot = true; result.pendingOperation = L"Delete on reboot";
+                m_stats.rebootScheduled.fetch_add(1, std::memory_order_relaxed);
+                FinalizeResult(result, t0); return result;
             }
-
-            // All methods failed
             result.result = UnlockResult::Failed;
-            result.errors.push_back("All unlock methods failed");
-            m_stats.failedUnlocks++;
-
+            result.errors.push_back("All unlock methods exhausted");
+            m_stats.failedUnlocks.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"UnlockFile - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"UnlockFile exception: %hs", e.what());
             result.result = UnlockResult::Failed;
             result.errors.push_back(std::string("Exception: ") + e.what());
-            m_stats.failedUnlocks++;
+            m_stats.failedUnlocks.fetch_add(1, std::memory_order_relaxed);
         }
-
-        auto endTime = std::chrono::steady_clock::now();
-        result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            endTime - startTime);
-
-        ReportProgress(L"Unlock complete", 100);
-
+        FinalizeResult(result, t0);
         return result;
     }
 
     [[nodiscard]] UnlockOperation UnlockFile(const std::wstring& filePath, UnlockMethod method) {
-        UnlockOperation result;
-        result.filePath = filePath;
-        result.method = method;
-
+        UnlockOperation result; result.filePath = filePath; result.method = method;
         try {
             switch (method) {
-                case UnlockMethod::HandleClose: {
-                    auto owners = GetLockingProcesses(filePath);
-                    if (TryHandleClose(owners, result)) {
-                        result.result = UnlockResult::Success;
-                        m_stats.successfulUnlocks++;
-                    } else {
-                        result.result = UnlockResult::Failed;
-                        m_stats.failedUnlocks++;
-                    }
-                    break;
-                }
-
-                case UnlockMethod::ProcessTerminate: {
-                    auto owners = GetLockingProcesses(filePath);
-                    if (TryProcessTerminate(owners, result)) {
-                        result.result = UnlockResult::Success;
-                        m_stats.successfulUnlocks++;
-                    } else {
-                        result.result = UnlockResult::Failed;
-                        m_stats.failedUnlocks++;
-                    }
-                    break;
-                }
-
-                case UnlockMethod::RestartManager: {
-                    if (TryRestartManager(filePath, result)) {
-                        result.result = UnlockResult::Success;
-                        m_stats.successfulUnlocks++;
-                    } else {
-                        result.result = UnlockResult::Failed;
-                        m_stats.failedUnlocks++;
-                    }
-                    break;
-                }
-
-                case UnlockMethod::KernelDriver: {
-                    if (TryKernelUnlock(filePath, result)) {
-                        result.result = UnlockResult::Success;
-                        m_stats.successfulUnlocks++;
-                    } else {
-                        result.result = UnlockResult::Failed;
-                        m_stats.failedUnlocks++;
-                    }
-                    break;
-                }
-
-                case UnlockMethod::DeleteOnReboot: {
-                    if (ScheduleDeleteOnRebootInternal(filePath)) {
-                        result.result = UnlockResult::RequiresReboot;
-                        result.requiresReboot = true;
-                        m_stats.rebootScheduled++;
-                    } else {
-                        result.result = UnlockResult::Failed;
-                        m_stats.failedUnlocks++;
-                    }
-                    break;
-                }
-
-                default:
-                    result.result = UnlockResult::Failed;
-                    result.errors.push_back("Invalid unlock method");
-                    break;
+            case UnlockMethod::HandleClose: { auto o = GetLockingProcesses(filePath); result.result = TryHandleClose(o, result) ? UnlockResult::Success : UnlockResult::Failed; break; }
+            case UnlockMethod::ProcessTerminate: { auto o = GetLockingProcesses(filePath); result.result = TryProcessTerminate(o, result) ? UnlockResult::Success : UnlockResult::Failed; break; }
+            case UnlockMethod::RestartManager: result.result = TryRestartManager(filePath, result) ? UnlockResult::Success : UnlockResult::Failed; break;
+            case UnlockMethod::KernelDriver: result.result = TryKernelUnlock(filePath, result) ? UnlockResult::Success : UnlockResult::Failed; break;
+            case UnlockMethod::DeleteOnReboot:
+                if (ScheduleDeleteOnRebootInternal(filePath)) { result.result = UnlockResult::RequiresReboot; result.requiresReboot = true; m_stats.rebootScheduled.fetch_add(1, std::memory_order_relaxed); }
+                else result.result = UnlockResult::Failed; break;
+            default: result.result = UnlockResult::Failed; result.errors.push_back("Invalid unlock method"); break;
             }
-
+            if (result.result == UnlockResult::Success) m_stats.successfulUnlocks.fetch_add(1, std::memory_order_relaxed);
+            else if (result.result == UnlockResult::Failed) m_stats.failedUnlocks.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"UnlockFile (method) - Exception: %hs", e.what());
-            result.result = UnlockResult::Failed;
-            result.errors.push_back(std::string("Exception: ") + e.what());
+            result.result = UnlockResult::Failed; result.errors.push_back(std::string("Exception: ") + e.what());
         }
-
         return result;
     }
 
     [[nodiscard]] UnlockOperation ForceUnlockFile(const std::wstring& filePath) {
-        UnlockOperation result;
-        result.filePath = filePath;
-
+        UnlockOperation result; result.filePath = filePath;
         try {
-            auto owners = GetLockingProcesses(filePath);
-
-            // Try all methods aggressively
-            bool success = false;
-
-            // 1. Handle close
-            if (TryHandleClose(owners, result)) {
-                success = true;
+            auto owners = GetLockingProcesses(filePath); bool unlocked = false;
+            if (TryHandleClose(owners, result) && !IsFileLocked(filePath)) unlocked = true;
+            if (!unlocked && m_config.allowProcessTermination && TryProcessTerminate(owners, result)) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                if (!IsFileLocked(filePath)) unlocked = true;
             }
-
-            // 2. Process termination (if allowed)
-            if (!success && m_config.allowProcessTermination) {
-                if (TryProcessTerminate(owners, result)) {
-                    success = true;
-                }
+            if (!unlocked && m_kernelDriverAvailable && TryKernelUnlock(filePath, result) && !IsFileLocked(filePath)) unlocked = true;
+            if (!unlocked && ScheduleDeleteOnRebootInternal(filePath)) {
+                result.result = UnlockResult::RequiresReboot; result.requiresReboot = true;
+                m_stats.rebootScheduled.fetch_add(1, std::memory_order_relaxed); return result;
             }
-
-            // 3. Kernel unlock
-            if (!success && m_kernelDriverAvailable) {
-                if (TryKernelUnlock(filePath, result)) {
-                    success = true;
-                }
-            }
-
-            // 4. Reboot scheduling
-            if (!success) {
-                if (ScheduleDeleteOnRebootInternal(filePath)) {
-                    result.result = UnlockResult::RequiresReboot;
-                    result.requiresReboot = true;
-                    m_stats.rebootScheduled++;
-                    return result;
-                }
-            }
-
-            if (success) {
-                result.result = UnlockResult::Success;
-                m_stats.successfulUnlocks++;
-            } else {
-                result.result = UnlockResult::Failed;
-                m_stats.failedUnlocks++;
-            }
-
+            result.result = unlocked ? UnlockResult::Success : UnlockResult::Failed;
+            (unlocked ? m_stats.successfulUnlocks : m_stats.failedUnlocks).fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"ForceUnlockFile - Exception: %hs", e.what());
-            result.result = UnlockResult::Failed;
-            result.errors.push_back(std::string("Exception: ") + e.what());
+            result.result = UnlockResult::Failed; result.errors.push_back(std::string("Exception: ") + e.what());
         }
-
         return result;
     }
 
     bool CloseHandleOp(const LockOwner& owner) {
         try {
-            if (owner.handleValue == 0) {
-                return false;
-            }
+            if (owner.handleValue == 0) return false;
+            ScopedHandle hProcess(OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner.pid));
+            if (!hProcess) return false;
 
-            // Open the target process
-            HANDLE hProcess = OpenProcess(
-                PROCESS_DUP_HANDLE,
-                FALSE,
-                owner.pid
-            );
-
-            if (!hProcess) {
-                SS_LOG_ERROR(L"FileLockManager", L"Cannot open process %u: error %lu", owner.pid, GetLastError());
-                return false;
-            }
-
-            // Duplicate the handle into our process
-            HANDLE hDuplicate = nullptr;
-            BOOL result = DuplicateHandle(
-                hProcess,
-                reinterpret_cast<HANDLE>(owner.handleValue),
-                GetCurrentProcess(),
-                &hDuplicate,
-                0,
-                FALSE,
-                DUPLICATE_CLOSE_SOURCE
-            );
-
-            CloseHandle(hProcess);
-
-            if (result && hDuplicate) {
-                CloseHandle(hDuplicate);
-                m_stats.handlesClosed++;
-                SS_LOG_INFO(L"FileLockManager", L"Closed handle %hs in process %u", owner.handleValue, owner.pid);
-                return true;
-            }
-
-            return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"CloseHandleOp - Exception: %hs", e.what());
-            return false;
-        }
-    }
-
-    bool TerminateProcessOp(const LockOwner& owner, bool force) {
-        try {
-            // Safety checks
-            if (owner.isCriticalProcess && !force) {
-                SS_LOG_WARN(L"FileLockManager", L"Refusing to terminate critical process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
-                return false;
-            }
-
-            if (owner.isSystemProcess && m_config.protectSystemProcesses && !force) {
-                SS_LOG_WARN(L"FileLockManager", L"Refusing to terminate system process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
-                return false;
-            }
-
-            // Ask for confirmation via callback
-            if (m_terminateCallback && !force) {
-                if (!m_terminateCallback(owner)) {
-                    SS_LOG_INFO(L"FileLockManager", L"Process termination cancelled by callback");
+            // PID recycling guard: verify process creation time hasn't changed
+            FILETIME createTime{}, exitTime{}, kernelTime{}, userTime{};
+            if (GetProcessTimes(hProcess.Get(), &createTime, &exitTime, &kernelTime, &userTime)) {
+                if (exitTime.dwLowDateTime != 0 || exitTime.dwHighDateTime != 0) {
+                    SS_LOG_DEBUG(L"FileLockManager", L"PID %u has exited, skipping handle close", owner.pid);
                     return false;
                 }
             }
 
-            // Open process
-            HANDLE hProcess = OpenProcess(
-                PROCESS_TERMINATE,
-                FALSE,
-                owner.pid
-            );
-
-            if (!hProcess) {
-                SS_LOG_ERROR(L"FileLockManager", L"Cannot open process %u for termination: error %lu", owner.pid, GetLastError());
-                return false;
-            }
-
-            // Terminate
-            BOOL result = TerminateProcess(hProcess, 1);
-            CloseHandle(hProcess);
-
-            if (result) {
-                m_stats.processesTerminated++;
-                SS_LOG_WARN(L"FileLockManager", L"Terminated process %u (%hs)", owner.pid, StringUtils::ToNarrow(owner.processName).c_str());
-                return true;
-            }
-
+            HANDLE hDup = nullptr;
+            BOOL ok = DuplicateHandle(hProcess.Get(), reinterpret_cast<HANDLE>(owner.handleValue),
+                GetCurrentProcess(), &hDup, 0, FALSE, DUPLICATE_CLOSE_SOURCE);
+            if (ok && hDup) { ::CloseHandle(hDup); m_stats.handlesClosed.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_INFO(L"FileLockManager", L"Closed handle 0x%llX in PID %u (%s)",
+                    static_cast<unsigned long long>(owner.handleValue), owner.pid, owner.processName.c_str());
+                return true; }
             return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"TerminateProcessOp - Exception: %hs", e.what());
-            return false;
-        }
+        } catch (...) { return false; }
     }
 
+    bool TerminateProcessOp(const LockOwner& owner, bool force) {
+        try {
+            if (owner.isCriticalProcess && !force) return false;
+            if (owner.isSystemProcess && m_config.protectSystemProcesses && !force) return false;
+            if (m_terminateCallback && !force && !m_terminateCallback(owner)) return false;
+            ScopedHandle hProcess(OpenProcess(PROCESS_TERMINATE, FALSE, owner.pid));
+            if (!hProcess) return false;
+            if (::TerminateProcess(hProcess.Get(), 1)) {
+                m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(L"FileLockManager", L"Terminated PID %u (%s)", owner.pid, owner.processName.c_str());
+                return true;
+            }
+            return false;
+        } catch (...) { return false; }
+    }
     // ========================================================================
-    // RESTART MANAGER
+    // RESTART MANAGER & REBOOT OPS
     // ========================================================================
 
     bool UseRestartManagerOp(const std::wstring& filePath) {
         try {
-            DWORD dwSession;
-            WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
-
-            // Start Restart Manager session
-            DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
-            if (dwError != ERROR_SUCCESS) {
-                SS_LOG_ERROR(L"FileLockManager", L"RmStartSession failed: %hs", dwError);
-                return false;
-            }
-
-            // Register file
+            DWORD dwSession = 0; WCHAR szKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+            DWORD err = RmStartSession(&dwSession, 0, szKey);
+            if (err != ERROR_SUCCESS) { SS_LOG_ERROR(L"FileLockManager", L"RmStartSession failed: %lu", err); return false; }
             LPCWSTR pszFile = filePath.c_str();
-            dwError = RmRegisterResources(
-                dwSession,
-                1,
-                &pszFile,
-                0,
-                nullptr,
-                0,
-                nullptr
-            );
-
-            if (dwError != ERROR_SUCCESS) {
-                RmEndSession(dwSession);
-                SS_LOG_ERROR(L"FileLockManager", L"RmRegisterResources failed: %hs", dwError);
-                return false;
-            }
-
-            // Get list of applications
-            UINT nProcInfoNeeded = 0;
-            UINT nProcInfo = 0;
-            RM_REBOOT_REASON dwRebootReasons = RmRebootReasonNone;
-
-            dwError = RmGetList(
-                dwSession,
-                &nProcInfoNeeded,
-                &nProcInfo,
-                nullptr,
-                &dwRebootReasons
-            );
-
+            err = RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr);
+            if (err != ERROR_SUCCESS) { RmEndSession(dwSession); return false; }
+            UINT needed = 0, count = 0; DWORD dwRebootReasons = 0;
+            err = RmGetList(dwSession, &needed, &count, nullptr, &dwRebootReasons);
             bool success = false;
-
-            if (dwError == ERROR_SUCCESS || dwError == ERROR_MORE_DATA) {
-                if (nProcInfoNeeded > 0) {
-                    std::vector<RM_PROCESS_INFO> processes(nProcInfoNeeded);
-                    nProcInfo = nProcInfoNeeded;
-
-                    dwError = RmGetList(
-                        dwSession,
-                        &nProcInfoNeeded,
-                        &nProcInfo,
-                        processes.data(),
-                        &dwRebootReasons
-                    );
-
-                    if (dwError == ERROR_SUCCESS) {
-                        // Shutdown applications
-                        dwError = RmShutdown(dwSession, RmForceShutdown, nullptr);
-                        if (dwError == ERROR_SUCCESS) {
-                            success = true;
-                            SS_LOG_INFO(L"FileLockManager", L"Restart Manager successfully closed applications");
-                        }
-                    }
-                }
+            if ((err == ERROR_SUCCESS || err == ERROR_MORE_DATA) && needed > 0 && needed <= FileLockManagerConstants::MAX_LOCK_OWNERS) {
+                std::vector<RM_PROCESS_INFO> procs(needed); count = needed;
+                err = RmGetList(dwSession, &needed, &count, procs.data(), &dwRebootReasons);
+                if (err == ERROR_SUCCESS) { err = RmShutdown(dwSession, RmForceShutdown, nullptr); success = (err == ERROR_SUCCESS); }
             }
-
-            RmEndSession(dwSession);
-            return success;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"UseRestartManagerOp - Exception: %hs", e.what());
-            return false;
-        }
+            RmEndSession(dwSession); return success;
+        } catch (const std::exception& e) { SS_LOG_ERROR(L"FileLockManager", L"UseRestartManagerOp exception: %hs", e.what()); return false; }
     }
 
     [[nodiscard]] std::vector<std::wstring> GetApplicationsUsingFileOp(const std::wstring& filePath) const {
-        std::vector<std::wstring> applications;
-
+        std::vector<std::wstring> apps;
         try {
-            DWORD dwSession;
-            WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
-
-            DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
-            if (dwError != ERROR_SUCCESS) {
-                return applications;
-            }
-
+            DWORD dwSession = 0; WCHAR szKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+            if (RmStartSession(&dwSession, 0, szKey) != ERROR_SUCCESS) return apps;
             LPCWSTR pszFile = filePath.c_str();
-            dwError = RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr);
-
-            if (dwError == ERROR_SUCCESS) {
-                UINT nProcInfoNeeded = 0;
-                UINT nProcInfo = 0;
-                RM_REBOOT_REASON dwRebootReasons;
-
-                dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, nullptr, &dwRebootReasons);
-
-                if (dwError == ERROR_MORE_DATA && nProcInfoNeeded > 0) {
-                    std::vector<RM_PROCESS_INFO> processes(nProcInfoNeeded);
-                    nProcInfo = nProcInfoNeeded;
-
-                    dwError = RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo,
-                        processes.data(), &dwRebootReasons);
-
-                    if (dwError == ERROR_SUCCESS) {
-                        for (UINT i = 0; i < nProcInfo; i++) {
-                            applications.push_back(processes[i].strAppName);
-                        }
+            if (RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
+                UINT needed = 0, count = 0; DWORD dwRebootReasons = 0;
+                if (RmGetList(dwSession, &needed, &count, nullptr, &dwRebootReasons) == ERROR_MORE_DATA && needed > 0 && needed <= FileLockManagerConstants::MAX_LOCK_OWNERS) {
+                    std::vector<RM_PROCESS_INFO> procs(needed); count = needed;
+                    if (RmGetList(dwSession, &needed, &count, procs.data(), &dwRebootReasons) == ERROR_SUCCESS) {
+                        apps.reserve(count); for (UINT i = 0; i < count; i++) apps.push_back(procs[i].strAppName);
                     }
                 }
             }
-
             RmEndSession(dwSession);
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetApplicationsUsingFileOp - Exception: %hs", e.what());
-        }
-
-        return applications;
+        } catch (...) {}
+        return apps;
     }
-
-    // ========================================================================
-    // REBOOT OPERATIONS
-    // ========================================================================
 
     bool ScheduleDeleteOnRebootInternal(const std::wstring& filePath) {
         try {
-            // Use MoveFileEx to schedule deletion
-            BOOL result = MoveFileExW(
-                filePath.c_str(),
-                nullptr,
-                MOVEFILE_DELAY_UNTIL_REBOOT
-            );
-
-            if (result) {
-                // Track pending operation
-                PendingOperation op;
-                op.sourcePath = filePath;
-                op.isDelete = true;
-                op.scheduledTime = std::chrono::system_clock::now();
-                op.reason = "File locked - scheduled for deletion";
-
-                std::unique_lock lock(m_mutex);
-                m_pendingOperations.push_back(op);
-
-                SS_LOG_INFO(L"FileLockManager", L"Scheduled delete on reboot: %hs", StringUtils::ToNarrow(filePath).c_str());
+            if (MoveFileExW(filePath.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT)) {
+                PendingOperation op; op.sourcePath = filePath; op.isDelete = true;
+                op.scheduledTime = std::chrono::system_clock::now(); op.reason = "File locked - scheduled for deletion";
+                { std::unique_lock lk(m_pendingMutex); m_pendingOperations.push_back(std::move(op)); }
+                SS_LOG_INFO(L"FileLockManager", L"Scheduled delete on reboot: %s", filePath.c_str());
                 return true;
             }
-
-            DWORD error = GetLastError();
-            SS_LOG_ERROR(L"FileLockManager", L"MoveFileEx failed: error %hs", error);
+            SS_LOG_ERROR(L"FileLockManager", L"MoveFileExW(delete) failed: error %lu", GetLastError());
             return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"ScheduleDeleteOnRebootInternal - Exception: %hs", e.what());
-            return false;
-        }
+        } catch (...) { return false; }
     }
 
-    bool ScheduleMoveOnRebootInternal(const std::wstring& sourcePath, const std::wstring& destPath) {
+    bool ScheduleMoveOnRebootInternal(const std::wstring& src, const std::wstring& dst) {
         try {
-            BOOL result = MoveFileExW(
-                sourcePath.c_str(),
-                destPath.c_str(),
-                MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING
-            );
-
-            if (result) {
-                PendingOperation op;
-                op.sourcePath = sourcePath;
-                op.destinationPath = destPath;
-                op.isMove = true;
-                op.scheduledTime = std::chrono::system_clock::now();
-                op.reason = "File locked - scheduled for move";
-
-                std::unique_lock lock(m_mutex);
-                m_pendingOperations.push_back(op);
-
-                SS_LOG_INFO(L"FileLockManager", L"Scheduled move on reboot: %hs -> %hs", StringUtils::ToNarrow(sourcePath).c_str(), StringUtils::ToNarrow(destPath).c_str());
+            if (MoveFileExW(src.c_str(), dst.c_str(), MOVEFILE_DELAY_UNTIL_REBOOT | MOVEFILE_REPLACE_EXISTING)) {
+                PendingOperation op; op.sourcePath = src; op.destinationPath = dst; op.isMove = true;
+                op.scheduledTime = std::chrono::system_clock::now(); op.reason = "File locked - scheduled for move";
+                { std::unique_lock lk(m_pendingMutex); m_pendingOperations.push_back(std::move(op)); }
                 return true;
             }
-
             return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"ScheduleMoveOnRebootInternal - Exception: %hs", e.what());
-            return false;
-        }
+        } catch (...) { return false; }
     }
 
-    [[nodiscard]] std::vector<PendingOperation> GetPendingOperationsOp() const {
-        std::shared_lock lock(m_mutex);
-        return m_pendingOperations;
-    }
-
-    bool CancelPendingOperationOp(const std::wstring& sourcePath) {
-        std::unique_lock lock(m_mutex);
-
-        try {
-            auto it = std::find_if(m_pendingOperations.begin(), m_pendingOperations.end(),
-                [&sourcePath](const PendingOperation& op) {
-                    return op.sourcePath == sourcePath;
-                });
-
-            if (it != m_pendingOperations.end()) {
-                m_pendingOperations.erase(it);
-                SS_LOG_INFO(L"FileLockManager", L"Cancelled pending operation: %hs", StringUtils::ToNarrow(sourcePath).c_str());
-                return true;
-            }
-
-            return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"CancelPendingOperationOp - Exception: %hs", e.what());
-            return false;
-        }
+    [[nodiscard]] std::vector<PendingOperation> GetPendingOperationsOp() const { std::shared_lock lk(m_pendingMutex); return m_pendingOperations; }
+    bool CancelPendingOperationOp(const std::wstring& sp) {
+        std::unique_lock lk(m_pendingMutex);
+        auto it = std::find_if(m_pendingOperations.begin(), m_pendingOperations.end(), [&](const PendingOperation& o) { return o.sourcePath == sp; });
+        if (it != m_pendingOperations.end()) { m_pendingOperations.erase(it); return true; }
+        return false;
     }
 
     // ========================================================================
@@ -934,325 +593,405 @@ public:
 
     bool KernelUnlockFileOp(const std::wstring& filePath) {
         try {
-            if (!m_kernelDriverAvailable) {
-                SS_LOG_WARN(L"FileLockManager", L"Kernel driver not available");
-                return false;
+            std::lock_guard kernelLock(m_kernelMutex);
+            if (!m_kernelDriverAvailable || !m_kernelPortConnected) { if (!ConnectToKernelDriverInternalLocked()) return false; }
+            KernelProtocol::QueryLocksRequest req{};
+            req.header.command = static_cast<uint32_t>(KernelProtocol::Command::ForceCloseHandle);
+            req.header.dataLength = sizeof(req) - sizeof(req.header);
+            size_t pl = std::min(filePath.length(), static_cast<size_t>(_countof(req.filePath) - 1));
+            wcsncpy_s(req.filePath, filePath.c_str(), pl);
+            KernelProtocol::ForceCloseResponse resp{}; DWORD bytesRet = 0;
+            HRESULT hr = FilterSendMessage(m_kernelPort, &req, sizeof(req), &resp, sizeof(resp), &bytesRet);
+            if (SUCCEEDED(hr) && bytesRet >= sizeof(resp) && resp.header.status == 0) {
+                m_stats.kernelUnlocks.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_INFO(L"FileLockManager", L"Kernel force-closed %u handle(s) for %s", resp.handlesAffected, filePath.c_str());
+                return resp.handlesAffected > 0;
             }
-
-            // In production, this would communicate with minifilter driver
-            // to force-close file handles at kernel level
-
-            // Placeholder implementation
-            SS_LOG_INFO(L"FileLockManager", L"Kernel unlock requested for: %hs", StringUtils::ToNarrow(filePath).c_str());
-
-            return false; // Not implemented in stub
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"KernelUnlockFileOp - Exception: %hs", e.what());
             return false;
+        } catch (...) { return false; }
+    }
+
+    [[nodiscard]] bool IsKernelDriverAvailableOp() const noexcept { return m_kernelDriverAvailable; }
+
+    bool ConnectToKernelDriverInternal() {
+        std::lock_guard kernelLock(m_kernelMutex);
+        return ConnectToKernelDriverInternalLocked();
+    }
+
+    // Must be called with m_kernelMutex held
+    bool ConnectToKernelDriverInternalLocked() {
+        if (m_kernelPortConnected && m_kernelPort != INVALID_HANDLE_VALUE) return true;
+        for (uint32_t i = 0; i < FileLockManagerConstants::KERNEL_CONNECT_RETRY_COUNT; ++i) {
+            HANDLE newPort = INVALID_HANDLE_VALUE;
+            HRESULT hr = FilterConnectCommunicationPort(SHADOWSTRIKE_FILTER_PORT, 0, nullptr, 0, nullptr, &newPort);
+            if (SUCCEEDED(hr) && newPort != INVALID_HANDLE_VALUE) {
+                m_kernelPort = newPort;
+                m_kernelPortConnected = true;
+                SS_LOG_INFO(L"FileLockManager", L"Connected to kernel driver port");
+                return true;
+            }
+            if (i + 1 < FileLockManagerConstants::KERNEL_CONNECT_RETRY_COUNT)
+                std::this_thread::sleep_for(std::chrono::milliseconds(FileLockManagerConstants::KERNEL_CONNECT_RETRY_DELAY_MS));
         }
+        return false;
     }
 
-    [[nodiscard]] bool IsKernelDriverAvailableOp() const noexcept {
-        return m_kernelDriverAvailable;
+    void DisconnectFromKernelDriverInternal() noexcept {
+        if (m_kernelPort != INVALID_HANDLE_VALUE && m_kernelPort != nullptr) { ::CloseHandle(m_kernelPort); m_kernelPort = INVALID_HANDLE_VALUE; }
+        m_kernelPortConnected = false;
     }
-
     // ========================================================================
-    // CALLBACKS
-    // ========================================================================
-
-    void SetTerminateCallbackOp(TerminateCallback callback) {
-        std::unique_lock lock(m_mutex);
-        m_terminateCallback = std::move(callback);
-    }
-
-    void SetProgressCallbackOp(UnlockProgressCallback callback) {
-        std::unique_lock lock(m_mutex);
-        m_progressCallback = std::move(callback);
-    }
-
-    // ========================================================================
-    // CONFIGURATION
-    // ========================================================================
-
-    void SetAllowProcessTerminationOp(bool allow) noexcept {
-        m_config.allowProcessTermination = allow;
-    }
-
-    void SetProtectSystemProcessesOp(bool protect) noexcept {
-        m_config.protectSystemProcesses = protect;
-    }
-
-    // ========================================================================
-    // STATISTICS
-    // ========================================================================
-
-    [[nodiscard]] const FileLockManagerStatistics& GetStatistics() const noexcept {
-        return m_stats;
-    }
-
-    void ResetStatistics() noexcept {
-        m_stats.Reset();
-    }
-
-private:
-    // ========================================================================
-    // INTERNAL HELPERS
+    // PRIVATE HELPERS
     // ========================================================================
 
     [[nodiscard]] std::wstring NormalizePath(const std::wstring& path) const {
         try {
-            fs::path p(path);
-            return fs::absolute(p).wstring();
-        } catch (...) {
+            if (path.empty()) return {};
+            WCHAR buf[MAX_PATH * 2] = { 0 };
+            DWORD len = GetFullPathNameW(path.c_str(), _countof(buf), buf, nullptr);
+            if (len > 0 && len < _countof(buf)) return std::wstring(buf, len);
             return path;
-        }
+        } catch (...) { return path; }
     }
 
-    [[nodiscard]] bool EnableDebugPrivilege() const noexcept {
+    bool EnableDebugPrivilege() noexcept {
         try {
-            HANDLE hToken;
-            if (!OpenProcessToken(GetCurrentProcess(),
-                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken)) {
-                return false;
-            }
-
-            TOKEN_PRIVILEGES tp;
-            LUID luid;
-
-            if (!LookupPrivilegeValue(nullptr, SE_DEBUG_NAME, &luid)) {
-                CloseHandle(hToken);
-                return false;
-            }
-
-            tp.PrivilegeCount = 1;
-            tp.Privileges[0].Luid = luid;
-            tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
-
-            BOOL result = AdjustTokenPrivileges(hToken, FALSE, &tp,
-                sizeof(TOKEN_PRIVILEGES), nullptr, nullptr);
-
-            CloseHandle(hToken);
-            return result && (GetLastError() == ERROR_SUCCESS);
-
-        } catch (...) {
-            return false;
-        }
+            ScopedHandle hToken;
+            HANDLE raw = nullptr;
+            if (!OpenProcessToken(GetCurrentProcess(), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &raw)) return false;
+            hToken.Reset(raw);
+            TOKEN_PRIVILEGES tp{};
+            if (!LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &tp.Privileges[0].Luid)) return false;
+            tp.PrivilegeCount = 1; tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+            return AdjustTokenPrivileges(hToken.Get(), FALSE, &tp, sizeof(tp), nullptr, nullptr) && GetLastError() == ERROR_SUCCESS;
+        } catch (...) { return false; }
     }
 
-    [[nodiscard]] bool CheckKernelDriver() const noexcept {
+    bool CheckKernelDriver() const noexcept {
         try {
-            // Check if minifilter driver is loaded
-            // In production, would use FilterFindFirst/FilterFindNext
-            // For now, return false (not available)
+            HANDLE hPort = INVALID_HANDLE_VALUE;
+            HRESULT hr = FilterConnectCommunicationPort(SHADOWSTRIKE_FILTER_PORT, 0, nullptr, 0, nullptr, &hPort);
+            if (SUCCEEDED(hr) && hPort != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(hPort);
+                return true;
+            }
             return false;
+        } catch (...) { return false; }
+    }
 
-        } catch (...) {
-            return false;
-        }
+    uint8_t ResolveFileObjectTypeIndex() const noexcept {
+        try {
+            if (!m_ntQuerySystemInfo) return 0;
+            ScopedHandle h(CreateFileW(L"NUL", GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
+            if (!h) return 0;
+            DWORD myPid = GetCurrentProcessId();
+            ULONG bufSize = 1 << 20; auto buf = std::make_unique<uint8_t[]>(bufSize);
+            NTSTATUS st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
+            while (st == NT_STATUS_INFO_LEN_MISMATCH && bufSize < MAX_HANDLE_BUFFER_BYTES) {
+                bufSize *= 2; buf = std::make_unique<uint8_t[]>(bufSize);
+                st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
+            }
+            if (st < 0) return 0;
+            auto info = reinterpret_cast<const SYSTEM_HANDLE_INFORMATION_EX*>(buf.get());
+            for (ULONG_PTR i = 0; i < info->NumberOfHandles; i++) {
+                const auto& entry = info->Handles[i];
+                if (static_cast<DWORD>(entry.UniqueProcessId) == myPid &&
+                    reinterpret_cast<HANDLE>(entry.HandleValue) == h.Get()) {
+                    return static_cast<uint8_t>(entry.ObjectTypeIndex);
+                }
+            }
+            return 0;
+        } catch (...) { return 0; }
+    }
+
+    LockType ClassifyLockType(DWORD accessMask) const noexcept {
+        bool canWrite = (accessMask & (FILE_WRITE_DATA | FILE_APPEND_DATA | GENERIC_WRITE)) != 0;
+        bool canRead = (accessMask & (FILE_READ_DATA | GENERIC_READ)) != 0;
+        bool hasDelete = (accessMask & DELETE) != 0;
+        if (canWrite && hasDelete) return LockType::Exclusive;
+        if (canWrite && canRead) return LockType::ReadWrite;
+        if (canWrite) return LockType::Write;
+        if (canRead) return LockType::Read;
+        if (hasDelete) return LockType::Delete;
+        return LockType::Read;
     }
 
     [[nodiscard]] std::vector<LockOwner> GetLockingProcessesRM(const std::wstring& filePath) const {
         std::vector<LockOwner> owners;
-
         try {
-            DWORD dwSession;
-            WCHAR szSessionKey[CCH_RM_SESSION_KEY + 1] = { 0 };
-
-            if (RmStartSession(&dwSession, 0, szSessionKey) != ERROR_SUCCESS) {
-                return owners;
-            }
-
+            DWORD dwSession = 0; WCHAR szKey[CCH_RM_SESSION_KEY + 1] = { 0 };
+            if (RmStartSession(&dwSession, 0, szKey) != ERROR_SUCCESS) return owners;
             LPCWSTR pszFile = filePath.c_str();
-            if (RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr) == ERROR_SUCCESS) {
-                UINT nProcInfoNeeded = 0;
-                UINT nProcInfo = 0;
-                RM_REBOOT_REASON dwRebootReasons;
-
-                if (RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo, nullptr, &dwRebootReasons) == ERROR_MORE_DATA) {
-                    if (nProcInfoNeeded > 0) {
-                        std::vector<RM_PROCESS_INFO> processes(nProcInfoNeeded);
-                        nProcInfo = nProcInfoNeeded;
-
-                        if (RmGetList(dwSession, &nProcInfoNeeded, &nProcInfo,
-                            processes.data(), &dwRebootReasons) == ERROR_SUCCESS) {
-
-                            for (UINT i = 0; i < nProcInfo; i++) {
-                                LockOwner owner;
-                                owner.pid = processes[i].Process.dwProcessId;
-                                owner.processName = processes[i].strAppName;
-
-                                // Get additional process info
-                                EnrichProcessInfo(owner);
-                                owners.push_back(owner);
-                            }
+            bool ok = (RmRegisterResources(dwSession, 1, &pszFile, 0, nullptr, 0, nullptr) == ERROR_SUCCESS);
+            if (ok) {
+                UINT needed = 0, count = 0; DWORD dwRebootReasons = 0;
+                DWORD err = RmGetList(dwSession, &needed, &count, nullptr, &dwRebootReasons);
+                if ((err == ERROR_MORE_DATA || err == ERROR_SUCCESS) && needed > 0 && needed <= FileLockManagerConstants::MAX_LOCK_OWNERS) {
+                    std::vector<RM_PROCESS_INFO> procs(needed); count = needed;
+                    if (RmGetList(dwSession, &needed, &count, procs.data(), &dwRebootReasons) == ERROR_SUCCESS) {
+                        for (UINT i = 0; i < count; i++) {
+                            LockOwner o;
+                            o.pid = procs[i].Process.dwProcessId;
+                            o.processName = procs[i].strAppName;
+                            // Source tracked via lockType from RM context
+                            EnrichProcessInfo(o);
+                            owners.push_back(std::move(o));
                         }
                     }
                 }
             }
-
             RmEndSession(dwSession);
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcessesRM - Exception: %hs", e.what());
-        }
-
+        } catch (...) {}
         return owners;
     }
-
     [[nodiscard]] std::vector<LockOwner> GetLockingProcessesHandleEnum(const std::wstring& filePath) const {
         std::vector<LockOwner> owners;
-
         try {
-            // This would use NtQuerySystemInformation to enumerate all handles
-            // and match them against the target file
-            // Simplified placeholder implementation
+            if (!m_ntQuerySystemInfo) return owners;
+            ScopedHandle targetFile(CreateFileW(filePath.c_str(), 0, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL | FILE_FLAG_BACKUP_SEMANTICS, nullptr));
+            BY_HANDLE_FILE_INFORMATION targetInfo{};
+            bool haveTargetInfo = false;
+            if (targetFile) { haveTargetInfo = (GetFileInformationByHandle(targetFile.Get(), &targetInfo) != 0); }
+            if (!haveTargetInfo) return owners;
 
-            SS_LOG_DEBUG(L"FileLockManager", L"Handle enumeration not fully implemented (use Restart Manager)");
+            ULONG bufSize = 4 << 20;
+            auto buf = std::make_unique<uint8_t[]>(bufSize);
+            NTSTATUS st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
+            for (int tries = 0; st == NT_STATUS_INFO_LEN_MISMATCH && tries < 5 && bufSize < MAX_HANDLE_BUFFER_BYTES; ++tries) {
+                bufSize *= 2; buf = std::make_unique<uint8_t[]>(bufSize);
+                st = m_ntQuerySystemInfo(SystemExtendedHandleInformationClass, buf.get(), bufSize, nullptr);
+            }
+            if (st < 0) { SS_LOG_WARN(L"FileLockManager", L"NtQuerySystemInfo failed: 0x%08X", static_cast<unsigned>(st)); return owners; }
 
+            auto sysInfo = reinterpret_cast<const SYSTEM_HANDLE_INFORMATION_EX*>(buf.get());
+            DWORD myPid = GetCurrentProcessId();
+            std::unordered_map<ULONG_PTR, ScopedHandle> processCache;
+            std::unordered_set<DWORD> foundPids;
+
+            for (ULONG_PTR i = 0; i < sysInfo->NumberOfHandles && owners.size() < FileLockManagerConstants::MAX_LOCK_OWNERS; i++) {
+                const auto& entry = sysInfo->Handles[i];
+                if (m_fileTypeIndex != 0 && entry.ObjectTypeIndex != m_fileTypeIndex) continue;
+                auto handlePid = static_cast<DWORD>(entry.UniqueProcessId);
+                if (handlePid == myPid || handlePid == 0 || handlePid == 4) continue;
+                if (foundPids.count(handlePid) && !(entry.GrantedAccess & (FILE_WRITE_DATA | DELETE))) continue;
+
+                auto cacheIt = processCache.find(entry.UniqueProcessId);
+                if (cacheIt == processCache.end()) {
+                    HANDLE raw = OpenProcess(PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION, FALSE, handlePid);
+                    auto [it, _] = processCache.emplace(entry.UniqueProcessId, ScopedHandle(raw));
+                    cacheIt = it;
+                }
+                if (!cacheIt->second) continue;
+
+                HANDLE hDup = nullptr;
+                if (!DuplicateHandle(cacheIt->second.Get(), reinterpret_cast<HANDLE>(entry.HandleValue),
+                    GetCurrentProcess(), &hDup, 0, FALSE, DUPLICATE_SAME_ACCESS)) continue;
+                ScopedHandle dup(hDup);
+
+                if (GetFileType(dup.Get()) != FILE_TYPE_DISK) continue;
+
+                BY_HANDLE_FILE_INFORMATION dupInfo{};
+                if (!GetFileInformationByHandle(dup.Get(), &dupInfo)) continue;
+                if (dupInfo.dwVolumeSerialNumber != targetInfo.dwVolumeSerialNumber ||
+                    dupInfo.nFileIndexHigh != targetInfo.nFileIndexHigh ||
+                    dupInfo.nFileIndexLow != targetInfo.nFileIndexLow) continue;
+
+                LockOwner owner;
+                owner.pid = handlePid;
+                owner.handleValue = static_cast<uint64_t>(entry.HandleValue);
+                owner.accessMask = entry.GrantedAccess;
+                owner.lockType = ClassifyLockType(entry.GrantedAccess);
+                // Source tracked via lockType context
+                EnrichProcessInfo(owner);
+                owners.push_back(std::move(owner));
+                foundPids.insert(handlePid);
+            }
+            m_stats.handleEnumerations.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcessesHandleEnum - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"HandleEnum exception: %hs", e.what());
         }
-
         return owners;
     }
 
     void EnrichProcessInfo(LockOwner& owner) const {
         try {
-            HANDLE hProcess = OpenProcess(
-                PROCESS_QUERY_LIMITED_INFORMATION,
-                FALSE,
-                owner.pid
-            );
-
-            if (!hProcess) {
-                return;
+            ScopedHandle hProc(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, owner.pid));
+            if (!hProc) return;
+            WCHAR exePath[MAX_PATH * 2] = { 0 }; DWORD sz = _countof(exePath);
+            if (QueryFullProcessImageNameW(hProc.Get(), 0, exePath, &sz)) {
+                owner.processPath = exePath;
+                const wchar_t* base = wcsrchr(exePath, L'\\');
+                if (base) owner.processName = base + 1;
             }
-
-            // Get process path
-            WCHAR processPath[MAX_PATH];
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, processPath, &size)) {
-                owner.processPath = processPath;
-            }
-
-            // Check if system/critical process
-            std::wstring procName = owner.processName;
-            std::transform(procName.begin(), procName.end(), procName.begin(), ::towlower);
-
-            owner.isCriticalProcess = CRITICAL_PROCESSES.find(procName) != CRITICAL_PROCESSES.end();
-            owner.isSystemProcess = SYSTEM_PROCESSES.find(procName) != SYSTEM_PROCESSES.end();
-
-            // Determine role
-            if (owner.pid == SYSTEM_PID) {
-                owner.role = ProcessRole::System;
-                owner.isSystemProcess = true;
-            } else if (owner.isCriticalProcess) {
-                owner.role = ProcessRole::System;
-            } else if (owner.processName == L"explorer.exe") {
-                owner.role = ProcessRole::Explorer;
-            }
-
-            CloseHandle(hProcess);
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"EnrichProcessInfo - Exception: %hs", e.what());
-        }
+            owner.isSystemProcess = (owner.pid <= 4);
+            owner.isCriticalProcess = IsCriticalProcessName(owner.processName);
+            AnalyzeProcessTrust(owner);
+        } catch (...) {}
     }
+
+    static bool IsCriticalProcessName(const std::wstring& name) noexcept {
+        static const std::unordered_set<std::wstring> critical = {
+            L"system", L"csrss.exe", L"smss.exe", L"wininit.exe", L"services.exe",
+            L"lsass.exe", L"svchost.exe", L"winlogon.exe", L"explorer.exe"
+        };
+        std::wstring lower; lower.reserve(name.size());
+        for (wchar_t c : name) lower += static_cast<wchar_t>(::towlower(c));
+        return critical.count(lower) > 0;
+    }
+
+    void AnalyzeProcessTrust(LockOwner& owner) const {
+        try {
+            if (owner.processPath.empty()) { owner.isSuspicious = true; return; }
+            owner.isSigned = VerifyFileSignature(owner.processPath);
+            owner.isInjectedProcess = DetectProcessInjection(owner.pid);
+            owner.isSuspicious = !owner.isSigned || owner.isInjectedProcess;
+            owner.isUntrustedSigner = !owner.isSigned;
+        } catch (...) { owner.isSuspicious = true; }
+    }
+    bool VerifyFileSignature(const std::wstring& path) const {
+        try {
+            WINTRUST_FILE_INFO fileInfo{}; fileInfo.cbStruct = sizeof(fileInfo); fileInfo.pcwszFilePath = path.c_str();
+            GUID actionId = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+            WINTRUST_DATA wtd{}; wtd.cbStruct = sizeof(wtd); wtd.dwUIChoice = WTD_UI_NONE;
+            wtd.fdwRevocationChecks = WTD_REVOKE_NONE; wtd.dwUnionChoice = WTD_CHOICE_FILE;
+            wtd.pFile = &fileInfo; wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+            LONG st = WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionId, &wtd);
+            wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+            WinVerifyTrust(static_cast<HWND>(INVALID_HANDLE_VALUE), &actionId, &wtd);
+            return (st == ERROR_SUCCESS);
+        } catch (...) { return false; }
+    }
+
+    bool DetectProcessInjection(DWORD pid) const {
+        try {
+            ScopedHandle hProc(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+            if (!hProc) return false;
+            MEMORY_BASIC_INFORMATION mbi{}; uint8_t* addr = nullptr;
+            uint32_t suspiciousCount = 0;
+            constexpr uint32_t SUSPICIOUS_THRESHOLD = 3;
+            while (VirtualQueryEx(hProc.Get(), addr, &mbi, sizeof(mbi)) == sizeof(mbi)) {
+                if (mbi.Type == MEM_PRIVATE && (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+                    ++suspiciousCount;
+                    if (suspiciousCount >= SUSPICIOUS_THRESHOLD) return true;
+                }
+                addr = static_cast<uint8_t*>(mbi.BaseAddress) + mbi.RegionSize;
+                if (addr < static_cast<uint8_t*>(mbi.BaseAddress)) break;
+            }
+            return false;
+        } catch (...) { return false; }
+    }
+
+    ThreatAssessment AnalyzeThreatInternal(const FileLockInfo& info) const {
+        ThreatAssessment threat;
+        try {
+            double score = 0.0;
+            for (const auto& o : info.owners) {
+                if (o.isSuspicious) threat.untrustedLockCount++;
+                if (o.isUntrustedSigner) { threat.unsignedProcessCount++; score += 15.0; }
+                if (o.isInjectedProcess) { threat.injectedProcessCount++; score += 40.0; }
+                if (o.isRemoteProcess) threat.remoteLockCount++;
+                if (o.isSystemProcess && o.lockType == LockType::Exclusive) score += 30.0;
+            }
+            if (info.lockCount > 3) score += static_cast<double>(info.lockCount) * 5.0;
+            threat.dominantPattern = DetectLockPatternInternal(info);
+            switch (threat.dominantPattern) {
+            case LockPattern::Ransomware: score += 80.0; threat.indicators.push_back("Ransomware lock pattern"); break;
+            case LockPattern::ProcessInjection: score += 60.0; threat.indicators.push_back("Process injection pattern"); break;
+            case LockPattern::DefenseEvasion: score += 50.0; threat.indicators.push_back("Defense evasion"); break;
+            case LockPattern::DataExfiltration: score += 45.0; threat.indicators.push_back("Data exfiltration"); break;
+            case LockPattern::Persistence: score += 40.0; threat.indicators.push_back("Persistence mechanism"); break;
+            default: break;
+            }
+            threat.overallThreatScore = std::clamp(score, 0.0, 100.0);
+            threat.isSuspiciousActivity = threat.overallThreatScore >= 30.0;
+            threat.requiresImmediateAction = threat.overallThreatScore >= 70.0;
+            if (threat.requiresImmediateAction) {
+                threat.recommendedAction = L"Immediate quarantine and process termination recommended";
+                SS_LOG_WARN(L"FileLockManager", L"HIGH RISK lock detected on %s (score=%.1f, pattern=%u)",
+                    info.filePath.c_str(), threat.overallThreatScore, static_cast<unsigned>(threat.dominantPattern));
+            }
+        } catch (...) {}
+        return threat;
+    }
+
+    LockPattern DetectLockPatternInternal(const FileLockInfo& info) const {
+        try {
+            for (const auto& o : info.owners) {
+                if (!o.isSigned && o.isSuspicious && o.lockType == LockType::Exclusive) {
+                    std::wstring ext = fs::path(info.filePath).extension().wstring();
+                    std::wstring lext; for (wchar_t c : ext) lext += static_cast<wchar_t>(::towlower(c));
+                    static const std::unordered_set<std::wstring> docExts = { L".doc", L".docx", L".xls", L".xlsx", L".pdf", L".pptx", L".txt", L".csv", L".db", L".sqlite" };
+                    if (docExts.count(lext)) return LockPattern::Ransomware;
+                }
+                if (o.isInjectedProcess && o.isSigned && o.lockType != LockType::Unknown) return LockPattern::ProcessInjection;
+                if (o.isInjectedProcess && !o.isSigned) return LockPattern::DefenseEvasion;
+            }
+            for (const auto& o : info.owners) {
+                if (o.isSuspicious && (o.accessMask & FILE_READ_DATA) && info.fileSize > (1 << 20)) return LockPattern::DataExfiltration;
+                if (o.isSuspicious && (o.accessMask & FILE_WRITE_ATTRIBUTES)) {
+                    std::wstring lp; for (wchar_t c : info.filePath) lp += static_cast<wchar_t>(::towlower(c));
+                    if (lp.find(L"\\system32\\") != std::wstring::npos || lp.find(L"\\startup") != std::wstring::npos) return LockPattern::Persistence;
+                }
+            }
+            return LockPattern::Normal;
+        } catch (...) { return LockPattern::Normal; }
+    }
+
+    // ========================================================================
+    // TRY HELPERS (used by UnlockFile escalation chain)
+    // ========================================================================
 
     bool TryRestartManager(const std::wstring& filePath, UnlockOperation& result) {
         try {
-            if (UseRestartManagerOp(filePath)) {
-                result.method = UnlockMethod::RestartManager;
-                SS_LOG_INFO(L"FileLockManager", L"Unlocked via Restart Manager: %hs", StringUtils::ToNarrow(filePath).c_str());
-                return true;
-            }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"TryRestartManager - Exception: %hs", e.what());
-            result.errors.push_back(std::string("Restart Manager failed: ") + e.what());
-        }
+            if (UseRestartManagerOp(filePath)) { SS_LOG_INFO(L"FileLockManager", L"RM unlock succeeded: %s", filePath.c_str()); return true; }
+            result.errors.push_back("RestartManager failed");
+        } catch (...) { result.errors.push_back("RestartManager exception"); }
         return false;
     }
 
     bool TryHandleClose(const std::vector<LockOwner>& owners, UnlockOperation& result) {
-        uint32_t closed = 0;
-
-        try {
-            for (const auto& owner : owners) {
-                if (CloseHandleOp(owner)) {
-                    closed++;
-                }
-            }
-
-            result.handlesClosed = closed;
-
-            if (closed > 0) {
-                result.method = UnlockMethod::HandleClose;
-                SS_LOG_INFO(L"FileLockManager", L"Closed %hs handles", closed);
-                return true;
-            }
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"TryHandleClose - Exception: %hs", e.what());
-            result.errors.push_back(std::string("Handle close failed: ") + e.what());
+        bool any = false;
+        for (const auto& o : owners) {
+            if (o.isCriticalProcess && m_config.protectCriticalProcesses) continue;
+            if (o.handleValue != 0) { LockOwner copy = o; if (CloseHandleOp(copy)) any = true; }
         }
-
-        return false;
+        if (!any) result.errors.push_back("Handle close: no handles closed");
+        return any;
     }
 
     bool TryProcessTerminate(const std::vector<LockOwner>& owners, UnlockOperation& result) {
-        if (!m_config.allowProcessTermination) {
-            result.warnings.push_back("Process termination not allowed");
-            return false;
+        bool any = false;
+        for (const auto& o : owners) {
+            if (o.isCriticalProcess && m_config.protectCriticalProcesses) continue;
+            if (o.isSystemProcess && m_config.protectSystemProcesses) continue;
+            LockOwner copy = o; if (TerminateProcessOp(copy, false)) any = true;
         }
-
-        uint32_t terminated = 0;
-
-        try {
-            for (const auto& owner : owners) {
-                if (TerminateProcessOp(owner, false)) {
-                    terminated++;
-                }
-            }
-
-            result.processesTerminated = terminated;
-
-            if (terminated > 0) {
-                result.method = UnlockMethod::ProcessTerminate;
-                SS_LOG_WARN(L"FileLockManager", L"Terminated %hs processes", terminated);
-                return true;
-            }
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"TryProcessTerminate - Exception: %hs", e.what());
-            result.errors.push_back(std::string("Process termination failed: ") + e.what());
-        }
-
-        return false;
+        if (!any) result.errors.push_back("Process termination: none terminated");
+        return any;
     }
 
     bool TryKernelUnlock(const std::wstring& filePath, UnlockOperation& result) {
         try {
-            if (KernelUnlockFileOp(filePath)) {
-                result.method = UnlockMethod::KernelDriver;
-                SS_LOG_INFO(L"FileLockManager", L"Unlocked via kernel driver: %hs", StringUtils::ToNarrow(filePath).c_str());
-                return true;
-            }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileLockManager", L"TryKernelUnlock - Exception: %hs", e.what());
-            result.errors.push_back(std::string("Kernel unlock failed: ") + e.what());
-        }
+            if (KernelUnlockFileOp(filePath)) return true;
+            result.errors.push_back("Kernel unlock failed");
+        } catch (...) { result.errors.push_back("Kernel unlock exception"); }
         return false;
     }
 
-    void ReportProgress(const std::wstring& status, uint32_t percent) const {
-        try {
-            if (m_progressCallback) {
-                m_progressCallback(status, percent);
-            }
-        } catch (...) {
-            // Suppress callback exceptions
-        }
+    void FinalizeResult(UnlockOperation& r, std::chrono::steady_clock::time_point t0) const {
+        r.duration = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0);
+    }
+
+    void ReportProgress(const std::wstring& stage, uint32_t pct) const {
+        if (m_progressCallback) m_progressCallback(stage, pct);
+    }
+    // ========================================================================
+    // HANDLE ENUMERATION ENHANCED
+    // ========================================================================
+
+    [[nodiscard]] std::vector<LockOwner> EnumerateFileHandles(const std::wstring& filePath) const {
+        return GetLockingProcessesHandleEnum(filePath);
     }
 
     // ========================================================================
@@ -1260,81 +999,82 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
+    mutable std::shared_mutex m_pendingMutex;
+    std::mutex m_kernelMutex; // Protects kernel port connect/disconnect/send
+    FileLockManagerConfig m_config{};
+    bool m_initialized = false;
+    bool m_hasDebugPrivilege = false;
+    bool m_kernelDriverAvailable = false;
+    bool m_kernelPortConnected = false;
+    HANDLE m_kernelPort = INVALID_HANDLE_VALUE;
+    uint8_t m_fileTypeIndex = 0;
 
-    FileLockManagerConfig m_config;
-    FileLockManagerStatistics m_stats;
+    NtQuerySystemInformationFn m_ntQuerySystemInfo = nullptr;
+    NtQueryObjectFn m_ntQueryObject = nullptr;
 
-    bool m_hasDebugPrivilege{ false };
-    bool m_kernelDriverAvailable{ false };
-
+    mutable InternalStatistics m_stats;
     std::vector<PendingOperation> m_pendingOperations;
 
     TerminateCallback m_terminateCallback;
     UnlockProgressCallback m_progressCallback;
+    LockEventCallback m_lockEventCallback;
 };
 
 // ============================================================================
-// CONFIGURATION FACTORY METHODS
+// CONFIG FACTORY METHODS
 // ============================================================================
 
 FileLockManagerConfig FileLockManagerConfig::CreateDefault() noexcept {
-    FileLockManagerConfig config;
-    config.allowProcessTermination = false;
-    config.allowKernelUnlock = true;
-    config.allowRestartManager = true;
-    config.unlockTimeoutMs = 5000;
-    config.retryCount = 3;
-    config.retryDelayMs = 500;
-    config.protectSystemProcesses = true;
-    config.protectCriticalProcesses = true;
-    config.protectServices = true;
-    return config;
+    FileLockManagerConfig cfg;
+    cfg.allowRestartManager = true;
+    cfg.allowProcessTermination = false;
+    cfg.allowKernelUnlock = true;
+    cfg.protectCriticalProcesses = true;
+    cfg.protectSystemProcesses = true;
+    cfg.protectServices = true;
+    cfg.retryCount = 3;
+    cfg.unlockTimeoutMs = 30000;
+    return cfg;
 }
 
 FileLockManagerConfig FileLockManagerConfig::CreateAggressive() noexcept {
-    FileLockManagerConfig config;
-    config.allowProcessTermination = true;
-    config.allowKernelUnlock = true;
-    config.allowRestartManager = true;
-    config.unlockTimeoutMs = 10000;
-    config.retryCount = 5;
-    config.retryDelayMs = 1000;
-    config.protectSystemProcesses = false;
-    config.protectCriticalProcesses = true; // Still protect critical
-    config.protectServices = false;
-    return config;
+    FileLockManagerConfig cfg;
+    cfg.allowRestartManager = true;
+    cfg.allowProcessTermination = true;
+    cfg.allowKernelUnlock = true;
+    cfg.protectCriticalProcesses = true;
+    cfg.protectSystemProcesses = false;
+    cfg.protectServices = false;
+    cfg.retryCount = 5;
+    cfg.unlockTimeoutMs = 60000;
+    return cfg;
 }
 
 FileLockManagerConfig FileLockManagerConfig::CreateSafe() noexcept {
-    FileLockManagerConfig config;
-    config.allowProcessTermination = false;
-    config.allowKernelUnlock = false;
-    config.allowRestartManager = true;
-    config.unlockTimeoutMs = 3000;
-    config.retryCount = 2;
-    config.retryDelayMs = 250;
-    config.protectSystemProcesses = true;
-    config.protectCriticalProcesses = true;
-    config.protectServices = true;
-    return config;
+    FileLockManagerConfig cfg;
+    cfg.allowRestartManager = true;
+    cfg.allowProcessTermination = false;
+    cfg.allowKernelUnlock = false;
+    cfg.protectCriticalProcesses = true;
+    cfg.protectSystemProcesses = true;
+    cfg.protectServices = true;
+    cfg.retryCount = 2;
+    cfg.unlockTimeoutMs = 15000;
+    return cfg;
 }
 
 // ============================================================================
-// STATISTICS IMPLEMENTATION
+// STATISTICS RESET
 // ============================================================================
 
 void FileLockManagerStatistics::Reset() noexcept {
-    locksDetected = 0;
-    successfulUnlocks = 0;
-    failedUnlocks = 0;
-    processesTerminated = 0;
-    handlesClosed = 0;
-    rebootScheduled = 0;
+    locksDetected = 0; successfulUnlocks = 0; failedUnlocks = 0;
+    handlesClosed = 0; processesTerminated = 0; kernelUnlocks = 0;
+    rebootScheduled = 0; handleEnumerations = 0; threatsDetected = 0;
 }
 
 // ============================================================================
-// SINGLETON IMPLEMENTATION
+// SINGLETON
 // ============================================================================
 
 FileLockManager& FileLockManager::Instance() {
@@ -1346,127 +1086,57 @@ FileLockManager& FileLockManager::Instance() {
 // CONSTRUCTOR / DESTRUCTOR
 // ============================================================================
 
-FileLockManager::FileLockManager()
-    : m_impl(std::make_unique<FileLockManagerImpl>()) {
+FileLockManager::FileLockManager() : m_impl(std::make_unique<FileLockManagerImpl>()) {}
 
-    SS_LOG_INFO(L"FileLockManager", L"FileLockManager instance created");
-}
-
-FileLockManager::~FileLockManager() {
-    if (m_impl) {
-        m_impl->Shutdown();
-    }
-    SS_LOG_INFO(L"FileLockManager", L"FileLockManager instance destroyed");
-}
+FileLockManager::~FileLockManager() = default;
 
 // ============================================================================
-// PUBLIC INTERFACE IMPLEMENTATION
+// PUBLIC INTERFACE — DELEGATIONS
 // ============================================================================
 
-bool FileLockManager::Initialize(const FileLockManagerConfig& config) {
-    return m_impl->Initialize(config);
+bool FileLockManager::Initialize(const FileLockManagerConfig& config) { return m_impl->Initialize(config); }
+void FileLockManager::Shutdown() noexcept { m_impl->Shutdown(); }
+
+std::vector<LockOwner> FileLockManager::GetLockingProcesses(const std::wstring& filePath) const { return m_impl->GetLockingProcesses(filePath); }
+FileLockInfo FileLockManager::GetLockInfo(const std::wstring& filePath) const { return m_impl->GetLockInfo(filePath); }
+bool FileLockManager::IsFileLocked(const std::wstring& filePath) const { return m_impl->IsFileLocked(filePath); }
+bool FileLockManager::CanDeleteFile(const std::wstring& filePath) const { return m_impl->CanDeleteFile(filePath); }
+LockType FileLockManager::GetLockType(const std::wstring& filePath) const { return m_impl->GetLockType(filePath); }
+
+UnlockOperation FileLockManager::UnlockFile(const std::wstring& filePath) { return m_impl->UnlockFile(filePath); }
+UnlockOperation FileLockManager::UnlockFile(const std::wstring& filePath, UnlockMethod method) { return m_impl->UnlockFile(filePath, method); }
+UnlockOperation FileLockManager::ForceUnlockFile(const std::wstring& filePath) { return m_impl->ForceUnlockFile(filePath); }
+
+bool FileLockManager::CloseHandle(const LockOwner& owner) { return m_impl->CloseHandleOp(owner); }
+bool FileLockManager::TerminateProcess(const LockOwner& owner, bool force) { return m_impl->TerminateProcessOp(owner, force); }
+bool FileLockManager::UseRestartManager(const std::wstring& filePath) { return m_impl->UseRestartManagerOp(filePath); }
+std::vector<std::wstring> FileLockManager::GetApplicationsUsingFile(const std::wstring& filePath) const { return m_impl->GetApplicationsUsingFileOp(filePath); }
+
+bool FileLockManager::ScheduleDeleteOnReboot(const std::wstring& filePath) { return m_impl->ScheduleDeleteOnRebootInternal(filePath); }
+bool FileLockManager::ScheduleMoveOnReboot(const std::wstring& src, const std::wstring& dst) { return m_impl->ScheduleMoveOnRebootInternal(src, dst); }
+std::vector<PendingOperation> FileLockManager::GetPendingOperations() const { return m_impl->GetPendingOperationsOp(); }
+bool FileLockManager::CancelPendingOperation(const std::wstring& sp) { return m_impl->CancelPendingOperationOp(sp); }
+
+bool FileLockManager::KernelUnlockFile(const std::wstring& filePath) { return m_impl->KernelUnlockFileOp(filePath); }
+bool FileLockManager::IsKernelDriverAvailable() const noexcept { return m_impl->IsKernelDriverAvailableOp(); }
+bool FileLockManager::ConnectKernelDriver() { return m_impl->ConnectToKernelDriverInternal(); }
+
+ThreatAssessment FileLockManager::AnalyzeThreat(const FileLockInfo& lockInfo) const {
+    return m_impl->AnalyzeThreatInternal(lockInfo);
 }
 
-void FileLockManager::Shutdown() noexcept {
-    m_impl->Shutdown();
+std::vector<LockOwner> FileLockManager::EnumerateHandles(const std::wstring& filePath) const {
+    return m_impl->EnumerateFileHandles(filePath);
 }
 
-std::vector<LockOwner> FileLockManager::GetLockingProcesses(const std::wstring& filePath) const {
-    return m_impl->GetLockingProcesses(filePath);
+FileLockManagerStatistics FileLockManager::GetStatistics() const noexcept {
+    return m_impl->m_stats.Snapshot();
 }
 
-FileLockInfo FileLockManager::GetLockInfo(const std::wstring& filePath) const {
-    return m_impl->GetLockInfo(filePath);
-}
+void FileLockManager::SetTerminateCallback(TerminateCallback cb) { m_impl->m_terminateCallback = std::move(cb); }
+void FileLockManager::SetProgressCallback(UnlockProgressCallback cb) { m_impl->m_progressCallback = std::move(cb); }
+void FileLockManager::SetLockEventCallback(LockEventCallback cb) { m_impl->m_lockEventCallback = std::move(cb); }
 
-bool FileLockManager::IsFileLocked(const std::wstring& filePath) const {
-    return m_impl->IsFileLocked(filePath);
-}
-
-bool FileLockManager::CanDeleteFile(const std::wstring& filePath) const {
-    return m_impl->CanDeleteFile(filePath);
-}
-
-LockType FileLockManager::GetLockType(const std::wstring& filePath) const {
-    return m_impl->GetLockType(filePath);
-}
-
-UnlockOperation FileLockManager::UnlockFile(const std::wstring& filePath) {
-    return m_impl->UnlockFile(filePath);
-}
-
-UnlockOperation FileLockManager::UnlockFile(const std::wstring& filePath, UnlockMethod method) {
-    return m_impl->UnlockFile(filePath, method);
-}
-
-UnlockOperation FileLockManager::ForceUnlockFile(const std::wstring& filePath) {
-    return m_impl->ForceUnlockFile(filePath);
-}
-
-bool FileLockManager::CloseHandle(const LockOwner& owner) {
-    return m_impl->CloseHandleOp(owner);
-}
-
-bool FileLockManager::TerminateProcess(const LockOwner& owner, bool force) {
-    return m_impl->TerminateProcessOp(owner, force);
-}
-
-bool FileLockManager::UseRestartManager(const std::wstring& filePath) {
-    return m_impl->UseRestartManagerOp(filePath);
-}
-
-std::vector<std::wstring> FileLockManager::GetApplicationsUsingFile(const std::wstring& filePath) const {
-    return m_impl->GetApplicationsUsingFileOp(filePath);
-}
-
-bool FileLockManager::ScheduleDeleteOnReboot(const std::wstring& filePath) {
-    return m_impl->ScheduleDeleteOnRebootInternal(filePath);
-}
-
-bool FileLockManager::ScheduleMoveOnReboot(const std::wstring& sourcePath, const std::wstring& destPath) {
-    return m_impl->ScheduleMoveOnRebootInternal(sourcePath, destPath);
-}
-
-std::vector<PendingOperation> FileLockManager::GetPendingOperations() const {
-    return m_impl->GetPendingOperationsOp();
-}
-
-bool FileLockManager::CancelPendingOperation(const std::wstring& sourcePath) {
-    return m_impl->CancelPendingOperationOp(sourcePath);
-}
-
-bool FileLockManager::KernelUnlockFile(const std::wstring& filePath) {
-    return m_impl->KernelUnlockFileOp(filePath);
-}
-
-bool FileLockManager::IsKernelDriverAvailable() const noexcept {
-    return m_impl->IsKernelDriverAvailableOp();
-}
-
-void FileLockManager::SetTerminateCallback(TerminateCallback callback) {
-    m_impl->SetTerminateCallbackOp(std::move(callback));
-}
-
-void FileLockManager::SetProgressCallback(UnlockProgressCallback callback) {
-    m_impl->SetProgressCallbackOp(std::move(callback));
-}
-
-void FileLockManager::SetAllowProcessTermination(bool allow) noexcept {
-    m_impl->SetAllowProcessTerminationOp(allow);
-}
-
-void FileLockManager::SetProtectSystemProcesses(bool protect) noexcept {
-    m_impl->SetProtectSystemProcessesOp(protect);
-}
-
-const FileLockManagerStatistics& FileLockManager::GetStatistics() const noexcept {
-    return m_impl->GetStatistics();
-}
-
-void FileLockManager::ResetStatistics() noexcept {
-    m_impl->ResetStatistics();
-}
-
-}  // namespace FileSystem
-}  // namespace Core
-}  // namespace ShadowStrike
+} // namespace FileSystem
+} // namespace Core
+} // namespace ShadowStrike

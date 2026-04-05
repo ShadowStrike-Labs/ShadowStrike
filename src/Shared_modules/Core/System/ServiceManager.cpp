@@ -37,6 +37,7 @@
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Core/FileSystem/FileHasher.hpp"
+#include "../../Core/FileSystem/FileLockManager.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
@@ -526,6 +527,15 @@ public:
 
             // Establish baseline for our services
             EstablishServiceBaselines();
+
+            // Initialize FileLockManager for service binary lock detection
+            {
+                auto flmConfig = Core::FileSystem::FileLockManagerConfig::CreateDefault();
+                auto& flm = Core::FileSystem::FileLockManager::Instance();
+                if (!flm.Initialize(flmConfig)) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"FileLockManager initialization failed - lock detection degraded");
+                }
+            }
 
             m_initialized.store(true, std::memory_order_release);
             SS_LOG_INFO(LOG_CATEGORY, L"ServiceManager::Impl: Initialization complete");
