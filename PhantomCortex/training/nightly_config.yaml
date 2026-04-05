@@ -1,0 +1,131 @@
+# =============================================================================
+# PhantomCortex Nightly Training Pipeline Configuration
+# =============================================================================
+# Default configuration for the automated nightly retraining entrypoint.
+# Override any value via CLI flags or environment variables.
+#
+# Paths use Windows conventions for the production deployment target.
+# Relative paths are resolved from the training/ directory.
+# =============================================================================
+
+# ---------------------------------------------------------------------------
+# Pipeline settings
+# ---------------------------------------------------------------------------
+pipeline:
+  default_mode: "nightly"            # nightly | full | evaluate
+  lock_stale_hours: 6                # Override stale-lock after this many hours
+  checkpoint_enabled: true           # Enable resume-from-checkpoint
+  max_concurrent_models: 2           # Parallel model training slots (GPU bound)
+
+# ---------------------------------------------------------------------------
+# Directory layout
+# ---------------------------------------------------------------------------
+directories:
+  production: "C:\\ProgramData\\ShadowStrike\\Models"
+  staging: "C:\\ProgramData\\ShadowStrike\\Models\\staging"
+  training_data: "data"              # Relative to training/ dir
+  logs: "logs"                       # Relative to training/ dir
+  temp: "data/tmp"                   # Cleaned up after each run
+
+# ---------------------------------------------------------------------------
+# Models
+# ---------------------------------------------------------------------------
+models:
+  static:
+    enabled: true
+    description: "LightGBM PE static feature classifier"
+    config_section: "cortex_static"
+    onnx_filename: "cortex_static.onnx"
+  behavioral:
+    enabled: true
+    description: "CNN+Attention behavioral API sequence classifier"
+    config_section: "cortex_behavioral"
+    onnx_filename: "cortex_behavioral.onnx"
+  memory:
+    enabled: true
+    description: "MLP memory forensics classifier"
+    config_section: "cortex_memory"
+    onnx_filename: "cortex_memory.onnx"
+  network:
+    enabled: true
+    description: "Autoencoder network anomaly detector"
+    config_section: "cortex_network"
+    onnx_filename: "cortex_network.onnx"
+  emulation:
+    enabled: true
+    description: "GRU emulation trace classifier"
+    config_section: "cortex_emulation"
+    onnx_filename: "cortex_emulation.onnx"
+
+# ---------------------------------------------------------------------------
+# Quality gates (must pass before promotion to production)
+# ---------------------------------------------------------------------------
+quality_gates:
+  min_auc_roc: 0.995
+  max_fpr_at_001: 0.001              # FPR at 0.1% threshold
+  min_detection_rate: 0.995
+  max_model_size_mb: 20.0
+  max_inference_ms: 5.0
+  max_regression_pct: 0.5            # Max % AUC drop vs current production model
+
+# ---------------------------------------------------------------------------
+# Feed sync
+# ---------------------------------------------------------------------------
+feeds:
+  enabled: true
+  timeout_seconds: 1800              # 30 min hard cap on feed sync
+  retry_count: 3
+  retry_delay_seconds: 10
+  sources:
+    - "malwarebazaar"
+    - "threatfox"
+    - "otx"
+    - "urlhaus"
+    - "ember"
+    - "feodo"
+
+# ---------------------------------------------------------------------------
+# Resource limits
+# ---------------------------------------------------------------------------
+resources:
+  min_disk_gb: 10.0                  # Abort if free disk is below this
+  gpu_memory_fraction: 0.9           # Max fraction of GPU VRAM to use
+  max_training_hours: 8              # Hard timeout on training step
+  max_total_hours: 12                # Hard timeout on entire pipeline run
+
+# ---------------------------------------------------------------------------
+# Notifications
+# ---------------------------------------------------------------------------
+notifications:
+  webhook:
+    enabled: false
+    url: ""
+    timeout_seconds: 30
+    retry_count: 2
+  email:
+    enabled: false
+    smtp_server: ""
+    smtp_port: 25
+    use_tls: false
+    sender: "phantomcortex@shadowstrike.local"
+    recipients: []
+
+# ---------------------------------------------------------------------------
+# Log retention
+# ---------------------------------------------------------------------------
+logging:
+  level: "INFO"
+  console_enabled: true
+  file_enabled: true
+  retention_days: 30                 # Auto-delete logs older than this
+  max_log_size_mb: 100               # Rotate individual log files at this size
+
+# ---------------------------------------------------------------------------
+# Windows Task Scheduler
+# ---------------------------------------------------------------------------
+scheduler:
+  task_name: "ShadowStrike-PhantomCortex-Nightly"
+  run_time: "02:00"                  # 24-hour format
+  run_as_system: true
+  priority: 4                        # 0=Realtime .. 7=Idle; 4=BelowNormal
+  wake_to_run: true
