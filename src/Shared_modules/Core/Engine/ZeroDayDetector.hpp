@@ -582,8 +582,11 @@ struct ZeroDayConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using DetectionCallback = std::function<void(const ZeroDayResult& result)>;
+using ZeroDayDetectionCallback = std::function<void(const ZeroDayResult& result)>;
+#ifndef SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // ZERO DAY DETECTOR CLASS
@@ -692,7 +695,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterDetectionCallback(DetectionCallback callback);
+    void RegisterDetectionCallback(ZeroDayDetectionCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 

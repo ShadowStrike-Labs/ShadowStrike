@@ -467,7 +467,10 @@ struct PolymorphicConfiguration {
 
 using AnalysisCallback = std::function<void(const PolyResult& result)>;
 using FuzzyMatchCallback = std::function<void(const FuzzyHashMatch& match)>;
+#ifndef SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // POLYMORPHIC DETECTOR CLASS
