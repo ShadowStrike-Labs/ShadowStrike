@@ -250,7 +250,7 @@ public:
     [[nodiscard]] bool HasDirectML() const noexcept;
 
 private:
-    ModelInference() = default;
+    ModelInference();
     ~ModelInference();
 
     /// @brief Opaque implementation — hides all ONNX Runtime types.
