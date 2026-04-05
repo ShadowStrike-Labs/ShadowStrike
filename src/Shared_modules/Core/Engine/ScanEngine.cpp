@@ -52,6 +52,8 @@
 #include "EmulationEngine.hpp"
 #include "ZeroDayDetector.hpp"
 #include "../FileSystem/ArchiveExtractor.hpp"
+#include "../FileSystem/DocumentScanner.hpp"
+#include "../FileSystem/FileTypeAnalyzer.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -1179,6 +1181,83 @@ EngineResult ScanEngine::ScanFile(
         }
 
         // ====================================================================
+        // STAGE 4.5: DOCUMENT ANALYSIS (OLE/OOXML/PDF/RTF Malware Detection)
+        // ====================================================================
+
+        {
+            const auto stage45Start = steady_clock::now();
+
+            try {
+                auto& fileTypeAnalyzer = FileSystem::FileTypeAnalyzer::Instance();
+                auto typeInfo = fileTypeAnalyzer.Analyze(filePath);
+
+                bool isDocument = (typeInfo.category == FileSystem::FileCategory::Document ||
+                                   typeInfo.category == FileSystem::FileCategory::Spreadsheet ||
+                                   typeInfo.category == FileSystem::FileCategory::Presentation);
+
+                if (isDocument) {
+                    auto& docScanner = FileSystem::DocumentScanner::Instance();
+
+                    if (docScanner.IsInitialized()) {
+                        auto docResult = docScanner.Scan(filePath);
+
+                        if (docResult.verdict == FileSystem::ScanVerdict::HighlyMalicious ||
+                            docResult.verdict == FileSystem::ScanVerdict::Malicious) {
+
+                            result.verdict = ScanVerdict::Infected;
+                            result.threatName = docResult.detectedThreat.empty() ?
+                                "Doc.Malware.Generic" : docResult.detectedThreat;
+                            result.detectionSource = "DocumentScanner";
+                            result.sha256 = fileHash;
+                            result.confidence = docResult.aiMaliciousConfidence;
+
+                            for (const auto& threat : docResult.threats) {
+                                if (!threat.mitreId.empty()) {
+                                    result.mitreTechniques.push_back(threat.mitreId);
+                                }
+                                result.indicators.push_back(threat.description);
+                            }
+
+                            result.detectionMethods.push_back("DocumentAnalysis");
+
+                            SS_LOG_WARN(L"ScanEngine",
+                                L"Document malware detected: %ls (risk=%u, AI=%.2f)",
+                                StringUtils::ToWide(result.threatName).c_str(),
+                                docResult.riskScore, docResult.aiMaliciousConfidence);
+
+                            m_impl->InvokeDetectionCallbacks(result);
+                            goto finalize_scan;
+
+                        } else if (docResult.verdict == FileSystem::ScanVerdict::Suspicious) {
+
+                            if (result.verdict != ScanVerdict::Infected) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = docResult.detectedThreat.empty() ?
+                                    "Doc.Suspicious.Generic" : docResult.detectedThreat;
+                                result.detectionSource = "DocumentScanner";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(docResult.riskScore);
+
+                                result.detectionMethods.push_back("DocumentAnalysis");
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Suspicious document: %ls (risk=%u)",
+                                    StringUtils::ToWide(result.threatName).c_str(),
+                                    docResult.riskScore);
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ScanEngine", L"Stage 4.5 DocumentScanner exception: %hs", e.what());
+            }
+
+            const auto stage45End = steady_clock::now();
+            SS_LOG_TRACE(L"ScanEngine", L"Stage 4.5 DocumentAnalysis: %lldus",
+                static_cast<long long>(duration_cast<microseconds>(stage45End - stage45Start).count()));
+        }
+
+        // ====================================================================
         // STAGE 5: HEURISTIC ANALYSIS (PE/Entropy/Import/String Analysis)
         // ====================================================================
 
@@ -2184,7 +2263,7 @@ BatchScanResult ScanEngine::ScanArchive(
 
                 // Run the entry through our scan pipeline
                 EngineResult entryResult{};
-                entryResult.sha256 = entry.sha256;
+                entryResult.sha256 = entry.sha256Hex;
 
                 // Check for path traversal in results
                 if (FileSystem::HasFlag(entry.securityFlags,
@@ -2204,11 +2283,12 @@ BatchScanResult ScanEngine::ScanArchive(
                 if (m_impl->m_signatureStore) {
                     auto sigResult = m_impl->m_signatureStore->ScanBuffer(
                         std::span<const uint8_t>(data.data(), data.size()));
-                    if (sigResult.matched) {
+                    if (!sigResult.detections.empty()) {
+                        const auto& det = sigResult.detections.front();
                         entryResult.verdict = ScanVerdict::Infected;
-                        entryResult.threatName = sigResult.threatName;
-                        entryResult.threatFamily = sigResult.family;
-                        entryResult.confidence = sigResult.confidence;
+                        entryResult.threatName = det.signatureName;
+                        entryResult.threatCategory = det.description;
+                        entryResult.confidence = det.similarity * 100.0f;
                         entryResult.detectionSource = "SignatureStore";
                         result.results.push_back(std::move(entryResult));
                         return;
