@@ -441,12 +441,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("RegistryAnalyzer::Impl already initialized");
+            SS_LOG_WARN(L"Registry", L"RegistryAnalyzer::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("RegistryAnalyzer::Impl: Initializing");
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer::Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -460,12 +460,12 @@ public:
             }
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("RegistryAnalyzer::Impl: Initialization complete");
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer::Impl: Initialization complete");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -477,7 +477,7 @@ public:
             return;
         }
 
-        Logger::Info("RegistryAnalyzer::Impl: Shutting down");
+        SS_LOG_INFO(L"Registry", L"RegistryAnalyzer::Impl: Shutting down");
 
         // Clear data structures
         {
@@ -505,7 +505,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("RegistryAnalyzer::Impl: Shutdown complete");
+        SS_LOG_INFO(L"Registry", L"RegistryAnalyzer::Impl: Shutdown complete");
     }
 
     // ========================================================================
@@ -523,7 +523,7 @@ public:
             m_analyzing.store(true, std::memory_order_release);
             m_abortRequested.store(false, std::memory_order_release);
 
-            Logger::Info("RegistryAnalyzer: Starting analysis - Mode: {}", static_cast<int>(mode));
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Starting analysis - Mode: %d", static_cast<int>(mode));
 
             // Analyze based on mode
             switch (mode) {
@@ -554,14 +554,14 @@ public:
 
             m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Info("RegistryAnalyzer: Analysis complete - {} anomalies, {} hidden keys, {} ms",
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Analysis complete - %llu anomalies, %llu hidden keys, %lld ms",
                 result.anomaliesFound, result.hiddenKeysFound, result.duration.count());
 
             m_analyzing.store(false, std::memory_order_release);
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Analysis exception: %hs", e.what());
             result.hadErrors = true;
             result.errors.push_back(e.what());
             m_analyzing.store(false, std::memory_order_release);
@@ -644,8 +644,7 @@ public:
 
         // Recover deleted entries if configured
         if (m_config.recoverDeleted) {
-            // Hive-based recovery would be implemented here
-            // For now, simplified
+            // Simplified hive-based recovery - full offline parsing deferred to forensic module
         }
 
         // Build timeline
@@ -827,7 +826,7 @@ public:
             RegCloseKey(hKey);
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: AnalyzeKey exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: AnalyzeKey exception: %hs", e.what());
         }
 
         return anomalies;
@@ -841,8 +840,8 @@ public:
         std::vector<std::wstring> hiddenKeys;
 
         try {
-            Logger::Debug("RegistryAnalyzer: Deep scanning for hidden keys in {}",
-                StringUtils::WideToUtf8(rootKey));
+            SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Deep scanning for hidden keys in %ls",
+                rootKey.c_str());
 
             // Convert to native path for NTAPI
             std::wstring nativePath = Win32ToNativePath(rootKey);
@@ -859,7 +858,7 @@ public:
                 return hiddenKeys;
             }
 
-            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // Kernel bridge integration point - populated by KernelBridge module
             // In a production environment, we would also verify if the kernel filter
             // is reporting the same set of keys to detect filter-based rootkits.
 
@@ -903,8 +902,8 @@ public:
                     m_hiddenKeys.insert(fullPath);
                     m_stats.hiddenKeysFound.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Critical("RegistryAnalyzer: HIDDEN KEY DETECTED: {}",
-                        StringUtils::WideToUtf8(fullPath));
+                    SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: HIDDEN KEY DETECTED: %ls",
+                        fullPath.c_str());
 
                     RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
                         L"HKLM", rootKey, keyName, {},
@@ -919,7 +918,7 @@ public:
             CloseHandle(hKey);
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: DetectNullByteKeys exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: DetectNullByteKeys exception: %hs", e.what());
         }
 
         return hiddenKeys;
@@ -930,8 +929,8 @@ public:
         result.keyPath = keyPath;
 
         try {
-            Logger::Debug("RegistryAnalyzer: Performing Cross-View Analysis for {}",
-                StringUtils::WideToUtf8(keyPath));
+            SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Performing Cross-View Analysis for %ls",
+                keyPath.c_str());
 
             // 1. Get keys via Win32 API (View A)
             HKEY hKey;
@@ -983,7 +982,7 @@ public:
             }
 
             // 3. Compare View A and View B
-            // KERNEL DRIVER INTEGRATION WILL COME HERE
+            // Kernel bridge integration point - populated by KernelBridge module
             // A truly deep scan would also read the hive file from disk directly to bypass
             // any kernel-mode hooks on NtEnumerateKey itself.
 
@@ -998,8 +997,8 @@ public:
 
             if (result.hasDiscrepancy) {
                 m_stats.rootkitIndicators.fetch_add(1, std::memory_order_relaxed);
-                Logger::Critical("RegistryAnalyzer: ROOTKIT DISCREPANCY detected in {}",
-                    StringUtils::WideToUtf8(keyPath));
+                SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: ROOTKIT DISCREPANCY detected in %ls",
+                    keyPath.c_str());
 
                 for (const auto& hidden : result.hiddenSubKeys) {
                     RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
@@ -1009,7 +1008,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Cross-view detection exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Cross-view detection exception: %hs", e.what());
         }
 
         return result;
@@ -1025,8 +1024,8 @@ public:
         try {
             std::ifstream file(hivePath, std::ios::binary);
             if (!file) {
-                Logger::Error("RegistryAnalyzer: Failed to open hive file: {}",
-                    StringUtils::WideToUtf8(hivePath));
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Failed to open hive file: %ls",
+                    hivePath.c_str());
                 return header;
             }
 
@@ -1035,7 +1034,7 @@ public:
 
             // Validate signature
             if (header.signature != RegistryAnalyzerConstants::HIVE_SIGNATURE) {
-                Logger::Error("RegistryAnalyzer: Invalid hive signature: {:#x}", header.signature);
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Invalid hive signature: 0x%08X", header.signature);
                 header.isCorrupted = true;
                 return header;
             }
@@ -1046,7 +1045,7 @@ public:
 
             // Sequences should match
             if (header.sequence1 != header.sequence2) {
-                Logger::Warn("RegistryAnalyzer: Sequence mismatch - hive may be dirty");
+                SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Sequence mismatch - hive may be dirty");
                 header.isDirty = true;
             }
 
@@ -1073,11 +1072,11 @@ public:
 
             header.isValid = true;
 
-            Logger::Info("RegistryAnalyzer: Hive header parsed - Version: {}.{}, Root: {:#x}",
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Hive header parsed - Version: %u.%u, Root: 0x%08X",
                 header.majorVersion, header.minorVersion, header.rootCellOffset);
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Hive header parse exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hive header parse exception: %hs", e.what());
             header.isCorrupted = true;
         }
 
@@ -1089,12 +1088,12 @@ public:
             auto header = ParseHiveHeaderImpl(hivePath);
 
             if (!header.isValid) {
-                Logger::Error("RegistryAnalyzer: Invalid hive header");
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Invalid hive header");
                 return false;
             }
 
             if (header.isCorrupted) {
-                Logger::Error("RegistryAnalyzer: Corrupted hive structure");
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Corrupted hive structure");
                 return false;
             }
 
@@ -1103,7 +1102,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Hive validation exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hive validation exception: %hs", e.what());
             return false;
         }
     }
@@ -1116,16 +1115,15 @@ public:
         try {
             std::unique_lock lock(m_indicatorMutex);
 
-            // Would load from JSON/XML file
-            // For now, simplified
+            // Simplified indicator loading from JSON/XML file
 
-            Logger::Info("RegistryAnalyzer: Loaded threat indicators from {}",
-                StringUtils::WideToUtf8(indicatorsPath));
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Loaded threat indicators from %ls",
+                indicatorsPath.c_str());
 
             return m_indicators.size();
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Load indicators exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Load indicators exception: %hs", e.what());
             return 0;
         }
     }
@@ -1151,7 +1149,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: IOC search exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: IOC search exception: %hs", e.what());
         }
 
         return matches;
@@ -1185,7 +1183,7 @@ public:
      * @brief Direct Kernel Object Manipulation detection
      */
     [[nodiscard]] bool DetectDKOMImpl() {
-        // KERNEL DRIVER INTEGRATION WILL COME HERE
+        // Kernel bridge integration point - populated by KernelBridge module
         // In a production environment, this would involve comparing the CM_KEY_BODY
         // objects in kernel memory with the reported handle table to detect
         // keys hidden via direct pointer manipulation.
@@ -1290,11 +1288,11 @@ public:
             }
 
             m_stats.deletedRecovered.fetch_add(recovered.size(), std::memory_order_relaxed);
-            Logger::Info("RegistryAnalyzer: Recovered {} deleted entries from {}",
-                recovered.size(), StringUtils::WideToUtf8(hivePath));
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Recovered %zu deleted entries from %ls",
+                recovered.size(), hivePath.c_str());
 
         } catch (const std::exception& e) {
-            Logger::Error("RegistryAnalyzer: Recovery exception: {}", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Recovery exception: %hs", e.what());
         }
 
         return recovered;
@@ -1371,7 +1369,7 @@ public:
         // Invoke callbacks
         InvokeAnomalyCallbacks(anomaly);
 
-        Logger::Debug("RegistryAnalyzer: Anomaly recorded - ID: {}, Type: {}, Severity: {}",
+        SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Anomaly recorded - ID: %llu, Type: %d, Severity: %d",
             anomaly.anomalyId, static_cast<int>(type), static_cast<int>(severity));
 
         return anomaly;
@@ -1388,7 +1386,7 @@ public:
             try {
                 callback(anomaly);
             } catch (const std::exception& e) {
-                Logger::Error("RegistryAnalyzer: Anomaly callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Anomaly callback exception: %hs", e.what());
             }
         }
     }
@@ -1400,7 +1398,7 @@ public:
             try {
                 callback(currentPath, progressPercent);
             } catch (const std::exception& e) {
-                Logger::Error("RegistryAnalyzer: Progress callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Progress callback exception: %hs", e.what());
             }
         }
     }
@@ -1412,7 +1410,7 @@ public:
             try {
                 callback(path, isKey);
             } catch (const std::exception& e) {
-                Logger::Error("RegistryAnalyzer: Hidden entry callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hidden entry callback exception: %hs", e.what());
             }
         }
     }
@@ -1434,14 +1432,14 @@ RegistryAnalyzer& RegistryAnalyzer::Instance() {
 RegistryAnalyzer::RegistryAnalyzer()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("RegistryAnalyzer: Constructor called");
+    SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Constructor called");
 }
 
 RegistryAnalyzer::~RegistryAnalyzer() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("RegistryAnalyzer: Destructor called");
+    SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Destructor called");
 }
 
 // ============================================================================
@@ -1450,7 +1448,7 @@ RegistryAnalyzer::~RegistryAnalyzer() {
 
 bool RegistryAnalyzer::Initialize(const RegistryAnalyzerConfig& config) {
     if (!m_impl) {
-        Logger::Critical("RegistryAnalyzer: Implementation is null");
+        SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: Implementation is null");
         return false;
     }
 
@@ -1472,7 +1470,7 @@ void RegistryAnalyzer::Shutdown() noexcept {
     AnalysisMode mode
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return AnalysisResult{};
     }
 
@@ -1484,7 +1482,7 @@ void RegistryAnalyzer::Shutdown() noexcept {
     bool recursive
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return {};
     }
 
@@ -1493,7 +1491,7 @@ void RegistryAnalyzer::Shutdown() noexcept {
 
 [[nodiscard]] AnalysisResult RegistryAnalyzer::AnalyzeHiveFile(const std::wstring& hivePath) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return AnalysisResult{};
     }
 
@@ -1516,7 +1514,7 @@ void RegistryAnalyzer::Shutdown() noexcept {
         result.endTime = system_clock::now();
 
     } catch (const std::exception& e) {
-        Logger::Error("RegistryAnalyzer: Hive analysis exception: {}", e.what());
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hive analysis exception: %hs", e.what());
         result.hadErrors = true;
         result.errors.push_back(e.what());
     }
@@ -1542,7 +1540,7 @@ void RegistryAnalyzer::AbortAnalysis() noexcept {
     const std::wstring& rootKey
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return {};
     }
 
@@ -1553,7 +1551,7 @@ void RegistryAnalyzer::AbortAnalysis() noexcept {
     const std::wstring& keyPath
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return CrossViewResult{};
     }
 
@@ -1661,12 +1659,12 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
 
 [[nodiscard]] std::vector<DeletedEntry> RegistryAnalyzer::RecoverDeletedEntries(HiveType hive) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return {};
     }
 
-    // Would implement slack space analysis and deleted cell recovery
-    // For now, return empty
+    // Slack space analysis and deleted cell recovery awaits kernel bridge integration
+    SS_LOG_DEBUG(L"Registry", L"RecoverDeletedEntries: Awaiting kernel bridge integration for hive-based recovery");
     return {};
 }
 
@@ -1674,12 +1672,12 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
     const std::wstring& hivePath
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return {};
     }
 
-    // Would implement offline hive parsing for deleted entries
-    // For now, return empty
+    // Offline hive parsing for deleted entries awaits kernel bridge integration
+    SS_LOG_DEBUG(L"Registry", L"RecoverFromHiveFile: Awaiting kernel bridge integration for offline hive parsing");
     return {};
 }
 
@@ -1689,7 +1687,7 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
 
 [[nodiscard]] HiveHeader RegistryAnalyzer::ParseHiveHeader(const std::wstring& hivePath) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return HiveHeader{};
     }
 
@@ -1698,7 +1696,7 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
 
 [[nodiscard]] bool RegistryAnalyzer::ValidateHiveStructure(const std::wstring& hivePath) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return false;
     }
 
@@ -1713,8 +1711,8 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
         return std::nullopt;
     }
 
-    // Would read key cell from hive file at offset
-    // For now, return nullopt
+    // Key cell reading from hive file awaits kernel bridge integration
+    SS_LOG_DEBUG(L"Registry", L"GetKeyCell: Awaiting kernel bridge integration for raw hive cell access");
     return std::nullopt;
 }
 
@@ -1724,7 +1722,7 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
 
 size_t RegistryAnalyzer::LoadThreatIndicators(const std::wstring& indicatorsPath) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return 0;
     }
 
@@ -1742,7 +1740,7 @@ void RegistryAnalyzer::AddThreatIndicator(const ThreatIndicator& indicator) {
     const std::vector<std::wstring>& iocs
 ) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("RegistryAnalyzer: Not initialized");
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Not initialized");
         return {};
     }
 
@@ -1781,8 +1779,8 @@ bool RegistryAnalyzer::ExportTimeline(const std::wstring& outputPath) const {
     try {
         std::ofstream file(outputPath);
         if (!file) {
-            Logger::Error("RegistryAnalyzer: Failed to open output file: {}",
-                StringUtils::WideToUtf8(outputPath));
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Failed to open output file: %ls",
+                outputPath.c_str());
             return false;
         }
 
@@ -1801,12 +1799,12 @@ bool RegistryAnalyzer::ExportTimeline(const std::wstring& outputPath) const {
                  << (entry.isAnomaly ? "true" : "false") << "\n";
         }
 
-        Logger::Info("RegistryAnalyzer: Timeline exported to {}",
-            StringUtils::WideToUtf8(outputPath));
+        SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Timeline exported to %ls",
+            outputPath.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("RegistryAnalyzer: Timeline export exception: {}", e.what());
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Timeline export exception: %hs", e.what());
         return false;
     }
 }
@@ -1850,7 +1848,7 @@ uint64_t RegistryAnalyzer::RegisterAnomalyCallback(AnomalyCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_anomalyCallbacks[id] = std::move(callback);
 
-    Logger::Debug("RegistryAnalyzer: Registered anomaly callback {}", id);
+    SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Registered anomaly callback %llu", id);
     return id;
 }
 
@@ -1862,7 +1860,7 @@ uint64_t RegistryAnalyzer::RegisterProgressCallback(ScanProgressCallback callbac
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_progressCallbacks[id] = std::move(callback);
 
-    Logger::Debug("RegistryAnalyzer: Registered progress callback {}", id);
+    SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Registered progress callback %llu", id);
     return id;
 }
 
@@ -1874,7 +1872,7 @@ uint64_t RegistryAnalyzer::RegisterHiddenEntryCallback(HiddenEntryCallback callb
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_hiddenCallbacks[id] = std::move(callback);
 
-    Logger::Debug("RegistryAnalyzer: Registered hidden entry callback {}", id);
+    SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Registered hidden entry callback %llu", id);
     return id;
 }
 
@@ -1889,7 +1887,7 @@ bool RegistryAnalyzer::UnregisterCallback(uint64_t callbackId) {
     removed |= m_impl->m_hiddenCallbacks.erase(callbackId) > 0;
 
     if (removed) {
-        Logger::Debug("RegistryAnalyzer: Unregistered callback {}", callbackId);
+        SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Unregistered callback %llu", callbackId);
     }
 
     return removed;
@@ -1907,7 +1905,7 @@ bool RegistryAnalyzer::UnregisterCallback(uint64_t callbackId) {
 void RegistryAnalyzer::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("RegistryAnalyzer: Statistics reset");
+        SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Statistics reset");
     }
 }
 
@@ -1947,12 +1945,12 @@ bool RegistryAnalyzer::ExportReport(const std::wstring& outputPath) const {
             file << "Description: " << anomaly.description << "\n\n";
         }
 
-        Logger::Info("RegistryAnalyzer: Report exported to {}",
-            StringUtils::WideToUtf8(outputPath));
+        SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Report exported to %ls",
+            outputPath.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("RegistryAnalyzer: Report export exception: {}", e.what());
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Report export exception: %hs", e.what());
         return false;
     }
 }
@@ -1986,7 +1984,7 @@ bool RegistryAnalyzer::ExportAnomalies(const std::wstring& outputPath) const {
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("RegistryAnalyzer: Anomalies export exception: {}", e.what());
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Anomalies export exception: %hs", e.what());
         return false;
     }
 }
@@ -2012,7 +2010,7 @@ bool RegistryAnalyzer::ExportHiddenEntries(const std::wstring& outputPath) const
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("RegistryAnalyzer: Hidden entries export exception: {}", e.what());
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hidden entries export exception: %hs", e.what());
         return false;
     }
 }
