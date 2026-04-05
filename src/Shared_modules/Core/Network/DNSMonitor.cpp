@@ -445,7 +445,7 @@ struct DNSMonitor::DNSMonitorImpl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"DNSMonitor: DGA analysis failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA analysis failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
 
@@ -547,7 +547,7 @@ struct DNSMonitor::DNSMonitorImpl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"DNSMonitor: Tunneling analysis failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling analysis failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
 
@@ -592,7 +592,7 @@ struct DNSMonitor::DNSMonitorImpl {
             return ValidationResult::VALID;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"DNSMonitor: Response validation failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Response validation failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
             return ValidationResult::ERROR;
         }
@@ -655,7 +655,7 @@ struct DNSMonitor::DNSMonitorImpl {
                         m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
                         rule->hitCount.fetch_add(1, std::memory_order_relaxed);
 
-                        Utils::Logger::Warn(L"DNSMonitor: Blocked query to {} by rule {}",
+                        SS_LOG_WARN(L"Network", L"DNSMonitor: Blocked query to {} by rule {}",
                                           Utils::StringUtils::Utf8ToWide(query.domain),
                                           rule->name);
 
@@ -681,7 +681,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 if (dgaAnalysis.isDGA) {
                     m_statistics.dgaDetections.fetch_add(1, std::memory_order_relaxed);
 
-                    Utils::Logger::Warn(L"DNSMonitor: DGA domain detected - {} (confidence: {:.2f})",
+                    SS_LOG_WARN(L"Network", L"DNSMonitor: DGA domain detected - {} (confidence: {:.2f})",
                                       Utils::StringUtils::Utf8ToWide(query.domain),
                                       dgaAnalysis.confidence);
 
@@ -753,7 +753,7 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             m_statistics.errorCount.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Error(L"DNSMonitor: Query processing failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Query processing failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
@@ -765,7 +765,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(query);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: Query callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: Query callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -777,7 +777,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(response);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: Response callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: Response callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -789,7 +789,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: Event callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: Event callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -801,7 +801,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: DGA callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -813,7 +813,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: Tunneling callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -826,7 +826,7 @@ struct DNSMonitor::DNSMonitorImpl {
             try {
                 callback(domain, expectedIp, actualIp);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"DNSMonitor: Poisoning callback {} failed - {}",
+                SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning callback {} failed - {}",
                                    id, Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
@@ -838,7 +838,7 @@ struct DNSMonitor::DNSMonitorImpl {
         if (!pThis) return 1;
 
         try {
-            Utils::Logger::Info(L"DNSMonitor: Monitor thread started");
+            SS_LOG_INFO(L"Network", L"DNSMonitor: Monitor thread started");
 
             // Main monitoring loop
             while (pThis->m_running.load(std::memory_order_acquire)) {
@@ -854,11 +854,11 @@ struct DNSMonitor::DNSMonitorImpl {
                 pThis->UpdateQPSStatistics();
             }
 
-            Utils::Logger::Info(L"DNSMonitor: Monitor thread stopped");
+            SS_LOG_INFO(L"Network", L"DNSMonitor: Monitor thread stopped");
             return 0;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"DNSMonitor: Monitor thread failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Monitor thread failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
             return 1;
         }
@@ -900,7 +900,7 @@ struct DNSMonitor::DNSMonitorImpl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"DNSMonitor: Cleanup failed - {}",
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Cleanup failed - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
@@ -948,19 +948,19 @@ bool DNSMonitor::HasInstance() noexcept {
 DNSMonitor::DNSMonitor()
     : m_impl(std::make_unique<DNSMonitorImpl>())
 {
-    Utils::Logger::Info(L"DNSMonitor: Constructor called");
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Constructor called");
 }
 
 DNSMonitor::~DNSMonitor() {
     Shutdown();
-    Utils::Logger::Info(L"DNSMonitor: Destructor called");
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Destructor called");
 }
 
 bool DNSMonitor::Initialize(const DNSMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"DNSMonitor: Already initialized");
+        SS_LOG_WARN(L"Network", L"DNSMonitor: Already initialized");
         return true;
     }
 
@@ -975,17 +975,17 @@ bool DNSMonitor::Initialize(const DNSMonitorConfig& config) {
         // Initialize Winsock
         WSADATA wsaData;
         if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-            Utils::Logger::Error(L"DNSMonitor: WSAStartup failed");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: WSAStartup failed");
             return false;
         }
 
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"DNSMonitor: Initialized successfully");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Initialization failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Initialization failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -995,12 +995,12 @@ void DNSMonitor::Start() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Error(L"DNSMonitor: Not initialized");
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Not initialized");
         return;
     }
 
     if (m_impl->m_running.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"DNSMonitor: Already running");
+        SS_LOG_WARN(L"Network", L"DNSMonitor: Already running");
         return;
     }
 
@@ -1008,7 +1008,7 @@ void DNSMonitor::Start() {
         // Create stop event
         m_impl->m_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!m_impl->m_hStopEvent) {
-            Utils::Logger::Error(L"DNSMonitor: Failed to create stop event");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Failed to create stop event");
             return;
         }
 
@@ -1028,14 +1028,14 @@ void DNSMonitor::Start() {
             m_impl->m_running.store(false, std::memory_order_release);
             CloseHandle(m_impl->m_hStopEvent);
             m_impl->m_hStopEvent = nullptr;
-            Utils::Logger::Error(L"DNSMonitor: Failed to create monitor thread");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Failed to create monitor thread");
             return;
         }
 
-        Utils::Logger::Info(L"DNSMonitor: Started successfully");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Started successfully");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Start failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Start failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1049,10 +1049,10 @@ void DNSMonitor::Stop() {
         m_impl->m_running.store(false, std::memory_order_release);
         m_impl->StopMonitoring();
 
-        Utils::Logger::Info(L"DNSMonitor: Stopped");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Stopped");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Stop failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Stop failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1108,10 +1108,10 @@ void DNSMonitor::Shutdown() noexcept {
 
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"DNSMonitor: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Shutdown error - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Shutdown error - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1132,7 +1132,7 @@ DNSMonitorConfig DNSMonitor::GetConfig() const {
 bool DNSMonitor::UpdateConfig(const DNSMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"DNSMonitor: Configuration updated");
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Configuration updated");
     return true;
 }
 
@@ -1157,7 +1157,7 @@ bool DNSMonitor::IsPoisoned(const std::string& domain, const std::string& ip) {
         return result == ValidationResult::SPOOFED;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Poisoning check failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning check failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1222,7 +1222,7 @@ DomainReputation DNSMonitor::GetReputation(const std::string& domain) const {
             // For now, return unknown
         }
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Reputation lookup failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Reputation lookup failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -1253,7 +1253,7 @@ uint64_t DNSMonitor::AddFilterRule(const DNSFilterRule& rule) {
 
     m_impl->m_filterRules[newRule.priority * 1000000 + ruleId] = newRule;
 
-    Utils::Logger::Info(L"DNSMonitor: Filter rule added - ID: {}, Pattern: {}",
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Filter rule added - ID: {}, Pattern: {}",
                       ruleId, Utils::StringUtils::Utf8ToWide(rule.domainPattern));
 
     return ruleId;
@@ -1265,7 +1265,7 @@ bool DNSMonitor::RemoveFilterRule(uint64_t ruleId) {
     for (auto it = m_impl->m_filterRules.begin(); it != m_impl->m_filterRules.end(); ++it) {
         if (it->second.ruleId == ruleId) {
             m_impl->m_filterRules.erase(it);
-            Utils::Logger::Info(L"DNSMonitor: Filter rule removed - ID: {}", ruleId);
+            SS_LOG_INFO(L"Network", L"DNSMonitor: Filter rule removed - ID: {}", ruleId);
             return true;
         }
     }
@@ -1408,7 +1408,7 @@ void DNSMonitor::FlushCache() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
     m_impl->m_cache.clear();
     m_impl->m_statistics.cacheSize.store(0, std::memory_order_relaxed);
-    Utils::Logger::Info(L"DNSMonitor: Cache flushed");
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Cache flushed");
 }
 
 size_t DNSMonitor::GetCacheSize() const noexcept {
@@ -1557,7 +1557,7 @@ const DNSStatistics& DNSMonitor::GetStatistics() const noexcept {
 
 void DNSMonitor::ResetStatistics() noexcept {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"DNSMonitor: Statistics reset");
+    SS_LOG_INFO(L"Network", L"DNSMonitor: Statistics reset");
 }
 
 // ============================================================================
@@ -1566,25 +1566,25 @@ void DNSMonitor::ResetStatistics() noexcept {
 
 bool DNSMonitor::PerformDiagnostics() const {
     try {
-        Utils::Logger::Info(L"DNSMonitor: Running diagnostics");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Running diagnostics");
 
         // Check initialization
         if (!IsInitialized()) {
-            Utils::Logger::Error(L"DNSMonitor: Not initialized");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Not initialized");
             return false;
         }
 
         // Check infrastructure
         if (!m_impl->m_threatIntel) {
-            Utils::Logger::Error(L"DNSMonitor: ThreatIntel not initialized");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: ThreatIntel not initialized");
             return false;
         }
 
-        Utils::Logger::Info(L"DNSMonitor: Diagnostics passed");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Diagnostics passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Diagnostics failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Diagnostics failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1617,19 +1617,19 @@ bool DNSMonitor::ExportDiagnostics(const std::wstring& outputPath) const {
 
 bool DNSMonitor::SelfTest() {
     try {
-        Utils::Logger::Info(L"DNSMonitor: Starting self-test");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Starting self-test");
 
         // Test DGA detection
         auto dgaAnalysis = AnalyzeDGA("xvkdf8s9df.com");
         if (!dgaAnalysis.isDGA) {
-            Utils::Logger::Error(L"DNSMonitor: DGA detection test failed");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA detection test failed");
             return false;
         }
 
         // Test filtering
         BlockDomain("evil.com", L"Test");
         if (!IsBlocked("evil.com")) {
-            Utils::Logger::Error(L"DNSMonitor: Filtering test failed");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Filtering test failed");
             return false;
         }
         UnblockDomain("evil.com");
@@ -1644,17 +1644,17 @@ bool DNSMonitor::SelfTest() {
 
         auto cached = QueryCache("test.com", DNSRecordType::A);
         if (!cached.has_value()) {
-            Utils::Logger::Error(L"DNSMonitor: Cache test failed");
+            SS_LOG_ERROR(L"Network", L"DNSMonitor: Cache test failed");
             return false;
         }
 
         FlushCache();
 
-        Utils::Logger::Info(L"DNSMonitor: Self-test passed");
+        SS_LOG_INFO(L"Network", L"DNSMonitor: Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"DNSMonitor: Self-test failed - {}",
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Self-test failed - {}",
                             Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }

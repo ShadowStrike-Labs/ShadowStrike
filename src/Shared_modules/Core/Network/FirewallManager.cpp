@@ -595,19 +595,19 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("FirewallManager::Impl already initialized");
+            SS_LOG_WARN(L"Network", L"FirewallManager::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("FirewallManager::Impl: Initializing");
+            SS_LOG_INFO(L"Network", L"FirewallManager::Impl: Initializing");
 
             // Store configuration
             m_config = config;
 
             // Initialize WFP
             if (!InitializeWFP()) {
-                Logger::Error("FirewallManager: Failed to initialize WFP");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to initialize WFP");
                 return false;
             }
 
@@ -622,33 +622,33 @@ public:
             m_stats.Reset();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("FirewallManager::Impl: Initialization complete");
+            SS_LOG_INFO(L"Network", L"FirewallManager::Impl: Initialization complete");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager::Impl: Initialization exception: {}", e.what());
             return false;
         }
     }
 
     [[nodiscard]] bool Start() {
         if (!m_initialized.load(std::memory_order_acquire)) {
-            Logger::Error("FirewallManager: Cannot start - not initialized");
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Cannot start - not initialized");
             return false;
         }
 
         if (m_running.exchange(true, std::memory_order_acquire)) {
-            Logger::Warn("FirewallManager: Already running");
+            SS_LOG_WARN(L"Network", L"FirewallManager: Already running");
             return true;
         }
 
         try {
-            Logger::Info("FirewallManager: Starting firewall enforcement");
+            SS_LOG_INFO(L"Network", L"FirewallManager: Starting firewall enforcement");
 
             // Apply initial rules to WFP
             if (!ApplyAllRulesToWFP()) {
-                Logger::Error("FirewallManager: Failed to apply rules to WFP");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to apply rules to WFP");
                 m_running.store(false, std::memory_order_release);
                 return false;
             }
@@ -658,11 +658,11 @@ public:
                 ApplyStealthModeImpl(m_config.stealthMode);
             }
 
-            Logger::Info("FirewallManager: Firewall enforcement started");
+            SS_LOG_INFO(L"Network", L"FirewallManager: Firewall enforcement started");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: Start exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Start exception: {}", e.what());
             m_running.store(false, std::memory_order_release);
             return false;
         }
@@ -673,12 +673,12 @@ public:
             return;
         }
 
-        Logger::Info("FirewallManager: Stopping firewall enforcement");
+        SS_LOG_INFO(L"Network", L"FirewallManager: Stopping firewall enforcement");
 
         // Remove all WFP filters
         RemoveAllWFPFilters();
 
-        Logger::Info("FirewallManager: Firewall enforcement stopped");
+        SS_LOG_INFO(L"Network", L"FirewallManager: Firewall enforcement stopped");
     }
 
     void Shutdown() noexcept {
@@ -688,7 +688,7 @@ public:
             return;
         }
 
-        Logger::Info("FirewallManager::Impl: Shutting down");
+        SS_LOG_INFO(L"Network", L"FirewallManager::Impl: Shutting down");
 
         Stop();
 
@@ -720,7 +720,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("FirewallManager::Impl: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"FirewallManager::Impl: Shutdown complete");
     }
 
     // ========================================================================
@@ -731,7 +731,7 @@ public:
         std::unique_lock lock(m_wfpMutex);
 
         try {
-            Logger::Debug("FirewallManager: Initializing WFP engine");
+            SS_LOG_DEBUG(L"Network", L"FirewallManager: Initializing WFP engine");
 
             // Open WFP engine
             FWPM_SESSION0 session{};
@@ -747,7 +747,7 @@ public:
             );
 
             if (result != ERROR_SUCCESS) {
-                Logger::Error("FirewallManager: FwpmEngineOpen0 failed: {}", result);
+                SS_LOG_ERROR(L"Network", L"FirewallManager: FwpmEngineOpen0 failed: {}", result);
                 m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -758,21 +758,21 @@ public:
 
             // Register provider
             if (!RegisterWFPProvider()) {
-                Logger::Error("FirewallManager: Failed to register WFP provider");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to register WFP provider");
                 return false;
             }
 
             // Register sublayer
             if (!RegisterWFPSublayer()) {
-                Logger::Error("FirewallManager: Failed to register WFP sublayer");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to register WFP sublayer");
                 return false;
             }
 
-            Logger::Info("FirewallManager: WFP engine initialized successfully");
+            SS_LOG_INFO(L"Network", L"FirewallManager: WFP engine initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: WFP initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: WFP initialization exception: {}", e.what());
             return false;
         }
     }
@@ -786,7 +786,7 @@ public:
 
         DWORD result = FwpmProviderAdd0(m_wfpEngineHandle, &provider, nullptr);
         if (result != ERROR_SUCCESS && result != FWP_E_ALREADY_EXISTS) {
-            Logger::Error("FirewallManager: FwpmProviderAdd0 failed: {}", result);
+            SS_LOG_ERROR(L"Network", L"FirewallManager: FwpmProviderAdd0 failed: {}", result);
             m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -804,7 +804,7 @@ public:
 
         DWORD result = FwpmSubLayerAdd0(m_wfpEngineHandle, &sublayer, nullptr);
         if (result != ERROR_SUCCESS && result != FWP_E_ALREADY_EXISTS) {
-            Logger::Error("FirewallManager: FwpmSubLayerAdd0 failed: {}", result);
+            SS_LOG_ERROR(L"Network", L"FirewallManager: FwpmSubLayerAdd0 failed: {}", result);
             m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -822,14 +822,14 @@ public:
         try {
             // Validate rule
             if (!rule.IsValid()) {
-                Logger::Error("FirewallManager: Invalid rule");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Invalid rule");
                 m_stats.ruleErrors.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
 
             // Check limits
             if (m_rules.size() >= m_config.maxRules) {
-                Logger::Error("FirewallManager: Maximum rules reached");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Maximum rules reached");
                 return 0;
             }
 
@@ -842,7 +842,7 @@ public:
             // Add to WFP if running
             if (m_running.load(std::memory_order_acquire)) {
                 if (!AddRuleToWFP(newRule)) {
-                    Logger::Error("FirewallManager: Failed to add rule to WFP");
+                    SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to add rule to WFP");
                     return 0;
                 }
             }
@@ -851,7 +851,7 @@ public:
             m_rules[newRule.ruleId] = newRule;
             m_stats.activeRuleCount.store(m_rules.size(), std::memory_order_relaxed);
 
-            Logger::Info("FirewallManager: Rule {} added: {}", newRule.ruleId,
+            SS_LOG_INFO(L"Network", L"FirewallManager: Rule {} added: {}", newRule.ruleId,
                 StringUtils::WideToUtf8(newRule.name));
 
             // Invoke callbacks
@@ -860,7 +860,7 @@ public:
             return newRule.ruleId;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: AddRule exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: AddRule exception: {}", e.what());
             m_stats.ruleErrors.fetch_add(1, std::memory_order_relaxed);
             return 0;
         }
@@ -871,7 +871,7 @@ public:
 
         auto it = m_rules.find(ruleId);
         if (it == m_rules.end()) {
-            Logger::Warn("FirewallManager: Rule {} not found", ruleId);
+            SS_LOG_WARN(L"Network", L"FirewallManager: Rule {} not found", ruleId);
             return false;
         }
 
@@ -879,7 +879,7 @@ public:
 
         // Check if locked
         if (rule.isLocked) {
-            Logger::Error("FirewallManager: Cannot remove locked rule {}", ruleId);
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Cannot remove locked rule {}", ruleId);
             return false;
         }
 
@@ -895,7 +895,7 @@ public:
         m_rules.erase(it);
         m_stats.activeRuleCount.store(m_rules.size(), std::memory_order_relaxed);
 
-        Logger::Info("FirewallManager: Rule {} removed", ruleId);
+        SS_LOG_INFO(L"Network", L"FirewallManager: Rule {} removed", ruleId);
         return true;
     }
 
@@ -904,13 +904,13 @@ public:
 
         auto it = m_rules.find(ruleId);
         if (it == m_rules.end()) {
-            Logger::Warn("FirewallManager: Rule {} not found", ruleId);
+            SS_LOG_WARN(L"Network", L"FirewallManager: Rule {} not found", ruleId);
             return false;
         }
 
         // Check if locked
         if (it->second.isLocked) {
-            Logger::Error("FirewallManager: Cannot update locked rule {}", ruleId);
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Cannot update locked rule {}", ruleId);
             return false;
         }
 
@@ -928,14 +928,14 @@ public:
         // Add new WFP filter
         if (m_running.load(std::memory_order_acquire)) {
             if (!AddRuleToWFP(updatedRule)) {
-                Logger::Error("FirewallManager: Failed to update rule in WFP");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Failed to update rule in WFP");
                 return false;
             }
         }
 
         it->second = updatedRule;
 
-        Logger::Info("FirewallManager: Rule {} updated", ruleId);
+        SS_LOG_INFO(L"Network", L"FirewallManager: Rule {} updated", ruleId);
         return true;
     }
 
@@ -979,13 +979,13 @@ public:
             rule.wfpFilterId = m_nextRuleId.load(std::memory_order_relaxed);
             m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Debug("FirewallManager: Rule {} added to WFP (filter ID: {})",
+            SS_LOG_DEBUG(L"Network", L"FirewallManager: Rule {} added to WFP (filter ID: {})",
                 rule.ruleId, rule.wfpFilterId);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: AddRuleToWFP exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: AddRuleToWFP exception: {}", e.what());
             m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
@@ -999,11 +999,11 @@ public:
                 // In real implementation: FwpmFilterDeleteById0(m_wfpEngineHandle, rule.wfpFilterId);
                 m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
 
-                Logger::Debug("FirewallManager: Rule {} removed from WFP", rule.ruleId);
+                SS_LOG_DEBUG(L"Network", L"FirewallManager: Rule {} removed from WFP", rule.ruleId);
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: RemoveRuleFromWFP exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: RemoveRuleFromWFP exception: {}", e.what());
         }
     }
 
@@ -1017,7 +1017,7 @@ public:
             }
         }
 
-        Logger::Info("FirewallManager: Applied {}/{} rules to WFP", successCount, m_rules.size());
+        SS_LOG_INFO(L"Network", L"FirewallManager: Applied {}/{} rules to WFP", successCount, m_rules.size());
         return successCount == m_rules.size();
     }
 
@@ -1028,7 +1028,7 @@ public:
             RemoveRuleFromWFP(rule);
         }
 
-        Logger::Info("FirewallManager: All WFP filters removed");
+        SS_LOG_INFO(L"Network", L"FirewallManager: All WFP filters removed");
     }
 
     // ========================================================================
@@ -1153,7 +1153,7 @@ public:
 
         m_blockedCountries[countryCode] = true;
 
-        Logger::Info("FirewallManager: Country {} blocked", countryCode);
+        SS_LOG_INFO(L"Network", L"FirewallManager: Country {} blocked", countryCode);
         return true;
     }
 
@@ -1162,7 +1162,7 @@ public:
 
         auto removed = m_blockedCountries.erase(countryCode) > 0;
         if (removed) {
-            Logger::Info("FirewallManager: Country {} unblocked", countryCode);
+            SS_LOG_INFO(L"Network", L"FirewallManager: Country {} unblocked", countryCode);
         }
 
         return removed;
@@ -1224,11 +1224,11 @@ public:
                 // Additional stealth rules would go here
             }
 
-            Logger::Info("FirewallManager: Stealth mode set to {}", static_cast<int>(mode));
+            SS_LOG_INFO(L"Network", L"FirewallManager: Stealth mode set to {}", static_cast<int>(mode));
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: ApplyStealthMode exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: ApplyStealthMode exception: {}", e.what());
             return false;
         }
     }
@@ -1239,12 +1239,12 @@ public:
 
     bool EnableLockdownImpl(std::wstring_view reason) {
         if (m_lockdownActive.exchange(true, std::memory_order_acquire)) {
-            Logger::Warn("FirewallManager: Lockdown already active");
+            SS_LOG_WARN(L"Network", L"FirewallManager: Lockdown already active");
             return true;
         }
 
         try {
-            Logger::Warn("FirewallManager: EMERGENCY LOCKDOWN ACTIVATED - Reason: {}",
+            SS_LOG_WARN(L"Network", L"FirewallManager: EMERGENCY LOCKDOWN ACTIVATED - Reason: {}",
                 StringUtils::WideToUtf8(std::wstring(reason)));
 
             // Create lockdown rule (block everything)
@@ -1268,7 +1268,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: EnableLockdown exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: EnableLockdown exception: {}", e.what());
             m_lockdownActive.store(false, std::memory_order_release);
             return false;
         }
@@ -1279,7 +1279,7 @@ public:
             return true;
         }
 
-        Logger::Info("FirewallManager: Lockdown deactivated");
+        SS_LOG_INFO(L"Network", L"FirewallManager: Lockdown deactivated");
 
         // Remove lockdown rules (they're tracked in m_stealthRuleIds)
         // Would need proper tracking in real implementation
@@ -1298,7 +1298,7 @@ public:
             try {
                 callback(rule, isAdded);
             } catch (const std::exception& e) {
-                Logger::Error("FirewallManager: Rule change callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Rule change callback exception: {}", e.what());
             }
         }
     }
@@ -1310,7 +1310,7 @@ public:
             try {
                 callback(attempt, reason);
             } catch (const std::exception& e) {
-                Logger::Error("FirewallManager: Blocked connection callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Blocked connection callback exception: {}", e.what());
             }
         }
     }
@@ -1321,41 +1321,41 @@ public:
 
     [[nodiscard]] bool PerformDiagnosticsImpl() const {
         try {
-            Logger::Info("FirewallManager: Running diagnostics");
+            SS_LOG_INFO(L"Network", L"FirewallManager: Running diagnostics");
 
             // Check initialization
             if (!m_initialized.load(std::memory_order_acquire)) {
-                Logger::Error("FirewallManager: Not initialized");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Not initialized");
                 return false;
             }
 
             // Check WFP engine
             if (m_wfpEngineHandle == nullptr) {
-                Logger::Error("FirewallManager: WFP engine not initialized");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: WFP engine not initialized");
                 return false;
             }
 
             // Check configuration
             if (!m_config.enabled) {
-                Logger::Warn("FirewallManager: Firewall is disabled");
+                SS_LOG_WARN(L"Network", L"FirewallManager: Firewall is disabled");
             }
 
             // Check running state
             if (!m_running.load(std::memory_order_acquire)) {
-                Logger::Warn("FirewallManager: Not running");
+                SS_LOG_WARN(L"Network", L"FirewallManager: Not running");
             }
 
             // Check rule count
             {
                 std::shared_lock lock(m_rulesMutex);
-                Logger::Info("FirewallManager: {} active rules", m_rules.size());
+                SS_LOG_INFO(L"Network", L"FirewallManager: {} active rules", m_rules.size());
             }
 
-            Logger::Info("FirewallManager: Diagnostics passed");
+            SS_LOG_INFO(L"Network", L"FirewallManager: Diagnostics passed");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: Diagnostics exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Diagnostics exception: {}", e.what());
             return false;
         }
     }
@@ -1364,7 +1364,7 @@ public:
         try {
             std::ofstream file(outputPath);
             if (!file) {
-                Logger::Error("FirewallManager: Cannot create diagnostics file");
+                SS_LOG_ERROR(L"Network", L"FirewallManager: Cannot create diagnostics file");
                 return false;
             }
 
@@ -1397,13 +1397,13 @@ public:
             }
 
             file.close();
-            Logger::Info("FirewallManager: Diagnostics exported to {}",
+            SS_LOG_INFO(L"Network", L"FirewallManager: Diagnostics exported to {}",
                 StringUtils::WideToUtf8(outputPath));
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FirewallManager: Export diagnostics exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Export diagnostics exception: {}", e.what());
             return false;
         }
     }
@@ -1425,14 +1425,14 @@ FirewallManager& FirewallManager::Instance() {
 FirewallManager::FirewallManager()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("FirewallManager: Constructor called");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Constructor called");
 }
 
 FirewallManager::~FirewallManager() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("FirewallManager: Destructor called");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Destructor called");
 }
 
 // ============================================================================
@@ -1450,7 +1450,7 @@ bool FirewallManager::Initialize(const FirewallManagerConfig& config) {
 
 bool FirewallManager::Start() {
     if (!m_impl) {
-        Logger::Error("FirewallManager: Implementation is null");
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Implementation is null");
         return false;
     }
 
@@ -1486,7 +1486,7 @@ bool FirewallManager::UpdateConfig(const FirewallManagerConfig& config) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
 
-    Logger::Info("FirewallManager: Configuration updated");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Configuration updated");
     return true;
 }
 
@@ -1585,7 +1585,7 @@ void FirewallManager::ClearAllRules() {
         m_impl->RemoveRuleImpl(ruleId);
     }
 
-    Logger::Info("FirewallManager: All non-system rules cleared");
+    SS_LOG_INFO(L"Network", L"FirewallManager: All non-system rules cleared");
 }
 
 void FirewallManager::ClearTemporaryRules() {
@@ -1606,7 +1606,7 @@ void FirewallManager::ClearTemporaryRules() {
         m_impl->RemoveRuleImpl(ruleId);
     }
 
-    Logger::Info("FirewallManager: Temporary rules cleared");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Temporary rules cleared");
 }
 
 // ============================================================================
@@ -1686,7 +1686,7 @@ uint32_t FirewallManager::RemoveApplicationRules(const std::wstring& appPath) {
     // Parse CIDR (e.g., "192.168.1.0/24")
     size_t slashPos = cidr.find(L'/');
     if (slashPos == std::wstring::npos) {
-        Logger::Error("FirewallManager: Invalid CIDR format");
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Invalid CIDR format");
         return 0;
     }
 
@@ -1696,7 +1696,7 @@ uint32_t FirewallManager::RemoveApplicationRules(const std::wstring& appPath) {
     bool isIPv6 = false;
     auto parsedIP = ParseIPAddress(ipPart, isIPv6);
     if (!parsedIP) {
-        Logger::Error("FirewallManager: Invalid IP in CIDR");
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Invalid IP in CIDR");
         return 0;
     }
 
@@ -1704,7 +1704,7 @@ uint32_t FirewallManager::RemoveApplicationRules(const std::wstring& appPath) {
     try {
         prefixLength = static_cast<uint8_t>(std::stoi(prefixPart));
     } catch (...) {
-        Logger::Error("FirewallManager: Invalid prefix length in CIDR");
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Invalid prefix length in CIDR");
         return 0;
     }
 
@@ -1900,7 +1900,7 @@ void FirewallManager::SetAllowedCountries(const std::vector<std::string>& countr
     // In allow-list mode, all countries not in the list are blocked
     // This would need proper implementation with geo-IP database
 
-    Logger::Info("FirewallManager: Allowed countries set");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Allowed countries set");
 }
 
 void FirewallManager::ClearGeoRestrictions() {
@@ -1909,7 +1909,7 @@ void FirewallManager::ClearGeoRestrictions() {
     std::unique_lock lock(m_impl->m_geoMutex);
     m_impl->m_blockedCountries.clear();
 
-    Logger::Info("FirewallManager: Geo restrictions cleared");
+    SS_LOG_INFO(L"Network", L"FirewallManager: Geo restrictions cleared");
 }
 
 [[nodiscard]] std::optional<GeoIPEntry> FirewallManager::GetGeoInfo(const std::wstring& ip) const {
@@ -1963,7 +1963,7 @@ bool FirewallManager::SetProfileRules(
 ) {
     // In real implementation, would store profile-specific rules
     // For now, just log
-    Logger::Info("FirewallManager: Profile rules set for profile {}",
+    SS_LOG_INFO(L"Network", L"FirewallManager: Profile rules set for profile {}",
         static_cast<int>(profile));
     return true;
 }
@@ -1999,7 +1999,7 @@ bool FirewallManager::DisableLockdown() {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_connectionCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FirewallManager: Registered connection attempt callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"FirewallManager: Registered connection attempt callback {}", id);
     return id;
 }
 
@@ -2011,7 +2011,7 @@ bool FirewallManager::DisableLockdown() {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_ruleMatchCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FirewallManager: Registered rule match callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"FirewallManager: Registered rule match callback {}", id);
     return id;
 }
 
@@ -2023,7 +2023,7 @@ bool FirewallManager::DisableLockdown() {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_ruleChangeCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FirewallManager: Registered rule change callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"FirewallManager: Registered rule change callback {}", id);
     return id;
 }
 
@@ -2035,7 +2035,7 @@ bool FirewallManager::DisableLockdown() {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_blockedCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FirewallManager: Registered blocked connection callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"FirewallManager: Registered blocked connection callback {}", id);
     return id;
 }
 
@@ -2047,7 +2047,7 @@ bool FirewallManager::DisableLockdown() {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_appCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FirewallManager: Registered application callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"FirewallManager: Registered application callback {}", id);
     return id;
 }
 
@@ -2078,7 +2078,7 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
 
         std::ofstream file(filePath);
         if (!file) {
-            Logger::Error("FirewallManager: Cannot create export file");
+            SS_LOG_ERROR(L"Network", L"FirewallManager: Cannot create export file");
             return false;
         }
 
@@ -2101,13 +2101,13 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
         file << "}\n";
 
         file.close();
-        Logger::Info("FirewallManager: Exported {} rules to {}",
+        SS_LOG_INFO(L"Network", L"FirewallManager: Exported {} rules to {}",
             rules.size(), StringUtils::WideToUtf8(filePath));
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("FirewallManager: Export exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Export exception: {}", e.what());
         return false;
     }
 }
@@ -2115,7 +2115,7 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
 uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) {
     // Import implementation would parse JSON/XML and add rules
     // For now, placeholder
-    Logger::Info("FirewallManager: Import rules from {} (merge: {})",
+    SS_LOG_INFO(L"Network", L"FirewallManager: Import rules from {} (merge: {})",
         StringUtils::WideToUtf8(filePath), merge);
     return 0;
 }
@@ -2132,7 +2132,7 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
 void FirewallManager::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("FirewallManager: Statistics reset");
+        SS_LOG_INFO(L"Network", L"FirewallManager: Statistics reset");
     }
 }
 

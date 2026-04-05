@@ -493,12 +493,12 @@ public:
             // Initialize Winsock
             WSADATA wsaData;
             if (WSAStartup(MAKEWORD(2, 2), &wsaData) != 0) {
-                Logger::Error("WSAStartup failed");
+                SS_LOG_ERROR(L"Network", L"WSAStartup failed");
                 return false;
             }
             m_wsaInitialized = true;
 
-            Logger::Info("VPNDetector initialized (policy={}, adapters={}, proxy={})",
+            SS_LOG_INFO(L"Network", L"VPNDetector initialized (policy={}, adapters={}, proxy={})",
                 static_cast<int>(config.policy),
                 config.enableAdapterDetection,
                 config.enableProxyDetection);
@@ -506,7 +506,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("VPNDetector initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"VPNDetector initialization failed: {}", e.what());
             return false;
         }
     }
@@ -516,12 +516,12 @@ public:
 
         try {
             if (!m_initialized) {
-                Logger::Error("Cannot start: not initialized");
+                SS_LOG_ERROR(L"Network", L"Cannot start: not initialized");
                 return false;
             }
 
             if (m_running) {
-                Logger::Warn("Already running");
+                SS_LOG_WARN(L"Network", L"Already running");
                 return true;
             }
 
@@ -536,12 +536,12 @@ public:
 
             m_running = true;
 
-            Logger::Info("VPNDetector started");
+            SS_LOG_INFO(L"Network", L"VPNDetector started");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"Start failed: {}", e.what());
             return false;
         }
     }
@@ -564,10 +564,10 @@ public:
 
             m_running = false;
 
-            Logger::Info("VPNDetector stopped");
+            SS_LOG_INFO(L"Network", L"VPNDetector stopped");
 
         } catch (const std::exception& e) {
-            Logger::Error("Stop failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"Stop failed: {}", e.what());
         }
     }
 
@@ -597,7 +597,7 @@ public:
 
             m_initialized = false;
 
-            Logger::Info("VPNDetector shutdown complete");
+            SS_LOG_INFO(L"Network", L"VPNDetector shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions
@@ -640,7 +640,7 @@ public:
             }
 
             if (result != NO_ERROR) {
-                Logger::Error("GetAdaptersAddresses failed: {}", result);
+                SS_LOG_ERROR(L"Network", L"GetAdaptersAddresses failed: {}", result);
                 return adapters;
             }
 
@@ -724,7 +724,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EnumerateAdapters - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EnumerateAdapters - Exception: {}", e.what());
         }
 
         return adapters;
@@ -761,7 +761,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectVPNInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectVPNInternal - Exception: {}", e.what());
         }
 
         return std::nullopt;
@@ -827,7 +827,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectVPNProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectVPNProcess - Exception: {}", e.what());
         }
     }
 
@@ -882,7 +882,7 @@ public:
             connection.allMethods.push_back(VPNDetectionMethod::IP_RANGE);
 
         } catch (const std::exception& e) {
-            Logger::Error("IdentifyProviderByIP - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"IdentifyProviderByIP - Exception: {}", e.what());
         }
     }
 
@@ -905,7 +905,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectLeaks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectLeaks - Exception: {}", e.what());
         }
     }
 
@@ -932,14 +932,14 @@ public:
 
                 // If another adapter has DNS servers configured, it's a leak
                 if (!adapter.dnsServers.empty()) {
-                    Logger::Warn("DNS leak detected: Adapter '{}' has DNS servers while VPN active",
+                    SS_LOG_WARN(L"Network", L"DNS leak detected: Adapter '{}' has DNS servers while VPN active",
                         StringUtils::WideToUtf8(adapter.friendlyName));
                     return true;
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckDNSLeakInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckDNSLeakInternal - Exception: {}", e.what());
         }
 
         return false;
@@ -966,14 +966,14 @@ public:
                 if (!adapter.isConnected) continue;
 
                 if (!adapter.ipv6Addresses.empty()) {
-                    Logger::Warn("IPv6 leak detected: Adapter '{}' has IPv6 while VPN active",
+                    SS_LOG_WARN(L"Network", L"IPv6 leak detected: Adapter '{}' has IPv6 while VPN active",
                         StringUtils::WideToUtf8(adapter.friendlyName));
                     return true;
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckIPv6LeakInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckIPv6LeakInternal - Exception: {}", e.what());
         }
 
         return false;
@@ -1046,7 +1046,7 @@ public:
             FreeLibrary(hWinHttp);
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectProxyInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectProxyInternal - Exception: {}", e.what());
         }
 
         return proxy;
@@ -1057,7 +1057,7 @@ public:
     // ========================================================================
 
     void MonitorThreadProc() {
-        Logger::Debug("VPN monitor thread started");
+        SS_LOG_DEBUG(L"Network", L"VPN monitor thread started");
 
         while (!m_stopRequested) {
             try {
@@ -1068,7 +1068,7 @@ public:
                 }
 
             } catch (const std::exception& e) {
-                Logger::Error("MonitorThreadProc - Exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"MonitorThreadProc - Exception: {}", e.what());
             }
 
             // Sleep with stop check
@@ -1077,7 +1077,7 @@ public:
             }
         }
 
-        Logger::Debug("VPN monitor thread stopped");
+        SS_LOG_DEBUG(L"Network", L"VPN monitor thread stopped");
     }
 
     void PerformAdapterScan() {
@@ -1102,7 +1102,7 @@ public:
             DetectAndNotifyVPNConnections();
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformAdapterScan - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformAdapterScan - Exception: {}", e.what());
         }
     }
 
@@ -1155,7 +1155,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectAndNotifyVPNConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectAndNotifyVPNConnections - Exception: {}", e.what());
         }
     }
 
@@ -1172,7 +1172,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformLeakCheck - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformLeakCheck - Exception: {}", e.what());
         }
     }
 
@@ -1207,7 +1207,7 @@ public:
             }
 
             if (shouldBlock) {
-                Logger::Warn("Blocking VPN connection: {} (policy={})",
+                SS_LOG_WARN(L"Network", L"Blocking VPN connection: {} (policy={})",
                     StringUtils::WideToUtf8(connection.providerName),
                     static_cast<int>(m_config.policy));
 
@@ -1228,7 +1228,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ApplyPolicy - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ApplyPolicy - Exception: {}", e.what());
         }
     }
 
@@ -1262,7 +1262,7 @@ public:
         // Invoke alert callbacks
         InvokeAlertCallbacks(alert);
 
-        Logger::Info("VPN alert: {} (provider={}, confidence={})",
+        SS_LOG_INFO(L"Network", L"VPN alert: {} (provider={}, confidence={})",
             alert.description,
             StringUtils::WideToUtf8(connection.providerName),
             connection.confidence);
@@ -1282,7 +1282,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeDetectionCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"InvokeDetectionCallbacks - Exception: {}", e.what());
         }
     }
 
@@ -1296,7 +1296,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeAlertCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"InvokeAlertCallbacks - Exception: {}", e.what());
         }
     }
 
@@ -1310,7 +1310,7 @@ public:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("InvokeLeakCallbacks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"InvokeLeakCallbacks - Exception: {}", e.what());
         }
     }
 
@@ -1374,22 +1374,22 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            Logger::Info("=== VPNDetector Diagnostics ===");
-            Logger::Info("Initialized: {}", m_initialized);
-            Logger::Info("Running: {}", m_running);
-            Logger::Info("Policy: {}", static_cast<int>(m_config.policy));
-            Logger::Info("Total scans: {}", m_stats.totalScans.load());
-            Logger::Info("VPN connections detected: {}", m_stats.vpnConnectionsDetected.load());
-            Logger::Info("Active VPN connections: {}", m_stats.activeVPNConnections.load());
-            Logger::Info("Virtual adapters: {}", m_stats.virtualAdapters.load());
-            Logger::Info("Connections blocked: {}", m_stats.connectionsBlocked.load());
-            Logger::Info("DNS leaks: {}", m_stats.dnsLeaksDetected.load());
-            Logger::Info("IPv6 leaks: {}", m_stats.ipv6LeaksDetected.load());
+            SS_LOG_INFO(L"Network", L"=== VPNDetector Diagnostics ===");
+            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
+            SS_LOG_INFO(L"Network", L"Running: {}", m_running);
+            SS_LOG_INFO(L"Network", L"Policy: {}", static_cast<int>(m_config.policy));
+            SS_LOG_INFO(L"Network", L"Total scans: {}", m_stats.totalScans.load());
+            SS_LOG_INFO(L"Network", L"VPN connections detected: {}", m_stats.vpnConnectionsDetected.load());
+            SS_LOG_INFO(L"Network", L"Active VPN connections: {}", m_stats.activeVPNConnections.load());
+            SS_LOG_INFO(L"Network", L"Virtual adapters: {}", m_stats.virtualAdapters.load());
+            SS_LOG_INFO(L"Network", L"Connections blocked: {}", m_stats.connectionsBlocked.load());
+            SS_LOG_INFO(L"Network", L"DNS leaks: {}", m_stats.dnsLeaksDetected.load());
+            SS_LOG_INFO(L"Network", L"IPv6 leaks: {}", m_stats.ipv6LeaksDetected.load());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
             return false;
         }
     }
@@ -1441,14 +1441,14 @@ VPNDetector& VPNDetector::Instance() {
 
 VPNDetector::VPNDetector()
     : m_impl(std::make_unique<VPNDetectorImpl>()) {
-    Logger::Info("VPNDetector instance created");
+    SS_LOG_INFO(L"Network", L"VPNDetector instance created");
 }
 
 VPNDetector::~VPNDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("VPNDetector instance destroyed");
+    SS_LOG_INFO(L"Network", L"VPNDetector instance destroyed");
 }
 
 // ============================================================================
@@ -1741,12 +1741,12 @@ bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
     std::shared_lock lock(m_impl->m_mutex);
 
     try {
-        Logger::Info("Exported VPN detector diagnostics to: {}",
+        SS_LOG_INFO(L"Network", L"Exported VPN detector diagnostics to: {}",
             StringUtils::WideToUtf8(outputPath));
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("ExportDiagnostics - Exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
         return false;
     }
 }

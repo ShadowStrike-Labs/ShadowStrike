@@ -350,11 +350,11 @@ public:
 bool TorDetector::TorDetectorImpl::Initialize(const TorDetectorConfig& config) noexcept {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"TorDetector: Already initialized");
+            SS_LOG_WARN(L"Network", L"TorDetector: Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"TorDetector: Initializing...");
+        SS_LOG_INFO(L"Network", L"TorDetector: Initializing...");
 
         m_config = config;
 
@@ -376,14 +376,14 @@ bool TorDetector::TorDetectorImpl::Initialize(const TorDetectorConfig& config) n
 
         m_statistics.lastNodeListUpdate = Clock::now();
 
-        Utils::Logger::Info(L"TorDetector: Initialized successfully with {} nodes ({} exit, {} relay, {} bridge)",
+        SS_LOG_INFO(L"Network", L"TorDetector: Initialized successfully with {} nodes ({} exit, {} relay, {} bridge)",
                           m_nodes.size(), m_exitNodes.size(),
                           m_nodes.size() - m_exitNodes.size() - m_bridges.size(),
                           m_bridges.size());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Initialization failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Initialization failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         m_initialized.store(false, std::memory_order_release);
         return false;
@@ -396,7 +396,7 @@ void TorDetector::TorDetectorImpl::Shutdown() noexcept {
             return;
         }
 
-        Utils::Logger::Info(L"TorDetector: Shutting down...");
+        SS_LOG_INFO(L"Network", L"TorDetector: Shutting down...");
 
         Stop();
 
@@ -431,30 +431,30 @@ void TorDetector::TorDetectorImpl::Shutdown() noexcept {
             m_nodeListCallbacks.clear();
         }
 
-        Utils::Logger::Info(L"TorDetector: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"TorDetector: Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"TorDetector: Exception during shutdown");
+        SS_LOG_ERROR(L"Network", L"TorDetector: Exception during shutdown");
     }
 }
 
 bool TorDetector::TorDetectorImpl::Start() noexcept {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
-            Utils::Logger::Error(L"TorDetector: Not initialized");
+            SS_LOG_ERROR(L"Network", L"TorDetector: Not initialized");
             return false;
         }
 
         if (m_running.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"TorDetector: Already running");
+            SS_LOG_WARN(L"Network", L"TorDetector: Already running");
             return true;
         }
 
-        Utils::Logger::Info(L"TorDetector: Started");
+        SS_LOG_INFO(L"Network", L"TorDetector: Started");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Start failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Start failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -462,7 +462,7 @@ bool TorDetector::TorDetectorImpl::Start() noexcept {
 
 void TorDetector::TorDetectorImpl::Stop() noexcept {
     if (m_running.exchange(false, std::memory_order_acq_rel)) {
-        Utils::Logger::Info(L"TorDetector: Stopped");
+        SS_LOG_INFO(L"Network", L"TorDetector: Stopped");
     }
 }
 
@@ -481,13 +481,13 @@ void TorDetector::TorDetectorImpl::InitializeDirectoryAuthorities() {
 
             m_nodes[ip] = node;
 
-            Utils::Logger::Debug(L"TorDetector: Added directory authority {} ({})",
+            SS_LOG_DEBUG(L"Network", L"TorDetector: Added directory authority {} ({})",
                                Utils::StringUtils::Utf8ToWide(name),
                                Utils::StringUtils::Utf8ToWide(ip));
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Failed to initialize directory authorities - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Failed to initialize directory authorities - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -495,7 +495,7 @@ void TorDetector::TorDetectorImpl::InitializeDirectoryAuthorities() {
 void TorDetector::TorDetectorImpl::LoadDefaultNodes() {
     // In production, this would load from cached consensus or local database
     // For demonstration, we initialize with directory authorities only
-    Utils::Logger::Info(L"TorDetector: Default nodes loaded (directory authorities only)");
+    SS_LOG_INFO(L"Network", L"TorDetector: Default nodes loaded (directory authorities only)");
 }
 
 // ============================================================================
@@ -545,7 +545,7 @@ TorTrafficAnalysis TorDetector::TorDetectorImpl::AnalyzeTrafficInternal(uint64_t
         analysis = conn.analysis;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Traffic analysis failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Traffic analysis failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 
@@ -715,7 +715,7 @@ bool TorDetector::TorDetectorImpl::DetectTorProcess(uint32_t pid, TorProcessInfo
         return false;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Process detection failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Process detection failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -842,7 +842,7 @@ void TorDetector::TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn,
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Failed to generate alert - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Failed to generate alert - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -898,14 +898,14 @@ TorDetector& TorDetector::Instance() {
 TorDetector::TorDetector()
     : m_impl(std::make_unique<TorDetectorImpl>())
 {
-    Utils::Logger::Info(L"TorDetector: Constructor called");
+    SS_LOG_INFO(L"Network", L"TorDetector: Constructor called");
 }
 
 TorDetector::~TorDetector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"TorDetector: Destructor called");
+    SS_LOG_INFO(L"Network", L"TorDetector: Destructor called");
 }
 
 // Lifecycle
@@ -1058,7 +1058,7 @@ void TorDetector::FeedPacket(uint64_t connectionId, size_t packetSize) {
         m_impl->UpdateTrafficAnalysis(conn);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: FeedPacket failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: FeedPacket failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
     }
 }
@@ -1128,7 +1128,7 @@ bool TorDetector::UpdateNodeList() {
         // 3. Update internal node database
         // 4. Invoke callbacks
 
-        Utils::Logger::Info(L"TorDetector: Node list update completed");
+        SS_LOG_INFO(L"Network", L"TorDetector: Node list update completed");
         m_impl->m_statistics.lastNodeListUpdate = Clock::now();
 
         // Invoke callbacks
@@ -1150,7 +1150,7 @@ bool TorDetector::UpdateNodeList() {
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"TorDetector: Node list update failed - {}",
+        SS_LOG_ERROR(L"Network", L"TorDetector: Node list update failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
         return false;
     }
@@ -1182,7 +1182,7 @@ void TorDetector::SetPolicy(TorPolicy policy) {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_config.policy = policy;
 
-        Utils::Logger::Info(L"TorDetector: Policy changed to {}",
+        SS_LOG_INFO(L"Network", L"TorDetector: Policy changed to {}",
                           static_cast<int>(policy));
     }
 }
@@ -1196,7 +1196,7 @@ void TorDetector::AddProcessException(uint32_t pid) {
         std::unique_lock lock(m_impl->m_mutex);
         m_impl->m_config.allowedProcessIds.push_back(pid);
 
-        Utils::Logger::Info(L"TorDetector: Added process exception - PID: {}", pid);
+        SS_LOG_INFO(L"Network", L"TorDetector: Added process exception - PID: {}", pid);
     }
 }
 
@@ -1206,7 +1206,7 @@ void TorDetector::RemoveProcessException(uint32_t pid) {
         auto& vec = m_impl->m_config.allowedProcessIds;
         vec.erase(std::remove(vec.begin(), vec.end(), pid), vec.end());
 
-        Utils::Logger::Info(L"TorDetector: Removed process exception - PID: {}", pid);
+        SS_LOG_INFO(L"Network", L"TorDetector: Removed process exception - PID: {}", pid);
     }
 }
 
@@ -1277,15 +1277,15 @@ void TorDetector::ResetStatistics() noexcept {
 bool TorDetector::PerformDiagnostics() const {
     if (!m_impl) return false;
 
-    Utils::Logger::Info(L"TorDetector: Diagnostics");
-    Utils::Logger::Info(L"  Initialized: {}", m_impl->m_initialized.load());
-    Utils::Logger::Info(L"  Running: {}", m_impl->m_running.load());
-    Utils::Logger::Info(L"  Connections Checked: {}", m_impl->m_statistics.totalConnectionsChecked.load());
-    Utils::Logger::Info(L"  Tor Connections: {}", m_impl->m_statistics.torConnectionsDetected.load());
-    Utils::Logger::Info(L"  Exit Nodes: {}", m_impl->m_statistics.exitNodesDetected.load());
-    Utils::Logger::Info(L"  Tor Processes: {}", m_impl->m_statistics.torProcessesDetected.load());
-    Utils::Logger::Info(L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
-    Utils::Logger::Info(L"  Known Nodes: {} (Exit: {}, Relay: {}, Bridge: {})",
+    SS_LOG_INFO(L"Network", L"TorDetector: Diagnostics");
+    SS_LOG_INFO(L"Network", L"  Initialized: {}", m_impl->m_initialized.load());
+    SS_LOG_INFO(L"Network", L"  Running: {}", m_impl->m_running.load());
+    SS_LOG_INFO(L"Network", L"  Connections Checked: {}", m_impl->m_statistics.totalConnectionsChecked.load());
+    SS_LOG_INFO(L"Network", L"  Tor Connections: {}", m_impl->m_statistics.torConnectionsDetected.load());
+    SS_LOG_INFO(L"Network", L"  Exit Nodes: {}", m_impl->m_statistics.exitNodesDetected.load());
+    SS_LOG_INFO(L"Network", L"  Tor Processes: {}", m_impl->m_statistics.torProcessesDetected.load());
+    SS_LOG_INFO(L"Network", L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
+    SS_LOG_INFO(L"Network", L"  Known Nodes: {} (Exit: {}, Relay: {}, Bridge: {})",
                       m_impl->m_nodes.size(),
                       m_impl->m_statistics.knownExitNodes.load(),
                       m_impl->m_statistics.knownRelays.load(),

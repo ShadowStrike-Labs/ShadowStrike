@@ -390,13 +390,13 @@ public:
             m_config = config;
             m_initialized = true;
 
-            Logger::Info("URLAnalyzer initialized (reputation={}, DGA={}, phishing={})",
+            SS_LOG_INFO(L"Network", L"URLAnalyzer initialized (reputation={}, DGA={}, phishing={})",
                 config.enableReputation, config.enableDGADetection, config.enablePhishingDetection);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("URLAnalyzer initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"URLAnalyzer initialization failed: {}", e.what());
             return false;
         }
     }
@@ -416,7 +416,7 @@ public:
 
             m_initialized = false;
 
-            Logger::Info("URLAnalyzer shutdown complete");
+            SS_LOG_INFO(L"Network", L"URLAnalyzer shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -438,11 +438,11 @@ public:
 
         try {
             m_config = config;
-            Logger::Info("URLAnalyzer configuration updated");
+            SS_LOG_INFO(L"Network", L"URLAnalyzer configuration updated");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("UpdateConfig - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UpdateConfig - Exception: {}", e.what());
             return false;
         }
     }
@@ -572,7 +572,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ScanURL - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ScanURL - Exception: {}", e.what());
             verdict.category = URLCategory::UNKNOWN;
             verdict.recommendedAction = FilterAction::BLOCK;
             m_stats.analysisErrors++;
@@ -618,7 +618,7 @@ public:
                 auto verdict = ScanURL(url);
                 callback(url, verdict);
             } catch (const std::exception& e) {
-                Logger::Error("ScanURLAsync - Exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"ScanURLAsync - Exception: {}", e.what());
             }
         }).detach();
     }
@@ -683,7 +683,7 @@ public:
             verdict.reputationScore = 50;  // Unknown
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeDomain - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeDomain - Exception: {}", e.what());
         }
 
         auto endTime = std::chrono::steady_clock::now();
@@ -782,7 +782,7 @@ public:
             return {score, ""};
 
         } catch (const std::exception& e) {
-            Logger::Error("GetDGAScoreInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetDGAScoreInternal - Exception: {}", e.what());
             return {0.0, ""};
         }
     }
@@ -843,7 +843,7 @@ public:
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectPhishing - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectPhishing - Exception: {}", e.what());
             return std::nullopt;
         }
     }
@@ -864,7 +864,7 @@ public:
             // In production, would use Unicode confusables database
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckHomograph - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckHomograph - Exception: {}", e.what());
         }
 
         return analysis;
@@ -874,7 +874,7 @@ public:
         try {
             return CalculateSimilarity(domain, targetDomain);
         } catch (const std::exception& e) {
-            Logger::Error("CheckTyposquatting - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckTyposquatting - Exception: {}", e.what());
             return 0.0;
         }
     }
@@ -1013,7 +1013,7 @@ public:
             parsed.normalizedUrl = parsed.schemeString + "://" + parsed.hostNormalized + parsed.path;
 
         } catch (const std::exception& e) {
-            Logger::Error("ParseURL - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ParseURL - Exception: {}", e.what());
             parsed.isValid = false;
         }
 
@@ -1082,7 +1082,7 @@ public:
             features.hasExecutableExtension = HasExecutableExtension(parsed.path);
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractFeaturesInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExtractFeaturesInternal - Exception: {}", e.what());
         }
 
         return features;
@@ -1108,11 +1108,11 @@ public:
             std::string normalized = StringUtils::ToLower(domain);
             m_whitelist.insert(normalized);
 
-            Logger::Info("Added to URL whitelist: {} (subdomains={})", domain, includeSubdomains);
+            SS_LOG_INFO(L"Network", L"Added to URL whitelist: {} (subdomains={})", domain, includeSubdomains);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddToWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddToWhitelist - Exception: {}", e.what());
             return false;
         }
     }
@@ -1125,13 +1125,13 @@ public:
             bool removed = m_whitelist.erase(normalized) > 0;
 
             if (removed) {
-                Logger::Info("Removed from URL whitelist: {}", domain);
+                SS_LOG_INFO(L"Network", L"Removed from URL whitelist: {}", domain);
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            Logger::Error("RemoveFromWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"RemoveFromWhitelist - Exception: {}", e.what());
             return false;
         }
     }
@@ -1147,7 +1147,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddToBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddToBlacklist - Exception: {}", e.what());
             return false;
         }
     }
@@ -1160,13 +1160,13 @@ public:
             bool removed = m_blacklist.erase(normalized) > 0;
 
             if (removed) {
-                Logger::Info("Removed from URL blacklist: {}", domain);
+                SS_LOG_INFO(L"Network", L"Removed from URL blacklist: {}", domain);
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            Logger::Error("RemoveFromBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"RemoveFromBlacklist - Exception: {}", e.what());
             return false;
         }
     }
@@ -1232,7 +1232,7 @@ public:
             m_stats.cacheSize = static_cast<uint32_t>(m_cache.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("CacheVerdict - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CacheVerdict - Exception: {}", e.what());
         }
     }
 
@@ -1261,7 +1261,7 @@ public:
         std::unique_lock lock(m_mutex);
         m_cache.clear();
         m_stats.cacheSize = 0;
-        Logger::Info("URL analyzer cache cleared");
+        SS_LOG_INFO(L"Network", L"URL analyzer cache cleared");
     }
 
     [[nodiscard]] size_t GetCacheSize() const noexcept {
@@ -1333,22 +1333,22 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            Logger::Info("=== URLAnalyzer Diagnostics ===");
-            Logger::Info("Initialized: {}", m_initialized);
-            Logger::Info("Cache size: {}", m_cache.size());
-            Logger::Info("Whitelist size: {}", m_whitelist.size());
-            Logger::Info("Blacklist size: {}", m_blacklist.size());
-            Logger::Info("Total URLs analyzed: {}", m_stats.totalURLsAnalyzed.load());
-            Logger::Info("URLs blocked: {}", m_stats.urlsBlocked.load());
-            Logger::Info("Phishing detected: {}", m_stats.phishingDetected.load());
-            Logger::Info("DGA detected: {}", m_stats.dgaDetected.load());
-            Logger::Info("Cache hit rate: {:.2f}%",
+            SS_LOG_INFO(L"Network", L"=== URLAnalyzer Diagnostics ===");
+            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
+            SS_LOG_INFO(L"Network", L"Cache size: {}", m_cache.size());
+            SS_LOG_INFO(L"Network", L"Whitelist size: {}", m_whitelist.size());
+            SS_LOG_INFO(L"Network", L"Blacklist size: {}", m_blacklist.size());
+            SS_LOG_INFO(L"Network", L"Total URLs analyzed: {}", m_stats.totalURLsAnalyzed.load());
+            SS_LOG_INFO(L"Network", L"URLs blocked: {}", m_stats.urlsBlocked.load());
+            SS_LOG_INFO(L"Network", L"Phishing detected: {}", m_stats.phishingDetected.load());
+            SS_LOG_INFO(L"Network", L"DGA detected: {}", m_stats.dgaDetected.load());
+            SS_LOG_INFO(L"Network", L"Cache hit rate: {:.2f}%",
                 (m_stats.cacheHits.load() * 100.0) / std::max(1ULL, m_stats.totalURLsAnalyzed.load()));
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
             return false;
         }
     }
@@ -1357,12 +1357,12 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            Logger::Info("Exported URL analyzer diagnostics to: {}",
+            SS_LOG_INFO(L"Network", L"Exported URL analyzer diagnostics to: {}",
                 StringUtils::WideToUtf8(outputPath));
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ExportDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
             return false;
         }
     }
@@ -1408,7 +1408,7 @@ private:
             verdict.reputationSource = "Local";
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeReputation - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeReputation - Exception: {}", e.what());
         }
 
         return score;
@@ -1422,7 +1422,7 @@ private:
             // For now, basic pattern checks
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzePatterns - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzePatterns - Exception: {}", e.what());
         }
 
         return score;
@@ -1446,7 +1446,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeDGA - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeDGA - Exception: {}", e.what());
         }
 
         return score;
@@ -1470,7 +1470,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzePhishing - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzePhishing - Exception: {}", e.what());
         }
 
         return score;
@@ -1493,7 +1493,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeHomograph - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeHomograph - Exception: {}", e.what());
         }
 
         return score;
@@ -1539,7 +1539,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeHeuristics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeHeuristics - Exception: {}", e.what());
         }
 
         return score;
@@ -1553,7 +1553,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyAnalysis - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyAnalysis - Exception: {}", e.what());
         }
     }
 
@@ -1565,7 +1565,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyThreat - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyThreat - Exception: {}", e.what());
         }
     }
 
@@ -1577,7 +1577,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyPhishing - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyPhishing - Exception: {}", e.what());
         }
     }
 
@@ -1589,7 +1589,7 @@ private:
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("NotifyDGA - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyDGA - Exception: {}", e.what());
         }
     }
 
@@ -1652,14 +1652,14 @@ URLAnalyzer& URLAnalyzer::Instance() {
 
 URLAnalyzer::URLAnalyzer()
     : m_impl(std::make_unique<URLAnalyzerImpl>()) {
-    Logger::Info("URLAnalyzer instance created");
+    SS_LOG_INFO(L"Network", L"URLAnalyzer instance created");
 }
 
 URLAnalyzer::~URLAnalyzer() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("URLAnalyzer instance destroyed");
+    SS_LOG_INFO(L"Network", L"URLAnalyzer instance destroyed");
 }
 
 // ============================================================================

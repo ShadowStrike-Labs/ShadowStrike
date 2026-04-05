@@ -526,7 +526,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("PacketCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"PacketCallback exception: {}", e.what());
             }
         }
     }
@@ -537,7 +537,7 @@ public:
             try {
                 callback(stream, isNew);
             } catch (const std::exception& e) {
-                Logger::Error("StreamCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"StreamCallback exception: {}", e.what());
             }
         }
     }
@@ -548,7 +548,7 @@ public:
             try {
                 callback(streamId, protocol, stream);
             } catch (const std::exception& e) {
-                Logger::Error("ProtocolCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"ProtocolCallback exception: {}", e.what());
             }
         }
     }
@@ -559,7 +559,7 @@ public:
             try {
                 callback(streamId, threat, result);
             } catch (const std::exception& e) {
-                Logger::Error("ThreatCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"ThreatCallback exception: {}", e.what());
             }
         }
     }
@@ -570,7 +570,7 @@ public:
             try {
                 callback(streamId, tlsInfo);
             } catch (const std::exception& e) {
-                Logger::Error("TLSCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"TLSCallback exception: {}", e.what());
             }
         }
     }
@@ -606,7 +606,7 @@ public:
 
         // Check limit
         if (m_streams.size() >= m_maxStreams) {
-            Logger::Warn("StreamManager: Max streams reached");
+            SS_LOG_WARN(L"Network", L"StreamManager: Max streams reached");
             return std::nullopt;
         }
 
@@ -728,7 +728,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("TrafficAnalyzer: Initializing...");
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Initializing...");
 
             m_config = config;
 
@@ -744,15 +744,15 @@ public:
             // Verify infrastructure
             if (!PatternStore::PatternStore::Instance().Initialize(
                 PatternStore::PatternStoreConfig::CreateDefault())) {
-                Logger::Warn("TrafficAnalyzer: PatternStore initialization warning");
+                SS_LOG_WARN(L"Network", L"TrafficAnalyzer: PatternStore initialization warning");
             }
 
             m_initialized = true;
-            Logger::Info("TrafficAnalyzer: Initialized successfully");
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("TrafficAnalyzer: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Initialization failed: {}", e.what());
             return false;
         }
     }
@@ -761,12 +761,12 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("TrafficAnalyzer: Not initialized");
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Not initialized");
             return false;
         }
 
         if (m_running) {
-            Logger::Warn("TrafficAnalyzer: Already running");
+            SS_LOG_WARN(L"Network", L"TrafficAnalyzer: Already running");
             return true;
         }
 
@@ -776,11 +776,11 @@ public:
             // Start cleanup thread
             m_cleanupThread = std::thread([this]() { CleanupThread(); });
 
-            Logger::Info("TrafficAnalyzer: Started");
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Started");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("TrafficAnalyzer: Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Start failed: {}", e.what());
             m_running = false;
             return false;
         }
@@ -791,7 +791,7 @@ public:
             std::unique_lock lock(m_mutex);
             if (!m_running) return;
 
-            Logger::Info("TrafficAnalyzer: Stopping...");
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Stopping...");
             m_running = false;
         }
 
@@ -801,7 +801,7 @@ public:
             m_cleanupThread.join();
         }
 
-        Logger::Info("TrafficAnalyzer: Stopped");
+        SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Stopped");
     }
 
     void Shutdown() noexcept {
@@ -811,7 +811,7 @@ public:
         if (m_streamManager) {
             m_streamManager->ClearAll();
         }
-        Logger::Info("TrafficAnalyzer: Shutdown complete");
+        SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Shutdown complete");
     }
 
     bool IsRunning() const noexcept {
@@ -1023,7 +1023,7 @@ public:
             ja3.hash = hashStr.str();
 
         } catch (const std::exception& e) {
-            Logger::Error("TrafficAnalyzer::CalculateJA3: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::CalculateJA3: {}", e.what());
         }
 
         return ja3;
@@ -1173,12 +1173,12 @@ public:
     // ========================================================================
 
     bool PerformDiagnostics() const {
-        Logger::Info("TrafficAnalyzer Diagnostics:");
-        Logger::Info("  Initialized: {}", m_initialized);
-        Logger::Info("  Running: {}", m_running.load());
-        Logger::Info("  Active Streams: {}", m_stats.activeStreams.load());
-        Logger::Info("  Packets Analyzed: {}", m_stats.packetsAnalyzed.load());
-        Logger::Info("  Threats Detected: {}", m_stats.threatsDetected.load());
+        SS_LOG_INFO(L"Network", L"TrafficAnalyzer Diagnostics:");
+        SS_LOG_INFO(L"Network", L"  Initialized: {}", m_initialized);
+        SS_LOG_INFO(L"Network", L"  Running: {}", m_running.load());
+        SS_LOG_INFO(L"Network", L"  Active Streams: {}", m_stats.activeStreams.load());
+        SS_LOG_INFO(L"Network", L"  Packets Analyzed: {}", m_stats.packetsAnalyzed.load());
+        SS_LOG_INFO(L"Network", L"  Threats Detected: {}", m_stats.threatsDetected.load());
         return true;
     }
 
@@ -1193,7 +1193,7 @@ private:
     // ========================================================================
 
     void CleanupThread() {
-        Logger::Info("TrafficAnalyzer: Cleanup thread started");
+        SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Cleanup thread started");
 
         while (m_running.load(std::memory_order_acquire)) {
             std::unique_lock lock(m_mutex);
@@ -1206,11 +1206,11 @@ private:
             if (removed > 0) {
                 m_stats.streamsTimedOut.fetch_add(removed, std::memory_order_relaxed);
                 m_stats.activeStreams.fetch_sub(removed, std::memory_order_relaxed);
-                Logger::Info("TrafficAnalyzer: Cleaned up {} timed-out streams", removed);
+                SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Cleaned up {} timed-out streams", removed);
             }
         }
 
-        Logger::Info("TrafficAnalyzer: Cleanup thread exited");
+        SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Cleanup thread exited");
     }
 
     AnalysisResult AnalyzePacketImpl(std::span<const uint8_t> packet,
@@ -1301,7 +1301,7 @@ private:
                             m_stats.shellcodeDetected.fetch_add(1, std::memory_order_relaxed);
                             m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                            Logger::Warn("TrafficAnalyzer: Shellcode detected in stream {} (score: {:.2f})",
+                            SS_LOG_WARN(L"Network", L"TrafficAnalyzer: Shellcode detected in stream {} (score: {:.2f})",
                                 result.streamId, result.payloadAnalysis.shellcodeScore);
                         }
 
@@ -1367,7 +1367,7 @@ private:
             UpdateAnalysisTimeStats(result.analysisTime.count());
 
         } catch (const std::exception& e) {
-            Logger::Error("TrafficAnalyzer::AnalyzePacketImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::AnalyzePacketImpl: {}", e.what());
         }
 
         return result;
