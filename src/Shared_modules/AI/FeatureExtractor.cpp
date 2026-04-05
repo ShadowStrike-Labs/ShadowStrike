@@ -206,7 +206,6 @@ static_assert(sizeof(kKnownSectionNames) / sizeof(kKnownSectionNames[0]) == kNum
     constexpr uint32_t c1 = 0xCC9E2D51;
     constexpr uint32_t c2 = 0x1B873593;
 
-    const auto* blocks = reinterpret_cast<const uint32_t*>(data);
     // Process in safe way — read via memcpy to avoid alignment issues
     for (size_t i = 0; i < nblocks; ++i) {
         uint32_t k1;
@@ -318,7 +317,7 @@ struct SectionLocator {
     std::span<const SectionLocator> sections) noexcept
 {
     for (const auto& s : sections) {
-        if (rva >= s.virtualAddress && rva < s.virtualAddress + s.virtualSize) {
+        if (rva >= s.virtualAddress && (rva - s.virtualAddress) < s.virtualSize) {
             uint32_t delta = rva - s.virtualAddress;
             if (delta < s.sizeOfRawData) {
                 return static_cast<size_t>(s.pointerToRawData) + delta;
@@ -361,6 +360,8 @@ FeatureExtractor& FeatureExtractor::Instance() noexcept {
 // ============================================================================
 
 bool FeatureExtractor::Initialize() noexcept {
+    std::lock_guard<std::mutex> lock(m_initMutex);
+
     if (m_impl && m_impl->initialized) {
         return true;
     }
@@ -508,7 +509,9 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
     // ---- Read data directories ----
     std::array<PEParser::DataDirectoryEntry, 16> dataDirs{};
     for (uint32_t i = 0; i < numberOfRvaAndSizes && i < 16; ++i) {
-        reader.Read(dataDirectoriesOffset + i * sizeof(PEParser::DataDirectoryEntry), dataDirs[i]);
+        if (!reader.Read(dataDirectoriesOffset + i * sizeof(PEParser::DataDirectoryEntry), dataDirs[i])) {
+            break;
+        }
     }
 
     // ---- Parse section headers ----
@@ -545,7 +548,9 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
         entry.characteristics = sh.Characteristics;
 
         // Compute section entropy.
-        if (sh.SizeOfRawData > 0 && sh.PointerToRawData + sh.SizeOfRawData <= fileSize) {
+        if (sh.SizeOfRawData > 0 &&
+            sh.PointerToRawData < fileSize &&
+            sh.SizeOfRawData <= fileSize - sh.PointerToRawData) {
             entry.entropy = ComputeShannonEntropy(
                 fileBytes.data() + sh.PointerToRawData, sh.SizeOfRawData);
         } else {
@@ -703,7 +708,6 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
             // Simple IP-address heuristic: \d+\.\d+\.\d+\.\d+
             for (size_t p = 0; p < s.size(); ++p) {
                 if (s[p] >= '0' && s[p] <= '9') {
-                    size_t dotCount = 0;
                     size_t q = p;
                     bool valid = true;
                     for (int seg = 0; seg < 4 && valid; ++seg) {
@@ -714,7 +718,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
                             ++q;
                         }
                     }
-                    if (valid && dotCount == 0 && q > p) {
+                    if (valid && q > p) {
                         // Ensure we matched exactly 4 segments.
                         size_t dots = 0;
                         for (size_t k = p; k < q; ++k) {
@@ -1045,7 +1049,7 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractPEFeatures(
                                 uint32_t h = MurmurHash3_x86_32(combined.data(), combined.size(), 0);
                                 impf[h % kImportBins] += 1.0f;
                             } else {
-                                uint32_t hintNameRva = static_cast<uint32_t>(thunkVal & 0x7FFFFFFF);
+                                uint32_t hintNameRva = static_cast<uint32_t>(thunkVal);
                                 auto nameOff = RvaToFileOffset(hintNameRva, sectionLocators);
                                 if (nameOff.has_value()) {
                                     std::string_view funcName;
@@ -1536,16 +1540,16 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractNetworkFeatures(
 
     // Byte ratio (sent / total)
     {
-        uint64_t totalBytes = flow.bytesSent + flow.bytesReceived;
-        features[idx++] = (totalBytes > 0)
-            ? static_cast<float>(flow.bytesSent) / static_cast<float>(totalBytes)
+        const double totalBytes = static_cast<double>(flow.bytesSent) + static_cast<double>(flow.bytesReceived);
+        features[idx++] = (totalBytes > 0.0)
+            ? static_cast<float>(static_cast<double>(flow.bytesSent) / totalBytes)
             : 0.0f;
     }
     // Packet ratio (sent / total)
     {
-        uint32_t totalPackets = flow.packetsSent + flow.packetsReceived;
-        features[idx++] = (totalPackets > 0)
-            ? static_cast<float>(flow.packetsSent) / static_cast<float>(totalPackets)
+        const double totalPackets = static_cast<double>(flow.packetsSent) + static_cast<double>(flow.packetsReceived);
+        features[idx++] = (totalPackets > 0.0)
+            ? static_cast<float>(static_cast<double>(flow.packetsSent) / totalPackets)
             : 0.0f;
     }
 
@@ -1597,12 +1601,16 @@ std::optional<std::vector<float>> FeatureExtractor::ExtractNetworkFeatures(
 
     // ---- Packets-per-second ----
     features[idx++] = (flow.durationMs > 0.0f)
-        ? SafeLog1p(static_cast<float>(flow.packetsSent + flow.packetsReceived) * 1000.0f / flow.durationMs)
+        ? SafeLog1p(static_cast<float>(
+            (static_cast<double>(flow.packetsSent) + static_cast<double>(flow.packetsReceived))
+            * 1000.0 / static_cast<double>(flow.durationMs)))
         : 0.0f;
 
     // ---- Bytes-per-second ----
     features[idx++] = (flow.durationMs > 0.0f)
-        ? SafeLog1p(static_cast<float>(flow.bytesSent + flow.bytesReceived) * 1000.0f / flow.durationMs)
+        ? SafeLog1p(static_cast<float>(
+            (static_cast<double>(flow.bytesSent) + static_cast<double>(flow.bytesReceived))
+            * 1000.0 / static_cast<double>(flow.durationMs)))
         : 0.0f;
 
     // Remaining features are zero-padded to NETWORK_FEATURE_COUNT.

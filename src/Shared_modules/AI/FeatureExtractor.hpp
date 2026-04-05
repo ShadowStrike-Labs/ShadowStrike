@@ -73,6 +73,7 @@
 #include <vector>
 #include <span>
 #include <optional>
+#include <mutex>
 
 // ============================================================================
 // SHADOWSTRIKE INCLUDES
@@ -228,6 +229,7 @@ private:
     /// @brief Opaque implementation — hides lookup tables and normalization state.
     struct Impl;
     std::unique_ptr<Impl> m_impl;
+    std::mutex m_initMutex;
 };
 
 }  // namespace AI
