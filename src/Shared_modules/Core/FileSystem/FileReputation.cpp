@@ -181,15 +181,12 @@ public:
                 m_cloudAvailable = CheckCloudConnectivity();
             }
 
-            Logger::Info("FileReputation initialized (mode={}, cloud={}, cache={})",
-                static_cast<int>(config.defaultMode),
-                m_cloudAvailable,
-                config.maxCacheSize);
+            SS_LOG_INFO(L"FileReputation", L"FileReputation initialized (mode=%d, cloud=%hs, cache=%llu)", static_cast<int>(config.defaultMode), m_cloudAvailable, config.maxCacheSize);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileReputation initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"FileReputation initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -205,7 +202,7 @@ public:
             m_cache.clear();
 
             m_initialized = false;
-            Logger::Info("FileReputation shutdown complete");
+            SS_LOG_INFO(L"FileReputation", L"FileReputation shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -226,7 +223,7 @@ public:
 
             // Validate path
             if (filePath.empty()) {
-                Logger::Warn("FileReputation::CheckFile - Empty file path");
+                SS_LOG_WARN(L"FileReputation", L"FileReputation::CheckFile - Empty file path");
                 result.level = ReputationLevel::Unknown;
                 result.recommendation = "Block";
                 result.reasons.push_back("Invalid file path");
@@ -234,8 +231,7 @@ public:
             }
 
             if (!fs::exists(filePath)) {
-                Logger::Warn("FileReputation::CheckFile - File not found: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_WARN(L"FileReputation", L"FileReputation::CheckFile - File not found: %hs", StringUtils::ToNarrow(filePath).c_str());
                 result.level = ReputationLevel::Unknown;
                 result.recommendation = "Block";
                 result.reasons.push_back("File not found");
@@ -259,7 +255,7 @@ public:
             result = QueryInternal(query);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileReputation::CheckFile - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"FileReputation::CheckFile - Exception: %hs", e.what());
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
             result.reasons.push_back(std::string("Error: ") + e.what());
@@ -310,7 +306,7 @@ public:
                 auto result = CheckFile(filePath, m_config.defaultMode);
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("CheckFileAsync - Exception: {}", e.what());
+                SS_LOG_ERROR(L"FileReputation", L"CheckFileAsync - Exception: %hs", e.what());
             }
         }).detach();
     }
@@ -349,8 +345,7 @@ public:
 
             m_localWhitelist.insert(std::string(sha256));
 
-            Logger::Info("Added to whitelist: {} (reason: {})",
-                std::string(sha256).substr(0, 16), reason);
+            SS_LOG_INFO(L"FileReputation", L"Added to whitelist: %hs (reason: %hs)", std::string(sha256).substr(0, 16), reason);
 
             // Invalidate cache entry
             m_cache.erase(std::string(sha256));
@@ -358,7 +353,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddToWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AddToWhitelist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -372,13 +367,13 @@ public:
             auto removed = m_localWhitelist.erase(std::string(sha256)) > 0;
             if (removed) {
                 m_cache.erase(std::string(sha256));
-                Logger::Info("Removed from whitelist: {}", std::string(sha256).substr(0, 16));
+                SS_LOG_INFO(L"FileReputation", L"Removed from whitelist: %hs", std::string(sha256).substr(0, 16));
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            Logger::Error("RemoveFromWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"RemoveFromWhitelist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -400,7 +395,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddToBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AddToBlacklist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -414,13 +409,13 @@ public:
             auto removed = m_localBlacklist.erase(std::string(sha256)) > 0;
             if (removed) {
                 m_cache.erase(std::string(sha256));
-                Logger::Info("Removed from blacklist: {}", std::string(sha256).substr(0, 16));
+                SS_LOG_INFO(L"FileReputation", L"Removed from blacklist: %hs", std::string(sha256).substr(0, 16));
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            Logger::Error("RemoveFromBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"RemoveFromBlacklist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -462,7 +457,7 @@ public:
             // certRep.isRevoked = CheckRevocation();
 
         } catch (const std::exception& e) {
-            Logger::Error("GetCertificateReputation - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"GetCertificateReputation - Exception: %hs", e.what());
         }
 
         return certRep;
@@ -483,7 +478,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("GetCertificateTrust - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"GetCertificateTrust - Exception: %hs", e.what());
         }
 
         return TrustLevel::Unknown;
@@ -494,11 +489,11 @@ public:
 
         try {
             m_trustedCertificates[std::string(thumbprint)] = std::string(reason);
-            Logger::Info("Added trusted certificate: {} (reason: {})", thumbprint, reason);
+            SS_LOG_INFO(L"FileReputation", L"Added trusted certificate: %hs (reason: %hs)", thumbprint, reason);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddTrustedCertificate - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AddTrustedCertificate - Exception: %hs", e.what());
             return false;
         }
     }
@@ -508,11 +503,11 @@ public:
 
         try {
             m_untrustedCertificates[std::string(thumbprint)] = std::string(reason);
-            Logger::Warn("Added untrusted certificate: {} (reason: {})", thumbprint, reason);
+            SS_LOG_WARN(L"FileReputation", L"Added untrusted certificate: %hs (reason: %hs)", thumbprint, reason);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("AddUntrustedCertificate - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AddUntrustedCertificate - Exception: %hs", e.what());
             return false;
         }
     }
@@ -524,7 +519,7 @@ public:
     bool SubmitForAnalysis(const std::wstring& filePath) {
         try {
             if (!m_cloudAvailable) {
-                Logger::Warn("Cloud service unavailable - cannot submit file");
+                SS_LOG_WARN(L"FileReputation", L"Cloud service unavailable - cannot submit file");
                 return false;
             }
 
@@ -532,12 +527,12 @@ public:
             // For now, just log the submission
 
             auto hash = HashStore::CalculateSHA256(filePath);
-            Logger::Info("Submitted file for cloud analysis: {}", hash.substr(0, 16));
+            SS_LOG_INFO(L"FileReputation", L"Submitted file for cloud analysis: %hs", hash.substr(0, 16));
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("SubmitForAnalysis - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"SubmitForAnalysis - Exception: %hs", e.what());
             return false;
         }
     }
@@ -550,12 +545,12 @@ public:
             auto hash = HashStore::CalculateSHA256(filePath);
             auto size = fs::file_size(filePath);
 
-            Logger::Info("Submitted metadata: {} ({} bytes)", hash.substr(0, 16), size);
+            SS_LOG_INFO(L"FileReputation", L"Submitted metadata: %hs (%hs bytes)", hash.substr(0, 16), size);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("SubmitMetadata - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"SubmitMetadata - Exception: %hs", e.what());
             return false;
         }
     }
@@ -564,13 +559,12 @@ public:
         try {
             if (!m_cloudAvailable) return false;
 
-            Logger::Info("Reported false positive: {} (reason: {})",
-                std::string(sha256).substr(0, 16), reason);
+            SS_LOG_INFO(L"FileReputation", L"Reported false positive: %hs (reason: %hs)", std::string(sha256).substr(0, 16), reason);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ReportFalsePositive - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"ReportFalsePositive - Exception: %hs", e.what());
             return false;
         }
     }
@@ -585,7 +579,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ReportFalseNegative - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"ReportFalseNegative - Exception: %hs", e.what());
             return false;
         }
     }
@@ -597,7 +591,7 @@ public:
     void ClearCache() noexcept {
         std::unique_lock lock(m_mutex);
         m_cache.clear();
-        Logger::Info("Reputation cache cleared");
+        SS_LOG_INFO(L"FileReputation", L"Reputation cache cleared");
     }
 
     [[nodiscard]] size_t GetCacheSize() const noexcept {
@@ -612,11 +606,11 @@ public:
             // In production, load from persistent cache file
             // For now, return 0
 
-            Logger::Info("Preloaded cache from: {}", StringUtils::WideToUtf8(cachePath));
+            SS_LOG_INFO(L"FileReputation", L"Preloaded cache from: %hs", StringUtils::ToNarrow(cachePath).c_str());
             return 0;
 
         } catch (const std::exception& e) {
-            Logger::Error("PreloadCache - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"PreloadCache - Exception: %hs", e.what());
             return 0;
         }
     }
@@ -628,13 +622,12 @@ public:
             // In production, save cache to persistent file
             // For now, just log
 
-            Logger::Info("Saved cache to: {} ({} entries)",
-                StringUtils::WideToUtf8(cachePath), m_cache.size());
+            SS_LOG_INFO(L"FileReputation", L"Saved cache to: %hs (%llu entries)", StringUtils::ToNarrow(cachePath).c_str(), m_cache.size());
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("SaveCache - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"SaveCache - Exception: %hs", e.what());
             return false;
         }
     }
@@ -649,7 +642,7 @@ public:
         uint64_t callbackId = ++m_nextCallbackId;
         m_unknownFileCallbacks[callbackId] = std::move(callback);
 
-        Logger::Info("Registered unknown file callback: {}", callbackId);
+        SS_LOG_INFO(L"FileReputation", L"Registered unknown file callback: %hs", callbackId);
         return callbackId;
     }
 
@@ -658,7 +651,7 @@ public:
 
         auto removed = m_unknownFileCallbacks.erase(callbackId) > 0;
         if (removed) {
-            Logger::Info("Unregistered callback: {}", callbackId);
+            SS_LOG_INFO(L"FileReputation", L"Unregistered callback: %hs", callbackId);
         }
 
         return removed;
@@ -762,7 +755,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("QueryInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"QueryInternal - Exception: %hs", e.what());
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
             result.reasons.push_back(std::string("Query error: ") + e.what());
@@ -788,7 +781,7 @@ private:
             m_stats.localHits++;
             m_stats.trustedFiles++;
 
-            Logger::Info("Whitelist hit: {}", query.sha256.substr(0, 16));
+            SS_LOG_INFO(L"FileReputation", L"Whitelist hit: %hs", query.sha256.substr(0, 16));
             return true;
         }
 
@@ -841,7 +834,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckHashStore - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"CheckHashStore - Exception: %hs", e.what());
         }
 
         return false;
@@ -899,7 +892,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeCertificate - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AnalyzeCertificate - Exception: %hs", e.what());
         }
     }
 
@@ -935,22 +928,21 @@ private:
 
                     result.reasons.push_back("Threat Intelligence match: " + match.threatName);
 
-                    Logger::Warn("Threat Intel match: {} - {}",
-                        query.sha256.substr(0, 16), match.threatName);
+                    SS_LOG_WARN(L"FileReputation", L"Threat Intel match: %hs - %hs", query.sha256.substr(0, 16), match.threatName);
                 }
 
                 m_stats.maliciousDetected++;
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckThreatIntelligence - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"CheckThreatIntelligence - Exception: %hs", e.what());
         }
     }
 
     void QueryCloudReputation(const ReputationQuery& query, ReputationResult& result) {
         try {
             if (!m_cloudAvailable) {
-                Logger::Debug("Cloud service unavailable");
+                SS_LOG_DEBUG(L"FileReputation", L"Cloud service unavailable");
                 return;
             }
 
@@ -966,7 +958,7 @@ private:
 
             if (!querySuccess) {
                 m_stats.cloudFailures++;
-                Logger::Warn("Cloud query failed for: {}", query.sha256.substr(0, 16));
+                SS_LOG_WARN(L"FileReputation", L"Cloud query failed for: %hs", query.sha256.substr(0, 16));
                 return;
             }
 
@@ -1009,7 +1001,7 @@ private:
             UpdateCloudLatency(result.cloud.queryLatency.count());
 
         } catch (const std::exception& e) {
-            Logger::Error("QueryCloudReputation - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"QueryCloudReputation - Exception: %hs", e.what());
             m_stats.cloudFailures++;
         }
     }
@@ -1046,7 +1038,7 @@ private:
             result.contributingSources.push_back(ReputationSource::BehavioralAnalysis);
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeBehavior - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"AnalyzeBehavior - Exception: %hs", e.what());
         }
     }
 
@@ -1097,11 +1089,10 @@ private:
                 result.primarySource = result.contributingSources[0];
             }
 
-            Logger::Debug("Final reputation: {} (score={}, confidence={:.2f})",
-                static_cast<int>(result.level), result.score, result.confidence);
+            SS_LOG_DEBUG(L"FileReputation", L"Final reputation: %u (score=%hs, confidence=%.2f)", static_cast<int>(result.level), result.score, result.confidence);
 
         } catch (const std::exception& e) {
-            Logger::Error("CalculateFinalScore - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"CalculateFinalScore - Exception: %hs", e.what());
         }
     }
 
@@ -1168,7 +1159,7 @@ private:
             m_cache[result.sha256] = entry;
 
         } catch (const std::exception& e) {
-            Logger::Error("CacheResult - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"CacheResult - Exception: %hs", e.what());
         }
     }
 
@@ -1191,7 +1182,7 @@ private:
             // For now, assume available if endpoint is configured
 
             if (!m_config.cloudEndpoint.empty()) {
-                Logger::Info("Cloud service connectivity check: OK");
+                SS_LOG_INFO(L"FileReputation", L"Cloud service connectivity check: OK");
                 return true;
             }
 
@@ -1220,7 +1211,7 @@ private:
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("PerformCloudQuery - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"PerformCloudQuery - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1270,7 +1261,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("NotifyUnknownFile - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"NotifyUnknownFile - Exception: %hs", e.what());
         }
     }
 
@@ -1415,14 +1406,14 @@ FileReputation& FileReputation::Instance() {
 FileReputation::FileReputation()
     : m_impl(std::make_unique<FileReputationImpl>()) {
 
-    Logger::Info("FileReputation instance created");
+    SS_LOG_INFO(L"FileReputation", L"FileReputation instance created");
 }
 
 FileReputation::~FileReputation() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("FileReputation instance destroyed");
+    SS_LOG_INFO(L"FileReputation", L"FileReputation instance destroyed");
 }
 
 // ============================================================================

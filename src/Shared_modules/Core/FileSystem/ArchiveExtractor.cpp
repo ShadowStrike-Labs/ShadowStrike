@@ -333,19 +333,18 @@ public:
                 if (!fs::exists(m_config.tempDirectory, ec)) {
                     fs::create_directories(m_config.tempDirectory, ec);
                     if (ec) {
-                        Logger::Error("ArchiveExtractor: Failed to create temp dir: {}", ec.message());
+                        SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: Failed to create temp dir: %hs", ec.message().c_str());
                         return false;
                     }
                 }
             }
 
-            Logger::Info("ArchiveExtractor initialized (maxRatio={:.1f}, maxNesting={}, security={})",
-                config.defaultMaxRatio, config.defaultMaxNesting, config.strictSecurityChecks);
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor initialized (maxRatio=%.1f, maxNesting=%d, security=%d)", config.defaultMaxRatio, config.defaultMaxNesting, config.strictSecurityChecks);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -360,7 +359,7 @@ public:
             m_cache.clear();
             m_initialized = false;
 
-            Logger::Info("ArchiveExtractor shutdown complete");
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -375,7 +374,7 @@ public:
         try {
             // Check extension first (fast path)
             fs::path p(filePath);
-            auto ext = StringUtils::ToLower(p.extension().wstring());
+            auto ext = StringUtils::ToLowerCopy(p.extension().wstring());
 
             if (ext == L".zip") return ArchiveFormat::ZIP;
             if (ext == L".rar") return ArchiveFormat::RAR;
@@ -402,7 +401,7 @@ public:
             if (ext == L".deb") return ArchiveFormat::DEB;
 
             // Compound extensions
-            auto filename = StringUtils::ToLower(p.filename().wstring());
+            auto filename = StringUtils::ToLowerCopy(p.filename().wstring());
             if (filename.ends_with(L".tar.gz") || filename.ends_with(L".tgz")) {
                 return ArchiveFormat::TarGz;
             }
@@ -433,7 +432,7 @@ public:
             return DetectFormat(std::span<const uint8_t>(buffer.data(), bytesRead));
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: Format detection failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: Format detection failed: %hs", e.what());
             return ArchiveFormat::Unknown;
         }
     }
@@ -461,7 +460,7 @@ public:
             return ArchiveFormat::Unknown;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: Buffer format detection failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: Buffer format detection failed: %hs", e.what());
             return ArchiveFormat::Unknown;
         }
     }
@@ -517,7 +516,7 @@ public:
             std::error_code ec;
             info.fileSize = fs::file_size(filePath, ec);
             if (ec) {
-                Logger::Error("ArchiveExtractor: Cannot get file size: {}", ec.message());
+                SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: Cannot get file size: %hs", ec.message().c_str());
                 return info;
             }
 
@@ -561,7 +560,7 @@ public:
             return info;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: GetArchiveInfo failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: GetArchiveInfo failed: %hs", e.what());
             return info;
         }
     }
@@ -575,15 +574,14 @@ public:
         try {
             // Placeholder implementation
             // Real implementation would use libarchive to enumerate entries
-            Logger::Info("ArchiveExtractor: Listing contents of {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Listing contents of %hs", StringUtils::ToNarrow(filePath).c_str());
 
             m_stats.archivesProcessed++;
 
             return entries;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ListContents failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ListContents failed: %hs", e.what());
             return entries;
         }
     }
@@ -591,13 +589,12 @@ public:
     [[nodiscard]] bool VerifyIntegrity(const std::wstring& filePath) const {
         try {
             // Placeholder: Real implementation would verify CRCs, checksums
-            Logger::Info("ArchiveExtractor: Verifying integrity of {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Verifying integrity of %hs", StringUtils::ToNarrow(filePath).c_str());
 
             return fs::exists(filePath);
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: VerifyIntegrity failed: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: VerifyIntegrity failed: %hs", e.what());
             return false;
         }
     }
@@ -621,8 +618,7 @@ public:
                     summary.result = ExtractionResult::ZipBombDetected;
                     summary.securityFlags = SecurityFlag::ZipBombSuspected;
                     summary.errors.push_back("Zip bomb detected");
-                    Logger::Warn("ArchiveExtractor: Zip bomb detected in {}",
-                        StringUtils::WideToUtf8(filePath));
+                    SS_LOG_WARN(L"ArchiveExtractor", L"ArchiveExtractor: Zip bomb detected in %hs", StringUtils::ToNarrow(filePath).c_str());
                     return summary;
                 }
             }
@@ -639,7 +635,7 @@ public:
                         std::vector<uint8_t> emptyData;  // Metadata only
                         callback(entry, emptyData);
                     } catch (const std::exception& e) {
-                        Logger::Error("ArchiveExtractor: Entry callback exception: {}", e.what());
+                        SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: Entry callback exception: %hs", e.what());
                         summary.entriesFailed++;
                     }
                 }
@@ -654,7 +650,7 @@ public:
             m_stats.archivesProcessed++;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ScanArchive exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ScanArchive exception: %hs", e.what());
             summary.result = ExtractionResult::IOError;
             summary.errors.push_back(std::string("Exception: ") + e.what());
         }
@@ -675,9 +671,7 @@ public:
         ExtractionSummary summary;
 
         try {
-            Logger::Info("ArchiveExtractor: Extracting {} to {}",
-                StringUtils::WideToUtf8(filePath),
-                StringUtils::WideToUtf8(outputDir));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Extracting %hs to %hs", StringUtils::ToNarrow(filePath).c_str(), StringUtils::ToNarrow(outputDir).c_str());
 
             // Security check
             if (m_config.strictSecurityChecks) {
@@ -710,7 +704,7 @@ public:
             m_stats.archivesProcessed++;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ExtractAll exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ExtractAll exception: %hs", e.what());
             summary.result = ExtractionResult::IOError;
             summary.errors.push_back(std::string("Exception: ") + e.what());
         }
@@ -731,9 +725,7 @@ public:
         result.entryPath = entryPath;
 
         try {
-            Logger::Info("ArchiveExtractor: Extracting entry {} from {}",
-                StringUtils::WideToUtf8(entryPath),
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Extracting entry %hs from %hs", StringUtils::ToNarrow(entryPath).c_str(), StringUtils::ToNarrow(filePath).c_str());
 
             // Placeholder
             result.result = ExtractionResult::Success;
@@ -742,7 +734,7 @@ public:
             m_stats.entriesExtracted++;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ExtractEntry exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ExtractEntry exception: %hs", e.what());
             result.result = ExtractionResult::IOError;
             result.errorMessage = e.what();
         }
@@ -759,8 +751,7 @@ public:
         ExtractionSummary summary;
 
         try {
-            Logger::Info("ArchiveExtractor: Extracting matching pattern: {}",
-                StringUtils::WideToUtf8(pattern));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Extracting matching pattern: %hs", StringUtils::ToNarrow(pattern).c_str());
 
             // List all entries
             auto entries = ListContents(filePath, options);
@@ -780,7 +771,7 @@ public:
             summary.entriesProcessed = static_cast<uint32_t>(entries.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ExtractMatching exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ExtractMatching exception: %hs", e.what());
             summary.result = ExtractionResult::IOError;
         }
 
@@ -795,14 +786,13 @@ public:
         ExtractionSummary summary;
 
         try {
-            Logger::Info("ArchiveExtractor: Streaming extraction from {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Streaming extraction from %hs", StringUtils::ToNarrow(filePath).c_str());
 
             // Placeholder
             summary.result = ExtractionResult::Success;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: ExtractStreaming exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: ExtractStreaming exception: %hs", e.what());
             summary.result = ExtractionResult::IOError;
         }
 
@@ -842,7 +832,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: AnalyzeSecurity exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: AnalyzeSecurity exception: %hs", e.what());
         }
 
         return info;
@@ -861,7 +851,7 @@ public:
 
             // For now, check file size against limits
             if (fileSize > m_config.defaultMaxTotal) {
-                Logger::Warn("ArchiveExtractor: File size {} exceeds limit", fileSize);
+                SS_LOG_WARN(L"ArchiveExtractor", L"ArchiveExtractor: File size %llu exceeds limit", fileSize);
                 return true;
             }
 
@@ -876,7 +866,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: IsZipBomb exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: IsZipBomb exception: %hs", e.what());
             return false;
         }
     }
@@ -911,7 +901,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: CheckEntrySecurity exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: CheckEntrySecurity exception: %hs", e.what());
         }
 
         return static_cast<SecurityFlag>(flags);
@@ -928,15 +918,14 @@ public:
 
     [[nodiscard]] bool TestPassword(const std::wstring& filePath, const std::string& password) const {
         try {
-            Logger::Info("ArchiveExtractor: Testing password for {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Testing password for %hs", StringUtils::ToNarrow(filePath).c_str());
 
             // Placeholder
             // Real implementation would attempt to open archive with password
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ArchiveExtractor: TestPassword exception: {}", e.what());
+            SS_LOG_ERROR(L"ArchiveExtractor", L"ArchiveExtractor: TestPassword exception: %hs", e.what());
             return false;
         }
     }
@@ -961,7 +950,7 @@ public:
 
     void Cancel() noexcept {
         m_cancelled.store(true);
-        Logger::Info("ArchiveExtractor: Operation cancelled");
+        SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor: Operation cancelled");
     }
 
     [[nodiscard]] bool IsCancelled() const noexcept {
@@ -1092,14 +1081,14 @@ ArchiveExtractor& ArchiveExtractor::Instance() {
 ArchiveExtractor::ArchiveExtractor()
     : m_impl(std::make_unique<ArchiveExtractorImpl>()) {
 
-    Logger::Info("ArchiveExtractor instance created");
+    SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor instance created");
 }
 
 ArchiveExtractor::~ArchiveExtractor() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("ArchiveExtractor instance destroyed");
+    SS_LOG_INFO(L"ArchiveExtractor", L"ArchiveExtractor instance destroyed");
 }
 
 // ============================================================================
