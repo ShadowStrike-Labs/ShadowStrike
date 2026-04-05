@@ -1,0 +1,63 @@
+{
+  "model_name": "cortex_static",
+  "model_hash": "2326d7633d60acd5",
+  "num_iterations": 1196,
+  "feature_count": 2381,
+  "seed": 42,
+  "threshold": 0.5,
+  "hpo_enabled": false,
+  "hpo_trials": 0,
+  "hpo_best_params": {
+    "num_leaves": 247,
+    "max_depth": 12,
+    "learning_rate": 0.04946558243375748,
+    "min_child_samples": 52,
+    "subsample": 0.8162443361108642,
+    "colsample_bytree": 0.7004115581639594,
+    "reg_alpha": 5.001865813583779,
+    "reg_lambda": 0.004834437467679396,
+    "min_split_gain": 0.05559865809267517,
+    "n_estimators": 2421
+  },
+  "training_params": {
+    "objective": "binary",
+    "metric": "auc",
+    "boosting_type": "gbdt",
+    "num_leaves": 247,
+    "max_depth": 12,
+    "learning_rate": 0.04946558243375748,
+    "min_child_samples": 52,
+    "subsample": 0.8162443361108642,
+    "colsample_bytree": 0.7004115581639594,
+    "reg_alpha": 5.001865813583779,
+    "reg_lambda": 0.004834437467679396,
+    "min_split_gain": 0.05559865809267517,
+    "seed": 42,
+    "n_jobs": -1,
+    "device": "cpu",
+    "verbose": -1,
+    "is_unbalance": true,
+    "n_estimators": 2421
+  },
+  "test_metrics": {
+    "accuracy": 0.96464,
+    "precision": 0.9664966566936407,
+    "recall": 0.96265,
+    "f1": 0.9645694932916504,
+    "auc_roc": 0.99238460075,
+    "auc_pr": 0.9931760427227856,
+    "fpr_at_threshold": 0.03337,
+    "detection_rate": 0.96265,
+    "threshold": 0.5
+  },
+  "quantization": {
+    "original_size_mb": 17.6815,
+    "quantized_size_mb": 17.6815,
+    "size_reduction_pct": -0.0,
+    "quantization_method": "dynamic",
+    "weight_type": "QInt8",
+    "success": true,
+    "error_message": null
+  },
+  "total_elapsed_sec": 282.28
+}

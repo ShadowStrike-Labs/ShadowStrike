@@ -146,7 +146,10 @@ def export_lgbm_to_onnx(
     from onnxmltools.convert.lightgbm.operator_converters.LightGbm import (
         convert_lightgbm,
     )
-    from onnxconverter_common.data_types import FloatTensorType
+    from onnxmltools.convert.common.data_types import FloatTensorType
+
+    # onnxmltools LightGBM converter supports max opset 15
+    lgbm_opset = min(opset, 15)
 
     out = Path(output_path)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -156,18 +159,18 @@ def export_lgbm_to_onnx(
     logger.info(
         "Converting LightGBM model to ONNX (features=%d, opset=%d)",
         feature_count,
-        opset,
+        lgbm_opset,
     )
 
     onnx_model = onnxmltools.convert_lightgbm(
         model,
         initial_types=initial_types,
-        target_opset=opset,
+        target_opset=lgbm_opset,
     )
 
-    # Rename outputs
-    for output in onnx_model.graph.output:
-        output.name = output_name
+    # Log output names (LightGBM typically produces 'label' + 'probabilities')
+    out_names = [o.name for o in onnx_model.graph.output]
+    logger.info("ONNX model outputs: %s", out_names)
 
     onnx.checker.check_model(onnx_model)
     onnx.save(onnx_model, str(out))
