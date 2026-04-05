@@ -1,0 +1,34 @@
+{
+  "model": "cortex_emulation",
+  "seed": 42,
+  "device": "cuda",
+  "data_generation_time_s": 321.31,
+  "train_samples": 48000,
+  "val_samples": 6000,
+  "test_samples": 6000,
+  "training_time_s": 4203.58,
+  "metrics": {
+    "loss": 3.973642748178463e-11,
+    "accuracy": 1.0,
+    "macro_f1": 1.0,
+    "per_class_precision": {
+      "Benign": 1.0,
+      "Suspicious": 1.0,
+      "Malicious": 1.0
+    },
+    "per_class_recall": {
+      "Benign": 1.0,
+      "Suspicious": 1.0,
+      "Malicious": 1.0
+    },
+    "per_class_f1": {
+      "Benign": 1.0,
+      "Suspicious": 1.0,
+      "Malicious": 1.0
+    }
+  },
+  "onnx_path": "training\\data\\models\\cortex_emulation.onnx",
+  "onnx_size_mb": 8.3581,
+  "model_state_path": "training\\data\\models\\cortex_emulation_best.pt",
+  "total_time_s": 4529.37
+}

@@ -1,0 +1,73 @@
+{
+  "reconstruction_loss": 0.005680129192769528,
+  "classification_loss": 0.0,
+  "accuracy": 1.0,
+  "macro_f1": 1.0,
+  "anomaly_auc": 0.06228991696322657,
+  "per_class_precision": {
+    "Normal": 1.0,
+    "C2Beacon": 1.0,
+    "Exfiltration": 1.0,
+    "LateralMovement": 1.0,
+    "Scanning": 1.0,
+    "DGADomain": 1.0,
+    "DNSTunnel": 1.0,
+    "CryptoMining": 1.0
+  },
+  "per_class_recall": {
+    "Normal": 1.0,
+    "C2Beacon": 1.0,
+    "Exfiltration": 1.0,
+    "LateralMovement": 1.0,
+    "Scanning": 1.0,
+    "DGADomain": 1.0,
+    "DNSTunnel": 1.0,
+    "CryptoMining": 1.0
+  },
+  "per_class_f1": {
+    "Normal": 1.0,
+    "C2Beacon": 1.0,
+    "Exfiltration": 1.0,
+    "LateralMovement": 1.0,
+    "Scanning": 1.0,
+    "DGADomain": 1.0,
+    "DNSTunnel": 1.0,
+    "CryptoMining": 1.0
+  },
+  "training_config": {
+    "samples_per_class": 10000,
+    "total_samples": 80000,
+    "epochs": 100,
+    "batch_size": 256,
+    "learning_rate": 0.001,
+    "weight_decay": 0.0001,
+    "grad_clip": 1.0,
+    "recon_weight": 0.5,
+    "latent_dim": 32,
+    "seed": 42,
+    "device": "cuda",
+    "feature_dim": 64,
+    "num_classes": 8,
+    "class_names": [
+      "Normal",
+      "C2Beacon",
+      "Exfiltration",
+      "LateralMovement",
+      "Scanning",
+      "DGADomain",
+      "DNSTunnel",
+      "CryptoMining"
+    ]
+  },
+  "timing": {
+    "data_generation_sec": 0.094,
+    "training_sec": 125.766,
+    "evaluation_sec": 0.078,
+    "total_sec": 126.0
+  },
+  "artifacts": {
+    "onnx_model": "training\\data\\models\\cortex_network.onnx",
+    "checkpoint_dir": "training\\data\\models\\checkpoints",
+    "tensorboard_dir": "training\\data\\models\\tensorboard"
+  }
+}
