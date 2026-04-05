@@ -31,7 +31,7 @@
  * ==============================
  *
  * 1. ENVIRONMENT MANAGEMENT
- *    - Hyper-V integration
+ *    - Hyper-V integration via PowerShell/WMI
  *    - VMware support
  *    - Container isolation (Docker/WC)
  *    - Snapshot management
@@ -123,14 +123,6 @@
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 
-// ============================================================================
-// FORWARD DECLARATIONS
-// ============================================================================
-
-namespace ShadowStrike::Core::Engine {
-    class SandboxAnalyzerImpl;
-}
-
 namespace ShadowStrike {
 namespace Core {
 namespace Engine {
@@ -147,21 +139,33 @@ namespace SandboxConstants {
 
     /// @brief Default analysis timeout (seconds)
     inline constexpr uint32_t DEFAULT_TIMEOUT_SECONDS = 120;
-    
+
     /// @brief Maximum analysis timeout
     inline constexpr uint32_t MAX_TIMEOUT_SECONDS = 600;
-    
+
     /// @brief Maximum concurrent analyses
     inline constexpr uint32_t MAX_CONCURRENT_ANALYSES = 4;
-    
+
     /// @brief Maximum dropped files to extract
     inline constexpr size_t MAX_DROPPED_FILES = 1000;
-    
+
+    /// @brief Maximum events per category to prevent unbounded growth
+    inline constexpr size_t MAX_EVENTS_PER_CATEGORY = 10000;
+
     /// @brief Maximum memory dump size (1 GB)
-    inline constexpr size_t MAX_MEMORY_DUMP_SIZE = 1024 * 1024 * 1024;
-    
+    inline constexpr size_t MAX_MEMORY_DUMP_SIZE = 1024ULL * 1024 * 1024;
+
     /// @brief Maximum PCAP size (256 MB)
-    inline constexpr size_t MAX_PCAP_SIZE = 256 * 1024 * 1024;
+    inline constexpr size_t MAX_PCAP_SIZE = 256ULL * 1024 * 1024;
+
+    /// @brief PowerShell command timeout (ms) for VM operations
+    inline constexpr DWORD PS_COMMAND_TIMEOUT_MS = 60000;
+
+    /// @brief VM readiness polling interval (ms)
+    inline constexpr uint32_t VM_READY_POLL_MS = 2000;
+
+    /// @brief Maximum VM readiness wait (seconds)
+    inline constexpr uint32_t VM_READY_MAX_WAIT_S = 120;
 
 }  // namespace SandboxConstants
 
@@ -209,16 +213,33 @@ enum class GuestOSType : uint8_t {
 };
 
 /**
- * @brief Analysis status
+ * @brief Analysis pipeline status
  */
 enum class AnalysisStatus : uint8_t {
-    Pending         = 0,
+    Queued          = 0,
     Preparing       = 1,
+    Transferring    = 2,
+    Executing       = 3,
+    Monitoring      = 4,
+    Capturing       = 5,
+    Analyzing       = 6,
+    Completed       = 7,
+    Failed          = 8,
+    Timeout         = 9,
+    Cancelled       = 10
+};
+
+/**
+ * @brief VM lifecycle state
+ */
+enum class VMState : uint8_t {
+    Stopped         = 0,
+    Starting        = 1,
     Running         = 2,
-    Completed       = 3,
-    Timeout         = 4,
-    Failed          = 5,
-    Cancelled       = 6
+    Paused          = 3,
+    Stopping        = 4,
+    Error           = 5,
+    Restoring       = 6
 };
 
 /**
@@ -267,6 +288,22 @@ enum class SandboxStatus : uint8_t {
 };
 
 // ============================================================================
+// ERROR TYPE
+// ============================================================================
+
+/**
+ * @brief Structured error from sandbox operations
+ */
+struct SandboxError {
+    DWORD code = ERROR_SUCCESS;
+    std::wstring message;
+    std::wstring context;
+
+    [[nodiscard]] bool HasError() const noexcept { return code != ERROR_SUCCESS; }
+    void Clear() noexcept { code = ERROR_SUCCESS; message.clear(); context.clear(); }
+};
+
+// ============================================================================
 // STRUCTURES
 // ============================================================================
 
@@ -274,33 +311,16 @@ enum class SandboxStatus : uint8_t {
  * @brief VM configuration
  */
 struct VMConfiguration {
-    /// @brief Environment type
     SandboxEnvironment environment = SandboxEnvironment::HyperV;
-    
-    /// @brief Guest OS type
     GuestOSType guestOS = GuestOSType::Windows10_x64;
-    
-    /// @brief VM name/ID
     std::string vmName;
-    
-    /// @brief Snapshot name
     std::string snapshotName;
-    
-    /// @brief Memory (MB)
     uint32_t memoryMb = 4096;
-    
-    /// @brief CPU cores
     uint32_t cpuCores = 2;
-    
-    /// @brief Network isolation
     bool networkIsolation = true;
-    
-    /// @brief Allow internet access (isolated by default)
     bool allowInternet = false;
-    
-    /// @brief Simulated internet
     bool simulatedInternet = true;
-    
+
     [[nodiscard]] bool IsValid() const noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -309,27 +329,14 @@ struct VMConfiguration {
  * @brief Process event
  */
 struct ProcessEvent {
-    /// @brief Timestamp
     SystemTimePoint timestamp;
-    
-    /// @brief Event type
     std::string eventType;
-    
-    /// @brief Process ID
     uint32_t processId = 0;
-    
-    /// @brief Parent process ID
     uint32_t parentProcessId = 0;
-    
-    /// @brief Process name
     std::wstring processName;
-    
-    /// @brief Command line
     std::wstring commandLine;
-    
-    /// @brief Image path
     fs::path imagePath;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -337,27 +344,14 @@ struct ProcessEvent {
  * @brief File event
  */
 struct FileEvent {
-    /// @brief Timestamp
     SystemTimePoint timestamp;
-    
-    /// @brief Event type (create/modify/delete)
     std::string eventType;
-    
-    /// @brief File path
     fs::path filePath;
-    
-    /// @brief File size
     uint64_t fileSize = 0;
-    
-    /// @brief File hash (SHA-256)
     std::string sha256Hash;
-    
-    /// @brief Process that performed operation
     std::wstring processName;
-    
-    /// @brief Process ID
     uint32_t processId = 0;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -365,27 +359,14 @@ struct FileEvent {
  * @brief Registry event
  */
 struct RegistryEvent {
-    /// @brief Timestamp
     SystemTimePoint timestamp;
-    
-    /// @brief Event type (create/modify/delete)
     std::string eventType;
-    
-    /// @brief Key path
     std::wstring keyPath;
-    
-    /// @brief Value name
     std::wstring valueName;
-    
-    /// @brief Value data
     std::string valueData;
-    
-    /// @brief Process that performed operation
     std::wstring processName;
-    
-    /// @brief Process ID
     uint32_t processId = 0;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -393,39 +374,18 @@ struct RegistryEvent {
  * @brief Network event
  */
 struct NetworkEvent {
-    /// @brief Timestamp
     SystemTimePoint timestamp;
-    
-    /// @brief Protocol (TCP/UDP/HTTP/DNS)
     std::string protocol;
-    
-    /// @brief Source IP
     std::string sourceIP;
-    
-    /// @brief Source port
     uint16_t sourcePort = 0;
-    
-    /// @brief Destination IP
     std::string destinationIP;
-    
-    /// @brief Destination port
     uint16_t destinationPort = 0;
-    
-    /// @brief Hostname (for DNS/HTTP)
     std::string hostname;
-    
-    /// @brief URL (for HTTP)
     std::string url;
-    
-    /// @brief Data sent (bytes)
     uint64_t bytesSent = 0;
-    
-    /// @brief Data received (bytes)
     uint64_t bytesReceived = 0;
-    
-    /// @brief Process that performed operation
     std::wstring processName;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -433,27 +393,14 @@ struct NetworkEvent {
  * @brief Behavioral indicator
  */
 struct BehavioralIndicator {
-    /// @brief Indicator ID
     std::string indicatorId;
-    
-    /// @brief Description
     std::string description;
-    
-    /// @brief Category
     BehaviorCategory category = BehaviorCategory::FileSystem;
-    
-    /// @brief Severity (1-10)
-    uint32_t severity = 1;
-    
-    /// @brief MITRE ATT&CK technique ID
+    uint32_t severity = 1;  ///< 1-10 scale
     std::string mitreId;
-    
-    /// @brief MITRE ATT&CK technique name
     std::string mitreName;
-    
-    /// @brief Evidence
     std::vector<std::string> evidence;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -461,27 +408,14 @@ struct BehavioralIndicator {
  * @brief Extracted artifact
  */
 struct ExtractedArtifact {
-    /// @brief Artifact type
     std::string artifactType;
-    
-    /// @brief Original path
     fs::path originalPath;
-    
-    /// @brief Extracted path
     fs::path extractedPath;
-    
-    /// @brief Size
     uint64_t size = 0;
-    
-    /// @brief SHA-256 hash
     std::string sha256Hash;
-    
-    /// @brief File type
     std::string fileType;
-    
-    /// @brief Is malicious
     bool isMalicious = false;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -489,18 +423,11 @@ struct ExtractedArtifact {
  * @brief IOC (Indicator of Compromise)
  */
 struct ExtractedIOC {
-    /// @brief IOC type (hash/ip/domain/url)
     std::string iocType;
-    
-    /// @brief IOC value
     std::string value;
-    
-    /// @brief Context
     std::string context;
-    
-    /// @brief Confidence
     float confidence = 0.0f;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -508,60 +435,25 @@ struct ExtractedIOC {
  * @brief Sandbox analysis verdict
  */
 struct SandboxVerdict {
-    /// @brief Is malicious
     bool isMalicious = false;
-    
-    /// @brief Threat score (0-100)
     int threatScore = 0;
-    
-    /// @brief Threat score level
     ThreatScoreLevel scoreLevel = ThreatScoreLevel::Clean;
-    
-    /// @brief Malware family (if identified)
     std::string malwareFamily;
-    
-    /// @brief Malware type
     std::string malwareType;
-    
-    /// @brief Behavior summary
     std::vector<std::string> behaviorSummary;
-    
-    /// @brief Behavioral indicators
     std::vector<BehavioralIndicator> indicators;
-    
-    /// @brief Process events
     std::vector<ProcessEvent> processEvents;
-    
-    /// @brief File events
     std::vector<FileEvent> fileEvents;
-    
-    /// @brief Registry events
     std::vector<RegistryEvent> registryEvents;
-    
-    /// @brief Network events
     std::vector<NetworkEvent> networkEvents;
-    
-    /// @brief Extracted artifacts
     std::vector<ExtractedArtifact> artifacts;
-    
-    /// @brief Extracted IOCs
     std::vector<ExtractedIOC> iocs;
-    
-    /// @brief MITRE ATT&CK techniques
     std::set<std::string> mitreIds;
-    
-    /// @brief Analysis status
-    AnalysisStatus status = AnalysisStatus::Pending;
-    
-    /// @brief Analysis duration (seconds)
+    AnalysisStatus status = AnalysisStatus::Queued;
     uint32_t durationSeconds = 0;
-    
-    /// @brief VM used
     std::string vmUsed;
-    
-    /// @brief Errors/warnings
     std::vector<std::string> warnings;
-    
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -569,100 +461,37 @@ struct SandboxVerdict {
  * @brief Analysis options
  */
 struct SandboxAnalysisOptions {
-    /// @brief Analysis timeout (seconds)
     uint32_t timeoutSeconds = SandboxConstants::DEFAULT_TIMEOUT_SECONDS;
-    
-    /// @brief Preferred VM
     std::string preferredVM;
-    
-    /// @brief Preferred OS
     GuestOSType preferredOS = GuestOSType::Windows10_x64;
-    
-    /// @brief Command line arguments
     std::wstring arguments;
-    
-    /// @brief Working directory
     fs::path workingDirectory;
-    
-    /// @brief Enable network monitoring
     bool monitorNetwork = true;
-    
-    /// @brief Enable process monitoring
     bool monitorProcesses = true;
-    
-    /// @brief Enable file monitoring
     bool monitorFiles = true;
-    
-    /// @brief Enable registry monitoring
     bool monitorRegistry = true;
-    
-    /// @brief Extract dropped files
     bool extractDroppedFiles = true;
-    
-    /// @brief Create memory dump
     bool createMemoryDump = false;
-    
-    /// @brief Create network capture
     bool createNetworkCapture = true;
-    
-    /// @brief Inject DLL (for instrumentation)
     fs::path instrumentationDll;
-    
-    /// @brief Priority (higher = more urgent)
     uint32_t priority = 0;
-    
-    [[nodiscard]] bool IsValid() const noexcept;
-};
 
-/**
- * @brief Statistics
- */
-struct SandboxStatistics {
-    std::atomic<uint64_t> totalAnalyses{0};
-    std::atomic<uint64_t> maliciousDetected{0};
-    std::atomic<uint64_t> cleanSamples{0};
-    std::atomic<uint64_t> timeouts{0};
-    std::atomic<uint64_t> failures{0};
-    std::atomic<uint64_t> processEventsLogged{0};
-    std::atomic<uint64_t> fileEventsLogged{0};
-    std::atomic<uint64_t> networkEventsLogged{0};
-    std::atomic<uint64_t> artifactsExtracted{0};
-    std::atomic<uint64_t> iocsExtracted{0};
-    std::atomic<uint64_t> totalAnalysisTimeSeconds{0};
-    TimePoint startTime = Clock::now();
-    
-    void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] bool IsValid() const noexcept;
 };
 
 /**
  * @brief Configuration
  */
 struct SandboxAnalyzerConfiguration {
-    /// @brief Enable sandbox analysis
     bool enabled = true;
-    
-    /// @brief VM configurations
     std::vector<VMConfiguration> vms;
-    
-    /// @brief Maximum concurrent analyses
     uint32_t maxConcurrentAnalyses = SandboxConstants::MAX_CONCURRENT_ANALYSES;
-    
-    /// @brief Default timeout (seconds)
     uint32_t defaultTimeoutSeconds = SandboxConstants::DEFAULT_TIMEOUT_SECONDS;
-    
-    /// @brief Artifact storage path
     fs::path artifactStoragePath;
-    
-    /// @brief Report storage path
     fs::path reportStoragePath;
-    
-    /// @brief Agent port (for communication with sandbox)
     uint16_t agentPort = 8443;
-    
-    /// @brief Cleanup after analysis
     bool cleanupAfterAnalysis = true;
-    
+
     [[nodiscard]] bool IsValid() const noexcept;
 };
 
@@ -680,13 +509,12 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
 /**
  * @class SandboxAnalyzer
- * @brief Enterprise sandbox analysis
+ * @brief Enterprise sandbox analysis engine (Meyers singleton, PIMPL)
  */
 class SandboxAnalyzer final {
 public:
     [[nodiscard]] static SandboxAnalyzer& Instance() noexcept;
-    [[nodiscard]] static bool HasInstance() noexcept;
-    
+
     SandboxAnalyzer(const SandboxAnalyzer&) = delete;
     SandboxAnalyzer& operator=(const SandboxAnalyzer&) = delete;
     SandboxAnalyzer(SandboxAnalyzer&&) = delete;
@@ -695,111 +523,102 @@ public:
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
-    
-    [[nodiscard]] bool Initialize(const SandboxAnalyzerConfiguration& config = {});
-    void Shutdown();
+
+    [[nodiscard]] bool Initialize(const SandboxAnalyzerConfiguration& config = {},
+                                  SandboxError* err = nullptr) noexcept;
+    void Shutdown() noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] SandboxStatus GetStatus() const noexcept;
 
     // ========================================================================
     // ANALYSIS
     // ========================================================================
-    
-    /// @brief Analyze file (synchronous)
-    [[nodiscard]] SandboxVerdict Analyze(const std::wstring& filePath, uint32_t timeoutSeconds = SandboxConstants::DEFAULT_TIMEOUT_SECONDS);
-    
-    /// @brief Analyze file with options
-    [[nodiscard]] SandboxVerdict Analyze(const fs::path& filePath, const SandboxAnalysisOptions& options = {});
-    
-    /// @brief Submit file for analysis (async)
-    [[nodiscard]] std::string SubmitForAnalysis(const fs::path& filePath, const SandboxAnalysisOptions& options = {});
-    
-    /// @brief Get analysis result
-    [[nodiscard]] std::optional<SandboxVerdict> GetAnalysisResult(const std::string& taskId) const;
-    
-    /// @brief Cancel analysis
-    [[nodiscard]] bool CancelAnalysis(const std::string& taskId);
-    
-    /// @brief Get pending analyses
-    [[nodiscard]] std::vector<std::string> GetPendingAnalyses() const;
+
+    [[nodiscard]] SandboxVerdict Analyze(const fs::path& filePath,
+                                         const SandboxAnalysisOptions& options = {},
+                                         SandboxError* err = nullptr) noexcept;
+
+    [[nodiscard]] std::string SubmitForAnalysis(const fs::path& filePath,
+                                                 const SandboxAnalysisOptions& options = {},
+                                                 SandboxError* err = nullptr) noexcept;
+
+    [[nodiscard]] std::optional<SandboxVerdict> GetAnalysisResult(const std::string& taskId) const noexcept;
+    [[nodiscard]] bool CancelAnalysis(const std::string& taskId) noexcept;
+    [[nodiscard]] std::vector<std::string> GetPendingAnalyses() const noexcept;
 
     // ========================================================================
     // VM MANAGEMENT
     // ========================================================================
-    
-    /// @brief Get available VMs
-    [[nodiscard]] std::vector<VMConfiguration> GetAvailableVMs() const;
-    
-    /// @brief Get VM status
-    [[nodiscard]] std::string GetVMStatus(const std::string& vmName) const;
-    
-    /// @brief Revert VM to snapshot
-    [[nodiscard]] bool RevertToSnapshot(const std::string& vmName, const std::string& snapshotName);
-    
-    /// @brief Start VM
-    [[nodiscard]] bool StartVM(const std::string& vmName);
-    
-    /// @brief Stop VM
-    [[nodiscard]] bool StopVM(const std::string& vmName);
+
+    [[nodiscard]] std::vector<VMConfiguration> GetAvailableVMs() const noexcept;
+    [[nodiscard]] std::string GetVMStatus(const std::string& vmName) const noexcept;
+    [[nodiscard]] bool RevertToSnapshot(const std::string& vmName, const std::string& snapshotName) noexcept;
+    [[nodiscard]] bool StartVM(const std::string& vmName) noexcept;
+    [[nodiscard]] bool StopVM(const std::string& vmName) noexcept;
 
     // ========================================================================
     // ARTIFACT MANAGEMENT
     // ========================================================================
-    
-    /// @brief Get extracted artifacts for task
-    [[nodiscard]] std::vector<ExtractedArtifact> GetArtifacts(const std::string& taskId) const;
-    
-    /// @brief Download artifact
-    [[nodiscard]] bool DownloadArtifact(const std::string& taskId, const std::string& artifactId, const fs::path& destination);
-    
-    /// @brief Get memory dump
-    [[nodiscard]] std::optional<fs::path> GetMemoryDump(const std::string& taskId) const;
-    
-    /// @brief Get network capture
-    [[nodiscard]] std::optional<fs::path> GetNetworkCapture(const std::string& taskId) const;
+
+    [[nodiscard]] std::vector<ExtractedArtifact> GetArtifacts(const std::string& taskId) const noexcept;
+    [[nodiscard]] bool DownloadArtifact(const std::string& taskId, const std::string& artifactId,
+                                         const fs::path& destination) noexcept;
+    [[nodiscard]] std::optional<fs::path> GetMemoryDump(const std::string& taskId) const noexcept;
+    [[nodiscard]] std::optional<fs::path> GetNetworkCapture(const std::string& taskId) const noexcept;
 
     // ========================================================================
     // CALLBACKS
     // ========================================================================
-    
-    void RegisterProgressCallback(AnalysisProgressCallback callback);
-    void RegisterCompleteCallback(AnalysisCompleteCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
-    void UnregisterCallbacks();
+
+    void RegisterProgressCallback(AnalysisProgressCallback callback) noexcept;
+    void RegisterCompleteCallback(AnalysisCompleteCallback callback) noexcept;
+    void RegisterErrorCallback(ErrorCallback callback) noexcept;
+    void UnregisterCallbacks() noexcept;
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
-    
-    [[nodiscard]] SandboxStatistics GetStatistics() const;
-    void ResetStatistics();
-    
-    [[nodiscard]] bool SelfTest();
+
+    struct Statistics {
+        std::atomic<uint64_t> totalAnalyses{0};
+        std::atomic<uint64_t> maliciousSamplesDetected{0};
+        std::atomic<uint64_t> vmsStarted{0};
+        std::atomic<uint64_t> vmsStopped{0};
+        std::atomic<uint64_t> snapshotsRestored{0};
+        std::atomic<uint64_t> filesTransferred{0};
+        std::atomic<uint64_t> artifactsExtracted{0};
+        std::atomic<uint64_t> totalAnalysisTimeSeconds{0};
+        std::atomic<uint64_t> timeouts{0};
+        std::atomic<uint64_t> failures{0};
+        TimePoint startTime = Clock::now();
+
+        void Reset() noexcept;
+    };
+
+    [[nodiscard]] const Statistics& GetStatistics() const noexcept;
+    void ResetStatistics() noexcept;
+
+    [[nodiscard]] bool SelfTest() noexcept;
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
-    SandboxAnalyzer();
+    SandboxAnalyzer() noexcept;
     ~SandboxAnalyzer();
-    
-    std::unique_ptr<SandboxAnalyzerImpl> m_impl;
-    static std::atomic<bool> s_instanceCreated;
+
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetSandboxEnvironmentName(SandboxEnvironment env) noexcept;
-[[nodiscard]] std::string_view GetGuestOSTypeName(GuestOSType os) noexcept;
-[[nodiscard]] std::string_view GetAnalysisStatusName(AnalysisStatus status) noexcept;
-[[nodiscard]] std::string_view GetThreatScoreLevelName(ThreatScoreLevel level) noexcept;
-[[nodiscard]] std::string_view GetBehaviorCategoryName(BehaviorCategory category) noexcept;
-
-/// @brief Calculate threat score level from numeric score
-[[nodiscard]] ThreatScoreLevel CalculateThreatLevel(int score);
-
-/// @brief Check if Hyper-V is available
-[[nodiscard]] bool IsHyperVAvailable();
+[[nodiscard]] const wchar_t* SandboxEnvironmentToString(SandboxEnvironment env) noexcept;
+[[nodiscard]] const wchar_t* GuestOSTypeToString(GuestOSType os) noexcept;
+[[nodiscard]] const wchar_t* AnalysisStatusToString(AnalysisStatus status) noexcept;
+[[nodiscard]] const wchar_t* ThreatScoreLevelToString(ThreatScoreLevel level) noexcept;
+[[nodiscard]] ThreatScoreLevel CalculateThreatLevel(int score) noexcept;
+[[nodiscard]] bool IsHyperVAvailable() noexcept;
 
 }  // namespace Engine
 }  // namespace Core
