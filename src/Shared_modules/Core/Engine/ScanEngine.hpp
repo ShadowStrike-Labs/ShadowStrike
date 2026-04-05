@@ -597,9 +597,9 @@ struct EngineConfig {
 // ============================================================================
 
 using ScanProgressCallback = std::function<void(const ScanProgress&)>;
-using DetectionCallback = std::function<void(const EngineResult&)>;
+using ScanDetectionCallback = std::function<void(const EngineResult&)>;
 using ScanCompleteCallback = std::function<void(const ScanStatistics&)>;
-using ErrorCallback = std::function<void(const std::wstring& error, uint32_t errorCode)>;
+using ScanErrorCallback = std::function<void(const std::wstring& error, uint32_t errorCode)>;
 
 // ============================================================================
 // SCAN ENGINE CLASS
@@ -914,7 +914,7 @@ public:
      * @brief Register detection callback.
      * @return Callback ID for unregistration.
      */
-    [[nodiscard]] uint64_t RegisterDetectionCallback(DetectionCallback callback);
+    [[nodiscard]] uint64_t RegisterDetectionCallback(ScanDetectionCallback callback);
 
     /**
      * @brief Unregister detection callback.
@@ -934,7 +934,7 @@ public:
     /**
      * @brief Register error callback.
      */
-    [[nodiscard]] uint64_t RegisterErrorCallback(ErrorCallback callback);
+    [[nodiscard]] uint64_t RegisterErrorCallback(ScanErrorCallback callback);
 
     /**
      * @brief Unregister error callback.

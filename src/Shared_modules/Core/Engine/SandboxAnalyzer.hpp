@@ -501,7 +501,10 @@ struct SandboxAnalyzerConfiguration {
 
 using AnalysisProgressCallback = std::function<void(const std::string& taskId, uint32_t progress, const std::string& status)>;
 using AnalysisCompleteCallback = std::function<void(const std::string& taskId, const SandboxVerdict& verdict)>;
+#ifndef SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
+#define SHADOWSTRIKE_ENGINE_ERROR_CALLBACK_DEFINED
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
+#endif
 
 // ============================================================================
 // SANDBOX ANALYZER CLASS

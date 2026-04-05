@@ -164,9 +164,9 @@ public:
         std::function<void()> callback;
     };
     std::atomic<uint64_t> m_nextCallbackId{1};
-    std::unordered_map<uint64_t, DetectionCallback> m_detectionCallbacks;
+    std::unordered_map<uint64_t, ScanDetectionCallback> m_detectionCallbacks;
     std::unordered_map<uint64_t, ScanCompleteCallback> m_completeCallbacks;
-    std::unordered_map<uint64_t, ErrorCallback> m_errorCallbacks;
+    std::unordered_map<uint64_t, ScanErrorCallback> m_errorCallbacks;
 
     // Job management
     std::atomic<uint64_t> m_nextJobId{1};
@@ -2359,7 +2359,7 @@ bool ScanEngine::IsExcluded(const std::wstring& path) const {
 // CALLBACKS
 // ============================================================================
 
-uint64_t ScanEngine::RegisterDetectionCallback(DetectionCallback callback) {
+uint64_t ScanEngine::RegisterDetectionCallback(ScanDetectionCallback callback) {
     if (!callback) return 0;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -2407,7 +2407,7 @@ bool ScanEngine::UnregisterCompleteCallback(uint64_t callbackId) {
     return false;
 }
 
-uint64_t ScanEngine::RegisterErrorCallback(ErrorCallback callback) {
+uint64_t ScanEngine::RegisterErrorCallback(ScanErrorCallback callback) {
     if (!callback) return 0;
 
     std::unique_lock lock(m_impl->m_callbackMutex);

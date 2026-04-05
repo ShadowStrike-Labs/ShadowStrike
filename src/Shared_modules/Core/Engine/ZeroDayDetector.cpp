@@ -93,7 +93,7 @@ public:
     ZeroDayConfiguration       m_config;
     ZeroDayStatistics          m_stats;
 
-    DetectionCallback m_detectionCallback;
+    ZeroDayDetectionCallback m_detectionCallback;
     ErrorCallback     m_errorCallback;
 
     struct ShellcodePattern {
@@ -1185,7 +1185,7 @@ std::optional<CVEMatch> ZeroDayDetector::GetCVEInfo(const std::string& cveId) {
 // PUBLIC API: CALLBACKS / STATS / SELF-TEST
 // ============================================================================
 
-void ZeroDayDetector::RegisterDetectionCallback(DetectionCallback cb) {
+void ZeroDayDetector::RegisterDetectionCallback(ZeroDayDetectionCallback cb) {
     if (!m_impl) return;
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_detectionCallback = std::move(cb);
