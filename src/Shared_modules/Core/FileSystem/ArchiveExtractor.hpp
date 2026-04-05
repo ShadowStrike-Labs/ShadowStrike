@@ -133,6 +133,7 @@
 #include <atomic>
 #include <shared_mutex>
 #include <span>
+#include <filesystem>
 
 namespace ShadowStrike {
 namespace Core {
@@ -286,11 +287,25 @@ enum class SecurityFlag : uint32_t {
 };
 
 // Enable bitwise operations
-inline SecurityFlag operator|(SecurityFlag a, SecurityFlag b) {
+inline SecurityFlag operator|(SecurityFlag a, SecurityFlag b) noexcept {
     return static_cast<SecurityFlag>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
-inline SecurityFlag operator&(SecurityFlag a, SecurityFlag b) {
+inline SecurityFlag operator&(SecurityFlag a, SecurityFlag b) noexcept {
     return static_cast<SecurityFlag>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+inline SecurityFlag& operator|=(SecurityFlag& a, SecurityFlag b) noexcept {
+    a = a | b;
+    return a;
+}
+inline SecurityFlag& operator&=(SecurityFlag& a, SecurityFlag b) noexcept {
+    a = a & b;
+    return a;
+}
+inline SecurityFlag operator~(SecurityFlag a) noexcept {
+    return static_cast<SecurityFlag>(~static_cast<uint32_t>(a));
+}
+[[nodiscard]] inline bool HasFlag(SecurityFlag flags, SecurityFlag test) noexcept {
+    return (static_cast<uint32_t>(flags) & static_cast<uint32_t>(test)) != 0;
 }
 
 // ============================================================================
@@ -523,21 +538,25 @@ struct alignas(64) ArchiveExtractorConfig {
 
 /**
  * @struct ArchiveExtractorStatistics
- * @brief Runtime statistics.
+ * @brief Runtime statistics snapshot (copyable, returned to callers).
+ *
+ * Internal counters use std::atomic; this struct captures a point-in-time
+ * snapshot with plain integers so callers can copy/serialize freely.
  */
-struct alignas(128) ArchiveExtractorStatistics {
-    std::atomic<uint64_t> archivesProcessed{ 0 };
-    std::atomic<uint64_t> entriesExtracted{ 0 };
-    std::atomic<uint64_t> bytesExtracted{ 0 };
+struct alignas(64) ArchiveExtractorStatistics {
+    uint64_t archivesProcessed{ 0 };
+    uint64_t entriesExtracted{ 0 };
+    uint64_t bytesExtracted{ 0 };
 
-    std::atomic<uint64_t> zipBombsDetected{ 0 };
-    std::atomic<uint64_t> pathTraversalsBlocked{ 0 };
-    std::atomic<uint64_t> encryptedSkipped{ 0 };
+    uint64_t zipBombsDetected{ 0 };
+    uint64_t pathTraversalsBlocked{ 0 };
+    uint64_t encryptedSkipped{ 0 };
 
-    std::atomic<uint64_t> nestedArchives{ 0 };
-    std::atomic<uint64_t> extractionErrors{ 0 };
+    uint64_t nestedArchives{ 0 };
+    uint64_t extractionErrors{ 0 };
 
-    void Reset() noexcept;
+    uint64_t cacheHits{ 0 };
+    uint64_t cacheMisses{ 0 };
 };
 
 // ============================================================================
@@ -557,7 +576,7 @@ using StreamCallback = std::function<bool(const ArchiveEntry& entry, std::span<c
 /**
  * @brief Callback for progress updates.
  */
-using ProgressCallback = std::function<void(const ExtractionProgress& progress)>;
+using ArchiveProgressCallback = std::function<void(const ExtractionProgress& progress)>;
 
 /**
  * @brief Callback for password request.
@@ -802,7 +821,7 @@ public:
     // CALLBACKS
     // ========================================================================
 
-    void SetProgressCallback(ProgressCallback callback);
+    void SetProgressCallback(ArchiveProgressCallback callback);
     void SetSecurityCallback(SecurityCallback callback);
 
     // ========================================================================
@@ -824,8 +843,44 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] const ArchiveExtractorStatistics& GetStatistics() const noexcept;
+    [[nodiscard]] ArchiveExtractorStatistics GetStatistics() const noexcept;
     void ResetStatistics() noexcept;
+
+    // ========================================================================
+    // KERNEL INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Handles an archive scan request originating from the kernel.
+     *
+     * When the kernel minifilter detects a file open/write on an archive,
+     * this method is invoked to extract and scan every entry, returning
+     * a composite verdict suitable for the kernel reply.
+     *
+     * @param filePath  Full path to the archive file.
+     * @param processId PID of the process that triggered the file access.
+     * @param scanCallback Per-entry scan callback returning true if entry is clean.
+     * @return True if archive is entirely clean; false if any entry is malicious.
+     */
+    [[nodiscard]] bool HandleKernelScanRequest(
+        const std::wstring& filePath,
+        uint32_t processId,
+        std::function<bool(const ArchiveEntry& entry, std::span<const uint8_t> data)> scanCallback);
+
+    /**
+     * @brief Quick pre-scan check for use in real-time filtering hot path.
+     *
+     * Performs lightweight security checks (format detection, zip bomb
+     * heuristics, metadata-only analysis) without full extraction.
+     * Designed to complete in < 5ms for the kernel verdict path.
+     *
+     * @param filePath Path to the archive.
+     * @param fileSize Known file size (from kernel).
+     * @return SecurityFlag bitmask with detected issues.
+     */
+    [[nodiscard]] SecurityFlag QuickSecurityCheck(
+        const std::wstring& filePath,
+        uint64_t fileSize) const;
 
 private:
     ArchiveExtractor();
