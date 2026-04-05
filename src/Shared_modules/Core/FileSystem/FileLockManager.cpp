@@ -270,6 +270,7 @@ public:
     [[nodiscard]] std::vector<LockOwner> GetLockingProcesses(const std::wstring& filePath) const {
         std::shared_lock lock(m_mutex);
         std::vector<LockOwner> owners;
+        if (!m_initialized || filePath.empty()) return owners;
         try {
             auto np = NormalizePath(filePath);
             if (np.empty()) return owners;
@@ -303,6 +304,7 @@ public:
         auto t0 = std::chrono::steady_clock::now();
         FileLockInfo info;
         info.filePath = filePath;
+        if (!m_initialized || filePath.empty()) return info;
         try {
             std::error_code ec;
             if (!fs::exists(filePath, ec)) { info.fileExists = false; return info; }
@@ -327,6 +329,7 @@ public:
     }
 
     [[nodiscard]] bool IsFileLocked(const std::wstring& filePath) const {
+        if (filePath.empty()) return false;
         try {
             ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
             if (hFile.IsValid()) return false;
@@ -336,6 +339,7 @@ public:
     }
 
     [[nodiscard]] bool CanDeleteFile(const std::wstring& filePath) const {
+        if (filePath.empty()) return false;
         try {
             ScopedHandle h(CreateFileW(filePath.c_str(), DELETE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
             return h.IsValid();
@@ -343,6 +347,7 @@ public:
     }
 
     [[nodiscard]] LockType GetLockType(const std::wstring& filePath) const {
+        if (filePath.empty()) return LockType::Unknown;
         try {
             ScopedHandle hr(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr));
             ScopedHandle hw(CreateFileW(filePath.c_str(), GENERIC_WRITE, FILE_SHARE_WRITE, nullptr, OPEN_EXISTING, 0, nullptr));
@@ -360,6 +365,11 @@ public:
         auto t0 = std::chrono::steady_clock::now();
         UnlockOperation result;
         result.filePath = filePath;
+        if (!m_initialized || filePath.empty()) {
+            result.result = UnlockResult::Failed;
+            result.errors.push_back("FileLockManager not initialized or empty path");
+            return result;
+        }
         try {
             ReportProgress(std::wstring{L"Detecting file locks"}, 10u);
             if (!IsFileLocked(filePath)) { result.result = UnlockResult::NotLocked; return result; }
@@ -427,6 +437,11 @@ public:
 
     [[nodiscard]] UnlockOperation UnlockFile(const std::wstring& filePath, UnlockMethod method) {
         UnlockOperation result; result.filePath = filePath; result.method = method;
+        if (!m_initialized || filePath.empty()) {
+            result.result = UnlockResult::Failed;
+            result.errors.push_back("FileLockManager not initialized or empty path");
+            return result;
+        }
         try {
             switch (method) {
             case UnlockMethod::HandleClose: { auto o = GetLockingProcesses(filePath); result.result = TryHandleClose(o, result) ? UnlockResult::Success : UnlockResult::Failed; break; }
@@ -448,6 +463,11 @@ public:
 
     [[nodiscard]] UnlockOperation ForceUnlockFile(const std::wstring& filePath) {
         UnlockOperation result; result.filePath = filePath;
+        if (!m_initialized || filePath.empty()) {
+            result.result = UnlockResult::Failed;
+            result.errors.push_back("FileLockManager not initialized or empty path");
+            return result;
+        }
         try {
             auto owners = GetLockingProcesses(filePath); bool unlocked = false;
             if (TryHandleClose(owners, result) && !IsFileLocked(filePath)) unlocked = true;
@@ -498,7 +518,11 @@ public:
         try {
             if (owner.isCriticalProcess && !force) return false;
             if (owner.isSystemProcess && m_config.protectSystemProcesses && !force) return false;
-            if (m_terminateCallback && !force && !m_terminateCallback(owner)) return false;
+            {
+                TerminateCallback cb;
+                { std::lock_guard lk(m_callbackMutex); cb = m_terminateCallback; }
+                if (cb && !force && !cb(owner)) return false;
+            }
             ScopedHandle hProcess(OpenProcess(PROCESS_TERMINATE, FALSE, owner.pid));
             if (!hProcess) return false;
             if (::TerminateProcess(hProcess.Get(), 1)) {
@@ -595,9 +619,11 @@ public:
         try {
             std::lock_guard kernelLock(m_kernelMutex);
             if (!m_kernelDriverAvailable || !m_kernelPortConnected) { if (!ConnectToKernelDriverInternalLocked()) return false; }
-            KernelProtocol::QueryLocksRequest req{};
+            KernelProtocol::ForceCloseRequest req{};
             req.header.command = static_cast<uint32_t>(KernelProtocol::Command::ForceCloseHandle);
             req.header.dataLength = sizeof(req) - sizeof(req.header);
+            req.targetPid = 0;    // 0 signals kernel to close all process handles for this file
+            req.handleValue = 0;  // 0 signals kernel to close all handles (not a specific one)
             size_t pl = std::min(filePath.length(), static_cast<size_t>(_countof(req.filePath) - 1));
             wcsncpy_s(req.filePath, filePath.c_str(), pl);
             KernelProtocol::ForceCloseResponse resp{}; DWORD bytesRet = 0;
@@ -646,10 +672,17 @@ public:
 
     [[nodiscard]] std::wstring NormalizePath(const std::wstring& path) const {
         try {
-            if (path.empty()) return {};
-            WCHAR buf[MAX_PATH * 2] = { 0 };
-            DWORD len = GetFullPathNameW(path.c_str(), _countof(buf), buf, nullptr);
-            if (len > 0 && len < _countof(buf)) return std::wstring(buf, len);
+            if (path.empty() || path.length() > 32767) return {};
+            // Two-pass GetFullPathNameW: first call gets required buffer size
+            DWORD len = GetFullPathNameW(path.c_str(), 0, nullptr, nullptr);
+            if (len == 0) return path;
+            if (len > 32768) return {};
+            std::wstring result(static_cast<size_t>(len), L'\0');
+            DWORD written = GetFullPathNameW(path.c_str(), len, result.data(), nullptr);
+            if (written > 0 && written < len) {
+                result.resize(written);
+                return result;
+            }
             return path;
         } catch (...) { return path; }
     }
@@ -984,7 +1017,9 @@ public:
     }
 
     void ReportProgress(const std::wstring& stage, uint32_t pct) const {
-        if (m_progressCallback) m_progressCallback(stage, pct);
+        UnlockProgressCallback cb;
+        { std::lock_guard lk(m_callbackMutex); cb = m_progressCallback; }
+        if (cb) cb(stage, pct);
     }
     // ========================================================================
     // HANDLE ENUMERATION ENHANCED
@@ -995,12 +1030,47 @@ public:
     }
 
     // ========================================================================
+    // THREAD-SAFE CONFIGURATION & CALLBACK SETTERS
+    // ========================================================================
+
+    void SetAllowProcessTerminationOp(bool allow) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_config.allowProcessTermination = allow;
+    }
+
+    void SetProtectSystemProcessesOp(bool protect) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_config.protectSystemProcesses = protect;
+    }
+
+    void DisconnectKernelDriverOp() noexcept {
+        std::lock_guard lk(m_kernelMutex);
+        DisconnectFromKernelDriverInternal();
+    }
+
+    void SetTerminateCallbackOp(TerminateCallback cb) {
+        std::lock_guard lk(m_callbackMutex);
+        m_terminateCallback = std::move(cb);
+    }
+
+    void SetProgressCallbackOp(UnlockProgressCallback cb) {
+        std::lock_guard lk(m_callbackMutex);
+        m_progressCallback = std::move(cb);
+    }
+
+    void SetLockEventCallbackOp(LockEventCallback cb) {
+        std::lock_guard lk(m_callbackMutex);
+        m_lockEventCallback = std::move(cb);
+    }
+
+    // ========================================================================
     // MEMBER VARIABLES
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_pendingMutex;
     std::mutex m_kernelMutex; // Protects kernel port connect/disconnect/send
+    mutable std::mutex m_callbackMutex; // Protects callback function objects
     FileLockManagerConfig m_config{};
     bool m_initialized = false;
     bool m_hasDebugPrivilege = false;
@@ -1133,9 +1203,14 @@ FileLockManagerStatistics FileLockManager::GetStatistics() const noexcept {
     return m_impl->m_stats.Snapshot();
 }
 
-void FileLockManager::SetTerminateCallback(TerminateCallback cb) { m_impl->m_terminateCallback = std::move(cb); }
-void FileLockManager::SetProgressCallback(UnlockProgressCallback cb) { m_impl->m_progressCallback = std::move(cb); }
-void FileLockManager::SetLockEventCallback(LockEventCallback cb) { m_impl->m_lockEventCallback = std::move(cb); }
+void FileLockManager::SetTerminateCallback(TerminateCallback cb) { m_impl->SetTerminateCallbackOp(std::move(cb)); }
+void FileLockManager::SetProgressCallback(UnlockProgressCallback cb) { m_impl->SetProgressCallbackOp(std::move(cb)); }
+void FileLockManager::SetLockEventCallback(LockEventCallback cb) { m_impl->SetLockEventCallbackOp(std::move(cb)); }
+
+void FileLockManager::DisconnectKernelDriver() noexcept { m_impl->DisconnectKernelDriverOp(); }
+void FileLockManager::SetAllowProcessTermination(bool allow) noexcept { m_impl->SetAllowProcessTerminationOp(allow); }
+void FileLockManager::SetProtectSystemProcesses(bool protect) noexcept { m_impl->SetProtectSystemProcessesOp(protect); }
+void FileLockManager::ResetStatistics() noexcept { m_impl->m_stats.Reset(); }
 
 } // namespace FileSystem
 } // namespace Core
