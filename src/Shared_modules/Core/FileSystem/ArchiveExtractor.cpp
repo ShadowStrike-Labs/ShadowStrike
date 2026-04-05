@@ -247,6 +247,49 @@ namespace {
 } // anonymous namespace
 
 // ============================================================================
+// RAII FILE HANDLE GUARD
+// ============================================================================
+
+namespace {
+
+    /// RAII wrapper for Win32 HANDLE — prevents leaks on all exit paths.
+    struct ScopedHandle {
+        HANDLE h{ INVALID_HANDLE_VALUE };
+
+        explicit ScopedHandle(HANDLE handle = INVALID_HANDLE_VALUE) noexcept
+            : h(handle) {}
+
+        ~ScopedHandle() noexcept {
+            if (h != INVALID_HANDLE_VALUE) {
+                CloseHandle(h);
+            }
+        }
+
+        ScopedHandle(const ScopedHandle&) = delete;
+        ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+        ScopedHandle(ScopedHandle&& other) noexcept : h(other.h) {
+            other.h = INVALID_HANDLE_VALUE;
+        }
+        ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+            if (this != &other) {
+                if (h != INVALID_HANDLE_VALUE) CloseHandle(h);
+                h = other.h;
+                other.h = INVALID_HANDLE_VALUE;
+            }
+            return *this;
+        }
+
+        [[nodiscard]] bool valid() const noexcept {
+            return h != INVALID_HANDLE_VALUE;
+        }
+        [[nodiscard]] explicit operator bool() const noexcept { return valid(); }
+        [[nodiscard]] HANDLE get() const noexcept { return h; }
+    };
+
+} // anonymous namespace
+
+// ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
 
@@ -319,6 +362,11 @@ namespace {
 
         // Reject "." components (current dir traversal in some parsers)
         // Allow empty components (double slash) — harmless, just skip
+
+        // Reject trailing dots/spaces — Windows silently strips these,
+        // enabling evasion (e.g., "evil.exe." resolves to "evil.exe")
+        if (!component.empty() &&
+            (component.back() == L'.' || component.back() == L' ')) return false;
 
         // Reject reserved device names
         if (!component.empty() && IsReservedDeviceName(component)) return false;
@@ -600,27 +648,21 @@ public:
     [[nodiscard]] ArchiveFormat DetectFormat(const std::wstring& filePath) const {
         try {
             // Read header bytes first — magic bytes take priority over extension
-            HANDLE hFile = CreateFileW(
+            ScopedHandle hFile(CreateFileW(
                 filePath.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_DELETE,
                 nullptr, OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
 
-            if (hFile == INVALID_HANDLE_VALUE) {
+            if (!hFile) {
                 SS_LOG_DEBUG(L"ArchiveExtractor",
                     L"Cannot open file for format detection: 0x%08X",
                     GetLastError());
                 return ArchiveFormat::Unknown;
             }
 
-            // RAII handle wrapper
-            struct HandleGuard {
-                HANDLE h;
-                ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) CloseHandle(h); }
-            } guard{ hFile };
-
             // Get file size for validation
             LARGE_INTEGER fileSize{};
-            if (!GetFileSizeEx(hFile, &fileSize) || fileSize.QuadPart < 4) {
+            if (!GetFileSizeEx(hFile.get(), &fileSize) || fileSize.QuadPart < 4) {
                 return ArchiveFormat::Unknown;
             }
 
@@ -631,7 +673,7 @@ public:
 
             std::vector<uint8_t> headerBuf(readSize, 0);
             DWORD bytesRead = 0;
-            if (!ReadFile(hFile, headerBuf.data(),
+            if (!ReadFile(hFile.get(), headerBuf.data(),
                           static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
                 return ArchiveFormat::Unknown;
             }
@@ -848,6 +890,47 @@ public:
 
             // Skip extra field and comment
             if (pos + cde.extraFieldLength + cde.commentLength > bytesRead) break;
+
+            // Parse Zip64 extended information extra field (header ID 0x0001)
+            // before advancing past extra data.  Per APPNOTE 4.5.3, the 64-bit
+            // values appear in the extra field only when the corresponding
+            // 32-bit CDE field is 0xFFFFFFFF (or 0xFFFF for disk number).
+            uint64_t z64UncompSize   = cde.uncompressedSize;
+            uint64_t z64CompSize     = cde.compressedSize;
+            uint64_t z64LocalOffset  = cde.localHeaderOffset;
+
+            if (cde.extraFieldLength >= 4) {
+                const uint8_t* extra = cdBuf.data() + pos;
+                size_t extraLen = cde.extraFieldLength;
+                size_t ePos = 0;
+
+                while (ePos + 4 <= extraLen) {
+                    uint16_t headerId = 0, dataSize = 0;
+                    std::memcpy(&headerId, extra + ePos, 2);
+                    std::memcpy(&dataSize, extra + ePos + 2, 2);
+                    ePos += 4;
+                    if (ePos + dataSize > extraLen) break;
+
+                    if (headerId == 0x0001) {
+                        size_t fPos = 0;
+                        if (cde.uncompressedSize == 0xFFFFFFFF && fPos + 8 <= dataSize) {
+                            std::memcpy(&z64UncompSize, extra + ePos + fPos, 8);
+                            fPos += 8;
+                        }
+                        if (cde.compressedSize == 0xFFFFFFFF && fPos + 8 <= dataSize) {
+                            std::memcpy(&z64CompSize, extra + ePos + fPos, 8);
+                            fPos += 8;
+                        }
+                        if (cde.localHeaderOffset == 0xFFFFFFFF && fPos + 8 <= dataSize) {
+                            std::memcpy(&z64LocalOffset, extra + ePos + fPos, 8);
+                            fPos += 8;
+                        }
+                        break;
+                    }
+                    ePos += dataSize;
+                }
+            }
+
             pos += cde.extraFieldLength + cde.commentLength;
 
             // Build entry
@@ -855,8 +938,8 @@ public:
             entry.entryId = entryId++;
             entry.path = Utils::StringUtils::ToWide(nameUtf8);
             entry.filename = fs::path(entry.path).filename().wstring();
-            entry.compressedSize = cde.compressedSize;
-            entry.uncompressedSize = cde.uncompressedSize;
+            entry.compressedSize = z64CompSize;
+            entry.uncompressedSize = z64UncompSize;
             entry.crc32 = cde.crc32;
             entry.isEncrypted = (cde.flags & ZIP_FLAG_ENCRYPTED) != 0;
             entry.isDirectory = !nameUtf8.empty() && (nameUtf8.back() == '/');
@@ -895,9 +978,9 @@ public:
             }
 
             // Overlapping entry detection (with overflow-safe arithmetic)
-            uint64_t entryStart = cde.localHeaderOffset;
+            uint64_t entryStart = z64LocalOffset;
             uint64_t addend = static_cast<uint64_t>(sizeof(ZipLocalFileHeader)) +
-                              cde.fileNameLength + cde.extraFieldLength + cde.compressedSize;
+                              cde.fileNameLength + cde.extraFieldLength + z64CompSize;
             uint64_t entryEnd = (entryStart > UINT64_MAX - addend)
                 ? UINT64_MAX : entryStart + addend;
             for (const auto& [rStart, rEnd] : entryRanges) {
@@ -965,14 +1048,13 @@ public:
 
             // For ZIP, parse central directory to get real metadata
             if (info.format == ArchiveFormat::ZIP) {
-                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
 
-                if (hFile != INVALID_HANDLE_VALUE) {
+                if (hFile) {
                     auto entries = ParseZipCentralDirectory(
-                        hFile, info.fileSize, ExtractionOptions::CreateDefault());
-                    CloseHandle(hFile);
+                        hFile.get(), info.fileSize, ExtractionOptions::CreateDefault());
 
                     info.totalEntries = static_cast<uint32_t>(entries.size());
                     info.fileCount = 0;
@@ -987,8 +1069,11 @@ public:
                         } else {
                             info.fileCount++;
                         }
-                        info.totalCompressedSize += entry.compressedSize;
-                        info.totalUncompressedSize += entry.uncompressedSize;
+                        // Overflow-safe accumulation — cap at UINT64_MAX
+                        if (info.totalCompressedSize <= UINT64_MAX - entry.compressedSize)
+                            info.totalCompressedSize += entry.compressedSize;
+                        if (info.totalUncompressedSize <= UINT64_MAX - entry.uncompressedSize)
+                            info.totalUncompressedSize += entry.uncompressedSize;
                         if (entry.isEncrypted) hasEncrypted = true;
                         info.securityFlags |= entry.securityFlags;
                         if (entry.isSuspicious) info.isSuspicious = true;
@@ -1056,22 +1141,26 @@ public:
             if (ec || fileSize == 0) return entries;
 
             if (format == ArchiveFormat::ZIP) {
-                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
 
-                if (hFile == INVALID_HANDLE_VALUE) {
+                if (!hFile) {
                     SS_LOG_ERROR(L"ArchiveExtractor",
                         L"Cannot open archive '%ls': 0x%08X",
                         filePath.c_str(), GetLastError());
                     return entries;
                 }
 
-                entries = ParseZipCentralDirectory(hFile, fileSize, options);
-                CloseHandle(hFile);
+                entries = ParseZipCentralDirectory(hFile.get(), fileSize, options);
+            } else {
+                // Non-ZIP formats: content listing not yet implemented.
+                // Format was detected — log explicitly so callers know why
+                // the entry list is empty.
+                SS_LOG_INFO(L"ArchiveExtractor",
+                    L"Content listing not yet implemented for %hs format: '%ls'",
+                    GetFormatName(format).c_str(), filePath.c_str());
             }
-            // Other formats: report format detected but entries not enumerable
-            // without the corresponding library (RAR, 7z, etc.)
 
             m_stats.archivesProcessed.fetch_add(1, std::memory_order_relaxed);
 
@@ -1098,12 +1187,12 @@ public:
             uint64_t fileSize = fs::file_size(filePath, ec);
             if (ec || fileSize < sizeof(ZipEndOfCentralDir)) return false;
 
-            HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+            ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-            if (hFile == INVALID_HANDLE_VALUE) return false;
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+            if (!hFile) return false;
 
-            auto entries = ParseZipCentralDirectory(hFile, fileSize,
+            auto entries = ParseZipCentralDirectory(hFile.get(), fileSize,
                 ExtractionOptions::CreateDefault());
 
             // Verify structural integrity: check each local file header is reachable
@@ -1117,11 +1206,11 @@ public:
             const size_t searchLen = static_cast<size_t>(
                 std::min(static_cast<uint64_t>(EOCD_VERIFY_SIZE), fileSize));
             cdSeek.QuadPart = static_cast<LONGLONG>(fileSize - searchLen);
-            SetFilePointerEx(hFile, cdSeek, nullptr, FILE_BEGIN);
+            SetFilePointerEx(hFile.get(), cdSeek, nullptr, FILE_BEGIN);
             
             std::vector<uint8_t> searchBuf(searchLen);
             DWORD searchRead = 0;
-            ReadFile(hFile, searchBuf.data(), static_cast<DWORD>(searchLen), &searchRead, nullptr);
+            ReadFile(hFile.get(), searchBuf.data(), static_cast<DWORD>(searchLen), &searchRead, nullptr);
             
             uint64_t cdOffset = 0;
             bool foundEOCD = false;
@@ -1133,21 +1222,44 @@ public:
                     ZipEndOfCentralDir eocd{};
                     std::memcpy(&eocd, searchBuf.data() + i, sizeof(eocd));
                     cdOffset = eocd.centralDirOffset;
+
+                    // Handle Zip64: if offset is 0xFFFFFFFF, look for Zip64 EOCD locator
+                    if (cdOffset == 0xFFFFFFFF &&
+                        i >= static_cast<int64_t>(sizeof(Zip64EndOfCentralDirLocator))) {
+                        Zip64EndOfCentralDirLocator locator{};
+                        std::memcpy(&locator, searchBuf.data() + i - sizeof(locator), sizeof(locator));
+                        if (locator.signature == ZIP_ZIP64_EOCD_LOCATOR_SIG) {
+                            LARGE_INTEGER z64Seek{};
+                            z64Seek.QuadPart = static_cast<LONGLONG>(locator.zip64EOCDOffset);
+                            if (SetFilePointerEx(hFile.get(), z64Seek, nullptr, FILE_BEGIN)) {
+                                Zip64EndOfCentralDir z64eocd{};
+                                DWORD z64Read = 0;
+                                if (ReadFile(hFile.get(), &z64eocd, sizeof(z64eocd), &z64Read, nullptr)
+                                    && z64Read >= sizeof(z64eocd)
+                                    && z64eocd.signature == ZIP_ZIP64_EOCD_SIG) {
+                                    cdOffset = z64eocd.centralDirOffset;
+                                }
+                            }
+                        }
+                    }
+
                     foundEOCD = true;
                     break;
                 }
             }
-            if (!foundEOCD) { CloseHandle(hFile); return false; }
-            
+            if (!foundEOCD) return false;
+
+            if (cdOffset >= fileSize) return false;
+
             cdSeek.QuadPart = static_cast<LONGLONG>(cdOffset);
-            SetFilePointerEx(hFile, cdSeek, nullptr, FILE_BEGIN);
+            SetFilePointerEx(hFile.get(), cdSeek, nullptr, FILE_BEGIN);
             
             // Read central directory
             const size_t safeLen = static_cast<size_t>(
                 std::min(fileSize - cdOffset, static_cast<uint64_t>(256 * 1024 * 1024)));
             std::vector<uint8_t> cdData(safeLen);
             DWORD cdRead = 0;
-            ReadFile(hFile, cdData.data(), static_cast<DWORD>(safeLen), &cdRead, nullptr);
+            ReadFile(hFile.get(), cdData.data(), static_cast<DWORD>(safeLen), &cdRead, nullptr);
             
             size_t cdPos = 0;
             uint32_t verified = 0;
@@ -1157,23 +1269,51 @@ public:
                 ZipCentralDirEntry cde{};
                 std::memcpy(&cde, cdData.data() + cdPos, sizeof(cde));
                 if (cde.signature != ZIP_CENTRAL_SIG) break;
-                
+
+                // Parse Zip64 local header offset from extra field
+                uint64_t localOffset = cde.localHeaderOffset;
+                if (cde.localHeaderOffset == 0xFFFFFFFF) {
+                    size_t extraStart = cdPos + sizeof(cde) + cde.fileNameLength;
+                    if (extraStart + cde.extraFieldLength <= cdRead) {
+                        const uint8_t* extra = cdData.data() + extraStart;
+                        size_t ePos = 0;
+                        while (ePos + 4 <= cde.extraFieldLength) {
+                            uint16_t hId = 0, dSz = 0;
+                            std::memcpy(&hId, extra + ePos, 2);
+                            std::memcpy(&dSz, extra + ePos + 2, 2);
+                            ePos += 4;
+                            if (ePos + dSz > cde.extraFieldLength) break;
+                            if (hId == 0x0001) {
+                                // Skip uncompressed/compressed size fields to reach offset
+                                size_t fPos = 0;
+                                if (cde.uncompressedSize == 0xFFFFFFFF) fPos += 8;
+                                if (cde.compressedSize == 0xFFFFFFFF) fPos += 8;
+                                if (fPos + 8 <= dSz) {
+                                    std::memcpy(&localOffset, extra + ePos + fPos, 8);
+                                }
+                                break;
+                            }
+                            ePos += dSz;
+                        }
+                    }
+                }
+
                 cdPos += sizeof(cde) + cde.fileNameLength + cde.extraFieldLength + cde.commentLength;
                 if (cdPos > cdRead) break;
                 
                 // Verify local file header signature
-                if (cde.localHeaderOffset < fileSize) {
+                if (localOffset < fileSize) {
                     LARGE_INTEGER lfhSeek{};
-                    lfhSeek.QuadPart = cde.localHeaderOffset;
-                    if (SetFilePointerEx(hFile, lfhSeek, nullptr, FILE_BEGIN)) {
+                    lfhSeek.QuadPart = static_cast<LONGLONG>(localOffset);
+                    if (SetFilePointerEx(hFile.get(), lfhSeek, nullptr, FILE_BEGIN)) {
                         uint32_t lfhSig = 0;
                         DWORD lfhRead = 0;
-                        if (ReadFile(hFile, &lfhSig, 4, &lfhRead, nullptr) && lfhRead == 4) {
+                        if (ReadFile(hFile.get(), &lfhSig, 4, &lfhRead, nullptr) && lfhRead == 4) {
                             if (lfhSig != ZIP_LOCAL_SIG) {
                                 allValid = false;
                                 SS_LOG_WARN(L"ArchiveExtractor",
                                     L"Integrity: invalid LFH signature at offset %llu",
-                                    static_cast<uint64_t>(cde.localHeaderOffset));
+                                    localOffset);
                             }
                         }
                     }
@@ -1183,7 +1323,6 @@ public:
                 verified++;
             }
 
-            CloseHandle(hFile);
             return allValid && !entries.empty();
 
         } catch (const std::exception& e) {
@@ -1202,6 +1341,15 @@ public:
         size_t nameLen, const ExtractionOptions& options) const {
 
         std::vector<uint8_t> result;
+
+        // Reject encrypted entries — decompressing encrypted data without
+        // decryption produces garbage and wastes resources.
+        if ((cde.flags & ZIP_FLAG_ENCRYPTED) != 0 ||
+            (cde.flags & ZIP_FLAG_STRONG_ENCRYPTION) != 0) {
+            SS_LOG_DEBUG(L"ArchiveExtractor",
+                L"Skipping encrypted entry (flags=0x%04X)", cde.flags);
+            return result;
+        }
 
         // Seek to local file header
         LARGE_INTEGER seekPos{};
@@ -1244,8 +1392,14 @@ public:
             result.resize(bytesRead);
 
         } else if (cde.compressionMethod == ZIP_DEFLATE) {
-            // Deflate — use Windows Compression API
-            if (compSize > 256 * 1024 * 1024) return result; // 256MB compressed limit
+            // NOTE: MSZIP (Windows Compression API) wraps deflate blocks with a
+            // 2-byte 'CK' header.  Standard ZIP files use raw RFC 1951 deflate.
+            // This means MSZIP decompression may fail on most standard ZIP entries.
+            // For full compatibility, integrate a raw deflate codec (e.g., zlib or
+            // miniz).  Until then, decompression failures are expected and handled
+            // gracefully below.
+            constexpr uint64_t MAX_COMPRESSED_ENTRY = 256ULL * 1024 * 1024;
+            if (compSize > MAX_COMPRESSED_ENTRY) return result;
 
             std::vector<uint8_t> compressed(static_cast<size_t>(compSize));
             if (!ReadFile(hFile, compressed.data(),
@@ -1253,9 +1407,7 @@ public:
                 return result;
             }
 
-            // Windows Compression API doesn't support raw deflate directly.
-            // For production, we'd use zlib or the MS-ZIP variant.
-            // Use MSZIP decompressor which handles deflate blocks.
+            // Use MSZIP decompressor (see NOTE above re: raw deflate compat)
             DECOMPRESSOR_HANDLE decompressor = nullptr;
             if (!CreateDecompressor(COMPRESS_ALGORITHM_MSZIP, nullptr, &decompressor)) {
                 SS_LOG_DEBUG(L"ArchiveExtractor",
@@ -1290,8 +1442,8 @@ public:
 
             result.resize(decompressedSize);
 
-            // Verify compression ratio
-            if (compressed.size() > 0) {
+            // Verify compression ratio post-decompression
+            if (!compressed.empty()) {
                 double ratio = static_cast<double>(decompressedSize) /
                                static_cast<double>(compressed.size());
                 if (ratio > m_config.defaultMaxRatio) {
@@ -1356,7 +1508,12 @@ public:
             if (format == ArchiveFormat::ZIP) {
                 ScanZipArchive(filePath, callback, options, summary, 0);
             } else {
-                // For non-ZIP formats, list metadata only
+                // Non-ZIP formats: extraction not yet implemented.
+                // Provide metadata-only pass and report as such.
+                SS_LOG_INFO(L"ArchiveExtractor",
+                    L"Extraction not yet implemented for %hs — metadata-only pass: '%ls'",
+                    GetFormatName(format).c_str(), filePath.c_str());
+
                 auto entries = ListContents(filePath, options);
                 summary.entriesProcessed = static_cast<uint32_t>(entries.size());
                 for (const auto& entry : entries) {
@@ -1375,8 +1532,13 @@ public:
                         }
                     }
                 }
-                if (summary.result == ExtractionResult::Success) {
-                    summary.entriesExtracted = summary.entriesProcessed;
+                // Do NOT report entriesExtracted — no data was actually extracted.
+                // Callers must check entriesProcessed vs entriesExtracted to see
+                // that this was a metadata-only pass.
+                if (entries.empty() && summary.result == ExtractionResult::Success) {
+                    summary.warnings.push_back(
+                        "No entries enumerated — extraction not supported for " +
+                        GetFormatName(format));
                 }
             }
 
@@ -1627,23 +1789,38 @@ public:
             if (ec || fileSize == 0) return false;
 
             // Open and parse central directory
-            HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+            ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
                 FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                FILE_ATTRIBUTE_NORMAL, nullptr);
-            if (hFile == INVALID_HANDLE_VALUE) return false;
+                FILE_ATTRIBUTE_NORMAL, nullptr));
+            if (!hFile) return false;
 
-            auto entries = ParseZipCentralDirectory(hFile, fileSize,
+            auto entries = ParseZipCentralDirectory(hFile.get(), fileSize,
                 ExtractionOptions::CreateDefault());
-            CloseHandle(hFile);
 
             if (entries.empty()) return false;
 
             // Check 1: Total claimed uncompressed size vs file size
+            // Use overflow-safe accumulation
             uint64_t totalUncompressed = 0;
             uint64_t totalCompressed = 0;
+            bool overflowed = false;
             for (const auto& entry : entries) {
+                if (totalUncompressed > UINT64_MAX - entry.uncompressedSize) {
+                    overflowed = true;
+                    break;
+                }
                 totalUncompressed += entry.uncompressedSize;
+                if (totalCompressed > UINT64_MAX - entry.compressedSize) {
+                    overflowed = true;
+                    break;
+                }
                 totalCompressed += entry.compressedSize;
+            }
+
+            if (overflowed) {
+                SS_LOG_WARN(L"ArchiveExtractor",
+                    L"Zip bomb heuristic: integer overflow in total size calculation");
+                return true;
             }
 
             if (totalCompressed > 0) {
@@ -1852,19 +2029,24 @@ public:
 
             if (format == ArchiveFormat::ZIP) {
                 // Quick central directory scan without extraction
-                HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
                     FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-                    FILE_ATTRIBUTE_NORMAL, nullptr);
-                if (hFile == INVALID_HANDLE_VALUE) return flags;
+                    FILE_ATTRIBUTE_NORMAL, nullptr));
+                if (!hFile) return flags;
 
                 ExtractionOptions quickOpts;
                 quickOpts.maxEntries = 1000; // Cap for speed
-                auto entries = ParseZipCentralDirectory(hFile, fileSize, quickOpts);
-                CloseHandle(hFile);
+                auto entries = ParseZipCentralDirectory(hFile.get(), fileSize, quickOpts);
 
                 uint64_t totalUncomp = 0;
                 for (const auto& entry : entries) {
-                    totalUncomp += entry.uncompressedSize;
+                    // Overflow-safe accumulation
+                    if (totalUncomp <= UINT64_MAX - entry.uncompressedSize)
+                        totalUncomp += entry.uncompressedSize;
+                    else {
+                        flags |= SecurityFlag::ZipBombSuspected;
+                        break;
+                    }
                     flags |= entry.securityFlags;
                 }
 
@@ -1907,30 +2089,29 @@ private:
         uint64_t fileSize = fs::file_size(filePath, ec);
         if (ec || fileSize == 0) return;
 
-        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+        ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) {
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (!hFile) {
             summary.result = ExtractionResult::AccessDenied;
             return;
         }
 
-        auto entries = ParseZipCentralDirectory(hFile, fileSize, options);
+        auto entries = ParseZipCentralDirectory(hFile.get(), fileSize, options);
 
-        // Re-read central directory entries for extraction data offsets
-        // We need to also store ZipCentralDirEntry structs
+        // Re-read central directory entries for extraction data offsets.
+        // Locate EOCD (with Zip64 support) to find central dir offset.
         LARGE_INTEGER seekPos{};
 
-        // Find EOCD to get central dir offset
         constexpr size_t SEARCH_SIZE = 65558;
         const size_t searchSize = static_cast<size_t>(
             std::min(static_cast<uint64_t>(SEARCH_SIZE), fileSize));
         seekPos.QuadPart = static_cast<LONGLONG>(fileSize - searchSize);
-        SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+        SetFilePointerEx(hFile.get(), seekPos, nullptr, FILE_BEGIN);
 
         std::vector<uint8_t> eocdBuf(searchSize);
         DWORD bytesRead = 0;
-        ReadFile(hFile, eocdBuf.data(), static_cast<DWORD>(searchSize), &bytesRead, nullptr);
+        ReadFile(hFile.get(), eocdBuf.data(), static_cast<DWORD>(searchSize), &bytesRead, nullptr);
 
         uint64_t centralDirOffset = 0;
         for (int64_t i = static_cast<int64_t>(bytesRead) - sizeof(ZipEndOfCentralDir);
@@ -1941,13 +2122,41 @@ private:
                 ZipEndOfCentralDir eocd{};
                 std::memcpy(&eocd, eocdBuf.data() + i, sizeof(eocd));
                 centralDirOffset = eocd.centralDirOffset;
+
+                // Handle Zip64: if offset is 0xFFFFFFFF, look for Zip64 EOCD locator
+                if (centralDirOffset == 0xFFFFFFFF &&
+                    i >= static_cast<int64_t>(sizeof(Zip64EndOfCentralDirLocator))) {
+                    Zip64EndOfCentralDirLocator locator{};
+                    std::memcpy(&locator, eocdBuf.data() + i - sizeof(locator), sizeof(locator));
+                    if (locator.signature == ZIP_ZIP64_EOCD_LOCATOR_SIG) {
+                        LARGE_INTEGER z64Seek{};
+                        z64Seek.QuadPart = static_cast<LONGLONG>(locator.zip64EOCDOffset);
+                        if (SetFilePointerEx(hFile.get(), z64Seek, nullptr, FILE_BEGIN)) {
+                            Zip64EndOfCentralDir z64eocd{};
+                            DWORD z64Read = 0;
+                            if (ReadFile(hFile.get(), &z64eocd, sizeof(z64eocd), &z64Read, nullptr)
+                                && z64Read >= sizeof(z64eocd)
+                                && z64eocd.signature == ZIP_ZIP64_EOCD_SIG) {
+                                centralDirOffset = z64eocd.centralDirOffset;
+                            }
+                        }
+                    }
+                }
+
                 break;
             }
         }
 
+        // Validate central dir offset before seeking
+        if (centralDirOffset >= fileSize) {
+            summary.result = ExtractionResult::CorruptedArchive;
+            summary.errors.push_back("Central directory offset beyond EOF");
+            return;
+        }
+
         // Read central directory for extraction
         seekPos.QuadPart = static_cast<LONGLONG>(centralDirOffset);
-        SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+        SetFilePointerEx(hFile.get(), seekPos, nullptr, FILE_BEGIN);
 
         uint64_t totalExtracted = 0;
         uint32_t entryIndex = 0;
@@ -1962,7 +2171,7 @@ private:
 
             // Read central directory entry for this position
             ZipCentralDirEntry cde{};
-            if (!ReadFile(hFile, &cde, sizeof(cde), &bytesRead, nullptr) ||
+            if (!ReadFile(hFile.get(), &cde, sizeof(cde), &bytesRead, nullptr) ||
                 bytesRead < sizeof(cde) || cde.signature != ZIP_CENTRAL_SIG) {
                 break;
             }
@@ -1970,15 +2179,15 @@ private:
             // Skip filename, extra, comment
             LARGE_INTEGER skipLen{};
             skipLen.QuadPart = cde.fileNameLength + cde.extraFieldLength + cde.commentLength;
-            SetFilePointerEx(hFile, skipLen, nullptr, FILE_CURRENT);
+            SetFilePointerEx(hFile.get(), skipLen, nullptr, FILE_CURRENT);
 
             // Save current position before extraction
             LARGE_INTEGER savedPos{};
-            SetFilePointerEx(hFile, {}, &savedPos, FILE_CURRENT);
+            SetFilePointerEx(hFile.get(), {}, &savedPos, FILE_CURRENT);
 
             // Skip directories
             if (entry.isDirectory) {
-                SetFilePointerEx(hFile, savedPos, nullptr, FILE_BEGIN);
+                SetFilePointerEx(hFile.get(), savedPos, nullptr, FILE_BEGIN);
                 entryIndex++;
                 continue;
             }
@@ -1987,22 +2196,34 @@ private:
             if (entry.isEncrypted && options.skipEncrypted) {
                 m_stats.encryptedSkipped.fetch_add(1, std::memory_order_relaxed);
                 summary.entriesSkipped++;
-                SetFilePointerEx(hFile, savedPos, nullptr, FILE_BEGIN);
+                SetFilePointerEx(hFile.get(), savedPos, nullptr, FILE_BEGIN);
                 entryIndex++;
                 continue;
             }
 
             // Skip entries with security issues if configured
-            if (m_config.abortOnSecurityIssue &&
-                HasFlag(entry.securityFlags, SecurityFlag::PathTraversalAttempt)) {
-                summary.entriesSkipped++;
-                SetFilePointerEx(hFile, savedPos, nullptr, FILE_BEGIN);
-                entryIndex++;
-                continue;
+            if (entry.securityFlags != SecurityFlag::None) {
+                // Fire SecurityCallback so callers can log/alert on the issue
+                bool shouldContinue = true;
+                {
+                    std::shared_lock lock(m_dataMutex);
+                    if (m_securityCallback) {
+                        try { shouldContinue = m_securityCallback(entry, entry.securityFlags); }
+                        catch (...) {}
+                    }
+                }
+                if (!shouldContinue || (m_config.abortOnSecurityIssue &&
+                    HasFlag(entry.securityFlags, SecurityFlag::PathTraversalAttempt))) {
+                    summary.entriesSkipped++;
+                    SetFilePointerEx(hFile.get(), savedPos, nullptr, FILE_BEGIN);
+                    entryIndex++;
+                    continue;
+                }
             }
 
-            // Check total extraction size limit
-            if (totalExtracted + entry.uncompressedSize > options.maxTotalSize) {
+            // Overflow-safe total extraction size limit check
+            if (totalExtracted > options.maxTotalSize - entry.uncompressedSize ||
+                totalExtracted + entry.uncompressedSize > options.maxTotalSize) {
                 summary.warnings.push_back("Total extraction size limit reached");
                 break;
             }
@@ -2010,7 +2231,7 @@ private:
             // Extract the entry if not metadata-only mode
             std::vector<uint8_t> data;
             if (options.mode != ExtractionMode::MetadataOnly) {
-                data = ExtractZipEntry(hFile, cde, cde.fileNameLength, options);
+                data = ExtractZipEntry(hFile.get(), cde, cde.fileNameLength, options);
 
                 if (!data.empty()) {
                     totalExtracted += data.size();
@@ -2124,11 +2345,11 @@ private:
             }
 
             // Restore position to continue reading central directory
-            SetFilePointerEx(hFile, savedPos, nullptr, FILE_BEGIN);
+            SetFilePointerEx(hFile.get(), savedPos, nullptr, FILE_BEGIN);
             entryIndex++;
         }
 
-        CloseHandle(hFile);
+        // ScopedHandle closes hFile automatically
 
         if (summary.result == ExtractionResult::Success && summary.entriesFailed > 0) {
             summary.result = ExtractionResult::PartialSuccess;
@@ -2199,18 +2420,25 @@ private:
         if (pattern == L"*") return true;
         if (pattern.find(L'*') == std::wstring::npos) return path == pattern;
 
+        // Extension match: *.exe
         if (pattern.starts_with(L"*.")) {
             auto ext = pattern.substr(1);
             return path.ends_with(ext);
         }
+
+        // Contains match: *foo* — must be checked BEFORE single-end wildcard
+        if (pattern.starts_with(L"*") && pattern.ends_with(L"*") && pattern.length() > 2) {
+            auto middle = pattern.substr(1, pattern.length() - 2);
+            return path.find(middle) != std::wstring::npos;
+        }
+
+        // Prefix match: dir/*
         if (pattern.ends_with(L"*")) {
             auto prefix = pattern.substr(0, pattern.length() - 1);
             return path.starts_with(prefix);
         }
-        if (pattern.starts_with(L"*") && pattern.ends_with(L"*")) {
-            auto middle = pattern.substr(1, pattern.length() - 2);
-            return path.find(middle) != std::wstring::npos;
-        }
+
+        // Suffix match: *filename
         if (pattern.starts_with(L"*")) {
             auto suffix = pattern.substr(1);
             return path.ends_with(suffix);
