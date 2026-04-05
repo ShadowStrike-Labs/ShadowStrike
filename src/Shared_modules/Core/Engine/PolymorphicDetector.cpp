@@ -331,7 +331,7 @@ namespace ShadowStrike::Core::Engine {
         // SCORING
         // ====================================================================
 
-        [[nodiscard]] DetectionConfidence CalculateConfidence(
+        [[nodiscard]] PolymorphicDetectionConfidence CalculateConfidence(
             const PolyResult& result) noexcept;
 
         // ====================================================================
@@ -1628,7 +1628,7 @@ namespace ShadowStrike::Core::Engine {
     // IMPL: CONFIDENCE SCORING
     // ========================================================================
 
-    DetectionConfidence PolymorphicDetectorImpl::CalculateConfidence(
+    PolymorphicDetectionConfidence PolymorphicDetectorImpl::CalculateConfidence(
         const PolyResult& result) noexcept {
         try {
             int score = 0;
@@ -1652,13 +1652,13 @@ namespace ShadowStrike::Core::Engine {
             // Metamorphic classification
             if (result.isMetamorphic) score += 25;
 
-            if (score >= 90) return DetectionConfidence::Certain;
-            if (score >= 60) return DetectionConfidence::High;
-            if (score >= 40) return DetectionConfidence::Medium;
-            if (score >= 20) return DetectionConfidence::Low;
-            return DetectionConfidence::None;
+            if (score >= 90) return PolymorphicDetectionConfidence::Certain;
+            if (score >= 60) return PolymorphicDetectionConfidence::High;
+            if (score >= 40) return PolymorphicDetectionConfidence::Medium;
+            if (score >= 20) return PolymorphicDetectionConfidence::Low;
+            return PolymorphicDetectionConfidence::None;
         } catch (...) {
-            return DetectionConfidence::None;
+            return PolymorphicDetectionConfidence::None;
         }
     }
 
@@ -2333,13 +2333,13 @@ namespace ShadowStrike::Core::Engine {
         }
     }
 
-    std::string_view GetDetectionConfidenceName(DetectionConfidence confidence) noexcept {
+    std::string_view GetPolymorphicDetectionConfidenceName(PolymorphicDetectionConfidence confidence) noexcept {
         switch (confidence) {
-        case DetectionConfidence::None:    return "None";
-        case DetectionConfidence::Low:     return "Low";
-        case DetectionConfidence::Medium:  return "Medium";
-        case DetectionConfidence::High:    return "High";
-        case DetectionConfidence::Certain: return "Certain";
+        case PolymorphicDetectionConfidence::None:    return "None";
+        case PolymorphicDetectionConfidence::Low:     return "Low";
+        case PolymorphicDetectionConfidence::Medium:  return "Medium";
+        case PolymorphicDetectionConfidence::High:    return "High";
+        case PolymorphicDetectionConfidence::Certain: return "Certain";
         default:                           return "Unknown";
         }
     }

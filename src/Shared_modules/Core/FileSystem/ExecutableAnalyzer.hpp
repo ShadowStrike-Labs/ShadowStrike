@@ -284,6 +284,8 @@ enum class SignatureStatus : uint8_t {
  * @enum PackerType
  * @brief Detected packer/crypter type.
  */
+#ifndef SHADOWSTRIKE_PACKER_TYPE_DEFINED
+#define SHADOWSTRIKE_PACKER_TYPE_DEFINED
 enum class PackerType : uint16_t {
     None = 0,
     UPX = 1,
@@ -302,6 +304,7 @@ enum class PackerType : uint16_t {
     Custom = 100,
     Unknown = 255
 };
+#endif // SHADOWSTRIKE_PACKER_TYPE_DEFINED
 
 /**
  * @enum ImportRiskLevel

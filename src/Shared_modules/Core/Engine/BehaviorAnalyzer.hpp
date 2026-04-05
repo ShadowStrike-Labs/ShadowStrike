@@ -261,7 +261,7 @@ class BehaviorAnalyzer;
 struct BehaviorEvent;
 struct ProcessBehaviorState;
 struct BehaviorVerdict;
-struct AttackChain;
+struct BehaviorAttackChain;
 
 // ============================================================================
 // CONSTANTS
@@ -1463,9 +1463,9 @@ struct BehaviorVerdict {
 };
 
 /**
- * @brief Attack chain representing multi-step attack.
+ * @brief Behavior attack chain representing multi-step attack.
  */
-struct AttackChain {
+struct BehaviorAttackChain {
     /// @brief Unique chain ID
     uint64_t chainId = 0;
     
@@ -1796,7 +1796,7 @@ struct BehaviorAnalyzerStats {
  * @brief Callback types for behavior analysis.
  */
 using BehaviorVerdictCallback = std::function<void(const BehaviorVerdict&)>;
-using AttackChainCallback = std::function<void(const AttackChain&)>;
+using BehaviorAttackChainCallback = std::function<void(const BehaviorAttackChain&)>;
 using ProcessTerminateCallback = std::function<bool(uint32_t pid, const std::wstring& reason)>;
 
 // ============================================================================
@@ -2017,21 +2017,21 @@ public:
      * @brief Get active attack chains.
      * @return Vector of active attack chains.
      */
-    [[nodiscard]] std::vector<AttackChain> GetActiveAttackChains() const;
+    [[nodiscard]] std::vector<BehaviorAttackChain> GetActiveAttackChains() const;
 
     /**
      * @brief Get attack chain by ID.
      * @param chainId Chain identifier.
      * @return Attack chain or nullopt if not found.
      */
-    [[nodiscard]] std::optional<AttackChain> GetAttackChain(uint64_t chainId) const;
+    [[nodiscard]] std::optional<BehaviorAttackChain> GetAttackChain(uint64_t chainId) const;
 
     /**
      * @brief Get attack chains involving a process.
      * @param processId Process ID.
      * @return Vector of attack chains.
      */
-    [[nodiscard]] std::vector<AttackChain> GetAttackChainsForProcess(uint32_t processId) const;
+    [[nodiscard]] std::vector<BehaviorAttackChain> GetAttackChainsForProcess(uint32_t processId) const;
 
     // =========================================================================
     // Process Operations
@@ -2108,7 +2108,7 @@ public:
      * @param callback Callback function.
      * @return Registration ID.
      */
-    [[nodiscard]] uint64_t RegisterAttackChainCallback(AttackChainCallback callback);
+    [[nodiscard]] uint64_t RegisterAttackChainCallback(BehaviorAttackChainCallback callback);
 
     /**
      * @brief Unregister attack chain callback.
@@ -2265,7 +2265,7 @@ private:
     /**
      * @brief Invoke attack chain callbacks.
      */
-    void InvokeAttackChainCallbacks(const AttackChain& chain);
+    void InvokeAttackChainCallbacks(const BehaviorAttackChain& chain);
 
     /**
      * @brief Cleanup old states and chains.
