@@ -611,10 +611,10 @@ public:
                 throw std::runtime_error("PBKDF2 key derivation failed");
             }
 
-            Logger::Debug("QuarantineManager: Master key derived (PBKDF2-SHA256, 100k iterations)");
+            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Master key derived (PBKDF2-SHA256, 100k iterations)");
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Key derivation failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Key derivation failed: %S", e.what());
             throw;
         }
     }
@@ -664,11 +664,10 @@ public:
             // Owner information
             metadata.ownerSid = GetFileOwnerSidInternal(filePath);
 
-            Logger::Debug("QuarantineManager: Metadata collected for {}",
-                StringUtils::ToNarrow(metadata.fileName));
+            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Metadata collected for %ls", metadata.fileName.c_str());
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Metadata collection failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Metadata collection failed: %S", e.what());
         }
 
         return metadata;
@@ -703,11 +702,10 @@ public:
                 hashes.sha1 = HashUtils::ToHexLower(hashBytes);
             }
 
-            Logger::Debug("QuarantineManager: Hashes calculated - SHA256: {}",
-                hashes.sha256.substr(0, 16));
+            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Hashes calculated - SHA256: %S", hashes.sha256.substr(0, 16).c_str());
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Hash calculation failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Hash calculation failed: %S", e.what());
         }
 
         return hashes;
@@ -752,13 +750,12 @@ public:
             // Append authentication tag to ciphertext
             encrypted.insert(encrypted.end(), tag.begin(), tag.end());
 
-            Logger::Debug("QuarantineManager: Content encrypted ({} bytes -> {} bytes)",
-                data.size(), encrypted.size());
+            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Content encrypted (%zu bytes -> %zu bytes)", data.size(), encrypted.size());
 
             return encrypted;
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Encryption failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Encryption failed: %S", e.what());
             throw;
         }
     }
@@ -798,13 +795,12 @@ public:
                 throw std::runtime_error("AES-256-GCM decryption failed (authentication tag mismatch)");
             }
 
-            Logger::Debug("QuarantineManager: Content decrypted ({} bytes -> {} bytes)",
-                data.size(), decrypted.size());
+            SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Content decrypted (%zu bytes -> %zu bytes)", data.size(), decrypted.size());
 
             return decrypted;
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Decryption failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Decryption failed: %S", e.what());
             throw;
         }
     }
@@ -855,15 +851,14 @@ public:
                         processes.push_back(proc);
                     }
 
-                    Logger::Info("QuarantineManager: Found {} locking processes",
-                        processes.size());
+                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Found %zu locking processes", processes.size());
                 }
             }
 
             RmEndSession(dwSession);
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: GetLockingProcesses failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetLockingProcesses failed: %S", e.what());
         }
 #endif
 
@@ -880,8 +875,7 @@ public:
 
             for (auto& proc : processes) {
                 if (!proc.canTerminate) {
-                    Logger::Warn("QuarantineManager: Cannot terminate system process: {} (PID {})",
-                        StringUtils::ToNarrow(proc.processName), proc.processId);
+                    SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Cannot terminate system process: %ls (PID %u)", proc.processName.c_str(), proc.processId);
                     continue;
                 }
 
@@ -902,16 +896,14 @@ public:
                     terminated.push_back(proc);
                     m_stats.processesTerminated.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Info("QuarantineManager: Terminated process: {} (PID {})",
-                        StringUtils::ToNarrow(proc.processName), proc.processId);
+                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Terminated process: %ls (PID %u)", proc.processName.c_str(), proc.processId);
                 } else {
-                    Logger::Warn("QuarantineManager: Failed to terminate process: {} (PID {})",
-                        StringUtils::ToNarrow(proc.processName), proc.processId);
+                    SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Failed to terminate process: %ls (PID %u)", proc.processName.c_str(), proc.processId);
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: TerminateLockingProcesses failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: TerminateLockingProcesses failed: %S", e.what());
         }
 
         return terminated;
@@ -961,7 +953,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Quarantine callback exception: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Quarantine callback exception: %S", e.what());
             }
         }
     }
@@ -973,7 +965,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Restore callback exception: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Restore callback exception: %S", e.what());
             }
         }
     }
@@ -985,7 +977,7 @@ public:
             try {
                 callback(action);
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Remediation callback exception: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Remediation callback exception: %S", e.what());
             }
         }
     }
@@ -1038,7 +1030,7 @@ public:
             return (fs::path(m_config.vaultPath) / filename).wstring();
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: GenerateQuarantinePath failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GenerateQuarantinePath failed: %S", e.what());
             return (fs::path(m_config.vaultPath) / L"unknown.ssqf").wstring();
         }
     }
@@ -1210,8 +1202,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         auto lockingProcesses = m_impl->GetLockingProcessesImpl(request.filePath);
 
         if (!lockingProcesses.empty()) {
-            Logger::Info("QuarantineManager: File locked by {} processes",
-                lockingProcesses.size());
+            SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File locked by %zu processes", lockingProcesses.size());
 
             if (m_impl->m_config.autoTerminateProcesses) {
                 auto terminated = m_impl->TerminateLockingProcessesImpl(request.filePath);
@@ -1383,7 +1374,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                         fErr.message);
                     fs::remove(request.filePath, ec);
                     if (ec) {
-                        Logger::Error("QuarantineManager: Fallback delete also failed: {}", ec.message());
+                        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Fallback delete also failed: %S", ec.message().c_str());
                         result.rebootRequired = true;
                     }
                 } else {
@@ -1392,7 +1383,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
             } else {
                 fs::remove(request.filePath, ec);
                 if (ec) {
-                    Logger::Error("QuarantineManager: Failed to delete original: {}", ec.message());
+                    SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Failed to delete original: %S", ec.message().c_str());
                     result.rebootRequired = true;
                 } else {
                     SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Original file deleted");
@@ -1400,7 +1391,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Delete failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Delete failed: %S", e.what());
             result.rebootRequired = true;
         }
 
@@ -1471,8 +1462,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         result.message = L"File quarantined successfully";
         result.duration = duration_cast<milliseconds>(steady_clock::now() - opStart);
 
-        Logger::Info("QuarantineManager: Quarantine complete - Entry ID: {}, Duration: {} ms",
-            entry.entryId, result.duration.count());
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Quarantine complete - Entry ID: %llu, Duration: %lld ms", entry.entryId, result.duration.count());
 
         // Invoke callbacks
         m_impl->InvokeQuarantineCallbacks(result);
@@ -1480,7 +1470,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: Quarantine exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Quarantine exception: %S", e.what());
         m_impl->m_stats.quarantineFailures.fetch_add(1, std::memory_order_relaxed);
 
         result.status = QuarantineStatus::UnknownError;
@@ -1516,7 +1506,7 @@ std::future<QuarantineResult> QuarantineManager::QuarantineFileAsync(
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Async callback exception: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Async callback exception: %S", e.what());
             }
         }
 
@@ -1648,10 +1638,10 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
                 fileContent = encryptedContent;
             }
 
-            Logger::Info("QuarantineManager: File decrypted, size: {}", fileContent.size());
+            SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File decrypted, size: %zu", fileContent.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Read/decrypt failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Read/decrypt failed: %S", e.what());
             m_impl->m_stats.restoreFailures.fetch_add(1, std::memory_order_relaxed);
             result.status = QuarantineStatus::DecryptionFailed;
             result.message = L"Decryption failed";
@@ -1721,11 +1711,10 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
                          fileContent.size());
             outFile.close();
 
-            Logger::Info("QuarantineManager: File restored to: {}",
-                StringUtils::ToNarrow(restorePath));
+            SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File restored to: %ls", restorePath.c_str());
 
         } catch (const std::exception& e) {
-            Logger::Error("QuarantineManager: Restore write failed: {}", e.what());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Restore write failed: %S", e.what());
             m_impl->m_stats.restoreFailures.fetch_add(1, std::memory_order_relaxed);
             result.status = QuarantineStatus::AccessDenied;
             result.message = L"Failed to write restored file";
@@ -1767,7 +1756,7 @@ RestoreResult QuarantineManager::RestoreFile(const RestoreRequest& request) {
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: Restore exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Restore exception: %S", e.what());
         m_impl->m_stats.restoreFailures.fetch_add(1, std::memory_order_relaxed);
 
         result.status = QuarantineStatus::UnknownError;
@@ -1801,7 +1790,7 @@ std::future<RestoreResult> QuarantineManager::RestoreFileAsync(
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Async callback exception: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Async callback exception: %S", e.what());
             }
         }
 
@@ -1842,16 +1831,14 @@ bool QuarantineManager::DeleteFile(uint64_t entryId, bool secureWipe) {
                     SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Secure erase failed, falling back to standard delete");
                     fs::remove(entry.quarantinePath, ec);
                     if (ec) {
-                        Logger::Error("QuarantineManager: Failed to delete quarantine file: {}",
-                            ec.message());
+                        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Failed to delete quarantine file: %S", ec.message().c_str());
                         return false;
                     }
                 }
             } else {
                 fs::remove(entry.quarantinePath, ec);
                 if (ec) {
-                    Logger::Error("QuarantineManager: Failed to delete quarantine file: {}",
-                        ec.message());
+                    SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Failed to delete quarantine file: %S", ec.message().c_str());
                     return false;
                 }
             }
@@ -1878,7 +1865,7 @@ bool QuarantineManager::DeleteFile(uint64_t entryId, bool secureWipe) {
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: Delete exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Delete exception: %S", e.what());
         return false;
     }
 }
@@ -1917,7 +1904,7 @@ size_t QuarantineManager::DeleteExpiredEntries() {
         return deleted;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: DeleteExpiredEntries exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: DeleteExpiredEntries exception: %S", e.what());
         return 0;
     }
 }
@@ -1939,7 +1926,7 @@ size_t QuarantineManager::DeleteAllEntries() {
         return deleted;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: DeleteAllEntries exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: DeleteAllEntries exception: %S", e.what());
         return 0;
     }
 }
@@ -1973,7 +1960,7 @@ std::optional<QuarantineEntry> QuarantineManager::GetEntry(uint64_t entryId) con
         return std::nullopt;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: GetEntry exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetEntry exception: %S", e.what());
         return std::nullopt;
     }
 }
@@ -1991,7 +1978,7 @@ std::optional<QuarantineEntry> QuarantineManager::GetEntryByHash(
         }
         return std::nullopt;
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: GetEntryByHash exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetEntryByHash exception: %S", e.what());
         return std::nullopt;
     }
 }
@@ -2028,7 +2015,7 @@ std::vector<QuarantineEntry> QuarantineManager::QueryEntries(
         }
         return results;
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: QueryEntries exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: QueryEntries exception: %S", e.what());
         return {};
     }
 }
@@ -2045,7 +2032,7 @@ std::vector<QuarantineEntry> QuarantineManager::GetActiveEntries() const {
         }
         return results;
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: GetActiveEntries exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetActiveEntries exception: %S", e.what());
         return {};
     }
 }
@@ -2057,7 +2044,7 @@ size_t QuarantineManager::GetEntryCount(std::optional<QuarantineState> state) co
         auto count = m_impl->m_database->CountEntries(nullptr);
         return count > 0 ? static_cast<size_t>(count) : 0;
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: GetEntryCount exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetEntryCount exception: %S", e.what());
         return 0;
     }
 }
@@ -2153,21 +2140,18 @@ std::vector<RemediationAction> QuarantineManager::RemediateArtifacts(uint64_t en
                     actions.push_back(action);
                     m_impl->InvokeRemediationCallbacks(action);
 
-                    Logger::Info("QuarantineManager: Registry remediation {}: {}",
-                        action.success ? "succeeded" : "failed",
-                        StringUtils::ToNarrow(action.target));
+                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Registry remediation %S: %ls", action.success ? "succeeded" : "failed", action.target.c_str());
                 }
             }
         }
 
         m_impl->m_stats.remediationActions.fetch_add(actions.size(), std::memory_order_relaxed);
-        Logger::Info("QuarantineManager: Remediation complete - {} actions for entry {}",
-            actions.size(), entryId);
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Remediation complete - %zu actions for entry %llu", actions.size(), entryId);
 
         return actions;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: RemediateArtifacts exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: RemediateArtifacts exception: %S", e.what());
         return actions;
     }
 }
@@ -2199,12 +2183,11 @@ bool QuarantineManager::RollbackRemediation(uint64_t entryId) {
                 if (it->type == RemediationType::DeleteRegistryValue &&
                     !it->originalValue.empty())
                 {
-                    Logger::Info("QuarantineManager: Rollback registry value: {}",
-                        StringUtils::ToNarrow(it->target));
+                    SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Rollback registry value: %ls", it->target.c_str());
                 }
                 // Additional rollback types handled as implemented
             } catch (const std::exception& e) {
-                Logger::Error("QuarantineManager: Rollback action failed: {}", e.what());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Rollback action failed: %S", e.what());
                 allSuccess = false;
             }
         }
@@ -2214,7 +2197,7 @@ bool QuarantineManager::RollbackRemediation(uint64_t entryId) {
         return allSuccess;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: RollbackRemediation exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: RollbackRemediation exception: %S", e.what());
         return false;
     }
 }
@@ -2248,7 +2231,7 @@ bool QuarantineManager::AddRemediationAction(
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: AddRemediationAction exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: AddRemediationAction exception: %S", e.what());
         return false;
     }
 }
@@ -2290,17 +2273,15 @@ bool QuarantineManager::ExtractForAnalysis(
 
         auto result = RestoreFile(rr);
         if (!result.IsSuccess()) {
-            Logger::Error("QuarantineManager: Extraction failed: {}",
-                StringUtils::ToNarrow(result.message));
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Extraction failed: %ls", result.message.c_str());
             return false;
         }
 
-        Logger::Info("QuarantineManager: File extracted for analysis to: {}",
-            StringUtils::ToNarrow(destPath));
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: File extracted for analysis to: %ls", destPath.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: ExtractForAnalysis exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: ExtractForAnalysis exception: %S", e.what());
         return false;
     }
 }
@@ -2347,7 +2328,7 @@ std::string QuarantineManager::SubmitSample(uint64_t entryId) {
         return submissionId;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: SubmitSample exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: SubmitSample exception: %S", e.what());
         return "";
     }
 }
@@ -2380,7 +2361,7 @@ std::wstring QuarantineManager::PreserveEvidence(uint64_t entryId) {
         std::error_code ec;
         fs::create_directories(forensicsDir, ec);
         if (ec) {
-            Logger::Error("QuarantineManager: Failed to create forensics dir: {}", ec.message());
+            SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Failed to create forensics dir: %S", ec.message().c_str());
             return L"";
         }
 
@@ -2397,7 +2378,7 @@ std::wstring QuarantineManager::PreserveEvidence(uint64_t entryId) {
             fs::copy_file(entry.quarantinePath,
                 archivePath / fs::path(entry.quarantinePath).filename(), ec);
             if (ec) {
-                Logger::Error("QuarantineManager: Evidence copy failed: {}", ec.message());
+                SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Evidence copy failed: %S", ec.message().c_str());
                 return L"";
             }
         }
@@ -2408,12 +2389,11 @@ std::wstring QuarantineManager::PreserveEvidence(uint64_t entryId) {
         m_impl->m_database->UpdateEntry(ToDBEntry(entry));
         m_impl->UpdateCache(entry);
 
-        Logger::Info("QuarantineManager: Evidence preserved at: {}",
-            StringUtils::ToNarrow(archivePath.wstring()));
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Evidence preserved at: %ls", archivePath.wstring().c_str());
         return archivePath.wstring();
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: PreserveEvidence exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: PreserveEvidence exception: %S", e.what());
         return L"";
     }
 }
@@ -2479,12 +2459,11 @@ bool QuarantineManager::ExportDatabase(const std::wstring& filePath) const {
         }
 
         outFile.close();
-        Logger::Info("QuarantineManager: Exported {} entries to: {}",
-            count, StringUtils::ToNarrow(filePath));
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Exported %llu entries to: %ls", count, filePath.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: ExportDatabase exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: ExportDatabase exception: %S", e.what());
         return false;
     }
 }
@@ -2574,12 +2553,11 @@ size_t QuarantineManager::ImportDatabase(const std::wstring& filePath) {
             }
         }
 
-        Logger::Info("QuarantineManager: Imported {} of {} entries from: {}",
-            imported, count, StringUtils::ToNarrow(filePath));
+        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Imported %llu of %llu entries from: %ls", imported, count, filePath.c_str());
         return imported;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: ImportDatabase exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: ImportDatabase exception: %S", e.what());
         return 0;
     }
 }
@@ -2605,7 +2583,7 @@ void QuarantineManager::RunMaintenance() {
         SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Maintenance complete");
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: Maintenance exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: Maintenance exception: %S", e.what());
     }
 }
 
@@ -2620,8 +2598,7 @@ size_t QuarantineManager::VerifyVaultIntegrity() {
         for (const auto& entry : entries) {
             std::error_code ec;
             if (!fs::exists(entry.quarantinePath, ec)) {
-                Logger::Warn("QuarantineManager: Quarantine file missing: {}",
-                    StringUtils::ToNarrow(entry.quarantinePath));
+                SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Quarantine file missing: %ls", entry.quarantinePath.c_str());
                 corrupted++;
             }
         }
@@ -2630,7 +2607,7 @@ size_t QuarantineManager::VerifyVaultIntegrity() {
         return corrupted;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: VerifyVaultIntegrity exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: VerifyVaultIntegrity exception: %S", e.what());
         return 0;
     }
 }
@@ -2672,8 +2649,7 @@ uint64_t QuarantineManager::CompactVault() {
                     fs::remove(dirEntry.path(), ec);
                     if (!ec) {
                         reclaimed += fileSize;
-                        Logger::Info("QuarantineManager: Removed orphaned file: {}",
-                            StringUtils::ToNarrow(dirEntry.path().wstring()));
+                        SS_LOG_INFO(L"QuarantineManager", L"QuarantineManager: Removed orphaned file: %ls", dirEntry.path().wstring().c_str());
                     }
                 }
             }
@@ -2689,7 +2665,7 @@ uint64_t QuarantineManager::CompactVault() {
         return reclaimed;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: CompactVault exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: CompactVault exception: %S", e.what());
         return 0;
     }
 }
@@ -2717,7 +2693,7 @@ uint64_t QuarantineManager::GetAvailableSpace() const {
         std::error_code ec;
         auto spaceInfo = fs::space(vaultPath, ec);
         if (ec) {
-            Logger::Warn("QuarantineManager: Failed to query disk space: {}", ec.message());
+            SS_LOG_WARN(L"QuarantineManager", L"QuarantineManager: Failed to query disk space: %S", ec.message().c_str());
             return 0;
         }
 
@@ -2735,7 +2711,7 @@ uint64_t QuarantineManager::GetAvailableSpace() const {
         return diskAvailable;
 
     } catch (const std::exception& e) {
-        Logger::Error("QuarantineManager: GetAvailableSpace exception: {}", e.what());
+        SS_LOG_ERROR(L"QuarantineManager", L"QuarantineManager: GetAvailableSpace exception: %S", e.what());
         return 0;
     }
 }
@@ -2752,7 +2728,7 @@ uint64_t QuarantineManager::RegisterQuarantineCallback(QuarantineCallback callba
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_quarantineCallbacks[id] = std::move(callback);
 
-    Logger::Debug("QuarantineManager: Registered quarantine callback {}", id);
+    SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Registered quarantine callback %llu", id);
     return id;
 }
 
@@ -2771,7 +2747,7 @@ uint64_t QuarantineManager::RegisterRestoreCallback(RestoreCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_restoreCallbacks[id] = std::move(callback);
 
-    Logger::Debug("QuarantineManager: Registered restore callback {}", id);
+    SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Registered restore callback %llu", id);
     return id;
 }
 
@@ -2790,7 +2766,7 @@ uint64_t QuarantineManager::RegisterRemediationCallback(RemediationCallback call
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_remediationCallbacks[id] = std::move(callback);
 
-    Logger::Debug("QuarantineManager: Registered remediation callback {}", id);
+    SS_LOG_DEBUG(L"QuarantineManager", L"QuarantineManager: Registered remediation callback %llu", id);
     return id;
 }
 
