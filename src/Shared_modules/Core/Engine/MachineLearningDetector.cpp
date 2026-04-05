@@ -264,7 +264,7 @@ struct MachineLearningDetector::Impl {
     };
 
     std::unordered_map<std::string, CachedPrediction> m_predictionCache;
-    std::mutex m_predictionCacheMutex;
+    mutable std::mutex m_predictionCacheMutex;
 
     // Raw file bytes cache — enables PhantomCortex inference from the features-based path
     struct CachedBytes {
@@ -281,7 +281,7 @@ struct MachineLearningDetector::Impl {
     // Callbacks
     PredictionCallback m_predictionCallback;
     ModelUpdateCallback m_modelUpdateCallback;
-    ErrorCallback m_errorCallback;
+    MLErrorCallback m_errorCallback;
 
     // Initialization flag
     std::atomic<bool> m_initialized{false};
@@ -1181,7 +1181,7 @@ ExtractedFeatures MachineLearningDetector::ExtractFeatures(const fs::path& fileP
             result.categoryRanges[FeatureCategory::ControlFlow] = {2182, 2381};
         } else {
             // FeatureExtractor could not parse the PE — fall back to ExecutableAnalyzer
-            FileSystem::ExecutableAnalyzer analyzer;
+            auto& analyzer = FileSystem::ExecutableAnalyzer::Instance();
             auto execInfo = analyzer.Analyze(filePath.wstring());
             result = ExtractFeatures(execInfo);
             result.fileHash = fileHash;
@@ -1648,7 +1648,7 @@ void MachineLearningDetector::RegisterModelUpdateCallback(ModelUpdateCallback ca
     m_impl->m_modelUpdateCallback = std::move(callback);
 }
 
-void MachineLearningDetector::RegisterErrorCallback(ErrorCallback callback) {
+void MachineLearningDetector::RegisterErrorCallback(MLErrorCallback callback) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_errorCallback = std::move(callback);
 }
@@ -1680,8 +1680,27 @@ void MachineLearningDetector::SetConfiguration(const MachineLearningConfiguratio
 // Statistics
 // ============================================================================
 
-MLStatistics MachineLearningDetector::GetStatistics() const {
-    return m_impl->m_statistics;
+MLStatisticsSnapshot MachineLearningDetector::GetStatistics() const {
+    MLStatisticsSnapshot snap;
+    const auto& s = m_impl->m_statistics;
+    snap.totalPredictions = s.totalPredictions.load(std::memory_order_relaxed);
+    snap.maliciousDetections = s.maliciousDetections.load(std::memory_order_relaxed);
+    snap.benignClassifications = s.benignClassifications.load(std::memory_order_relaxed);
+    snap.featureExtractions = s.featureExtractions.load(std::memory_order_relaxed);
+    snap.cacheHits = s.cacheHits.load(std::memory_order_relaxed);
+    snap.cacheMisses = s.cacheMisses.load(std::memory_order_relaxed);
+    snap.modelInferences = s.modelInferences.load(std::memory_order_relaxed);
+    snap.gpuInferences = s.gpuInferences.load(std::memory_order_relaxed);
+    snap.cpuInferences = s.cpuInferences.load(std::memory_order_relaxed);
+    snap.timeouts = s.timeouts.load(std::memory_order_relaxed);
+    snap.errors = s.errors.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < 16; ++i) {
+        snap.byClassification[i] = s.byClassification[i].load(std::memory_order_relaxed);
+    }
+    snap.totalInferenceTimeUs = s.totalInferenceTimeUs.load(std::memory_order_relaxed);
+    snap.totalFeatureExtractionTimeUs = s.totalFeatureExtractionTimeUs.load(std::memory_order_relaxed);
+    snap.startTime = s.startTime;
+    return snap;
 }
 
 void MachineLearningDetector::ResetStatistics() {
