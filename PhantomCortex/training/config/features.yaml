@@ -1,0 +1,39 @@
+# PhantomCortex Feature Extraction Configuration
+# ================================================
+# Central configuration for all Cortex feature extractors.
+# Used by the training pipeline and inference engine.
+
+pe_features:
+  byte_histogram_size: 256
+  byte_entropy_bins: 256
+  string_min_length: 5
+  max_sections: 10
+  import_hash_bins: 1280       # 256 library bins + 1024 function bins
+  export_hash_bins: 128
+  total_features: 2381         # EMBER v2 compatible
+  feature_version: 2
+
+behavioral_features:
+  max_sequence_length: 512
+  api_vocabulary_size: 2000
+  feature_dim: 4               # [api_id, arg_hash, retval, dt_ms]
+
+memory_features:
+  feature_count: 128
+  ngram_features: 50
+  compressed_histogram_size: 16
+
+network_features:
+  flow_features: 64
+  timing_stats: 10
+  payload_features: 20
+
+emulation_features:
+  max_events: 1024
+  feature_dim: 4               # [opcode_cat, mem_access, api_id, eflags]
+
+pipeline:
+  batch_size: 1000
+  num_workers: 0               # 0 = auto-detect CPU cores
+  output_format: "npz"
+  max_file_size_mb: 256

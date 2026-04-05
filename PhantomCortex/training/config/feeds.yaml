@@ -1,0 +1,77 @@
+# =============================================================================
+# ShadowStrike PhantomCortex — Threat Feed Configuration
+# =============================================================================
+# Configuration for all external threat intelligence feed sources.
+# API keys can also be set via environment variables (takes precedence).
+# Paths are relative to the training/ directory unless absolute.
+# =============================================================================
+
+feeds:
+  malwarebazaar:
+    enabled: true
+    update_interval_hours: 1
+    max_samples_per_run: 500
+    download_samples: true
+    api_url: "https://mb-api.abuse.ch/api/v1/"
+    rate_limit_rpm: 60
+
+  threatfox:
+    enabled: true
+    update_interval_hours: 1
+    max_iocs_per_run: 1000
+    api_url: "https://threatfox-api.abuse.ch/api/v1/"
+    rate_limit_rpm: 100
+
+  otx:
+    enabled: true
+    api_key: ""  # Optional — set via PHANTOM_OTX_API_KEY env var
+    update_interval_hours: 6
+    api_url: "https://otx.alienvault.com/api/v1/"
+    rate_limit_rpm: 120
+    max_pulses_per_run: 200
+
+  urlhaus:
+    enabled: true
+    update_interval_hours: 2
+    api_url: "https://urlhaus-api.abuse.ch/v1/"
+    rate_limit_rpm: 60
+    max_urls_per_run: 2000
+
+  ember:
+    enabled: true
+    dataset_version: "2018_2"
+    download_url: "https://ember.elastic.co/ember_dataset_2018_2.tar.bz2"
+    expected_sha256: "b6052eb8d350a49a8d5a5396fbe7d16cf42848b86ff969b77464434cf2997812"
+
+  feodo:
+    enabled: true
+    update_interval_hours: 1
+    feodo_url: "https://feodotracker.abuse.ch/downloads/ipblocklist_recommended.json"
+    ssl_url: "https://sslbl.abuse.ch/blacklist/sslblacklist.csv"
+    rate_limit_rpm: 30
+
+storage:
+  data_dir: "../data"
+  raw_samples_dir: "../data/raw"
+  feed_cache_dir: "../data/feeds"
+  processed_dir: "../data/processed"
+  db_path: "../data/feeds/feed_tracker.db"
+  max_storage_gb: 50
+
+logging:
+  level: "INFO"
+  file: "../data/feeds/feed_sync.log"
+  rotate_mb: 100
+  format: "%(asctime)s [%(name)s] %(levelname)s %(message)s"
+
+retry:
+  max_retries: 3
+  base_delay_seconds: 2.0
+  max_delay_seconds: 60.0
+  backoff_factor: 2.0
+
+network:
+  request_timeout_seconds: 30
+  download_timeout_seconds: 300
+  user_agent: "ShadowStrike-PhantomCortex/1.0 (ThreatFeedIngestion)"
+  verify_ssl: true

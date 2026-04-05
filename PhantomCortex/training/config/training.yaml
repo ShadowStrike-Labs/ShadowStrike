@@ -1,0 +1,77 @@
+# =============================================================================
+# PhantomCortex Training Configuration
+# =============================================================================
+# Central configuration for all Cortex ML models in the ShadowStrike NGAV
+# engine. Controls hyperparameters, training schedules, quantization, and
+# deployment thresholds.
+#
+# Usage:
+#   from pathlib import Path
+#   import yaml
+#   config = yaml.safe_load(Path("config/training.yaml").read_text())
+# =============================================================================
+
+cortex_static:
+  model_type: "lightgbm"
+  feature_count: 2381
+  n_estimators: 2000
+  learning_rate: 0.05
+  num_leaves: 127
+  max_depth: 10
+  objective: "binary"
+  metric: "auc"
+  early_stopping_rounds: 50
+  optuna_trials: 100
+  cv_folds: 5
+  detection_threshold: 0.5
+  target_fpr: 0.001        # 0.1%
+  target_detection_rate: 0.995  # 99.5%
+
+cortex_behavioral:
+  model_type: "cnn_attention"
+  sequence_length: 512
+  feature_dim: 4
+  embed_dim: 64
+  num_classes: 20
+  epochs: 100
+  batch_size: 256
+  learning_rate: 0.001
+  weight_decay: 0.0001
+
+cortex_memory:
+  model_type: "mlp"
+  input_dim: 128
+  num_classes: 5
+  epochs: 50
+  batch_size: 512
+  learning_rate: 0.001
+
+cortex_network:
+  model_type: "autoencoder_classifier"
+  latent_dim: 32
+  num_classes: 8
+  epochs: 100
+  batch_size: 128
+  anomaly_threshold: 0.95
+
+cortex_emulation:
+  model_type: "gru"
+  sequence_length: 1024
+  feature_dim: 4
+  hidden_dim: 256
+  num_layers: 2
+  num_classes: 3
+  epochs: 80
+  batch_size: 128
+
+quantization:
+  method: "dynamic"        # dynamic or static
+  weight_type: "INT8"
+  max_model_size_mb: 20
+  max_inference_ms: 5.0
+
+deployment:
+  model_dir: "../data/models"
+  min_auc: 0.995
+  max_fpr: 0.001
+  rollback_on_regression: true
