@@ -489,8 +489,10 @@ enum class PESubsystem : uint16_t {
 /**
  * @brief Type of packer/protector detected.
  */
+#ifndef SHADOWSTRIKE_PACKER_TYPE_DEFINED
+#define SHADOWSTRIKE_PACKER_TYPE_DEFINED
 enum class PackerType : uint16_t {
-    None = 0,
+    Unknown = 0,
     
     // -------------------------------------------------------------------------
     // Common Packers (1-49)
@@ -559,6 +561,7 @@ enum class PackerType : uint16_t {
     /// @brief Generic/unknown packer
     Generic = 999
 };
+#endif // SHADOWSTRIKE_PACKER_TYPE_DEFINED
 
 /**
  * @brief Category of suspicious API.
@@ -939,11 +942,6 @@ enum class StringIndicatorType : uint8_t {
  * @brief Get string name for FileType.
  */
 [[nodiscard]] constexpr const char* FileTypeToString(FileType type) noexcept;
-
-/**
- * @brief Get string name for PackerType.
- */
-[[nodiscard]] constexpr const char* PackerTypeToString(PackerType type) noexcept;
 
 /**
  * @brief Get string name for PEAnomaly.

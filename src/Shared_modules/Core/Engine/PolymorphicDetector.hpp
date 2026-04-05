@@ -217,9 +217,9 @@ enum class NormalizationLevel : uint8_t {
 };
 
 /**
- * @brief Detection confidence
+ * @brief Polymorphic detection confidence
  */
-enum class DetectionConfidence : uint8_t {
+enum class PolymorphicDetectionConfidence : uint8_t {
     None            = 0,
     Low             = 1,
     Medium          = 2,
@@ -364,7 +364,7 @@ struct PolyResult {
     std::set<MutationType> mutations;
     
     /// @brief Detection confidence
-    DetectionConfidence confidence = DetectionConfidence::None;
+    PolymorphicDetectionConfidence confidence = PolymorphicDetectionConfidence::None;
     
     /// @brief Normalized body
     std::vector<uint8_t> normalizedBody;
@@ -607,7 +607,7 @@ private:
 [[nodiscard]] std::string_view GetPolyEngineTypeName(PolyEngineType engine) noexcept;
 [[nodiscard]] std::string_view GetMutationTypeName(MutationType mutation) noexcept;
 [[nodiscard]] std::string_view GetNormalizationLevelName(NormalizationLevel level) noexcept;
-[[nodiscard]] std::string_view GetDetectionConfidenceName(DetectionConfidence confidence) noexcept;
+[[nodiscard]] std::string_view GetPolymorphicDetectionConfidenceName(PolymorphicDetectionConfidence confidence) noexcept;
 
 /// @brief Is code potentially polymorphic (quick check)
 [[nodiscard]] bool IsPotentiallyPolymorphic(std::span<const uint8_t> code);

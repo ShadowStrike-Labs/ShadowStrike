@@ -88,7 +88,7 @@ struct BehaviorAnalyzer::Impl {
 
     // Attack chains
     mutable std::shared_mutex m_chainsMutex;
-    std::vector<AttackChain> m_attackChains;
+    std::vector<BehaviorAttackChain> m_attackChains;
     std::atomic<uint64_t> m_nextChainId{1};
 
     // Canary files
@@ -1544,7 +1544,7 @@ void BehaviorAnalyzer::CorrelateWithAttackChains(
         // Need at least 2 distinct attack categories for a chain
         if (categories.size() >= 2) {
             if (m_impl->m_attackChains.size() < BehaviorConstants::MAX_ATTACK_CHAINS) {
-                AttackChain newChain;
+                BehaviorAttackChain newChain;
                 newChain.chainId = m_impl->m_nextChainId.fetch_add(1, std::memory_order_relaxed);
                 newChain.creationTime = std::chrono::system_clock::now();
                 newChain.lastUpdateTime = newChain.creationTime;
@@ -1569,11 +1569,11 @@ void BehaviorAnalyzer::CorrelateWithAttackChains(
                 m_impl->m_stats.activeAttackChains.store(
                     std::count_if(m_impl->m_attackChains.begin(),
                                   m_impl->m_attackChains.end(),
-                                  [](const AttackChain& c) { return c.isActive; }),
+                                  [](const BehaviorAttackChain& c) { return c.isActive; }),
                     std::memory_order_relaxed);
 
                 // Copy chain to invoke callbacks outside lock (vector may reallocate)
-                AttackChain chainCopy = m_impl->m_attackChains.back();
+                BehaviorAttackChain chainCopy = m_impl->m_attackChains.back();
                 chainLock.unlock();
                 InvokeAttackChainCallbacks(chainCopy);
                 return;
@@ -1731,7 +1731,7 @@ void BehaviorAnalyzer::InvokeVerdictCallbacks(const BehaviorVerdict& verdict) {
     }
 }
 
-void BehaviorAnalyzer::InvokeAttackChainCallbacks(const AttackChain& chain) {
+void BehaviorAnalyzer::InvokeAttackChainCallbacks(const BehaviorAttackChain& chain) {
     std::vector<AttackChainCallback> callbacks;
     {
         std::shared_lock cbLock(m_impl->m_callbackMutex);
@@ -1803,7 +1803,7 @@ void BehaviorAnalyzer::PerformCleanup() {
             m_impl->m_attackChains.erase(
                 std::remove_if(m_impl->m_attackChains.begin(),
                                m_impl->m_attackChains.end(),
-                               [&now](const AttackChain& chain) {
+                               [&now](const BehaviorAttackChain& chain) {
                                    if (!chain.isActive) {
                                        auto age = std::chrono::duration_cast<std::chrono::hours>(
                                            std::chrono::system_clock::now() - chain.lastUpdateTime);
@@ -1816,7 +1816,7 @@ void BehaviorAnalyzer::PerformCleanup() {
             m_impl->m_stats.activeAttackChains.store(
                 std::count_if(m_impl->m_attackChains.begin(),
                               m_impl->m_attackChains.end(),
-                              [](const AttackChain& c) { return c.isActive; }),
+                              [](const BehaviorAttackChain& c) { return c.isActive; }),
                 std::memory_order_relaxed);
         }
     }
@@ -1899,9 +1899,9 @@ std::vector<std::pair<uint32_t, double>> BehaviorAnalyzer::GetProcessesAboveThre
 // Public: Attack Chain Management
 // ============================================================================
 
-std::vector<AttackChain> BehaviorAnalyzer::GetActiveAttackChains() const {
+std::vector<BehaviorAttackChain> BehaviorAnalyzer::GetActiveAttackChains() const {
     std::shared_lock lock(m_impl->m_chainsMutex);
-    std::vector<AttackChain> active;
+    std::vector<BehaviorAttackChain> active;
     for (const auto& chain : m_impl->m_attackChains) {
         if (chain.isActive) {
             active.push_back(chain);
@@ -1910,7 +1910,7 @@ std::vector<AttackChain> BehaviorAnalyzer::GetActiveAttackChains() const {
     return active;
 }
 
-std::optional<AttackChain> BehaviorAnalyzer::GetAttackChain(uint64_t chainId) const {
+std::optional<BehaviorAttackChain> BehaviorAnalyzer::GetAttackChain(uint64_t chainId) const {
     std::shared_lock lock(m_impl->m_chainsMutex);
     for (const auto& chain : m_impl->m_attackChains) {
         if (chain.chainId == chainId) {
@@ -1920,9 +1920,9 @@ std::optional<AttackChain> BehaviorAnalyzer::GetAttackChain(uint64_t chainId) co
     return std::nullopt;
 }
 
-std::vector<AttackChain> BehaviorAnalyzer::GetAttackChainsForProcess(uint32_t processId) const {
+std::vector<BehaviorAttackChain> BehaviorAnalyzer::GetAttackChainsForProcess(uint32_t processId) const {
     std::shared_lock lock(m_impl->m_chainsMutex);
-    std::vector<AttackChain> results;
+    std::vector<BehaviorAttackChain> results;
     for (const auto& chain : m_impl->m_attackChains) {
         for (auto pid : chain.involvedProcessIds) {
             if (pid == processId) {

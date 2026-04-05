@@ -345,7 +345,7 @@ namespace EmulationConstants {
     constexpr uint32_t STACK_BASE_32 = 0x7FFE0000;
     
     /// @brief Default stack size
-    constexpr size_t DEFAULT_STACK_SIZE = 1 * 1024 * 1024;  // 1MB
+    constexpr size_t EMU_DEFAULT_STACK_SIZE = 1 * 1024 * 1024;  // 1MB
     
     /// @brief Heap base address (64-bit)
     constexpr uint64_t HEAP_BASE_64 = 0x000001000000ULL;
@@ -641,7 +641,11 @@ enum class MemoryRegionType : uint8_t {
 
 /**
  * @brief Known packer/protector families.
+ * Note: This enum may also be defined in HeuristicAnalyzer.hpp / ExecutableAnalyzer.hpp.
+ * Guard against redefinition.
  */
+#ifndef SHADOWSTRIKE_PACKER_TYPE_DEFINED
+#define SHADOWSTRIKE_PACKER_TYPE_DEFINED
 enum class PackerType : uint16_t {
     /// @brief Unknown/custom packer
     Unknown = 0,
@@ -686,6 +690,7 @@ enum class PackerType : uint16_t {
     /// @brief Not packed
     None = 65535
 };
+#endif // SHADOWSTRIKE_PACKER_TYPE_DEFINED
 
 /**
  * @brief Get string representation of emulation backend.
@@ -718,40 +723,62 @@ enum class PackerType : uint16_t {
     }
 }
 
+#ifndef SHADOWSTRIKE_PACKER_TYPE_TO_STRING_DEFINED
+#define SHADOWSTRIKE_PACKER_TYPE_TO_STRING_DEFINED
+
 /**
  * @brief Get string representation of packer type.
+ * Uses enum values from the authoritative PackerType definition.
  */
-[[nodiscard]] constexpr const char* PackerTypeToString(PackerType packer) noexcept {
-    switch (packer) {
-        case PackerType::Unknown:           return "Unknown Packer";
-        case PackerType::UPX:               return "UPX";
-        case PackerType::ASPack:            return "ASPack";
-        case PackerType::PECompact:         return "PECompact";
-        case PackerType::FSG:               return "FSG";
-        case PackerType::MEW:               return "MEW";
-        case PackerType::MPRESS:            return "MPRESS";
-        case PackerType::Petite:            return "Petite";
-        case PackerType::NsPack:            return "NsPack";
-        case PackerType::Themida:           return "Themida/WinLicense";
-        case PackerType::VMProtect:         return "VMProtect";
-        case PackerType::Enigma:            return "Enigma Protector";
-        case PackerType::Obsidium:          return "Obsidium";
-        case PackerType::ExeCryptor:        return "ExeCryptor";
-        case PackerType::Armadillo:         return "Armadillo";
-        case PackerType::ASProtect:         return "ASProtect";
-        case PackerType::CodeVirtualizer:   return "Code Virtualizer";
-        case PackerType::ConfuserEx:        return "ConfuserEx";
-        case PackerType::Eazfuscator:       return "Eazfuscator.NET";
-        case PackerType::Dotfuscator:       return "Dotfuscator";
-        case PackerType::SmartAssembly:     return "SmartAssembly";
-        case PackerType::Crypto_Obfuscator: return "Crypto Obfuscator";
-        case PackerType::CustomCrypter:     return "Custom Crypter";
-        case PackerType::MalwarePacker:     return "Malware Packer";
-        case PackerType::MultiLayer:        return "Multi-Layer Protection";
-        case PackerType::None:              return "Not Packed";
-        default:                            return "Unknown";
+[[nodiscard]] inline const char* PackerTypeToString(PackerType packer) noexcept {
+    switch (static_cast<uint16_t>(packer)) {
+        case 0:   return "Not Packed";
+        case 1:   return "UPX";
+        case 2:   return "ASPack";
+        case 3:   return "FSG";
+        case 4:   return "PECompact";
+        case 5:   return "MPRESS";
+        case 6:   return "MEW";
+        case 7:   return "NsPack";
+        case 8:   return "Petite";
+        case 9:   return "RLPack";
+        case 10:  return "WinUpack";
+        case 50:  return "Themida/WinLicense";
+        case 51:  return "VMProtect";
+        case 52:  return "Obsidium";
+        case 53:  return "Enigma Protector";
+        case 54:  return "Armadillo";
+        case 55:  return "ASProtect";
+        case 56:  return "ExeCryptor";
+        case 57:  return "EXECstealth";
+        case 58:  return "MoleBox";
+        case 59:  return "PELock";
+        case 100: return "Generic Crypter";
+        case 101: return "XOR Crypter";
+        case 102: return "AES Crypter";
+        case 103: return "RC4 Crypter";
+        case 150: return "Malware Packer";
+        case 151: return "Custom Packer";
+        case 152: return "ConfuserEx";
+        case 153: return "SmartAssembly";
+        case 154: return "Dotfuscator";
+        case 200: return "NSIS";
+        case 201: return "InnoSetup";
+        case 202: return "InstallShield";
+        case 203: return "WinRAR SFX";
+        case 204: return "7-Zip SFX";
+        case 205: return "AutoIt";
+        case 206: return "PyInstaller";
+        case 250: return ".NET Obfuscator";
+        case 251: return "Agile.NET";
+        case 252: return "Babel.NET";
+        case 253: return "Crypto Obfuscator";
+        case 999: return "Generic/Unknown";
+        default:  return "Unknown Packer";
     }
 }
+
+#endif // SHADOWSTRIKE_PACKER_TYPE_TO_STRING_DEFINED
 
 // ============================================================================
 // DATA STRUCTURES
