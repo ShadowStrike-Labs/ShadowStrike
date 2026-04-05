@@ -1227,6 +1227,40 @@ struct QuarantineManagerStats {
     
     /// @brief Expired entries auto-deleted
     std::atomic<uint64_t> expiredDeleted{ 0 };
+
+    QuarantineManagerStats() noexcept = default;
+
+    // Atomics are neither copyable nor movable; provide explicit snapshot semantics
+    QuarantineManagerStats(const QuarantineManagerStats& o) noexcept {
+        totalQuarantined.store(o.totalQuarantined.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalRestored.store(o.totalRestored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalDeleted.store(o.totalDeleted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        activeEntries.store(o.activeEntries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        currentVaultSize.store(o.currentVaultSize.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        remediationActions.store(o.remediationActions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        quarantineFailures.store(o.quarantineFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        restoreFailures.store(o.restoreFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        samplesSubmitted.store(o.samplesSubmitted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        expiredDeleted.store(o.expiredDeleted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    QuarantineManagerStats& operator=(const QuarantineManagerStats& o) noexcept {
+        if (this != &o) {
+            totalQuarantined.store(o.totalQuarantined.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalRestored.store(o.totalRestored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalDeleted.store(o.totalDeleted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeEntries.store(o.activeEntries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            currentVaultSize.store(o.currentVaultSize.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processesTerminated.store(o.processesTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            remediationActions.store(o.remediationActions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            quarantineFailures.store(o.quarantineFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            restoreFailures.store(o.restoreFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            samplesSubmitted.store(o.samplesSubmitted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            expiredDeleted.store(o.expiredDeleted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
     
     /**
      * @brief Reset all statistics.
@@ -1805,7 +1839,7 @@ private:
     // Internal Data (PIMPL)
     // =========================================================================
 
-    struct Impl;
+    class Impl;
     std::unique_ptr<Impl> m_impl;
 };
 
