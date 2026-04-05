@@ -482,7 +482,7 @@ public:
      * @param config Configuration settings.
      * @return True if successful.
      */
-    bool Initialize(const FileLockManagerConfig& config);
+    [[nodiscard]] bool Initialize(const FileLockManagerConfig& config);
 
     /**
      * @brief Shuts down and releases resources.
@@ -559,7 +559,7 @@ public:
      * @param owner Lock owner.
      * @return True if closed.
      */
-    bool CloseHandle(const LockOwner& owner);
+    [[nodiscard]] bool CloseHandle(const LockOwner& owner);
 
     /**
      * @brief Terminates locking process.
@@ -567,7 +567,7 @@ public:
      * @param force Force termination.
      * @return True if terminated.
      */
-    bool TerminateProcess(const LockOwner& owner, bool force = false);
+    [[nodiscard]] bool TerminateProcess(const LockOwner& owner, bool force = false);
 
     // ========================================================================
     // RESTART MANAGER
@@ -578,7 +578,7 @@ public:
      * @param filePath Path to file.
      * @return True if successful.
      */
-    bool UseRestartManager(const std::wstring& filePath);
+    [[nodiscard]] bool UseRestartManager(const std::wstring& filePath);
 
     /**
      * @brief Gets applications using file via Restart Manager.
@@ -596,7 +596,7 @@ public:
      * @param filePath Path to file.
      * @return True if scheduled.
      */
-    bool ScheduleDeleteOnReboot(const std::wstring& filePath);
+    [[nodiscard]] bool ScheduleDeleteOnReboot(const std::wstring& filePath);
 
     /**
      * @brief Schedules file move on reboot.
@@ -604,7 +604,7 @@ public:
      * @param destPath Destination path.
      * @return True if scheduled.
      */
-    bool ScheduleMoveOnReboot(const std::wstring& sourcePath, const std::wstring& destPath);
+    [[nodiscard]] bool ScheduleMoveOnReboot(const std::wstring& sourcePath, const std::wstring& destPath);
 
     /**
      * @brief Gets pending reboot operations.
@@ -617,7 +617,7 @@ public:
      * @param sourcePath Source path.
      * @return True if cancelled.
      */
-    bool CancelPendingOperation(const std::wstring& sourcePath);
+    [[nodiscard]] bool CancelPendingOperation(const std::wstring& sourcePath);
 
     // ========================================================================
     // KERNEL INTEGRATION
@@ -628,7 +628,7 @@ public:
      * @param filePath Path to file.
      * @return True if successful.
      */
-    bool KernelUnlockFile(const std::wstring& filePath);
+    [[nodiscard]] bool KernelUnlockFile(const std::wstring& filePath);
 
     /**
      * @brief Checks if kernel driver is available.
@@ -640,7 +640,7 @@ public:
      * @brief Connects to the PhantomSensor kernel driver for file lock ops.
      * @return True if connection established.
      */
-    bool ConnectKernelDriver();
+    [[nodiscard]] bool ConnectKernelDriver();
 
     /**
      * @brief Disconnects from the kernel driver.
