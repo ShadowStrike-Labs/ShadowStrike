@@ -295,14 +295,13 @@ public:
                 m_signatureStore = std::make_unique<SignatureStore::SignatureStore>();
 
                 auto sigResult = m_signatureStore->Initialize(m_config.signatureDbPath);
-                if (sigResult != SignatureStore::StoreError::Success) {
-                    SS_LOG_ERROR(L"ScanEngine: SignatureStore initialization failed", L" %ls",
-                        static_cast<int>(sigResult));
+                if (!sigResult) {
+                    SS_LOG_ERROR(L"ScanEngine", L"SignatureStore initialization failed: %ls",
+                        StringUtils::ToWide(sigResult.message).c_str());
                     return false;
                 }
 
-                SS_LOG_INFO(L"ScanEngine", L"SignatureStore initialized -  %ls signatures loaded",
-                    m_signatureStore->GetSignatureCount());
+                SS_LOG_INFO(L"ScanEngine", L"SignatureStore initialized successfully");
             }
 
             // Initialize WhitelistStore (Bloom Filter + Trie + Certificates)
@@ -312,14 +311,14 @@ public:
 
                 m_whitelistStore = std::make_unique<Whitelist::WhitelistStore>();
 
-                auto wlResult = m_whitelistStore->Initialize(m_config.whitelistDbPath);
-                if (wlResult != Whitelist::WhitelistError::Success) {
-                    SS_LOG_ERROR(L"ScanEngine: WhitelistStore initialization failed", L" %ls",
-                        static_cast<int>(wlResult));
+                auto wlResult = m_whitelistStore->Load(m_config.whitelistDbPath);
+                if (!wlResult) {
+                    SS_LOG_ERROR(L"ScanEngine", L"WhitelistStore initialization failed: %ls",
+                        StringUtils::ToWide(wlResult.message).c_str());
                     return false;
                 }
 
-                SS_LOG_INFO(L"ScanEngine", L"WhitelistStore initialized -  %ls entries",
+                SS_LOG_INFO(L"ScanEngine", L"WhitelistStore initialized - %llu entries",
                     m_whitelistStore->GetEntryCount());
             }
 
@@ -333,14 +332,13 @@ public:
                 ThreatIntel::DatabaseConfig tiConfig =
                     ThreatIntel::DatabaseConfig::CreateDefault(m_config.threatIntelDbPath);
 
-                auto tiResult = m_threatIntelDB->Initialize(tiConfig);
-                if (tiResult != ThreatIntel::ThreatIntelError::Success) {
-                    SS_LOG_ERROR(L"ScanEngine: ThreatIntelDatabase initialization failed", L" %ls",
-                        static_cast<int>(tiResult));
+                auto tiResult = m_threatIntelDB->Open(tiConfig);
+                if (!tiResult) {
+                    SS_LOG_ERROR(L"ScanEngine", L"ThreatIntelDatabase initialization failed");
                     return false;
                 }
 
-                SS_LOG_INFO(L"ScanEngine", L"ThreatIntelDatabase initialized -  %ls entries",
+                SS_LOG_INFO(L"ScanEngine", L"ThreatIntelDatabase initialized - %zu entries",
                     m_threatIntelDB->GetEntryCount());
             }
 
@@ -381,12 +379,7 @@ public:
                 SS_LOG_INFO(L"ScanEngine", L"Initializing PackerUnpacker");
                 m_packerUnpacker = std::make_unique<PackerUnpacker>();
                 
-                PackerUnpackerConfig packConfig = PackerUnpackerConfig::CreateDefault();
-                packConfig.maxUnpackDepth = 5;
-                packConfig.maxUnpackSize = 100 * 1024 * 1024; // 100MB
-                packConfig.timeoutMs = 30000;
-                
-                if (!m_packerUnpacker->Initialize(packConfig)) {
+                if (!m_packerUnpacker->Initialize()) {
                     SS_LOG_ERROR(L"ScanEngine", L"PackerUnpacker initialization failed");
                     return false;
                 }
@@ -395,14 +388,12 @@ public:
             }
 
             // Initialize PolymorphicDetector
-            if (m_config.enablePolymorphicDetection) {
+            if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing PolymorphicDetector");
                 m_polymorphicDetector = std::make_unique<PolymorphicDetector>();
                 
-                PolymorphicConfig polyConfig = PolymorphicConfig::CreateDefault();
-                polyConfig.enableCodeMorphing = true;
-                polyConfig.enableEncryptionDetection = true;
-                polyConfig.confidenceThreshold = 0.85;
+                PolymorphicConfiguration polyConfig{};
+                polyConfig.enabled = true;
                 
                 if (!m_polymorphicDetector->Initialize(polyConfig)) {
                     SS_LOG_ERROR(L"ScanEngine", L"PolymorphicDetector initialization failed");
@@ -413,15 +404,12 @@ public:
             }
 
             // Initialize SandboxAnalyzer  
-            if (m_config.enableSandboxing) {
+            if (m_config.enableBehaviorAnalysis) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SandboxAnalyzer");
                 m_sandboxAnalyzer = std::make_unique<SandboxAnalyzer>();
                 
-                SandboxConfig sbConfig = SandboxConfig::CreateDefault();
-                sbConfig.maxExecutionTimeMs = 60000; // 1 minute
-                sbConfig.enableNetworkMonitoring = true;
-                sbConfig.enableRegistryMonitoring = true;
-                sbConfig.enableFileSystemMonitoring = true;
+                SandboxAnalyzerConfiguration sbConfig{};
+                sbConfig.enabled = true;
                 
                 if (!m_sandboxAnalyzer->Initialize(sbConfig)) {
                     SS_LOG_ERROR(L"ScanEngine", L"SandboxAnalyzer initialization failed");
@@ -432,16 +420,11 @@ public:
             }
 
             // Initialize EmulationEngine
-            if (m_config.enableEmulation) {
+            if (m_config.enableMemoryScanning) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing EmulationEngine");
                 m_emulationEngine = std::make_unique<EmulationEngine>();
                 
-                EmulationConfig emuConfig = EmulationConfig::CreateDefault();
-                emuConfig.maxInstructions = 100000;
-                emuConfig.timeoutMs = 30000;
-                emuConfig.enableAPIHooking = true;
-                
-                if (!m_emulationEngine->Initialize(emuConfig)) {
+                if (!m_emulationEngine->Initialize(m_threadPool)) {
                     SS_LOG_ERROR(L"ScanEngine", L"EmulationEngine initialization failed");
                     return false;
                 }
@@ -450,14 +433,12 @@ public:
             }
 
             // Initialize ZeroDayDetector
-            if (m_config.enableZeroDayDetection) {
+            if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing ZeroDayDetector");
                 m_zeroDayDetector = std::make_unique<ZeroDayDetector>();
                 
-                ZeroDayConfig zdConfig = ZeroDayConfig::CreateDefault();
-                zdConfig.enableAnomalyDetection = true;
-                zdConfig.enableBehaviorProfiling = true;
-                zdConfig.sensitivityLevel = 0.7;
+                ZeroDayConfiguration zdConfig{};
+                zdConfig.enabled = true;
                 
                 if (!m_zeroDayDetector->Initialize(zdConfig)) {
                     SS_LOG_ERROR(L"ScanEngine", L"ZeroDayDetector initialization failed");
@@ -468,7 +449,26 @@ public:
             }
 
             // Reset statistics
-            m_stats = InternalStats %ls;
+            m_stats.totalScans.store(0, std::memory_order_relaxed);
+            m_stats.infections.store(0, std::memory_order_relaxed);
+            m_stats.suspicious.store(0, std::memory_order_relaxed);
+            m_stats.cacheHits.store(0, std::memory_order_relaxed);
+            m_stats.whitelistHits.store(0, std::memory_order_relaxed);
+            m_stats.hashHits.store(0, std::memory_order_relaxed);
+            m_stats.signatureHits.store(0, std::memory_order_relaxed);
+            m_stats.heuristicHits.store(0, std::memory_order_relaxed);
+            m_stats.behaviorHits.store(0, std::memory_order_relaxed);
+            m_stats.mlHits.store(0, std::memory_order_relaxed);
+            m_stats.totalTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.whitelistTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.hashTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.threatIntelTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.signatureTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.heuristicTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.archivesScanned.store(0, std::memory_order_relaxed);
+            m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
+            m_stats.processesScanned.store(0, std::memory_order_relaxed);
+            m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
             m_stats.startTime = steady_clock::now();
 
             m_initialized.store(true, std::memory_order_release);
@@ -520,17 +520,17 @@ public:
         }
 
         if (m_threatIntelDB) {
-            m_threatIntelDB->Shutdown();
+            m_threatIntelDB->Close();
             m_threatIntelDB.reset();
         }
 
         if (m_whitelistStore) {
-            m_whitelistStore->Shutdown();
+            m_whitelistStore->Close();
             m_whitelistStore.reset();
         }
 
         if (m_signatureStore) {
-            m_signatureStore->Shutdown();
+            m_signatureStore->Close();
             m_signatureStore.reset();
         }
 
@@ -654,7 +654,7 @@ public:
                     if (rule.caseSensitive) {
                         if (path == rule.pattern) return true;
                     } else {
-                        if (StringUtils::ToLower(path) == StringUtils::ToLower(rule.pattern)) {
+                        if (StringUtils::ToLowerCopy(path) == StringUtils::ToLowerCopy(rule.pattern)) {
                             return true;
                         }
                     }
@@ -665,8 +665,8 @@ public:
                     if (rule.caseSensitive) {
                         if (path.starts_with(rule.pattern)) return true;
                     } else {
-                        auto lowerPath = StringUtils::ToLower(path);
-                        auto lowerPattern = StringUtils::ToLower(rule.pattern);
+                        auto lowerPath = StringUtils::ToLowerCopy(path);
+                        auto lowerPattern = StringUtils::ToLowerCopy(rule.pattern);
                         if (lowerPath.starts_with(lowerPattern)) return true;
                     }
                     break;
@@ -678,7 +678,7 @@ public:
                     if (rule.caseSensitive) {
                         if (ext == rule.pattern) return true;
                     } else {
-                        if (StringUtils::ToLower(ext) == StringUtils::ToLower(rule.pattern)) {
+                        if (StringUtils::ToLowerCopy(ext) == StringUtils::ToLowerCopy(rule.pattern)) {
                             return true;
                         }
                     }
@@ -691,7 +691,7 @@ public:
                     if (rule.caseSensitive) {
                         if (filename == rule.pattern) return true;
                     } else {
-                        if (StringUtils::ToLower(filename) == StringUtils::ToLower(rule.pattern)) {
+                        if (StringUtils::ToLowerCopy(filename) == StringUtils::ToLowerCopy(rule.pattern)) {
                             return true;
                         }
                     }
@@ -758,7 +758,7 @@ public:
         };
 
         fs::path p(path);
-        auto ext = StringUtils::ToLower(p.extension().wstring());
+        auto ext = StringUtils::ToLowerCopy(p.extension().wstring());
 
         return std::find(archiveExtensions.begin(), archiveExtensions.end(), ext)
             != archiveExtensions.end();
@@ -837,7 +837,7 @@ ScanEngine::~ScanEngine() {
 
 bool ScanEngine::Initialize(const EngineConfig& config) {
     if (!m_impl) {
-        SS_LOG_CRITICAL(L"ScanEngine", L"Implementation is null");
+        SS_LOG_ERROR(L"ScanEngine", L"Implementation is null");
         return false;
     }
 
@@ -981,7 +981,9 @@ EngineResult ScanEngine::ScanFile(
             const auto stage1Start = steady_clock::now();
 
             // Check by hash (bloom filter fast path)
-            if (m_impl->m_whitelistStore->IsHashWhitelisted(fileHash)) {
+            auto hashLookup = m_impl->m_whitelistStore->IsHashWhitelisted(
+                fileHash, Whitelist::HashAlgorithm::SHA256);
+            if (hashLookup.found) {
                 m_impl->m_stats.whitelistHits.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Whitelisted;
@@ -993,7 +995,8 @@ EngineResult ScanEngine::ScanFile(
             }
 
             // Check by path (trie index)
-            if (m_impl->m_whitelistStore->IsPathWhitelisted(filePath)) {
+            auto pathLookup = m_impl->m_whitelistStore->IsPathWhitelisted(filePath);
+            if (pathLookup.found) {
                 m_impl->m_stats.whitelistHits.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Whitelisted;
@@ -1025,21 +1028,22 @@ EngineResult ScanEngine::ScanFile(
             hashScanOpts.enableYaraScan = false;
             hashScanOpts.stopOnFirstMatch = true;
 
-            auto hashResult = m_impl->m_signatureStore->ScanHash(fileHash, hashScanOpts);
+            auto hashResult = m_impl->m_signatureStore->ScanFile(filePath, hashScanOpts);
 
-            if (hashResult.isDetected) {
+            if (hashResult.HasDetections()) {
                 m_impl->m_stats.hashHits.fetch_add(1, std::memory_order_relaxed);
                 m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
 
+                const auto& topDetection = hashResult.detections.front();
                 result.verdict = ScanVerdict::Infected;
-                result.threatName = hashResult.threatName;
-                result.severity = hashResult.severity;
-                result.threatId = hashResult.signatureId;
+                result.threatName = topDetection.signatureName;
+                result.severity = topDetection.threatLevel;
+                result.threatId = topDetection.signatureId;
                 result.detectionSource = "HashStore";
                 result.sha256 = fileHash;
 
-                SS_LOG_WARN(L"ScanEngine: Hash match found - Threat", L" %ls",
-                    hashResult.threatName);
+                SS_LOG_WARN(L"ScanEngine", L"Hash match found - Threat: %ls",
+                    StringUtils::ToWide(topDetection.signatureName).c_str());
 
                 // Invoke detection callbacks
                 m_impl->InvokeDetectionCallbacks(result);
@@ -1061,17 +1065,17 @@ EngineResult ScanEngine::ScanFile(
         if (m_impl->m_config.enableCloudLookup && m_impl->m_threatIntelDB) {
             const auto stage3Start = steady_clock::now();
 
-            auto tiResult = m_impl->m_threatIntelDB->QueryHash(fileHash);
+            bool tiFound = m_impl->m_threatIntelDB->HasEntry(fileHash, ThreatIntel::IOCType::FileHash);
 
-            if (tiResult.found && tiResult.isMalicious) {
+            if (tiFound) {
                 result.verdict = ScanVerdict::Suspicious;
-                result.threatName = tiResult.threatName;
+                result.threatName = "ThreatIntel.Match";
                 result.severity = SignatureStore::ThreatLevel::Medium;
                 result.detectionSource = "ThreatIntel";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine: Threat intelligence match - Threat", L" %ls",
-                    tiResult.threatName);
+                SS_LOG_INFO(L"ScanEngine", L"Threat intelligence match for hash: %ls",
+                    StringUtils::ToWide(fileHash.substr(0, 16)).c_str());
 
                 // Don't goto finalize - continue with deeper analysis
                 // This is a suspicion, not a confirmed detection
@@ -1130,19 +1134,20 @@ EngineResult ScanEngine::ScanFile(
 
                 auto sigResult = m_impl->m_signatureStore->ScanBuffer(fileBuffer, sigScanOpts);
 
-                if (sigResult.isDetected) {
+                if (sigResult.HasDetections()) {
                     m_impl->m_stats.signatureHits.fetch_add(1, std::memory_order_relaxed);
                     m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
 
+                    const auto& topDetection = sigResult.detections.front();
                     result.verdict = ScanVerdict::Infected;
-                    result.threatName = sigResult.threatName;
-                    result.severity = sigResult.severity;
-                    result.threatId = sigResult.signatureId;
-                    result.detectionSource = sigResult.detectionMethod;
+                    result.threatName = topDetection.signatureName;
+                    result.severity = topDetection.threatLevel;
+                    result.threatId = topDetection.signatureId;
+                    result.detectionSource = "SignatureStore";
                     result.sha256 = fileHash;
 
-                    SS_LOG_WARN(L"ScanEngine: Signature match found - Threat: {} (Method", L" %ls)",
-                        sigResult.threatName, sigResult.detectionMethod);
+                    SS_LOG_WARN(L"ScanEngine", L"Signature match found - Threat: %ls",
+                        StringUtils::ToWide(topDetection.signatureName).c_str());
 
                     // Invoke detection callbacks
                     m_impl->InvokeDetectionCallbacks(result);
@@ -1174,8 +1179,8 @@ EngineResult ScanEngine::ScanFile(
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Suspicious;
-                result.threatName = heuristicResult.threatName;
-                result.threatScore = heuristicResult.riskScore;
+                result.threatName = StringUtils::ToNarrow(heuristicResult.threatName);
+                result.threatScore = static_cast<float>(heuristicResult.riskScore);
                 result.detectionSource = "Heuristic";
                 result.sha256 = fileHash;
 
@@ -1200,23 +1205,24 @@ EngineResult ScanEngine::ScanFile(
         // STAGE 6: POLYMORPHIC DETECTION (Code Morphing & Encryption)
         // ====================================================================
 
-        if (m_impl->m_config.enablePolymorphicDetection && m_impl->m_polymorphicDetector) {
+        if (m_impl->m_polymorphicDetector && m_impl->m_polymorphicDetector->IsInitialized()) {
             const auto stage6Start = steady_clock::now();
 
             auto polyResult = m_impl->m_polymorphicDetector->AnalyzeFile(filePath);
 
-            if (polyResult.isPolymorphic && polyResult.confidence >= m_impl->m_config.sensitivityLevel) {
+            if (polyResult.isPolymorphic &&
+                static_cast<uint8_t>(polyResult.confidence) >= static_cast<uint8_t>(PolymorphicDetectionConfidence::Medium)) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Suspicious;
-                result.threatName = polyResult.detectedVariant;
-                result.threatScore = polyResult.confidence * 100.0;
+                result.threatName = polyResult.threatFamily.empty() ? "Polymorphic.Generic" : polyResult.threatFamily;
+                result.threatScore = static_cast<float>(static_cast<double>(static_cast<uint8_t>(polyResult.confidence)) * 25.0);
                 result.detectionSource = "PolymorphicDetector";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine", L"Polymorphic detection - Confidence: %.1f%%, Variant: %ls",
-                    polyResult.confidence * 100.0,
-                    StringUtils::ToWide(polyResult.detectedVariant).c_str());
+                SS_LOG_INFO(L"ScanEngine", L"Polymorphic detection - Confidence: %u, Family: %ls",
+                    static_cast<unsigned>(polyResult.confidence),
+                    StringUtils::ToWide(polyResult.threatFamily).c_str());
 
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
@@ -1229,28 +1235,26 @@ EngineResult ScanEngine::ScanFile(
         // STAGE 7: SANDBOX ANALYSIS (Dynamic Behavior)
         // ====================================================================
 
-        if (m_impl->m_config.enableSandboxing && m_impl->m_sandboxAnalyzer && context.deepScan) {
+        if (m_impl->m_sandboxAnalyzer && m_impl->m_sandboxAnalyzer->IsInitialized() && context.deepScan) {
             const auto stage7Start = steady_clock::now();
 
-            SandboxRequest sbRequest{};
-            sbRequest.filePath = filePath;
-            sbRequest.analysisType = SandboxAnalysisType::QuickScan;
-            sbRequest.timeoutMs = 30000; // 30 seconds for quick scan
+            SandboxAnalysisOptions sbOptions{};
+            sbOptions.timeoutSeconds = 30;
 
-            auto sbResult = m_impl->m_sandboxAnalyzer->AnalyzeFile(sbRequest);
+            auto sbResult = m_impl->m_sandboxAnalyzer->Analyze(filePath, sbOptions);
 
-            if (sbResult.isMalicious && sbResult.confidence >= 0.7) {
+            if (sbResult.isMalicious && sbResult.threatScore >= 70) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Suspicious;
-                result.threatName = sbResult.threatFamily;
-                result.threatScore = sbResult.confidence * 100.0;
+                result.threatName = sbResult.malwareFamily.empty() ? "Sandbox.Malicious" : sbResult.malwareFamily;
+                result.threatScore = static_cast<float>(sbResult.threatScore);
                 result.detectionSource = "SandboxAnalyzer";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine", L"Sandbox detection - Threat: %ls, Confidence: %.1f%%",
-                    StringUtils::ToWide(sbResult.threatFamily).c_str(),
-                    sbResult.confidence * 100.0);
+                SS_LOG_INFO(L"ScanEngine", L"Sandbox detection - Threat: %ls, Score: %d",
+                    StringUtils::ToWide(sbResult.malwareFamily).c_str(),
+                    sbResult.threatScore);
 
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
@@ -1263,31 +1267,44 @@ EngineResult ScanEngine::ScanFile(
         // STAGE 8: EMULATION ENGINE (Code Execution Simulation)
         // ====================================================================
 
-        if (m_impl->m_config.enableEmulation && m_impl->m_emulationEngine && context.deepScan) {
+        if (m_impl->m_emulationEngine && m_impl->m_emulationEngine->IsInitialized() && context.deepScan) {
             const auto stage8Start = steady_clock::now();
 
-            EmulationRequest emuRequest{};
-            emuRequest.filePath = filePath;
-            emuRequest.maxInstructions = 50000; // Conservative limit for performance
-            emuRequest.timeoutMs = 15000; // 15 seconds
+            // Read file into buffer for emulation
+            try {
+                std::ifstream emuFile(filePath, std::ios::binary | std::ios::ate);
+                if (emuFile) {
+                    auto emuFileSize = emuFile.tellg();
+                    emuFile.seekg(0, std::ios::beg);
 
-            auto emuResult = m_impl->m_emulationEngine->EmulateFile(emuRequest);
+                    constexpr size_t MAX_EMU_SIZE = 50 * 1024 * 1024; // 50MB limit
+                    size_t emuReadSize = std::min<size_t>(emuFileSize, MAX_EMU_SIZE);
 
-            if (emuResult.maliciousBehaviorDetected) {
-                m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+                    std::vector<uint8_t> emuBuffer(emuReadSize);
+                    emuFile.read(reinterpret_cast<char*>(emuBuffer.data()), emuReadSize);
 
-                result.verdict = ScanVerdict::Suspicious;
-                result.threatName = emuResult.detectedBehavior;
-                result.threatScore = emuResult.riskScore;
-                result.detectionSource = "EmulationEngine";
-                result.sha256 = fileHash;
+                    EmulationConfig emuConfig = EmulationConfig::CreateDefault();
+                    auto emuResult = m_impl->m_emulationEngine->EmulatePE(emuBuffer, emuConfig);
 
-                SS_LOG_INFO(L"ScanEngine", L"Emulation detection - Behavior: %ls, Risk: %.1f",
-                    StringUtils::ToWide(emuResult.detectedBehavior).c_str(),
-                    emuResult.riskScore);
+                    if (emuResult.isMalicious) {
+                        m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
-                m_impl->InvokeDetectionCallbacks(result);
-                goto finalize_scan;
+                        result.verdict = ScanVerdict::Suspicious;
+                        result.threatName = emuResult.threatName.empty() ? "Emulation.Malicious" : emuResult.threatName;
+                        result.threatScore = static_cast<float>(emuResult.threatScore);
+                        result.detectionSource = "EmulationEngine";
+                        result.sha256 = fileHash;
+
+                        SS_LOG_INFO(L"ScanEngine", L"Emulation detection - Behavior: %ls, Score: %.1f",
+                            StringUtils::ToWide(emuResult.threatName).c_str(),
+                            emuResult.threatScore);
+
+                        m_impl->InvokeDetectionCallbacks(result);
+                        goto finalize_scan;
+                    }
+                }
+            } catch (const std::exception& emuEx) {
+                SS_LOG_ERROR(L"ScanEngine", L"Emulation exception: %ls", emuEx.what());
             }
 
             const auto stage8End = steady_clock::now();
@@ -1297,28 +1314,25 @@ EngineResult ScanEngine::ScanFile(
         // STAGE 9: ZERO-DAY DETECTION (Advanced Anomaly Detection)
         // ====================================================================
 
-        if (m_impl->m_config.enableZeroDayDetection && m_impl->m_zeroDayDetector && context.deepScan) {
+        if (m_impl->m_zeroDayDetector && m_impl->m_zeroDayDetector->IsInitialized() && context.deepScan) {
             const auto stage9Start = steady_clock::now();
 
-            ZeroDayAnalysisRequest zdRequest{};
-            zdRequest.filePath = filePath;
-            zdRequest.enableBehaviorProfiling = true;
-            zdRequest.enableAnomalyDetection = true;
+            ZeroDayAnalysisOptions zdOptions{};
+            auto zdResult = m_impl->m_zeroDayDetector->AnalyzeFile(filePath, zdOptions);
 
-            auto zdResult = m_impl->m_zeroDayDetector->AnalyzeForZeroDay(zdRequest);
-
-            if (zdResult.isZeroDay && zdResult.confidence >= m_impl->m_config.sensitivityLevel) {
+            if (zdResult.detected &&
+                static_cast<uint8_t>(zdResult.confidence) >= static_cast<uint8_t>(DetectionConfidence::Medium)) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
 
                 result.verdict = ScanVerdict::Suspicious;
-                result.threatName = "ZeroDay." + zdResult.anomalyType;
-                result.threatScore = zdResult.confidence * 100.0;
+                result.threatName = "ZeroDay." + zdResult.description;
+                result.threatScore = static_cast<float>(static_cast<double>(static_cast<uint8_t>(zdResult.confidence)) * 33.3);
                 result.detectionSource = "ZeroDayDetector";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine", L"Zero-day detection - Type: %ls, Confidence: %.1f%%",
-                    StringUtils::ToWide(zdResult.anomalyType).c_str(),
-                    zdResult.confidence * 100.0);
+                SS_LOG_INFO(L"ScanEngine", L"Zero-day detection - Type: %ls, Confidence: %u",
+                    StringUtils::ToWide(zdResult.description).c_str(),
+                    static_cast<unsigned>(zdResult.confidence));
 
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
@@ -1351,8 +1365,7 @@ EngineResult ScanEngine::ScanFile(
         // Update cache
         m_impl->UpdateCache(fileHash, result);
 
-        SS_LOG_INFO(L"ScanEngine: Scan complete - File: {}, Verdict:  %ls, Duration", L"{} µs",
-            StringUtils::ToNarrow(fs::path(filePath).filename()),
+        SS_LOG_INFO(L"ScanEngine", L"Scan complete - Verdict: %d, Duration: %llu us",
             static_cast<int>(result.verdict),
             result.scanDurationUs);
 
@@ -1458,7 +1471,8 @@ BatchScanResult ScanEngine::ScanBatch(
                 if (result.verdict == ScanVerdict::Suspicious) {
                     stats.filesSuspicious++;
                 }
-                stats.totalBytesScanned += fs::file_size(filePath, std::error_code{});
+                std::error_code fsSizeEc;
+                stats.totalBytesScanned += fs::file_size(fs::path(filePath), fsSizeEc);
             }
 
             completed.fetch_add(1, std::memory_order_relaxed);
@@ -1561,7 +1575,7 @@ DirectoryScanResult ScanEngine::ScanDirectory(
         std::vector<std::wstring> filesToScan;
         std::error_code ec;
 
-        auto collectFiles = [&](const fs::path& root, uint32_t depth) -> void {
+        std::function<void(const fs::path&, uint32_t)> collectFiles = [&](const fs::path& root, uint32_t depth) -> void {
             if (depth > request.maxDepth) return;
 
             try {
@@ -1823,12 +1837,14 @@ EngineResult ScanEngine::ScanMemory(
             hashOpts.enablePatternScan = false;
             hashOpts.enableYaraScan = false;
 
-            auto hashResult = m_impl->m_signatureStore->ScanHash(bufferHash, hashOpts);
-            if (hashResult.isDetected) {
+            auto hashResult = m_impl->m_signatureStore->ScanBuffer(
+                std::span<const uint8_t>(buffer.data(), buffer.size()), hashOpts);
+            if (hashResult.HasDetections()) {
                 m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+                const auto& topDet = hashResult.detections.front();
                 result.verdict = ScanVerdict::Infected;
-                result.threatName = hashResult.threatName;
-                result.severity = hashResult.severity;
+                result.threatName = topDet.signatureName;
+                result.severity = topDet.threatLevel;
                 result.detectionSource = "HashStore";
                 goto finalize_memory_scan;
             }
@@ -1842,12 +1858,13 @@ EngineResult ScanEngine::ScanMemory(
             sigOpts.enableYaraScan = true;
 
             auto sigResult = m_impl->m_signatureStore->ScanBuffer(buffer, sigOpts);
-            if (sigResult.isDetected) {
+            if (sigResult.HasDetections()) {
                 m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+                const auto& topDet = sigResult.detections.front();
                 result.verdict = ScanVerdict::Infected;
-                result.threatName = sigResult.threatName;
-                result.severity = sigResult.severity;
-                result.detectionSource = sigResult.detectionMethod;
+                result.threatName = topDet.signatureName;
+                result.severity = topDet.threatLevel;
+                result.detectionSource = "SignatureStore";
                 goto finalize_memory_scan;
             }
         }
@@ -1885,12 +1902,13 @@ EngineResult ScanEngine::ScanProcess(
         m_impl->m_stats.processesScanned.fetch_add(1, std::memory_order_relaxed);
 
         // Get process executable path
-        auto processPath = ProcessUtils::GetProcessImagePath(pid);
-        if (processPath.empty()) {
-            SS_LOG_WARN(L"ScanEngine", L"Cannot get process path for PID  %ls", pid);
+        auto processPathOpt = ProcessUtils::GetProcessPath(pid);
+        if (!processPathOpt.has_value() || processPathOpt->empty()) {
+            SS_LOG_WARN(L"ScanEngine", L"Cannot get process path for PID %u", pid);
             result.verdict = ScanVerdict::Error;
             return result;
         }
+        auto processPath = processPathOpt.value();
 
         // Scan the executable
         result = ScanFile(processPath, context);
@@ -1917,8 +1935,12 @@ std::vector<EngineResult> ScanEngine::ScanAllProcesses(
     try {
         SS_LOG_INFO(L"ScanEngine", L"Scanning all processes");
 
-        auto processes = ProcessUtils::EnumerateProcesses();
-        SS_LOG_INFO(L"ScanEngine", L"Found  %ls processes", processes.size());
+        std::vector<ProcessUtils::ProcessId> processes;
+        if (!ProcessUtils::EnumerateProcesses(processes)) {
+            SS_LOG_ERROR(L"ScanEngine", L"Failed to enumerate processes");
+            return results;
+        }
+        SS_LOG_INFO(L"ScanEngine", L"Found %zu processes", processes.size());
 
         uint64_t scanned = 0;
         for (const auto& pid : processes) {
@@ -1961,29 +1983,17 @@ EngineResult ScanEngine::ScanProcessMemoryDeep(
     }
 
     try {
-        SS_LOG_INFO(L"ScanEngine: Deep scanning process memory", L" %ls", pid);
+        SS_LOG_INFO(L"ScanEngine", L"Deep scanning process memory for PID %u", pid);
 
-        // Get process memory regions
-        auto memoryRegions = ProcessUtils::GetProcessMemoryRegions(pid);
-
-        for (const auto& region : memoryRegions) {
-            // Read memory
-            std::vector<uint8_t> memory = ProcessUtils::ReadProcessMemory(
-                pid, region.baseAddress, region.size
-            );
-
-            if (!memory.empty()) {
-                auto scanResult = ScanMemory(memory, context);
-
-                if (scanResult.verdict == ScanVerdict::Infected ||
-                    scanResult.verdict == ScanVerdict::Suspicious) {
-                    result = scanResult;
-                    return result; // Found threat
-                }
-            }
+        // Deep memory scan requires kernel driver support.
+        // For now, fall back to scanning the process executable.
+        auto pathOpt = ProcessUtils::GetProcessPath(pid);
+        if (pathOpt.has_value() && !pathOpt->empty()) {
+            result = ScanFile(pathOpt.value(), context);
+        } else {
+            result.verdict = ScanVerdict::Error;
         }
 
-        result.verdict = ScanVerdict::Clean;
         return result;
 
     } catch (const std::exception& e) {
@@ -2024,13 +2034,20 @@ BatchScanResult ScanEngine::ScanArchive(
 
         // Extract and scan
         if (m_impl->m_packerUnpacker) {
-            auto extractedFiles = m_impl->m_packerUnpacker->ExtractArchive(
+            auto extractedPaths = m_impl->m_packerUnpacker->ExtractArchive(
                 archivePath, options.maxNestingDepth
             );
 
             m_impl->m_stats.archiveFilesScanned.fetch_add(
-                extractedFiles.size(), std::memory_order_relaxed
+                extractedPaths.size(), std::memory_order_relaxed
             );
+
+            // Convert fs::path to wstring for batch scan
+            std::vector<std::wstring> extractedFiles;
+            extractedFiles.reserve(extractedPaths.size());
+            for (const auto& p : extractedPaths) {
+                extractedFiles.push_back(p.wstring());
+            }
 
             // Scan extracted files
             BatchScanRequest batchReq{};
@@ -2448,19 +2465,20 @@ bool ScanEngine::ReloadDatabases() {
 
         // Reload SignatureStore
         if (m_impl->m_signatureStore) {
-            auto result = m_impl->m_signatureStore->Reload();
-            if (result != SignatureStore::StoreError::Success) {
+            m_impl->m_signatureStore->Close();
+            auto result = m_impl->m_signatureStore->Initialize(m_impl->m_config.signatureDbPath);
+            if (!result) {
                 SS_LOG_ERROR(L"ScanEngine", L"SignatureStore reload failed");
                 return false;
             }
-            SS_LOG_INFO(L"ScanEngine", L"SignatureStore reloaded -  %ls signatures",
-                m_impl->m_signatureStore->GetSignatureCount());
+            SS_LOG_INFO(L"ScanEngine", L"SignatureStore reloaded");
         }
 
         // Reload WhitelistStore
         if (m_impl->m_whitelistStore) {
-            auto result = m_impl->m_whitelistStore->Reload();
-            if (result != Whitelist::WhitelistError::Success) {
+            m_impl->m_whitelistStore->Close();
+            auto result = m_impl->m_whitelistStore->Load(m_impl->m_config.whitelistDbPath);
+            if (!result) {
                 SS_LOG_ERROR(L"ScanEngine", L"WhitelistStore reload failed");
                 return false;
             }
@@ -2469,8 +2487,9 @@ bool ScanEngine::ReloadDatabases() {
 
         // Reload ThreatIntelDatabase
         if (m_impl->m_threatIntelDB) {
-            auto result = m_impl->m_threatIntelDB->Reload();
-            if (result != ThreatIntel::ThreatIntelError::Success) {
+            m_impl->m_threatIntelDB->Close();
+            auto tiConfig = ThreatIntel::DatabaseConfig::CreateDefault(m_impl->m_config.threatIntelDbPath);
+            if (!m_impl->m_threatIntelDB->Open(tiConfig)) {
                 SS_LOG_ERROR(L"ScanEngine", L"ThreatIntelDatabase reload failed");
                 return false;
             }
@@ -2503,7 +2522,7 @@ void ScanEngine::UpdateConfig(const EngineConfig& newConfig) {
 }
 
 EngineConfig ScanEngine::GetConfig() const {
-    if (!m_impl) return EngineConfig %ls;
+    if (!m_impl) return EngineConfig{};
 
     std::shared_lock lock(m_impl->m_configMutex);
     return m_impl->m_config;
@@ -2607,14 +2626,33 @@ ScanEngine::Stats ScanEngine::GetStatistics() const {
 void ScanEngine::ResetStatistics() {
     if (!m_impl) return;
 
-    m_impl->m_stats = Impl::InternalStats{};
+    m_impl->m_stats.totalScans.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.infections.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.suspicious.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.cacheHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.whitelistHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.hashHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.signatureHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.heuristicHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.behaviorHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.mlHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.totalTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.whitelistTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.hashTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.threatIntelTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.signatureTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.heuristicTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.archivesScanned.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.peakMemoryBytes.store(0, std::memory_order_relaxed);
     m_impl->m_stats.startTime = steady_clock::now();
 
     SS_LOG_INFO(L"ScanEngine", L"Statistics reset");
 }
 
 ScanEngine::PerformanceMetrics ScanEngine::GetPerformanceMetrics() const {
-    PerformanceMetrics metrics %ls;
+    PerformanceMetrics metrics{};
 
     if (!m_impl) return metrics;
 
@@ -2658,7 +2696,7 @@ bool ScanEngine::SelfTest() {
         // Test 1: Cache functionality
         {
             std::string testHash = "test123";
-            EngineResult testResult %ls;
+            EngineResult testResult{};
             testResult.verdict = ScanVerdict::Clean;
 
             m_impl->UpdateCache(testHash, testResult);
@@ -2672,7 +2710,7 @@ bool ScanEngine::SelfTest() {
 
         // Test 2: Exclusion system
         {
-            ExclusionRule rule %ls;
+            ExclusionRule rule{};
             rule.type = ExclusionRule::Type::Path;
             rule.pattern = L"C:\\Test\\exclude.exe";
             rule.enabled = true;
@@ -2707,7 +2745,7 @@ ScanEngine::VersionInfo ScanEngine::GetVersionInfo() const {
     info.yaraVersion = "4.2.0";
 
     if (m_impl && m_impl->m_signatureStore) {
-        info.signatureVersion = m_impl->m_signatureStore->GetVersion();
+        info.signatureVersion = SignatureStore::Store::GetVersion();
     }
 
     info.lastUpdate = system_clock::now();
@@ -2758,13 +2796,13 @@ std::string ScanEngine::SubmitSampleToCloud(
             }
 
             // Prepare cloud submission metadata
-            CloudSubmissionRequest request{};
+            Impl::CloudSubmissionRequest request{};
             request.submissionId = submissionId;
             request.sha256 = localResult.sha256;
             request.fileSize = static_cast<size_t>(fileSize);
             request.filePath = filePath;
             request.submitTime = system_clock::now();
-            request.priority = CloudPriority::Normal;
+            request.priority = Impl::CloudPriority::Normal;
 
             // Store pending submission for tracking
             {
@@ -2776,16 +2814,16 @@ std::string ScanEngine::SubmitSampleToCloud(
                          submissionId, fileSize);
 
             // Submit asynchronously to avoid blocking
-            m_impl->m_threadPool->SubmitTask([this, request]() {
+            auto cloudFuture = m_impl->m_threadPool->Submit([impl = m_impl.get(), request](const Utils::TaskContext&) {
                 try {
-                    PerformCloudUpload(request);
+                    impl->PerformCloudUpload(request);
                 } catch (const std::exception& e) {
                     SS_LOG_ERROR(L"ScanEngine: Cloud upload failed", L" %ls", e.what());
-                    // Mark submission as failed
-                    std::lock_guard<std::mutex> lock(m_impl->m_pendingSubmissionsMutex);
-                    m_impl->m_pendingSubmissions.erase(request.submissionId);
+                    std::lock_guard<std::mutex> lock(impl->m_pendingSubmissionsMutex);
+                    impl->m_pendingSubmissions.erase(request.submissionId);
                 }
             });
+            (void)cloudFuture;
 
         } catch (const std::exception& uploadEx) {
             SS_LOG_ERROR(L"ScanEngine: Cloud upload preparation failed", L" %ls", uploadEx.what());
@@ -2812,9 +2850,9 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
         SS_LOG_DEBUG(L"ScanEngine", L"Querying cloud results for  %ls", submissionId);
 
         // Check if submission exists in our tracking
-        CloudSubmissionRequest submission{};
+        Impl::CloudSubmissionRequest submission{};
         {
-            std::shared_lock<std::shared_mutex> lock(m_impl->m_pendingSubmissionsMutex);
+            std::lock_guard<std::mutex> lock(m_impl->m_pendingSubmissionsMutex);
             auto it = m_impl->m_pendingSubmissions.find(submissionId);
             if (it == m_impl->m_pendingSubmissions.end()) {
                 SS_LOG_DEBUG(L"ScanEngine: Submission ID not found", L" %ls", submissionId);
@@ -2832,7 +2870,7 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
 
         // Query cloud service for results
         try {
-            CloudAnalysisResult cloudResult{};
+            Impl::CloudAnalysisResult cloudResult{};
             cloudResult.submissionId = submissionId;
             cloudResult.analysisComplete = true;
             cloudResult.detectionCount = 0;
@@ -2853,13 +2891,10 @@ std::optional<EngineResult> ScanEngine::GetCloudResult(
             // Convert to EngineResult
             EngineResult result{};
             result.verdict = (cloudResult.detectionCount > 5) ? ScanVerdict::Infected : ScanVerdict::Clean;
-            result.confidence = cloudResult.confidence;
+            result.threatScore = static_cast<float>(cloudResult.confidence * 100.0);
             result.sha256 = submission.sha256;
-            result.engineName = "ShadowStrike Cloud";
-            result.signatureName = cloudResult.verdict;
-            result.details = "Cloud engines: " + 
-                           std::to_string(cloudResult.detectionCount) + 
-                           "/" + std::to_string(67) + " detected";
+            result.detectionSource = "ShadowStrike Cloud";
+            result.threatName = cloudResult.verdict;
 
             // Remove from pending submissions
             {
@@ -2907,19 +2942,19 @@ std::optional<EngineResult> ScanEngine::QueryCloudReputation(
 
         // Check cache first
         std::string cacheKey = "CLOUD_REP_" + hash;
-        if (auto cached = m_impl->GetCachedResult(cacheKey)) {
+        if (auto cached = m_impl->CheckCache(cacheKey)) {
             SS_LOG_DEBUG(L"ScanEngine", L"Cloud reputation cache hit for  %ls", hash.substr(0, 16));
             return cached;
         }
 
         // Query multiple reputation sources
         try {
-            ReputationQuery query{};
+            Impl::ReputationQuery query{};
             query.hash = hash;
             query.hashType = "SHA256";
             query.queryTime = system_clock::now();
 
-            ReputationResult result{};
+            Impl::ReputationResult result{};
             result.hash = hash;
             result.totalEngines = 0;
             result.positiveDetections = 0;
@@ -2948,25 +2983,21 @@ std::optional<EngineResult> ScanEngine::QueryCloudReputation(
             EngineResult engineResult{};
             if (result.positiveDetections > 5) {
                 engineResult.verdict = ScanVerdict::Infected;
-                engineResult.confidence = static_cast<double>(result.positiveDetections) / result.totalEngines;
+                engineResult.threatScore = static_cast<float>(static_cast<double>(result.positiveDetections) / result.totalEngines * 100.0);
             } else if (result.positiveDetections > 0) {
                 engineResult.verdict = ScanVerdict::Suspicious;
-                engineResult.confidence = static_cast<double>(result.positiveDetections) / result.totalEngines;
+                engineResult.threatScore = static_cast<float>(static_cast<double>(result.positiveDetections) / result.totalEngines * 100.0);
             } else {
                 engineResult.verdict = ScanVerdict::Clean;
-                engineResult.confidence = 0.95; // High confidence for clean files
+                engineResult.threatScore = 0.0f;
             }
 
             engineResult.sha256 = hash;
-            engineResult.engineName = "Cloud Reputation";
-            engineResult.signatureName = result.reputation;
-            engineResult.details = "Reputation: " + 
-                                std::to_string(result.positiveDetections) + 
-                                "/" + std::to_string(result.totalEngines) + 
-                                " engines flagged as malicious";
+            engineResult.detectionSource = "Cloud Reputation";
+            engineResult.threatName = result.reputation;
 
             // Cache the result
-            m_impl->CacheResult(cacheKey, engineResult);
+            m_impl->UpdateCache(cacheKey, engineResult);
 
             SS_LOG_INFO(L"ScanEngine: Cloud reputation query complete", L"{} - {}/ %ls flagged", 
                         hash.substr(0, 16), result.positiveDetections, result.totalEngines);
@@ -2998,11 +3029,11 @@ std::wstring ScanEngine::GenerateReport(
 
     try {
         report += L"=== ShadowStrike Scan Report ===\n\n";
-        report += L"Root Path: {}\n" + std::to_wstring(result.rootPath);
-        report += L"Total Files Scanned: {}\n" + std::to_wstring(result.statistics.filesScanned);
-        report += L"Infections Found: {}\n" + std::to_wstring(result.statistics.filesInfected);
-        report += L"Suspicious Files: {}\n" + std::to_wstring(result.statistics.filesSuspicious);
-        report += L"Duration: {} ms\n" + std::to_wstring(result.totalDuration.count());
+        report += L"Root Path: " + result.rootPath + L"\n";
+        report += L"Total Files Scanned: " + std::to_wstring(result.statistics.filesScanned) + L"\n";
+        report += L"Infections Found: " + std::to_wstring(result.statistics.filesInfected) + L"\n";
+        report += L"Suspicious Files: " + std::to_wstring(result.statistics.filesSuspicious) + L"\n";
+        report += L"Duration: " + std::to_wstring(result.totalDuration.count()) + L" ms\n";
         report += L"\n";
 
         if (includeDetails && result.statistics.filesInfected > 0) {
@@ -3043,34 +3074,36 @@ bool ScanEngine::ExportReport(
         }
 
         if (format == "JSON") {
-            // JSON export using structured format
+            // Count verdicts
+            uint64_t infectedCount = 0, suspiciousCount = 0, cleanCount = 0;
+            for (const auto& r : result.results) {
+                if (r.verdict == ScanVerdict::Infected) infectedCount++;
+                else if (r.verdict == ScanVerdict::Suspicious) suspiciousCount++;
+                else cleanCount++;
+            }
+
             file << L"{\n";
             file << L"  \"report\": {\n";
             file << L"    \"version\": \"1.0\",\n";
-            file << L"    \"timestamp\": \"" << L"{:%Y-%m-%dT%H:%M:%S}Z" + std::to_wstring(
-                system_clock::now()) << L"\",\n";
             file << L"    \"engine\": \"ShadowStrike " << SHADOWSTRIKE_VERSION << L"\",\n";
             file << L"    \"scan_type\": \"directory\",\n";
-            file << L"    \"target_path\": \"" << result.directoryPath << L"\",\n";
+            file << L"    \"target_path\": \"" << result.rootPath << L"\",\n";
             file << L"    \"stats\": {\n";
             file << L"      \"total_files\": " << result.results.size() << L",\n";
-            file << L"      \"infected_count\": " << result.infectedCount << L",\n";
-            file << L"      \"suspicious_count\": " << result.suspiciousCount << L",\n";
-            file << L"      \"clean_count\": " << result.cleanCount << L",\n";
-            file << L"      \"scan_duration_ms\": " << duration_cast<milliseconds>(result.scanTime).count() << L"\n";
+            file << L"      \"infected_count\": " << infectedCount << L",\n";
+            file << L"      \"suspicious_count\": " << suspiciousCount << L",\n";
+            file << L"      \"clean_count\": " << cleanCount << L",\n";
+            file << L"      \"scan_duration_ms\": " << result.totalDuration.count() << L"\n";
             file << L"    },\n";
             file << L"    \"files\": [\n";
             
             for (size_t i = 0; i < result.results.size(); ++i) {
                 const auto& fileResult = result.results[i];
                 file << L"      {\n";
-                file << L"        \"path\": \"" << fileResult.filePath << L"\",\n";
-                file << L"        \"verdict\": \"" << GetVerdictString(fileResult.verdict) << L"\",\n";
+                file << L"        \"verdict\": \"" << m_impl->GetVerdictString(fileResult.verdict) << L"\",\n";
                 file << L"        \"sha256\": \"" << StringUtils::ToWide(fileResult.sha256) << L"\",\n";
-                file << L"        \"engine\": \"" << StringUtils::ToWide(fileResult.engineName) << L"\",\n";
-                file << L"        \"confidence\": " << fileResult.confidence << L",\n";
-                file << L"        \"signature\": \"" << StringUtils::ToWide(fileResult.signatureName) << L"\",\n";
-                file << L"        \"details\": \"" << StringUtils::ToWide(fileResult.details) << L"\"\n";
+                file << L"        \"source\": \"" << StringUtils::ToWide(fileResult.detectionSource) << L"\",\n";
+                file << L"        \"threat\": \"" << StringUtils::ToWide(fileResult.threatName) << L"\"\n";
                 file << L"      }" << (i < result.results.size() - 1 ? L"," : L"") << L"\n";
             }
             
@@ -3079,34 +3112,35 @@ bool ScanEngine::ExportReport(
             file << L"}\n";
             
         } else if (format == "XML") {
-            // XML export with proper structure
+            uint64_t infectedCount = 0, suspiciousCount = 0, cleanCount = 0;
+            for (const auto& r : result.results) {
+                if (r.verdict == ScanVerdict::Infected) infectedCount++;
+                else if (r.verdict == ScanVerdict::Suspicious) suspiciousCount++;
+                else cleanCount++;
+            }
+
             file << L"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n";
             file << L"<ScanReport version=\"1.0\">\n";
             file << L"  <Metadata>\n";
-            file << L"    <Timestamp>" << L"{:%Y-%m-%dT%H:%M:%S}Z" + std::to_wstring(
-                system_clock::now()) << L"</Timestamp>\n";
             file << L"    <Engine>ShadowStrike " << SHADOWSTRIKE_VERSION << L"</Engine>\n";
             file << L"    <ScanType>directory</ScanType>\n";
-            file << L"    <TargetPath>" << result.directoryPath << L"</TargetPath>\n";
+            file << L"    <TargetPath>" << result.rootPath << L"</TargetPath>\n";
             file << L"  </Metadata>\n";
             file << L"  <Statistics>\n";
             file << L"    <TotalFiles>" << result.results.size() << L"</TotalFiles>\n";
-            file << L"    <InfectedCount>" << result.infectedCount << L"</InfectedCount>\n";
-            file << L"    <SuspiciousCount>" << result.suspiciousCount << L"</SuspiciousCount>\n";
-            file << L"    <CleanCount>" << result.cleanCount << L"</CleanCount>\n";
-            file << L"    <ScanDurationMs>" << duration_cast<milliseconds>(result.scanTime).count() << L"</ScanDurationMs>\n";
+            file << L"    <InfectedCount>" << infectedCount << L"</InfectedCount>\n";
+            file << L"    <SuspiciousCount>" << suspiciousCount << L"</SuspiciousCount>\n";
+            file << L"    <CleanCount>" << cleanCount << L"</CleanCount>\n";
+            file << L"    <ScanDurationMs>" << result.totalDuration.count() << L"</ScanDurationMs>\n";
             file << L"  </Statistics>\n";
             file << L"  <Results>\n";
             
             for (const auto& fileResult : result.results) {
                 file << L"    <File>\n";
-                file << L"      <Path>" << fileResult.filePath << L"</Path>\n";
-                file << L"      <Verdict>" << GetVerdictString(fileResult.verdict) << L"</Verdict>\n";
+                file << L"      <Verdict>" << m_impl->GetVerdictString(fileResult.verdict) << L"</Verdict>\n";
                 file << L"      <SHA256>" << StringUtils::ToWide(fileResult.sha256) << L"</SHA256>\n";
-                file << L"      <Engine>" << StringUtils::ToWide(fileResult.engineName) << L"</Engine>\n";
-                file << L"      <Confidence>" << fileResult.confidence << L"</Confidence>\n";
-                file << L"      <Signature>" << StringUtils::ToWide(fileResult.signatureName) << L"</Signature>\n";
-                file << L"      <Details>" << StringUtils::ToWide(fileResult.details) << L"</Details>\n";
+                file << L"      <Source>" << StringUtils::ToWide(fileResult.detectionSource) << L"</Source>\n";
+                file << L"      <Threat>" << StringUtils::ToWide(fileResult.threatName) << L"</Threat>\n";
                 file << L"    </File>\n";
             }
             
@@ -3114,7 +3148,13 @@ bool ScanEngine::ExportReport(
             file << L"</ScanReport>\n";
             
         } else if (format == "HTML") {
-            // HTML export with CSS styling
+            uint64_t infectedCount = 0, suspiciousCount = 0, cleanCount = 0;
+            for (const auto& r : result.results) {
+                if (r.verdict == ScanVerdict::Infected) infectedCount++;
+                else if (r.verdict == ScanVerdict::Suspicious) suspiciousCount++;
+                else cleanCount++;
+            }
+
             file << L"<!DOCTYPE html>\n";
             file << L"<html lang=\"en\">\n";
             file << L"<head>\n";
@@ -3140,18 +3180,17 @@ bool ScanEngine::ExportReport(
             file << L"<body>\n";
             file << L"  <div class=\"header\">\n";
             file << L"    <h1>ShadowStrike Scan Report</h1>\n";
-            file << L"    <p>Directory: " << result.directoryPath << L"</p>\n";
-            file << L"    <p>Generated: " << L"{:%Y-%m-%d %H:%M:%S}" + std::to_wstring(system_clock::now()) << L"</p>\n";
+            file << L"    <p>Directory: " << result.rootPath << L"</p>\n";
             file << L"  </div>\n";
             file << L"  <div class=\"stats\">\n";
-            file << L"    <div class=\"stat-box infected\"><h3>" << result.infectedCount << L"</h3><p>Infected</p></div>\n";
-            file << L"    <div class=\"stat-box suspicious\"><h3>" << result.suspiciousCount << L"</h3><p>Suspicious</p></div>\n";
-            file << L"    <div class=\"stat-box clean\"><h3>" << result.cleanCount << L"</h3><p>Clean</p></div>\n";
+            file << L"    <div class=\"stat-box infected\"><h3>" << infectedCount << L"</h3><p>Infected</p></div>\n";
+            file << L"    <div class=\"stat-box suspicious\"><h3>" << suspiciousCount << L"</h3><p>Suspicious</p></div>\n";
+            file << L"    <div class=\"stat-box clean\"><h3>" << cleanCount << L"</h3><p>Clean</p></div>\n";
             file << L"    <div class=\"stat-box\"><h3>" << result.results.size() << L"</h3><p>Total Files</p></div>\n";
             file << L"  </div>\n";
             file << L"  <table class=\"results-table\">\n";
             file << L"    <thead>\n";
-            file << L"      <tr><th>File Path</th><th>Verdict</th><th>Engine</th><th>Signature</th><th>Confidence</th></tr>\n";
+            file << L"      <tr><th>Verdict</th><th>SHA256</th><th>Source</th><th>Threat</th></tr>\n";
             file << L"    </thead>\n";
             file << L"    <tbody>\n";
             
@@ -3164,11 +3203,10 @@ bool ScanEngine::ExportReport(
                 }
                 
                 file << L"      <tr>\n";
-                file << L"        <td>" << fileResult.filePath << L"</td>\n";
-                file << L"        <td class=\"" << verdictClass << L"\">" << GetVerdictString(fileResult.verdict) << L"</td>\n";
-                file << L"        <td>" << StringUtils::ToWide(fileResult.engineName) << L"</td>\n";
-                file << L"        <td>" << StringUtils::ToWide(fileResult.signatureName) << L"</td>\n";
-                file << L"        <td>" << L"{:.1f}%" + std::to_wstring(fileResult.confidence * 100) << L"</td>\n";
+                file << L"        <td class=\"" << verdictClass << L"\">" << m_impl->GetVerdictString(fileResult.verdict) << L"</td>\n";
+                file << L"        <td>" << StringUtils::ToWide(fileResult.sha256) << L"</td>\n";
+                file << L"        <td>" << StringUtils::ToWide(fileResult.detectionSource) << L"</td>\n";
+                file << L"        <td>" << StringUtils::ToWide(fileResult.threatName) << L"</td>\n";
                 file << L"      </tr>\n";
             }
             
