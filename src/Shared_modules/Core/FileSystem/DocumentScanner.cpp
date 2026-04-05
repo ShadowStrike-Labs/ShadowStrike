@@ -62,7 +62,6 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
-#include <regex>
 #include <unordered_set>
 #include <cmath>
 
@@ -118,7 +117,7 @@ namespace {
 
     // Known CVE patterns (simplified - full database would be in PatternStore)
     const std::unordered_map<std::string, std::string> CVE_PATTERNS = {
-        {"Equation\\.3", "CVE-2017-11882"}, // Equation Editor
+        {"Equation.3", "CVE-2017-11882"}, // Equation Editor
         {"objupdate", "CVE-2015-1641"}, // RTF objupdate
         {"INCLUDEPICTURE", "CVE-2017-0199"}, // Template Injection
         {"objdata 0105000", "CVE-2012-0158"}, // MSCOMCTL
@@ -190,6 +189,17 @@ public:
         result.filePath = filePath;
         result.scanTime = std::chrono::system_clock::now();
 
+        // Initialized check
+        if (!m_initialized) {
+            SS_LOG_ERROR(L"DocumentScanner", L"Scan called before initialization");
+            result.verdict = ScanVerdict::Error;
+            result.errors.push_back("DocumentScanner not initialized");
+            return result;
+        }
+
+        // Thread-safe read access to shared state
+        std::shared_lock lock(m_mutex);
+
         try {
             // Validate path
             if (filePath.empty()) {
@@ -230,7 +240,7 @@ public:
             if (CheckKnownMalwareHash(filePath, result)) {
                 result.verdict = ScanVerdict::HighlyMalicious;
                 result.riskScore = 100;
-                m_stats.maliciousDocuments++;
+                m_stats.maliciousDocuments.fetch_add(1, std::memory_order_relaxed);
                 return result;
             }
 
@@ -285,10 +295,10 @@ public:
             CalculateVerdict(result);
 
             // Update statistics
-            m_stats.documentsScanned++;
+            m_stats.documentsScanned.fetch_add(1, std::memory_order_relaxed);
             if (result.verdict == ScanVerdict::Malicious ||
                 result.verdict == ScanVerdict::HighlyMalicious) {
-                m_stats.maliciousDocuments++;
+                m_stats.maliciousDocuments.fetch_add(1, std::memory_order_relaxed);
             }
 
             ReportProgress(L"Scan complete", 100);
@@ -304,7 +314,8 @@ public:
         result.scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
             endTime - startTime);
 
-        SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner::Scan - Completed in %ums (verdict=%u, risk=%hs)", result.scanDuration.count(), static_cast<int>(result.verdict), result.riskScore);
+        SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner::Scan - Completed in %lldms (verdict=%u, risk=%u)", 
+            static_cast<long long>(result.scanDuration.count()), static_cast<unsigned>(result.verdict), result.riskScore);
 
         return result;
     }
@@ -347,7 +358,7 @@ public:
             }
 
             CalculateVerdict(result);
-            m_stats.documentsScanned++;
+            m_stats.documentsScanned.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ScanBuffer - Exception: %hs", e.what());
@@ -397,26 +408,41 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            // Quick hash check
-            auto hash = HashStore::CalculateSHA256(filePath);
-            if (HashStore::Instance().IsKnownMalware(hash)) {
-                return true;
+            // Hash-based detection via FileHasher
+            auto& hasher = FileHasher::Instance();
+            auto hash = hasher.ComputeSHA256(filePath);
+            if (!hash.empty()) {
+                auto& hashStore = HashStore::HashStore::Instance();
+                auto lookupResult = hashStore.LookupHashString(hash, HashStore::HashType::SHA256);
+                if (lookupResult.has_value()) {
+                    return true;
+                }
             }
 
-            // Quick pattern scan for obvious exploits
+            // PatternStore YARA-based exploit detection
+            auto& patterns = PatternStore::PatternStore::Instance();
+            auto patternResults = patterns.ScanFile(filePath);
+            if (!patternResults.empty()) {
+                for (const auto& det : patternResults) {
+                    if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
+                        SS_LOG_WARN(L"DocumentScanner", L"Pattern match: %hs", det.signatureName.c_str());
+                        return true;
+                    }
+                }
+            }
+
+            // Quick CVE pattern scan on first 1MB
             std::ifstream file(filePath, std::ios::binary);
             if (!file) return false;
 
-            std::vector<uint8_t> buffer(std::min<size_t>(1024 * 1024,
-                static_cast<size_t>(fs::file_size(filePath))));
+            const auto fileSize = fs::file_size(filePath);
+            std::vector<uint8_t> buffer(std::min<size_t>(1024 * 1024, static_cast<size_t>(fileSize)));
             file.read(reinterpret_cast<char*>(buffer.data()), buffer.size());
-
             std::string content(buffer.begin(), buffer.end());
 
-            // Check for known exploit patterns
             for (const auto& [pattern, cve] : CVE_PATTERNS) {
                 if (content.find(pattern) != std::string::npos) {
-                    SS_LOG_WARN(L"DocumentScanner", L"Quick malicious check: Found %hs pattern", cve);
+                    SS_LOG_WARN(L"DocumentScanner", L"Quick malicious check: Found %hs pattern", cve.c_str());
                     return true;
                 }
             }
@@ -424,7 +450,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::IsMalicious - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"IsMalicious - Exception: %hs", e.what());
             return false;
         }
     }
@@ -474,30 +500,51 @@ public:
         std::string deobfuscated = obfuscatedCode;
 
         try {
-            // Remove obvious obfuscation patterns
+            // 1. Expand Chr() concatenation: Chr(72)&Chr(101) -> "He"
+            std::string expanded;
+            expanded.reserve(deobfuscated.size());
+            size_t pos = 0;
+            while (pos < deobfuscated.size()) {
+                if (pos + 4 < deobfuscated.size() && deobfuscated.substr(pos, 4) == "Chr(") {
+                    size_t numStart = pos + 4;
+                    size_t numEnd = deobfuscated.find(')', numStart);
+                    if (numEnd != std::string::npos && numEnd - numStart <= 3) {
+                        int val = 0;
+                        auto [ptr, ec] = std::from_chars(deobfuscated.data() + numStart,
+                                                         deobfuscated.data() + numEnd, val);
+                        if (ec == std::errc{} && val >= 0 && val <= 127) {
+                            expanded += static_cast<char>(val);
+                            pos = numEnd + 1;
+                            // Skip "&" between Chr() calls
+                            while (pos < deobfuscated.size() && (deobfuscated[pos] == '&' || deobfuscated[pos] == ' ')) pos++;
+                            continue;
+                        }
+                    }
+                }
+                expanded += deobfuscated[pos];
+                pos++;
+            }
+            deobfuscated = std::move(expanded);
 
-            // 1. Chr() concatenation: Chr(72)&Chr(101)&Chr(108)... -> Hel...
-            std::regex chrPattern(R"(Chr\((\d+)\))");
-            std::string result;
-            auto it = std::sregex_iterator(deobfuscated.begin(), deobfuscated.end(), chrPattern);
-            auto end = std::sregex_iterator();
+            // 2. Remove line continuations (space + underscore + newline)
+            std::string cleaned;
+            cleaned.reserve(deobfuscated.size());
+            for (size_t i = 0; i < deobfuscated.size(); ++i) {
+                if (deobfuscated[i] == ' ' && i + 1 < deobfuscated.size() && deobfuscated[i + 1] == '_') {
+                    size_t j = i + 2;
+                    while (j < deobfuscated.size() && (deobfuscated[j] == '\r' || deobfuscated[j] == '\n')) j++;
+                    if (j > i + 2) { i = j - 1; continue; }
+                }
+                cleaned += deobfuscated[i];
+            }
+            deobfuscated = std::move(cleaned);
 
-            // 2. Remove excessive underscores and line continuations
-            deobfuscated = std::regex_replace(deobfuscated, std::regex(" _\r?\n"), "");
-
-            // 3. Expand concatenated strings
-            deobfuscated = std::regex_replace(deobfuscated,
-                std::regex(R"(""\s*&\s*"")"), "\"\"");
-
-            // 4. Remove comment noise
-            deobfuscated = std::regex_replace(deobfuscated,
-                std::regex(R"(^\s*'\s*[a-z]{30,}\s*$)", std::regex::multiline), "");
-
-            SS_LOG_INFO(L"DocumentScanner", L"Macro deobfuscation: %llu -> %llu bytes", obfuscatedCode.size(), deobfuscated.size());
+            SS_LOG_DEBUG(L"DocumentScanner", L"Macro deobfuscation: %zu -> %zu bytes",
+                obfuscatedCode.size(), deobfuscated.size());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"DeobfuscateMacro - Exception: %hs", e.what());
-            return obfuscatedCode; // Return original on error
+            return obfuscatedCode;
         }
 
         return deobfuscated;
@@ -556,37 +603,77 @@ public:
                 return objects;
             }
 
-            std::stringstream buffer;
-            buffer << file.rdbuf();
-            std::string content = buffer.str();
+            // Cap file read to 100MB
+            file.seekg(0, std::ios::end);
+            auto fileSize = file.tellg();
+            if (fileSize <= 0 || fileSize > 100 * 1024 * 1024) {
+                SS_LOG_WARN(L"DocumentScanner", L"PDF file too large or empty (%lld bytes)", static_cast<long long>(fileSize));
+                return objects;
+            }
+            file.seekg(0);
 
-            // Extract PDF objects (simplified parser)
-            std::regex objPattern(R"((\d+)\s+(\d+)\s+obj)");
-            auto it = std::sregex_iterator(content.begin(), content.end(), objPattern);
-            auto end = std::sregex_iterator();
+            std::string content(static_cast<size_t>(fileSize), '\0');
+            file.read(content.data(), fileSize);
 
-            for (; it != end; ++it) {
+            // Parse PDF objects manually: "<num> <gen> obj ... endobj"
+            constexpr size_t kMaxObjects = 5000;
+            size_t pos = 0;
+            while (pos < content.size() && objects.size() < kMaxObjects) {
+                // Find digit sequence followed by space, digit, space, "obj"
+                size_t numStart = std::string::npos;
+                for (size_t i = pos; i < content.size() - 5; ++i) {
+                    if (std::isdigit(static_cast<unsigned char>(content[i]))) {
+                        // Parse first number
+                        size_t j = i;
+                        while (j < content.size() && std::isdigit(static_cast<unsigned char>(content[j]))) j++;
+                        if (j >= content.size() || content[j] != ' ') { pos = j; continue; }
+                        j++; // skip space
+                        // Parse second number (generation)
+                        if (j >= content.size() || !std::isdigit(static_cast<unsigned char>(content[j]))) { pos = j; continue; }
+                        while (j < content.size() && std::isdigit(static_cast<unsigned char>(content[j]))) j++;
+                        // Check for " obj"
+                        if (j + 4 <= content.size() && content.substr(j, 4) == " obj") {
+                            numStart = i;
+                            pos = j + 4;
+                            break;
+                        }
+                        pos = j;
+                        continue;
+                    }
+                    pos = i + 1;
+                }
+                if (numStart == std::string::npos) break;
+
+                // Parse object ID
+                uint32_t objId = 0;
+                auto [ptr, ec] = std::from_chars(content.data() + numStart, 
+                    content.data() + content.find(' ', numStart), objId);
+                if (ec != std::errc{}) { continue; }
+
+                // Find endobj
+                size_t objEnd = content.find("endobj", pos);
+                if (objEnd == std::string::npos) break;
+
+                // Cap object content to 1MB
+                size_t objContentLen = std::min(objEnd - pos, static_cast<size_t>(1024 * 1024));
+                std::string_view objContent(content.data() + pos, objContentLen);
+
                 PDFObjectInfo objInfo;
-                objInfo.objectId = static_cast<uint32_t>(std::stoul((*it)[1].str()));
-
-                // Extract object content (find matching endobj)
-                size_t objStart = it->position();
-                size_t objEnd = content.find("endobj", objStart);
-                if (objEnd == std::string::npos) continue;
-
-                std::string objContent = content.substr(objStart, objEnd - objStart);
+                objInfo.objectId = objId;
 
                 // Check for JavaScript
-                if (objContent.find("/JavaScript") != std::string::npos ||
-                    objContent.find("/JS") != std::string::npos) {
+                if (objContent.find("/JavaScript") != std::string_view::npos ||
+                    objContent.find("/JS") != std::string_view::npos) {
                     objInfo.hasJavaScript = true;
                     objInfo.objectType = "JavaScript";
-                    ExtractPDFJavaScriptFromObject(objContent, objInfo);
+                    // Extract JS content from stream if present
+                    std::string objStr(objContent);
+                    ExtractPDFJavaScriptFromObject(objStr, objInfo);
                 }
 
-                // Check for actions
+                // Check for malicious actions
                 for (const auto& action : MALICIOUS_PDF_ACTIONS) {
-                    if (objContent.find(action) != std::string::npos) {
+                    if (objContent.find(action) != std::string_view::npos) {
                         objInfo.hasAction = true;
                         objInfo.actionType = action;
                         break;
@@ -594,13 +681,15 @@ public:
                 }
 
                 // Check for embedded files
-                if (objContent.find("/EmbeddedFile") != std::string::npos) {
+                if (objContent.find("/EmbeddedFile") != std::string_view::npos) {
                     objInfo.hasEmbeddedFile = true;
                 }
 
                 if (objInfo.hasJavaScript || objInfo.hasAction || objInfo.hasEmbeddedFile) {
                     objects.push_back(objInfo);
                 }
+
+                pos = objEnd + 6; // Skip past "endobj"
             }
 
         } catch (const std::exception& e) {
@@ -611,7 +700,6 @@ public:
     }
 
     [[nodiscard]] std::vector<std::string> ExtractPDFJavaScript(const std::wstring& filePath) const {
-        std::shared_lock lock(m_mutex);
         std::vector<std::string> scripts;
 
         try {
@@ -680,6 +768,22 @@ public:
         return m_stats;
     }
 
+    [[nodiscard]] DocumentScannerSnapshotStats GetStatisticsSnapshot() const noexcept {
+        DocumentScannerSnapshotStats snap;
+        snap.documentsScanned = m_stats.documentsScanned.load(std::memory_order_relaxed);
+        snap.macrosDetected = m_stats.macrosDetected.load(std::memory_order_relaxed);
+        snap.maliciousMacros = m_stats.maliciousMacros.load(std::memory_order_relaxed);
+        snap.oleObjectsDetected = m_stats.oleObjectsDetected.load(std::memory_order_relaxed);
+        snap.pdfJavaScriptDetected = m_stats.pdfJavaScriptDetected.load(std::memory_order_relaxed);
+        snap.cvesDetected = m_stats.cvesDetected.load(std::memory_order_relaxed);
+        snap.maliciousDocuments = m_stats.maliciousDocuments.load(std::memory_order_relaxed);
+        return snap;
+    }
+
+    [[nodiscard]] bool IsInitialized() const noexcept {
+        return m_initialized;
+    }
+
     void ResetStatistics() noexcept {
         m_stats.Reset();
     }
@@ -691,46 +795,60 @@ private:
 
     [[nodiscard]] DocumentType DetectDocumentType(const std::wstring& filePath) const {
         try {
-            // Check file extension first
-            fs::path path(filePath);
-            std::string ext = path.extension().string();
-            std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+            auto& fta = FileTypeAnalyzer::Instance();
+            auto fileInfo = fta.Analyze(filePath);
 
-            if (ext == ".pdf") return DocumentType::PDF;
-            if (ext == ".doc") return DocumentType::DOC;
-            if (ext == ".docx") return DocumentType::DOCX;
-            if (ext == ".docm") return DocumentType::DOCM;
-            if (ext == ".dot") return DocumentType::DOT;
-            if (ext == ".dotm") return DocumentType::DOTM;
-            if (ext == ".xls") return DocumentType::XLS;
-            if (ext == ".xlsx") return DocumentType::XLSX;
-            if (ext == ".xlsm") return DocumentType::XLSM;
-            if (ext == ".xlsb") return DocumentType::XLSB;
-            if (ext == ".ppt") return DocumentType::PPT;
-            if (ext == ".pptx") return DocumentType::PPTX;
-            if (ext == ".pptm") return DocumentType::PPTM;
-            if (ext == ".rtf") return DocumentType::RTF;
-            if (ext == ".msg") return DocumentType::MSG;
-            if (ext == ".eml") return DocumentType::EML;
-
-            // Verify with magic bytes
-            std::ifstream file(filePath, std::ios::binary);
-            if (!file) return DocumentType::Unknown;
-
-            std::vector<uint8_t> header(8);
-            file.read(reinterpret_cast<char*>(header.data()), header.size());
-
-            if (std::equal(std::begin(PDF_SIGNATURE), std::end(PDF_SIGNATURE), header.begin())) {
-                return DocumentType::PDF;
+            if (!fileInfo.detected) {
+                return DocumentType::Unknown;
             }
-            if (std::equal(std::begin(OLE_SIGNATURE), std::end(OLE_SIGNATURE), header.begin())) {
-                return DocumentType::DOC; // Could be XLS/PPT/MSG - refine based on streams
+
+            // Map FileFormat to DocumentType using enterprise FileTypeAnalyzer
+            switch (fileInfo.format) {
+                case FileFormat::PDF:  return DocumentType::PDF;
+                case FileFormat::DOC: {
+                    if (fileInfo.isCompound) {
+                        auto ext = fs::path(filePath).extension().string();
+                        std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                        if (ext == ".xls") return DocumentType::XLS;
+                        if (ext == ".ppt") return DocumentType::PPT;
+                        if (ext == ".msg") return DocumentType::MSG;
+                    }
+                    return DocumentType::DOC;
+                }
+                case FileFormat::DOCX: {
+                    auto ext = fs::path(filePath).extension().string();
+                    std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                    if (ext == ".docm") return DocumentType::DOCM;
+                    if (ext == ".dotm") return DocumentType::DOTM;
+                    if (ext == ".xlsx") return DocumentType::XLSX;
+                    if (ext == ".xlsm") return DocumentType::XLSM;
+                    if (ext == ".xlsb") return DocumentType::XLSB;
+                    if (ext == ".pptx") return DocumentType::PPTX;
+                    if (ext == ".pptm") return DocumentType::PPTM;
+                    return DocumentType::DOCX;
+                }
+                case FileFormat::XLS:  return DocumentType::XLS;
+                case FileFormat::XLSX: return DocumentType::XLSX;
+                case FileFormat::PPT:  return DocumentType::PPT;
+                case FileFormat::PPTX: return DocumentType::PPTX;
+                case FileFormat::RTF:  return DocumentType::RTF;
+                default: break;
             }
-            if (std::equal(std::begin(ZIP_SIGNATURE), std::end(ZIP_SIGNATURE), header.begin())) {
-                return DocumentType::DOCX; // OOXML format
+
+            // Extension fallback for types not in FileFormat
+            if (fileInfo.category == FileCategory::Document ||
+                fileInfo.category == FileCategory::Spreadsheet ||
+                fileInfo.category == FileCategory::Presentation) {
+                auto ext = fs::path(filePath).extension().string();
+                std::transform(ext.begin(), ext.end(), ext.begin(), ::tolower);
+                if (ext == ".eml") return DocumentType::EML;
+                if (ext == ".msg") return DocumentType::MSG;
+                if (ext == ".dot") return DocumentType::DOT;
             }
-            if (std::equal(std::begin(RTF_SIGNATURE), std::end(RTF_SIGNATURE), header.begin())) {
-                return DocumentType::RTF;
+
+            if (fileInfo.isSpoofed) {
+                SS_LOG_WARN(L"DocumentScanner", L"File type spoofing detected: %ls",
+                    filePath.c_str());
             }
 
         } catch (const std::exception& e) {
@@ -743,24 +861,46 @@ private:
     [[nodiscard]] bool CheckKnownMalwareHash(const std::wstring& filePath,
                                             DocumentScanResult& result) const {
         try {
-            auto hash = HashStore::CalculateSHA256(filePath);
+            // Use enterprise FileHasher for hash computation
+            auto& hasher = FileHasher::Instance();
+            auto hash = hasher.ComputeSHA256(filePath);
+            if (hash.empty()) return false;
 
-            if (HashStore::Instance().IsKnownMalware(hash)) {
+            // Check against HashStore known malware database
+            auto& hashStore = HashStore::HashStore::Instance();
+            auto lookupResult = hashStore.LookupHashString(hash, HashStore::HashType::SHA256);
+            if (lookupResult.has_value()) {
                 DocumentThreat threat;
                 threat.type = ThreatType::CVEExploit;
                 threat.severity = 100;
-                threat.description = "Known malware hash detected";
+                threat.description = "Known malware hash match: " + hash;
                 threat.evidence = hash;
                 threat.location = "File hash";
                 threat.mitreId = "T1566.001";
 
                 result.threats.push_back(threat);
                 result.criticalThreats++;
-
                 ReportThreat(threat);
 
-                Logger::Critical("Known malware detected: {}", hash);
+                SS_LOG_FATAL(L"DocumentScanner", L"Known malware detected: %hs", hash.c_str());
                 return true;
+            }
+
+            // Check file reputation
+            auto& reputation = FileReputation::Instance();
+            auto repScore = reputation.QueryReputation(hash);
+            if (repScore.has_value() && repScore.value() <= 10) {
+                DocumentThreat threat;
+                threat.type = ThreatType::CVEExploit;
+                threat.severity = 85;
+                threat.description = "Very low file reputation score";
+                threat.evidence = "Reputation: " + std::to_string(repScore.value());
+                threat.location = "Cloud reputation";
+                threat.mitreId = "T1566.001";
+
+                result.threats.push_back(threat);
+                result.highThreats++;
+                ReportThreat(threat);
             }
 
         } catch (const std::exception& e) {
@@ -781,7 +921,7 @@ private:
             for (const auto& obj : result.pdfObjects) {
                 if (obj.hasJavaScript) {
                     result.hasPDFJavaScript = true;
-                    m_stats.pdfJavaScriptDetected++;
+                    m_stats.pdfJavaScriptDetected.fetch_add(1, std::memory_order_relaxed);
 
                     DocumentThreat threat;
                     threat.type = ThreatType::PDFJavaScript;
@@ -829,7 +969,7 @@ private:
                 result.hasMacros = (result.macroCount > 0);
 
                 if (result.hasMacros) {
-                    m_stats.macrosDetected++;
+                    m_stats.macrosDetected.fetch_add(1, std::memory_order_relaxed);
 
                     for (const auto& macro : result.macros) {
                         if (macro.riskLevel > result.highestMacroRisk) {
@@ -837,7 +977,7 @@ private:
                         }
 
                         if (macro.riskLevel >= MacroRisk::High) {
-                            m_stats.maliciousMacros++;
+                            m_stats.maliciousMacros.fetch_add(1, std::memory_order_relaxed);
 
                             DocumentThreat threat;
                             threat.type = macro.isAutoExec ? ThreatType::AutoExecMacro : ThreatType::VBAMacro;
@@ -868,7 +1008,7 @@ private:
                 result.hasOLEObjects = (result.oleObjectCount > 0);
 
                 if (result.hasOLEObjects) {
-                    m_stats.oleObjectsDetected++;
+                    m_stats.oleObjectsDetected.fetch_add(1, std::memory_order_relaxed);
 
                     for (const auto& oleObj : result.oleObjects) {
                         if (oleObj.isExecutable || oleObj.hasAutoStart) {
@@ -908,18 +1048,49 @@ private:
                 result.macroCount = static_cast<uint32_t>(result.macros.size());
                 result.hasMacros = (result.macroCount > 0);
 
-                // Same macro analysis as legacy format
                 if (result.hasMacros) {
-                    m_stats.macrosDetected++;
-                    // Process macros (same logic as legacy)
+                    m_stats.macrosDetected.fetch_add(1, std::memory_order_relaxed);
+
+                    for (auto& macro : result.macros) {
+                        AnalyzeMacroCode(macro);
+
+                        if (macro.riskLevel > result.highestMacroRisk) {
+                            result.highestMacroRisk = macro.riskLevel;
+                        }
+
+                        if (macro.riskLevel >= MacroRisk::High) {
+                            m_stats.maliciousMacros.fetch_add(1, std::memory_order_relaxed);
+
+                            DocumentThreat threat;
+                            threat.type = macro.isAutoExec ? ThreatType::AutoExecMacro : ThreatType::VBAMacro;
+                            threat.severity = static_cast<uint8_t>(macro.riskLevel) * 25;
+                            threat.description = "Suspicious VBA macro: " + macro.moduleName;
+                            threat.location = "VBA Module: " + macro.moduleName;
+                            threat.evidence = macro.sourceCode.substr(0, 500);
+                            threat.mitreId = "T1059.005";
+
+                            for (const auto& api : macro.apiCalls) {
+                                threat.indicators.push_back("API: " + api);
+                            }
+
+                            result.threats.push_back(threat);
+                            if (threat.severity >= 75) result.highThreats++;
+                            else result.mediumThreats++;
+
+                            ReportThreat(threat);
+                        }
+                    }
                 }
             }
 
-            // Check for external template injection
+            // Check for external template injection (T1221)
             CheckTemplateInjection(filePath, result);
 
             // Check for external links
             CheckExternalLinks(filePath, result);
+
+            // Check for DDE in OOXML
+            CheckForDDE(filePath, result);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeOOXMLDocument - Exception: %hs", e.what());
@@ -957,7 +1128,7 @@ private:
             if (config.detectCVEs) {
                 for (const auto& [pattern, cve] : CVE_PATTERNS) {
                     if (content.find(pattern) != std::string::npos) {
-                        m_stats.cvesDetected++;
+                        m_stats.cvesDetected.fetch_add(1, std::memory_order_relaxed);
 
                         DocumentThreat threat;
                         threat.type = ThreatType::CVEExploit;
@@ -1049,26 +1220,88 @@ private:
         std::vector<MacroInfo> macros;
 
         try {
-            // In production, this would use a proper OLE/VBA parser
-            // For now, detect presence and extract basic info
-
             auto streams = ListOLEStreamsInternal(filePath);
+            if (streams.empty()) return macros;
 
+            bool hasVBAProject = false;
             for (const auto& stream : streams) {
                 if (stream.find("VBA") != std::string::npos ||
-                    stream == "_VBA_PROJECT") {
-
-                    MacroInfo macro;
-                    macro.moduleName = stream;
-                    macro.moduleType = "Module";
-
-                    // Extract macro code (simplified - would use actual OLE parser)
-                    // This is a placeholder for demonstration
-                    macro.sourceCode = "' VBA code would be extracted here";
-
-                    macros.push_back(macro);
+                    stream.find("_VBA_PROJECT") != std::string::npos ||
+                    stream.find("Macros") != std::string::npos) {
+                    hasVBAProject = true;
+                    break;
                 }
             }
+            if (!hasVBAProject) return macros;
+
+            // Read file for VBA extraction
+            std::ifstream file(filePath, std::ios::binary | std::ios::ate);
+            if (!file) return macros;
+
+            const auto fileSize = file.tellg();
+            if (fileSize > static_cast<std::streamoff>(MAX_DOCUMENT_SIZE)) return macros;
+            file.seekg(0);
+
+            std::vector<uint8_t> fileData(static_cast<size_t>(fileSize));
+            file.read(reinterpret_cast<char*>(fileData.data()), fileSize);
+
+            // Search for VBA module signatures via Attribute VB_Name directives
+            std::string content(fileData.begin(), fileData.end());
+            const std::string vbNameMarker = "Attribute VB_Name = \"";
+            size_t searchPos = 0;
+
+            while ((searchPos = content.find(vbNameMarker, searchPos)) != std::string::npos) {
+                searchPos += vbNameMarker.length();
+                size_t nameEnd = content.find('"', searchPos);
+                if (nameEnd == std::string::npos || nameEnd - searchPos > 256) break;
+
+                MacroInfo macro;
+                macro.moduleName = content.substr(searchPos, nameEnd - searchPos);
+                macro.moduleType = "Module";
+
+                // Extract source code block (find readable text around this module)
+                size_t codeEnd = content.find(vbNameMarker, searchPos);
+                if (codeEnd == std::string::npos) codeEnd = std::min(searchPos + 100000, content.size());
+                codeEnd = std::min(codeEnd, searchPos + 100000);
+
+                // Filter non-printable characters for readable VBA source
+                std::string codeBlock;
+                codeBlock.reserve(codeEnd - searchPos);
+                for (size_t i = searchPos; i < codeEnd; ++i) {
+                    char c = content[i];
+                    if ((c >= 0x20 && c <= 0x7E) || c == '\n' || c == '\r' || c == '\t') {
+                        codeBlock += c;
+                    }
+                }
+
+                if (codeBlock.size() > m_config.maxMacroSize) {
+                    codeBlock.resize(m_config.maxMacroSize);
+                }
+                macro.sourceCode = std::move(codeBlock);
+                macro.lineCount = static_cast<uint32_t>(
+                    std::count(macro.sourceCode.begin(), macro.sourceCode.end(), '\n') + 1);
+
+                macros.push_back(std::move(macro));
+                searchPos = nameEnd + 1;
+
+                if (macros.size() >= 200) break;
+            }
+
+            // Fallback: VBA streams found but no Attribute directives
+            if (macros.empty()) {
+                for (const auto& stream : streams) {
+                    if (stream.find("VBA") != std::string::npos && stream != "_VBA_PROJECT") {
+                        MacroInfo macro;
+                        macro.moduleName = stream;
+                        macro.moduleType = "Module";
+                        macro.sourceCode = "[Binary VBA content in stream: " + stream + "]";
+                        macro.lineCount = 1;
+                        macros.push_back(std::move(macro));
+                    }
+                }
+            }
+
+            SS_LOG_DEBUG(L"DocumentScanner", L"Extracted %zu OLE macros from %ls", macros.size(), filePath.c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractOLEMacros - Exception: %hs", e.what());
@@ -1081,11 +1314,87 @@ private:
         std::vector<MacroInfo> macros;
 
         try {
-            // OOXML macros are stored in xl/vbaProject.bin or word/vbaProject.bin
-            // This would use ZIP extraction + OLE parsing in production
+            // OOXML stores macros in vbaProject.bin inside the ZIP archive
+            // Try multiple known locations for the VBA project binary
+            auto& archiveExtractor = ArchiveExtractor::Instance();
 
-            // Placeholder implementation
-            SS_LOG_INFO(L"DocumentScanner", L"Extracting OOXML macros from: %hs", StringUtils::ToNarrow(filePath).c_str());
+            const std::vector<std::wstring> vbaProjectPaths = {
+                L"word/vbaProject.bin",
+                L"xl/vbaProject.bin",
+                L"ppt/vbaProject.bin",
+                L"vbaProject.bin"
+            };
+
+            for (const auto& vbaPath : vbaProjectPaths) {
+                try {
+                    auto extracted = archiveExtractor.ExtractEntry(filePath, vbaPath);
+                    if (extracted.data.empty()) continue;
+
+                    SS_LOG_DEBUG(L"DocumentScanner", L"Found VBA project at %ls (%zu bytes)",
+                        vbaPath.c_str(), extracted.data.size());
+
+                    // Write extracted OLE binary to temp for OLE parsing
+                    // Parse the extracted vbaProject.bin as an OLE compound file
+                    std::string oleContent(extracted.data.begin(), extracted.data.end());
+
+                    // Search for VBA module Attribute directives in the OLE binary
+                    const std::string vbNameMarker = "Attribute VB_Name = \"";
+                    size_t searchPos = 0;
+
+                    while ((searchPos = oleContent.find(vbNameMarker, searchPos)) != std::string::npos) {
+                        searchPos += vbNameMarker.length();
+                        size_t nameEnd = oleContent.find('"', searchPos);
+                        if (nameEnd == std::string::npos || nameEnd - searchPos > 256) break;
+
+                        MacroInfo macro;
+                        macro.moduleName = oleContent.substr(searchPos, nameEnd - searchPos);
+                        macro.moduleType = "Module";
+
+                        // Extract readable source code
+                        size_t codeEnd = oleContent.find(vbNameMarker, searchPos);
+                        if (codeEnd == std::string::npos) codeEnd = std::min(searchPos + 100000, oleContent.size());
+                        codeEnd = std::min(codeEnd, searchPos + 100000);
+
+                        std::string codeBlock;
+                        codeBlock.reserve(codeEnd - searchPos);
+                        for (size_t i = searchPos; i < codeEnd; ++i) {
+                            char c = oleContent[i];
+                            if ((c >= 0x20 && c <= 0x7E) || c == '\n' || c == '\r' || c == '\t') {
+                                codeBlock += c;
+                            }
+                        }
+
+                        if (codeBlock.size() > m_config.maxMacroSize) {
+                            codeBlock.resize(m_config.maxMacroSize);
+                        }
+                        macro.sourceCode = std::move(codeBlock);
+                        macro.lineCount = static_cast<uint32_t>(
+                            std::count(macro.sourceCode.begin(), macro.sourceCode.end(), '\n') + 1);
+
+                        macros.push_back(std::move(macro));
+                        searchPos = nameEnd + 1;
+
+                        if (macros.size() >= 200) break;
+                    }
+
+                    // If we found the vbaProject.bin, stop searching other paths
+                    if (!macros.empty()) break;
+
+                    // Fallback: OLE binary present but no Attribute directives found
+                    MacroInfo macro;
+                    macro.moduleName = "vbaProject";
+                    macro.moduleType = "Binary";
+                    macro.sourceCode = "[Binary VBA project detected, size: " + std::to_string(extracted.data.size()) + " bytes]";
+                    macro.lineCount = 1;
+                    macros.push_back(std::move(macro));
+                    break;
+
+                } catch (...) {
+                    continue; // Path not found in archive, try next
+                }
+            }
+
+            SS_LOG_DEBUG(L"DocumentScanner", L"Extracted %zu OOXML macros from %ls", macros.size(), filePath.c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractOOXMLMacros - Exception: %hs", e.what());
@@ -1180,25 +1489,93 @@ private:
 
     [[nodiscard]] std::vector<std::string> ListOLEStreamsInternal(const std::wstring& filePath) const {
         std::vector<std::string> streams;
+        constexpr size_t MAX_DIR_ENTRIES = 10000;
 
         try {
-            // In production, this would use a proper OLE library (like libgsf or custom parser)
-            // For demonstration, return placeholder streams
-
             std::ifstream file(filePath, std::ios::binary);
             if (!file) return streams;
 
-            // Check for OLE signature
-            std::vector<uint8_t> header(8);
-            file.read(reinterpret_cast<char*>(header.data()), 8);
+            // Read and validate CFB header (512 bytes)
+            std::vector<uint8_t> header(512);
+            file.read(reinterpret_cast<char*>(header.data()), 512);
+            if (!file || file.gcount() < 512) return streams;
 
-            if (std::equal(std::begin(OLE_SIGNATURE), std::end(OLE_SIGNATURE), header.begin())) {
-                // This is an OLE file - would parse directory entries here
-                streams.push_back("Root Entry");
-                streams.push_back("WordDocument");
-                streams.push_back("_VBA_PROJECT");
-                streams.push_back("Macros");
+            // Verify OLE magic signature
+            if (!std::equal(std::begin(OLE_SIGNATURE), std::end(OLE_SIGNATURE), header.begin())) {
+                return streams;
             }
+
+            // Parse sector size: 2^header[0x1E] (typically 512 for v3, 4096 for v4)
+            const uint16_t sectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x1E]);
+            if (sectorSizePow < 7 || sectorSizePow > 16) return streams; // Sanity check
+            const uint32_t sectorSize = 1u << sectorSizePow;
+
+            // First directory sector SECT (at offset 0x30)
+            const uint32_t firstDirSect = *reinterpret_cast<const uint32_t*>(&header[0x30]);
+            if (firstDirSect == 0xFFFFFFFE) return streams; // ENDOFCHAIN
+
+            // Read FAT sectors from DIFAT in header (109 entries at offset 0x4C)
+            const uint32_t fatSectors = *reinterpret_cast<const uint32_t*>(&header[0x2C]);
+            if (fatSectors > 10000) return streams; // Cap for safety
+
+            // Build FAT table
+            std::vector<uint32_t> fat;
+            const uint32_t entriesPerSector = sectorSize / 4;
+            for (uint32_t fi = 0; fi < std::min(fatSectors, 109u); ++fi) {
+                uint32_t fatSectId = *reinterpret_cast<const uint32_t*>(&header[0x4C + fi * 4]);
+                if (fatSectId == 0xFFFFFFFE || fatSectId == 0xFFFFFFFF) break;
+
+                std::vector<uint8_t> fatSectData(sectorSize);
+                file.seekg(512 + static_cast<std::streamoff>(fatSectId) * sectorSize);
+                file.read(reinterpret_cast<char*>(fatSectData.data()), sectorSize);
+                if (!file) break;
+
+                for (uint32_t j = 0; j < entriesPerSector; ++j) {
+                    fat.push_back(*reinterpret_cast<const uint32_t*>(&fatSectData[j * 4]));
+                }
+            }
+
+            // Traverse directory sector chain and read directory entries
+            uint32_t dirSect = firstDirSect;
+            size_t dirEntriesRead = 0;
+            constexpr uint32_t DIR_ENTRY_SIZE = 128;
+            const uint32_t entriesPerDirSector = sectorSize / DIR_ENTRY_SIZE;
+
+            while (dirSect != 0xFFFFFFFE && dirSect != 0xFFFFFFFF && dirEntriesRead < MAX_DIR_ENTRIES) {
+                if (dirSect >= fat.size()) break; // Invalid sector reference
+
+                std::vector<uint8_t> dirData(sectorSize);
+                file.seekg(512 + static_cast<std::streamoff>(dirSect) * sectorSize);
+                file.read(reinterpret_cast<char*>(dirData.data()), sectorSize);
+                if (!file) break;
+
+                for (uint32_t e = 0; e < entriesPerDirSector && dirEntriesRead < MAX_DIR_ENTRIES; ++e) {
+                    const uint8_t* entry = &dirData[e * DIR_ENTRY_SIZE];
+                    const uint8_t objectType = entry[0x42];
+
+                    // objectType: 0=unknown/empty, 1=storage, 2=stream, 5=root
+                    if (objectType == 0) continue;
+
+                    // Read name (UTF-16LE, 64 bytes max)
+                    const uint16_t nameSize = *reinterpret_cast<const uint16_t*>(&entry[0x40]);
+                    if (nameSize == 0 || nameSize > 64) { dirEntriesRead++; continue; }
+
+                    std::wstring wname(reinterpret_cast<const wchar_t*>(entry), nameSize / 2);
+                    // Remove null terminator
+                    while (!wname.empty() && wname.back() == L'\\0') wname.pop_back();
+
+                    std::string name = StringUtils::ToNarrow(wname);
+                    if (!name.empty()) {
+                        streams.push_back(name);
+                    }
+                    dirEntriesRead++;
+                }
+
+                // Follow the FAT chain to next directory sector
+                dirSect = fat[dirSect];
+            }
+
+            SS_LOG_DEBUG(L"DocumentScanner", L"OLE streams found: %zu in %ls", streams.size(), filePath.c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ListOLEStreamsInternal - Exception: %hs", e.what());
@@ -1269,11 +1646,65 @@ private:
 
     void CheckTemplateInjection(const std::wstring& filePath, DocumentScanResult& result) {
         try {
-            // Check for external template references in OOXML
-            // This would extract and parse word/_rels/settings.xml.rels
+            // Extract and parse OOXML relationship files for external template references (T1221)
+            auto& archiveExtractor = ArchiveExtractor::Instance();
 
-            // Placeholder detection
-            result.hasTemplateInjection = false;
+            const std::vector<std::wstring> relsPaths = {
+                L"word/_rels/settings.xml.rels",
+                L"word/_rels/document.xml.rels",
+                L"xl/_rels/workbook.xml.rels",
+                L"ppt/_rels/presentation.xml.rels"
+            };
+
+            for (const auto& relsPath : relsPaths) {
+                try {
+                    auto extracted = archiveExtractor.ExtractEntry(filePath, relsPath);
+                    if (extracted.data.empty()) continue;
+
+                    pugi::xml_document doc;
+                    auto parseResult = doc.load_buffer(extracted.data.data(), extracted.data.size());
+                    if (!parseResult) continue;
+
+                    for (auto& rel : doc.child("Relationships").children("Relationship")) {
+                        std::string type = rel.attribute("Type").as_string();
+                        std::string target = rel.attribute("Target").as_string();
+                        std::string targetMode = rel.attribute("TargetMode").as_string();
+
+                        // Template injection: external template reference
+                        if (targetMode == "External" &&
+                            (type.find("attachedTemplate") != std::string::npos ||
+                             type.find("oleObject") != std::string::npos ||
+                             type.find("frame") != std::string::npos)) {
+
+                            result.hasTemplateInjection = true;
+
+                            DocumentThreat threat;
+                            threat.type = ThreatType::TemplateInjection;
+                            threat.severity = 85;
+                            threat.description = "External template injection detected";
+                            threat.evidence = "Target: " + target;
+                            threat.location = StringUtils::ToNarrow(relsPath);
+                            threat.mitreId = "T1221";
+
+                            // Extract URL as IOC
+                            if (target.find("http") == 0 || target.find("\\\\") == 0) {
+                                threat.indicators.push_back("URL: " + target);
+                                result.urls.push_back(target);
+                            }
+
+                            result.threats.push_back(threat);
+                            result.highThreats++;
+                            m_stats.cvesDetected.fetch_add(1, std::memory_order_relaxed);
+                            ReportThreat(threat);
+
+                            SS_LOG_WARN(L"DocumentScanner", L"Template injection: %hs -> %hs",
+                                StringUtils::ToNarrow(relsPath).c_str(), target.c_str());
+                        }
+                    }
+                } catch (...) {
+                    continue;
+                }
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"CheckTemplateInjection - Exception: %hs", e.what());
@@ -1282,10 +1713,64 @@ private:
 
     void CheckExternalLinks(const std::wstring& filePath, DocumentScanResult& result) {
         try {
-            // Check for external links in OOXML relationships
-            // This would parse _rels files
+            // Parse ALL .rels files for external targets
+            auto& archiveExtractor = ArchiveExtractor::Instance();
 
-            result.hasExternalLinks = false;
+            // List archive entries to find all .rels files
+            try {
+                auto archiveInfo = archiveExtractor.ListArchive(filePath);
+
+                // Common .rels paths to check
+                const std::vector<std::wstring> relsPaths = {
+                    L"_rels/.rels",
+                    L"word/_rels/document.xml.rels",
+                    L"word/_rels/header1.xml.rels",
+                    L"word/_rels/footer1.xml.rels",
+                    L"xl/_rels/workbook.xml.rels",
+                    L"xl/worksheets/_rels/sheet1.xml.rels",
+                    L"ppt/_rels/presentation.xml.rels",
+                    L"ppt/slides/_rels/slide1.xml.rels"
+                };
+
+                for (const auto& relsPath : relsPaths) {
+                    try {
+                        auto extracted = archiveExtractor.ExtractEntry(filePath, relsPath);
+                        if (extracted.data.empty()) continue;
+
+                        pugi::xml_document doc;
+                        auto parseResult = doc.load_buffer(extracted.data.data(), extracted.data.size());
+                        if (!parseResult) continue;
+
+                        for (auto& rel : doc.child("Relationships").children("Relationship")) {
+                            std::string targetMode = rel.attribute("TargetMode").as_string();
+                            std::string target = rel.attribute("Target").as_string();
+
+                            if (targetMode == "External" &&
+                                (target.find("http://") == 0 || target.find("https://") == 0 ||
+                                 target.find("ftp://") == 0 || target.find("\\\\") == 0)) {
+
+                                result.hasExternalLinks = true;
+                                result.urls.push_back(target);
+
+                                DocumentThreat threat;
+                                threat.type = ThreatType::ExternalLink;
+                                threat.severity = 40;
+                                threat.description = "External link: " + target;
+                                threat.location = StringUtils::ToNarrow(relsPath);
+                                threat.mitreId = "T1071.001";
+                                threat.indicators.push_back("URL: " + target);
+
+                                result.threats.push_back(threat);
+                                result.mediumThreats++;
+                            }
+                        }
+                    } catch (...) {
+                        continue;
+                    }
+                }
+            } catch (...) {
+                // Archive listing not supported or failed
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"CheckExternalLinks - Exception: %hs", e.what());
@@ -1294,12 +1779,87 @@ private:
 
     void ExtractMetadata(const std::wstring& filePath, DocumentScanResult& result) {
         try {
-            // Extract author, title, etc. from document metadata
-            // This would use document-specific metadata extraction
+            auto docType = result.documentType;
 
-            result.author = L"";
-            result.title = L"";
-            result.subject = L"";
+            // OOXML metadata: parse docProps/core.xml
+            if (docType == DocumentType::DOCX || docType == DocumentType::DOCM ||
+                docType == DocumentType::DOTM || docType == DocumentType::XLSX ||
+                docType == DocumentType::XLSM || docType == DocumentType::PPTX ||
+                docType == DocumentType::PPTM) {
+
+                auto& archiveExtractor = ArchiveExtractor::Instance();
+                try {
+                    auto extracted = archiveExtractor.ExtractEntry(filePath, L"docProps/core.xml");
+                    if (!extracted.data.empty()) {
+                        pugi::xml_document doc;
+                        auto parseResult = doc.load_buffer(extracted.data.data(), extracted.data.size());
+                        if (parseResult) {
+                            auto props = doc.child("cp:coreProperties");
+                            if (!props) props = doc.first_child();
+
+                            for (auto& child : props.children()) {
+                                std::string name = child.name();
+                                std::string value = child.child_value();
+
+                                if (name.find("creator") != std::string::npos && !value.empty()) {
+                                    result.author = StringUtils::ToWide(value);
+                                }
+                                if (name.find("title") != std::string::npos && !value.empty()) {
+                                    result.title = StringUtils::ToWide(value);
+                                }
+                                if (name.find("subject") != std::string::npos && !value.empty()) {
+                                    result.subject = StringUtils::ToWide(value);
+                                }
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // docProps/core.xml not found or parse error
+                }
+            }
+
+            // PDF metadata: parse /Info dictionary
+            if (docType == DocumentType::PDF) {
+                std::ifstream file(filePath, std::ios::binary);
+                if (!file) return;
+
+                // Read first 64KB for metadata (usually near the end, but /Info can be early)
+                const size_t readSize = std::min<size_t>(65536, static_cast<size_t>(fs::file_size(filePath)));
+                std::vector<char> buf(readSize);
+                file.read(buf.data(), readSize);
+                std::string content(buf.begin(), buf.end());
+
+                // Extract /Author, /Title, /Subject from PDF /Info dict
+                auto extractPdfField = [&](const std::string& field) -> std::string {
+                    size_t pos = content.find("/" + field);
+                    if (pos == std::string::npos) return "";
+                    pos = content.find('(', pos);
+                    if (pos == std::string::npos) return "";
+                    size_t end = content.find(')', pos + 1);
+                    if (end == std::string::npos || end - pos > 512) return "";
+                    return content.substr(pos + 1, end - pos - 1);
+                };
+
+                auto author = extractPdfField("Author");
+                auto title = extractPdfField("Title");
+                auto subject = extractPdfField("Subject");
+
+                if (!author.empty()) result.author = StringUtils::ToWide(author);
+                if (!title.empty()) result.title = StringUtils::ToWide(title);
+                if (!subject.empty()) result.subject = StringUtils::ToWide(subject);
+            }
+
+            // OLE metadata: look for SummaryInformation stream
+            if (docType == DocumentType::DOC || docType == DocumentType::XLS ||
+                docType == DocumentType::PPT) {
+                auto streams = ListOLEStreamsInternal(filePath);
+                for (const auto& stream : streams) {
+                    if (stream.find("SummaryInformation") != std::string::npos) {
+                        SS_LOG_DEBUG(L"DocumentScanner", L"Found SummaryInformation stream in %ls", filePath.c_str());
+                        break;
+                    }
+                }
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractMetadata - Exception: %hs", e.what());
@@ -1343,18 +1903,41 @@ private:
 
     void ExtractURLs(const std::string& content, std::vector<std::string>& urls) const {
         try {
-            // Regex for URLs
-            std::regex urlPattern(
-                R"((https?://|ftp://|www\.)[a-zA-Z0-9\-\.]+\.[a-zA-Z]{2,}[^\s\)\]\}\"']*)",
-                std::regex::icase);
+            // Manual URL extraction — no std::regex (ReDoS-safe, production performance)
+            const size_t len = content.size();
+            size_t i = 0;
 
-            auto it = std::sregex_iterator(content.begin(), content.end(), urlPattern);
-            auto end = std::sregex_iterator();
+            while (i < len - 8) {
+                bool isUrl = false;
+                size_t urlStart = i;
 
-            for (; it != end; ++it) {
-                urls.push_back(it->str());
+                // Check for http:// or https:// or ftp://
+                if (i + 7 < len && content[i] == 'h' && content[i+1] == 't' && content[i+2] == 't' && content[i+3] == 'p') {
+                    if (content[i+4] == ':' && content[i+5] == '/' && content[i+6] == '/') {
+                        isUrl = true; i += 7;
+                    } else if (i + 8 < len && content[i+4] == 's' && content[i+5] == ':' && content[i+6] == '/' && content[i+7] == '/') {
+                        isUrl = true; i += 8;
+                    }
+                } else if (i + 6 < len && content[i] == 'f' && content[i+1] == 't' && content[i+2] == 'p' && content[i+3] == ':' && content[i+4] == '/' && content[i+5] == '/') {
+                    isUrl = true; i += 6;
+                }
+
+                if (isUrl) {
+                    // Scan until whitespace or terminator
+                    while (i < len && content[i] != ' ' && content[i] != '\n' && content[i] != '\r' &&
+                           content[i] != '\t' && content[i] != '"' && content[i] != '\'' &&
+                           content[i] != ')' && content[i] != ']' && content[i] != '}' &&
+                           content[i] != '>' && content[i] != '\0') {
+                        i++;
+                    }
+                    if (i - urlStart >= 10 && i - urlStart < 2048) {
+                        urls.push_back(content.substr(urlStart, i - urlStart));
+                        if (urls.size() >= 1000) return; // Cap IOCs
+                    }
+                } else {
+                    i++;
+                }
             }
-
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractURLs - Exception: %hs", e.what());
         }
@@ -1362,36 +1945,49 @@ private:
 
     void ExtractIPs(const std::string& content, std::vector<std::string>& ips) const {
         try {
-            // Regex for IPv4 addresses
-            std::regex ipPattern(
-                R"(\b(?:[0-9]{1,3}\.){3}[0-9]{1,3}\b)");
+            // Manual IPv4 extraction — no std::regex (ReDoS-safe)
+            const size_t len = content.size();
 
-            auto it = std::sregex_iterator(content.begin(), content.end(), ipPattern);
-            auto end = std::sregex_iterator();
+            for (size_t i = 0; i < len; ++i) {
+                if (content[i] < '0' || content[i] > '9') continue;
 
-            for (; it != end; ++it) {
-                std::string ip = it->str();
-
-                // Validate IP (simple check)
+                // Try to parse N.N.N.N pattern
+                int octets[4] = {0, 0, 0, 0};
+                size_t pos = i;
                 bool valid = true;
-                std::istringstream iss(ip);
-                std::string octet;
-                int count = 0;
 
-                while (std::getline(iss, octet, '.')) {
-                    int val = std::stoi(octet);
-                    if (val < 0 || val > 255) {
-                        valid = false;
-                        break;
+                for (int o = 0; o < 4 && valid; ++o) {
+                    int val = 0;
+                    int digits = 0;
+                    while (pos < len && content[pos] >= '0' && content[pos] <= '9' && digits < 3) {
+                        val = val * 10 + (content[pos] - '0');
+                        pos++;
+                        digits++;
                     }
-                    count++;
+                    if (digits == 0 || val > 255) { valid = false; break; }
+                    octets[o] = val;
+
+                    if (o < 3) {
+                        if (pos >= len || content[pos] != '.') { valid = false; break; }
+                        pos++;
+                    }
                 }
 
-                if (valid && count == 4) {
-                    ips.push_back(ip);
+                // Verify it's not part of a larger number
+                if (valid && pos > i + 6) {
+                    if (i > 0 && (std::isalnum(static_cast<unsigned char>(content[i-1])) || content[i-1] == '.')) { i = pos; continue; }
+                    if (pos < len && (std::isdigit(static_cast<unsigned char>(content[pos])) || content[pos] == '.')) { i = pos; continue; }
+
+                    // Skip loopback and link-local
+                    if (octets[0] != 127 && octets[0] != 0 && !(octets[0] == 169 && octets[1] == 254)) {
+                        std::string ip = std::to_string(octets[0]) + "." + std::to_string(octets[1]) + "." +
+                                        std::to_string(octets[2]) + "." + std::to_string(octets[3]);
+                        ips.push_back(ip);
+                        if (ips.size() >= 1000) return;
+                    }
+                    i = pos - 1;
                 }
             }
-
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractIPs - Exception: %hs", e.what());
         }
@@ -1399,17 +1995,47 @@ private:
 
     void ExtractEmails(const std::string& content, std::vector<std::string>& emails) const {
         try {
-            // Regex for email addresses
-            std::regex emailPattern(
-                R"([a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,})");
+            // Manual email extraction — no std::regex (ReDoS-safe)
+            const size_t len = content.size();
 
-            auto it = std::sregex_iterator(content.begin(), content.end(), emailPattern);
-            auto end = std::sregex_iterator();
+            for (size_t i = 1; i < len; ++i) {
+                if (content[i] != '@') continue;
 
-            for (; it != end; ++it) {
-                emails.push_back(it->str());
+                // Scan backward for local part
+                size_t localStart = i;
+                while (localStart > 0) {
+                    char c = content[localStart - 1];
+                    if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '_' || c == '+' || c == '-' || c == '%') {
+                        localStart--;
+                    } else {
+                        break;
+                    }
+                }
+                if (localStart == i) continue; // No local part
+
+                // Scan forward for domain part
+                size_t domainEnd = i + 1;
+                bool hasDot = false;
+                while (domainEnd < len) {
+                    char c = content[domainEnd];
+                    if (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-') {
+                        if (c == '.') hasDot = true;
+                        domainEnd++;
+                    } else {
+                        break;
+                    }
+                }
+
+                if (hasDot && domainEnd - i > 4 && domainEnd - localStart < 256) {
+                    std::string email = content.substr(localStart, domainEnd - localStart);
+                    // Basic validation: must have TLD of 2+ chars
+                    size_t lastDot = email.rfind('.');
+                    if (lastDot != std::string::npos && email.size() - lastDot > 2) {
+                        emails.push_back(email);
+                        if (emails.size() >= 500) return;
+                    }
+                }
             }
-
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"ExtractEmails - Exception: %hs", e.what());
         }
@@ -1428,6 +2054,70 @@ private:
             if (result.highestMacroRisk == MacroRisk::Critical) totalRisk += 40;
             else if (result.highestMacroRisk == MacroRisk::High) totalRisk += 30;
             else if (result.highestMacroRisk == MacroRisk::Medium) totalRisk += 15;
+
+            // AI/ML analysis (PhantomCortex integration)
+            if (m_config.enableAI) {
+                try {
+                    auto& cortex = AI::PhantomCortex::Instance();
+                    if (cortex.IsOperational() && !result.filePath.empty()) {
+                        // Read file for AI analysis
+                        std::ifstream aiFile(result.filePath, std::ios::binary | std::ios::ate);
+                        if (aiFile) {
+                            const auto fileSize = aiFile.tellg();
+                            if (fileSize > 0 && fileSize <= static_cast<std::streamoff>(MAX_DOCUMENT_SIZE)) {
+                                aiFile.seekg(0);
+                                std::vector<uint8_t> fileBuffer(static_cast<size_t>(fileSize));
+                                aiFile.read(reinterpret_cast<char*>(fileBuffer.data()), fileSize);
+
+                                auto aiVerdict = cortex.AnalyzeFile(std::span<const uint8_t>(fileBuffer));
+                                result.aiAnalysisPerformed = true;
+                                result.aiMaliciousConfidence = aiVerdict.confidence;
+                                result.aiClassification = (aiVerdict.verdict == AI::ThreatVerdict::Malicious) ? "Malicious" :
+                                                          (aiVerdict.verdict == AI::ThreatVerdict::Suspicious) ? "Suspicious" : "Benign";
+
+                                if (aiVerdict.verdict == AI::ThreatVerdict::Malicious &&
+                                    aiVerdict.confidence >= m_config.aiConfidenceThreshold) {
+                                    totalRisk += static_cast<uint32_t>(aiVerdict.confidence * 40.0f);
+                                    m_stats.maliciousDocuments.fetch_add(1, std::memory_order_relaxed);
+
+                                    SS_LOG_WARN(L"DocumentScanner", L"AI classified as malicious (confidence: %.2f)",
+                                        aiVerdict.confidence);
+                                } else if (aiVerdict.verdict == AI::ThreatVerdict::Suspicious) {
+                                    totalRisk += static_cast<uint32_t>(aiVerdict.confidence * 15.0f);
+                                }
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    SS_LOG_DEBUG(L"DocumentScanner", L"AI analysis skipped: %hs", e.what());
+                }
+            }
+
+            // PatternStore YARA-based detection
+            if (!result.filePath.empty()) {
+                try {
+                    auto& patterns = PatternStore::PatternStore::Instance();
+                    auto patternResults = patterns.ScanFile(result.filePath);
+                    for (const auto& det : patternResults) {
+                        if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
+                            totalRisk += 30;
+                            m_stats.cvesDetected.fetch_add(1, std::memory_order_relaxed);
+
+                            DocumentThreat threat;
+                            threat.type = ThreatType::CVEExploit;
+                            threat.severity = 90;
+                            threat.description = "YARA pattern match: " + det.signatureName;
+                            threat.location = "PatternStore";
+                            threat.mitreId = "T1203";
+                            result.threats.push_back(threat);
+                            result.criticalThreats++;
+                            ReportThreat(threat);
+                        }
+                    }
+                } catch (...) {
+                    // PatternStore not available
+                }
+            }
 
             // Cap at 100
             result.riskScore = std::min(totalRisk, 100u);
@@ -1476,9 +2166,15 @@ private:
     }
 
     void ReportProgress(const std::wstring& stage, uint32_t percent) const {
+        // Copy callback under lock to invoke outside (prevent deadlock)
+        DocumentProgressCallback cb;
+        {
+            std::shared_lock lock(m_mutex);
+            cb = m_progressCallback;
+        }
         try {
-            if (m_progressCallback) {
-                m_progressCallback(stage, percent);
+            if (cb) {
+                cb(stage, percent);
             }
         } catch (...) {
             // Suppress callback exceptions
@@ -1486,9 +2182,15 @@ private:
     }
 
     void ReportThreat(const DocumentThreat& threat) const {
+        // Copy callback under lock to invoke outside (prevent deadlock)
+        ThreatCallback cb;
+        {
+            std::shared_lock lock(m_mutex);
+            cb = m_threatCallback;
+        }
         try {
-            if (m_threatCallback) {
-                m_threatCallback(threat);
+            if (cb) {
+                cb(threat);
             }
         } catch (...) {
             // Suppress callback exceptions
@@ -1674,6 +2376,14 @@ const DocumentScannerStatistics& DocumentScanner::GetStatistics() const noexcept
 
 void DocumentScanner::ResetStatistics() noexcept {
     m_impl->ResetStatistics();
+}
+
+DocumentScannerSnapshotStats DocumentScanner::GetStatisticsSnapshot() const noexcept {
+    return m_impl->GetStatisticsSnapshot();
+}
+
+bool DocumentScanner::IsInitialized() const noexcept {
+    return m_impl->IsInitialized();
 }
 
 }  // namespace FileSystem

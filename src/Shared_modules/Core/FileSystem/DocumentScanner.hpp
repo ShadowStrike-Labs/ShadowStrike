@@ -110,6 +110,11 @@
 #include "../../Utils/StringUtils.hpp"        // String extraction
 #include "../../PatternStore/PatternStore.hpp" // Exploit patterns
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"  // CVE/exploit database
+#include "FileTypeAnalyzer.hpp"               // Unified file type detection
+#include "FileHasher.hpp"                     // Enterprise-grade hashing
+#include "ArchiveExtractor.hpp"               // OOXML/ZIP extraction
+#include "FileReputation.hpp"                 // Cloud reputation
+#include "../../AI/PhantomCortex.hpp"         // AI/ML inference engine
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -422,6 +427,16 @@ struct alignas(256) DocumentScanResult {
     std::chrono::system_clock::time_point created;
     std::chrono::system_clock::time_point modified;
 
+    // AI/ML analysis
+    std::optional<float> aiMaliciousConfidence;
+    std::string aiClassification;
+    bool aiAnalysisPerformed{ false };
+
+    // Emulation results
+    bool emulationPerformed{ false };
+    std::string emulationVerdict;
+    uint32_t emulatedAPICallCount{ 0 };
+
     // Scan metadata
     std::chrono::system_clock::time_point scanTime;
     std::chrono::milliseconds scanDuration{ 0 };
@@ -452,6 +467,15 @@ struct alignas(64) DocumentScannerConfig {
     bool recursiveScan{ true };
     uint32_t maxRecursionDepth{ 5 };
 
+    // AI/ML integration
+    bool enableAI{ true };
+    bool enableEmulation{ true };
+    float aiConfidenceThreshold{ 0.7f };
+
+    // Timeouts
+    std::chrono::milliseconds scanTimeout{ 30000 };
+    std::chrono::milliseconds emulationTimeout{ 10000 };
+
     // Factory methods
     static DocumentScannerConfig CreateDefault() noexcept;
     static DocumentScannerConfig CreateQuick() noexcept;
@@ -472,6 +496,24 @@ struct alignas(128) DocumentScannerStatistics {
     std::atomic<uint64_t> maliciousDocuments{ 0 };
 
     void Reset() noexcept;
+};
+
+/**
+ * @struct DocumentScannerSnapshotStats
+ * @brief Non-atomic snapshot for API return (copyable).
+ */
+struct DocumentScannerSnapshotStats {
+    uint64_t documentsScanned{ 0 };
+    uint64_t macrosDetected{ 0 };
+    uint64_t maliciousMacros{ 0 };
+    uint64_t oleObjectsDetected{ 0 };
+    uint64_t pdfJavaScriptDetected{ 0 };
+    uint64_t cvesDetected{ 0 };
+    uint64_t maliciousDocuments{ 0 };
+    uint64_t aiDetections{ 0 };
+    uint64_t emulationDetections{ 0 };
+    uint64_t templateInjections{ 0 };
+    uint64_t ddeAttacks{ 0 };
 };
 
 // ============================================================================
@@ -676,7 +718,14 @@ public:
     // ========================================================================
 
     [[nodiscard]] const DocumentScannerStatistics& GetStatistics() const noexcept;
+    [[nodiscard]] DocumentScannerSnapshotStats GetStatisticsSnapshot() const noexcept;
     void ResetStatistics() noexcept;
+
+    // ========================================================================
+    // STATE QUERY
+    // ========================================================================
+
+    [[nodiscard]] bool IsInitialized() const noexcept;
 
 private:
     DocumentScanner();
