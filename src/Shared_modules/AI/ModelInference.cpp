@@ -68,6 +68,7 @@
 #include <filesystem>
 #include <numeric>
 #include <algorithm>
+#include <atomic>
 #include <cstring>
 #include <thread>
 #include <fstream>
@@ -458,19 +459,26 @@ ModelInference::~ModelInference() {
 }
 
 // ============================================================================
+// Constructor — eagerly create Impl so modelMutex is available immediately
+// ============================================================================
+
+ModelInference::ModelInference() {
+    try {
+        m_impl = std::make_unique<Impl>();
+    } catch (...) {
+        // m_impl remains null — Initialize() will report the failure.
+    }
+}
+
+// ============================================================================
 // Initialize
 // ============================================================================
 
 bool ModelInference::Initialize(const CortexConfig& config) noexcept {
     try {
-        // Lazy-create Impl
         if (!m_impl) {
-            try {
-                m_impl = std::make_unique<Impl>();
-            } catch (...) {
-                SS_LOG_ERROR(kLogTag, L"Initialize: Impl allocation failed");
-                return false;
-            }
+            SS_LOG_ERROR(kLogTag, L"Initialize: Impl allocation failed at construction");
+            return false;
         }
 
         std::unique_lock lock(m_impl->modelMutex);
@@ -950,6 +958,8 @@ bool ModelInference::LoadModel(CortexModelType type,
         // -----------------------------------------------------------
         // Commit to slot under exclusive lock
         // -----------------------------------------------------------
+        size_t committedInputCount  = 0;
+        size_t committedOutputCount = 0;
         {
             std::unique_lock lock(m_impl->modelMutex);
             if (!m_impl->initialized) {
@@ -973,13 +983,17 @@ bool ModelInference::LoadModel(CortexModelType type,
             slot.outputShapes   = std::move(outputShapes);
             slot.version        = std::move(ver);
             slot.loaded         = true;
+
+            // Capture metadata while still under lock to avoid data race
+            committedInputCount  = slot.inputNames.size();
+            committedOutputCount = slot.outputNames.size();
         }
 
         SS_LOG_INFO(kLogTag,
             L"LoadModel(%ls): loaded successfully (inputs=%zu, outputs=%zu, hash=%.16ls...)",
             kModelTypeNames[idx],
-            m_impl->slots[idx].inputNames.size(),
-            m_impl->slots[idx].outputNames.size(),
+            committedInputCount,
+            committedOutputCount,
             modelHash.c_str());
 
         return true;
@@ -1091,6 +1105,38 @@ std::optional<std::vector<float>> ModelInference::Infer(
             return std::nullopt;
         }
 
+        // Reject multi-input/output models — current API handles exactly one
+        if (slot.inputNames.size() != 1 || slot.outputNames.size() != 1) {
+            SS_LOG_ERROR(kLogTag,
+                L"Infer(%ls): expected single-input/single-output model "
+                L"(got %zu inputs, %zu outputs)",
+                kModelTypeNames[idx],
+                slot.inputNames.size(), slot.outputNames.size());
+            return std::nullopt;
+        }
+
+        // Validate caller's shape against model's expected input dimensions
+        if (!slot.inputShapes.empty()) {
+            const auto& expected = slot.inputShapes[0];
+            if (inputShape.size() != expected.size()) {
+                SS_LOG_ERROR(kLogTag,
+                    L"Infer(%ls): shape rank mismatch (model expects %zu dims, got %zu)",
+                    kModelTypeNames[idx], expected.size(), inputShape.size());
+                return std::nullopt;
+            }
+            for (size_t d = 0; d < expected.size(); ++d) {
+                // Dynamic dimensions (<=0 in ONNX) are skipped
+                if (expected[d] > 0 && inputShape[d] != expected[d]) {
+                    SS_LOG_ERROR(kLogTag,
+                        L"Infer(%ls): dim[%zu] mismatch (model expects %lld, got %lld)",
+                        kModelTypeNames[idx], d,
+                        static_cast<long long>(expected[d]),
+                        static_cast<long long>(inputShape[d]));
+                    return std::nullopt;
+                }
+            }
+        }
+
         // -----------------------------------------------------------
         // Create input tensor
         // -----------------------------------------------------------
@@ -1098,6 +1144,7 @@ std::optional<std::vector<float>> ModelInference::Infer(
         if (!CheckOrtStatus(api,
                 api->CreateTensorWithDataAsOrtValue(
                     m_impl->memoryInfo,
+                    // ORT C API takes void* but does not modify input tensor data
                     const_cast<float*>(inputData.data()),
                     inputData.size_bytes(),
                     inputShape.data(),
@@ -1121,17 +1168,57 @@ std::optional<std::vector<float>> ModelInference::Infer(
         const char* outName = slot.outputNames[0].c_str();
 
         // -----------------------------------------------------------
+        // Create run options with timeout termination
+        // -----------------------------------------------------------
+        OrtRunOptions* runOpts = nullptr;
+        if (!CheckOrtStatus(api, api->CreateRunOptions(&runOpts),
+                            L"CreateRunOptions")) {
+            return std::nullopt;
+        }
+        struct RunOptsGuard {
+            const OrtApi* a; OrtRunOptions* p;
+            ~RunOptsGuard() { if (a && p) a->ReleaseRunOptions(p); }
+        } runOptsGuard{api, runOpts};
+
+        const uint32_t timeoutMs = m_impl->config.inferenceTimeoutMs;
+        std::atomic<bool> inferDone{false};
+        std::thread timeoutWatcher;
+        if (timeoutMs > 0) {
+            try {
+                timeoutWatcher = std::thread(
+                    [api, runOpts, timeoutMs, &inferDone]() noexcept {
+                        const auto deadline = std::chrono::steady_clock::now()
+                                            + std::chrono::milliseconds(timeoutMs);
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            if (inferDone.load(std::memory_order_acquire)) return;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                        if (!inferDone.load(std::memory_order_acquire)) {
+                            api->RunOptionsSetTerminate(runOpts);
+                        }
+                    });
+            } catch (...) {
+                SS_LOG_WARN(kLogTag, L"Infer(%ls): timeout thread creation failed",
+                            kModelTypeNames[idx]);
+            }
+        }
+
+        // -----------------------------------------------------------
         // Run inference
         // -----------------------------------------------------------
         OrtValue* outputTensor = nullptr;
-        if (!CheckOrtStatus(api,
+        const bool runOk = CheckOrtStatus(api,
                 api->Run(slot.session,
-                         nullptr,       // run options
+                         runOpts,
                          &inName, &inputTensor, 1,
                          &outName, 1, &outputTensor),
-                L"Run")) {
-            return std::nullopt;
-        }
+                L"Run");
+
+        // Signal timeout thread to exit and wait for it
+        inferDone.store(true, std::memory_order_release);
+        if (timeoutWatcher.joinable()) timeoutWatcher.join();
+
+        if (!runOk) return std::nullopt;
 
         TensorGuard outputGuard{api, outputTensor};
 
@@ -1215,7 +1302,7 @@ std::optional<std::vector<std::vector<float>>> ModelInference::InferBatch(
                          kModelTypeNames[idx]);
             return std::nullopt;
         }
-        if (static_cast<uint32_t>(batchSize) > CortexConstants::MAX_BATCH_SIZE) {
+        if (batchSize > static_cast<int64_t>(CortexConstants::MAX_BATCH_SIZE)) {
             SS_LOG_ERROR(kLogTag,
                 L"InferBatch(%ls): batch size %lld exceeds MAX_BATCH_SIZE (%u)",
                 kModelTypeNames[idx],
@@ -1274,11 +1361,44 @@ std::optional<std::vector<std::vector<float>>> ModelInference::InferBatch(
             return std::nullopt;
         }
 
+        // Reject multi-input/output models — current API handles exactly one
+        if (slot.inputNames.size() != 1 || slot.outputNames.size() != 1) {
+            SS_LOG_ERROR(kLogTag,
+                L"InferBatch(%ls): expected single-input/single-output model "
+                L"(got %zu inputs, %zu outputs)",
+                kModelTypeNames[idx],
+                slot.inputNames.size(), slot.outputNames.size());
+            return std::nullopt;
+        }
+
+        // Validate caller's shape against model's expected input dimensions
+        // (skip dim[0] = batch, which is expected to vary)
+        if (!slot.inputShapes.empty()) {
+            const auto& expected = slot.inputShapes[0];
+            if (batchShape.size() != expected.size()) {
+                SS_LOG_ERROR(kLogTag,
+                    L"InferBatch(%ls): shape rank mismatch (model expects %zu dims, got %zu)",
+                    kModelTypeNames[idx], expected.size(), batchShape.size());
+                return std::nullopt;
+            }
+            for (size_t d = 1; d < expected.size(); ++d) {
+                if (expected[d] > 0 && batchShape[d] != expected[d]) {
+                    SS_LOG_ERROR(kLogTag,
+                        L"InferBatch(%ls): dim[%zu] mismatch (model expects %lld, got %lld)",
+                        kModelTypeNames[idx], d,
+                        static_cast<long long>(expected[d]),
+                        static_cast<long long>(batchShape[d]));
+                    return std::nullopt;
+                }
+            }
+        }
+
         // Create input tensor
         OrtValue* inputTensor = nullptr;
         if (!CheckOrtStatus(api,
                 api->CreateTensorWithDataAsOrtValue(
                     m_impl->memoryInfo,
+                    // ORT C API takes void* but does not modify input tensor data
                     const_cast<float*>(batchData.data()),
                     batchData.size_bytes(),
                     batchShape.data(),
@@ -1297,15 +1417,55 @@ std::optional<std::vector<std::vector<float>>> ModelInference::InferBatch(
         const char* inName  = slot.inputNames[0].c_str();
         const char* outName = slot.outputNames[0].c_str();
 
-        OrtValue* outputTensor = nullptr;
-        if (!CheckOrtStatus(api,
-                api->Run(slot.session,
-                         nullptr,
-                         &inName, &inputTensor, 1,
-                         &outName, 1, &outputTensor),
-                L"Run(batch)")) {
+        // -----------------------------------------------------------
+        // Create run options with timeout termination
+        // -----------------------------------------------------------
+        OrtRunOptions* runOpts = nullptr;
+        if (!CheckOrtStatus(api, api->CreateRunOptions(&runOpts),
+                            L"CreateRunOptions(batch)")) {
             return std::nullopt;
         }
+        struct RunOptsGuard {
+            const OrtApi* a; OrtRunOptions* p;
+            ~RunOptsGuard() { if (a && p) a->ReleaseRunOptions(p); }
+        } runOptsGuard{api, runOpts};
+
+        const uint32_t timeoutMs = m_impl->config.inferenceTimeoutMs;
+        std::atomic<bool> inferDone{false};
+        std::thread timeoutWatcher;
+        if (timeoutMs > 0) {
+            try {
+                timeoutWatcher = std::thread(
+                    [api, runOpts, timeoutMs, &inferDone]() noexcept {
+                        const auto deadline = std::chrono::steady_clock::now()
+                                            + std::chrono::milliseconds(timeoutMs);
+                        while (std::chrono::steady_clock::now() < deadline) {
+                            if (inferDone.load(std::memory_order_acquire)) return;
+                            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                        }
+                        if (!inferDone.load(std::memory_order_acquire)) {
+                            api->RunOptionsSetTerminate(runOpts);
+                        }
+                    });
+            } catch (...) {
+                SS_LOG_WARN(kLogTag, L"InferBatch(%ls): timeout thread creation failed",
+                            kModelTypeNames[idx]);
+            }
+        }
+
+        OrtValue* outputTensor = nullptr;
+        const bool runOk = CheckOrtStatus(api,
+                api->Run(slot.session,
+                         runOpts,
+                         &inName, &inputTensor, 1,
+                         &outName, 1, &outputTensor),
+                L"Run(batch)");
+
+        // Signal timeout thread to exit and wait for it
+        inferDone.store(true, std::memory_order_release);
+        if (timeoutWatcher.joinable()) timeoutWatcher.join();
+
+        if (!runOk) return std::nullopt;
 
         TensorGuard outputGuard{api, outputTensor};
 
