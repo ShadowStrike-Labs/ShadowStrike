@@ -1167,6 +1167,9 @@ struct ThreatVerdict {
             default: return "None";
         }
     }
+
+    /// @brief Serialize verdict to JSON string.
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**
@@ -1297,6 +1300,9 @@ struct AttackChain {
             lastUpdateTime - creationTime
         );
     }
+
+    /// @brief Serialize attack chain to JSON string.
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**

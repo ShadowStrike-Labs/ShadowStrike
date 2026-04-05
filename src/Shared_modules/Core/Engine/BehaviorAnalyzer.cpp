@@ -98,7 +98,7 @@ struct BehaviorAnalyzer::Impl {
     // Callbacks
     mutable std::shared_mutex m_callbackMutex;
     std::unordered_map<uint64_t, BehaviorVerdictCallback> m_verdictCallbacks;
-    std::unordered_map<uint64_t, AttackChainCallback> m_chainCallbacks;
+    std::unordered_map<uint64_t, BehaviorAttackChainCallback> m_chainCallbacks;
     ProcessTerminateCallback m_terminationCallback;
     std::atomic<uint64_t> m_nextCallbackId{1};
 
@@ -1732,7 +1732,7 @@ void BehaviorAnalyzer::InvokeVerdictCallbacks(const BehaviorVerdict& verdict) {
 }
 
 void BehaviorAnalyzer::InvokeAttackChainCallbacks(const BehaviorAttackChain& chain) {
-    std::vector<AttackChainCallback> callbacks;
+    std::vector<BehaviorAttackChainCallback> callbacks;
     {
         std::shared_lock cbLock(m_impl->m_callbackMutex);
         callbacks.reserve(m_impl->m_chainCallbacks.size());
@@ -2007,7 +2007,7 @@ bool BehaviorAnalyzer::UnregisterVerdictCallback(uint64_t callbackId) {
     return m_impl->m_verdictCallbacks.erase(callbackId) > 0;
 }
 
-uint64_t BehaviorAnalyzer::RegisterAttackChainCallback(AttackChainCallback callback) {
+uint64_t BehaviorAnalyzer::RegisterAttackChainCallback(BehaviorAttackChainCallback callback) {
     if (!callback) return 0;
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);

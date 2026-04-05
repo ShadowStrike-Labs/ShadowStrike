@@ -559,7 +559,10 @@ enum class PackerType : uint16_t {
     Crypto_Obfuscator = 253,
     
     /// @brief Generic/unknown packer
-    Generic = 999
+    Generic = 999,
+    
+    /// @brief Alias: Not packed (same as Unknown)
+    None = 0
 };
 #endif // SHADOWSTRIKE_PACKER_TYPE_DEFINED
 
@@ -1391,7 +1394,7 @@ struct PackerDetection {
     bool isPacked = false;
     
     /// @brief Packer type
-    PackerType packerType = PackerType::None;
+    PackerType packerType = PackerType::Unknown;
     
     /// @brief Packer name
     std::string packerName;
