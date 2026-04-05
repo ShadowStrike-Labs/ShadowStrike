@@ -1,0 +1,37 @@
+# PhantomCortex gitignore
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+dist/
+build/
+.eggs/
+
+# Training data (large files)
+training/data/raw/
+training/data/processed/
+training/data/feeds/
+training/data/models/
+
+# Experiment tracking
+mlruns/
+.mlflow/
+
+# DVC
+*.dvc
+.dvc/
+
+# Environment
+.env
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store

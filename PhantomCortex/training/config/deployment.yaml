@@ -1,0 +1,33 @@
+deployment:
+  staging_dir: "../data/models/staging"
+  production_dir: "../data/models/production"
+  backup_dir: "../data/models/backup"
+  max_backups: 5
+
+  quality_gates:
+    min_auc_roc: 0.995
+    max_fpr_at_001: 0.001       # FPR at 0.1% threshold
+    min_detection_rate: 0.995
+    max_model_size_mb: 20
+    max_inference_ms: 5.0
+    max_regression_pct: 0.5     # max % drop vs previous model
+
+  versioning:
+    scheme: "semver"            # major.minor.patch
+    auto_increment: "minor"     # auto-bump minor on each train
+    manifest_file: "model_manifest.json"
+
+  notifications:
+    email:
+      enabled: false
+      smtp_server: ""
+      recipients: []
+    webhook:
+      enabled: false
+      url: ""
+
+  scheduling:
+    feed_sync_cron: "0 2 * * *"       # 2:00 AM daily
+    incremental_train: "0 4 * * *"    # 4:00 AM daily
+    full_train: "0 3 * * 0"           # 3:00 AM Sunday
+    evaluate: "0 5 * * *"             # 5:00 AM daily
