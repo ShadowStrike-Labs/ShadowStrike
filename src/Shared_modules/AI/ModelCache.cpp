@@ -38,6 +38,7 @@
 #include "ModelCache.hpp"
 
 #include <array>
+#include <mutex>
 #include <shared_mutex>
 #include <filesystem>
 #include <algorithm>
@@ -118,6 +119,80 @@ namespace {
     }
 
     // ----------------------------------------------------------------
+    // HTTPS URL Scheme Enforcement
+    // ----------------------------------------------------------------
+
+    [[nodiscard]] bool IsHttpsUrl(const std::wstring& url) noexcept {
+        constexpr std::wstring_view kHttpsPrefix = L"https://";
+        if (url.size() < kHttpsPrefix.size()) return false;
+        for (size_t i = 0; i < kHttpsPrefix.size(); ++i) {
+            if (towlower(static_cast<wint_t>(url[i])) != kHttpsPrefix[i]) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Symlink / Reparse Point Guard
+    // ----------------------------------------------------------------
+
+    [[nodiscard]] bool IsReparsePoint(const std::filesystem::path& p) noexcept {
+        try {
+            Utils::FileUtils::FileStat stat;
+            Utils::FileUtils::Error fErr;
+            if (!Utils::FileUtils::Stat(p.wstring(), stat, &fErr)) {
+                return false;  // file doesn't exist — not a reparse point
+            }
+            return stat.isReparsePoint;
+        }
+        catch (...) { return true; }  // err on the side of caution
+    }
+
+    [[nodiscard]] bool RejectIfReparsePoint(const std::filesystem::path& p) noexcept {
+        if (IsReparsePoint(p)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"Reparse point (symlink/junction) detected, refusing operation: %ls",
+                p.c_str());
+            return false;
+        }
+        return true;
+    }
+
+    // ----------------------------------------------------------------
+    // Disk Space Guard
+    // ----------------------------------------------------------------
+
+    [[nodiscard]] bool HasSufficientDiskSpace(
+            const std::filesystem::path& dir,
+            uintmax_t requiredBytes) noexcept {
+        try {
+            std::error_code ec;
+            const auto spaceInfo = std::filesystem::space(dir, ec);
+            if (ec) {
+                SS_LOG_WARN(kLogCategory,
+                    L"Cannot query disk space for %ls: %hs",
+                    dir.c_str(), ec.message().c_str());
+                return true;  // don't block on query failure
+            }
+            constexpr uintmax_t kHeadroomBytes = 64ULL * 1024 * 1024;  // 64 MB
+            const uintmax_t needed = requiredBytes + kHeadroomBytes;
+            if (spaceInfo.available < needed) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Insufficient disk space in %ls: available=%llu, required=%llu bytes",
+                    dir.c_str(),
+                    static_cast<unsigned long long>(spaceInfo.available),
+                    static_cast<unsigned long long>(needed));
+                return false;
+            }
+            return true;
+        }
+        catch (...) {
+            return true;  // don't block on exception
+        }
+    }
+
+    // ----------------------------------------------------------------
     // File-Size Guard
     // ----------------------------------------------------------------
 
@@ -177,10 +252,13 @@ namespace {
     [[nodiscard]] bool ConstantTimeHashCompare(const std::wstring& a,
                                                const std::wstring& b) noexcept {
         if (a.size() != b.size()) return false;
-        volatile unsigned char result = 0;
+        // Accumulator must hold full wchar_t width (16-bit on Windows).
+        // Using unsigned char here would truncate XOR results to 8 bits,
+        // allowing crafted strings differing only in high byte to pass.
+        volatile uint32_t result = 0;
         for (size_t i = 0; i < a.size(); ++i) {
-            result |= static_cast<unsigned char>(
-                static_cast<wchar_t>(a[i]) ^ static_cast<wchar_t>(b[i]));
+            result |= static_cast<uint32_t>(
+                static_cast<uint16_t>(a[i]) ^ static_cast<uint16_t>(b[i]));
         }
         return result == 0;
     }
@@ -488,6 +566,9 @@ ModelCache& ModelCache::Instance() noexcept {
 
 bool ModelCache::Initialize(const std::filesystem::path& cacheDir) noexcept {
     try {
+        // Serialize concurrent Initialize calls
+        static std::mutex initMutex;
+        std::unique_lock initLock(initMutex);
         // Validate input path
         if (cacheDir.empty()) {
             SS_LOG_ERROR(kLogCategory, L"ModelCache::Initialize called with empty cacheDir");
@@ -723,6 +804,19 @@ bool ModelCache::SwapModel(CortexModelType type,
             return false;
         }
 
+        // Post-copy validation on staging (closes TOCTOU gap with source file)
+        if (!CheckFileSize(s.stagingModel)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"SwapModel: staged file exceeds size limit for slot '%ls'",
+                kSlotNames[idx]);
+            SafeRemove(s.stagingModel);
+            return false;
+        }
+        if (!RejectIfReparsePoint(s.stagingModel)) {
+            SafeRemove(s.stagingModel);
+            return false;
+        }
+
         // ---- Step 2: Compute SHA-256 of staged file ----
         std::wstring newHash;
         if (!ComputeFileSha256Hex(s.stagingModel, newHash)) {
@@ -818,6 +912,9 @@ bool ModelCache::Rollback(CortexModelType type) noexcept {
             return false;
         }
 
+        // Clean any leftover staging file
+        SafeRemove(s.stagingModel);
+
         // Remove current (may be corrupt)
         SafeRemove(s.currentModel);
 
@@ -890,10 +987,26 @@ bool ModelCache::DownloadModel(CortexModelType type,
                 L"DownloadModel called with empty expected SHA-256");
             return false;
         }
+        if (!IsHttpsUrl(url)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"DownloadModel rejected non-HTTPS URL: %ls", url.c_str());
+            return false;
+        }
 
         const auto idx = SlotIndex(type);
         std::unique_lock lock(m_impl->slotMutexes[idx]);
         auto& s = m_impl->slots[idx];
+
+        // Verify slot directory hasn't been replaced with a symlink/junction
+        if (!RejectIfReparsePoint(m_impl->SlotDir(idx))) {
+            return false;
+        }
+
+        // Pre-flight disk space check (conservative: MAX_MODEL_FILE_SIZE + headroom)
+        if (!HasSufficientDiskSpace(m_impl->SlotDir(idx),
+                CortexConstants::MAX_MODEL_FILE_SIZE)) {
+            return false;
+        }
 
         SS_LOG_INFO(kLogCategory,
             L"Downloading model for slot '%ls' from %ls",
@@ -948,10 +1061,52 @@ bool ModelCache::DownloadModel(CortexModelType type,
             return false;
         }
 
+        // ---- Atomic Swap: Steps 3-5 (staging already written and verified) ----
+
+        // Step 3: Backup current → previous (if exists)
+        if (s.hasModel && SafeExists(s.currentModel)) {
+            SafeRemove(s.previousModel);
+            if (!SafeRename(s.currentModel, s.previousModel)) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"DownloadModel step 3 (backup) failed for slot '%ls'",
+                    kSlotNames[idx]);
+                SafeRemove(s.stagingModel);
+                return false;
+            }
+            s.previousHash = s.currentHash;
+            s.hasPrevious  = true;
+        }
+
+        // Step 4: Rename staging → current
+        if (!SafeRename(s.stagingModel, s.currentModel)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"DownloadModel step 4 (activate) failed for slot '%ls'; "
+                L"restoring previous model", kSlotNames[idx]);
+            if (s.hasPrevious && SafeExists(s.previousModel)) {
+                SafeRename(s.previousModel, s.currentModel);
+                s.hasPrevious = false;
+            }
+            SafeRemove(s.stagingModel);
+            return false;
+        }
+
+        // Step 5: Update manifest
+        s.currentHash       = downloadedHash;
+        s.hasModel          = true;
+        s.version.modelHash = downloadedHash;
+        s.version.patch += 1;
+        s.version.trainedAt = std::chrono::system_clock::now();
+
+        if (!m_impl->SaveManifest(idx)) {
+            SS_LOG_WARN(kLogCategory,
+                L"DownloadModel step 5 (manifest) failed for slot '%ls'; "
+                L"swap succeeded but manifest is stale", kSlotNames[idx]);
+        }
+
         SS_LOG_INFO(kLogCategory,
-            L"Model download verified for slot '%ls': sha256=%ls "
-            L"(staged, not yet swapped)",
-            kSlotNames[idx], downloadedHash.c_str());
+            L"DownloadModel completed for slot '%ls': sha256=%ls v%u.%u.%u",
+            kSlotNames[idx], s.currentHash.c_str(),
+            s.version.major, s.version.minor, s.version.patch);
         return true;
     }
     catch (...) {
@@ -975,6 +1130,12 @@ bool ModelCache::CheckForUpdates(const std::wstring& manifestUrl) noexcept {
         if (manifestUrl.empty()) {
             SS_LOG_ERROR(kLogCategory,
                 L"CheckForUpdates called with empty manifest URL");
+            return false;
+        }
+        if (!IsHttpsUrl(manifestUrl)) {
+            SS_LOG_ERROR(kLogCategory,
+                L"CheckForUpdates rejected non-HTTPS URL: %ls",
+                manifestUrl.c_str());
             return false;
         }
 

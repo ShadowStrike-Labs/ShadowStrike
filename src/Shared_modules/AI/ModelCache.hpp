@@ -155,14 +155,17 @@ public:
     [[nodiscard]] bool CheckForUpdates(const std::wstring& manifestUrl) noexcept;
 
     /**
-     * @brief Download a model file and verify its integrity.
+     * @brief Download a model file, verify its integrity, and atomically swap it in.
      * @param type            Model slot to update.
-     * @param url             HTTPS URL to download from.
+     * @param url             HTTPS URL to download from (non-HTTPS is rejected).
      * @param expectedSha256  Expected SHA-256 hex digest of the file.
-     * @return true if the download succeeded and the hash matched.
+     * @return true if the download, verification, and atomic swap all succeeded.
      *
      * The file is written to a staging location first. If verification
-     * fails, the staging file is deleted and no swap occurs.
+     * fails, the staging file is deleted and no swap occurs. On success,
+     * the verified staging file is atomically promoted to the active model
+     * using the five-step swap protocol, and the previous model is preserved
+     * for rollback.
      *
      * Thread Safety: Exclusive lock on the target model slot.
      */
