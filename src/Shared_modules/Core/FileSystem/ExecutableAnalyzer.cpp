@@ -420,23 +420,23 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("ExecutableAnalyzer: Initializing...");
+            SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initializing...");
 
             // Verify infrastructure is available
             if (!HashStore::HashStore::Instance().IsInitialized()) {
-                Logger::Warn("ExecutableAnalyzer: HashStore not initialized, initializing now");
+                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: HashStore not initialized, initializing now");
                 if (!HashStore::HashStore::Instance().Initialize()) {
-                    Logger::Error("ExecutableAnalyzer: Failed to initialize HashStore");
+                    SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Failed to initialize HashStore");
                     return false;
                 }
             }
 
             m_initialized = true;
-            Logger::Info("ExecutableAnalyzer: Initialized successfully");
+            SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -444,7 +444,7 @@ public:
     void Shutdown() noexcept {
         std::unique_lock lock(m_mutex);
         m_initialized = false;
-        Logger::Info("ExecutableAnalyzer: Shutdown complete");
+        SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Shutdown complete");
     }
 
     // ========================================================================
@@ -460,21 +460,20 @@ public:
         try {
             // Validate input
             if (filePath.empty()) {
-                Logger::Error("ExecutableAnalyzer::Analyze: Empty file path");
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Empty file path");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
             if (filePath.length() > 32767) {
-                Logger::Error("ExecutableAnalyzer::Analyze: Path too long: {}", filePath.length());
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Path too long: %ls", filePath.length());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
             // Check file exists
             if (!Utils::FileUtils::FileExists(filePath)) {
-                Logger::Error("ExecutableAnalyzer::Analyze: File not found: {}",
-                    Utils::StringUtils::WideToUtf8(filePath));
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs", Utils::StringUtils::ToNarrow(filePath).c_str());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
@@ -482,13 +481,13 @@ public:
             // Get file size
             info.fileSize = Utils::FileUtils::GetFileSize(filePath);
             if (info.fileSize == 0) {
-                Logger::Warn("ExecutableAnalyzer::Analyze: File is empty");
+                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File is empty");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
             if (info.fileSize > ExecutableAnalyzerConstants::MAX_FILE_SIZE) {
-                Logger::Error("ExecutableAnalyzer::Analyze: File too large: {} bytes", info.fileSize);
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File too large: %llu bytes", info.fileSize);
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
@@ -496,7 +495,7 @@ public:
             // Memory-map the file for analysis
             auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
             if (!fileMapping || fileMapping->size() == 0) {
-                Logger::Error("ExecutableAnalyzer::Analyze: Failed to memory-map file");
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to memory-map file");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
@@ -539,16 +538,12 @@ public:
             const uint64_t newAvg = (currentAvg + duration.count()) / 2;
             m_stats.averageAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
 
-            Logger::Info("ExecutableAnalyzer: Analyzed {} in {} μs (type: {}, risk: {})",
-                Utils::StringUtils::WideToUtf8(filePath),
-                duration.count(),
-                static_cast<int>(info.type),
-                info.riskScore);
+            SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Analyzed %hs in %u μs (type: %u, risk: %hs)", Utils::StringUtils::ToNarrow(filePath).c_str(), duration.count(), static_cast<int>(info.type), info.riskScore);
 
             return info;
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::Analyze: Exception: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Exception: %hs", e.what());
             m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
             return info;
         }
@@ -573,7 +568,7 @@ public:
             return info;
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::AnalyzeBuffer: Exception: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::AnalyzeBuffer: Exception: %hs", e.what());
             m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
             return ExecutableInfo{};
         }
@@ -697,7 +692,7 @@ public:
             return ParseImportsImpl(data, info);
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseImports: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseImports: %hs", e.what());
             return {};
         }
     }
@@ -719,7 +714,7 @@ public:
             return ParseExportsImpl(data, info);
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseExports: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseExports: %hs", e.what());
             return {};
         }
     }
@@ -743,7 +738,7 @@ public:
             return DetectPackerImpl(data, info);
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::DetectPacker: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::DetectPacker: %hs", e.what());
             return PackerInfo{};
         }
     }
@@ -967,7 +962,7 @@ private:
 
         const uint16_t numSections = ntHeaders->FileHeader.NumberOfSections;
         if (numSections > ExecutableAnalyzerConstants::MAX_SECTIONS) {
-            Logger::Warn("ExecutableAnalyzer: Too many sections: {}", numSections);
+            SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Too many sections: %u", numSections);
             return;
         }
 
@@ -1144,7 +1139,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseImportsImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseImportsImpl: %hs", e.what());
         }
 
         return imports;
@@ -1255,7 +1250,7 @@ private:
             const uint32_t numNames = exportDir->NumberOfNames;
 
             if (numFunctions > ExecutableAnalyzerConstants::MAX_EXPORTS) {
-                Logger::Warn("ExecutableAnalyzer: Too many exports: {}", numFunctions);
+                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Too many exports: %u", numFunctions);
                 return exports;
             }
 
@@ -1263,7 +1258,7 @@ private:
             // Full implementation would parse AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals arrays
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseExportsImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseExportsImpl: %hs", e.what());
         }
 
         return exports;
@@ -1312,7 +1307,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseRichHeaderImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseRichHeaderImpl: %hs", e.what());
         }
 
         return richHeader;
@@ -1351,7 +1346,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::ParseDotNetImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseDotNetImpl: %hs", e.what());
         }
 
         return dotNet;
@@ -1435,7 +1430,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::DetectPackerImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::DetectPackerImpl: %hs", e.what());
         }
 
         return packerInfo;
@@ -1616,7 +1611,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::DetectAnomaliesImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::DetectAnomaliesImpl: %hs", e.what());
         }
 
         return anomalies;
@@ -1685,7 +1680,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::CalculateRiskScoreImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::CalculateRiskScoreImpl: %hs", e.what());
         }
 
         return static_cast<uint8_t>(score);
@@ -1762,7 +1757,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::GetVersionInfoImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::GetVersionInfoImpl: %hs", e.what());
         }
 
         return versionInfo;
@@ -1820,7 +1815,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::VerifySignatureImpl: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::VerifySignatureImpl: %hs", e.what());
         }
 
         return sigInfo;
@@ -1854,7 +1849,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExecutableAnalyzer::CalculateHashes: {}", e.what());
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::CalculateHashes: %hs", e.what());
         }
     }
 

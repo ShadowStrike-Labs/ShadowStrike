@@ -381,12 +381,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("FileHasher::Impl already initialized");
+            SS_LOG_WARN(L"FileHasher", L"FileHasher::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("FileHasher::Impl: Initializing");
+            SS_LOG_INFO(L"FileHasher", L"FileHasher::Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -397,22 +397,20 @@ public:
             // Create thread pool if needed
             if (!m_threadPool && m_config.workerThreads > 0) {
                 m_threadPool = std::make_shared<ThreadPool>(m_config.workerThreads);
-                Logger::Info("FileHasher: Thread pool created with {} workers",
-                    m_config.workerThreads);
+                SS_LOG_INFO(L"FileHasher", L"FileHasher: Thread pool created with %d workers", m_config.workerThreads);
             }
 
             // Reset statistics
             m_stats.Reset();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("FileHasher::Impl: Initialization complete");
-            Logger::Info("FileHasher: Hardware - AES-NI: {}, SHA-NI: {}",
-                m_hasAESNI ? "YES" : "NO", m_hasSHANI ? "YES" : "NO");
+            SS_LOG_INFO(L"FileHasher", L"FileHasher::Impl: Initialization complete");
+            SS_LOG_INFO(L"FileHasher", L"FileHasher: Hardware - AES-NI: %hs, SHA-NI: %hs", m_hasAESNI ? "YES" : "NO", m_hasSHANI ? "YES" : "NO");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -424,7 +422,7 @@ public:
             return;
         }
 
-        Logger::Info("FileHasher::Impl: Shutting down");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher::Impl: Shutting down");
 
         // Clear cache
         {
@@ -440,7 +438,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("FileHasher::Impl: Shutdown complete");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher::Impl: Shutdown complete");
     }
 
     // ========================================================================
@@ -461,11 +459,10 @@ public:
             __cpuidex(cpuInfo, 7, 0);
             m_hasSHANI = (cpuInfo[1] & (1 << 29)) != 0; // EBX bit 29
 
-            Logger::Debug("FileHasher: Hardware detection - AES-NI: {}, SHA-NI: {}",
-                m_hasAESNI, m_hasSHANI);
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Hardware detection - AES-NI: %hs, SHA-NI: %hs", m_hasAESNI, m_hasSHANI);
 #endif
         } catch (...) {
-            Logger::Warn("FileHasher: Hardware capability detection failed");
+            SS_LOG_WARN(L"FileHasher", L"FileHasher: Hardware capability detection failed");
             m_hasAESNI = false;
             m_hasSHANI = false;
         }
@@ -540,8 +537,7 @@ public:
             );
 
             if (lru != m_hashCache.end()) {
-                Logger::Debug("FileHasher: Cache eviction (LRU): {}",
-                    StringUtils::ToNarrowString(lru->first));
+                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache eviction (LRU): %hs", StringUtils::ToNarrowString(lru->first));
                 m_hashCache.erase(lru);
             }
         }
@@ -568,8 +564,7 @@ public:
 
         m_hashCache[filePath] = cached;
 
-        Logger::Debug("FileHasher: Added to cache: {} (size: {})",
-            StringUtils::ToNarrowString(filePath), m_hashCache.size());
+        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Added to cache: %hs (size: %llu)", StringUtils::ToNarrowString(filePath), m_hashCache.size());
     }
 
     void InvalidateCacheEntry(const std::wstring& filePath) {
@@ -580,7 +575,7 @@ public:
     void ClearCacheImpl() noexcept {
         std::unique_lock lock(m_cacheMutex);
         m_hashCache.clear();
-        Logger::Info("FileHasher: Cache cleared");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Cache cleared");
     }
 
     // ========================================================================
@@ -599,8 +594,7 @@ public:
             if (m_config.enableCache) {
                 if (auto cached = GetFromCache(filePath)) {
                     m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    Logger::Debug("FileHasher: Cache hit for {}",
-                        StringUtils::ToNarrowString(filePath));
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache hit for %hs", StringUtils::ToNarrowString(filePath));
                     return *cached;
                 }
                 m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
@@ -611,19 +605,17 @@ public:
             // Validate file
             std::error_code ec;
             if (!fs::exists(filePath, ec)) {
-                Logger::Error("FileHasher: File not found: {}",
-                    StringUtils::ToNarrowString(filePath));
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: File not found: %hs", StringUtils::ToNarrowString(filePath));
                 return result;
             }
 
             result.fileSize = fs::file_size(filePath, ec);
             if (ec) {
-                Logger::Error("FileHasher: Cannot get file size: {}", ec.message());
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Cannot get file size: %hs", ec.message().c_str());
                 return result;
             }
 
-            Logger::Info("FileHasher: Computing hashes for {} ({} bytes)",
-                StringUtils::ToNarrowString(filePath), result.fileSize);
+            SS_LOG_INFO(L"FileHasher", L"FileHasher: Computing hashes for %hs (%llu bytes)", StringUtils::ToNarrowString(filePath), result.fileSize);
 
             // Decide whether to use memory mapping
             bool useMemMap = m_config.useMemoryMapping &&
@@ -697,13 +689,12 @@ public:
                 AddToCache(filePath, result);
             }
 
-            Logger::Info("FileHasher: Computed {} hashes in {} ms",
-                CountComputedHashes(result), result.computeDuration.count());
+            SS_LOG_INFO(L"FileHasher", L"FileHasher: Computed %u hashes in %u ms", CountComputedHashes(result), result.computeDuration.count());
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: ComputeAll exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: ComputeAll exception: %hs", e.what());
             return result;
         }
     }
@@ -725,13 +716,13 @@ public:
                     result.hasMD5 = true;
                     m_stats.md5Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Debug("FileHasher: MD5 = {}", result.md5Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: MD5 = %hs", result.md5Hex);
                 }
             } else {
-                Logger::Warn("FileHasher: MD5 computation failed");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: MD5 computation failed");
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: MD5 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: MD5 exception: %hs", e.what());
         }
     }
 
@@ -748,11 +739,11 @@ public:
                     result.hasSHA1 = true;
                     m_stats.sha1Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Debug("FileHasher: SHA1 = {}", result.sha1Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA1 = %hs", result.sha1Hex);
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: SHA1 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA1 exception: %hs", e.what());
         }
     }
 
@@ -769,11 +760,11 @@ public:
                     result.hasSHA256 = true;
                     m_stats.sha256Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Debug("FileHasher: SHA256 = {}", result.sha256Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA256 = %hs", result.sha256Hex);
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: SHA256 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA256 exception: %hs", e.what());
         }
     }
 
@@ -790,11 +781,11 @@ public:
                     result.hasSHA512 = true;
                     m_stats.sha512Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    Logger::Debug("FileHasher: SHA512 = {}", result.sha512Hex.substr(0, 32) + "...");
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA512 = %hs", result.sha512Hex.substr(0, 32) + "...");
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: SHA512 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA512 exception: %hs", e.what());
         }
     }
 
@@ -810,11 +801,11 @@ public:
                     result.sha3_256Hex = HashUtils::ToHexLower(hashBytes);
                     result.hasSHA3_256 = true;
 
-                    Logger::Debug("FileHasher: SHA3-256 = {}", result.sha3_256Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-256 = %hs", result.sha3_256Hex);
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: SHA3-256 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA3-256 exception: %hs", e.what());
         }
     }
 
@@ -830,11 +821,11 @@ public:
                     result.sha3_512Hex = HashUtils::ToHexLower(hashBytes);
                     result.hasSHA3_512 = true;
 
-                    Logger::Debug("FileHasher: SHA3-512 = {}", result.sha3_512Hex.substr(0, 32) + "...");
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-512 = %hs", result.sha3_512Hex.substr(0, 32) + "...");
                 }
             }
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: SHA3-512 exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA3-512 exception: %hs", e.what());
         }
     }
 
@@ -845,14 +836,12 @@ public:
             // to the file size and works efficiently on large files.
             Utils::MemoryUtils::MappedView mappedFile;
             if (!mappedFile.mapReadOnly(filePath)) {
-                Logger::Warn("FileHasher: Failed to memory-map file for fuzzy hash: {}",
-                    StringUtils::ToNarrowString(filePath));
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: Failed to memory-map file for fuzzy hash: %hs", StringUtils::ToNarrowString(filePath));
                 return;
             }
 
             if (!mappedFile.hasData()) {
-                Logger::Debug("FileHasher: Skipping fuzzy hash for empty file: {}",
-                    StringUtils::ToNarrowString(filePath));
+                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Skipping fuzzy hash for empty file: %hs", StringUtils::ToNarrowString(filePath));
                 return;
             }
 
@@ -870,8 +859,7 @@ public:
             );
 
             if (!digest.has_value()) {
-                Logger::Warn("FileHasher: FuzzyHasher::HashBuffer returned no digest for: {}",
-                    StringUtils::ToNarrowString(filePath));
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::HashBuffer returned no digest for: %hs", StringUtils::ToNarrowString(filePath));
                 return;
             }
 
@@ -879,10 +867,10 @@ public:
             result.hasFuzzyHash = true;
             m_stats.fuzzyHashComputed.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Debug("FileHasher: Fuzzy hash = {}", result.fuzzyHash);
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Fuzzy hash = %hs", result.fuzzyHash);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: Fuzzy hash exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: Fuzzy hash exception: %hs", e.what());
         }
     }
 
@@ -890,7 +878,7 @@ public:
         try {
             // TODO: Integrate TLSH library
             // For now, placeholder implementation
-            Logger::Debug("FileHasher: TLSH computation not yet implemented");
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH computation not yet implemented");
 
             result.tlsh = "T1PLACEHOLDER";
             result.hasTLSH = false; // Set to true when implemented
@@ -898,14 +886,14 @@ public:
             // m_stats.tlshComputed.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: TLSH exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: TLSH exception: %hs", e.what());
         }
     }
 
     void ComputeImpHashImpl(const std::wstring& filePath, FileHashes& result) {
         try {
             // TODO: Parse PE import table and compute MD5 of sorted imports
-            Logger::Debug("FileHasher: imphash computation not yet implemented");
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: imphash computation not yet implemented");
 
             result.imphash = "placeholder_imphash";
             result.hasImpHash = false; // Set to true when implemented
@@ -913,20 +901,20 @@ public:
             // m_stats.imphashComputed.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: imphash exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: imphash exception: %hs", e.what());
         }
     }
 
     void ComputeAuthentihashImpl(const std::wstring& filePath, FileHashes& result) {
         try {
             // TODO: Parse PE authenticode signature and hash
-            Logger::Debug("FileHasher: authentihash computation not yet implemented");
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: authentihash computation not yet implemented");
 
             result.authentihash = "placeholder_authentihash";
             result.hasAuthentihash = false; // Set to true when implemented
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: authentihash exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: authentihash exception: %hs", e.what());
         }
     }
 
@@ -945,8 +933,7 @@ public:
             result.fileSize = buffer.size();
             result.filePath = L"<memory buffer>";
 
-            Logger::Debug("FileHasher: Computing hashes for buffer ({} bytes)",
-                buffer.size());
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Computing hashes for buffer (%llu bytes)", buffer.size());
 
             // Compute cryptographic hashes
             if (HasFlag(algorithms, HashAlgorithm::MD5)) {
@@ -1003,7 +990,7 @@ public:
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: ComputeAllBuffer exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: ComputeAllBuffer exception: %hs", e.what());
             return result;
         }
     }
@@ -1050,7 +1037,7 @@ public:
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: Compare exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: Compare exception: %hs", e.what());
             return result;
         }
     }
@@ -1072,8 +1059,7 @@ public:
             );
 
             if (score < 0) {
-                Logger::Warn("FileHasher: FuzzyHasher::Compare returned error (-1) — "
-                             "one or both digests may be malformed");
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::Compare returned error (-1) — ");
                 return 0.0;
             }
 
@@ -1093,7 +1079,7 @@ public:
         try {
             // TODO: Implement TLSH distance using library
             // For now, return max distance
-            Logger::Debug("FileHasher: TLSH distance not yet implemented");
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH distance not yet implemented");
             return UINT32_MAX;
 
         } catch (...) {
@@ -1113,7 +1099,7 @@ public:
         try {
             auto headerData = ReadFileHeader(filePath, headerSize);
             if (headerData.empty()) {
-                Logger::Error("FileHasher: Cannot read file header");
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Cannot read file header");
                 return "";
             }
 
@@ -1132,7 +1118,7 @@ public:
             return HashUtils::ToHexLower(hashBytes);
 
         } catch (const std::exception& e) {
-            Logger::Error("FileHasher: ComputeHeaderHash exception: {}", e.what());
+            SS_LOG_ERROR(L"FileHasher", L"FileHasher: ComputeHeaderHash exception: %hs", e.what());
             return "";
         }
     }
@@ -1148,7 +1134,7 @@ public:
         std::vector<FileHashes> results;
         results.reserve(filePaths.size());
 
-        Logger::Info("FileHasher: Batch hashing {} files", filePaths.size());
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Batch hashing %ls files", filePaths.size());
 
         for (const auto& path : filePaths) {
             results.push_back(ComputeAllImpl(path, algorithms));
@@ -1168,7 +1154,7 @@ public:
             try {
                 callback(hashes);
             } catch (const std::exception& e) {
-                Logger::Error("FileHasher: Hash callback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Hash callback exception: %hs", e.what());
             }
         }
     }
@@ -1180,7 +1166,7 @@ public:
             try {
                 callback(current, total);
             } catch (const std::exception& e) {
-                Logger::Error("FileHasher: Progress callback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Progress callback exception: %hs", e.what());
             }
         }
     }
@@ -1221,14 +1207,14 @@ FileHasher& FileHasher::Instance() {
 FileHasher::FileHasher()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("FileHasher: Constructor called");
+    SS_LOG_INFO(L"FileHasher", L"FileHasher: Constructor called");
 }
 
 FileHasher::~FileHasher() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("FileHasher: Destructor called");
+    SS_LOG_INFO(L"FileHasher", L"FileHasher: Destructor called");
 }
 
 // ============================================================================
@@ -1264,7 +1250,7 @@ void FileHasher::UpdateConfig(const FileHasherConfig& config) {
     std::unique_lock lock(m_impl->m_configMutex);
     m_impl->m_config = config;
 
-    Logger::Info("FileHasher: Configuration updated");
+    SS_LOG_INFO(L"FileHasher", L"FileHasher: Configuration updated");
 }
 
 FileHasherConfig FileHasher::GetConfig() const {
@@ -1283,7 +1269,7 @@ FileHashes FileHasher::ComputeAll(
     HashAlgorithm algorithms
 ) {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
         return FileHashes{};
     }
 
@@ -1295,7 +1281,7 @@ FileHashes FileHasher::ComputeAll(
     HashAlgorithm algorithms
 ) {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
         return FileHashes{};
     }
 
@@ -1317,7 +1303,7 @@ void FileHasher::ComputeAllAsync(
     HashAlgorithm algorithms
 ) {
     if (!IsInitialized() || !m_impl->m_threadPool) {
-        Logger::Error("FileHasher: Not initialized or no thread pool");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized or no thread pool");
         return;
     }
 
@@ -1328,7 +1314,7 @@ void FileHasher::ComputeAllAsync(
             try {
                 callback(hashes);
             } catch (const std::exception& e) {
-                Logger::Error("FileHasher: Async callback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Async callback exception: %hs", e.what());
             }
         }
 
@@ -1342,7 +1328,7 @@ std::vector<FileHashes> FileHasher::ComputeBatch(
     ProgressCallback progressCallback
 ) {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
         return {};
     }
 
@@ -1427,7 +1413,7 @@ std::string FileHasher::ComputeHeaderHash(
     size_t headerSize
 ) {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
         return "";
     }
 
@@ -1439,7 +1425,7 @@ std::unordered_map<std::string, std::string> FileHasher::ComputeSectionHashes(
     HashAlgorithm algorithm
 ) {
     // TODO: Implement PE section parsing and hashing
-    Logger::Warn("FileHasher: ComputeSectionHashes not yet implemented");
+    SS_LOG_WARN(L"FileHasher", L"FileHasher: ComputeSectionHashes not yet implemented");
     return {};
 }
 
@@ -1452,7 +1438,7 @@ HashComparison FileHasher::Compare(
     const FileHashes& hashes2
 ) const {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
         return HashComparison{};
     }
 
@@ -1550,7 +1536,7 @@ uint64_t FileHasher::RegisterHashCallback(HashCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_hashCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FileHasher: Registered hash callback {}", id);
+    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered hash callback %u", id);
     return id;
 }
 
@@ -1569,7 +1555,7 @@ uint64_t FileHasher::RegisterProgressCallback(ProgressCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_progressCallbacks[id] = std::move(callback);
 
-    Logger::Debug("FileHasher: Registered progress callback {}", id);
+    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered progress callback %u", id);
     return id;
 }
 
@@ -1591,7 +1577,7 @@ FileHasherStatistics FileHasher::GetStatistics() const {
 void FileHasher::ResetStatistics() {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("FileHasher: Statistics reset");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Statistics reset");
     }
 }
 
@@ -1601,12 +1587,12 @@ void FileHasher::ResetStatistics() {
 
 bool FileHasher::SelfTest() {
     if (!IsInitialized()) {
-        Logger::Error("FileHasher: Self-test failed - not initialized");
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Self-test failed - not initialized");
         return false;
     }
 
     try {
-        Logger::Info("FileHasher: Running self-test");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Running self-test");
 
         // Test 1: Hash a small buffer
         {
@@ -1614,7 +1600,7 @@ bool FileHasher::SelfTest() {
             auto hashes = ComputeAll(testData, HashAlgorithm::Standard);
 
             if (!hashes.hasSHA256) {
-                Logger::Error("FileHasher: Self-test failed - SHA256 not computed");
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Self-test failed - SHA256 not computed");
                 return false;
             }
         }
@@ -1624,7 +1610,7 @@ bool FileHasher::SelfTest() {
             ClearCache();
             auto cacheSize = GetCacheSize();
             if (cacheSize != 0) {
-                Logger::Error("FileHasher: Self-test failed - cache not cleared");
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: Self-test failed - cache not cleared");
                 return false;
             }
         }
@@ -1635,11 +1621,11 @@ bool FileHasher::SelfTest() {
             // Just verify we can get stats without crashing
         }
 
-        Logger::Info("FileHasher: Self-test passed");
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("FileHasher: Self-test exception: {}", e.what());
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Self-test exception: %hs", e.what());
         return false;
     }
 }

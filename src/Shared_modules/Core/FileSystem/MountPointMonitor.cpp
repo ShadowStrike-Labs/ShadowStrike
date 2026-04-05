@@ -312,7 +312,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Failed to get volume info for {} - {}",
-                               driveLetter, Utils::StringUtils::Utf8ToWide(e.what()));
+                               driveLetter, Utils::StringUtils::ToWide(e.what()));
             return false;
         }
     }
@@ -396,7 +396,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Threat detection failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
             return DeviceThreatType::None;
         }
     }
@@ -433,7 +433,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Policy determination failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
             return DevicePolicy::Allow;
         }
     }
@@ -461,7 +461,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Autorun blocking failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -499,7 +499,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Device history update failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -606,7 +606,7 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             Utils::Logger::Error(L"MountPointMonitor: Drive arrival processing failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -652,7 +652,7 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             Utils::Logger::Error(L"MountPointMonitor: Drive removal processing failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -753,7 +753,7 @@ struct MountPointMonitor::Impl {
 
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"MountPointMonitor: Monitor thread failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
             return 1;
         }
     }
@@ -828,7 +828,7 @@ bool MountPointMonitor::Initialize(const MountPointMonitorConfig& config) {
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
         Utils::Logger::Error(L"MountPointMonitor: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -876,7 +876,7 @@ void MountPointMonitor::Shutdown() noexcept {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -929,7 +929,7 @@ bool MountPointMonitor::Start() {
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
         Utils::Logger::Error(L"MountPointMonitor: Start failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -951,7 +951,7 @@ void MountPointMonitor::Stop() noexcept {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Stop error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1063,7 +1063,7 @@ void MountPointMonitor::RefreshDriveList() {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Drive list refresh failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1188,7 +1188,7 @@ bool MountPointMonitor::EjectDrive(wchar_t driveLetter) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Eject failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1206,7 +1206,7 @@ bool MountPointMonitor::BlockDrive(wchar_t driveLetter) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Block drive failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1220,7 +1220,7 @@ bool MountPointMonitor::SetReadOnly(wchar_t driveLetter, bool readOnly) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Set read-only failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1308,7 +1308,7 @@ bool MountPointMonitor::SelfTest() {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"MountPointMonitor: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }

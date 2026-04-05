@@ -205,12 +205,12 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("MediaFileScanner::Impl already initialized");
+            SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("MediaFileScanner::Impl: Initializing");
+            SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner::Impl: Initializing");
 
             // Store configuration
             m_config = config;
@@ -219,12 +219,12 @@ public:
             m_stats.Reset();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("MediaFileScanner::Impl: Initialization complete");
+            SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner::Impl: Initialization complete");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -236,10 +236,10 @@ public:
             return;
         }
 
-        Logger::Info("MediaFileScanner::Impl: Shutting down");
+        SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner::Impl: Shutting down");
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("MediaFileScanner::Impl: Shutdown complete");
+        SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner::Impl: Shutdown complete");
     }
 
     // ========================================================================
@@ -250,7 +250,7 @@ public:
         try {
             std::ifstream file(filePath, std::ios::binary);
             if (!file) {
-                Logger::Warn("MediaFileScanner: Cannot open file for type detection");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Cannot open file for type detection");
                 return MediaType::Unknown;
             }
 
@@ -318,11 +318,11 @@ public:
                 }
             }
 
-            Logger::Debug("MediaFileScanner: Unknown media type");
+            SS_LOG_DEBUG(L"MediaFileScanner", L"MediaFileScanner: Unknown media type");
             return MediaType::Unknown;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Type detection exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Type detection exception: %hs", e.what());
             return MediaType::Unknown;
         }
     }
@@ -341,24 +341,22 @@ public:
             // Validate file
             std::error_code ec;
             if (!fs::exists(filePath, ec)) {
-                Logger::Error("MediaFileScanner: File not found: {}",
-                    StringUtils::ToNarrowString(filePath));
+                SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: File not found: %hs", StringUtils::ToNarrowString(filePath));
                 return result;
             }
 
             result.fileSize = fs::file_size(filePath, ec);
             if (ec) {
-                Logger::Error("MediaFileScanner: Cannot get file size: {}", ec.message());
+                SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Cannot get file size: %hs", ec.message().c_str());
                 return result;
             }
 
-            Logger::Info("MediaFileScanner: Scanning {} ({} bytes)",
-                StringUtils::ToNarrowString(filePath), result.fileSize);
+            SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Scanning %hs (%llu bytes)", StringUtils::ToNarrowString(filePath), result.fileSize);
 
             // Detect media type
             result.mediaType = DetectMediaType(filePath);
             if (result.mediaType == MediaType::Unknown) {
-                Logger::Warn("MediaFileScanner: Unknown media type, limited analysis");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Unknown media type, limited analysis");
             }
 
             // Validate format
@@ -416,13 +414,12 @@ public:
 
             result.scanDuration = duration_cast<milliseconds>(steady_clock::now() - scanStart);
 
-            Logger::Info("MediaFileScanner: Scan complete - Risk: {}, Threats: {}, Duration: {} ms",
-                result.riskScore, result.threats.size(), result.scanDuration.count());
+            SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Scan complete - Risk: %hs, Threats: %llu, Duration: %u ms", result.riskScore, result.threats.size(), result.scanDuration.count());
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Scan exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Scan exception: %hs", e.what());
             return result;
         }
     }
@@ -444,7 +441,7 @@ public:
                     return true; // Unknown formats pass
             }
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Format validation exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Format validation exception: %hs", e.what());
             return false;
         }
     }
@@ -458,7 +455,7 @@ public:
             uint8_t soi[2];
             file.read(reinterpret_cast<char*>(soi), 2);
             if (soi[0] != 0xFF || soi[1] != 0xD8) {
-                Logger::Warn("MediaFileScanner: Invalid JPEG SOI marker");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Invalid JPEG SOI marker");
                 return false;
             }
 
@@ -467,14 +464,14 @@ public:
             uint8_t eoi[2];
             file.read(reinterpret_cast<char*>(eoi), 2);
             if (eoi[0] != 0xFF || eoi[1] != 0xD9) {
-                Logger::Warn("MediaFileScanner: JPEG missing EOI marker (possible appended data)");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: JPEG missing EOI marker (possible appended data)");
                 return false;
             }
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: JPEG validation exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: JPEG validation exception: %hs", e.what());
             return false;
         }
     }
@@ -490,7 +487,7 @@ public:
             if (!std::equal(MagicNumbers::PNG_SIGNATURE,
                            MagicNumbers::PNG_SIGNATURE + 8,
                            signature.begin())) {
-                Logger::Warn("MediaFileScanner: Invalid PNG signature");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Invalid PNG signature");
                 return false;
             }
 
@@ -499,14 +496,14 @@ public:
             file.seekg(12, std::ios::beg);
             file.read(chunkType.data(), 4);
             if (std::string(chunkType.data(), 4) != "IHDR") {
-                Logger::Warn("MediaFileScanner: PNG missing IHDR chunk");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: PNG missing IHDR chunk");
                 return false;
             }
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: PNG validation exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: PNG validation exception: %hs", e.what());
             return false;
         }
     }
@@ -528,14 +525,14 @@ public:
                                          signature.begin());
 
             if (!validGIF87a && !validGIF89a) {
-                Logger::Warn("MediaFileScanner: Invalid GIF signature");
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Invalid GIF signature");
                 return false;
             }
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: GIF validation exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: GIF validation exception: %hs", e.what());
             return false;
         }
     }
@@ -551,7 +548,7 @@ public:
         StegoAnalysis result{};
 
         try {
-            Logger::Debug("MediaFileScanner: Analyzing for steganography");
+            SS_LOG_DEBUG(L"MediaFileScanner", L"MediaFileScanner: Analyzing for steganography");
 
             // LSB analysis
             auto lsbResult = DetectLSBStego(filePath, type);
@@ -574,14 +571,13 @@ public:
             result.stegoDetected = (result.confidence >= 0.6);
 
             if (result.stegoDetected) {
-                Logger::Warn("MediaFileScanner: Steganography detected - Technique: {}, Confidence: {:.2f}",
-                    StegoTechniqueToString(result.technique), result.confidence);
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Steganography detected - Technique: %hs, Confidence: %.2f", StegoTechniqueToString(result.technique), result.confidence);
             }
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Steganography detection exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Steganography detection exception: %hs", e.what());
             return result;
         }
     }
@@ -632,13 +628,13 @@ public:
                 result.confidence = 0.7;
                 result.analysisDetails = std::format("Chi-square: {:.2f} (uniform LSBs)", chiSquare);
 
-                Logger::Debug("MediaFileScanner: LSB analysis - Chi-square: {:.2f}", chiSquare);
+                SS_LOG_DEBUG(L"MediaFileScanner", L"MediaFileScanner: LSB analysis - Chi-square: %.2f", chiSquare);
             }
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: LSB analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: LSB analysis exception: %hs", e.what());
             return result;
         }
     }
@@ -683,8 +679,7 @@ public:
                         );
                         result.analysisDetails = std::format("{} bytes after JPEG EOI", appendedSize);
 
-                        Logger::Warn("MediaFileScanner: EOF steganography detected - {} bytes appended",
-                            appendedSize);
+                        SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: EOF steganography detected - %hs bytes appended", appendedSize);
                     }
                 }
             }
@@ -692,7 +687,7 @@ public:
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: EOF analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: EOF analysis exception: %hs", e.what());
             return result;
         }
     }
@@ -715,14 +710,13 @@ public:
                 result.estimatedPayloadSize = totalMetadataSize;
                 result.analysisDetails = std::format("{} bytes in metadata", totalMetadataSize);
 
-                Logger::Warn("MediaFileScanner: Large metadata detected - {} bytes",
-                    totalMetadataSize);
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Large metadata detected - %u bytes", totalMetadataSize);
             }
 
             return result;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Metadata analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Metadata analysis exception: %hs", e.what());
             return result;
         }
     }
@@ -747,7 +741,7 @@ public:
                     return metadata;
             }
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Metadata extraction exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Metadata extraction exception: %hs", e.what());
             return metadata;
         }
     }
@@ -771,7 +765,7 @@ public:
                 if (buffer[i] == 'E' && buffer[i+1] == 'x' &&
                     buffer[i+2] == 'i' && buffer[i+3] == 'f') {
                     metadata.comments.push_back("EXIF data present");
-                    Logger::Debug("MediaFileScanner: JPEG has EXIF data");
+                    SS_LOG_DEBUG(L"MediaFileScanner", L"MediaFileScanner: JPEG has EXIF data");
                     break;
                 }
             }
@@ -779,7 +773,7 @@ public:
             return metadata;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: JPEG metadata exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: JPEG metadata exception: %hs", e.what());
             return metadata;
         }
     }
@@ -814,14 +808,13 @@ public:
                 file.read(reinterpret_cast<char*>(&bitDepth), 1);
                 metadata.bitDepth = bitDepth;
 
-                Logger::Debug("MediaFileScanner: PNG dimensions: {}x{}, depth: {}",
-                    metadata.width, metadata.height, metadata.bitDepth);
+                SS_LOG_DEBUG(L"MediaFileScanner", L"MediaFileScanner: PNG dimensions: %hsx%hs, depth: %hs", metadata.width, metadata.height, metadata.bitDepth);
             }
 
             return metadata;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: PNG metadata exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: PNG metadata exception: %hs", e.what());
             return metadata;
         }
     }
@@ -864,7 +857,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Exploit detection exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Exploit detection exception: %hs", e.what());
         }
     }
 
@@ -886,7 +879,7 @@ public:
                         uint32_t peOffset = *reinterpret_cast<uint32_t*>(&data[i + 0x3C]);
                         if (peOffset < data.size() - 4 && peOffset < 1024) {
                             if (data[i + peOffset] == 'P' && data[i + peOffset + 1] == 'E') {
-                                Logger::Warn("MediaFileScanner: PE signature found at offset {}", i);
+                                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: PE signature found at offset %hs", i);
                                 return true;
                             }
                         }
@@ -898,7 +891,7 @@ public:
             const uint8_t ELF_MAGIC[4] = { 0x7F, 'E', 'L', 'F' };
             for (size_t i = 0; i < data.size() - 4; i++) {
                 if (std::equal(ELF_MAGIC, ELF_MAGIC + 4, data.begin() + i)) {
-                    Logger::Warn("MediaFileScanner: ELF signature found at offset {}", i);
+                    SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: ELF signature found at offset %hs", i);
                     return true;
                 }
             }
@@ -906,7 +899,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Embedded executable check exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Embedded executable check exception: %hs", e.what());
             return false;
         }
     }
@@ -935,15 +928,14 @@ public:
             }
 
             if (detectedTypes.size() > 1) {
-                Logger::Warn("MediaFileScanner: Polyglot detected - {} valid formats",
-                    detectedTypes.size());
+                SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: Polyglot detected - %llu valid formats", detectedTypes.size());
                 return true;
             }
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Polyglot check exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Polyglot check exception: %hs", e.what());
             return false;
         }
     }
@@ -958,7 +950,7 @@ public:
                 AnalyzeJPEGAppendedData(filePath, result);
             }
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: Appended data analysis exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Appended data analysis exception: %hs", e.what());
         }
     }
 
@@ -1000,13 +992,12 @@ public:
                         result.riskScore += 35;
                     }
 
-                    Logger::Warn("MediaFileScanner: JPEG has {} bytes of appended data",
-                        appendedSize);
+                    SS_LOG_WARN(L"MediaFileScanner", L"MediaFileScanner: JPEG has %hs bytes of appended data", appendedSize);
                 }
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: JPEG appended data exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: JPEG appended data exception: %hs", e.what());
         }
     }
 
@@ -1066,7 +1057,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: HasAppendedData exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: HasAppendedData exception: %hs", e.what());
             return false;
         }
     }
@@ -1093,8 +1084,7 @@ public:
                 if (eoiPos > 0 && eoiPos < data.size()) {
                     size_t appendedSize = data.size() - eoiPos;
                     if (appendedSize > 10) {
-                        Logger::Info("MediaFileScanner: Extracted {} bytes of appended data",
-                            appendedSize);
+                        SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Extracted %hs bytes of appended data", appendedSize);
                         return std::vector<uint8_t>(data.begin() + eoiPos, data.end());
                     }
                 }
@@ -1103,7 +1093,7 @@ public:
             return {};
 
         } catch (const std::exception& e) {
-            Logger::Error("MediaFileScanner: ExtractAppendedData exception: {}", e.what());
+            SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: ExtractAppendedData exception: %hs", e.what());
             return {};
         }
     }
@@ -1125,14 +1115,14 @@ MediaFileScanner& MediaFileScanner::Instance() {
 MediaFileScanner::MediaFileScanner()
     : m_impl(std::make_unique<Impl>())
 {
-    Logger::Info("MediaFileScanner: Constructor called");
+    SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Constructor called");
 }
 
 MediaFileScanner::~MediaFileScanner() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("MediaFileScanner: Destructor called");
+    SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Destructor called");
 }
 
 // ============================================================================
@@ -1160,7 +1150,7 @@ void MediaFileScanner::Shutdown() noexcept {
 
 MediaScanResult MediaFileScanner::Scan(const std::wstring& filePath) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("MediaFileScanner: Not initialized");
+        SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Not initialized");
         return MediaScanResult{};
     }
 
@@ -1169,7 +1159,7 @@ MediaScanResult MediaFileScanner::Scan(const std::wstring& filePath) {
 
 StegoAnalysis MediaFileScanner::DetectSteganography(const std::wstring& filePath) const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("MediaFileScanner: Not initialized");
+        SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Not initialized");
         return StegoAnalysis{};
     }
 
@@ -1179,7 +1169,7 @@ StegoAnalysis MediaFileScanner::DetectSteganography(const std::wstring& filePath
 
 MediaMetadata MediaFileScanner::ExtractMetadata(const std::wstring& filePath) const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("MediaFileScanner: Not initialized");
+        SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Not initialized");
         return MediaMetadata{};
     }
 
@@ -1189,7 +1179,7 @@ MediaMetadata MediaFileScanner::ExtractMetadata(const std::wstring& filePath) co
 
 bool MediaFileScanner::HasAppendedData(const std::wstring& filePath) const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("MediaFileScanner: Not initialized");
+        SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Not initialized");
         return false;
     }
 
@@ -1198,7 +1188,7 @@ bool MediaFileScanner::HasAppendedData(const std::wstring& filePath) const {
 
 std::vector<uint8_t> MediaFileScanner::ExtractAppendedData(const std::wstring& filePath) const {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("MediaFileScanner: Not initialized");
+        SS_LOG_ERROR(L"MediaFileScanner", L"MediaFileScanner: Not initialized");
         return {};
     }
 
@@ -1217,7 +1207,7 @@ const MediaFileScannerStatistics& MediaFileScanner::GetStatistics() const noexce
 void MediaFileScanner::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("MediaFileScanner: Statistics reset");
+        SS_LOG_INFO(L"MediaFileScanner", L"MediaFileScanner: Statistics reset");
     }
 }
 

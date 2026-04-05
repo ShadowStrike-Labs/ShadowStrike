@@ -81,7 +81,7 @@ namespace FileSystem {
 std::string MonitoredPath::ToJson() const {
     std::ostringstream oss;
     oss << "{\"monitorId\":" << monitorId << ",";
-    oss << "\"path\":\"" << Utils::StringUtils::WideToUtf8(path) << "\",";
+    oss << "\"path\":\"" << Utils::StringUtils::ToNarrow(path) << "\",";
     oss << "\"category\":" << static_cast<int>(category) << ",";
     oss << "\"recursive\":" << (recursive ? "true" : "false") << ",";
     oss << "\"isActive\":" << (isActive ? "true" : "false") << ",";
@@ -177,8 +177,8 @@ std::string DirectoryEvent::ToJson() const {
     std::ostringstream oss;
     oss << "{\"eventId\":" << eventId << ",";
     oss << "\"monitorId\":" << monitorId << ",";
-    oss << "\"path\":\"" << Utils::StringUtils::WideToUtf8(path) << "\",";
-    oss << "\"filename\":\"" << Utils::StringUtils::WideToUtf8(filename) << "\",";
+    oss << "\"path\":\"" << Utils::StringUtils::ToNarrow(path) << "\",";
+    oss << "\"filename\":\"" << Utils::StringUtils::ToNarrow(filename) << "\",";
     oss << "\"action\":" << static_cast<int>(action) << ",";
     oss << "\"category\":" << static_cast<int>(category) << "}";
     return oss.str();
@@ -516,7 +516,7 @@ struct DirectoryMonitor::Impl {
                         m_statistics.callbackInvocations.fetch_add(1, std::memory_order_relaxed);
                     } catch (const std::exception& e) {
                         Utils::Logger::Error(L"DirectoryMonitor: Event callback failed - {}",
-                                           Utils::StringUtils::Utf8ToWide(e.what()));
+                                           Utils::StringUtils::ToWide(e.what()));
                     }
                 }
             }
@@ -528,7 +528,7 @@ struct DirectoryMonitor::Impl {
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
             Utils::Logger::Error(L"DirectoryMonitor: Failed to process notification - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -687,7 +687,7 @@ bool DirectoryMonitor::Initialize(const DirectoryMonitorConfig& config) {
     } catch (const std::exception& e) {
         m_impl->m_status.store(DirectoryMonitorStatus::Error, std::memory_order_release);
         Utils::Logger::Error(L"DirectoryMonitor: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -723,7 +723,7 @@ void DirectoryMonitor::Shutdown() noexcept {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"DirectoryMonitor: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -785,7 +785,7 @@ void DirectoryMonitor::MonitorCriticalPaths() {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"DirectoryMonitor: Failed to monitor critical paths - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -924,7 +924,7 @@ uint32_t DirectoryMonitor::AddMonitor(const std::wstring& path,
     } catch (const std::exception& e) {
         m_impl->m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
         Utils::Logger::Error(L"DirectoryMonitor: Failed to add monitor - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return 0;
     }
 }
@@ -958,7 +958,7 @@ void DirectoryMonitor::RemoveMonitor(uint32_t monitorId) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"DirectoryMonitor: Failed to remove monitor - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1152,7 +1152,7 @@ bool DirectoryMonitor::SelfTest() {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"DirectoryMonitor: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }

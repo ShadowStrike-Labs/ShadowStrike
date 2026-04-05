@@ -178,13 +178,12 @@ public:
             // Check kernel driver availability
             m_kernelDriverAvailable = CheckKernelDriver();
 
-            Logger::Info("FileLockManager initialized (debug={}, kernel={})",
-                m_hasDebugPrivilege, m_kernelDriverAvailable);
+            SS_LOG_INFO(L"FileLockManager", L"FileLockManager initialized (debug=%hs, kernel=%hs)", m_hasDebugPrivilege, m_kernelDriverAvailable);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileLockManager initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"FileLockManager initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -197,7 +196,7 @@ public:
             m_progressCallback = nullptr;
             m_initialized = false;
 
-            Logger::Info("FileLockManager shutdown complete");
+            SS_LOG_INFO(L"FileLockManager", L"FileLockManager shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -216,7 +215,7 @@ public:
             // Normalize path
             auto normalizedPath = NormalizePath(filePath);
             if (normalizedPath.empty()) {
-                Logger::Warn("Invalid file path: {}", StringUtils::WideToUtf8(filePath));
+                SS_LOG_WARN(L"FileLockManager", L"Invalid file path: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return owners;
             }
 
@@ -230,7 +229,7 @@ public:
             owners = GetLockingProcessesHandleEnum(normalizedPath);
 
         } catch (const std::exception& e) {
-            Logger::Error("GetLockingProcesses - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcesses - Exception: %hs", e.what());
         }
 
         return owners;
@@ -271,7 +270,7 @@ public:
             m_stats.locksDetected++;
 
         } catch (const std::exception& e) {
-            Logger::Error("GetLockInfo - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockInfo - Exception: %hs", e.what());
         }
 
         return info;
@@ -304,7 +303,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("IsFileLocked - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"IsFileLocked - Exception: %hs", e.what());
             return false;
         }
     }
@@ -330,7 +329,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("CanDeleteFile - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"CanDeleteFile - Exception: %hs", e.what());
             return false;
         }
     }
@@ -363,7 +362,7 @@ public:
             return type;
 
         } catch (const std::exception& e) {
-            Logger::Error("GetLockType - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockType - Exception: %hs", e.what());
             return LockType::Unknown;
         }
     }
@@ -384,7 +383,7 @@ public:
             if (!IsFileLocked(filePath)) {
                 result.result = UnlockResult::NotLocked;
                 result.method = UnlockMethod::None;
-                Logger::Info("File not locked: {}", StringUtils::WideToUtf8(filePath));
+                SS_LOG_INFO(L"FileLockManager", L"File not locked: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return result;
             }
 
@@ -402,9 +401,8 @@ public:
                 if (owner.isCriticalProcess && m_config.protectCriticalProcesses) {
                     result.result = UnlockResult::ProcessCritical;
                     result.errors.push_back("File locked by critical process: " +
-                        StringUtils::WideToUtf8(owner.processName));
-                    Logger::Warn("Cannot unlock - critical process: {}",
-                        StringUtils::WideToUtf8(owner.processName));
+                        StringUtils::ToNarrow(owner.processName));
+                    SS_LOG_WARN(L"FileLockManager", L"Cannot unlock - critical process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
                     return result;
                 }
             }
@@ -446,8 +444,7 @@ public:
                 result.requiresReboot = true;
                 result.pendingOperation = L"Delete on reboot";
                 m_stats.rebootScheduled++;
-                Logger::Info("Scheduled delete on reboot: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_INFO(L"FileLockManager", L"Scheduled delete on reboot: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return result;
             }
 
@@ -457,7 +454,7 @@ public:
             m_stats.failedUnlocks++;
 
         } catch (const std::exception& e) {
-            Logger::Error("UnlockFile - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"UnlockFile - Exception: %hs", e.what());
             result.result = UnlockResult::Failed;
             result.errors.push_back(std::string("Exception: ") + e.what());
             m_stats.failedUnlocks++;
@@ -544,7 +541,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("UnlockFile (method) - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"UnlockFile (method) - Exception: %hs", e.what());
             result.result = UnlockResult::Failed;
             result.errors.push_back(std::string("Exception: ") + e.what());
         }
@@ -600,7 +597,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ForceUnlockFile - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"ForceUnlockFile - Exception: %hs", e.what());
             result.result = UnlockResult::Failed;
             result.errors.push_back(std::string("Exception: ") + e.what());
         }
@@ -622,8 +619,7 @@ public:
             );
 
             if (!hProcess) {
-                Logger::Error("Cannot open process {}: error {}",
-                    owner.pid, GetLastError());
+                SS_LOG_ERROR(L"FileLockManager", L"Cannot open process %u: error %lu", owner.pid, GetLastError());
                 return false;
             }
 
@@ -644,14 +640,14 @@ public:
             if (result && hDuplicate) {
                 CloseHandle(hDuplicate);
                 m_stats.handlesClosed++;
-                Logger::Info("Closed handle {} in process {}", owner.handleValue, owner.pid);
+                SS_LOG_INFO(L"FileLockManager", L"Closed handle %hs in process %u", owner.handleValue, owner.pid);
                 return true;
             }
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("CloseHandleOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"CloseHandleOp - Exception: %hs", e.what());
             return false;
         }
     }
@@ -660,21 +656,19 @@ public:
         try {
             // Safety checks
             if (owner.isCriticalProcess && !force) {
-                Logger::Warn("Refusing to terminate critical process: {}",
-                    StringUtils::WideToUtf8(owner.processName));
+                SS_LOG_WARN(L"FileLockManager", L"Refusing to terminate critical process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
                 return false;
             }
 
             if (owner.isSystemProcess && m_config.protectSystemProcesses && !force) {
-                Logger::Warn("Refusing to terminate system process: {}",
-                    StringUtils::WideToUtf8(owner.processName));
+                SS_LOG_WARN(L"FileLockManager", L"Refusing to terminate system process: %hs", StringUtils::ToNarrow(owner.processName).c_str());
                 return false;
             }
 
             // Ask for confirmation via callback
             if (m_terminateCallback && !force) {
                 if (!m_terminateCallback(owner)) {
-                    Logger::Info("Process termination cancelled by callback");
+                    SS_LOG_INFO(L"FileLockManager", L"Process termination cancelled by callback");
                     return false;
                 }
             }
@@ -687,8 +681,7 @@ public:
             );
 
             if (!hProcess) {
-                Logger::Error("Cannot open process {} for termination: error {}",
-                    owner.pid, GetLastError());
+                SS_LOG_ERROR(L"FileLockManager", L"Cannot open process %u for termination: error %lu", owner.pid, GetLastError());
                 return false;
             }
 
@@ -698,15 +691,14 @@ public:
 
             if (result) {
                 m_stats.processesTerminated++;
-                Logger::Warn("Terminated process {} ({})",
-                    owner.pid, StringUtils::WideToUtf8(owner.processName));
+                SS_LOG_WARN(L"FileLockManager", L"Terminated process %u (%hs)", owner.pid, StringUtils::ToNarrow(owner.processName).c_str());
                 return true;
             }
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("TerminateProcessOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"TerminateProcessOp - Exception: %hs", e.what());
             return false;
         }
     }
@@ -723,7 +715,7 @@ public:
             // Start Restart Manager session
             DWORD dwError = RmStartSession(&dwSession, 0, szSessionKey);
             if (dwError != ERROR_SUCCESS) {
-                Logger::Error("RmStartSession failed: {}", dwError);
+                SS_LOG_ERROR(L"FileLockManager", L"RmStartSession failed: %hs", dwError);
                 return false;
             }
 
@@ -741,7 +733,7 @@ public:
 
             if (dwError != ERROR_SUCCESS) {
                 RmEndSession(dwSession);
-                Logger::Error("RmRegisterResources failed: {}", dwError);
+                SS_LOG_ERROR(L"FileLockManager", L"RmRegisterResources failed: %hs", dwError);
                 return false;
             }
 
@@ -778,7 +770,7 @@ public:
                         dwError = RmShutdown(dwSession, RmForceShutdown, nullptr);
                         if (dwError == ERROR_SUCCESS) {
                             success = true;
-                            Logger::Info("Restart Manager successfully closed applications");
+                            SS_LOG_INFO(L"FileLockManager", L"Restart Manager successfully closed applications");
                         }
                     }
                 }
@@ -788,7 +780,7 @@ public:
             return success;
 
         } catch (const std::exception& e) {
-            Logger::Error("UseRestartManagerOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"UseRestartManagerOp - Exception: %hs", e.what());
             return false;
         }
     }
@@ -833,7 +825,7 @@ public:
             RmEndSession(dwSession);
 
         } catch (const std::exception& e) {
-            Logger::Error("GetApplicationsUsingFileOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetApplicationsUsingFileOp - Exception: %hs", e.what());
         }
 
         return applications;
@@ -863,17 +855,16 @@ public:
                 std::unique_lock lock(m_mutex);
                 m_pendingOperations.push_back(op);
 
-                Logger::Info("Scheduled delete on reboot: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_INFO(L"FileLockManager", L"Scheduled delete on reboot: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return true;
             }
 
             DWORD error = GetLastError();
-            Logger::Error("MoveFileEx failed: error {}", error);
+            SS_LOG_ERROR(L"FileLockManager", L"MoveFileEx failed: error %hs", error);
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ScheduleDeleteOnRebootInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"ScheduleDeleteOnRebootInternal - Exception: %hs", e.what());
             return false;
         }
     }
@@ -897,16 +888,14 @@ public:
                 std::unique_lock lock(m_mutex);
                 m_pendingOperations.push_back(op);
 
-                Logger::Info("Scheduled move on reboot: {} -> {}",
-                    StringUtils::WideToUtf8(sourcePath),
-                    StringUtils::WideToUtf8(destPath));
+                SS_LOG_INFO(L"FileLockManager", L"Scheduled move on reboot: %hs -> %hs", StringUtils::ToNarrow(sourcePath).c_str(), StringUtils::ToNarrow(destPath).c_str());
                 return true;
             }
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("ScheduleMoveOnRebootInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"ScheduleMoveOnRebootInternal - Exception: %hs", e.what());
             return false;
         }
     }
@@ -927,15 +916,14 @@ public:
 
             if (it != m_pendingOperations.end()) {
                 m_pendingOperations.erase(it);
-                Logger::Info("Cancelled pending operation: {}",
-                    StringUtils::WideToUtf8(sourcePath));
+                SS_LOG_INFO(L"FileLockManager", L"Cancelled pending operation: %hs", StringUtils::ToNarrow(sourcePath).c_str());
                 return true;
             }
 
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("CancelPendingOperationOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"CancelPendingOperationOp - Exception: %hs", e.what());
             return false;
         }
     }
@@ -947,7 +935,7 @@ public:
     bool KernelUnlockFileOp(const std::wstring& filePath) {
         try {
             if (!m_kernelDriverAvailable) {
-                Logger::Warn("Kernel driver not available");
+                SS_LOG_WARN(L"FileLockManager", L"Kernel driver not available");
                 return false;
             }
 
@@ -955,13 +943,12 @@ public:
             // to force-close file handles at kernel level
 
             // Placeholder implementation
-            Logger::Info("Kernel unlock requested for: {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"FileLockManager", L"Kernel unlock requested for: %hs", StringUtils::ToNarrow(filePath).c_str());
 
             return false; // Not implemented in stub
 
         } catch (const std::exception& e) {
-            Logger::Error("KernelUnlockFileOp - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"KernelUnlockFileOp - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1107,7 +1094,7 @@ private:
             RmEndSession(dwSession);
 
         } catch (const std::exception& e) {
-            Logger::Error("GetLockingProcessesRM - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcessesRM - Exception: %hs", e.what());
         }
 
         return owners;
@@ -1121,10 +1108,10 @@ private:
             // and match them against the target file
             // Simplified placeholder implementation
 
-            Logger::Debug("Handle enumeration not fully implemented (use Restart Manager)");
+            SS_LOG_DEBUG(L"FileLockManager", L"Handle enumeration not fully implemented (use Restart Manager)");
 
         } catch (const std::exception& e) {
-            Logger::Error("GetLockingProcessesHandleEnum - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"GetLockingProcessesHandleEnum - Exception: %hs", e.what());
         }
 
         return owners;
@@ -1169,7 +1156,7 @@ private:
             CloseHandle(hProcess);
 
         } catch (const std::exception& e) {
-            Logger::Error("EnrichProcessInfo - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"EnrichProcessInfo - Exception: %hs", e.what());
         }
     }
 
@@ -1177,12 +1164,11 @@ private:
         try {
             if (UseRestartManagerOp(filePath)) {
                 result.method = UnlockMethod::RestartManager;
-                Logger::Info("Unlocked via Restart Manager: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_INFO(L"FileLockManager", L"Unlocked via Restart Manager: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return true;
             }
         } catch (const std::exception& e) {
-            Logger::Error("TryRestartManager - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"TryRestartManager - Exception: %hs", e.what());
             result.errors.push_back(std::string("Restart Manager failed: ") + e.what());
         }
         return false;
@@ -1202,12 +1188,12 @@ private:
 
             if (closed > 0) {
                 result.method = UnlockMethod::HandleClose;
-                Logger::Info("Closed {} handles", closed);
+                SS_LOG_INFO(L"FileLockManager", L"Closed %hs handles", closed);
                 return true;
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("TryHandleClose - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"TryHandleClose - Exception: %hs", e.what());
             result.errors.push_back(std::string("Handle close failed: ") + e.what());
         }
 
@@ -1233,12 +1219,12 @@ private:
 
             if (terminated > 0) {
                 result.method = UnlockMethod::ProcessTerminate;
-                Logger::Warn("Terminated {} processes", terminated);
+                SS_LOG_WARN(L"FileLockManager", L"Terminated %hs processes", terminated);
                 return true;
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("TryProcessTerminate - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"TryProcessTerminate - Exception: %hs", e.what());
             result.errors.push_back(std::string("Process termination failed: ") + e.what());
         }
 
@@ -1249,12 +1235,11 @@ private:
         try {
             if (KernelUnlockFileOp(filePath)) {
                 result.method = UnlockMethod::KernelDriver;
-                Logger::Info("Unlocked via kernel driver: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_INFO(L"FileLockManager", L"Unlocked via kernel driver: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return true;
             }
         } catch (const std::exception& e) {
-            Logger::Error("TryKernelUnlock - Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileLockManager", L"TryKernelUnlock - Exception: %hs", e.what());
             result.errors.push_back(std::string("Kernel unlock failed: ") + e.what());
         }
         return false;
@@ -1364,14 +1349,14 @@ FileLockManager& FileLockManager::Instance() {
 FileLockManager::FileLockManager()
     : m_impl(std::make_unique<FileLockManagerImpl>()) {
 
-    Logger::Info("FileLockManager instance created");
+    SS_LOG_INFO(L"FileLockManager", L"FileLockManager instance created");
 }
 
 FileLockManager::~FileLockManager() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("FileLockManager instance destroyed");
+    SS_LOG_INFO(L"FileLockManager", L"FileLockManager instance destroyed");
 }
 
 // ============================================================================

@@ -153,14 +153,12 @@ public:
             m_config = config;
             m_initialized = true;
 
-            Logger::Info("DocumentScanner initialized (macros={}, ole={}, pdf={}, cve={})",
-                config.analyzeMacros, config.analyzeOLEObjects,
-                config.analyzePDFJavaScript, config.detectCVEs);
+            SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner initialized (macros=%d, ole=%d, pdf=%d, cve=%d)", config.analyzeMacros, config.analyzeOLEObjects, config.analyzePDFJavaScript, config.detectCVEs);
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -173,7 +171,7 @@ public:
             m_threatCallback = nullptr;
             m_initialized = false;
 
-            Logger::Info("DocumentScanner shutdown complete");
+            SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -195,15 +193,14 @@ public:
         try {
             // Validate path
             if (filePath.empty()) {
-                Logger::Warn("DocumentScanner::Scan - Empty file path");
+                SS_LOG_WARN(L"DocumentScanner", L"DocumentScanner::Scan - Empty file path");
                 result.verdict = ScanVerdict::Error;
                 result.errors.push_back("Empty file path");
                 return result;
             }
 
             if (!fs::exists(filePath)) {
-                Logger::Warn("DocumentScanner::Scan - File not found: {}",
-                    StringUtils::WideToUtf8(filePath));
+                SS_LOG_WARN(L"DocumentScanner", L"DocumentScanner::Scan - File not found: %hs", StringUtils::ToNarrow(filePath).c_str());
                 result.verdict = ScanVerdict::Error;
                 result.errors.push_back("File not found");
                 return result;
@@ -212,8 +209,7 @@ public:
             // Check file size
             result.fileSize = fs::file_size(filePath);
             if (result.fileSize > MAX_DOCUMENT_SIZE) {
-                Logger::Warn("DocumentScanner::Scan - File too large: {} bytes",
-                    result.fileSize);
+                SS_LOG_WARN(L"DocumentScanner", L"DocumentScanner::Scan - File too large: %llu bytes", result.fileSize);
                 result.verdict = ScanVerdict::Error;
                 result.errors.push_back("File exceeds maximum size");
                 return result;
@@ -222,7 +218,7 @@ public:
             // Detect document type
             result.documentType = DetectDocumentType(filePath);
             if (result.documentType == DocumentType::Unknown) {
-                Logger::Warn("DocumentScanner::Scan - Unknown document type");
+                SS_LOG_WARN(L"DocumentScanner", L"DocumentScanner::Scan - Unknown document type");
                 result.verdict = ScanVerdict::Error;
                 result.errors.push_back("Unknown document type");
                 return result;
@@ -268,7 +264,7 @@ public:
                     break;
 
                 default:
-                    Logger::Warn("DocumentScanner::Scan - Unsupported document type");
+                    SS_LOG_WARN(L"DocumentScanner", L"DocumentScanner::Scan - Unsupported document type");
                     result.errors.push_back("Unsupported document type");
                     break;
             }
@@ -298,7 +294,7 @@ public:
             ReportProgress(L"Scan complete", 100);
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::Scan - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::Scan - Exception: %hs", e.what());
             result.verdict = ScanVerdict::Error;
             result.hadErrors = true;
             result.errors.push_back(e.what());
@@ -308,8 +304,7 @@ public:
         result.scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
             endTime - startTime);
 
-        Logger::Info("DocumentScanner::Scan - Completed in {}ms (verdict={}, risk={})",
-            result.scanDuration.count(), static_cast<int>(result.verdict), result.riskScore);
+        SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner::Scan - Completed in %ums (verdict=%u, risk=%hs)", result.scanDuration.count(), static_cast<int>(result.verdict), result.riskScore);
 
         return result;
     }
@@ -347,7 +342,7 @@ public:
 
                 default:
                     // For binary formats, need file-based analysis
-                    Logger::Warn("Buffer scan not fully supported for this type");
+                    SS_LOG_WARN(L"DocumentScanner", L"Buffer scan not fully supported for this type");
                     break;
             }
 
@@ -355,7 +350,7 @@ public:
             m_stats.documentsScanned++;
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::ScanBuffer - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ScanBuffer - Exception: %hs", e.what());
             result.verdict = ScanVerdict::Error;
             result.hadErrors = true;
             result.errors.push_back(e.what());
@@ -393,7 +388,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::HasMacros - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::HasMacros - Exception: %hs", e.what());
             return false;
         }
     }
@@ -421,7 +416,7 @@ public:
             // Check for known exploit patterns
             for (const auto& [pattern, cve] : CVE_PATTERNS) {
                 if (content.find(pattern) != std::string::npos) {
-                    Logger::Warn("Quick malicious check: Found {} pattern", cve);
+                    SS_LOG_WARN(L"DocumentScanner", L"Quick malicious check: Found %hs pattern", cve);
                     return true;
                 }
             }
@@ -429,7 +424,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::IsMalicious - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::IsMalicious - Exception: %hs", e.what());
             return false;
         }
     }
@@ -459,7 +454,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::ExtractMacros - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ExtractMacros - Exception: %hs", e.what());
         }
 
         return macros;
@@ -498,11 +493,10 @@ public:
             deobfuscated = std::regex_replace(deobfuscated,
                 std::regex(R"(^\s*'\s*[a-z]{30,}\s*$)", std::regex::multiline), "");
 
-            Logger::Info("Macro deobfuscation: {} -> {} bytes",
-                obfuscatedCode.size(), deobfuscated.size());
+            SS_LOG_INFO(L"DocumentScanner", L"Macro deobfuscation: %llu -> %llu bytes", obfuscatedCode.size(), deobfuscated.size());
 
         } catch (const std::exception& e) {
-            Logger::Error("DeobfuscateMacro - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DeobfuscateMacro - Exception: %hs", e.what());
             return obfuscatedCode; // Return original on error
         }
 
@@ -526,7 +520,7 @@ public:
                     stream.find("\\x01Ole") != std::string::npos) {
 
                     OLEObjectInfo objInfo;
-                    objInfo.displayName = StringUtils::Utf8ToWide(stream);
+                    objInfo.displayName = StringUtils::ToWide(stream);
 
                     // Extract object data (simplified - full implementation would parse OLE structure)
                     // This would use a proper OLE parser library in production
@@ -536,7 +530,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::ExtractOLEObjects - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ExtractOLEObjects - Exception: %hs", e.what());
         }
 
         return objects;
@@ -558,7 +552,7 @@ public:
         try {
             std::ifstream file(filePath, std::ios::binary);
             if (!file) {
-                Logger::Error("Cannot open PDF file");
+                SS_LOG_ERROR(L"DocumentScanner", L"Cannot open PDF file");
                 return objects;
             }
 
@@ -610,7 +604,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::AnalyzePDF - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::AnalyzePDF - Exception: %hs", e.what());
         }
 
         return objects;
@@ -630,7 +624,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::ExtractPDFJavaScript - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ExtractPDFJavaScript - Exception: %hs", e.what());
         }
 
         return scripts;
@@ -658,7 +652,7 @@ public:
             ExtractIOCsFromContent(content, result);
 
         } catch (const std::exception& e) {
-            Logger::Error("DocumentScanner::ExtractIOCs - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ExtractIOCs - Exception: %hs", e.what());
         }
 
         return result;
@@ -740,7 +734,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("DetectDocumentType - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"DetectDocumentType - Exception: %hs", e.what());
         }
 
         return DocumentType::Unknown;
@@ -770,7 +764,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckKnownMalwareHash - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"CheckKnownMalwareHash - Exception: %hs", e.what());
         }
 
         return false;
@@ -819,7 +813,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzePDFDocument - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzePDFDocument - Exception: %hs", e.what());
             result.errors.push_back(std::string("PDF analysis error: ") + e.what());
         }
     }
@@ -882,7 +876,7 @@ private:
                             threat.type = oleObj.isExecutable ? ThreatType::OLEExecutable : ThreatType::OLEAutoOpen;
                             threat.severity = 80;
                             threat.description = "Suspicious OLE object";
-                            threat.location = "OLE: " + StringUtils::WideToUtf8(oleObj.displayName);
+                            threat.location = "OLE: " + StringUtils::ToNarrow(oleObj.displayName);
                             threat.mitreId = "T1204.002";
 
                             result.threats.push_back(threat);
@@ -897,7 +891,7 @@ private:
             CheckForDDE(filePath, result);
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeLegacyOfficeDocument - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeLegacyOfficeDocument - Exception: %hs", e.what());
             result.errors.push_back(std::string("Legacy Office analysis error: ") + e.what());
         }
     }
@@ -928,7 +922,7 @@ private:
             CheckExternalLinks(filePath, result);
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeOOXMLDocument - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeOOXMLDocument - Exception: %hs", e.what());
             result.errors.push_back(std::string("OOXML analysis error: ") + e.what());
         }
     }
@@ -982,7 +976,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeRTFDocument - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeRTFDocument - Exception: %hs", e.what());
             result.errors.push_back(std::string("RTF analysis error: ") + e.what());
         }
     }
@@ -1023,7 +1017,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzePDFBuffer - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzePDFBuffer - Exception: %hs", e.what());
         }
     }
 
@@ -1047,7 +1041,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeRTFBuffer - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeRTFBuffer - Exception: %hs", e.what());
         }
     }
 
@@ -1077,7 +1071,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractOLEMacros - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractOLEMacros - Exception: %hs", e.what());
         }
 
         return macros;
@@ -1091,11 +1085,10 @@ private:
             // This would use ZIP extraction + OLE parsing in production
 
             // Placeholder implementation
-            Logger::Info("Extracting OOXML macros from: {}",
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(L"DocumentScanner", L"Extracting OOXML macros from: %hs", StringUtils::ToNarrow(filePath).c_str());
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractOOXMLMacros - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractOOXMLMacros - Exception: %hs", e.what());
         }
 
         return macros;
@@ -1181,7 +1174,7 @@ private:
             else if (riskScore > 0) macro.riskLevel = MacroRisk::Low;
 
         } catch (const std::exception& e) {
-            Logger::Error("AnalyzeMacroCode - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeMacroCode - Exception: %hs", e.what());
         }
     }
 
@@ -1208,7 +1201,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ListOLEStreamsInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ListOLEStreamsInternal - Exception: %hs", e.what());
         }
 
         return streams;
@@ -1239,7 +1232,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractPDFJavaScriptFromObject - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractPDFJavaScriptFromObject - Exception: %hs", e.what());
         }
     }
 
@@ -1270,7 +1263,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckForDDE - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"CheckForDDE - Exception: %hs", e.what());
         }
     }
 
@@ -1283,7 +1276,7 @@ private:
             result.hasTemplateInjection = false;
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckTemplateInjection - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"CheckTemplateInjection - Exception: %hs", e.what());
         }
     }
 
@@ -1295,7 +1288,7 @@ private:
             result.hasExternalLinks = false;
 
         } catch (const std::exception& e) {
-            Logger::Error("CheckExternalLinks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"CheckExternalLinks - Exception: %hs", e.what());
         }
     }
 
@@ -1309,7 +1302,7 @@ private:
             result.subject = L"";
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractMetadata - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractMetadata - Exception: %hs", e.what());
         }
     }
 
@@ -1333,7 +1326,7 @@ private:
                 result.ips.end());
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractAllIOCs - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractAllIOCs - Exception: %hs", e.what());
         }
     }
 
@@ -1344,7 +1337,7 @@ private:
             ExtractEmails(content, result.emails);
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractIOCsFromContent - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractIOCsFromContent - Exception: %hs", e.what());
         }
     }
 
@@ -1363,7 +1356,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractURLs - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractURLs - Exception: %hs", e.what());
         }
     }
 
@@ -1400,7 +1393,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractIPs - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractIPs - Exception: %hs", e.what());
         }
     }
 
@@ -1418,7 +1411,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("ExtractEmails - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"ExtractEmails - Exception: %hs", e.what());
         }
     }
 
@@ -1455,7 +1448,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("CalculateVerdict - Exception: {}", e.what());
+            SS_LOG_ERROR(L"DocumentScanner", L"CalculateVerdict - Exception: %hs", e.what());
             result.verdict = ScanVerdict::Error;
         }
     }
@@ -1595,14 +1588,14 @@ DocumentScanner& DocumentScanner::Instance() {
 DocumentScanner::DocumentScanner()
     : m_impl(std::make_unique<DocumentScannerImpl>()) {
 
-    Logger::Info("DocumentScanner instance created");
+    SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner instance created");
 }
 
 DocumentScanner::~DocumentScanner() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("DocumentScanner instance destroyed");
+    SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner instance destroyed");
 }
 
 // ============================================================================

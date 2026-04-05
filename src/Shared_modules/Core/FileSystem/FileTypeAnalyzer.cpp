@@ -811,21 +811,21 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("FileTypeAnalyzer: Initializing...");
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initializing...");
 
             m_config = config;
 
             // Load built-in signatures
             m_signatures = MagicDB::g_signatures;
 
-            Logger::Info("FileTypeAnalyzer: Loaded {} built-in signatures", m_signatures.size());
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Loaded %llu built-in signatures", m_signatures.size());
 
             m_initialized = true;
-            Logger::Info("FileTypeAnalyzer: Initialized successfully");
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileTypeAnalyzer: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -833,7 +833,7 @@ public:
     void Shutdown() noexcept {
         std::unique_lock lock(m_mutex);
         m_initialized = false;
-        Logger::Info("FileTypeAnalyzer: Shutdown complete");
+        SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Shutdown complete");
     }
 
     // ========================================================================
@@ -847,7 +847,7 @@ public:
         try {
             // Validate input
             if (filePath.empty()) {
-                Logger::Error("FileTypeAnalyzer::Analyze: Empty file path");
+                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Empty file path");
                 return info;
             }
 
@@ -856,7 +856,7 @@ public:
 
             // Check if file exists
             if (!Utils::FileUtils::FileExists(filePath)) {
-                Logger::Error("FileTypeAnalyzer::Analyze: File not found");
+                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: File not found");
                 return info;
             }
 
@@ -883,7 +883,7 @@ public:
 
             auto headerData = Utils::FileUtils::ReadFileBytes(filePath, readSize);
             if (headerData.empty()) {
-                Logger::Error("FileTypeAnalyzer::Analyze: Failed to read file header");
+                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Failed to read file header");
                 return info;
             }
 
@@ -901,16 +901,12 @@ public:
 
             m_stats.filesAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Info("FileTypeAnalyzer: Analyzed {} - Format: {}, Category: {}, Risk: {}",
-                Utils::StringUtils::WideToUtf8(filePath),
-                static_cast<int>(info.format),
-                GetCategoryName(info.category),
-                static_cast<int>(info.riskLevel));
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Analyzed %hs - Format: %u, Category: %hs, Risk: %u", Utils::StringUtils::ToNarrow(filePath).c_str(), static_cast<int>(info.format), GetCategoryName(info.category), static_cast<int>(info.riskLevel));
 
             return info;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileTypeAnalyzer::Analyze: Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Exception: %hs", e.what());
             return info;
         }
     }
@@ -921,7 +917,7 @@ public:
             m_stats.buffersAnalyzed.fetch_add(1, std::memory_order_relaxed);
             return info;
         } catch (const std::exception& e) {
-            Logger::Error("FileTypeAnalyzer::AnalyzeBuffer: Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::AnalyzeBuffer: Exception: %hs", e.what());
             return FileTypeInfo{};
         }
     }
@@ -1207,7 +1203,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (m_signatures.size() >= FileTypeAnalyzerConstants::MAX_SIGNATURES) {
-            Logger::Warn("FileTypeAnalyzer: Maximum signatures reached");
+            SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Maximum signatures reached");
             return false;
         }
 
@@ -1322,7 +1318,7 @@ private:
 
         // Fall back to extension-based detection
         if (!diskExtension.empty()) {
-            std::string ext = Utils::StringUtils::WideToUtf8(std::wstring(diskExtension));
+            std::string ext = Utils::StringUtils::ToNarrow(std::wstring(diskExtension));
             auto extInfo = GetExtensionInfo(ext);
 
             if (extInfo.format != FileFormat::Unknown) {
@@ -1377,7 +1373,7 @@ private:
         }
 
         // Convert to string for comparison
-        std::string diskExt = Utils::StringUtils::WideToUtf8(info.diskExtension);
+        std::string diskExt = Utils::StringUtils::ToNarrow(info.diskExtension);
         diskExt = NormalizeExtension(diskExt);
 
         // Get expected extension
@@ -1405,12 +1401,11 @@ private:
             // Extension mismatch detected
             info.isSpoofed = true;
             info.spoofingType = SpoofingType::ExtensionMismatch;
-            info.suggestedExtension = Utils::StringUtils::Utf8ToWide(expectedExt);
+            info.suggestedExtension = Utils::StringUtils::ToWide(expectedExt);
 
             m_stats.spoofingDetected.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Warn("FileTypeAnalyzer: Extension spoofing detected - Disk: {}, Actual: {}",
-                diskExt, expectedExt);
+            SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Extension spoofing detected - Disk: %hs, Actual: %hs", diskExt, expectedExt);
         }
     }
 

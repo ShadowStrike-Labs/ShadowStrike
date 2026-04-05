@@ -333,8 +333,7 @@ public:
             m_lastDetectionTime = now;
             m_detectionCount++;
 
-            Logger::Warn("RapidChange: {} events in {} ms - possible ransomware",
-                m_events.size(), m_config.windowSizeMs);
+            SS_LOG_WARN(L"FileWatcher", L"RapidChange: %llu events in %d ms - possible ransomware", m_events.size(), m_config.windowSizeMs);
 
             return true;
         }
@@ -508,7 +507,7 @@ public:
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Logger::Error("EventCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileWatcher", L"EventCallback exception: %hs", e.what());
             }
         }
     }
@@ -519,7 +518,7 @@ public:
             try {
                 callback(alert);
             } catch (const std::exception& e) {
-                Logger::Error("AlertCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileWatcher", L"AlertCallback exception: %hs", e.what());
             }
         }
     }
@@ -530,7 +529,7 @@ public:
             try {
                 callback(watchId, newState);
             } catch (const std::exception& e) {
-                Logger::Error("StateCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"FileWatcher", L"StateCallback exception: %hs", e.what());
             }
         }
     }
@@ -566,21 +565,21 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("FileWatcher: Initializing...");
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Initializing...");
 
             m_config = config;
 
             // Validate configuration
             if (m_config.workerThreads < FileWatcherConstants::MIN_WORKER_THREADS ||
                 m_config.workerThreads > FileWatcherConstants::MAX_WORKER_THREADS) {
-                Logger::Error("FileWatcher: Invalid worker thread count: {}", m_config.workerThreads);
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Invalid worker thread count: %d", m_config.workerThreads);
                 return false;
             }
 
             // Create IOCP
             m_completionPort = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, m_config.workerThreads);
             if (m_completionPort == nullptr) {
-                Logger::Error("FileWatcher: Failed to create IOCP: {}", GetLastError());
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to create IOCP: %lu", GetLastError());
                 return false;
             }
 
@@ -596,11 +595,11 @@ public:
             m_callbackManager = std::make_unique<CallbackManager>();
 
             m_initialized = true;
-            Logger::Info("FileWatcher: Initialized successfully");
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileWatcher: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -609,12 +608,12 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("FileWatcher: Not initialized");
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Not initialized");
             return false;
         }
 
         if (m_running) {
-            Logger::Warn("FileWatcher: Already running");
+            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Already running");
             return true;
         }
 
@@ -628,11 +627,11 @@ public:
                 m_workerThreads.emplace_back([this]() { WorkerThread(); });
             }
 
-            Logger::Info("FileWatcher: Started with {} worker threads", m_config.workerThreads);
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Started with %d worker threads", m_config.workerThreads);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileWatcher: Start failed: {}", e.what());
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Start failed: %hs", e.what());
             m_running = false;
             return false;
         }
@@ -643,7 +642,7 @@ public:
             std::unique_lock lock(m_mutex);
             if (!m_running) return;
 
-            Logger::Info("FileWatcher: Stopping...");
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Stopping...");
             m_running = false;
         }
 
@@ -671,7 +670,7 @@ public:
             m_completionPort = nullptr;
         }
 
-        Logger::Info("FileWatcher: Stopped");
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Stopped");
     }
 
     bool IsRunning() const noexcept {
@@ -685,20 +684,19 @@ public:
     uint32_t AddWatch(const std::wstring& directory, bool recursive,
                      WatchPriority priority, WatchFilter filter) {
         if (!m_initialized || !m_running) {
-            Logger::Error("FileWatcher: Not initialized or not running");
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Not initialized or not running");
             return 0;
         }
 
         try {
             // Validate path
             if (directory.empty() || directory.length() > FileWatcherConstants::MAX_PATH_LENGTH) {
-                Logger::Error("FileWatcher: Invalid directory path");
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Invalid directory path");
                 return 0;
             }
 
             if (!fs::exists(directory) || !fs::is_directory(directory)) {
-                Logger::Error("FileWatcher: Directory does not exist: {}",
-                    Utils::StringUtils::WideToUtf8(directory));
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Directory does not exist: %hs", Utils::StringUtils::ToNarrow(directory).c_str());
                 return 0;
             }
 
@@ -706,7 +704,7 @@ public:
 
             // Check limit
             if (m_watches.size() >= FileWatcherConstants::MAX_WATCHES) {
-                Logger::Error("FileWatcher: Maximum watches reached");
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Maximum watches reached");
                 return 0;
             }
 
@@ -725,8 +723,7 @@ public:
             );
 
             if (handle->directoryHandle == INVALID_HANDLE_VALUE) {
-                Logger::Error("FileWatcher: Failed to open directory: {} (error: {})",
-                    Utils::StringUtils::WideToUtf8(directory), GetLastError());
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to open directory: %hs (error: %lu)", Utils::StringUtils::ToNarrow(directory).c_str(), GetLastError());
                 m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
@@ -734,7 +731,7 @@ public:
             // Associate with IOCP
             if (CreateIoCompletionPort(handle->directoryHandle, m_completionPort,
                                       reinterpret_cast<ULONG_PTR>(handle.get()), 0) == nullptr) {
-                Logger::Error("FileWatcher: Failed to associate with IOCP: {}", GetLastError());
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to associate with IOCP: %lu", GetLastError());
                 m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
@@ -751,7 +748,7 @@ public:
 
             // Start async read
             if (!StartWatchRead(handle.get())) {
-                Logger::Error("FileWatcher: Failed to start watch read");
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to start watch read");
                 m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
                 return 0;
             }
@@ -762,8 +759,7 @@ public:
             m_watches[watchId] = std::move(handle);
             m_stats.activeWatches.fetch_add(1, std::memory_order_relaxed);
 
-            Logger::Info("FileWatcher: Added watch {} for: {}", watchId,
-                Utils::StringUtils::WideToUtf8(directory));
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Added watch %hs for: %hs", watchId, Utils::StringUtils::ToNarrow(directory).c_str());
 
             // Invoke state callback
             m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Active);
@@ -771,7 +767,7 @@ public:
             return watchId;
 
         } catch (const std::exception& e) {
-            Logger::Error("FileWatcher::AddWatch: Exception: {}", e.what());
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher::AddWatch: Exception: %hs", e.what());
             return 0;
         }
     }
@@ -805,7 +801,7 @@ public:
             return false;
         }
 
-        Logger::Info("FileWatcher: Removing watch {}", watchId);
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing watch %hs", watchId);
 
         it->second->Close();
         m_watches.erase(it);
@@ -819,7 +815,7 @@ public:
     void RemoveAll() noexcept {
         std::unique_lock lock(m_mutex);
 
-        Logger::Info("FileWatcher: Removing all watches ({} total)", m_watches.size());
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing all watches (%llu total)", m_watches.size());
 
         for (auto& [id, handle] : m_watches) {
             handle->Close();
@@ -902,8 +898,7 @@ public:
     void AddExclusionPattern(const std::wstring& pattern) {
         std::unique_lock lock(m_mutex);
         m_globalExclusions.insert(pattern);
-        Logger::Info("FileWatcher: Added exclusion pattern: {}",
-            Utils::StringUtils::WideToUtf8(pattern));
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Added exclusion pattern: %hs", Utils::StringUtils::ToNarrow(pattern).c_str());
     }
 
     void RemoveExclusionPattern(const std::wstring& pattern) {
@@ -1032,7 +1027,7 @@ private:
         );
 
         if (!result) {
-            Logger::Error("ReadDirectoryChangesW failed: {}", GetLastError());
+            SS_LOG_ERROR(L"FileWatcher", L"ReadDirectoryChangesW failed: %lu", GetLastError());
             return false;
         }
 
@@ -1040,7 +1035,7 @@ private:
     }
 
     void WorkerThread() {
-        Logger::Info("FileWatcher: Worker thread started");
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Worker thread started");
 
         while (m_running.load(std::memory_order_acquire)) {
             DWORD bytesTransferred = 0;
@@ -1063,7 +1058,7 @@ private:
                 }
 
                 if (error == ERROR_ABANDONED_WAIT_0) {
-                    Logger::Info("FileWatcher: IOCP abandoned, thread exiting");
+                    SS_LOG_INFO(L"FileWatcher", L"FileWatcher: IOCP abandoned, thread exiting");
                     break;
                 }
 
@@ -1075,7 +1070,7 @@ private:
                 // Error on specific watch
                 auto* handle = reinterpret_cast<WatchHandle*>(completionKey);
                 if (handle) {
-                    Logger::Error("FileWatcher: Error on watch {}: {}", handle->entry.watchId, error);
+                    SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Error on watch %hs: %hs", handle->entry.watchId, error);
                     HandleWatchError(handle);
                 }
 
@@ -1084,7 +1079,7 @@ private:
 
             // Check for shutdown signal
             if (bytesTransferred == 0 && completionKey == 0 && overlapped == nullptr) {
-                Logger::Info("FileWatcher: Shutdown signal received");
+                SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Shutdown signal received");
                 break;
             }
 
@@ -1100,7 +1095,7 @@ private:
             }
         }
 
-        Logger::Info("FileWatcher: Worker thread exited");
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Worker thread exited");
     }
 
     void ProcessNotifications(WatchHandle* handle, DWORD bytesTransferred) {
@@ -1114,7 +1109,7 @@ private:
             try {
                 ProcessSingleNotification(handle, notification);
             } catch (const std::exception& e) {
-                Logger::Error("FileWatcher: Exception processing notification: {}", e.what());
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Exception processing notification: %hs", e.what());
             }
 
             if (notification->NextEntryOffset == 0) {
@@ -1294,7 +1289,7 @@ private:
             m_callbackManager->InvokeEventCallbacks(event);
             m_stats.eventsProcessed.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
-            Logger::Error("FileWatcher: Exception dispatching event: {}", e.what());
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Exception dispatching event: %hs", e.what());
             m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1325,7 +1320,7 @@ private:
 
         // Pause watch if configured
         if (m_config.rapidChangeConfig.pauseWatchOnDetection) {
-            Logger::Warn("FileWatcher: Pausing watch {} due to rapid change", handle->entry.watchId);
+            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Pausing watch %hs due to rapid change", handle->entry.watchId);
             handle->entry.state = WatchState::Paused;
             m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Paused);
         }
@@ -1334,7 +1329,7 @@ private:
     void HandleWatchError(WatchHandle* handle) {
         m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
 
-        Logger::Error("FileWatcher: Watch {} encountered error", handle->entry.watchId);
+        SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Watch %hs encountered error", handle->entry.watchId);
 
         handle->entry.state = WatchState::Error;
         m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Error);
@@ -1343,7 +1338,7 @@ private:
         std::this_thread::sleep_for(std::chrono::seconds(1));
 
         if (StartWatchRead(handle)) {
-            Logger::Info("FileWatcher: Successfully restarted watch {}", handle->entry.watchId);
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Successfully restarted watch %hs", handle->entry.watchId);
             handle->entry.state = WatchState::Active;
             m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Active);
             m_stats.watchRestarts.fetch_add(1, std::memory_order_relaxed);
