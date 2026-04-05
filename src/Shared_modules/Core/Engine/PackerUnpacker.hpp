@@ -27,50 +27,13 @@
  * Provides comprehensive unpacking support for common and custom packers,
  * including import reconstruction and memory dump analysis.
  *
- * UNPACKING CAPABILITIES:
- * =======================
- *
- * 1. STATIC UNPACKING
- *    - UPX unpacking
- *    - ASPack unpacking
- *    - FSG unpacking
- *    - PECompact unpacking
- *    - MPRESS unpacking
- *    - Custom packer scripts
- *
- * 2. DYNAMIC UNPACKING
- *    - Emulation-based unpacking
- *    - OEP (Original Entry Point) detection
- *    - Multi-layer unpacking
- *    - Self-extracting archives
- *    - VM-protected code
- *
- * 3. IMPORT RECONSTRUCTION
- *    - IAT rebuilding
- *    - Import name resolution
- *    - Ordinal-to-name mapping
- *    - API redirection detection
- *
- * 4. MEMORY DUMP ANALYSIS
- *    - Section dump
- *    - Full PE reconstruction
- *    - Overlay extraction
- *    - Resource extraction
- *
- * 5. PACKER DETECTION
- *    - Signature-based detection
- *    - Heuristic detection
- *    - Entropy analysis
- *    - Section characteristics
- *
- * @note Thread-safe singleton design.
+ * @note Thread-safe singleton design (Meyers' singleton).
+ * @note PackerType enum is defined in EmulationEngine.hpp to avoid duplication.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
  * @date 2026
  * @copyright (c) 2026 ShadowStrike Security. All rights reserved.
- *
- * LICENSE: Proprietary - ShadowStrike Enterprise License
  * ============================================================================
  */
 
@@ -94,6 +57,7 @@
 #include <chrono>
 #include <atomic>
 #include <mutex>
+#include <shared_mutex>
 #include <filesystem>
 #include <span>
 
@@ -124,8 +88,10 @@
 // FORWARD DECLARATIONS
 // ============================================================================
 
+// PackerType is authoritatively defined in EmulationEngine.hpp.
+// Forward-declare here so consumers do not need the heavyweight header.
 namespace ShadowStrike::Core::Engine {
-    class PackerUnpackerImpl;
+    enum class PackerType : uint16_t;
 }
 
 namespace ShadowStrike {
@@ -142,20 +108,26 @@ namespace UnpackerConstants {
     inline constexpr uint32_t VERSION_MINOR = 0;
     inline constexpr uint32_t VERSION_PATCH = 0;
 
-    /// @brief Maximum unpacking layers
+    /// Maximum unpacking layers
     inline constexpr uint32_t MAX_UNPACKING_LAYERS = 10;
-    
-    /// @brief Maximum emulation instructions
-    inline constexpr uint64_t MAX_EMULATION_INSTRUCTIONS = 10000000;
-    
-    /// @brief Maximum unpacked size (256 MB)
-    inline constexpr size_t MAX_UNPACKED_SIZE = 256 * 1024 * 1024;
-    
-    /// @brief Unpacking timeout (seconds)
+
+    /// Maximum emulation instructions
+    inline constexpr uint64_t MAX_EMULATION_INSTRUCTIONS = 10'000'000;
+
+    /// Maximum unpacked size (256 MB)
+    inline constexpr size_t MAX_UNPACKED_SIZE = 256ULL * 1024 * 1024;
+
+    /// Maximum input file size for detection/unpacking (512 MB)
+    inline constexpr size_t MAX_INPUT_FILE_SIZE = 512ULL * 1024 * 1024;
+
+    /// Default unpacking timeout (seconds)
     inline constexpr uint32_t DEFAULT_TIMEOUT_SECONDS = 60;
-    
-    /// @brief Maximum section count
+
+    /// Maximum PE section count (hardened against crafted headers)
     inline constexpr uint32_t MAX_SECTIONS = 96;
+
+    /// Maximum archive nesting depth
+    inline constexpr uint32_t MAX_ARCHIVE_DEPTH = 8;
 
 }  // namespace UnpackerConstants
 
@@ -171,344 +143,204 @@ namespace fs = std::filesystem;
 // ENUMERATIONS
 // ============================================================================
 
-/**
- * @brief Known packer types
- */
-enum class PackerType : uint8_t {
-    Unknown         = 0,
-    UPX             = 1,
-    ASPack          = 2,
-    FSG             = 3,
-    PECompact       = 4,
-    MPRESS          = 5,
-    NSPack          = 6,
-    PEtite          = 7,
-    Armadillo       = 8,
-    Themida         = 9,
-    VMProtect       = 10,
-    Enigma          = 11,
-    ExeCryptor      = 12,
-    PELock          = 13,
-    ASProtect       = 14,
-    SafeEngine      = 15,
-    Custom          = 16,
-    SelfExtractor   = 17,
-    DotNetObfuscator= 18,
-    Confuser        = 19,
-    SmartAssembly   = 20
-};
-
-/**
- * @brief Unpacking method
- */
+/// Unpacking method
 enum class UnpackMethod : uint8_t {
-    Static          = 0,    ///< Pattern-based static unpacking
-    Dynamic         = 1,    ///< Emulation-based dynamic unpacking
-    Hybrid          = 2,    ///< Combined approach
-    Plugin          = 3,    ///< External unpacker plugin
-    Memory          = 4     ///< Live memory dump (for running processes)
+    Static  = 0,
+    Dynamic = 1,
+    Hybrid  = 2,
+    Plugin  = 3,
+    Memory  = 4
 };
 
-/**
- * @brief Unpacking result status
- */
+/// Unpacking result status
 enum class UnpackStatus : uint8_t {
-    Success             = 0,
-    PartialSuccess      = 1,    ///< Some layers unpacked
-    UnsupportedPacker   = 2,
-    CorruptedInput      = 3,
-    EmulationFailed     = 4,
-    Timeout             = 5,
-    OutputTooLarge      = 6,
-    ImportRecoveryFailed= 7,
-    AntiDebugDetected   = 8,
-    VirtualizedCode     = 9,
-    Error               = 10
+    Success              = 0,
+    PartialSuccess       = 1,
+    NotPacked            = 2,
+    UnsupportedPacker    = 3,
+    CorruptedInput       = 4,
+    OEPNotFound          = 5,
+    EmulationFailed      = 6,
+    Timeout              = 7,
+    OutputTooLarge       = 8,
+    ImportRecoveryFailed = 9,
+    AntiDebugDetected    = 10,
+    VirtualizedCode      = 11,
+    Error                = 12
 };
 
-/**
- * @brief OEP detection method
- */
+/// OEP detection method
 enum class OEPDetectionMethod : uint8_t {
-    PatternMatch        = 0,    ///< Known OEP patterns
-    MemoryWrite         = 1,    ///< Detect write to code section
-    ExecutionBreakpoint = 2,    ///< Break on execution of original code
-    StackFrame          = 3,    ///< Stack analysis
-    Heuristic           = 4     ///< Combined heuristics
+    PatternMatch        = 0,
+    MemoryWrite         = 1,
+    ExecutionBreakpoint = 2,
+    StackFrame          = 3,
+    Heuristic           = 4
 };
 
-/**
- * @brief Detector status
- */
+/// Module lifecycle status
 enum class UnpackerStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Unpacking       = 3,
-    Error           = 4,
-    Stopping        = 5,
-    Stopped         = 6
+    Uninitialized = 0,
+    Initializing  = 1,
+    Running       = 2,
+    Unpacking     = 3,
+    Error         = 4,
+    Stopping      = 5,
+    Stopped       = 6
+};
+
+// ============================================================================
+// ERROR TYPE
+// ============================================================================
+
+/// Error detail for unpacker operations.
+struct UnpackError {
+    DWORD        win32Code = ERROR_SUCCESS;
+    std::wstring message;
+    std::wstring context;
+
+    [[nodiscard]] bool HasError() const noexcept { return win32Code != ERROR_SUCCESS; }
+    void Clear() noexcept { win32Code = ERROR_SUCCESS; message.clear(); context.clear(); }
 };
 
 // ============================================================================
 // STRUCTURES
 // ============================================================================
 
-/**
- * @brief Packer detection result
- */
+/// Packer detection result
 struct PackerDetectionResult {
-    /// @brief Detected packer type
-    PackerType packerType = PackerType::Unknown;
-    
-    /// @brief Packer name
-    std::string packerName;
-    
-    /// @brief Packer version (if detectable)
-    std::string version;
-    
-    /// @brief Detection confidence (0.0 - 1.0)
-    float confidence = 0.0f;
-    
-    /// @brief Is packed
-    bool isPacked = false;
-    
-    /// @brief Is encrypted
-    bool isEncrypted = false;
-    
-    /// @brief Is virtualized (VM protection)
-    bool isVirtualized = false;
-    
-    /// @brief Estimated layers
-    uint32_t estimatedLayers = 0;
-    
-    /// @brief Entry point section
-    std::string entryPointSection;
-    
-    /// @brief Suspicious section entropy
+    PackerType    packerType{};
+    std::string   packerName;
+    std::string   version;
+    float         confidence    = 0.0f;
+    bool          isPacked      = false;
+    bool          isEncrypted   = false;
+    bool          isVirtualized = false;
+    uint32_t      estimatedLayers = 0;
+    std::string   entryPointSection;
     std::vector<std::pair<std::string, float>> sectionEntropies;
-    
-    [[nodiscard]] std::string ToJson() const;
+
+    /// Path of the analysed file (set by file-based detection)
+    fs::path      filePath;
+    /// Human-readable detection method label
+    std::wstring  detectionMethod;
+    /// Additional informational strings
+    std::vector<std::wstring> additionalInfo;
 };
 
-/**
- * @brief PE section info
- */
+/// PE section info
 struct SectionInfo {
-    /// @brief Section name
     std::string name;
-    
-    /// @brief Virtual address
-    uint32_t virtualAddress = 0;
-    
-    /// @brief Virtual size
-    uint32_t virtualSize = 0;
-    
-    /// @brief Raw data size
-    uint32_t rawDataSize = 0;
-    
-    /// @brief Raw data offset
-    uint32_t rawDataOffset = 0;
-    
-    /// @brief Characteristics
+    uint32_t virtualAddress  = 0;
+    uint32_t virtualSize     = 0;
+    uint32_t rawDataSize     = 0;
+    uint32_t rawDataOffset   = 0;
     uint32_t characteristics = 0;
-    
-    /// @brief Entropy
-    float entropy = 0.0f;
-    
-    /// @brief Is executable
-    bool isExecutable = false;
-    
-    /// @brief Is writable
-    bool isWritable = false;
-    
-    [[nodiscard]] std::string ToJson() const;
+    float    entropy         = 0.0f;
+    bool     isExecutable    = false;
+    bool     isWritable      = false;
 };
 
-/**
- * @brief Import entry
- */
+/// Import entry
 struct ImportEntry {
-    /// @brief DLL name
     std::string dllName;
-    
-    /// @brief Function name
     std::string functionName;
-    
-    /// @brief Ordinal (if by ordinal)
-    uint16_t ordinal = 0;
-    
-    /// @brief IAT address
-    uint64_t iatAddress = 0;
-    
-    /// @brief Resolved address
-    uint64_t resolvedAddress = 0;
-    
-    /// @brief Is by ordinal
-    bool byOrdinal = false;
-    
-    [[nodiscard]] std::string ToJson() const;
+    uint16_t    ordinal         = 0;
+    uint64_t    iatAddress      = 0;
+    uint64_t    resolvedAddress = 0;
+    bool        byOrdinal       = false;
 };
 
-/**
- * @brief Unpacked PE info
- */
+/// A single reconstructed import descriptor (per DLL).
+struct ReconstructedImportDescriptor {
+    std::string dllName;
+    std::vector<ImportEntry> functions;
+};
+
+/// Reconstructed import table after unpacking.
+struct ReconstructedImports {
+    uint64_t iatRVA = 0;
+    std::vector<ReconstructedImportDescriptor> importDescriptors;
+    uint32_t totalFunctions = 0;
+    bool     reconstructedSuccessfully = false;
+};
+
+/// Options for import reconstruction.
+struct ImportReconstructionOptions {
+    bool resolveByOrdinal  = true;
+    bool resolveByAddress  = true;
+    bool allowPartial      = true;
+};
+
+/// Unpacked PE info
 struct UnpackedPEInfo {
-    /// @brief Original Entry Point (OEP)
     uint64_t originalEntryPoint = 0;
-    
-    /// @brief Image base
-    uint64_t imageBase = 0;
-    
-    /// @brief Size of image
-    uint32_t sizeOfImage = 0;
-    
-    /// @brief Sections
+    uint64_t newEntryPoint      = 0;
+    uint64_t imageBase          = 0;
+    uint32_t sizeOfImage        = 0;
     std::vector<SectionInfo> sections;
-    
-    /// @brief Reconstructed imports
     std::vector<ImportEntry> imports;
-    
-    /// @brief OEP detection method used
     OEPDetectionMethod oepMethod = OEPDetectionMethod::Heuristic;
-    
-    /// @brief Has reconstructed imports
     bool hasValidImports = false;
-    
-    /// @brief Has valid PE structure
-    bool hasValidPE = false;
-    
-    [[nodiscard]] std::string ToJson() const;
+    bool hasValidPE      = false;
 };
 
-/**
- * @brief Unpacking result
- */
+/// Unpacking result
 struct UnpackResult {
-    /// @brief Status
-    UnpackStatus status = UnpackStatus::Error;
-    
-    /// @brief Unpacked data
+    UnpackStatus  status = UnpackStatus::Error;
     std::vector<uint8_t> unpackedData;
-    
-    /// @brief PE information
     UnpackedPEInfo peInfo;
-    
-    /// @brief Packer detection
     PackerDetectionResult packerInfo;
-    
-    /// @brief Unpacking method used
-    UnpackMethod methodUsed = UnpackMethod::Static;
-    
-    /// @brief Layers unpacked
-    uint32_t layersUnpacked = 0;
-    
-    /// @brief Original size
-    size_t originalSize = 0;
-    
-    /// @brief Unpacked size
-    size_t unpackedSize = 0;
-    
-    /// @brief Compression ratio
-    float compressionRatio = 0.0f;
-    
-    /// @brief Instructions emulated
-    uint64_t instructionsEmulated = 0;
-    
-    /// @brief Processing time (milliseconds)
-    uint32_t processingTimeMs = 0;
-    
-    /// @brief Error message (if failed)
-    std::string errorMessage;
-    
-    /// @brief Warnings
+    UnpackMethod  methodUsed       = UnpackMethod::Static;
+    uint32_t      layersUnpacked   = 0;
+    size_t        originalSize     = 0;
+    size_t        unpackedSize     = 0;
+    float         compressionRatio = 0.0f;
+    uint64_t      instructionsEmulated = 0;
+    uint32_t      processingTimeMs     = 0;
+    std::string   errorMessage;
     std::vector<std::string> warnings;
-    
-    [[nodiscard]] bool IsSuccess() const noexcept { return status == UnpackStatus::Success || status == UnpackStatus::PartialSuccess; }
-    [[nodiscard]] std::string ToJson() const;
+
+    [[nodiscard]] bool IsSuccess() const noexcept {
+        return status == UnpackStatus::Success || status == UnpackStatus::PartialSuccess;
+    }
 };
 
-/**
- * @brief Unpacking options
- */
+/// Unpacking options
 struct UnpackOptions {
-    /// @brief Preferred method
     UnpackMethod preferredMethod = UnpackMethod::Hybrid;
-    
-    /// @brief Maximum layers
-    uint32_t maxLayers = UnpackerConstants::MAX_UNPACKING_LAYERS;
-    
-    /// @brief Maximum emulation instructions
-    uint64_t maxInstructions = UnpackerConstants::MAX_EMULATION_INSTRUCTIONS;
-    
-    /// @brief Timeout (seconds)
-    uint32_t timeoutSeconds = UnpackerConstants::DEFAULT_TIMEOUT_SECONDS;
-    
-    /// @brief Reconstruct imports
-    bool reconstructImports = true;
-    
-    /// @brief Fix PE headers
-    bool fixPEHeaders = true;
-    
-    /// @brief Extract overlay
-    bool extractOverlay = false;
-    
-    /// @brief Dump all layers
-    bool dumpAllLayers = false;
-    
-    /// @brief Anti-anti-debug
-    bool antiAntiDebug = true;
-    
-    [[nodiscard]] bool IsValid() const noexcept;
+    uint32_t maxLayers        = UnpackerConstants::MAX_UNPACKING_LAYERS;
+    uint64_t maxInstructions  = UnpackerConstants::MAX_EMULATION_INSTRUCTIONS;
+    uint32_t timeoutSeconds   = UnpackerConstants::DEFAULT_TIMEOUT_SECONDS;
+    bool     reconstructImports    = true;
+    bool     fixPEHeaders          = true;
+    bool     extractOverlay        = false;
+    bool     dumpAllLayers         = false;
+    bool     antiAntiDebug         = true;
+    bool     enableStaticUnpacking  = true;
+    bool     enableDynamicUnpacking = true;
+
+    [[nodiscard]] uint32_t MaxEmulationTimeMs() const noexcept {
+        return timeoutSeconds * 1000u;
+    }
+    [[nodiscard]] bool IsValid() const noexcept {
+        return maxLayers > 0 && maxLayers <= UnpackerConstants::MAX_UNPACKING_LAYERS;
+    }
 };
 
-/**
- * @brief Statistics
- */
-struct UnpackerStatistics {
-    std::atomic<uint64_t> totalAttempts{0};
-    std::atomic<uint64_t> successfulUnpacks{0};
-    std::atomic<uint64_t> partialUnpacks{0};
-    std::atomic<uint64_t> failedUnpacks{0};
-    std::atomic<uint64_t> staticUnpacks{0};
-    std::atomic<uint64_t> dynamicUnpacks{0};
-    std::atomic<uint64_t> hybridUnpacks{0};
-    std::atomic<uint64_t> timeouts{0};
-    std::atomic<uint64_t> importReconstructions{0};
-    std::atomic<uint64_t> totalInstructionsEmulated{0};
-    std::array<std::atomic<uint64_t>, 32> byPackerType{};
-    TimePoint startTime = Clock::now();
-    
-    void Reset() noexcept;
-    [[nodiscard]] std::string ToJson() const;
-};
-
-/**
- * @brief Configuration
- */
+/// Configuration
 struct PackerUnpackerConfiguration {
-    /// @brief Enable unpacker
     bool enabled = true;
-    
-    /// @brief Default options
     UnpackOptions defaultOptions;
-    
-    /// @brief Maximum concurrent unpacks
     uint32_t maxConcurrentUnpacks = 4;
-    
-    /// @brief Cache unpacked results
-    bool enableCache = true;
-    
-    /// @brief Cache TTL (seconds)
-    uint32_t cacheTtlSeconds = 3600;
-    
-    /// @brief Worker threads
-    uint32_t workerThreads = 2;
-    
-    /// @brief Custom packer scripts path
+    bool     enableCache          = true;
+    uint32_t cacheTtlSeconds      = 3600;
+    uint32_t workerThreads        = 2;
     fs::path scriptsPath;
-    
-    [[nodiscard]] bool IsValid() const noexcept;
+
+    [[nodiscard]] bool IsValid() const noexcept {
+        return workerThreads > 0 && maxConcurrentUnpacks > 0;
+    }
 };
 
 // ============================================================================
@@ -517,7 +349,7 @@ struct PackerUnpackerConfiguration {
 
 using UnpackProgressCallback = std::function<void(uint32_t layer, const std::string& status)>;
 using UnpackCompleteCallback = std::function<void(const UnpackResult& result)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using UnpackerErrorCallback  = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
 // PACKER UNPACKER CLASS
@@ -525,174 +357,132 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
 /**
  * @class PackerUnpacker
- * @brief Enterprise packer unpacking
+ * @brief Enterprise-grade packer detection and unpacking engine.
+ *
+ * Meyers' singleton.  All public methods are thread-safe.
  */
 class PackerUnpacker final {
 public:
+    // ========================================================================
+    // STATISTICS
+    // ========================================================================
+
+    struct Statistics {
+        std::atomic<uint64_t> totalUnpackAttempts{0};
+        std::atomic<uint64_t> successfulUnpacks{0};
+        std::atomic<uint64_t> failedUnpacks{0};
+        std::atomic<uint64_t> packersDetected{0};
+        std::atomic<uint64_t> staticUnpacks{0};
+        std::atomic<uint64_t> dynamicUnpacks{0};
+        std::atomic<uint64_t> oepsFound{0};
+        std::atomic<uint64_t> importsReconstructed{0};
+
+        void Reset() noexcept;
+    };
+
+    // ========================================================================
+    // SINGLETON
+    // ========================================================================
+
     [[nodiscard]] static PackerUnpacker& Instance() noexcept;
-    [[nodiscard]] static bool HasInstance() noexcept;
-    
-    PackerUnpacker(const PackerUnpacker&) = delete;
+
+    PackerUnpacker(const PackerUnpacker&)            = delete;
     PackerUnpacker& operator=(const PackerUnpacker&) = delete;
-    PackerUnpacker(PackerUnpacker&&) = delete;
-    PackerUnpacker& operator=(PackerUnpacker&&) = delete;
+    PackerUnpacker(PackerUnpacker&&)                 = delete;
+    PackerUnpacker& operator=(PackerUnpacker&&)      = delete;
 
     // ========================================================================
     // LIFECYCLE
     // ========================================================================
-    
-    [[nodiscard]] bool Initialize(const PackerUnpackerConfiguration& config = {});
-    void Shutdown();
+
+    [[nodiscard]] bool Initialize(UnpackError* err = nullptr) noexcept;
+    void Shutdown() noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] UnpackerStatus GetStatus() const noexcept;
 
     // ========================================================================
     // PACKER DETECTION
     // ========================================================================
-    
-    /// @brief Detect packer in file
-    [[nodiscard]] PackerDetectionResult DetectPacker(const fs::path& filePath);
-    
-    /// @brief Detect packer in buffer
-    [[nodiscard]] PackerDetectionResult DetectPacker(std::span<const uint8_t> data);
-    
-    /// @brief Is file packed
-    [[nodiscard]] bool IsPacked(const fs::path& filePath);
-    
-    /// @brief Is buffer packed
-    [[nodiscard]] bool IsPacked(std::span<const uint8_t> data);
+
+    [[nodiscard]] PackerDetectionResult DetectPacker(const fs::path& filePath) noexcept;
+    [[nodiscard]] PackerDetectionResult DetectPacker(std::span<const uint8_t> data) noexcept;
 
     // ========================================================================
     // UNPACKING
     // ========================================================================
-    
-    /// @brief Unpack file
-    [[nodiscard]] UnpackResult UnpackFile(const fs::path& filePath, const UnpackOptions& options = {});
-    
-    /// @brief Unpack buffer (legacy interface)
-    [[nodiscard]] bool Unpack(const std::vector<uint8_t>& input, std::vector<uint8_t>& output);
-    
-    /// @brief Unpack buffer with full result
-    [[nodiscard]] UnpackResult UnpackBuffer(std::span<const uint8_t> input, const UnpackOptions& options = {});
-    
-    /// @brief Async unpack
-    void UnpackAsync(const fs::path& filePath, UnpackCompleteCallback callback, const UnpackOptions& options = {});
+
+    [[nodiscard]] UnpackResult UnpackFile(const fs::path& filePath,
+                                          const UnpackOptions& options = {}) noexcept;
+    [[nodiscard]] UnpackResult StaticUnpack(std::span<const uint8_t> data,
+                                            PackerType type) noexcept;
+    [[nodiscard]] UnpackResult DynamicUnpack(std::span<const uint8_t> data,
+                                             const UnpackOptions& options = {}) noexcept;
 
     // ========================================================================
-    // STATIC UNPACKING
+    // OEP DETECTION
     // ========================================================================
-    
-    /// @brief Static unpack UPX
-    [[nodiscard]] UnpackResult UnpackUPX(std::span<const uint8_t> data);
-    
-    /// @brief Static unpack ASPack
-    [[nodiscard]] UnpackResult UnpackASPack(std::span<const uint8_t> data);
-    
-    /// @brief Static unpack MPRESS
-    [[nodiscard]] UnpackResult UnpackMPRESS(std::span<const uint8_t> data);
-    
-    /// @brief Static unpack by detected type
-    [[nodiscard]] UnpackResult StaticUnpack(std::span<const uint8_t> data, PackerType type);
 
-    // ========================================================================
-    // DYNAMIC UNPACKING
-    // ========================================================================
-    
-    /// @brief Dynamic unpack using emulation
-    [[nodiscard]] UnpackResult DynamicUnpack(std::span<const uint8_t> data, const UnpackOptions& options = {});
-    
-    /// @brief Find Original Entry Point
-    [[nodiscard]] std::optional<uint64_t> FindOEP(std::span<const uint8_t> data);
+    [[nodiscard]] std::optional<uint64_t> FindOEP(std::span<const uint8_t> data) noexcept;
 
     // ========================================================================
     // IMPORT RECONSTRUCTION
     // ========================================================================
-    
-    /// @brief Reconstruct imports
-    [[nodiscard]] std::vector<ImportEntry> ReconstructImports(
+
+    [[nodiscard]] std::optional<ReconstructedImports> ReconstructImports(
         std::span<const uint8_t> unpackedData,
-        uint64_t imageBase);
-    
-    /// @brief Rebuild IAT
-    [[nodiscard]] bool RebuildIAT(
-        std::vector<uint8_t>& peData,
-        const std::vector<ImportEntry>& imports);
+        const ImportReconstructionOptions& options = {}) noexcept;
 
     // ========================================================================
     // PE RECONSTRUCTION
     // ========================================================================
-    
-    /// @brief Fix PE headers
-    [[nodiscard]] bool FixPEHeaders(std::vector<uint8_t>& peData, uint64_t oep);
-    
-    /// @brief Realign sections
-    [[nodiscard]] bool RealignSections(std::vector<uint8_t>& peData);
-    
-    /// @brief Extract overlay
-    [[nodiscard]] std::vector<uint8_t> ExtractOverlay(std::span<const uint8_t> data);
+
+    [[nodiscard]] std::optional<std::vector<uint8_t>> FixPEHeaders(
+        std::span<const uint8_t> data,
+        uint64_t newEntryPoint,
+        const ReconstructedImports* imports = nullptr) noexcept;
 
     // ========================================================================
-    // CALLBACKS
+    // ARCHIVE / SELF-EXTRACTOR
     // ========================================================================
-    
-    void RegisterProgressCallback(UnpackProgressCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
-    void UnregisterCallbacks();
 
-    // ========================================================================
-    // CACHE
-    // ========================================================================
-    
-    /// @brief Get cached result
-    [[nodiscard]] std::optional<UnpackResult> GetCachedResult(const std::string& hash) const;
-    
-    /// @brief Clear cache
-    void ClearCache();
+    [[nodiscard]] std::vector<fs::path> ExtractArchive(
+        const fs::path& archivePath,
+        uint32_t maxDepth = UnpackerConstants::MAX_ARCHIVE_DEPTH) noexcept;
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
-    
-    [[nodiscard]] UnpackerStatistics GetStatistics() const;
-    void ResetStatistics();
-    
+
+    [[nodiscard]] const Statistics& GetStatistics() const noexcept;
+    void ResetStatistics() noexcept;
+
     [[nodiscard]] std::vector<std::string> GetSupportedPackers() const;
-    [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
-    PackerUnpacker();
+    PackerUnpacker() noexcept;
     ~PackerUnpacker();
-    
-    std::unique_ptr<PackerUnpackerImpl> m_impl;
-    static std::atomic<bool> s_instanceCreated;
+
+    struct Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 // ============================================================================
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetPackerTypeName(PackerType type) noexcept;
-[[nodiscard]] std::string_view GetUnpackMethodName(UnpackMethod method) noexcept;
-[[nodiscard]] std::string_view GetUnpackStatusName(UnpackStatus status) noexcept;
-[[nodiscard]] std::string_view GetOEPDetectionMethodName(OEPDetectionMethod method) noexcept;
-
-/// @brief Calculate section entropy
-[[nodiscard]] float CalculateSectionEntropy(std::span<const uint8_t> data);
-
-/// @brief Is high entropy section
-[[nodiscard]] bool IsHighEntropySection(float entropy);
+[[nodiscard]] float CalculateSectionEntropy(std::span<const uint8_t> data) noexcept;
+[[nodiscard]] bool  IsHighEntropySection(float entropy) noexcept;
 
 }  // namespace Engine
 }  // namespace Core
 }  // namespace ShadowStrike
 
 // ============================================================================
-// MACROS
+// CONVENIENCE MACROS
 // ============================================================================
 
 #define SS_IS_PACKED(path) \
-    ::ShadowStrike::Core::Engine::PackerUnpacker::Instance().IsPacked(path)
+    ::ShadowStrike::Core::Engine::PackerUnpacker::Instance().DetectPacker(path).isPacked
 
-#define SS_UNPACK(input, output) \
-    ::ShadowStrike::Core::Engine::PackerUnpacker::Instance().Unpack(input, output)
+#define SS_UNPACK_FILE(path) \
+    ::ShadowStrike::Core::Engine::PackerUnpacker::Instance().UnpackFile(path)
