@@ -114,7 +114,7 @@ def _check_environment(output_dir: Path) -> dict[str, Any]:
     if torch.cuda.is_available():
         env["cuda_device"] = torch.cuda.get_device_name(0)
         env["cuda_memory_gb"] = round(
-            torch.cuda.get_device_properties(0).total_mem / (1024**3), 2
+            torch.cuda.get_device_properties(0).total_memory / (1024**3), 2
         )
 
     disk = shutil.disk_usage(str(output_dir))

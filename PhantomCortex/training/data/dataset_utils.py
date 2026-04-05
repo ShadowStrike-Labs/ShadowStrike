@@ -191,7 +191,7 @@ def split_data(
     rng.shuffle(test_idx)
 
     logger.info(
-        "Split %d samples → train=%d, val=%d, test=%d",
+        "Split %d samples -> train=%d, val=%d, test=%d",
         n,
         len(train_idx),
         len(val_idx),
