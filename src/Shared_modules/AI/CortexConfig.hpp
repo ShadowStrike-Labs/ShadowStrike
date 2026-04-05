@@ -147,17 +147,12 @@ public:
     // ================================================================
 
     /**
-     * @brief Get the current configuration.
-     * @return Const reference to the active CortexConfig.
+     * @brief Get a snapshot of the current configuration.
+     * @return Copy of the active CortexConfig, safe to use without synchronization.
      *
-     * @warning The returned reference is invalidated if a concurrent
-     *          LoadConfig() or LoadFromRegistry() call begins. Callers
-     *          operating in multi-threaded contexts should copy the
-     *          struct if they need a stable snapshot.
-     *
-     * Thread Safety: Shared lock (concurrent reads are safe).
+     * Thread Safety: Shared lock held during copy; caller owns the returned snapshot.
      */
-    [[nodiscard]] const CortexConfig& GetConfig() const noexcept;
+    [[nodiscard]] CortexConfig GetConfig() const noexcept;
 
     // ================================================================
     // Configuration Persistence
@@ -174,8 +169,8 @@ public:
         const std::filesystem::path& configPath) const noexcept;
 
 private:
-    CortexConfigManager() = default;
-    ~CortexConfigManager() = default;
+    CortexConfigManager();
+    ~CortexConfigManager();
 
     /// @brief Opaque implementation — hides JSON parsing, registry I/O, and lock state.
     struct Impl;
