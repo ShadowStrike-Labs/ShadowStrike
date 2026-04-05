@@ -282,10 +282,10 @@ enum class SignatureStatus : uint8_t {
 
 /**
  * @enum PackerType
- * @brief Detected packer/crypter type.
+ * @brief Detected packer/crypter type for FileSystem namespace.
+ * @note Each namespace defines its own PackerType to avoid cross-namespace
+ *       include-guard collisions. Values are compatible across namespaces.
  */
-#ifndef SHADOWSTRIKE_PACKER_TYPE_DEFINED
-#define SHADOWSTRIKE_PACKER_TYPE_DEFINED
 enum class PackerType : uint16_t {
     None = 0,
     UPX = 1,
@@ -304,7 +304,6 @@ enum class PackerType : uint16_t {
     Custom = 100,
     Unknown = 255
 };
-#endif // SHADOWSTRIKE_PACKER_TYPE_DEFINED
 
 /**
  * @enum ImportRiskLevel
@@ -603,7 +602,7 @@ struct alignas(64) DetectedAnomaly {
  */
 struct alignas(64) PackerInfo {
     bool isPacked{ false };
-    PackerType type{ PackerType::None };
+    PackerType packerType{ PackerType::None };
     std::string name;
     std::string version;
 
@@ -696,6 +695,31 @@ struct alignas(256) ExecutableInfo {
     uint32_t overlaySize{ 0 };
 
     std::chrono::system_clock::time_point analysisTime;
+
+    // Advanced APT detection fields
+    bool hasTLSCallbacks{ false };
+    uint32_t tlsCallbackCount{ 0 };
+    std::vector<uint64_t> tlsCallbackRVAs;
+
+    bool hasDelayLoadImports{ false };
+    std::vector<ImportedDLL> delayLoadImports;
+
+    bool hasDebugDirectory{ false };
+    std::string pdbPath;
+    uint32_t debugType{ 0 };
+
+    bool hasOverlappingSections{ false };
+    bool hasEntryPointOutsideCode{ false };
+    bool hasSuspiciousAlignment{ false };
+
+    // Security mitigations detail
+    bool hasCET{ false };           // CET shadow stack
+    bool hasIntegrityCheck{ false }; // FORCE_INTEGRITY
+    bool isAppContainer{ false };
+
+    // Overlay analysis
+    double overlayEntropy{ 0.0 };
+    bool overlayContainsPE{ false };
 };
 
 /**
@@ -720,6 +744,14 @@ struct alignas(32) AnalysisOptions {
     uint32_t minStringLength{ 4 };
 
     size_t maxResourceSize{ 10 * 1024 * 1024 };  // 10 MB
+
+    // Advanced APT detection options
+    bool parseDelayLoadImports{ true };
+    bool parseTLSCallbacks{ true };
+    bool parseDebugDirectory{ true };
+    bool detectOverlappingSections{ true };
+    bool analyzeOverlay{ true };
+    bool detectEntryPointAnomalies{ true };
 
     static AnalysisOptions CreateFull() noexcept;
     static AnalysisOptions CreateQuick() noexcept;
@@ -947,6 +979,53 @@ public:
      */
     [[nodiscard]] std::unordered_map<std::string, std::string> ComputeSectionHashes(
         const std::wstring& filePath) const;
+
+    // ========================================================================
+    // KERNEL SENSOR INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Callback type for kernel-triggered real-time file analysis.
+     * @param filePath Path from kernel scan request.
+     * @param processId PID of the process triggering the event.
+     * @param info Analysis result.
+     */
+    using KernelScanCallback = std::function<void(
+        const std::wstring& filePath,
+        uint32_t processId,
+        const ExecutableInfo& info)>;
+
+    /**
+     * @brief Registers callback for kernel-initiated scan verdicts.
+     * Called by RealTimeProtection when kernel sends FILE_SCAN_REQUEST.
+     */
+    void RegisterKernelScanCallback(KernelScanCallback callback);
+
+    /**
+     * @brief Performs rapid analysis optimized for kernel real-time path.
+     * Uses CreateQuick() options + cached results when possible.
+     * @param filePath Path from kernel event.
+     * @param processId Originating process.
+     * @param fileSize File size from kernel (used for pre-validation).
+     * @return Analysis result with risk score.
+     */
+    [[nodiscard]] ExecutableInfo AnalyzeForKernel(
+        const std::wstring& filePath,
+        uint32_t processId,
+        uint64_t fileSize);
+
+    // ========================================================================
+    // AI/ML PIPELINE INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Extracts static PE features suitable for PhantomCortex ML inference.
+     * Returns a flat float vector matching EMBER-aligned feature layout.
+     * @param info Analyzed executable info.
+     * @return Feature vector for ML model, or nullopt on extraction failure.
+     */
+    [[nodiscard]] std::optional<std::vector<float>> ExtractMLFeatures(
+        const ExecutableInfo& info) const;
 
     // ========================================================================
     // STATISTICS

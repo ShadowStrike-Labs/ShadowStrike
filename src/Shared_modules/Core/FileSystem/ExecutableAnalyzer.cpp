@@ -47,6 +47,7 @@
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
+#include "../../Utils/HashUtils.hpp"
 
 // Windows includes for PE parsing
 #include <Windows.h>
@@ -54,9 +55,11 @@
 #include <wintrust.h>
 #include <softpub.h>
 #include <Imagehlp.h>
+#include <mscat.h>
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "imagehlp.lib")
+#pragma comment(lib, "crypt32.lib")
 
 // Standard library
 #include <algorithm>
@@ -224,6 +227,39 @@ struct RiskyAPIDatabase {
         apis["FindResource"] = {ImportRiskLevel::Low, "Resource access"};
         apis["LoadResource"] = {ImportRiskLevel::Low, "Resource loading"};
         apis["SizeofResource"] = {ImportRiskLevel::Low, "Resource size query"};
+
+        // Critical: Nation-state APT techniques
+        apis["NtAllocateVirtualMemory"] = {ImportRiskLevel::Critical, "Direct syscall memory allocation (injection)"};
+        apis["NtWriteVirtualMemory"] = {ImportRiskLevel::Critical, "Direct syscall memory write (injection)"};
+        apis["NtCreateThreadEx"] = {ImportRiskLevel::Critical, "Direct syscall thread creation (injection)"};
+        apis["NtMapViewOfSection"] = {ImportRiskLevel::Critical, "Section mapping (process hollowing)"};
+        apis["NtUnmapViewOfSection"] = {ImportRiskLevel::Critical, "Section unmapping (process hollowing)"};
+        apis["NtQueueApcThread"] = {ImportRiskLevel::Critical, "APC injection technique"};
+        apis["NtSuspendThread"] = {ImportRiskLevel::High, "Thread suspension (injection prep)"};
+        apis["NtResumeThread"] = {ImportRiskLevel::High, "Thread resume (injection finalization)"};
+        apis["NtCreateSection"] = {ImportRiskLevel::High, "Section creation (process hollowing prep)"};
+        apis["NtProtectVirtualMemory"] = {ImportRiskLevel::High, "Memory protection change via syscall"};
+        apis["NtReadVirtualMemory"] = {ImportRiskLevel::High, "Process memory read via syscall"};
+
+        // Credential theft APIs
+        apis["CredEnumerateW"] = {ImportRiskLevel::Critical, "Credential enumeration (credential theft)"};
+        apis["CredEnumerateA"] = {ImportRiskLevel::Critical, "Credential enumeration (credential theft)"};
+        apis["LsaEnumerateLogonSessions"] = {ImportRiskLevel::Critical, "Logon session enum (mimikatz-like)"};
+        apis["SamConnect"] = {ImportRiskLevel::Critical, "SAM database access (credential dump)"};
+        apis["LdrLoadDll"] = {ImportRiskLevel::High, "Direct DLL loading bypassing LoadLibrary hooks"};
+
+        // Privilege escalation
+        apis["AdjustTokenPrivileges"] = {ImportRiskLevel::High, "Token privilege adjustment (privesc)"};
+        apis["ImpersonateLoggedOnUser"] = {ImportRiskLevel::Critical, "User impersonation (privesc)"};
+        apis["DuplicateToken"] = {ImportRiskLevel::High, "Token duplication (privesc)"};
+        apis["DuplicateTokenEx"] = {ImportRiskLevel::High, "Token duplication (privesc)"};
+        apis["SetTokenInformation"] = {ImportRiskLevel::High, "Token modification (defense evasion)"};
+
+        // Defense evasion
+        apis["NtSetInformationThread"] = {ImportRiskLevel::High, "Thread info manipulation (hide from debugger)"};
+        apis["NtSetInformationProcess"] = {ImportRiskLevel::High, "Process info manipulation (defense evasion)"};
+        apis["AmsiScanBuffer"] = {ImportRiskLevel::Medium, "AMSI interaction (possible bypass prep)"};
+        apis["EtwEventWrite"] = {ImportRiskLevel::Medium, "ETW interaction (possible blind/patch)"};
     }
 
     std::pair<ImportRiskLevel, std::string> GetAPIRisk(const std::string& apiName) const {
@@ -235,7 +271,10 @@ struct RiskyAPIDatabase {
     }
 };
 
-static const RiskyAPIDatabase g_riskyAPIs;
+const RiskyAPIDatabase& GetRiskyAPIs() {
+    static const RiskyAPIDatabase instance;
+    return instance;
+}
 
 /**
  * @brief Packer signature database.
@@ -422,15 +461,6 @@ public:
         try {
             SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initializing...");
 
-            // Verify infrastructure is available
-            if (!HashStore::HashStore::Instance().IsInitialized()) {
-                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: HashStore not initialized, initializing now");
-                if (!HashStore::HashStore::Instance().Initialize()) {
-                    SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Failed to initialize HashStore");
-                    return false;
-                }
-            }
-
             m_initialized = true;
             SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Initialized successfully");
             return true;
@@ -458,6 +488,12 @@ public:
         info.analysisTime = std::chrono::system_clock::now();
 
         try {
+            if (!m_initialized) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Not initialized");
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return info;
+            }
+
             // Validate input
             if (filePath.empty()) {
                 SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Empty file path");
@@ -466,20 +502,28 @@ public:
             }
 
             if (filePath.length() > 32767) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Path too long: %ls", filePath.length());
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Path too long: %zu", filePath.length());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
-            // Check file exists
-            if (!Utils::FileUtils::FileExists(filePath)) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs", Utils::StringUtils::ToNarrow(filePath).c_str());
+            // Check file exists using real FileUtils API
+            if (!Utils::FileUtils::Exists(filePath)) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File not found: %hs",
+                    Utils::StringUtils::ToNarrow(filePath).c_str());
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
-            // Get file size
-            info.fileSize = Utils::FileUtils::GetFileSize(filePath);
+            // Get file size via Stat
+            Utils::FileUtils::FileStat fileStat;
+            if (!Utils::FileUtils::Stat(filePath, fileStat)) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to stat file");
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return info;
+            }
+
+            info.fileSize = fileStat.size;
             if (info.fileSize == 0) {
                 SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: File is empty");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
@@ -492,17 +536,25 @@ public:
                 return info;
             }
 
-            // Memory-map the file for analysis
-            auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
-            if (!fileMapping || fileMapping->size() == 0) {
-                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to memory-map file");
+            // Read file into memory for analysis
+            std::vector<std::byte> fileBytes;
+            Utils::FileUtils::Error fileErr;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes, &fileErr)) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Failed to read file: %hs",
+                    fileErr.message.c_str());
+                m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+                return info;
+            }
+
+            if (fileBytes.empty()) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::Analyze: Read returned empty buffer");
                 m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
                 return info;
             }
 
             std::span<const uint8_t> fileData(
-                static_cast<const uint8_t*>(fileMapping->data()),
-                fileMapping->size()
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
             );
 
             // Analyze the buffer
@@ -538,7 +590,12 @@ public:
             const uint64_t newAvg = (currentAvg + duration.count()) / 2;
             m_stats.averageAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Analyzed %hs in %u μs (type: %u, risk: %hs)", Utils::StringUtils::ToNarrow(filePath).c_str(), duration.count(), static_cast<int>(info.type), info.riskScore);
+            SS_LOG_INFO(L"ExecutableAnalyzer",
+                L"ExecutableAnalyzer: Analyzed %hs in %llu μs (type: %u, risk: %u)",
+                Utils::StringUtils::ToNarrow(filePath).c_str(),
+                static_cast<uint64_t>(duration.count()),
+                static_cast<unsigned>(info.type),
+                static_cast<unsigned>(info.riskScore));
 
             return info;
 
@@ -580,14 +637,17 @@ public:
 
     bool IsPE(const std::wstring& filePath) const {
         try {
-            auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
-            if (!fileMapping || fileMapping->size() < sizeof(IMAGE_DOS_HEADER)) {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
+                return false;
+            }
+            if (fileBytes.size() < sizeof(IMAGE_DOS_HEADER)) {
                 return false;
             }
 
             std::span<const uint8_t> data(
-                static_cast<const uint8_t*>(fileMapping->data()),
-                fileMapping->size()
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
             );
 
             return IsPEBuffer(data);
@@ -607,7 +667,9 @@ public:
             return false;
         }
 
-        if (dosHeader->e_lfanew < 0 ||
+        if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+            dosHeader->e_lfanew > 4096 ||
+            (dosHeader->e_lfanew & 0x3) != 0 ||
             static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS) > buffer.size()) {
             return false;
         }
@@ -677,18 +739,19 @@ public:
 
     std::vector<ImportedDLL> ParseImports(const std::wstring& filePath) const {
         try {
-            auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
-            if (!fileMapping) {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
                 return {};
             }
 
             std::span<const uint8_t> data(
-                static_cast<const uint8_t*>(fileMapping->data()),
-                fileMapping->size()
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
             );
 
             ExecutableInfo info{};
             ParsePEHeaders(data, info);
+            ParseSections(data, info, false);
             return ParseImportsImpl(data, info);
 
         } catch (const std::exception& e) {
@@ -699,18 +762,19 @@ public:
 
     std::vector<ExportedFunction> ParseExports(const std::wstring& filePath) const {
         try {
-            auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
-            if (!fileMapping) {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
                 return {};
             }
 
             std::span<const uint8_t> data(
-                static_cast<const uint8_t*>(fileMapping->data()),
-                fileMapping->size()
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
             );
 
             ExecutableInfo info{};
             ParsePEHeaders(data, info);
+            ParseSections(data, info, false);
             return ParseExportsImpl(data, info);
 
         } catch (const std::exception& e) {
@@ -721,14 +785,14 @@ public:
 
     PackerInfo DetectPacker(const std::wstring& filePath) const {
         try {
-            auto fileMapping = Utils::FileUtils::MemoryMapFile(filePath);
-            if (!fileMapping) {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
                 return PackerInfo{};
             }
 
             std::span<const uint8_t> data(
-                static_cast<const uint8_t*>(fileMapping->data()),
-                fileMapping->size()
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
             );
 
             ExecutableInfo info{};
@@ -759,9 +823,8 @@ public:
         m_stats.Reset();
     }
 
-private:
     // ========================================================================
-    // INTERNAL IMPLEMENTATION
+    // INTERNAL IMPLEMENTATION (accessible via PIMPL forwarding)
     // ========================================================================
 
     ExecutableInfo AnalyzeBufferImpl(std::span<const uint8_t> buffer, const AnalysisOptions& options) {
@@ -862,7 +925,9 @@ private:
             return;
         }
 
-        if (dosHeader->e_lfanew < 0 ||
+        if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
+            dosHeader->e_lfanew > 4096 ||
+            (dosHeader->e_lfanew & 0x3) != 0 ||
             static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > buffer.size()) {
             return;
         }
@@ -1021,9 +1086,14 @@ private:
 
                     // Calculate section hash
                     if (sectionData.size() > 0) {
-                        auto hash = Utils::HashUtils::SHA256(sectionData);
-                        std::copy(hash.begin(), hash.end(), section.sha256.begin());
-                        section.sha256Hex = BytesToHex(hash);
+                        Utils::HashUtils::Hasher sha(Utils::HashUtils::Algorithm::SHA256);
+                        if (sha.Init() && sha.Update(sectionData.data(), sectionData.size())) {
+                            std::vector<uint8_t> digest;
+                            if (sha.Final(digest) && digest.size() == 32) {
+                                std::copy(digest.begin(), digest.end(), section.sha256.begin());
+                                section.sha256Hex = BytesToHex(digest);
+                            }
+                        }
                     }
                 }
             }
@@ -1093,11 +1163,18 @@ private:
             for (size_t i = 0; i < ExecutableAnalyzerConstants::MAX_IMPORTS && importDesc[i].Name != 0; ++i) {
                 ImportedDLL dll;
 
-                // Get DLL name
+                // Get DLL name (bounded read)
                 auto nameOffset = RVAToFileOffset(importDesc[i].Name, info.sections);
                 if (nameOffset.has_value() && nameOffset.value() < buffer.size()) {
-                    const char* dllName = reinterpret_cast<const char*>(buffer.data() + nameOffset.value());
-                    dll.name = dllName;
+                    const size_t nameStart = nameOffset.value();
+                    const size_t maxNameLen = std::min(
+                        buffer.size() - nameStart,
+                        size_t(260)  // MAX_PATH cap for DLL names
+                    );
+                    dll.name = std::string(
+                        reinterpret_cast<const char*>(buffer.data() + nameStart),
+                        strnlen(reinterpret_cast<const char*>(buffer.data() + nameStart), maxNameLen)
+                    );
 
                     // Check if known system DLL
                     std::string lowerName = dll.name;
@@ -1147,59 +1224,86 @@ private:
 
     void ParseImportFunctions(std::span<const uint8_t> buffer, size_t thunkOffset,
                               const ExecutableInfo& info, ImportedDLL& dll) const {
+        const auto& riskyAPIs = GetRiskyAPIs();
+
         if (info.is64Bit) {
-            const auto* thunks = reinterpret_cast<const IMAGE_THUNK_DATA64*>(buffer.data() + thunkOffset);
+            for (size_t i = 0; i < ExecutableAnalyzerConstants::MAX_IMPORTS; ++i) {
+                const size_t entryOffset = thunkOffset + i * sizeof(IMAGE_THUNK_DATA64);
+                if (entryOffset + sizeof(IMAGE_THUNK_DATA64) > buffer.size()) break;
 
-            for (size_t i = 0; i < 10000 && thunks[i].u1.AddressOfData != 0; ++i) {
+                const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA64*>(buffer.data() + entryOffset);
+                if (thunk->u1.AddressOfData == 0) break;
+
                 ImportedFunction func;
-                func.thunkRVA = static_cast<uint64_t>(thunks[i].u1.AddressOfData);
+                func.thunkRVA = static_cast<uint64_t>(thunk->u1.AddressOfData);
 
-                if (IMAGE_SNAP_BY_ORDINAL64(thunks[i].u1.Ordinal)) {
+                if (IMAGE_SNAP_BY_ORDINAL64(thunk->u1.Ordinal)) {
                     func.byOrdinal = true;
-                    func.ordinal = IMAGE_ORDINAL64(thunks[i].u1.Ordinal);
+                    func.ordinal = IMAGE_ORDINAL64(thunk->u1.Ordinal);
                     func.name = "#" + std::to_string(func.ordinal);
                 } else {
-                    auto nameOffset = RVAToFileOffset(static_cast<uint32_t>(thunks[i].u1.AddressOfData), info.sections);
-                    if (nameOffset.has_value() && nameOffset.value() + 2 < buffer.size()) {
+                    auto nameOffset = RVAToFileOffset(static_cast<uint32_t>(thunk->u1.AddressOfData), info.sections);
+                    if (nameOffset.has_value() &&
+                        nameOffset.value() + sizeof(IMAGE_IMPORT_BY_NAME) <= buffer.size()) {
                         const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                             buffer.data() + nameOffset.value()
                         );
-                        func.name = reinterpret_cast<const char*>(importByName->Name);
+                        // Safe bounded string read — find null terminator within buffer
+                        const size_t nameStart = nameOffset.value() + offsetof(IMAGE_IMPORT_BY_NAME, Name);
+                        const size_t maxNameLen = std::min(
+                            buffer.size() - nameStart,
+                            size_t(512)  // Cap function name length
+                        );
+                        func.name = std::string(
+                            reinterpret_cast<const char*>(buffer.data() + nameStart),
+                            strnlen(reinterpret_cast<const char*>(buffer.data() + nameStart), maxNameLen)
+                        );
                         func.ordinal = importByName->Hint;
                     }
                 }
 
-                // Assess risk
-                auto [riskLevel, reason] = g_riskyAPIs.GetAPIRisk(func.name);
+                auto [riskLevel, reason] = riskyAPIs.GetAPIRisk(func.name);
                 func.riskLevel = riskLevel;
                 func.riskReason = reason;
 
                 dll.functions.push_back(std::move(func));
             }
         } else {
-            const auto* thunks = reinterpret_cast<const IMAGE_THUNK_DATA32*>(buffer.data() + thunkOffset);
+            for (size_t i = 0; i < ExecutableAnalyzerConstants::MAX_IMPORTS; ++i) {
+                const size_t entryOffset = thunkOffset + i * sizeof(IMAGE_THUNK_DATA32);
+                if (entryOffset + sizeof(IMAGE_THUNK_DATA32) > buffer.size()) break;
 
-            for (size_t i = 0; i < 10000 && thunks[i].u1.AddressOfData != 0; ++i) {
+                const auto* thunk = reinterpret_cast<const IMAGE_THUNK_DATA32*>(buffer.data() + entryOffset);
+                if (thunk->u1.AddressOfData == 0) break;
+
                 ImportedFunction func;
-                func.thunkRVA = thunks[i].u1.AddressOfData;
+                func.thunkRVA = thunk->u1.AddressOfData;
 
-                if (IMAGE_SNAP_BY_ORDINAL32(thunks[i].u1.Ordinal)) {
+                if (IMAGE_SNAP_BY_ORDINAL32(thunk->u1.Ordinal)) {
                     func.byOrdinal = true;
-                    func.ordinal = IMAGE_ORDINAL32(thunks[i].u1.Ordinal);
+                    func.ordinal = IMAGE_ORDINAL32(thunk->u1.Ordinal);
                     func.name = "#" + std::to_string(func.ordinal);
                 } else {
-                    auto nameOffset = RVAToFileOffset(thunks[i].u1.AddressOfData, info.sections);
-                    if (nameOffset.has_value() && nameOffset.value() + 2 < buffer.size()) {
+                    auto nameOffset = RVAToFileOffset(thunk->u1.AddressOfData, info.sections);
+                    if (nameOffset.has_value() &&
+                        nameOffset.value() + sizeof(IMAGE_IMPORT_BY_NAME) <= buffer.size()) {
                         const auto* importByName = reinterpret_cast<const IMAGE_IMPORT_BY_NAME*>(
                             buffer.data() + nameOffset.value()
                         );
-                        func.name = reinterpret_cast<const char*>(importByName->Name);
+                        const size_t nameStart = nameOffset.value() + offsetof(IMAGE_IMPORT_BY_NAME, Name);
+                        const size_t maxNameLen = std::min(
+                            buffer.size() - nameStart,
+                            size_t(512)
+                        );
+                        func.name = std::string(
+                            reinterpret_cast<const char*>(buffer.data() + nameStart),
+                            strnlen(reinterpret_cast<const char*>(buffer.data() + nameStart), maxNameLen)
+                        );
                         func.ordinal = importByName->Hint;
                     }
                 }
 
-                // Assess risk
-                auto [riskLevel, reason] = g_riskyAPIs.GetAPIRisk(func.name);
+                auto [riskLevel, reason] = riskyAPIs.GetAPIRisk(func.name);
                 func.riskLevel = riskLevel;
                 func.riskReason = reason;
 
@@ -1216,25 +1320,27 @@ private:
                 return exports;
             }
 
-            // Get export directory RVA
             const size_t ntHeaderOffset = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
 
             uint32_t exportDirRVA = 0;
+            uint32_t exportDirSize = 0;
 
             if (info.is64Bit) {
                 const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntHeaderOffset);
                 if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
                     exportDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                    exportDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
                 }
             } else {
                 const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntHeaderOffset);
                 if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
                     exportDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+                    exportDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].Size;
                 }
             }
 
-            if (exportDirRVA == 0) {
-                return exports;  // No exports
+            if (exportDirRVA == 0 || exportDirSize == 0) {
+                return exports;
             }
 
             auto exportDirOffset = RVAToFileOffset(exportDirRVA, info.sections);
@@ -1249,13 +1355,90 @@ private:
             const uint32_t numFunctions = exportDir->NumberOfFunctions;
             const uint32_t numNames = exportDir->NumberOfNames;
 
-            if (numFunctions > ExecutableAnalyzerConstants::MAX_EXPORTS) {
-                SS_LOG_WARN(L"ExecutableAnalyzer", L"ExecutableAnalyzer: Too many exports: %u", numFunctions);
+            if (numFunctions > ExecutableAnalyzerConstants::MAX_EXPORTS || numFunctions == 0) {
                 return exports;
             }
 
-            // Parse exports (simplified version)
-            // Full implementation would parse AddressOfFunctions, AddressOfNames, AddressOfNameOrdinals arrays
+            // Parse AddressOfFunctions array
+            auto functionsOffset = RVAToFileOffset(exportDir->AddressOfFunctions, info.sections);
+            if (!functionsOffset.has_value() ||
+                functionsOffset.value() + numFunctions * sizeof(uint32_t) > buffer.size()) {
+                return exports;
+            }
+            const auto* functionRVAs = reinterpret_cast<const uint32_t*>(
+                buffer.data() + functionsOffset.value()
+            );
+
+            // Parse AddressOfNames and AddressOfNameOrdinals arrays
+            const uint32_t* nameRVAs = nullptr;
+            const uint16_t* nameOrdinals = nullptr;
+
+            if (numNames > 0) {
+                auto namesOffset = RVAToFileOffset(exportDir->AddressOfNames, info.sections);
+                auto ordinalsOffset = RVAToFileOffset(exportDir->AddressOfNameOrdinals, info.sections);
+
+                if (namesOffset.has_value() &&
+                    namesOffset.value() + numNames * sizeof(uint32_t) <= buffer.size()) {
+                    nameRVAs = reinterpret_cast<const uint32_t*>(buffer.data() + namesOffset.value());
+                }
+
+                if (ordinalsOffset.has_value() &&
+                    ordinalsOffset.value() + numNames * sizeof(uint16_t) <= buffer.size()) {
+                    nameOrdinals = reinterpret_cast<const uint16_t*>(buffer.data() + ordinalsOffset.value());
+                }
+            }
+
+            // Build name-to-ordinal map for named exports
+            std::unordered_map<uint16_t, std::string> ordinalToName;
+            if (nameRVAs && nameOrdinals) {
+                for (uint32_t i = 0; i < numNames; ++i) {
+                    auto nameOff = RVAToFileOffset(nameRVAs[i], info.sections);
+                    if (nameOff.has_value() && nameOff.value() < buffer.size()) {
+                        const size_t maxLen = std::min(buffer.size() - nameOff.value(), size_t(512));
+                        std::string name(
+                            reinterpret_cast<const char*>(buffer.data() + nameOff.value()),
+                            strnlen(reinterpret_cast<const char*>(buffer.data() + nameOff.value()), maxLen)
+                        );
+                        ordinalToName[nameOrdinals[i]] = std::move(name);
+                    }
+                }
+            }
+
+            // Build export entries
+            exports.reserve(std::min(numFunctions, uint32_t(4096)));
+            for (uint32_t i = 0; i < numFunctions; ++i) {
+                if (functionRVAs[i] == 0) continue;
+
+                ExportedFunction func;
+                func.ordinal = static_cast<uint16_t>(exportDir->Base + i);
+                func.rva = functionRVAs[i];
+
+                auto nameIt = ordinalToName.find(static_cast<uint16_t>(i));
+                if (nameIt != ordinalToName.end()) {
+                    func.name = nameIt->second;
+                }
+
+                // Detect forwarded exports (RVA points within export directory)
+                if (functionRVAs[i] >= exportDirRVA &&
+                    functionRVAs[i] < exportDirRVA + exportDirSize) {
+                    func.isForwarded = true;
+                    auto fwdOffset = RVAToFileOffset(functionRVAs[i], info.sections);
+                    if (fwdOffset.has_value() && fwdOffset.value() < buffer.size()) {
+                        const size_t maxLen = std::min(buffer.size() - fwdOffset.value(), size_t(512));
+                        func.forwardedTo = std::string(
+                            reinterpret_cast<const char*>(buffer.data() + fwdOffset.value()),
+                            strnlen(reinterpret_cast<const char*>(buffer.data() + fwdOffset.value()), maxLen)
+                        );
+                    }
+                }
+
+                // Flag suspicious exports (common in malicious DLLs)
+                if (func.name.empty() && !func.isForwarded) {
+                    func.isSuspicious = true;  // Ordinal-only exports are suspicious
+                }
+
+                exports.push_back(std::move(func));
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseExportsImpl: %hs", e.what());
@@ -1267,8 +1450,171 @@ private:
     std::vector<ResourceEntry> ParseResourcesImpl(std::span<const uint8_t> buffer, const ExecutableInfo& info) const {
         std::vector<ResourceEntry> resources;
 
-        // Resource parsing is complex - simplified implementation
-        // Full implementation would recursively parse resource directory tree
+        try {
+            if (info.sections.empty()) return resources;
+
+            const size_t ntHeaderOffset = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
+
+            uint32_t rsrcDirRVA = 0;
+            uint32_t rsrcDirSize = 0;
+
+            if (info.is64Bit) {
+                const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntHeaderOffset);
+                if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+                    rsrcDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+                    rsrcDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+                }
+            } else {
+                const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntHeaderOffset);
+                if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_RESOURCE) {
+                    rsrcDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].VirtualAddress;
+                    rsrcDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_RESOURCE].Size;
+                }
+            }
+
+            if (rsrcDirRVA == 0 || rsrcDirSize == 0) return resources;
+
+            auto rsrcOffset = RVAToFileOffset(rsrcDirRVA, info.sections);
+            if (!rsrcOffset.has_value()) return resources;
+
+            const size_t rsrcBase = rsrcOffset.value();
+            if (rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) return resources;
+
+            // Parse top-level resource directory (Type level)
+            const auto* rootDir = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(buffer.data() + rsrcBase);
+            const uint16_t numEntries = rootDir->NumberOfNamedEntries + rootDir->NumberOfIdEntries;
+
+            if (numEntries > ExecutableAnalyzerConstants::MAX_RESOURCES) return resources;
+
+            const auto* entries = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(
+                buffer.data() + rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY)
+            );
+
+            for (uint16_t i = 0; i < numEntries; ++i) {
+                const size_t entryOffset = rsrcBase + sizeof(IMAGE_RESOURCE_DIRECTORY) +
+                    i * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
+                if (entryOffset + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+
+                const auto& entry = entries[i];
+                if (!entry.DataIsDirectory) continue;
+
+                // Descend to Name/ID level
+                const size_t nameDir = rsrcBase + entry.OffsetToDirectory;
+                if (nameDir + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) continue;
+
+                const auto* nameDirPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(
+                    buffer.data() + nameDir
+                );
+                const uint16_t nameEntries = nameDirPtr->NumberOfNamedEntries + nameDirPtr->NumberOfIdEntries;
+                const auto* nameEntriesPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(
+                    buffer.data() + nameDir + sizeof(IMAGE_RESOURCE_DIRECTORY)
+                );
+
+                for (uint16_t j = 0; j < nameEntries && resources.size() < ExecutableAnalyzerConstants::MAX_RESOURCES; ++j) {
+                    const size_t nameEntryOff = nameDir + sizeof(IMAGE_RESOURCE_DIRECTORY) +
+                        j * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
+                    if (nameEntryOff + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+
+                    const auto& nameEntry = nameEntriesPtr[j];
+                    if (!nameEntry.DataIsDirectory) continue;
+
+                    // Descend to Language level
+                    const size_t langDir = rsrcBase + nameEntry.OffsetToDirectory;
+                    if (langDir + sizeof(IMAGE_RESOURCE_DIRECTORY) > buffer.size()) continue;
+
+                    const auto* langDirPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY*>(
+                        buffer.data() + langDir
+                    );
+                    const uint16_t langEntries = langDirPtr->NumberOfNamedEntries + langDirPtr->NumberOfIdEntries;
+                    const auto* langEntriesPtr = reinterpret_cast<const IMAGE_RESOURCE_DIRECTORY_ENTRY*>(
+                        buffer.data() + langDir + sizeof(IMAGE_RESOURCE_DIRECTORY)
+                    );
+
+                    for (uint16_t k = 0; k < langEntries && resources.size() < ExecutableAnalyzerConstants::MAX_RESOURCES; ++k) {
+                        const size_t langEntryOff = langDir + sizeof(IMAGE_RESOURCE_DIRECTORY) +
+                            k * sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY);
+                        if (langEntryOff + sizeof(IMAGE_RESOURCE_DIRECTORY_ENTRY) > buffer.size()) break;
+
+                        const auto& langEntry = langEntriesPtr[k];
+                        if (langEntry.DataIsDirectory) continue;
+
+                        // Get data entry
+                        const size_t dataEntryOff = rsrcBase + langEntry.OffsetToData;
+                        if (dataEntryOff + sizeof(IMAGE_RESOURCE_DATA_ENTRY) > buffer.size()) continue;
+
+                        const auto* dataEntry = reinterpret_cast<const IMAGE_RESOURCE_DATA_ENTRY*>(
+                            buffer.data() + dataEntryOff
+                        );
+
+                        ResourceEntry res;
+                        res.type = entry.Id;
+                        res.id = nameEntry.Id;
+                        res.language = langEntry.Id;
+                        res.size = dataEntry->Size;
+
+                        // Map resource type IDs to names
+                        switch (res.type) {
+                            case 1:  res.typeName = "RT_CURSOR"; break;
+                            case 2:  res.typeName = "RT_BITMAP"; break;
+                            case 3:  res.typeName = "RT_ICON"; break;
+                            case 4:  res.typeName = "RT_MENU"; break;
+                            case 5:  res.typeName = "RT_DIALOG"; break;
+                            case 6:  res.typeName = "RT_STRING"; break;
+                            case 9:  res.typeName = "RT_ACCELERATOR"; break;
+                            case 10: res.typeName = "RT_RCDATA"; break;
+                            case 14: res.typeName = "RT_GROUP_ICON"; break;
+                            case 16: res.typeName = "RT_VERSION"; break;
+                            case 24: res.typeName = "RT_MANIFEST"; break;
+                            default: res.typeName = "RT_UNKNOWN(" + std::to_string(res.type) + ")"; break;
+                        }
+
+                        // Check for embedded PE in resources (malware hiding technique)
+                        auto resDataOffset = RVAToFileOffset(dataEntry->OffsetToData, info.sections);
+                        if (resDataOffset.has_value() && dataEntry->Size >= 2) {
+                            const size_t resStart = resDataOffset.value();
+                            const size_t resEnd = std::min(resStart + dataEntry->Size, buffer.size());
+                            if (resStart < resEnd) {
+                                res.offset = static_cast<uint32_t>(resStart);
+
+                                // Check for MZ header in resource data
+                                if (resEnd - resStart >= sizeof(IMAGE_DOS_HEADER)) {
+                                    const auto* mz = reinterpret_cast<const IMAGE_DOS_HEADER*>(
+                                        buffer.data() + resStart
+                                    );
+                                    if (mz->e_magic == ExecutableAnalyzerConstants::DOS_SIGNATURE) {
+                                        res.isPE = true;
+                                    }
+                                }
+
+                                // Check for script content
+                                if (resEnd - resStart >= 10) {
+                                    const auto* textStart = reinterpret_cast<const char*>(buffer.data() + resStart);
+                                    std::string_view preview(textStart, std::min(resEnd - resStart, size_t(64)));
+                                    if (preview.find("powershell") != std::string_view::npos ||
+                                        preview.find("wscript") != std::string_view::npos ||
+                                        preview.find("cscript") != std::string_view::npos ||
+                                        preview.find("cmd /c") != std::string_view::npos) {
+                                        res.isScript = true;
+                                    }
+                                }
+
+                                // Calculate resource entropy
+                                std::span<const uint8_t> resData = buffer.subspan(resStart, resEnd - resStart);
+                                res.entropy = CalculateEntropy(resData);
+                                if (res.entropy >= ExecutableAnalyzerConstants::HIGH_ENTROPY_THRESHOLD) {
+                                    res.isEncrypted = true;
+                                }
+                            }
+                        }
+
+                        resources.push_back(std::move(res));
+                    }
+                }
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::ParseResourcesImpl: %hs", e.what());
+        }
 
         return resources;
     }
@@ -1282,28 +1628,134 @@ private:
             }
 
             const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data());
-
-            // Rich header is located between DOS stub and PE header
-            // Look for "Rich" signature (backwards from PE header)
             const size_t peOffset = dosHeader->e_lfanew;
-            if (peOffset < 128 || peOffset > buffer.size()) {
+
+            if (peOffset < 128 || peOffset > buffer.size() || peOffset > 4096) {
                 return richHeader;
             }
 
-            // Search for "Rich" signature
-            const uint32_t richSignature = 0x68636952;  // "Rich"
+            // Search for "Rich" signature (backwards from PE header)
+            constexpr uint32_t RICH_SIGNATURE = 0x68636952;  // "Rich"
+            constexpr uint32_t DANS_SIGNATURE = 0x536E6144;  // "DanS"
 
-            for (size_t i = peOffset - 4; i >= sizeof(IMAGE_DOS_HEADER) && i > peOffset - 256; i -= 4) {
-                const uint32_t* dword = reinterpret_cast<const uint32_t*>(buffer.data() + i);
-                if (*dword == richSignature) {
-                    richHeader.present = true;
-                    richHeader.checksum = *(dword + 1);
+            size_t richOffset = 0;
+            // Use checked arithmetic: start from peOffset - 8 (need 4 for "Rich" + 4 for checksum)
+            if (peOffset < 8) return richHeader;
 
-                    // Rich header found - could parse entries here
-                    // Entries are XORed with checksum
-
+            for (size_t i = peOffset - 8; i >= sizeof(IMAGE_DOS_HEADER); i -= 4) {
+                if (i + 4 > buffer.size()) break;
+                const uint32_t dword = *reinterpret_cast<const uint32_t*>(buffer.data() + i);
+                if (dword == RICH_SIGNATURE) {
+                    richOffset = i;
                     break;
                 }
+                if (i < sizeof(IMAGE_DOS_HEADER) + 4) break;  // Prevent underflow
+            }
+
+            if (richOffset == 0) return richHeader;
+
+            // Checksum is the DWORD immediately after "Rich"
+            if (richOffset + 8 > buffer.size()) return richHeader;
+            const uint32_t xorKey = *reinterpret_cast<const uint32_t*>(buffer.data() + richOffset + 4);
+
+            richHeader.present = true;
+            richHeader.checksum = xorKey;
+
+            // Find "DanS" signature (start of rich header, XORed with key)
+            size_t dansOffset = 0;
+            for (size_t i = sizeof(IMAGE_DOS_HEADER); i < richOffset; i += 4) {
+                if (i + 4 > buffer.size()) break;
+                const uint32_t dword = *reinterpret_cast<const uint32_t*>(buffer.data() + i);
+                if ((dword ^ xorKey) == DANS_SIGNATURE) {
+                    dansOffset = i;
+                    break;
+                }
+            }
+
+            if (dansOffset == 0) {
+                richHeader.isPossibleFake = true;
+                return richHeader;
+            }
+
+            // Entries start after DanS + 3 padding DWORDs (all XORed with key)
+            const size_t entriesStart = dansOffset + 16;  // DanS + 3 padding
+            if (entriesStart >= richOffset) return richHeader;
+
+            const size_t entriesSize = richOffset - entriesStart;
+            if (entriesSize % 8 != 0) {
+                richHeader.isPossibleFake = true;
+                return richHeader;
+            }
+
+            const size_t numEntries = entriesSize / 8;
+            if (numEntries > 256) {
+                richHeader.isPossibleFake = true;
+                return richHeader;
+            }
+
+            richHeader.entries.reserve(numEntries);
+            for (size_t i = 0; i < numEntries; ++i) {
+                const size_t off = entriesStart + i * 8;
+                if (off + 8 > buffer.size()) break;
+
+                const uint32_t compId = *reinterpret_cast<const uint32_t*>(buffer.data() + off) ^ xorKey;
+                const uint32_t count = *reinterpret_cast<const uint32_t*>(buffer.data() + off + 4) ^ xorKey;
+
+                RichHeaderEntry entry;
+                entry.productId = static_cast<uint16_t>(compId >> 16);
+                entry.buildId = static_cast<uint16_t>(compId & 0xFFFF);
+                entry.count = count;
+
+                // Map known product IDs to names (for attribution/APT tracking)
+                switch (entry.productId) {
+                    case 1: entry.productName = "Import0"; break;
+                    case 4: entry.productName = "Linker510"; break;
+                    case 5: entry.productName = "Cvtomf510"; break;
+                    case 6: entry.productName = "Linker600"; break;
+                    case 10: entry.productName = "Linker622"; break;
+                    case 19: entry.productName = "Linker700"; break;
+                    case 40: entry.productName = "Linker710"; break;
+                    case 45: entry.productName = "Linker800"; break;
+                    case 83: entry.productName = "Linker900"; break;
+                    case 93: entry.productName = "Linker1000"; break;
+                    case 170: entry.productName = "Linker1100"; break;
+                    case 199: entry.productName = "Linker1200"; break;
+                    case 219: entry.productName = "Linker1210"; break;
+                    case 258: entry.productName = "Linker1400"; break;
+                    default:
+                        entry.productName = "ProdId" + std::to_string(entry.productId);
+                        break;
+                }
+
+                // Extract linker version from highest product ID entry
+                if (entry.productId >= 258) {
+                    richHeader.linkerVersion = "MSVC " + std::to_string(entry.productId) +
+                        " (build " + std::to_string(entry.buildId) + ")";
+                }
+
+                richHeader.entries.push_back(std::move(entry));
+            }
+
+            // Validate checksum: compute expected and compare
+            uint32_t computedChecksum = static_cast<uint32_t>(dansOffset);  // Initial value = offset of DanS
+            // Rotate-add the DOS header bytes (excluding e_lfanew at offset 0x3C)
+            for (size_t i = 0; i < dansOffset; ++i) {
+                if (i >= 0x3C && i < 0x40) continue;  // Skip e_lfanew
+                if (i >= buffer.size()) break;
+                computedChecksum += _rotl(buffer[i], static_cast<int>(i));
+            }
+            // Add each entry's contribution
+            for (const auto& entry : richHeader.entries) {
+                uint32_t compId = (static_cast<uint32_t>(entry.productId) << 16) | entry.buildId;
+                computedChecksum += _rotl(compId, static_cast<int>(entry.count & 0x1F));
+            }
+
+            richHeader.valid = (computedChecksum == xorKey);
+            if (!richHeader.valid) {
+                richHeader.isPossibleFake = true;
+                SS_LOG_WARN(L"ExecutableAnalyzer",
+                    L"Rich header checksum mismatch: expected 0x%08X, computed 0x%08X",
+                    xorKey, computedChecksum);
             }
 
         } catch (const std::exception& e) {
@@ -1321,28 +1773,73 @@ private:
                 return dotNet;
             }
 
-            // Get CLR directory RVA
             const size_t ntHeaderOffset = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
 
             uint32_t clrDirRVA = 0;
+            uint32_t clrDirSize = 0;
 
             if (info.is64Bit) {
                 const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntHeaderOffset);
                 if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) {
                     clrDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
+                    clrDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size;
                 }
             } else {
                 const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntHeaderOffset);
                 if (ntHeaders->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR) {
                     clrDirRVA = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
+                    clrDirSize = ntHeaders->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].Size;
                 }
             }
 
-            if (clrDirRVA != 0) {
-                dotNet.isDotNet = true;
+            if (clrDirRVA == 0 || clrDirSize < sizeof(IMAGE_COR20_HEADER)) {
+                return dotNet;
+            }
 
-                // Could parse IMAGE_COR20_HEADER here for detailed .NET info
-                // For now, just mark as .NET
+            auto clrOffset = RVAToFileOffset(clrDirRVA, info.sections);
+            if (!clrOffset.has_value() || clrOffset.value() + sizeof(IMAGE_COR20_HEADER) > buffer.size()) {
+                return dotNet;
+            }
+
+            const auto* corHeader = reinterpret_cast<const IMAGE_COR20_HEADER*>(
+                buffer.data() + clrOffset.value()
+            );
+
+            dotNet.isDotNet = true;
+            dotNet.majorRuntimeVersion = corHeader->MajorRuntimeVersion;
+            dotNet.minorRuntimeVersion = corHeader->MinorRuntimeVersion;
+            dotNet.flags = corHeader->Flags;
+
+            // Check COMIMAGE_FLAGS_ILONLY = 0x00000001
+            // COMIMAGE_FLAGS_32BITREQUIRED = 0x00000002
+            // COMIMAGE_FLAGS_IL_LIBRARY = 0x00000004
+            // COMIMAGE_FLAGS_NATIVE_ENTRYPOINT = 0x00000010
+
+            dotNet.isNativeImage = (corHeader->Flags & 0x00000010) != 0;
+            dotNet.isMixedMode = !(corHeader->Flags & 0x00000001);  // Not IL-only = mixed mode
+
+            // Parse metadata root if present
+            if (corHeader->MetaData.VirtualAddress != 0 && corHeader->MetaData.Size >= 20) {
+                auto metaOffset = RVAToFileOffset(corHeader->MetaData.VirtualAddress, info.sections);
+                if (metaOffset.has_value() && metaOffset.value() + 20 <= buffer.size()) {
+                    const size_t metaBase = metaOffset.value();
+                    const size_t metaEnd = std::min(metaBase + corHeader->MetaData.Size, buffer.size());
+
+                    // Metadata root starts with signature 0x424A5342 ("BSJB")
+                    if (metaEnd - metaBase >= 16) {
+                        const uint32_t metaSig = *reinterpret_cast<const uint32_t*>(buffer.data() + metaBase);
+                        if (metaSig == 0x424A5342) {
+                            // Read version string at offset 12
+                            const uint32_t versionLen = *reinterpret_cast<const uint32_t*>(buffer.data() + metaBase + 12);
+                            if (versionLen > 0 && versionLen <= 256 && metaBase + 16 + versionLen <= metaEnd) {
+                                dotNet.targetFramework = std::string(
+                                    reinterpret_cast<const char*>(buffer.data() + metaBase + 16),
+                                    strnlen(reinterpret_cast<const char*>(buffer.data() + metaBase + 16), versionLen)
+                                );
+                            }
+                        }
+                    }
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1362,7 +1859,7 @@ private:
                     for (const auto& packerSection : sig.sectionNames) {
                         if (section.name.find(packerSection) != std::string::npos) {
                             packerInfo.isPacked = true;
-                            packerInfo.type = sig.type;
+                            packerInfo.packerType = sig.type;
                             packerInfo.name = sig.name;
                             packerInfo.confidence = 0.9;
                             packerInfo.indicators.push_back("Section name: " + section.name);
@@ -1405,7 +1902,7 @@ private:
 
                                             if (match) {
                                                 packerInfo.isPacked = true;
-                                                packerInfo.type = sig.type;
+                                                packerInfo.packerType = sig.type;
                                                 packerInfo.name = sig.name;
                                                 packerInfo.confidence = 0.95;
                                                 packerInfo.indicators.push_back("Signature match at EP");
@@ -1423,7 +1920,7 @@ private:
             // Generic packing heuristics
             if (highEntropyDetected && info.averageEntropy >= 7.0) {
                 packerInfo.isPacked = true;
-                packerInfo.type = PackerType::Unknown;
+                packerInfo.packerType = PackerType::Unknown;
                 packerInfo.name = "Unknown Packer";
                 packerInfo.confidence = 0.7;
                 packerInfo.indicators.push_back("High entropy: " + std::to_string(info.averageEntropy));
@@ -1823,27 +2320,53 @@ private:
 
     void CalculateHashes(const std::wstring& filePath, ExecutableInfo& info) const {
         try {
-            // Use HashStore infrastructure
-            auto md5 = HashStore::HashStore::Instance().CalculateMD5(filePath);
-            auto sha1 = HashStore::HashStore::Instance().CalculateSHA1(filePath);
-            auto sha256 = HashStore::HashStore::Instance().CalculateSHA256(filePath);
-
-            if (md5.size() == 16) {
-                std::copy(md5.begin(), md5.end(), info.md5.begin());
-                info.md5Hex = BytesToHex(md5);
+            // Read file for hashing
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes) || fileBytes.empty()) {
+                SS_LOG_ERROR(L"ExecutableAnalyzer", L"CalculateHashes: Failed to read file for hashing");
+                return;
             }
 
-            if (sha1.size() == 20) {
-                std::copy(sha1.begin(), sha1.end(), info.sha1.begin());
-                info.sha1Hex = BytesToHex(sha1);
+            const auto* dataPtr = reinterpret_cast<const uint8_t*>(fileBytes.data());
+            const size_t dataSize = fileBytes.size();
+
+            // MD5
+            {
+                Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::MD5);
+                if (hasher.Init() && hasher.Update(dataPtr, dataSize)) {
+                    std::vector<uint8_t> digest;
+                    if (hasher.Final(digest) && digest.size() == 16) {
+                        std::copy(digest.begin(), digest.end(), info.md5.begin());
+                        info.md5Hex = BytesToHex(digest);
+                    }
+                }
             }
 
-            if (sha256.size() == 32) {
-                std::copy(sha256.begin(), sha256.end(), info.sha256.begin());
-                info.sha256Hex = BytesToHex(sha256);
+            // SHA-1
+            {
+                Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA1);
+                if (hasher.Init() && hasher.Update(dataPtr, dataSize)) {
+                    std::vector<uint8_t> digest;
+                    if (hasher.Final(digest) && digest.size() == 20) {
+                        std::copy(digest.begin(), digest.end(), info.sha1.begin());
+                        info.sha1Hex = BytesToHex(digest);
+                    }
+                }
             }
 
-            // Calculate ImpHash
+            // SHA-256
+            {
+                Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+                if (hasher.Init() && hasher.Update(dataPtr, dataSize)) {
+                    std::vector<uint8_t> digest;
+                    if (hasher.Final(digest) && digest.size() == 32) {
+                        std::copy(digest.begin(), digest.end(), info.sha256.begin());
+                        info.sha256Hex = BytesToHex(digest);
+                    }
+                }
+            }
+
+            // Calculate ImpHash (Mandiant standard)
             if (!info.imports.empty()) {
                 info.imphash = ComputeImpHashImpl(info.imports);
             }
@@ -1854,27 +2377,270 @@ private:
     }
 
     std::string ComputeImpHashImpl(const std::vector<ImportedDLL>& imports) const {
+        // Mandiant ImpHash standard: "dll_name.function_name" all lowercase, comma-separated
         std::ostringstream oss;
+        bool first = true;
 
         for (const auto& dll : imports) {
+            // Strip .dll extension for ImpHash per Mandiant spec
+            std::string dllLower = dll.name;
+            std::transform(dllLower.begin(), dllLower.end(), dllLower.begin(), ::tolower);
+
+            // Remove common extensions
+            for (const char* ext : { ".dll", ".sys", ".drv", ".ocx" }) {
+                if (dllLower.length() > strlen(ext)) {
+                    size_t pos = dllLower.length() - strlen(ext);
+                    if (dllLower.compare(pos, strlen(ext), ext) == 0) {
+                        dllLower.erase(pos);
+                        break;
+                    }
+                }
+            }
+
             for (const auto& func : dll.functions) {
-                if (!func.name.empty() && func.name[0] != '#') {
-                    std::string lowerName = func.name;
-                    std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::tolower);
-                    oss << lowerName << ",";
+                if (func.name.empty()) continue;
+
+                if (!first) oss << ',';
+                first = false;
+
+                if (func.byOrdinal) {
+                    // For ordinal imports: "dll_name.ord<ordinal>"
+                    oss << dllLower << ".ord" << func.ordinal;
+                } else {
+                    std::string funcLower = func.name;
+                    std::transform(funcLower.begin(), funcLower.end(), funcLower.begin(), ::tolower);
+                    oss << dllLower << '.' << funcLower;
                 }
             }
         }
 
         std::string impString = oss.str();
-        if (!impString.empty()) {
-            impString.pop_back();  // Remove trailing comma
+        if (impString.empty()) return {};
+
+        // Hash with MD5 per Mandiant ImpHash spec
+        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::MD5);
+        if (!hasher.Init()) return {};
+        if (!hasher.Update(impString.data(), impString.size())) return {};
+
+        std::string hexResult;
+        if (!hasher.FinalHex(hexResult, false)) return {};
+        return hexResult;
+    }
+
+    // ========================================================================
+    // KERNEL REAL-TIME PATH
+    // ========================================================================
+
+    void RegisterKernelScanCallback(ExecutableAnalyzer::KernelScanCallback callback) {
+        std::unique_lock lock(m_mutex);
+        m_kernelCallback = std::move(callback);
+        SS_LOG_INFO(L"ExecutableAnalyzer", L"Kernel scan callback registered");
+    }
+
+    ExecutableInfo AnalyzeForKernel(const std::wstring& filePath, uint32_t processId, uint64_t fileSize) {
+        // Fast-path analysis for kernel real-time scanning
+        // Uses quick options + skips expensive operations
+
+        if (fileSize > ExecutableAnalyzerConstants::MAX_FILE_SIZE) {
+            SS_LOG_WARN(L"ExecutableAnalyzer",
+                L"Kernel scan skipped: file too large (%llu bytes), PID %u",
+                fileSize, processId);
+            ExecutableInfo info{};
+            m_stats.invalidFiles.fetch_add(1, std::memory_order_relaxed);
+            return info;
         }
 
-        // Hash the import string
-        std::vector<uint8_t> data(impString.begin(), impString.end());
-        auto hash = Utils::HashUtils::MD5(std::span<const uint8_t>(data.data(), data.size()));
-        return BytesToHex(hash);
+        auto opts = AnalysisOptions::CreateQuick();
+        opts.calculateHashes = true;  // Always hash for kernel path (needed for hash lookups)
+
+        auto info = Analyze(filePath, opts);
+
+        // Notify registered callback
+        {
+            std::shared_lock lock(m_mutex);
+            if (m_kernelCallback) {
+                try {
+                    m_kernelCallback(filePath, processId, info);
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"ExecutableAnalyzer",
+                        L"Kernel callback exception: %hs", e.what());
+                }
+            }
+        }
+
+        return info;
+    }
+
+    // ========================================================================
+    // AI/ML FEATURE EXTRACTION
+    // ========================================================================
+
+    std::optional<std::vector<float>> ExtractMLFeatures(const ExecutableInfo& info) const {
+        try {
+            // EMBER-aligned static PE feature vector
+            // Layout: [header_features(62) | section_features(255) | import_features(256) |
+            //          export_features(128) | general_features(10) | histogram(256) | byteentropy(256)]
+            // Subset: we extract what we have; total ~400 usable features
+
+            std::vector<float> features;
+            features.reserve(512);
+
+            // --- Header features ---
+            features.push_back(info.is64Bit ? 1.0f : 0.0f);
+            features.push_back(static_cast<float>(info.imageBase));
+            features.push_back(static_cast<float>(info.entryPoint));
+            features.push_back(static_cast<float>(info.fileSize));
+            features.push_back(static_cast<float>(info.sections.size()));
+            features.push_back(static_cast<float>(info.imports.size()));
+            features.push_back(static_cast<float>(info.exports.size()));
+            features.push_back(static_cast<float>(info.overallEntropy));
+            features.push_back(static_cast<float>(info.averageEntropy));
+            features.push_back(info.signature.isSigned ? 1.0f : 0.0f);
+            features.push_back(info.dotNet.isDotNet ? 1.0f : 0.0f);
+            features.push_back(info.packer.isPacked ? 1.0f : 0.0f);
+            features.push_back(info.richHeader.present ? 1.0f : 0.0f);
+            features.push_back(info.richHeader.valid ? 1.0f : 0.0f);
+            features.push_back(static_cast<float>(info.richHeader.entries.size()));
+            features.push_back(static_cast<float>(info.riskScore));
+
+            // --- Per-section features (up to 16 sections, 8 features each = 128) ---
+            constexpr size_t MAX_ML_SECTIONS = 16;
+            for (size_t i = 0; i < MAX_ML_SECTIONS; ++i) {
+                if (i < info.sections.size()) {
+                    const auto& s = info.sections[i];
+                    features.push_back(static_cast<float>(s.virtualSize));
+                    features.push_back(static_cast<float>(s.rawDataSize));
+                    features.push_back(static_cast<float>(s.entropy));
+                    features.push_back(s.isExecutable ? 1.0f : 0.0f);
+                    features.push_back(s.isWritable ? 1.0f : 0.0f);
+                    features.push_back(s.isPacked ? 1.0f : 0.0f);
+                    features.push_back(s.virtualSize > 0 ? static_cast<float>(s.rawDataSize) / static_cast<float>(s.virtualSize) : 0.0f);
+                    features.push_back(static_cast<float>(s.characteristics));
+                } else {
+                    for (int j = 0; j < 8; ++j) features.push_back(0.0f);
+                }
+            }
+
+            // --- Import features ---
+            size_t totalImportFunctions = 0;
+            size_t riskyImportCount = 0;
+            size_t ordinalImportCount = 0;
+            for (const auto& dll : info.imports) {
+                totalImportFunctions += dll.functions.size();
+                for (const auto& func : dll.functions) {
+                    if (func.byOrdinal) ++ordinalImportCount;
+                    if (func.riskLevel >= ImportRiskLevel::High) ++riskyImportCount;
+                }
+            }
+            features.push_back(static_cast<float>(totalImportFunctions));
+            features.push_back(static_cast<float>(riskyImportCount));
+            features.push_back(static_cast<float>(ordinalImportCount));
+
+            // --- Export features ---
+            size_t fwdExportCount = 0;
+            size_t ordExportCount = 0;
+            for (const auto& exp : info.exports) {
+                if (exp.isForwarded) ++fwdExportCount;
+                if (exp.name.empty()) ++ordExportCount;
+            }
+            features.push_back(static_cast<float>(info.exports.size()));
+            features.push_back(static_cast<float>(fwdExportCount));
+            features.push_back(static_cast<float>(ordExportCount));
+
+            // --- Anomaly features ---
+            features.push_back(static_cast<float>(info.anomalies.size()));
+
+            // Count anomalies by severity
+            size_t criticalAnomalies = 0, highAnomalies = 0, mediumAnomalies = 0;
+            for (const auto& a : info.anomalies) {
+                if (a.severity >= 8) ++criticalAnomalies;
+                else if (a.severity >= 5) ++highAnomalies;
+                else ++mediumAnomalies;
+            }
+            features.push_back(static_cast<float>(criticalAnomalies));
+            features.push_back(static_cast<float>(highAnomalies));
+            features.push_back(static_cast<float>(mediumAnomalies));
+
+            // --- Resource features ---
+            size_t peResources = 0, encryptedResources = 0, scriptResources = 0;
+            for (const auto& r : info.resources) {
+                if (r.isPE) ++peResources;
+                if (r.isEncrypted) ++encryptedResources;
+                if (r.isScript) ++scriptResources;
+            }
+            features.push_back(static_cast<float>(info.resources.size()));
+            features.push_back(static_cast<float>(peResources));
+            features.push_back(static_cast<float>(encryptedResources));
+            features.push_back(static_cast<float>(scriptResources));
+
+            return features;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExtractMLFeatures failed: %hs", e.what());
+            return std::nullopt;
+        }
+    }
+
+    // ========================================================================
+    // EXTRACT RESOURCES FORWARDING
+    // ========================================================================
+
+    std::vector<ResourceEntry> ExtractResources(const std::wstring& filePath) const {
+        try {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
+                return {};
+            }
+
+            std::span<const uint8_t> data(
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
+            );
+
+            ExecutableInfo info{};
+            ParsePEHeaders(data, info);
+            ParseSections(data, info, false);
+            return ParseResourcesImpl(data, info);
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExtractResources: %hs", e.what());
+            return {};
+        }
+    }
+
+    // ========================================================================
+    // COMPUTE SECTION HASHES FORWARDING
+    // ========================================================================
+
+    std::unordered_map<std::string, std::string> ComputeSectionHashes(const std::wstring& filePath) const {
+        std::unordered_map<std::string, std::string> result;
+
+        try {
+            std::vector<std::byte> fileBytes;
+            if (!Utils::FileUtils::ReadAllBytes(filePath, fileBytes)) {
+                return result;
+            }
+
+            std::span<const uint8_t> data(
+                reinterpret_cast<const uint8_t*>(fileBytes.data()),
+                fileBytes.size()
+            );
+
+            ExecutableInfo info{};
+            ParsePEHeaders(data, info);
+            ParseSections(data, info, true);
+
+            for (const auto& section : info.sections) {
+                if (!section.sha256Hex.empty()) {
+                    result[section.name] = section.sha256Hex;
+                }
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ComputeSectionHashes: %hs", e.what());
+        }
+
+        return result;
     }
 
     // ========================================================================
@@ -1884,6 +2650,7 @@ private:
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };
     ExecutableAnalyzerStatistics m_stats;
+    ExecutableAnalyzer::KernelScanCallback m_kernelCallback;
 };
 
 // ============================================================================
@@ -1943,8 +2710,7 @@ std::vector<ExportedFunction> ExecutableAnalyzer::ParseExports(const std::wstrin
 }
 
 std::vector<ResourceEntry> ExecutableAnalyzer::ExtractResources(const std::wstring& filePath) const {
-    // Not implemented in this version
-    return {};
+    return m_impl->ExtractResources(filePath);
 }
 
 VersionInfo ExecutableAnalyzer::GetVersionInfo(const std::wstring& filePath) const {
@@ -1972,8 +2738,7 @@ std::string ExecutableAnalyzer::ComputeImpHash(const std::vector<ImportedDLL>& i
 }
 
 std::unordered_map<std::string, std::string> ExecutableAnalyzer::ComputeSectionHashes(const std::wstring& filePath) const {
-    // Not implemented in this version
-    return {};
+    return m_impl->ComputeSectionHashes(filePath);
 }
 
 const ExecutableAnalyzerStatistics& ExecutableAnalyzer::GetStatistics() const noexcept {
@@ -1982,6 +2747,20 @@ const ExecutableAnalyzerStatistics& ExecutableAnalyzer::GetStatistics() const no
 
 void ExecutableAnalyzer::ResetStatistics() noexcept {
     m_impl->ResetStatistics();
+}
+
+void ExecutableAnalyzer::RegisterKernelScanCallback(KernelScanCallback callback) {
+    m_impl->RegisterKernelScanCallback(std::move(callback));
+}
+
+ExecutableInfo ExecutableAnalyzer::AnalyzeForKernel(
+    const std::wstring& filePath, uint32_t processId, uint64_t fileSize) {
+    return m_impl->AnalyzeForKernel(filePath, processId, fileSize);
+}
+
+std::optional<std::vector<float>> ExecutableAnalyzer::ExtractMLFeatures(
+    const ExecutableInfo& info) const {
+    return m_impl->ExtractMLFeatures(info);
 }
 
 }  // namespace FileSystem
