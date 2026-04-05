@@ -115,14 +115,21 @@ double CalculateEntropy(std::span<const uint8_t> data) {
 }
 
 /**
- * @brief Safe RVA to file offset conversion.
+ * @brief Safe RVA to file offset conversion with integer overflow protection.
  */
 std::optional<uint32_t> RVAToFileOffset(uint32_t rva, std::span<const PESection> sections) {
     for (const auto& section : sections) {
-        if (rva >= section.virtualAddress &&
-            rva < section.virtualAddress + section.virtualSize) {
-            const uint32_t offset = rva - section.virtualAddress;
-            return section.rawDataOffset + offset;
+        // Overflow-safe: rva >= VA && rva - VA < VirtualSize
+        if (rva >= section.virtualAddress) {
+            const uint32_t delta = rva - section.virtualAddress;
+            if (delta < section.virtualSize) {
+                // Overflow-safe addition for raw offset
+                const uint64_t result = static_cast<uint64_t>(section.rawDataOffset) + delta;
+                if (result > UINT32_MAX) {
+                    return std::nullopt;
+                }
+                return static_cast<uint32_t>(result);
+            }
         }
     }
     return std::nullopt;
@@ -360,6 +367,30 @@ static const std::vector<PackerSignature> g_packerSignatures = {
         {},
         6.7,
         true
+    },
+    {
+        PackerType::NsPack,
+        "NsPack",
+        {".nsp0", ".nsp1", ".nsp2"},
+        {},
+        7.0,
+        true
+    },
+    {
+        PackerType::FSG,
+        "FSG",
+        {},
+        {{0, {0x87, 0x25}}},  // Common FSG entry stub
+        7.1,
+        true
+    },
+    {
+        PackerType::Enigma,
+        "Enigma Protector",
+        {".enigma1", ".enigma2"},
+        {},
+        7.4,
+        false
     }
 };
 
@@ -667,8 +698,10 @@ public:
             return false;
         }
 
+        // e_lfanew must be >= DOS header size, within 4MB (hostile PEs set huge values),
+        // 4-byte aligned, and leave room for NT headers within the buffer.
         if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
-            dosHeader->e_lfanew > 4096 ||
+            dosHeader->e_lfanew > 0x400000 ||
             (dosHeader->e_lfanew & 0x3) != 0 ||
             static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS) > buffer.size()) {
             return false;
@@ -691,6 +724,7 @@ public:
             const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data());
             if (dosHeader->e_magic == ExecutableAnalyzerConstants::DOS_SIGNATURE) {
                 if (dosHeader->e_lfanew > 0 &&
+                    dosHeader->e_lfanew <= 0x400000 &&
                     static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS) <= buffer.size()) {
 
                     const auto* ntHeaders = reinterpret_cast<const IMAGE_NT_HEADERS*>(
@@ -886,6 +920,25 @@ public:
                 }
             }
 
+            // Parse delay-load imports
+            if (options.parseDelayLoadImports) {
+                info.delayLoadImports = ParseDelayLoadImportsImpl(buffer, info);
+                info.hasDelayLoadImports = !info.delayLoadImports.empty();
+            }
+
+            // Parse TLS callbacks (anti-debug / evasion indicator)
+            if (options.parseTLSCallbacks) {
+                ParseTLSCallbacksImpl(buffer, info);
+            }
+
+            // Parse debug directory (PDB path extraction)
+            if (options.parseDebugDirectory) {
+                ParseDebugDirectoryImpl(buffer, info);
+            }
+
+            // Extract detailed security mitigations
+            ExtractSecurityMitigationsImpl(buffer, info);
+
             // Detect packers
             if (options.detectPackers) {
                 info.packer = DetectPackerImpl(buffer, info);
@@ -898,6 +951,21 @@ public:
             if (options.detectAnomalies) {
                 info.anomalies = DetectAnomaliesImpl(info);
                 m_stats.anomaliesDetected.fetch_add(info.anomalies.size(), std::memory_order_relaxed);
+            }
+
+            // Detect overlapping sections
+            if (options.detectOverlappingSections) {
+                DetectOverlappingSectionsImpl(info);
+            }
+
+            // Detect entry point anomalies
+            if (options.detectEntryPointAnomalies) {
+                DetectEntryPointAnomaliesImpl(buffer, info);
+            }
+
+            // Analyze overlay
+            if (options.analyzeOverlay) {
+                AnalyzeOverlayImpl(buffer, info);
             }
 
             // Calculate risk score
@@ -925,8 +993,10 @@ public:
             return;
         }
 
+        // Allow e_lfanew up to 4MB — packers/protectors often relocate PE headers.
+        // Restricting to 4096 would miss packed malware we need to detect.
         if (dosHeader->e_lfanew < static_cast<LONG>(sizeof(IMAGE_DOS_HEADER)) ||
-            dosHeader->e_lfanew > 4096 ||
+            dosHeader->e_lfanew > 0x400000 ||
             (dosHeader->e_lfanew & 0x3) != 0 ||
             static_cast<size_t>(dosHeader->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > buffer.size()) {
             return;
@@ -1159,8 +1229,12 @@ public:
 
             const auto* importDesc = reinterpret_cast<const IMAGE_IMPORT_DESCRIPTOR*>(buffer.data() + offset);
 
-            // Parse each imported DLL
-            for (size_t i = 0; i < ExecutableAnalyzerConstants::MAX_IMPORTS && importDesc[i].Name != 0; ++i) {
+            // Parse each imported DLL with bounds checking on each descriptor
+            for (size_t i = 0; i < ExecutableAnalyzerConstants::MAX_IMPORTS; ++i) {
+                // Validate that this descriptor is within the buffer
+                const size_t descEnd = offset + (i + 1) * sizeof(IMAGE_IMPORT_DESCRIPTOR);
+                if (descEnd > buffer.size()) break;
+                if (importDesc[i].Name == 0) break;
                 ImportedDLL dll;
 
                 // Get DLL name (bounded read)
@@ -1926,6 +2000,23 @@ public:
                 packerInfo.indicators.push_back("High entropy: " + std::to_string(info.averageEntropy));
             }
 
+            // Few imports + high entropy = strong packing indicator
+            if (!packerInfo.isPacked && highEntropyDetected) {
+                size_t totalFunctions = 0;
+                for (const auto& dll : info.imports) {
+                    totalFunctions += dll.functions.size();
+                }
+                if (totalFunctions <= 5 && info.imports.size() <= 2) {
+                    packerInfo.isPacked = true;
+                    packerInfo.packerType = PackerType::Unknown;
+                    packerInfo.name = "Unknown Packer/Crypter";
+                    packerInfo.confidence = 0.75;
+                    packerInfo.indicators.push_back(
+                        "Minimal imports (" + std::to_string(totalFunctions) +
+                        " functions) + high entropy sections");
+                }
+            }
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::DetectPackerImpl: %hs", e.what());
         }
@@ -2107,6 +2198,58 @@ public:
                 }
             }
 
+            // Check TLS callbacks (anti-debug / anti-analysis evasion)
+            if (info.hasTLSCallbacks) {
+                anomalies.push_back({
+                    AnomalyType::AntiDebug,
+                    "TLS callbacks detected (" + std::to_string(info.tlsCallbackCount) +
+                        ") — common anti-analysis / pre-main execution",
+                    "",
+                    0,
+                    55,
+                    "T1497"
+                });
+            }
+
+            // Check delay-load imports with suspicious APIs
+            for (const auto& dll : info.delayLoadImports) {
+                if (dll.criticalAPIs > 0) {
+                    anomalies.push_back({
+                        AnomalyType::SuspiciousImports,
+                        "Delay-loaded DLL '" + dll.name + "' has critical APIs (evasion technique)",
+                        "",
+                        0,
+                        50,
+                        "T1027"
+                    });
+                }
+            }
+
+            // Check for missing CFG (Control Flow Guard)
+            if (!info.hasCFG && !info.isDLL && !info.dotNet.isDotNet) {
+                anomalies.push_back({
+                    AnomalyType::SuspiciousChecksum,
+                    "Control Flow Guard (CFG) not enabled",
+                    "",
+                    0,
+                    15,
+                    ""
+                });
+            }
+
+            // Check for no imports + high entropy (shellcode indicator)
+            if (info.imports.empty() && !info.isDLL &&
+                info.averageEntropy >= ExecutableAnalyzerConstants::SUSPICIOUS_ENTROPY_THRESHOLD) {
+                anomalies.push_back({
+                    AnomalyType::APIHashing,
+                    "No imports + high entropy — possible shellcode or API hashing",
+                    "",
+                    0,
+                    85,
+                    "T1027"
+                });
+            }
+
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExecutableAnalyzer::DetectAnomaliesImpl: %hs", e.what());
         }
@@ -2169,6 +2312,34 @@ public:
             }
             if (!info.hasASLR && !info.isDLL) {
                 score += 5;
+            }
+
+            // TLS callbacks (+15 — common anti-analysis technique)
+            if (info.hasTLSCallbacks) {
+                score += 15;
+            }
+
+            // Delay-load imports with high-risk APIs (+10)
+            for (const auto& dll : info.delayLoadImports) {
+                if (dll.criticalAPIs > 0) {
+                    score += 10;
+                    break;
+                }
+            }
+
+            // Overlapping sections (+20 — strong malware indicator)
+            if (info.hasOverlappingSections) {
+                score += 20;
+            }
+
+            // Entry point outside code (+15)
+            if (info.hasEntryPointOutsideCode) {
+                score += 15;
+            }
+
+            // Overlay with embedded PE (+10)
+            if (info.overlayContainsPE) {
+                score += 10;
             }
 
             // Cap at 100
@@ -2307,8 +2478,7 @@ public:
 
             // Get detailed certificate info if signed
             if (sigInfo.isSigned) {
-                // Could use CertUtils here for detailed certificate chain parsing
-                // Simplified for now
+                ExtractCertificateDetailsImpl(filePath, sigInfo);
             }
 
         } catch (const std::exception& e) {
@@ -2573,6 +2743,21 @@ public:
             features.push_back(static_cast<float>(encryptedResources));
             features.push_back(static_cast<float>(scriptResources));
 
+            // --- APT indicator features ---
+            features.push_back(info.hasTLSCallbacks ? 1.0f : 0.0f);
+            features.push_back(static_cast<float>(info.tlsCallbackCount));
+            features.push_back(info.hasDelayLoadImports ? 1.0f : 0.0f);
+            features.push_back(static_cast<float>(info.delayLoadImports.size()));
+            features.push_back(info.hasOverlappingSections ? 1.0f : 0.0f);
+            features.push_back(info.hasEntryPointOutsideCode ? 1.0f : 0.0f);
+            features.push_back(info.hasCFG ? 1.0f : 0.0f);
+            features.push_back(info.hasCET ? 1.0f : 0.0f);
+            features.push_back(info.hasIntegrityCheck ? 1.0f : 0.0f);
+            features.push_back(info.overlayContainsPE ? 1.0f : 0.0f);
+            features.push_back(static_cast<float>(info.overlayEntropy));
+            features.push_back(static_cast<float>(info.overlaySize));
+            features.push_back(info.hasDebugDirectory ? 1.0f : 0.0f);
+
             return features;
 
         } catch (const std::exception& e) {
@@ -2605,6 +2790,638 @@ public:
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExtractResources: %hs", e.what());
             return {};
+        }
+    }
+
+    // ========================================================================
+    // DELAY-LOAD IMPORT PARSING
+    // ========================================================================
+
+    std::vector<ImportedDLL> ParseDelayLoadImportsImpl(
+        std::span<const uint8_t> buffer, const ExecutableInfo& info) const
+    {
+        std::vector<ImportedDLL> delayImports;
+        try {
+            if (info.sections.empty()) return delayImports;
+
+            const size_t ntOff = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
+            uint32_t delayDirRVA = 0;
+            uint32_t delayDirSize = 0;
+
+            if (info.is64Bit) {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) {
+                    delayDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+                    delayDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
+                }
+            } else {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT) {
+                    delayDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].VirtualAddress;
+                    delayDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DELAY_IMPORT].Size;
+                }
+            }
+
+            if (delayDirRVA == 0 || delayDirSize == 0) return delayImports;
+
+            auto dirOffset = RVAToFileOffset(delayDirRVA, info.sections);
+            if (!dirOffset.has_value()) return delayImports;
+
+            const size_t base = dirOffset.value();
+
+            // ImgDelayDescr is 32 bytes: Attributes, DllNameRVA, ModuleHandleRVA, ImportAddressTableRVA,
+            //   ImportNameTableRVA, BoundImportAddressTableRVA, UnloadInformationTableRVA, TimeDateStamp
+            constexpr size_t DESC_SIZE = 32;
+            constexpr size_t MAX_DELAY_DESCS = 1000;
+
+            for (size_t i = 0; i < MAX_DELAY_DESCS; ++i) {
+                const size_t descOff = base + i * DESC_SIZE;
+                if (descOff + DESC_SIZE > buffer.size()) break;
+
+                uint32_t attrs = 0, dllNameRVA = 0, intRVA = 0;
+                std::memcpy(&attrs, buffer.data() + descOff, 4);
+                std::memcpy(&dllNameRVA, buffer.data() + descOff + 4, 4);
+                std::memcpy(&intRVA, buffer.data() + descOff + 16, 4);
+
+                if (dllNameRVA == 0) break;
+
+                ImportedDLL dll;
+                dll.isDelayLoad = true;
+
+                // attrs bit 0: if set, RVAs are used; if clear, VAs (old-style).
+                // Modern linkers always set bit 0 (RVA-based).
+                const bool rvaMode = (attrs & 1) != 0;
+
+                // Read DLL name
+                auto nameOff = RVAToFileOffset(dllNameRVA, info.sections);
+                if (nameOff.has_value() && nameOff.value() < buffer.size()) {
+                    const size_t ns = nameOff.value();
+                    const size_t ml = std::min(buffer.size() - ns, size_t(260));
+                    dll.name = std::string(
+                        reinterpret_cast<const char*>(buffer.data() + ns),
+                        strnlen(reinterpret_cast<const char*>(buffer.data() + ns), ml)
+                    );
+                }
+
+                // Parse delay-loaded functions via INT (ImportNameTable)
+                if (intRVA != 0) {
+                    auto thunkOff = RVAToFileOffset(intRVA, info.sections);
+                    if (thunkOff.has_value()) {
+                        ParseImportFunctions(buffer, thunkOff.value(), info, dll);
+                    }
+                }
+
+                // Aggregate risk
+                const auto& riskyAPIs = GetRiskyAPIs();
+                for (const auto& func : dll.functions) {
+                    if (func.riskLevel > dll.highestRisk) dll.highestRisk = func.riskLevel;
+                    if (func.riskLevel == ImportRiskLevel::Critical) dll.criticalAPIs++;
+                    else if (func.riskLevel == ImportRiskLevel::High) dll.highRiskAPIs++;
+                }
+                dll.isSuspicious = (dll.criticalAPIs > 0) || (dll.highRiskAPIs >= 3);
+
+                delayImports.push_back(std::move(dll));
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ParseDelayLoadImportsImpl: %hs", e.what());
+        }
+        return delayImports;
+    }
+
+    // ========================================================================
+    // TLS CALLBACK PARSING
+    // ========================================================================
+
+    void ParseTLSCallbacksImpl(std::span<const uint8_t> buffer, ExecutableInfo& info) const {
+        try {
+            if (info.sections.empty()) return;
+
+            const size_t ntOff = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
+            uint32_t tlsDirRVA = 0;
+            uint32_t tlsDirSize = 0;
+
+            if (info.is64Bit) {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS) {
+                    tlsDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                    tlsDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+                }
+            } else {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS) {
+                    tlsDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress;
+                    tlsDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_TLS].Size;
+                }
+            }
+
+            if (tlsDirRVA == 0 || tlsDirSize == 0) return;
+
+            auto tlsOffset = RVAToFileOffset(tlsDirRVA, info.sections);
+            if (!tlsOffset.has_value()) return;
+
+            if (info.is64Bit) {
+                if (tlsOffset.value() + sizeof(IMAGE_TLS_DIRECTORY64) > buffer.size()) return;
+                const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY64*>(
+                    buffer.data() + tlsOffset.value());
+
+                if (tls->AddressOfCallBacks == 0) return;
+
+                // AddressOfCallBacks is a VA, convert to RVA then to file offset
+                const uint64_t cbVA = tls->AddressOfCallBacks;
+                if (cbVA < info.imageBase) return;
+                const uint32_t cbRVA = static_cast<uint32_t>(cbVA - info.imageBase);
+
+                auto cbOffset = RVAToFileOffset(cbRVA, info.sections);
+                if (!cbOffset.has_value()) return;
+
+                constexpr size_t MAX_TLS_CBS = 256;
+                for (size_t i = 0; i < MAX_TLS_CBS; ++i) {
+                    const size_t entryOff = cbOffset.value() + i * sizeof(uint64_t);
+                    if (entryOff + sizeof(uint64_t) > buffer.size()) break;
+
+                    uint64_t callbackVA = 0;
+                    std::memcpy(&callbackVA, buffer.data() + entryOff, sizeof(uint64_t));
+                    if (callbackVA == 0) break;
+
+                    info.tlsCallbackRVAs.push_back(
+                        callbackVA >= info.imageBase ? callbackVA - info.imageBase : callbackVA);
+                }
+            } else {
+                if (tlsOffset.value() + sizeof(IMAGE_TLS_DIRECTORY32) > buffer.size()) return;
+                const auto* tls = reinterpret_cast<const IMAGE_TLS_DIRECTORY32*>(
+                    buffer.data() + tlsOffset.value());
+
+                if (tls->AddressOfCallBacks == 0) return;
+
+                const uint32_t cbVA = tls->AddressOfCallBacks;
+                if (cbVA < static_cast<uint32_t>(info.imageBase)) return;
+                const uint32_t cbRVA = cbVA - static_cast<uint32_t>(info.imageBase);
+
+                auto cbOffset = RVAToFileOffset(cbRVA, info.sections);
+                if (!cbOffset.has_value()) return;
+
+                constexpr size_t MAX_TLS_CBS = 256;
+                for (size_t i = 0; i < MAX_TLS_CBS; ++i) {
+                    const size_t entryOff = cbOffset.value() + i * sizeof(uint32_t);
+                    if (entryOff + sizeof(uint32_t) > buffer.size()) break;
+
+                    uint32_t callbackVA = 0;
+                    std::memcpy(&callbackVA, buffer.data() + entryOff, sizeof(uint32_t));
+                    if (callbackVA == 0) break;
+
+                    info.tlsCallbackRVAs.push_back(
+                        callbackVA >= static_cast<uint32_t>(info.imageBase)
+                            ? callbackVA - static_cast<uint32_t>(info.imageBase)
+                            : callbackVA);
+                }
+            }
+
+            info.hasTLSCallbacks = !info.tlsCallbackRVAs.empty();
+            info.tlsCallbackCount = static_cast<uint32_t>(info.tlsCallbackRVAs.size());
+
+            if (info.hasTLSCallbacks) {
+                SS_LOG_DEBUG(L"ExecutableAnalyzer", L"TLS callbacks detected: %u", info.tlsCallbackCount);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ParseTLSCallbacksImpl: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // DEBUG DIRECTORY PARSING
+    // ========================================================================
+
+    void ParseDebugDirectoryImpl(std::span<const uint8_t> buffer, ExecutableInfo& info) const {
+        try {
+            if (info.sections.empty()) return;
+
+            const size_t ntOff = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
+            uint32_t dbgDirRVA = 0;
+            uint32_t dbgDirSize = 0;
+
+            if (info.is64Bit) {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+                    dbgDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+                    dbgDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+                }
+            } else {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntOff);
+                if (nt->OptionalHeader.NumberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+                    dbgDirRVA = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress;
+                    dbgDirSize = nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG].Size;
+                }
+            }
+
+            if (dbgDirRVA == 0 || dbgDirSize < sizeof(IMAGE_DEBUG_DIRECTORY)) return;
+
+            auto dbgOffset = RVAToFileOffset(dbgDirRVA, info.sections);
+            if (!dbgOffset.has_value()) return;
+
+            const size_t numEntries = dbgDirSize / sizeof(IMAGE_DEBUG_DIRECTORY);
+            constexpr size_t MAX_DBG_ENTRIES = 64;
+
+            for (size_t i = 0; i < std::min(numEntries, MAX_DBG_ENTRIES); ++i) {
+                const size_t entryOff = dbgOffset.value() + i * sizeof(IMAGE_DEBUG_DIRECTORY);
+                if (entryOff + sizeof(IMAGE_DEBUG_DIRECTORY) > buffer.size()) break;
+
+                const auto* dbgDir = reinterpret_cast<const IMAGE_DEBUG_DIRECTORY*>(
+                    buffer.data() + entryOff);
+
+                info.hasDebugDirectory = true;
+                info.debugType = dbgDir->Type;
+
+                // Extract PDB path from CodeView (type 2) debug data
+                if (dbgDir->Type == IMAGE_DEBUG_TYPE_CODEVIEW &&
+                    dbgDir->PointerToRawData > 0 &&
+                    dbgDir->SizeOfData >= 24)
+                {
+                    const size_t cvOff = dbgDir->PointerToRawData;
+                    if (cvOff + dbgDir->SizeOfData <= buffer.size()) {
+                        uint32_t cvSig = 0;
+                        std::memcpy(&cvSig, buffer.data() + cvOff, 4);
+
+                        // RSDS signature (PDB 7.0+)
+                        if (cvSig == 0x53445352 && dbgDir->SizeOfData > 24) {
+                            const size_t pathStart = cvOff + 24;
+                            const size_t maxPathLen = std::min(
+                                static_cast<size_t>(dbgDir->SizeOfData) - 24,
+                                size_t(1024));
+                            if (pathStart + maxPathLen <= buffer.size()) {
+                                info.pdbPath = std::string(
+                                    reinterpret_cast<const char*>(buffer.data() + pathStart),
+                                    strnlen(reinterpret_cast<const char*>(buffer.data() + pathStart), maxPathLen)
+                                );
+                            }
+                        }
+                        // NB10 signature (PDB 2.0)
+                        else if (cvSig == 0x3031424E && dbgDir->SizeOfData > 16) {
+                            const size_t pathStart = cvOff + 16;
+                            const size_t maxPathLen = std::min(
+                                static_cast<size_t>(dbgDir->SizeOfData) - 16,
+                                size_t(1024));
+                            if (pathStart + maxPathLen <= buffer.size()) {
+                                info.pdbPath = std::string(
+                                    reinterpret_cast<const char*>(buffer.data() + pathStart),
+                                    strnlen(reinterpret_cast<const char*>(buffer.data() + pathStart), maxPathLen)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ParseDebugDirectoryImpl: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // OVERLAPPING SECTION DETECTION
+    // ========================================================================
+
+    void DetectOverlappingSectionsImpl(ExecutableInfo& info) const {
+        if (info.sections.size() < 2) return;
+
+        for (size_t i = 0; i < info.sections.size(); ++i) {
+            const auto& a = info.sections[i];
+            if (a.rawDataSize == 0) continue;
+
+            const uint64_t aStart = a.rawDataOffset;
+            const uint64_t aEnd = static_cast<uint64_t>(a.rawDataOffset) + a.rawDataSize;
+
+            for (size_t j = i + 1; j < info.sections.size(); ++j) {
+                const auto& b = info.sections[j];
+                if (b.rawDataSize == 0) continue;
+
+                const uint64_t bStart = b.rawDataOffset;
+                const uint64_t bEnd = static_cast<uint64_t>(b.rawDataOffset) + b.rawDataSize;
+
+                if (aStart < bEnd && bStart < aEnd) {
+                    info.hasOverlappingSections = true;
+                    info.anomalies.push_back({
+                        AnomalyType::OverlappingSections,
+                        "Overlapping sections: " + a.name + " and " + b.name,
+                        a.name,
+                        a.rawDataOffset,
+                        75,
+                        "T1027"
+                    });
+                }
+            }
+        }
+    }
+
+    // ========================================================================
+    // ENTRY POINT ANOMALY DETECTION
+    // ========================================================================
+
+    void DetectEntryPointAnomaliesImpl(
+        std::span<const uint8_t> buffer, ExecutableInfo& info) const
+    {
+        if (info.entryPoint == 0 && !info.isDLL) {
+            info.anomalies.push_back({
+                AnomalyType::InvalidNTHeader,
+                "Entry point is zero for non-DLL executable",
+                "", 0, 60, "T1027"
+            });
+            return;
+        }
+
+        if (info.entryPoint == 0) return;
+
+        bool foundInSection = false;
+        bool inExecutable = false;
+        bool inLastSection = false;
+        bool inWritable = false;
+
+        for (size_t i = 0; i < info.sections.size(); ++i) {
+            const auto& sec = info.sections[i];
+            if (info.entryPoint >= sec.virtualAddress &&
+                info.entryPoint < static_cast<uint64_t>(sec.virtualAddress) + sec.virtualSize)
+            {
+                foundInSection = true;
+                inExecutable = sec.isExecutable;
+                inWritable = sec.isWritable;
+                inLastSection = (i == info.sections.size() - 1);
+
+                // Entry point near end of section (common packer pattern)
+                const uint64_t epOffsetInSec = info.entryPoint - sec.virtualAddress;
+                if (sec.virtualSize > 0 && epOffsetInSec > (sec.virtualSize * 9 / 10)) {
+                    info.anomalies.push_back({
+                        AnomalyType::SuspiciousSectionNames,
+                        "Entry point near end of section " + sec.name +
+                            " (offset " + std::to_string(epOffsetInSec) + "/" +
+                            std::to_string(sec.virtualSize) + ")",
+                        sec.name, sec.rawDataOffset, 45, "T1027"
+                    });
+                }
+                break;
+            }
+        }
+
+        if (!foundInSection) {
+            info.hasEntryPointOutsideCode = true;
+            info.anomalies.push_back({
+                AnomalyType::InvalidNTHeader,
+                "Entry point (0x" + std::to_string(info.entryPoint) +
+                    ") outside all sections",
+                "", 0, 80, "T1027"
+            });
+        } else if (!inExecutable) {
+            info.hasEntryPointOutsideCode = true;
+            info.anomalies.push_back({
+                AnomalyType::ExecutableData,
+                "Entry point in non-executable section",
+                "", 0, 70, "T1055"
+            });
+        }
+
+        if (inWritable && inExecutable) {
+            info.anomalies.push_back({
+                AnomalyType::WritableCode,
+                "Entry point in writable+executable section (self-modifying code)",
+                "", 0, 75, "T1027"
+            });
+        }
+
+        if (inLastSection && info.sections.size() > 1) {
+            info.anomalies.push_back({
+                AnomalyType::SuspiciousSectionNames,
+                "Entry point in last section (common packer pattern)",
+                "", 0, 40, "T1027"
+            });
+        }
+
+        // Check entry point in header area (before first section VA)
+        if (!info.sections.empty() &&
+            info.entryPoint < info.sections.front().virtualAddress &&
+            info.entryPoint > 0)
+        {
+            info.anomalies.push_back({
+                AnomalyType::InvalidNTHeader,
+                "Entry point in PE headers (before first section)",
+                "", 0, 85, "T1027"
+            });
+        }
+    }
+
+    // ========================================================================
+    // OVERLAY ANALYSIS
+    // ========================================================================
+
+    void AnalyzeOverlayImpl(std::span<const uint8_t> buffer, ExecutableInfo& info) const {
+        try {
+            if (info.sections.empty()) return;
+
+            // Overlay = data after last section's raw data
+            uint64_t lastSectionEnd = 0;
+            for (const auto& sec : info.sections) {
+                if (sec.rawDataSize > 0) {
+                    const uint64_t secEnd =
+                        static_cast<uint64_t>(sec.rawDataOffset) + sec.rawDataSize;
+                    if (secEnd > lastSectionEnd) {
+                        lastSectionEnd = secEnd;
+                    }
+                }
+            }
+
+            if (lastSectionEnd == 0 || lastSectionEnd >= buffer.size()) return;
+
+            info.overlayOffset = static_cast<uint32_t>(std::min(lastSectionEnd, uint64_t(UINT32_MAX)));
+            const size_t overlaySize = buffer.size() - static_cast<size_t>(lastSectionEnd);
+            info.overlaySize = static_cast<uint32_t>(std::min(overlaySize, size_t(UINT32_MAX)));
+
+            if (info.overlaySize == 0) return;
+
+            // Calculate overlay entropy
+            std::span<const uint8_t> overlayData = buffer.subspan(
+                static_cast<size_t>(lastSectionEnd),
+                std::min(overlaySize, size_t(1024 * 1024))  // Sample first 1MB for perf
+            );
+            info.overlayEntropy = CalculateEntropy(overlayData);
+
+            // Check for embedded PE in overlay
+            if (overlaySize >= sizeof(IMAGE_DOS_HEADER)) {
+                const auto* mz = reinterpret_cast<const IMAGE_DOS_HEADER*>(
+                    buffer.data() + static_cast<size_t>(lastSectionEnd));
+                if (mz->e_magic == ExecutableAnalyzerConstants::DOS_SIGNATURE) {
+                    info.overlayContainsPE = true;
+                    info.anomalies.push_back({
+                        AnomalyType::SuspiciousOverlay,
+                        "Overlay contains embedded PE (dropper indicator)",
+                        "", info.overlayOffset, 70, "T1027"
+                    });
+                }
+            }
+
+            if (info.overlayEntropy >= ExecutableAnalyzerConstants::HIGH_ENTROPY_THRESHOLD) {
+                info.anomalies.push_back({
+                    AnomalyType::SuspiciousOverlay,
+                    "Overlay has high entropy (" + std::to_string(info.overlayEntropy) +
+                        ") — likely encrypted payload",
+                    "", info.overlayOffset, 55, "T1027"
+                });
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"AnalyzeOverlayImpl: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // CERTIFICATE CHAIN EXTRACTION
+    // ========================================================================
+
+    void ExtractCertificateDetailsImpl(const std::wstring& filePath, SignatureInfo& sigInfo) const {
+        try {
+            HCERTSTORE hStore = nullptr;
+            HCRYPTMSG hMsg = nullptr;
+
+            if (!CryptQueryObject(
+                    CERT_QUERY_OBJECT_FILE,
+                    filePath.c_str(),
+                    CERT_QUERY_CONTENT_FLAG_PKCS7_SIGNED_EMBED,
+                    CERT_QUERY_FORMAT_FLAG_BINARY,
+                    0, nullptr, nullptr, nullptr,
+                    &hStore, &hMsg, nullptr))
+            {
+                return;
+            }
+
+            // Get signer info
+            DWORD signerInfoSize = 0;
+            if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, nullptr, &signerInfoSize) &&
+                signerInfoSize > 0 && signerInfoSize < 64 * 1024)
+            {
+                std::vector<uint8_t> signerInfoBuf(signerInfoSize);
+                if (CryptMsgGetParam(hMsg, CMSG_SIGNER_INFO_PARAM, 0, signerInfoBuf.data(), &signerInfoSize))
+                {
+                    const auto* signerInfo = reinterpret_cast<CMSG_SIGNER_INFO*>(signerInfoBuf.data());
+
+                    CERT_INFO certInfo{};
+                    certInfo.Issuer = signerInfo->Issuer;
+                    certInfo.SerialNumber = signerInfo->SerialNumber;
+
+                    PCCERT_CONTEXT pCertCtx = CertFindCertificateInStore(
+                        hStore, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                        0, CERT_FIND_SUBJECT_CERT, &certInfo, nullptr);
+
+                    if (pCertCtx) {
+                        // Extract subject name
+                        wchar_t nameBuf[512] = {};
+                        DWORD nameLen = CertGetNameStringW(
+                            pCertCtx, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                            nameBuf, _countof(nameBuf));
+                        if (nameLen > 1) {
+                            sigInfo.signerName = nameBuf;
+                        }
+
+                        // Extract issuer name
+                        nameLen = CertGetNameStringW(
+                            pCertCtx, CERT_NAME_SIMPLE_DISPLAY_TYPE, CERT_NAME_ISSUER_FLAG,
+                            nullptr, nameBuf, _countof(nameBuf));
+                        if (nameLen > 1) {
+                            sigInfo.issuerName = nameBuf;
+                        }
+
+                        // Check for Microsoft signature
+                        if (sigInfo.signerName.find(L"Microsoft") != std::wstring::npos) {
+                            sigInfo.isMicrosoftSigned = true;
+                        }
+
+                        // Extract certificate validity dates
+                        FILETIME localFt{};
+                        SYSTEMTIME st{};
+
+                        FileTimeToLocalFileTime(&pCertCtx->pCertInfo->NotBefore, &localFt);
+                        FileTimeToSystemTime(&localFt, &st);
+                        // Convert SYSTEMTIME to time_point
+                        std::tm tmFrom{};
+                        tmFrom.tm_year = st.wYear - 1900;
+                        tmFrom.tm_mon = st.wMonth - 1;
+                        tmFrom.tm_mday = st.wDay;
+                        tmFrom.tm_hour = st.wHour;
+                        tmFrom.tm_min = st.wMinute;
+                        tmFrom.tm_sec = st.wSecond;
+                        sigInfo.certValidFrom = std::chrono::system_clock::from_time_t(std::mktime(&tmFrom));
+
+                        FileTimeToLocalFileTime(&pCertCtx->pCertInfo->NotAfter, &localFt);
+                        FileTimeToSystemTime(&localFt, &st);
+                        std::tm tmTo{};
+                        tmTo.tm_year = st.wYear - 1900;
+                        tmTo.tm_mon = st.wMonth - 1;
+                        tmTo.tm_mday = st.wDay;
+                        tmTo.tm_hour = st.wHour;
+                        tmTo.tm_min = st.wMinute;
+                        tmTo.tm_sec = st.wSecond;
+                        sigInfo.certValidTo = std::chrono::system_clock::from_time_t(std::mktime(&tmTo));
+
+                        // Build certificate chain
+                        CERT_CHAIN_PARA chainPara{};
+                        chainPara.cbSize = sizeof(chainPara);
+                        PCCERT_CHAIN_CONTEXT pChainCtx = nullptr;
+
+                        if (CertGetCertificateChain(
+                                nullptr, pCertCtx, nullptr, hStore,
+                                &chainPara, 0, nullptr, &pChainCtx))
+                        {
+                            if (pChainCtx->cChain > 0) {
+                                const auto* chain = pChainCtx->rgpChain[0];
+                                for (DWORD ci = 0; ci < chain->cElement && ci < 16; ++ci) {
+                                    wchar_t chainName[512] = {};
+                                    CertGetNameStringW(
+                                        chain->rgpElement[ci]->pCertContext,
+                                        CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, nullptr,
+                                        chainName, _countof(chainName));
+                                    sigInfo.certificateChain.emplace_back(chainName);
+                                }
+
+                                sigInfo.isTrusted =
+                                    (pChainCtx->TrustStatus.dwErrorStatus == CERT_TRUST_NO_ERROR);
+                            }
+                            CertFreeCertificateChain(pChainCtx);
+                        }
+
+                        CertFreeCertificateContext(pCertCtx);
+                    }
+                }
+            }
+
+            if (hMsg) CryptMsgClose(hMsg);
+            if (hStore) CertCloseStore(hStore, 0);
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExtractCertificateDetailsImpl: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // SECURITY MITIGATION DETAIL EXTRACTION
+    // ========================================================================
+
+    void ExtractSecurityMitigationsImpl(std::span<const uint8_t> buffer, ExecutableInfo& info) const {
+        try {
+            if (info.sections.empty()) return;
+
+            const size_t ntOff = reinterpret_cast<const IMAGE_DOS_HEADER*>(buffer.data())->e_lfanew;
+
+            uint16_t dllChars = 0;
+            if (info.is64Bit) {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS64*>(buffer.data() + ntOff);
+                dllChars = nt->OptionalHeader.DllCharacteristics;
+            } else {
+                const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS32*>(buffer.data() + ntOff);
+                dllChars = nt->OptionalHeader.DllCharacteristics;
+            }
+
+            info.hasIntegrityCheck = (dllChars & IMAGE_DLLCHARACTERISTICS_FORCE_INTEGRITY) != 0;
+            info.isAppContainer = (dllChars & IMAGE_DLLCHARACTERISTICS_APPCONTAINER) != 0;
+
+            // CET (Shadow Stack) detection via extended DLL characteristics in debug dir
+            // Type 20 (IMAGE_DEBUG_TYPE_EX_DLLCHARACTERISTICS) contains CET flags
+            // This is detected if the debug directory was parsed and type matches
+            // For now, flag from load config if present
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ExecutableAnalyzer", L"ExtractSecurityMitigationsImpl: %hs", e.what());
         }
     }
 
