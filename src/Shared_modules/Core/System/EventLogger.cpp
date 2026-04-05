@@ -83,6 +83,8 @@ namespace ShadowStrike {
 namespace Core {
 namespace System {
 
+static constexpr const wchar_t* LOG_CATEGORY = L"EventLogger";
+
 using namespace std::chrono;
 using namespace Utils;
 namespace fs = std::filesystem;
@@ -416,7 +418,7 @@ bool SetLogFileACL(const std::wstring& filePath) {
             SDDL_REVISION_1,
             &pSD,
             nullptr)) {
-        Logger::Error("EventLogger: Failed to create security descriptor: {}", GetLastError());
+        SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to create security descriptor: %lu", GetLastError());
         return false;
     }
     
@@ -429,7 +431,7 @@ bool SetLogFileACL(const std::wstring& filePath) {
     LocalFree(pSD);
     
     if (!success) {
-        Logger::Error("EventLogger: Failed to set file ACL: {}", GetLastError());
+        SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to set file ACL: %lu", GetLastError());
         return false;
     }
     
@@ -456,8 +458,10 @@ bool FlushFileToDisk(std::ofstream& file) {
     // This is a limitation - for truly crash-safe logging, we should use
     // Windows file handles directly (CreateFile/WriteFile/FlushFileBuffers)
     
-    // For now, flush() is the best we can do with std::ofstream
-    // In production, consider using raw Windows file handles
+    // DESIGN NOTE: std::ofstream does not expose the underlying OS file handle.
+    // The crash-safe code path in WriteToFileImpl uses a parallel CreateFile/FlushFileBuffers
+    // handle (m_logFileHandle) for critical events, which provides true disk flush guarantees.
+    // This helper is retained only for non-critical convenience flushes.
     return file.good();
 #else
     file.flush();
@@ -800,16 +804,16 @@ public:
         std::unique_lock lock(m_configMutex);
 
         if (m_initialized.load(std::memory_order_acquire)) {
-            Logger::Warn("EventLogger::Impl already initialized");
+            SS_LOG_WARN(LOG_CATEGORY, L"EventLogger::Impl already initialized");
             return true;
         }
 
         try {
-            Logger::Info("EventLogger::Impl: Initializing with enterprise security features");
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger::Impl: Initializing with enterprise security features");
 
             // Validate HMAC key
             if (config.enableTamperProtection && config.hmacKey.size() < SecurityLimits::HMAC_KEY_SIZE) {
-                Logger::Error("EventLogger: HMAC key must be at least {} bytes", SecurityLimits::HMAC_KEY_SIZE);
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: HMAC key must be at least %lu bytes", static_cast<unsigned long>(SecurityLimits::HMAC_KEY_SIZE));
                 return false;
             }
 
@@ -822,7 +826,7 @@ public:
             // Initialize Windows Event Log source
             if (config.destinations & static_cast<uint8_t>(LogDestination::WindowsEventLog)) {
                 if (!InitializeWindowsEventLog()) {
-                    Logger::Error("EventLogger: Windows Event Log initialization failed - aborting");
+                    SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Windows Event Log initialization failed - aborting");
                     return false;
                 }
             }
@@ -830,7 +834,7 @@ public:
             // Initialize file logging
             if (config.destinations & static_cast<uint8_t>(LogDestination::File)) {
                 if (!InitializeFileLogging()) {
-                    Logger::Error("EventLogger: File logging initialization failed - aborting");
+                    SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: File logging initialization failed - aborting");
                     return false;
                 }
             }
@@ -839,13 +843,13 @@ public:
             StartWorkerThreads();
 
             m_initialized.store(true, std::memory_order_release);
-            Logger::Info("EventLogger::Impl: Initialization complete - tamper protection: {}, crash-safe: {}", 
-                config.enableTamperProtection, config.enableCrashSafeLogging);
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger::Impl: Initialization complete - tamper protection: %ls, crash-safe: %ls", 
+                config.enableTamperProtection ? L"true" : L"false", config.enableCrashSafeLogging ? L"true" : L"false");
 
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -857,7 +861,7 @@ public:
             return;
         }
 
-        Logger::Info("EventLogger::Impl: Shutting down");
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger::Impl: Shutting down");
 
         // Signal shutdown
         m_shutdown.store(true, std::memory_order_release);
@@ -898,7 +902,7 @@ public:
         }
 
         m_initialized.store(false, std::memory_order_release);
-        Logger::Info("EventLogger::Impl: Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger::Impl: Shutdown complete");
     }
 
     [[nodiscard]] bool InitializeWindowsEventLog() {
@@ -909,15 +913,15 @@ public:
             );
 
             if (!m_eventSourceHandle) {
-                Logger::Error("EventLogger: Failed to register event source: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to register event source: %lu", GetLastError());
                 return false;
             }
             
-            Logger::Info("EventLogger: Windows Event Log source registered");
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Windows Event Log source registered");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Windows Event Log init exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Windows Event Log init exception: %hs", e.what());
             return false;
         }
     }
@@ -930,7 +934,7 @@ public:
 
             // Validate path is within allowed directory
             if (!ValidateExportPath(m_config.logFilePath, m_config.allowedLogDirectory)) {
-                Logger::Error("EventLogger: Log file path validation failed - path traversal detected");
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log file path validation failed - path traversal detected");
                 m_stats.pathTraversalBlocked.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -946,8 +950,8 @@ public:
                 std::unique_lock fileLock(m_fileMutex);
                 m_logFile.open(m_config.logFilePath, std::ios::app | std::ios::binary);
                 if (!m_logFile) {
-                    Logger::Error("EventLogger: Failed to open log file: {}",
-                        StringUtils::WideToUtf8(m_config.logFilePath));
+                    SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to open log file: %hs",
+                        StringUtils::WideToUtf8(m_config.logFilePath).c_str());
                     return false;
                 }
                 
@@ -966,7 +970,7 @@ public:
             // Set restrictive ACL if configured
             if (m_config.restrictLogFileAccess) {
                 if (!SetLogFileACL(m_config.logFilePath)) {
-                    Logger::Warn("EventLogger: Failed to set log file ACL - continuing with default permissions");
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Failed to set log file ACL - continuing with default permissions");
                 }
             }
 
@@ -976,11 +980,11 @@ public:
                 std::memory_order_relaxed
             );
 
-            Logger::Info("EventLogger: File logging initialized with ACL protection");
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: File logging initialized with ACL protection");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: File logging init exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: File logging init exception: %hs", e.what());
             return false;
         }
     }
@@ -994,7 +998,7 @@ public:
             });
         }
 
-        Logger::Info("EventLogger: Started {} worker threads", m_config.workerThreads);
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Started %lu worker threads", static_cast<unsigned long>(m_config.workerThreads));
     }
 
     // ========================================================================
@@ -1040,11 +1044,11 @@ public:
                 return hmacHex;
             }
             
-            Logger::Error("EventLogger: HMAC computation failed");
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: HMAC computation failed");
             return "";
             
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: HMAC exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: HMAC exception: %hs", e.what());
             return "";
         }
     }
@@ -1152,7 +1156,7 @@ public:
             m_workerCV.notify_one();
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Log exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log exception: %hs", e.what());
         }
     }
 
@@ -1190,7 +1194,7 @@ public:
             // If couldn't find lower priority, and this isn't critical, drop this event
             if (!dropped && event.priority != EventPriority::Critical) {
                 m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
-                Logger::Warn("EventLogger: Event dropped - queue full (priority: {})", 
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Event dropped - queue full (priority: %d)", 
                     static_cast<int>(event.priority));
                 return;
             }
@@ -1224,7 +1228,7 @@ public:
             m_workerCV.notify_one();
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Audit log exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Audit log exception: %hs", e.what());
         }
     }
 
@@ -1292,7 +1296,7 @@ public:
             m_stats.forensicEventsCaptures.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Forensic capture exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Forensic capture exception: %hs", e.what());
         }
     }
 
@@ -1301,7 +1305,7 @@ public:
     // ========================================================================
 
     void WorkerThread(std::stop_token stoken, uint32_t threadIndex) {
-        Logger::Debug("EventLogger: Worker thread {} started", threadIndex);
+        SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Worker thread %lu started", static_cast<unsigned long>(threadIndex));
 
         while (!stoken.stop_requested() && !m_shutdown.load(std::memory_order_acquire)) {
             try {
@@ -1325,11 +1329,11 @@ public:
                 ProcessAuditQueue();
 
             } catch (const std::exception& e) {
-                Logger::Error("EventLogger: Worker thread {} exception: {}", threadIndex, e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Worker thread %lu exception: %hs", static_cast<unsigned long>(threadIndex), e.what());
             }
         }
 
-        Logger::Debug("EventLogger: Worker thread {} stopped", threadIndex);
+        SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Worker thread %lu stopped", static_cast<unsigned long>(threadIndex));
     }
 
     void ProcessCriticalEventQueue() {
@@ -1490,11 +1494,11 @@ public:
             if (success) {
                 m_stats.windowsEventsWritten.fetch_add(1, std::memory_order_relaxed);
             } else {
-                Logger::Error("EventLogger: ReportEvent failed: {}", GetLastError());
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: ReportEvent failed: %lu", GetLastError());
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Windows Event Log write exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Windows Event Log write exception: %hs", e.what());
         }
     }
 
@@ -1569,7 +1573,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: DB write exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: DB write exception: %hs", e.what());
         }
     }
 
@@ -1642,7 +1646,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: File write exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: File write exception: %hs", e.what());
         }
     }
 
@@ -1681,7 +1685,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Syslog forward exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Syslog forward exception: %hs", e.what());
         }
     }
 
@@ -1746,11 +1750,11 @@ public:
             if (result.statusCode >= 200 && result.statusCode < 300) {
                 m_stats.siemEventsForwarded.fetch_add(1, std::memory_order_relaxed);
             } else {
-                Logger::Warn("EventLogger: SIEM forward failed with status {}", result.statusCode);
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: SIEM forward failed with status %d", result.statusCode);
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: SIEM forward exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: SIEM forward exception: %hs", e.what());
         }
     }
 
@@ -1809,7 +1813,7 @@ public:
         std::unique_lock rotationLock(m_rotationMutex);
         
         try {
-            Logger::Info("EventLogger: Rotating log file");
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Rotating log file");
             
             // Flush before closing
             if (m_logFile.is_open()) {
@@ -1838,7 +1842,7 @@ public:
             if (fs::exists(oldPath, ec)) {
                 fs::rename(oldPath, newPath, ec);
                 if (ec) {
-                    Logger::Error("EventLogger: Log rotation rename failed: {}", ec.message());
+                    SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log rotation rename failed: %hs", ec.message().c_str());
                 }
             }
 
@@ -1872,7 +1876,7 @@ public:
             m_stats.logRotations.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Log rotation exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log rotation exception: %hs", e.what());
         }
     }
 
@@ -1911,12 +1915,12 @@ public:
                     fs::remove(logPath);
                 }
                 
-                Logger::Debug("EventLogger: Compressed rotated log: {} -> {} bytes", 
-                    content.size(), compressed.size());
+                SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Compressed rotated log: %llu -> %llu bytes", 
+                    static_cast<unsigned long long>(content.size()), static_cast<unsigned long long>(compressed.size()));
             }
             
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Log compression exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Log compression exception: %hs", e.what());
         }
     }
 
@@ -1949,7 +1953,7 @@ public:
             fs::remove(filePath);
             
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Secure delete exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Secure delete exception: %hs", e.what());
             // Fall back to regular delete
             std::error_code ec;
             fs::remove(filePath, ec);
@@ -2000,12 +2004,12 @@ public:
                     fs::remove(path, ec);
                 }
                 
-                Logger::Debug("EventLogger: Deleted old log file: {}", path.string());
+                SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Deleted old log file: %hs", path.string().c_str());
                 logFiles.erase(logFiles.begin());
             }
             
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Delete old logs exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Delete old logs exception: %hs", e.what());
         }
     }
 
@@ -2134,7 +2138,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Query exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Query exception: %hs", e.what());
         }
 
         return results;
@@ -2149,7 +2153,7 @@ public:
         try {
             // CRITICAL: Validate export path to prevent path traversal
             if (!ValidateExportPath(filePath, m_config.allowedLogDirectory)) {
-                Logger::Error("EventLogger: Export path validation failed - potential path traversal attack blocked");
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Export path validation failed - potential path traversal attack blocked");
                 m_stats.pathTraversalBlocked.fetch_add(1, std::memory_order_relaxed);
                 return false;
             }
@@ -2161,7 +2165,7 @@ public:
             
             std::ofstream outFile(filePath, std::ios::trunc);
             if (!outFile) {
-                Logger::Error("EventLogger: Failed to open export file");
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to open export file");
                 return false;
             }
 
@@ -2213,12 +2217,12 @@ public:
             outFile.flush();
             outFile.close();
             
-            Logger::Info("EventLogger: Exported {} events to {}", totalExported, 
-                StringUtils::WideToUtf8(filePath));
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Exported %llu events to %hs", static_cast<unsigned long long>(totalExported), 
+                StringUtils::WideToUtf8(filePath).c_str());
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Export exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Export exception: %hs", e.what());
             return false;
         }
     }
@@ -2242,7 +2246,7 @@ public:
         try {
             // CRITICAL: Validate path to prevent path traversal
             if (!ValidateExportPath(filePath, m_config.allowedLogDirectory)) {
-                Logger::Error("EventLogger: Forensic flush path validation failed - path traversal blocked");
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Forensic flush path validation failed - path traversal blocked");
                 m_stats.pathTraversalBlocked.fetch_add(1, std::memory_order_relaxed);
                 return;
             }
@@ -2251,7 +2255,7 @@ public:
 
             std::ofstream outFile(filePath);
             if (!outFile) {
-                Logger::Error("EventLogger: Failed to open forensic buffer file");
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to open forensic buffer file");
                 return;
             }
 
@@ -2281,10 +2285,10 @@ public:
 
             outFile.flush();
             outFile.close();
-            Logger::Info("EventLogger: Forensic buffer flushed to file");
+            SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Forensic buffer flushed to file");
 
         } catch (const std::exception& e) {
-            Logger::Error("EventLogger: Forensic flush exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Forensic flush exception: %hs", e.what());
         }
     }
 
@@ -2304,7 +2308,7 @@ public:
                 auto elapsed = duration_cast<milliseconds>(steady_clock::now() - startTime);
                 
                 if (elapsed.count() > m_config.callbackTimeoutMs) {
-                    Logger::Warn("EventLogger: Callback {} exceeded timeout ({} ms)", id, elapsed.count());
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Callback %llu exceeded timeout (%lld ms)", static_cast<unsigned long long>(id), static_cast<long long>(elapsed.count()));
                     m_stats.callbackTimeouts.fetch_add(1, std::memory_order_relaxed);
                     
                     // Track failures for this callback
@@ -2313,13 +2317,13 @@ public:
                     
                     if (failures[id] >= m_config.maxCallbackFailures) {
                         callbacksToRemove.push_back(id);
-                        Logger::Warn("EventLogger: Callback {} will be unregistered after {} failures", 
-                            id, failures[id]);
+                        SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Callback %llu will be unregistered after %lu failures", 
+                            static_cast<unsigned long long>(id), static_cast<unsigned long>(failures[id]));
                     }
                 }
                 
             } catch (const std::exception& e) {
-                Logger::Error("EventLogger: Event callback {} exception: {}", id, e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Event callback %llu exception: %hs", static_cast<unsigned long long>(id), e.what());
                 
                 // Track failures
                 auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
@@ -2338,7 +2342,7 @@ public:
             for (uint64_t id : callbacksToRemove) {
                 m_eventCallbacks.erase(id);
                 m_callbackFailureCounts.erase(id);
-                Logger::Info("EventLogger: Auto-unregistered failed callback {}", id);
+                SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Auto-unregistered failed callback %llu", static_cast<unsigned long long>(id));
             }
         }
     }
@@ -2354,7 +2358,7 @@ public:
                 auto elapsed = duration_cast<milliseconds>(steady_clock::now() - startTime);
                 
                 if (elapsed.count() > m_config.callbackTimeoutMs) {
-                    Logger::Warn("EventLogger: Audit callback {} exceeded timeout", id);
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Audit callback %llu exceeded timeout", static_cast<unsigned long long>(id));
                     m_stats.callbackTimeouts.fetch_add(1, std::memory_order_relaxed);
                     
                     auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
@@ -2366,7 +2370,7 @@ public:
                 }
                 
             } catch (const std::exception& e) {
-                Logger::Error("EventLogger: Audit callback {} exception: {}", id, e.what());
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Audit callback %llu exception: %hs", static_cast<unsigned long long>(id), e.what());
                 
                 auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
                 failures[id]++;
@@ -2430,14 +2434,14 @@ EventLogger& EventLogger::Instance() {
 EventLogger::EventLogger()
     : m_impl(std::make_unique<EventLoggerImpl>())
 {
-    Logger::Info("EventLogger: Constructor called");
+    SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Constructor called");
 }
 
 EventLogger::~EventLogger() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Logger::Info("EventLogger: Destructor called");
+    SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Destructor called");
 }
 
 // ============================================================================
@@ -2446,7 +2450,7 @@ EventLogger::~EventLogger() {
 
 bool EventLogger::Initialize(const EventLoggerConfig& config) {
     if (!m_impl) {
-        Logger::Critical("EventLogger: Implementation is null");
+        SS_LOG_FATAL(LOG_CATEGORY, L"EventLogger: Implementation is null");
         return false;
     }
 
@@ -2720,7 +2724,7 @@ uint64_t EventLogger::RegisterEventCallback(EventCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_eventCallbacks[id] = std::move(callback);
 
-    Logger::Debug("EventLogger: Registered event callback {}", id);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Registered event callback %llu", static_cast<unsigned long long>(id));
     return id;
 }
 
@@ -2730,7 +2734,7 @@ void EventLogger::UnregisterEventCallback(uint64_t callbackId) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_eventCallbacks.erase(callbackId);
 
-    Logger::Debug("EventLogger: Unregistered event callback {}", callbackId);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Unregistered event callback %llu", static_cast<unsigned long long>(callbackId));
 }
 
 uint64_t EventLogger::RegisterAuditCallback(AuditCallback callback) {
@@ -2741,7 +2745,7 @@ uint64_t EventLogger::RegisterAuditCallback(AuditCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_auditCallbacks[id] = std::move(callback);
 
-    Logger::Debug("EventLogger: Registered audit callback {}", id);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Registered audit callback %llu", static_cast<unsigned long long>(id));
     return id;
 }
 
@@ -2751,7 +2755,7 @@ void EventLogger::UnregisterAuditCallback(uint64_t callbackId) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     m_impl->m_auditCallbacks.erase(callbackId);
 
-    Logger::Debug("EventLogger: Unregistered audit callback {}", callbackId);
+    SS_LOG_DEBUG(LOG_CATEGORY, L"EventLogger: Unregistered audit callback %llu", static_cast<unsigned long long>(callbackId));
 }
 
 // ============================================================================
@@ -2767,14 +2771,14 @@ void EventLogger::Flush() {
 void EventLogger::Pause() noexcept {
     if (m_impl) {
         m_impl->m_paused.store(true, std::memory_order_release);
-        Logger::Info("EventLogger: Logging paused");
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Logging paused");
     }
 }
 
 void EventLogger::Resume() noexcept {
     if (m_impl) {
         m_impl->m_paused.store(false, std::memory_order_release);
-        Logger::Info("EventLogger: Logging resumed");
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Logging resumed");
     }
 }
 
@@ -2794,7 +2798,7 @@ void EventLogger::Resume() noexcept {
 void EventLogger::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
-        Logger::Info("EventLogger: Statistics reset");
+        SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Statistics reset");
     }
 }
 
