@@ -47,6 +47,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
+#include "../AI/PhantomCortex.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 
@@ -775,7 +776,55 @@ struct FileSystemFilter::Impl {
             }
         }
 
-        // 4. Default: Allow (fail-open by default)
+        // 4. PhantomCortex AI/ML pre-screening for high-risk file types
+        if (ShadowStrike::AI::PhantomCortex::Instance().IsOperational()) {
+            try {
+                const std::wstring ext = GetFileExtension(event.filePath);
+                if (IsExecutableExtension(ext) || IsScriptExtension(ext)) {
+                    std::ifstream ifs(event.filePath, std::ios::binary | std::ios::ate);
+                    if (ifs.is_open()) {
+                        const auto fileSize = ifs.tellg();
+                        if (fileSize > 0 &&
+                            static_cast<size_t>(fileSize) <= ShadowStrike::AI::CortexConstants::MAX_PE_FILE_SIZE) {
+                            ifs.seekg(0, std::ios::beg);
+                            std::vector<uint8_t> fileBytes(static_cast<size_t>(fileSize));
+                            if (ifs.read(reinterpret_cast<char*>(fileBytes.data()),
+                                         static_cast<std::streamsize>(fileSize))) {
+                                auto mlVerdict = ShadowStrike::AI::PhantomCortex::Instance().AnalyzeFile(
+                                    std::span<const uint8_t>(fileBytes));
+
+                                if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Malicious) {
+                                    SS_LOG_WARN(L"FileSystemFilter",
+                                        L"PhantomCortex ML blocked high-risk file: %s (confidence: %.2f)",
+                                        event.filePath.c_str(), mlVerdict.confidence);
+                                    InvokeThreatCallbacks(event,
+                                        L"ML/PhantomCortex." + mlVerdict.details,
+                                        mlVerdict.confidence);
+                                    return ScanVerdict::BlockAndQuarantine;
+                                }
+
+                                if (mlVerdict.verdict == ShadowStrike::AI::ThreatVerdict::Suspicious) {
+                                    SS_LOG_INFO(L"FileSystemFilter",
+                                        L"PhantomCortex ML flagged suspicious file: %s (confidence: %.2f)",
+                                        event.filePath.c_str(), mlVerdict.confidence);
+                                    InvokeThreatCallbacks(event,
+                                        L"ML/PhantomCortex.Suspicious",
+                                        mlVerdict.confidence);
+                                    return ScanVerdict::Block;
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("FileSystemFilter: PhantomCortex ML analysis failed: {}",
+                    ex.what());
+            } catch (...) {
+                Utils::Logger::Error("FileSystemFilter: PhantomCortex ML unknown exception");
+            }
+        }
+
+        // 5. Default: Allow (fail-open by default)
         return ScanVerdict::Allow;
     }
 
