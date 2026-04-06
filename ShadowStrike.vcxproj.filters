@@ -153,9 +153,6 @@
     <ClCompile Include="src\Shared_modules\Core\Engine\ScanEngine.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Core\Engine\SignatureDatabase_Manager.cpp">
-      <Filter>Source Files</Filter>
-    </ClCompile>
     <ClCompile Include="src\Shared_modules\Core\Engine\ThreatDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -603,37 +600,37 @@
     <ClCompile Include="src\Shared_modules\Scripts\VBScriptScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\AntiDebug.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\AntiDebug.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\CertificateValidator.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\CertificateValidator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Shared_modules\Security\CodeObfuscation.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\CryptoManager.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\CryptoManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\DigitalSignatureValidator.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\DigitalSignatureValidator.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\FileProtection.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\FileProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\MemoryProtection.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\MemoryProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\ProcessProtection.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\ProcessProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\RegistryProtection.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\RegistryProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\SelfDefense.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\SelfDefense.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Shared_modules\Security\TamperProtection.cpp">
+    <ClCompile Include="src\Shared_modules\SelfProtection\TamperProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Shared_modules\Service\AntivirusService.cpp">
@@ -955,6 +952,27 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\Shared_modules\PEParser\PEValidation.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\AI\CortexConfig.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\AI\FeatureExtractor.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\AI\ModelCache.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\AI\ModelInference.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\AI\PhantomCortex.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\RealTime\RealTimeProtection.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\Shared_modules\Update\LocalFolderTransport.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
   </ItemGroup>
@@ -1673,34 +1691,289 @@
     <ClInclude Include="src\Shared_modules\Scripts\VBScriptScanner.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\AntiDebug.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\AntiDebug.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\CertificateValidator.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\CertificateValidator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\CryptoManager.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\CryptoManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\DigitalSignatureValidator.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\DigitalSignatureValidator.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\FileProtection.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\FileProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\MemoryProtection.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\MemoryProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\ProcessProtection.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\ProcessProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\RegistryProtection.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\RegistryProtection.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\SelfDefense.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\SelfDefense.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Shared_modules\Security\TamperProtection.hpp">
+    <ClInclude Include="src\Shared_modules\SelfProtection\TamperProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\CortexConfig.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\CortexTypes.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\FeatureExtractor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\ModelCache.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\ModelInference.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\AI\PhantomCortex.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Config\ConfigManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Config\PolicyManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Config\ProfileManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Config\SettingsManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\BehaviorAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\EmulationEngine.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\HeuristicAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\MachineLearningDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\PackerUnpacker.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\PolymorphicDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\QuarantineManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\SandboxAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\ScanEngine.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\ThreatDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Engine\ZeroDayDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\ArchiveExtractor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\DirectoryMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\DocumentScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\ExecutableAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\FileHasher.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\FileLockManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\FileReputation.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\FileWatcher.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\MediaFileScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\FileSystem\MountPointMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\BotnetDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\DDosProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\DNSMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\EmailScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\FirewallManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\NetworkMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\P2PMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\TorDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\TrafficAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\URLAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\VPNDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Network\WebProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\AtomBombingDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\DLLInjectionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\MemoryScanner.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ProcessAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ProcessHollowingDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ProcessInjectionDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ProcessKiller.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ProcessMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ReflectiveDLLDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Process\ThreadHijackDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Registry\PersistenceDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Registry\RegistryAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Registry\RegistryMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Registry\StartupAnalyzer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Core\Registry\SystemSettingsMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\BufferOverflowProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\HeapSprayDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\JITSprayDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\KernelExploitDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\PrivilegeEscalationDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\ROPProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Exploits\StackPivotDetector.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\AccessControlManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\BehaviorBlocker.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\ExploitPrevention.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\FileIntegrityMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\FileSystemFilter.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\MemoryProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\NetworkTrafficFilter.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\ProcessCreationMonitor.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\RealTimeProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\RealTime\ZeroHourProtection.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\SelfProtection\SecurityEnums.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\DeltaUpdater.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\IUpdateTransport.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\ProgramUpdater.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\RollbackManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\SignatureUpdater.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\UpdateManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\UpdateScheduler.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\Shared_modules\Update\UpdateVerifier.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
@@ -1723,5 +1996,8 @@
     <MASM Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="src\Shared_modules\Core\Engine\HeuristicAnalyzer.cpp.bak" />
   </ItemGroup>
 </Project>
