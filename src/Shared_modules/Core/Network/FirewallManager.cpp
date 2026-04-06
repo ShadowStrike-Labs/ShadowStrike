@@ -92,7 +92,7 @@ namespace {
     std::array<uint8_t, 16> result{0};
 
     // Try IPv4 first
-    std::string narrowIp = StringUtils::WideToUtf8(ipStr);
+    std::string narrowIp = StringUtils::ToNarrow(ipStr);
 
     // IPv4
     struct in_addr addr4;
@@ -125,7 +125,7 @@ namespace {
         inet_ntop(AF_INET, ip.data(), buffer, INET_ADDRSTRLEN);
     }
 
-    return StringUtils::Utf8ToWide(buffer);
+    return StringUtils::ToWide(buffer);
 }
 
 /**
@@ -157,6 +157,35 @@ namespace {
     return true;
 }
 
+/**
+ * @brief Escapes a string for safe JSON embedding.
+ */
+[[nodiscard]] std::string EscapeJsonString(const std::string& input) {
+    std::string output;
+    output.reserve(input.size() + 16);
+    for (char c : input) {
+        switch (c) {
+            case '"':  output += "\\\""; break;
+            case '\\': output += "\\\\"; break;
+            case '\b': output += "\\b";  break;
+            case '\f': output += "\\f";  break;
+            case '\n': output += "\\n";  break;
+            case '\r': output += "\\r";  break;
+            case '\t': output += "\\t";  break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    output += buf;
+                } else {
+                    output += c;
+                }
+                break;
+        }
+    }
+    return output;
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -172,17 +201,12 @@ namespace {
             return std::equal(address.begin(), address.end(), ip.begin());
 
         case Type::RANGE: {
-            // Check if IP is between address and rangeEnd
-            bool inRange = true;
+            // Check if IP is between address (start) and rangeEnd (end)
+            // using lexicographic byte comparison (network byte order)
             const size_t len = isIPv6 ? 16 : 4;
-
-            for (size_t i = 0; i < len; ++i) {
-                if (ip[i] < address[i] || ip[i] > rangeEnd[i]) {
-                    inRange = false;
-                    break;
-                }
-            }
-            return inRange;
+            int cmpStart = std::memcmp(ip.data(), address.data(), len);
+            int cmpEnd = std::memcmp(ip.data(), rangeEnd.data(), len);
+            return cmpStart >= 0 && cmpEnd <= 0;
         }
 
         case Type::CIDR:
@@ -231,7 +255,7 @@ namespace {
             return true;
 
         case Type::PATH:
-            return StringUtils::EqualsIgnoreCase(path, processPath);
+            return StringUtils::IEquals(path, processPath);
 
         case Type::PATH_WILDCARD: {
             // Simple wildcard matching
@@ -242,7 +266,7 @@ namespace {
         }
 
         case Type::NAME:
-            return StringUtils::EqualsIgnoreCase(processName, procName);
+            return StringUtils::IEquals(processName, procName);
 
         case Type::PUBLISHER:
             return !publisher.empty() && pub.find(publisher) != std::wstring::npos;
@@ -411,7 +435,7 @@ FirewallRule FirewallRule::CreateGeoBlock(const std::vector<std::string>& countr
 
 FirewallRuleLegacy::operator FirewallRule() const {
     FirewallRule rule;
-    rule.name = StringUtils::Utf8ToWide(id);
+    rule.name = StringUtils::ToWide(id);
     rule.type = appPath.empty() ? RuleType::PORT : RuleType::APPLICATION;
     rule.action = isAllow ? RuleAction::ALLOW : RuleAction::BLOCK;
     rule.direction = RuleDirection::BOTH;
@@ -528,7 +552,7 @@ void FirewallStatistics::Reset() noexcept {
 /**
  * @brief Private implementation class for FirewallManager.
  */
-class FirewallManager::Impl {
+class FirewallManagerImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -555,7 +579,7 @@ public:
 
     // Rules (ordered by priority)
     std::map<uint64_t, FirewallRule> m_rules;  // ruleId -> rule
-    uint64_t m_nextRuleId{1};
+    std::atomic<uint64_t> m_nextRuleId{1};
 
     // Application tracking
     std::unordered_map<std::wstring, ApplicationNetworkStats> m_appStats;
@@ -579,6 +603,9 @@ public:
 
     // Stealth mode rules
     std::vector<uint64_t> m_stealthRuleIds;
+
+    // Lockdown rules (separate from stealth)
+    std::vector<uint64_t> m_lockdownRuleIds;
 
     // ========================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -849,10 +876,11 @@ public:
 
             // Store rule
             m_rules[newRule.ruleId] = newRule;
-            m_stats.activeRuleCount.store(m_rules.size(), std::memory_order_relaxed);
+            m_stats.activeRuleCount.store(
+                static_cast<uint32_t>(m_rules.size()), std::memory_order_relaxed);
 
             SS_LOG_INFO(L"Network", L"FirewallManager: Rule {} added: {}", newRule.ruleId,
-                StringUtils::WideToUtf8(newRule.name));
+                newRule.name);
 
             // Invoke callbacks
             InvokeRuleChangeCallbacks(newRule, true);
@@ -893,7 +921,8 @@ public:
 
         // Remove from map
         m_rules.erase(it);
-        m_stats.activeRuleCount.store(m_rules.size(), std::memory_order_relaxed);
+        m_stats.activeRuleCount.store(
+            static_cast<uint32_t>(m_rules.size()), std::memory_order_relaxed);
 
         SS_LOG_INFO(L"Network", L"FirewallManager: Rule {} removed", ruleId);
         return true;
@@ -971,13 +1000,205 @@ public:
     [[nodiscard]] bool AddRuleToWFP(FirewallRule& rule) {
         std::unique_lock lock(m_wfpMutex);
 
-        try {
-            // In a real implementation, this would create FWPM_FILTER0 structures
-            // and add them to WFP using FwpmFilterAdd0()
+        if (m_wfpEngineHandle == nullptr) {
+            SS_LOG_ERROR(L"Network", L"FirewallManager: WFP engine not open, cannot add filter");
+            m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
+            return false;
+        }
 
-            // For now, simulate successful addition
-            rule.wfpFilterId = m_nextRuleId.load(std::memory_order_relaxed);
-            m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+        try {
+            // Build WFP filter for IPv4
+            if (rule.applyToIPv4) {
+                FWPM_FILTER0 filter{};
+                filter.displayData.name = const_cast<wchar_t*>(rule.name.c_str());
+                filter.displayData.description = const_cast<wchar_t*>(rule.description.c_str());
+                filter.providerKey = &m_providerGuid;
+                filter.subLayerKey = m_sublayerGuid;
+                filter.weight.type = FWP_UINT32;
+                filter.weight.uint32 = rule.priority;
+                filter.flags = (rule.persistence == RulePersistence::PERSISTENT)
+                    ? FWPM_FILTER_FLAG_PERSISTENT : 0;
+                if (rule.persistence == RulePersistence::BOOT_TIME) {
+                    filter.flags |= FWPM_FILTER_FLAG_BOOTTIME;
+                }
+
+                filter.action.type = (rule.action == RuleAction::ALLOW ||
+                                      rule.action == RuleAction::ALLOW_BYPASS)
+                    ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK;
+
+                // Select WFP layer based on direction
+                if (rule.direction == RuleDirection::OUTBOUND || rule.direction == RuleDirection::BOTH) {
+                    filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+                } else {
+                    filter.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4;
+                }
+
+                // Build conditions
+                std::vector<FWPM_FILTER_CONDITION0> conditions;
+                FWP_V4_ADDR_AND_MASK addrMask{};
+                FWP_RANGE0 portRange{};
+
+                // IP condition
+                if (rule.remoteAddress.type == IPAddressMatch::Type::SINGLE) {
+                    FWPM_FILTER_CONDITION0 cond{};
+                    cond.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                    cond.matchType = FWP_MATCH_EQUAL;
+                    cond.conditionValue.type = FWP_UINT32;
+                    uint32_t addr = 0;
+                    std::memcpy(&addr, rule.remoteAddress.address.data(), 4);
+                    cond.conditionValue.uint32 = ntohl(addr);
+                    conditions.push_back(cond);
+                } else if (rule.remoteAddress.type == IPAddressMatch::Type::CIDR) {
+                    FWPM_FILTER_CONDITION0 cond{};
+                    cond.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                    cond.matchType = FWP_MATCH_EQUAL;
+                    cond.conditionValue.type = FWP_V4_ADDR_MASK;
+                    std::memcpy(&addrMask.addr, rule.remoteAddress.address.data(), 4);
+                    addrMask.addr = ntohl(addrMask.addr);
+                    addrMask.mask = rule.remoteAddress.prefixLength >= 32 ? 0xFFFFFFFF :
+                        ~((1u << (32 - rule.remoteAddress.prefixLength)) - 1);
+                    cond.conditionValue.v4AddrMask = &addrMask;
+                    conditions.push_back(cond);
+                }
+
+                // Port condition
+                if (!rule.remotePorts.empty()) {
+                    FWPM_FILTER_CONDITION0 cond{};
+                    cond.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+                    if (rule.remotePorts[0].IsSinglePort()) {
+                        cond.matchType = FWP_MATCH_EQUAL;
+                        cond.conditionValue.type = FWP_UINT16;
+                        cond.conditionValue.uint16 = rule.remotePorts[0].start;
+                    } else {
+                        cond.matchType = FWP_MATCH_RANGE;
+                        cond.conditionValue.type = FWP_RANGE_TYPE;
+                        portRange.valueLow.type = FWP_UINT16;
+                        portRange.valueLow.uint16 = rule.remotePorts[0].start;
+                        portRange.valueHigh.type = FWP_UINT16;
+                        portRange.valueHigh.uint16 = rule.remotePorts[0].end;
+                        cond.conditionValue.rangeValue = &portRange;
+                    }
+                    conditions.push_back(cond);
+                }
+
+                // Protocol condition
+                if (rule.protocol != RuleProtocol::ANY) {
+                    FWPM_FILTER_CONDITION0 cond{};
+                    cond.fieldKey = FWPM_CONDITION_IP_PROTOCOL;
+                    cond.matchType = FWP_MATCH_EQUAL;
+                    cond.conditionValue.type = FWP_UINT8;
+                    cond.conditionValue.uint8 = static_cast<uint8_t>(rule.protocol);
+                    conditions.push_back(cond);
+                }
+
+                // Application condition
+                FWP_BYTE_BLOB appBlob{};
+                std::wstring appIdBuf;
+                if (rule.application.type == ApplicationMatch::Type::PATH &&
+                    !rule.application.path.empty()) {
+                    FWPM_FILTER_CONDITION0 cond{};
+                    cond.fieldKey = FWPM_CONDITION_ALE_APP_ID;
+                    cond.matchType = FWP_MATCH_EQUAL;
+                    cond.conditionValue.type = FWP_BYTE_BLOB_TYPE;
+                    // WFP requires the app path in a device-path format via FwpmGetAppIdFromFileName0
+                    FWP_BYTE_BLOB* appId = nullptr;
+                    DWORD appIdResult = FwpmGetAppIdFromFileName0(
+                        rule.application.path.c_str(), &appId);
+                    if (appIdResult == ERROR_SUCCESS && appId != nullptr) {
+                        cond.conditionValue.byteBlob = appId;
+                        conditions.push_back(cond);
+                    } else {
+                        SS_LOG_WARN(L"Network",
+                            L"FirewallManager: FwpmGetAppIdFromFileName0 failed for {}: {}",
+                            rule.application.path, appIdResult);
+                    }
+                }
+
+                filter.numFilterConditions = static_cast<UINT32>(conditions.size());
+                filter.filterCondition = conditions.empty() ? nullptr : conditions.data();
+
+                UINT64 filterId = 0;
+                DWORD addResult = FwpmFilterAdd0(
+                    m_wfpEngineHandle, &filter, nullptr, &filterId);
+
+                // Cleanup app ID blob
+                if (rule.application.type == ApplicationMatch::Type::PATH &&
+                    !conditions.empty()) {
+                    for (auto& c : conditions) {
+                        if (c.fieldKey == FWPM_CONDITION_ALE_APP_ID &&
+                            c.conditionValue.byteBlob != nullptr) {
+                            FwpmFreeMemory0(reinterpret_cast<void**>(&c.conditionValue.byteBlob));
+                        }
+                    }
+                }
+
+                if (addResult != ERROR_SUCCESS) {
+                    SS_LOG_ERROR(L"Network",
+                        L"FirewallManager: FwpmFilterAdd0 failed for rule {}: {}",
+                        rule.ruleId, addResult);
+                    m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
+                    return false;
+                }
+
+                rule.wfpFilterId = filterId;
+                m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+
+                // Also add inbound filter if direction is BOTH
+                if (rule.direction == RuleDirection::BOTH) {
+                    filter.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4;
+                    UINT64 filterId2 = 0;
+                    DWORD addResult2 = FwpmFilterAdd0(
+                        m_wfpEngineHandle, &filter, nullptr, &filterId2);
+                    if (addResult2 == ERROR_SUCCESS) {
+                        m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            // Build WFP filter for IPv6
+            if (rule.applyToIPv6 && rule.remoteAddress.isIPv6 &&
+                rule.remoteAddress.type == IPAddressMatch::Type::SINGLE) {
+                FWPM_FILTER0 filter6{};
+                filter6.displayData.name = const_cast<wchar_t*>(rule.name.c_str());
+                filter6.displayData.description = const_cast<wchar_t*>(rule.description.c_str());
+                filter6.providerKey = &m_providerGuid;
+                filter6.subLayerKey = m_sublayerGuid;
+                filter6.weight.type = FWP_UINT32;
+                filter6.weight.uint32 = rule.priority;
+
+                filter6.action.type = (rule.action == RuleAction::ALLOW ||
+                                       rule.action == RuleAction::ALLOW_BYPASS)
+                    ? FWP_ACTION_PERMIT : FWP_ACTION_BLOCK;
+
+                if (rule.direction == RuleDirection::OUTBOUND || rule.direction == RuleDirection::BOTH) {
+                    filter6.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V6;
+                } else {
+                    filter6.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6;
+                }
+
+                FWPM_FILTER_CONDITION0 cond{};
+                cond.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                cond.matchType = FWP_MATCH_EQUAL;
+                cond.conditionValue.type = FWP_BYTE_ARRAY16_TYPE;
+                FWP_BYTE_ARRAY16 addr6{};
+                std::memcpy(addr6.byteArray16, rule.remoteAddress.address.data(), 16);
+                cond.conditionValue.byteArray16 = &addr6;
+
+                filter6.numFilterConditions = 1;
+                filter6.filterCondition = &cond;
+
+                UINT64 filterId6 = 0;
+                DWORD addResult6 = FwpmFilterAdd0(
+                    m_wfpEngineHandle, &filter6, nullptr, &filterId6);
+                if (addResult6 == ERROR_SUCCESS) {
+                    rule.wfpFilterId6 = filterId6;
+                    m_stats.wfpFilterCount.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    SS_LOG_WARN(L"Network",
+                        L"FirewallManager: IPv6 filter add failed for rule {}: {}",
+                        rule.ruleId, addResult6);
+                }
+            }
 
             SS_LOG_DEBUG(L"Network", L"FirewallManager: Rule {} added to WFP (filter ID: {})",
                 rule.ruleId, rule.wfpFilterId);
@@ -994,12 +1215,29 @@ public:
     void RemoveRuleFromWFP(const FirewallRule& rule) {
         std::unique_lock lock(m_wfpMutex);
 
+        if (m_wfpEngineHandle == nullptr) {
+            return;
+        }
+
         try {
             if (rule.wfpFilterId != 0) {
-                // In real implementation: FwpmFilterDeleteById0(m_wfpEngineHandle, rule.wfpFilterId);
-                m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
-
+                DWORD result = FwpmFilterDeleteById0(m_wfpEngineHandle, rule.wfpFilterId);
+                if (result == ERROR_SUCCESS || result == FWP_E_FILTER_NOT_FOUND) {
+                    m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
+                } else {
+                    SS_LOG_WARN(L"Network",
+                        L"FirewallManager: FwpmFilterDeleteById0 failed for rule {}: {}",
+                        rule.ruleId, result);
+                    m_stats.wfpErrors.fetch_add(1, std::memory_order_relaxed);
+                }
                 SS_LOG_DEBUG(L"Network", L"FirewallManager: Rule {} removed from WFP", rule.ruleId);
+            }
+
+            if (rule.wfpFilterId6 != 0) {
+                DWORD result6 = FwpmFilterDeleteById0(m_wfpEngineHandle, rule.wfpFilterId6);
+                if (result6 == ERROR_SUCCESS || result6 == FWP_E_FILTER_NOT_FOUND) {
+                    m_stats.wfpFilterCount.fetch_sub(1, std::memory_order_relaxed);
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1008,21 +1246,26 @@ public:
     }
 
     [[nodiscard]] bool ApplyAllRulesToWFP() {
-        std::shared_lock lock(m_rulesMutex);
+        std::unique_lock lock(m_rulesMutex);
 
         size_t successCount = 0;
+        size_t enabledCount = 0;
         for (auto& [id, rule] : m_rules) {
-            if (rule.isEnabled && AddRuleToWFP(rule)) {
-                successCount++;
+            if (rule.isEnabled) {
+                enabledCount++;
+                if (AddRuleToWFP(rule)) {
+                    successCount++;
+                }
             }
         }
 
-        SS_LOG_INFO(L"Network", L"FirewallManager: Applied {}/{} rules to WFP", successCount, m_rules.size());
-        return successCount == m_rules.size();
+        SS_LOG_INFO(L"Network", L"FirewallManager: Applied {}/{} rules to WFP",
+            successCount, enabledCount);
+        return successCount == enabledCount;
     }
 
     void RemoveAllWFPFilters() {
-        std::shared_lock lock(m_rulesMutex);
+        std::unique_lock lock(m_rulesMutex);
 
         for (const auto& [id, rule] : m_rules) {
             RemoveRuleFromWFP(rule);
@@ -1059,7 +1302,7 @@ public:
                 rule.action == RuleAction::BLOCK &&
                 rule.type == RuleType::APPLICATION &&
                 rule.application.type == ApplicationMatch::Type::PATH &&
-                StringUtils::EqualsIgnoreCase(rule.application.path, appPath)) {
+                StringUtils::IEquals(rule.application.path, appPath)) {
                 return true;
             }
         }
@@ -1187,14 +1430,19 @@ public:
     // ========================================================================
 
     bool ApplyStealthModeImpl(StealthMode mode) {
-        std::unique_lock lock(m_rulesMutex);
-
         try {
-            // Remove existing stealth rules
-            for (uint64_t ruleId : m_stealthRuleIds) {
+            // Collect existing stealth rule IDs to remove (under lock)
+            std::vector<uint64_t> oldStealthIds;
+            {
+                std::unique_lock lock(m_rulesMutex);
+                oldStealthIds = m_stealthRuleIds;
+                m_stealthRuleIds.clear();
+            }
+
+            // Remove existing stealth rules (lock-free — RemoveRuleImpl handles its own locking)
+            for (uint64_t ruleId : oldStealthIds) {
                 RemoveRuleImpl(ruleId);
             }
-            m_stealthRuleIds.clear();
 
             if (mode == StealthMode::OFF) {
                 return true;
@@ -1215,13 +1463,49 @@ public:
 
                 uint64_t ruleId = AddRuleImpl(icmpRule);
                 if (ruleId != 0) {
+                    std::unique_lock lock(m_rulesMutex);
                     m_stealthRuleIds.push_back(ruleId);
                 }
             }
 
             // ENHANCED: Drop unsolicited inbound
             if (mode >= StealthMode::ENHANCED) {
-                // Additional stealth rules would go here
+                FirewallRule dropUnsolicited;
+                dropUnsolicited.name = L"Stealth: Drop Unsolicited Inbound";
+                dropUnsolicited.description = L"Stealth mode - drop unsolicited inbound traffic";
+                dropUnsolicited.type = RuleType::COMBINED;
+                dropUnsolicited.action = RuleAction::BLOCK_SILENT;
+                dropUnsolicited.direction = RuleDirection::INBOUND;
+                dropUnsolicited.protocol = RuleProtocol::ANY;
+                dropUnsolicited.priority = FirewallConstants::PRIORITY_SYSTEM;
+                dropUnsolicited.isBuiltIn = true;
+                dropUnsolicited.isLocked = true;
+
+                uint64_t ruleId = AddRuleImpl(dropUnsolicited);
+                if (ruleId != 0) {
+                    std::unique_lock lock(m_rulesMutex);
+                    m_stealthRuleIds.push_back(ruleId);
+                }
+
+                // Block ICMPv6 as well
+                FirewallRule icmpv6Rule;
+                icmpv6Rule.name = L"Stealth: Block ICMPv6";
+                icmpv6Rule.description = L"Stealth mode ICMPv6 blocking";
+                icmpv6Rule.type = RuleType::COMBINED;
+                icmpv6Rule.action = RuleAction::BLOCK;
+                icmpv6Rule.direction = RuleDirection::INBOUND;
+                icmpv6Rule.protocol = RuleProtocol::ICMPv6;
+                icmpv6Rule.priority = FirewallConstants::PRIORITY_SYSTEM;
+                icmpv6Rule.isBuiltIn = true;
+                icmpv6Rule.isLocked = true;
+                icmpv6Rule.applyToIPv4 = false;
+                icmpv6Rule.applyToIPv6 = true;
+
+                ruleId = AddRuleImpl(icmpv6Rule);
+                if (ruleId != 0) {
+                    std::unique_lock lock(m_rulesMutex);
+                    m_stealthRuleIds.push_back(ruleId);
+                }
             }
 
             SS_LOG_INFO(L"Network", L"FirewallManager: Stealth mode set to {}", static_cast<int>(mode));
@@ -1245,27 +1529,45 @@ public:
 
         try {
             SS_LOG_WARN(L"Network", L"FirewallManager: EMERGENCY LOCKDOWN ACTIVATED - Reason: {}",
-                StringUtils::WideToUtf8(std::wstring(reason)));
+                std::wstring(reason));
 
-            // Create lockdown rule (block everything)
-            FirewallRule lockdownRule;
-            lockdownRule.name = L"EMERGENCY LOCKDOWN";
-            lockdownRule.description = std::format(L"Emergency lockdown: {}", reason);
-            lockdownRule.type = RuleType::COMBINED;
-            lockdownRule.action = RuleAction::BLOCK;
-            lockdownRule.direction = RuleDirection::BOTH;
-            lockdownRule.priority = FirewallConstants::PRIORITY_EMERGENCY;
-            lockdownRule.isBuiltIn = true;
-            lockdownRule.isLocked = true;
-            lockdownRule.isTemporary = true;
+            // Create lockdown rule blocking ALL outbound traffic
+            FirewallRule lockdownOutbound;
+            lockdownOutbound.name = L"EMERGENCY LOCKDOWN - OUTBOUND";
+            lockdownOutbound.description = std::format(L"Emergency lockdown: {}", reason);
+            lockdownOutbound.type = RuleType::COMBINED;
+            lockdownOutbound.action = RuleAction::BLOCK;
+            lockdownOutbound.direction = RuleDirection::OUTBOUND;
+            lockdownOutbound.priority = FirewallConstants::PRIORITY_EMERGENCY;
+            lockdownOutbound.isBuiltIn = true;
+            lockdownOutbound.isLocked = true;
+            lockdownOutbound.isTemporary = true;
 
-            uint64_t ruleId = AddRuleImpl(lockdownRule);
-            if (ruleId != 0) {
-                m_stealthRuleIds.push_back(ruleId);  // Track for removal
-                return true;
+            uint64_t outRuleId = AddRuleImpl(lockdownOutbound);
+            if (outRuleId != 0) {
+                std::unique_lock lock(m_rulesMutex);
+                m_lockdownRuleIds.push_back(outRuleId);
             }
 
-            return false;
+            // Also block ALL inbound traffic
+            FirewallRule lockdownInbound;
+            lockdownInbound.name = L"EMERGENCY LOCKDOWN - INBOUND";
+            lockdownInbound.description = std::format(L"Emergency lockdown: {}", reason);
+            lockdownInbound.type = RuleType::COMBINED;
+            lockdownInbound.action = RuleAction::BLOCK;
+            lockdownInbound.direction = RuleDirection::INBOUND;
+            lockdownInbound.priority = FirewallConstants::PRIORITY_EMERGENCY;
+            lockdownInbound.isBuiltIn = true;
+            lockdownInbound.isLocked = true;
+            lockdownInbound.isTemporary = true;
+
+            uint64_t inRuleId = AddRuleImpl(lockdownInbound);
+            if (inRuleId != 0) {
+                std::unique_lock lock(m_rulesMutex);
+                m_lockdownRuleIds.push_back(inRuleId);
+            }
+
+            return (outRuleId != 0 || inRuleId != 0);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"FirewallManager: EnableLockdown exception: {}", e.what());
@@ -1281,8 +1583,25 @@ public:
 
         SS_LOG_INFO(L"Network", L"FirewallManager: Lockdown deactivated");
 
-        // Remove lockdown rules (they're tracked in m_stealthRuleIds)
-        // Would need proper tracking in real implementation
+        // Collect lockdown rule IDs under lock, then remove outside lock
+        std::vector<uint64_t> toRemove;
+        {
+            std::unique_lock lock(m_rulesMutex);
+            toRemove = m_lockdownRuleIds;
+            m_lockdownRuleIds.clear();
+        }
+
+        // Lockdown rules are marked isLocked=true, temporarily unlock them for removal
+        for (uint64_t ruleId : toRemove) {
+            {
+                std::unique_lock lock(m_rulesMutex);
+                auto it = m_rules.find(ruleId);
+                if (it != m_rules.end()) {
+                    it->second.isLocked = false;
+                }
+            }
+            RemoveRuleImpl(ruleId);
+        }
 
         return true;
     }
@@ -1391,14 +1710,14 @@ public:
                 std::shared_lock lock(m_rulesMutex);
                 file << "ACTIVE RULES (" << m_rules.size() << "):\n";
                 for (const auto& [id, rule] : m_rules) {
-                    file << "  [" << id << "] " << StringUtils::WideToUtf8(rule.name);
+                    file << "  [" << id << "] " << StringUtils::ToNarrow(rule.name);
                     file << " - " << (rule.isEnabled ? "Enabled" : "Disabled") << "\n";
                 }
             }
 
             file.close();
             SS_LOG_INFO(L"Network", L"FirewallManager: Diagnostics exported to {}",
-                StringUtils::WideToUtf8(outputPath));
+                outputPath);
 
             return true;
 
@@ -1423,7 +1742,7 @@ FirewallManager& FirewallManager::Instance() {
 // ============================================================================
 
 FirewallManager::FirewallManager()
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(std::make_unique<FirewallManagerImpl>())
 {
     SS_LOG_INFO(L"Network", L"FirewallManager: Constructor called");
 }
@@ -1441,7 +1760,7 @@ FirewallManager::~FirewallManager() {
 
 bool FirewallManager::Initialize(const FirewallManagerConfig& config) {
     if (!m_impl) {
-        Logger::Critical("FirewallManager: Implementation is null");
+        SS_LOG_FATAL(L"Network", L"FirewallManager: Implementation is null");
         return false;
     }
 
@@ -1557,7 +1876,7 @@ bool FirewallManager::SetRuleEnabled(uint64_t ruleId, bool enabled) {
     std::copy_if(allRules.begin(), allRules.end(), std::back_inserter(result),
         [&appPath](const FirewallRule& rule) {
             return rule.type == RuleType::APPLICATION &&
-                   StringUtils::EqualsIgnoreCase(rule.application.path, appPath);
+                   StringUtils::IEquals(rule.application.path, appPath);
         });
 
     return result;
@@ -1702,7 +2021,15 @@ uint32_t FirewallManager::RemoveApplicationRules(const std::wstring& appPath) {
 
     uint8_t prefixLength = 0;
     try {
-        prefixLength = static_cast<uint8_t>(std::stoi(prefixPart));
+        int parsed = std::stoi(prefixPart);
+        uint8_t maxPrefix = isIPv6 ? 128 : 32;
+        if (parsed < 0 || parsed > maxPrefix) {
+            SS_LOG_ERROR(L"Network",
+                L"FirewallManager: Prefix length {} out of range (0-{}) for CIDR",
+                parsed, maxPrefix);
+            return 0;
+        }
+        prefixLength = static_cast<uint8_t>(parsed);
     } catch (...) {
         SS_LOG_ERROR(L"Network", L"FirewallManager: Invalid prefix length in CIDR");
         return 0;
@@ -1939,7 +2266,10 @@ void FirewallManager::ClearGeoRestrictions() {
 bool FirewallManager::SetStealthMode(StealthMode mode) {
     if (!m_impl) return false;
 
-    m_impl->m_config.stealthMode = mode;
+    {
+        std::unique_lock lock(m_impl->m_configMutex);
+        m_impl->m_config.stealthMode = mode;
+    }
     return m_impl->ApplyStealthModeImpl(mode);
 }
 
@@ -2090,7 +2420,7 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
             const auto& rule = rules[i];
             file << "    {\n";
             file << "      \"id\": " << rule.ruleId << ",\n";
-            file << "      \"name\": \"" << StringUtils::WideToUtf8(rule.name) << "\",\n";
+            file << "      \"name\": \"" << EscapeJsonString(StringUtils::ToNarrow(rule.name)) << "\",\n";
             file << "      \"enabled\": " << (rule.isEnabled ? "true" : "false") << "\n";
             file << "    }";
             if (i < rules.size() - 1) file << ",";
@@ -2102,7 +2432,7 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
 
         file.close();
         SS_LOG_INFO(L"Network", L"FirewallManager: Exported {} rules to {}",
-            rules.size(), StringUtils::WideToUtf8(filePath));
+            rules.size(), filePath);
 
         return true;
 
@@ -2116,7 +2446,7 @@ uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) 
     // Import implementation would parse JSON/XML and add rules
     // For now, placeholder
     SS_LOG_INFO(L"Network", L"FirewallManager: Import rules from {} (merge: {})",
-        StringUtils::WideToUtf8(filePath), merge);
+        filePath, merge);
     return 0;
 }
 
