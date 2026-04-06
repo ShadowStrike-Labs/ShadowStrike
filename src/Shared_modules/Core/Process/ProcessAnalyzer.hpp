@@ -1879,6 +1879,72 @@ public:
     [[nodiscard]] bool DetectDirectSyscalls(uint32_t pid);
 
     // ========================================================================
+    // KERNEL & PROCESSMONITOR WIRING
+    // ========================================================================
+
+    /**
+     * @brief Register with ProcessMonitor to receive process lifecycle events.
+     *
+     * Subscribes to process create/terminate and image-load events so the
+     * analyzer can proactively invalidate caches, detect PPID spoofing at
+     * creation time, and trigger deep analysis for suspicious spawns.
+     * Call AFTER both ProcessAnalyzer and ProcessMonitor are initialized.
+     */
+    void WireToProcessMonitor();
+
+    /**
+     * @brief Handle kernel process creation notification.
+     *
+     * Called by ProcessMonitor (or kernel IPC dispatcher) when the
+     * PsSetCreateProcessNotifyRoutineEx callback fires.
+     *
+     * @param pid           New process ID.
+     * @param parentPid     Parent PID as reported by the kernel.
+     * @param creatingPid   Actual creating process PID (may differ from parent).
+     * @param creatingTid   Creating thread ID.
+     * @param imagePath     Full NT image path.
+     */
+    void OnKernelProcessCreate(uint32_t pid, uint32_t parentPid,
+        uint32_t creatingPid, uint32_t creatingTid, const std::wstring& imagePath);
+
+    /**
+     * @brief Handle kernel process termination notification.
+     * @param pid Terminating process ID.
+     */
+    void OnKernelProcessTerminate(uint32_t pid);
+
+    /**
+     * @brief Handle kernel image load notification (DLL / driver).
+     *
+     * Called by ProcessMonitor (or kernel IPC dispatcher) when the
+     * PsSetLoadImageNotifyRoutineEx callback fires.
+     *
+     * @param pid           Process into which the image was loaded.
+     * @param imageBase     Base address of the loaded image.
+     * @param imageSize     Size of the loaded image.
+     * @param imageName     Name/path of the image.
+     * @param isSystemImage Whether the image is a known system image.
+     */
+    void OnKernelImageLoad(uint32_t pid, uintptr_t imageBase,
+        size_t imageSize, const std::wstring& imageName, bool isSystemImage);
+
+    /**
+     * @brief Handle kernel remote-thread creation notification.
+     *
+     * Called when PsSetCreateThreadNotifyRoutineEx detects a thread whose
+     * creator process differs from the target process — a hallmark of
+     * remote thread injection (T1055.003).
+     *
+     * @param targetPid         Process receiving the new thread.
+     * @param threadId          New thread ID.
+     * @param creatorPid        Process that created the thread.
+     * @param creatorTid        Thread that created the new thread.
+     * @param isRemote          True if creator != target (cross-process).
+     */
+    void OnKernelThreadCreate(uint32_t targetPid, uint32_t threadId,
+        uint32_t creatorPid, uint32_t creatorTid, bool isRemote);
+
+    // ========================================================================
     // CALLBACK REGISTRATION
     // ========================================================================
 
@@ -2014,6 +2080,10 @@ private:
     // ========================================================================
 
     std::unique_ptr<ProcessAnalyzerImpl> m_impl;
+
+    /// @brief ProcessMonitor callback IDs for cleanup on shutdown.
+    uint64_t m_monitorCallbackId = 0;
+    uint64_t m_monitorEventCallbackId = 0;
 };
 
 } // namespace Process
