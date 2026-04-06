@@ -4281,6 +4281,17 @@ void ThreatIntelStore::UnregisterEventCallback(size_t callbackId) noexcept {
 }
 
 // ============================================================================
+// Store Wiring (Orchestrator Access)
+// ============================================================================
+
+ThreatIntelLookup* ThreatIntelStore::GetLookup() noexcept {
+    if (!m_isInitialized.load(std::memory_order_acquire) || !m_impl || !m_impl->lookup) {
+        return nullptr;
+    }
+    return m_impl->lookup.get();
+}
+
+// ============================================================================
 // Factory Functions
 // ============================================================================
 

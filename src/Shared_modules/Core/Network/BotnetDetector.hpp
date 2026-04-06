@@ -1041,6 +1041,16 @@ public:
     bool ExportDiagnostics(const std::wstring& outputPath) const;
     bool ExportAlerts(const std::wstring& outputPath, uint32_t lastHours = 24) const;
 
+    // ========================================================================
+    // Store Wiring (Orchestrator-Injected Dependencies)
+    // ========================================================================
+
+    /**
+     * @brief Set the ThreatIntelStore instance (non-owning, orchestrator manages lifetime)
+     * @param store Pointer to the ThreatIntelStore, or nullptr to clear
+     */
+    void SetThreatIntelStore(ShadowStrike::ThreatIntel::ThreatIntelStore* store) noexcept;
+
 private:
     class BotnetDetectorImpl;
 

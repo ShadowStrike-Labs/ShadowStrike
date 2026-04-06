@@ -1491,7 +1491,17 @@ public:
      * @param callbackId Callback ID returned from RegisterEventCallback
      */
     void UnregisterEventCallback(size_t callbackId) noexcept;
-    
+
+    // ========================================================================
+    // Store Wiring (Orchestrator Access)
+    // ========================================================================
+
+    /**
+     * @brief Get the underlying ThreatIntelLookup pointer for orchestrator wiring
+     * @return Raw pointer to the lookup subsystem, or nullptr if not initialized
+     */
+    [[nodiscard]] ThreatIntelLookup* GetLookup() noexcept;
+
 private:
     // Internal implementation using Pimpl pattern for ABI stability
     class Impl;

@@ -927,6 +927,16 @@ public:
     [[nodiscard]] bool PerformDiagnostics() const;
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    // ========================================================================
+    // Store Wiring (Orchestrator-Injected Dependencies)
+    // ========================================================================
+
+    /**
+     * @brief Set the ThreatIntelStore instance (non-owning, orchestrator manages lifetime)
+     * @param store Pointer to the ThreatIntelStore, or nullptr to clear
+     */
+    void SetThreatIntelStore(ShadowStrike::ThreatIntel::ThreatIntelStore* store) noexcept;
+
 private:
     P2PMonitor();
     ~P2PMonitor();

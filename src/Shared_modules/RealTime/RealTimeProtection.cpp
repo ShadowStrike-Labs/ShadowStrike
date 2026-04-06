@@ -52,6 +52,22 @@
 #include "ZeroHourProtection.hpp"
 
 // ============================================================================
+// CORE NETWORK MODULE INCLUDES
+// ============================================================================
+#include "../Core/Network/NetworkMonitor.hpp"
+#include "../Core/Network/TrafficAnalyzer.hpp"
+#include "../Core/Network/DNSMonitor.hpp"
+#include "../Core/Network/URLAnalyzer.hpp"
+#include "../Core/Network/BotnetDetector.hpp"
+#include "../Core/Network/WebProtection.hpp"
+#include "../Core/Network/TorDetector.hpp"
+#include "../Core/Network/VPNDetector.hpp"
+#include "../Core/Network/P2PMonitor.hpp"
+
+// Kernel network event structures (for FilterMessageType_NetworkAlert parsing)
+#include "../../PhantomSensor/Shared/NetworkTypes.h"
+
+// ============================================================================
 // EXPLOIT DETECTOR INCLUDES
 // ============================================================================
 #include "../Exploits/HeapSprayDetector.hpp"
@@ -1163,6 +1179,204 @@ public:
             }
         }
 
+        // ====================================================================
+        // CORE NETWORK MODULES (gated on filterNetworkTraffic)
+        // ====================================================================
+        if (m_config.filterNetworkTraffic) {
+
+            // ---- NetworkMonitor ----
+            try {
+                auto& nm = Core::Network::NetworkMonitor::Instance();
+                auto nmCfg = Core::Network::NetworkMonitorConfig::CreateDefault();
+                if (!nm.Initialize(nmCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: NetworkMonitor::Initialize failed");
+                } else {
+                    nm.Start();
+                    Utils::Logger::Info("RealTimeProtection: NetworkMonitor initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: NetworkMonitor startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: NetworkMonitor startup unknown exception");
+            }
+
+            // ---- TrafficAnalyzer ----
+            try {
+                auto& ta = Core::Network::TrafficAnalyzer::Instance();
+                auto taCfg = Core::Network::TrafficAnalyzerConfig::CreateDefault();
+                if (!ta.Initialize(taCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: TrafficAnalyzer::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        ta.SetThreatIntelLookup(m_sharedThreatIntelStore->GetLookup());
+                    }
+                    if (m_sharedSignatureStore) {
+                        ta.SetSignatureStore(m_sharedSignatureStore.get());
+                    }
+                    ta.Start();
+                    Utils::Logger::Info("RealTimeProtection: TrafficAnalyzer initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: TrafficAnalyzer startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: TrafficAnalyzer startup unknown exception");
+            }
+
+            // ---- DNSMonitor ----
+            try {
+                auto& dm = Core::Network::DNSMonitor::Instance();
+                auto dmCfg = Core::Network::DNSMonitorConfig::CreateDefault();
+                if (!dm.Initialize(dmCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: DNSMonitor::Initialize failed");
+                } else {
+                    dm.Start();
+                    Utils::Logger::Info("RealTimeProtection: DNSMonitor initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: DNSMonitor startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: DNSMonitor startup unknown exception");
+            }
+
+            // ---- URLAnalyzer ----
+            try {
+                auto& ua = Core::Network::URLAnalyzer::Instance();
+                auto uaCfg = Core::Network::URLAnalyzerConfig::CreateDefault();
+                if (!ua.Initialize(uaCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: URLAnalyzer::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        ua.SetThreatIntelLookup(m_sharedThreatIntelStore->GetLookup());
+                    }
+                    if (m_sharedPatternStore) {
+                        ua.SetPatternStore(m_sharedPatternStore.get());
+                    }
+                    Utils::Logger::Info("RealTimeProtection: URLAnalyzer initialized");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: URLAnalyzer startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: URLAnalyzer startup unknown exception");
+            }
+
+            // ---- BotnetDetector ----
+            try {
+                auto& bd = Core::Network::BotnetDetector::Instance();
+                auto bdCfg = Core::Network::BotnetDetectorConfig::CreateDefault();
+                if (!bd.Initialize(bdCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: BotnetDetector::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        bd.SetThreatIntelStore(m_sharedThreatIntelStore.get());
+                    }
+                    bd.Start();
+                    Utils::Logger::Info("RealTimeProtection: BotnetDetector initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: BotnetDetector startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: BotnetDetector startup unknown exception");
+            }
+
+            // ---- WebProtection ----
+            try {
+                auto& wp = Core::Network::WebProtection::Instance();
+                auto wpCfg = Core::Network::WebProtectionConfig::CreateDefault();
+                if (!wp.Initialize(wpCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: WebProtection::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        wp.SetThreatIntelStore(m_sharedThreatIntelStore.get());
+                    }
+                    wp.Start();
+                    Utils::Logger::Info("RealTimeProtection: WebProtection initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: WebProtection startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: WebProtection startup unknown exception");
+            }
+
+            // ---- TorDetector ----
+            try {
+                auto& td = Core::Network::TorDetector::Instance();
+                auto tdCfg = Core::Network::TorDetectorConfig::CreateDefault();
+                if (!td.Initialize(tdCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: TorDetector::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        td.SetThreatIntelStore(m_sharedThreatIntelStore.get());
+                    }
+                    td.Start();
+                    Utils::Logger::Info("RealTimeProtection: TorDetector initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: TorDetector startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: TorDetector startup unknown exception");
+            }
+
+            // ---- VPNDetector ----
+            try {
+                auto& vd = Core::Network::VPNDetector::Instance();
+                auto vdCfg = Core::Network::VPNDetectorConfig::CreateDefault();
+                if (!vd.Initialize(vdCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: VPNDetector::Initialize failed");
+                } else {
+                    vd.Start();
+                    Utils::Logger::Info("RealTimeProtection: VPNDetector initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: VPNDetector startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: VPNDetector startup unknown exception");
+            }
+
+            // ---- P2PMonitor ----
+            try {
+                auto& pm = Core::Network::P2PMonitor::Instance();
+                auto pmCfg = Core::Network::P2PMonitorConfig::CreateDefault();
+                if (!pm.Initialize(pmCfg)) {
+                    Utils::Logger::Error("RealTimeProtection: P2PMonitor::Initialize failed");
+                } else {
+                    if (m_sharedThreatIntelStore) {
+                        pm.SetThreatIntelStore(m_sharedThreatIntelStore.get());
+                    }
+                    pm.Start();
+                    Utils::Logger::Info("RealTimeProtection: P2PMonitor initialized and started");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: P2PMonitor startup exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: P2PMonitor startup unknown exception");
+            }
+
+            // ---- Event bridge: NetworkTrafficFilter -> TrafficAnalyzer ----
+            try {
+                auto& ntf = NetworkTrafficFilter::Instance();
+                if (ntf.IsRunning()) {
+                    ntf.RegisterEventCallback(
+                        [](const NetworkEvent& event) {
+                            try {
+                                auto& analyzer = Core::Network::TrafficAnalyzer::Instance();
+                                if (analyzer.IsRunning() && !event.dataPreview.empty()) {
+                                    analyzer.AnalyzePacket(event.dataPreview);
+                                }
+                            } catch (...) {
+                                // Best-effort forwarding; do not let callback exceptions
+                                // propagate back into the filter's event loop.
+                            }
+                        });
+                    Utils::Logger::Info("RealTimeProtection: Event bridge registered (NetworkTrafficFilter -> TrafficAnalyzer)");
+                }
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("RealTimeProtection: Event bridge registration failed: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("RealTimeProtection: Event bridge registration unknown exception");
+            }
+
+        } // end filterNetworkTraffic (Core Network modules)
+
         // ExploitPrevention
         if (m_config.enableExploitPrevention) {
             try {
@@ -1509,6 +1723,20 @@ public:
             BehaviorBlocker::Instance().Shutdown();
         } catch (...) {}
         SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::STOPPED);
+
+        // ====================================================================
+        // CORE NETWORK MODULES — shutdown in reverse initialization order
+        // ====================================================================
+        try { Core::Network::P2PMonitor::Instance().Stop(); Core::Network::P2PMonitor::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::VPNDetector::Instance().Stop(); Core::Network::VPNDetector::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::TorDetector::Instance().Stop(); Core::Network::TorDetector::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::WebProtection::Instance().Stop(); Core::Network::WebProtection::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::BotnetDetector::Instance().Stop(); Core::Network::BotnetDetector::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::URLAnalyzer::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::DNSMonitor::Instance().Stop(); Core::Network::DNSMonitor::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::TrafficAnalyzer::Instance().Stop(); Core::Network::TrafficAnalyzer::Instance().Shutdown(); } catch (...) {}
+        try { Core::Network::NetworkMonitor::Instance().Stop(); Core::Network::NetworkMonitor::Instance().Shutdown(); } catch (...) {}
+        Utils::Logger::Info("RealTimeProtection: Core Network modules stopped");
 
         try { NetworkTrafficFilter::Instance().Stop(); NetworkTrafficFilter::Instance().Shutdown(); } catch (...) {}
         SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::STOPPED);
@@ -2677,12 +2905,191 @@ public:
             }
 
             case FilterMessageType_NetworkAlert: {
-                // Kernel network threat intelligence (C2 beaconing, suspicious DNS, etc.)
-                // Forward to NetworkBasedEvasionDetector for domain/IP correlation
-                Utils::Logger::Warn("RealTimeProtection: Network threat alert from kernel (payload {} bytes)", size);
-                // NOTE: When kernel NetworkFilter starts sending structured NetworkAlert
-                // messages, parse the payload here and feed to m_networkDetector->AnalyzeDomain()
-                // for DGA/C2/DNS tunneling correlation against ThreatIntel store.
+                // ============================================================
+                // Kernel network event dispatch to Core Network modules
+                // ============================================================
+                if (size < sizeof(NETWORK_EVENT_HEADER) || !data) {
+                    Utils::Logger::Warn("RealTimeProtection: NetworkAlert too small ({} bytes) or null payload", size);
+                    break;
+                }
+
+                const auto* header = reinterpret_cast<const NETWORK_EVENT_HEADER*>(data);
+
+                try {
+                    switch (header->EventType) {
+
+                    case NetworkEvent_Connect: {
+                        if (size < sizeof(NETWORK_CONNECTION_EVENT)) break;
+                        const auto* connEvent = reinterpret_cast<const NETWORK_CONNECTION_EVENT*>(data);
+
+                        std::string remoteHost = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(connEvent->RemoteHostname));
+
+                        // Feed to BotnetDetector for C2 correlation
+                        auto& bd = Core::Network::BotnetDetector::Instance();
+                        if (bd.IsRunning()) {
+                            bd.RecordConnectionEvent(
+                                connEvent->Header.ProcessId,
+                                remoteHost,
+                                connEvent->RemoteAddress.Port,
+                                0, 0); // Byte counts unavailable at connect time
+                        }
+
+                        // Feed to TorDetector (connection-level tracking)
+                        auto& td = Core::Network::TorDetector::Instance();
+                        if (td.IsRunning()) {
+                            td.FeedPacket(connEvent->ConnectionId, 0);
+                        }
+
+                        Utils::Logger::Debug("RealTimeProtection: NetworkAlert Connect PID={} connId={} host={}",
+                            connEvent->Header.ProcessId, connEvent->ConnectionId, remoteHost);
+                        break;
+                    }
+
+                    case NetworkEvent_DnsQuery: {
+                        if (size < sizeof(NETWORK_DNS_EVENT)) break;
+                        const auto* dnsEvent = reinterpret_cast<const NETWORK_DNS_EVENT*>(data);
+
+                        std::string domainNarrow = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(dnsEvent->QueryName, dnsEvent->QueryNameLength));
+
+                        // Feed to URLAnalyzer for domain reputation check
+                        auto& ua = Core::Network::URLAnalyzer::Instance();
+                        ua.AnalyzeDomain(domainNarrow);
+
+                        // Feed to DNSMonitor for DGA analysis
+                        auto& dm = Core::Network::DNSMonitor::Instance();
+                        if (dm.IsRunning()) {
+                            auto dgaResult = dm.AnalyzeDGA(domainNarrow);
+                            if (dgaResult.isDGA) {
+                                Utils::Logger::Warn(
+                                    "RealTimeProtection: DNSMonitor flagged DGA: {} entropy={:.2f} confidence={:.2f}",
+                                    domainNarrow, dgaResult.entropy, dgaResult.confidence);
+                            }
+                        }
+
+                        // If DGA flagged by kernel, also log
+                        if (dnsEvent->IsDGA) {
+                            Utils::Logger::Warn("RealTimeProtection: Kernel flagged DGA domain: {} (score={} PID={})",
+                                domainNarrow, dnsEvent->DGAScore, dnsEvent->Header.ProcessId);
+                        }
+                        break;
+                    }
+
+                    case NetworkEvent_TlsHandshake: {
+                        if (size < sizeof(NETWORK_TLS_EVENT)) break;
+                        const auto* tlsEvent = reinterpret_cast<const NETWORK_TLS_EVENT*>(data);
+
+                        std::string sni = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(tlsEvent->ServerName));
+
+                        // Feed SNI to URLAnalyzer for domain reputation
+                        if (!sni.empty()) {
+                            auto& ua = Core::Network::URLAnalyzer::Instance();
+                            ua.AnalyzeDomain(sni);
+                        }
+
+                        // Feed to TrafficAnalyzer for JA3 correlation
+                        auto& ta = Core::Network::TrafficAnalyzer::Instance();
+                        if (ta.IsRunning()) {
+                            std::span<const uint8_t> ja3Span(
+                                reinterpret_cast<const uint8_t*>(tlsEvent->JA3Fingerprint),
+                                strnlen(tlsEvent->JA3Fingerprint, MAX_JA3_FINGERPRINT_LENGTH));
+                            if (!ja3Span.empty()) {
+                                ta.AnalyzePacket(ja3Span, std::chrono::system_clock::now());
+                            }
+                        }
+
+                        if (tlsEvent->IsKnownMaliciousJA3) {
+                            Utils::Logger::Warn("RealTimeProtection: Malicious JA3 detected: {} (SNI={} PID={})",
+                                tlsEvent->JA3Fingerprint, sni, tlsEvent->Header.ProcessId);
+                        }
+                        break;
+                    }
+
+                    case NetworkEvent_C2Communication: {
+                        if (size < sizeof(NETWORK_C2_EVENT)) break;
+                        const auto* c2Event = reinterpret_cast<const NETWORK_C2_EVENT*>(data);
+
+                        std::string hostname = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(c2Event->RemoteHostname));
+
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: C2 communication detected PID={} host={} confidence={} score={}",
+                            c2Event->Header.ProcessId, hostname,
+                            c2Event->ConfidenceScore, c2Event->ThreatScore);
+
+                        // Feed to BotnetDetector
+                        auto& bd = Core::Network::BotnetDetector::Instance();
+                        if (bd.IsRunning()) {
+                            bd.RecordConnectionEvent(
+                                c2Event->Header.ProcessId,
+                                hostname,
+                                c2Event->RemoteAddress.Port,
+                                c2Event->BeaconingData.AverageIntervalMs,
+                                0);
+                        }
+                        break;
+                    }
+
+                    case NetworkEvent_Beaconing: {
+                        if (size < sizeof(NETWORK_C2_EVENT)) break;
+                        const auto* beaconEvent = reinterpret_cast<const NETWORK_C2_EVENT*>(data);
+
+                        std::string hostname = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(beaconEvent->RemoteHostname));
+
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: Beaconing detected PID={} host={} count={} interval={}ms jitter={}%",
+                            beaconEvent->Header.ProcessId, hostname,
+                            beaconEvent->BeaconingData.BeaconCount,
+                            beaconEvent->BeaconingData.AverageIntervalMs,
+                            beaconEvent->BeaconingData.JitterPercent);
+                        break;
+                    }
+
+                    case NetworkEvent_DataExfiltration: {
+                        if (size < sizeof(NETWORK_EXFIL_EVENT)) break;
+                        const auto* exfilEvent = reinterpret_cast<const NETWORK_EXFIL_EVENT*>(data);
+
+                        std::string hostname = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(exfilEvent->RemoteHostname));
+
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: Data exfiltration detected PID={} dest={} sent={} recv={} ratio={} score={}",
+                            exfilEvent->Header.ProcessId, hostname,
+                            exfilEvent->TotalBytesSent, exfilEvent->TotalBytesReceived,
+                            exfilEvent->UploadDownloadRatio, exfilEvent->ThreatScore);
+                        break;
+                    }
+
+                    case NetworkEvent_DNSTunneling: {
+                        if (size < sizeof(NETWORK_DNS_TUNNEL_EVENT)) break;
+                        const auto* tunnelEvent = reinterpret_cast<const NETWORK_DNS_TUNNEL_EVENT*>(data);
+
+                        std::string baseDomain = Utils::StringUtils::ToNarrow(
+                            std::wstring_view(tunnelEvent->BaseDomain));
+
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: DNS tunneling detected domain={} queries={} entropy={} unique_sub={} confirmed={}",
+                            baseDomain,
+                            tunnelEvent->QueryCount,
+                            tunnelEvent->EntropyScore,
+                            tunnelEvent->UniqueSubdomains,
+                            tunnelEvent->IsConfirmedTunneling ? "YES" : "NO");
+                        break;
+                    }
+
+                    default:
+                        Utils::Logger::Debug("RealTimeProtection: Unhandled NetworkAlert event type {}",
+                            static_cast<uint32_t>(header->EventType));
+                        break;
+                    }
+                } catch (const std::exception& ex) {
+                    Utils::Logger::Error("RealTimeProtection: NetworkAlert dispatch exception: {}", ex.what());
+                } catch (...) {
+                    Utils::Logger::Error("RealTimeProtection: NetworkAlert dispatch unknown exception");
+                }
                 break;
             }
 

@@ -350,7 +350,7 @@ public:
     std::atomic<uint64_t> m_nextCallbackId{1};
 
     /// @brief Infrastructure integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
+    ThreatIntel::ThreatIntelStore* m_threatIntel{nullptr};
     std::shared_ptr<PatternStore::PatternStore> m_patternStore;
     std::shared_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::shared_ptr<Whitelist::WhitelistStore> m_whitelist;
@@ -427,7 +427,6 @@ bool BotnetDetector::BotnetDetectorImpl::Initialize(const BotnetDetectorConfig& 
         m_config = config;
 
         // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
         m_patternStore = std::make_shared<PatternStore::PatternStore>();
         m_signatureStore = std::make_shared<SignatureStore::SignatureStore>();
         m_whitelist = std::make_shared<Whitelist::WhitelistStore>();
@@ -2052,6 +2051,18 @@ bool BotnetDetector::ExportAlerts(const std::wstring& outputPath, uint32_t lastH
                            Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
+}
+
+// ============================================================================
+// Store Wiring (Orchestrator-Injected Dependencies)
+// ============================================================================
+
+void BotnetDetector::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
+    if (!m_impl) return;
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_threatIntel = store;
+    SS_LOG_INFO(L"Network", L"BotnetDetector: ThreatIntelStore %ls",
+                store ? L"wired" : L"cleared");
 }
 
 }  // namespace Network
