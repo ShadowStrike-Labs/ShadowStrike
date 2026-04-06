@@ -296,7 +296,7 @@ struct alignas(64) CertificateReputation {
 
     // Trust reasons
     std::vector<std::string> trustReasons;
-    std::vector<std::string> untristReasons;
+    std::vector<std::string> untrustReasons;
 };
 
 /**
