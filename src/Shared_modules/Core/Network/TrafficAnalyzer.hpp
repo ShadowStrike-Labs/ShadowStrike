@@ -1193,6 +1193,26 @@ public:
     [[nodiscard]] bool PerformDiagnostics() const;
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    // ========================================================================
+    // SUBSYSTEM WIRING
+    // ========================================================================
+
+    /**
+     * @brief Wire the ThreatIntel subsystem for JA3 and hash reputation checks.
+     * @param lookup Pointer to initialized ThreatIntelLookup. Caller must
+     *               guarantee the object outlives TrafficAnalyzer.
+     */
+    void SetThreatIntelLookup(
+        ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
+    /**
+     * @brief Wire the SignatureStore for payload signature scanning.
+     * @param store Pointer to initialized SignatureStore. Caller must
+     *              guarantee the object outlives TrafficAnalyzer.
+     */
+    void SetSignatureStore(
+        ShadowStrike::SignatureStore::SignatureStore* store) noexcept;
+
 private:
     TrafficAnalyzer();
     ~TrafficAnalyzer();

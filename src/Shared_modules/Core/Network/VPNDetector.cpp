@@ -87,6 +87,7 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
+#include "../../Utils/RegistryUtils.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../../HashStore/HashStore.hpp"
@@ -98,7 +99,7 @@
 #include <winsock2.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
-#include <wininet.h>
+#include <winhttp.h>
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -108,15 +109,17 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
-#include <regex>
+#include <fstream>
 
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
-#pragma comment(lib, "wininet.lib")
+#pragma comment(lib, "winhttp.lib")
 
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
+
+using namespace Utils;
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -161,24 +164,50 @@ namespace {
         L"pulsesecure.exe"
     };
 
-    // OpenVPN signature (first bytes of handshake)
-    const std::vector<uint8_t> OPENVPN_SIGNATURE = {
-        0x00, 0x00, 0x00, 0x00  // HMAC placeholder
+    // VPN registry key paths for installed VPN software
+    const std::vector<std::wstring> VPN_REGISTRY_PATHS = {
+        L"SOFTWARE\\OpenVPN",
+        L"SOFTWARE\\WireGuard",
+        L"SOFTWARE\\NordVPN",
+        L"SOFTWARE\\ExpressVPN",
+        L"SOFTWARE\\Surfshark",
+        L"SOFTWARE\\Private Internet Access",
+        L"SOFTWARE\\Mullvad VPN",
+        L"SOFTWARE\\ProtonVPN",
+        L"SOFTWARE\\CyberGhost",
+        L"SOFTWARE\\IPVanish",
+        L"SOFTWARE\\Windscribe",
+        L"SOFTWARE\\TunnelBear",
+        L"SOFTWARE\\AnchorFree\\Hotspot Shield",
+        L"SOFTWARE\\Cisco\\Cisco AnyConnect Secure Mobility Client",
+        L"SOFTWARE\\Palo Alto Networks\\GlobalProtect",
+        L"SOFTWARE\\Pulse Secure\\Pulse",
+        L"SOFTWARE\\Fortinet\\FortiClient",
     };
 
-    // WireGuard handshake signature
-    const std::vector<uint8_t> WIREGUARD_HANDSHAKE = {
-        0x01, 0x00, 0x00, 0x00  // Message type 1 (handshake initiation)
-    };
-
-    // IPSec IKE signature
-    const std::vector<uint8_t> IPSEC_IKE_SIGNATURE = {
-        // ISAKMP header
+    // VPN service names to detect running VPN services
+    const std::vector<std::wstring> VPN_SERVICE_NAMES = {
+        L"OpenVPNService",
+        L"WireGuardTunnel",
+        L"NordVpnService",
+        L"ExpressVpnService",
+        L"SurfsharkService",
+        L"PrivateInternetAccessService",
+        L"MullvadVPN",
+        L"ProtonVPN Service",
+        L"CyberGhostService",
+        L"vpnagent",            // Cisco AnyConnect
+        L"PanGPS",              // GlobalProtect
+        L"PulseSecureService",
+        L"FortiClient",
     };
 
     // Update interval
     constexpr uint32_t ADAPTER_SCAN_INTERVAL_MS = 5000;
     constexpr uint32_t LEAK_CHECK_INTERVAL_MS = 10000;
+
+    // Cap on tracked connections to prevent unbounded growth
+    constexpr size_t MAX_ACTIVE_CONNECTIONS = 256;
 
 } // anonymous namespace
 
@@ -187,18 +216,18 @@ namespace {
 // ============================================================================
 
 [[nodiscard]] static bool IsVirtualAdapterName(const std::wstring& name) noexcept {
-    std::wstring lowerName = StringUtils::ToLower(name);
+    std::wstring lowerName = StringUtils::ToLowerCopy(name);
 
     // Check for TAP/TUN
     for (const auto& keyword : TAP_ADAPTER_KEYWORDS) {
-        if (lowerName.find(StringUtils::ToLower(keyword)) != std::wstring::npos) {
+        if (lowerName.find(StringUtils::ToLowerCopy(keyword)) != std::wstring::npos) {
             return true;
         }
     }
 
     // Check for WireGuard
     for (const auto& keyword : WIREGUARD_KEYWORDS) {
-        if (lowerName.find(StringUtils::ToLower(keyword)) != std::wstring::npos) {
+        if (lowerName.find(StringUtils::ToLowerCopy(keyword)) != std::wstring::npos) {
             return true;
         }
     }
@@ -212,13 +241,13 @@ namespace {
 }
 
 [[nodiscard]] static AdapterType DetermineAdapterType(const std::wstring& name, const std::wstring& description) noexcept {
-    std::wstring lowerName = StringUtils::ToLower(name);
-    std::wstring lowerDesc = StringUtils::ToLower(description);
+    std::wstring lowerName = StringUtils::ToLowerCopy(name);
+    std::wstring lowerDesc = StringUtils::ToLowerCopy(description);
     std::wstring combined = lowerName + L" " + lowerDesc;
 
     // WireGuard
     for (const auto& keyword : WIREGUARD_KEYWORDS) {
-        if (combined.find(StringUtils::ToLower(keyword)) != std::wstring::npos) {
+        if (combined.find(StringUtils::ToLowerCopy(keyword)) != std::wstring::npos) {
             return AdapterType::WIREGUARD;
         }
     }
@@ -228,9 +257,17 @@ namespace {
         return AdapterType::TAP;
     }
 
-    // TUN
-    if (combined.find(L"tun") != std::wstring::npos) {
-        return AdapterType::TUN;
+    // TUN - require word boundary to avoid false positives like "fortune", "stunt"
+    for (size_t pos = combined.find(L"tun"); pos != std::wstring::npos;
+         pos = combined.find(L"tun", pos + 3)) {
+        // Check left boundary (start of string or non-alpha)
+        bool leftOk = (pos == 0) || !std::iswalpha(combined[pos - 1]);
+        // Check right boundary (end of string, digit, or non-alpha)
+        size_t endPos = pos + 3;
+        bool rightOk = (endPos >= combined.size()) || !std::iswalpha(combined[endPos]);
+        if (leftOk && rightOk) {
+            return AdapterType::TUN;
+        }
     }
 
     // IPSec
@@ -498,50 +535,54 @@ public:
             }
             m_wsaInitialized = true;
 
-            SS_LOG_INFO(L"Network", L"VPNDetector initialized (policy={}, adapters={}, proxy={})",
+            SS_LOG_INFO(L"Network", L"VPNDetector initialized (policy=%d, adapters=%d, proxy=%d)",
                 static_cast<int>(config.policy),
-                config.enableAdapterDetection,
-                config.enableProxyDetection);
+                config.enableAdapterDetection ? 1 : 0,
+                config.enableProxyDetection ? 1 : 0);
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"VPNDetector initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"VPNDetector initialization failed: %hs", e.what());
             return false;
         }
     }
 
     [[nodiscard]] bool Start() {
-        std::unique_lock lock(m_mutex);
-
         try {
-            if (!m_initialized) {
-                SS_LOG_ERROR(L"Network", L"Cannot start: not initialized");
-                return false;
+            {
+                std::unique_lock lock(m_mutex);
+
+                if (!m_initialized) {
+                    SS_LOG_ERROR(L"Network", L"Cannot start: not initialized");
+                    return false;
+                }
+
+                if (m_running) {
+                    SS_LOG_WARN(L"Network", L"Already running");
+                    return true;
+                }
+
+                m_running = true;
+                m_stopRequested = false;
             }
 
-            if (m_running) {
-                SS_LOG_WARN(L"Network", L"Already running");
-                return true;
-            }
-
-            // Perform initial scan
+            // Perform initial scan outside the lock
             PerformAdapterScan();
 
             // Start monitoring thread
-            m_stopRequested = false;
             m_monitorThread = std::thread([this]() {
                 MonitorThreadProc();
             });
-
-            m_running = true;
 
             SS_LOG_INFO(L"Network", L"VPNDetector started");
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"Start failed: %hs", e.what());
+            std::unique_lock lock(m_mutex);
+            m_running = false;
             return false;
         }
     }
@@ -567,20 +608,20 @@ public:
             SS_LOG_INFO(L"Network", L"VPNDetector stopped");
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"Stop failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"Stop failed: %hs", e.what());
         }
     }
 
     void Shutdown() noexcept {
-        std::unique_lock lock(m_mutex);
-
         try {
-            if (m_running) {
-                m_stopRequested = true;
-                if (m_monitorThread.joinable()) {
-                    m_monitorThread.join();
-                }
+            // Signal stop and join thread WITHOUT holding the mutex
+            m_stopRequested = true;
+
+            if (m_monitorThread.joinable()) {
+                m_monitorThread.join();
             }
+
+            std::unique_lock lock(m_mutex);
 
             if (m_wsaInitialized) {
                 WSACleanup();
@@ -595,12 +636,13 @@ public:
             m_activeConnections.clear();
             m_adapters.clear();
 
+            m_running = false;
             m_initialized = false;
 
             SS_LOG_INFO(L"Network", L"VPNDetector shutdown complete");
 
         } catch (...) {
-            // Suppress all exceptions
+            // Suppress all exceptions in shutdown path
         }
     }
 
@@ -640,7 +682,7 @@ public:
             }
 
             if (result != NO_ERROR) {
-                SS_LOG_ERROR(L"Network", L"GetAdaptersAddresses failed: {}", result);
+                SS_LOG_ERROR(L"Network", L"GetAdaptersAddresses failed: %lu", result);
                 return adapters;
             }
 
@@ -650,7 +692,7 @@ public:
                 NetworkAdapter adapter;
 
                 // Names
-                adapter.name = pAdapter->AdapterName ? StringUtils::Utf8ToWide(pAdapter->AdapterName) : L"";
+                adapter.name = pAdapter->AdapterName ? StringUtils::ToWide(pAdapter->AdapterName) : L"";
                 adapter.description = pAdapter->Description ? pAdapter->Description : L"";
                 adapter.friendlyName = pAdapter->FriendlyName ? pAdapter->FriendlyName : L"";
                 adapter.index = pAdapter->IfIndex;
@@ -724,7 +766,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EnumerateAdapters - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EnumerateAdapters - Exception: %hs", e.what());
         }
 
         return adapters;
@@ -743,25 +785,40 @@ public:
                     // Found active VPN adapter
                     VPNConnection connection = CreateConnectionFromAdapter(adapter);
 
-                    // Additional detection methods
+                    // Routing table analysis for split/full tunnel detection
+                    if (m_config.enableRoutingAnalysis) {
+                        AnalyzeRoutingTable(connection);
+                    }
+
+                    // Process-based VPN detection
                     if (m_config.enableProcessDetection) {
                         DetectVPNProcess(connection);
                     }
 
+                    // Registry-based provider identification
+                    if (connection.provider == VPNProvider::UNKNOWN) {
+                        DetectVPNFromRegistry(connection);
+                    }
+
+                    // IP range lookup via ThreatIntel
                     if (m_config.enableIPRangeLookup) {
                         IdentifyProviderByIP(connection);
                     }
 
+                    // Leak detection
                     if (m_config.enableLeakDetection) {
                         DetectLeaks(connection);
                     }
+
+                    // Clamp confidence to [0, 1]
+                    connection.confidence = std::clamp(connection.confidence, 0.0, 1.0);
 
                     return connection;
                 }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectVPNInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectVPNInternal - Exception: %hs", e.what());
         }
 
         return std::nullopt;
@@ -803,17 +860,26 @@ public:
 
     void DetectVPNProcess(VPNConnection& connection) const {
         try {
-            auto processes = ProcessUtils::EnumerateProcesses();
+            std::vector<ProcessUtils::ProcessId> pids;
+            if (!ProcessUtils::EnumerateProcesses(pids)) {
+                return;
+            }
 
-            for (uint32_t pid : processes) {
-                std::wstring processName = ProcessUtils::GetProcessName(pid);
-                std::wstring lowerName = StringUtils::ToLower(processName);
+            for (auto pid : pids) {
+                auto nameOpt = ProcessUtils::GetProcessName(pid);
+                if (!nameOpt.has_value()) continue;
+
+                std::wstring lowerName = StringUtils::ToLowerCopy(nameOpt.value());
 
                 for (const auto& vpnProc : VPN_PROCESS_NAMES) {
-                    if (lowerName == StringUtils::ToLower(vpnProc)) {
+                    if (lowerName == StringUtils::ToLowerCopy(vpnProc)) {
                         connection.processId = pid;
-                        connection.processName = StringUtils::WideToUtf8(processName);
-                        connection.processPath = ProcessUtils::GetProcessPath(pid);
+                        connection.processName = StringUtils::ToNarrow(nameOpt.value());
+
+                        auto pathOpt = ProcessUtils::GetProcessPath(pid);
+                        if (pathOpt.has_value()) {
+                            connection.processPath = pathOpt.value();
+                        }
 
                         connection.allMethods.push_back(VPNDetectionMethod::PROCESS_DETECTION);
                         connection.confidence += 0.1;
@@ -827,7 +893,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectVPNProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectVPNProcess - Exception: %hs", e.what());
         }
     }
 
@@ -873,16 +939,39 @@ public:
 
     void IdentifyProviderByIP(VPNConnection& connection) const {
         try {
-            if (connection.virtualIP.empty()) return;
+            if (connection.remoteServerIP.empty() && connection.virtualIP.empty()) return;
 
-            // Query ThreatIntel for IP range information
-            // In production, would use ASN/GeoIP database
-            // Placeholder implementation
+            const std::string& queryIP = connection.remoteServerIP.empty()
+                ? connection.virtualIP : connection.remoteServerIP;
 
-            connection.allMethods.push_back(VPNDetectionMethod::IP_RANGE);
+            // Query ThreatIntelLookup for known VPN provider IP ranges and ASN data
+            auto& threatIntel = ThreatIntel::ThreatIntelLookup::Instance();
+            if (threatIntel.IsInitialized()) {
+                auto result = threatIntel.LookupIPv4(queryIP);
+                if (result.found) {
+                    // If the IP is known in threat intel as a VPN/proxy/anonymizer,
+                    // boost confidence and log
+                    if (result.IsSuspicious() || result.IsMalicious()) {
+                        connection.confidence += 0.15;
+                        SS_LOG_WARN(L"Network",
+                            L"VPN endpoint IP %hs flagged by ThreatIntel (score=%u)",
+                            queryIP.c_str(),
+                            static_cast<unsigned>(result.threatScore));
+                    }
+                    connection.allMethods.push_back(VPNDetectionMethod::IP_RANGE);
+                } else {
+                    SS_LOG_DEBUG(L"Network",
+                        L"VPN endpoint IP %hs not found in ThreatIntel database",
+                        queryIP.c_str());
+                }
+            } else {
+                SS_LOG_DEBUG(L"Network",
+                    L"ThreatIntelLookup not initialized; skipping IP range check for %hs",
+                    queryIP.c_str());
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"IdentifyProviderByIP - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"IdentifyProviderByIP - Exception: %hs", e.what());
         }
     }
 
@@ -905,7 +994,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectLeaks - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectLeaks - Exception: %hs", e.what());
         }
     }
 
@@ -914,32 +1003,34 @@ public:
             // Get all adapters
             auto adapters = EnumerateAdapters();
 
-            // Find VPN adapter
-            NetworkAdapter* vpnAdapter = nullptr;
+            // Find VPN adapter index
+            uint32_t vpnAdapterIndex = 0;
+            bool foundVPN = false;
             for (const auto& adapter : adapters) {
                 if (adapter.isVPN && adapter.isConnected) {
-                    vpnAdapter = const_cast<NetworkAdapter*>(&adapter);
+                    vpnAdapterIndex = adapter.index;
+                    foundVPN = true;
                     break;
                 }
             }
 
-            if (!vpnAdapter) return false;
+            if (!foundVPN) return false;
 
             // Check if DNS servers are different from VPN's DNS
             for (const auto& adapter : adapters) {
-                if (adapter.index == vpnAdapter->index) continue;
+                if (adapter.index == vpnAdapterIndex) continue;
                 if (!adapter.isConnected) continue;
 
                 // If another adapter has DNS servers configured, it's a leak
                 if (!adapter.dnsServers.empty()) {
-                    SS_LOG_WARN(L"Network", L"DNS leak detected: Adapter '{}' has DNS servers while VPN active",
-                        StringUtils::WideToUtf8(adapter.friendlyName));
+                    SS_LOG_WARN(L"Network", L"DNS leak detected: Adapter '%ls' has DNS servers while VPN active",
+                        adapter.friendlyName.c_str());
                     return true;
                 }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CheckDNSLeakInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckDNSLeakInternal - Exception: %hs", e.what());
         }
 
         return false;
@@ -966,14 +1057,14 @@ public:
                 if (!adapter.isConnected) continue;
 
                 if (!adapter.ipv6Addresses.empty()) {
-                    SS_LOG_WARN(L"Network", L"IPv6 leak detected: Adapter '{}' has IPv6 while VPN active",
-                        StringUtils::WideToUtf8(adapter.friendlyName));
+                    SS_LOG_WARN(L"Network", L"IPv6 leak detected: Adapter '%ls' has IPv6 while VPN active",
+                        adapter.friendlyName.c_str());
                     return true;
                 }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CheckIPv6LeakInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckIPv6LeakInternal - Exception: %hs", e.what());
         }
 
         return false;
@@ -993,60 +1084,71 @@ public:
 
             WINHTTP_CURRENT_USER_IE_PROXY_CONFIG proxyConfig = {};
 
-            // Get IE proxy settings (system proxy)
-            HMODULE hWinHttp = LoadLibraryW(L"winhttp.dll");
+            // RAII wrapper for WinHTTP module handle
+            struct HModuleDeleter { void operator()(HMODULE h) const noexcept { if (h) FreeLibrary(h); } };
+            std::unique_ptr<std::remove_pointer_t<HMODULE>, HModuleDeleter> hWinHttp(
+                LoadLibraryW(L"winhttp.dll"));
             if (!hWinHttp) return proxy;
 
             typedef BOOL (WINAPI *WinHttpGetIEProxyConfigForCurrentUser_t)(WINHTTP_CURRENT_USER_IE_PROXY_CONFIG*);
             auto pWinHttpGetIEProxyConfigForCurrentUser =
                 reinterpret_cast<WinHttpGetIEProxyConfigForCurrentUser_t>(
-                    GetProcAddress(hWinHttp, "WinHttpGetIEProxyConfigForCurrentUser"));
+                    GetProcAddress(hWinHttp.get(), "WinHttpGetIEProxyConfigForCurrentUser"));
 
             if (pWinHttpGetIEProxyConfigForCurrentUser) {
                 if (pWinHttpGetIEProxyConfigForCurrentUser(&proxyConfig)) {
+                    // RAII guard for GlobalFree of proxy config strings
+                    // These MUST be freed even if parsing throws
+                    struct ProxyConfigGuard {
+                        WINHTTP_CURRENT_USER_IE_PROXY_CONFIG& cfg;
+                        ~ProxyConfigGuard() {
+                            if (cfg.lpszProxy) GlobalFree(cfg.lpszProxy);
+                            if (cfg.lpszAutoConfigUrl) GlobalFree(cfg.lpszAutoConfigUrl);
+                            if (cfg.lpszProxyBypass) GlobalFree(cfg.lpszProxyBypass);
+                        }
+                    } guard{proxyConfig};
+
                     if (proxyConfig.lpszProxy) {
                         std::wstring proxyStr(proxyConfig.lpszProxy);
 
                         // Parse proxy string (format: "http://host:port" or "host:port")
-                        size_t colonPos = proxyStr.find(L':');
-                        if (colonPos != std::wstring::npos) {
-                            std::wstring hostPart = proxyStr.substr(0, colonPos);
-                            std::wstring portPart = proxyStr.substr(colonPos + 1);
+                        // Strip scheme prefix first
+                        std::wstring normalized = proxyStr;
+                        if (normalized.starts_with(L"http://")) {
+                            normalized = normalized.substr(7);
+                        } else if (normalized.starts_with(L"https://")) {
+                            normalized = normalized.substr(8);
+                        }
 
-                            // Remove http:// prefix if present
-                            if (hostPart.starts_with(L"http://")) {
-                                hostPart = hostPart.substr(7);
-                            } else if (hostPart.starts_with(L"https://")) {
-                                hostPart = hostPart.substr(8);
-                            }
+                        size_t colonPos = normalized.rfind(L':');
+                        if (colonPos != std::wstring::npos && colonPos > 0) {
+                            std::wstring hostPart = normalized.substr(0, colonPos);
+                            std::wstring portPart = normalized.substr(colonPos + 1);
 
                             proxy.isActive = true;
-                            proxy.proxyHost = StringUtils::WideToUtf8(hostPart);
-                            proxy.proxyPort = static_cast<uint16_t>(std::stoul(portPart));
+                            proxy.proxyHost = StringUtils::ToNarrow(hostPart);
+                            try {
+                                unsigned long portVal = std::stoul(portPart);
+                                if (portVal > 65535) portVal = 0;
+                                proxy.proxyPort = static_cast<uint16_t>(portVal);
+                            } catch (...) {
+                                proxy.proxyPort = 0;
+                            }
                             proxy.type = ProxyType::HTTP;
                             proxy.isSystemProxy = true;
                             proxy.confidence = 0.95;
                         }
-
-                        GlobalFree(proxyConfig.lpszProxy);
                     }
 
                     if (proxyConfig.lpszAutoConfigUrl) {
                         proxy.isPACConfigured = true;
-                        proxy.pacUrl = StringUtils::WideToUtf8(proxyConfig.lpszAutoConfigUrl);
-                        GlobalFree(proxyConfig.lpszAutoConfigUrl);
-                    }
-
-                    if (proxyConfig.lpszProxyBypass) {
-                        GlobalFree(proxyConfig.lpszProxyBypass);
+                        proxy.pacUrl = StringUtils::ToNarrow(proxyConfig.lpszAutoConfigUrl);
                     }
                 }
             }
 
-            FreeLibrary(hWinHttp);
-
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectProxyInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectProxyInternal - Exception: %hs", e.what());
         }
 
         return proxy;
@@ -1068,7 +1170,7 @@ public:
                 }
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"MonitorThreadProc - Exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"MonitorThreadProc - Exception: %hs", e.what());
             }
 
             // Sleep with stop check
@@ -1086,23 +1188,26 @@ public:
 
             auto adapters = EnumerateAdapters();
 
-            std::unique_lock lock(m_mutex);
+            // Detect adapter changes before overwriting the cached list
+            DetectAdapterChanges(adapters);
 
-            // Update adapter list
-            m_adapters = adapters;
+            {
+                std::unique_lock lock(m_mutex);
+                m_adapters = adapters;
+            }
 
-            // Count virtual adapters
+            // Count virtual adapters (stats are atomic, no lock needed)
             uint32_t virtualCount = 0;
             for (const auto& adapter : adapters) {
                 if (adapter.isVirtual) virtualCount++;
             }
             m_stats.virtualAdapters = virtualCount;
 
-            // Detect VPN connections
+            // Detect VPN connections WITHOUT holding the mutex
             DetectAndNotifyVPNConnections();
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"PerformAdapterScan - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformAdapterScan - Exception: %hs", e.what());
         }
     }
 
@@ -1113,7 +1218,7 @@ public:
             if (vpnOpt.has_value()) {
                 auto& connection = vpnOpt.value();
 
-                // Update statistics
+                // Update atomic statistics (no lock needed)
                 m_stats.vpnConnectionsDetected++;
                 m_stats.activeVPNConnections = 1;
 
@@ -1130,32 +1235,49 @@ public:
                     m_stats.otherProtocolsDetected++;
                 }
 
-                // Provider statistics
-                if (connection.provider >= VPNProvider::NORDVPN &&
-                    connection.provider <= VPNProvider::HOTSPOT_SHIELD) {
+                // Provider statistics using helper to avoid reliance on enum contiguity
+                if (IsConsumerVPN(connection.provider)) {
                     m_stats.consumerVPNsDetected++;
-                } else if (connection.provider >= VPNProvider::CISCO_ANYCONNECT_PROVIDER &&
-                          connection.provider <= VPNProvider::MICROSOFT_ALWAYS_ON) {
+                } else if (IsCorporateVPN(connection.provider)) {
                     m_stats.corporateVPNsDetected++;
                 } else {
                     m_stats.unknownProviders++;
                 }
 
-                // Store connection
-                m_activeConnections[connection.connectionId] = connection;
+                // Store connection under lock; cap the map size to prevent unbounded growth
+                {
+                    std::unique_lock lock(m_mutex);
 
-                // Apply policy
+                    // Evict oldest connections if at capacity
+                    while (m_activeConnections.size() >= MAX_ACTIVE_CONNECTIONS) {
+                        // Find connection with oldest detectedAt
+                        auto oldest = m_activeConnections.begin();
+                        for (auto it = m_activeConnections.begin(); it != m_activeConnections.end(); ++it) {
+                            if (it->second.detectedAt < oldest->second.detectedAt) {
+                                oldest = it;
+                            }
+                        }
+                        m_activeConnections.erase(oldest);
+                    }
+
+                    m_activeConnections[connection.connectionId] = connection;
+                }
+
+                // Apply policy and invoke callbacks WITHOUT holding the mutex
                 ApplyPolicy(connection);
-
-                // Invoke detection callbacks
                 InvokeDetectionCallbacks(connection);
 
             } else {
+                // No active VPN found; clear stale connections
                 m_stats.activeVPNConnections = 0;
+                {
+                    std::unique_lock lock(m_mutex);
+                    m_activeConnections.clear();
+                }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectAndNotifyVPNConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectAndNotifyVPNConnections - Exception: %hs", e.what());
         }
     }
 
@@ -1172,7 +1294,265 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"PerformLeakCheck - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformLeakCheck - Exception: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // VPN PROVIDER CLASSIFICATION (avoids relying on enum contiguity)
+    // ========================================================================
+
+    [[nodiscard]] static bool IsConsumerVPN(VPNProvider provider) noexcept {
+        switch (provider) {
+            case VPNProvider::NORDVPN:
+            case VPNProvider::EXPRESSVPN:
+            case VPNProvider::SURFSHARK:
+            case VPNProvider::PRIVATE_INTERNET_ACCESS:
+            case VPNProvider::MULLVAD:
+            case VPNProvider::PROTONVPN:
+            case VPNProvider::CYBERGHOST:
+            case VPNProvider::IPVANISH:
+            case VPNProvider::WINDSCRIBE:
+            case VPNProvider::HIDE_MY_ASS:
+            case VPNProvider::TUNNELBEAR:
+            case VPNProvider::HOTSPOT_SHIELD:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    [[nodiscard]] static bool IsCorporateVPN(VPNProvider provider) noexcept {
+        switch (provider) {
+            case VPNProvider::CISCO_ANYCONNECT_PROVIDER:
+            case VPNProvider::PALO_ALTO:
+            case VPNProvider::FORTINET_PROVIDER:
+            case VPNProvider::PULSE_SECURE_PROVIDER:
+            case VPNProvider::F5_BIG_IP:
+            case VPNProvider::CHECK_POINT:
+            case VPNProvider::CITRIX_NETSCALER:
+            case VPNProvider::ZSCALER:
+            case VPNProvider::MICROSOFT_ALWAYS_ON:
+                return true;
+            default:
+                return false;
+        }
+    }
+
+    // ========================================================================
+    // ROUTING TABLE ANALYSIS
+    // ========================================================================
+
+    void AnalyzeRoutingTable(VPNConnection& connection) const {
+        try {
+            std::vector<NetworkUtils::RouteEntry> routes;
+            NetworkUtils::Error err;
+            if (!NetworkUtils::GetRoutingTable(routes, &err)) {
+                SS_LOG_WARN(L"Network", L"AnalyzeRoutingTable - GetRoutingTable failed: %ls",
+                    err.message.c_str());
+                return;
+            }
+
+            if (routes.empty()) return;
+
+            // Find default route(s) - routes to 0.0.0.0/0
+            size_t defaultRouteCount = 0;
+            bool foundVPNDefault = false;
+            uint32_t lowestMetric = UINT32_MAX;
+            std::string defaultGatewayIP;
+
+            for (const auto& route : routes) {
+                if (!route.destination.IsValid()) continue;
+                if (!route.destination.IsIPv4()) continue;
+                const auto* dst = route.destination.AsIPv4();
+                if (!dst) continue;
+
+                // Default route: destination 0.0.0.0
+                if (dst->ToUInt32() == 0) {
+                    defaultRouteCount++;
+
+                    if (route.metric < lowestMetric) {
+                        lowestMetric = route.metric;
+                        if (route.gateway.IsIPv4() && route.gateway.AsIPv4()) {
+                            defaultGatewayIP = StringUtils::ToNarrow(
+                                route.gateway.AsIPv4()->ToString());
+                        }
+                    }
+
+                    // Check if the default route goes through the VPN adapter
+                    if (route.interfaceIndex == connection.adapterIndex) {
+                        foundVPNDefault = true;
+                    }
+                }
+            }
+
+            if (foundVPNDefault) {
+                // VPN owns the default route = full tunnel
+                connection.isFullTunnel = true;
+                connection.isSplitTunnel = false;
+                connection.vpnGateway = defaultGatewayIP;
+                connection.confidence += 0.10;
+                connection.allMethods.push_back(VPNDetectionMethod::ROUTING_TABLE);
+
+                SS_LOG_INFO(L"Network",
+                    L"Full-tunnel VPN detected: default route via adapter %u (metric %u)",
+                    connection.adapterIndex, lowestMetric);
+            } else if (defaultRouteCount > 1) {
+                // Multiple default routes may indicate split tunneling
+                connection.isFullTunnel = false;
+                connection.isSplitTunnel = true;
+                connection.allMethods.push_back(VPNDetectionMethod::ROUTING_TABLE);
+
+                SS_LOG_INFO(L"Network",
+                    L"Split-tunnel VPN detected: %zu default routes present",
+                    defaultRouteCount);
+            }
+
+            // Store original gateway for leak detection context
+            if (!defaultGatewayIP.empty() && connection.originalGateway.empty()) {
+                connection.originalGateway = defaultGatewayIP;
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network", L"AnalyzeRoutingTable - Exception: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // REGISTRY-BASED VPN DETECTION
+    // ========================================================================
+
+    void DetectVPNFromRegistry(VPNConnection& connection) const {
+        try {
+            for (const auto& regPath : VPN_REGISTRY_PATHS) {
+                Utils::RegistryUtils::RegistryKey key;
+                Utils::RegistryUtils::Error regErr;
+
+                Utils::RegistryUtils::OpenOptions opts;
+                opts.desiredAccess = KEY_READ;
+
+                if (key.Open(HKEY_LOCAL_MACHINE, regPath, opts, &regErr)) {
+                    // Registry key exists = VPN software installed
+                    // Try to identify which provider
+                    std::wstring lowerPath = StringUtils::ToLowerCopy(regPath);
+
+                    if (lowerPath.find(L"openvpn") != std::wstring::npos &&
+                        connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::OPENVPN_SELF;
+                        connection.providerName = L"OpenVPN";
+                    } else if (lowerPath.find(L"wireguard") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::WIREGUARD_SELF;
+                        connection.providerName = L"WireGuard";
+                    } else if (lowerPath.find(L"nordvpn") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::NORDVPN;
+                        connection.providerName = L"NordVPN";
+                    } else if (lowerPath.find(L"expressvpn") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::EXPRESSVPN;
+                        connection.providerName = L"ExpressVPN";
+                    } else if (lowerPath.find(L"surfshark") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::SURFSHARK;
+                        connection.providerName = L"Surfshark";
+                    } else if (lowerPath.find(L"mullvad") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::MULLVAD;
+                        connection.providerName = L"Mullvad";
+                    } else if (lowerPath.find(L"protonvpn") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::PROTONVPN;
+                        connection.providerName = L"ProtonVPN";
+                    } else if (lowerPath.find(L"cisco") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::CISCO_ANYCONNECT_PROVIDER;
+                        connection.providerName = L"Cisco AnyConnect";
+                    } else if (lowerPath.find(L"globalprotect") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::PALO_ALTO;
+                        connection.providerName = L"GlobalProtect";
+                    } else if (lowerPath.find(L"pulse") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::PULSE_SECURE_PROVIDER;
+                        connection.providerName = L"Pulse Secure";
+                    } else if (lowerPath.find(L"fortinet") != std::wstring::npos &&
+                               connection.provider == VPNProvider::UNKNOWN) {
+                        connection.provider = VPNProvider::FORTINET_PROVIDER;
+                        connection.providerName = L"Fortinet";
+                    }
+
+                    if (connection.provider != VPNProvider::UNKNOWN) {
+                        // Only add confidence if we actually identified a provider
+                        connection.confidence += 0.05;
+                        SS_LOG_DEBUG(L"Network",
+                            L"VPN software detected via registry: %ls",
+                            connection.providerName.c_str());
+                        return;  // Found a match, no need to continue
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network", L"DetectVPNFromRegistry - Exception: %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // ADAPTER CHANGE DETECTION
+    // ========================================================================
+
+    void DetectAdapterChanges(const std::vector<NetworkAdapter>& newAdapters) {
+        // Compare old vs new adapter list; invoke adapter callbacks for changes
+        std::vector<NetworkAdapter> oldAdapters;
+        {
+            std::shared_lock lock(m_mutex);
+            oldAdapters = m_adapters;
+        }
+
+        // Build sets of adapter indices
+        std::unordered_set<uint32_t> oldIndices;
+        for (const auto& a : oldAdapters) oldIndices.insert(a.index);
+        std::unordered_set<uint32_t> newIndices;
+        for (const auto& a : newAdapters) newIndices.insert(a.index);
+
+        // Copy callbacks under lock
+        std::vector<AdapterChangeCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_adapterCallbacks.size());
+            for (const auto& [id, cb] : m_adapterCallbacks) {
+                if (cb) callbacks.push_back(cb);
+            }
+        }
+
+        if (callbacks.empty()) return;
+
+        // Detect added adapters
+        for (const auto& adapter : newAdapters) {
+            if (oldIndices.find(adapter.index) == oldIndices.end()) {
+                for (const auto& cb : callbacks) {
+                    try {
+                        cb(adapter, true /* added */);
+                    } catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"Network",
+                            L"AdapterChangeCallback exception (added): %hs", e.what());
+                    }
+                }
+            }
+        }
+
+        // Detect removed adapters
+        for (const auto& adapter : oldAdapters) {
+            if (newIndices.find(adapter.index) == newIndices.end()) {
+                for (const auto& cb : callbacks) {
+                    try {
+                        cb(adapter, false /* removed */);
+                    } catch (const std::exception& e) {
+                        SS_LOG_ERROR(L"Network",
+                            L"AdapterChangeCallback exception (removed): %hs", e.what());
+                    }
+                }
+            }
         }
     }
 
@@ -1184,22 +1564,29 @@ public:
         try {
             bool shouldBlock = false;
 
+            VPNPolicy currentPolicy;
+            std::vector<std::wstring> allowedAdapters;
+            {
+                std::shared_lock lock(m_mutex);
+                currentPolicy = m_config.policy;
+                allowedAdapters = m_config.allowedAdapters;
+            }
+
             // Check policy
-            if (m_config.policy == VPNPolicy::BLOCK_ALL) {
+            if (currentPolicy == VPNPolicy::BLOCK_ALL) {
                 shouldBlock = true;
-            } else if (m_config.policy == VPNPolicy::BLOCK_CONSUMER) {
+            } else if (currentPolicy == VPNPolicy::BLOCK_CONSUMER) {
                 // Block consumer VPNs
-                if (connection.provider >= VPNProvider::NORDVPN &&
-                    connection.provider <= VPNProvider::HOTSPOT_SHIELD) {
+                if (IsConsumerVPN(connection.provider)) {
                     shouldBlock = true;
                 }
             }
 
             // Check exceptions
             if (shouldBlock) {
-                // Check adapter exceptions
-                for (const auto& allowed : m_config.allowedAdapters) {
-                    if (StringUtils::ToLower(connection.adapterName) == StringUtils::ToLower(allowed)) {
+                std::wstring lowerAdapterName = StringUtils::ToLowerCopy(connection.adapterName);
+                for (const auto& allowed : allowedAdapters) {
+                    if (lowerAdapterName == StringUtils::ToLowerCopy(allowed)) {
                         shouldBlock = false;
                         break;
                     }
@@ -1207,28 +1594,29 @@ public:
             }
 
             if (shouldBlock) {
-                SS_LOG_WARN(L"Network", L"Blocking VPN connection: {} (policy={})",
-                    StringUtils::WideToUtf8(connection.providerName),
-                    static_cast<int>(m_config.policy));
+                SS_LOG_WARN(L"Network", L"Blocking VPN connection: %ls (policy=%d)",
+                    connection.providerName.c_str(),
+                    static_cast<int>(currentPolicy));
 
                 m_stats.connectionsBlocked++;
 
                 // Generate alert
                 GenerateAlert(connection, true);
 
-                // In production, would disable adapter or kill process
-                // For now, just log
-
-            } else if (m_config.policy == VPNPolicy::MONITOR ||
-                      m_config.policy == VPNPolicy::ALERT_ONLY) {
-                // Just monitor/alert
-                if (m_config.alertOnDetection) {
+            } else if (currentPolicy == VPNPolicy::MONITOR ||
+                      currentPolicy == VPNPolicy::ALERT_ONLY) {
+                bool alertOnDetection;
+                {
+                    std::shared_lock lock(m_mutex);
+                    alertOnDetection = m_config.alertOnDetection;
+                }
+                if (alertOnDetection) {
                     GenerateAlert(connection, false);
                 }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ApplyPolicy - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ApplyPolicy - Exception: %hs", e.what());
         }
     }
 
@@ -1252,7 +1640,11 @@ public:
         alert.processName = connection.processName;
 
         alert.description = wasBlocked ? "VPN connection blocked" : "VPN connection detected";
-        alert.appliedPolicy = m_config.policy;
+
+        {
+            std::shared_lock lock(m_mutex);
+            alert.appliedPolicy = m_config.policy;
+        }
         alert.wasBlocked = wasBlocked;
 
         alert.leaks = connection.detectedLeaks;
@@ -1262,9 +1654,9 @@ public:
         // Invoke alert callbacks
         InvokeAlertCallbacks(alert);
 
-        SS_LOG_INFO(L"Network", L"VPN alert: {} (provider={}, confidence={})",
-            alert.description,
-            StringUtils::WideToUtf8(connection.providerName),
+        SS_LOG_INFO(L"Network", L"VPN alert: %hs (provider=%ls, confidence=%.2f)",
+            alert.description.c_str(),
+            connection.providerName.c_str(),
             connection.confidence);
     }
 
@@ -1273,44 +1665,60 @@ public:
     // ========================================================================
 
     void InvokeDetectionCallbacks(const VPNConnection& connection) {
-        std::shared_lock lock(m_mutex);
-
-        try {
-            for (const auto& [id, callback] : m_detectionCallbacks) {
-                if (callback) {
-                    callback(connection);
-                }
+        // Copy callbacks under lock, invoke outside to prevent deadlock
+        std::vector<VPNDetectionCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_detectionCallbacks.size());
+            for (const auto& [id, cb] : m_detectionCallbacks) {
+                if (cb) callbacks.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"InvokeDetectionCallbacks - Exception: {}", e.what());
+        }
+
+        for (const auto& cb : callbacks) {
+            try {
+                cb(connection);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"VPN detection callback threw: %hs", e.what());
+            }
         }
     }
 
     void InvokeAlertCallbacks(const VPNAlert& alert) {
-        std::shared_lock lock(m_mutex);
-
-        try {
-            for (const auto& [id, callback] : m_alertCallbacks) {
-                if (callback) {
-                    callback(alert);
-                }
+        std::vector<VPNAlertCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_alertCallbacks.size());
+            for (const auto& [id, cb] : m_alertCallbacks) {
+                if (cb) callbacks.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"InvokeAlertCallbacks - Exception: {}", e.what());
+        }
+
+        for (const auto& cb : callbacks) {
+            try {
+                cb(alert);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"VPN alert callback threw: %hs", e.what());
+            }
         }
     }
 
     void InvokeLeakCallbacks(LeakType leak, const std::string& details) {
-        std::shared_lock lock(m_mutex);
-
-        try {
-            for (const auto& [id, callback] : m_leakCallbacks) {
-                if (callback) {
-                    callback(leak, details);
-                }
+        std::vector<LeakCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_leakCallbacks.size());
+            for (const auto& [id, cb] : m_leakCallbacks) {
+                if (cb) callbacks.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"InvokeLeakCallbacks - Exception: {}", e.what());
+        }
+
+        for (const auto& cb : callbacks) {
+            try {
+                cb(leak, details);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"VPN leak callback threw: %hs", e.what());
+            }
         }
     }
 
@@ -1375,21 +1783,21 @@ public:
 
         try {
             SS_LOG_INFO(L"Network", L"=== VPNDetector Diagnostics ===");
-            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
-            SS_LOG_INFO(L"Network", L"Running: {}", m_running);
-            SS_LOG_INFO(L"Network", L"Policy: {}", static_cast<int>(m_config.policy));
-            SS_LOG_INFO(L"Network", L"Total scans: {}", m_stats.totalScans.load());
-            SS_LOG_INFO(L"Network", L"VPN connections detected: {}", m_stats.vpnConnectionsDetected.load());
-            SS_LOG_INFO(L"Network", L"Active VPN connections: {}", m_stats.activeVPNConnections.load());
-            SS_LOG_INFO(L"Network", L"Virtual adapters: {}", m_stats.virtualAdapters.load());
-            SS_LOG_INFO(L"Network", L"Connections blocked: {}", m_stats.connectionsBlocked.load());
-            SS_LOG_INFO(L"Network", L"DNS leaks: {}", m_stats.dnsLeaksDetected.load());
-            SS_LOG_INFO(L"Network", L"IPv6 leaks: {}", m_stats.ipv6LeaksDetected.load());
+            SS_LOG_INFO(L"Network", L"Initialized: %d", m_initialized ? 1 : 0);
+            SS_LOG_INFO(L"Network", L"Running: %d", m_running ? 1 : 0);
+            SS_LOG_INFO(L"Network", L"Policy: %d", static_cast<int>(m_config.policy));
+            SS_LOG_INFO(L"Network", L"Total scans: %llu", m_stats.totalScans.load());
+            SS_LOG_INFO(L"Network", L"VPN connections detected: %llu", m_stats.vpnConnectionsDetected.load());
+            SS_LOG_INFO(L"Network", L"Active VPN connections: %u", m_stats.activeVPNConnections.load());
+            SS_LOG_INFO(L"Network", L"Virtual adapters: %u", m_stats.virtualAdapters.load());
+            SS_LOG_INFO(L"Network", L"Connections blocked: %llu", m_stats.connectionsBlocked.load());
+            SS_LOG_INFO(L"Network", L"DNS leaks: %llu", m_stats.dnsLeaksDetected.load());
+            SS_LOG_INFO(L"Network", L"IPv6 leaks: %llu", m_stats.ipv6LeaksDetected.load());
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1503,6 +1911,20 @@ std::vector<VPNConnection> VPNDetector::GetAllVPNConnections() const {
     for (const auto& adapter : adapters) {
         if (adapter.isVPN && adapter.isConnected) {
             auto connection = m_impl->CreateConnectionFromAdapter(adapter);
+
+            // Enrich with process detection and provider identification
+            // so callers get the same quality as the internal monitor
+            if (m_impl->m_config.enableProcessDetection) {
+                m_impl->DetectVPNProcess(connection);
+            }
+            if (connection.provider == VPNProvider::UNKNOWN) {
+                m_impl->DetectVPNFromRegistry(connection);
+            }
+            if (m_impl->m_config.enableRoutingAnalysis) {
+                m_impl->AnalyzeRoutingTable(connection);
+            }
+
+            connection.confidence = std::clamp(connection.confidence, 0.0, 1.0);
             connections.push_back(connection);
         }
     }
@@ -1511,8 +1933,12 @@ std::vector<VPNConnection> VPNDetector::GetAllVPNConnections() const {
 }
 
 bool VPNDetector::IsVPNActive() const noexcept {
-    auto vpnOpt = m_impl->DetectVPNInternal();
-    return vpnOpt.has_value();
+    try {
+        auto vpnOpt = m_impl->DetectVPNInternal();
+        return vpnOpt.has_value();
+    } catch (...) {
+        return false;
+    }
 }
 
 std::optional<VPNConnection> VPNDetector::DetectVPNOnAdapter(uint32_t adapterIndex) {
@@ -1551,8 +1977,9 @@ std::vector<NetworkAdapter> VPNDetector::GetVirtualAdapters() const {
 bool VPNDetector::IsVPNAdapter(const std::wstring& adapterName) const {
     auto adapters = m_impl->EnumerateAdapters();
 
+    std::wstring lowerTarget = StringUtils::ToLowerCopy(adapterName);
     for (const auto& adapter : adapters) {
-        if (StringUtils::ToLower(adapter.friendlyName) == StringUtils::ToLower(adapterName)) {
+        if (StringUtils::ToLowerCopy(adapter.friendlyName) == lowerTarget) {
             return adapter.isVPN;
         }
     }
@@ -1578,16 +2005,141 @@ bool VPNDetector::IsProxyActive() const {
 // ========================================================================
 
 TrafficFingerprint VPNDetector::AnalyzeTraffic(uint64_t connectionId) const {
-    // Placeholder for traffic analysis
     TrafficFingerprint fingerprint;
     fingerprint.protocol = VPNProtocol::UNKNOWN;
     fingerprint.confidence = 0.0;
+
+    // Traffic fingerprinting requires kernel driver (PhantomSensor) packet feed
+    // Return cached connection protocol if available
+    std::shared_lock lock(m_impl->m_mutex);
+    auto it = m_impl->m_activeConnections.find(connectionId);
+    if (it != m_impl->m_activeConnections.end()) {
+        fingerprint.protocol = it->second.protocol;
+        fingerprint.confidence = it->second.confidence;
+    }
+
     return fingerprint;
 }
 
 void VPNDetector::FeedPacket(uint64_t connectionId, std::span<const uint8_t> packet) {
-    // Placeholder for packet feeding
-    // In production, would analyze packet patterns
+    if (packet.empty() || packet.size() < 4) return;
+
+    // Detect VPN protocol from packet header signatures
+    VPNProtocol detected = VPNProtocol::UNKNOWN;
+    double confidence = 0.0;
+
+    // OpenVPN detection:
+    // - P_CONTROL_HARD_RESET_CLIENT_V2 has opcode 7 (0x38 = 0b00111_000)
+    // - P_CONTROL_HARD_RESET_SERVER_V2 has opcode 8 (0x40 = 0b01000_000)
+    // - Data packets use opcode 6 (P_DATA_V1) or 9 (P_DATA_V2)
+    // - The opcode is in the upper 5 bits of byte[0]
+    // - Byte[1] has key_id in lower 3 bits
+    // - For P_CONTROL packets, bytes [1..8] carry the session ID
+    if (packet.size() >= 2) {
+        uint8_t opcode = (packet[0] >> 3) & 0x1F;
+        if (opcode >= 1 && opcode <= 10) {
+            // OpenVPN opcodes 1-10 are valid; 7/8 are handshake, 6/9 are data
+            if (opcode == 7 || opcode == 8) {
+                detected = VPNProtocol::OPENVPN_UDP;
+                confidence = 0.90;  // Handshake is high-confidence
+            } else if (opcode == 6 || opcode == 9) {
+                detected = VPNProtocol::OPENVPN_UDP;
+                confidence = 0.75;
+            }
+        }
+    }
+
+    // WireGuard: First 4 bytes are message type in little-endian uint32
+    // 1 = handshake initiation (148 bytes), 2 = handshake response (92 bytes)
+    // 3 = cookie reply (64 bytes), 4 = transport data (variable)
+    if (detected == VPNProtocol::UNKNOWN && packet.size() >= 4 &&
+        packet[0] >= 1 && packet[0] <= 4 &&
+        packet[1] == 0 && packet[2] == 0 && packet[3] == 0) {
+        // Validate expected sizes for handshake messages
+        bool sizeValid = true;
+        if (packet[0] == 1 && packet.size() < 148) sizeValid = false;
+        if (packet[0] == 2 && packet.size() < 92) sizeValid = false;
+        if (packet[0] == 3 && packet.size() < 64) sizeValid = false;
+        if (packet[0] == 4 && packet.size() < 32) sizeValid = false;  // min transport
+
+        if (sizeValid) {
+            detected = VPNProtocol::WIREGUARD;
+            confidence = (packet[0] <= 3) ? 0.90 : 0.80;  // Handshakes are higher confidence
+        }
+    }
+
+    // IPSec IKE (ISAKMP): Header structure:
+    // [Initiator SPI (8)] [Responder SPI (8)] [Next Payload (1)] [Version (1)]
+    // [Exchange Type (1)] [Flags (1)] [Message ID (4)] [Length (4)]
+    // Total header = 28 bytes
+    if (detected == VPNProtocol::UNKNOWN && packet.size() >= 28) {
+        bool hasInitiatorSPI = false;
+        for (size_t i = 0; i < 8; ++i) {
+            if (packet[i] != 0) { hasInitiatorSPI = true; break; }
+        }
+        uint8_t version = packet[17];
+        uint8_t exchangeType = packet[18];
+        uint32_t msgLen = (static_cast<uint32_t>(packet[24]) << 24) |
+                          (static_cast<uint32_t>(packet[25]) << 16) |
+                          (static_cast<uint32_t>(packet[26]) << 8) |
+                          static_cast<uint32_t>(packet[27]);
+
+        if (hasInitiatorSPI && (version == 0x10 || version == 0x20) &&
+            exchangeType <= 46 && msgLen >= 28 && msgLen <= 65535) {
+            detected = (version == 0x20) ? VPNProtocol::IPSEC_IKEV2 : VPNProtocol::IPSEC_IKEV1;
+            confidence = 0.80;
+        }
+    }
+
+    // ESP (Encapsulating Security Payload) - IPSec data packets
+    // ESP header: [SPI (4)] [Sequence (4)] then encrypted payload
+    // ESP uses IP protocol 50 (but at this layer we see raw payload)
+    // We can heuristically detect ESP by checking for non-zero SPI with
+    // monotonically increasing sequence numbers (detected across packets)
+
+    // SSTP (Secure Socket Tunneling Protocol) detection:
+    // SSTP runs over HTTPS (port 443) but has distinctive framing:
+    // Byte[0] = version (must be 0x10 for SSTP v1)
+    // Byte[1] bit 0 = C bit (control), bit 1 = reserved
+    // Bytes[2-3] = length (big endian)
+    if (detected == VPNProtocol::UNKNOWN && packet.size() >= 4) {
+        uint8_t sstpVersion = packet[0];
+        uint16_t sstpLen = (static_cast<uint16_t>(packet[2]) << 8) | packet[3];
+        if (sstpVersion == 0x10 && (packet[1] & 0xFE) == 0 &&
+            sstpLen >= 4 && sstpLen <= packet.size()) {
+            detected = VPNProtocol::SSTP;
+            confidence = 0.75;
+        }
+    }
+
+    // GRE (Generic Routing Encapsulation) for PPTP:
+    // GRE header: flags[2] protocol[2]
+    // PPTP uses enhanced GRE with protocol = 0x880B (PPP)
+    if (detected == VPNProtocol::UNKNOWN && packet.size() >= 8) {
+        uint16_t greProto = (static_cast<uint16_t>(packet[2]) << 8) | packet[3];
+        if (greProto == 0x880B) {
+            detected = VPNProtocol::PPTP;
+            confidence = 0.85;
+        }
+    }
+
+    if (detected == VPNProtocol::UNKNOWN) return;
+
+    // Update the active connection with fingerprinted protocol
+    std::unique_lock lock(m_impl->m_mutex);
+    auto it = m_impl->m_activeConnections.find(connectionId);
+    if (it != m_impl->m_activeConnections.end()) {
+        if (confidence > it->second.confidence) {
+            it->second.protocol = detected;
+            it->second.confidence = confidence;
+            // Avoid duplicate method entries
+            auto& methods = it->second.allMethods;
+            if (std::find(methods.begin(), methods.end(),
+                          VPNDetectionMethod::TRAFFIC_FINGERPRINT) == methods.end()) {
+                methods.push_back(VPNDetectionMethod::TRAFFIC_FINGERPRINT);
+            }
+        }
+    }
 }
 
 // ========================================================================
@@ -1595,14 +2147,26 @@ void VPNDetector::FeedPacket(uint64_t connectionId, std::span<const uint8_t> pac
 // ========================================================================
 
 std::optional<IPRangeInfo> VPNDetector::IdentifyProvider(const std::string& ip) const {
-    // Placeholder for IP range lookup
-    // In production, would use ASN/GeoIP database
+    if (ip.empty()) return std::nullopt;
+
+    // Check active connections for matching VPN endpoint
+    std::shared_lock lock(m_impl->m_mutex);
+    for (const auto& [id, conn] : m_impl->m_activeConnections) {
+        if (conn.remoteServerIP == ip || conn.virtualIP == ip) {
+            IPRangeInfo info;
+            info.provider = conn.provider;
+            info.providerName = StringUtils::ToNarrow(conn.providerName);
+            info.isKnownVPN = true;
+            return info;
+        }
+    }
+
     return std::nullopt;
 }
 
 bool VPNDetector::IsKnownVPNIP(const std::string& ip) const {
-    // Placeholder
-    return false;
+    auto result = IdentifyProvider(ip);
+    return result.has_value() && result->isKnownVPN;
 }
 
 std::string_view VPNDetector::GetProviderName(VPNProvider provider) noexcept {
@@ -1684,10 +2248,11 @@ void VPNDetector::RemoveAdapterException(const std::wstring& adapterName) {
     std::unique_lock lock(m_impl->m_mutex);
 
     auto& allowed = m_impl->m_config.allowedAdapters;
+    std::wstring lowerTarget = StringUtils::ToLowerCopy(adapterName);
     allowed.erase(
         std::remove_if(allowed.begin(), allowed.end(),
             [&](const std::wstring& name) {
-                return StringUtils::ToLower(name) == StringUtils::ToLower(adapterName);
+                return StringUtils::ToLowerCopy(name) == lowerTarget;
             }),
         allowed.end()
     );
@@ -1738,15 +2303,78 @@ bool VPNDetector::PerformDiagnostics() const {
 }
 
 bool VPNDetector::ExportDiagnostics(const std::wstring& outputPath) const {
-    std::shared_lock lock(m_impl->m_mutex);
-
     try {
-        SS_LOG_INFO(L"Network", L"Exported VPN detector diagnostics to: {}",
-            StringUtils::WideToUtf8(outputPath));
+        // Snapshot all data under lock, then write to file WITHOUT holding the lock
+        // to prevent blocking all other operations during potentially slow file I/O
+        bool initialized;
+        bool running;
+        int policyVal;
+        uint64_t totalScans;
+        uint64_t vpnDetected;
+        uint32_t activeVPN;
+        uint32_t virtualAdapt;
+        uint64_t blocked;
+        uint64_t dnsLeaks;
+        uint64_t ipv6Leaks;
+        uint64_t alertsGen;
+        std::vector<std::pair<uint64_t, VPNConnection>> connectionsCopy;
+
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            initialized = m_impl->m_initialized;
+            running = m_impl->m_running;
+            policyVal = static_cast<int>(m_impl->m_config.policy);
+
+            const auto& stats = m_impl->m_stats;
+            totalScans = stats.totalScans.load();
+            vpnDetected = stats.vpnConnectionsDetected.load();
+            activeVPN = stats.activeVPNConnections.load();
+            virtualAdapt = stats.virtualAdapters.load();
+            blocked = stats.connectionsBlocked.load();
+            dnsLeaks = stats.dnsLeaksDetected.load();
+            ipv6Leaks = stats.ipv6LeaksDetected.load();
+            alertsGen = stats.alertsGenerated.load();
+
+            for (const auto& [id, conn] : m_impl->m_activeConnections) {
+                connectionsCopy.emplace_back(id, conn);
+            }
+        }
+
+        // Now write to file without any lock held
+        std::wofstream file(outputPath, std::ios::out | std::ios::trunc);
+        if (!file.is_open()) {
+            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Failed to open output file: %ls",
+                outputPath.c_str());
+            return false;
+        }
+
+        file << L"=== VPNDetector Diagnostics ===\n";
+        file << L"Initialized: " << (initialized ? L"yes" : L"no") << L"\n";
+        file << L"Running: " << (running ? L"yes" : L"no") << L"\n";
+        file << L"Policy: " << policyVal << L"\n";
+        file << L"Total scans: " << totalScans << L"\n";
+        file << L"VPN connections detected: " << vpnDetected << L"\n";
+        file << L"Active VPN connections: " << activeVPN << L"\n";
+        file << L"Virtual adapters: " << virtualAdapt << L"\n";
+        file << L"Connections blocked: " << blocked << L"\n";
+        file << L"DNS leaks: " << dnsLeaks << L"\n";
+        file << L"IPv6 leaks: " << ipv6Leaks << L"\n";
+        file << L"Alerts generated: " << alertsGen << L"\n";
+
+        file << L"\n=== Active Connections ===\n";
+        for (const auto& [id, conn] : connectionsCopy) {
+            file << L"Connection " << id << L": " << conn.providerName
+                 << L" (protocol=" << static_cast<int>(conn.protocol)
+                 << L", confidence=" << conn.confidence << L")\n";
+        }
+
+        file.flush();
+        SS_LOG_INFO(L"Network", L"Exported VPN detector diagnostics to: %ls",
+            outputPath.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: %hs", e.what());
         return false;
     }
 }

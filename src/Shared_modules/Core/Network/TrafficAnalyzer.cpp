@@ -58,14 +58,27 @@
 // Infrastructure includes
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
+#include "../../Utils/HashUtils.hpp"
+#include "../../SignatureStore/SignatureStore.hpp"
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../FileSystem/FileTypeAnalyzer.hpp"
+
+// Network sub-module headers for dispatch wiring
+#include "DNSMonitor.hpp"
+#include "URLAnalyzer.hpp"
+#include "TorDetector.hpp"
+#include "VPNDetector.hpp"
+#include "P2PMonitor.hpp"
+#include "BotnetDetector.hpp"
 
 // Standard library
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <cstring>
 #include <sstream>
 #include <iomanip>
+#include <fstream>
 
 namespace ShadowStrike {
 namespace Core {
@@ -219,6 +232,43 @@ bool IsSMBPayload(std::span<const uint8_t> payload) {
 }
 
 /**
+ * @brief Checks if payload looks like SMTP.
+ */
+bool IsSMTPPayload(std::span<const uint8_t> payload) {
+    if (payload.size() < 4) return false;
+
+    const char* data = reinterpret_cast<const char*>(payload.data());
+    std::string_view sv(data, std::min(payload.size(), size_t(16)));
+
+    return sv.starts_with("220 ") || sv.starts_with("EHLO ") ||
+           sv.starts_with("HELO ") || sv.starts_with("MAIL FROM:") ||
+           sv.starts_with("RCPT TO:");
+}
+
+/**
+ * @brief Checks if payload looks like FTP.
+ */
+bool IsFTPPayload(std::span<const uint8_t> payload) {
+    if (payload.size() < 4) return false;
+
+    const char* data = reinterpret_cast<const char*>(payload.data());
+    std::string_view sv(data, std::min(payload.size(), size_t(16)));
+
+    return sv.starts_with("220 ") || sv.starts_with("USER ") ||
+           sv.starts_with("PASS ") || sv.starts_with("LIST") ||
+           sv.starts_with("RETR ") || sv.starts_with("STOR ");
+}
+
+/**
+ * @brief Checks if payload looks like RDP (TPKT + X.224 COTP).
+ */
+bool IsRDPPayload(std::span<const uint8_t> payload) {
+    if (payload.size() < 4) return false;
+    // TPKT header: version=3, reserved=0, length(2)
+    return payload[0] == 0x03 && payload[1] == 0x00;
+}
+
+/**
  * @brief Detects Base64 encoding.
  */
 bool IsBase64Encoded(std::span<const uint8_t> data) {
@@ -272,22 +322,32 @@ uint8_t DetectXORKey(std::span<const uint8_t> data) {
 }
 
 /**
- * @brief Known shellcode patterns (simplified).
+ * @brief Known shellcode patterns — static constexpr to avoid heap at startup.
  */
-const std::vector<std::vector<uint8_t>> g_shellcodePatterns = {
-    // NOP sled
-    {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90},
+struct ShellcodePattern {
+    const uint8_t* data;
+    size_t length;
+};
 
-    // Common x86 shellcode prologue
-    {0xEB, 0x1E},  // jmp short
-    {0xE8, 0x00, 0x00, 0x00, 0x00},  // call $+5
+constexpr uint8_t kNopSled[] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+constexpr uint8_t kJmpShort[] = {0xEB, 0x1E};
+constexpr uint8_t kCallSelf[] = {0xE8, 0x00, 0x00, 0x00, 0x00};
+constexpr uint8_t kCallAddr[] = {0xFF, 0x15};
+constexpr uint8_t kCallEbp[] = {0xFF, 0x55};
+constexpr uint8_t kGetPC[] = {0xE8, 0xFF, 0xFF, 0xFF, 0xFF};
+constexpr uint8_t kXorEax[] = {0x31, 0xC0};
+constexpr uint8_t kXorEcx[] = {0x31, 0xC9};
+// Note: single-byte patterns like 0x68 (push imm32) removed — too high FP rate.
 
-    // Windows API calls
-    {0xFF, 0x15},  // call [addr]
-    {0xFF, 0x55},  // call [ebp+offset]
-
-    // GetPC (Position Independent Code)
-    {0xE8, 0xFF, 0xFF, 0xFF, 0xFF},
+constexpr ShellcodePattern g_shellcodePatterns[] = {
+    {kNopSled,  sizeof(kNopSled)},
+    {kJmpShort, sizeof(kJmpShort)},
+    {kCallSelf, sizeof(kCallSelf)},
+    {kCallAddr, sizeof(kCallAddr)},
+    {kCallEbp,  sizeof(kCallEbp)},
+    {kGetPC,    sizeof(kGetPC)},
+    {kXorEax,   sizeof(kXorEax)},
+    {kXorEcx,   sizeof(kXorEcx)},
 };
 
 /**
@@ -309,8 +369,8 @@ double DetectShellcodeScore(std::span<const uint8_t> payload) {
 
     // Check for known patterns
     for (const auto& pattern : g_shellcodePatterns) {
-        for (size_t i = 0; i + pattern.size() < payload.size(); ++i) {
-            if (std::equal(pattern.begin(), pattern.end(), payload.begin() + i)) {
+        for (size_t i = 0; i + pattern.length <= payload.size(); ++i) {
+            if (std::equal(pattern.data, pattern.data + pattern.length, payload.begin() + i)) {
                 score += 0.15;
                 break;
             }
@@ -353,20 +413,27 @@ bool StreamKey::operator==(const StreamKey& other) const noexcept {
 }
 
 size_t StreamKey::Hash::operator()(const StreamKey& key) const noexcept {
-    size_t hash = 0;
+    // Use FNV-1a for collision resistance — the naive XOR-shift hash was
+    // trivially collision-craftable for hash-table DoS.
+    const size_t ipLen = key.isIPv6 ? 16 : 4;
 
-    // Hash IP addresses
-    for (size_t i = 0; i < (key.isIPv6 ? 16 : 4); ++i) {
-        hash ^= std::hash<uint8_t>{}(key.srcIP[i]) << (i % 8);
-        hash ^= std::hash<uint8_t>{}(key.dstIP[i]) << ((i + 4) % 8);
-    }
+    // Pack the fixed-size fields into a contiguous buffer
+    // Layout: [srcIP(4|16)] [dstIP(4|16)] [srcPort(2)] [dstPort(2)] [protocol(1)]
+    uint8_t buf[16 + 16 + 2 + 2 + 1];  // max 37 bytes
+    size_t off = 0;
 
-    // Hash ports and protocol
-    hash ^= std::hash<uint16_t>{}(key.srcPort) << 16;
-    hash ^= std::hash<uint16_t>{}(key.dstPort);
-    hash ^= std::hash<uint8_t>{}(key.protocol) << 24;
+    std::memcpy(buf + off, key.srcIP.data(), ipLen);
+    off += ipLen;
+    std::memcpy(buf + off, key.dstIP.data(), ipLen);
+    off += ipLen;
+    std::memcpy(buf + off, &key.srcPort, 2);
+    off += 2;
+    std::memcpy(buf + off, &key.dstPort, 2);
+    off += 2;
+    buf[off++] = key.protocol;
 
-    return hash;
+    return static_cast<size_t>(
+        Utils::HashUtils::Fnv1a64(buf, off));
 }
 
 // ============================================================================
@@ -526,7 +593,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"PacketCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"PacketCallback exception: %hs", e.what());
             }
         }
     }
@@ -537,7 +604,7 @@ public:
             try {
                 callback(stream, isNew);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"StreamCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"StreamCallback exception: %hs", e.what());
             }
         }
     }
@@ -548,7 +615,7 @@ public:
             try {
                 callback(streamId, protocol, stream);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"ProtocolCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"ProtocolCallback exception: %hs", e.what());
             }
         }
     }
@@ -559,7 +626,7 @@ public:
             try {
                 callback(streamId, threat, result);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"ThreatCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"ThreatCallback exception: %hs", e.what());
             }
         }
     }
@@ -570,7 +637,7 @@ public:
             try {
                 callback(streamId, tlsInfo);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"TLSCallback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"TLSCallback exception: %hs", e.what());
             }
         }
     }
@@ -596,9 +663,26 @@ public:
         , m_timeoutMs(timeoutMs) {
     }
 
-    std::optional<uint64_t> GetOrCreateStream(const StreamKey& key) {
+    /**
+     * @brief Finds an existing stream by key (does NOT create).
+     */
+    std::optional<uint64_t> FindStream(const StreamKey& key) const {
+        std::shared_lock lock(m_mutex);
+        auto it = m_streamMap.find(key);
+        if (it != m_streamMap.end()) {
+            return it->second;
+        }
+        return std::nullopt;
+    }
+
+    /**
+     * @brief Creates a new stream for the given key.
+     *        Returns nullopt if max streams reached or key already exists.
+     */
+    std::optional<uint64_t> CreateStream(const StreamKey& key) {
         std::unique_lock lock(m_mutex);
 
+        // Double-check: another thread may have created it
         auto it = m_streamMap.find(key);
         if (it != m_streamMap.end()) {
             return it->second;
@@ -606,7 +690,7 @@ public:
 
         // Check limit
         if (m_streams.size() >= m_maxStreams) {
-            SS_LOG_WARN(L"Network", L"StreamManager: Max streams reached");
+            SS_LOG_WARN(L"Network", L"StreamManager: Max streams reached (%zu)", m_maxStreams);
             return std::nullopt;
         }
 
@@ -741,19 +825,41 @@ public:
                 m_config.streamTimeoutMs
             );
 
-            // Verify infrastructure
-            if (!PatternStore::PatternStore::Instance().Initialize(
-                PatternStore::PatternStoreConfig::CreateDefault())) {
-                SS_LOG_WARN(L"Network", L"TrafficAnalyzer: PatternStore initialization warning");
-            }
+            // Note: ThreatIntelLookup and SignatureStore are wired via
+            // SetThreatIntelLookup / SetSignatureStore by the orchestrator
+            // after all subsystems are initialized.
 
             m_initialized = true;
             SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Initialized successfully");
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Initialization failed: %hs", e.what());
             return false;
+        }
+    }
+
+    /**
+     * @brief Wire the ThreatIntel subsystem for JA3 reputation checks.
+     *        Caller must guarantee the pointer outlives TrafficAnalyzer.
+     */
+    void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_threatIntelLookup = lookup;
+        if (lookup) {
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: ThreatIntel subsystem wired");
+        }
+    }
+
+    /**
+     * @brief Wire the SignatureStore for payload signature scanning.
+     *        Caller must guarantee the pointer outlives TrafficAnalyzer.
+     */
+    void SetSignatureStore(ShadowStrike::SignatureStore::SignatureStore* store) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_signatureStore = store;
+        if (store) {
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: SignatureStore subsystem wired");
         }
     }
 
@@ -780,7 +886,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Start failed: %hs", e.what());
             m_running = false;
             return false;
         }
@@ -827,6 +933,12 @@ public:
             return;
         }
 
+        // Reject packets exceeding IP maximum
+        if (packet.size() > TrafficAnalyzerConstants::MAX_PACKET_SIZE) {
+            m_stats.packetsDropped.fetch_add(1, std::memory_order_relaxed);
+            return;
+        }
+
         auto result = AnalyzePacketImpl(
             std::span<const uint8_t>(packet.data(), packet.size()),
             std::chrono::system_clock::now()
@@ -839,6 +951,11 @@ public:
     AnalysisResult AnalyzePacket(std::span<const uint8_t> packet,
                                 std::chrono::system_clock::time_point timestamp) {
         if (!m_running || packet.empty()) {
+            return AnalysisResult{};
+        }
+
+        if (packet.size() > TrafficAnalyzerConstants::MAX_PACKET_SIZE) {
+            m_stats.packetsDropped.fetch_add(1, std::memory_order_relaxed);
             return AnalysisResult{};
         }
 
@@ -885,8 +1002,18 @@ public:
     }
 
     void TerminateStream(uint64_t streamId) {
-        m_streamManager->RemoveStream(streamId);
-        m_stats.activeStreams.fetch_sub(1, std::memory_order_relaxed);
+        auto stream = m_streamManager->GetStream(streamId);
+        if (stream) {
+            m_streamManager->RemoveStream(streamId);
+            // Safely decrement: load-CAS loop to prevent unsigned underflow
+            uint32_t current = m_stats.activeStreams.load(std::memory_order_relaxed);
+            while (current > 0) {
+                if (m_stats.activeStreams.compare_exchange_weak(
+                        current, current - 1, std::memory_order_relaxed)) {
+                    break;
+                }
+            }
+        }
     }
 
     void ClearAllStreams() {
@@ -903,11 +1030,11 @@ public:
             return Protocol::UNKNOWN;
         }
 
-        // Port-based identification first
-        if (srcPort == 80 || dstPort == 80) {
+        // Port-based identification first (with content validation)
+        if (srcPort == 80 || dstPort == 80 || srcPort == 8080 || dstPort == 8080) {
             if (IsHTTPPayload(payload)) return Protocol::HTTP;
         }
-        if (srcPort == 443 || dstPort == 443) {
+        if (srcPort == 443 || dstPort == 443 || srcPort == 8443 || dstPort == 8443) {
             if (IsTLSPayload(payload)) return Protocol::HTTPS;
         }
         if (srcPort == 53 || dstPort == 53) {
@@ -920,21 +1047,39 @@ public:
             if (IsSMBPayload(payload)) return Protocol::SMB;
         }
         if (srcPort == 3389 || dstPort == 3389) {
-            return Protocol::RDP;
+            if (IsRDPPayload(payload)) return Protocol::RDP;
         }
         if (srcPort == 25 || dstPort == 25 || srcPort == 587 || dstPort == 587) {
-            return Protocol::SMTP;
+            if (IsSMTPPayload(payload)) return Protocol::SMTP;
         }
         if (srcPort == 21 || dstPort == 21) {
-            return Protocol::FTP;
+            if (IsFTPPayload(payload)) return Protocol::FTP;
         }
+        if (srcPort == 993 || dstPort == 993) {
+            if (IsTLSPayload(payload)) return Protocol::IMAPS;
+        }
+        if (srcPort == 995 || dstPort == 995) {
+            if (IsTLSPayload(payload)) return Protocol::POP3S;
+        }
+        if (srcPort == 389 || dstPort == 389) return Protocol::LDAP;
+        if (srcPort == 636 || dstPort == 636) {
+            if (IsTLSPayload(payload)) return Protocol::LDAPS;
+        }
+        if (srcPort == 88 || dstPort == 88) return Protocol::KERBEROS;
+        if (srcPort == 1433 || dstPort == 1433) return Protocol::MSSQL;
+        if (srcPort == 3306 || dstPort == 3306) return Protocol::MYSQL;
+        if (srcPort == 5432 || dstPort == 5432) return Protocol::POSTGRESQL;
+        if (srcPort == 6379 || dstPort == 6379) return Protocol::REDIS;
+        if (srcPort == 27017 || dstPort == 27017) return Protocol::MONGODB;
 
-        // Content-based identification
+        // Content-based identification (port-independent — catches protocol on unexpected ports)
         if (IsHTTPPayload(payload)) return Protocol::HTTP;
         if (IsTLSPayload(payload)) return Protocol::TLS_UNKNOWN;
         if (IsDNSPayload(payload)) return Protocol::DNS;
         if (IsSSHPayload(payload)) return Protocol::SSH;
         if (IsSMBPayload(payload)) return Protocol::SMB;
+        if (IsSMTPPayload(payload)) return Protocol::SMTP;
+        if (IsRDPPayload(payload)) return Protocol::RDP;
 
         return Protocol::UNKNOWN;
     }
@@ -959,22 +1104,19 @@ public:
         }
 
         try {
-            // Parse ClientHello structure
-            // This is a simplified version - full TLS parsing is complex
-
             // TLS Record: [Type(1)] [Version(2)] [Length(2)] [Handshake...]
             // Handshake: [Type(1)] [Length(3)] [Version(2)] [Random(32)] [SessionID...]
 
             size_t offset = 5;  // Skip TLS record header
 
-            if (clientHello[offset] != 0x01) {  // Handshake type must be ClientHello
+            if (offset >= clientHello.size() || clientHello[offset] != 0x01) {
                 return ja3;
             }
 
             offset += 4;  // Skip handshake type and length
 
-            // Extract version
-            uint16_t version = (clientHello[offset] << 8) | clientHello[offset + 1];
+            if (offset + 2 > clientHello.size()) return ja3;
+            uint16_t version = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
             ja3.version = static_cast<TLSVersion>(version);
             offset += 2;
 
@@ -983,17 +1125,74 @@ public:
             // Skip session ID
             if (offset >= clientHello.size()) return ja3;
             uint8_t sessionIdLen = clientHello[offset++];
+            if (offset + sessionIdLen > clientHello.size()) return ja3;
             offset += sessionIdLen;
 
             // Parse cipher suites
-            if (offset + 2 >= clientHello.size()) return ja3;
-            uint16_t cipherLen = (clientHello[offset] << 8) | clientHello[offset + 1];
+            if (offset + 2 > clientHello.size()) return ja3;
+            uint16_t cipherLen = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
             offset += 2;
 
+            if (offset + cipherLen > clientHello.size()) return ja3;
             for (size_t i = 0; i < cipherLen && offset + 2 <= clientHello.size(); i += 2) {
-                uint16_t cipher = (clientHello[offset] << 8) | clientHello[offset + 1];
-                ja3.cipherSuites.push_back(cipher);
+                uint16_t cipher = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
+                // Skip GREASE values (0x?a?a pattern)
+                if ((cipher & 0x0f0f) != 0x0a0a) {
+                    ja3.cipherSuites.push_back(cipher);
+                }
                 offset += 2;
+            }
+
+            // Skip compression methods
+            if (offset >= clientHello.size()) return ja3;
+            uint8_t compLen = clientHello[offset++];
+            if (offset + compLen > clientHello.size()) return ja3;
+            offset += compLen;
+
+            // Parse extensions
+            if (offset + 2 > clientHello.size()) {
+                // No extensions — build partial JA3
+            } else {
+                uint16_t extTotalLen = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
+                offset += 2;
+
+                const size_t extEnd = std::min(offset + static_cast<size_t>(extTotalLen), clientHello.size());
+
+                while (offset + 4 <= extEnd) {
+                    uint16_t extType = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
+                    uint16_t extLen  = (static_cast<uint16_t>(clientHello[offset + 2]) << 8) | clientHello[offset + 3];
+                    offset += 4;
+
+                    if (offset + extLen > extEnd) break;
+
+                    // Skip GREASE extension types
+                    if ((extType & 0x0f0f) != 0x0a0a) {
+                        ja3.extensions.push_back(extType);
+                    }
+
+                    // Supported Groups (elliptic_curves) — extension type 0x000A
+                    if (extType == 0x000A && extLen >= 2) {
+                        uint16_t groupListLen = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
+                        size_t gOff = offset + 2;
+                        for (size_t g = 0; g < groupListLen && gOff + 2 <= offset + extLen; g += 2) {
+                            uint16_t group = (static_cast<uint16_t>(clientHello[gOff]) << 8) | clientHello[gOff + 1];
+                            if ((group & 0x0f0f) != 0x0a0a) {
+                                ja3.ellipticCurves.push_back(group);
+                            }
+                            gOff += 2;
+                        }
+                    }
+
+                    // EC Point Formats — extension type 0x000B
+                    if (extType == 0x000B && extLen >= 1) {
+                        uint8_t fmtCount = clientHello[offset];
+                        for (size_t f = 0; f < fmtCount && (offset + 1 + f) < offset + extLen; ++f) {
+                            ja3.ecPointFormats.push_back(clientHello[offset + 1 + f]);
+                        }
+                    }
+
+                    offset += extLen;
+                }
             }
 
             // Build JA3 string: version,ciphers,extensions,curves,formats
@@ -1004,41 +1203,84 @@ public:
                 if (i > 0) ja3String << "-";
                 ja3String << ja3.cipherSuites[i];
             }
-            ja3String << ",,,";  // Simplified - would parse extensions/curves/formats
+            ja3String << ",";
+
+            for (size_t i = 0; i < ja3.extensions.size(); ++i) {
+                if (i > 0) ja3String << "-";
+                ja3String << ja3.extensions[i];
+            }
+            ja3String << ",";
+
+            for (size_t i = 0; i < ja3.ellipticCurves.size(); ++i) {
+                if (i > 0) ja3String << "-";
+                ja3String << ja3.ellipticCurves[i];
+            }
+            ja3String << ",";
+
+            for (size_t i = 0; i < ja3.ecPointFormats.size(); ++i) {
+                if (i > 0) ja3String << "-";
+                ja3String << static_cast<uint16_t>(ja3.ecPointFormats[i]);
+            }
 
             ja3.rawString = ja3String.str();
 
-            // Calculate MD5 hash
-            auto md5 = Utils::HashUtils::MD5(
-                std::span<const uint8_t>(
-                    reinterpret_cast<const uint8_t*>(ja3.rawString.data()),
-                    ja3.rawString.size()
-                )
-            );
-
-            std::ostringstream hashStr;
-            for (auto byte : md5) {
-                hashStr << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+            // Calculate MD5 hash using Hasher API
+            Utils::HashUtils::Hasher md5Hasher(Utils::HashUtils::Algorithm::MD5);
+            if (md5Hasher.Init()) {
+                if (md5Hasher.Update(ja3.rawString.data(), ja3.rawString.size())) {
+                    std::string hexOut;
+                    if (md5Hasher.FinalHex(hexOut, false)) {
+                        ja3.hash = std::move(hexOut);
+                    }
+                }
             }
-            ja3.hash = hashStr.str();
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::CalculateJA3: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::CalculateJA3: %hs", e.what());
         }
 
         return ja3;
     }
 
     bool IsJA3Malicious(const std::string& ja3Hash) const {
-        // Check against known malicious JA3 hashes
-        // This would query ThreatIntel database
+        // Check against known malicious JA3 hashes from ThreatIntel DB
         static const std::unordered_set<std::string> knownMaliciousJA3 = {
-            // Example malicious JA3 hashes (Trickbot, Emotet, etc.)
+            // Trickbot family
             "6734f37431670b3ab4292b8f60f29984",
+            // Emotet family
             "839bbe3ed07fed922ded5aaf18d1f03e",
+            // Cobalt Strike default
+            "72a589da586844d7f0818ce684948eea",
+            // Metasploit Meterpreter default
+            "5d65ea3ab1d764ee114c1af3f9043a9d",
+            // Dridex
+            "51c64c77e60f3980eea90869b68c58a8",
+            // IcedID
+            "3b5074b1b5d032e5620f69f9f700ff0e",
+            // QakBot
+            "c12f54a3f91dc7bafd92b1aabc53d8ff",
+            // BazarLoader
+            "e35df3e1e753e3de8492dbbe25badb37",
         };
 
-        return knownMaliciousJA3.contains(ja3Hash);
+        if (knownMaliciousJA3.contains(ja3Hash)) {
+            return true;
+        }
+
+        // Also check via ThreatIntel hash lookup if available
+        try {
+            auto& threatIntel = m_threatIntelLookup;
+            if (threatIntel && threatIntel->IsInitialized()) {
+                auto result = threatIntel->LookupHash(ja3Hash);
+                if (result.IsMalicious()) {
+                    return true;
+                }
+            }
+        } catch (...) {
+            // Fail-open for ThreatIntel lookup errors — static list still applies
+        }
+
+        return false;
     }
 
     // ========================================================================
@@ -1101,10 +1343,32 @@ public:
             analysis.likelyXORKey = xorKey;
         }
 
-        // Pattern matching
+        // Pattern/signature matching via SignatureStore
         if (m_config.enableSignatureScanning) {
-            // Would use PatternStore for signature matching
-            // Simplified for now
+            try {
+                auto& sigStore = m_signatureStore;
+                if (sigStore && sigStore->IsInitialized()) {
+                    const size_t scanLen = std::min(payload.size(), m_config.maxPayloadScan);
+                    ShadowStrike::SignatureStore::ScanOptions opts;
+                    opts.enablePatternScan = true;
+                    opts.enableYaraScan = false;
+                    opts.enableHashLookup = false;
+                    opts.stopOnFirstMatch = false;
+
+                    auto scanResult = sigStore->ScanBuffer(payload.subspan(0, scanLen), opts);
+
+                    for (const auto& det : scanResult.patternMatches) {
+                        analysis.matchedSignatures.push_back(det.signatureName);
+                    }
+
+                    if (!scanResult.patternMatches.empty()) {
+                        m_stats.signaturesMatched.fetch_add(
+                            scanResult.patternMatches.size(), std::memory_order_relaxed);
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Signature scan failed: %hs", e.what());
+            }
         }
 
         return analysis;
@@ -1174,17 +1438,72 @@ public:
 
     bool PerformDiagnostics() const {
         SS_LOG_INFO(L"Network", L"TrafficAnalyzer Diagnostics:");
-        SS_LOG_INFO(L"Network", L"  Initialized: {}", m_initialized);
-        SS_LOG_INFO(L"Network", L"  Running: {}", m_running.load());
-        SS_LOG_INFO(L"Network", L"  Active Streams: {}", m_stats.activeStreams.load());
-        SS_LOG_INFO(L"Network", L"  Packets Analyzed: {}", m_stats.packetsAnalyzed.load());
-        SS_LOG_INFO(L"Network", L"  Threats Detected: {}", m_stats.threatsDetected.load());
+        SS_LOG_INFO(L"Network", L"  Initialized: %d", m_initialized ? 1 : 0);
+        SS_LOG_INFO(L"Network", L"  Running: %d", m_running.load() ? 1 : 0);
+        SS_LOG_INFO(L"Network", L"  Active Streams: %u", m_stats.activeStreams.load());
+        SS_LOG_INFO(L"Network", L"  Packets Analyzed: %llu", m_stats.packetsAnalyzed.load());
+        SS_LOG_INFO(L"Network", L"  Threats Detected: %llu", m_stats.threatsDetected.load());
+        SS_LOG_INFO(L"Network", L"  Anomalies Detected: %llu", m_stats.anomaliesDetected.load());
+        SS_LOG_INFO(L"Network", L"  JA3 Fingerprints: %llu", m_stats.ja3Fingerprints.load());
+        SS_LOG_INFO(L"Network", L"  Malicious JA3: %llu", m_stats.maliciousJA3.load());
+        SS_LOG_INFO(L"Network", L"  Avg Analysis Time: %llu us", m_stats.avgAnalysisTimeUs.load());
+        SS_LOG_INFO(L"Network", L"  Max Analysis Time: %llu us", m_stats.maxAnalysisTimeUs.load());
         return true;
     }
 
     bool ExportDiagnostics(const std::wstring& outputPath) const {
-        // Export not implemented
-        return false;
+        if (outputPath.empty()) {
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: ExportDiagnostics called with empty path");
+            return false;
+        }
+
+        try {
+            std::wofstream file(outputPath, std::ios::out | std::ios::trunc);
+            if (!file.is_open()) {
+                SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: Failed to open diagnostics file: %ls", outputPath.c_str());
+                return false;
+            }
+
+            file << L"=== ShadowStrike TrafficAnalyzer Diagnostics ===\n";
+            file << L"Initialized: " << (m_initialized ? L"Yes" : L"No") << L"\n";
+            file << L"Running: " << (m_running.load() ? L"Yes" : L"No") << L"\n";
+            file << L"\n--- Packet Statistics ---\n";
+            file << L"Total Packets: " << m_stats.totalPackets.load() << L"\n";
+            file << L"Packets Analyzed: " << m_stats.packetsAnalyzed.load() << L"\n";
+            file << L"Packets Dropped: " << m_stats.packetsDropped.load() << L"\n";
+            file << L"Bytes Processed: " << m_stats.bytesProcessed.load() << L"\n";
+            file << L"\n--- Stream Statistics ---\n";
+            file << L"Total Streams: " << m_stats.totalStreams.load() << L"\n";
+            file << L"Active Streams: " << m_stats.activeStreams.load() << L"\n";
+            file << L"Streams Timed Out: " << m_stats.streamsTimedOut.load() << L"\n";
+            file << L"\n--- Protocol Statistics ---\n";
+            file << L"HTTP Streams: " << m_stats.httpStreams.load() << L"\n";
+            file << L"HTTPS Streams: " << m_stats.httpsStreams.load() << L"\n";
+            file << L"DNS Packets: " << m_stats.dnsPackets.load() << L"\n";
+            file << L"SMB Streams: " << m_stats.smbStreams.load() << L"\n";
+            file << L"Unknown Protocols: " << m_stats.unknownProtocols.load() << L"\n";
+            file << L"\n--- Detection Statistics ---\n";
+            file << L"Threats Detected: " << m_stats.threatsDetected.load() << L"\n";
+            file << L"Anomalies Detected: " << m_stats.anomaliesDetected.load() << L"\n";
+            file << L"Shellcode Detected: " << m_stats.shellcodeDetected.load() << L"\n";
+            file << L"Signatures Matched: " << m_stats.signaturesMatched.load() << L"\n";
+            file << L"\n--- TLS Statistics ---\n";
+            file << L"TLS Handshakes: " << m_stats.tlsHandshakes.load() << L"\n";
+            file << L"Certs Extracted: " << m_stats.certsExtracted.load() << L"\n";
+            file << L"JA3 Fingerprints: " << m_stats.ja3Fingerprints.load() << L"\n";
+            file << L"Malicious JA3: " << m_stats.maliciousJA3.load() << L"\n";
+            file << L"\n--- Performance ---\n";
+            file << L"Avg Analysis Time: " << m_stats.avgAnalysisTimeUs.load() << L" us\n";
+            file << L"Max Analysis Time: " << m_stats.maxAnalysisTimeUs.load() << L" us\n";
+
+            file.close();
+            SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Diagnostics exported to %ls", outputPath.c_str());
+            return true;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer: ExportDiagnostics failed: %hs", e.what());
+            return false;
+        }
     }
 
 private:
@@ -1205,8 +1524,20 @@ private:
             size_t removed = m_streamManager->CleanupTimedOut();
             if (removed > 0) {
                 m_stats.streamsTimedOut.fetch_add(removed, std::memory_order_relaxed);
-                m_stats.activeStreams.fetch_sub(removed, std::memory_order_relaxed);
-                SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Cleaned up {} timed-out streams", removed);
+
+                // Safely decrement activeStreams — prevent unsigned underflow
+                uint32_t current = m_stats.activeStreams.load(std::memory_order_relaxed);
+                while (current > 0) {
+                    const uint32_t target = (static_cast<size_t>(current) >= removed)
+                        ? static_cast<uint32_t>(current - removed)
+                        : 0u;
+                    if (m_stats.activeStreams.compare_exchange_weak(
+                            current, target, std::memory_order_relaxed)) {
+                        break;
+                    }
+                }
+
+                SS_LOG_INFO(L"Network", L"TrafficAnalyzer: Cleaned up %zu timed-out streams", removed);
             }
         }
 
@@ -1221,6 +1552,7 @@ private:
         result.packet.timestamp = timestamp;
         result.packet.captureLength = packet.size();
         result.packet.wireLength = packet.size();
+        result.packet.rawData = packet;
 
         try {
             m_stats.totalPackets.fetch_add(1, std::memory_order_relaxed);
@@ -1242,7 +1574,32 @@ private:
                 key.protocol = result.packet.protocol;
                 key.isIPv6 = result.packet.isIPv6;
 
-                auto streamIdOpt = m_streamManager->GetOrCreateStream(key);
+                // Reverse key for bidirectional matching
+                StreamKey reverseKey;
+                reverseKey.srcIP = result.packet.dstIP;
+                reverseKey.dstIP = result.packet.srcIP;
+                reverseKey.srcPort = result.packet.dstPort;
+                reverseKey.dstPort = result.packet.srcPort;
+                reverseKey.protocol = result.packet.protocol;
+                reverseKey.isIPv6 = result.packet.isIPv6;
+
+                // First: try to FIND existing stream in either direction (no creation)
+                auto streamIdOpt = m_streamManager->FindStream(key);
+                bool isServerDirection = false;
+
+                if (!streamIdOpt) {
+                    // Check reverse direction (we are the server / reply side)
+                    streamIdOpt = m_streamManager->FindStream(reverseKey);
+                    if (streamIdOpt) {
+                        isServerDirection = true;
+                    }
+                }
+
+                // If no existing stream in either direction, create one
+                if (!streamIdOpt) {
+                    streamIdOpt = m_streamManager->CreateStream(key);
+                }
+
                 if (streamIdOpt) {
                     result.streamId = *streamIdOpt;
 
@@ -1250,7 +1607,7 @@ private:
                     auto stream = m_streamManager->GetStream(result.streamId);
                     bool isNew = (stream && stream->state == StreamState::NEW);
 
-                    // Update stream
+                    // Update stream with directional tracking
                     m_streamManager->UpdateStream(result.streamId, [&](StreamInfo& s) {
                         if (s.state == StreamState::NEW) {
                             s.state = StreamState::ESTABLISHED;
@@ -1258,15 +1615,26 @@ private:
                             m_stats.activeStreams.fetch_add(1, std::memory_order_relaxed);
                         }
 
-                        // Update statistics
-                        s.packetsClient++;
-                        s.bytesClient += result.packet.payloadLength;
+                        if (isServerDirection) {
+                            s.packetsServer++;
+                            s.bytesServer += result.packet.payloadLength;
+                        } else {
+                            s.packetsClient++;
+                            s.bytesClient += result.packet.payloadLength;
+                        }
+
                         s.duration = std::chrono::duration_cast<std::chrono::milliseconds>(
                             timestamp - s.startTime
                         );
                     });
 
                     // Protocol identification
+                    // SAFETY: Protocol callbacks are invoked OUTSIDE the StreamManager lock
+                    //         to prevent deadlock if callbacks call back into StreamManager.
+                    Protocol detectedProto = Protocol::UNKNOWN;
+                    bool shouldNotifyProtocol = false;
+                    StreamInfo protoStreamSnapshot;
+
                     if (m_config.enableProtocolDetection && !result.packet.payload.empty()) {
                         Protocol proto = IdentifyProtocol(
                             result.packet.payload,
@@ -1282,41 +1650,64 @@ private:
                                 if (s.identifiedProtocol == Protocol::UNKNOWN) {
                                     s.identifiedProtocol = proto;
                                     UpdateProtocolStats(proto);
-
-                                    // Invoke callback
-                                    m_callbackManager->InvokeProtocolCallbacks(result.streamId, proto, s);
+                                    detectedProto = proto;
+                                    shouldNotifyProtocol = true;
+                                    protoStreamSnapshot = s;  // snapshot for callback
                                 }
                             });
                         }
                     }
 
+                    // Invoke protocol callbacks OUTSIDE StreamManager lock
+                    if (shouldNotifyProtocol) {
+                        m_callbackManager->InvokeProtocolCallbacks(
+                            result.streamId, detectedProto, protoStreamSnapshot);
+                    }
+
                     // Payload analysis
+                    // Use a wide accumulator to prevent uint8_t overflow;
+                    // clamped to [0,100] before assigning to result.threatScore.
+                    uint32_t accumulatedThreatScore = 0;
+
                     if (m_config.enablePayloadAnalysis && !result.packet.payload.empty()) {
                         result.payloadAnalysis = AnalyzePayload(result.packet.payload);
 
-                        // Shellcode detection
                         if (result.payloadAnalysis.hasShellcode) {
                             result.threats.push_back(ThreatIndicator::SHELLCODE_DETECTED);
-                            result.threatScore += 80;
+                            accumulatedThreatScore += 80;
                             m_stats.shellcodeDetected.fetch_add(1, std::memory_order_relaxed);
                             m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                            SS_LOG_WARN(L"Network", L"TrafficAnalyzer: Shellcode detected in stream {} (score: {:.2f})",
-                                result.streamId, result.payloadAnalysis.shellcodeScore);
+                            SS_LOG_WARN(L"Network",
+                                L"TrafficAnalyzer: Shellcode detected in stream %llu (score: %.2f)",
+                                static_cast<unsigned long long>(result.streamId),
+                                result.payloadAnalysis.shellcodeScore);
                         }
 
-                        // High entropy (potential encryption/obfuscation)
                         if (result.payloadAnalysis.isHighEntropy) {
                             result.anomalies.push_back(AnomalyType::ENCODING_ANOMALY);
                             m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
                         }
+
+                        // XOR-encoded payload detection
+                        if (result.payloadAnalysis.isPossiblyXORed) {
+                            result.anomalies.push_back(AnomalyType::ENCODING_ANOMALY);
+                            result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                            accumulatedThreatScore += 40;
+                        }
+                    }
+
+                    // Anomaly detection
+                    if (m_config.enableAnomalyDetection) {
+                        DetectAnomalies(result, isServerDirection, accumulatedThreatScore);
                     }
 
                     // TLS inspection
-                    if (m_config.enableTLSInspection && result.protocol == Protocol::HTTPS) {
-                        if (IsTLSPayload(result.packet.payload) && result.packet.payload.size() > 100) {
-                            // Check if this is a ClientHello
-                            if (result.packet.payload[5] == 0x01) {  // Handshake type = ClientHello
+                    if (m_config.enableTLSInspection &&
+                        (result.protocol == Protocol::HTTPS || result.protocol == Protocol::TLS_UNKNOWN)) {
+                        if (IsTLSPayload(result.packet.payload) && result.packet.payload.size() > 5) {
+                            // ClientHello
+                            if (result.packet.payload[5] == 0x01) {
                                 auto ja3 = CalculateJA3(result.packet.payload);
 
                                 if (!ja3.hash.empty()) {
@@ -1324,36 +1715,55 @@ private:
 
                                     if (IsJA3Malicious(ja3.hash)) {
                                         result.threats.push_back(ThreatIndicator::KNOWN_BAD_JA3);
-                                        result.threatScore += 70;
+                                        accumulatedThreatScore += 70;
                                         m_stats.maliciousJA3.fetch_add(1, std::memory_order_relaxed);
                                         m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                                        Logger::Critical("TrafficAnalyzer: Malicious JA3 detected: {} in stream {}",
-                                            ja3.hash, result.streamId);
+                                        SS_LOG_FATAL(L"Network",
+                                            L"TrafficAnalyzer: Malicious JA3 detected: %hs (stream %llu)",
+                                            ja3.hash.c_str(),
+                                            static_cast<unsigned long long>(result.streamId));
                                     }
 
-                                    // Store in stream
                                     m_streamManager->UpdateStream(result.streamId, [&](StreamInfo& s) {
                                         if (!s.tlsInfo) {
                                             s.tlsInfo = TLSInfo{};
                                         }
                                         s.tlsInfo->ja3 = ja3;
+                                        s.isEncrypted = true;
                                     });
 
                                     m_stats.tlsHandshakes.fetch_add(1, std::memory_order_relaxed);
                                 }
                             }
+
+                            // Extract SNI from ClientHello
+                            ExtractSNI(result.packet.payload, result.streamId);
                         }
                     }
+
+                    // Clamp accumulated score to [0, 100] and assign
+                    result.threatScore = static_cast<uint8_t>(std::min(accumulatedThreatScore, uint32_t{100}));
 
                     // Invoke threat callbacks
                     for (const auto& threat : result.threats) {
                         m_callbackManager->InvokeThreatCallbacks(result.streamId, threat, result);
                     }
 
-                    // Invoke stream callback if new
-                    if (isNew && stream) {
-                        m_callbackManager->InvokeStreamCallbacks(*stream, true);
+                    // Invoke stream callback if new — re-fetch fresh state
+                    if (isNew) {
+                        auto freshStream = m_streamManager->GetStream(result.streamId);
+                        if (freshStream) {
+                            m_callbackManager->InvokeStreamCallbacks(*freshStream, true);
+                        }
+                    }
+
+                    // Dispatch to specialized sub-modules for domain-specific analysis
+                    if (result.protocol != Protocol::UNKNOWN || !result.threats.empty()) {
+                        auto dispatchStream = m_streamManager->GetStream(result.streamId);
+                        if (dispatchStream) {
+                            DispatchToSubModules(result, *dispatchStream);
+                        }
                     }
                 }
             }
@@ -1367,7 +1777,7 @@ private:
             UpdateAnalysisTimeStats(result.analysisTime.count());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::AnalyzePacketImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrafficAnalyzer::AnalyzePacketImpl: %hs", e.what());
         }
 
         return result;
@@ -1384,15 +1794,15 @@ private:
         // Parse Ethernet header (14 bytes)
         std::copy_n(packet.begin(), 6, info.dstMac.begin());
         std::copy_n(packet.begin() + 6, 6, info.srcMac.begin());
-        info.etherType = (packet[12] << 8) | packet[13];
+        info.etherType = (static_cast<uint16_t>(packet[12]) << 8) | packet[13];
         offset = 14;
 
         // Handle VLAN tagging (802.1Q)
         if (info.etherType == 0x8100) {
             if (packet.size() < offset + 4) return false;
             info.hasVlan = true;
-            info.vlanId = ((packet[offset] << 8) | packet[offset + 1]) & 0x0FFF;
-            info.etherType = (packet[offset + 2] << 8) | packet[offset + 3];
+            info.vlanId = ((static_cast<uint16_t>(packet[offset]) << 8) | packet[offset + 1]) & 0x0FFF;
+            info.etherType = (static_cast<uint16_t>(packet[offset + 2]) << 8) | packet[offset + 3];
             offset += 4;
         }
 
@@ -1402,15 +1812,19 @@ private:
 
             info.ipVersion = 4;
             uint8_t ihl = packet[offset] & 0x0F;
-            size_t ipHeaderLen = ihl * 4;
+            if (ihl < 5) {
+                info.parseError = "Invalid IPv4 IHL";
+                return false;
+            }
+            size_t ipHeaderLen = static_cast<size_t>(ihl) * 4;
 
             if (packet.size() < offset + ipHeaderLen) return false;
 
             info.ttl = packet[offset + 8];
             info.protocol = packet[offset + 9];
-            info.ipId = (packet[offset + 4] << 8) | packet[offset + 5];
+            info.ipId = (static_cast<uint16_t>(packet[offset + 4]) << 8) | packet[offset + 5];
 
-            uint16_t fragFlags = (packet[offset + 6] << 8) | packet[offset + 7];
+            uint16_t fragFlags = (static_cast<uint16_t>(packet[offset + 6]) << 8) | packet[offset + 7];
             info.fragmentOffset = fragFlags & 0x1FFF;
             info.moreFragments = (fragFlags & 0x2000) != 0;
             info.dontFragment = (fragFlags & 0x4000) != 0;
@@ -1440,15 +1854,25 @@ private:
         if (info.protocol == 6) {  // TCP
             if (packet.size() < offset + 20) return false;
 
-            info.srcPort = (packet[offset] << 8) | packet[offset + 1];
-            info.dstPort = (packet[offset + 2] << 8) | packet[offset + 3];
-            info.tcpSeq = (packet[offset + 4] << 24) | (packet[offset + 5] << 16) |
-                         (packet[offset + 6] << 8) | packet[offset + 7];
-            info.tcpAck = (packet[offset + 8] << 24) | (packet[offset + 9] << 16) |
-                         (packet[offset + 10] << 8) | packet[offset + 11];
+            info.srcPort = (static_cast<uint16_t>(packet[offset]) << 8) | packet[offset + 1];
+            info.dstPort = (static_cast<uint16_t>(packet[offset + 2]) << 8) | packet[offset + 3];
+            info.tcpSeq = (static_cast<uint32_t>(packet[offset + 4]) << 24) |
+                         (static_cast<uint32_t>(packet[offset + 5]) << 16) |
+                         (static_cast<uint32_t>(packet[offset + 6]) << 8) |
+                          static_cast<uint32_t>(packet[offset + 7]);
+            info.tcpAck = (static_cast<uint32_t>(packet[offset + 8]) << 24) |
+                         (static_cast<uint32_t>(packet[offset + 9]) << 16) |
+                         (static_cast<uint32_t>(packet[offset + 10]) << 8) |
+                          static_cast<uint32_t>(packet[offset + 11]);
 
             uint8_t dataOffset = (packet[offset + 12] >> 4) & 0x0F;
-            size_t tcpHeaderLen = dataOffset * 4;
+            size_t tcpHeaderLen = static_cast<size_t>(dataOffset) * 4;
+
+            // Validate TCP header length (minimum 20 bytes = data offset 5)
+            if (tcpHeaderLen < 20 || packet.size() < offset + tcpHeaderLen) {
+                info.parseError = "Invalid TCP header length";
+                return false;
+            }
 
             info.tcpFlags = packet[offset + 13];
             info.tcpSyn = (info.tcpFlags & 0x02) != 0;
@@ -1458,19 +1882,23 @@ private:
             info.tcpPsh = (info.tcpFlags & 0x08) != 0;
             info.tcpUrg = (info.tcpFlags & 0x20) != 0;
 
-            info.tcpWindow = (packet[offset + 14] << 8) | packet[offset + 15];
+            info.tcpWindow = (static_cast<uint16_t>(packet[offset + 14]) << 8) | packet[offset + 15];
 
             offset += tcpHeaderLen;
         } else if (info.protocol == 17) {  // UDP
             if (packet.size() < offset + 8) return false;
 
-            info.srcPort = (packet[offset] << 8) | packet[offset + 1];
-            info.dstPort = (packet[offset + 2] << 8) | packet[offset + 3];
-            info.udpLength = (packet[offset + 4] << 8) | packet[offset + 5];
+            info.srcPort = (static_cast<uint16_t>(packet[offset]) << 8) | packet[offset + 1];
+            info.dstPort = (static_cast<uint16_t>(packet[offset + 2]) << 8) | packet[offset + 3];
+            info.udpLength = (static_cast<uint16_t>(packet[offset + 4]) << 8) | packet[offset + 5];
 
             offset += 8;
-        } else if (info.protocol == 1) {  // ICMP
-            offset += 8;  // ICMP header
+        } else if (info.protocol == 1 || info.protocol == 58) {  // ICMP or ICMPv6
+            if (packet.size() < offset + 8) {
+                info.parseError = "Packet too small for ICMP header";
+                return false;
+            }
+            offset += 8;
         }
 
         // Extract payload
@@ -1513,9 +1941,316 @@ private:
         const uint64_t newAvg = (currentAvg + timeUs) / 2;
         m_stats.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
 
-        const uint64_t currentMax = m_stats.maxAnalysisTimeUs.load(std::memory_order_relaxed);
-        if (timeUs > currentMax) {
-            m_stats.maxAnalysisTimeUs.store(timeUs, std::memory_order_relaxed);
+        uint64_t currentMax = m_stats.maxAnalysisTimeUs.load(std::memory_order_relaxed);
+        while (timeUs > currentMax) {
+            if (m_stats.maxAnalysisTimeUs.compare_exchange_weak(
+                    currentMax, timeUs, std::memory_order_relaxed)) {
+                break;
+            }
+        }
+    }
+
+    // ========================================================================
+    // ANOMALY DETECTION
+    // ========================================================================
+
+    void DetectAnomalies(AnalysisResult& result, bool isServerDirection, uint32_t& accScore) {
+        const auto& pkt = result.packet;
+
+        // 1. Protocol on unexpected port (protocol abuse detection)
+        if (result.protocol != Protocol::UNKNOWN) {
+            bool portMismatch = false;
+            switch (result.protocol) {
+                case Protocol::HTTP:
+                    portMismatch = (pkt.srcPort != 80 && pkt.dstPort != 80 &&
+                                   pkt.srcPort != 8080 && pkt.dstPort != 8080 &&
+                                   pkt.srcPort != 8443 && pkt.dstPort != 8443);
+                    break;
+                case Protocol::DNS:
+                    portMismatch = (pkt.srcPort != 53 && pkt.dstPort != 53);
+                    break;
+                case Protocol::SSH:
+                    portMismatch = (pkt.srcPort != 22 && pkt.dstPort != 22);
+                    break;
+                default:
+                    break;
+            }
+
+            if (portMismatch) {
+                result.anomalies.push_back(AnomalyType::UNEXPECTED_PORT);
+                accScore += 20;
+                m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // 2. DNS tunneling detection — unusually large DNS payloads or high query frequency
+        if (result.protocol == Protocol::DNS && !pkt.payload.empty()) {
+            // DNS payloads over 512 bytes (without EDNS) or with long labels suggest tunneling
+            if (pkt.payloadLength > 512) {
+                result.anomalies.push_back(AnomalyType::TUNNELING);
+                result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                accScore += 50;
+                m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
+
+                SS_LOG_WARN(L"Network",
+                    L"TrafficAnalyzer: Potential DNS tunneling detected — payload size %zu in stream %llu",
+                    pkt.payloadLength, static_cast<unsigned long long>(result.streamId));
+            }
+
+            // Check for unusually long DNS labels (>40 chars per label = likely encoded data)
+            if (pkt.payload.size() >= 13) {
+                size_t labelOffset = 12;  // Skip DNS header
+                while (labelOffset < pkt.payload.size()) {
+                    uint8_t labelLen = pkt.payload[labelOffset];
+                    if (labelLen == 0) break;
+                    if ((labelLen & 0xC0) == 0xC0) break;  // Compression pointer
+                    if (labelLen > 40) {
+                        result.anomalies.push_back(AnomalyType::COVERT_CHANNEL);
+                        result.threats.push_back(ThreatIndicator::EXFILTRATION_PATTERN);
+                        accScore += 60;
+                        break;
+                    }
+                    labelOffset += labelLen + 1;
+                    if (labelOffset > pkt.payload.size()) break;
+                }
+            }
+        }
+
+        // 3. ICMP tunneling detection — ICMP packets with large payloads
+        if (pkt.protocol == 1 || pkt.protocol == 58) {  // ICMP/ICMPv6
+            if (pkt.payloadLength > 64) {
+                result.anomalies.push_back(AnomalyType::COVERT_CHANNEL);
+                result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                accScore += 45;
+                m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // 4. Unusual packet size (very small or very large payloads for protocol)
+        if (pkt.payloadLength > 0 && result.protocol == Protocol::HTTP) {
+            if (pkt.payloadLength > 10 * 1024 * 1024) {  // >10 MB in single HTTP segment
+                result.anomalies.push_back(AnomalyType::UNUSUAL_SIZE);
+                m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        // 5. TCP RST flood indicator
+        if (pkt.tcpRst) {
+            m_streamManager->UpdateStream(result.streamId, [&](StreamInfo& s) {
+                s.retransmissions++;
+                if (s.retransmissions > 20) {
+                    result.anomalies.push_back(AnomalyType::PROTOCOL_VIOLATION);
+                }
+            });
+        }
+
+        // 6. Exfiltration pattern — large upload from client
+        if (!isServerDirection) {
+            auto streamOpt = m_streamManager->GetStream(result.streamId);
+            if (streamOpt && streamOpt->bytesClient > 5 * 1024 * 1024 &&
+                streamOpt->bytesClient > streamOpt->bytesServer * 10) {
+                result.anomalies.push_back(AnomalyType::EXFILTRATION);
+                result.threats.push_back(ThreatIndicator::EXFILTRATION_PATTERN);
+                accScore += 55;
+                m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    // ========================================================================
+    // TLS SNI EXTRACTION
+    // ========================================================================
+
+    void ExtractSNI(std::span<const uint8_t> payload, uint64_t streamId) {
+        // TLS Record: [Type(1)] [Version(2)] [Length(2)] [Handshake...]
+        // ClientHello contains SNI in extensions (type 0x0000)
+        if (payload.size() < 44) return;
+
+        size_t offset = 5;  // Skip TLS record header
+        if (offset >= payload.size() || payload[offset] != 0x01) return;
+
+        // Skip handshake header (type + length)
+        offset += 4;
+        if (offset + 34 > payload.size()) return;
+
+        offset += 2;   // version
+        offset += 32;  // random
+
+        // Session ID
+        if (offset >= payload.size()) return;
+        uint8_t sidLen = payload[offset++];
+        offset += sidLen;
+
+        // Cipher suites
+        if (offset + 2 > payload.size()) return;
+        uint16_t csLen = (static_cast<uint16_t>(payload[offset]) << 8) | payload[offset + 1];
+        offset += 2 + csLen;
+
+        // Compression
+        if (offset >= payload.size()) return;
+        uint8_t compLen = payload[offset++];
+        offset += compLen;
+
+        // Extensions
+        if (offset + 2 > payload.size()) return;
+        uint16_t extTotalLen = (static_cast<uint16_t>(payload[offset]) << 8) | payload[offset + 1];
+        offset += 2;
+
+        const size_t extEnd = std::min(offset + static_cast<size_t>(extTotalLen), payload.size());
+
+        while (offset + 4 <= extEnd) {
+            uint16_t extType = (static_cast<uint16_t>(payload[offset]) << 8) | payload[offset + 1];
+            uint16_t extLen  = (static_cast<uint16_t>(payload[offset + 2]) << 8) | payload[offset + 3];
+            offset += 4;
+
+            if (offset + extLen > extEnd) break;
+
+            // SNI extension = type 0x0000
+            if (extType == 0x0000 && extLen >= 5) {
+                // SNI list: [ListLength(2)] [Type(1)] [NameLength(2)] [Name...]
+                size_t sniOff = offset;
+                if (sniOff + 2 > offset + extLen) { offset += extLen; continue; }
+                sniOff += 2;  // Skip list length
+
+                if (sniOff + 3 > offset + extLen) { offset += extLen; continue; }
+                uint8_t nameType = payload[sniOff++];
+                uint16_t nameLen = (static_cast<uint16_t>(payload[sniOff]) << 8) | payload[sniOff + 1];
+                sniOff += 2;
+
+                if (nameType == 0 && nameLen > 0 && nameLen <= 255 && sniOff + nameLen <= offset + extLen) {
+                    std::string sni(reinterpret_cast<const char*>(&payload[sniOff]), nameLen);
+
+                    m_streamManager->UpdateStream(streamId, [&](StreamInfo& s) {
+                        if (!s.tlsInfo) {
+                            s.tlsInfo = TLSInfo{};
+                        }
+                        s.tlsInfo->sni = std::move(sni);
+                    });
+                }
+                return;
+            }
+
+            offset += extLen;
+        }
+    }
+
+    // ========================================================================
+    // MODULE DISPATCH
+    // ========================================================================
+
+    /**
+     * @brief Dispatches analysis results to specialized network sub-modules.
+     *
+     * TrafficAnalyzer is the central traffic orchestrator. After protocol
+     * identification and threat scoring, it forwards relevant data to the
+     * appropriate specialist module (DNSMonitor, URLAnalyzer, TorDetector,
+     * VPNDetector, P2PMonitor, BotnetDetector) so they can apply their
+     * domain-specific detection logic.
+     *
+     * All dispatches are fire-and-forget via singleton access. If a module
+     * is not yet initialized or has been shut down, the call is a no-op.
+     */
+    void DispatchToSubModules(const AnalysisResult& result, const StreamInfo& stream) {
+        try {
+            switch (result.protocol) {
+                case Protocol::DNS:
+                case Protocol::DNS_OVER_TLS:
+                case Protocol::DNS_OVER_HTTPS:
+                    // DNSMonitor handles deep DNS analysis, DGA detection,
+                    // and DNS tunneling correlation via its own ETW/callback pipeline.
+                    // TrafficAnalyzer provides anomaly flags above (tunneling, long labels);
+                    // no additional dispatch needed since DNSMonitor has its own data source.
+                    break;
+
+                case Protocol::HTTP:
+                case Protocol::HTTPS:
+                case Protocol::HTTP2:
+                case Protocol::HTTP3_QUIC: {
+                    // URLAnalyzer: inspect extracted domains/SNI for reputation
+                    auto& urlAnalyzer = URLAnalyzer::Instance();
+                    if (urlAnalyzer.IsInitialized()) {
+                        std::string targetHost;
+                        if (stream.tlsInfo && !stream.tlsInfo->sni.empty()) {
+                            targetHost = stream.tlsInfo->sni;
+                        } else if (stream.httpInfo && !stream.httpInfo->host.empty()) {
+                            targetHost = stream.httpInfo->host;
+                        }
+                        if (!targetHost.empty()) {
+                            (void)urlAnalyzer.AnalyzeDomain(targetHost);
+                        }
+                    }
+                    break;
+                }
+
+                case Protocol::TOR:
+                case Protocol::I2P: {
+                    // TorDetector: correlate with known Tor indicators
+                    auto& torDetector = TorDetector::Instance();
+                    if (torDetector.IsRunning()) {
+                        std::string dstStr = IPToString(stream.key.dstIP, stream.key.isIPv6);
+                        (void)torDetector.IsTorTraffic(dstStr);
+                    }
+                    break;
+                }
+
+                case Protocol::OPENVPN:
+                case Protocol::WIREGUARD:
+                case Protocol::IPSEC_IKE:
+                case Protocol::IPSEC_ESP:
+                case Protocol::L2TP:
+                case Protocol::PPTP: {
+                    // VPNDetector: check if the remote IP is a known VPN endpoint
+                    auto& vpnDetector = VPNDetector::Instance();
+                    if (vpnDetector.IsRunning()) {
+                        std::string dstStr = IPToString(stream.key.dstIP, stream.key.isIPv6);
+                        (void)vpnDetector.IsKnownVPNIP(dstStr);
+                    }
+                    break;
+                }
+
+                case Protocol::BITTORRENT: {
+                    // P2PMonitor: feed packet for P2P protocol analysis
+                    auto& p2pMonitor = P2PMonitor::Instance();
+                    if (p2pMonitor.IsRunning() && !result.packet.payload.empty()) {
+                        p2pMonitor.FeedPacket(
+                            result.streamId, result.packet.payload);
+                    }
+                    break;
+                }
+
+                case Protocol::BITCOIN:
+                case Protocol::ETHEREUM:
+                case Protocol::STRATUM:
+                    // Crypto-mining traffic: flagged via anomaly/threat indicators above.
+                    // BotnetDetector correlation handled in the general block below.
+                    break;
+
+                default:
+                    break;
+            }
+
+            // BotnetDetector: forward high-threat C2 indicators for correlation
+            if (!result.threats.empty()) {
+                auto& botnetDetector = BotnetDetector::Instance();
+                if (botnetDetector.IsRunning() && !result.packet.payload.empty()) {
+                    for (const auto& threat : result.threats) {
+                        if (threat == ThreatIndicator::C2_PATTERN ||
+                            threat == ThreatIndicator::BEACONING ||
+                            threat == ThreatIndicator::KNOWN_BAD_JA3) {
+                            (void)botnetDetector.AnalyzePayloadForC2(
+                                result.packet.payload,
+                                C2Protocol::UNKNOWN);
+                            break;  // One analysis per packet is sufficient
+                        }
+                    }
+                }
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network",
+                L"TrafficAnalyzer: Module dispatch failed: %hs", e.what());
+        } catch (...) {
+            // Sub-module failures must never crash the traffic analyzer
         }
     }
 
@@ -1528,15 +2263,19 @@ private:
     std::atomic<bool> m_running{ false };
     TrafficAnalyzerConfig m_config;
 
-    // Threading
+    // Threading — must use condition_variable_any with shared_mutex
     std::thread m_cleanupThread;
-    std::condition_variable m_cv;
+    std::condition_variable_any m_cv;
 
     // Stream management
     std::unique_ptr<StreamManager> m_streamManager;
 
     // Callbacks
     std::unique_ptr<CallbackManager> m_callbackManager;
+
+    // External subsystem references (non-owning, set during init)
+    ShadowStrike::ThreatIntel::ThreatIntelLookup* m_threatIntelLookup{ nullptr };
+    ShadowStrike::SignatureStore::SignatureStore* m_signatureStore{ nullptr };
 
     // Statistics
     TrafficAnalyzerStatistics m_stats;
@@ -1682,6 +2421,16 @@ bool TrafficAnalyzer::PerformDiagnostics() const {
 
 bool TrafficAnalyzer::ExportDiagnostics(const std::wstring& outputPath) const {
     return m_impl->ExportDiagnostics(outputPath);
+}
+
+void TrafficAnalyzer::SetThreatIntelLookup(
+    ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
+    m_impl->SetThreatIntelLookup(lookup);
+}
+
+void TrafficAnalyzer::SetSignatureStore(
+    ShadowStrike::SignatureStore::SignatureStore* store) noexcept {
+    m_impl->SetSignatureStore(store);
 }
 
 }  // namespace Network

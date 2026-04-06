@@ -75,8 +75,6 @@
 #include <numeric>
 #include <cmath>
 #include <cctype>
-#include <numbers>
-#include <regex>
 #include <sstream>
 #include <iomanip>
 #include <fstream>
@@ -95,44 +93,11 @@ using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
-// XSS PATTERNS (HARDCODED)
+// XSS PATTERNS (LEGACY — retained as documentation of what the linear
+// scanners in AnalyzeScriptInternal / SanitizeResponseInternal detect)
 // ============================================================================
-
-/**
- * @brief Common XSS attack patterns.
- */
-static const std::array<std::string, 30> XSS_PATTERNS = {{
-    "<script[^>]*>.*?</script>",
-    "javascript:",
-    "onerror\\s*=",
-    "onload\\s*=",
-    "onclick\\s*=",
-    "onmouseover\\s*=",
-    "<iframe[^>]*>",
-    "eval\\s*\\(",
-    "document\\.cookie",
-    "document\\.write",
-    "window\\.location",
-    "innerHTML\\s*=",
-    "outerHTML\\s*=",
-    "<embed[^>]*>",
-    "<object[^>]*>",
-    "fromCharCode",
-    "String\\.fromCharCode",
-    "alert\\s*\\(",
-    "confirm\\s*\\(",
-    "prompt\\s*\\(",
-    "expression\\s*\\(",
-    "vbscript:",
-    "data:text/html",
-    "base64,",
-    "<img[^>]*onerror",
-    "<svg[^>]*onload",
-    "<body[^>]*onload",
-    "<input[^>]*onfocus",
-    "<meta[^>]*http-equiv",
-    "\\\\x[0-9a-fA-F]{2}"
-}};
+// XSS detection now uses bounded case-insensitive substring matching
+// instead of std::regex to prevent ReDoS on attacker-controlled content.
 
 /**
  * @brief Known tracker domains.
@@ -476,6 +441,9 @@ public:
     mutable std::shared_mutex m_alertsMutex;
     std::atomic<uint64_t> m_nextAlertId{1};
 
+    /// @brief Analysis ID counter
+    std::atomic<uint64_t> m_nextAnalysisId{1};
+
     /// @brief Analysis results cache
     std::unordered_map<std::string, WebContentAnalysis> m_analysisCache;
     mutable std::shared_mutex m_cacheMutex;
@@ -689,6 +657,7 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
     const auto startTime = Clock::now();
 
     WebContentAnalysis analysis;
+    analysis.analysisId = m_nextAnalysisId.fetch_add(1, std::memory_order_relaxed);
     analysis.url = url;
     analysis.host = ExtractHost(url);
     analysis.contentType = DetermineContentType(contentType);
@@ -850,10 +819,12 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
             }
         }
 
-        // Privacy analysis
+        // Privacy analysis (cap content size to prevent DoS)
         if (m_config.enablePrivacyProtection && analysis.contentType == WebContentType::HTML) {
-            std::string htmlContent(reinterpret_cast<const char*>(content.data()), content.size());
-            analysis.privacyAnalysis = AnalyzePrivacyInternal(htmlContent, url);
+            std::string htmlContentPrivacy(
+                reinterpret_cast<const char*>(content.data()),
+                std::min(content.size(), m_config.maxContentToAnalyze));
+            analysis.privacyAnalysis = AnalyzePrivacyInternal(htmlContentPrivacy, url);
         }
 
         // Determine action
@@ -916,18 +887,56 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
             return analysis;
         }
 
-        // XSS pattern detection
+        // XSS pattern detection — uses case-insensitive substring search
+        // (avoids std::regex on untrusted input to prevent ReDoS)
         if (m_config.enableXSSProtection) {
-            for (const auto& pattern : XSS_PATTERNS) {
-                try {
-                    std::regex regex(pattern, std::regex_constants::icase);
-                    if (std::regex_search(script, regex)) {
-                        analysis.hasXSS = true;
-                        analysis.xssPatterns.push_back(pattern);
-                        analysis.xssCount++;
-                    }
-                } catch (...) {
-                    // Regex error, skip pattern
+            // Build a lowered copy once, capped to prevent DoS
+            constexpr size_t kMaxXssScan = 8ULL * 1024 * 1024;
+            const size_t xssScanLen = std::min(script.size(), kMaxXssScan);
+            std::string lower(script.data(), xssScanLen);
+            std::transform(lower.begin(), lower.end(), lower.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+            // Literal XSS indicator strings for fast substring matching
+            static const std::array<std::pair<std::string_view, std::string_view>, 30>
+                kXssSubstrings = {{
+                    {"<script",           "<script"},
+                    {"javascript:",       "javascript:"},
+                    {"onerror",           "onerror="},
+                    {"onload",            "onload="},
+                    {"onclick",           "onclick="},
+                    {"onmouseover",       "onmouseover="},
+                    {"<iframe",           "<iframe"},
+                    {"eval(",             "eval("},
+                    {"document.cookie",   "document.cookie"},
+                    {"document.write",    "document.write"},
+                    {"window.location",   "window.location"},
+                    {"innerhtml",         "innerHTML="},
+                    {"outerhtml",         "outerHTML="},
+                    {"<embed",            "<embed"},
+                    {"<object",           "<object"},
+                    {"fromcharcode",      "fromCharCode"},
+                    {"string.fromcharcode","String.fromCharCode"},
+                    {"alert(",            "alert("},
+                    {"confirm(",          "confirm("},
+                    {"prompt(",           "prompt("},
+                    {"expression(",       "expression("},
+                    {"vbscript:",         "vbscript:"},
+                    {"data:text/html",    "data:text/html"},
+                    {"base64,",           "base64,"},
+                    {"onerror",           "<img onerror"},
+                    {"<svg",              "<svg onload"},
+                    {"<body",             "<body onload"},
+                    {"onfocus",           "<input onfocus"},
+                    {"http-equiv",        "<meta http-equiv"},
+                    {"\\x",              "\\x hex escape"}
+                }};
+
+            for (const auto& [needle, label] : kXssSubstrings) {
+                if (lower.find(needle) != std::string::npos) {
+                    analysis.hasXSS = true;
+                    analysis.xssPatterns.emplace_back(label);
+                    analysis.xssCount++;
                 }
             }
 
@@ -997,10 +1006,17 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
         analysis.riskScore = std::min(riskScore, 100.0);
         analysis.isMalicious = (analysis.riskScore >= 50.0);
 
-        // Invoke XSS callbacks if detected
+        // Invoke XSS callbacks if detected (copy under lock, invoke outside)
         if (analysis.hasXSS) {
-            std::lock_guard lock(m_callbacksMutex);
-            for (const auto& [id, callback] : m_xssCallbacks) {
+            std::vector<XSSCallback> callbacksCopy;
+            {
+                std::lock_guard lock(m_callbacksMutex);
+                callbacksCopy.reserve(m_xssCallbacks.size());
+                for (const auto& [id, cb] : m_xssCallbacks) {
+                    callbacksCopy.push_back(cb);
+                }
+            }
+            for (const auto& callback : callbacksCopy) {
                 try {
                     callback(sourceUrl, analysis);
                 } catch (...) {
@@ -1026,37 +1042,132 @@ bool WebProtection::WebProtectionImpl::SanitizeResponseInternal(
             return false;
         }
 
+        // Cap content to prevent DoS during sanitization
+        constexpr size_t kMaxSanitizeLen = 8ULL * 1024 * 1024;
+        if (htmlContent.size() > kMaxSanitizeLen) {
+            htmlContent.resize(kMaxSanitizeLen);
+        }
+
         bool sanitized = false;
 
-        // Remove dangerous script tags
-        for (const auto& pattern : XSS_PATTERNS) {
-            try {
-                std::regex regex(pattern, std::regex_constants::icase);
-                std::string replacement = "<!-- BLOCKED: XSS -->";
+        // Case-insensitive substring removal for dangerous tags/attributes.
+        // Uses simple linear scanning instead of std::regex to avoid ReDoS
+        // on attacker-controlled content.
 
-                std::string newContent = std::regex_replace(htmlContent, regex, replacement);
-                if (newContent != htmlContent) {
-                    htmlContent = newContent;
+        // Build lowercase copy once for case-insensitive searching
+        std::string lower(htmlContent.size(), '\0');
+        std::transform(htmlContent.begin(), htmlContent.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        // Remove <script> ... </script> blocks
+        {
+            const std::string_view openTag = "<script";
+            const std::string_view closeTag = "</script>";
+            size_t searchFrom = 0;
+            while (searchFrom < lower.size()) {
+                const size_t startPos = lower.find(openTag, searchFrom);
+                if (startPos == std::string::npos) break;
+                const size_t endPos = lower.find(closeTag, startPos);
+                if (endPos == std::string::npos) {
+                    // Unclosed script tag -- remove from startPos to end
+                    htmlContent.replace(startPos, htmlContent.size() - startPos,
+                                        "<!-- BLOCKED: XSS -->");
+                    lower.replace(startPos, lower.size() - startPos,
+                                  "<!-- blocked: xss -->");
                     sanitized = true;
+                    break;
                 }
-            } catch (...) {
-                // Regex error
+                const size_t blockEnd = endPos + closeTag.size();
+                const std::string replacement = "<!-- BLOCKED: XSS -->";
+                htmlContent.replace(startPos, blockEnd - startPos, replacement);
+                lower.replace(startPos, blockEnd - startPos,
+                              "<!-- blocked: xss -->");
+                sanitized = true;
+                searchFrom = startPos + replacement.size();
             }
         }
 
-        // Remove inline event handlers
-        const std::array<std::string, 10> eventHandlers = {{
+        // Remove dangerous tags: <iframe>, <embed>, <object>
+        static const std::array<std::string_view, 3> kDangerousTags = {{
+            "<iframe", "<embed", "<object"
+        }};
+
+        for (const auto& tag : kDangerousTags) {
+            size_t searchFrom = 0;
+            while (searchFrom < lower.size()) {
+                const size_t pos = lower.find(tag, searchFrom);
+                if (pos == std::string::npos) break;
+                // Find the closing '>' of this tag
+                const size_t closePos = lower.find('>', pos);
+                if (closePos == std::string::npos) break;
+                const std::string replacement = "<!-- BLOCKED: XSS -->";
+                htmlContent.replace(pos, closePos - pos + 1, replacement);
+                lower.replace(pos, closePos - pos + 1,
+                              "<!-- blocked: xss -->");
+                sanitized = true;
+                searchFrom = pos + replacement.size();
+            }
+        }
+
+        // Remove inline event handlers (onclick=, onerror=, etc.)
+        static const std::array<std::string_view, 10> kEventHandlers = {{
             "onclick", "onload", "onerror", "onmouseover", "onfocus",
             "onblur", "onchange", "onsubmit", "onkeypress", "onkeydown"
         }};
 
-        for (const auto& handler : eventHandlers) {
-            std::regex handlerRegex(handler + "\\s*=\\s*[\"'][^\"']*[\"']",
-                                   std::regex_constants::icase);
-            std::string newContent = std::regex_replace(htmlContent, handlerRegex, "");
-            if (newContent != htmlContent) {
-                htmlContent = newContent;
+        for (const auto& handler : kEventHandlers) {
+            size_t searchFrom = 0;
+            while (searchFrom < lower.size()) {
+                const size_t pos = lower.find(handler, searchFrom);
+                if (pos == std::string::npos) break;
+                // Find the '=' after the handler name (skip whitespace)
+                size_t eqPos = pos + handler.size();
+                while (eqPos < lower.size() && (lower[eqPos] == ' ' || lower[eqPos] == '\t')) {
+                    ++eqPos;
+                }
+                if (eqPos >= lower.size() || lower[eqPos] != '=') {
+                    searchFrom = eqPos;
+                    continue;
+                }
+                // Skip whitespace after '='
+                size_t valStart = eqPos + 1;
+                while (valStart < lower.size() && (lower[valStart] == ' ' || lower[valStart] == '\t')) {
+                    ++valStart;
+                }
+                // Find end of the attribute value
+                size_t valEnd = valStart;
+                if (valStart < lower.size() && (lower[valStart] == '"' || lower[valStart] == '\'')) {
+                    const char quote = lower[valStart];
+                    valEnd = lower.find(quote, valStart + 1);
+                    if (valEnd == std::string::npos) {
+                        searchFrom = valStart + 1;
+                        continue;
+                    }
+                    valEnd += 1; // include closing quote
+                } else {
+                    // Unquoted value -- ends at whitespace or '>'
+                    while (valEnd < lower.size() && lower[valEnd] != ' ' &&
+                           lower[valEnd] != '>' && lower[valEnd] != '\t') {
+                        ++valEnd;
+                    }
+                }
+                htmlContent.erase(pos, valEnd - pos);
+                lower.erase(pos, valEnd - pos);
                 sanitized = true;
+                searchFrom = pos;
+            }
+        }
+
+        // Remove javascript: protocol in href/src attributes
+        {
+            size_t searchFrom = 0;
+            while (searchFrom < lower.size()) {
+                const size_t pos = lower.find("javascript:", searchFrom);
+                if (pos == std::string::npos) break;
+                htmlContent.replace(pos, 11, "blocked:");
+                lower.replace(pos, 11, "blocked:  ");
+                sanitized = true;
+                searchFrom = pos + 8;
             }
         }
 
@@ -1272,10 +1383,17 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
             }
         }
 
-        // Invoke certificate callbacks
+        // Invoke certificate callbacks (copy under lock, invoke outside)
         {
-            std::lock_guard lock(m_callbacksMutex);
-            for (const auto& [id, callback] : m_certCallbacks) {
+            std::vector<CertificateCallback> callbacksCopy;
+            {
+                std::lock_guard lock(m_callbacksMutex);
+                callbacksCopy.reserve(m_certCallbacks.size());
+                for (const auto& [id, cb] : m_certCallbacks) {
+                    callbacksCopy.push_back(cb);
+                }
+            }
+            for (const auto& callback : callbacksCopy) {
                 try {
                     callback(host, validation);
                 } catch (...) {
@@ -1354,7 +1472,6 @@ bool WebProtection::WebProtectionImpl::CheckCertificatePin(
                 SS_LOG_ERROR(L"Network", L"WebProtection: SHA-256 hash computation failed for pin check");
                 return true;  // On hash failure, do not block
             }
-            }
         }
 
         return false;  // No match found
@@ -1381,70 +1498,104 @@ FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
             return result;
         }
 
+        // Cap content to prevent DoS
+        constexpr size_t kMaxFormScan = 2ULL * 1024 * 1024;
+        const size_t scanLen = std::min(formHtml.size(), kMaxFormScan);
+
+        // Build lowercase copy for case-insensitive matching
+        std::string lower(formHtml.data(), scanLen);
+        std::transform(lower.begin(), lower.end(), lower.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+        // Helper lambda: extract attribute value from a tag substring.
+        // Searches for 'attrName=' followed by a quoted value, returns the inner text.
+        auto extractAttr = [](const std::string& lowTag, const std::string& origTag,
+                              std::string_view attrName) -> std::string {
+            const size_t attrPos = lowTag.find(attrName);
+            if (attrPos == std::string::npos) return {};
+            // Find '=' after attr name
+            size_t eq = attrPos + attrName.size();
+            while (eq < lowTag.size() && (lowTag[eq] == ' ' || lowTag[eq] == '\t')) ++eq;
+            if (eq >= lowTag.size() || lowTag[eq] != '=') return {};
+            ++eq;
+            while (eq < lowTag.size() && (lowTag[eq] == ' ' || lowTag[eq] == '\t')) ++eq;
+            if (eq >= lowTag.size()) return {};
+            if (lowTag[eq] == '"' || lowTag[eq] == '\'') {
+                const char q = lowTag[eq];
+                const size_t valStart = eq + 1;
+                const size_t valEnd = lowTag.find(q, valStart);
+                if (valEnd == std::string::npos) return {};
+                return origTag.substr(valStart, valEnd - valStart);
+            }
+            // Unquoted value
+            const size_t valStart = eq;
+            size_t valEnd = eq;
+            while (valEnd < lowTag.size() && lowTag[valEnd] != ' ' &&
+                   lowTag[valEnd] != '>' && lowTag[valEnd] != '\t') ++valEnd;
+            return origTag.substr(valStart, valEnd - valStart);
+        };
+
         // Extract form action
-        std::regex actionRegex(R"(action\s*=\s*[\"']([^\"']*)[\"'])");
-        std::smatch actionMatch;
-        if (std::regex_search(formHtml, actionMatch, actionRegex)) {
-            result.action = actionMatch[1].str();
-            result.isSecure = (result.action.find("https://") == 0);
-        }
+        result.action = extractAttr(lower, formHtml, "action");
+        result.isSecure = (result.action.find("https://") == 0);
 
         // Extract form method
-        std::regex methodRegex(R"(method\s*=\s*[\"']([^\"']*)[\"'])");
-        std::smatch methodMatch;
-        if (std::regex_search(formHtml, methodMatch, methodRegex)) {
-            result.method = methodMatch[1].str();
-        }
+        result.method = extractAttr(lower, formHtml, "method");
 
-        // Find all input fields
-        std::regex inputRegex(R"(<input[^>]*>)");
-        auto inputsBegin = std::sregex_iterator(formHtml.begin(), formHtml.end(), inputRegex);
-        auto inputsEnd = std::sregex_iterator();
+        // Find all <input> tags using linear scan
+        {
+            size_t searchFrom = 0;
+            uint32_t fieldCount = 0;
+            while (searchFrom < scanLen && fieldCount < WebProtectionConstants::MAX_FORM_FIELDS) {
+                const size_t pos = lower.find("<input", searchFrom);
+                if (pos == std::string::npos) break;
+                const size_t tagEnd = lower.find('>', pos);
+                if (tagEnd == std::string::npos) break;
+                const size_t tagLen = tagEnd - pos + 1;
 
-        for (std::sregex_iterator i = inputsBegin; i != inputsEnd; ++i) {
-            std::string inputTag = i->str();
-            FormField field;
+                const std::string lowTag = lower.substr(pos, tagLen);
+                const std::string origTag = formHtml.substr(pos, tagLen);
 
-            // Extract type
-            std::regex typeRegex(R"(type\s*=\s*[\"']([^\"']*)[\"'])");
-            std::smatch typeMatch;
-            if (std::regex_search(inputTag, typeMatch, typeRegex)) {
-                field.type = typeMatch[1].str();
+                FormField field;
+                field.type = extractAttr(lowTag, origTag, "type");
+                field.name = extractAttr(lowTag, origTag, "name");
+                field.id = extractAttr(lowTag, origTag, "id");
+
+                // Normalize type to lowercase for comparison
+                std::string typeLower = field.type;
+                std::transform(typeLower.begin(), typeLower.end(), typeLower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+                // Check if password field
+                if (typeLower == "password") {
+                    field.isPassword = true;
+                    result.passwordFields++;
+                }
+
+                // Check for sensitive fields
+                std::string nameLower = field.name;
+                std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+
+                if (nameLower.find("credit") != std::string::npos ||
+                    nameLower.find("card") != std::string::npos) {
+                    field.isCreditCard = true;
+                    field.isSensitive = true;
+                    result.sensitiveFields++;
+                }
+
+                if (nameLower.find("ssn") != std::string::npos ||
+                    nameLower.find("social") != std::string::npos) {
+                    field.isSSN = true;
+                    field.isSensitive = true;
+                    result.sensitiveFields++;
+                }
+
+                field.isEncrypted = result.isSecure;
+                result.fields.push_back(std::move(field));
+                ++fieldCount;
+                searchFrom = tagEnd + 1;
             }
-
-            // Extract name
-            std::regex nameRegex(R"(name\s*=\s*[\"']([^\"']*)[\"'])");
-            std::smatch nameMatch;
-            if (std::regex_search(inputTag, nameMatch, nameRegex)) {
-                field.name = nameMatch[1].str();
-            }
-
-            // Check if password field
-            if (field.type == "password") {
-                field.isPassword = true;
-                result.passwordFields++;
-            }
-
-            // Check for sensitive fields
-            std::string nameLower = field.name;
-            std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::tolower);
-
-            if (nameLower.find("credit") != std::string::npos ||
-                nameLower.find("card") != std::string::npos) {
-                field.isCreditCard = true;
-                field.isSensitive = true;
-                result.sensitiveFields++;
-            }
-
-            if (nameLower.find("ssn") != std::string::npos ||
-                nameLower.find("social") != std::string::npos) {
-                field.isSSN = true;
-                field.isSensitive = true;
-                result.sensitiveFields++;
-            }
-
-            field.isEncrypted = result.isSecure;
-            result.fields.push_back(field);
         }
 
         // Check for cleartext password submission
@@ -1464,6 +1615,19 @@ FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
             result.hasFormJacking = true;
             result.warnings.push_back("Suspicious number of password fields");
             result.riskScore += 30;
+        }
+
+        // Check for form action pointing to a different domain (formjacking)
+        if (!result.action.empty() && result.action.find("http") == 0) {
+            const std::string formHost = ExtractHost(result.action);
+            const std::string pageHost = ExtractHost(pageUrl);
+            if (!formHost.empty() && !pageHost.empty() && formHost != pageHost) {
+                // Cross-domain form submission -- potential formjacking
+                result.hasHiddenExfiltration = true;
+                result.warnings.push_back(
+                    "Form submits to different domain: " + formHost);
+                result.riskScore += 40;
+            }
         }
 
         m_statistics.formsProtected.fetch_add(1, std::memory_order_relaxed);
@@ -1534,10 +1698,17 @@ ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
             }
         }
 
-        // Invoke exploit callbacks if detected
+        // Invoke exploit callbacks if detected (copy under lock, invoke outside)
         if (analysis.exploitDetected) {
-            std::lock_guard lock(m_callbacksMutex);
-            for (const auto& [id, callback] : m_exploitCallbacks) {
+            std::vector<ExploitCallback> callbacksCopy;
+            {
+                std::lock_guard lock(m_callbacksMutex);
+                callbacksCopy.reserve(m_exploitCallbacks.size());
+                for (const auto& [id, cb] : m_exploitCallbacks) {
+                    callbacksCopy.push_back(cb);
+                }
+            }
+            for (const auto& callback : callbacksCopy) {
                 try {
                     callback("", analysis);
                 } catch (...) {
@@ -1671,10 +1842,17 @@ void WebProtection::WebProtectionImpl::GenerateAlert(
 
         m_statistics.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
 
-        // Invoke callbacks
+        // Invoke callbacks (copy under lock, invoke outside to prevent deadlock)
         {
-            std::lock_guard lock(m_callbacksMutex);
-            for (const auto& [id, callback] : m_alertCallbacks) {
+            std::vector<WebAlertCallback> callbacksCopy;
+            {
+                std::lock_guard lock(m_callbacksMutex);
+                callbacksCopy.reserve(m_alertCallbacks.size());
+                for (const auto& [id, cb] : m_alertCallbacks) {
+                    callbacksCopy.push_back(cb);
+                }
+            }
+            for (const auto& callback : callbacksCopy) {
                 try {
                     callback(alert);
                 } catch (...) {
@@ -1832,7 +2010,8 @@ CertificateValidation WebProtection::ValidateCertificate(
     const std::string& host,
     const std::vector<std::vector<uint8_t>>& certChain)
 {
-    return m_impl ? m_impl->ValidateCertificateInternal(host, certChain) : CertificateValidation{};
+    if (!m_impl || !m_impl->m_running.load(std::memory_order_acquire)) return CertificateValidation{};
+    return m_impl->ValidateCertificateInternal(host, certChain);
 }
 
 bool WebProtection::AddCertificatePin(const CertificatePin& pin) {

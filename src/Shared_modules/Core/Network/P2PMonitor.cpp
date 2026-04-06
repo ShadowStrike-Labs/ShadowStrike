@@ -478,6 +478,7 @@ public:
 
             m_connections.clear();
             m_swarms.clear();
+            m_swarmConnections.clear();
             m_peers.clear();
             m_dhtNodes.clear();
             m_maliciousHashes.clear();
@@ -498,8 +499,7 @@ public:
     }
 
     [[nodiscard]] bool IsRunning() const noexcept {
-        std::shared_lock lock(m_mutex);
-        return m_running;
+        return m_running.load(std::memory_order_acquire);
     }
 
     // ========================================================================
@@ -578,23 +578,45 @@ public:
                 }
             }
 
-            // DHT (bencode)
-            if (packet.size() >= 3) {
+            // DHT (bencode) -- require at least "d1:" prefix plus a known
+            // DHT key pattern ("y", "q", "r", "t") to reduce false positives
+            // from other bencoded protocols
+            if (packet.size() >= 10) {
                 std::string prefix(reinterpret_cast<const char*>(packet.data()),
                                   std::min(size_t(3), packet.size()));
                 if (prefix == DHT_QUERY_PREFIX) {
-                    return P2PProtocol::DHT;
+                    // Scan for DHT-specific keys: "1:y", "1:q", "1:t", "1:r"
+                    std::string_view payload(reinterpret_cast<const char*>(packet.data()),
+                                             std::min(packet.size(), size_t(256)));
+                    if (payload.find("1:y") != std::string_view::npos ||
+                        payload.find("1:q") != std::string_view::npos ||
+                        payload.find("1:t") != std::string_view::npos) {
+                        return P2PProtocol::DHT;
+                    }
                 }
             }
 
-            // uTP — verify version nibble (low nibble of byte 0) is 1
+            // uTP — verify version nibble (low nibble of byte 0) is 1,
+            // type nibble is valid, and extension byte (byte 1) is 0-2
+            // to reduce false positives on non-P2P traffic
             if (packet.size() >= 20) {
                 uint8_t ver_type = packet[0];
                 uint8_t version = ver_type & 0x0F;
                 uint8_t type = ver_type & UTP_TYPE_MASK;
+                uint8_t extension = packet[1];
                 if (version == UTP_VERSION_1 &&
-                    type >= UTP_ST_DATA && type <= UTP_ST_SYN) {
-                    return P2PProtocol::UTP;
+                    type >= UTP_ST_DATA && type <= UTP_ST_SYN &&
+                    extension <= 2) {
+                    // Additional validation: uTP connection_id at bytes 2-3
+                    // and timestamp at bytes 4-7 should not all be zero
+                    uint16_t connId = (static_cast<uint16_t>(packet[2]) << 8) | packet[3];
+                    uint32_t timestamp = (static_cast<uint32_t>(packet[4]) << 24) |
+                                         (static_cast<uint32_t>(packet[5]) << 16) |
+                                         (static_cast<uint32_t>(packet[6]) << 8) |
+                                         static_cast<uint32_t>(packet[7]);
+                    if (connId != 0 || timestamp != 0) {
+                        return P2PProtocol::UTP;
+                    }
                 }
             }
 
@@ -774,6 +796,12 @@ public:
         try {
             if (packet.empty()) return;
 
+            // Early-exit if module is disabled (avoid work under lock)
+            {
+                std::shared_lock lock(m_mutex);
+                if (!m_config.enabled) return;
+            }
+
             // Detect protocol (lock-free, const method)
             P2PProtocol protocol = DetectProtocol(packet);
             if (protocol == P2PProtocol::UNKNOWN) return;
@@ -806,6 +834,13 @@ public:
                 conn.lastActivity = std::chrono::system_clock::now();
                 conn.bytesReceived += packet.size();
 
+                // If this connection belongs to a blocked process, mark and skip
+                if (conn.processId != 0 && m_blockedProcesses.count(conn.processId) > 0) {
+                    m_stats.connectionsBlocked++;
+                    // Still track but don't fire detection callbacks
+                    return;
+                }
+
                 // Extract BitTorrent infohash if applicable
                 if (protocol == P2PProtocol::BITTORRENT_TCP && packet.size() >= 68) {
                     InfoHash ih;
@@ -813,10 +848,15 @@ public:
                     ih.hexString = InfoHashToHex(ih.hash);
                     conn.infoHash = ih;
 
-                    // Track swarm (no lock needed — caller holds it)
+                    // Extract peer ID if present (bytes 48-67)
+                    std::string peerIdStr(reinterpret_cast<const char*>(packet.data() + 48), 20);
+                    conn.application = IdentifyClient(peerIdStr);
+                    conn.applicationVersion = ExtractClientVersion(peerIdStr);
+
+                    // Track swarm (caller holds m_mutex)
                     TrackSwarm(ih, connectionId);
 
-                    // Check if malicious (lock-free internal version)
+                    // Check local malicious hash database
                     if (IsKnownMaliciousLocked(ih)) {
                         conn.isMalicious = true;
                         conn.threats.push_back(P2PThreatType::MALWARE_DISTRIBUTION);
@@ -831,10 +871,28 @@ public:
                 m_stats.p2pConnectionsDetected++;
                 UpdateProtocolStats(protocol);
 
-                // Snapshot for callback
+                // Update per-application statistics
+                switch (conn.application) {
+                    case P2PApplication::QBITTORRENT:
+                        m_stats.qbittorrentDetected++;
+                        break;
+                    case P2PApplication::UTORRENT:
+                        m_stats.utorrentDetected++;
+                        break;
+                    case P2PApplication::TRANSMISSION:
+                        m_stats.transmissionDetected++;
+                        break;
+                    case P2PApplication::UNKNOWN:
+                        break;  // Don't count unknown
+                    default:
+                        m_stats.otherClientsDetected++;
+                        break;
+                }
+
+                // Snapshot for callback (under lock so copy is consistent)
                 connSnapshot = conn;
             }
-            // Lock released — safe to fire callbacks and perform blocking
+            // Lock released -- safe to fire callbacks and perform blocking
 
             if (maliciousDetected) {
                 SS_LOG_FATAL(L"Network", L"Malicious P2P detected: pid=%u, protocol=%d, infohash=%hs",
@@ -916,7 +974,8 @@ public:
         try {
             m_throttledProcesses[pid] = limitBps;
 
-            SS_LOG_INFO(L"Network", L"Throttled P2P for process %u to %llu bytes/sec", pid, limitBps);
+            SS_LOG_INFO(L"Network", L"Throttled P2P for process %u to %llu bytes/sec",
+                pid, static_cast<unsigned long long>(limitBps));
 
             m_stats.connectionsThrottled++;
 
@@ -1014,16 +1073,16 @@ public:
             SS_LOG_INFO(L"Network", L"=== P2PMonitor Diagnostics ===");
             SS_LOG_INFO(L"Network", L"Initialized: %d", static_cast<int>(m_initialized));
             SS_LOG_INFO(L"Network", L"Running: %d", static_cast<int>(m_running.load()));
-            SS_LOG_INFO(L"Network", L"Active connections: %zu", m_connections.size());
-            SS_LOG_INFO(L"Network", L"Active swarms: %zu", m_swarms.size());
-            SS_LOG_INFO(L"Network", L"Tracked peers: %zu", m_peers.size());
-            SS_LOG_INFO(L"Network", L"DHT nodes: %zu", m_dhtNodes.size());
-            SS_LOG_INFO(L"Network", L"Malicious hashes: %zu", m_maliciousHashes.size());
-            SS_LOG_INFO(L"Network", L"Blocked processes: %zu", m_blockedProcesses.size());
-            SS_LOG_INFO(L"Network", L"Throttled processes: %zu", m_throttledProcesses.size());
-            SS_LOG_INFO(L"Network", L"Total P2P detected: %llu", m_stats.p2pConnectionsDetected.load());
-            SS_LOG_INFO(L"Network", L"BitTorrent connections: %llu", m_stats.bittorrentConnections.load());
-            SS_LOG_INFO(L"Network", L"Malicious torrents: %llu", m_stats.maliciousTorrents.load());
+            SS_LOG_INFO(L"Network", L"Active connections: %llu", static_cast<unsigned long long>(m_connections.size()));
+            SS_LOG_INFO(L"Network", L"Active swarms: %llu", static_cast<unsigned long long>(m_swarms.size()));
+            SS_LOG_INFO(L"Network", L"Tracked peers: %llu", static_cast<unsigned long long>(m_peers.size()));
+            SS_LOG_INFO(L"Network", L"DHT nodes: %llu", static_cast<unsigned long long>(m_dhtNodes.size()));
+            SS_LOG_INFO(L"Network", L"Malicious hashes: %llu", static_cast<unsigned long long>(m_maliciousHashes.size()));
+            SS_LOG_INFO(L"Network", L"Blocked processes: %llu", static_cast<unsigned long long>(m_blockedProcesses.size()));
+            SS_LOG_INFO(L"Network", L"Throttled processes: %llu", static_cast<unsigned long long>(m_throttledProcesses.size()));
+            SS_LOG_INFO(L"Network", L"Total P2P detected: %llu", static_cast<unsigned long long>(m_stats.p2pConnectionsDetected.load()));
+            SS_LOG_INFO(L"Network", L"BitTorrent connections: %llu", static_cast<unsigned long long>(m_stats.bittorrentConnections.load()));
+            SS_LOG_INFO(L"Network", L"Malicious torrents: %llu", static_cast<unsigned long long>(m_stats.maliciousTorrents.load()));
 
             return true;
 
@@ -1068,24 +1127,30 @@ public:
                 return ::WriteFile(hFile, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr) != FALSE;
             };
 
-            writeLine("=== P2PMonitor Diagnostics ===\r\n");
-            writeLine("Initialized: " + std::to_string(static_cast<int>(m_initialized)) + "\r\n");
-            writeLine("Running: " + std::to_string(static_cast<int>(m_running.load())) + "\r\n");
-            writeLine("Active connections: " + std::to_string(m_connections.size()) + "\r\n");
-            writeLine("Active swarms: " + std::to_string(m_swarms.size()) + "\r\n");
-            writeLine("Tracked peers: " + std::to_string(m_peers.size()) + "\r\n");
-            writeLine("DHT nodes: " + std::to_string(m_dhtNodes.size()) + "\r\n");
-            writeLine("Malicious hashes: " + std::to_string(m_maliciousHashes.size()) + "\r\n");
-            writeLine("Blocked processes: " + std::to_string(m_blockedProcesses.size()) + "\r\n");
-            writeLine("Throttled processes: " + std::to_string(m_throttledProcesses.size()) + "\r\n");
-            writeLine("Total P2P detected: " + std::to_string(m_stats.p2pConnectionsDetected.load()) + "\r\n");
-            writeLine("BitTorrent connections: " + std::to_string(m_stats.bittorrentConnections.load()) + "\r\n");
-            writeLine("DHT queries: " + std::to_string(m_stats.dhtQueries.load()) + "\r\n");
-            writeLine("eMule connections: " + std::to_string(m_stats.emuleConnections.load()) + "\r\n");
-            writeLine("Malicious torrents: " + std::to_string(m_stats.maliciousTorrents.load()) + "\r\n");
-            writeLine("Connections blocked: " + std::to_string(m_stats.connectionsBlocked.load()) + "\r\n");
-            writeLine("Alerts generated: " + std::to_string(m_stats.alertsGenerated.load()) + "\r\n");
-            writeLine("Policy: " + std::to_string(static_cast<int>(m_config.policy)) + "\r\n");
+            bool writeOk = true;
+            writeOk = writeOk && writeLine("=== P2PMonitor Diagnostics ===\r\n");
+            writeOk = writeOk && writeLine("Initialized: " + std::to_string(static_cast<int>(m_initialized)) + "\r\n");
+            writeOk = writeOk && writeLine("Running: " + std::to_string(static_cast<int>(m_running.load())) + "\r\n");
+            writeOk = writeOk && writeLine("Active connections: " + std::to_string(m_connections.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Active swarms: " + std::to_string(m_swarms.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Tracked peers: " + std::to_string(m_peers.size()) + "\r\n");
+            writeOk = writeOk && writeLine("DHT nodes: " + std::to_string(m_dhtNodes.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Malicious hashes: " + std::to_string(m_maliciousHashes.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Blocked processes: " + std::to_string(m_blockedProcesses.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Throttled processes: " + std::to_string(m_throttledProcesses.size()) + "\r\n");
+            writeOk = writeOk && writeLine("Total P2P detected: " + std::to_string(m_stats.p2pConnectionsDetected.load()) + "\r\n");
+            writeOk = writeOk && writeLine("BitTorrent connections: " + std::to_string(m_stats.bittorrentConnections.load()) + "\r\n");
+            writeOk = writeOk && writeLine("DHT queries: " + std::to_string(m_stats.dhtQueries.load()) + "\r\n");
+            writeOk = writeOk && writeLine("eMule connections: " + std::to_string(m_stats.emuleConnections.load()) + "\r\n");
+            writeOk = writeOk && writeLine("Malicious torrents: " + std::to_string(m_stats.maliciousTorrents.load()) + "\r\n");
+            writeOk = writeOk && writeLine("Connections blocked: " + std::to_string(m_stats.connectionsBlocked.load()) + "\r\n");
+            writeOk = writeOk && writeLine("Alerts generated: " + std::to_string(m_stats.alertsGenerated.load()) + "\r\n");
+            writeOk = writeOk && writeLine("Policy: " + std::to_string(static_cast<int>(m_config.policy)) + "\r\n");
+
+            if (!writeOk) {
+                SS_LOG_ERROR(L"Network", L"ExportDiagnostics - write failed for %ls", outputPath.c_str());
+                return false;
+            }
 
             SS_LOG_INFO(L"Network", L"Exported P2PMonitor diagnostics to: %ls", outputPath.c_str());
             return true;
@@ -1105,8 +1170,13 @@ private:
         SS_LOG_INFO(L"Network", L"P2PMonitor: Monitoring thread started");
 
         try {
-            while (m_running) {
-                std::this_thread::sleep_for(std::chrono::seconds(5));
+            while (m_running.load(std::memory_order_relaxed)) {
+                // Sleep in short increments to allow responsive shutdown
+                for (int i = 0; i < 50 && m_running.load(std::memory_order_relaxed); ++i) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                }
+
+                if (!m_running.load(std::memory_order_relaxed)) break;
 
                 // Cleanup stale connections
                 CleanupStaleConnections();
@@ -1165,6 +1235,7 @@ private:
             }
 
             for (const auto& hash : toRemove) {
+                m_swarmConnections.erase(hash);
                 m_swarms.erase(hash);
             }
 
@@ -1188,7 +1259,7 @@ private:
     }
 
     void TrackSwarm(const InfoHash& infoHash, uint64_t connectionId) {
-        // NOTE: Caller must hold m_mutex. Swarm callback is deferred.
+        // NOTE: Caller must hold m_mutex.
         try {
             auto& swarm = m_swarms[infoHash];
             if (swarm.infoHash.hexString.empty()) {
@@ -1197,15 +1268,18 @@ private:
             }
 
             swarm.lastActivity = std::chrono::system_clock::now();
-            swarm.connectedPeers++;
+
+            // Deduplicate: only increment connectedPeers for new connections
+            // Use a set of connection IDs tracked per swarm in our tracking map
+            auto& connSet = m_swarmConnections[infoHash];
+            if (connSet.insert(connectionId).second) {
+                swarm.connectedPeers++;
+            }
 
             // Check size limit
             if (m_swarms.size() > P2PMonitorConstants::MAX_TRACKED_SWARMS) {
                 EvictOldestSwarm();
             }
-
-            // Swarm notification is deferred to FeedPacket's post-lock phase
-            // to avoid recursive locking in NotifySwarm.
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"TrackSwarm - Exception: %hs", e.what());
@@ -1220,6 +1294,7 @@ private:
             }
         }
         if (oldest != m_swarms.end()) {
+            m_swarmConnections.erase(oldest->first);
             m_swarms.erase(oldest);
         }
     }
@@ -1259,10 +1334,7 @@ private:
     void GenerateAlert(const P2PConnection& conn, P2PThreatType threatType) {
         try {
             P2PAlert alert;
-            alert.alertId = [this]() {
-                std::unique_lock lock(m_mutex);
-                return ++m_nextAlertId;
-            }();
+            alert.alertId = m_nextAlertId.fetch_add(1, std::memory_order_relaxed) + 1;
             alert.timestamp = std::chrono::system_clock::now();
             alert.protocol = conn.protocol;
             alert.application = conn.application;
@@ -1358,6 +1430,7 @@ private:
     // Tracking
     std::unordered_map<uint64_t, P2PConnection> m_connections;
     std::unordered_map<InfoHash, SwarmInfo, InfoHash::Hash> m_swarms;
+    std::unordered_map<InfoHash, std::unordered_set<uint64_t>, InfoHash::Hash> m_swarmConnections;  // Per-swarm connection dedup
     std::unordered_map<std::string, PeerInfo> m_peers;
     std::unordered_map<uint32_t, DHTInfo> m_dhtNodes;
     std::unordered_map<InfoHash, std::string, InfoHash::Hash> m_maliciousHashes;
@@ -1373,7 +1446,7 @@ private:
     std::unordered_map<uint64_t, TorrentCallback> m_torrentCallbacks;
     std::unordered_map<uint64_t, DHTCallback> m_dhtCallbacks;
     uint64_t m_nextCallbackId{ 0 };
-    uint64_t m_nextAlertId{ 0 };
+    std::atomic<uint64_t> m_nextAlertId{ 0 };
 
     // Threading
     std::thread m_monitorThread;
