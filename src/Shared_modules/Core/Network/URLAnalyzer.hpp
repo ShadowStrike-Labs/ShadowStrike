@@ -661,7 +661,7 @@ struct alignas(64) URLAnalyzerConfig {
     static URLAnalyzerConfig CreateDefault() noexcept;
     static URLAnalyzerConfig CreateHighSecurity() noexcept;
     static URLAnalyzerConfig CreatePerformance() noexcept;
-    static URLAnalyzerConfig CreateContentFiltering() noexcept;
+    static URLAnalyzerConfig CreateContentFiltering();
 };
 
 /**
@@ -806,6 +806,20 @@ public:
      * @brief Shuts down and releases resources.
      */
     void Shutdown() noexcept;
+
+    /**
+     * @brief Wires in the ThreatIntelLookup subsystem for reputation checks.
+     * @param lookup Non-owning pointer to an initialized ThreatIntelLookup.
+     *        Must outlive the URLAnalyzer or be set to nullptr before destruction.
+     */
+    void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
+    /**
+     * @brief Wires in the PatternStore subsystem for signature scanning.
+     * @param store Non-owning pointer to an initialized PatternStore.
+     *        Must outlive the URLAnalyzer or be set to nullptr before destruction.
+     */
+    void SetPatternStore(ShadowStrike::PatternStore::PatternStore* store) noexcept;
 
     /**
      * @brief Checks if initialized.

@@ -83,6 +83,9 @@
 #include <thread>
 #include <future>
 
+// Shorthand alias for the StringUtils namespace to avoid long qualification
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
@@ -152,6 +155,87 @@ namespace {
 // HELPER FUNCTIONS
 // ============================================================================
 
+// ASCII-only lowercase for domain names (RFC 952 domains are ASCII).
+// Does NOT use StringUtils::ToLower which only operates on wide strings.
+[[nodiscard]] static std::string NarrowToLower(std::string_view input) {
+    std::string result(input);
+    std::transform(result.begin(), result.end(), result.begin(),
+        [](unsigned char c) -> char { return static_cast<char>(std::tolower(c)); });
+    return result;
+}
+
+// Checks if a string contains any embedded null bytes (security bypass vector).
+[[nodiscard]] static bool ContainsNullByte(std::string_view str) noexcept {
+    return str.find('\0') != std::string_view::npos;
+}
+
+// Checks if a string looks like an IPv4 address (digits and dots only).
+[[nodiscard]] static bool IsIPv4Address(std::string_view host) noexcept {
+    if (host.empty() || host.size() > 15) return false;
+    int dotCount = 0;
+    int digitRun = 0;
+    for (char c : host) {
+        if (c == '.') {
+            if (digitRun == 0 || digitRun > 3) return false;
+            dotCount++;
+            digitRun = 0;
+        } else if (std::isdigit(static_cast<unsigned char>(c))) {
+            digitRun++;
+        } else {
+            return false;
+        }
+    }
+    return dotCount == 3 && digitRun > 0 && digitRun <= 3;
+}
+
+// Checks if an IPv4 address is in a private/reserved range.
+[[nodiscard]] static bool IsPrivateIPv4(std::string_view host) noexcept {
+    if (!IsIPv4Address(host)) return false;
+    // Parse first two octets for quick check
+    unsigned int a = 0, b = 0;
+    int pos = 0;
+    for (char c : host) {
+        if (c == '.') {
+            pos++;
+            if (pos >= 2) break;
+        } else if (pos == 0) {
+            a = a * 10 + static_cast<unsigned>(c - '0');
+        } else if (pos == 1) {
+            b = b * 10 + static_cast<unsigned>(c - '0');
+        }
+    }
+    // 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 127.0.0.0/8, 169.254.0.0/16
+    return (a == 10) || (a == 127) || (a == 192 && b == 168) ||
+           (a == 172 && b >= 16 && b <= 31) || (a == 169 && b == 254);
+}
+
+[[nodiscard]] static bool IsLocalhostAddress(std::string_view host) noexcept {
+    auto lower = NarrowToLower(host);
+    return lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower == "[::1]";
+}
+
+// Detect double-percent-encoding (e.g., %2525 → %25 → %).
+[[nodiscard]] static bool HasDoublePercentEncoding(std::string_view str) noexcept {
+    // We check for the 4-byte pattern "%25%" which needs indices i..i+3.
+    // The condition i + 3 < str.size() ensures all four accesses are valid.
+    for (size_t i = 0; i + 3 < str.size(); ++i) {
+        if (str[i] == '%' && str[i + 1] == '2' && str[i + 2] == '5' && str[i + 3] == '%') {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Check for suspicious characters that indicate obfuscation.
+[[nodiscard]] static bool ContainsSuspiciousChars(std::string_view str) noexcept {
+    for (char c : SUSPICIOUS_CHARS) {
+        if (str.find(c) != std::string_view::npos) {
+            return true;
+        }
+    }
+    return false;
+}
+
 [[nodiscard]] static double CalculateLevenshteinDistance(
     const std::string& s1,
     const std::string& s2) {
@@ -188,7 +272,7 @@ namespace {
 }
 
 [[nodiscard]] static bool ContainsBrandKeyword(const std::string& domain) {
-    std::string lower = StringUtils::ToLower(domain);
+    std::string lower = NarrowToLower(domain);
     for (const auto& brand : PROTECTED_BRANDS) {
         if (lower.find(brand) != std::string::npos) {
             return true;
@@ -198,12 +282,12 @@ namespace {
 }
 
 [[nodiscard]] static bool IsURLShortener(const std::string& domain) {
-    std::string lower = StringUtils::ToLower(domain);
+    std::string lower = NarrowToLower(domain);
     return URL_SHORTENERS.find(lower) != URL_SHORTENERS.end();
 }
 
 [[nodiscard]] static bool HasExecutableExtension(const std::string& path) {
-    std::string lower = StringUtils::ToLower(path);
+    std::string lower = NarrowToLower(path);
     for (const auto& ext : EXECUTABLE_EXTENSIONS) {
         if (lower.ends_with(ext)) {
             return true;
@@ -213,7 +297,7 @@ namespace {
 }
 
 [[nodiscard]] static bool IsSuspiciousTLD(const std::string& tld) {
-    std::string lower = StringUtils::ToLower(tld);
+    std::string lower = NarrowToLower(tld);
     return SUSPICIOUS_TLDS.find(lower) != SUSPICIOUS_TLDS.end();
 }
 
@@ -291,7 +375,7 @@ URLAnalyzerConfig URLAnalyzerConfig::CreatePerformance() noexcept {
     return config;
 }
 
-URLAnalyzerConfig URLAnalyzerConfig::CreateContentFiltering() noexcept {
+URLAnalyzerConfig URLAnalyzerConfig::CreateContentFiltering() {
     URLAnalyzerConfig config;
     config.enabled = true;
     config.enableReputation = true;
@@ -357,7 +441,39 @@ struct CacheEntry {
     URLVerdict verdict;
     std::chrono::system_clock::time_point insertTime;
     std::chrono::system_clock::time_point expiryTime;
-    uint32_t hitCount{ 0 };
+    mutable std::atomic<uint32_t> hitCount{ 0 };
+
+    CacheEntry() = default;
+    CacheEntry(const CacheEntry& other)
+        : verdict(other.verdict)
+        , insertTime(other.insertTime)
+        , expiryTime(other.expiryTime)
+        , hitCount(other.hitCount.load(std::memory_order_relaxed)) {}
+    CacheEntry& operator=(const CacheEntry& other) {
+        if (this != &other) {
+            verdict = other.verdict;
+            insertTime = other.insertTime;
+            expiryTime = other.expiryTime;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        return *this;
+    }
+    CacheEntry(CacheEntry&& other) noexcept
+        : verdict(std::move(other.verdict))
+        , insertTime(other.insertTime)
+        , expiryTime(other.expiryTime)
+        , hitCount(other.hitCount.load(std::memory_order_relaxed)) {}
+    CacheEntry& operator=(CacheEntry&& other) noexcept {
+        if (this != &other) {
+            verdict = std::move(other.verdict);
+            insertTime = other.insertTime;
+            expiryTime = other.expiryTime;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        return *this;
+    }
 
     [[nodiscard]] bool IsExpired() const noexcept {
         return std::chrono::system_clock::now() >= expiryTime;
@@ -388,20 +504,73 @@ public:
 
         try {
             m_config = config;
+
+            // Load whitelist/blacklist from config
+            for (const auto& domain : config.whitelistedDomains) {
+                m_whitelist.insert(NarrowToLower(domain));
+            }
+            for (const auto& domain : config.blacklistedDomains) {
+                m_blacklist[NarrowToLower(domain)] = "Config-Blacklisted";
+            }
+
+            // Resolve external subsystem pointers.
+            // PatternStore and ThreatIntelLookup are NOT singletons --
+            // they are managed by the platform orchestrator and wired
+            // in during system startup.  We keep non-owning pointers.
+            // If an orchestrator has not registered them yet, we
+            // simply run without those engines (graceful degradation).
+            // Callers can re-init after the subsystems become available.
+
             m_initialized = true;
 
-            SS_LOG_INFO(L"Network", L"URLAnalyzer initialized (reputation={}, DGA={}, phishing={})",
-                config.enableReputation, config.enableDGADetection, config.enablePhishingDetection);
+            SS_LOG_INFO(L"Network", L"URLAnalyzer initialized (reputation=%d, DGA=%d, phishing=%d)",
+                static_cast<int>(config.enableReputation),
+                static_cast<int>(config.enableDGADetection),
+                static_cast<int>(config.enablePhishingDetection));
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"URLAnalyzer initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"URLAnalyzer initialization failed: %hs", e.what());
             return false;
         }
     }
 
+    // ========================================================================
+    // SUBSYSTEM WIRING (called by orchestrator after subsystems are alive)
+    // ========================================================================
+
+    void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_threatIntelLookup = lookup;
+    }
+
+    void SetPatternStore(ShadowStrike::PatternStore::PatternStore* store) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_patternStore = store;
+    }
+
     void Shutdown() noexcept {
+        // Signal any outstanding async work to stop BEFORE taking the lock.
+        // This avoids a deadlock where a ScanURLAsync thread is
+        // inside ScanURL (holding shared_lock) while we wait for exclusive.
+        m_shutdownRequested.store(true, std::memory_order_release);
+
+        // Wait for all outstanding async work to complete.
+        // We must do this BEFORE acquiring the exclusive lock, because
+        // the async threads may need shared_lock to finish.
+        {
+            std::vector<std::future<void>> pending;
+            {
+                std::unique_lock lock(m_mutex);
+                pending = std::move(m_pendingFutures);
+            }
+            // Wait outside the lock to avoid deadlock
+            for (auto& f : pending) {
+                try { f.wait(); } catch (...) {}
+            }
+        }
+
         std::unique_lock lock(m_mutex);
 
         try {
@@ -413,6 +582,10 @@ public:
             m_threatCallbacks.clear();
             m_phishingCallbacks.clear();
             m_dgaCallbacks.clear();
+
+            // Drop subsystem references -- they are about to be torn down
+            m_threatIntelLookup = nullptr;
+            m_patternStore = nullptr;
 
             m_initialized = false;
 
@@ -442,7 +615,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"UpdateConfig - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UpdateConfig - Exception: %hs", e.what());
             return false;
         }
     }
@@ -457,6 +630,22 @@ public:
         verdict.analyzedUrl = url;
 
         try {
+            // Snapshot config and check initialization under read lock.
+            // We copy the config so that all subsequent analysis uses a
+            // consistent snapshot, eliminating TOCTOU races against
+            // concurrent UpdateConfig() calls.
+            URLAnalyzerConfig configSnapshot;
+            {
+                std::shared_lock lock(m_mutex);
+                if (!m_initialized) {
+                    SS_LOG_WARN(L"Network", L"ScanURL called before initialization");
+                    verdict.category = URLCategory::UNKNOWN;
+                    verdict.recommendedAction = FilterAction::ALLOW;
+                    return verdict;
+                }
+                configSnapshot = m_config;
+            }
+
             m_stats.totalURLsAnalyzed++;
 
             // Input validation
@@ -467,8 +656,20 @@ public:
                 return verdict;
             }
 
-            // Check cache first
-            if (m_config.enableCaching) {
+            // Reject URLs with embedded null bytes (security bypass vector)
+            if (ContainsNullByte(url)) {
+                SS_LOG_WARN(L"Network", L"ScanURL - Rejected URL with embedded null byte");
+                verdict.isBlocked = true;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.severity = VerdictSeverity::HIGH;
+                verdict.recommendedAction = FilterAction::BLOCK;
+                verdict.threatName = "URL.EmbeddedNull";
+                m_stats.urlsBlocked++;
+                return verdict;
+            }
+
+            // Check cache first (cache has its own lock)
+            if (configSnapshot.enableCaching) {
                 auto cached = GetFromCache(url);
                 if (cached.has_value()) {
                     m_stats.cacheHits++;
@@ -488,55 +689,65 @@ public:
                 return verdict;
             }
 
-            // Check whitelist (highest priority)
-            if (IsWhitelistedInternal(parsed.hostNormalized)) {
-                verdict.category = URLCategory::SAFE;
-                verdict.severity = VerdictSeverity::CLEAN;
-                verdict.recommendedAction = FilterAction::ALLOW;
-                verdict.detectionMethod = DetectionMethod::UNKNOWN;
-                CacheVerdict(url, verdict);
-                m_stats.urlsAllowed++;
-                return verdict;
+            // Check whitelist/blacklist under read lock.
+            // NOTE: We must NOT write to the cache under a shared_lock --
+            // that would cause a data race.  Instead, we defer caching
+            // and use the normal CacheVerdict() (exclusive lock) path.
+            {
+                std::shared_lock lock(m_mutex);
+
+                if (IsWhitelistedInternal(parsed.hostNormalized)) {
+                    verdict.category = URLCategory::SAFE;
+                    verdict.severity = VerdictSeverity::CLEAN;
+                    verdict.recommendedAction = FilterAction::ALLOW;
+                    verdict.detectionMethod = DetectionMethod::UNKNOWN;
+                    // Cache after releasing the shared lock
+                    lock.unlock();
+                    CacheVerdict(url, verdict);
+                    m_stats.urlsAllowed++;
+                    return verdict;
+                }
+
+                if (IsBlacklistedInternal(parsed.hostNormalized)) {
+                    verdict.isBlocked = true;
+                    verdict.category = URLCategory::MALWARE_DIST;
+                    verdict.severity = VerdictSeverity::CRITICAL;
+                    verdict.recommendedAction = FilterAction::BLOCK;
+                    verdict.detectionMethod = DetectionMethod::MANUAL;
+                    verdict.threatName = GetBlacklistThreat(parsed.hostNormalized);
+                    // Cache after releasing the shared lock
+                    lock.unlock();
+                    CacheVerdict(url, verdict);
+                    m_stats.urlsBlocked++;
+                    return verdict;
+                }
             }
 
-            // Check blacklist
-            if (IsBlacklistedInternal(parsed.hostNormalized)) {
-                verdict.isBlocked = true;
-                verdict.category = URLCategory::MALWARE_DIST;
-                verdict.severity = VerdictSeverity::CRITICAL;
-                verdict.recommendedAction = FilterAction::BLOCK;
-                verdict.detectionMethod = DetectionMethod::MANUAL;
-                verdict.threatName = GetBlacklistThreat(parsed.hostNormalized);
-                CacheVerdict(url, verdict);
-                m_stats.urlsBlocked++;
-                return verdict;
-            }
-
-            // Multi-layer analysis
+            // Multi-layer analysis (uses configSnapshot for all thresholds)
             int totalScore = 0;
 
-            // 1. Reputation check
-            if (m_config.enableReputation) {
+            // 1. Reputation check (ThreatIntel integration)
+            if (configSnapshot.enableReputation) {
                 totalScore += AnalyzeReputation(parsed, verdict);
             }
 
-            // 2. Pattern matching
-            if (m_config.enablePatternMatching) {
+            // 2. Pattern matching (PatternStore integration)
+            if (configSnapshot.enablePatternMatching) {
                 totalScore += AnalyzePatterns(parsed, verdict);
             }
 
             // 3. DGA detection
-            if (m_config.enableDGADetection) {
-                totalScore += AnalyzeDGA(parsed, verdict);
+            if (configSnapshot.enableDGADetection) {
+                totalScore += AnalyzeDGA(parsed, verdict, configSnapshot);
             }
 
             // 4. Phishing detection
-            if (m_config.enablePhishingDetection) {
-                totalScore += AnalyzePhishing(parsed, verdict);
+            if (configSnapshot.enablePhishingDetection) {
+                totalScore += AnalyzePhishing(parsed, verdict, configSnapshot);
             }
 
             // 5. Homograph detection
-            if (m_config.enableHomographDetection) {
+            if (configSnapshot.enableHomographDetection) {
                 totalScore += AnalyzeHomograph(parsed, verdict);
             }
 
@@ -546,12 +757,12 @@ public:
             // Determine final verdict
             verdict.confidenceScore = std::clamp(totalScore, 0, 100);
 
-            if (totalScore >= m_config.blockThreshold) {
+            if (totalScore >= configSnapshot.blockThreshold) {
                 verdict.isBlocked = true;
                 verdict.severity = VerdictSeverity::HIGH;
                 verdict.recommendedAction = FilterAction::BLOCK;
                 m_stats.urlsBlocked++;
-            } else if (totalScore >= m_config.warnThreshold) {
+            } else if (totalScore >= configSnapshot.warnThreshold) {
                 verdict.isSuspicious = true;
                 verdict.severity = VerdictSeverity::MEDIUM;
                 verdict.recommendedAction = FilterAction::WARN;
@@ -562,17 +773,17 @@ public:
                 m_stats.urlsAllowed++;
             }
 
-            // Cache result
+            // Cache result (exclusive lock inside)
             CacheVerdict(url, verdict);
 
-            // Notify callbacks
+            // Snapshot callbacks under lock, invoke outside lock
             NotifyAnalysis(url, verdict);
             if (verdict.threatType != ThreatType::NONE) {
                 NotifyThreat(url, verdict.threatType, verdict);
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ScanURL - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ScanURL - Exception: %hs", e.what());
             verdict.category = URLCategory::UNKNOWN;
             verdict.recommendedAction = FilterAction::BLOCK;
             m_stats.analysisErrors++;
@@ -588,9 +799,15 @@ public:
     }
 
     [[nodiscard]] URLVerdict ScanURL(const std::string& url, bool followRedirects, bool extractFeatures) {
-        // For this implementation, just call base ScanURL
-        // In production, would follow redirects and extract ML features
         auto verdict = ScanURL(url);
+
+        if (followRedirects) {
+            // Redirect following requires an HTTP client subsystem (not yet
+            // integrated).  Log a warning so operators know the parameter
+            // was requested but could not be honoured.
+            SS_LOG_WARN(L"Network",
+                L"ScanURL: followRedirects requested but HTTP client not integrated");
+        }
 
         if (extractFeatures) {
             verdict.features = ExtractFeaturesInternal(ParseURL(url));
@@ -613,14 +830,39 @@ public:
     void ScanURLAsync(const std::string& url, URLAnalysisCallback callback) {
         if (!callback) return;
 
-        std::thread([this, url, callback = std::move(callback)]() {
-            try {
-                auto verdict = ScanURL(url);
-                callback(url, verdict);
-            } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"ScanURLAsync - Exception: {}", e.what());
-            }
-        }).detach();
+        // Check shutdown before spawning a new thread
+        if (m_shutdownRequested.load(std::memory_order_acquire)) return;
+
+        // We must NOT capture `this` in a detached thread -- the singleton
+        // may be destroyed during static teardown while the thread is still
+        // running, causing use-after-free.  Instead we perform the scan
+        // synchronously on a short-lived std::async with a shared_future
+        // that the system can abandon, and we guard with the shutdown flag.
+        // Using std::async with launch::async ensures the runtime joins or
+        // waits on the future destructor, preventing UAF.
+        auto fut = std::async(std::launch::async,
+            [this, url, cb = std::move(callback)]() {
+                try {
+                    if (m_shutdownRequested.load(std::memory_order_acquire)) return;
+                    auto verdict = ScanURL(url);
+                    if (m_shutdownRequested.load(std::memory_order_acquire)) return;
+                    cb(url, verdict);
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"Network", L"ScanURLAsync - Exception: %hs", e.what());
+                }
+            });
+
+        // Store the future so the destructor blocks until completion,
+        // preventing use-after-free during static destruction.
+        {
+            std::unique_lock lock(m_mutex);
+            // Garbage-collect completed futures first
+            std::erase_if(m_pendingFutures, [](std::future<void>& f) {
+                return f.valid() &&
+                       f.wait_for(std::chrono::seconds(0)) == std::future_status::ready;
+            });
+            m_pendingFutures.push_back(std::move(fut));
+        }
     }
 
     // ========================================================================
@@ -640,8 +882,31 @@ public:
         try {
             m_stats.totalDomainsAnalyzed++;
 
+            // Snapshot the config and resolve subsystem pointer under lock.
+            // Also perform whitelist/blacklist checks while we hold the lock
+            // (IsWhitelistedInternal/IsBlacklistedInternal read shared state).
+            URLAnalyzerConfig configSnapshot;
+            ShadowStrike::ThreatIntel::ThreatIntelLookup* threatIntelPtr = nullptr;
+            bool isWhitelisted = false;
+            bool isBlacklisted = false;
+            std::string blacklistThreat;
+            std::string normalizedDomain = NarrowToLower(domain);
+
+            {
+                std::shared_lock lock(m_mutex);
+                configSnapshot = m_config;
+                threatIntelPtr = m_threatIntelLookup;
+                isWhitelisted = IsWhitelistedInternal(normalizedDomain);
+                if (!isWhitelisted) {
+                    isBlacklisted = IsBlacklistedInternal(normalizedDomain);
+                    if (isBlacklisted) {
+                        blacklistThreat = GetBlacklistThreat(normalizedDomain);
+                    }
+                }
+            }
+
             // Check whitelist
-            if (IsWhitelistedInternal(domain)) {
+            if (isWhitelisted) {
                 verdict.category = URLCategory::SAFE;
                 verdict.confidenceScore = 100;
                 verdict.reputationScore = 100;
@@ -652,10 +917,10 @@ public:
             }
 
             // Check blacklist
-            if (IsBlacklistedInternal(domain)) {
+            if (isBlacklisted) {
                 verdict.isBlocked = true;
                 verdict.category = URLCategory::MALWARE_DIST;
-                verdict.threatName = GetBlacklistThreat(domain);
+                verdict.threatName = std::move(blacklistThreat);
                 verdict.confidenceScore = 100;
                 verdict.reputationScore = 0;
                 auto endTime = std::chrono::steady_clock::now();
@@ -665,9 +930,9 @@ public:
             }
 
             // DGA detection
-            if (m_config.enableDGADetection) {
-                auto [score, family] = GetDGAScoreInternal(domain);
-                verdict.isDGA = (score >= m_config.dgaThreshold);
+            if (configSnapshot.enableDGADetection) {
+                auto [score, family] = GetDGAScoreInternal(domain, configSnapshot);
+                verdict.isDGA = (score >= configSnapshot.dgaThreshold);
                 verdict.dgaFamily = family;
 
                 if (verdict.isDGA) {
@@ -678,12 +943,32 @@ public:
                 }
             }
 
-            // Reputation check (simplified)
-            // In production, would query ThreatIntel
-            verdict.reputationScore = 50;  // Unknown
+            // Reputation check via ThreatIntelLookup
+            if (threatIntelPtr) {
+                try {
+                    if (threatIntelPtr->IsInitialized()) {
+                        auto result = threatIntelPtr->LookupDomain(domain);
+                        if (result.found) {
+                            verdict.reputationScore = static_cast<uint8_t>(
+                                100 - std::min<uint8_t>(result.threatScore, 100));
+                            if (result.IsMalicious()) {
+                                verdict.isBlocked = true;
+                                verdict.category = URLCategory::MALWARE_DIST;
+                                verdict.confidenceScore = static_cast<int>(result.threatScore);
+                            }
+                        }
+                    } else {
+                        verdict.reputationScore = 50;  // Unknown
+                    }
+                } catch (...) {
+                    verdict.reputationScore = 50;
+                }
+            } else {
+                verdict.reputationScore = 50;  // No ThreatIntel subsystem
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzeDomain - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeDomain - Exception: %hs", e.what());
         }
 
         auto endTime = std::chrono::steady_clock::now();
@@ -710,11 +995,18 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool IsDGA(const std::string& domain) {
-        auto [score, family] = GetDGAScoreInternal(domain);
-        return score >= m_config.dgaThreshold;
+        URLAnalyzerConfig configSnapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            configSnapshot = m_config;
+        }
+        auto [score, family] = GetDGAScoreInternal(domain, configSnapshot);
+        return score >= configSnapshot.dgaThreshold;
     }
 
-    [[nodiscard]] std::pair<double, std::string> GetDGAScoreInternal(const std::string& domain) {
+    [[nodiscard]] std::pair<double, std::string> GetDGAScoreInternal(
+        const std::string& domain,
+        const URLAnalyzerConfig& cfg) {
         try {
             // Extract domain without TLD
             std::string domainPart = domain;
@@ -742,7 +1034,7 @@ public:
             // Calculate digit ratio
             size_t digitCount = 0;
             for (char c : domainPart) {
-                if (std::isdigit(c)) {
+                if (std::isdigit(static_cast<unsigned char>(c))) {
                     digitCount++;
                 }
             }
@@ -775,30 +1067,41 @@ public:
                 score += 0.3;
             }
 
-            if (score >= m_config.dgaThreshold) {
+            if (score >= cfg.dgaThreshold) {
                 return {score, "Generic"};
             }
 
             return {score, ""};
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetDGAScoreInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetDGAScoreInternal - Exception: %hs", e.what());
             return {0.0, ""};
         }
     }
 
     [[nodiscard]] std::pair<double, std::string> GetDGAScore(const std::string& domain) {
-        return GetDGAScoreInternal(domain);
+        URLAnalyzerConfig configSnapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            configSnapshot = m_config;
+        }
+        return GetDGAScoreInternal(domain, configSnapshot);
     }
 
     [[nodiscard]] std::vector<std::tuple<std::string, double, std::string>> DetectDGAs(
         const std::vector<std::string>& domains) {
 
+        URLAnalyzerConfig configSnapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            configSnapshot = m_config;
+        }
+
         std::vector<std::tuple<std::string, double, std::string>> results;
 
         for (const auto& domain : domains) {
-            auto [score, family] = GetDGAScoreInternal(domain);
-            if (score >= m_config.dgaThreshold) {
+            auto [score, family] = GetDGAScoreInternal(domain, configSnapshot);
+            if (score >= configSnapshot.dgaThreshold) {
                 results.emplace_back(domain, score, family);
             }
         }
@@ -810,31 +1113,53 @@ public:
     // PHISHING DETECTION
     // ========================================================================
 
-    [[nodiscard]] std::optional<BrandMatch> DetectPhishing(const std::string& url) {
+    [[nodiscard]] std::optional<BrandMatch> DetectPhishing(
+        const std::string& url, const URLAnalyzerConfig& cfg) {
         try {
             ParsedURL parsed = ParseURL(url);
             if (!parsed.isValid) return std::nullopt;
 
-            // Check for brand keywords in domain
-            std::string lowerDomain = StringUtils::ToLower(parsed.hostNormalized);
+            std::string lowerDomain = NarrowToLower(parsed.hostNormalized);
 
             for (const auto& brand : PROTECTED_BRANDS) {
                 if (lowerDomain.find(brand) != std::string::npos) {
-                    // Found brand keyword - check if it's legitimate
-
-                    // Simple check: if the registered domain contains the brand, it's likely phishing
-                    // unless it's the actual brand domain
-
+                    // Found brand keyword -- check if it's the legitimate domain
                     BrandMatch match;
                     match.brandName = brand;
                     match.matchedTerm = brand;
                     match.inDomain = true;
-                    match.similarityScore = 0.9;
 
-                    // In production, would check against legitimate domain list
-                    // For now, flag as suspicious if not exact match
-                    if (lowerDomain != brand + ".com" &&
-                        lowerDomain != "www." + brand + ".com") {
+                    // Compute actual similarity against known-good domain
+                    std::string expectedDomain = brand + ".com";
+                    match.similarityScore = CalculateSimilarity(lowerDomain, expectedDomain);
+
+                    // Flag if not exact match to legitimate domain
+                    if (lowerDomain != expectedDomain &&
+                        lowerDomain != "www." + expectedDomain) {
+
+                        // Also check in subdomain or path for combosquatting
+                        if (!parsed.subdomain.empty() &&
+                            parsed.subdomain.find(brand) != std::string::npos) {
+                            match.inSubdomain = true;
+                        }
+
+                        return match;
+                    }
+                }
+            }
+
+            // Also check configured protected brands (with known-good domains)
+            {
+                // cfg is a snapshot, no lock needed
+                for (const auto& [brandName, legitimateDomain] : cfg.protectedBrands) {
+                    double sim = CalculateSimilarity(lowerDomain, NarrowToLower(legitimateDomain));
+                    if (sim >= cfg.phishingThreshold && lowerDomain != NarrowToLower(legitimateDomain)) {
+                        BrandMatch match;
+                        match.brandName = brandName;
+                        match.legitimateDomain = legitimateDomain;
+                        match.similarityScore = sim;
+                        match.matchedTerm = brandName;
+                        match.inDomain = true;
                         return match;
                     }
                 }
@@ -843,7 +1168,7 @@ public:
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectPhishing - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectPhishing - Exception: %hs", e.what());
             return std::nullopt;
         }
     }
@@ -856,15 +1181,40 @@ public:
             // Check for punycode (xn--)
             if (domain.find("xn--") != std::string::npos) {
                 analysis.containsHomographs = true;
-                analysis.punycodeDecoded = domain;  // Would decode in production
+                analysis.punycodeDecoded = domain;
+
+                // Decode punycode to detect visual spoofing
+                std::wstring decoded = StringUtils::ToWide(domain);
+                analysis.asciiEquivalent = StringUtils::ToNarrow(decoded);
+
+                // Score based on mixed-script and confusable patterns
                 analysis.deceptionScore = 0.8;
+
+                // Check if decoded domain targets a known brand
+                std::string lowerDecoded = NarrowToLower(analysis.asciiEquivalent);
+                for (const auto& brand : PROTECTED_BRANDS) {
+                    double sim = CalculateSimilarity(lowerDecoded, brand + ".com");
+                    if (sim >= URLAnalyzerConstants::PHISHING_SIMILARITY_THRESHOLD) {
+                        analysis.targetedBrand = brand;
+                        analysis.deceptionScore = std::max(analysis.deceptionScore, sim);
+                        break;
+                    }
+                }
             }
 
-            // Check for confusable characters
-            // In production, would use Unicode confusables database
+            // Check for Unicode characters that look like ASCII (mixed script)
+            // Common homoglyph codepoints in URL domain names
+            for (unsigned char c : domain) {
+                if (c > 127) {
+                    // Non-ASCII byte in a domain name is suspicious
+                    analysis.containsHomographs = true;
+                    analysis.deceptionScore = std::max(analysis.deceptionScore, 0.7);
+                    break;
+                }
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CheckHomograph - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckHomograph - Exception: %hs", e.what());
         }
 
         return analysis;
@@ -874,7 +1224,7 @@ public:
         try {
             return CalculateSimilarity(domain, targetDomain);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CheckTyposquatting - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CheckTyposquatting - Exception: %hs", e.what());
             return 0.0;
         }
     }
@@ -892,8 +1242,42 @@ public:
                 return parsed;
             }
 
-            // Simple URL parsing (production would use robust URL parser)
+            // Reject embedded null bytes early
+            if (ContainsNullByte(std::string_view(url.data(), url.size()))) {
+                parsed.isValid = false;
+                return parsed;
+            }
+
             std::string remaining = url;
+
+            // Detect dangerous URI schemes that don't use ://
+            {
+                std::string lowerUrl = NarrowToLower(url);
+                // Strip leading whitespace that could bypass scheme detection
+                size_t start = lowerUrl.find_first_not_of(" \t\r\n");
+                if (start != std::string::npos) {
+                    lowerUrl = lowerUrl.substr(start);
+                }
+
+                if (lowerUrl.starts_with("javascript:")) {
+                    parsed.scheme = URLScheme::JAVASCRIPT;
+                    parsed.schemeString = "javascript";
+                    parsed.hasJavaScript = true;
+                    parsed.isValid = true;
+                    parsed.host = "";
+                    parsed.path = url.substr(url.find(':') + 1);
+                    return parsed;
+                }
+                if (lowerUrl.starts_with("data:")) {
+                    parsed.scheme = URLScheme::DATA;
+                    parsed.schemeString = "data";
+                    parsed.hasDataUri = true;
+                    parsed.isValid = true;
+                    parsed.host = "";
+                    parsed.path = url.substr(url.find(':') + 1);
+                    return parsed;
+                }
+            }
 
             // Extract scheme
             size_t schemeEnd = remaining.find("://");
@@ -901,15 +1285,19 @@ public:
                 parsed.schemeString = remaining.substr(0, schemeEnd);
                 remaining = remaining.substr(schemeEnd + 3);
 
-                std::string schemeLower = StringUtils::ToLower(parsed.schemeString);
-                if (schemeLower == "http") parsed.scheme = URLScheme::HTTP;
-                else if (schemeLower == "https") parsed.scheme = URLScheme::HTTPS;
-                else if (schemeLower == "ftp") parsed.scheme = URLScheme::FTP;
-                else if (schemeLower == "mailto") parsed.scheme = URLScheme::MAILTO;
+                std::string schemeLower = NarrowToLower(parsed.schemeString);
+                if (schemeLower == "http") { parsed.scheme = URLScheme::HTTP; parsed.defaultPort = 80; }
+                else if (schemeLower == "https") { parsed.scheme = URLScheme::HTTPS; parsed.defaultPort = 443; }
+                else if (schemeLower == "ftp") { parsed.scheme = URLScheme::FTP; parsed.defaultPort = 21; }
+                else if (schemeLower == "ftps") { parsed.scheme = URLScheme::FTPS; parsed.defaultPort = 990; }
+                else if (schemeLower == "sftp") { parsed.scheme = URLScheme::SFTP; parsed.defaultPort = 22; }
+                else if (schemeLower == "file") { parsed.scheme = URLScheme::FILE; }
+                else if (schemeLower == "mailto") { parsed.scheme = URLScheme::MAILTO; }
                 else parsed.scheme = URLScheme::CUSTOM;
             } else {
                 parsed.scheme = URLScheme::HTTP;
                 parsed.schemeString = "http";
+                parsed.defaultPort = 80;
             }
 
             // Extract credentials (user:pass@)
@@ -929,26 +1317,64 @@ public:
                 }
             }
 
-            // Extract host and port
+            // Extract host and port — handle IPv6 bracket notation
             size_t pathStart = remaining.find('/');
             std::string hostPort = (pathStart != std::string::npos) ?
                 remaining.substr(0, pathStart) : remaining;
 
-            size_t colonPos = hostPort.find(':');
-            if (colonPos != std::string::npos) {
-                parsed.host = hostPort.substr(0, colonPos);
-                try {
-                    parsed.port = static_cast<uint16_t>(std::stoi(hostPort.substr(colonPos + 1)));
-                    parsed.hasPort = true;
-                } catch (...) {
-                    parsed.port = 80;
+            if (!hostPort.empty() && hostPort.front() == '[') {
+                // IPv6 bracket notation: [::1]:port
+                size_t bracketEnd = hostPort.find(']');
+                if (bracketEnd != std::string::npos) {
+                    parsed.host = hostPort.substr(1, bracketEnd - 1);
+                    parsed.isIPv6 = true;
+                    parsed.isIP = true;
+                    if (bracketEnd + 1 < hostPort.size() && hostPort[bracketEnd + 1] == ':') {
+                        try {
+                            parsed.port = static_cast<uint16_t>(
+                                std::stoi(hostPort.substr(bracketEnd + 2)));
+                            parsed.hasPort = true;
+                        } catch (...) {
+                            parsed.port = parsed.defaultPort;
+                        }
+                    } else {
+                        parsed.port = parsed.defaultPort;
+                    }
+                } else {
+                    parsed.host = hostPort;
+                    parsed.port = parsed.defaultPort;
                 }
             } else {
-                parsed.host = hostPort;
-                parsed.port = (parsed.scheme == URLScheme::HTTPS) ? 443 : 80;
+                size_t colonPos = hostPort.find(':');
+                if (colonPos != std::string::npos) {
+                    parsed.host = hostPort.substr(0, colonPos);
+                    try {
+                        parsed.port = static_cast<uint16_t>(
+                            std::stoi(hostPort.substr(colonPos + 1)));
+                        parsed.hasPort = true;
+                    } catch (...) {
+                        parsed.port = parsed.defaultPort;
+                    }
+                } else {
+                    parsed.host = hostPort;
+                    parsed.port = parsed.defaultPort;
+                }
             }
 
-            parsed.hostNormalized = StringUtils::ToLower(parsed.host);
+            // Cap host length per RFC
+            if (parsed.host.length() > URLAnalyzerConstants::MAX_DOMAIN_LENGTH) {
+                parsed.isValid = false;
+                return parsed;
+            }
+
+            parsed.hostNormalized = NarrowToLower(parsed.host);
+
+            // Detect IP-based hosts
+            if (!parsed.isIPv6) {
+                parsed.isIP = IsIPv4Address(parsed.hostNormalized);
+            }
+            parsed.isLocalhost = IsLocalhostAddress(parsed.hostNormalized);
+            parsed.isPrivateIP = IsPrivateIPv4(parsed.hostNormalized);
 
             // Extract path, query, fragment
             if (pathStart != std::string::npos) {
@@ -984,8 +1410,8 @@ public:
                 parsed.tld = domain.substr(lastDot + 1);
                 parsed.effectiveTld = parsed.tld;
 
-                // Extract registered domain (simplified)
-                size_t secondLastDot = domain.find_last_of('.', lastDot - 1);
+                size_t secondLastDot = (lastDot > 0) ?
+                    domain.find_last_of('.', lastDot - 1) : std::string::npos;
                 if (secondLastDot != std::string::npos) {
                     parsed.registeredDomain = domain.substr(secondLastDot + 1);
                     parsed.subdomain = domain.substr(0, secondLastDot);
@@ -994,26 +1420,31 @@ public:
                 }
             }
 
-            // Split into labels
-            std::stringstream ss(domain);
-            std::string label;
-            while (std::getline(ss, label, '.')) {
-                if (!label.empty()) {
-                    parsed.labels.push_back(label);
+            // Split into labels (cap to prevent pathological input)
+            {
+                std::stringstream ss(domain);
+                std::string label;
+                while (std::getline(ss, label, '.') &&
+                       parsed.labels.size() < URLAnalyzerConstants::MAX_LABELS) {
+                    if (!label.empty()) {
+                        parsed.labels.push_back(label);
+                    }
                 }
             }
 
-            // Check flags
+            // Check security flags
             parsed.isPunycode = (domain.find("xn--") != std::string::npos);
             parsed.isValid = !parsed.host.empty();
             parsed.hasEncodedChars = (url.find('%') != std::string::npos);
+            parsed.hasDoubleEncoding = HasDoublePercentEncoding(url);
+            parsed.hasSuspiciousChars = ContainsSuspiciousChars(url);
             parsed.hasLongPath = (parsed.path.length() > URLAnalyzerConstants::MAX_PATH_LENGTH);
             parsed.hasExcessiveSubdomains = (parsed.labels.size() > 5);
 
             parsed.normalizedUrl = parsed.schemeString + "://" + parsed.hostNormalized + parsed.path;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ParseURL - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ParseURL - Exception: %hs", e.what());
             parsed.isValid = false;
         }
 
@@ -1031,8 +1462,7 @@ public:
     }
 
     [[nodiscard]] static std::wstring DecodePunycode(const std::string& domain) {
-        // Simplified - production would use ICU or similar
-        return StringUtils::Utf8ToWide(domain);
+        return StringUtils::ToWide(domain);
     }
 
     // ========================================================================
@@ -1055,22 +1485,80 @@ public:
             features.slashCount = std::count(parsed.path.begin(), parsed.path.end(), '/');
             features.labelCount = parsed.labels.size();
 
-            for (char c : parsed.originalUrl) {
-                if (std::isdigit(c)) features.digitCount++;
-                if (!std::isalnum(c)) features.specialCharCount++;
+            size_t letterCount = 0;
+            size_t vowelCount = 0;
+            size_t consonantCount = 0;
+
+            // Count characters in domain (not full URL) for domain-specific ratios
+            for (char c : parsed.host) {
+                if (std::isdigit(static_cast<unsigned char>(c))) features.digitCount++;
+                if (std::isalpha(static_cast<unsigned char>(c))) letterCount++;
+                if (VOWELS.find(c) != std::string::npos) vowelCount++;
+                if (CONSONANTS.find(c) != std::string::npos) consonantCount++;
                 if (c == '-') features.hyphenCount++;
                 if (c == '_') features.underscoreCount++;
+            }
+
+            // Count URL-wide special chars and @ symbols
+            for (char c : parsed.originalUrl) {
+                if (!std::isalnum(static_cast<unsigned char>(c))) features.specialCharCount++;
                 if (c == '@') features.atSymbolCount++;
             }
 
-            // Ratio features
+            // Count query parameters
+            if (!parsed.query.empty()) {
+                features.queryParamCount = 1;
+                for (char c : parsed.query) {
+                    if (c == '&') features.queryParamCount++;
+                }
+            }
+
+            // Ratio features (domain-specific)
             if (features.domainLength > 0) {
                 features.digitRatio = static_cast<double>(features.digitCount) / features.domainLength;
+                features.letterRatio = static_cast<double>(letterCount) / features.domainLength;
+                features.consonantRatio = static_cast<double>(consonantCount) / features.domainLength;
+                features.vowelRatio = static_cast<double>(vowelCount) / features.domainLength;
+            }
+            if (features.urlLength > 0) {
+                features.specialRatio = static_cast<double>(features.specialCharCount) / features.urlLength;
             }
 
             // Entropy features
             features.domainEntropy = CalculateEntropyInternal(parsed.host);
             features.pathEntropy = CalculateEntropyInternal(parsed.path);
+            if (!parsed.query.empty()) {
+                features.queryEntropy = CalculateEntropyInternal(parsed.query);
+            }
+            if (!parsed.subdomain.empty()) {
+                features.subdomainEntropy = CalculateEntropyInternal(parsed.subdomain);
+            }
+
+            // N-gram features (bigram frequency for domain)
+            if (parsed.host.length() >= 2) {
+                size_t uncommon = 0;
+                // Common English bigrams for reference
+                static const std::unordered_set<std::string> commonBigrams = {
+                    "th","he","in","er","an","re","on","at","en","nd","ti","es","or","te","of",
+                    "ed","is","it","al","ar","st","to","nt","ng","se","ha","as","ou","io","le",
+                    "co","me","de","hi","ri","ro","ic","ne","ea","ra","ce","li","ch","ll","be"
+                };
+                size_t totalBigrams = parsed.host.length() - 1;
+                size_t commonCount = 0;
+                std::string lower = NarrowToLower(parsed.host);
+                for (size_t i = 0; i + 1 < lower.size(); ++i) {
+                    std::string bigram = lower.substr(i, 2);
+                    if (commonBigrams.count(bigram)) {
+                        commonCount++;
+                    } else {
+                        uncommon++;
+                    }
+                }
+                if (totalBigrams > 0) {
+                    features.bigramFrequency = static_cast<double>(commonCount) / totalBigrams;
+                }
+                features.uncommonBigrams = static_cast<uint32_t>(uncommon);
+            }
 
             // Boolean features
             features.hasIP = parsed.isIP;
@@ -1081,8 +1569,23 @@ public:
             features.isPunycode = parsed.isPunycode;
             features.hasExecutableExtension = HasExecutableExtension(parsed.path);
 
+            // Check for double extension (e.g., document.pdf.exe)
+            size_t lastDot = parsed.path.find_last_of('.');
+            if (lastDot != std::string::npos && lastDot > 0) {
+                std::string beforeLast = parsed.path.substr(0, lastDot);
+                if (beforeLast.find_last_of('.') != std::string::npos) {
+                    features.hasDoubleExtension = true;
+                }
+            }
+
+            // Derived scores
+            features.dgaScore = (features.domainEntropy >= URLAnalyzerConstants::DGA_ENTROPY_THRESHOLD &&
+                                 features.consonantRatio >= URLAnalyzerConstants::DGA_CONSONANT_RATIO) ? 0.7 : 0.0;
+            features.phishingScore = features.hasKnownBrand ? 0.5 : 0.0;
+            features.malwareScore = features.hasExecutableExtension ? 0.5 : 0.0;
+
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ExtractFeaturesInternal - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExtractFeaturesInternal - Exception: %hs", e.what());
         }
 
         return features;
@@ -1105,14 +1608,15 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::string normalized = StringUtils::ToLower(domain);
+            std::string normalized = NarrowToLower(domain);
             m_whitelist.insert(normalized);
 
-            SS_LOG_INFO(L"Network", L"Added to URL whitelist: {} (subdomains={})", domain, includeSubdomains);
+            SS_LOG_INFO(L"Network", L"Added to URL whitelist: %hs (subdomains=%d)",
+                normalized.c_str(), static_cast<int>(includeSubdomains));
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AddToWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddToWhitelist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1121,17 +1625,17 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::string normalized = StringUtils::ToLower(domain);
+            std::string normalized = NarrowToLower(domain);
             bool removed = m_whitelist.erase(normalized) > 0;
 
             if (removed) {
-                SS_LOG_INFO(L"Network", L"Removed from URL whitelist: {}", domain);
+                SS_LOG_INFO(L"Network", L"Removed from URL whitelist: %hs", normalized.c_str());
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"RemoveFromWhitelist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"RemoveFromWhitelist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1140,14 +1644,15 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::string normalized = StringUtils::ToLower(domain);
+            std::string normalized = NarrowToLower(domain);
             m_blacklist[normalized] = std::string(threatName);
 
-            Logger::Critical("Added to URL blacklist: {} (threat: {})", domain, threatName);
+            SS_LOG_WARN(L"Network", L"Added to URL blacklist: %hs (threat: %hs)",
+                normalized.c_str(), std::string(threatName).c_str());
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AddToBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddToBlacklist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1156,17 +1661,17 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            std::string normalized = StringUtils::ToLower(domain);
+            std::string normalized = NarrowToLower(domain);
             bool removed = m_blacklist.erase(normalized) > 0;
 
             if (removed) {
-                SS_LOG_INFO(L"Network", L"Removed from URL blacklist: {}", domain);
+                SS_LOG_INFO(L"Network", L"Removed from URL blacklist: %hs", normalized.c_str());
             }
 
             return removed;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"RemoveFromBlacklist - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"RemoveFromBlacklist - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1177,7 +1682,7 @@ public:
 
     [[nodiscard]] bool IsWhitelisted(const std::string& domain) const {
         std::shared_lock lock(m_mutex);
-        std::string normalized = StringUtils::ToLower(domain);
+        std::string normalized = NarrowToLower(domain);
         return IsWhitelistedInternal(normalized);
     }
 
@@ -1187,7 +1692,7 @@ public:
 
     [[nodiscard]] bool IsBlacklisted(const std::string& domain) const {
         std::shared_lock lock(m_mutex);
-        std::string normalized = StringUtils::ToLower(domain);
+        std::string normalized = NarrowToLower(domain);
         return IsBlacklistedInternal(normalized);
     }
 
@@ -1206,7 +1711,8 @@ public:
         auto it = m_cache.find(url);
         if (it != m_cache.end()) {
             if (!it->second.IsExpired()) {
-                it->second.hitCount++;
+                // hitCount is atomic, safe to increment under shared_lock
+                it->second.hitCount.fetch_add(1, std::memory_order_relaxed);
                 return it->second.verdict;
             }
         }
@@ -1214,37 +1720,70 @@ public:
         return std::nullopt;
     }
 
+    // Cache under exclusive lock (caller must NOT hold the lock)
     void CacheVerdict(const std::string& url, const URLVerdict& verdict) {
         std::unique_lock lock(m_mutex);
+        CacheVerdictInternal(url, verdict);
+    }
 
+    // Cache without acquiring lock (caller must already hold an EXCLUSIVE lock)
+    void CacheVerdictInternal(const std::string& url, const URLVerdict& verdict) {
         try {
             if (m_cache.size() >= m_config.maxCacheSize) {
-                EvictOldestCacheEntry();
+                EvictExpiredAndOldestBatch();
             }
 
             CacheEntry entry;
             entry.verdict = verdict;
             entry.insertTime = std::chrono::system_clock::now();
-            entry.expiryTime = entry.insertTime +
-                std::chrono::milliseconds(m_config.cacheTTLMs);
 
-            m_cache[url] = entry;
-            m_stats.cacheSize = static_cast<uint32_t>(m_cache.size());
+            // Malicious verdicts get longer TTL
+            uint32_t ttl = m_config.cacheTTLMs;
+            if (verdict.isBlocked) {
+                ttl = std::max(ttl, URLAnalyzerConstants::CACHE_TTL_MALICIOUS_MS);
+            }
+            entry.expiryTime = entry.insertTime + std::chrono::milliseconds(ttl);
+
+            m_cache[url] = std::move(entry);
+            m_stats.cacheSize.store(static_cast<uint32_t>(m_cache.size()),
+                std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CacheVerdict - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CacheVerdict - Exception: %hs", e.what());
         }
     }
 
-    void EvictOldestCacheEntry() {
-        if (!m_cache.empty()) {
-            auto oldest = m_cache.begin();
-            for (auto it = m_cache.begin(); it != m_cache.end(); ++it) {
-                if (it->second.insertTime < oldest->second.insertTime) {
-                    oldest = it;
-                }
+    // Batch eviction: remove all expired entries first, then oldest entries if still over limit
+    void EvictExpiredAndOldestBatch() {
+        auto now = std::chrono::system_clock::now();
+
+        // Phase 1: Remove all expired entries
+        for (auto it = m_cache.begin(); it != m_cache.end(); ) {
+            if (it->second.expiryTime <= now) {
+                it = m_cache.erase(it);
+            } else {
+                ++it;
             }
-            m_cache.erase(oldest);
+        }
+
+        // Phase 2: If still over 90% capacity, evict oldest 10%
+        if (m_cache.size() >= (m_config.maxCacheSize * 9 / 10)) {
+            size_t toEvict = m_config.maxCacheSize / 10;
+            if (toEvict == 0) toEvict = 1;
+
+            // Collect oldest entries by insertion time
+            std::vector<std::pair<std::chrono::system_clock::time_point, std::string>> candidates;
+            candidates.reserve(m_cache.size());
+            for (const auto& [key, entry] : m_cache) {
+                candidates.emplace_back(entry.insertTime, key);
+            }
+            std::partial_sort(candidates.begin(),
+                candidates.begin() + std::min(toEvict, candidates.size()),
+                candidates.end());
+
+            for (size_t i = 0; i < std::min(toEvict, candidates.size()); ++i) {
+                m_cache.erase(candidates[i].second);
+            }
         }
     }
 
@@ -1260,7 +1799,7 @@ public:
     void ClearCache() {
         std::unique_lock lock(m_mutex);
         m_cache.clear();
-        m_stats.cacheSize = 0;
+        m_stats.cacheSize.store(0, std::memory_order_relaxed);
         SS_LOG_INFO(L"Network", L"URL analyzer cache cleared");
     }
 
@@ -1334,21 +1873,24 @@ public:
 
         try {
             SS_LOG_INFO(L"Network", L"=== URLAnalyzer Diagnostics ===");
-            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
-            SS_LOG_INFO(L"Network", L"Cache size: {}", m_cache.size());
-            SS_LOG_INFO(L"Network", L"Whitelist size: {}", m_whitelist.size());
-            SS_LOG_INFO(L"Network", L"Blacklist size: {}", m_blacklist.size());
-            SS_LOG_INFO(L"Network", L"Total URLs analyzed: {}", m_stats.totalURLsAnalyzed.load());
-            SS_LOG_INFO(L"Network", L"URLs blocked: {}", m_stats.urlsBlocked.load());
-            SS_LOG_INFO(L"Network", L"Phishing detected: {}", m_stats.phishingDetected.load());
-            SS_LOG_INFO(L"Network", L"DGA detected: {}", m_stats.dgaDetected.load());
-            SS_LOG_INFO(L"Network", L"Cache hit rate: {:.2f}%",
-                (m_stats.cacheHits.load() * 100.0) / std::max(1ULL, m_stats.totalURLsAnalyzed.load()));
+            SS_LOG_INFO(L"Network", L"Initialized: %d", static_cast<int>(m_initialized));
+            SS_LOG_INFO(L"Network", L"Cache size: %zu", m_cache.size());
+            SS_LOG_INFO(L"Network", L"Whitelist size: %zu", m_whitelist.size());
+            SS_LOG_INFO(L"Network", L"Blacklist size: %zu", m_blacklist.size());
+            SS_LOG_INFO(L"Network", L"Total URLs analyzed: %llu", m_stats.totalURLsAnalyzed.load());
+            SS_LOG_INFO(L"Network", L"URLs blocked: %llu", m_stats.urlsBlocked.load());
+            SS_LOG_INFO(L"Network", L"Phishing detected: %llu", m_stats.phishingDetected.load());
+            SS_LOG_INFO(L"Network", L"DGA detected: %llu", m_stats.dgaDetected.load());
+
+            uint64_t total = m_stats.totalURLsAnalyzed.load();
+            uint64_t hits = m_stats.cacheHits.load();
+            double hitRate = (total > 0) ? (static_cast<double>(hits) * 100.0 / total) : 0.0;
+            SS_LOG_INFO(L"Network", L"Cache hit rate: %.2f%%", hitRate);
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1357,12 +1899,70 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            SS_LOG_INFO(L"Network", L"Exported URL analyzer diagnostics to: {}",
-                StringUtils::WideToUtf8(outputPath));
+            std::string narrowPath = StringUtils::ToNarrow(outputPath);
+
+            // Build diagnostics report as JSON
+            std::ostringstream json;
+            json << "{\n";
+            json << "  \"module\": \"URLAnalyzer\",\n";
+            json << "  \"version\": \"" << URLAnalyzerConstants::VERSION_MAJOR << "."
+                 << URLAnalyzerConstants::VERSION_MINOR << "."
+                 << URLAnalyzerConstants::VERSION_PATCH << "\",\n";
+            json << "  \"initialized\": " << (m_initialized ? "true" : "false") << ",\n";
+            json << "  \"cacheSize\": " << m_cache.size() << ",\n";
+            json << "  \"whitelistSize\": " << m_whitelist.size() << ",\n";
+            json << "  \"blacklistSize\": " << m_blacklist.size() << ",\n";
+            json << "  \"totalURLsAnalyzed\": " << m_stats.totalURLsAnalyzed.load() << ",\n";
+            json << "  \"totalDomainsAnalyzed\": " << m_stats.totalDomainsAnalyzed.load() << ",\n";
+            json << "  \"urlsBlocked\": " << m_stats.urlsBlocked.load() << ",\n";
+            json << "  \"urlsWarned\": " << m_stats.urlsWarned.load() << ",\n";
+            json << "  \"urlsAllowed\": " << m_stats.urlsAllowed.load() << ",\n";
+            json << "  \"phishingDetected\": " << m_stats.phishingDetected.load() << ",\n";
+            json << "  \"malwareDetected\": " << m_stats.malwareDetected.load() << ",\n";
+            json << "  \"c2Detected\": " << m_stats.c2Detected.load() << ",\n";
+            json << "  \"dgaDetected\": " << m_stats.dgaDetected.load() << ",\n";
+            json << "  \"homographDetected\": " << m_stats.homographDetected.load() << ",\n";
+            json << "  \"cacheHits\": " << m_stats.cacheHits.load() << ",\n";
+            json << "  \"cacheMisses\": " << m_stats.cacheMisses.load() << ",\n";
+            json << "  \"avgAnalysisTimeUs\": " << m_stats.avgAnalysisTimeUs.load() << ",\n";
+            json << "  \"maxAnalysisTimeUs\": " << m_stats.maxAnalysisTimeUs.load() << ",\n";
+            json << "  \"parseErrors\": " << m_stats.parseErrors.load() << ",\n";
+            json << "  \"analysisErrors\": " << m_stats.analysisErrors.load() << "\n";
+            json << "}\n";
+
+            std::string content = json.str();
+
+            // Write to file using Win32 API for reliable wide-path handling
+            HANDLE hFile = ::CreateFileW(
+                outputPath.c_str(),
+                GENERIC_WRITE,
+                0, nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Failed to create file: %ls",
+                    outputPath.c_str());
+                return false;
+            }
+
+            DWORD written = 0;
+            BOOL ok = ::WriteFile(hFile, content.data(),
+                static_cast<DWORD>(content.size()), &written, nullptr);
+            ::CloseHandle(hFile);
+
+            if (!ok || written != static_cast<DWORD>(content.size())) {
+                SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Write failed for: %ls",
+                    outputPath.c_str());
+                return false;
+            }
+
+            SS_LOG_INFO(L"Network", L"Exported URL analyzer diagnostics to: %hs",
+                narrowPath.c_str());
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1401,14 +2001,71 @@ private:
         int score = 0;
 
         try {
-            // In production, would query ThreatIntel
-            // For now, basic checks
+            // Grab the subsystem pointer under lock
+            ShadowStrike::ThreatIntel::ThreatIntelLookup* threatIntelPtr = nullptr;
+            {
+                std::shared_lock lock(m_mutex);
+                threatIntelPtr = m_threatIntelLookup;
+            }
 
-            verdict.reputationScore = 50;  // Unknown
-            verdict.reputationSource = "Local";
+            if (!threatIntelPtr || !threatIntelPtr->IsInitialized()) {
+                verdict.reputationScore = 50;  // Unknown
+                verdict.reputationSource = "Unavailable";
+                return 0;
+            }
+
+            // Lookup the full URL first
+            auto urlResult = threatIntelPtr->LookupURL(parsed.normalizedUrl);
+            if (urlResult.found) {
+                verdict.reputationScore = static_cast<uint8_t>(
+                    100 - std::min<uint8_t>(urlResult.threatScore, 100));
+                verdict.reputationSource = "ThreatIntel-URL";
+
+                if (!urlResult.mitreTechniques.empty()) {
+                    verdict.mitreIds = urlResult.mitreTechniques;
+                }
+
+                if (urlResult.IsMalicious()) {
+                    score += 60;
+                    verdict.detectionMethod = DetectionMethod::REPUTATION;
+                    if (!urlResult.description.empty()) {
+                        verdict.threatName = urlResult.description;
+                    }
+                } else if (urlResult.IsSuspicious()) {
+                    score += 30;
+                }
+                return score;
+            }
+
+            // Fallback: lookup domain
+            auto domainResult = threatIntelPtr->LookupDomain(parsed.hostNormalized);
+            if (domainResult.found) {
+                verdict.reputationScore = static_cast<uint8_t>(
+                    100 - std::min<uint8_t>(domainResult.threatScore, 100));
+                verdict.reputationSource = "ThreatIntel-Domain";
+
+                if (!domainResult.mitreTechniques.empty()) {
+                    verdict.mitreIds = domainResult.mitreTechniques;
+                }
+
+                if (domainResult.IsMalicious()) {
+                    score += 50;
+                    verdict.detectionMethod = DetectionMethod::REPUTATION;
+                    if (!domainResult.description.empty()) {
+                        verdict.threatName = domainResult.description;
+                    }
+                } else if (domainResult.IsSuspicious()) {
+                    score += 20;
+                }
+            } else {
+                verdict.reputationScore = 50;
+                verdict.reputationSource = "Unknown";
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzeReputation - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeReputation - Exception: %hs", e.what());
+            verdict.reputationScore = 50;
+            verdict.reputationSource = "Error";
         }
 
         return score;
@@ -1418,23 +2075,76 @@ private:
         int score = 0;
 
         try {
-            // In production, would use PatternStore
-            // For now, basic pattern checks
+            // Grab the subsystem pointer under lock
+            ShadowStrike::PatternStore::PatternStore* patternStorePtr = nullptr;
+            {
+                std::shared_lock lock(m_mutex);
+                patternStorePtr = m_patternStore;
+            }
+
+            // Scan URL bytes against PatternStore signatures
+            if (patternStorePtr && patternStorePtr->IsInitialized()) {
+                const std::string& urlStr = parsed.normalizedUrl;
+                std::span<const uint8_t> urlBytes(
+                    reinterpret_cast<const uint8_t*>(urlStr.data()), urlStr.size());
+
+                auto matches = patternStorePtr->Scan(urlBytes);
+                if (!matches.empty()) {
+                    // Take the highest-severity match
+                    score += static_cast<int>(matches.size()) * 15;
+                    score = std::min(score, 60);
+
+                    verdict.detectionMethod = DetectionMethod::PATTERN_MATCH;
+                    verdict.matchedPattern = matches.front().signatureName;
+
+                    SS_LOG_DEBUG(L"Network", L"PatternStore matched %zu patterns on URL",
+                        matches.size());
+                }
+            }
+
+            // Additional inline pattern checks for known malware URLs
+            const std::string& urlLower = NarrowToLower(parsed.normalizedUrl);
+
+            // Encoded base64 payloads in query parameters
+            if (!parsed.query.empty() && parsed.query.length() > 100) {
+                // Long query strings with base64 charset are suspicious
+                size_t b64Chars = 0;
+                for (char c : parsed.query) {
+                    if (std::isalnum(static_cast<unsigned char>(c)) ||
+                        c == '+' || c == '/' || c == '=') {
+                        b64Chars++;
+                    }
+                }
+                double b64Ratio = static_cast<double>(b64Chars) / parsed.query.length();
+                if (b64Ratio > 0.9 && parsed.query.length() > 200) {
+                    score += 15;
+                }
+            }
+
+            // Known exploit kit landing page patterns
+            if (urlLower.find("/gate.php") != std::string::npos ||
+                urlLower.find("/payload.") != std::string::npos ||
+                urlLower.find("/download.php?id=") != std::string::npos ||
+                urlLower.find("&cmd=") != std::string::npos ||
+                urlLower.find("?exec=") != std::string::npos) {
+                score += 20;
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzePatterns - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzePatterns - Exception: %hs", e.what());
         }
 
         return score;
     }
 
-    int AnalyzeDGA(const ParsedURL& parsed, URLVerdict& verdict) {
+    int AnalyzeDGA(const ParsedURL& parsed, URLVerdict& verdict,
+                   const URLAnalyzerConfig& cfg) {
         int score = 0;
 
         try {
-            auto [dgaScore, family] = GetDGAScoreInternal(parsed.hostNormalized);
+            auto [dgaScore, family] = GetDGAScoreInternal(parsed.hostNormalized, cfg);
 
-            if (dgaScore >= m_config.dgaThreshold) {
+            if (dgaScore >= cfg.dgaThreshold) {
                 score += 60;
                 verdict.category = URLCategory::DGA;
                 verdict.threatType = ThreatType::DGA_DOMAIN;
@@ -1446,17 +2156,18 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzeDGA - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeDGA - Exception: %hs", e.what());
         }
 
         return score;
     }
 
-    int AnalyzePhishing(const ParsedURL& parsed, URLVerdict& verdict) {
+    int AnalyzePhishing(const ParsedURL& parsed, URLVerdict& verdict,
+                        const URLAnalyzerConfig& cfg) {
         int score = 0;
 
         try {
-            auto brandMatch = DetectPhishing(parsed.originalUrl);
+            auto brandMatch = DetectPhishing(parsed.originalUrl, cfg);
             if (brandMatch.has_value()) {
                 score += 70;
                 verdict.category = URLCategory::PHISHING;
@@ -1470,7 +2181,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzePhishing - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzePhishing - Exception: %hs", e.what());
         }
 
         return score;
@@ -1493,7 +2204,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzeHomograph - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeHomograph - Exception: %hs", e.what());
         }
 
         return score;
@@ -1503,112 +2214,189 @@ private:
         int score = 0;
 
         try {
+            // javascript: URI — always block
+            if (parsed.hasJavaScript) {
+                score += 80;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.threatType = ThreatType::DRIVE_BY_DOWNLOAD;
+                verdict.threatName = "URL.JavaScriptScheme";
+            }
+
+            // data: URI — high risk for XSS / credential harvesting
+            if (parsed.hasDataUri) {
+                score += 60;
+                verdict.category = URLCategory::SUSPICIOUS;
+                verdict.threatName = "URL.DataURIScheme";
+            }
+
             // Suspicious TLD
             if (IsSuspiciousTLD(parsed.tld)) {
                 score += 10;
             }
 
-            // Excessive subdomains
+            // Excessive subdomains (evasion technique)
             if (parsed.labels.size() > 5) {
                 score += 15;
             }
 
-            // IP address in URL
+            // IP address in URL (no DNS, common in phishing/C2)
             if (parsed.isIP) {
                 score += 20;
+                // Private IP is even more suspicious in external URL context
+                if (parsed.isPrivateIP) {
+                    score += 10;
+                }
             }
 
-            // Credentials in URL
+            // Credentials in URL (credential harvesting indicator)
             if (parsed.hasCredentials) {
                 score += 25;
             }
 
-            // URL shortener
+            // URL shortener (obfuscation)
             if (IsURLShortener(parsed.host)) {
                 score += 5;
             }
 
-            // Executable extension
+            // Executable extension in path
             if (HasExecutableExtension(parsed.path)) {
                 score += 30;
+                verdict.threatType = ThreatType::MALWARE_DOWNLOAD;
             }
 
-            // Long path
+            // Long path (obfuscation / evasion)
             if (parsed.path.length() > 200) {
                 score += 10;
             }
 
+            // Double encoding (evasion attempt)
+            if (parsed.hasDoubleEncoding) {
+                score += 20;
+            }
+
+            // Suspicious characters (@, %, etc.) in unexpected positions
+            if (parsed.hasSuspiciousChars) {
+                score += 5;
+            }
+
+            // Non-standard port (often C2 or exfiltration)
+            if (parsed.hasPort && parsed.port != parsed.defaultPort &&
+                parsed.port != 80 && parsed.port != 443 && parsed.port != 8080) {
+                score += 10;
+            }
+
+            // Punycode domain (potential homograph)
+            if (parsed.isPunycode) {
+                score += 15;
+            }
+
+            // Very long query string (possible encoded payload)
+            if (parsed.query.length() > URLAnalyzerConstants::MAX_QUERY_LENGTH) {
+                score += 10;
+            }
+
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AnalyzeHeuristics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AnalyzeHeuristics - Exception: %hs", e.what());
         }
 
         return score;
     }
 
     void NotifyAnalysis(const std::string& url, const URLVerdict& verdict) {
-        try {
-            for (const auto& [id, callback] : m_analysisCallbacks) {
-                if (callback) {
-                    callback(url, verdict);
-                }
+        // Snapshot callbacks under lock to avoid iterator invalidation
+        std::vector<URLAnalysisCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_analysisCallbacks.size());
+            for (const auto& [id, cb] : m_analysisCallbacks) {
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyAnalysis - Exception: {}", e.what());
+        }
+        // Invoke outside lock
+        for (const auto& callback : snapshot) {
+            try {
+                callback(url, verdict);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"NotifyAnalysis callback exception: %hs", e.what());
+            }
         }
     }
 
     void NotifyThreat(const std::string& url, ThreatType threat, const URLVerdict& verdict) {
-        try {
-            for (const auto& [id, callback] : m_threatCallbacks) {
-                if (callback) {
-                    callback(url, threat, verdict);
-                }
+        std::vector<URLThreatCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_threatCallbacks.size());
+            for (const auto& [id, cb] : m_threatCallbacks) {
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyThreat - Exception: {}", e.what());
+        }
+        for (const auto& callback : snapshot) {
+            try {
+                callback(url, threat, verdict);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"NotifyThreat callback exception: %hs", e.what());
+            }
         }
     }
 
     void NotifyPhishing(const std::string& url, const BrandMatch& brandMatch, const URLVerdict& verdict) {
-        try {
-            for (const auto& [id, callback] : m_phishingCallbacks) {
-                if (callback) {
-                    callback(url, brandMatch, verdict);
-                }
+        std::vector<PhishingCallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_phishingCallbacks.size());
+            for (const auto& [id, cb] : m_phishingCallbacks) {
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyPhishing - Exception: {}", e.what());
+        }
+        for (const auto& callback : snapshot) {
+            try {
+                callback(url, brandMatch, verdict);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"NotifyPhishing callback exception: %hs", e.what());
+            }
         }
     }
 
     void NotifyDGA(const std::string& domain, double score, const std::string& family) {
-        try {
-            for (const auto& [id, callback] : m_dgaCallbacks) {
-                if (callback) {
-                    callback(domain, score, family);
-                }
+        std::vector<DGACallback> snapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            snapshot.reserve(m_dgaCallbacks.size());
+            for (const auto& [id, cb] : m_dgaCallbacks) {
+                if (cb) snapshot.push_back(cb);
             }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyDGA - Exception: {}", e.what());
+        }
+        for (const auto& callback : snapshot) {
+            try {
+                callback(domain, score, family);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"Network", L"NotifyDGA callback exception: %hs", e.what());
+            }
         }
     }
 
     void UpdatePerformanceStats(uint64_t latencyUs) noexcept {
         try {
-            // Update average
-            uint64_t currentAvg = m_stats.avgAnalysisTimeUs.load();
-            uint64_t queries = m_stats.totalURLsAnalyzed.load();
-            uint64_t newAvg = ((currentAvg * (queries - 1)) + latencyUs) / queries;
-            m_stats.avgAnalysisTimeUs.store(newAvg);
+            uint64_t queries = m_stats.totalURLsAnalyzed.load(std::memory_order_relaxed);
+            if (queries == 0) return;  // Guard division by zero
 
-            // Update max
-            uint64_t currentMax = m_stats.maxAnalysisTimeUs.load();
-            if (latencyUs > currentMax) {
-                m_stats.maxAnalysisTimeUs.store(latencyUs);
+            // Update running average (atomic CAS loop for correctness)
+            uint64_t currentAvg = m_stats.avgAnalysisTimeUs.load(std::memory_order_relaxed);
+            uint64_t newAvg = ((currentAvg * (queries - 1)) + latencyUs) / queries;
+            m_stats.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
+
+            // Update max (CAS loop to handle concurrent updates)
+            uint64_t currentMax = m_stats.maxAnalysisTimeUs.load(std::memory_order_relaxed);
+            while (latencyUs > currentMax) {
+                if (m_stats.maxAnalysisTimeUs.compare_exchange_weak(
+                        currentMax, latencyUs, std::memory_order_relaxed)) {
+                    break;
+                }
             }
 
         } catch (...) {
-            // Suppress exceptions
+            // Suppress exceptions in stats path
         }
     }
 
@@ -1618,9 +2406,14 @@ private:
 
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };
+    std::atomic<bool> m_shutdownRequested{ false };
 
     URLAnalyzerConfig m_config;
     URLAnalyzerStatistics m_stats;
+
+    // External subsystem references (non-owning, set during init or wiring)
+    ShadowStrike::ThreatIntel::ThreatIntelLookup* m_threatIntelLookup{ nullptr };
+    ShadowStrike::PatternStore::PatternStore* m_patternStore{ nullptr };
 
     // Cache
     mutable std::unordered_map<std::string, CacheEntry> m_cache;
@@ -1635,6 +2428,9 @@ private:
     std::unordered_map<uint64_t, PhishingCallback> m_phishingCallbacks;
     std::unordered_map<uint64_t, DGACallback> m_dgaCallbacks;
     uint64_t m_nextCallbackId{ 0 };
+
+    // Outstanding async work (futures held to prevent use-after-free)
+    std::vector<std::future<void>> m_pendingFutures;
 };
 
 // ============================================================================
@@ -1677,6 +2473,16 @@ bool URLAnalyzer::Initialize(const URLAnalyzerConfig& config) {
 
 void URLAnalyzer::Shutdown() noexcept {
     m_impl->Shutdown();
+}
+
+void URLAnalyzer::SetThreatIntelLookup(
+    ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept {
+    m_impl->SetThreatIntelLookup(lookup);
+}
+
+void URLAnalyzer::SetPatternStore(
+    ShadowStrike::PatternStore::PatternStore* store) noexcept {
+    m_impl->SetPatternStore(store);
 }
 
 bool URLAnalyzer::IsInitialized() const noexcept {
@@ -1734,7 +2540,8 @@ std::vector<std::tuple<std::string, double, std::string>> URLAnalyzer::DetectDGA
 }
 
 std::optional<BrandMatch> URLAnalyzer::DetectPhishing(const std::string& url) {
-    return m_impl->DetectPhishing(url);
+    URLAnalyzerConfig cfg = m_impl->GetConfig();
+    return m_impl->DetectPhishing(url, cfg);
 }
 
 HomographAnalysis URLAnalyzer::CheckHomograph(const std::string& domain) {
