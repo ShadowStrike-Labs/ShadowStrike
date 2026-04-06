@@ -3,16 +3,22 @@
   <img src="https://shadowstrike.dev/logo.png" alt="ShadowStrike Phantom" width="120"/>
 </a>
 
-<h3>ShadowStrike Phantom</h3>
+<h1>ShadowStrike Phantom</h1>
 
-**Open-Source Next-Generation Endpoint Protection Platform for Windows**
+<strong>Open-Source Next-Generation Endpoint Protection Platform for Windows</strong>
+
+<br/>
+<em>Custom kernel sensor · On-device AI/ML · Full-system emulation engine · 1.5M+ lines of C/C++/ASM</em>
+
+<br/><br/>
 
 [![Status](https://img.shields.io/badge/status-alpha-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![License](https://img.shields.io/badge/license-AGPL--3.0-blue?style=flat-square)](LICENSE.txt)
 [![Platform](https://img.shields.io/badge/platform-Windows%2010%2F11%20x64-lightgrey?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
-[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B20%20%2F%20ASM-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
+[![Language](https://img.shields.io/badge/language-C%20%2F%20C%2B%2B20%20%2F%20ASM%20%2F%20Python-orange?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![Coverity](https://img.shields.io/badge/Coverity%20Scan-0.25%20defect%2FKLoC-brightgreen?style=flat-square&logo=synopsys)](https://scan.coverity.com/projects/ShadowStrike-Labs-ShadowStrike)
 [![Commits](https://img.shields.io/github/commit-activity/w/ShadowStrike-Labs/ShadowStrike?style=flat-square&label=commits%2Fweek)](https://github.com/ShadowStrike-Labs/ShadowStrike/commits/master)
+[![LoC](https://img.shields.io/badge/lines%20of%20code-1.5M%2B-blue?style=flat-square)](https://github.com/ShadowStrike-Labs/ShadowStrike)
 [![Beta](https://img.shields.io/badge/beta%20target-early%202027-blueviolet?style=flat-square)](https://www.shadowstrike.dev/beta)
 
 [Website](https://www.shadowstrike.dev) · [Architecture](https://www.shadowstrike.dev/architecture) · [Roadmap](https://www.shadowstrike.dev/roadmap) · [Join Beta](https://www.shadowstrike.dev/beta) · [Research](https://www.shadowstrike.dev/research)
@@ -51,174 +57,382 @@ Your support helps build transparent, auditable endpoint protection that anyone 
 
 ## What Is ShadowStrike Phantom?
 
-ShadowStrike Phantom is a **from-scratch, open-source endpoint protection platform** for Windows 10/11 x64. It follows the same architectural principles as commercial EDR/XDR solutions — custom kernel sensor, behavioral analysis engine, memory-mapped threat intelligence databases, exploit prevention orchestrator — with one fundamental difference: **every line of code is auditable.**
+ShadowStrike Phantom is a **from-scratch, open-source endpoint protection platform** for Windows 10/11 x64, engineered to compete with the detection capabilities of commercial EDR/XDR solutions — CrowdStrike Falcon, SentinelOne Singularity, Microsoft Defender for Endpoint — with one fundamental difference: **every line of code is auditable.**
 
-This is not a wrapper around existing tools. `PhantomSensor.sys` is a 380,000-line WDM minifilter that has passed Coverity static analysis at 0.25 defects/KLoC and runs under Driver Verifier with zero violations. The user-mode agent implements 23+ detection modules covering everything from ROP chain detection to STIX 2.1 threat intelligence ingestion.
+This is not a wrapper around existing tools. This is not a PoC. This is a production-grade security platform comprising **five major subsystems**, each purpose-built from the ground up:
 
-> **Current state:** Alpha. The kernel driver is complete and verified. User-mode shared infrastructure is 76% complete, undergoing module-by-module security audits. On track for public beta in early 2027.
+| Subsystem | What It Is | Scale |
+|-----------|-----------|-------|
+| **[PhantomSensor](#-phantomsensor--kernel-driver)** | WDM minifilter kernel driver with 20 detection subsystems | 380K LoC · 241 source files |
+| **[Shared Modules](#-shared-modules--user-mode-detection-infrastructure)** | User-mode detection, protection, and intelligence infrastructure | 500K+ LoC · 461 source files · 23 modules |
+| **[PhantomEmulator](#-phantomemulator--malware-emulation-engine)** | Custom x86/x64 CPU emulation engine for safe malware detonation | 300K+ LoC · 195 source files |
+| **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device AI/ML threat classification — 5 neural network models | 23K LoC · 56 Python files |
+| **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler replacing third-party dependencies | In development |
+
+> **1.5 million lines** of C, C++20, x86 Assembly, and Python. One developer. Zero external contributions. Every commit mine.
+
+> **Current state:** Alpha. Kernel driver is complete and Coverity-verified. User-mode infrastructure in active module-by-module security audit. AI models trained on 452K real PE samples (EMBER 2018). Emulation engine operational. On track for public beta early 2027.
 
 ---
 
 ## Why This Exists
 
-Commercial endpoint protection products run kernel-level code you cannot inspect. Every major vendor — including those who have caused global outages from faulty kernel updates — ships a black box with ring-0 access to your machine.
+Commercial endpoint protection products run kernel-level code you cannot inspect. Every major vendor — including those who have caused [global outages](https://en.wikipedia.org/wiki/2024_CrowdStrike_incident) from faulty kernel updates — ships a black box with ring-0 access to your machine.
 
 ShadowStrike Phantom is the alternative:
 
 - **No hidden telemetry.** Every network call the product makes is in the source.
-- **No black-box detection.** Every rule, every heuristic, every scoring weight is auditable.
-- **No trust required.** Read the code. Verify it yourself.
+- **No black-box detection.** Every rule, every heuristic, every model weight is auditable.
+- **No trust required.** Read the code. Build it. Verify it. Run it on your own infrastructure.
 
 ---
 
 ## Project Status
 
-| Component | Status |
-|---|---|
-| Architecture | ✅ Designed and documented |
-| Core Infrastructure | ✅ Complete |
-| Kernel Driver (PhantomSensor.sys) | ✅ Complete — Coverity 0.25 defect/KLoC, Driver Verifier passed |
-| User-Mode Shared Modules | 🔧 In Progress — 76% (security audit phase) |
-| Local AI/ML Inference Pipeline | 📋 Planned — on-device threat classification |
-| Product Splits (EDR / XDR / Home) | 📋 Planned — after shared infrastructure |
-| Windows Service & IPC | 🔧 In Progress |
-| Management Dashboard (EDR/XDR) | 📋 Planned |
-| Desktop UI (Home) | 📋 Planned |
-| Public Beta | 🎯 Early 2027 |
-
-**Overall progress: ~76%** — Kernel sensor done, user-mode modules in active security audit and hardening.
+| Component | Status | Detail |
+|-----------|--------|--------|
+| Architecture | ✅ Complete | Designed and documented |
+| PhantomSensor.sys | ✅ Complete | 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier passed |
+| User-Mode Shared Modules | 🔧 85% | 23 modules — security audit phase |
+| PhantomEmulator | 🔧 90% | CPU emulation · 10 DLL stubs · Analysis suite |
+| PhantomCortex AI/ML | 🔧 80% | 5 models trained · ONNX inference · Nightly retraining pipeline |
+| PhantomDisassembler | 📋 Planned | Custom x86/x64 decoder — replacing Zydis dependency |
+| Kernel ↔ User-Mode Wiring | 🔧 70% | Encrypted IPC · Module-by-module integration in progress |
+| Product Tiers (Home/EDR/XDR) | 📋 Planned | After shared infrastructure |
+| Management Dashboard | 📋 Planned | EDR/XDR fleet management |
+| Public Beta | 🎯 Early 2027 | |
 
 ---
 
-## Detection Coverage
+## Platform Architecture
 
-ShadowStrike Phantom implements detection across **18 kernel subsystems** and **23+ user-space modules**:
+```
+┌──────────────────────────────────────────────────────────────────────────────────────────┐
+│                                      USER MODE                                            │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                           │
+│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐                  │
+│  │  PhantomEDR  │  │ PhantomHome  │  │ PhantomXDR   │  │  Dashboard   │                  │
+│  │  (Service)   │  │    (GUI)     │  │  (Service)   │  │  (Planned)   │                  │
+│  └──────┬───────┘  └──────┬───────┘  └──────┬───────┘  └──────────────┘                  │
+│         └──────────────────┴──────────────────┘                                           │
+│                            │                                                              │
+│  ┌─────────────────────────┴──────────────────────────┐                                  │
+│  │           Shared Detection Infrastructure           │                                  │
+│  │  ┌────────────────────────────────────────────────┐ │                                  │
+│  │  │ RealTimeProtection · ExploitPrevention         │ │                                  │
+│  │  │ BehaviorBlocker · ProcessCreationMonitor       │ │                                  │
+│  │  │ NetworkTrafficFilter · MemoryProtection        │ │                                  │
+│  │  │ FileSystemFilter · ZeroHourProtection          │ │                                  │
+│  │  └────────────────────────────────────────────────┘ │                                  │
+│  │  ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌────────┐ │                                  │
+│  │  │Signature │ │ Pattern  │ │  Hash    │ │ Threat │ │                                  │
+│  │  │  Store   │ │  Store   │ │  Store   │ │ Intel  │ │                                  │
+│  │  │ (B-tree) │ │(Aho-Cor.)│ │ (Bloom)  │ │(STIX)  │ │                                  │
+│  │  └──────────┘ └──────────┘ └──────────┘ └────────┘ │                                  │
+│  │  ┌──────────────────┐  ┌──────────────────────────┐ │                                  │
+│  │  │ PhantomEmulator  │  │     PhantomCortex AI     │ │                                  │
+│  │  │ x86/x64 CPU Emu  │  │  5 Neural Network Models │ │                                  │
+│  │  │ 10 DLL Emulation │  │  ONNX · On-Device · <1ms │ │                                  │
+│  │  └──────────────────┘  └──────────────────────────┘ │                                  │
+│  └─────────────────────────┬──────────────────────────┘                                  │
+│                            │                                                              │
+│              ┌─────────────┴─────────────┐                                               │
+│              │   Encrypted IPC Bridge    │                                                │
+│              │  (FilterConnectPort)      │                                                │
+│              └─────────────┬─────────────┘                                               │
+├────────────────────────────┼─────────────────────────────────────────────────────────────┤
+│                        KERNEL MODE                                                        │
+├────────────────────────────┼─────────────────────────────────────────────────────────────┤
+│              ┌─────────────┴─────────────┐                                               │
+│              │    PhantomSensor.sys       │                                               │
+│              │  WDM Minifilter · Alt 385210                                              │
+│              │  380K LoC · 20 Subsystems │                                               │
+│              └─────────────┬─────────────┘                                               │
+│   ┌────────────────────────┼────────────────────────┐                                    │
+│   ▼                        ▼                        ▼                                    │
+│ ┌──────────────┐ ┌─────────────────────┐ ┌──────────────────┐                            │
+│ │ File System  │ │  Process / Thread   │ │ Registry Monitor │                            │
+│ │  Callbacks   │ │  Image · Syscall    │ │ Persistence Det. │                            │
+│ └──────────────┘ └─────────────────────┘ └──────────────────┘                            │
+│ ┌──────────────┐ ┌─────────────────────┐ ┌──────────────────┐                            │
+│ │ Memory Mon   │ │  Object Callbacks   │ │ Self-Protection  │                            │
+│ │ VAD·ROP·Inj  │ │  Handle Protection  │ │ Anti-Tamper      │                            │
+│ └──────────────┘ └─────────────────────┘ └──────────────────┘                            │
+│ ┌──────────────┐ ┌─────────────────────┐ ┌──────────────────┐                            │
+│ │ Network Flt  │ │  Behavioral Engine  │ │ ETW Telemetry    │                            │
+│ │ C2·DGA·Exfil │ │  MITRE · Scoring    │ │ Structured Trace │                            │
+│ └──────────────┘ └─────────────────────┘ └──────────────────┘                            │
+├──────────────────────────────────────────────────────────────────────────────────────────┤
+│                              HARDWARE / FIRMWARE                                          │
+│                Secure Boot · TPM Attestation · Firmware Integrity                         │
+└──────────────────────────────────────────────────────────────────────────────────────────┘
+```
 
-### Kernel-Mode (PhantomSensor.sys)
+---
+
+## 🛡️ PhantomSensor — Kernel Driver
+
+A **380,000-line WDM minifilter** kernel driver that intercepts, analyzes, and blocks threats at the lowest software level. Coverity static analysis at **0.25 defects/KLoC**. Driver Verifier: zero violations.
 
 | Subsystem | Techniques Covered |
-|---|---|
-| **Syscall Monitor** | Direct syscall detection · Heaven's Gate (WoW64) · Hell's Gate / Halo's Gate · NTDLL integrity · Callstack origin analysis |
-| **Memory Monitor** | VAD tree tracking · Process injection (VirtualAllocEx chain) · Process hollowing · Reflective DLL · Shellcode detection · ROP chains · Heap spray |
-| **Behavioral Engine** | MITRE ATT&CK mapping · Kill-chain correlation · Threat scoring (0–100) · IOC matching |
-| **File System Callbacks** | Pre/post I/O interception · Ransomware pattern detection · Rename/delete monitoring · Entropy analysis |
-| **Process Callbacks** | LOLBin detection · Parent spoofing · Token manipulation · AMSI bypass detection · WSL boundary crossing |
-| **Network Filter** | C2 beacon detection · DGA pattern recognition · DNS anomaly · Data exfiltration · SSL metadata inspection |
-| **Self-Protection** | Anti-unload · Callback protection · Runtime `.text` integrity · UEFI variable monitoring · Anti-debug |
-| **ELAM Alternative** | Boot-time driver validation · Signature verification · Early threat heuristics |
+|-----------|-------------------|
+| **Syscall Monitor** | Direct syscall detection · Heaven's Gate (WoW64) · Hell's Gate / Halo's Gate · NTDLL integrity · Callstack origin analysis · SSN validation |
+| **Memory Monitor** | VAD tree tracking · Process injection chains · Process hollowing · Reflective DLL loading · Shellcode detection · ROP chains · Heap spray · Code cave detection |
+| **Behavioral Engine** | MITRE ATT&CK mapping (550+ TIDs) · Kill-chain correlation · Threat scoring (0–100) · IOC matching · Attack chain tracking · Anomaly detection |
+| **File System Callbacks** | Pre/post I/O interception · Ransomware pattern detection (write-rate, entropy, extension analysis) · Rename/delete monitoring · MFT analysis |
+| **Process Callbacks** | LOLBin detection · Parent PID spoofing · Token manipulation · Command-line analysis · WSL boundary crossing · Process masquerading |
+| **Thread Callbacks** | Remote thread detection · APC injection monitoring · Thread context hijacking · Start address validation |
+| **Image Load Callbacks** | DLL injection detection · Reflective loading · Unsigned module tracking · Known-vulnerable driver blocking |
+| **Registry Callbacks** | Persistence detection (Run/RunOnce/Services) · Security descriptor tampering · Registry key protection |
+| **Network Filter** | C2 beacon detection · DGA domain recognition · DNS anomaly analysis · Data exfiltration detection · TLS metadata inspection |
+| **Object Callbacks** | Handle-based self-protection · Suspicion scoring · Handle stripping for protected processes |
+| **Self-Protection** | Anti-unload · Callback guard · Runtime `.text` integrity verification · Anti-debug · UEFI variable monitoring |
+| **ALPC Monitor** | Advanced Local Procedure Call tracking · Cross-process communication analysis |
+| **ETW Provider** | Structured kernel telemetry · Event correlation · Diagnostic tracing |
+| **Sync Infrastructure** | Thread pool · Timer manager · Work queue · Deferred procedure calls · Async work queue |
+| **Cache System** | Scan cache with LRU eviction · TTL-based expiry · Concurrent access optimization |
+| **Transaction Monitor** | NTFS transactional operations · TxF abuse detection (process doppelgänging) |
+| **Power Management** | Sleep/hibernate state tracking · Resume-time integrity checks |
+| **Exclusion Engine** | Per-process · Per-path · Per-hash exclusion management with kernel-user sync |
 
-### User-Space (Detection Engines)
+### Kernel Technologies
+- Windows Filter Manager minifilter — altitude **385210**, 14 operation callbacks
+- `PsSetCreateProcessNotifyRoutineEx2` — process lifecycle with LOLBin scoring
+- `CmRegisterCallbackEx` — registry monitoring with persistence detection
+- `ObRegisterCallbacks` — handle-based self-protection with suspicion scoring
+- `/INTEGRITYCHECK` linked for `PsSetCreateProcessNotifyRoutineEx` compliance
+- CNG (BCrypt) — kernel-mode SHA-256/MD5 hashing for file reputation
+- Memory-mapped shared definitions for kernel↔user-mode type safety
 
+---
+
+## 🧠 PhantomCortex — On-Device AI/ML
+
+Five purpose-built neural network models running inference **locally on each endpoint** — no cloud dependency for detection decisions. Trained on **452,000 real PE samples** from the EMBER 2018 dataset plus synthetic behavioral, memory, network, and emulation data.
+
+| Model | Architecture | Input | Purpose |
+|-------|-------------|-------|---------|
+| **Cortex-Static** | LightGBM (gradient boosting) | PE headers, imports, sections, entropy | Static file classification before execution |
+| **Cortex-Behavioral** | 1D CNN | API call sequences (512-length) | Runtime behavior pattern recognition |
+| **Cortex-Emulation** | GRU (recurrent) | Emulation trace sequences | Malware family classification from sandbox runs |
+| **Cortex-Memory** | MLP (feedforward) | Memory region features | Injected code / shellcode detection in process memory |
+| **Cortex-Network** | Autoencoder (anomaly) | Network flow features | C2 communication and exfiltration anomaly detection |
+
+### Training Pipeline
+- **Nightly automated retraining** with fresh threat intelligence feeds
+- **INT8 quantization** for minimal CPU footprint on endpoints
+- **ONNX Runtime** inference — sub-millisecond scoring per sample
+- **6 threat intel feeds**: EMBER, Feodo Tracker, MalwareBazaar, OTX AlienVault, ThreatFox, URLhaus
+- **Feature extraction pipeline** with PE, behavioral, emulation, memory, and network feature modules
+- **Model evaluation** with precision/recall/F1 tracking, A/B deployment support
+
+### C++ Inference Bridge (`src/Shared_modules/AI/`)
+- `PhantomCortex.cpp` — Singleton orchestrator coordinating all 5 models
+- `ModelInference.cpp` — ONNX Runtime integration with thread-safe batch inference
+- `ModelCache.cpp` — LRU model cache with secure hash verification
+- `FeatureExtractor.cpp` — Real-time feature extraction from scan pipeline
+- `CortexConfig.cpp` — Dynamic model configuration with hot-reload
+
+---
+
+## 🔬 PhantomEmulator — Malware Emulation Engine
+
+A **custom-built x86/x64 CPU emulation engine** for safe malware detonation and analysis — no hypervisor dependency, no third-party emulation library. Designed to execute and analyze packed, obfuscated, and evasion-aware malware in a fully controlled virtual environment.
+
+### Core Engine
+| Component | Description |
+|-----------|-------------|
+| **CPU Emulator** | Full x86/x64 instruction execution — arithmetic, logic, control flow, stack, string, FPU, SSE2, SSE4, AES-NI |
+| **Instruction Decoder** | Custom decoder with VEX/EVEX/AVX-512 prefix support and YMM register handling |
+| **JIT Compiler** | Just-in-time compilation framework for hot-path acceleration |
+| **Virtual Memory** | Page-level memory management with protection flags, guard pages, and access tracking |
+| **PE Loader** | Full PE32/PE32+ loading — imports, exports, relocations, TLS callbacks, resources, shellcode injection |
+| **Thread Scheduler** | Cooperative multi-threading with synchronization primitives (mutex, event, semaphore, critical section) |
+
+### Windows API Emulation — 10 DLLs, 90+ API Handlers
+| DLL | Emulated APIs |
+|-----|--------------|
+| **kernel32.dll** | File I/O · Memory · Process · Thread · Console · Library · APC Injection · File Mapping · Sync · Time · Environment · Strings |
+| **ntdll.dll** | Nt/Zw File · Memory · Process · Thread · Registry · System Info · Token · Loader · RTL · Syscall dispatch |
+| **advapi32.dll** | Registry · Service · Security · Credential access |
+| **ws2_32.dll** | Socket · Connect · Send/Recv · DNS resolution |
+| **winhttp.dll** | HTTP sessions · Request/Response · TLS |
+| **wininet.dll** | Internet sessions · FTP · HTTP · Cache |
+| **ole32.dll** | COM initialization · Object creation |
+| **shell32.dll** | Shell execution · File operations |
+| **user32.dll** | Window messages · Screen capture · Input |
+| **urlmon.dll** | URL download · MIME detection |
+
+### Virtual OS Environment
+- **Virtual File System** — Isolated FS with pre-seeded Windows directory structure
+- **Virtual Registry** — Full HKLM/HKCU emulation with common key population
+- **Virtual Network** — Simulated DNS, HTTP, and socket responses for C2 detonation
+- **Virtual Process** — Process environment block (PEB/TEB) emulation
+
+### Anti-Evasion Countermeasures
+- **Timing anti-evasion** — Accelerated tick counts, `QueryPerformanceCounter` spoofing, `GetTickCount` manipulation
+- **Debugger anti-evasion** — `IsDebuggerPresent` returns false, PEB flags cleaned, NtQueryInformationProcess spoofed
+- **Environment anti-evasion** — Realistic CPU/RAM/disk metrics, proper username/computername, registry artifacts
+- **VM anti-evasion** — No hypervisor artifacts, realistic CPUID responses, clean SMBIOS/DMI data
+
+### Analysis Suite — 12 Analyzers
+| Analyzer | Capability |
+|----------|-----------|
+| **APISequenceAnalyzer** | Markov chain API call pattern analysis · n-gram extraction · Sequence similarity scoring |
+| **BehaviorMonitor** | 150 behavioral rules covering fileless, LOLBin, injection, credential theft, evasion, ransomware |
+| **CryptoDetector** | AES/Twofish/Serpent/ECC detection · Encoding/obfuscation · Ransomware crypto patterns |
+| **EvasionDetector** | Anti-debug, anti-VM, anti-sandbox technique identification |
+| **IOCExtractor** | IP/domain/URL/email/hash/mutex/registry IOC extraction from emulation traces |
+| **MemoryForensics** | Process memory diff analysis · Injected code detection · Unpacking artifact recovery |
+| **MITREMapper** | Automatic MITRE ATT&CK technique attribution from observed behaviors |
+| **NetworkBehaviorAnalyzer** | C2 signature matching · JA3 fingerprinting · TLS analysis · P2P detection · HTTP header profiling |
+| **StringExtractor** | ASCII/Unicode/stack-constructed string recovery from emulation memory |
+| **ThreatScorer** | Multi-signal threat scoring with weighted evidence aggregation |
+| **UnpackingEngine** | Runtime unpacking with OEP detection · Multi-layer unpacking · 100+ packer signatures |
+| **PerformanceProfiler** | Instruction-level profiling for emulation optimization |
+
+### Integration
+- **KernelIPCBridge** — Direct communication with PhantomSensor.sys for kernel-assisted analysis
+- **ResultConverter** — Translates emulation results to unified detection events
+- **EmulationSession** — Orchestrates full sample analysis with timeout and resource limits
+
+---
+
+## 🔧 PhantomDisassembler — Custom Instruction Decoder
+
+> **Status: In Development**
+
+A from-scratch x86/x64 instruction decoder being built to replace the Zydis third-party dependency. Goal: zero external dependencies for instruction-level analysis across the entire platform.
+
+The PhantomEmulator's existing instruction decoder (VEX/EVEX/AVX-512 support) serves as the foundation.
+
+---
+
+## 🔍 Shared Modules — User-Mode Detection Infrastructure
+
+**23 module families** comprising the user-mode detection, protection, and intelligence stack:
+
+### Real-Time Protection Layer
+| Module | Role |
+|--------|------|
+| **RealTimeProtection** | Master orchestrator — coordinates all detection engines |
+| **ExploitPrevention** | ROP · JIT spray · Stack pivot · Heap spray · Kernel exploit detection · DEP/ASLR/CFG/CET enforcement |
+| **BehaviorBlocker** | Real-time behavioral analysis with MITRE ATT&CK correlation |
+| **FileSystemFilter** | On-access scan orchestration · LRU cache · Kernel minifilter communication |
+| **NetworkTrafficFilter** | C2 beacon analysis · DGA detection · Exfiltration monitoring · WFP integration |
+| **ProcessCreationMonitor** | LOLBin classification · Parent-child validation · Command-line analysis · Masquerading detection |
+| **MemoryProtection** | DEP enforcement · Guard pages · W^X policy · ROP/shellcode/reflective DLL detection |
+| **ZeroHourProtection** | Zero-day cloud verdict · Adaptive heuristics · Outbreak mode |
+| **FileIntegrityMonitor** | Critical system file integrity verification |
+| **AccessControlManager** | Fine-grained access policy enforcement |
+
+### Detection Data Stores
+| Store | Technology |
+|-------|-----------|
+| **SignatureStore** | Custom B-tree index · YARA rule integration · Copy-on-write updates · Bulk import |
+| **PatternStore** | Aho-Corasick automaton · Boyer-Moore · KMP failure functions · SSE4.2/AVX2 SIMD acceleration |
+| **HashStore** | Bloom filter (0.001% FP) · Memory-mapped DB · O(1) reputation lookups |
+| **FuzzyHasher** | Custom approximate hash engine · Clean-room implementation · Zero GPL dependencies |
+| **ThreatIntel** | STIX 2.1 / TAXII 2.1 ingestion · Sharded B-tree index · LRU cache · IOC correlation |
+| **Whitelist** | Hash + pattern whitelisting · Bloom filter · Publisher trust chains |
+
+### Core Detection Modules
 | Category | Modules |
-|---|---|
-| **Anti-Evasion** | VM detection · Sandbox evasion · Debugger detection · Packer analysis · Metamorphic/polymorphic engine (Zydis) |
-| **Exploit Prevention** | ROP detection · JIT spray · Stack pivot · Heap spray · Kernel exploit detection · EAF/IAF · DEP/ASLR/CFG/CET enforcement |
-| **Behavioral Analysis** | BehaviorBlocker · AccessControlManager · Real-time process monitoring · MITRE ATT&CK correlation |
-| **Data Stores** | SignatureStore (B-tree + YARA) · PatternStore (Aho-Corasick + SIMD) · HashStore (Bloom filter) · ThreatIntel (STIX 2.1) |
-| **Protection** | Ransomware (honeypot + VSS guard + entropy) · Self-defense · File/Registry/Process protection |
-| **Other** | Script scanning (AMSI · PowerShell · JS) · Web protection · USB/BadUSB · Crypto-miner detection · Forensics |
+|----------|---------|
+| **Process** | ProcessAnalyzer · ProcessInjectionDetector · ProcessHollowingDetector · AtomBombingDetector · DLLInjectionDetector · ReflectiveDLLDetector · ThreadHijackDetector · MemoryScanner · ProcessMonitor · ProcessKiller |
+| **File System** | DirectoryMonitor · FileWatcher · FileHasher · FileTypeAnalyzer · ExecutableAnalyzer · ArchiveExtractor · DocumentScanner · MediaFileScanner · FileLockManager · MountPointMonitor · FileReputation |
+| **Network** | NetworkMonitor · DNSMonitor · BotnetDetector · FirewallManager · DDosProtection · EmailScanner · TorDetector · P2PMonitor · WebProtection |
+| **Registry** | RegistryAnalyzer · EventLogger |
+| **Engine** | ScanEngine · ThreatDetector · HeuristicAnalyzer · QuarantineManager · PolymorphicDetector · ZeroDayDetector · PackerUnpacker · SandboxAnalyzer · EmulationEngine · MachineLearningDetector |
+| **System** | CrashHandler |
+
+### Anti-Evasion Suite
+| Module | Detection |
+|--------|----------|
+| **VMEvasionDetector** | 50+ VM detection techniques with ASM-level CPUID/RDTSC/MSR checks |
+| **SandboxEvasionDetector** | Sleep acceleration · Mouse movement · Screen resolution · Environment fingerprinting |
+| **DebuggerEvasionDetector** | Hardware breakpoints · Software breakpoints · Timing checks · NtQueryInformationProcess |
+| **PackerDetector** | 100+ packer signatures · Entropy analysis · Section characteristics · Import table anomalies |
+| **ProcessEvasionDetector** | Parent PID spoofing · Token theft · Job object escape · WoW64 abuse |
+| **NetworkBasedEvasionDetector** | DNS tunneling · Domain fronting · Fast-flux · Encrypted C2 channels |
+| **TimeBasedEvasionDetector** | RDTSC delta analysis · NTP manipulation · Delayed execution |
+| **EnvironmentEvasionDetector** | User/system artifact checks · Registry fingerprinting · File system probing |
+| **Metamorphic/Polymorphic** | Instruction-level mutation detection · Code morphing analysis |
+
+### Security & Self-Defense
+| Module | Protection |
+|--------|-----------|
+| **SelfDefense** | Orchestrates all protection modules |
+| **TamperProtection** | File hash integrity · DLL hijack prevention · Critical path monitoring |
+| **ProcessProtection** | Anti-termination · Handle stripping · Token protection |
+| **MemoryProtection** | DEP · Guard pages · RWX prevention |
+| **FileProtection** | ACL hardening · ADS stripping · Integrity monitoring |
+| **RegistryProtection** | Service key protection · Run/RunOnce guarding |
+| **AntiDebug** | Multi-layer debugger detection and prevention |
+| **CryptoManager** | AES-GCM encryption · BCryptGenRandom · Key zeroization |
+| **CertificateValidator** | Chain validation · CRL/OCSP checking |
+| **DigitalSignatureValidator** | Authenticode verification · Catalog file validation |
+
+### Scripts & Scripting Engine Protection
+| Module | Coverage |
+|--------|---------|
+| **AMSIIntegration** | AMSI bypass detection · Provider integrity · Tamper repair |
+| **PowerShellScanner** | -EncodedCommand · IEX · AMSI bypass · Constrained Language Mode bypass |
+| **JavaScriptScanner** | Obfuscation detection · eval() chains · WSH abuse |
+| **VBScriptScanner** | WScript.Shell · CreateObject · ActiveX abuse |
+| **MacroDetector** | VBA macros · AutoOpen/AutoExec · Macro 4.0 · DDE |
+| **PythonScriptScanner** | exec/eval · subprocess · ctypes injection · PyInstaller analysis |
+
+### Other Infrastructure
+| Module | Purpose |
+|--------|---------|
+| **PEParser** | Full PE32/PE32+ parsing · Section analysis · Import/export · Delay imports · .NET metadata |
+| **Communication** | Encrypted kernel↔user-mode IPC · Message dispatch · Protocol handling |
+| **Database** | SQLite-backed persistent storage · Configuration management |
+| **RansomwareProtection** | Honeypot files · VSS guard · Entropy-based detection · Rollback |
+| **Performance** | CPU/Disk/Network monitoring · Ransomware write-rate detection · C2 beaconing |
+| **Update** | Secure delta updates · Cryptographic verification · Rollback support |
+| **Config** | Centralized configuration management |
 
 ### MITRE ATT&CK Coverage
 
-**550+ technique IDs** defined across all 14 ATT&CK tactics. Every detection fires with precise T-ID attribution.
+**550+ technique IDs** mapped across all 14 ATT&CK tactics. Every detection fires with precise T-ID attribution for SOC integration.
 
 ---
 
-## Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────────────────┐
-│                              USER MODE                                       │
-├─────────────────────────────────────────────────────────────────────────────┤
-│  ┌─────────────┐  ┌─────────────┐  ┌─────────────┐  ┌─────────────────────┐ │
-│  │   GUI App   │  │  Service    │  │  Scanner    │  │  Threat Intel       │ │
-│  │  (Planned)  │  │  Manager    │  │  Engine     │  │  Feed Manager       │ │
-│  └──────┬──────┘  └──────┬──────┘  └──────┬──────┘  └──────────┬──────────┘ │
-│         └────────────────┴────────────────┴─────────────────────┘            │
-│                                   │                                          │
-│                    ┌──────────────┴──────────────┐                           │
-│                    │     Communication Port      │                           │
-│                    │    (FilterConnectPort)      │                           │
-│                    └──────────────┬──────────────┘                           │
-├───────────────────────────────────┼─────────────────────────────────────────┤
-│                              KERNEL MODE                                     │
-├───────────────────────────────────┼─────────────────────────────────────────┤
-│                    ┌──────────────┴──────────────┐                           │
-│                    │       PhantomSensor.sys     │                           │
-│                    │    (Minifilter · Alt. 385210)│                          │
-│                    └──────────────┬──────────────┘                           │
-│    ┌──────────────────────────────┼──────────────────────────────┐           │
-│    ▼                              ▼                              ▼           │
-│ ┌──────────────┐  ┌───────────────────────────┐  ┌──────────────────────┐   │
-│ │  File System │  │  Process/Thread/Image     │  │  Registry Callback   │   │
-│ │  Callbacks   │  │  Callbacks + Syscall Mon  │  │  Persistence Det.    │   │
-│ └──────────────┘  └───────────────────────────┘  └──────────────────────┘   │
-│ ┌──────────────┐  ┌───────────────────────────┐  ┌──────────────────────┐   │
-│ │  Memory Mon  │  │    Object Callbacks       │  │   Self Protection    │   │
-│ │  VAD/ROP/Inj │  │    (Handle Protection)    │  │   Anti-Tamper        │   │
-│ └──────────────┘  └───────────────────────────┘  └──────────────────────┘   │
-├─────────────────────────────────────────────────────────────────────────────┤
-│                         HARDWARE / FIRMWARE                                  │
-│              Secure Boot · TPM Attestation · Firmware Integrity              │
-└─────────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## Core Technologies
-
-### Kernel Driver
-- Windows Filter Manager minifilter — altitude 385210, 14 operation callbacks
-- `CmRegisterCallbackEx` — registry monitoring with persistence detection
-- `PsSetCreateProcessNotifyRoutineEx2` — process lifecycle with LOLBin scoring
-- `ObRegisterCallbacks` — handle-based self-protection with suspicion scoring
-- CNG (BCrypt) — kernel-mode SHA-256 hashing for file reputation
-- 380,000 lines of C, Coverity-scanned at 0.25 defects/KLoC
-
-### Detection Data Stores
-- **SignatureStore** — Custom B-tree index with YARA rule integration and copy-on-write updates
-- **PatternStore** — Aho-Corasick + Boyer-Moore with SSE4.2/AVX2 SIMD acceleration
-- **HashStore** — Bloom filter + memory-mapped DB for O(1) hash reputation lookups
-- **FuzzyHasher** — Custom approximate hash engine (built in-house, zero GPL dependencies)
-- **ThreatIntel** — STIX 2.1 / TAXII 2.1 feed ingestion, sharded B-tree index with LRU cache
-
-### Infrastructure
-- Memory-mapped file databases for zero-copy persistence
-- Lock-free data structures on hot paths
-- ETW-based structured telemetry
-- Encrypted kernel ↔ user-space IPC (FilterConnectPort)
-- Enterprise thread pool with task priorities, cancellation, and ETW tracing
-- Secure update pipeline with cryptographic verification (Windows BCrypt)
-
----
-
-## Planned: Local AI/ML Integration
-
-On-device machine learning models for threat classification — no cloud dependency for detection decisions. Trained on curated malware datasets, running inference locally on each endpoint for real-time scoring alongside the heuristic and signature engines.
-
----
-
-## Product Tiers (Planned)
+## Product Tiers
 
 | Tier | Target | Description |
-|---|---|---|
-| **Phantom Home** | Consumer endpoints | Lightweight protection with local UI |
+|------|--------|-------------|
+| **Phantom Home** | Consumer endpoints | Lightweight protection with local desktop UI |
 | **Phantom EDR** | Enterprise endpoints | Full detection + response with management dashboard |
 | **Phantom XDR** | Enterprise fleet | Extended detection across endpoint, cloud, identity, network |
 
-All three tiers share the same kernel sensor and detection engine. Product differentiation happens at the orchestration, UI, and management layers.
+All three tiers share the same kernel sensor, detection engines, AI models, and emulation engine. Product differentiation happens at the orchestration, UI, and management layers.
 
 ---
 
 ## Building
 
-> The codebase is under active development and not yet packaged for external builds. Build instructions will be provided when the project reaches beta.
+> ⚠️ The codebase is under active development and not yet packaged for external builds. Full build instructions will be provided when the project reaches beta.
 
 **Requirements:**
-- Visual Studio 2022 with C++20 support
+- Visual Studio 2022 with C++20 support (MSVC v143)
 - Windows Driver Kit (WDK) 10.0.22621.0+
 - Windows SDK 10.0.22621.0+
+- Python 3.10+ with PyTorch (for PhantomCortex training only)
 - Test environment: Windows 10/11 x64 VM with Driver Verifier enabled
+
+**Quick build (user-mode only):**
+```powershell
+MSBuild.exe ShadowStrike.sln /p:Configuration=Release /p:Platform=x64 /t:ShadowStrike /m
+```
+
+**Full build (includes kernel driver — requires WDK):**
+```powershell
+MSBuild.exe ShadowStrike.sln /p:Configuration=Release /p:Platform=x64 /m
+```
 
 ---
 
@@ -226,29 +440,61 @@ All three tiers share the same kernel sensor and detection engine. Product diffe
 
 ```
 ShadowStrike/
-├── PhantomSensor/           # Kernel driver (WDM minifilter, 380K LoC)
+├── PhantomSensor/              # Kernel driver — WDM minifilter (380K LoC, 20 subsystems)
+│   └── PhantomSensor/
+│       ├── Behavioral/         # MITRE engine · Threat scoring · IOC matching
+│       ├── Callbacks/          # Process · Thread · Image · Registry · FS callbacks
+│       ├── Communication/      # Kernel↔user-mode IPC port
+│       ├── Memory/             # VAD tracking · Injection detection · ROP/shellcode
+│       ├── Network/            # WFP filters · C2/DGA/exfil detection
+│       ├── Syscall/            # Direct syscall · Heaven's Gate · Hell's Gate
+│       ├── SelfProtection/     # Anti-tamper · Callback guard · Integrity
+│       ├── Sync/               # Thread pool · Timer · Work queue · DPC
+│       └── ...                 # 20 subsystem folders total
+│
+├── PhantomEmulator/            # Custom x86/x64 emulation engine (195 source files)
+│   ├── Core/                   # CPU · Memory · JIT · PE Loader · Threading
+│   │   ├── CPU/                # Instruction decoder · Executor (15 categories)
+│   │   ├── Memory/             # Virtual memory manager · Memory tracker
+│   │   ├── Loader/             # PE/shellcode loading · Import/export resolution
+│   │   └── Threading/          # Cooperative scheduler · Sync primitives
+│   ├── WinAPI/                 # 10 DLLs · 90+ API handlers
+│   ├── VirtualOS/              # Virtual FS · Registry · Network · Anti-evasion
+│   ├── Analysis/               # 12 analyzers · Behavior · Crypto · MITRE · IOC
+│   ├── Integration/            # Kernel IPC bridge · Session · Result converter
+│   └── Common/                 # Types · Config · Constants · Errors
+│
+├── PhantomCortex/              # AI/ML training pipeline (Python)
+│   └── training/
+│       ├── models/             # 5 model architectures (LightGBM, CNN, GRU, MLP, AE)
+│       ├── features/           # Feature extraction pipeline
+│       ├── feeds/              # 6 threat intel feed integrators
+│       ├── data/               # Dataset generators · EMBER loader
+│       ├── evaluation/         # Model evaluation · Metrics
+│       └── export/             # ONNX export · Quantization
+│
 ├── src/
-│   ├── Shared_modules/      # Shared detection infrastructure
-│   │   ├── RealTime/        # RTP · ExploitPrevention · BehaviorBlocker · ACM
-│   │   ├── Security/        # File · Registry · Process · Self-defense
-│   │   ├── SignatureStore/   # B-tree · YARA rules · COW updates
-│   │   ├── ThreatIntel/     # STIX/TAXII · IOC · Bloom filter · LRU cache
-│   │   ├── HashStore/       # Bloom filter · memory-mapped reputation DB
-│   │   ├── PatternStore/    # Aho-Corasick · Boyer-Moore · SIMD
-│   │   ├── Whitelist/       # Hash/pattern whitelisting with Bloom filter
-│   │   ├── Update/          # Secure delta-update pipeline (BCrypt verified)
-│   │   ├── AntiEvasion/     # VM · debugger · sandbox · packer · polymorphic
-│   │   ├── Exploits/        # ROP · JIT spray · heap spray · kernel exploits
-│   │   ├── Utils/           # Logger · ThreadPool · StringUtils · SystemUtils
-│   │   └── ...              # 23+ modules
-│   ├── PhantomEDR/          # EDR product layer
-│   ├── PhantomHome/         # Home product layer
-│   └── PhantomXDR/          # XDR product layer (planned)
-├── include/                 # Vendored headers (YARA · Zydis · SQLiteCpp · tlsh)
-├── vendor/                  # Vendored libraries
-├── tests/                   # Unit · integration · fuzz
-├── malware_tests/           # Malware sample testing framework
-└── docs/                    # Architecture documentation
+│   └── Shared_modules/         # User-mode detection infrastructure (461 source files)
+│       ├── AI/                 # C++ inference bridge → PhantomCortex models
+│       ├── Core/               # Engine · FileSystem · Network · Process · Registry · System
+│       ├── RealTime/           # RTP · Exploit prevention · Behavior blocking
+│       ├── AntiEvasion/        # 9 evasion detection modules + ASM
+│       ├── Security/           # 10 self-defense modules
+│       ├── Scripts/            # 6 script analysis engines
+│       ├── SignatureStore/     # B-tree · YARA · Copy-on-write
+│       ├── PatternStore/       # Aho-Corasick · Boyer-Moore · SIMD
+│       ├── HashStore/          # Bloom filter · Memory-mapped DB
+│       ├── ThreatIntel/        # STIX 2.1 · IOC · Sharded index
+│       ├── PEParser/           # Full PE32/PE32+ parser
+│       ├── RansomwareProtection/ # Honeypot · VSS · Entropy · Rollback
+│       ├── Performance/        # CPU · Disk · Network monitoring
+│       └── ...                 # 23 module families total
+│
+├── include/                    # Vendored headers (YARA · SQLiteCpp · tlsh)
+├── vendor/                     # Vendored libraries
+├── tests/                      # Unit · integration · fuzz tests
+├── malware_tests/              # Malware sample testing framework
+└── docs/                       # Architecture documentation
 ```
 
 ---
@@ -257,7 +503,7 @@ ShadowStrike/
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) before submitting anything.
 
-> ShadowStrike is not actively accepting external code contributions during the alpha phase. Contribution guidelines will be published when the project reaches beta.
+> ShadowStrike is not actively accepting external code contributions during the alpha phase. Contribution guidelines will be published when the project reaches beta. Issues and discussions are welcome.
 
 ---
 
@@ -278,15 +524,18 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 ## Acknowledgments
 
 - The Windows Driver Kit documentation and Microsoft kernel engineering resources
-- [YARA](https://github.com/VirusTotal/yara) — malware pattern matching
-- [Zydis](https://github.com/zyantific/zydis) — x86/x64 instruction decoder
+- [YARA](https://github.com/VirusTotal/yara) — malware pattern matching engine
+- The [EMBER](https://github.com/elastic/ember) dataset by Elastic — PE feature training data
 - The security research community whose published work makes open-source EDR possible
+- Every open-source threat intel feed provider (abuse.ch, AlienVault OTX, MalwareBazaar)
 
 ---
 
 <div align="center">
 
 **ShadowStrike-Labs** · Alpha · [shadowstrike.dev](https://www.shadowstrike.dev)
+
+*1.5 million lines of code. One developer. Every line auditable.*
 
 For business inquiries: [contact@shadowstrike.dev](mailto:contact@shadowstrike.dev)
 
