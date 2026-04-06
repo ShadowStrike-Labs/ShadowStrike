@@ -331,7 +331,7 @@ struct alignas(64) WatchEntry {
     bool recursive{ true };
     WatchFilter filter{ WatchFilter::AllChanges };
     WatchPriority priority{ WatchPriority::Normal };
-    WatchState state{ WatchState::Pending };
+    std::atomic<WatchState> state{ WatchState::Pending };
 
     // Pattern filters
     std::vector<std::wstring> includePatterns;   // Glob patterns to include
@@ -341,6 +341,39 @@ struct alignas(64) WatchEntry {
     std::atomic<uint64_t> eventsReceived{ 0 };
     std::chrono::steady_clock::time_point createdTime;
     std::chrono::steady_clock::time_point lastEventTime;
+
+    WatchEntry() = default;
+
+    WatchEntry(const WatchEntry& other)
+        : watchId(other.watchId)
+        , directory(other.directory)
+        , recursive(other.recursive)
+        , filter(other.filter)
+        , priority(other.priority)
+        , state(other.state.load(std::memory_order_relaxed))
+        , includePatterns(other.includePatterns)
+        , excludePatterns(other.excludePatterns)
+        , eventsReceived(other.eventsReceived.load(std::memory_order_relaxed))
+        , createdTime(other.createdTime)
+        , lastEventTime(other.lastEventTime) {
+    }
+
+    WatchEntry& operator=(const WatchEntry& other) {
+        if (this != &other) {
+            watchId = other.watchId;
+            directory = other.directory;
+            recursive = other.recursive;
+            filter = other.filter;
+            priority = other.priority;
+            state.store(other.state.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            includePatterns = other.includePatterns;
+            excludePatterns = other.excludePatterns;
+            eventsReceived.store(other.eventsReceived.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            createdTime = other.createdTime;
+            lastEventTime = other.lastEventTime;
+        }
+        return *this;
+    }
 };
 
 /**
