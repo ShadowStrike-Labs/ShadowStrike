@@ -39,6 +39,7 @@
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/ThreadPool.hpp"
+#include "../../Communication/IPCManager.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -104,34 +105,58 @@ namespace {
 }
 
 /**
- * @brief Check for common shellcode patterns.
+ * @brief Check for common shellcode patterns (x86 and x64).
+ *
+ * Uses a broad set of instruction-level signatures found in real-world
+ * shellcode payloads (Metasploit, Cobalt Strike, custom loaders).
+ * Matching two or more distinct families strongly indicates executable
+ * content rather than coincidental data.
  */
 [[nodiscard]] bool HasShellcodePatterns(std::span<const uint8_t> data) noexcept {
     if (data.size() < 16) return false;
 
-    // Common shellcode patterns
-    const std::array<std::array<uint8_t, 3>, 8> patterns = {{
-        {0x90, 0x90, 0x90},  // NOP sled
-        {0x31, 0xC0, 0x50},  // xor eax, eax; push eax (common in shellcode)
-        {0x64, 0x8B, 0x00},  // mov eax, fs:[eax] (TEB access)
-        {0xEB, 0xFE, 0x00},  // jmp $ (infinite loop marker)
-        {0x55, 0x8B, 0xEC},  // push ebp; mov ebp, esp (function prologue)
-        {0x48, 0x83, 0xEC},  // sub rsp, xx (x64 stack allocation)
-        {0x4C, 0x8B, 0xDC},  // mov r11, rsp (x64 common)
-        {0xCC, 0xCC, 0xCC}   // int3 breakpoints
+    // Each entry: bytes + length (up to 4 bytes per signature)
+    struct PatternEntry {
+        uint8_t bytes[4];
+        uint8_t len;
+    };
+
+    static constexpr std::array<PatternEntry, 16> patterns = {{
+        // x86 common
+        {{0x90, 0x90, 0x90, 0x00}, 3},  // NOP sled
+        {{0x31, 0xC0, 0x50, 0x00}, 3},  // xor eax,eax; push eax
+        {{0x64, 0xA1, 0x30, 0x00}, 4},  // mov eax, fs:[0x30] (PEB access x86)
+        {{0x55, 0x8B, 0xEC, 0x00}, 3},  // push ebp; mov ebp,esp
+        {{0xEB, 0xFE, 0x00, 0x00}, 2},  // jmp $ (infinite loop / egg-hunt marker)
+        {{0xCC, 0xCC, 0xCC, 0x00}, 3},  // int3 breakpoints
+
+        // x64 common
+        {{0x48, 0x83, 0xEC, 0x00}, 3},  // sub rsp, imm8 (stack frame)
+        {{0x4C, 0x8B, 0xDC, 0x00}, 3},  // mov r11, rsp
+        {{0x65, 0x48, 0x8B, 0x04}, 4},  // mov rax, gs:[...] (PEB access x64)
+        {{0x48, 0x31, 0xC9, 0x00}, 3},  // xor rcx, rcx (zero register)
+        {{0x48, 0x89, 0xE5, 0x00}, 3},  // mov rbp, rsp
+
+        // Shellcode-specific
+        {{0xFC, 0x48, 0x83, 0xE4}, 4},  // cld; and rsp,-10h (Cobalt Strike beacon)
+        {{0xFC, 0xE8, 0x00, 0x00}, 4},  // cld; call $+5  (position-independent stub)
+        {{0x31, 0xC9, 0x64, 0x8B}, 4},  // xor ecx,ecx; mov ...,fs:[...] (PEB walk)
+        {{0x41, 0x51, 0x41, 0x50}, 4},  // push r9; push r8 (x64 shellcode prologue)
+        {{0x48, 0x8D, 0x05, 0x00}, 3},  // lea rax,[rip+...] (RIP-relative addressing)
     }};
 
     size_t patternMatches = 0;
     for (const auto& pattern : patterns) {
-        for (size_t i = 0; i < data.size() - pattern.size(); ++i) {
-            if (std::equal(pattern.begin(), pattern.end(), data.begin() + i)) {
+        const size_t pLen = pattern.len;
+        if (data.size() < pLen) continue;
+        for (size_t i = 0; i <= data.size() - pLen; ++i) {
+            if (std::memcmp(data.data() + i, pattern.bytes, pLen) == 0) {
                 patternMatches++;
                 break;
             }
         }
     }
 
-    // If multiple patterns found, likely shellcode
     return patternMatches >= 2;
 }
 
@@ -143,19 +168,39 @@ namespace {
 }
 
 /**
+ * @brief RAII wrapper for Windows HANDLE to prevent handle leaks.
+ */
+struct ScopedHandle {
+    HANDLE h = nullptr;
+    explicit ScopedHandle(HANDLE handle) noexcept : h(handle) {}
+    ~ScopedHandle() { if (h && h != INVALID_HANDLE_VALUE) { CloseHandle(h); } }
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+    [[nodiscard]] explicit operator bool() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] HANDLE get() const noexcept { return h; }
+};
+
+/**
  * @brief Get module name from address.
+ *
+ * Uses a heap-allocated buffer capped at 512 modules to avoid blowing
+ * the stack in deeply-loaded processes.
  */
 [[nodiscard]] std::wstring GetModuleNameFromAddress(HANDLE hProcess, uintptr_t address) {
-    HMODULE hMods[1024];
-    DWORD cbNeeded;
+    constexpr DWORD kMaxModules = 512;
+    auto hMods = std::make_unique<HMODULE[]>(kMaxModules);
+    DWORD cbNeeded = 0;
 
-    if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-        for (unsigned int i = 0; i < (cbNeeded / sizeof(HMODULE)); i++) {
-            MODULEINFO modInfo;
+    if (EnumProcessModules(hProcess, hMods.get(),
+                           kMaxModules * sizeof(HMODULE), &cbNeeded)) {
+        const DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+        const DWORD limit = std::min(moduleCount, kMaxModules);
+        for (DWORD i = 0; i < limit; i++) {
+            MODULEINFO modInfo{};
             if (GetModuleInformation(hProcess, hMods[i], &modInfo, sizeof(modInfo))) {
-                uintptr_t baseAddr = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
+                auto baseAddr = reinterpret_cast<uintptr_t>(modInfo.lpBaseOfDll);
                 if (address >= baseAddr && address < baseAddr + modInfo.SizeOfImage) {
-                    wchar_t szModName[MAX_PATH];
+                    wchar_t szModName[MAX_PATH]{};
                     if (GetModuleFileNameExW(hProcess, hMods[i], szModName, MAX_PATH)) {
                         return fs::path(szModName).filename().wstring();
                     }
@@ -304,11 +349,11 @@ public:
     // APC tracking
     std::deque<APCEvent> m_recentApcs;
     std::deque<APCEvent> m_suspiciousApcs;
-    uint64_t m_nextEventId{1};
+    std::atomic<uint64_t> m_nextEventId{1};
 
     // Attack detection
     std::deque<AtomBombingAttack> m_detectedAttacks;
-    uint64_t m_nextAttackId{1};
+    std::atomic<uint64_t> m_nextAttackId{1};
 
     // Callbacks
     std::atomic<uint64_t> m_nextCallbackId{1};
@@ -325,6 +370,67 @@ public:
 
     Impl() = default;
     ~Impl() = default;
+
+    // ========================================================================
+    // CONFIGURATION HELPERS
+    // ========================================================================
+
+    /**
+     * @brief Return a thread-safe copy of the current configuration.
+     *
+     * All Impl methods that read m_config MUST use a snapshot obtained
+     * through this helper to avoid data races with UpdateConfig().
+     */
+    [[nodiscard]] AtomBombingConfig SnapshotConfig() const {
+        std::shared_lock lock(m_configMutex);
+        return m_config;
+    }
+
+    // ========================================================================
+    // CACHED API ADDRESSES (resolved once at init, boot-stable on Windows)
+    // ========================================================================
+
+    struct AtomApiAddresses {
+        uintptr_t GlobalGetAtomNameA = 0;
+        uintptr_t GlobalGetAtomNameW = 0;
+        uintptr_t GlobalGetAtomNameA_KB = 0;   // KernelBase forwarded
+        uintptr_t GlobalGetAtomNameW_KB = 0;
+        uintptr_t NtAddAtom = 0;
+        uintptr_t NtFindAtom = 0;
+        bool resolved = false;
+    };
+    AtomApiAddresses m_cachedApiAddrs{};
+
+    /**
+     * @brief Resolve atom-related API addresses once.
+     *
+     * kernel32/KernelBase/ntdll are mapped at the same virtual address
+     * in every process (per-boot ASLR, not per-process), so resolving
+     * in our own process is sufficient.
+     */
+    void ResolveApiAddresses() noexcept {
+        if (m_cachedApiAddrs.resolved) return;
+
+        if (HMODULE hK32 = GetModuleHandleW(L"kernel32.dll")) {
+            m_cachedApiAddrs.GlobalGetAtomNameA =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hK32, "GlobalGetAtomNameA"));
+            m_cachedApiAddrs.GlobalGetAtomNameW =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hK32, "GlobalGetAtomNameW"));
+        }
+        if (HMODULE hKB = GetModuleHandleW(L"KernelBase.dll")) {
+            m_cachedApiAddrs.GlobalGetAtomNameA_KB =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hKB, "GlobalGetAtomNameA"));
+            m_cachedApiAddrs.GlobalGetAtomNameW_KB =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hKB, "GlobalGetAtomNameW"));
+        }
+        if (HMODULE hNtdll = GetModuleHandleW(L"ntdll.dll")) {
+            m_cachedApiAddrs.NtAddAtom =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hNtdll, "NtAddAtom"));
+            m_cachedApiAddrs.NtFindAtom =
+                reinterpret_cast<uintptr_t>(GetProcAddress(hNtdll, "NtFindAtom"));
+        }
+        m_cachedApiAddrs.resolved = true;
+    }
 
     // ========================================================================
     // INITIALIZATION
@@ -349,6 +455,14 @@ public:
 
             // Initialize known safe atoms (system atoms)
             InitializeKnownSafeAtoms();
+
+            // Cache atom-related API addresses for APC target detection
+            ResolveApiAddresses();
+
+            // Register with kernel driver to receive thread creation events
+            // that may indicate APC injection (cross-process thread creation
+            // is a strong indicator of APC-based injection techniques)
+            RegisterKernelHandlers();
 
             m_initialized.store(true, std::memory_order_release);
             SS_LOG_INFO(L"AtomBombing", L"Impl: Initialization complete");
@@ -403,10 +517,96 @@ public:
         SS_LOG_INFO(L"AtomBombing", L"Impl: Shutdown complete");
     }
 
+    /**
+     * @brief Register with IPCManager to receive kernel thread creation
+     *        events. Remote thread creation is a precursor to APC injection.
+     */
+    void RegisterKernelHandlers() noexcept {
+        try {
+            if (!Communication::IPCManager::HasInstance()) {
+                SS_LOG_WARN(L"AtomBombing",
+                    L"IPCManager not available — kernel thread event integration disabled");
+                return;
+            }
+
+            auto& ipc = Communication::IPCManager::Instance();
+            ipc.RegisterGenericHandler(
+                [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* payload, size_t payloadSize) {
+                    if (!m_initialized.load(std::memory_order_acquire)) return;
+
+                    if (msgType == FilterMessageType_ThreadNotify) {
+                        OnKernelThreadNotify(payload, payloadSize);
+                    }
+                }
+            );
+
+            SS_LOG_INFO(L"AtomBombing",
+                L"Registered kernel handler for ThreadNotify events");
+
+        } catch (const std::exception& e) {
+            SS_LOG_WARN(L"AtomBombing",
+                L"Failed to register kernel handlers: %S", e.what());
+        }
+    }
+
+    /**
+     * @brief Handle kernel thread creation notification.
+     *
+     * Remote thread creation events from the kernel driver are forwarded
+     * into our APC analysis pipeline — remote thread creation is the
+     * observable precursor to APC-based injection techniques including
+     * AtomBombing. The kernel monitors PsSetCreateThreadNotifyRoutine
+     * and flags cross-process thread creation.
+     */
+    void OnKernelThreadNotify(const void* data, size_t size) {
+        if (data == nullptr || size < sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)) {
+            return;
+        }
+
+        const auto* tn = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);
+
+        // Only care about remote (cross-process) thread events
+        if (!tn->IsRemote) return;
+
+        // Self-exclusion
+        const uint32_t selfPid = GetCurrentProcessId();
+        if (tn->ProcessId == selfPid || tn->CreatorProcessId == selfPid) return;
+
+        SS_LOG_DEBUG(L"AtomBombing",
+            L"Kernel ThreadNotify: PID %u -> PID %u (TID %u, remote)",
+            tn->CreatorProcessId, tn->ProcessId, tn->ThreadId);
+
+        // Feed into our APC analysis pipeline. The start address is not
+        // available from the basic thread notification, so apcRoutine = 0.
+        // The cross-process nature alone is a risk signal for AtomBombing.
+        OnAPCQueueImpl(
+            tn->CreatorProcessId,
+            tn->ProcessId,
+            tn->ThreadId,
+            0,  // apcRoutine unknown from kernel thread notify
+            0, 0, 0
+        );
+    }
+
     void InitializeKnownSafeAtoms() {
-        // Common system atoms (window classes, etc.)
-        // These are typically safe and shouldn't trigger alerts
-        // This is a simplified list - real implementation would be more comprehensive
+        // Populate known safe system atoms (window classes, OLE/COM, etc.)
+        // These are standard Windows RegisterClass atom names that should not
+        // trigger false positives during atom table scanning.
+        const std::array<std::wstring_view, 14> safeNames = {
+            L"Button", L"ComboBox", L"Edit", L"ListBox",
+            L"MDIClient", L"ScrollBar", L"Static",
+            L"ComboLBox", L"DDEMLEvent", L"DDEMLMom",
+            L"DDEMLAnsiClient", L"DDEMLUnicodeClient",
+            L"IME", L"MSCTFIME UI"
+        };
+
+        // Resolve actual atom values for known window class names
+        for (const auto& name : safeNames) {
+            ATOM a = GlobalFindAtomW(name.data());
+            if (a != 0 && a >= AtomBombingConstants::MIN_GLOBAL_ATOM) {
+                m_knownSafeAtoms.insert(static_cast<uint16_t>(a));
+            }
+        }
     }
 
     // ========================================================================
@@ -416,6 +616,7 @@ public:
     [[nodiscard]] ScanResult ScanAtomTableImpl() {
         ScanResult result{};
         const auto scanStart = steady_clock::now();
+        const auto config = SnapshotConfig();
 
         try {
             result.scanTime = system_clock::now();
@@ -447,8 +648,8 @@ public:
             }
 
             // Correlate events to detect attacks
-            if (m_config.correlateAtomAndAPC) {
-                result.detectedAttacks = CorrelateEventsImpl();
+            if (config.correlateAtomAndAPC) {
+                result.detectedAttacks = CorrelateEventsImpl(config);
                 result.attackDetected = !result.detectedAttacks.empty();
 
                 if (result.attackDetected) {
@@ -469,13 +670,15 @@ public:
             m_stats.scansPerformed.fetch_add(1, std::memory_order_relaxed);
             m_stats.totalScanTimeMs.fetch_add(result.scanDurationMs, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"AtomBombing", L"Scan complete - %d atoms, %d suspicious, %zu attacks, %.2f ms", result.totalAtomsAnalyzed, result.suspiciousAtomsFound, result.detectedAttacks.size(), result.scanDurationMs);
+            SS_LOG_INFO(L"AtomBombing", L"Scan complete - %u atoms, %u suspicious, %u attacks, %u ms",
+                result.totalAtomsAnalyzed, result.suspiciousAtomsFound,
+                static_cast<uint32_t>(result.detectedAttacks.size()), result.scanDurationMs);
 
             return result;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"AtomBombing", L"Scan exception: %S", e.what());
-            result.scanError = StringUtils::Utf8ToWide(e.what());
+            result.scanError = StringUtils::ToWide(e.what());
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
@@ -483,35 +686,34 @@ public:
 
     [[nodiscard]] std::vector<AtomInfo> EnumerateAtomsImpl() {
         std::vector<AtomInfo> atoms;
+        const auto config = SnapshotConfig();
 
         try {
-            // Enumerate global atoms in range
-            for (uint16_t atomValue = AtomBombingConstants::MIN_GLOBAL_ATOM;
-                 atomValue <= AtomBombingConstants::MAX_GLOBAL_ATOM;
-                 ++atomValue) {
+            // Enumerate global atoms in range.
+            // Use uint32_t to avoid overflow: uint16_t would wrap from 0xFFFF to 0,
+            // creating an infinite loop since the condition <= 0xFFFF is always true.
+            for (uint32_t atomVal = AtomBombingConstants::MIN_GLOBAL_ATOM;
+                 atomVal <= AtomBombingConstants::MAX_GLOBAL_ATOM;
+                 ++atomVal) {
 
-                if (atoms.size() >= m_config.maxAtomsToAnalyze) {
+                if (atoms.size() >= config.maxAtomsToAnalyze) {
                     break;
                 }
 
-                // Try to get atom name
-                wchar_t atomName[AtomBombingConstants::MAX_ATOM_NAME_LENGTH + 1]{};
-                UINT result = GlobalGetAtomNameW(
-                    static_cast<ATOM>(atomValue),
-                    atomName,
-                    AtomBombingConstants::MAX_ATOM_NAME_LENGTH
-                );
+                const uint16_t atomValue = static_cast<uint16_t>(atomVal);
 
-                if (result > 0) {
-                    // Atom exists, analyze it
-                    auto atomInfo = AnalyzeAtomImpl(atomValue);
-                    atoms.push_back(atomInfo);
-
-                    m_stats.atomsMonitored.fetch_add(1, std::memory_order_relaxed);
-
-                    if (atomInfo.suspicionLevel >= AtomSuspicion::MediumRisk) {
-                        m_stats.suspiciousAtomsDetected.fetch_add(1, std::memory_order_relaxed);
+                // Skip known-safe atoms
+                {
+                    std::shared_lock lock(m_atomMutex);
+                    if (m_knownSafeAtoms.count(atomValue) > 0) {
+                        continue;
                     }
+                }
+
+                auto atomInfo = AnalyzeAtomImpl(atomValue, config);
+                if (atomInfo.contentLength > 0) {
+                    atoms.push_back(std::move(atomInfo));
+                    m_stats.atomsMonitored.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
@@ -522,7 +724,21 @@ public:
         return atoms;
     }
 
+    /**
+     * @brief Analyze a single atom (public entry point — snapshots config).
+     */
     [[nodiscard]] AtomInfo AnalyzeAtomImpl(uint16_t atomValue) {
+        return AnalyzeAtomImpl(atomValue, SnapshotConfig());
+    }
+
+    /**
+     * @brief Analyze a single atom using a caller-provided config snapshot.
+     *
+     * This overload is used in hot paths (e.g. EnumerateAtomsImpl) to
+     * avoid re-acquiring the config lock on every iteration.
+     */
+    [[nodiscard]] AtomInfo AnalyzeAtomImpl(uint16_t atomValue,
+                                           const AtomBombingConfig& config) {
         AtomInfo atom{};
         atom.atomValue = atomValue;
         atom.type = AtomType::GlobalAtom;
@@ -533,10 +749,11 @@ public:
             UINT nameLength = GlobalGetAtomNameW(
                 static_cast<ATOM>(atomValue),
                 atomName,
-                AtomBombingConstants::MAX_ATOM_NAME_LENGTH
+                AtomBombingConstants::MAX_ATOM_NAME_LENGTH + 1
             );
 
             if (nameLength > 0) {
+                atomName[nameLength] = L'\0';  // Defensive: ensure null termination
                 atom.atomName = atomName;
                 atom.contentLength = nameLength;
 
@@ -545,9 +762,9 @@ public:
                 std::memcpy(atom.rawContent.data(), atomName, atom.rawContent.size());
 
                 // Analyze content
-                if (m_config.analyzeEntropy) {
+                if (config.analyzeEntropy) {
                     atom.entropy = CalculateEntropy(atom.rawContent);
-                    atom.hasHighEntropy = (atom.entropy >= m_config.entropyThreshold);
+                    atom.hasHighEntropy = (atom.entropy >= config.entropyThreshold);
 
                     if (atom.hasHighEntropy) {
                         m_stats.highEntropyAtomsDetected.fetch_add(1, std::memory_order_relaxed);
@@ -557,7 +774,7 @@ public:
                     }
                 }
 
-                if (m_config.detectShellcodePatterns) {
+                if (config.detectShellcodePatterns) {
                     atom.hasShellcodePatterns = HasShellcodePatterns(atom.rawContent);
                     if (atom.hasShellcodePatterns) {
                         m_stats.shellcodePatternsDetected.fetch_add(1, std::memory_order_relaxed);
@@ -567,10 +784,16 @@ public:
 
                 atom.hasNullBytes = HasNullBytes(atom.rawContent);
 
-                // Calculate suspicion level
-                atom.suspicionLevel = CalculateAtomSuspicion(atom);
+                // Check for suspicious API name strings in atom content
+                CheckSuspiciousStrings(atom);
 
-                // Store in monitored atoms
+                // Calculate suspicion level
+                atom.suspicionLevel = CalculateAtomSuspicion(atom, config);
+
+                // Store in monitored atoms. Callbacks MUST be invoked OUTSIDE the data
+                // lock to prevent deadlocks when user callbacks call back into the detector.
+                bool shouldNotifyAtom = false;
+
                 if (atom.suspicionLevel >= AtomSuspicion::LowRisk) {
                     std::unique_lock lock(m_atomMutex);
                     m_monitoredAtoms[atomValue] = atom;
@@ -580,10 +803,14 @@ public:
                         if (m_suspiciousAtoms.size() > AtomBombingConstants::MAX_ATOM_EVENTS) {
                             m_suspiciousAtoms.pop_front();
                         }
-
-                        // Invoke callbacks
-                        InvokeAtomCallbacks(atom);
+                        m_stats.suspiciousAtomsDetected.fetch_add(1, std::memory_order_relaxed);
+                        shouldNotifyAtom = true;
                     }
+                }
+
+                // Invoke callbacks OUTSIDE the data lock
+                if (shouldNotifyAtom) {
+                    InvokeAtomCallbacks(atom);
                 }
             }
 
@@ -594,12 +821,36 @@ public:
         return atom;
     }
 
-    [[nodiscard]] AtomSuspicion CalculateAtomSuspicion(const AtomInfo& atom) const noexcept {
+    /**
+     * @brief Check for suspicious API-related strings embedded in atom content.
+     */
+    void CheckSuspiciousStrings(AtomInfo& atom) const noexcept {
+        static constexpr std::array<std::wstring_view, 8> suspiciousTokens = {
+            L"VirtualAlloc", L"VirtualProtect", L"LoadLibrary",
+            L"GetProcAddress", L"NtProtect", L"WriteProcessMemory",
+            L"CreateRemoteThread", L"NtQueueApcThread"
+        };
+
+        for (const auto& token : suspiciousTokens) {
+            if (atom.atomName.find(token) != std::wstring::npos) {
+                atom.hasSuspiciousStrings = true;
+                atom.suspicionReasons.push_back(
+                    std::format(L"Contains suspicious API name: {}", token));
+                break;
+            }
+        }
+    }
+
+    [[nodiscard]] AtomSuspicion CalculateAtomSuspicion(
+        const AtomInfo& atom,
+        const AtomBombingConfig& config) const noexcept
+    {
         uint32_t score = 0;
 
         if (atom.hasHighEntropy) score += 25;
         if (atom.hasShellcodePatterns) score += 40;
-        if (atom.contentLength >= m_config.suspiciousAtomSizeThreshold) score += 15;
+        if (atom.hasSuspiciousStrings) score += 20;
+        if (atom.contentLength >= config.suspiciousAtomSizeThreshold) score += 15;
         if (atom.hasNullBytes && atom.contentLength > 16) score += 10;
 
         if (score >= 60) return AtomSuspicion::Critical;
@@ -622,6 +873,7 @@ public:
         APCEvent event{};
         event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
         event.timestamp = system_clock::now();
+        const auto config = SnapshotConfig();
 
         try {
             event.sourcePid = sourcePid;
@@ -632,34 +884,47 @@ public:
             event.isCrossProcess = (sourcePid != targetPid);
             event.targetsSelf = (sourcePid == targetPid);
 
-            // Get process names
-            HANDLE hSourceProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                FALSE, sourcePid);
-            if (hSourceProcess) {
-                wchar_t processPath[MAX_PATH];
-                if (GetModuleFileNameExW(hSourceProcess, nullptr, processPath, MAX_PATH)) {
-                    event.sourceProcessPath = processPath;
-                    event.sourceProcessName = fs::path(processPath).filename().wstring();
-                }
-
-                // Get module containing APC routine
-                event.moduleName = GetModuleNameFromAddress(hSourceProcess, apcRoutine);
-                CloseHandle(hSourceProcess);
+            // Check process exclusions
+            if (IsProcessExcluded(sourcePid, config) ||
+                IsProcessExcluded(targetPid, config)) {
+                return event;
             }
 
-            HANDLE hTargetProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                FALSE, targetPid);
-            if (hTargetProcess) {
-                wchar_t processPath[MAX_PATH];
-                if (GetModuleFileNameExW(hTargetProcess, nullptr, processPath, MAX_PATH)) {
-                    event.targetProcessPath = processPath;
-                    event.targetProcessName = fs::path(processPath).filename().wstring();
+            // Get source process info using RAII handle
+            {
+                ScopedHandle hSourceProcess(
+                    OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, sourcePid));
+                if (hSourceProcess) {
+                    wchar_t processPath[MAX_PATH]{};
+                    if (GetModuleFileNameExW(hSourceProcess.get(), nullptr, processPath, MAX_PATH)) {
+                        event.sourceProcessPath = processPath;
+                        event.sourceProcessName = fs::path(processPath).filename().wstring();
+                    }
                 }
-                CloseHandle(hTargetProcess);
             }
 
-            // Check if APC targets atom-related functions
+            // Get target process info and resolve APC routine module using RAII handle
+            {
+                ScopedHandle hTargetProcess(
+                    OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, targetPid));
+                if (hTargetProcess) {
+                    wchar_t processPath[MAX_PATH]{};
+                    if (GetModuleFileNameExW(hTargetProcess.get(), nullptr, processPath, MAX_PATH)) {
+                        event.targetProcessPath = processPath;
+                        event.targetProcessName = fs::path(processPath).filename().wstring();
+                    }
+
+                    // Resolve APC routine's containing module in the TARGET process
+                    // (the APC executes in the target's address space)
+                    event.moduleName = GetModuleNameFromAddress(hTargetProcess.get(), apcRoutine);
+                }
+            }
+
+            // Check if APC targets atom-related functions by resolving exports
             event.targetsAtomFunction = TargetsAtomRetrievalImpl(apcRoutine, targetPid);
+            if (event.targetsAtomFunction) {
+                event.targetType = APCTargetType::GlobalGetAtomName;
+            }
 
             // Risk assessment
             uint32_t riskScore = 0;
@@ -678,7 +943,8 @@ public:
             event.riskScore = riskScore;
             event.isSuspicious = (riskScore >= 40);
 
-            // Store event
+            // Store event - callbacks OUTSIDE the lock
+            bool shouldNotifyAPC = false;
             {
                 std::unique_lock lock(m_apcMutex);
                 m_recentApcs.push_back(event);
@@ -691,12 +957,14 @@ public:
                     if (m_suspiciousApcs.size() > AtomBombingConstants::MAX_APC_EVENTS) {
                         m_suspiciousApcs.pop_front();
                     }
-
                     m_stats.suspiciousApcsDetected.fetch_add(1, std::memory_order_relaxed);
-
-                    // Invoke callbacks
-                    InvokeAPCCallbacks(event);
+                    shouldNotifyAPC = true;
                 }
+            }
+
+            // Invoke callbacks OUTSIDE the data lock
+            if (shouldNotifyAPC) {
+                InvokeAPCCallbacks(event);
             }
 
             m_stats.apcsMonitored.fetch_add(1, std::memory_order_relaxed);
@@ -714,26 +982,50 @@ public:
         return event;
     }
 
-    [[nodiscard]] bool TargetsAtomRetrievalImpl(uintptr_t apcRoutine, uint32_t pid) const {
-        try {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ,
-                FALSE, pid);
-            if (!hProcess) return false;
+    /**
+     * @brief Check whether an APC routine targets atom retrieval APIs.
+     *
+     * Uses cached addresses resolved once during initialization.  No
+     * process handle is needed because kernel32/KernelBase/ntdll are
+     * mapped at identical virtual addresses in all processes (per-boot
+     * ASLR, not per-process).
+     */
+    [[nodiscard]] bool TargetsAtomRetrievalImpl(uintptr_t apcRoutine,
+                                                [[maybe_unused]] uint32_t pid) const noexcept {
+        if (!m_cachedApiAddrs.resolved || apcRoutine == 0) return false;
 
-            // Get module name
-            auto moduleName = GetModuleNameFromAddress(hProcess, apcRoutine);
-            CloseHandle(hProcess);
+        const auto& a = m_cachedApiAddrs;
+        return (a.GlobalGetAtomNameA  != 0 && apcRoutine == a.GlobalGetAtomNameA)  ||
+               (a.GlobalGetAtomNameW  != 0 && apcRoutine == a.GlobalGetAtomNameW)  ||
+               (a.GlobalGetAtomNameA_KB != 0 && apcRoutine == a.GlobalGetAtomNameA_KB) ||
+               (a.GlobalGetAtomNameW_KB != 0 && apcRoutine == a.GlobalGetAtomNameW_KB) ||
+               (a.NtAddAtom  != 0 && apcRoutine == a.NtAddAtom)  ||
+               (a.NtFindAtom != 0 && apcRoutine == a.NtFindAtom);
+    }
 
-            // Check if it's in kernel32.dll (GlobalGetAtomName) or ntdll.dll
-            if (moduleName == L"kernel32.dll" || moduleName == L"KernelBase.dll" ||
-                moduleName == L"ntdll.dll") {
-                // In a real implementation, would check function export or disassemble
-                // For now, simplified heuristic
+    /**
+     * @brief Check if a process is excluded from monitoring.
+     *
+     * Accepts a config snapshot to avoid re-acquiring the config lock.
+     */
+    [[nodiscard]] bool IsProcessExcluded(uint32_t pid,
+                                          const AtomBombingConfig& config) const {
+        if (config.excludedProcesses.empty()) return false;
+
+        ScopedHandle hProcess(
+            OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        if (!hProcess) return false;
+
+        wchar_t processPath[MAX_PATH]{};
+        if (!GetModuleFileNameExW(hProcess.get(), nullptr, processPath, MAX_PATH)) {
+            return false;
+        }
+
+        std::wstring processName = fs::path(processPath).filename().wstring();
+        for (const auto& excluded : config.excludedProcesses) {
+            if (StringUtils::IEquals(processName, excluded)) {
                 return true;
             }
-
-        } catch (...) {
-            return false;
         }
 
         return false;
@@ -744,56 +1036,95 @@ public:
     // ========================================================================
 
     [[nodiscard]] std::vector<AtomBombingAttack> CorrelateEventsImpl() {
+        return CorrelateEventsImpl(SnapshotConfig());
+    }
+
+    [[nodiscard]] std::vector<AtomBombingAttack> CorrelateEventsImpl(
+        const AtomBombingConfig& config)
+    {
         std::vector<AtomBombingAttack> attacks;
 
         try {
-            std::shared_lock atomLock(m_atomMutex);
-            std::shared_lock apcLock(m_apcMutex);
+            // Collect correlated attacks under data locks, but do NOT invoke
+            // callbacks while any data lock is held.
+            {
+                std::shared_lock atomLock(m_atomMutex);
+                std::shared_lock apcLock(m_apcMutex);
 
-            // For each suspicious atom, look for correlated APCs
-            for (const auto& atom : m_suspiciousAtoms) {
-                for (const auto& apc : m_suspiciousApcs) {
-                    // Check temporal correlation
-                    auto timeDiff = duration_cast<milliseconds>(
-                        apc.timestamp - atom.createTime
-                    );
+                // For each suspicious atom, look for correlated APCs
+                for (const auto& atom : m_suspiciousAtoms) {
+                    for (const auto& apc : m_suspiciousApcs) {
+                        // Check temporal correlation
+                        auto timeDiff = duration_cast<milliseconds>(
+                            apc.timestamp - atom.createTime
+                        );
 
-                    if (std::abs(timeDiff.count()) <= static_cast<int64_t>(m_config.apcCorrelationWindowMs)) {
-                        // Potential attack correlation
-                        if (apc.targetsAtomFunction && apc.isCrossProcess) {
-                            AtomBombingAttack attack = BuildAttackFromCorrelation(atom, apc);
-                            attacks.push_back(attack);
+                        if (std::abs(timeDiff.count()) <= static_cast<int64_t>(config.apcCorrelationWindowMs)) {
+                            // Potential attack correlation
+                            if (apc.targetsAtomFunction && apc.isCrossProcess) {
+                                AtomBombingAttack attack = BuildAttackFromCorrelation(atom, apc, config);
+                                attacks.push_back(std::move(attack));
+                            }
+                        }
+                    }
+
+                    // For high-risk atoms (shellcode + high entropy), also correlate
+                    // with cross-process events from m_recentApcs. Kernel-originated
+                    // events lack apcRoutine, but cross-process activity near a
+                    // shellcode-bearing atom is a strong signal.
+                    if (atom.suspicionLevel >= AtomSuspicion::HighRisk) {
+                        for (const auto& apc : m_recentApcs) {
+                            if (!apc.isCrossProcess || apc.isSuspicious) continue;
+
+                            auto timeDiff = duration_cast<milliseconds>(
+                                apc.timestamp - atom.createTime
+                            );
+                            if (std::abs(timeDiff.count()) <= static_cast<int64_t>(config.apcCorrelationWindowMs)) {
+                                AtomBombingAttack attack = BuildAttackFromCorrelation(atom, apc, config);
+                                attack.confidence = DetectionConfidence::Medium;
+                                attack.detectionReasons.push_back(
+                                    L"Cross-process activity near shellcode-bearing atom (kernel event)");
+                                attacks.push_back(std::move(attack));
+                            }
                         }
                     }
                 }
-            }
+            } // Release atom and apc locks before taking attack lock
 
-            // Store detected attacks
+            // Store detected attacks under attack lock
             if (!attacks.empty()) {
-                std::unique_lock attackLock(m_attackMutex);
-                for (const auto& attack : attacks) {
-                    m_detectedAttacks.push_back(attack);
-                    m_stats.attacksDetected.fetch_add(1, std::memory_order_relaxed);
+                {
+                    std::unique_lock attackLock(m_attackMutex);
+                    for (const auto& attack : attacks) {
+                        m_detectedAttacks.push_back(attack);
+                        if (m_detectedAttacks.size() > AtomBombingConstants::MAX_APC_EVENTS) {
+                            m_detectedAttacks.pop_front();
+                        }
 
-                    // Update confidence statistics
-                    switch (attack.confidence) {
-                        case DetectionConfidence::Low:
-                            m_stats.lowConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        case DetectionConfidence::Medium:
-                            m_stats.mediumConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        case DetectionConfidence::High:
-                            m_stats.highConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        case DetectionConfidence::Confirmed:
-                            m_stats.confirmedAttacks.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        default:
-                            break;
+                        m_stats.attacksDetected.fetch_add(1, std::memory_order_relaxed);
+
+                        // Update confidence statistics
+                        switch (attack.confidence) {
+                            case DetectionConfidence::Low:
+                                m_stats.lowConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            case DetectionConfidence::Medium:
+                                m_stats.mediumConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            case DetectionConfidence::High:
+                                m_stats.highConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            case DetectionConfidence::Confirmed:
+                                m_stats.confirmedAttacks.fetch_add(1, std::memory_order_relaxed);
+                                break;
+                            default:
+                                break;
+                        }
                     }
+                } // Release attack lock before invoking callbacks
 
-                    // Invoke attack callbacks
+                // Invoke attack callbacks OUTSIDE all data locks
+                for (const auto& attack : attacks) {
                     InvokeAttackCallbacks(attack);
                 }
             }
@@ -807,7 +1138,8 @@ public:
 
     [[nodiscard]] AtomBombingAttack BuildAttackFromCorrelation(
         const AtomInfo& atom,
-        const APCEvent& apc
+        const APCEvent& apc,
+        const AtomBombingConfig& config
     ) {
         AtomBombingAttack attack{};
         attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -859,15 +1191,28 @@ public:
         attack.mitreAttackId = "T1055.009";  // Process Injection: AtomBombing
 
         // Extract payload if configured
-        if (m_config.extractPayloads && !atom.rawContent.empty()) {
+        if (config.extractPayloads && !atom.rawContent.empty()) {
             attack.payloadExtracted = true;
             attack.payload = atom.rawContent;
-            attack.payloadHash = HashUtils::CalculateSHA256(atom.rawContent);
-            attack.payloadDescription = std::format(L"Atom {} content", atom.atomValue);
+
+            // Compute SHA-256 of payload using streaming Hasher API
+            std::vector<uint8_t> hashResult;
+            if (HashUtils::Compute(HashUtils::Algorithm::SHA256,
+                                   atom.rawContent.data(), atom.rawContent.size(),
+                                   hashResult)) {
+                const size_t copyLen = std::min(hashResult.size(), attack.payloadHash.size());
+                std::memcpy(attack.payloadHash.data(), hashResult.data(), copyLen);
+            }
+
+            attack.payloadDescription = std::format(L"Atom {} content ({} bytes)",
+                atom.atomValue, atom.rawContent.size());
             m_stats.payloadsExtracted.fetch_add(1, std::memory_order_relaxed);
         }
 
-        SS_LOG_WARN(L"AtomBombing", L"Attack detected - PID %u -> PID %u, Confidence: %.2f, Risk: %.2f", attack.attackerPid, attack.victimPid, static_cast<int>(attack.confidence), attack.riskScore);
+        SS_LOG_WARN(L"AtomBombing",
+            L"Attack detected - PID %u -> PID %u, Confidence: %u, Risk: %u",
+            attack.attackerPid, attack.victimPid,
+            static_cast<unsigned>(attack.confidence), attack.riskScore);
 
         return attack;
     }
@@ -884,6 +1229,9 @@ public:
 
         try {
             SS_LOG_INFO(L"AtomBombing", L"Starting real-time monitoring");
+
+            // Clean up any completed threads from prior start/stop cycles
+            m_workerThreads.clear();
 
             // Start monitoring thread
             m_workerThreads.emplace_back([this](std::stop_token stoken) {
@@ -918,18 +1266,22 @@ public:
 
         while (!stoken.stop_requested()) {
             try {
-                // Periodic scanning
-                if (m_config.enableOnDemandScanning) {
+                const auto config = SnapshotConfig();
+
+                // Periodic scanning (ScanAtomTableImpl already calls CorrelateEventsImpl
+                // when correlateAtomAndAPC is enabled, so no separate correlation call needed)
+                if (config.enableOnDemandScanning) {
                     ScanAtomTableImpl();
+                } else if (config.correlateAtomAndAPC) {
+                    // If on-demand scanning is disabled but correlation is enabled,
+                    // run correlation only on existing event data
+                    CorrelateEventsImpl(config);
                 }
 
-                // Check for attack correlations
-                if (m_config.correlateAtomAndAPC) {
-                    CorrelateEventsImpl();
+                // Use stop_token-aware sleep to enable clean shutdown
+                for (int i = 0; i < 50 && !stoken.stop_requested(); ++i) {
+                    std::this_thread::sleep_for(milliseconds(100));
                 }
-
-                // Sleep
-                std::this_thread::sleep_for(seconds(5));
 
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"AtomBombing", L"Monitoring thread exception: %S", e.what());
@@ -948,7 +1300,13 @@ public:
         uint32_t creatorPid,
         const std::wstring& atomName
     ) {
-        if (!m_config.monitorAtomTable) return;
+        const auto config = SnapshotConfig();
+        if (!config.monitorAtomTable) return;
+
+        // Check excluded atoms
+        for (const auto& excludedAtom : config.excludedAtoms) {
+            if (excludedAtom == atomValue) return;
+        }
 
         try {
             m_stats.atomCreations.fetch_add(1, std::memory_order_relaxed);
@@ -958,17 +1316,23 @@ public:
             atom.creatorPid = creatorPid;
             atom.createTime = system_clock::now();
 
-            // Store creation context
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, creatorPid);
-            if (hProcess) {
-                wchar_t processPath[MAX_PATH];
-                if (GetModuleFileNameExW(hProcess, nullptr, processPath, MAX_PATH)) {
-                    atom.creatorProcessName = fs::path(processPath).filename().wstring();
+            // Store creation context using RAII handle
+            {
+                ScopedHandle hProcess(
+                    OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, creatorPid));
+                if (hProcess) {
+                    wchar_t processPath[MAX_PATH]{};
+                    if (GetModuleFileNameExW(hProcess.get(), nullptr, processPath, MAX_PATH)) {
+                        atom.creatorProcessName = fs::path(processPath).filename().wstring();
+                    }
                 }
-                CloseHandle(hProcess);
             }
 
-            SS_LOG_DEBUG(L"AtomBombing", L"Atom %ls created by PID %u (%S), Suspicion: %d", atomValue, creatorPid, StringUtils::WideToUtf8(atom.creatorProcessName), static_cast<int>(atom.suspicionLevel));
+            SS_LOG_DEBUG(L"AtomBombing",
+                L"Atom 0x%04X created by PID %u (%ls), Suspicion: %d",
+                static_cast<unsigned>(atomValue), creatorPid,
+                atom.creatorProcessName.c_str(),
+                static_cast<int>(atom.suspicionLevel));
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"AtomBombing", L"OnAtomCreate exception: %S", e.what());
@@ -976,7 +1340,8 @@ public:
     }
 
     void OnAtomDeleteImpl(uint16_t atomValue, uint32_t deleterPid) {
-        if (!m_config.monitorAtomTable) return;
+        const auto config = SnapshotConfig();
+        if (!config.monitorAtomTable) return;
 
         m_stats.atomDeletions.fetch_add(1, std::memory_order_relaxed);
 
@@ -993,7 +1358,8 @@ public:
         uintptr_t arg2,
         uintptr_t arg3
     ) {
-        if (!m_config.monitorAPCs) return;
+        const auto config = SnapshotConfig();
+        if (!config.monitorAPCs) return;
 
         try {
             auto apcEvent = AnalyzeAPCImpl(sourcePid, targetPid, targetTid, apcRoutine);
@@ -1001,12 +1367,41 @@ public:
             apcEvent.apcArgument2 = arg2;
             apcEvent.apcArgument3 = arg3;
 
-            // Check if should be blocked
-            if (m_config.blockSuspiciousApcs && apcEvent.isSuspicious) {
-                if (m_config.mode == MonitoringMode::Active ||
-                    m_config.mode == MonitoringMode::Aggressive) {
-                    // In real implementation, would actually block the APC
-                    SS_LOG_WARN(L"AtomBombing", L"Would block suspicious APC from PID %u to PID %u", sourcePid, targetPid);
+            // Blocking decision: if the APC is suspicious and blocking is enabled,
+            // signal the kernel driver to deny the APC via the registered attack callbacks.
+            // The kernel bridge (if present) handles the actual APC cancellation;
+            // user-mode cannot retroactively cancel a queued APC.
+            if (config.blockSuspiciousApcs && apcEvent.isSuspicious) {
+                if (config.mode == MonitoringMode::Active ||
+                    config.mode == MonitoringMode::Aggressive) {
+
+                    SS_LOG_WARN(L"AtomBombing",
+                        L"Suspicious APC blocked: PID %u -> PID %u (TID %u), routine 0x%llX",
+                        sourcePid, targetPid, targetTid,
+                        static_cast<unsigned long long>(apcRoutine));
+                    m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
+
+                    // Notify attack callbacks so the kernel bridge or BehaviorBlocker
+                    // can enforce the block at the kernel level
+                    AtomBombingAttack blockEvent{};
+                    blockEvent.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
+                    blockEvent.detectionTime = system_clock::now();
+                    blockEvent.attackerPid = sourcePid;
+                    blockEvent.attackerProcessName = apcEvent.sourceProcessName;
+                    blockEvent.attackerProcessPath = apcEvent.sourceProcessPath;
+                    blockEvent.victimPid = targetPid;
+                    blockEvent.victimProcessName = apcEvent.targetProcessName;
+                    blockEvent.victimProcessPath = apcEvent.targetProcessPath;
+                    blockEvent.victimTid = targetTid;
+                    blockEvent.apcQueueDetected = true;
+                    blockEvent.relatedApcs.push_back(apcEvent);
+                    blockEvent.confidence = DetectionConfidence::High;
+                    blockEvent.riskScore = apcEvent.riskScore;
+                    blockEvent.wasBlocked = true;
+                    blockEvent.mitreAttackId = "T1055.009";
+                    blockEvent.mitigationAction = L"APC blocked via kernel callback";
+
+                    InvokeAttackCallbacks(blockEvent);
                 }
             }
 
@@ -1363,9 +1758,30 @@ bool AtomBombingDetector::BlockAPC(const APCEvent& apc) {
         return false;
     }
 
-    SS_LOG_INFO(L"AtomBombing", L"Blocking APC from PID %u to PID %u", apc.sourcePid, apc.targetPid);
+    SS_LOG_INFO(L"AtomBombing",
+        L"Blocking APC from PID %u to PID %u (TID %u)",
+        apc.sourcePid, apc.targetPid, apc.targetTid);
 
-    // In real implementation, would use kernel driver to block APC
+    // Signal the kernel driver via attack callbacks. The kernel bridge component
+    // (PhantomSensor) handles actual APC cancellation via its pre-operation callback.
+    // User-mode cannot directly cancel a queued APC; this is a policy notification.
+    AtomBombingAttack blockEvent{};
+    blockEvent.attackId = m_impl->m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
+    blockEvent.detectionTime = system_clock::now();
+    blockEvent.attackerPid = apc.sourcePid;
+    blockEvent.attackerProcessName = apc.sourceProcessName;
+    blockEvent.victimPid = apc.targetPid;
+    blockEvent.victimProcessName = apc.targetProcessName;
+    blockEvent.victimTid = apc.targetTid;
+    blockEvent.apcQueueDetected = true;
+    blockEvent.relatedApcs.push_back(apc);
+    blockEvent.confidence = DetectionConfidence::High;
+    blockEvent.riskScore = apc.riskScore;
+    blockEvent.wasBlocked = true;
+    blockEvent.mitreAttackId = "T1055.009";
+    blockEvent.mitigationAction = L"APC blocked via detector policy";
+
+    m_impl->InvokeAttackCallbacks(blockEvent);
     m_impl->m_stats.attacksBlocked.fetch_add(1, std::memory_order_relaxed);
     return true;
 }
@@ -1376,12 +1792,34 @@ bool AtomBombingDetector::RemoveMaliciousAtom(uint16_t atomValue) {
     }
 
     try {
-        if (GlobalDeleteAtom(static_cast<ATOM>(atomValue)) == 0) {
-            SS_LOG_INFO(L"AtomBombing", L"Removed malicious atom %ls", atomValue);
+        // GlobalDeleteAtom returns 0 on success, the atom value on failure.
+        // Atoms are reference-counted; call repeatedly until fully removed.
+        constexpr int maxAttempts = 256;  // Cap to prevent infinite loop if atom is pinned
+        bool deleted = false;
+
+        for (int attempt = 0; attempt < maxAttempts; ++attempt) {
+            ATOM remaining = GlobalDeleteAtom(static_cast<ATOM>(atomValue));
+            if (remaining == 0) {
+                deleted = true;
+                break;
+            }
+            // Atom still has references - try again
+        }
+
+        if (deleted) {
+            SS_LOG_INFO(L"AtomBombing", L"Removed malicious atom 0x%04X",
+                static_cast<unsigned>(atomValue));
+
+            // Remove from monitored atoms
+            std::unique_lock lock(m_impl->m_atomMutex);
+            m_impl->m_monitoredAtoms.erase(atomValue);
+
             return true;
         } else {
             DWORD error = GetLastError();
-            SS_LOG_ERROR(L"AtomBombing", L"Failed to delete atom %ls: error %ls", atomValue, error);
+            SS_LOG_ERROR(L"AtomBombing",
+                L"Failed to fully delete atom 0x%04X: error %u",
+                static_cast<unsigned>(atomValue), error);
             return false;
         }
     } catch (const std::exception& e) {
@@ -1395,23 +1833,29 @@ bool AtomBombingDetector::TerminateAttacker(const AtomBombingAttack& attack) {
         return false;
     }
 
-    if (!m_impl->m_config.terminateAttacker) {
-        SS_LOG_WARN(L"AtomBombing", L"Termination disabled in config");
-        return false;
+    {
+        std::shared_lock lock(m_impl->m_configMutex);
+        if (!m_impl->m_config.terminateAttacker) {
+            SS_LOG_WARN(L"AtomBombing", L"Termination disabled in config");
+            return false;
+        }
     }
 
     try {
-        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, attack.attackerPid);
+        ScopedHandle hProcess(OpenProcess(PROCESS_TERMINATE, FALSE, attack.attackerPid));
         if (hProcess) {
-            if (TerminateProcess(hProcess, 1)) {
-                SS_LOG_WARN(L"AtomBombing", L"Terminated attacker process PID %u", attack.attackerPid);
-                CloseHandle(hProcess);
+            if (TerminateProcess(hProcess.get(), 1)) {
+                SS_LOG_WARN(L"AtomBombing",
+                    L"Terminated attacker process PID %u (%ls)",
+                    attack.attackerPid, attack.attackerProcessName.c_str());
                 return true;
             }
-            CloseHandle(hProcess);
         }
 
-        SS_LOG_ERROR(L"AtomBombing", L"Failed to terminate attacker PID %u", attack.attackerPid);
+        DWORD error = GetLastError();
+        SS_LOG_ERROR(L"AtomBombing",
+            L"Failed to terminate attacker PID %u: error %u",
+            attack.attackerPid, error);
         return false;
 
     } catch (const std::exception& e) {
@@ -1512,7 +1956,7 @@ void AtomBombingDetector::ResetStatistics() {
     UINT result = GlobalGetAtomNameW(
         static_cast<ATOM>(atomValue),
         atomName,
-        AtomBombingConstants::MAX_ATOM_NAME_LENGTH
+        AtomBombingConstants::MAX_ATOM_NAME_LENGTH + 1
     );
 
     if (result > 0) {

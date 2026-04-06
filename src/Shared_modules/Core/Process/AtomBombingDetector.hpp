@@ -113,8 +113,6 @@ namespace Process {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-class AtomBombingDetectorImpl;
-
 // ============================================================================
 // CONSTANTS
 // ============================================================================
@@ -317,7 +315,7 @@ struct APCEvent {
  * @struct AtomBombingAttack
  * @brief Detected AtomBombing attack.
  */
-struct alignas(64) AtomBombingAttack {
+struct AtomBombingAttack {
     uint64_t attackId = 0;
     std::chrono::system_clock::time_point detectionTime;
     
@@ -922,7 +920,8 @@ private:
     // IMPLEMENTATION
     // ========================================================================
 
-    std::unique_ptr<AtomBombingDetectorImpl> m_impl;
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 } // namespace Process
