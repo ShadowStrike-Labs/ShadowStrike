@@ -1060,6 +1060,49 @@ struct InjectionDetectorStats {
     /// @brief Processes currently tracked
     std::atomic<size_t> trackedProcesses{ 0 };
     
+    // -------------------------------------------------------------------------
+    // Special Member Functions (std::atomic is non-copyable)
+    // -------------------------------------------------------------------------
+
+    InjectionDetectorStats() noexcept = default;
+
+    /// @brief Copy constructor - snapshot atomic values from source
+    InjectionDetectorStats(const InjectionDetectorStats& other) noexcept
+        : totalEvents{other.totalEvents.load(std::memory_order_relaxed)}
+        , handleEvents{other.handleEvents.load(std::memory_order_relaxed)}
+        , memoryEvents{other.memoryEvents.load(std::memory_order_relaxed)}
+        , threadEvents{other.threadEvents.load(std::memory_order_relaxed)}
+        , injectionsDetected{other.injectionsDetected.load(std::memory_order_relaxed)}
+        , injectionsBlocked{other.injectionsBlocked.load(std::memory_order_relaxed)}
+        , remoteThreadsDetected{other.remoteThreadsDetected.load(std::memory_order_relaxed)}
+        , apcInjectionsDetected{other.apcInjectionsDetected.load(std::memory_order_relaxed)}
+        , hollowingDetected{other.hollowingDetected.load(std::memory_order_relaxed)}
+        , reflectiveDLLDetected{other.reflectiveDLLDetected.load(std::memory_order_relaxed)}
+        , chainsDetected{other.chainsDetected.load(std::memory_order_relaxed)}
+        , falsePositivesSuppressed{other.falsePositivesSuppressed.load(std::memory_order_relaxed)}
+        , trackedProcesses{other.trackedProcesses.load(std::memory_order_relaxed)}
+    {}
+
+    /// @brief Copy assignment - snapshot atomic values from source
+    InjectionDetectorStats& operator=(const InjectionDetectorStats& other) noexcept {
+        if (this != &other) {
+            totalEvents.store(other.totalEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            handleEvents.store(other.handleEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            memoryEvents.store(other.memoryEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threadEvents.store(other.threadEvents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            injectionsDetected.store(other.injectionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            injectionsBlocked.store(other.injectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            remoteThreadsDetected.store(other.remoteThreadsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apcInjectionsDetected.store(other.apcInjectionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hollowingDetected.store(other.hollowingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            reflectiveDLLDetected.store(other.reflectiveDLLDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            chainsDetected.store(other.chainsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            falsePositivesSuppressed.store(other.falsePositivesSuppressed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            trackedProcesses.store(other.trackedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset all statistics.
      */
