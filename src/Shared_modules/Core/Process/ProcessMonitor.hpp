@@ -125,7 +125,6 @@
 // Internal infrastructure
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
 #include "../../Whitelist/WhitelistStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
 
@@ -159,7 +158,7 @@ namespace Process {
 // FORWARD DECLARATIONS
 // ============================================================================
 
-class ProcessMonitorImpl;
+// ProcessMonitor::Impl is forward-declared inside the class (nested PIMPL).
 
 // ============================================================================
 // CONSTANTS
@@ -705,6 +704,9 @@ struct alignas(64) MonitorStatistics {
     std::atomic<uint64_t> callbacksInvoked{0};
     std::atomic<uint64_t> callbackErrors{0};
 
+    // Timing — set at initialization for events/sec calculation
+    std::chrono::system_clock::time_point startTime{};
+
     /**
      * @brief Reset all statistics.
      */
@@ -1200,9 +1202,9 @@ public:
 
     /**
      * @brief Get monitor statistics.
-     * @return Current statistics.
+     * @param out Statistics output populated with current values.
      */
-    [[nodiscard]] MonitorStatistics GetStatistics() const;
+    void GetStatistics(MonitorStatistics& out) const;
 
     /**
      * @brief Get process tree statistics.
@@ -1274,7 +1276,8 @@ private:
     // IMPLEMENTATION
     // ========================================================================
 
-    std::unique_ptr<ProcessMonitorImpl> m_impl;
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 } // namespace Process
