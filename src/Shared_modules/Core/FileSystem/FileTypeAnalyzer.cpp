@@ -80,14 +80,19 @@ bool MatchesPattern(std::span<const uint8_t> buffer, size_t offset,
 
     if (mask.empty()) {
         return std::equal(pattern.begin(), pattern.end(), data);
-    } else {
-        for (size_t i = 0; i < pattern.size(); ++i) {
-            if ((data[i] & mask[i]) != (pattern[i] & mask[i])) {
-                return false;
-            }
-        }
-        return true;
     }
+
+    // Mask must be same length as pattern to avoid out-of-bounds access
+    if (mask.size() != pattern.size()) {
+        return false;
+    }
+
+    for (size_t i = 0; i < pattern.size(); ++i) {
+        if ((data[i] & mask[i]) != (pattern[i] & mask[i])) {
+            return false;
+        }
+    }
+    return true;
 }
 
 /**
@@ -152,6 +157,75 @@ std::wstring ExtractExtension(std::wstring_view filename) {
     std::wstring ext = std::wstring(filename.substr(dotPos));
     std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
     return ext;
+}
+
+/**
+ * @brief Result of a partial file header read.
+ */
+struct FileHeaderResult {
+    uint64_t fileSize = 0;
+    std::vector<uint8_t> header;
+    bool success = false;
+};
+
+/**
+ * @brief Reads file header bytes efficiently using Win32 API.
+ *
+ * Opens the file for shared-read access and reads only the requested
+ * number of header bytes. Much more efficient than reading the entire
+ * file for magic-number-based type detection.
+ */
+FileHeaderResult ReadFileHeader(std::wstring_view filePath, size_t maxHeaderBytes) {
+    FileHeaderResult result;
+
+    HANDLE hFile = ::CreateFileW(
+        std::wstring(filePath).c_str(),
+        GENERIC_READ,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr,
+        OPEN_EXISTING,
+        FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN,
+        nullptr);
+
+    if (hFile == INVALID_HANDLE_VALUE) {
+        return result;
+    }
+
+    // RAII guard for file handle
+    struct HandleGuard {
+        HANDLE h;
+        ~HandleGuard() { if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h); }
+    } guard{hFile};
+
+    LARGE_INTEGER li{};
+    if (!::GetFileSizeEx(hFile, &li) || li.QuadPart < 0) {
+        return result;
+    }
+
+    result.fileSize = static_cast<uint64_t>(li.QuadPart);
+
+    if (result.fileSize == 0) {
+        result.success = true;
+        return result;
+    }
+
+    // maxHeaderBytes is at most MAX_HEADER_SIZE (64KB) — safe DWORD cast
+    const size_t readSize = static_cast<size_t>(
+        std::min(static_cast<uint64_t>(maxHeaderBytes), result.fileSize));
+
+    result.header.resize(readSize);
+
+    DWORD bytesRead = 0;
+    if (!::ReadFile(hFile, result.header.data(),
+                    static_cast<DWORD>(readSize),
+                    &bytesRead, nullptr) || bytesRead == 0) {
+        result.header.clear();
+        return result;
+    }
+
+    result.header.resize(bytesRead);
+    result.success = true;
+    return result;
 }
 
 /**
@@ -590,10 +664,8 @@ static const std::vector<MagicSignature> g_signatures = {
     // EXECUTABLES (PE, ELF, Mach-O, Java, .NET)
     // ========================================================================
 
-    // PE (Windows executables)
-    SIG(PE32, "PE32 Executable", 0x4D, 0x5A),  // MZ
-    SIG(DLL32, "PE32 DLL", 0x4D, 0x5A),
-    SIG(SYS32, "PE32 Driver", 0x4D, 0x5A),
+    // PE (Windows executables) — All MZ files disambiguated by DisambiguatePE
+    SIG(PE32, "PE Executable (MZ)", 0x4D, 0x5A),  // MZ header; disambiguates to PE32/64, DLL, SYS, .NET
 
     // ELF (Linux executables)
     SIG(ELF32, "ELF 32-bit", 0x7F, 0x45, 0x4C, 0x46, 0x01),  // \x7FELF + class 1
@@ -602,11 +674,8 @@ static const std::vector<MagicSignature> g_signatures = {
     // Mach-O (macOS executables)
     SIG(MachO32, "Mach-O 32-bit", 0xFE, 0xED, 0xFA, 0xCE),
     SIG(MachO64, "Mach-O 64-bit", 0xFE, 0xED, 0xFA, 0xCF),
-    SIG(MachOUniversal, "Mach-O Universal", 0xCA, 0xFE, 0xBA, 0xBE),
-
-    // Java
-    SIG(JavaClass, "Java Class", 0xCA, 0xFE, 0xBA, 0xBE),
-    SIG(JavaJAR, "Java JAR", 0x50, 0x4B, 0x03, 0x04),  // ZIP with manifest
+    // Mach-O / Java (0xCAFEBABE) — Disambiguated by DisambiguateCAFEBABE
+    SIG(MachOUniversal, "Mach-O/Java (CAFEBABE)", 0xCA, 0xFE, 0xBA, 0xBE),
 
     // WebAssembly
     SIG(WebAssembly, "WebAssembly", 0x00, 0x61, 0x73, 0x6D),  // \0asm
@@ -615,7 +684,8 @@ static const std::vector<MagicSignature> g_signatures = {
     // ARCHIVES (ZIP, RAR, 7Z, TAR, etc.)
     // ========================================================================
 
-    SIG(ZIP, "ZIP Archive", 0x50, 0x4B, 0x03, 0x04),
+    // ZIP archive family — All PK\x03\x04 disambiguated by DisambiguateZIP
+    SIG(ZIP, "ZIP/PK Archive", 0x50, 0x4B, 0x03, 0x04),  // Handles ZIP, DOCX, XLSX, PPTX, ODT, ODS, ODP, JAR
     SIG(ZIP, "ZIP Archive (empty)", 0x50, 0x4B, 0x05, 0x06),
     SIG(ZIP, "ZIP Archive (spanned)", 0x50, 0x4B, 0x07, 0x08),
     SIG(RAR, "RAR Archive", 0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00),
@@ -642,20 +712,10 @@ static const std::vector<MagicSignature> g_signatures = {
     SIG(RTF, "RTF Document", 0x7B, 0x5C, 0x72, 0x74, 0x66),  // {\rtf
 
     // Microsoft Office (OLE Compound)
-    SIG(DOC, "MS Word Document", 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),
-    SIG(XLS, "MS Excel Spreadsheet", 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),
-    SIG(PPT, "MS PowerPoint", 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),
-    SIG(MSI, "Windows Installer", 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),
+    // Microsoft Office / OLE Compound — Disambiguated by DisambiguateOLE
+    SIG(DOC, "OLE Compound File", 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1),  // Handles DOC, XLS, PPT, MSI
 
-    // Office Open XML (ZIP-based)
-    SIG(DOCX, "MS Word DOCX", 0x50, 0x4B, 0x03, 0x04),
-    SIG(XLSX, "MS Excel XLSX", 0x50, 0x4B, 0x03, 0x04),
-    SIG(PPTX, "MS PowerPoint PPTX", 0x50, 0x4B, 0x03, 0x04),
-
-    // OpenDocument
-    SIG(ODT, "OpenDocument Text", 0x50, 0x4B, 0x03, 0x04),
-    SIG(ODS, "OpenDocument Spreadsheet", 0x50, 0x4B, 0x03, 0x04),
-    SIG(ODP, "OpenDocument Presentation", 0x50, 0x4B, 0x03, 0x04),
+    // Office Open XML and OpenDocument — Handled by ZIP + DisambiguateZIP above
 
     // HTML/XML
     SIG(HTML, "HTML Document", 0x3C, 0x21, 0x44, 0x4F, 0x43, 0x54, 0x59, 0x50, 0x45),  // <!DOCTYPE
@@ -678,7 +738,7 @@ static const std::vector<MagicSignature> g_signatures = {
     SIG(TIFF, "TIFF Image (LE)", 0x49, 0x49, 0x2A, 0x00),  // Little-endian
     SIG(TIFF, "TIFF Image (BE)", 0x4D, 0x4D, 0x00, 0x2A),  // Big-endian
     SIG(ICO, "Windows Icon", 0x00, 0x00, 0x01, 0x00),
-    SIG(WEBP, "WebP Image", 0x52, 0x49, 0x46, 0x46),  // RIFF (needs WEBP check)
+    SIG(WEBP, "RIFF Container", 0x52, 0x49, 0x46, 0x46),  // Disambiguated by DisambiguateRIFF → WEBP/WAV/AVI
     SIG(PSD, "Photoshop Document", 0x38, 0x42, 0x50, 0x53),  // 8BPS
 
     // ========================================================================
@@ -689,7 +749,7 @@ static const std::vector<MagicSignature> g_signatures = {
     SIG(MP3, "MP3 Audio", 0xFF, 0xF3),  // MPEG-2 Layer 3
     SIG(MP3, "MP3 Audio", 0xFF, 0xF2),
     SIG(MP3, "MP3 Audio (ID3v2)", 0x49, 0x44, 0x33),  // ID3
-    SIG(WAV, "WAV Audio", 0x52, 0x49, 0x46, 0x46),  // RIFF
+    // WAV uses RIFF container — handled above by DisambiguateRIFF
     SIG(FLAC, "FLAC Audio", 0x66, 0x4C, 0x61, 0x43),  // fLaC
     SIG(OGG, "OGG Audio", 0x4F, 0x67, 0x67, 0x53),  // OggS
     SIG(M4A, "M4A Audio", 0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70, 0x4D, 0x34, 0x41),
@@ -699,9 +759,8 @@ static const std::vector<MagicSignature> g_signatures = {
     // ========================================================================
 
     SIG(MP4, "MP4 Video", 0x00, 0x00, 0x00, 0x20, 0x66, 0x74, 0x79, 0x70),  // ftyp
-    SIG(AVI, "AVI Video", 0x52, 0x49, 0x46, 0x46),  // RIFF
-    SIG(MKV, "Matroska Video", 0x1A, 0x45, 0xDF, 0xA3),
-    SIG(WEBM, "WebM Video", 0x1A, 0x45, 0xDF, 0xA3),
+    // AVI uses RIFF container — handled above by DisambiguateRIFF
+    SIG(MKV, "EBML Container", 0x1A, 0x45, 0xDF, 0xA3),  // Disambiguated → MKV or WEBM
     SIG(MOV, "QuickTime Movie", 0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74),
     SIG(FLV, "Flash Video", 0x46, 0x4C, 0x56, 0x01),
 
@@ -719,9 +778,8 @@ static const std::vector<MagicSignature> g_signatures = {
     // CERTIFICATES
     // ========================================================================
 
-    SIG(DER, "DER Certificate", 0x30, 0x82),
+    SIG(DER, "DER/ASN.1 Certificate", 0x30, 0x82),  // Also matches PFX — disambiguated by DisambiguateDERPFX
     SIG(PEM, "PEM Certificate", 0x2D, 0x2D, 0x2D, 0x2D, 0x2D, 0x42, 0x45, 0x47, 0x49, 0x4E),  // -----BEGIN
-    SIG(PFX, "PFX Certificate", 0x30, 0x82),
 
     // ========================================================================
     // FONTS
@@ -898,6 +956,7 @@ RiskLevel GetRiskForFormat(FileFormat format) {
         case FileFormat::MachO64:
         case FileFormat::MachOUniversal:
         case FileFormat::DotNetAssembly:
+        case FileFormat::WebAssembly:
         case FileFormat::MSI:
         case FileFormat::HTA:
             return RiskLevel::Critical;
@@ -921,6 +980,8 @@ RiskLevel GetRiskForFormat(FileFormat format) {
         case FileFormat::JavaJAR:
         case FileFormat::CAB:
         case FileFormat::ISO:
+        case FileFormat::VHD:
+        case FileFormat::VHDX:
         case FileFormat::LNK:
             return RiskLevel::High;
 
@@ -968,33 +1029,90 @@ RiskLevel GetRiskForFormat(FileFormat format) {
  */
 std::string GetMimeForFormat(FileFormat format) {
     static const std::unordered_map<FileFormat, std::string> mimeMap = {
+        // Executables
         {FileFormat::PE32, "application/x-msdownload"},
         {FileFormat::PE64, "application/x-msdownload"},
         {FileFormat::DLL32, "application/x-msdownload"},
         {FileFormat::DLL64, "application/x-msdownload"},
+        {FileFormat::SYS32, "application/x-msdownload"},
+        {FileFormat::SYS64, "application/x-msdownload"},
         {FileFormat::ELF32, "application/x-executable"},
         {FileFormat::ELF64, "application/x-executable"},
+        {FileFormat::MachO32, "application/x-mach-binary"},
+        {FileFormat::MachO64, "application/x-mach-binary"},
+        {FileFormat::MachOUniversal, "application/x-mach-binary"},
+        {FileFormat::DotNetAssembly, "application/x-msdownload"},
+        {FileFormat::JavaClass, "application/java-vm"},
+        {FileFormat::JavaJAR, "application/java-archive"},
+        {FileFormat::WebAssembly, "application/wasm"},
+        // Scripts
+        {FileFormat::PowerShell, "application/x-powershell"},
+        {FileFormat::Batch, "application/x-bat"},
+        {FileFormat::VBScript, "text/vbscript"},
+        {FileFormat::JScript, "application/javascript"},
+        {FileFormat::JavaScript, "application/javascript"},
+        {FileFormat::Python, "text/x-python"},
+        {FileFormat::HTA, "application/hta"},
+        // Documents
         {FileFormat::PDF, "application/pdf"},
+        {FileFormat::RTF, "application/rtf"},
+        {FileFormat::DOC, "application/msword"},
+        {FileFormat::XLS, "application/vnd.ms-excel"},
+        {FileFormat::PPT, "application/vnd.ms-powerpoint"},
+        {FileFormat::DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
+        {FileFormat::XLSX, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
+        {FileFormat::PPTX, "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
+        {FileFormat::ODT, "application/vnd.oasis.opendocument.text"},
+        {FileFormat::ODS, "application/vnd.oasis.opendocument.spreadsheet"},
+        {FileFormat::ODP, "application/vnd.oasis.opendocument.presentation"},
+        {FileFormat::HTML, "text/html"},
+        {FileFormat::XML, "text/xml"},
+        {FileFormat::MHTML, "message/rfc822"},
+        // Archives
         {FileFormat::ZIP, "application/zip"},
         {FileFormat::RAR, "application/x-rar-compressed"},
+        {FileFormat::RAR5, "application/x-rar-compressed"},
         {FileFormat::SevenZip, "application/x-7z-compressed"},
+        {FileFormat::TAR, "application/x-tar"},
+        {FileFormat::GZIP, "application/gzip"},
+        {FileFormat::BZIP2, "application/x-bzip2"},
+        {FileFormat::XZ, "application/x-xz"},
+        {FileFormat::CAB, "application/vnd.ms-cab-compressed"},
+        {FileFormat::MSI, "application/x-msi"},
+        // Disk images
+        {FileFormat::ISO, "application/x-iso9660-image"},
+        {FileFormat::VHD, "application/x-vhd"},
+        {FileFormat::VHDX, "application/x-vhdx"},
+        // Images
         {FileFormat::JPEG, "image/jpeg"},
         {FileFormat::PNG, "image/png"},
         {FileFormat::GIF, "image/gif"},
         {FileFormat::BMP, "image/bmp"},
-        {FileFormat::HTML, "text/html"},
-        {FileFormat::XML, "text/xml"},
-        {FileFormat::JSON, "application/json"},
+        {FileFormat::TIFF, "image/tiff"},
+        {FileFormat::ICO, "image/x-icon"},
+        {FileFormat::WEBP, "image/webp"},
+        {FileFormat::SVG, "image/svg+xml"},
+        {FileFormat::PSD, "image/vnd.adobe.photoshop"},
+        // Audio
         {FileFormat::MP3, "audio/mpeg"},
         {FileFormat::WAV, "audio/wav"},
+        {FileFormat::FLAC, "audio/flac"},
+        {FileFormat::OGG, "audio/ogg"},
+        {FileFormat::M4A, "audio/mp4"},
+        {FileFormat::AAC, "audio/aac"},
+        // Video
         {FileFormat::MP4, "video/mp4"},
         {FileFormat::AVI, "video/x-msvideo"},
-        {FileFormat::DOCX, "application/vnd.openxmlformats-officedocument.wordprocessingml.document"},
-        {FileFormat::XLSX, "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"},
-        {FileFormat::PPTX, "application/vnd.openxmlformats-officedocument.presentationml.presentation"},
-        {FileFormat::DOC, "application/msword"},
-        {FileFormat::XLS, "application/vnd.ms-excel"},
-        {FileFormat::PPT, "application/vnd.ms-powerpoint"},
+        {FileFormat::MKV, "video/x-matroska"},
+        {FileFormat::MOV, "video/quicktime"},
+        {FileFormat::WEBM, "video/webm"},
+        {FileFormat::FLV, "video/x-flv"},
+        // Data
+        {FileFormat::JSON, "application/json"},
+        {FileFormat::YAML, "text/yaml"},
+        {FileFormat::SQLite, "application/x-sqlite3"},
+        // Other
+        {FileFormat::LNK, "application/x-ms-shortcut"},
     };
 
     auto it = mimeMap.find(format);
@@ -1163,7 +1281,7 @@ public:
             // Load built-in signatures
             m_signatures = MagicDB::g_signatures;
 
-            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Loaded %llu built-in signatures", m_signatures.size());
+            SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Loaded %zu built-in signatures", m_signatures.size());
 
             m_initialized = true;
             SS_LOG_INFO(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Initialized successfully");
@@ -1244,14 +1362,14 @@ public:
             // Extract disk extension
             info.diskExtension = ExtractExtension(filePath);
 
-            // Check if file exists
-            if (!Utils::FileUtils::FileExists(filePath)) {
-                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: File not found");
+            // Efficient partial file read (only header bytes, not entire file)
+            auto headerResult = ReadFileHeader(filePath, m_config.headerSize);
+            if (!headerResult.success) {
+                SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: File not found or unreadable");
                 return info;
             }
 
-            // Get file size
-            info.fileSize = Utils::FileUtils::GetFileSize(filePath);
+            info.fileSize = headerResult.fileSize;
 
             // Empty file
             if (info.fileSize == 0) {
@@ -1265,26 +1383,30 @@ public:
                 return info;
             }
 
-            // Read file header
-            const size_t readSize = std::min(
-                static_cast<size_t>(info.fileSize),
-                m_config.headerSize
-            );
-
-            auto headerData = Utils::FileUtils::ReadFileBytes(filePath, readSize);
-            if (headerData.empty()) {
+            if (headerResult.header.empty()) {
                 SS_LOG_ERROR(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Failed to read file header");
                 return info;
             }
 
-            std::span<const uint8_t> buffer(headerData.data(), headerData.size());
+            std::span<const uint8_t> buffer(headerResult.header.data(), headerResult.header.size());
+
+            // Preserve spoofing flags from path security checks (RTLO, ADS, trailing dots)
+            const bool priorSpoofed = info.isSpoofed;
+            const SpoofingType priorSpoofType = info.spoofingType;
+            const std::wstring diskExt = info.diskExtension;
 
             // Analyze the buffer
-            info = AnalyzeBufferImpl(buffer, info.diskExtension);
+            info = AnalyzeBufferImpl(buffer, diskExt);
             info.filePath = filePath;
-            info.fileSize = Utils::FileUtils::GetFileSize(filePath);
+            info.fileSize = headerResult.fileSize;
 
-            // Detect spoofing if enabled
+            // Restore path-level spoofing if AnalyzeBufferImpl did not detect its own
+            if (priorSpoofed && !info.isSpoofed) {
+                info.isSpoofed = true;
+                info.spoofingType = priorSpoofType;
+            }
+
+            // Detect extension-vs-content spoofing if enabled
             if (m_config.detectSpoofing) {
                 DetectSpoofingImpl(info);
             }
@@ -1318,17 +1440,12 @@ public:
 
     FileFormat DetectFormat(const std::wstring& filePath) const {
         try {
-            const size_t readSize = std::min(
-                Utils::FileUtils::GetFileSize(filePath),
-                m_config.headerSize
-            );
-
-            auto headerData = Utils::FileUtils::ReadFileBytes(filePath, readSize);
-            if (headerData.empty()) {
+            auto headerResult = ReadFileHeader(filePath, m_config.headerSize);
+            if (!headerResult.success || headerResult.header.empty()) {
                 return FileFormat::Unknown;
             }
 
-            return DetectFormatImpl(std::span<const uint8_t>(headerData.data(), headerData.size()));
+            return DetectFormatImpl(std::span<const uint8_t>(headerResult.header.data(), headerResult.header.size()));
 
         } catch (...) {
             return FileFormat::Unknown;
@@ -1620,7 +1737,8 @@ public:
     }
 
     size_t LoadSignatures(const std::wstring& signaturePath) {
-        // Custom signature loading not implemented in this version
+        (void)signaturePath;
+        SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Custom signature loading not yet implemented");
         return 0;
     }
 
@@ -1849,9 +1967,11 @@ private:
                 }
             }
 
-            // Extension mismatch detected
-            info.isSpoofed = true;
-            info.spoofingType = SpoofingType::ExtensionMismatch;
+            // Extension mismatch detected — don't override more severe spoofing (RTLO, ADS)
+            if (!info.isSpoofed) {
+                info.isSpoofed = true;
+                info.spoofingType = SpoofingType::ExtensionMismatch;
+            }
             info.suggestedExtension = Utils::StringUtils::ToWide(expectedExt);
 
             m_stats.spoofingDetected.fetch_add(1, std::memory_order_relaxed);
@@ -1871,35 +1991,48 @@ private:
     }
 
     bool HasDoubleExtensionImpl(std::wstring_view filename) const {
-        // Look for patterns like: file.txt.exe, file.pdf.scr
-        // Common fake extensions
-        static const std::vector<std::wstring> fakeExtensions = {
-            L".txt", L".pdf", L".doc", L".jpg", L".png", L".gif"
+        // Detect patterns like: file.txt.exe, file.pdf.scr, report.xlsx.bat
+        static const std::unordered_set<std::wstring_view> safeExtensions = {
+            L".txt", L".pdf", L".doc", L".docx", L".xls", L".xlsx",
+            L".ppt", L".pptx", L".jpg", L".jpeg", L".png", L".gif",
+            L".bmp", L".tif", L".tiff", L".csv", L".rtf", L".odt",
+            L".ods", L".odp", L".mp3", L".mp4", L".wav", L".avi",
+            L".html", L".htm", L".xml", L".json", L".yaml", L".yml",
+            L".log", L".cfg", L".ini", L".zip", L".rar", L".7z",
         };
 
-        // Dangerous real extensions
-        static const std::vector<std::wstring> dangerousExtensions = {
+        static const std::unordered_set<std::wstring_view> dangerousExtensions = {
             L".exe", L".scr", L".bat", L".cmd", L".com", L".pif",
-            L".vbs", L".js", L".ps1", L".hta"
+            L".vbs", L".vbe", L".js", L".jse", L".wsf", L".wsh",
+            L".ps1", L".psm1", L".hta", L".cpl", L".msi", L".msp",
+            L".dll", L".sys", L".lnk",
         };
 
-        std::wstring lower = std::wstring(filename);
+        std::wstring lower(filename);
         std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
 
-        // Check for fake extension followed by dangerous extension
-        for (const auto& fakeExt : fakeExtensions) {
-            size_t pos = lower.find(fakeExt);
-            if (pos != std::wstring::npos) {
-                // Check if there's a dangerous extension after it
-                for (const auto& dangerExt : dangerousExtensions) {
-                    if (lower.find(dangerExt, pos + fakeExt.length()) != std::wstring::npos) {
-                        return true;
-                    }
-                }
-            }
+        // Find last dot position (the final extension)
+        const size_t lastDot = lower.find_last_of(L'.');
+        if (lastDot == std::wstring::npos || lastDot == 0) {
+            return false;
         }
 
-        return false;
+        std::wstring_view finalExt(lower.data() + lastDot, lower.size() - lastDot);
+
+        // Only suspicious if the final extension is dangerous
+        if (dangerousExtensions.find(finalExt) == dangerousExtensions.end()) {
+            return false;
+        }
+
+        // Check if there's a safe-looking extension before the dangerous one
+        std::wstring_view stem(lower.data(), lastDot);
+        const size_t prevDot = stem.find_last_of(L'.');
+        if (prevDot == std::wstring_view::npos) {
+            return false;
+        }
+
+        std::wstring_view prevExt(stem.data() + prevDot, stem.size() - prevDot);
+        return safeExtensions.find(prevExt) != safeExtensions.end();
     }
 
     // ========================================================================
