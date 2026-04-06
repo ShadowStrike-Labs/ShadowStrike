@@ -1063,6 +1063,28 @@ public:
     [[nodiscard]] bool PerformDiagnostics() const;
     bool ExportDiagnostics(const std::wstring& outputPath) const;
 
+    // ========================================================================
+    // Store Wiring (Orchestrator-Injected Dependencies)
+    // ========================================================================
+
+    /**
+     * @brief Set the ThreatIntelStore instance (non-owning, orchestrator manages lifetime)
+     * @param store Pointer to the ThreatIntelStore, or nullptr to clear
+     */
+    void SetThreatIntelStore(ShadowStrike::ThreatIntel::ThreatIntelStore* store) noexcept;
+
+    /**
+     * @brief Set the PatternStore instance (non-owning, orchestrator manages lifetime)
+     * @param store Pointer to the PatternStore, or nullptr to clear
+     */
+    void SetPatternStore(ShadowStrike::PatternStore::PatternStore* store) noexcept;
+
+    /**
+     * @brief Set the SignatureStore instance (non-owning, orchestrator manages lifetime)
+     * @param store Pointer to the SignatureStore, or nullptr to clear
+     */
+    void SetSignatureStore(ShadowStrike::SignatureStore::SignatureStore* store) noexcept;
+
 private:
     WebProtection();
     ~WebProtection();

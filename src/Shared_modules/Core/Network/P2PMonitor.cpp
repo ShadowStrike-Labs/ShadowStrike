@@ -76,6 +76,7 @@
 #include "../../Utils/SystemUtils.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
+#include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 
@@ -1439,6 +1440,9 @@ private:
     std::unordered_set<uint32_t> m_blockedProcesses;
     std::unordered_map<uint32_t, uint64_t> m_throttledProcesses;  // pid -> bps limit
 
+    /// @brief Infrastructure integrations (non-owning, orchestrator manages lifetime)
+    ThreatIntel::ThreatIntelStore* m_threatIntel{nullptr};
+
     // Callbacks
     std::unordered_map<uint64_t, P2PDetectionCallback> m_detectionCallbacks;
     std::unordered_map<uint64_t, P2PAlertCallback> m_alertCallbacks;
@@ -1611,6 +1615,18 @@ bool P2PMonitor::PerformDiagnostics() const {
 
 bool P2PMonitor::ExportDiagnostics(const std::wstring& outputPath) const {
     return m_impl->ExportDiagnostics(outputPath);
+}
+
+// ============================================================================
+// Store Wiring (Orchestrator-Injected Dependencies)
+// ============================================================================
+
+void P2PMonitor::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
+    if (!m_impl) return;
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_threatIntel = store;
+    SS_LOG_INFO(L"Network", L"P2PMonitor: ThreatIntelStore %ls",
+                store ? L"wired" : L"cleared");
 }
 
 }  // namespace Network
