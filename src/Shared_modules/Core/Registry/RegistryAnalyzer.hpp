@@ -156,7 +156,6 @@ namespace Registry {
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
-class RegistryAnalyzerImpl;  // PIMPL implementation
 
 // ============================================================================
 // NAMESPACE CONSTANTS
@@ -173,6 +172,8 @@ namespace RegistryAnalyzerConstants {
     constexpr size_t MAX_KEY_NAME_LENGTH = 255;
     constexpr size_t MAX_VALUE_SIZE = 1024 * 1024;  // 1 MB
     constexpr uint32_t MAX_SCAN_DEPTH = 50;
+    constexpr size_t MIN_BLOB_SIZE_FOR_ANALYSIS = 256;
+    constexpr size_t MAX_NTAPI_BUFFER_SIZE = 64 * 1024;  // 64 KB cap for NtEnumerateKey
 
     // Entropy thresholds
     constexpr double HIGH_ENTROPY_THRESHOLD = 7.0;
@@ -952,7 +953,8 @@ private:
     RegistryAnalyzer(const RegistryAnalyzer&) = delete;
     RegistryAnalyzer& operator=(const RegistryAnalyzer&) = delete;
 
-    std::unique_ptr<RegistryAnalyzerImpl> m_impl;
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 }  // namespace Registry

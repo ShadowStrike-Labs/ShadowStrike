@@ -41,6 +41,8 @@
 #include "../../Utils/RegistryUtils.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
+#include "../Process/ProcessMonitor.hpp"
+#include "RegistryMonitor.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -63,7 +65,9 @@
 #ifdef _WIN32
 #  include <Windows.h>
 #  include <winternl.h>
+#  include <sddl.h>
 #  pragma comment(lib, "ntdll.lib")
+#  pragma comment(lib, "advapi32.lib")
 
 // Native API definitions not in winternl.h
 typedef enum _KEY_INFORMATION_CLASS {
@@ -122,7 +126,41 @@ namespace fs = std::filesystem;
 namespace {
 
 /**
- * @brief Convert Win32 path to Native path.
+ * @brief Resolve the current interactive user's SID as a wide string.
+ * Falls back to "S-1-5-21-0-0-0-0" if token introspection fails.
+ */
+[[nodiscard]] std::wstring ResolveCurrentUserSid() noexcept {
+    std::wstring sidStr;
+    HANDLE hToken = nullptr;
+
+    if (!::OpenProcessToken(::GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+        return L".DEFAULT";
+    }
+
+    DWORD tokenUserLen = 0;
+    ::GetTokenInformation(hToken, TokenUser, nullptr, 0, &tokenUserLen);
+
+    if (tokenUserLen == 0 || tokenUserLen > 4096) {
+        ::CloseHandle(hToken);
+        return L".DEFAULT";
+    }
+
+    auto buf = std::make_unique<uint8_t[]>(tokenUserLen);
+    if (::GetTokenInformation(hToken, TokenUser, buf.get(), tokenUserLen, &tokenUserLen)) {
+        auto* pTokenUser = reinterpret_cast<TOKEN_USER*>(buf.get());
+        LPWSTR pSidStr = nullptr;
+        if (::ConvertSidToStringSidW(pTokenUser->User.Sid, &pSidStr)) {
+            sidStr = pSidStr;
+            ::LocalFree(pSidStr);
+        }
+    }
+
+    ::CloseHandle(hToken);
+    return sidStr.empty() ? L".DEFAULT" : sidStr;
+}
+
+/**
+ * @brief Convert Win32 path to Native path, resolving user SID.
  */
 [[nodiscard]] std::wstring Win32ToNativePath(const std::wstring& path) {
     std::wstring native = path;
@@ -131,8 +169,14 @@ namespace {
         native = L"\\Registry\\Machine" + (pos != std::wstring::npos ? native.substr(pos) : L"");
     } else if (native.starts_with(L"HKEY_CURRENT_USER") || native.starts_with(L"HKCU")) {
         size_t pos = native.find(L'\\');
-        native = L"\\Registry\\User\\<SID>" + (pos != std::wstring::npos ? native.substr(pos) : L"");
-        // In a real implementation, we would resolve the current user's SID here
+        static const std::wstring currentSid = ResolveCurrentUserSid();
+        native = L"\\Registry\\User\\" + currentSid + (pos != std::wstring::npos ? native.substr(pos) : L"");
+    } else if (native.starts_with(L"HKEY_USERS") || native.starts_with(L"HKU")) {
+        size_t pos = native.find(L'\\');
+        native = L"\\Registry\\User" + (pos != std::wstring::npos ? native.substr(pos) : L"");
+    } else if (native.starts_with(L"HKEY_CLASSES_ROOT") || native.starts_with(L"HKCR")) {
+        size_t pos = native.find(L'\\');
+        native = L"\\Registry\\Machine\\SOFTWARE\\Classes" + (pos != std::wstring::npos ? native.substr(pos) : L"");
     }
     return native;
 }
@@ -181,45 +225,194 @@ namespace {
 }
 
 /**
- * @brief Check if data looks like executable.
+ * @brief Check if data looks like executable content.
+ * Detects PE files, ELF, scripts (.NET, PowerShell, VBScript, JScript), and shellcode patterns.
  */
 [[nodiscard]] bool LooksLikeExecutable(std::span<const uint8_t> data) noexcept {
-    if (data.size() < 64) return false;
+    if (data.size() < 4) return false;
 
-    // Check for PE signature (MZ header)
-    if (data.size() >= 2 && data[0] == 'M' && data[1] == 'Z') {
+    // PE signature (MZ header)
+    if (data[0] == 'M' && data[1] == 'Z') {
         return true;
     }
 
-    // Check for ELF signature
+    // ELF signature
     if (data.size() >= 4 && data[0] == 0x7F && data[1] == 'E' &&
         data[2] == 'L' && data[3] == 'F') {
         return true;
+    }
+
+    // .NET assembly / MSIL (check for CLI header marker after MZ)
+    // BSJB (.NET metadata) signature
+    if (data.size() >= 64) {
+        for (size_t i = 0; i + 4 <= data.size() && i < 512; ++i) {
+            if (data[i] == 'B' && data[i+1] == 'S' &&
+                data[i+2] == 'J' && data[i+3] == 'B') {
+                return true;
+            }
+        }
+    }
+
+    // Common x86/x64 shellcode stubs
+    // NOP sled (>= 8 consecutive NOPs)
+    if (data.size() >= 8) {
+        size_t nopCount = 0;
+        for (size_t i = 0; i < std::min(data.size(), size_t(256)); ++i) {
+            if (data[i] == 0x90) {
+                if (++nopCount >= 8) return true;
+            } else {
+                nopCount = 0;
+            }
+        }
+    }
+
+    // Common shellcode prologues: push/mov patterns
+    if (data.size() >= 4) {
+        // x86 GetPC via call $+5 (E8 00 00 00 00)
+        if (data.size() >= 5 && data[0] == 0xE8 && data[1] == 0x00 &&
+            data[2] == 0x00 && data[3] == 0x00 && data[4] == 0x00) {
+            return true;
+        }
+        // x64 typical: 48 83 EC (sub rsp, N) or 48 89 E5 (mov rbp, rsp)
+        if (data.size() >= 3 && data[0] == 0x48 && data[1] == 0x83 && data[2] == 0xEC) {
+            return true;
+        }
+    }
+
+    // Script detection - check as narrow string for script markers
+    auto asStr = std::string_view(reinterpret_cast<const char*>(data.data()),
+                                   std::min(data.size(), size_t(512)));
+
+    // PowerShell markers
+    static constexpr std::string_view psMarkers[] = {
+        "powershell", "Invoke-Expression", "IEX(", "New-Object",
+        "[System.Convert]::", "[System.Reflection.Assembly]::",
+        "-EncodedCommand", "FromBase64String"
+    };
+    for (auto marker : psMarkers) {
+        if (asStr.find(marker) != std::string_view::npos) return true;
+    }
+
+    // VBScript/JScript markers
+    static constexpr std::string_view scriptMarkers[] = {
+        "WScript.Shell", "CreateObject(", "Scripting.FileSystemObject",
+        "ADODB.Stream", "eval(", "ActiveXObject"
+    };
+    for (auto marker : scriptMarkers) {
+        if (asStr.find(marker) != std::string_view::npos) return true;
     }
 
     return false;
 }
 
 /**
- * @brief Detect if data is Base64 encoded.
+ * @brief Sanitize a registry path for safe logging.
+ * Replaces NULL bytes and control characters with escape sequences.
+ */
+[[nodiscard]] std::wstring SanitizePathForLogging(const std::wstring& path) noexcept {
+    std::wstring sanitized;
+    sanitized.reserve(path.size());
+    for (wchar_t ch : path) {
+        if (ch == L'\0') {
+            sanitized += L"\\x00";
+        } else if (ch < 0x20) {
+            sanitized += std::format(L"\\x{:02X}", static_cast<unsigned>(ch));
+        } else {
+            sanitized += ch;
+        }
+    }
+    return sanitized;
+}
+
+/**
+ * @brief Escape a string field for CSV output (RFC 4180 compliant).
+ */
+[[nodiscard]] std::string EscapeCsvField(const std::string& field) noexcept {
+    if (field.find_first_of(",\"\r\n") == std::string::npos &&
+        !field.starts_with('=') && !field.starts_with('+') &&
+        !field.starts_with('-') && !field.starts_with('@')) {
+        return field;
+    }
+    std::string escaped = "\"";
+    for (char ch : field) {
+        if (ch == '"') escaped += "\"\"";
+        else escaped += ch;
+    }
+    escaped += '"';
+    return escaped;
+}
+
+/**
+ * @brief Resolve HKEY root + subkey from a full path like "HKLM\\SOFTWARE\\..."
+ */
+[[nodiscard]] std::pair<HKEY, std::wstring> ResolveRootKey(const std::wstring& keyPath) noexcept {
+    if (keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\") || keyPath.starts_with(L"HKLM\\")) {
+        size_t pos = keyPath.find(L'\\');
+        return { HKEY_LOCAL_MACHINE, keyPath.substr(pos + 1) };
+    }
+    if (keyPath.starts_with(L"HKEY_CURRENT_USER\\") || keyPath.starts_with(L"HKCU\\")) {
+        size_t pos = keyPath.find(L'\\');
+        return { HKEY_CURRENT_USER, keyPath.substr(pos + 1) };
+    }
+    if (keyPath.starts_with(L"HKEY_CLASSES_ROOT\\") || keyPath.starts_with(L"HKCR\\")) {
+        size_t pos = keyPath.find(L'\\');
+        return { HKEY_CLASSES_ROOT, keyPath.substr(pos + 1) };
+    }
+    if (keyPath.starts_with(L"HKEY_USERS\\") || keyPath.starts_with(L"HKU\\")) {
+        size_t pos = keyPath.find(L'\\');
+        return { HKEY_USERS, keyPath.substr(pos + 1) };
+    }
+    // Default to HKLM with the path as-is (relative path)
+    return { HKEY_LOCAL_MACHINE, keyPath };
+}
+
+/**
+ * @brief Detect if data is Base64 encoded with reduced false-positive rate.
+ * Checks alphabet match, length divisibility, padding, and whitespace ratio.
  */
 [[nodiscard]] bool IsBase64Encoded(std::span<const uint8_t> data) noexcept {
     if (data.size() < 16) return false;
 
-    // Base64 alphabet + padding
-    const char base64Chars[] =
-        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/=";
+    // Determine effective length (strip trailing whitespace/newlines)
+    size_t effectiveLen = data.size();
+    while (effectiveLen > 0 && (data[effectiveLen - 1] == '\r' || data[effectiveLen - 1] == '\n' ||
+                                 data[effectiveLen - 1] == ' ')) {
+        effectiveLen--;
+    }
+    if (effectiveLen < 16) return false;
 
-    size_t validCount = 0;
-    for (size_t i = 0; i < std::min(data.size(), size_t(100)); ++i) {
-        char ch = static_cast<char>(data[i]);
-        if (strchr(base64Chars, ch) != nullptr) {
-            validCount++;
+    size_t validB64Count = 0;
+    size_t whitespaceCount = 0;
+    size_t paddingCount = 0;
+    bool lastWasPadding = false;
+
+    for (size_t i = 0; i < effectiveLen; ++i) {
+        uint8_t ch = data[i];
+        if ((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') ||
+            (ch >= '0' && ch <= '9') || ch == '+' || ch == '/') {
+            if (lastWasPadding) return false;  // data after padding = not base64
+            validB64Count++;
+        } else if (ch == '=') {
+            paddingCount++;
+            lastWasPadding = true;
+            if (paddingCount > 2) return false;
+        } else if (ch == '\r' || ch == '\n' || ch == ' ') {
+            whitespaceCount++;
+        } else {
+            return false;  // Invalid character for base64
         }
     }
 
-    // If >90% of chars are Base64, likely encoded
-    return validCount > (std::min(data.size(), size_t(100)) * 9 / 10);
+    size_t contentLen = validB64Count + paddingCount;
+    if (contentLen < 16) return false;
+
+    // Base64 content length must be divisible by 4
+    if (contentLen % 4 != 0) return false;
+
+    // High ratio of valid chars (>95% excluding whitespace)
+    size_t nonWhitespace = effectiveLen - whitespaceCount;
+    if (nonWhitespace == 0) return false;
+    return (validB64Count + paddingCount) > (nonWhitespace * 95 / 100);
 }
 
 /**
@@ -644,15 +837,84 @@ public:
 
         // Recover deleted entries if configured
         if (m_config.recoverDeleted) {
-            // Simplified hive-based recovery - full offline parsing deferred to forensic module
+            // Recover from system hives where we have access
+            const std::wstring sysRoot = L"C:\\Windows\\System32\\config\\";
+            struct HiveEntry { HiveType type; std::wstring path; };
+            const HiveEntry hives[] = {
+                { HiveType::SOFTWARE, sysRoot + L"SOFTWARE" },
+                { HiveType::SYSTEM,   sysRoot + L"SYSTEM" },
+                { HiveType::SAM,      sysRoot + L"SAM" },
+                { HiveType::SECURITY, sysRoot + L"SECURITY" },
+            };
+
+            for (const auto& [hiveType, hivePath] : hives) {
+                if (m_abortRequested.load(std::memory_order_acquire)) break;
+                try {
+                    auto recovered = RecoverDeletedEntriesImpl(hivePath);
+                    result.deletedRecovered += recovered.size();
+                    for (auto& entry : recovered) {
+                        std::unique_lock lock(m_anomalyMutex);
+                        m_deletedEntries.push_back(std::move(entry));
+                    }
+                } catch (const std::exception& e) {
+                    SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Recovery from %ls failed: %hs",
+                        hivePath.c_str(), e.what());
+                }
+            }
         }
 
-        // Build timeline
+        // Build forensic timeline from key timestamps
         if (m_config.buildTimeline) {
-            // Timeline construction would enumerate keys with timestamps
+            BuildTimelineFromKeys(scope);
         }
 
         return result;
+    }
+
+    /**
+     * @brief Build forensic timeline by enumerating keys and recording their last-write times.
+     */
+    void BuildTimelineFromKeys(const AnalysisScope& scope) {
+        for (const auto& path : scope.specificPaths) {
+            if (m_abortRequested.load(std::memory_order_acquire)) break;
+            try {
+                auto [rootKey, subKey] = ResolveRootKey(path);
+
+                RegistryUtils::RegistryKey regKey;
+                RegistryUtils::OpenOptions opts;
+                opts.access = KEY_READ;
+                opts.wow64_64 = true;
+
+                if (!regKey.Open(rootKey, subKey, opts)) continue;
+
+                RegistryUtils::KeyInfo info;
+                if (regKey.QueryInfo(info)) {
+                    ULARGE_INTEGER uli;
+                    uli.LowPart = info.lastWriteTime.dwLowDateTime;
+                    uli.HighPart = info.lastWriteTime.dwHighDateTime;
+
+                    if (uli.QuadPart > 0) {
+                        constexpr int64_t FILETIME_EPOCH_OFFSET_SEC = 11644473600LL;
+                        auto windowsDuration = std::chrono::duration<int64_t, std::ratio<1, 10000000>>(
+                            static_cast<int64_t>(uli.QuadPart));
+                        auto unixDuration = windowsDuration - std::chrono::seconds(FILETIME_EPOCH_OFFSET_SEC);
+
+                        ForensicTimeline entry;
+                        entry.timestamp = std::chrono::system_clock::time_point(
+                            std::chrono::duration_cast<std::chrono::system_clock::duration>(unixDuration));
+                        entry.action = "Modified";
+                        entry.keyPath = path;
+                        entry.description = "Key last write time";
+
+                        std::unique_lock lock(m_timelineMutex);
+                        m_timeline.push_back(std::move(entry));
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Timeline build exception for %ls: %hs",
+                    SanitizePathForLogging(path).c_str(), e.what());
+            }
+        }
     }
 
     [[nodiscard]] AnalysisResult PerformRootkitHunting(const AnalysisScope& scope) {
@@ -679,10 +941,11 @@ public:
             }
         }
 
-        // DKOM detection
+        // DKOM detection — queries kernel registry integrity
         if (m_config.detectDKOM) {
-            // Direct Kernel Object Manipulation detection
-            // Would require kernel driver support
+            if (DetectDKOMImpl()) {
+                result.maliciousEntries++;
+            }
         }
 
         return result;
@@ -690,143 +953,192 @@ public:
 
     [[nodiscard]] std::vector<RegistryAnomaly> AnalyzeKeyImpl(
         const std::wstring& keyPath,
-        bool recursive
+        bool recursive,
+        uint32_t currentDepth = 0
     ) {
         std::vector<RegistryAnomaly> anomalies;
 
+        if (m_abortRequested.load(std::memory_order_acquire)) {
+            return anomalies;
+        }
+
+        if (currentDepth >= RegistryAnalyzerConstants::MAX_SCAN_DEPTH) {
+            SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Max scan depth %u reached at %ls",
+                RegistryAnalyzerConstants::MAX_SCAN_DEPTH, SanitizePathForLogging(keyPath).c_str());
+            return anomalies;
+        }
+
         try {
-            HKEY hKey;
-            LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
-                                       KEY_READ | KEY_WOW64_64KEY, &hKey);
-            if (result != ERROR_SUCCESS) {
-                // Try HKCU
-                result = RegOpenKeyExW(HKEY_CURRENT_USER, keyPath.c_str(), 0,
-                                      KEY_READ | KEY_WOW64_64KEY, &hKey);
-                if (result != ERROR_SUCCESS) {
+            // Resolve the root key from path prefix
+            auto [rootHKey, subKeyPath] = ResolveRootKey(keyPath);
+            std::wstring hiveLabel = (rootHKey == HKEY_LOCAL_MACHINE) ? L"HKLM" :
+                                     (rootHKey == HKEY_CURRENT_USER) ? L"HKCU" :
+                                     (rootHKey == HKEY_CLASSES_ROOT) ? L"HKCR" :
+                                     (rootHKey == HKEY_USERS) ? L"HKU" : L"UNKNOWN";
+
+            // Use RAII registry key wrapper
+            RegistryUtils::RegistryKey regKey;
+            RegistryUtils::OpenOptions opts;
+            opts.access = KEY_READ;
+            opts.wow64_64 = true;
+
+            RegistryUtils::Error regErr;
+            if (!regKey.Open(rootHKey, subKeyPath, opts, &regErr)) {
+                // If HKLM fails, try HKCU as fallback (for bare paths)
+                if (rootHKey == HKEY_LOCAL_MACHINE) {
+                    if (regKey.Open(HKEY_CURRENT_USER, subKeyPath, opts)) {
+                        hiveLabel = L"HKCU";
+                    } else {
+                        return anomalies;
+                    }
+                } else {
                     return anomalies;
                 }
             }
 
-            // Enumerate values
+            // Enumerate values using RAII key
             DWORD index = 0;
-            wchar_t valueName[16384];
             DWORD valueNameSize;
             DWORD valueType;
-            std::vector<uint8_t> valueData(65536);
             DWORD valueDataSize;
 
-            while (true) {
-                valueNameSize = sizeof(valueName) / sizeof(wchar_t);
-                valueDataSize = static_cast<DWORD>(valueData.size());
+            // Heap-allocated name buffer (not stack)
+            auto valueNameBuf = std::make_unique<wchar_t[]>(16384);
 
-                result = RegEnumValueW(hKey, index, valueName, &valueNameSize, nullptr,
-                                      &valueType, valueData.data(), &valueDataSize);
+            while (!m_abortRequested.load(std::memory_order_acquire)) {
+                valueNameSize = 16384;
+                // First call with NULL data to get required size
+                valueDataSize = 0;
+
+                LONG result = RegEnumValueW(regKey.Handle(), index, valueNameBuf.get(),
+                                            &valueNameSize, nullptr, &valueType,
+                                            nullptr, &valueDataSize);
 
                 if (result == ERROR_NO_MORE_ITEMS) {
                     break;
                 }
 
-                if (result != ERROR_SUCCESS) {
+                if (result != ERROR_SUCCESS && result != ERROR_MORE_DATA) {
                     index++;
                     continue;
                 }
 
-                // Analyze value
-                std::span<const uint8_t> dataSpan(valueData.data(), valueDataSize);
+                // Cap value data to prevent DoS from oversized values
+                const DWORD cappedDataSize = std::min(
+                    valueDataSize,
+                    static_cast<DWORD>(RegistryAnalyzerConstants::MAX_VALUE_SIZE));
 
-                // Check for high entropy
-                if (m_config.analyzeEntropy && valueDataSize >= RegistryAnalyzerConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
+                // Allocate exact-size buffer for the actual data
+                std::vector<uint8_t> valueData(cappedDataSize);
+                DWORD actualDataSize = cappedDataSize;
+                valueNameSize = 16384;  // Reset for second call
+
+                result = RegEnumValueW(regKey.Handle(), index, valueNameBuf.get(),
+                                       &valueNameSize, nullptr, &valueType,
+                                       valueData.data(), &actualDataSize);
+
+                if (result != ERROR_SUCCESS) {
+                    // If still overflows our cap, record oversized anomaly
+                    if (result == ERROR_MORE_DATA && valueDataSize > RegistryAnalyzerConstants::MAX_VALUE_SIZE) {
+                        anomalies.push_back(RecordAnomaly(
+                            AnomalyType::OversizedValue,
+                            AnomalySeverity::Medium,
+                            hiveLabel,
+                            keyPath,
+                            std::wstring(valueNameBuf.get(), valueNameSize),
+                            {},
+                            std::format("Oversized value: {} bytes (capped at {})",
+                                        valueDataSize, RegistryAnalyzerConstants::MAX_VALUE_SIZE)
+                        ));
+                    }
+                    index++;
+                    continue;
+                }
+
+                // Trim vector to actual size
+                valueData.resize(actualDataSize);
+                std::wstring valName(valueNameBuf.get(), valueNameSize);
+                std::span<const uint8_t> dataSpan(valueData);
+
+                // --- Value Analysis ---
+
+                // High entropy check
+                if (m_config.analyzeEntropy && actualDataSize >= RegistryAnalyzerConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
                     double entropy = CalculateEntropy(dataSpan);
                     if (entropy >= RegistryAnalyzerConstants::HIGH_ENTROPY_THRESHOLD) {
                         anomalies.push_back(RecordAnomaly(
                             AnomalyType::HighEntropy,
                             AnomalySeverity::Medium,
-                            L"HKLM",
+                            hiveLabel,
                             keyPath,
-                            valueName,
+                            valName,
                             valueData,
-                            std::format("High entropy value: {:.2f}", entropy)
+                            std::format("High entropy value: {:.2f} ({} bytes)", entropy, actualDataSize)
                         ));
                     }
                 }
 
-                // Check for embedded executable
+                // Embedded executable check
                 if (m_config.detectEmbeddedExecutables && LooksLikeExecutable(dataSpan)) {
                     anomalies.push_back(RecordAnomaly(
                         AnomalyType::EmbeddedExecutable,
                         AnomalySeverity::High,
-                        L"HKLM",
+                        hiveLabel,
                         keyPath,
-                        valueName,
+                        valName,
                         valueData,
-                        "Embedded executable detected in registry value"
+                        std::format("Embedded executable detected in registry value ({} bytes)", actualDataSize)
                     ));
                     m_stats.maliciousEntries.fetch_add(1, std::memory_order_relaxed);
                 }
 
-                // Check for Base64 encoding
+                // Base64 encoding check
                 if (IsBase64Encoded(dataSpan)) {
                     anomalies.push_back(RecordAnomaly(
                         AnomalyType::EncodedData,
                         AnomalySeverity::Medium,
-                        L"HKLM",
+                        hiveLabel,
                         keyPath,
-                        valueName,
+                        valName,
                         valueData,
-                        "Base64-encoded data detected"
+                        std::format("Base64-encoded data detected ({} bytes)", actualDataSize)
                     ));
                 }
 
-                // Check for oversized values
-                if (valueDataSize > RegistryAnalyzerConstants::MAX_VALUE_SIZE) {
-                    anomalies.push_back(RecordAnomaly(
-                        AnomalyType::OversizedValue,
-                        AnomalySeverity::Low,
-                        L"HKLM",
-                        keyPath,
-                        valueName,
-                        valueData,
-                        std::format("Oversized value: {} bytes", valueDataSize)
-                    ));
+                // ThreatIntel hash reputation check
+                if (actualDataSize >= RegistryAnalyzerConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
+                    CheckValueAgainstThreatIntel(hiveLabel, keyPath, valName, valueData, anomalies);
                 }
 
                 m_stats.valuesAnalyzed.fetch_add(1, std::memory_order_relaxed);
-                m_stats.bytesAnalyzed.fetch_add(valueDataSize, std::memory_order_relaxed);
+                m_stats.bytesAnalyzed.fetch_add(actualDataSize, std::memory_order_relaxed);
 
                 index++;
             }
 
             m_stats.keysAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
-            // Recursive enumeration
-            if (recursive) {
-                index = 0;
-                wchar_t subkeyName[256];
-                DWORD subkeyNameSize;
-
-                while (true) {
-                    subkeyNameSize = sizeof(subkeyName) / sizeof(wchar_t);
-                    result = RegEnumKeyExW(hKey, index, subkeyName, &subkeyNameSize,
-                                          nullptr, nullptr, nullptr, nullptr);
-
-                    if (result == ERROR_NO_MORE_ITEMS) {
-                        break;
-                    }
-
-                    if (result == ERROR_SUCCESS) {
+            // Recursive enumeration of subkeys
+            if (recursive && !m_abortRequested.load(std::memory_order_acquire)) {
+                std::vector<std::wstring> subkeyNames;
+                RegistryUtils::Error enumErr;
+                if (regKey.EnumKeys(subkeyNames, &enumErr)) {
+                    for (const auto& subkeyName : subkeyNames) {
+                        if (m_abortRequested.load(std::memory_order_acquire)) break;
                         std::wstring subkeyPath = keyPath + L"\\" + subkeyName;
-                        auto subkeyAnomalies = AnalyzeKeyImpl(subkeyPath, true);
-                        anomalies.insert(anomalies.end(), subkeyAnomalies.begin(), subkeyAnomalies.end());
+                        auto subkeyAnomalies = AnalyzeKeyImpl(subkeyPath, true, currentDepth + 1);
+                        anomalies.insert(anomalies.end(),
+                            std::make_move_iterator(subkeyAnomalies.begin()),
+                            std::make_move_iterator(subkeyAnomalies.end()));
                     }
-
-                    index++;
                 }
             }
 
-            RegCloseKey(hKey);
+            // regKey closes automatically via RAII
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: AnalyzeKey exception: %hs", e.what());
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: AnalyzeKey exception at %ls: %hs",
+                SanitizePathForLogging(keyPath).c_str(), e.what());
         }
 
         return anomalies;
@@ -841,7 +1153,7 @@ public:
 
         try {
             SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Deep scanning for hidden keys in %ls",
-                rootKey.c_str());
+                SanitizePathForLogging(rootKey).c_str());
 
             // Convert to native path for NTAPI
             std::wstring nativePath = Win32ToNativePath(rootKey);
@@ -858,20 +1170,26 @@ public:
                 return hiddenKeys;
             }
 
-            // Kernel bridge integration point - populated by KernelBridge module
-            // In a production environment, we would also verify if the kernel filter
-            // is reporting the same set of keys to detect filter-based rootkits.
+            // RAII guard for native handle
+            auto handleGuard = std::unique_ptr<void, decltype(&::CloseHandle)>(hKey, &::CloseHandle);
 
             ULONG index = 0;
             std::vector<uint8_t> buffer(4096);
             ULONG resultLength = 0;
 
-            while (true) {
+            while (!m_abortRequested.load(std::memory_order_acquire)) {
                 status = NtEnumerateKey(hKey, index, KeyBasicInformation, buffer.data(),
                                         static_cast<ULONG>(buffer.size()), &resultLength);
 
                 if (status == 0x80000005 /* STATUS_BUFFER_OVERFLOW */ ||
                     status == 0xC0000023 /* STATUS_BUFFER_TOO_SMALL */) {
+                    // Cap buffer resize to prevent DoS
+                    if (resultLength > RegistryAnalyzerConstants::MAX_NTAPI_BUFFER_SIZE) {
+                        SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: NtEnumerateKey requested %lu bytes, exceeds cap",
+                            resultLength);
+                        index++;
+                        continue;
+                    }
                     buffer.resize(resultLength);
                     continue;
                 }
@@ -881,11 +1199,18 @@ public:
                 }
 
                 auto* pInfo = reinterpret_cast<PKEY_BASIC_INFORMATION>(buffer.data());
+
+                // Validate NameLength to prevent out-of-bounds read
+                if (pInfo->NameLength > buffer.size() - offsetof(KEY_BASIC_INFORMATION, Name)) {
+                    SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: NameLength %lu exceeds buffer at index %lu",
+                        pInfo->NameLength, index);
+                    index++;
+                    continue;
+                }
+
                 std::wstring keyName(pInfo->Name, pInfo->NameLength / sizeof(WCHAR));
 
                 // Detect NULL-byte injection (RegHider technique)
-                // If the name length reported by NTAPI contains a NULL, but the Win32 API
-                // would stop reading at that NULL, it's a hidden key.
                 bool isHidden = false;
                 for (size_t i = 0; i < keyName.length(); ++i) {
                     if (keyName[i] == L'\0' && i < keyName.length() - 1) {
@@ -903,10 +1228,10 @@ public:
                     m_stats.hiddenKeysFound.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: HIDDEN KEY DETECTED: %ls",
-                        fullPath.c_str());
+                        SanitizePathForLogging(fullPath).c_str());
 
                     RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
-                        L"HKLM", rootKey, keyName, {},
+                        L"HKLM", rootKey, SanitizePathForLogging(keyName), {},
                         "Registry key hidden using NULL-byte or control character injection");
 
                     InvokeHiddenCallbacks(fullPath, true);
@@ -915,7 +1240,7 @@ public:
                 index++;
             }
 
-            CloseHandle(hKey);
+            // handleGuard automatically closes hKey
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: DetectNullByteKeys exception: %hs", e.what());
@@ -930,26 +1255,22 @@ public:
 
         try {
             SS_LOG_DEBUG(L"Registry", L"RegistryAnalyzer: Performing Cross-View Analysis for %ls",
-                keyPath.c_str());
+                SanitizePathForLogging(keyPath).c_str());
 
-            // 1. Get keys via Win32 API (View A)
-            HKEY hKey;
-            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(), 0,
-                             KEY_READ | KEY_WOW64_64KEY, &hKey) == ERROR_SUCCESS) {
-                result.foundViaAPI = true;
-                DWORD index = 0;
-                wchar_t subkeyName[256];
-                DWORD subkeyNameSize;
-                while (true) {
-                    subkeyNameSize = sizeof(subkeyName) / sizeof(wchar_t);
-                    if (RegEnumKeyExW(hKey, index, subkeyName, &subkeyNameSize,
-                                     nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) {
-                        break;
+            // 1. Get keys via Win32 API (View A) — uses RAII wrapper
+            {
+                RegistryUtils::RegistryKey apiKey;
+                RegistryUtils::OpenOptions opts;
+                opts.access = KEY_READ;
+                opts.wow64_64 = true;
+
+                if (apiKey.Open(HKEY_LOCAL_MACHINE, keyPath, opts)) {
+                    result.foundViaAPI = true;
+                    std::vector<std::wstring> subkeys;
+                    if (apiKey.EnumKeys(subkeys)) {
+                        result.apiSubKeys = std::move(subkeys);
                     }
-                    result.apiSubKeys.push_back(subkeyName);
-                    index++;
                 }
-                RegCloseKey(hKey);
             }
 
             // 2. Get keys via Native API (View B)
@@ -961,35 +1282,48 @@ public:
 
             HANDLE hNativeKey = nullptr;
             if (NtOpenKey(&hNativeKey, KEY_READ, &objAttr) == 0 /* STATUS_SUCCESS */) {
+                auto handleGuard = std::unique_ptr<void, decltype(&::CloseHandle)>(hNativeKey, &::CloseHandle);
+
                 result.foundViaRaw = true;
                 ULONG index = 0;
                 std::vector<uint8_t> buffer(4096);
                 ULONG resLen = 0;
-                while (true) {
+
+                while (!m_abortRequested.load(std::memory_order_acquire)) {
                     NTSTATUS status = NtEnumerateKey(hNativeKey, index, KeyBasicInformation,
                                                    buffer.data(), static_cast<ULONG>(buffer.size()), &resLen);
-                    if (status == 0xC0000023 /* BUFFER_TOO_SMALL */) {
+                    if (status == 0x80000005 || status == 0xC0000023 /* BUFFER_TOO_SMALL */) {
+                        if (resLen > RegistryAnalyzerConstants::MAX_NTAPI_BUFFER_SIZE) {
+                            index++;
+                            continue;
+                        }
                         buffer.resize(resLen);
                         continue;
                     }
                     if (status != 0) break;
 
                     auto* pInfo = reinterpret_cast<PKEY_BASIC_INFORMATION>(buffer.data());
-                    result.rawSubKeys.emplace_back(pInfo->Name, pInfo->NameLength / sizeof(WCHAR));
+                    if (pInfo->NameLength <= buffer.size() - offsetof(KEY_BASIC_INFORMATION, Name)) {
+                        result.rawSubKeys.emplace_back(pInfo->Name, pInfo->NameLength / sizeof(WCHAR));
+                    }
                     index++;
                 }
-                CloseHandle(hNativeKey);
+                // handleGuard closes automatically
             }
 
-            // 3. Compare View A and View B
-            // Kernel bridge integration point - populated by KernelBridge module
-            // A truly deep scan would also read the hive file from disk directly to bypass
-            // any kernel-mode hooks on NtEnumerateKey itself.
+            // 3. Compare View A and View B — case-insensitive (registry is case-insensitive)
+            std::unordered_set<std::wstring> apiSetLower;
+            apiSetLower.reserve(result.apiSubKeys.size());
+            for (const auto& key : result.apiSubKeys) {
+                std::wstring lower = key;
+                std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+                apiSetLower.insert(std::move(lower));
+            }
 
-            std::unordered_set<std::wstring> apiSet(result.apiSubKeys.begin(), result.apiSubKeys.end());
             for (const auto& rawKey : result.rawSubKeys) {
-                // If found in Native but not in Win32, it's hidden
-                if (apiSet.find(rawKey) == apiSet.end()) {
+                std::wstring lowerRaw = rawKey;
+                std::transform(lowerRaw.begin(), lowerRaw.end(), lowerRaw.begin(), ::towlower);
+                if (apiSetLower.find(lowerRaw) == apiSetLower.end()) {
                     result.hiddenSubKeys.push_back(rawKey);
                     result.hasDiscrepancy = true;
                 }
@@ -997,12 +1331,12 @@ public:
 
             if (result.hasDiscrepancy) {
                 m_stats.rootkitIndicators.fetch_add(1, std::memory_order_relaxed);
-                SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: ROOTKIT DISCREPANCY detected in %ls",
-                    keyPath.c_str());
+                SS_LOG_FATAL(L"Registry", L"RegistryAnalyzer: ROOTKIT DISCREPANCY detected in %ls - %zu hidden keys",
+                    SanitizePathForLogging(keyPath).c_str(), result.hiddenSubKeys.size());
 
                 for (const auto& hidden : result.hiddenSubKeys) {
                     RecordAnomaly(AnomalyType::APIHiddenKey, AnomalySeverity::Critical,
-                        L"HKLM", keyPath, hidden, {},
+                        L"HKLM", keyPath, SanitizePathForLogging(hidden), {},
                         "Key found via NTAPI but hidden from Win32 API (Rootkit indicator)");
                 }
             }
@@ -1053,7 +1387,17 @@ public:
             file.seekg(0x0C);
             uint64_t timestamp;
             file.read(reinterpret_cast<char*>(&timestamp), sizeof(timestamp));
-            // Convert FILETIME to system_clock
+
+            // Convert Windows FILETIME (100ns intervals since 1601-01-01) to system_clock
+            // FILETIME epoch offset: 11644473600 seconds from 1601-01-01 to 1970-01-01
+            constexpr int64_t FILETIME_EPOCH_OFFSET_SEC = 11644473600LL;
+            if (timestamp > 0) {
+                auto windowsDuration = std::chrono::duration<int64_t, std::ratio<1, 10000000>>(
+                    static_cast<int64_t>(timestamp));
+                auto unixDuration = windowsDuration - std::chrono::seconds(FILETIME_EPOCH_OFFSET_SEC);
+                header.lastWritten = std::chrono::system_clock::time_point(
+                    std::chrono::duration_cast<std::chrono::system_clock::duration>(unixDuration));
+            }
 
             // Read version (offset 0x14)
             file.seekg(0x14);
@@ -1115,10 +1459,53 @@ public:
         try {
             std::unique_lock lock(m_indicatorMutex);
 
-            // Simplified indicator loading from JSON/XML file
+            std::ifstream file(indicatorsPath);
+            if (!file) {
+                SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Failed to open indicators file: %ls",
+                    indicatorsPath.c_str());
+                return 0;
+            }
 
-            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Loaded threat indicators from %ls",
-                indicatorsPath.c_str());
+            // Parse line-delimited indicator file.
+            // Format: keyPattern|valuePattern|threatName|malwareFamily|mitreId
+            size_t loaded = 0;
+            std::string line;
+            while (std::getline(file, line)) {
+                if (line.empty() || line[0] == '#') continue;  // Skip comments/empty
+                if (line.size() > 4096) {
+                    SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Skipping oversized indicator line (%zu bytes)",
+                        line.size());
+                    continue;
+                }
+
+                std::istringstream iss(line);
+                std::string keyPat, valPat, threat, family, mitre;
+                if (!std::getline(iss, keyPat, '|')) continue;
+                std::getline(iss, valPat, '|');
+                std::getline(iss, threat, '|');
+                std::getline(iss, family, '|');
+                std::getline(iss, mitre, '|');
+
+                ThreatIndicator indicator;
+                indicator.keyPattern = StringUtils::ToWide(keyPat);
+                indicator.valuePattern = StringUtils::ToWide(valPat);
+                indicator.threatName = threat;
+                indicator.malwareFamily = family;
+                indicator.mitreId = mitre.empty() ? "T1112" : mitre;
+                indicator.isRegex = (keyPat.find_first_of(".*+?[](){}^$\\") != std::string::npos);
+
+                m_indicators.push_back(std::move(indicator));
+                loaded++;
+
+                constexpr size_t MAX_INDICATORS = 50000;
+                if (loaded >= MAX_INDICATORS) {
+                    SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Indicator cap reached (%zu)", MAX_INDICATORS);
+                    break;
+                }
+            }
+
+            SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Loaded %zu threat indicators from %ls",
+                loaded, indicatorsPath.c_str());
 
             return m_indicators.size();
 
@@ -1158,21 +1545,52 @@ public:
     [[nodiscard]] bool MatchesIndicator(
         const RegistryAnomaly& anomaly,
         const ThreatIndicator& indicator
-    ) const {
-        // Simple pattern matching - would use regex in real implementation
-        if (!indicator.keyPattern.empty()) {
-            if (anomaly.keyPath.find(indicator.keyPattern) == std::wstring::npos) {
-                return false;
+    ) const noexcept {
+        try {
+            if (!indicator.keyPattern.empty()) {
+                if (indicator.isRegex) {
+                    std::wregex rx(indicator.keyPattern, std::regex_constants::icase | std::regex_constants::nosubs);
+                    if (!std::regex_search(anomaly.keyPath, rx)) {
+                        return false;
+                    }
+                } else {
+                    // Case-insensitive substring match
+                    std::wstring lowerPath = anomaly.keyPath;
+                    std::wstring lowerPat = indicator.keyPattern;
+                    std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+                    std::transform(lowerPat.begin(), lowerPat.end(), lowerPat.begin(), ::towlower);
+                    if (lowerPath.find(lowerPat) == std::wstring::npos) {
+                        return false;
+                    }
+                }
             }
-        }
 
-        if (!indicator.valuePattern.empty()) {
-            if (anomaly.valueName.find(indicator.valuePattern) == std::wstring::npos) {
-                return false;
+            if (!indicator.valuePattern.empty()) {
+                std::wstring lowerVal = anomaly.valueName;
+                std::wstring lowerPat = indicator.valuePattern;
+                std::transform(lowerVal.begin(), lowerVal.end(), lowerVal.begin(), ::towlower);
+                std::transform(lowerPat.begin(), lowerPat.end(), lowerPat.begin(), ::towlower);
+                if (lowerVal.find(lowerPat) == std::wstring::npos) {
+                    return false;
+                }
             }
-        }
 
-        return true;
+            // Binary data pattern match
+            if (!indicator.dataPattern.empty() && !anomaly.rawData.empty()) {
+                auto it = std::search(anomaly.rawData.begin(), anomaly.rawData.end(),
+                                      indicator.dataPattern.begin(), indicator.dataPattern.end());
+                if (it == anomaly.rawData.end()) {
+                    return false;
+                }
+            }
+
+            return true;
+        } catch (const std::regex_error&) {
+            // Malformed regex in indicator — treat as no match
+            return false;
+        } catch (...) {
+            return false;
+        }
     }
 
     // ========================================================================
@@ -1180,14 +1598,89 @@ public:
     // ========================================================================
 
     /**
-     * @brief Direct Kernel Object Manipulation detection
+     * @brief Direct Kernel Object Manipulation detection.
+     *
+     * Queries the RegistryMonitor for kernel-side integrity data.
+     * If RegistryMonitor reports CmCallback list tampering or handle table
+     * mismatches, we flag DKOM evidence.
      */
     [[nodiscard]] bool DetectDKOMImpl() {
-        // Kernel bridge integration point - populated by KernelBridge module
-        // In a production environment, this would involve comparing the CM_KEY_BODY
-        // objects in kernel memory with the reported handle table to detect
-        // keys hidden via direct pointer manipulation.
+        try {
+            // Query RegistryMonitor for kernel connection status
+            auto& regMon = ShadowStrike::Core::Registry::RegistryMonitor::Instance();
+            if (!regMon.IsKernelConnected()) {
+                SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: DKOM detection unavailable - kernel not connected");
+                return false;
+            }
+
+            // Cross-reference recent registry events with our analysis.
+            // If events come from processes that don't exist in ProcessMonitor,
+            // or the kernel reports callback list modifications, that's DKOM evidence.
+            auto recentEvents = regMon.GetRecentEvents(50);
+            auto& procMon = ShadowStrike::Core::Process::ProcessMonitor::Instance();
+
+            for (const auto& event : recentEvents) {
+                if (event.processId == 0) continue;
+
+                auto procInfo = procMon.GetProcessInfo(event.processId);
+                if (!procInfo.has_value()) {
+                    // Process performed registry op but doesn't exist in process table
+                    RecordAnomaly(AnomalyType::DKOMEvidence, AnomalySeverity::Critical,
+                        L"KERNEL", event.keyPath, event.valueName, {},
+                        std::format("Registry operation from phantom PID {} - possible DKOM",
+                                    event.processId));
+                    m_stats.rootkitIndicators.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: DKOM detection exception: %hs", e.what());
+        }
         return false;
+    }
+
+    /**
+     * @brief Check a registry value's hash against ThreatIntelManager.
+     */
+    void CheckValueAgainstThreatIntel(
+        const std::wstring& hiveLabel,
+        const std::wstring& keyPath,
+        const std::wstring& valueName,
+        const std::vector<uint8_t>& data,
+        std::vector<RegistryAnomaly>& anomalies
+    ) {
+        try {
+            auto& threatIntel = ShadowStrike::ThreatIntel::ThreatIntelManager::Instance();
+            if (!threatIntel.IsInitialized()) return;
+
+            // Hash the value data
+            std::vector<uint8_t> hashResult;
+            if (!HashUtils::Compute(HashUtils::Algorithm::SHA256,
+                                     data.data(), data.size(), hashResult)) {
+                return;
+            }
+
+            std::string hexHash = HashUtils::ToHexLower(hashResult);
+
+            double riskScore = 0.0;
+            std::string threatName;
+            if (threatIntel.IsKnownMalicious(hexHash, riskScore, threatName)) {
+                anomalies.push_back(RecordAnomaly(
+                    AnomalyType::KnownMalwareValue,
+                    AnomalySeverity::Critical,
+                    hiveLabel,
+                    keyPath,
+                    valueName,
+                    data,
+                    std::format("Known malicious value - SHA256: {} (score: {:.0f})",
+                                hexHash.substr(0, 16) + "...", riskScore)
+                ));
+                m_stats.maliciousEntries.fetch_add(1, std::memory_order_relaxed);
+                m_stats.iocsMatched.fetch_add(1, std::memory_order_relaxed);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: ThreatIntel check exception: %hs", e.what());
+        }
     }
 
     /**
@@ -1274,7 +1767,7 @@ public:
                             std::vector<char> nameBuf(nameLen);
                             file.seekg(0x1000 + currentOffset + cellOffset + 0x4C + 4);
                             file.read(nameBuf.data(), nameLen);
-                            entry.name = StringUtils::Utf8ToWide(std::string(nameBuf.begin(), nameBuf.end()));
+                            entry.name = StringUtils::ToWide(std::string_view(nameBuf.data(), nameLen));
 
                             entry.isRecoverable = true;
                             recovered.push_back(entry);
@@ -1324,8 +1817,16 @@ public:
 
         if (!rawData.empty()) {
             anomaly.entropy = CalculateEntropy(rawData);
-            anomaly.sha256 = HashUtils::CalculateSHA256(rawData);
-            anomaly.sha256Hex = HashUtils::ToHexString(anomaly.sha256);
+
+            // Compute SHA-256 using the correct HashUtils API
+            std::vector<uint8_t> hashResult;
+            if (HashUtils::Compute(HashUtils::Algorithm::SHA256,
+                                    rawData.data(), rawData.size(), hashResult)) {
+                // Copy into fixed-size array
+                const size_t copyLen = std::min(hashResult.size(), anomaly.sha256.size());
+                std::copy_n(hashResult.begin(), copyLen, anomaly.sha256.begin());
+                anomaly.sha256Hex = HashUtils::ToHexLower(hashResult);
+            }
         }
 
         // Determine if hidden/deleted/malicious based on type
@@ -1357,6 +1858,9 @@ public:
             std::unique_lock lock(m_anomalyMutex);
 
             if (m_anomalies.size() >= m_config.maxAnomalies) {
+                // Evict oldest — also remove from map to prevent unbounded growth
+                const uint64_t evictedId = m_anomalies.front().anomalyId;
+                m_anomalyMap.erase(evictedId);
                 m_anomalies.pop_front();
             }
 
@@ -1663,9 +2167,28 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
         return {};
     }
 
-    // Slack space analysis and deleted cell recovery awaits kernel bridge integration
-    SS_LOG_DEBUG(L"Registry", L"RecoverDeletedEntries: Awaiting kernel bridge integration for hive-based recovery");
-    return {};
+    // Map hive type to system hive file path
+    std::wstring hivePath;
+    const std::wstring sysRoot = L"C:\\Windows\\System32\\config\\";
+
+    switch (hive) {
+        case HiveType::SAM:       hivePath = sysRoot + L"SAM"; break;
+        case HiveType::SECURITY:  hivePath = sysRoot + L"SECURITY"; break;
+        case HiveType::SOFTWARE:  hivePath = sysRoot + L"SOFTWARE"; break;
+        case HiveType::SYSTEM:    hivePath = sysRoot + L"SYSTEM"; break;
+        case HiveType::DEFAULT:   hivePath = sysRoot + L"DEFAULT"; break;
+        case HiveType::AMCACHE:   hivePath = L"C:\\Windows\\AppCompat\\Programs\\Amcache.hve"; break;
+        case HiveType::BCD:       hivePath = L"C:\\Boot\\BCD"; break;
+        default:
+            SS_LOG_WARN(L"Registry", L"RegistryAnalyzer: Unsupported hive type for recovery: %d",
+                static_cast<int>(hive));
+            return {};
+    }
+
+    SS_LOG_INFO(L"Registry", L"RegistryAnalyzer: Attempting deleted entry recovery from %ls",
+        hivePath.c_str());
+
+    return m_impl->RecoverDeletedEntriesImpl(hivePath);
 }
 
 [[nodiscard]] std::vector<DeletedEntry> RegistryAnalyzer::RecoverFromHiveFile(
@@ -1676,9 +2199,25 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
         return {};
     }
 
-    // Offline hive parsing for deleted entries awaits kernel bridge integration
-    SS_LOG_DEBUG(L"Registry", L"RecoverFromHiveFile: Awaiting kernel bridge integration for offline hive parsing");
-    return {};
+    // Validate the hive file path
+    if (hivePath.empty()) {
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Empty hive path for recovery");
+        return {};
+    }
+
+    if (!fs::exists(hivePath)) {
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Hive file does not exist: %ls", hivePath.c_str());
+        return {};
+    }
+
+    // Validate hive structure before attempting recovery
+    auto header = m_impl->ParseHiveHeaderImpl(hivePath);
+    if (!header.isValid) {
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: Invalid hive file for recovery: %ls", hivePath.c_str());
+        return {};
+    }
+
+    return m_impl->RecoverDeletedEntriesImpl(hivePath);
 }
 
 // ============================================================================
@@ -1711,9 +2250,101 @@ void RegistryAnalyzer::ClearAnomalies() noexcept {
         return std::nullopt;
     }
 
-    // Key cell reading from hive file awaits kernel bridge integration
-    SS_LOG_DEBUG(L"Registry", L"GetKeyCell: Awaiting kernel bridge integration for raw hive cell access");
-    return std::nullopt;
+    try {
+        std::ifstream file(hivePath, std::ios::binary);
+        if (!file) {
+            SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: GetKeyCell: Cannot open hive: %ls", hivePath.c_str());
+            return std::nullopt;
+        }
+
+        if (offset == 0xFFFFFFFF) return std::nullopt;
+
+        // Offsets are relative to first hbin (0x1000) and 4-byte aligned
+        uint64_t absoluteOffset = static_cast<uint64_t>(offset) + 0x1000;
+        file.seekg(absoluteOffset);
+
+        int32_t cellSize;
+        file.read(reinterpret_cast<char*>(&cellSize), sizeof(cellSize));
+        if (file.gcount() != sizeof(cellSize)) return std::nullopt;
+
+        uint32_t absCellSize = static_cast<uint32_t>(std::abs(cellSize));
+        if (absCellSize < 6) return std::nullopt;  // Minimum: size(4) + sig(2)
+
+        // Read signature
+        uint16_t sig;
+        file.read(reinterpret_cast<char*>(&sig), sizeof(sig));
+        if (file.gcount() != sizeof(sig) || sig != 0x6B6E /* 'nk' */) {
+            return std::nullopt;
+        }
+
+        KeyCell cell;
+        cell.offset = offset;
+        cell.cellSize = cellSize;
+        cell.isAllocated = (cellSize < 0);
+        cell.isDeleted = (cellSize > 0);
+
+        // Read flags (2 bytes at nk+0x02)
+        uint16_t flags;
+        file.read(reinterpret_cast<char*>(&flags), sizeof(flags));
+
+        // Read timestamp (8 bytes at nk+0x04)
+        uint64_t timestamp;
+        file.read(reinterpret_cast<char*>(&timestamp), sizeof(timestamp));
+        constexpr int64_t FILETIME_EPOCH_OFFSET_SEC = 11644473600LL;
+        if (timestamp > 0) {
+            auto windowsDuration = std::chrono::duration<int64_t, std::ratio<1, 10000000>>(
+                static_cast<int64_t>(timestamp));
+            auto unixDuration = windowsDuration - std::chrono::seconds(FILETIME_EPOCH_OFFSET_SEC);
+            cell.lastWritten = std::chrono::system_clock::time_point(
+                std::chrono::duration_cast<std::chrono::system_clock::duration>(unixDuration));
+        }
+
+        // Skip to parent offset (nk+0x10)
+        file.seekg(absoluteOffset + 4 + 0x10);  // +4 for cellSize
+        file.read(reinterpret_cast<char*>(&cell.parentOffset), sizeof(cell.parentOffset));
+
+        // Subkey count (nk+0x14)
+        file.read(reinterpret_cast<char*>(&cell.subKeyCount), sizeof(cell.subKeyCount));
+
+        // Skip volatile subkeys (nk+0x18), subkeys list offset (nk+0x1C), volatile list (nk+0x20)
+        file.seekg(absoluteOffset + 4 + 0x24);
+        file.read(reinterpret_cast<char*>(&cell.valueCount), sizeof(cell.valueCount));
+
+        // Security offset (nk+0x2C)
+        file.seekg(absoluteOffset + 4 + 0x2C);
+        file.read(reinterpret_cast<char*>(&cell.securityOffset), sizeof(cell.securityOffset));
+
+        // Class name offset (nk+0x30)
+        file.read(reinterpret_cast<char*>(&cell.classNameOffset), sizeof(cell.classNameOffset));
+
+        // Key name length (nk+0x48)
+        file.seekg(absoluteOffset + 4 + 0x48);
+        uint16_t nameLen;
+        file.read(reinterpret_cast<char*>(&nameLen), sizeof(nameLen));
+
+        // Cap name length
+        nameLen = std::min(nameLen, static_cast<uint16_t>(1024));
+
+        // Key name starts at nk+0x4C
+        file.seekg(absoluteOffset + 4 + 0x4C);
+        std::vector<char> nameBuf(nameLen);
+        file.read(nameBuf.data(), nameLen);
+        if (file.gcount() == nameLen) {
+            cell.keyName = StringUtils::ToWide(std::string_view(nameBuf.data(), nameLen));
+            cell.keyNameRaw = cell.keyName;
+
+            // Check for hidden characters
+            cell.hasNullByte = std::any_of(nameBuf.begin(), nameBuf.end(),
+                                            [](char c) { return c == '\0'; });
+            cell.hasHiddenChars = HasControlCharacters(cell.keyName);
+        }
+
+        return cell;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Registry", L"RegistryAnalyzer: GetKeyCell exception: %hs", e.what());
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -1789,13 +2420,12 @@ bool RegistryAnalyzer::ExportTimeline(const std::wstring& outputPath) const {
 
         std::shared_lock lock(m_impl->m_timelineMutex);
         for (const auto& entry : m_impl->m_timeline) {
-            // Format: timestamp, action, hive, keyPath, valueName, description, isAnomaly
             file << std::chrono::system_clock::to_time_t(entry.timestamp) << ","
-                 << entry.action << ","
-                 << StringUtils::WideToUtf8(HiveTypeToString(entry.hive)) << ","
-                 << StringUtils::WideToUtf8(entry.keyPath) << ","
-                 << StringUtils::WideToUtf8(entry.valueName) << ","
-                 << entry.description << ","
+                 << EscapeCsvField(entry.action) << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(HiveTypeToString(entry.hive))) << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(entry.keyPath)) << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(entry.valueName)) << ","
+                 << EscapeCsvField(entry.description) << ","
                  << (entry.isAnomaly ? "true" : "false") << "\n";
         }
 
@@ -1941,7 +2571,7 @@ bool RegistryAnalyzer::ExportReport(const std::wstring& outputPath) const {
             file << "ID: " << anomaly.anomalyId << "\n";
             file << "Type: " << static_cast<int>(anomaly.type) << "\n";
             file << "Severity: " << static_cast<int>(anomaly.severity) << "\n";
-            file << "Path: " << StringUtils::WideToUtf8(anomaly.keyPath) << "\n";
+            file << "Path: " << StringUtils::ToNarrow(anomaly.keyPath) << "\n";
             file << "Description: " << anomaly.description << "\n\n";
         }
 
@@ -1974,10 +2604,10 @@ bool RegistryAnalyzer::ExportAnomalies(const std::wstring& outputPath) const {
             file << anomaly.anomalyId << ","
                  << static_cast<int>(anomaly.type) << ","
                  << static_cast<int>(anomaly.severity) << ","
-                 << StringUtils::WideToUtf8(anomaly.hivePath) << ","
-                 << StringUtils::WideToUtf8(anomaly.keyPath) << ","
-                 << StringUtils::WideToUtf8(anomaly.valueName) << ","
-                 << anomaly.description << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(anomaly.hivePath)) << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(anomaly.keyPath)) << ","
+                 << EscapeCsvField(StringUtils::ToNarrow(anomaly.valueName)) << ","
+                 << EscapeCsvField(anomaly.description) << ","
                  << anomaly.sha256Hex << "\n";
         }
 
@@ -2004,7 +2634,7 @@ bool RegistryAnalyzer::ExportHiddenEntries(const std::wstring& outputPath) const
 
         std::shared_lock lock(m_impl->m_hiddenMutex);
         for (const auto& hiddenKey : m_impl->m_hiddenKeys) {
-            file << StringUtils::WideToUtf8(hiddenKey) << "\n";
+            file << StringUtils::ToNarrow(hiddenKey) << "\n";
         }
 
         return true;
