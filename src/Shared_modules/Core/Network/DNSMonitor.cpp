@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -60,6 +60,7 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
+#include "../../ThreatIntel/ThreatIntelFormat.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 
@@ -287,9 +288,11 @@ struct DNSMonitor::DNSMonitorImpl {
         std::unordered_set<std::string> uniqueSubdomains;
         uint32_t txtQueries{0};
         double totalTxtResponseSize{0.0};
+
+        static constexpr size_t MAX_UNIQUE_SUBDOMAINS = 10000;
     };
     std::unordered_map<std::string, DomainTrackingInfo> m_domainTracking;
-    std::mutex m_trackingMutex;
+    mutable std::mutex m_trackingMutex;
 
     // Callbacks
     std::vector<std::pair<uint64_t, DNSQueryCallback>> m_queryCallbacks;
@@ -307,6 +310,10 @@ struct DNSMonitor::DNSMonitorImpl {
     // State
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_running{false};
+
+    // QPS tracking (member vars, not statics — reset correctly across Stop/Start)
+    std::chrono::steady_clock::time_point m_lastQpsUpdate{std::chrono::steady_clock::now()};
+    uint64_t m_lastQpsQueryCount{0};
 
     // Monitoring thread
     HANDLE m_hMonitorThread = nullptr;
@@ -446,7 +453,7 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA analysis failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
 
         return analysis;
@@ -548,7 +555,7 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling analysis failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
 
         return analysis;
@@ -593,7 +600,7 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Response validation failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
             return ValidationResult::ERROR;
         }
     }
@@ -656,7 +663,7 @@ struct DNSMonitor::DNSMonitorImpl {
                         rule->hitCount.fetch_add(1, std::memory_order_relaxed);
 
                         SS_LOG_WARN(L"Network", L"DNSMonitor: Blocked query to {} by rule {}",
-                                          Utils::StringUtils::Utf8ToWide(query.domain),
+                                          Utils::StringUtils::ToWide(query.domain),
                                           rule->name);
 
                         // Invoke event callbacks
@@ -682,7 +689,7 @@ struct DNSMonitor::DNSMonitorImpl {
                     m_statistics.dgaDetections.fetch_add(1, std::memory_order_relaxed);
 
                     SS_LOG_WARN(L"Network", L"DNSMonitor: DGA domain detected - {} (confidence: {:.2f})",
-                                      Utils::StringUtils::Utf8ToWide(query.domain),
+                                      Utils::StringUtils::ToWide(query.domain),
                                       dgaAnalysis.confidence);
 
                     // Invoke DGA callbacks
@@ -701,17 +708,34 @@ struct DNSMonitor::DNSMonitorImpl {
                 }
             }
 
-            // Track for tunneling detection
+            // Track for tunneling detection — use base domain as key
             if (m_config.detectTunneling) {
+                std::string baseDomain;
+                std::string subdomain;
+
+                // Extract base domain and subdomain for correlation
+                size_t lastDot = query.domain.find_last_of('.');
+                if (lastDot != std::string::npos && lastDot > 0) {
+                    size_t secondLastDot = query.domain.find_last_of('.', lastDot - 1);
+                    if (secondLastDot != std::string::npos) {
+                        baseDomain = query.domain.substr(secondLastDot + 1);
+                        subdomain = query.domain.substr(0, secondLastDot);
+                    } else {
+                        baseDomain = query.domain;
+                    }
+                } else {
+                    baseDomain = query.domain;
+                }
+
                 std::lock_guard<std::mutex> lock(m_trackingMutex);
-                auto& tracking = m_domainTracking[query.domain];
+                auto& tracking = m_domainTracking[baseDomain];
                 tracking.queryTimes.push_back(std::chrono::system_clock::now());
                 tracking.queryLengths.push_back(query.domain.length());
 
-                // Extract subdomain
-                size_t firstDot = query.domain.find('.');
-                if (firstDot != std::string::npos) {
-                    tracking.uniqueSubdomains.insert(query.domain.substr(0, firstDot));
+                // Track unique subdomains (capped to prevent memory exhaustion)
+                if (!subdomain.empty() &&
+                    tracking.uniqueSubdomains.size() < DomainTrackingInfo::MAX_UNIQUE_SUBDOMAINS) {
+                    tracking.uniqueSubdomains.insert(subdomain);
                 }
 
                 if (query.recordType == DNSRecordType::TXT) {
@@ -754,7 +778,7 @@ struct DNSMonitor::DNSMonitorImpl {
         } catch (const std::exception& e) {
             m_statistics.errorCount.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Query processing failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
@@ -766,7 +790,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(query);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Query callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -778,7 +802,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(response);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Response callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -790,7 +814,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(event);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Event callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -802,7 +826,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -814,7 +838,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(domain, analysis);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Tunneling callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -827,7 +851,7 @@ struct DNSMonitor::DNSMonitorImpl {
                 callback(domain, expectedIp, actualIp);
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning callback {} failed - {}",
-                                   id, Utils::StringUtils::Utf8ToWide(e.what()));
+                                   id, Utils::StringUtils::ToWide(e.what()));
             }
         }
     }
@@ -859,7 +883,7 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Monitor thread failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
             return 1;
         }
     }
@@ -901,26 +925,23 @@ struct DNSMonitor::DNSMonitorImpl {
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: Cleanup failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+                               Utils::StringUtils::ToWide(e.what()));
         }
     }
 
     void UpdateQPSStatistics() {
-        static auto lastUpdate = std::chrono::steady_clock::now();
-        static uint64_t lastQueryCount = 0;
-
         const auto now = std::chrono::steady_clock::now();
         const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            now - lastUpdate).count();
+            now - m_lastQpsUpdate).count();
 
         if (elapsed >= 1) {
             const uint64_t currentCount = m_statistics.totalQueries.load(std::memory_order_relaxed);
-            const uint64_t qps = (currentCount - lastQueryCount) / elapsed;
+            const uint64_t qps = (currentCount - m_lastQpsQueryCount) / elapsed;
 
             m_statistics.queriesPerSecond.store(qps, std::memory_order_relaxed);
 
-            lastUpdate = now;
-            lastQueryCount = currentCount;
+            m_lastQpsUpdate = now;
+            m_lastQpsQueryCount = currentCount;
         }
     }
 };
@@ -986,7 +1007,7 @@ bool DNSMonitor::Initialize(const DNSMonitorConfig& config) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1036,7 +1057,7 @@ void DNSMonitor::Start() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Start failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1053,7 +1074,7 @@ void DNSMonitor::Stop() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Stop failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1112,7 +1133,7 @@ void DNSMonitor::Shutdown() noexcept {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
     }
 }
 
@@ -1158,7 +1179,7 @@ bool DNSMonitor::IsPoisoned(const std::string& domain, const std::string& ip) {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Poisoning check failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1170,8 +1191,35 @@ ValidationResult DNSMonitor::ValidateResponse(const std::string& domain,
 
 bool DNSMonitor::CrossValidate(const std::string& domain,
                                const std::vector<std::string>& ips) {
-    // Simplified cross-validation
-    return !ips.empty();
+    if (ips.empty() || domain.empty()) {
+        return false;
+    }
+
+    try {
+        // Build a synthetic response for validation through the existing path
+        DNSResponse syntheticResponse;
+        syntheticResponse.domain = domain;
+        syntheticResponse.responseCode = DNSResponseCode::NOERROR;
+
+        for (const auto& ip : ips) {
+            DNSResourceRecord record;
+            record.name = domain;
+            record.type = (ip.find(':') != std::string::npos)
+                          ? DNSRecordType::AAAA
+                          : DNSRecordType::A;
+            record.data = ip;
+            syntheticResponse.answers.push_back(std::move(record));
+        }
+
+        auto result = m_impl->ValidateResponseInternal(domain, syntheticResponse);
+        return result == ValidationResult::VALID;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: CrossValidate failed for {} - {}",
+                            Utils::StringUtils::ToWide(domain),
+                            Utils::StringUtils::ToWide(e.what()));
+        return false;
+    }
 }
 
 // ============================================================================
@@ -1218,12 +1266,54 @@ DomainReputation DNSMonitor::GetReputation(const std::string& domain) const {
 
     try {
         if (m_impl->m_threatIntel) {
-            // Would query threat intelligence here
-            // For now, return unknown
+            auto result = m_impl->m_threatIntel->LookupDomain(domain);
+            if (result.found) {
+                reputation.isKnownBad = result.IsMalicious();
+                reputation.riskScore = result.threatScore;
+                reputation.source = Utils::StringUtils::ToWide(result.GetSourceString());
+
+                // Map ThreatCategory to DomainCategory
+                using TC = ThreatIntel::ThreatCategory;
+                switch (result.category) {
+                    case TC::Malware:
+                    case TC::Ransomware:
+                    case TC::Trojan:
+                    case TC::Worm:
+                    case TC::Virus:
+                    case TC::Rootkit:
+                    case TC::Backdoor:
+                    case TC::RAT:
+                        reputation.category = DomainCategory::MALWARE;
+                        break;
+                    case TC::C2Server:
+                        reputation.category = DomainCategory::C2;
+                        break;
+                    case TC::Phishing:
+                        reputation.category = DomainCategory::PHISHING;
+                        break;
+                    case TC::Botnet:
+                        reputation.category = DomainCategory::BOTNET;
+                        break;
+                    case TC::Cryptominer:
+                        reputation.category = DomainCategory::CRYPTOMINING;
+                        break;
+                    default:
+                        if (result.IsMalicious()) {
+                            reputation.category = DomainCategory::MALWARE;
+                        }
+                        break;
+                }
+
+                // Map tags from narrow to wide strings
+                for (const auto& tag : result.tags) {
+                    reputation.tags.push_back(Utils::StringUtils::ToWide(tag));
+                }
+            }
         }
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"DNSMonitor: Reputation lookup failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"DNSMonitor: Reputation lookup failed for {} - {}",
+                            Utils::StringUtils::ToWide(domain),
+                            Utils::StringUtils::ToWide(e.what()));
     }
 
     return reputation;
@@ -1254,7 +1344,7 @@ uint64_t DNSMonitor::AddFilterRule(const DNSFilterRule& rule) {
     m_impl->m_filterRules[newRule.priority * 1000000 + ruleId] = newRule;
 
     SS_LOG_INFO(L"Network", L"DNSMonitor: Filter rule added - ID: {}, Pattern: {}",
-                      ruleId, Utils::StringUtils::Utf8ToWide(rule.domainPattern));
+                      ruleId, Utils::StringUtils::ToWide(rule.domainPattern));
 
     return ruleId;
 }
@@ -1585,7 +1675,7 @@ bool DNSMonitor::PerformDiagnostics() const {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Diagnostics failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
@@ -1655,7 +1745,7 @@ bool DNSMonitor::SelfTest() {
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(L"Network", L"DNSMonitor: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+                            Utils::StringUtils::ToWide(e.what()));
         return false;
     }
 }
