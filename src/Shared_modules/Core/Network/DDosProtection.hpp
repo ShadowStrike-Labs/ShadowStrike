@@ -373,6 +373,52 @@ struct alignas(64) TrafficMetrics {
     std::atomic<uint64_t> totalConnections{ 0 };
 
     void Reset() noexcept;
+
+    // Explicit copy/assign (atomics are non-copyable; snapshot via relaxed loads)
+    TrafficMetrics() = default;
+    TrafficMetrics(const TrafficMetrics& o) noexcept
+        : packetsPerSecond(o.packetsPerSecond.load(std::memory_order_relaxed))
+        , bytesPerSecond(o.bytesPerSecond.load(std::memory_order_relaxed))
+        , connectionsPerSecond(o.connectionsPerSecond.load(std::memory_order_relaxed))
+        , synPacketsPerSecond(o.synPacketsPerSecond.load(std::memory_order_relaxed))
+        , synAckPacketsPerSecond(o.synAckPacketsPerSecond.load(std::memory_order_relaxed))
+        , ackPacketsPerSecond(o.ackPacketsPerSecond.load(std::memory_order_relaxed))
+        , finPacketsPerSecond(o.finPacketsPerSecond.load(std::memory_order_relaxed))
+        , rstPacketsPerSecond(o.rstPacketsPerSecond.load(std::memory_order_relaxed))
+        , halfOpenConnections(o.halfOpenConnections.load(std::memory_order_relaxed))
+        , udpPacketsPerSecond(o.udpPacketsPerSecond.load(std::memory_order_relaxed))
+        , udpBytesPerSecond(o.udpBytesPerSecond.load(std::memory_order_relaxed))
+        , icmpPacketsPerSecond(o.icmpPacketsPerSecond.load(std::memory_order_relaxed))
+        , httpRequestsPerSecond(o.httpRequestsPerSecond.load(std::memory_order_relaxed))
+        , activeHttpConnections(o.activeHttpConnections.load(std::memory_order_relaxed))
+        , dnsQueriesPerSecond(o.dnsQueriesPerSecond.load(std::memory_order_relaxed))
+        , totalPackets(o.totalPackets.load(std::memory_order_relaxed))
+        , totalBytes(o.totalBytes.load(std::memory_order_relaxed))
+        , totalConnections(o.totalConnections.load(std::memory_order_relaxed))
+    {}
+    TrafficMetrics& operator=(const TrafficMetrics& o) noexcept {
+        if (this != &o) {
+            packetsPerSecond.store(o.packetsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesPerSecond.store(o.bytesPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            connectionsPerSecond.store(o.connectionsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            synPacketsPerSecond.store(o.synPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            synAckPacketsPerSecond.store(o.synAckPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ackPacketsPerSecond.store(o.ackPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            finPacketsPerSecond.store(o.finPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            rstPacketsPerSecond.store(o.rstPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            halfOpenConnections.store(o.halfOpenConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            udpPacketsPerSecond.store(o.udpPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            udpBytesPerSecond.store(o.udpBytesPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            icmpPacketsPerSecond.store(o.icmpPacketsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            httpRequestsPerSecond.store(o.httpRequestsPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            activeHttpConnections.store(o.activeHttpConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dnsQueriesPerSecond.store(o.dnsQueriesPerSecond.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalPackets.store(o.totalPackets.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalBytes.store(o.totalBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalConnections.store(o.totalConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
 };
 
 /**
@@ -490,6 +536,38 @@ struct alignas(64) IPTrackingInfo {
     // Risk
     uint8_t riskScore{ 0 };
     std::vector<std::string> violations;
+
+    // Explicit copy/assign (atomics are non-copyable; snapshot via relaxed loads)
+    IPTrackingInfo() = default;
+    IPTrackingInfo(const IPTrackingInfo& o)
+        : ipAddress(o.ipAddress)
+        , packetsTotal(o.packetsTotal.load(std::memory_order_relaxed))
+        , bytesTotal(o.bytesTotal.load(std::memory_order_relaxed))
+        , packetsInWindow(o.packetsInWindow.load(std::memory_order_relaxed))
+        , connectionsInWindow(o.connectionsInWindow.load(std::memory_order_relaxed))
+        , synPackets(o.synPackets.load(std::memory_order_relaxed))
+        , halfOpenConnections(o.halfOpenConnections.load(std::memory_order_relaxed))
+        , firstSeen(o.firstSeen), lastSeen(o.lastSeen), windowStart(o.windowStart)
+        , isRateLimited(o.isRateLimited), isBlocked(o.isBlocked)
+        , isWhitelisted(o.isWhitelisted), blockedUntil(o.blockedUntil)
+        , riskScore(o.riskScore), violations(o.violations)
+    {}
+    IPTrackingInfo& operator=(const IPTrackingInfo& o) {
+        if (this != &o) {
+            ipAddress = o.ipAddress;
+            packetsTotal.store(o.packetsTotal.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesTotal.store(o.bytesTotal.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            packetsInWindow.store(o.packetsInWindow.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            connectionsInWindow.store(o.connectionsInWindow.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            synPackets.store(o.synPackets.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            halfOpenConnections.store(o.halfOpenConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            firstSeen = o.firstSeen; lastSeen = o.lastSeen; windowStart = o.windowStart;
+            isRateLimited = o.isRateLimited; isBlocked = o.isBlocked;
+            isWhitelisted = o.isWhitelisted; blockedUntil = o.blockedUntil;
+            riskScore = o.riskScore; violations = o.violations;
+        }
+        return *this;
+    }
 };
 
 /**
