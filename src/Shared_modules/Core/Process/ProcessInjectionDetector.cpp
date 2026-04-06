@@ -66,6 +66,23 @@
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../SelfProtection/DigitalSignatureValidator.hpp"
+
+// ============================================================================
+// SUB-DETECTOR INCLUDES (Orchestrated by ProcessInjectionDetector)
+// ============================================================================
+#include "AtomBombingDetector.hpp"
+#include "DLLInjectionDetector.hpp"
+#include "ProcessHollowingDetector.hpp"
+#include "ReflectiveDLLDetector.hpp"
+#include "ThreadHijackDetector.hpp"
+#include "MemoryScanner.hpp"
+
+// ============================================================================
+// KERNEL COMMUNICATION INCLUDES
+// ============================================================================
+#include "../../Communication/IPCManager.hpp"
+#include "../../Communication/Communication.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -76,6 +93,7 @@
 #include <sstream>
 #include <iomanip>
 #include <thread>
+#include <condition_variable>
 #include <deque>
 #include <unordered_set>
 #include <map>
@@ -210,6 +228,21 @@ using TimePoint = std::chrono::system_clock::time_point;
     }
 }
 
+/// @brief Convert sub-detector confidence enums (0-4 scale) to our
+/// InjectionEvent double confidence (0-100).  Sub-detectors such as
+/// ProcessHollowingDetector, ReflectiveDLLDetector, and AtomBombing use
+/// scoped enums: None=0, Low=1, Medium=2, High=3, Confirmed=4.
+[[nodiscard]] constexpr double ConfidenceEnumToDouble(uint8_t level) noexcept {
+    switch (level) {
+        case 0:  return  0.0;  // None
+        case 1:  return 30.0;  // Low
+        case 2:  return 55.0;  // Medium
+        case 3:  return 80.0;  // High
+        case 4:  return 95.0;  // Confirmed
+        default: return 50.0;
+    }
+}
+
 [[nodiscard]] bool IsSuspiciousHandleAccess(uint32_t accessRights) noexcept {
     constexpr uint32_t PROCESS_VM_WRITE = 0x0020;
     constexpr uint32_t PROCESS_VM_OPERATION = 0x0008;
@@ -235,10 +268,13 @@ using TimePoint = std::chrono::system_clock::time_point;
 
 [[nodiscard]] bool IsAddressInModule(uint32_t pid, uintptr_t address) noexcept {
     try {
-        auto modules = Utils::ProcessUtils::GetProcessModules(pid);
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
+            return false;
+        }
         for (const auto& mod : modules) {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mod.baseAddress);
-            const uintptr_t end = base + mod.moduleSize;
+            const uintptr_t end = base + mod.size;
             if (address >= base && address < end) {
                 return true;
             }
@@ -251,12 +287,15 @@ using TimePoint = std::chrono::system_clock::time_point;
 
 [[nodiscard]] std::wstring GetModuleForAddress(uint32_t pid, uintptr_t address) noexcept {
     try {
-        auto modules = Utils::ProcessUtils::GetProcessModules(pid);
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
+            return L"<unknown>";
+        }
         for (const auto& mod : modules) {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mod.baseAddress);
-            const uintptr_t end = base + mod.moduleSize;
+            const uintptr_t end = base + mod.size;
             if (address >= base && address < end) {
-                return mod.moduleName;
+                return mod.name;
             }
         }
     } catch (...) {
@@ -269,28 +308,32 @@ using TimePoint = std::chrono::system_clock::time_point;
     const std::wstring& sourceName,
     const std::wstring& targetName) noexcept
 {
-    // Common legitimate injection pairs
-    static const std::vector<std::pair<std::wstring, std::wstring>> whitelistedPairs = {
-        {L"csrss.exe", L"*"},           // Windows Client Server Runtime
-        {L"wininit.exe", L"*"},         // Windows Initialization
-        {L"services.exe", L"*"},        // Windows Service Control Manager
-        {L"svchost.exe", L"*"},         // Service Host
-        {L"explorer.exe", L"*"},        // Windows Explorer (legitimate extensions)
-        {L"MsMpEng.exe", L"*"},         // Windows Defender
-        {L"AvastUI.exe", L"*"},         // Avast Antivirus
-        {L"avp.exe", L"*"},             // Third-party AV agent
-        {L"bdagent.exe", L"*"},         // Third-party AV agent
-        {L"ekrn.exe", L"*"},            // Third-party AV agent
-        {L"vsserv.exe", L"*"},          // Third-party AV service
-        {L"MBAMService.exe", L"*"}      // Malwarebytes
+    // Specific source→target pairs that are known-legitimate OS injection
+    // patterns. Wildcards are only used for kernel-backed processes that
+    // cannot be impersonated from user mode (csrss.exe).
+    //
+    // SECURITY: Name-only matching here is a weak signal. The caller
+    // (ShouldWhitelist) must ALSO verify the source path and digital
+    // signature before suppressing an alert. This function is a
+    // pre-filter to reduce unnecessary signature checks.
+    struct WhitelistEntry {
+        std::wstring_view source;
+        std::wstring_view target;  // L"*" means any target
+    };
+    static constexpr std::wstring_view kWild = L"*";
+    static const WhitelistEntry whitelistedPairs[] = {
+        {L"csrss.exe",     kWild},              // Windows CSRSS (kernel-backed, PPL)
+        {L"wininit.exe",   L"services.exe"},     // Windows Init → SCM
+        {L"services.exe",  L"svchost.exe"},      // SCM → Service Host
+        {L"smss.exe",      L"csrss.exe"},        // Session Manager → CSRSS
     };
 
-    const std::wstring sourceLower = Utils::StringUtils::ToLower(sourceName);
-    const std::wstring targetLower = Utils::StringUtils::ToLower(targetName);
+    const std::wstring sourceLower = Utils::StringUtils::ToLowerCopy(sourceName);
+    const std::wstring targetLower = Utils::StringUtils::ToLowerCopy(targetName);
 
-    for (const auto& [src, tgt] : whitelistedPairs) {
-        if (sourceLower == Utils::StringUtils::ToLower(src)) {
-            if (tgt == L"*" || targetLower == Utils::StringUtils::ToLower(tgt)) {
+    for (const auto& entry : whitelistedPairs) {
+        if (sourceLower == entry.source) {
+            if (entry.target == kWild || targetLower == entry.target) {
                 return true;
             }
         }
@@ -377,11 +420,54 @@ struct ProcessInjectionDetector::Impl {
     std::thread m_cleanupThread;
     std::atomic<bool> m_stopCleanup{false};
 
+    /// @brief Cleanup condition variable (for interruptible sleep)
+    std::condition_variable m_cleanupCv;
+    std::mutex m_cleanupCvMutex;
+
+    // ========================================================================
+    // SELF-PROCESS EXCLUSION
+    // ========================================================================
+
+    /// @brief Our own PID — events from/to our process are always allowed
+    uint32_t m_selfPid{0};
+
+    // ========================================================================
+    // EVENT DEDUPLICATION
+    // ========================================================================
+
+    /// @brief Recent injection event keys for deduplication.
+    /// Key = hash(sourcePid, targetPid, injectionType, time_bucket).
+    /// Prevents the same injection from generating duplicate events when
+    /// detected through multiple handlers (handle + memory + thread).
+    struct DeduplicationEntry {
+        uint64_t key{0};
+        TimePoint expiry{};
+    };
+    std::deque<DeduplicationEntry> m_recentInjections;
+    mutable std::mutex m_dedupMutex;
+
+    /// @brief Deduplication window — events with same source+target+type
+    /// within this window are suppressed.
+    static constexpr auto DEDUP_WINDOW = std::chrono::seconds(5);
+
+    // ========================================================================
+    // KNOWN LOLBins — Microsoft-signed binaries abused for injection/execution
+    // ========================================================================
+
+    static constexpr std::wstring_view kLolBins[] = {
+        L"mshta.exe",       L"regsvr32.exe",    L"rundll32.exe",
+        L"msiexec.exe",     L"cscript.exe",     L"wscript.exe",
+        L"certutil.exe",    L"bitsadmin.exe",   L"installutil.exe",
+        L"regasm.exe",      L"regsvcs.exe",     L"msbuild.exe",
+        L"cmstp.exe",       L"presentationhost.exe",
+        L"mavinject.exe",   L"eventvwr.exe",    L"dnscmd.exe",
+    };
+
     // ========================================================================
     // METHODS
     // ========================================================================
 
-    Impl() = default;
+    Impl() : m_selfPid(::GetCurrentProcessId()) {}
     ~Impl() = default;
 
     [[nodiscard]] bool Initialize(
@@ -422,6 +508,52 @@ struct ProcessInjectionDetector::Impl {
     InjectionVerdict InvokeInjectionCallbacks(const InjectionEvent& event);
     void InvokeAlertCallbacks(const InjectionAlert& alert);
     void InvokeChainCallbacks(const InjectionChain& chain);
+
+    // ========================================================================
+    // NEW: Deduplication
+    // ========================================================================
+
+    /// @brief Check if this injection was already detected recently.
+    /// @return true if duplicate (suppress), false if new (process it).
+    [[nodiscard]] bool IsDuplicate(uint32_t sourcePid, uint32_t targetPid, InjectionType type);
+
+    // ========================================================================
+    // NEW: Kernel driver integration
+    // ========================================================================
+
+    /// @brief Register message handlers with IPCManager for kernel events.
+    void RegisterKernelHandlers();
+
+    /// @brief Handle kernel thread creation notification.
+    void OnKernelThreadNotify(SHADOWSTRIKE_MESSAGE_TYPE type, const void* data, size_t size);
+
+    /// @brief Handle kernel handle alert notification.
+    void OnKernelHandleAlert(SHADOWSTRIKE_MESSAGE_TYPE type, const void* data, size_t size);
+
+    // ========================================================================
+    // NEW: Sub-detector orchestration
+    // ========================================================================
+
+    /// @brief Wire sub-detector callbacks so their findings feed into our
+    /// correlation engine.
+    void WireSubDetectorCallbacks();
+
+    /// @brief Process and store an injection event — called from all
+    /// detection paths (event handlers + sub-detector callbacks + kernel).
+    /// Handles dedup, callbacks, alerts, chain detection, stats.
+    void ProcessInjectionDetection(InjectionEvent event);
+
+    // ========================================================================
+    // NEW: Technique-specific stat helpers
+    // ========================================================================
+
+    void UpdateTechniqueStats(InjectionType type);
+
+    // ========================================================================
+    // NEW: LOLBin check
+    // ========================================================================
+
+    [[nodiscard]] bool IsLolBin(std::wstring_view processName) const;
 };
 
 // ============================================================================
@@ -442,16 +574,30 @@ bool ProcessInjectionDetector::Impl::Initialize(
 
         m_config = config;
         m_threadPool = threadPool;
+        m_selfPid = ::GetCurrentProcessId();
 
         // Initialize infrastructure
         m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
         m_patternStore = std::make_shared<PatternStore::PatternStore>();
 
-        SS_LOG_INFO(L"InjectionDetector", L"Initialized successfully");
+        // Wire kernel driver integration — register to receive thread
+        // creation, handle alert, and process creation events from the
+        // kernel driver via IPCManager.
+        RegisterKernelHandlers();
+
+        // Wire sub-detector callbacks — findings from specialized
+        // detectors feed into our event correlation engine.
+        WireSubDetectorCallbacks();
+
+        SS_LOG_INFO(L"InjectionDetector",
+            L"Initialized successfully (selfPid=%u, kernel=%s, subDetectors=%s)",
+            m_selfPid,
+            Communication::IPCManager::HasInstance() ? L"connected" : L"standalone",
+            L"wired");
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Initialization failed - %S", e.what());
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
@@ -541,8 +687,9 @@ void ProcessInjectionDetector::Impl::Stop() {
         return;
     }
 
-    // Stop cleanup thread
+    // Stop cleanup thread - wake it from CV sleep
     m_stopCleanup.store(true, std::memory_order_release);
+    m_cleanupCv.notify_all();
     if (m_cleanupThread.joinable()) {
         m_cleanupThread.join();
     }
@@ -626,14 +773,18 @@ std::optional<InjectionEvent> ProcessInjectionDetector::Impl::CorrelateEvents(
         event.targetProcessId = targetPid;
 
         // Get process information
-        if (auto srcInfo = Utils::ProcessUtils::GetProcessInfo(sourcePid)) {
-            event.sourceProcessName = srcInfo->processName;
-            event.sourceProcessPath = srcInfo->executablePath;
+        if (auto srcName = Utils::ProcessUtils::GetProcessName(sourcePid)) {
+            event.sourceProcessName = *srcName;
+        }
+        if (auto srcPath = Utils::ProcessUtils::GetProcessPath(sourcePid)) {
+            event.sourceProcessPath = *srcPath;
         }
 
-        if (auto tgtInfo = Utils::ProcessUtils::GetProcessInfo(targetPid)) {
-            event.targetProcessName = tgtInfo->processName;
-            event.targetProcessPath = tgtInfo->executablePath;
+        if (auto tgtName = Utils::ProcessUtils::GetProcessName(targetPid)) {
+            event.targetProcessName = *tgtName;
+        }
+        if (auto tgtPath = Utils::ProcessUtils::GetProcessPath(targetPid)) {
+            event.targetProcessPath = *tgtPath;
         }
 
         // Store related events
@@ -646,7 +797,6 @@ std::optional<InjectionEvent> ProcessInjectionDetector::Impl::CorrelateEvents(
             const auto& threadEvent = relatedThreads.back();
             event.targetThreadId = threadEvent.threadId;
             event.startAddress = threadEvent.startAddress;
-            event.startAddressModule = threadEvent.startAddressModule;
             event.startAddressLegitimate = IsAddressInModule(targetPid, threadEvent.startAddress);
         }
 
@@ -684,7 +834,7 @@ std::optional<InjectionEvent> ProcessInjectionDetector::Impl::CorrelateEvents(
         return event;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Event correlation failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Event correlation failed - %S", e.what());
         return std::nullopt;
     }
 }
@@ -894,7 +1044,7 @@ double ProcessInjectionDetector::Impl::CalculateRiskScore(const InjectionEvent& 
     }
 
     // Increase risk if injecting into critical system processes
-    const std::wstring targetLower = Utils::StringUtils::ToLower(event.targetProcessName);
+    const std::wstring targetLower = Utils::StringUtils::ToLowerCopy(event.targetProcessName);
     if (targetLower.find(L"lsass") != std::wstring::npos ||
         targetLower.find(L"winlogon") != std::wstring::npos ||
         targetLower.find(L"csrss") != std::wstring::npos) {
@@ -913,21 +1063,55 @@ bool ProcessInjectionDetector::Impl::ShouldWhitelist(const InjectionEvent& event
         return false;
     }
 
-    // Check process pair whitelist
-    if (IsInjectionPairWhitelisted(event.sourceProcessName, event.targetProcessName)) {
-        return true;
+    // Step 1: Check process pair whitelist (name-based pre-filter)
+    if (!IsInjectionPairWhitelisted(event.sourceProcessName, event.targetProcessName)) {
+        // Not in the hardcoded system pair whitelist — fall through to
+        // signature-based checks below.
+    } else {
+        // Name matches a known OS pair. Validate that the source is
+        // actually the real OS binary via digital signature, not a
+        // malware binary masquerading as csrss.exe or services.exe.
+        if (!event.sourceProcessPath.empty()) {
+            try {
+                if (Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(
+                        event.sourceProcessPath)) {
+                    return true;
+                }
+            } catch (...) {
+                // Signature check failed — do NOT whitelist; safer to alert.
+            }
+        }
+        // Name matched but signature check failed — process is
+        // impersonating a system binary. This is HIGHLY suspicious.
+        // Do NOT whitelist.
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Process %ls matched whitelist name but failed signature check — possible impersonation",
+            event.sourceProcessName.c_str());
+        return false;
     }
 
-    // Check if source is Microsoft signed and we trust Microsoft
-    if (m_config.trustMicrosoftSigned) {
-        if (Utils::FileUtils::IsMicrosoftSigned(event.sourceProcessPath)) {
-            return true;
+    // Step 2: Check if source is Microsoft signed AND not a LOLBin
+    if (m_config.trustMicrosoftSigned && !event.sourceProcessPath.empty()) {
+        // LOLBins are Microsoft-signed but routinely weaponized.
+        // Never auto-whitelist them for injection.
+        if (IsLolBin(event.sourceProcessName)) {
+            return false;
+        }
+
+        try {
+            if (Security::DigitalSignatureValidator::Instance().IsMicrosoftSigned(
+                    event.sourceProcessPath)) {
+                return true;
+            }
+        } catch (...) {
+            // Signature check may fail for inaccessible processes
         }
     }
 
-    // Check whitelist store
+    // Step 3: Check whitelist store
     if (m_whitelist) {
-        if (m_whitelist->IsProcessWhitelisted(event.sourceProcessPath)) {
+        auto lr = m_whitelist->IsWhitelisted(event.sourceProcessPath);
+        if (lr.found) {
             return true;
         }
     }
@@ -957,12 +1141,12 @@ InjectionAlert ProcessInjectionDetector::Impl::CreateAlert(const InjectionEvent&
 
     // Build details
     std::wostringstream details;
-    details << L"Injection detected: " << Utils::StringUtils::Utf8ToWide(InjectionTypeToString(event.injectionType))
+    details << L"Injection detected: " << Utils::StringUtils::ToWide(InjectionTypeToString(event.injectionType))
             << L"\nSource: " << event.sourceProcessName << L" (PID: " << event.sourceProcessId << L")"
             << L"\nTarget: " << event.targetProcessName << L" (PID: " << event.targetProcessId << L")"
             << L"\nConfidence: " << std::fixed << std::setprecision(1) << event.confidence << L"%"
             << L"\nRisk Score: " << std::fixed << std::setprecision(1) << event.riskScore
-            << L"\nMITRE: " << Utils::StringUtils::Utf8ToWide(event.mitreSubTechnique);
+            << L"\nMITRE: " << Utils::StringUtils::ToWide(event.mitreSubTechnique);
 
     if (event.targetThreadId > 0) {
         details << L"\nThread: " << event.targetThreadId;
@@ -1061,7 +1245,7 @@ std::optional<InjectionChain> ProcessInjectionDetector::Impl::DetectChain(uint32
         return chain;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Chain detection failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Chain detection failed - %S", e.what());
         return std::nullopt;
     }
 }
@@ -1076,9 +1260,14 @@ void ProcessInjectionDetector::Impl::CleanupThread() {
     while (!m_stopCleanup.load(std::memory_order_acquire)) {
         try {
             PurgeOldEvents();
-            std::this_thread::sleep_for(std::chrono::minutes(5));
+
+            // Interruptible sleep using condition variable
+            std::unique_lock cvLock(m_cleanupCvMutex);
+            m_cleanupCv.wait_for(cvLock, std::chrono::minutes(5), [this]() {
+                return m_stopCleanup.load(std::memory_order_acquire);
+            });
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"InjectionDetector", L"Cleanup error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Cleanup error - %S", e.what());
         }
     }
 
@@ -1133,8 +1322,63 @@ void ProcessInjectionDetector::Impl::PurgeOldEvents() {
         }
     }
 
+    // Purge stale injection events from the aggregated events map.
+    // These are keyed by eventId and referenced by process states; we
+    // only remove events older than maxAge to keep correlation valid.
+    {
+        std::unique_lock lock(m_eventsMutex);
+        auto it = m_events.begin();
+        while (it != m_events.end()) {
+            if ((now - it->second.timestamp) > maxAge) {
+                it = m_events.erase(it);
+                purged++;
+            } else {
+                ++it;
+            }
+        }
+    }
+
+    // Purge stale process states (no activity in 2 hours AND process is dead)
+    {
+        const auto staleAge = std::chrono::hours(2);
+        std::unique_lock lock(m_statesMutex);
+        auto it = m_processStates.begin();
+        while (it != m_processStates.end()) {
+            const auto& state = it->second;
+            if ((now - state.lastActivity) > staleAge &&
+                !Utils::ProcessUtils::IsProcessRunning(state.processId)) {
+                it = m_processStates.erase(it);
+                purged++;
+            } else {
+                // Cap per-state vectors to prevent unbounded growth
+                constexpr size_t MAX_PER_STATE = InjectionConstants::MAX_EVENTS_PER_SOURCE;
+                auto& s = it->second;
+                if (s.crossProcessHandles.size() > MAX_PER_STATE) {
+                    s.crossProcessHandles.erase(
+                        s.crossProcessHandles.begin(),
+                        s.crossProcessHandles.begin() +
+                            static_cast<ptrdiff_t>(s.crossProcessHandles.size() - MAX_PER_STATE));
+                }
+                if (s.remoteMemoryOps.size() > MAX_PER_STATE) {
+                    s.remoteMemoryOps.erase(
+                        s.remoteMemoryOps.begin(),
+                        s.remoteMemoryOps.begin() +
+                            static_cast<ptrdiff_t>(s.remoteMemoryOps.size() - MAX_PER_STATE));
+                }
+                if (s.remoteThreadOps.size() > MAX_PER_STATE) {
+                    s.remoteThreadOps.erase(
+                        s.remoteThreadOps.begin(),
+                        s.remoteThreadOps.begin() +
+                            static_cast<ptrdiff_t>(s.remoteThreadOps.size() - MAX_PER_STATE));
+                }
+                ++it;
+            }
+        }
+        m_stats.trackedProcesses.store(m_processStates.size(), std::memory_order_relaxed);
+    }
+
     if (purged > 0) {
-        SS_LOG_DEBUG(L"InjectionDetector", L"Purged %ls old events", purged);
+        SS_LOG_DEBUG(L"InjectionDetector", L"Purged %zu old events/states", purged);
     }
 }
 
@@ -1154,7 +1398,7 @@ InjectionVerdict ProcessInjectionDetector::Impl::InvokeInjectionCallbacks(const 
                 verdict = callbackVerdict;
             }
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"InjectionDetector", L"Injection callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Injection callback error - %S", e.what());
         }
     }
 
@@ -1167,7 +1411,7 @@ void ProcessInjectionDetector::Impl::InvokeAlertCallbacks(const InjectionAlert& 
         try {
             callback(alert);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"InjectionDetector", L"Alert callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Alert callback error - %S", e.what());
         }
     }
 }
@@ -1178,9 +1422,693 @@ void ProcessInjectionDetector::Impl::InvokeChainCallbacks(const InjectionChain& 
         try {
             callback(chain);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"InjectionDetector", L"Chain callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"InjectionDetector", L"Chain callback error - %S", e.what());
         }
     }
+}
+
+// ============================================================================
+// IMPL: DEDUPLICATION
+// ============================================================================
+
+bool ProcessInjectionDetector::Impl::IsDuplicate(
+    uint32_t sourcePid,
+    uint32_t targetPid,
+    InjectionType type)
+{
+    // Hash: combine source, target, and injection type into a single key.
+    // Time is quantized into DEDUP_WINDOW buckets.
+    const uint64_t key =
+        (static_cast<uint64_t>(sourcePid) << 32) ^
+        (static_cast<uint64_t>(targetPid) << 16) ^
+        static_cast<uint64_t>(type);
+
+    const auto now = Clock::now();
+
+    std::lock_guard lock(m_dedupMutex);
+
+    // Expire old entries
+    while (!m_recentInjections.empty() && m_recentInjections.front().expiry <= now) {
+        m_recentInjections.pop_front();
+    }
+
+    // Check if this key already exists
+    for (const auto& entry : m_recentInjections) {
+        if (entry.key == key) {
+            return true;  // Duplicate
+        }
+    }
+
+    // Not a duplicate — record it
+    m_recentInjections.push_back({key, now + DEDUP_WINDOW});
+
+    // Safety cap
+    if (m_recentInjections.size() > 10000) {
+        m_recentInjections.pop_front();
+    }
+
+    return false;
+}
+
+// ============================================================================
+// IMPL: KERNEL DRIVER INTEGRATION
+// ============================================================================
+
+void ProcessInjectionDetector::Impl::RegisterKernelHandlers() {
+    if (!Communication::IPCManager::HasInstance()) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"IPCManager not available — kernel integration disabled. "
+            L"Detection limited to user-mode callbacks.");
+        return;
+    }
+
+    try {
+        auto& ipc = Communication::IPCManager::Instance();
+
+        // Register a generic message handler that routes ThreadNotify and
+        // HandleAlert messages from the kernel driver into our detection
+        // pipeline. This is the critical kernel↔user-mode bridge.
+        ipc.RegisterGenericHandler(
+            [this](SHADOWSTRIKE_MESSAGE_TYPE msgType, const void* payload, size_t payloadSize) {
+                if (!m_running.load(std::memory_order_acquire)) return;
+
+                switch (msgType) {
+                    case FilterMessageType_ThreadNotify:
+                        OnKernelThreadNotify(msgType, payload, payloadSize);
+                        break;
+                    case FilterMessageType_HandleAlert:
+                        OnKernelHandleAlert(msgType, payload, payloadSize);
+                        break;
+                    default:
+                        break;
+                }
+            }
+        );
+
+        SS_LOG_INFO(L"InjectionDetector",
+            L"Kernel handlers registered (ThreadNotify + HandleAlert)");
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"InjectionDetector",
+            L"Failed to register kernel handlers - %S", e.what());
+    }
+}
+
+void ProcessInjectionDetector::Impl::OnKernelThreadNotify(
+    SHADOWSTRIKE_MESSAGE_TYPE /*type*/,
+    const void* data,
+    size_t size)
+{
+    if (data == nullptr || size < sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)) {
+        return;
+    }
+
+    const auto* tn = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);
+
+    // Self-exclusion: ignore our own process
+    if (tn->ProcessId == m_selfPid || tn->CreatorProcessId == m_selfPid) {
+        return;
+    }
+
+    // Only process remote thread creation events (cross-process injection)
+    if (!tn->IsRemote) {
+        return;
+    }
+
+    // Convert kernel notification into our ThreadOperationEvent format
+    ThreadOperationEvent threadEvent;
+    threadEvent.timestamp = Clock::now();
+    threadEvent.operation = ThreadOperationEvent::OpType::Create;
+    threadEvent.sourceProcessId = tn->CreatorProcessId;
+    threadEvent.targetProcessId = tn->ProcessId;
+    threadEvent.threadId = tn->ThreadId;
+    threadEvent.isRemote = true;
+
+    // Note: SHADOWSTRIKE_THREAD_NOTIFICATION does not carry the start
+    // address — leave startAddressModule empty.  Correlation will still
+    // work based on the cross-process thread creation event.
+
+    SS_LOG_DEBUG(L"InjectionDetector",
+        L"Kernel ThreadNotify: PID %u -> PID %u (TID %u, remote=%d)",
+        tn->CreatorProcessId, tn->ProcessId, tn->ThreadId, tn->IsRemote);
+
+    // Feed into the standard event handler pipeline
+    // (store event + correlate + detect)
+    m_stats.threadEvents.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalEvents.fetch_add(1, std::memory_order_relaxed);
+    m_stats.remoteThreadsDetected.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::unique_lock lock(m_threadEventsMutex);
+        m_threadEvents.push_back(threadEvent);
+        if (m_threadEvents.size() > InjectionConstants::MAX_INJECTION_EVENTS) {
+            m_threadEvents.pop_front();
+        }
+    }
+
+    {
+        std::unique_lock lock(m_statesMutex);
+        auto& state = m_processStates[threadEvent.sourceProcessId];
+        state.processId = threadEvent.sourceProcessId;
+        state.remoteThreadOps.push_back(threadEvent);
+        state.lastActivity = Clock::now();
+    }
+
+    // Correlate events to detect injection
+    if (auto injectionEvent = CorrelateEvents(
+            threadEvent.sourceProcessId, threadEvent.targetProcessId)) {
+        ProcessInjectionDetection(std::move(*injectionEvent));
+    }
+}
+
+void ProcessInjectionDetector::Impl::OnKernelHandleAlert(
+    SHADOWSTRIKE_MESSAGE_TYPE /*type*/,
+    const void* data,
+    size_t size)
+{
+    if (data == nullptr || size < sizeof(SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION)) {
+        return;
+    }
+
+    const auto* ha = static_cast<const SHADOWSTRIKE_HANDLE_ALERT_NOTIFICATION*>(data);
+
+    // Self-exclusion
+    if (ha->SourceProcessId == m_selfPid || ha->TargetProcessId == m_selfPid) {
+        return;
+    }
+
+    // Convert kernel handle alert into our HandleAccessEvent format
+    HandleAccessEvent handleEvent;
+    handleEvent.timestamp = Clock::now();
+    handleEvent.sourceProcessId = ha->SourceProcessId;
+    handleEvent.targetProcessId = ha->TargetProcessId;
+    handleEvent.desiredAccess = ha->RequestedAccess;
+    handleEvent.grantedAccess = ha->GrantedAccess;
+
+    constexpr uint32_t PROCESS_VM_WRITE_FLAG = 0x0020;
+    constexpr uint32_t PROCESS_VM_OPERATION_FLAG = 0x0008;
+    constexpr uint32_t PROCESS_CREATE_THREAD_FLAG = 0x0002;
+    constexpr uint32_t PROCESS_DUP_HANDLE_FLAG = 0x0040;
+
+    handleEvent.hasVMWrite      = (ha->GrantedAccess & PROCESS_VM_WRITE_FLAG) != 0;
+    handleEvent.hasVMOperation  = (ha->GrantedAccess & PROCESS_VM_OPERATION_FLAG) != 0;
+    handleEvent.hasCreateThread = (ha->GrantedAccess & PROCESS_CREATE_THREAD_FLAG) != 0;
+    handleEvent.hasDupHandle    = (ha->GrantedAccess & PROCESS_DUP_HANDLE_FLAG) != 0;
+
+    SS_LOG_DEBUG(L"InjectionDetector",
+        L"Kernel HandleAlert: PID %u -> PID %u (access=0x%08X, score=%u)",
+        ha->SourceProcessId, ha->TargetProcessId,
+        ha->GrantedAccess, ha->SuspicionScore);
+
+    m_stats.handleEvents.fetch_add(1, std::memory_order_relaxed);
+    m_stats.totalEvents.fetch_add(1, std::memory_order_relaxed);
+
+    {
+        std::unique_lock lock(m_handleEventsMutex);
+        m_handleEvents.push_back(handleEvent);
+        if (m_handleEvents.size() > InjectionConstants::MAX_INJECTION_EVENTS) {
+            m_handleEvents.pop_front();
+        }
+    }
+
+    {
+        std::unique_lock lock(m_statesMutex);
+        auto& state = m_processStates[handleEvent.sourceProcessId];
+        state.processId = handleEvent.sourceProcessId;
+        state.crossProcessHandles.push_back(handleEvent);
+        state.lastActivity = Clock::now();
+    }
+
+    // Correlate if the handle has injection-capable permissions
+    if (IsSuspiciousHandleAccess(handleEvent.grantedAccess)) {
+        if (auto injectionEvent = CorrelateEvents(
+                handleEvent.sourceProcessId, handleEvent.targetProcessId)) {
+            ProcessInjectionDetection(std::move(*injectionEvent));
+        }
+    }
+}
+
+// ============================================================================
+// IMPL: SUB-DETECTOR ORCHESTRATION
+// ============================================================================
+
+void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
+    // Wire ProcessHollowingDetector — when it detects hollowing, feed
+    // the result into our detection pipeline.
+    try {
+        if (ProcessHollowingDetector::HasInstance() &&
+            ProcessHollowingDetector::Instance().IsInitialized()) {
+            ProcessHollowingDetector::Instance().RegisterDetectionCallback(
+                [this](const ProcessHollowingDetector::HollowingDetectionResult& result) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+                    if (!result.isHollowed) return;
+
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::ProcessHollowing;
+                    event.targetProcessId = result.processId;
+                    event.confidence = ConfidenceEnumToDouble(
+                        static_cast<uint8_t>(result.confidence));
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055.012";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(result.processId)) {
+                        event.targetProcessName = *name;
+                    }
+                    if (auto path = Utils::ProcessUtils::GetProcessPath(result.processId)) {
+                        event.targetProcessPath = *path;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"ProcessHollowingDetector callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire ProcessHollowingDetector: %S", e.what());
+    }
+
+    // Wire ReflectiveDLLDetector
+    try {
+        auto& rdd = ReflectiveDLLDetector::Instance();
+        if (rdd.IsInitialized()) {
+            rdd.RegisterCallback(
+                [this](const ReflectiveDLLDetector::ReflectiveDetection& detection) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::ReflectiveDLL;
+                    event.targetProcessId = detection.processId;
+                    event.targetAddress = detection.peCandidate.baseAddress;
+                    event.dataSize = detection.peCandidate.regionSize;
+                    event.confidence = ConfidenceEnumToDouble(
+                        static_cast<uint8_t>(detection.confidence));
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055.001";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(detection.processId)) {
+                        event.targetProcessName = *name;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"ReflectiveDLLDetector callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire ReflectiveDLLDetector: %S", e.what());
+    }
+
+    // Wire ThreadHijackDetector
+    try {
+        auto& thd = ThreadHijackDetector::Instance();
+        if (thd.IsInitialized()) {
+            thd.RegisterCallback(
+                [this](const ThreadHijackDetector::HijackEvent& hijackEvent) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::ThreadHijacking;
+                    event.targetProcessId = hijackEvent.processId;
+                    event.targetThreadId = hijackEvent.threadId;
+                    event.confidence = 85.0;
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055.003";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(hijackEvent.processId)) {
+                        event.targetProcessName = *name;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"ThreadHijackDetector callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire ThreadHijackDetector: %S", e.what());
+    }
+
+    // Wire AtomBombingDetector
+    try {
+        auto& abd = AtomBombingDetector::Instance();
+        if (abd.IsInitialized()) {
+            abd.RegisterAttackCallback(
+                [this](const AtomBombingDetector::AtomBombingAttack& attack) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::AtomBombing;
+                    event.targetProcessId = attack.victimPid;
+                    event.sourceProcessId = attack.attackerPid;
+                    event.confidence = 85.0;
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(attack.victimPid)) {
+                        event.targetProcessName = *name;
+                    }
+                    if (auto name = Utils::ProcessUtils::GetProcessName(attack.attackerPid)) {
+                        event.sourceProcessName = *name;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"AtomBombingDetector callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire AtomBombingDetector: %S", e.what());
+    }
+
+    // Wire MemoryScanner
+    try {
+        auto& ms = MemoryScanner::Instance();
+        if (ms.IsInitialized()) {
+            ms.RegisterThreatCallback(
+                [this](const MemoryScanner::MemoryThreat& threat) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+
+                    // Only process injection-related memory threats
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::ShellcodeInjection;
+                    event.targetProcessId = threat.processId;
+                    event.targetAddress = threat.address;
+                    event.dataSize = threat.size;
+                    event.confidence = 70.0;
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055.002";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(threat.processId)) {
+                        event.targetProcessName = *name;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"MemoryScanner callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire MemoryScanner: %S", e.what());
+    }
+
+    // Wire DLLInjectionDetector
+    try {
+        auto& did = DLLInjectionDetector::Instance();
+        if (did.IsInitialized()) {
+            did.RegisterCallback(
+                [this](const DLLInjectionDetector::InjectionEvent& dllEvent) {
+                    if (!m_running.load(std::memory_order_acquire)) return;
+
+                    InjectionEvent event;
+                    event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
+                    event.timestamp = Clock::now();
+                    event.injectionType = InjectionType::DLLInjection;
+                    event.targetProcessId = dllEvent.targetPid;
+                    event.sourceProcessId = dllEvent.injectorPid;
+                    event.injectedModulePath = dllEvent.dllInfo.dllPath;
+                    event.confidence = 75.0;
+                    event.mitreTechnique = "T1055";
+                    event.mitreSubTechnique = "T1055.001";
+
+                    if (auto name = Utils::ProcessUtils::GetProcessName(dllEvent.targetPid)) {
+                        event.targetProcessName = *name;
+                    }
+                    if (auto name = Utils::ProcessUtils::GetProcessName(dllEvent.injectorPid)) {
+                        event.sourceProcessName = *name;
+                    }
+
+                    ProcessInjectionDetection(std::move(event));
+                }
+            );
+            SS_LOG_DEBUG(L"InjectionDetector", L"DLLInjectionDetector callback wired");
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Failed to wire DLLInjectionDetector: %S", e.what());
+    }
+}
+
+// ============================================================================
+// IMPL: CENTRALIZED INJECTION EVENT PROCESSING
+// ============================================================================
+
+void ProcessInjectionDetector::Impl::ProcessInjectionDetection(InjectionEvent event) {
+    // Self-exclusion MUST come before deduplication — otherwise self-process
+    // events poison the dedup table and silently suppress real injections
+    // that happen to share the same key.
+    if (event.sourceProcessId == m_selfPid || event.targetProcessId == m_selfPid) {
+        return;
+    }
+
+    // Deduplication: avoid re-alerting on same injection from multiple
+    // detection paths (handle + memory + thread + sub-detector)
+    if (IsDuplicate(event.sourceProcessId, event.targetProcessId, event.injectionType)) {
+        return;
+    }
+
+    // Fill in missing process info
+    if (event.sourceProcessName.empty() && event.sourceProcessId != 0) {
+        if (auto name = Utils::ProcessUtils::GetProcessName(event.sourceProcessId)) {
+            event.sourceProcessName = *name;
+        }
+    }
+    if (event.sourceProcessPath.empty() && event.sourceProcessId != 0) {
+        if (auto path = Utils::ProcessUtils::GetProcessPath(event.sourceProcessId)) {
+            event.sourceProcessPath = *path;
+        }
+    }
+    if (event.targetProcessName.empty() && event.targetProcessId != 0) {
+        if (auto name = Utils::ProcessUtils::GetProcessName(event.targetProcessId)) {
+            event.targetProcessName = *name;
+        }
+    }
+    if (event.targetProcessPath.empty() && event.targetProcessId != 0) {
+        if (auto path = Utils::ProcessUtils::GetProcessPath(event.targetProcessId)) {
+            event.targetProcessPath = *path;
+        }
+    }
+
+    // Recalculate confidence/risk if not already set
+    if (event.confidence <= 0.0) {
+        event.confidence = CalculateConfidence(event.injectionType, event);
+    }
+    if (event.riskScore <= 0.0) {
+        event.riskScore = CalculateRiskScore(event);
+    }
+
+    // MITRE ATT&CK mapping
+    if (event.mitreTechnique.empty()) {
+        event.mitreTechnique = "T1055";
+    }
+    if (event.mitreSubTechnique.empty()) {
+        event.mitreSubTechnique = InjectionTypeToMitre(event.injectionType);
+    }
+
+    // Whitelisting
+    if (ShouldWhitelist(event)) {
+        event.verdict = InjectionVerdict::Whitelisted;
+        event.confidence = 0.0;
+        m_stats.falsePositivesSuppressed.fetch_add(1, std::memory_order_relaxed);
+        return;
+    }
+
+    // Determine verdict
+    if (event.confidence >= m_config.blockConfidence) {
+        event.verdict = InjectionVerdict::Confirmed;
+    } else if (event.confidence >= m_config.alertConfidence) {
+        event.verdict = InjectionVerdict::Detected;
+    } else {
+        event.verdict = InjectionVerdict::Suspicious;
+    }
+
+    // Invoke injection callbacks (may escalate verdict)
+    event.verdict = InvokeInjectionCallbacks(event);
+
+    // Store event
+    {
+        std::unique_lock lock(m_eventsMutex);
+        m_events[event.eventId] = event;
+    }
+
+    // Update process states
+    {
+        std::unique_lock lock(m_statesMutex);
+        if (event.sourceProcessId != 0) {
+            auto& srcState = m_processStates[event.sourceProcessId];
+            srcState.processId = event.sourceProcessId;
+            srcState.processName = event.sourceProcessName;
+            srcState.isInjecting = true;
+            srcState.outgoingInjectionIds.push_back(event.eventId);
+            srcState.totalInjectionsAsSource++;
+            srcState.lastActivity = Clock::now();
+        }
+
+        auto& tgtState = m_processStates[event.targetProcessId];
+        tgtState.processId = event.targetProcessId;
+        tgtState.processName = event.targetProcessName;
+        tgtState.isBeingInjected = true;
+        tgtState.hasBeenInjected = true;
+        tgtState.incomingInjectionIds.push_back(event.eventId);
+        tgtState.totalInjectionsAsTarget++;
+        tgtState.lastActivity = Clock::now();
+    }
+
+    // Forward to BehaviorAnalyzer for attack chain correlation
+    if (m_behaviorAnalyzer && m_behaviorAnalyzer->IsInitialized()) {
+        try {
+            auto baEvent = Engine::CreateProcessEvent(
+                Engine::BehaviorEventType::ProcessInject,
+                event.sourceProcessId,
+                event.targetProcessId);
+            baEvent.processName = event.sourceProcessName;
+            baEvent.targetPath  = event.targetProcessName;
+            baEvent.accessMask  = static_cast<uint32_t>(event.injectionType);
+            baEvent.details     = L"confidence=" + std::to_wstring(event.confidence);
+            baEvent.success     = true;
+
+            auto baVerdict = m_behaviorAnalyzer->ProcessEvent(baEvent);
+            if (baVerdict.has_value() &&
+                baVerdict->RequiresImmediateAction()) {
+                // BA determined this injection warrants immediate blocking.
+                // This applies regardless of the blockInjections config —
+                // the BehaviorAnalyzer performs holistic attack-chain analysis
+                // and its escalation overrides monitor-only mode.
+                event.blocked = true;
+                m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(L"InjectionDetector",
+                    L"BA escalated injection %ls->%ls to BLOCK (score=%.1f)",
+                    event.sourceProcessName.c_str(),
+                    event.targetProcessName.c_str(),
+                    baVerdict->maliceScore);
+            }
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"InjectionDetector", L"BA forwarding failed: %S", ex.what());
+        }
+    }
+
+    // Update technique-specific stats
+    m_stats.injectionsDetected.fetch_add(1, std::memory_order_relaxed);
+    UpdateTechniqueStats(event.injectionType);
+
+    // Generate alert if confidence meets threshold
+    if (event.confidence >= m_config.alertConfidence) {
+        auto alert = CreateAlert(event);
+        {
+            std::unique_lock lock(m_alertsMutex);
+            m_alerts.push_back(alert);
+            if (m_alerts.size() > 10000) {
+                m_alerts.pop_front();
+            }
+        }
+        InvokeAlertCallbacks(alert);
+    }
+
+    // Block if configured
+    if (m_config.blockInjections &&
+        event.confidence >= m_config.blockConfidence &&
+        event.verdict != InjectionVerdict::Whitelisted) {
+        event.blocked = true;
+        m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_WARN(L"InjectionDetector",
+            L"Blocked injection %ls -> %ls (%S, confidence=%.1f)",
+            event.sourceProcessName.c_str(),
+            event.targetProcessName.c_str(),
+            InjectionTypeToString(event.injectionType),
+            event.confidence);
+    }
+
+    // Auto chain detection: if the source is already a known injection
+    // target (it was previously injected INTO), this is a multi-hop chain.
+    if (event.sourceProcessId != 0 && m_config.detectChains) {
+        std::shared_lock stateLock(m_statesMutex);
+        auto srcIt = m_processStates.find(event.sourceProcessId);
+        if (srcIt != m_processStates.end() && srcIt->second.hasBeenInjected) {
+            stateLock.unlock();
+            if (auto chain = DetectChain(event.sourceProcessId)) {
+                {
+                    std::unique_lock chainLock(m_chainsMutex);
+                    m_chains.push_back(*chain);
+                    if (m_chains.size() > 1000) {
+                        m_chains.erase(m_chains.begin());
+                    }
+                }
+                m_stats.chainsDetected.fetch_add(1, std::memory_order_relaxed);
+                InvokeChainCallbacks(*chain);
+
+                SS_LOG_WARN(L"InjectionDetector",
+                    L"Injection CHAIN detected: depth=%zu, start=%ls (PID %u) -> end=%ls (PID %u), risk=%.1f",
+                    chain->depth,
+                    chain->initialAttackerName.c_str(), chain->initialAttackerPid,
+                    chain->finalVictimName.c_str(), chain->finalVictimPid,
+                    chain->totalRiskScore);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// IMPL: TECHNIQUE-SPECIFIC STATS
+// ============================================================================
+
+void ProcessInjectionDetector::Impl::UpdateTechniqueStats(InjectionType type) {
+    switch (type) {
+        case InjectionType::RemoteThread:
+        case InjectionType::NtCreateThreadEx:
+        case InjectionType::RtlCreateUserThread:
+        case InjectionType::DirectSyscallThread:
+            m_stats.remoteThreadsDetected.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case InjectionType::APC:
+        case InjectionType::NtQueueApcThread:
+        case InjectionType::EarlyBird:
+        case InjectionType::APCWritePrimitive:
+        case InjectionType::KernelAPC:
+            m_stats.apcInjectionsDetected.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case InjectionType::ProcessHollowing:
+        case InjectionType::ProcessDoppelganging:
+        case InjectionType::ProcessHerpaderping:
+        case InjectionType::ProcessGhosting:
+        case InjectionType::TransactedHollowing:
+        case InjectionType::ProcessReimaging:
+            m_stats.hollowingDetected.fetch_add(1, std::memory_order_relaxed);
+            break;
+        case InjectionType::ReflectiveDLL:
+        case InjectionType::ManualMapping:
+        case InjectionType::ModuleStomping:
+            m_stats.reflectiveDLLDetected.fetch_add(1, std::memory_order_relaxed);
+            break;
+        default:
+            break;
+    }
+}
+
+// ============================================================================
+// IMPL: LOLBin CHECK
+// ============================================================================
+
+bool ProcessInjectionDetector::Impl::IsLolBin(std::wstring_view processName) const {
+    const std::wstring nameLower = Utils::StringUtils::ToLowerCopy(std::wstring(processName));
+    for (const auto& lolbin : kLolBins) {
+        if (nameLower == lolbin) {
+            return true;
+        }
+    }
+    return false;
 }
 
 // ============================================================================
@@ -1271,6 +2199,12 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
     }
 
     try {
+        // Self-exclusion
+        if (event.sourceProcessId == m_impl->m_selfPid ||
+            event.targetProcessId == m_impl->m_selfPid) {
+            return true;
+        }
+
         m_impl->m_stats.handleEvents.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_stats.totalEvents.fetch_add(1, std::memory_order_relaxed);
 
@@ -1278,8 +2212,6 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
         {
             std::unique_lock lock(m_impl->m_handleEventsMutex);
             m_impl->m_handleEvents.push_back(event);
-
-            // Limit history
             if (m_impl->m_handleEvents.size() > InjectionConstants::MAX_INJECTION_EVENTS) {
                 m_impl->m_handleEvents.pop_front();
             }
@@ -1294,87 +2226,15 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
             state.lastActivity = Clock::now();
         }
 
-        // Check if suspicious handle access
+        // Check if suspicious handle access — correlate and detect
         if (IsSuspiciousHandleAccess(event.grantedAccess)) {
-            // Attempt correlation
-            if (auto injectionEvent = m_impl->CorrelateEvents(event.sourceProcessId, event.targetProcessId)) {
-                // Invoke callbacks (may modify verdict)
-                injectionEvent->verdict = m_impl->InvokeInjectionCallbacks(*injectionEvent);
-
-                // Store event
-                {
-                    std::unique_lock lock(m_impl->m_eventsMutex);
-                    m_impl->m_events[injectionEvent->eventId] = *injectionEvent;
-                }
-
-                // Update process states
-                {
-                    std::unique_lock lock(m_impl->m_statesMutex);
-                    auto& srcState = m_impl->m_processStates[injectionEvent->sourceProcessId];
-                    srcState.isInjecting = true;
-                    srcState.outgoingInjectionIds.push_back(injectionEvent->eventId);
-                    srcState.totalInjectionsAsSource++;
-
-                    auto& tgtState = m_impl->m_processStates[injectionEvent->targetProcessId];
-                    tgtState.isBeingInjected = true;
-                    tgtState.hasBeenInjected = true;
-                    tgtState.incomingInjectionIds.push_back(injectionEvent->eventId);
-                    tgtState.totalInjectionsAsTarget++;
-                }
-
-                // Forward injection event to BehaviorAnalyzer for attack chain correlation
-                if (m_impl->m_behaviorAnalyzer && m_impl->m_behaviorAnalyzer->IsInitialized()) {
-                    try {
-                        auto baEvent = Engine::CreateProcessEvent(
-                            Engine::BehaviorEventType::ProcessInject,
-                            injectionEvent->sourceProcessId,
-                            injectionEvent->targetProcessId);
-                        baEvent.processName = injectionEvent->sourceProcessName;
-                        baEvent.targetPath  = injectionEvent->targetProcessName;
-                        baEvent.accessMask  = static_cast<uint32_t>(injectionEvent->injectionType);
-                        baEvent.details     = L"confidence=" + std::to_wstring(injectionEvent->confidence);
-                        baEvent.success     = true;
-
-                        auto baVerdict = m_impl->m_behaviorAnalyzer->ProcessEvent(baEvent);
-                        if (baVerdict.has_value() &&
-                            baVerdict->RequiresImmediateAction() &&
-                            !m_impl->m_config.blockInjections) {
-                            // BA escalated — override config to block this injection
-                            injectionEvent->blocked = true;
-                            m_impl->m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-                            SS_LOG_WARN(L"InjectionDetector", L"BA escalated injection %S->%ls to BLOCK (score=%.1f)", Utils::StringUtils::ToNarrow(injectionEvent->sourceProcessName), Utils::StringUtils::ToNarrow(injectionEvent->targetProcessName), baVerdict->maliceScore);
-                            return false;
-                        }
-                    } catch (const std::exception& ex) {
-                        SS_LOG_ERROR(L"InjectionDetector", L"BA forwarding failed: %S", ex.what());
-                    }
-                }
-
-                // Generate alert if confidence meets threshold
-                if (injectionEvent->confidence >= m_impl->m_config.alertConfidence) {
-                    auto alert = m_impl->CreateAlert(*injectionEvent);
-
-                    // Store alert
-                    {
-                        std::unique_lock lock(m_impl->m_alertsMutex);
-                        m_impl->m_alerts.push_back(alert);
-                        if (m_impl->m_alerts.size() > 10000) {
-                            m_impl->m_alerts.pop_front();
-                        }
-                    }
-
-                    m_impl->InvokeAlertCallbacks(alert);
-                    m_impl->m_stats.injectionsDetected.fetch_add(1, std::memory_order_relaxed);
-                }
-
-                // Block if configured and confidence is high
-                if (m_impl->m_config.blockInjections &&
-                    injectionEvent->confidence >= m_impl->m_config.blockConfidence &&
-                    injectionEvent->verdict != InjectionVerdict::Whitelisted) {
-                    injectionEvent->blocked = true;
-                    m_impl->m_stats.injectionsBlocked.fetch_add(1, std::memory_order_relaxed);
-
-                    SS_LOG_WARN(L"InjectionDetector", L"Blocked injection %S → %ls (%ls)", injectionEvent->sourceProcessName, injectionEvent->targetProcessName, Utils::StringUtils::Utf8ToWide(InjectionTypeToString(injectionEvent->injectionType)));
+            if (auto injectionEvent = m_impl->CorrelateEvents(
+                    event.sourceProcessId, event.targetProcessId)) {
+                const bool shouldBlock =
+                    m_impl->m_config.blockInjections &&
+                    injectionEvent->confidence >= m_impl->m_config.blockConfidence;
+                m_impl->ProcessInjectionDetection(std::move(*injectionEvent));
+                if (shouldBlock) {
                     return false;  // Block
                 }
             }
@@ -1383,7 +2243,7 @@ bool ProcessInjectionDetector::OnHandleAccess(const HandleAccessEvent& event) {
         return true;  // Allow
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Handle access handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Handle access handler failed - %S", e.what());
         return true;  // Allow on error
     }
 }
@@ -1394,6 +2254,12 @@ void ProcessInjectionDetector::OnMemoryOperation(const MemoryOperationEvent& eve
     }
 
     try {
+        // Self-exclusion
+        if (event.sourceProcessId == m_impl->m_selfPid ||
+            event.targetProcessId == m_impl->m_selfPid) {
+            return;
+        }
+
         m_impl->m_stats.memoryEvents.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_stats.totalEvents.fetch_add(1, std::memory_order_relaxed);
 
@@ -1401,24 +2267,37 @@ void ProcessInjectionDetector::OnMemoryOperation(const MemoryOperationEvent& eve
         {
             std::unique_lock lock(m_impl->m_memoryEventsMutex);
             m_impl->m_memoryEvents.push_back(event);
-
-            // Limit history
             if (m_impl->m_memoryEvents.size() > InjectionConstants::MAX_INJECTION_EVENTS) {
                 m_impl->m_memoryEvents.pop_front();
             }
         }
 
-        // Update process state
+        // Process cross-process memory operations
         if (event.isCrossProcess) {
-            std::unique_lock lock(m_impl->m_statesMutex);
-            auto& state = m_impl->m_processStates[event.sourceProcessId];
-            state.processId = event.sourceProcessId;
-            state.remoteMemoryOps.push_back(event);
-            state.lastActivity = Clock::now();
+            {
+                std::unique_lock lock(m_impl->m_statesMutex);
+                auto& state = m_impl->m_processStates[event.sourceProcessId];
+                state.processId = event.sourceProcessId;
+                state.remoteMemoryOps.push_back(event);
+                state.lastActivity = Clock::now();
+            }
+
+            const bool isExecProtChange =
+                (event.operation == MemoryOperationEvent::OpType::Protect &&
+                 IsExecutableProtection(event.newProtection));
+            const bool isCrossWrite =
+                (event.operation == MemoryOperationEvent::OpType::Write);
+
+            if (isExecProtChange || isCrossWrite) {
+                if (auto injectionEvent = m_impl->CorrelateEvents(
+                        event.sourceProcessId, event.targetProcessId)) {
+                    m_impl->ProcessInjectionDetection(std::move(*injectionEvent));
+                }
+            }
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Memory operation handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Memory operation handler failed - %S", e.what());
     }
 }
 
@@ -1428,6 +2307,12 @@ bool ProcessInjectionDetector::OnThreadOperation(const ThreadOperationEvent& eve
     }
 
     try {
+        // Self-exclusion
+        if (event.sourceProcessId == m_impl->m_selfPid ||
+            event.targetProcessId == m_impl->m_selfPid) {
+            return true;
+        }
+
         m_impl->m_stats.threadEvents.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_stats.totalEvents.fetch_add(1, std::memory_order_relaxed);
 
@@ -1435,31 +2320,48 @@ bool ProcessInjectionDetector::OnThreadOperation(const ThreadOperationEvent& eve
         {
             std::unique_lock lock(m_impl->m_threadEventsMutex);
             m_impl->m_threadEvents.push_back(event);
-
-            // Limit history
             if (m_impl->m_threadEvents.size() > InjectionConstants::MAX_INJECTION_EVENTS) {
                 m_impl->m_threadEvents.pop_front();
             }
         }
 
-        // Update process state
+        // Process remote thread operations
         if (event.isRemote) {
-            std::unique_lock lock(m_impl->m_statesMutex);
-            auto& state = m_impl->m_processStates[event.sourceProcessId];
-            state.processId = event.sourceProcessId;
-            state.remoteThreadOps.push_back(event);
-            state.lastActivity = Clock::now();
+            {
+                std::unique_lock lock(m_impl->m_statesMutex);
+                auto& state = m_impl->m_processStates[event.sourceProcessId];
+                state.processId = event.sourceProcessId;
+                state.remoteThreadOps.push_back(event);
+                state.lastActivity = Clock::now();
+            }
 
-            // Track remote thread detection
             if (event.operation == ThreadOperationEvent::OpType::Create) {
                 m_impl->m_stats.remoteThreadsDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            // Remote thread creation, APC queue, or context manipulation
+            // are key injection indicators.
+            if (event.operation == ThreadOperationEvent::OpType::Create ||
+                event.operation == ThreadOperationEvent::OpType::QueueAPC ||
+                event.operation == ThreadOperationEvent::OpType::SetContext) {
+
+                if (auto injectionEvent = m_impl->CorrelateEvents(
+                        event.sourceProcessId, event.targetProcessId)) {
+                    const bool shouldBlock =
+                        m_impl->m_config.blockInjections &&
+                        injectionEvent->confidence >= m_impl->m_config.blockConfidence;
+                    m_impl->ProcessInjectionDetection(std::move(*injectionEvent));
+                    if (shouldBlock) {
+                        return false;  // Block
+                    }
+                }
             }
         }
 
         return true;  // Allow
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"InjectionDetector", L"Thread operation handler failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"InjectionDetector", L"Thread operation handler failed - %S", e.what());
         return true;  // Allow on error
     }
 }
@@ -1603,19 +2505,48 @@ std::vector<uint32_t> ProcessInjectionDetector::GetTrackedProcesses() const {
 InjectionVerdict ProcessInjectionDetector::AnalyzeProcess(uint32_t pid) {
     if (!m_impl) return InjectionVerdict::Unknown;
 
-    std::shared_lock lock(m_impl->m_statesMutex);
-    auto it = m_impl->m_processStates.find(pid);
-
-    if (it == m_impl->m_processStates.end()) {
-        return InjectionVerdict::Clean;
+    // Step 1: Check existing state
+    {
+        std::shared_lock lock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(pid);
+        if (it != m_impl->m_processStates.end()) {
+            if (it->second.hasBeenInjected) {
+                return InjectionVerdict::Detected;
+            }
+            if (it->second.isBeingInjected) {
+                return InjectionVerdict::Suspicious;
+            }
+        }
     }
 
-    if (it->second.hasBeenInjected) {
-        return InjectionVerdict::Detected;
-    }
+    // Step 2: Actively scan using sub-detectors for indicators that
+    // may not have been caught by real-time event correlation.
+    try {
+        // Check for process hollowing
+        if (ProcessHollowingDetector::HasInstance()) {
+            auto& phd = ProcessHollowingDetector::Instance();
+            if (phd.IsInitialized() && phd.IsHollowed(pid)) {
+                return InjectionVerdict::Confirmed;
+            }
+        }
 
-    if (it->second.isBeingInjected) {
-        return InjectionVerdict::Suspicious;
+        // Check for reflective DLL loading
+        auto& rdd = ReflectiveDLLDetector::Instance();
+        if (rdd.IsInitialized() && rdd.HasReflectiveLoading(pid)) {
+            return InjectionVerdict::Confirmed;
+        }
+
+        // Check for thread hijacking
+        auto& thd = ThreadHijackDetector::Instance();
+        if (thd.IsInitialized()) {
+            auto scanResult = thd.ScanProcess(pid);
+            if (scanResult.hijackDetected) {
+                return InjectionVerdict::Detected;
+            }
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"InjectionDetector",
+            L"Active scan failed for PID %u - %S", pid, e.what());
     }
 
     return InjectionVerdict::Clean;
@@ -1648,21 +2579,35 @@ std::optional<InjectionChain> ProcessInjectionDetector::DetectChain(uint32_t sta
 bool ProcessInjectionDetector::CheckProcessHollowing(uint32_t pid) {
     if (!m_impl) return false;
 
-    std::shared_lock lock(m_impl->m_statesMutex);
-    auto it = m_impl->m_processStates.find(pid);
-    if (it == m_impl->m_processStates.end()) {
-        return false;
+    // Step 1: Check existing events
+    {
+        std::shared_lock lock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(pid);
+        if (it != m_impl->m_processStates.end()) {
+            for (uint64_t eventId : it->second.incomingInjectionIds) {
+                std::shared_lock eventLock(m_impl->m_eventsMutex);
+                auto eventIt = m_impl->m_events.find(eventId);
+                if (eventIt != m_impl->m_events.end() &&
+                    eventIt->second.injectionType == InjectionType::ProcessHollowing) {
+                    m_impl->m_stats.hollowingDetected.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        }
     }
 
-    // Check for hollowing indicators in events
-    for (uint64_t eventId : it->second.incomingInjectionIds) {
-        std::shared_lock eventLock(m_impl->m_eventsMutex);
-        auto eventIt = m_impl->m_events.find(eventId);
-        if (eventIt != m_impl->m_events.end() &&
-            eventIt->second.injectionType == InjectionType::ProcessHollowing) {
-            m_impl->m_stats.hollowingDetected.fetch_add(1, std::memory_order_relaxed);
-            return true;
+    // Step 2: Delegate to ProcessHollowingDetector for active scanning
+    try {
+        if (ProcessHollowingDetector::HasInstance()) {
+            auto& phd = ProcessHollowingDetector::Instance();
+            if (phd.IsInitialized() && phd.IsHollowed(pid)) {
+                m_impl->m_stats.hollowingDetected.fetch_add(1, std::memory_order_relaxed);
+                return true;
+            }
         }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"InjectionDetector",
+            L"ProcessHollowingDetector scan failed for PID %u - %S", pid, e.what());
     }
 
     return false;
@@ -1671,6 +2616,47 @@ bool ProcessInjectionDetector::CheckProcessHollowing(uint32_t pid) {
 bool ProcessInjectionDetector::CheckReflectiveDLL(uint32_t pid) {
     if (!m_impl) return false;
 
+    // Step 1: Check existing events
+    {
+        std::shared_lock lock(m_impl->m_statesMutex);
+        auto it = m_impl->m_processStates.find(pid);
+        if (it != m_impl->m_processStates.end()) {
+            for (uint64_t eventId : it->second.incomingInjectionIds) {
+                std::shared_lock eventLock(m_impl->m_eventsMutex);
+                auto eventIt = m_impl->m_events.find(eventId);
+                if (eventIt != m_impl->m_events.end() &&
+                    eventIt->second.injectionType == InjectionType::ReflectiveDLL) {
+                    m_impl->m_stats.reflectiveDLLDetected.fetch_add(1, std::memory_order_relaxed);
+                    return true;
+                }
+            }
+        }
+    }
+
+    // Step 2: Delegate to ReflectiveDLLDetector for active scanning
+    try {
+        auto& rdd = ReflectiveDLLDetector::Instance();
+        if (rdd.IsInitialized() && rdd.HasReflectiveLoading(pid)) {
+            m_impl->m_stats.reflectiveDLLDetected.fetch_add(1, std::memory_order_relaxed);
+            return true;
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"InjectionDetector",
+            L"ReflectiveDLLDetector scan failed for PID %u - %S", pid, e.what());
+    }
+
+    return false;
+}
+
+bool ProcessInjectionDetector::CheckAtomBombing(uint32_t pid) {
+    if (!m_impl) return false;
+
+    // Check for atom bombing indicators in our recorded events:
+    // Atom bombing uses NtQueueApcThread with GlobalGetAtomA as the APC routine
+    // to copy data from the global atom table into the target process. We look
+    // for APC-based injection events targeting this PID that were classified as
+    // AtomBombing by the correlator, or for APC queue events with suspicious
+    // start addresses pointing to GlobalGetAtom in kernel32/kernelbase.
     std::shared_lock lock(m_impl->m_statesMutex);
     auto it = m_impl->m_processStates.find(pid);
     if (it == m_impl->m_processStates.end()) {
@@ -1681,18 +2667,27 @@ bool ProcessInjectionDetector::CheckReflectiveDLL(uint32_t pid) {
         std::shared_lock eventLock(m_impl->m_eventsMutex);
         auto eventIt = m_impl->m_events.find(eventId);
         if (eventIt != m_impl->m_events.end() &&
-            eventIt->second.injectionType == InjectionType::ReflectiveDLL) {
-            m_impl->m_stats.reflectiveDLLDetected.fetch_add(1, std::memory_order_relaxed);
+            eventIt->second.injectionType == InjectionType::AtomBombing) {
             return true;
         }
     }
 
-    return false;
-}
+    // Also scan raw APC thread events for GlobalGetAtom pattern
+    for (const auto& threadOp : it->second.remoteThreadOps) {
+        if (threadOp.operation == ThreadOperationEvent::OpType::QueueAPC &&
+            threadOp.apcRoutine != 0) {
+            // Resolve the APC routine module -- if it points to
+            // GlobalGetAtomA/W in kernel32, this is atom bombing.
+            std::wstring modName = GetModuleForAddress(pid, threadOp.apcRoutine);
+            std::wstring modLower = Utils::StringUtils::ToLowerCopy(modName);
+            if (modLower.find(L"kernel32") != std::wstring::npos ||
+                modLower.find(L"kernelbase") != std::wstring::npos) {
+                // APC targeting GlobalGetAtom in kernel32 is a strong indicator
+                return true;
+            }
+        }
+    }
 
-bool ProcessInjectionDetector::CheckAtomBombing(uint32_t pid) {
-    // Atom bombing is difficult to detect - would require monitoring
-    // GlobalAddAtom/GlobalGetAtom API calls
     return false;
 }
 
