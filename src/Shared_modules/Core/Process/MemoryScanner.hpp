@@ -1280,6 +1280,42 @@ public:
      */
     void SetThreatDetector(Core::Engine::ThreatDetector* detector);
 
+    // =========================================================================
+    // State Query
+    // =========================================================================
+
+    /**
+     * @brief Check if scanner is initialized and ready.
+     */
+    [[nodiscard]] bool IsInitialized() const;
+
+    // =========================================================================
+    // Kernel Integration
+    // =========================================================================
+
+    /**
+     * @brief Process a kernel memory alert forwarded by IPCManager.
+     *
+     * The PhantomSensor kernel driver sends memory events (RWX allocations,
+     * protection changes, cross-process writes, shellcode detections) via
+     * the FilterSendMessage port.  IPCManager deserialises the wire header
+     * and dispatches the raw payload here for deep user-mode analysis.
+     *
+     * Supported event payloads (PhantomSensor/Shared/MemoryTypes.h):
+     *   - MEMORY_ALLOC_EVENT           (suspicious allocations)
+     *   - MEMORY_PROTECT_EVENT         (W->X / RW->RWX transitions)
+     *   - MEMORY_ACCESS_EVENT          (cross-process read/write)
+     *   - SHELLCODE_DETECTION_EVENT    (kernel-side shellcode hit)
+     *
+     * @param messageType  Kernel message type identifier
+     * @param payload      Raw packed event struct from kernel driver
+     * @param payloadSize  Payload size in bytes
+     */
+    void OnKernelMemoryEvent(
+        uint32_t messageType,
+        const void* payload,
+        size_t payloadSize);
+
 private:
     // =========================================================================
     // Private Constructor (Singleton)
