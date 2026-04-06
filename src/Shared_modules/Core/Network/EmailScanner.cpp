@@ -457,7 +457,7 @@ public:
             try {
                 callback(analysis);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"EmailScanner: Analysis callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Analysis callback exception: %hs", e.what());
             }
         }
     }
@@ -468,7 +468,7 @@ public:
             try {
                 callback(alert);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"EmailScanner: Alert callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Alert callback exception: %hs", e.what());
             }
         }
     }
@@ -479,7 +479,7 @@ public:
             try {
                 callback(emailId, attachment);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"EmailScanner: Attachment callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Attachment callback exception: %hs", e.what());
             }
         }
     }
@@ -490,7 +490,7 @@ public:
             try {
                 callback(emailId, analysis);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"EmailScanner: Phishing callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Phishing callback exception: %hs", e.what());
             }
         }
     }
@@ -501,7 +501,7 @@ public:
             try {
                 callback(emailId, threat, signature);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"EmailScanner: Malware callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"EmailScanner: Malware callback exception: %hs", e.what());
             }
         }
     }
@@ -561,7 +561,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner: Initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner: Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -587,11 +587,11 @@ public:
                 m_workers.emplace_back([this]() { WorkerThread(); });
             }
 
-            SS_LOG_INFO(L"Network", L"EmailScanner: Started with {} worker threads", m_config.workerThreads);
+            SS_LOG_INFO(L"Network", L"EmailScanner: Started with %u worker threads", m_config.workerThreads);
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner: Start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner: Start failed: %hs", e.what());
             m_running = false;
             return false;
         }
@@ -704,7 +704,7 @@ public:
             ProcessSessionBuffer(session);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::FeedPacket: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::FeedPacket: %hs", e.what());
         }
     }
 
@@ -816,14 +816,12 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeAnalysis(analysis);
 
-            SS_LOG_INFO(L"Network", L"EmailScanner: Scanned email {} - Score: {}, Result: {}, Action: {}",
-                analysis.messageId, analysis.threatScore,
-                static_cast<int>(analysis.result), static_cast<int>(analysis.action));
+            SS_LOG_INFO(L"Network", L"EmailScanner: Scanned email %hs - Score: %u, Result: %d, Action: %d", analysis.messageId.c_str(), static_cast<unsigned>(analysis.threatScore), static_cast<int>(analysis.result), static_cast<int>(analysis.action));
 
             return analysis;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmail: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmail: %hs", e.what());
             analysis.result = ScanResult::ERROR;
             return analysis;
         }
@@ -831,16 +829,17 @@ public:
 
     EmailAnalysis ScanEmailFile(const std::wstring& emlPath) {
         try {
-            auto fileData = Utils::FileUtils::ReadFileBytes(emlPath);
-            if (fileData.empty()) {
+            std::vector<std::byte> rawFileData;
+            if (!Utils::FileUtils::ReadAllBytes(emlPath, rawFileData) || rawFileData.empty()) {
                 SS_LOG_ERROR(L"Network", L"EmailScanner: Failed to read email file");
                 return EmailAnalysis{};
             }
 
-            return ScanEmail(std::span<const uint8_t>(fileData.data(), fileData.size()));
+            auto* fileDataPtr = reinterpret_cast<const uint8_t*>(rawFileData.data());
+            return ScanEmail(std::span<const uint8_t>(fileDataPtr, rawFileData.size()));
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmailFile: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanEmailFile: %hs", e.what());
             return EmailAnalysis{};
         }
     }
@@ -958,18 +957,18 @@ public:
 
     bool AddToWhitelist(const std::string& sender) {
         std::unique_lock lock(m_whitelistMutex);
-        auto [it, inserted] = m_whitelist.insert(sender);
+        auto [it, inserted] = m_whitelist.insert(NormalizeEmail(sender));
         return inserted;
     }
 
     bool RemoveFromWhitelist(const std::string& sender) {
         std::unique_lock lock(m_whitelistMutex);
-        return m_whitelist.erase(sender) > 0;
+        return m_whitelist.erase(NormalizeEmail(sender)) > 0;
     }
 
     bool IsWhitelisted(const std::string& sender) const {
         std::shared_lock lock(m_whitelistMutex);
-        return m_whitelist.contains(sender);
+        return m_whitelist.contains(NormalizeEmail(sender));
     }
 
     // ========================================================================
@@ -1018,18 +1017,43 @@ public:
 
     bool PerformDiagnostics() const {
         SS_LOG_INFO(L"Network", L"EmailScanner Diagnostics:");
-        SS_LOG_INFO(L"Network", L"  Initialized: {}", m_initialized);
-        SS_LOG_INFO(L"Network", L"  Running: {}", m_running.load());
-        SS_LOG_INFO(L"Network", L"  Active Sessions: {}", m_stats.activeSessions.load());
-        SS_LOG_INFO(L"Network", L"  Emails Scanned: {}", m_stats.totalEmailsScanned.load());
-        SS_LOG_INFO(L"Network", L"  Threats Detected: {}",
-            m_stats.malwareDetected.load() + m_stats.phishingDetected.load());
+        SS_LOG_INFO(L"Network", L"  Initialized: %d", static_cast<int>(m_initialized));
+        SS_LOG_INFO(L"Network", L"  Running: %d", static_cast<int>(m_running.load()));
+        SS_LOG_INFO(L"Network", L"  Active Sessions: %u", m_stats.activeSessions.load());
+        SS_LOG_INFO(L"Network", L"  Emails Scanned: %llu", static_cast<unsigned long long>(m_stats.totalEmailsScanned.load()));
+        SS_LOG_INFO(L"Network", L"  Threats Detected: %llu", static_cast<unsigned long long>(m_stats.malwareDetected.load() + m_stats.phishingDetected.load()));
         return true;
     }
 
     bool ExportDiagnostics(const std::wstring& outputPath) const {
-        // Export detailed diagnostics - not implemented
-        return false;
+        try {
+            std::wstring report;
+            report += L"EmailScanner Diagnostics Report\r\n";
+            report += L"================================\r\n";
+            report += L"Initialized: " + std::to_wstring(static_cast<int>(m_initialized)) + L"\r\n";
+            report += L"Running: " + std::to_wstring(static_cast<int>(m_running.load())) + L"\r\n";
+            report += L"Active Sessions: " + std::to_wstring(m_stats.activeSessions.load()) + L"\r\n";
+            report += L"Emails Scanned: " + std::to_wstring(m_stats.totalEmailsScanned.load()) + L"\r\n";
+            report += L"Malware Detected: " + std::to_wstring(m_stats.malwareDetected.load()) + L"\r\n";
+            report += L"Phishing Detected: " + std::to_wstring(m_stats.phishingDetected.load()) + L"\r\n";
+            report += L"Spam Detected: " + std::to_wstring(m_stats.spamDetected.load()) + L"\r\n";
+            report += L"BEC Detected: " + std::to_wstring(m_stats.becDetected.load()) + L"\r\n";
+            report += L"DLP Violations: " + std::to_wstring(m_stats.dlpViolations.load()) + L"\r\n";
+            report += L"Blocked: " + std::to_wstring(m_stats.emailsBlocked.load()) + L"\r\n";
+            report += L"Quarantined: " + std::to_wstring(m_stats.emailsQuarantined.load()) + L"\r\n";
+            report += L"Avg Scan (us): " + std::to_wstring(m_stats.avgScanTimeUs.load()) + L"\r\n";
+            report += L"Max Scan (us): " + std::to_wstring(m_stats.maxScanTimeUs.load()) + L"\r\n";
+
+            std::string narrow = ShadowStrike::Utils::StringUtils::ToNarrow(report);
+            Utils::FileUtils::Error err{};
+            return Utils::FileUtils::WriteAllBytesAtomic(
+                outputPath,
+                reinterpret_cast<const std::byte*>(narrow.data()), narrow.size(),
+                &err);
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ExportDiagnostics: %hs", e.what());
+            return false;
+        }
     }
 
 private:
@@ -1194,7 +1218,7 @@ private:
             processHeader();
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseHeadersImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseHeadersImpl: %hs", e.what());
         }
 
         return header;
@@ -1217,10 +1241,15 @@ private:
                     reinterpret_cast<const char*>(bodyData.data()),
                     bodyData.size()
                 );
+                // HTML exploit detection on non-multipart HTML body
+                auto htmlThreats = DetectHTMLExploits(analysis.bodyHtml);
+                for (auto& threat : htmlThreats) {
+                    analysis.header.anomalies.push_back(std::move(threat));
+                }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseBody: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseBody: %hs", e.what());
         }
     }
 
@@ -1347,58 +1376,96 @@ private:
 
     void ScanAttachmentImpl(AttachmentInfo& attachment) {
         try {
-            // Calculate hashes
+            // Calculate hashes using the correct HashUtils::Compute API
             if (!attachment.data.empty()) {
-                auto sha256 = Utils::HashUtils::SHA256(
-                    std::span<const uint8_t>(attachment.data.data(), attachment.data.size())
-                );
-                std::copy(sha256.begin(), sha256.end(), attachment.sha256.begin());
+                std::vector<uint8_t> sha256Digest;
+                if (Utils::HashUtils::Compute(
+                        Utils::HashUtils::Algorithm::SHA256,
+                        attachment.data.data(), attachment.data.size(),
+                        sha256Digest)) {
+                    const size_t copyLen = std::min(sha256Digest.size(), attachment.sha256.size());
+                    std::copy_n(sha256Digest.begin(), copyLen, attachment.sha256.begin());
 
-                std::ostringstream oss;
-                for (auto byte : sha256) {
-                    oss << std::hex << std::setw(2) << std::setfill('0') << static_cast<int>(byte);
+                    std::string hexStr;
+                    if (Utils::HashUtils::ComputeHex(
+                            Utils::HashUtils::Algorithm::SHA256,
+                            attachment.data.data(), attachment.data.size(),
+                            hexStr, false)) {
+                        attachment.sha256Hex = std::move(hexStr);
+                    }
                 }
-                attachment.sha256Hex = oss.str();
 
-                auto md5 = Utils::HashUtils::MD5(
-                    std::span<const uint8_t>(attachment.data.data(), attachment.data.size())
-                );
-                std::copy(md5.begin(), md5.end(), attachment.md5.begin());
+                std::vector<uint8_t> md5Digest;
+                if (Utils::HashUtils::Compute(
+                        Utils::HashUtils::Algorithm::MD5,
+                        attachment.data.data(), attachment.data.size(),
+                        md5Digest)) {
+                    const size_t copyLen = std::min(md5Digest.size(), attachment.md5.size());
+                    std::copy_n(md5Digest.begin(), copyLen, attachment.md5.begin());
+                }
             }
 
-            // Detect actual file type
+            // EICAR test pattern detection
+            if (!attachment.data.empty() && ContainsEicar(
+                    std::span<const uint8_t>(attachment.data.data(), attachment.data.size()))) {
+                attachment.riskLevel = AttachmentRisk::CRITICAL;
+                attachment.scanResult = ScanResult::MALICIOUS;
+                attachment.matchedSignatures.push_back("EICAR-Test-File");
+                attachment.threats.push_back(ThreatType::MALWARE_ATTACHMENT);
+                m_stats.attachmentsScanned.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+
+            // OLE compound document detection (embedded objects)
+            if (!attachment.data.empty() && ContainsOLEObject(
+                    std::span<const uint8_t>(attachment.data.data(), attachment.data.size()))) {
+                attachment.hasActiveContent = true;
+                attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::MEDIUM);
+            }
+
+            // RTLO / double-extension detection on filename
+            if (!attachment.filename.empty()) {
+                if (HasRTLOCharacter(attachment.filename)) {
+                    attachment.riskLevel = AttachmentRisk::CRITICAL;
+                    attachment.threats.push_back(ThreatType::MALWARE_ATTACHMENT);
+                }
+                if (HasDoubleExtension(attachment.filename)) {
+                    attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::HIGH);
+                    attachment.threats.push_back(ThreatType::MALWARE_ATTACHMENT);
+                }
+            }
+
+            // Detect actual file type via FileTypeAnalyzer
             if (!attachment.data.empty()) {
                 auto typeInfo = FileSystem::FileTypeAnalyzer::Instance().AnalyzeBuffer(
                     std::span<const uint8_t>(attachment.data.data(), attachment.data.size()),
-                    Utils::StringUtils::Utf8ToWide(attachment.filename)
+                    ShadowStrike::Utils::StringUtils::ToWide(attachment.filename)
                 );
 
                 attachment.detectedType = static_cast<int>(typeInfo.category) >= 0 ?
                     std::to_string(static_cast<int>(typeInfo.format)) : "Unknown";
 
-                // Check for type mismatch (spoofing)
                 if (typeInfo.isSpoofed) {
                     attachment.typeMismatch = true;
-                    attachment.riskLevel = AttachmentRisk::HIGH;
+                    attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::HIGH);
                     attachment.threats.push_back(ThreatType::MALWARE_ATTACHMENT);
                 }
 
-                // Categorize attachment
                 if (typeInfo.isExecutable) {
                     attachment.type = AttachmentType::EXECUTABLE;
                     attachment.riskLevel = AttachmentRisk::CRITICAL;
                     attachment.threats.push_back(ThreatType::MALWARE_ATTACHMENT);
                 } else if (typeInfo.isScript) {
                     attachment.type = AttachmentType::SCRIPT;
-                    attachment.riskLevel = AttachmentRisk::HIGH;
+                    attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::HIGH);
                     attachment.threats.push_back(ThreatType::MALWARE_SCRIPT);
                 } else if (typeInfo.isArchive) {
                     attachment.type = AttachmentType::ARCHIVE;
                     attachment.isArchive = true;
-                    attachment.riskLevel = AttachmentRisk::MEDIUM;
+                    attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::MEDIUM);
                 } else if (typeInfo.canContainMacros) {
-                    attachment.hasMacros = true;  // Possible
-                    attachment.riskLevel = AttachmentRisk::MEDIUM;
+                    attachment.hasMacros = true;
+                    attachment.riskLevel = std::max(attachment.riskLevel, AttachmentRisk::MEDIUM);
                 }
             }
 
@@ -1412,7 +1479,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanAttachmentImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ScanAttachmentImpl: %hs", e.what());
             attachment.scanResult = ScanResult::ERROR;
         }
     }
@@ -1450,7 +1517,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeURLsImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeURLsImpl: %hs", e.what());
         }
 
         return urls;
@@ -1584,7 +1651,7 @@ private:
             phishing.isPhishing = (phishing.confidence >= m_config.phishingThreshold);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzePhishingImpl: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzePhishingImpl: %hs", e.what());
         }
 
         return phishing;
@@ -1639,7 +1706,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeSpam: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeSpam: %hs", e.what());
         }
     }
 
@@ -1703,7 +1770,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeBEC: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeBEC: %hs", e.what());
         }
     }
 
@@ -1745,7 +1812,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeDLP: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::AnalyzeDLP: %hs", e.what());
         }
     }
 
@@ -1793,7 +1860,7 @@ private:
             results.anyFail = !results.failures.empty();
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseAuthenticationResults: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::ParseAuthenticationResults: %hs", e.what());
         }
 
         return results;
@@ -1939,18 +2006,26 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"EmailScanner::CreateAlerts: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"EmailScanner::CreateAlerts: %hs", e.what());
         }
     }
 
     void UpdateScanTimeStats(uint64_t timeUs) {
-        const uint64_t currentAvg = m_stats.avgScanTimeUs.load(std::memory_order_relaxed);
-        const uint64_t newAvg = (currentAvg + timeUs) / 2;
-        m_stats.avgScanTimeUs.store(newAvg, std::memory_order_relaxed);
+        // Atomic CAS loop for thread-safe running average
+        uint64_t currentAvg = m_stats.avgScanTimeUs.load(std::memory_order_relaxed);
+        uint64_t newAvg;
+        do {
+            newAvg = (currentAvg == 0) ? timeUs : (currentAvg + timeUs) / 2;
+        } while (!m_stats.avgScanTimeUs.compare_exchange_weak(
+            currentAvg, newAvg, std::memory_order_relaxed));
 
-        const uint64_t currentMax = m_stats.maxScanTimeUs.load(std::memory_order_relaxed);
-        if (timeUs > currentMax) {
-            m_stats.maxScanTimeUs.store(timeUs, std::memory_order_relaxed);
+        // Atomic CAS for max
+        uint64_t currentMax = m_stats.maxScanTimeUs.load(std::memory_order_relaxed);
+        while (timeUs > currentMax) {
+            if (m_stats.maxScanTimeUs.compare_exchange_weak(
+                    currentMax, timeUs, std::memory_order_relaxed)) {
+                break;
+            }
         }
     }
 
@@ -1968,7 +2043,7 @@ private:
 
     // Threading
     std::vector<std::thread> m_workers;
-    std::condition_variable m_cv;
+    std::condition_variable_any m_cv;
 
     // Sessions
     std::unordered_map<uint64_t, EmailSession> m_sessions;
