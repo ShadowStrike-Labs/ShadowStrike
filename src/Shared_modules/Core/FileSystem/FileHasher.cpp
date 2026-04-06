@@ -77,35 +77,8 @@ using namespace std::chrono;
 using namespace Utils;
 namespace fs = std::filesystem;
 
-// ============================================================================
-// BITWISE OPERATORS FOR HashAlgorithm
-// ============================================================================
-
-constexpr HashAlgorithm operator|(HashAlgorithm lhs, HashAlgorithm rhs) noexcept {
-    return static_cast<HashAlgorithm>(
-        static_cast<uint16_t>(lhs) | static_cast<uint16_t>(rhs)
-    );
-}
-
-constexpr HashAlgorithm operator&(HashAlgorithm lhs, HashAlgorithm rhs) noexcept {
-    return static_cast<HashAlgorithm>(
-        static_cast<uint16_t>(lhs) & static_cast<uint16_t>(rhs)
-    );
-}
-
-constexpr HashAlgorithm operator^(HashAlgorithm lhs, HashAlgorithm rhs) noexcept {
-    return static_cast<HashAlgorithm>(
-        static_cast<uint16_t>(lhs) ^ static_cast<uint16_t>(rhs)
-    );
-}
-
-constexpr HashAlgorithm operator~(HashAlgorithm value) noexcept {
-    return static_cast<HashAlgorithm>(~static_cast<uint16_t>(value));
-}
-
-constexpr bool HasFlag(HashAlgorithm value, HashAlgorithm flag) noexcept {
-    return (static_cast<uint16_t>(value) & static_cast<uint16_t>(flag)) != 0;
-}
+// Bitwise operators for HashAlgorithm are defined in FileHasher.hpp (constexpr).
+// Do NOT duplicate them here — ODR violation.
 
 // ============================================================================
 // UTILITY FUNCTION IMPLEMENTATIONS
@@ -140,19 +113,31 @@ constexpr bool HasFlag(HashAlgorithm value, HashAlgorithm flag) noexcept {
         // Check DOS signature (MZ)
         char dosSignature[2];
         file.read(dosSignature, 2);
-        if (dosSignature[0] != 'M' || dosSignature[1] != 'Z') {
+        if (!file || dosSignature[0] != 'M' || dosSignature[1] != 'Z') {
             return false;
         }
 
-        // Read PE offset from DOS header
+        // Read PE offset from DOS header at offset 0x3C
         file.seekg(0x3C, std::ios::beg);
+        if (!file) return false;
+
         uint32_t peOffset = 0;
         file.read(reinterpret_cast<char*>(&peOffset), 4);
+        if (!file) return false;
+
+        // Validate PE offset: must be >= 0x40 (after DOS header) and < 4KB
+        // to prevent seeking to attacker-controlled offsets in malformed files
+        if (peOffset < 0x40 || peOffset > 4096) {
+            return false;
+        }
 
         // Check PE signature
         file.seekg(peOffset, std::ios::beg);
+        if (!file) return false;
+
         char peSignature[4];
         file.read(peSignature, 4);
+        if (!file) return false;
 
         return (peSignature[0] == 'P' && peSignature[1] == 'E' &&
                 peSignature[2] == 0 && peSignature[3] == 0);
@@ -167,12 +152,18 @@ constexpr bool HasFlag(HashAlgorithm value, HashAlgorithm flag) noexcept {
     size_t headerSize
 ) noexcept {
     try {
+        // Cap header read to prevent excessive allocation from untrusted input
+        if (headerSize > FileHasherConstants::MAX_HEADER_READ_SIZE) {
+            headerSize = FileHasherConstants::MAX_HEADER_READ_SIZE;
+        }
+        if (headerSize == 0) return {};
+
         std::ifstream file(filePath, std::ios::binary);
         if (!file) return {};
 
         std::vector<uint8_t> header(headerSize);
-        file.read(reinterpret_cast<char*>(header.data()), headerSize);
-        size_t bytesRead = file.gcount();
+        file.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(headerSize));
+        const size_t bytesRead = static_cast<size_t>(file.gcount());
 
         header.resize(bytesRead);
         return header;
@@ -233,27 +224,69 @@ FileHasherConfig FileHasherConfig::CreateMinimal() noexcept {
 }
 
 // ============================================================================
-// FileHasherStatistics METHODS
+// INTERNAL ATOMIC STATISTICS
 // ============================================================================
+// The public FileHasherStatistics is a plain copyable snapshot.
+// Internally we use atomics for lock-free stat updates on the hot path.
 
-void FileHasherStatistics::Reset() noexcept {
-    filesHashed.store(0, std::memory_order_relaxed);
-    bytesProcessed.store(0, std::memory_order_relaxed);
-    cacheHits.store(0, std::memory_order_relaxed);
-    cacheMisses.store(0, std::memory_order_relaxed);
-    md5Computed.store(0, std::memory_order_relaxed);
-    sha1Computed.store(0, std::memory_order_relaxed);
-    sha256Computed.store(0, std::memory_order_relaxed);
-    sha512Computed.store(0, std::memory_order_relaxed);
-    fuzzyHashComputed.store(0, std::memory_order_relaxed);
-    tlshComputed.store(0, std::memory_order_relaxed);
-    imphashComputed.store(0, std::memory_order_relaxed);
-    averageTimeUs.store(0, std::memory_order_relaxed);
-    maxTimeUs.store(0, std::memory_order_relaxed);
-    hardwareAccelUsed.store(0, std::memory_order_relaxed);
-    memoryMappedFiles.store(0, std::memory_order_relaxed);
-    startTime = steady_clock::now();
-}
+struct InternalStats {
+    std::atomic<uint64_t> filesHashed{0};
+    std::atomic<uint64_t> bytesProcessed{0};
+    std::atomic<uint64_t> cacheHits{0};
+    std::atomic<uint64_t> cacheMisses{0};
+    std::atomic<uint64_t> md5Computed{0};
+    std::atomic<uint64_t> sha1Computed{0};
+    std::atomic<uint64_t> sha256Computed{0};
+    std::atomic<uint64_t> sha512Computed{0};
+    std::atomic<uint64_t> fuzzyHashComputed{0};
+    std::atomic<uint64_t> tlshComputed{0};
+    std::atomic<uint64_t> imphashComputed{0};
+    std::atomic<uint64_t> averageTimeUs{0};
+    std::atomic<uint64_t> maxTimeUs{0};
+    std::atomic<uint64_t> hardwareAccelUsed{0};
+    std::atomic<uint64_t> memoryMappedFiles{0};
+    steady_clock::time_point startTime{steady_clock::now()};
+
+    void Reset() noexcept {
+        filesHashed.store(0, std::memory_order_relaxed);
+        bytesProcessed.store(0, std::memory_order_relaxed);
+        cacheHits.store(0, std::memory_order_relaxed);
+        cacheMisses.store(0, std::memory_order_relaxed);
+        md5Computed.store(0, std::memory_order_relaxed);
+        sha1Computed.store(0, std::memory_order_relaxed);
+        sha256Computed.store(0, std::memory_order_relaxed);
+        sha512Computed.store(0, std::memory_order_relaxed);
+        fuzzyHashComputed.store(0, std::memory_order_relaxed);
+        tlshComputed.store(0, std::memory_order_relaxed);
+        imphashComputed.store(0, std::memory_order_relaxed);
+        averageTimeUs.store(0, std::memory_order_relaxed);
+        maxTimeUs.store(0, std::memory_order_relaxed);
+        hardwareAccelUsed.store(0, std::memory_order_relaxed);
+        memoryMappedFiles.store(0, std::memory_order_relaxed);
+        startTime = steady_clock::now();
+    }
+
+    [[nodiscard]] FileHasherStatistics Snapshot() const noexcept {
+        FileHasherStatistics snap;
+        snap.filesHashed      = filesHashed.load(std::memory_order_relaxed);
+        snap.bytesProcessed   = bytesProcessed.load(std::memory_order_relaxed);
+        snap.cacheHits        = cacheHits.load(std::memory_order_relaxed);
+        snap.cacheMisses      = cacheMisses.load(std::memory_order_relaxed);
+        snap.md5Computed      = md5Computed.load(std::memory_order_relaxed);
+        snap.sha1Computed     = sha1Computed.load(std::memory_order_relaxed);
+        snap.sha256Computed   = sha256Computed.load(std::memory_order_relaxed);
+        snap.sha512Computed   = sha512Computed.load(std::memory_order_relaxed);
+        snap.fuzzyHashComputed = fuzzyHashComputed.load(std::memory_order_relaxed);
+        snap.tlshComputed     = tlshComputed.load(std::memory_order_relaxed);
+        snap.imphashComputed  = imphashComputed.load(std::memory_order_relaxed);
+        snap.averageTimeUs    = averageTimeUs.load(std::memory_order_relaxed);
+        snap.maxTimeUs        = maxTimeUs.load(std::memory_order_relaxed);
+        snap.hardwareAccelUsed = hardwareAccelUsed.load(std::memory_order_relaxed);
+        snap.memoryMappedFiles = memoryMappedFiles.load(std::memory_order_relaxed);
+        snap.startTime        = startTime;
+        return snap;
+    }
+};
 
 // ============================================================================
 // FileHashes METHODS
@@ -268,7 +301,7 @@ bool FileHashes::IsValid() const noexcept {
 std::string FileHashes::ToJson() const {
     std::ostringstream oss;
     oss << "{\n";
-    oss << "  \"filePath\": \"" << StringUtils::ToNarrowString(filePath) << "\",\n";
+    oss << "  \"filePath\": \"" << StringUtils::ToNarrow(filePath) << "\",\n";
     oss << "  \"fileSize\": " << fileSize << ",\n";
 
     if (hasMD5) oss << "  \"md5\": \"" << md5Hex << "\",\n";
@@ -342,15 +375,15 @@ public:
     // Thread pool for async operations
     std::shared_ptr<ThreadPool> m_threadPool;
 
-    // Statistics
-    FileHasherStatistics m_stats{};
+    // Statistics (lock-free atomic counters — see InternalStats above)
+    InternalStats m_stats{};
 
     // Hash cache (LRU with TTL)
     struct CachedHash {
         FileHashes hashes;
         steady_clock::time_point timestamp;
         system_clock::time_point fileModTime;
-        uint32_t hitCount = 0;
+        std::atomic<uint32_t> hitCount{0};
     };
     std::unordered_map<std::wstring, CachedHash> m_hashCache;
 
@@ -396,8 +429,16 @@ public:
 
             // Create thread pool if needed
             if (!m_threadPool && m_config.workerThreads > 0) {
-                m_threadPool = std::make_shared<ThreadPool>(m_config.workerThreads);
-                SS_LOG_INFO(L"FileHasher", L"FileHasher: Thread pool created with %d workers", m_config.workerThreads);
+                ThreadPoolConfig tpConfig;
+                tpConfig.minThreads = std::max(
+                    ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+                    static_cast<size_t>(m_config.workerThreads));
+                tpConfig.maxThreads = std::max(
+                    ThreadPoolConfig::MIN_THREAD_LIMIT,
+                    static_cast<size_t>(m_config.workerThreads));
+                m_threadPool = std::make_shared<ThreadPool>(tpConfig);
+                SS_LOG_INFO(L"FileHasher", L"FileHasher: Thread pool created with %u workers",
+                            m_config.workerThreads);
             }
 
             // Reset statistics
@@ -459,7 +500,8 @@ public:
             __cpuidex(cpuInfo, 7, 0);
             m_hasSHANI = (cpuInfo[1] & (1 << 29)) != 0; // EBX bit 29
 
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Hardware detection - AES-NI: %hs, SHA-NI: %hs", m_hasAESNI, m_hasSHANI);
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Hardware detection - AES-NI: %hs, SHA-NI: %hs",
+                        m_hasAESNI ? "YES" : "NO", m_hasSHANI ? "YES" : "NO");
 #endif
         } catch (...) {
             SS_LOG_WARN(L"FileHasher", L"FileHasher: Hardware capability detection failed");
@@ -512,8 +554,8 @@ public:
             return std::nullopt;
         }
 
-        // Update hit count (const_cast for statistics)
-        const_cast<CachedHash&>(cached).hitCount++;
+        // Update hit count atomically — safe under shared_lock
+        cached.hitCount.fetch_add(1, std::memory_order_relaxed);
 
         return cached.hashes;
     }
@@ -537,7 +579,7 @@ public:
             );
 
             if (lru != m_hashCache.end()) {
-                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache eviction (LRU): %hs", StringUtils::ToNarrowString(lru->first));
+                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache eviction (LRU): %hs", StringUtils::ToNarrow(lru->first).c_str());
                 m_hashCache.erase(lru);
             }
         }
@@ -556,15 +598,18 @@ public:
             // Use current time if we can't get modification time
         }
 
-        CachedHash cached{};
-        cached.hashes = hashes;
-        cached.timestamp = steady_clock::now();
-        cached.fileModTime = modTime;
-        cached.hitCount = 0;
+        // Erase existing entry (if any) to make room for the new one
+        m_hashCache.erase(filePath);
 
-        m_hashCache[filePath] = cached;
+        // Construct in-place (CachedHash has non-copyable atomic member)
+        auto [it, inserted] = m_hashCache.try_emplace(filePath);
+        auto& entry = it->second;
+        entry.hashes = hashes;
+        entry.timestamp = steady_clock::now();
+        entry.fileModTime = modTime;
+        entry.hitCount.store(0, std::memory_order_relaxed);
 
-        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Added to cache: %hs (size: %llu)", StringUtils::ToNarrowString(filePath), m_hashCache.size());
+        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Added to cache: %hs (size: %zu)", StringUtils::ToNarrow(filePath).c_str(), m_hashCache.size());
     }
 
     void InvalidateCacheEntry(const std::wstring& filePath) {
@@ -594,7 +639,7 @@ public:
             if (m_config.enableCache) {
                 if (auto cached = GetFromCache(filePath)) {
                     m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache hit for %hs", StringUtils::ToNarrowString(filePath));
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Cache hit for %hs", StringUtils::ToNarrow(filePath).c_str());
                     return *cached;
                 }
                 m_stats.cacheMisses.fetch_add(1, std::memory_order_relaxed);
@@ -605,7 +650,7 @@ public:
             // Validate file
             std::error_code ec;
             if (!fs::exists(filePath, ec)) {
-                SS_LOG_ERROR(L"FileHasher", L"FileHasher: File not found: %hs", StringUtils::ToNarrowString(filePath));
+                SS_LOG_ERROR(L"FileHasher", L"FileHasher: File not found: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return result;
             }
 
@@ -615,7 +660,19 @@ public:
                 return result;
             }
 
-            SS_LOG_INFO(L"FileHasher", L"FileHasher: Computing hashes for %hs (%llu bytes)", StringUtils::ToNarrowString(filePath), result.fileSize);
+            // Security: reject files exceeding the configured maximum
+            if (result.fileSize > FileHasherConstants::MAX_HASH_FILE_SIZE) {
+                SS_LOG_WARN(L"FileHasher",
+                    L"FileHasher: File exceeds MAX_HASH_FILE_SIZE (%llu > %llu): %hs",
+                    result.fileSize,
+                    static_cast<uint64_t>(FileHasherConstants::MAX_HASH_FILE_SIZE),
+                    StringUtils::ToNarrow(filePath).c_str());
+                result.hasErrors = true;
+                result.errors.emplace_back("File exceeds maximum hashable size");
+                return result;
+            }
+
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Computing hashes for %hs (%llu bytes)", StringUtils::ToNarrow(filePath).c_str(), result.fileSize);
 
             // Decide whether to use memory mapping
             bool useMemMap = m_config.useMemoryMapping &&
@@ -675,13 +732,22 @@ public:
             m_stats.bytesProcessed.fetch_add(result.fileSize, std::memory_order_relaxed);
 
             uint64_t durationUs = duration_cast<microseconds>(endTime - startTime).count();
-            m_stats.averageTimeUs.store(
-                (m_stats.averageTimeUs.load() + durationUs) / 2,
-                std::memory_order_relaxed
-            );
 
-            if (durationUs > m_stats.maxTimeUs.load(std::memory_order_relaxed)) {
-                m_stats.maxTimeUs.store(durationUs, std::memory_order_relaxed);
+            // Update exponential moving average via CAS to avoid lost updates
+            uint64_t oldAvg = m_stats.averageTimeUs.load(std::memory_order_relaxed);
+            uint64_t newAvg;
+            do {
+                newAvg = (oldAvg == 0) ? durationUs : (oldAvg + durationUs) / 2;
+            } while (!m_stats.averageTimeUs.compare_exchange_weak(
+                oldAvg, newAvg, std::memory_order_relaxed));
+
+            // Update max via CAS
+            uint64_t oldMax = m_stats.maxTimeUs.load(std::memory_order_relaxed);
+            while (durationUs > oldMax) {
+                if (m_stats.maxTimeUs.compare_exchange_weak(
+                        oldMax, durationUs, std::memory_order_relaxed)) {
+                    break;
+                }
             }
 
             // Add to cache
@@ -689,7 +755,7 @@ public:
                 AddToCache(filePath, result);
             }
 
-            SS_LOG_INFO(L"FileHasher", L"FileHasher: Computed %u hashes in %u ms", CountComputedHashes(result), result.computeDuration.count());
+            SS_LOG_INFO(L"FileHasher", L"FileHasher: Computed %u hashes in %lld ms", CountComputedHashes(result), static_cast<long long>(result.computeDuration.count()));
 
             return result;
 
@@ -716,7 +782,7 @@ public:
                     result.hasMD5 = true;
                     m_stats.md5Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: MD5 = %hs", result.md5Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: MD5 = %hs", result.md5Hex.c_str());
                 }
             } else {
                 SS_LOG_WARN(L"FileHasher", L"FileHasher: MD5 computation failed");
@@ -739,7 +805,7 @@ public:
                     result.hasSHA1 = true;
                     m_stats.sha1Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA1 = %hs", result.sha1Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA1 = %hs", result.sha1Hex.c_str());
                 }
             }
         } catch (const std::exception& e) {
@@ -760,7 +826,7 @@ public:
                     result.hasSHA256 = true;
                     m_stats.sha256Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA256 = %hs", result.sha256Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA256 = %hs", result.sha256Hex.c_str());
                 }
             }
         } catch (const std::exception& e) {
@@ -781,7 +847,7 @@ public:
                     result.hasSHA512 = true;
                     m_stats.sha512Computed.fetch_add(1, std::memory_order_relaxed);
 
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA512 = %hs", result.sha512Hex.substr(0, 32) + "...");
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA512 = %hs...", result.sha512Hex.substr(0, 32).c_str());
                 }
             }
         } catch (const std::exception& e) {
@@ -801,7 +867,7 @@ public:
                     result.sha3_256Hex = HashUtils::ToHexLower(hashBytes);
                     result.hasSHA3_256 = true;
 
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-256 = %hs", result.sha3_256Hex);
+                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-256 = %hs", result.sha3_256Hex.c_str());
                 }
             }
         } catch (const std::exception& e) {
@@ -810,23 +876,13 @@ public:
     }
 
     void ComputeSHA3_512Impl(const std::wstring& filePath, FileHashes& result) {
-        try {
-            std::vector<uint8_t> hashBytes;
-            HashUtils::Error err;
-
-            if (HashUtils::ComputeFile(HashUtils::Algorithm::SHA3_512,
-                                      filePath, hashBytes, &err)) {
-                if (hashBytes.size() == 64) {
-                    std::copy(hashBytes.begin(), hashBytes.end(), result.sha3_512.begin());
-                    result.sha3_512Hex = HashUtils::ToHexLower(hashBytes);
-                    result.hasSHA3_512 = true;
-
-                    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: SHA3-512 = %hs", result.sha3_512Hex.substr(0, 32) + "...");
-                }
-            }
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileHasher", L"FileHasher: SHA3-512 exception: %hs", e.what());
-        }
+        // NOTE: HashUtils::Algorithm does not include SHA3_512.
+        // SHA3-512 support requires adding SHA3_512 to HashUtils::Algorithm
+        // or implementing a direct BCrypt call here. Marked unavailable until
+        // the HashUtils module is extended.
+        SS_LOG_DEBUG(L"FileHasher",
+            L"FileHasher: SHA3-512 unavailable — HashUtils does not yet support this algorithm");
+        result.hasSHA3_512 = false;
     }
 
     void ComputeFuzzyHashImpl(const std::wstring& filePath, FileHashes& result) {
@@ -836,12 +892,12 @@ public:
             // to the file size and works efficiently on large files.
             Utils::MemoryUtils::MappedView mappedFile;
             if (!mappedFile.mapReadOnly(filePath)) {
-                SS_LOG_WARN(L"FileHasher", L"FileHasher: Failed to memory-map file for fuzzy hash: %hs", StringUtils::ToNarrowString(filePath));
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: Failed to memory-map file for fuzzy hash: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return;
             }
 
             if (!mappedFile.hasData()) {
-                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Skipping fuzzy hash for empty file: %hs", StringUtils::ToNarrowString(filePath));
+                SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Skipping fuzzy hash for empty file: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return;
             }
 
@@ -859,7 +915,7 @@ public:
             );
 
             if (!digest.has_value()) {
-                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::HashBuffer returned no digest for: %hs", StringUtils::ToNarrowString(filePath));
+                SS_LOG_WARN(L"FileHasher", L"FileHasher: FuzzyHasher::HashBuffer returned no digest for: %hs", StringUtils::ToNarrow(filePath).c_str());
                 return;
             }
 
@@ -867,55 +923,32 @@ public:
             result.hasFuzzyHash = true;
             m_stats.fuzzyHashComputed.fetch_add(1, std::memory_order_relaxed);
 
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Fuzzy hash = %hs", result.fuzzyHash);
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Fuzzy hash = %hs", result.fuzzyHash.c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileHasher", L"FileHasher: Fuzzy hash exception: %hs", e.what());
         }
     }
 
-    void ComputeTLSHImpl(const std::wstring& filePath, FileHashes& result) {
-        try {
-            // TODO: Integrate TLSH library
-            // For now, placeholder implementation
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH computation not yet implemented");
-
-            result.tlsh = "T1PLACEHOLDER";
-            result.hasTLSH = false; // Set to true when implemented
-
-            // m_stats.tlshComputed.fetch_add(1, std::memory_order_relaxed);
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileHasher", L"FileHasher: TLSH exception: %hs", e.what());
-        }
+    void ComputeTLSHImpl(const std::wstring& /*filePath*/, FileHashes& result) {
+        // TLSH library integration pending. Do NOT set placeholder values
+        // that could be confused with real hashes in downstream lookups.
+        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH computation not yet integrated");
+        result.hasTLSH = false;
     }
 
-    void ComputeImpHashImpl(const std::wstring& filePath, FileHashes& result) {
-        try {
-            // TODO: Parse PE import table and compute MD5 of sorted imports
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: imphash computation not yet implemented");
-
-            result.imphash = "placeholder_imphash";
-            result.hasImpHash = false; // Set to true when implemented
-
-            // m_stats.imphashComputed.fetch_add(1, std::memory_order_relaxed);
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileHasher", L"FileHasher: imphash exception: %hs", e.what());
-        }
+    void ComputeImpHashImpl(const std::wstring& /*filePath*/, FileHashes& result) {
+        // PE import-table hash requires PEParser integration.
+        // Do NOT set placeholder values.
+        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: imphash computation not yet integrated");
+        result.hasImpHash = false;
     }
 
-    void ComputeAuthentihashImpl(const std::wstring& filePath, FileHashes& result) {
-        try {
-            // TODO: Parse PE authenticode signature and hash
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: authentihash computation not yet implemented");
-
-            result.authentihash = "placeholder_authentihash";
-            result.hasAuthentihash = false; // Set to true when implemented
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileHasher", L"FileHasher: authentihash exception: %hs", e.what());
-        }
+    void ComputeAuthentihashImpl(const std::wstring& /*filePath*/, FileHashes& result) {
+        // Authenticode hash requires PE signature parsing (PEParser integration).
+        // Do NOT set placeholder values.
+        SS_LOG_DEBUG(L"FileHasher", L"FileHasher: authentihash computation not yet integrated");
+        result.hasAuthentihash = false;
     }
 
     // ========================================================================
@@ -933,7 +966,7 @@ public:
             result.fileSize = buffer.size();
             result.filePath = L"<memory buffer>";
 
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Computing hashes for buffer (%llu bytes)", buffer.size());
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Computing hashes for buffer (%zu bytes)", buffer.size());
 
             // Compute cryptographic hashes
             if (HasFlag(algorithms, HashAlgorithm::MD5)) {
@@ -1077,9 +1110,9 @@ public:
         std::string_view tlsh2
     ) const noexcept {
         try {
-            // TODO: Implement TLSH distance using library
-            // For now, return max distance
-            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH distance not yet implemented");
+            // TLSH distance requires TLSH library integration.
+            // Returns max distance (no match) until library is available.
+            SS_LOG_DEBUG(L"FileHasher", L"FileHasher: TLSH distance requires library integration");
             return UINT32_MAX;
 
         } catch (...) {
@@ -1134,7 +1167,7 @@ public:
         std::vector<FileHashes> results;
         results.reserve(filePaths.size());
 
-        SS_LOG_INFO(L"FileHasher", L"FileHasher: Batch hashing %ls files", filePaths.size());
+        SS_LOG_INFO(L"FileHasher", L"FileHasher: Batch hashing %zu files", filePaths.size());
 
         for (const auto& path : filePaths) {
             results.push_back(ComputeAllImpl(path, algorithms));
@@ -1223,7 +1256,7 @@ FileHasher::~FileHasher() {
 
 bool FileHasher::Initialize(const FileHasherConfig& config) {
     if (!m_impl) {
-        Logger::Critical("FileHasher: Implementation is null");
+        SS_LOG_FATAL(L"FileHasher", L"FileHasher: Implementation is null");
         return false;
     }
 
@@ -1307,7 +1340,8 @@ void FileHasher::ComputeAllAsync(
         return;
     }
 
-    m_impl->m_threadPool->Enqueue([this, filePath, callback, algorithms]() {
+    (void)m_impl->m_threadPool->Submit(
+        [this, filePath, callback, algorithms](const TaskContext&) {
         auto hashes = ComputeAll(filePath, algorithms);
 
         if (callback) {
@@ -1424,8 +1458,10 @@ std::unordered_map<std::string, std::string> FileHasher::ComputeSectionHashes(
     const std::wstring& filePath,
     HashAlgorithm algorithm
 ) {
-    // TODO: Implement PE section parsing and hashing
-    SS_LOG_WARN(L"FileHasher", L"FileHasher: ComputeSectionHashes not yet implemented");
+    // PE section parsing requires PEParser integration.
+    // Returns empty map until PEParser provides section offsets/sizes.
+    SS_LOG_DEBUG(L"FileHasher",
+        L"FileHasher: ComputeSectionHashes requires PEParser integration");
     return {};
 }
 
@@ -1536,7 +1572,7 @@ uint64_t FileHasher::RegisterHashCallback(HashCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_hashCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered hash callback %u", id);
+    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered hash callback %llu", id);
     return id;
 }
 
@@ -1555,7 +1591,7 @@ uint64_t FileHasher::RegisterProgressCallback(ProgressCallback callback) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_progressCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered progress callback %u", id);
+    SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Registered progress callback %llu", id);
     return id;
 }
 
@@ -1571,10 +1607,10 @@ bool FileHasher::UnregisterProgressCallback(uint64_t callbackId) {
 // ============================================================================
 
 FileHasherStatistics FileHasher::GetStatistics() const {
-    return m_impl ? m_impl->m_stats : FileHasherStatistics{};
+    return m_impl ? m_impl->m_stats.Snapshot() : FileHasherStatistics{};
 }
 
-void FileHasher::ResetStatistics() {
+void FileHasher::ResetStatistics() noexcept {
     if (m_impl) {
         m_impl->m_stats.Reset();
         SS_LOG_INFO(L"FileHasher", L"FileHasher: Statistics reset");
@@ -1630,16 +1666,18 @@ bool FileHasher::SelfTest() {
     }
 }
 
-FileHasher::VersionInfo FileHasher::GetVersionInfo() const {
+VersionInfo FileHasher::GetVersionInfo() const {
     VersionInfo info{};
-    info.hasherVersion = "3.0.0";
-    info.fuzzyHasherVersion = "1.0.0"; // ShadowStrike FuzzyHasher
-    info.tlshVersion = "4.5.1";    // TODO: Get from library
+    info.hasherVersion = std::to_string(FileHasherConstants::VERSION_MAJOR) + "." +
+                         std::to_string(FileHasherConstants::VERSION_MINOR) + "." +
+                         std::to_string(FileHasherConstants::VERSION_PATCH);
+    info.fuzzyHasherVersion = "1.0.0";
+    info.tlshVersion = "not-integrated";
     info.lastUpdate = system_clock::now();
     return info;
 }
 
-FileHasher::HardwareInfo FileHasher::GetHardwareInfo() const {
+HardwareInfo FileHasher::GetHardwareInfo() const {
     HardwareInfo info{};
 
     if (m_impl) {
@@ -1650,6 +1688,103 @@ FileHasher::HardwareInfo FileHasher::GetHardwareInfo() const {
     }
 
     return info;
+}
+
+// ============================================================================
+// MISSING METHOD IMPLEMENTATIONS
+// ============================================================================
+
+bool FileHasher::HasHardwareAcceleration() const noexcept {
+    if (!m_impl) return false;
+    return m_impl->m_config.useHardwareAcceleration &&
+           (m_impl->m_hasAESNI || m_impl->m_hasSHANI);
+}
+
+std::vector<std::string> FileHasher::GetHardwareFeatures() const {
+    std::vector<std::string> features;
+    if (!m_impl) return features;
+
+    if (m_impl->m_hasAESNI) features.emplace_back("AES-NI");
+    if (m_impl->m_hasSHANI) features.emplace_back("SHA-NI");
+
+    return features;
+}
+
+std::string FileHasher::ToHexString(
+    std::span<const uint8_t> hash,
+    HashFormat format
+) const {
+    if (hash.empty()) return {};
+
+    switch (format) {
+        case HashFormat::Hex:
+            return HashUtils::ToHexLower(hash.data(), hash.size());
+        case HashFormat::HexUpper:
+            return HashUtils::ToHexUpper(hash.data(), hash.size());
+        case HashFormat::Base64:
+            // Delegate to Base64Utils if available; fallback to hex
+            return HashUtils::ToHexLower(hash.data(), hash.size());
+        case HashFormat::Raw:
+            return std::string(reinterpret_cast<const char*>(hash.data()), hash.size());
+        default:
+            return HashUtils::ToHexLower(hash.data(), hash.size());
+    }
+}
+
+std::vector<uint8_t> FileHasher::FromHexString(std::string_view hexString) const {
+    std::vector<uint8_t> result;
+    if (!HashUtils::FromHex(hexString, result)) {
+        SS_LOG_WARN(L"FileHasher", L"FileHasher: FromHexString failed for input length %zu", hexString.size());
+        result.clear();
+    }
+    return result;
+}
+
+bool FileHasher::ValidateHashFormat(
+    std::string_view hash,
+    HashAlgorithm algorithm
+) const {
+    if (hash.empty()) return false;
+
+    // Determine expected hex length from algorithm
+    size_t expectedHexLen = 0;
+    if (HasFlag(algorithm, HashAlgorithm::MD5))      expectedHexLen = FileHasherConstants::MD5_SIZE * 2;
+    else if (HasFlag(algorithm, HashAlgorithm::SHA1))      expectedHexLen = FileHasherConstants::SHA1_SIZE * 2;
+    else if (HasFlag(algorithm, HashAlgorithm::SHA256))    expectedHexLen = FileHasherConstants::SHA256_SIZE * 2;
+    else if (HasFlag(algorithm, HashAlgorithm::SHA512))    expectedHexLen = FileHasherConstants::SHA512_SIZE * 2;
+    else if (HasFlag(algorithm, HashAlgorithm::SHA3_256))  expectedHexLen = FileHasherConstants::SHA3_256_SIZE * 2;
+    else if (HasFlag(algorithm, HashAlgorithm::SHA3_512))  expectedHexLen = FileHasherConstants::SHA3_512_SIZE * 2;
+    else return false; // Fuzzy hashes have variable length — not validated here
+
+    if (hash.size() != expectedHexLen) return false;
+
+    // Validate all characters are hex
+    for (char c : hash) {
+        if (!((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F'))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+PartialHashes FileHasher::ComputePartialHashes(const std::wstring& filePath) {
+    PartialHashes result;
+
+    if (!IsInitialized()) {
+        SS_LOG_ERROR(L"FileHasher", L"FileHasher: Not initialized");
+        return result;
+    }
+
+    // Header hash (first 4KB, SHA-256)
+    result.headerSHA256 = ComputeHeaderHash(filePath, HashAlgorithm::SHA256,
+                                            FileHasherConstants::HEADER_HASH_SIZE);
+
+    // Section hashes (PE-specific)
+    if (IsPEFile(filePath)) {
+        result.sectionHashes = ComputeSectionHashes(filePath, HashAlgorithm::SHA256);
+    }
+
+    return result;
 }
 
 } // namespace FileSystem

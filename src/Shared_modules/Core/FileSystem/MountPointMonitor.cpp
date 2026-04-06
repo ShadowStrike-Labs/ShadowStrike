@@ -67,6 +67,8 @@
 #include <iomanip>
 #include <map>
 #include <set>
+#include <unordered_set>
+#include <filesystem>
 #include <Windows.h>
 #include <Dbt.h>
 #include <SetupAPI.h>
@@ -81,6 +83,118 @@
 namespace ShadowStrike {
 namespace Core {
 namespace FileSystem {
+
+namespace fs = std::filesystem;
+
+// ============================================================================
+// RAII Handle Wrapper — leak-free Win32 handle management
+// ============================================================================
+namespace {
+
+class ScopedHandle final {
+public:
+    explicit ScopedHandle(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+    ~ScopedHandle() noexcept { Close(); }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = INVALID_HANDLE_VALUE;
+    }
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            Close();
+            m_handle = other.m_handle;
+            other.m_handle = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    [[nodiscard]] bool IsValid() const noexcept {
+        return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr;
+    }
+    HANDLE Release() noexcept {
+        HANDLE h = m_handle;
+        m_handle = INVALID_HANDLE_VALUE;
+        return h;
+    }
+    void Reset(HANDLE h = INVALID_HANDLE_VALUE) noexcept {
+        Close();
+        m_handle = h;
+    }
+
+private:
+    void Close() noexcept {
+        if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+            ::CloseHandle(m_handle);
+            m_handle = INVALID_HANDLE_VALUE;
+        }
+    }
+    HANDLE m_handle;
+};
+
+[[nodiscard]] constexpr bool IsValidDriveLetter(wchar_t c) noexcept {
+    return (c >= L'A' && c <= L'Z') || (c >= L'a' && c <= L'z');
+}
+
+[[nodiscard]] constexpr wchar_t NormalizeDriveLetter(wchar_t c) noexcept {
+    return (c >= L'a' && c <= L'z') ? static_cast<wchar_t>(c - L'a' + L'A') : c;
+}
+
+/// Detect if a volume is backed by a virtual disk (VHD/VHDX/ISO)
+[[nodiscard]] DriveType ClassifyVirtualDisk(wchar_t driveLetter) noexcept {
+    wchar_t devicePath[8] = { L'\\', L'\\', L'.', L'\\', driveLetter, L':', L'\0' };
+
+    ScopedHandle hDevice(::CreateFileW(
+        devicePath, 0,
+        FILE_SHARE_READ | FILE_SHARE_WRITE,
+        nullptr, OPEN_EXISTING, 0, nullptr));
+
+    if (!hDevice.IsValid()) {
+        return DriveType::Unknown;
+    }
+
+    // Query storage property to check for virtual disk bus type
+    STORAGE_PROPERTY_QUERY query{};
+    query.PropertyId = StorageDeviceProperty;
+    query.QueryType = PropertyStandardQuery;
+
+    alignas(STORAGE_DEVICE_DESCRIPTOR) BYTE buffer[1024]{};
+    DWORD bytesReturned = 0;
+
+    if (!::DeviceIoControl(hDevice.Get(), IOCTL_STORAGE_QUERY_PROPERTY,
+            &query, sizeof(query), buffer, sizeof(buffer),
+            &bytesReturned, nullptr)) {
+        return DriveType::Unknown;
+    }
+
+    if (bytesReturned < sizeof(STORAGE_DEVICE_DESCRIPTOR)) {
+        return DriveType::Unknown;
+    }
+
+    const auto* desc = reinterpret_cast<const STORAGE_DEVICE_DESCRIPTOR*>(buffer);
+
+    // BusTypeVirtual (0x0E) indicates VHD/VHDX
+    // BusTypeFileBackedVirtual (0x11) also indicates virtual disk
+    if (desc->BusType == BusTypeVirtual || desc->BusType == BusTypeFileBackedVirtual) {
+        return DriveType::VirtualHardDisk;
+    }
+
+    // Virtual SCSI adapters used by ISO mounting
+    if (desc->BusType == BusTypeScsi && desc->RemovableMedia) {
+        // Windows ISO mounter typically appears as a virtual CD-ROM
+        wchar_t rootPath[4] = { driveLetter, L':', L'\\', L'\0' };
+        if (::GetDriveTypeW(rootPath) == DRIVE_CDROM) {
+            return DriveType::ISOImage;
+        }
+    }
+
+    return DriveType::Unknown;
+}
+
+}  // anonymous namespace
 
 // ============================================================================
 // Structure Implementations
@@ -274,8 +388,14 @@ struct MountPointMonitor::Impl {
 
     // Get volume information
     bool GetVolumeInformation(wchar_t driveLetter, DriveInfo& info) {
+        if (!IsValidDriveLetter(driveLetter)) {
+            SS_LOG_ERROR(L"MountPointMonitor", L"Invalid drive letter passed to GetVolumeInformation: 0x%04X",
+                         static_cast<unsigned>(driveLetter));
+            return false;
+        }
+
         try {
-            wchar_t rootPath[4] = { driveLetter, L':', L'\\', L'\0' };
+            wchar_t rootPath[4] = { NormalizeDriveLetter(driveLetter), L':', L'\\', L'\0' };
             wchar_t volumeName[MAX_PATH + 1] = { 0 };
             wchar_t fileSystemName[MAX_PATH + 1] = { 0 };
             DWORD serialNumber = 0;
@@ -290,10 +410,18 @@ struct MountPointMonitor::Impl {
                 &fileSystemFlags,
                 fileSystemName, MAX_PATH)) {
 
-                info.driveLetter = driveLetter;
+                info.driveLetter = NormalizeDriveLetter(driveLetter);
                 info.volumeName = volumeName;
                 info.fileSystem = fileSystemName;
-                info.driveType = GetDriveTypeFromLetter(driveLetter);
+                info.driveType = GetDriveTypeFromLetter(info.driveLetter);
+
+                // Refine classification for virtual disks
+                if (info.driveType == DriveType::Fixed || info.driveType == DriveType::CDRom) {
+                    DriveType vType = ClassifyVirtualDisk(info.driveLetter);
+                    if (vType == DriveType::VirtualHardDisk || vType == DriveType::ISOImage) {
+                        info.driveType = vType;
+                    }
+                }
 
                 // Get capacity
                 ULARGE_INTEGER freeBytesAvailable, totalBytes, totalFreeBytes;
@@ -311,66 +439,140 @@ struct MountPointMonitor::Impl {
             return false;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Failed to get volume info for {} - {}",
-                               driveLetter, Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Failed to get volume info for %c - %ls",
+                         driveLetter, Utils::StringUtils::ToWide(e.what()).c_str());
             return false;
         }
     }
 
-    // Get USB device information
+    // Get USB device information via SetupAPI for real VID/PID/Serial
     bool GetUSBDeviceInfo(wchar_t driveLetter, DriveInfo& info) {
+        if (!IsValidDriveLetter(driveLetter)) {
+            return false;
+        }
+
         try {
-            wchar_t devicePath[MAX_PATH];
-            swprintf_s(devicePath, L"\\\\.\\%c:", driveLetter);
+            wchar_t devicePath[8] = { L'\\', L'\\', L'.', L'\\',
+                                       NormalizeDriveLetter(driveLetter), L':', L'\0' };
 
-            HANDLE hDevice = CreateFileW(
-                devicePath,
-                0,
+            ScopedHandle hDevice(::CreateFileW(
+                devicePath, 0,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
-                nullptr,
-                OPEN_EXISTING,
-                0,
-                nullptr
-            );
+                nullptr, OPEN_EXISTING, 0, nullptr));
 
-            if (hDevice == INVALID_HANDLE_VALUE) {
+            if (!hDevice.IsValid()) {
                 return false;
             }
 
-            STORAGE_DEVICE_NUMBER deviceNumber;
+            STORAGE_DEVICE_NUMBER deviceNumber{};
             DWORD bytesReturned = 0;
 
-            if (DeviceIoControl(
-                hDevice,
-                IOCTL_STORAGE_GET_DEVICE_NUMBER,
-                nullptr, 0,
-                &deviceNumber, sizeof(deviceNumber),
-                &bytesReturned,
-                nullptr)) {
+            if (!::DeviceIoControl(
+                    hDevice.Get(),
+                    IOCTL_STORAGE_GET_DEVICE_NUMBER,
+                    nullptr, 0,
+                    &deviceNumber, sizeof(deviceNumber),
+                    &bytesReturned, nullptr)) {
+                return false;
+            }
 
-                // Get device instance ID
-                wchar_t instanceId[MAX_PATH];
-                swprintf_s(instanceId, L"\\\\?\\STORAGE#Volume#%08lx", deviceNumber.DeviceNumber);
+            // Enumerate USB devices via SetupAPI for real VID/PID/Serial
+            HDEVINFO devInfoSet = ::SetupDiGetClassDevsW(
+                &GUID_DEVINTERFACE_USB_DEVICE, nullptr, nullptr,
+                DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
 
-                // Parse VID/PID/Serial from instance ID (simplified)
+            if (devInfoSet == INVALID_HANDLE_VALUE) {
                 info.vendorId = L"Unknown";
                 info.productId = L"Unknown";
                 info.serialNumber = std::to_wstring(deviceNumber.DeviceNumber);
                 info.friendlyName = info.volumeName;
-
-                CloseHandle(hDevice);
                 return true;
             }
 
-            CloseHandle(hDevice);
-            return false;
+            SP_DEVINFO_DATA devInfoData{};
+            devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
 
-        } catch (...) {
+            bool found = false;
+            for (DWORD idx = 0; ::SetupDiEnumDeviceInfo(devInfoSet, idx, &devInfoData); ++idx) {
+                wchar_t instanceId[MAX_PATH]{};
+                if (!::SetupDiGetDeviceInstanceIdW(devInfoSet, &devInfoData,
+                        instanceId, MAX_PATH, nullptr)) {
+                    continue;
+                }
+
+                // Parse VID/PID/Serial from instance ID: USB\VID_xxxx&PID_xxxx\serial
+                std::wstring idStr(instanceId);
+                auto vidPos = idStr.find(L"VID_");
+                auto pidPos = idStr.find(L"PID_");
+                if (vidPos == std::wstring::npos || pidPos == std::wstring::npos) {
+                    continue;
+                }
+
+                // Validate VID/PID format (4 hex chars after VID_/PID_)
+                if (vidPos + 8 > idStr.size() || pidPos + 8 > idStr.size()) {
+                    continue;
+                }
+
+                std::wstring vid = idStr.substr(vidPos + 4, 4);
+                std::wstring pid = idStr.substr(pidPos + 4, 4);
+
+                // Validate hex characters
+                auto isHex = [](const std::wstring& s) {
+                    return std::all_of(s.begin(), s.end(), [](wchar_t c) {
+                        return (c >= L'0' && c <= L'9') ||
+                               (c >= L'A' && c <= L'F') ||
+                               (c >= L'a' && c <= L'f');
+                    });
+                };
+                if (!isHex(vid) || !isHex(pid)) {
+                    continue;
+                }
+
+                // Extract serial number (after last backslash)
+                auto lastSlash = idStr.rfind(L'\\');
+                std::wstring serial;
+                if (lastSlash != std::wstring::npos && lastSlash + 1 < idStr.size()) {
+                    serial = idStr.substr(lastSlash + 1);
+                }
+
+                info.vendorId = vid;
+                info.productId = pid;
+                info.serialNumber = serial.empty() ? std::to_wstring(deviceNumber.DeviceNumber) : serial;
+
+                // Get friendly name
+                wchar_t friendlyName[256]{};
+                if (::SetupDiGetDeviceRegistryPropertyW(devInfoSet, &devInfoData,
+                        SPDRP_FRIENDLYNAME, nullptr,
+                        reinterpret_cast<PBYTE>(friendlyName),
+                        sizeof(friendlyName), nullptr)) {
+                    info.friendlyName = friendlyName;
+                } else {
+                    info.friendlyName = info.volumeName;
+                }
+
+                found = true;
+                break;
+            }
+
+            ::SetupDiDestroyDeviceInfoList(devInfoSet);
+
+            if (!found) {
+                info.vendorId = L"Unknown";
+                info.productId = L"Unknown";
+                info.serialNumber = std::to_wstring(deviceNumber.DeviceNumber);
+                info.friendlyName = info.volumeName;
+            }
+
+            return true;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"MountPointMonitor", L"USB device info retrieval failed for %c - %ls",
+                         driveLetter, Utils::StringUtils::ToWide(e.what()).c_str());
             return false;
         }
     }
 
-    // Detect BadUSB threats
+    // Detect BadUSB and other device threats
     DeviceThreatType DetectThreats(const DriveInfo& info) {
         try {
             // Check if device is not whitelisted (if enforcement enabled)
@@ -382,21 +584,31 @@ struct MountPointMonitor::Impl {
             }
 
             // Check for type masquerading (e.g., USB claiming to be CD-ROM)
-            if (info.driveType == DriveType::CDRom && !info.vendorId.empty()) {
-                // CD-ROM shouldn't have USB vendor ID
+            if (info.driveType == DriveType::CDRom && !info.vendorId.empty() &&
+                info.vendorId != L"Unknown") {
                 return DeviceThreatType::Masquerading;
             }
 
-            // Additional BadUSB checks would go here
-            // - HID device masquerading as storage
-            // - Suspicious device class combinations
-            // - Known malicious VID/PID pairs
+            // Rubber Ducky detection: removable device with zero capacity
+            // that appears as mass storage but has no actual file system
+            if (info.driveType == DriveType::Removable &&
+                info.totalBytes == 0 && info.fileSystem.empty()) {
+                return DeviceThreatType::RubberDucky;
+            }
+
+            // Known malicious VID/PID pairs (Rubber Ducky / BadUSB platforms)
+            if (info.vendorId == L"03EB" && info.productId == L"2401") {
+                return DeviceThreatType::RubberDucky;
+            }
+            if (info.vendorId == L"1FC9" && info.productId == L"0083") {
+                return DeviceThreatType::BadUSB;
+            }
 
             return DeviceThreatType::None;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Threat detection failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Threat detection failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
             return DeviceThreatType::None;
         }
     }
@@ -432,13 +644,13 @@ struct MountPointMonitor::Impl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Policy determination failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Policy determination failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
             return DevicePolicy::Allow;
         }
     }
 
-    // Block autorun.inf
+    // Block autorun.inf — critical USB attack vector mitigation
     void BlockAutorun(wchar_t driveLetter) {
         if (!m_config.blockAutorun) {
             return;
@@ -446,26 +658,29 @@ struct MountPointMonitor::Impl {
 
         try {
             wchar_t autorunPath[MAX_PATH];
-            swprintf_s(autorunPath, L"%c:\\autorun.inf", driveLetter);
+            swprintf_s(autorunPath, L"%c:\\autorun.inf", NormalizeDriveLetter(driveLetter));
 
-            if (fs::exists(autorunPath)) {
-                // Delete or quarantine autorun.inf
-                try {
-                    fs::remove(autorunPath);
+            std::error_code ec;
+            if (fs::exists(autorunPath, ec) && !ec) {
+                if (fs::remove(autorunPath, ec) && !ec) {
                     m_statistics.autorunBlocked.fetch_add(1, std::memory_order_relaxed);
-                    Utils::Logger::Info(L"MountPointMonitor: Blocked autorun.inf on drive {}", driveLetter);
-                } catch (...) {
-                    // May fail if file is protected - try to set read-only
+                    SS_LOG_INFO(L"MountPointMonitor", L"Blocked autorun.inf on drive %c",
+                                NormalizeDriveLetter(driveLetter));
+                } else {
+                    SS_LOG_WARN(L"MountPointMonitor",
+                                L"Could not remove autorun.inf on drive %c (ec=%d)",
+                                NormalizeDriveLetter(driveLetter), ec.value());
                 }
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Autorun blocking failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Autorun blocking failed for %c - %ls",
+                         NormalizeDriveLetter(driveLetter),
+                         Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
-    // Update device history
+    // Update device history with cap enforcement
     void UpdateDeviceHistory(const DriveInfo& info) {
         if (info.serialNumber.empty() || info.serialNumber == L"Unknown") {
             return;
@@ -476,6 +691,19 @@ struct MountPointMonitor::Impl {
 
             auto it = m_deviceHistory.find(info.serialNumber);
             if (it == m_deviceHistory.end()) {
+                // Enforce history cap — evict oldest entry if at capacity
+                if (m_deviceHistory.size() >= MountPointMonitorConstants::MAX_DEVICE_HISTORY) {
+                    auto oldest = m_deviceHistory.begin();
+                    for (auto iter = m_deviceHistory.begin(); iter != m_deviceHistory.end(); ++iter) {
+                        if (iter->second.lastSeen < oldest->second.lastSeen) {
+                            oldest = iter;
+                        }
+                    }
+                    if (oldest != m_deviceHistory.end()) {
+                        m_deviceHistory.erase(oldest);
+                    }
+                }
+
                 // New device
                 DeviceHistoryEntry entry;
                 entry.serialNumber = info.serialNumber;
@@ -489,8 +717,10 @@ struct MountPointMonitor::Impl {
 
                 m_deviceHistory[info.serialNumber] = entry;
 
-                Utils::Logger::Info(L"MountPointMonitor: New device detected - Serial: {}, VID: {}, PID: {}",
-                                  info.serialNumber, info.vendorId, info.productId);
+                SS_LOG_INFO(L"MountPointMonitor",
+                            L"New device detected - Serial: %ls, VID: %ls, PID: %ls",
+                            info.serialNumber.c_str(), info.vendorId.c_str(),
+                            info.productId.c_str());
             } else {
                 // Existing device
                 it->second.lastSeen = std::chrono::system_clock::now();
@@ -498,16 +728,21 @@ struct MountPointMonitor::Impl {
             }
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Device history update failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Device history update failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
-    // Process drive arrival
+    // Process drive arrival with full threat analysis
     void ProcessDriveArrival(wchar_t driveLetter) {
         const auto startTime = Clock::now();
 
         try {
+            driveLetter = NormalizeDriveLetter(driveLetter);
+            if (!IsValidDriveLetter(driveLetter)) {
+                return;
+            }
+
             DriveInfo info;
             if (!GetVolumeInformation(driveLetter, info)) {
                 return;
@@ -519,6 +754,12 @@ struct MountPointMonitor::Impl {
                 m_statistics.usbConnections.fetch_add(1, std::memory_order_relaxed);
             } else if (info.driveType == DriveType::Network) {
                 m_statistics.networkMounts.fetch_add(1, std::memory_order_relaxed);
+            } else if (info.driveType == DriveType::VirtualHardDisk ||
+                       info.driveType == DriveType::ISOImage) {
+                m_statistics.virtualMounts.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_WARN(L"MountPointMonitor",
+                            L"Virtual disk mounted on %c (type=%d) — potential MotW bypass vector",
+                            driveLetter, static_cast<int>(info.driveType));
             }
 
             // Set mount time
@@ -527,7 +768,8 @@ struct MountPointMonitor::Impl {
             // Check whitelist
             {
                 std::lock_guard<std::mutex> lock(m_whitelistMutex);
-                info.isWhitelisted = m_whitelistedDevices.find(info.serialNumber) != m_whitelistedDevices.end();
+                info.isWhitelisted = m_whitelistedDevices.find(info.serialNumber) !=
+                                     m_whitelistedDevices.end();
             }
 
             // Detect threats
@@ -535,8 +777,9 @@ struct MountPointMonitor::Impl {
                 info.threatType = DetectThreats(info);
                 if (info.threatType != DeviceThreatType::None) {
                     m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
-                    Utils::Logger::Warn(L"MountPointMonitor: Threat detected on drive {} - Type: {}",
-                                      driveLetter, static_cast<int>(info.threatType));
+                    SS_LOG_WARN(L"MountPointMonitor",
+                                L"Threat detected on drive %c - Type: %d",
+                                driveLetter, static_cast<int>(info.threatType));
                 }
             }
 
@@ -545,13 +788,12 @@ struct MountPointMonitor::Impl {
             bool blocked = false;
 
             if (policy == DevicePolicy::Block || policy == DevicePolicy::BlockAndAlert) {
-                // Block the drive
                 blocked = true;
                 m_statistics.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
-                Utils::Logger::Warn(L"MountPointMonitor: Drive {} blocked by policy", driveLetter);
+                SS_LOG_WARN(L"MountPointMonitor", L"Drive %c blocked by policy", driveLetter);
             }
 
-            // Block autorun
+            // Block autorun on removable media
             if (!blocked && info.driveType == DriveType::Removable) {
                 BlockAutorun(driveLetter);
             }
@@ -566,53 +808,62 @@ struct MountPointMonitor::Impl {
                 m_statistics.activeMounts.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Update statistics
+            // Update per-type statistics
             auto typeIdx = static_cast<size_t>(info.driveType);
             if (typeIdx < m_statistics.byDriveType.size()) {
                 m_statistics.byDriveType[typeIdx].fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Invoke callback
+            // Invoke callback (copy callback under lock, invoke outside to avoid deadlock)
+            MountEventCallback cbCopy;
             {
                 std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                if (m_eventCallback) {
-                    try {
-                        MountEventInfo event;
-                        event.event = MountEvent::DriveArrival;
-                        event.path = std::wstring(1, driveLetter) + L":";
-                        event.driveInfo = info;
-                        event.timestamp = std::chrono::system_clock::now();
-                        event.appliedPolicy = policy;
-
-                        m_eventCallback(event);
-                    } catch (...) {
-                        // Callback failure should not affect processing
-                    }
+                cbCopy = m_eventCallback;
+            }
+            if (cbCopy) {
+                try {
+                    MountEventInfo event;
+                    event.event = MountEvent::DriveArrival;
+                    event.path = std::wstring(1, driveLetter) + L":";
+                    event.driveInfo = info;
+                    event.timestamp = std::chrono::system_clock::now();
+                    event.appliedPolicy = policy;
+                    cbCopy(event);
+                } catch (...) {
+                    SS_LOG_WARN(L"MountPointMonitor",
+                                L"Mount event callback threw for drive %c", driveLetter);
                 }
             }
 
             m_statistics.totalEvents.fetch_add(1, std::memory_order_relaxed);
 
+            auto eventIdx = static_cast<size_t>(MountEvent::DriveArrival);
+            if (eventIdx < m_statistics.byEventType.size()) {
+                m_statistics.byEventType[eventIdx].fetch_add(1, std::memory_order_relaxed);
+            }
+
             const auto endTime = Clock::now();
-            const auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(endTime - startTime).count();
+            const auto durationUs = std::chrono::duration_cast<std::chrono::microseconds>(
+                endTime - startTime).count();
             m_statistics.totalProcessingTimeUs.fetch_add(durationUs, std::memory_order_relaxed);
 
-            Utils::Logger::Info(L"MountPointMonitor: Drive {} arrived - Type: {}, Volume: {}, Policy: {}",
-                              driveLetter,
-                              static_cast<int>(info.driveType),
-                              info.volumeName,
-                              static_cast<int>(policy));
+            SS_LOG_INFO(L"MountPointMonitor",
+                        L"Drive %c arrived - Type: %d, Volume: %ls, FS: %ls, Policy: %d",
+                        driveLetter, static_cast<int>(info.driveType),
+                        info.volumeName.c_str(), info.fileSystem.c_str(),
+                        static_cast<int>(policy));
 
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Error(L"MountPointMonitor: Drive arrival processing failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Drive arrival processing failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
     // Process drive removal
     void ProcessDriveRemoval(wchar_t driveLetter) {
         try {
+            driveLetter = NormalizeDriveLetter(driveLetter);
             DriveInfo info;
             bool found = false;
 
@@ -628,31 +879,40 @@ struct MountPointMonitor::Impl {
             }
 
             if (found) {
-                // Invoke callback
-                std::lock_guard<std::mutex> lock(m_callbacksMutex);
-                if (m_eventCallback) {
+                // Copy callback under lock, invoke outside to avoid deadlock
+                MountEventCallback cbCopy;
+                {
+                    std::lock_guard<std::mutex> lock(m_callbacksMutex);
+                    cbCopy = m_eventCallback;
+                }
+                if (cbCopy) {
                     try {
                         MountEventInfo event;
                         event.event = MountEvent::DriveRemoval;
                         event.path = std::wstring(1, driveLetter) + L":";
                         event.driveInfo = info;
                         event.timestamp = std::chrono::system_clock::now();
-
-                        m_eventCallback(event);
+                        cbCopy(event);
                     } catch (...) {
-                        // Callback failure should not affect processing
+                        SS_LOG_WARN(L"MountPointMonitor",
+                                    L"Remove event callback threw for drive %c", driveLetter);
                     }
                 }
 
                 m_statistics.totalEvents.fetch_add(1, std::memory_order_relaxed);
 
-                Utils::Logger::Info(L"MountPointMonitor: Drive {} removed", driveLetter);
+                auto eventIdx = static_cast<size_t>(MountEvent::DriveRemoval);
+                if (eventIdx < m_statistics.byEventType.size()) {
+                    m_statistics.byEventType[eventIdx].fetch_add(1, std::memory_order_relaxed);
+                }
+
+                SS_LOG_INFO(L"MountPointMonitor", L"Drive %c removed", driveLetter);
             }
 
         } catch (const std::exception& e) {
             m_statistics.errors.fetch_add(1, std::memory_order_relaxed);
-            Utils::Logger::Error(L"MountPointMonitor: Drive removal processing failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Drive removal processing failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
@@ -666,12 +926,20 @@ struct MountPointMonitor::Impl {
 
             if (wParam == DBT_DEVICEARRIVAL || wParam == DBT_DEVICEREMOVECOMPLETE) {
                 DEV_BROADCAST_HDR* pHdr = reinterpret_cast<DEV_BROADCAST_HDR*>(lParam);
-                if (pHdr && pHdr->dbch_devicetype == DBT_DEVTYP_VOLUME) {
+
+                // Validate the structure before casting
+                if (!pHdr || pHdr->dbch_size < sizeof(DEV_BROADCAST_HDR)) {
+                    return DefWindowProcW(hwnd, msg, wParam, lParam);
+                }
+
+                if (pHdr->dbch_devicetype == DBT_DEVTYP_VOLUME) {
+                    if (pHdr->dbch_size < sizeof(DEV_BROADCAST_VOLUME)) {
+                        return DefWindowProcW(hwnd, msg, wParam, lParam);
+                    }
                     DEV_BROADCAST_VOLUME* pVolume = reinterpret_cast<DEV_BROADCAST_VOLUME*>(pHdr);
 
-                    // Extract drive letter from bitmask
                     DWORD unitMask = pVolume->dbcv_unitmask;
-                    for (wchar_t drive = L'A'; drive <= L'Z'; drive++) {
+                    for (wchar_t drive = L'A'; drive <= L'Z' && unitMask != 0; drive++) {
                         if (unitMask & 1) {
                             if (wParam == DBT_DEVICEARRIVAL) {
                                 pThis->ProcessDriveArrival(drive);
@@ -694,14 +962,18 @@ struct MountPointMonitor::Impl {
         if (!pThis) return 1;
 
         try {
-            // Register window class
-            WNDCLASSEXW wc = { 0 };
+            // Register window class (may already exist — ignore ERROR_CLASS_ALREADY_EXISTS)
+            WNDCLASSEXW wc{};
             wc.cbSize = sizeof(WNDCLASSEXW);
             wc.lpfnWndProc = DeviceNotifyWndProc;
             wc.hInstance = GetModuleHandleW(nullptr);
             wc.lpszClassName = L"ShadowStrikeMountPointMonitor";
 
-            RegisterClassExW(&wc);
+            ATOM atom = RegisterClassExW(&wc);
+            if (atom == 0 && ::GetLastError() != ERROR_CLASS_ALREADY_EXISTS) {
+                SS_LOG_LAST_ERROR(L"MountPointMonitor", L"RegisterClassExW failed");
+                return 1;
+            }
 
             // Create message-only window
             pThis->m_hMessageWindow = CreateWindowExW(
@@ -716,15 +988,17 @@ struct MountPointMonitor::Impl {
             );
 
             if (!pThis->m_hMessageWindow) {
-                Utils::Logger::Error(L"MountPointMonitor: Failed to create message window - Error: {}", GetLastError());
+                SS_LOG_LAST_ERROR(L"MountPointMonitor",
+                                  L"Failed to create message window");
                 return 1;
             }
 
             // Store this pointer in window data
-            SetWindowLongPtrW(pThis->m_hMessageWindow, GWLP_USERDATA, reinterpret_cast<LONG_PTR>(pThis));
+            SetWindowLongPtrW(pThis->m_hMessageWindow, GWLP_USERDATA,
+                              reinterpret_cast<LONG_PTR>(pThis));
 
-            // Register for device notifications
-            DEV_BROADCAST_DEVICEINTERFACE filter = { 0 };
+            // Register for device notifications — volumes and USB interfaces
+            DEV_BROADCAST_DEVICEINTERFACE filter{};
             filter.dbcc_size = sizeof(filter);
             filter.dbcc_devicetype = DBT_DEVTYP_DEVICEINTERFACE;
             filter.dbcc_classguid = GUID_DEVINTERFACE_USB_DEVICE;
@@ -735,25 +1009,42 @@ struct MountPointMonitor::Impl {
                 DEVICE_NOTIFY_WINDOW_HANDLE | DEVICE_NOTIFY_ALL_INTERFACE_CLASSES
             );
 
-            // Message loop
+            if (!pThis->m_hDeviceNotify) {
+                SS_LOG_LAST_ERROR(L"MountPointMonitor",
+                                  L"RegisterDeviceNotificationW failed — "
+                                  L"device events may not be received");
+                // Non-fatal: polling via RefreshDriveList still works
+            }
+
+            SS_LOG_DEBUG(L"MountPointMonitor",
+                         L"Monitor thread started, message window created");
+
+            // Message loop with stop event check
             MSG msg;
             while (pThis->m_running.load(std::memory_order_acquire)) {
-                if (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
+                // Process all pending messages before waiting
+                while (PeekMessageW(&msg, nullptr, 0, 0, PM_REMOVE)) {
                     TranslateMessage(&msg);
                     DispatchMessageW(&msg);
                 }
 
-                // Check stop event
-                if (WaitForSingleObject(pThis->m_hStopEvent, 100) == WAIT_OBJECT_0) {
-                    break;
+                // Wait for either new messages or stop event
+                DWORD result = MsgWaitForMultipleObjects(
+                    1, &pThis->m_hStopEvent, FALSE,
+                    MountPointMonitorConstants::POLLING_INTERVAL_MS,
+                    QS_ALLINPUT);
+
+                if (result == WAIT_OBJECT_0) {
+                    break;  // Stop event signalled
                 }
+                // WAIT_OBJECT_0+1 = new messages, WAIT_TIMEOUT = poll interval
             }
 
             return 0;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"MountPointMonitor: Monitor thread failed - {}",
-                               Utils::StringUtils::ToWide(e.what()));
+            SS_LOG_ERROR(L"MountPointMonitor", L"Monitor thread failed - %ls",
+                         Utils::StringUtils::ToWide(e.what()).c_str());
             return 1;
         }
     }
