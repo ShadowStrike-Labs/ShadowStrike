@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -72,6 +72,7 @@
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "MemoryScanner.hpp"
 
 // ============================================================================
 // WINDOWS API INCLUDES
@@ -80,6 +81,7 @@
 #include <winternl.h>
 #include <TlHelp32.h>
 #include <Psapi.h>
+#include <DbgHelp.h>
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -93,6 +95,7 @@
 #include <deque>
 #include <unordered_set>
 #include <map>
+#include <condition_variable>
 
 namespace ShadowStrike {
 namespace Core {
@@ -100,6 +103,66 @@ namespace Process {
 
 using Clock = std::chrono::system_clock;
 using TimePoint = std::chrono::system_clock::time_point;
+
+// ============================================================================
+// RAII HANDLE GUARD — eliminates all handle leaks
+// ============================================================================
+
+class HandleGuard {
+public:
+    explicit HandleGuard(HANDLE h = nullptr) noexcept : m_handle(h) {}
+    ~HandleGuard() noexcept { if (m_handle && m_handle != INVALID_HANDLE_VALUE) CloseHandle(m_handle); }
+
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    HandleGuard(HandleGuard&& other) noexcept : m_handle(other.m_handle) { other.m_handle = nullptr; }
+    HandleGuard& operator=(HandleGuard&& other) noexcept {
+        if (this != &other) {
+            if (m_handle && m_handle != INVALID_HANDLE_VALUE) CloseHandle(m_handle);
+            m_handle = other.m_handle;
+            other.m_handle = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+    [[nodiscard]] explicit operator bool() const noexcept { return m_handle && m_handle != INVALID_HANDLE_VALUE; }
+
+private:
+    HANDLE m_handle = nullptr;
+};
+
+// ============================================================================
+// NTDLL DYNAMIC LINKAGE — for thread start address and TEB access
+// ============================================================================
+
+// ThreadInformationClass values not in winternl.h
+constexpr ULONG ThreadQuerySetWin32StartAddress = 9;
+
+// THREAD_BASIC_INFORMATION may not be fully exposed by the SDK
+struct SS_THREAD_BASIC_INFORMATION {
+    NTSTATUS ExitStatus;
+    PVOID TebBaseAddress;
+    CLIENT_ID ClientId;
+    ULONG_PTR AffinityMask;
+    LONG Priority;
+    LONG BasePriority;
+};
+
+using NtQueryInformationThreadFn = NTSTATUS(NTAPI*)(
+    HANDLE ThreadHandle,
+    ULONG ThreadInformationClass,
+    PVOID ThreadInformation,
+    ULONG ThreadInformationLength,
+    PULONG ReturnLength
+);
+
+static NtQueryInformationThreadFn GetNtQueryInformationThread() noexcept {
+    static auto fn = reinterpret_cast<NtQueryInformationThreadFn>(
+        GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread")
+    );
+    return fn;
+}
 
 // ============================================================================
 // UTILITY FUNCTION IMPLEMENTATIONS
@@ -110,16 +173,19 @@ using TimePoint = std::chrono::system_clock::time_point;
  */
 [[nodiscard]] static bool IsAddressInModule(uint32_t pid, uintptr_t address) noexcept {
     try {
-        auto modules = Utils::ProcessUtils::GetProcessModules(pid);
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
+            return false;
+        }
         for (const auto& mod : modules) {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mod.baseAddress);
-            const uintptr_t end = base + mod.moduleSize;
+            const uintptr_t end = base + mod.size;
             if (address >= base && address < end) {
                 return true;
             }
         }
     } catch (...) {
-        // Error reading modules
+        // Swallow — process may have exited
     }
     return false;
 }
@@ -129,51 +195,60 @@ using TimePoint = std::chrono::system_clock::time_point;
  */
 [[nodiscard]] static std::wstring GetModuleForAddress(uint32_t pid, uintptr_t address) noexcept {
     try {
-        auto modules = Utils::ProcessUtils::GetProcessModules(pid);
+        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+        if (!Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
+            return L"<unknown>";
+        }
         for (const auto& mod : modules) {
             const uintptr_t base = reinterpret_cast<uintptr_t>(mod.baseAddress);
-            const uintptr_t end = base + mod.moduleSize;
+            const uintptr_t end = base + mod.size;
             if (address >= base && address < end) {
-                return mod.moduleName;
+                return mod.name;
             }
         }
     } catch (...) {
-        // Error reading modules
     }
     return L"<unbacked>";
 }
 
 /**
- * @brief Detect shellcode patterns at an address.
+ * @brief Detect shellcode patterns at an address using MemoryScanner integration.
+ *
+ * First queries MemoryScanner for region metadata (RWX/private/entropy),
+ * then falls back to pattern matching if scanner unavailable.
  */
 [[nodiscard]] static bool HasShellcodeAtAddress(uint32_t pid, uintptr_t address) noexcept {
     try {
-        // Read memory at address
-        std::array<uint8_t, 256> buffer{};
+        // Primary: use MemoryScanner for professional shellcode detection
+        auto& scanner = MemoryScanner::Instance();
+        if (scanner.IsInitialized()) {
+            auto regionInfo = scanner.GetRegionInfo(pid, address);
+            if (regionInfo.has_value()) {
+                // Private + executable memory is highly suspicious
+                if (regionInfo->isPrivate && regionInfo->isExecutable) {
+                    return true;
+                }
+                // RWX memory is almost always shellcode
+                if (regionInfo->isExecutable && regionInfo->isWritable && regionInfo->isPrivate) {
+                    return true;
+                }
+            }
+        }
 
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        // Fallback: direct memory read for signature patterns
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return false;
 
+        std::array<uint8_t, 256> buffer{};
         SIZE_T bytesRead = 0;
-        if (!ReadProcessMemory(hProcess, reinterpret_cast<LPCVOID>(address),
+        if (!ReadProcessMemory(hProcess.get(), reinterpret_cast<LPCVOID>(address),
                              buffer.data(), buffer.size(), &bytesRead)) {
-            CloseHandle(hProcess);
             return false;
         }
-        CloseHandle(hProcess);
 
         if (bytesRead < 20) return false;
 
-        // Common shellcode signatures (x86/x64)
-        const std::array<std::array<uint8_t, 4>, 5> shellcodeSignatures = {{
-            {0x90, 0x90, 0x90, 0x90},  // NOP sled
-            {0xEB, 0xFE, 0xEB, 0xFE},  // Jump to self
-            {0xCC, 0xCC, 0xCC, 0xCC},  // INT3 breakpoint
-            {0x31, 0xC0, 0x50, 0x68},  // Common shellcode prologue
-            {0x6A, 0x00, 0x6A, 0x00}   // Push sequences
-        }};
-
-        // Count NOP sled (20+ NOPs = likely shellcode)
+        // NOP sled detection (20+ consecutive NOPs = likely shellcode)
         uint32_t nopCount = 0;
         for (size_t i = 0; i < bytesRead; ++i) {
             if (buffer[i] == 0x90) {
@@ -184,17 +259,22 @@ using TimePoint = std::chrono::system_clock::time_point;
             }
         }
 
-        // Check for signature patterns
-        for (const auto& signature : shellcodeSignatures) {
+        // Common x64 shellcode prologues
+        const std::array<std::pair<std::array<uint8_t, 4>, const char*>, 3> shellcodeSignatures = {{
+            {{0x48, 0x31, 0xC9, 0x48}, "x64 xor rcx,rcx; rex prefix"},
+            {{0x48, 0x83, 0xEC, 0x28}, "x64 sub rsp,0x28 (shadow space)"},
+            {{0xFC, 0x48, 0x83, 0xE4}, "x64 cld; and rsp (align stack)"},
+        }};
+
+        for (const auto& [sig, _] : shellcodeSignatures) {
             for (size_t i = 0; i + 4 <= bytesRead; ++i) {
-                if (std::memcmp(&buffer[i], signature.data(), 4) == 0) {
+                if (std::memcmp(&buffer[i], sig.data(), 4) == 0) {
                     return true;
                 }
             }
         }
 
     } catch (...) {
-        // Error reading memory
     }
     return false;
 }
@@ -208,14 +288,90 @@ using TimePoint = std::chrono::system_clock::time_point;
     uint64_t oldRSP,
     uint64_t newRSP) noexcept
 {
-    // RIP changed significantly
     const bool ripChanged = (oldRIP != newRIP);
 
-    // Stack pivot (RSP changed to completely different region)
-    const int64_t stackDelta = std::abs(static_cast<int64_t>(newRSP - oldRSP));
+    // Stack pivot: compute absolute delta safely (avoid signed overflow UB)
+    const uint64_t stackDelta = (newRSP > oldRSP) ? (newRSP - oldRSP) : (oldRSP - newRSP);
     const bool stackPivoted = (stackDelta > 0x100000);  // >1MB change
 
     return ripChanged || stackPivoted;
+}
+
+/**
+ * @brief Check if a memory region at an address has executable + private attributes.
+ */
+[[nodiscard]] static bool IsAddressInRWXPrivate(uint32_t pid, uintptr_t address) noexcept {
+    try {
+        auto& scanner = MemoryScanner::Instance();
+        if (scanner.IsInitialized()) {
+            auto region = scanner.GetRegionInfo(pid, address);
+            if (region.has_value()) {
+                return region->isPrivate && region->isExecutable;
+            }
+        }
+
+        // Fallback: VirtualQueryEx
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+        if (!hProcess) return false;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(address),
+                          &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+
+        const bool isPrivate = (mbi.Type == MEM_PRIVATE);
+        const bool isExec = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+        return isPrivate && isExec;
+    } catch (...) {
+        return false;
+    }
+}
+
+/**
+ * @brief Get thread's actual stack bounds via NtQueryInformationThread(ThreadBasicInformation).
+ */
+[[nodiscard]] static bool GetThreadStackBounds(
+    HANDLE hThread,
+    uintptr_t& stackBase,
+    uintptr_t& stackLimit) noexcept
+{
+    auto ntQueryThread = GetNtQueryInformationThread();
+    if (!ntQueryThread) return false;
+
+    SS_THREAD_BASIC_INFORMATION tbi{};
+    ULONG returnLength = 0;
+    NTSTATUS status = ntQueryThread(
+        hThread, 0 /* ThreadBasicInformation */, &tbi, sizeof(tbi), &returnLength);
+
+    if (status != 0 || !tbi.TebBaseAddress) return false;
+
+    // Read stack bounds from TEB (Thread Environment Block)
+    // TEB.NtTib.StackBase is at offset 0x08 (x64)
+    // TEB.NtTib.StackLimit is at offset 0x10 (x64)
+    HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE,
+        GetProcessIdOfThread(hThread)));
+    if (!hProcess) return false;
+
+    struct {
+        uintptr_t stackBaseVal;
+        uintptr_t stackLimitVal;
+    } stackInfo{};
+
+    SIZE_T bytesRead = 0;
+    // TEB offset 0x08 = StackBase, 0x10 = StackLimit
+    const auto tebAddr = reinterpret_cast<const uint8_t*>(tbi.TebBaseAddress);
+    if (!ReadProcessMemory(hProcess.get(), tebAddr + 0x08,
+                          &stackInfo, sizeof(stackInfo), &bytesRead)) {
+        return false;
+    }
+
+    if (bytesRead < sizeof(stackInfo)) return false;
+
+    stackBase = stackInfo.stackBaseVal;
+    stackLimit = stackInfo.stackLimitVal;
+    return (stackBase > stackLimit && stackBase > 0x10000);
 }
 
 /**
@@ -227,29 +383,17 @@ using TimePoint = std::chrono::system_clock::time_point;
     bool crossProcess,
     bool stackPivoted,
     bool debugRegsActive,
-    uint32_t suspendDurationMs) noexcept
+    uint32_t suspendDurationMs,
+    bool isRWXPrivate = false) noexcept
 {
     uint32_t risk = 0;
 
-    // Base risk for any RIP change
-    risk += 50;
-
-    // RIP not in module (unbacked memory)
-    if (ripUnbacked) risk += 30;
-
-    // Shellcode detected at RIP
-    if (hasShellcode) risk += 20;
-
-    // Cross-process modification
-    if (crossProcess) risk += 15;
-
-    // Stack pivot
-    if (stackPivoted) risk += 10;
-
-    // Debug registers active
+    if (ripUnbacked)     risk += 40;
+    if (hasShellcode)    risk += 25;
+    if (crossProcess)    risk += 20;
+    if (stackPivoted)    risk += 15;
+    if (isRWXPrivate)    risk += 15;
     if (debugRegsActive) risk += 10;
-
-    // Long suspend duration
     if (suspendDurationMs > 500) risk += 5;
 
     return std::min(risk, 100u);
@@ -336,7 +480,7 @@ void ThreadHijackStatistics::Reset() noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class ThreadHijackDetector::ThreadHijackDetectorImpl {
+class ThreadHijackDetectorImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -389,10 +533,14 @@ public:
     /// @brief Monitoring thread
     std::thread m_monitorThread;
     std::atomic<bool> m_stopMonitoring{false};
+    std::mutex m_monitorCvMutex;
+    std::condition_variable m_monitorCv;
 
     /// @brief Cleanup thread
     std::thread m_cleanupThread;
     std::atomic<bool> m_stopCleanup{false};
+    std::mutex m_cleanupCvMutex;
+    std::condition_variable m_cleanupCv;
 
     // ========================================================================
     // METHODS
@@ -458,7 +606,7 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::Initialize(const ThreadHijackConfig& config) {
+bool ThreadHijackDetectorImpl::Initialize(const ThreadHijackConfig& config) {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
             SS_LOG_WARN(L"ThreadHijack", L"Already initialized");
@@ -469,11 +617,6 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::Initialize(const ThreadHija
 
         m_config = config;
 
-        // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelStore>();
-        m_patternStore = std::make_shared<PatternStore::PatternStore>();
-        m_whitelist = std::make_shared<Whitelist::WhitelistStore>();
-
         // Start cleanup thread
         m_stopCleanup.store(false, std::memory_order_release);
         m_cleanupThread = std::thread([this]() { CleanupThreadWorker(); });
@@ -482,13 +625,14 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::Initialize(const ThreadHija
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Initialization failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::Shutdown() {
+void ThreadHijackDetectorImpl::Shutdown() {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
@@ -498,8 +642,9 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::Shutdown() {
 
         StopMonitoring();
 
-        // Stop cleanup thread
+        // Stop cleanup thread (signal CV for immediate wake)
         m_stopCleanup.store(true, std::memory_order_release);
+        m_cleanupCv.notify_all();
         if (m_cleanupThread.joinable()) {
             m_cleanupThread.join();
         }
@@ -534,7 +679,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::Shutdown() {
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::StartMonitoring() {
+bool ThreadHijackDetectorImpl::StartMonitoring() {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_ERROR(L"ThreadHijack", L"Not initialized");
@@ -560,18 +705,20 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::StartMonitoring() {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Failed to start monitoring - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Failed to start monitoring - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
         m_monitoring.store(false, std::memory_order_release);
         return false;
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::StopMonitoring() {
+void ThreadHijackDetectorImpl::StopMonitoring() {
     if (!m_monitoring.exchange(false, std::memory_order_acq_rel)) {
         return;
     }
 
     m_stopMonitoring.store(true, std::memory_order_release);
+    m_monitorCv.notify_all();
     if (m_monitorThread.joinable()) {
         m_monitorThread.join();
     }
@@ -583,7 +730,7 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::StopMonitoring() {
 // IMPL: THREAD VALIDATION
 // ============================================================================
 
-ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) {
+ThreadValidation ThreadHijackDetectorImpl::ValidateThreadInternal(uint32_t tid) {
     ThreadValidation validation;
     validation.threadId = tid;
     validation.validationTime = Clock::now();
@@ -596,19 +743,25 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
         validation.instructionPointer = validation.context64.rip;
         validation.stackPointer = validation.context64.rsp;
 
-        // Get owner process
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        // Get owner process — RAII handle
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
         if (!hThread) {
-            validation.result = ValidationResult::Valid;  // Can't validate, assume valid
+            // ACCESS_DENIED or thread exited — do NOT assume valid
+            const DWORD err = GetLastError();
+            if (err == ERROR_ACCESS_DENIED) {
+                m_statistics.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_DEBUG(L"ThreadHijack", L"Access denied validating TID %u", tid);
+            }
+            validation.issues.push_back(L"Cannot open thread for validation");
             return validation;
         }
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
         validation.ownerPid = ownerPid;
-        CloseHandle(hThread);
 
-        if (auto procInfo = Utils::ProcessUtils::GetProcessInfo(ownerPid)) {
-            validation.ownerProcessName = procInfo->processName;
+        auto procName = Utils::ProcessUtils::GetProcessName(ownerPid);
+        if (procName.has_value()) {
+            validation.ownerProcessName = *procName;
         }
 
         // Validate RIP
@@ -622,37 +775,77 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
                 validation.result = validation.ripHasShellcodePattern ?
                     ValidationResult::ShellcodeRIP : ValidationResult::UnbackedRIP;
                 validation.isCompromised = true;
-                validation.issues.push_back(L"RIP points to unbacked memory");
+                validation.issues.push_back(
+                    std::format(L"RIP 0x{:X} points to unbacked memory", validation.instructionPointer));
                 validation.riskScore += 50;
 
                 m_statistics.unbackedRIPDetected.fetch_add(1, std::memory_order_relaxed);
                 if (validation.ripHasShellcodePattern) {
                     m_statistics.shellcodeRIPDetected.fetch_add(1, std::memory_order_relaxed);
                 }
+            } else if (IsAddressInRWXPrivate(ownerPid, validation.instructionPointer)) {
+                // RIP in module but region is private RWX — possible module stomping
+                validation.issues.push_back(L"RIP in private executable memory (possible module stomping)");
+                validation.riskScore += 30;
             }
         }
 
-        // Validate stack pointer
+        // Validate stack pointer — real TEB-based validation
         if (m_config.validateStackPointer) {
-            // Get stack bounds (simplified - real implementation would use NtQueryInformationThread)
-            validation.stackBase = validation.stackPointer + 0x100000;   // Assumed stack top
-            validation.stackLimit = validation.stackPointer - 0x100000;  // Assumed stack bottom
-            validation.stackInValidRange = true;  // Simplified validation
+            uintptr_t stackBase = 0, stackLimit = 0;
+            if (GetThreadStackBounds(hThread.get(), stackBase, stackLimit)) {
+                validation.stackBase = stackBase;
+                validation.stackLimit = stackLimit;
+                validation.stackInValidRange =
+                    (validation.stackPointer >= stackLimit &&
+                     validation.stackPointer <= stackBase);
+
+                if (!validation.stackInValidRange) {
+                    validation.stackPivoted = true;
+                    validation.isCompromised = true;
+                    validation.result = ValidationResult::StackPivoted;
+                    validation.issues.push_back(
+                        std::format(L"Stack pivot: RSP 0x{:X} outside stack [0x{:X}-0x{:X}]",
+                                   validation.stackPointer, stackLimit, stackBase));
+                    validation.riskScore += 40;
+                    m_statistics.stackPivots.fetch_add(1, std::memory_order_relaxed);
+                }
+            } else {
+                // Fallback: basic RSP sanity check
+                if (validation.stackPointer < 0x10000 ||
+                    validation.stackPointer > 0x7FFFFFFFFFFF ||
+                    validation.stackPointer % 8 != 0) {
+                    validation.stackPivoted = true;
+                    validation.isCompromised = true;
+                    validation.result = ValidationResult::InvalidRSP;
+                    validation.issues.push_back(L"RSP outside valid user-mode range or unaligned");
+                    validation.riskScore += 30;
+                } else {
+                    validation.stackInValidRange = true;
+                }
+            }
         }
 
         // Validate segments
         if (m_config.validateSegmentRegisters) {
-            // Check for valid user-mode segment selectors
             validation.segmentsValid = (
                 validation.context64.segCs == ThreadHijackConstants::USER_CS_64 &&
                 validation.context64.segSs == ThreadHijackConstants::USER_SS_64
             );
 
             if (!validation.segmentsValid) {
-                validation.result = ValidationResult::InvalidSegments;
-                validation.isCompromised = true;
-                validation.issues.push_back(L"Invalid segment selectors");
-                validation.riskScore += 30;
+                // WoW64 threads may have different selectors — check before flagging
+                const bool isWow64Cs = (validation.context64.segCs == ThreadHijackConstants::USER_CS_32);
+                if (!isWow64Cs) {
+                    validation.result = ValidationResult::InvalidSegments;
+                    validation.isCompromised = true;
+                    validation.issues.push_back(
+                        std::format(L"Invalid segments: CS=0x{:X} SS=0x{:X}",
+                                   validation.context64.segCs, validation.context64.segSs));
+                    validation.riskScore += 30;
+                } else {
+                    validation.segmentsValid = true;  // WoW64 is OK
+                }
             }
         }
 
@@ -660,14 +853,14 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
         if (m_config.checkDebugRegisters) {
             validation.hasHardwareBreakpoints = HasActiveDebugRegistersInternal(tid);
             if (validation.hasHardwareBreakpoints) {
-                // Count active breakpoints
-                if (validation.context64.dr7 & 0x1) validation.activeBreakpointCount++;
-                if (validation.context64.dr7 & 0x4) validation.activeBreakpointCount++;
+                if (validation.context64.dr7 & 0x1)  validation.activeBreakpointCount++;
+                if (validation.context64.dr7 & 0x4)  validation.activeBreakpointCount++;
                 if (validation.context64.dr7 & 0x10) validation.activeBreakpointCount++;
                 if (validation.context64.dr7 & 0x40) validation.activeBreakpointCount++;
 
                 validation.result = ValidationResult::DebugRegistersSet;
-                validation.issues.push_back(L"Hardware breakpoints active");
+                validation.issues.push_back(
+                    std::format(L"Hardware breakpoints active (count={})", validation.activeBreakpointCount));
                 validation.riskScore += 20;
             }
         }
@@ -675,13 +868,22 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
         // Analyze call stack
         if (m_config.analyzeCallStack) {
             validation.callStack = GetCallStackInternal(tid, ThreadHijackConstants::MAX_STACK_FRAMES);
-            validation.unbackedFrameCount = CountUnbackedFramesInternal(tid);
-
             m_statistics.callStacksAnalyzed.fetch_add(1, std::memory_order_relaxed);
+
+            // Count unbacked frames from the walked stack
+            uint32_t unbackedCount = 0;
+            for (uintptr_t frame : validation.callStack) {
+                if (!IsAddressInModule(ownerPid, frame)) {
+                    unbackedCount++;
+                }
+            }
+            validation.unbackedFrameCount = unbackedCount;
 
             if (validation.unbackedFrameCount > m_config.maxUnbackedFrames) {
                 validation.isCompromised = true;
-                validation.issues.push_back(L"Excessive unbacked stack frames");
+                validation.issues.push_back(
+                    std::format(L"Unbacked stack frames: {} (max={})",
+                               validation.unbackedFrameCount, m_config.maxUnbackedFrames));
                 validation.riskScore += 25;
 
                 m_statistics.unbackedFramesDetected.fetch_add(
@@ -689,44 +891,68 @@ ThreadValidation ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadI
             }
         }
 
+        // Set MultipleAnomalies if multiple issues found
+        if (validation.issues.size() > 1 && validation.isCompromised) {
+            validation.result = ValidationResult::MultipleAnomalies;
+        }
+
         // Invoke validation callbacks
         InvokeValidationCallbacks(validation);
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Thread validation failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Thread validation failed for TID %u - %ls",
+            tid, Utils::StringUtils::ToWide(e.what()).c_str());
         m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
     return validation;
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::ValidateThreadStartInternal(uint32_t tid) {
+bool ThreadHijackDetectorImpl::ValidateThreadStartInternal(uint32_t tid) {
     try {
-        // Get thread start address
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        HandleGuard hThread(OpenThread(
+            THREAD_QUERY_INFORMATION | THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
         if (!hThread) return true;  // Can't validate
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
-        CloseHandle(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
 
-        // For real implementation, would use NtQueryInformationThread to get start address
-        // For now, just validate current RIP
+        // Use NtQueryInformationThread to get actual start address
+        auto ntQueryThread = GetNtQueryInformationThread();
+        if (ntQueryThread) {
+            PVOID startAddress = nullptr;
+            ULONG returnLength = 0;
+            NTSTATUS status = ntQueryThread(
+                hThread.get(), ThreadQuerySetWin32StartAddress,
+                &startAddress, sizeof(startAddress), &returnLength);
+
+            if (status == 0 && startAddress != nullptr) {
+                const auto addr = reinterpret_cast<uintptr_t>(startAddress);
+                if (!IsAddressInModule(ownerPid, addr)) {
+                    SS_LOG_WARN(L"ThreadHijack",
+                        L"Thread TID %u has unbacked start address 0x%llX",
+                        tid, static_cast<unsigned long long>(addr));
+                    return false;
+                }
+                return true;
+            }
+        }
+
+        // Fallback: validate current RIP
         return IsRIPValidInternal(tid);
 
     } catch (...) {
-        return true;  // Assume valid on error
+        return true;
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::IsRIPValidInternal(uint32_t tid) {
+bool ThreadHijackDetectorImpl::IsRIPValidInternal(uint32_t tid) {
     try {
         auto context = GetThreadContextInternal(tid);
 
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
         if (!hThread) return true;
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
-        CloseHandle(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
 
         return IsAddressInModule(ownerPid, context.rip);
 
@@ -735,51 +961,105 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::IsRIPValidInternal(uint32_t
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::IsStackValidInternal(uint32_t tid) {
+bool ThreadHijackDetectorImpl::IsStackValidInternal(uint32_t tid) {
     try {
         auto context = GetThreadContextInternal(tid);
 
-        // Basic validation - RSP should be aligned
+        // RSP must be 8-byte aligned on x64
         if (context.rsp % 8 != 0) return false;
 
-        // RSP should be in reasonable range (user-mode address space)
+        // RSP must be in user-mode address space
         if (context.rsp < 0x10000 || context.rsp > 0x7FFFFFFFFFFF) return false;
 
-        return true;
+        // Validate against actual stack bounds from TEB
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        if (hThread) {
+            uintptr_t stackBase = 0, stackLimit = 0;
+            if (GetThreadStackBounds(hThread.get(), stackBase, stackLimit)) {
+                return (context.rsp >= stackLimit && context.rsp <= stackBase);
+            }
+        }
+
+        return true;  // Passed basic checks
 
     } catch (...) {
         return true;
     }
 }
 
-std::vector<uintptr_t> ThreadHijackDetector::ThreadHijackDetectorImpl::GetCallStackInternal(
+std::vector<uintptr_t> ThreadHijackDetectorImpl::GetCallStackInternal(
     uint32_t tid,
     uint32_t maxFrames)
 {
     std::vector<uintptr_t> callStack;
 
     try {
-        // Real implementation would use StackWalk64 or RtlWalkFrameChain
-        // For now, return simplified result
-        auto context = GetThreadContextInternal(tid);
-        callStack.push_back(context.rip);
+        HandleGuard hThread(OpenThread(
+            THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION | THREAD_SUSPEND_RESUME, FALSE, tid));
+        if (!hThread) return callStack;
+
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, ownerPid));
+        if (!hProcess) return callStack;
+
+        // Get thread context for StackWalk64 initialization
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (!::GetThreadContext(hThread.get(), &ctx)) {
+            // Fallback: just return RIP
+            auto context = GetThreadContextInternal(tid);
+            if (context.rip != 0) {
+                callStack.push_back(context.rip);
+            }
+            return callStack;
+        }
+
+        // Initialize STACKFRAME64 for x64
+        STACKFRAME64 frame{};
+        frame.AddrPC.Offset = ctx.Rip;
+        frame.AddrPC.Mode = AddrModeFlat;
+        frame.AddrFrame.Offset = ctx.Rbp;
+        frame.AddrFrame.Mode = AddrModeFlat;
+        frame.AddrStack.Offset = ctx.Rsp;
+        frame.AddrStack.Mode = AddrModeFlat;
+
+        const uint32_t frameLimit = std::min(maxFrames, ThreadHijackConstants::MAX_STACK_FRAMES);
+
+        for (uint32_t i = 0; i < frameLimit; ++i) {
+            if (!StackWalk64(IMAGE_FILE_MACHINE_AMD64,
+                            hProcess.get(), hThread.get(),
+                            &frame, &ctx,
+                            nullptr,       // ReadMemoryRoutine (use default)
+                            SymFunctionTableAccess64,
+                            SymGetModuleBase64,
+                            nullptr)) {
+                break;
+            }
+
+            if (frame.AddrPC.Offset == 0) break;
+
+            callStack.push_back(static_cast<uintptr_t>(frame.AddrPC.Offset));
+        }
+
+        // If StackWalk64 yielded nothing, at least return RIP
+        if (callStack.empty() && ctx.Rip != 0) {
+            callStack.push_back(ctx.Rip);
+        }
 
     } catch (...) {
-        // Return empty on error
     }
 
     return callStack;
 }
 
-uint32_t ThreadHijackDetector::ThreadHijackDetectorImpl::CountUnbackedFramesInternal(uint32_t tid) {
+uint32_t ThreadHijackDetectorImpl::CountUnbackedFramesInternal(uint32_t tid) {
     try {
         auto callStack = GetCallStackInternal(tid, ThreadHijackConstants::MAX_STACK_FRAMES);
 
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
         if (!hThread) return 0;
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
-        CloseHandle(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
 
         uint32_t unbackedCount = 0;
         for (uintptr_t frame : callStack) {
@@ -799,13 +1079,13 @@ uint32_t ThreadHijackDetector::ThreadHijackDetectorImpl::CountUnbackedFramesInte
 // IMPL: CONTEXT ANALYSIS
 // ============================================================================
 
-ThreadContext64 ThreadHijackDetector::ThreadHijackDetectorImpl::GetThreadContextInternal(uint32_t tid) {
+ThreadContext64 ThreadHijackDetectorImpl::GetThreadContextInternal(uint32_t tid) {
     ThreadContext64 result{};
 
     try {
         m_statistics.contextReads.fetch_add(1, std::memory_order_relaxed);
 
-        HANDLE hThread = OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid);
+        HandleGuard hThread(OpenThread(THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION, FALSE, tid));
         if (!hThread) {
             m_statistics.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return result;
@@ -814,8 +1094,7 @@ ThreadContext64 ThreadHijackDetector::ThreadHijackDetectorImpl::GetThreadContext
         CONTEXT ctx{};
         ctx.ContextFlags = CONTEXT_FULL | CONTEXT_DEBUG_REGISTERS;
 
-        if (GetThreadContext(hThread, &ctx)) {
-            // Copy to our structure
+        if (::GetThreadContext(hThread.get(), &ctx)) {
             result.rip = ctx.Rip;
             result.rsp = ctx.Rsp;
             result.rbp = ctx.Rbp;
@@ -849,16 +1128,15 @@ ThreadContext64 ThreadHijackDetector::ThreadHijackDetectorImpl::GetThreadContext
             result.contextFlags = ctx.ContextFlags;
         }
 
-        CloseHandle(hThread);
-
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"GetThreadContext failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"GetThreadContext failed for TID %u - %ls",
+            tid, Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return result;
 }
 
-std::vector<ContextChange> ThreadHijackDetector::ThreadHijackDetectorImpl::CompareContextsInternal(
+std::vector<ContextChange> ThreadHijackDetectorImpl::CompareContextsInternal(
     const ThreadContext64& before,
     const ThreadContext64& after,
     uint32_t pid)
@@ -922,13 +1200,14 @@ std::vector<ContextChange> ThreadHijackDetector::ThreadHijackDetectorImpl::Compa
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Context comparison failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Context comparison failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return changes;
 }
 
-ValidationResult ThreadHijackDetector::ThreadHijackDetectorImpl::AnalyzeContextInternal(
+ValidationResult ThreadHijackDetectorImpl::AnalyzeContextInternal(
     const ThreadContext64& context,
     uint32_t pid)
 {
@@ -954,7 +1233,7 @@ ValidationResult ThreadHijackDetector::ThreadHijackDetectorImpl::AnalyzeContextI
     return ValidationResult::Valid;
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::HasActiveDebugRegistersInternal(uint32_t tid) {
+bool ThreadHijackDetectorImpl::HasActiveDebugRegistersInternal(uint32_t tid) {
     try {
         auto context = GetThreadContextInternal(tid);
 
@@ -971,7 +1250,7 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::HasActiveDebugRegistersInte
 // IMPL: HIJACK DETECTION
 // ============================================================================
 
-std::optional<HijackEvent> ThreadHijackDetector::ThreadHijackDetectorImpl::DetectHijackInternal(uint32_t tid) {
+std::optional<HijackEvent> ThreadHijackDetectorImpl::DetectHijackInternal(uint32_t tid) {
     try {
         // Validate thread
         auto validation = ValidateThreadInternal(tid);
@@ -1006,10 +1285,10 @@ std::optional<HijackEvent> ThreadHijackDetector::ThreadHijackDetectorImpl::Detec
         }
 
         // Calculate confidence
-        if (validation.ripHasShellcodePattern && validation.targetIsUnbacked) {
+        if (validation.ripHasShellcodePattern && (!validation.ripIsBacked)) {
             event.confidence = DetectionConfidence::Confirmed;
             m_statistics.confirmedHijacks.fetch_add(1, std::memory_order_relaxed);
-        } else if (validation.targetIsUnbacked) {
+        } else if ((!validation.ripIsBacked)) {
             event.confidence = DetectionConfidence::High;
             m_statistics.highConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
         } else if (validation.unbackedFrameCount > 0) {
@@ -1020,14 +1299,39 @@ std::optional<HijackEvent> ThreadHijackDetector::ThreadHijackDetectorImpl::Detec
             m_statistics.lowConfidenceDetections.fetch_add(1, std::memory_order_relaxed);
         }
 
-        // Calculate risk score
+        // Calculate risk score — include RWX and cross-process tracking
+        const bool isRWX = (!validation.ripIsBacked) ?
+            IsAddressInRWXPrivate(validation.ownerPid, validation.instructionPointer) : false;
+
+        // Check if there's pending cross-process state for this thread
+        bool crossProcessDetected = false;
+        uint32_t suspendDurationMs = 0;
+        {
+            std::shared_lock lock(m_statesMutex);
+            auto stateIt = m_threadStates.find(tid);
+            if (stateIt != m_threadStates.end()) {
+                crossProcessDetected = (stateIt->second.suspenderPid != 0 &&
+                                       stateIt->second.suspenderPid != validation.ownerPid);
+                if (stateIt->second.isSuspended) {
+                    const auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                        Clock::now() - stateIt->second.suspendTime).count();
+                    suspendDurationMs = static_cast<uint32_t>(std::min<long long>(duration, UINT32_MAX));
+                }
+            }
+        }
+
+        if (crossProcessDetected) {
+            m_statistics.crossProcessChanges.fetch_add(1, std::memory_order_relaxed);
+        }
+
         event.riskScore = CalculateRiskScore(
-            validation.targetIsUnbacked,
+            (!validation.ripIsBacked),
             validation.ripHasShellcodePattern,
-            false,  // crossProcess (would need to track from event handlers)
+            crossProcessDetected,
             validation.stackPivoted,
             validation.hasHardwareBreakpoints,
-            0  // suspendDurationMs (would need to track from event handlers)
+            suspendDurationMs,
+            isRWX
         );
 
         // Add detection reasons
@@ -1055,12 +1359,13 @@ std::optional<HijackEvent> ThreadHijackDetector::ThreadHijackDetectorImpl::Detec
         return event;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Hijack detection failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Hijack detection failed for TID %u - %ls",
+            tid, Utils::StringUtils::ToWide(e.what()).c_str());
         return std::nullopt;
     }
 }
 
-ScanResult ThreadHijackDetector::ThreadHijackDetectorImpl::ScanProcessInternal(uint32_t pid) {
+ScanResult ThreadHijackDetectorImpl::ScanProcessInternal(uint32_t pid) {
     ScanResult result;
     result.scanTime = Clock::now();
     result.targetPid = pid;
@@ -1123,7 +1428,7 @@ ScanResult ThreadHijackDetector::ThreadHijackDetectorImpl::ScanProcessInternal(u
         result.scanComplete = true;
 
     } catch (const std::exception& e) {
-        result.scanError = Utils::StringUtils::Utf8ToWide(e.what());
+        result.scanError = Utils::StringUtils::ToWide(e.what());
         m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
     }
 
@@ -1141,7 +1446,7 @@ ScanResult ThreadHijackDetector::ThreadHijackDetectorImpl::ScanProcessInternal(u
 // IMPL: EVENT HANDLERS
 // ============================================================================
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadSuspendInternal(
+void ThreadHijackDetectorImpl::OnThreadSuspendInternal(
     uint32_t targetTid,
     uint32_t suspenderPid)
 {
@@ -1155,11 +1460,12 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadSuspendInternal(
         state.isSuspended = true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadSuspend failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadSuspend failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadResumeInternal(
+void ThreadHijackDetectorImpl::OnThreadResumeInternal(
     uint32_t targetTid,
     uint32_t resumerPid)
 {
@@ -1176,83 +1482,102 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnThreadResumeInternal(
                 now - it->second.suspendTime
             ).count();
 
-            if (duration > m_config.suspendDurationThresholdMs) {
-                SS_LOG_WARN(L"ThreadHijack", L"Long suspend duration %.2fms for TID %u", duration, targetTid);
+            if (duration > static_cast<long long>(m_config.suspendDurationThresholdMs)) {
+                SS_LOG_WARN(L"ThreadHijack",
+                    L"Long suspend duration %lldms for TID %u (suspended by PID %u, resumed by PID %u)",
+                    static_cast<long long>(duration), targetTid,
+                    it->second.suspenderPid, resumerPid);
+
+                // Release lock before calling DetectHijackInternal to avoid deadlock
+                lock.unlock();
 
                 // Validate thread after long suspend
                 if (m_config.enableRealTimeMonitoring) {
-                    DetectHijackInternal(targetTid);
+                    (void)DetectHijackInternal(targetTid);
                 }
             }
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadResume failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnThreadResume failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::OnContextChangeInternal(
+void ThreadHijackDetectorImpl::OnContextChangeInternal(
     uint32_t targetTid,
     uint32_t modifierPid,
     uint32_t contextFlags)
 {
     try {
-        // Get owner PID
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid);
+        // Get owner PID — RAII
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid));
         if (!hThread) return;
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
-        CloseHandle(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
 
         // Check if cross-process modification
         if (modifierPid != ownerPid) {
             m_statistics.crossProcessChanges.fetch_add(1, std::memory_order_relaxed);
 
-            SS_LOG_WARN(L"ThreadHijack", L"Cross-process context change - TID %u by PID %u", targetTid, modifierPid);
+            SS_LOG_WARN(L"ThreadHijack",
+                L"Cross-process context change - TID %u modified by PID %u (owner PID %u), flags=0x%X",
+                targetTid, modifierPid, ownerPid, contextFlags);
 
             // Validate thread
             if (m_config.detectCrossProcessModification) {
-                DetectHijackInternal(targetTid);
+                (void)DetectHijackInternal(targetTid);
             }
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"OnContextChange failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnContextChange failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::OnSetContextThreadInternal(
+void ThreadHijackDetectorImpl::OnSetContextThreadInternal(
     uint32_t callerPid,
     uint32_t targetTid,
     const ThreadContext64& newContext)
 {
     try {
-        // Get current context
+        // Get current context before the set
         auto oldContext = GetThreadContextInternal(targetTid);
 
-        // Get owner PID
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid);
+        // Get owner PID — RAII
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, targetTid));
         if (!hThread) return;
 
-        DWORD ownerPid = GetProcessIdOfThread(hThread);
-        CloseHandle(hThread);
+        DWORD ownerPid = GetProcessIdOfThread(hThread.get());
+
+        // Cross-process SetContextThread is always suspicious
+        const bool isCrossProcess = (callerPid != ownerPid);
+        if (isCrossProcess) {
+            SS_LOG_WARN(L"ThreadHijack",
+                L"NtSetContextThread cross-process: caller PID %u → TID %u (owner PID %u), "
+                L"RIP 0x%llX → 0x%llX",
+                callerPid, targetTid, ownerPid,
+                static_cast<unsigned long long>(oldContext.rip),
+                static_cast<unsigned long long>(newContext.rip));
+        }
 
         // Compare contexts
         auto changes = CompareContextsInternal(oldContext, newContext, ownerPid);
 
         for (const auto& change : changes) {
-            if (change.isSuspicious) {
+            if (change.isSuspicious || isCrossProcess) {
                 InvokeContextCallbacks(targetTid, change);
 
-                // Detect hijack if configured
-                if (m_config.blockSuspiciousChanges) {
-                    DetectHijackInternal(targetTid);
+                if (m_config.blockSuspiciousChanges || isCrossProcess) {
+                    (void)DetectHijackInternal(targetTid);
                 }
             }
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"OnSetContextThread failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"OnSetContextThread failed - %ls",
+            Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -1260,56 +1585,121 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::OnSetContextThreadInternal(
 // IMPL: RESPONSE ACTIONS
 // ============================================================================
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::BlockContextChangeInternal(
+bool ThreadHijackDetectorImpl::BlockContextChangeInternal(
     uint32_t targetTid,
     uint32_t modifierPid)
 {
     try {
+        // Blocking SetThreadContext requires kernel driver (PhantomSensor) interception.
+        // The kernel driver's thread notify callback intercepts NtSetContextThread
+        // and can deny the syscall. From user-mode, we can only:
+        // 1. Detect and alert (done)
+        // 2. Restore context after the fact (RestoreContextInternal)
+        // 3. Terminate the attacker process
+
         m_statistics.changesBlocked.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_WARN(L"ThreadHijack", L"Blocked context change - TID %u by PID %u", targetTid, modifierPid);
+        SS_LOG_WARN(L"ThreadHijack",
+            L"Context change blocked (post-detection) - TID %u by PID %u", targetTid, modifierPid);
 
-        // Real implementation would use kernel driver to block SetThreadContext
-        return true;
+        // Attempt to restore context from baseline
+        if (RestoreContextInternal(targetTid)) {
+            return true;
+        }
+
+        return false;
 
     } catch (...) {
         return false;
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
+bool ThreadHijackDetectorImpl::RestoreContextInternal(uint32_t tid) {
     try {
         // Get baseline
         auto baseline = GetBaselineInternal(tid);
         if (!baseline.has_value()) {
+            SS_LOG_WARN(L"ThreadHijack", L"No baseline to restore for TID %u", tid);
             return false;
         }
 
-        // Real implementation would call SetThreadContext with baseline
-        m_statistics.contextsRestored.fetch_add(1, std::memory_order_relaxed);
+        // Open thread with SET_CONTEXT permission
+        HandleGuard hThread(OpenThread(
+            THREAD_SET_CONTEXT | THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT, FALSE, tid));
+        if (!hThread) {
+            SS_LOG_ERROR(L"ThreadHijack", L"Cannot open thread TID %u for context restore", tid);
+            return false;
+        }
 
-        SS_LOG_INFO(L"ThreadHijack", L"Restored context for TID %u", tid);
-        return true;
+        // Suspend thread before modifying context
+        DWORD prevSuspendCount = SuspendThread(hThread.get());
+        if (prevSuspendCount == static_cast<DWORD>(-1)) {
+            SS_LOG_ERROR(L"ThreadHijack", L"Cannot suspend thread TID %u for restore", tid);
+            return false;
+        }
+
+        // Build CONTEXT from baseline
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+        ctx.Rip = baseline->rip;
+        ctx.Rsp = baseline->rsp;
+        ctx.Rbp = baseline->rbp;
+        ctx.EFlags = static_cast<DWORD>(baseline->rflags);
+        ctx.Rax = baseline->rax;
+        ctx.Rbx = baseline->rbx;
+        ctx.Rcx = baseline->rcx;
+        ctx.Rdx = baseline->rdx;
+        ctx.Rsi = baseline->rsi;
+        ctx.Rdi = baseline->rdi;
+        ctx.R8  = baseline->r8;
+        ctx.R9  = baseline->r9;
+        ctx.R10 = baseline->r10;
+        ctx.R11 = baseline->r11;
+        ctx.R12 = baseline->r12;
+        ctx.R13 = baseline->r13;
+        ctx.R14 = baseline->r14;
+        ctx.R15 = baseline->r15;
+
+        BOOL setResult = SetThreadContext(hThread.get(), &ctx);
+
+        // Always resume
+        ResumeThread(hThread.get());
+
+        if (setResult) {
+            m_statistics.contextsRestored.fetch_add(1, std::memory_order_relaxed);
+            SS_LOG_INFO(L"ThreadHijack", L"Restored context for TID %u (RIP=0x%llX)",
+                tid, static_cast<unsigned long long>(baseline->rip));
+            return true;
+        } else {
+            SS_LOG_ERROR(L"ThreadHijack", L"SetThreadContext failed for TID %u", tid);
+            return false;
+        }
 
     } catch (...) {
         return false;
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::TerminateAttackerInternal(const HijackEvent& event) {
+bool ThreadHijackDetectorImpl::TerminateAttackerInternal(const HijackEvent& event) {
     try {
         if (event.attackerPid == 0) return false;
 
-        HANDLE hProcess = OpenProcess(PROCESS_TERMINATE, FALSE, event.attackerPid);
+        // Safety check: never terminate critical system processes
+        if (Utils::ProcessUtils::IsProcessCritical(event.attackerPid)) {
+            SS_LOG_WARN(L"ThreadHijack",
+                L"Refusing to terminate critical process PID %u", event.attackerPid);
+            return false;
+        }
+
+        HandleGuard hProcess(OpenProcess(PROCESS_TERMINATE, FALSE, event.attackerPid));
         if (!hProcess) return false;
 
-        BOOL result = TerminateProcess(hProcess, 1);
-        CloseHandle(hProcess);
+        BOOL result = TerminateProcess(hProcess.get(), 1);
 
         if (result) {
             m_statistics.attackersTerminated.fetch_add(1, std::memory_order_relaxed);
-
-            SS_LOG_WARN(L"ThreadHijack", L"Terminated attacker PID %u (%ls)", event.attackerPid, event.attackerProcessName);
+            SS_LOG_WARN(L"ThreadHijack", L"Terminated attacker PID %u (%ls)",
+                event.attackerPid, event.attackerProcessName.c_str());
         }
 
         return result != FALSE;
@@ -1323,8 +1713,11 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::TerminateAttackerInternal(c
 // IMPL: BASELINE MANAGEMENT
 // ============================================================================
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::EstablishBaselineInternal(uint32_t tid) {
+void ThreadHijackDetectorImpl::EstablishBaselineInternal(uint32_t tid) {
     try {
+        // Get current context as baseline
+        auto context = GetThreadContextInternal(tid);
+
         std::unique_lock lock(m_threadsMutex);
 
         auto& monitored = m_threads[tid];
@@ -1332,34 +1725,32 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::EstablishBaselineInternal(u
         monitored.createTime = Clock::now();
         monitored.lastChecked = Clock::now();
 
-        // Get current context as baseline
-        auto context = GetThreadContextInternal(tid);
-        monitored.baselineRIP = context.rip;
-        monitored.baselineRSP = context.rsp;
+        // Store full context baseline
+        monitored.baselineContext = context;
         monitored.baselineEstablished = true;
 
-        // Get owner process
-        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
+        // Get owner process — RAII
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
         if (hThread) {
-            DWORD ownerPid = GetProcessIdOfThread(hThread);
+            DWORD ownerPid = GetProcessIdOfThread(hThread.get());
             monitored.ownerPid = ownerPid;
             monitored.baselineModule = GetModuleForAddress(ownerPid, context.rip);
-            CloseHandle(hThread);
         }
 
         m_statistics.threadsMonitored.fetch_add(1, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"ThreadHijack", L"Baseline establishment failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"ThreadHijack", L"Baseline establishment failed for TID %u - %ls",
+            tid, Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::ClearBaselineInternal(uint32_t tid) {
+void ThreadHijackDetectorImpl::ClearBaselineInternal(uint32_t tid) {
     std::unique_lock lock(m_threadsMutex);
     m_threads.erase(tid);
 }
 
-std::optional<ThreadContext64> ThreadHijackDetector::ThreadHijackDetectorImpl::GetBaselineInternal(uint32_t tid) const {
+std::optional<ThreadContext64> ThreadHijackDetectorImpl::GetBaselineInternal(uint32_t tid) const {
     std::shared_lock lock(m_threadsMutex);
 
     auto it = m_threads.find(tid);
@@ -1367,49 +1758,61 @@ std::optional<ThreadContext64> ThreadHijackDetector::ThreadHijackDetectorImpl::G
         return std::nullopt;
     }
 
-    // Reconstruct baseline context
-    ThreadContext64 baseline{};
-    baseline.rip = it->second.baselineRIP;
-    baseline.rsp = it->second.baselineRSP;
-
-    return baseline;
+    return it->second.baselineContext;
 }
 
 // ============================================================================
 // IMPL: WORKER THREADS
 // ============================================================================
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::MonitoringThreadWorker() {
+void ThreadHijackDetectorImpl::MonitoringThreadWorker() {
     SS_LOG_INFO(L"ThreadHijack", L"Monitoring thread started");
 
     while (!m_stopMonitoring.load(std::memory_order_acquire)) {
         try {
-            // Periodic validation of monitored threads
+            // Collect TIDs to validate (snapshot under lock)
             std::vector<uint32_t> tidsToValidate;
 
             {
                 std::shared_lock lock(m_threadsMutex);
+                tidsToValidate.reserve(m_threads.size());
                 for (const auto& [tid, thread] : m_threads) {
                     tidsToValidate.push_back(tid);
                 }
             }
 
             for (uint32_t tid : tidsToValidate) {
-                DetectHijackInternal(tid);
+                if (m_stopMonitoring.load(std::memory_order_acquire)) break;
+
+                // Verify thread still exists before validating
+                HandleGuard hCheck(OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid));
+                if (!hCheck) {
+                    // Thread exited — remove from monitoring
+                    std::unique_lock lock(m_threadsMutex);
+                    m_threads.erase(tid);
+                    continue;
+                }
+
+                (void)DetectHijackInternal(tid);
             }
 
-            // Sleep between scans
-            std::this_thread::sleep_for(std::chrono::seconds(5));
+            // Interruptible sleep via condition variable (1 second scan interval)
+            {
+                std::unique_lock lock(m_monitorCvMutex);
+                m_monitorCv.wait_for(lock, std::chrono::seconds(1),
+                    [this]() { return m_stopMonitoring.load(std::memory_order_acquire); });
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ThreadHijack", L"Monitoring thread error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Monitoring thread error - %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
     SS_LOG_INFO(L"ThreadHijack", L"Monitoring thread stopped");
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::CleanupThreadWorker() {
+void ThreadHijackDetectorImpl::CleanupThreadWorker() {
     SS_LOG_INFO(L"ThreadHijack", L"Cleanup thread started");
 
     while (!m_stopCleanup.load(std::memory_order_acquire)) {
@@ -1441,10 +1844,16 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::CleanupThreadWorker() {
                 }
             }
 
-            std::this_thread::sleep_for(std::chrono::minutes(5));
+            // Interruptible sleep via condition variable
+            {
+                std::unique_lock lock(m_cleanupCvMutex);
+                m_cleanupCv.wait_for(lock, std::chrono::minutes(5),
+                    [this]() { return m_stopCleanup.load(std::memory_order_acquire); });
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ThreadHijack", L"Cleanup thread error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Cleanup thread error - %ls",
+                Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
@@ -1455,18 +1864,19 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::CleanupThreadWorker() {
 // IMPL: HELPERS
 // ============================================================================
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeHijackCallbacks(const HijackEvent& event) {
+void ThreadHijackDetectorImpl::InvokeHijackCallbacks(const HijackEvent& event) {
     std::lock_guard lock(m_callbacksMutex);
     for (const auto& [id, callback] : m_hijackCallbacks) {
         try {
             callback(event);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ThreadHijack", L"Hijack callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Hijack callback %llu error - %ls",
+                id, Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeContextCallbacks(
+void ThreadHijackDetectorImpl::InvokeContextCallbacks(
     uint32_t tid,
     const ContextChange& change)
 {
@@ -1475,23 +1885,25 @@ void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeContextCallbacks(
         try {
             callback(tid, change);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ThreadHijack", L"Context callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Context callback %llu error - %ls",
+                id, Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 }
 
-void ThreadHijackDetector::ThreadHijackDetectorImpl::InvokeValidationCallbacks(const ThreadValidation& validation) {
+void ThreadHijackDetectorImpl::InvokeValidationCallbacks(const ThreadValidation& validation) {
     std::lock_guard lock(m_callbacksMutex);
     for (const auto& [id, callback] : m_validationCallbacks) {
         try {
             callback(validation);
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"ThreadHijack", L"Validation callback error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"ThreadHijack", L"Validation callback %llu error - %ls",
+                id, Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 }
 
-bool ThreadHijackDetector::ThreadHijackDetectorImpl::ShouldExclude(uint32_t pid) const {
+bool ThreadHijackDetectorImpl::ShouldExclude(uint32_t pid) const {
     // Check excluded PIDs
     if (std::find(m_config.excludedPids.begin(), m_config.excludedPids.end(), pid) !=
         m_config.excludedPids.end()) {
@@ -1499,10 +1911,10 @@ bool ThreadHijackDetector::ThreadHijackDetectorImpl::ShouldExclude(uint32_t pid)
     }
 
     // Check excluded process names
-    auto procInfo = Utils::ProcessUtils::GetProcessInfo(pid);
-    if (procInfo.has_value()) {
+    auto procName = Utils::ProcessUtils::GetProcessName(pid);
+    if (procName.has_value()) {
         for (const auto& excluded : m_config.excludedProcesses) {
-            if (procInfo->processName == excluded) {
+            if (*procName == excluded) {
                 return true;
             }
         }
@@ -1637,8 +2049,8 @@ std::vector<ContextChange> ThreadHijackDetector::CompareContexts(
 {
     if (!m_impl) return {};
 
-    // Get TID from context (would need to be passed in real implementation)
-    // For now, use placeholder PID
+    // Without a PID, module lookup will fail — perform context-only comparison
+    // Changes are still flagged as suspicious based on delta magnitude
     return m_impl->CompareContextsInternal(before, after, 0);
 }
 
@@ -1699,7 +2111,7 @@ ScanResult ThreadHijackDetector::ScanAllProcesses() {
         combinedResult.scanComplete = true;
 
     } catch (const std::exception& e) {
-        combinedResult.scanError = Utils::StringUtils::Utf8ToWide(e.what());
+        combinedResult.scanError = Utils::StringUtils::ToWide(e.what());
     }
 
     const auto endTime = Clock::now();
@@ -1873,8 +2285,37 @@ void ThreadHijackDetector::UnregisterCallback(uint64_t callbackId) {
 // STATISTICS
 // ============================================================================
 
-ThreadHijackStatistics ThreadHijackDetector::GetStatistics() const {
-    return m_impl ? m_impl->m_statistics : ThreadHijackStatistics{};
+void ThreadHijackDetector::GetStatistics(ThreadHijackStatistics& stats) const {
+    if (!m_impl) {
+        stats.Reset();
+        return;
+    }
+
+    // Snapshot all atomic counters into the local (single return path for NRVO)
+    const auto& src = m_impl->m_statistics;
+    stats.threadsMonitored.store(src.threadsMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.threadValidations.store(src.threadValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.contextReads.store(src.contextReads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.hijacksDetected.store(src.hijacksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.ripModifications.store(src.ripModifications.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.stackPivots.store(src.stackPivots.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.crossProcessChanges.store(src.crossProcessChanges.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.unbackedRIPDetected.store(src.unbackedRIPDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.shellcodeRIPDetected.store(src.shellcodeRIPDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.lowConfidenceDetections.store(src.lowConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.mediumConfidenceDetections.store(src.mediumConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.highConfidenceDetections.store(src.highConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.confirmedHijacks.store(src.confirmedHijacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.changesBlocked.store(src.changesBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.contextsRestored.store(src.contextsRestored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.attackersTerminated.store(src.attackersTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.callStacksAnalyzed.store(src.callStacksAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.unbackedFramesDetected.store(src.unbackedFramesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.totalScanTimeMs.store(src.totalScanTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.scansPerformed.store(src.scansPerformed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.scanErrors.store(src.scanErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.accessDeniedErrors.store(src.accessDeniedErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stats.timeoutErrors.store(src.timeoutErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
 }
 
 void ThreadHijackDetector::ResetStatistics() {

@@ -105,8 +105,6 @@
 #include "ProcessMonitor.hpp"
 #include "MemoryScanner.hpp"
 #include "../../Utils/ProcessUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
-#include "../../ThreatIntel/ThreatIntelManager.hpp"
 #include "../../Whitelist/WhiteListStore.hpp" // Trusted processes
 
 // Standard library
@@ -148,13 +146,13 @@ namespace ThreadHijackConstants {
     constexpr uint32_t VERSION_MINOR = 0;
     constexpr uint32_t VERSION_PATCH = 0;
 
-    // Thread context flags
-    constexpr uint32_t CONTEXT_CONTROL = 0x00010001;
-    constexpr uint32_t CONTEXT_INTEGER = 0x00010002;
-    constexpr uint32_t CONTEXT_SEGMENTS = 0x00010004;
-    constexpr uint32_t CONTEXT_FLOATING_POINT = 0x00010008;
-    constexpr uint32_t CONTEXT_DEBUG_REGISTERS = 0x00010010;
-    constexpr uint32_t CONTEXT_FULL = 0x0001001F;
+    // Thread context flags (prefixed to avoid clash with Windows CONTEXT_* macros)
+    constexpr uint32_t SS_CTX_CONTROL = 0x00010001;
+    constexpr uint32_t SS_CTX_INTEGER = 0x00010002;
+    constexpr uint32_t SS_CTX_SEGMENTS = 0x00010004;
+    constexpr uint32_t SS_CTX_FLOATING_POINT = 0x00010008;
+    constexpr uint32_t SS_CTX_DEBUG_REGISTERS = 0x00010010;
+    constexpr uint32_t SS_CTX_FULL = 0x0001001F;
 
     // x64 segment selectors (typical Windows values)
     constexpr uint16_t USER_CS_64 = 0x33;     ///< User-mode 64-bit code segment
@@ -479,10 +477,9 @@ struct MonitoredThread {
     ThreadState previousState = ThreadState::Unknown;
     uint32_t suspendCount = 0;
 
-    // Context baseline
+    // Context baseline (full context for proper restoration/comparison)
     bool baselineEstablished = false;
-    uintptr_t baselineRIP = 0;
-    uintptr_t baselineRSP = 0;
+    ThreadContext64 baselineContext;
     std::wstring baselineModule;
 
     // Modification history
@@ -697,6 +694,14 @@ using ValidationCallback = std::function<void(
  * @endcode
  */
 class ThreadHijackDetector {
+public:
+    // Wiring compatibility — allows ProcessInjectionDetector to reference
+    // ThreadHijackDetector::HijackEvent, ThreadHijackDetector::ScanResult, etc.
+    using HijackEvent = ::ShadowStrike::Core::Process::HijackEvent;
+    using ScanResult = ::ShadowStrike::Core::Process::ScanResult;
+    using ThreadValidation = ::ShadowStrike::Core::Process::ThreadValidation;
+    using ThreadContext64 = ::ShadowStrike::Core::Process::ThreadContext64;
+
 public:
     // ========================================================================
     // SINGLETON ACCESS
@@ -1044,10 +1049,10 @@ public:
     // ========================================================================
 
     /**
-     * @brief Get detector statistics.
-     * @return Current statistics.
-     */
-    [[nodiscard]] ThreadHijackStatistics GetStatistics() const;
+      * @brief Get detector statistics (snapshot into output parameter).
+      * @param[out] out Statistics snapshot.
+      */
+    void GetStatistics(ThreadHijackStatistics& out) const;
 
     /**
      * @brief Reset statistics.
