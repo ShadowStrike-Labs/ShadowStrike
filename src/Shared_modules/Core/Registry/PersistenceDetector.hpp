@@ -161,7 +161,6 @@ namespace Registry {
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
-class PersistenceDetectorImpl;  // PIMPL implementation
 
 // ============================================================================
 // NAMESPACE CONSTANTS
@@ -405,6 +404,7 @@ struct alignas(64) TargetBinary {
     bool inTempPath{ false };
     bool isPacked{ false };
     double entropy{ 0.0 };
+    std::wstring description;              // Contextual description (e.g. LOLBin resolution)
 };
 
 /**
@@ -953,7 +953,8 @@ private:
     PersistenceDetector(const PersistenceDetector&) = delete;
     PersistenceDetector& operator=(const PersistenceDetector&) = delete;
 
-    std::unique_ptr<PersistenceDetectorImpl> m_impl;
+    class Impl;
+    std::unique_ptr<Impl> m_impl;
 };
 
 }  // namespace Registry
