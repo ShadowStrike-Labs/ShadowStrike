@@ -42,6 +42,7 @@
 #include "../../Utils/HashUtils.hpp"
 #include "../../Whitelist/WhitelistStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
+#include "../../Communication/IPCManager.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -117,49 +118,66 @@ namespace {
 }
 
 /**
+ * @brief RAII wrapper for Windows HANDLE.
+ */
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    operator HANDLE() const noexcept { return h; }
+    explicit operator bool() const noexcept { return h && h != INVALID_HANDLE_VALUE; }
+};
+
+/**
  * @brief Get process integrity level.
  */
 [[nodiscard]] uint32_t GetProcessIntegrityLevel(HANDLE hProcess) noexcept {
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    HANDLE hTokenRaw = nullptr;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hTokenRaw)) {
         return 0;
     }
+    HandleGuard hToken(hTokenRaw);
 
     DWORD dwLength = 0;
     GetTokenInformation(hToken, TokenIntegrityLevel, nullptr, 0, &dwLength);
+    if (dwLength == 0 || dwLength > 4096) return 0;
 
-    std::vector<uint8_t> buffer(dwLength);
-    auto pIntegrity = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
+    try {
+        std::vector<uint8_t> buffer(dwLength);
+        auto pIntegrity = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(buffer.data());
 
-    uint32_t integrityLevel = 0;
-    if (GetTokenInformation(hToken, TokenIntegrityLevel, pIntegrity, dwLength, &dwLength)) {
-        DWORD sidSubAuthCount = *GetSidSubAuthorityCount(pIntegrity->Label.Sid);
-        integrityLevel = *GetSidSubAuthority(pIntegrity->Label.Sid, sidSubAuthCount - 1);
+        uint32_t integrityLevel = 0;
+        if (GetTokenInformation(hToken, TokenIntegrityLevel, pIntegrity, dwLength, &dwLength)) {
+            DWORD sidSubAuthCount = *GetSidSubAuthorityCount(pIntegrity->Label.Sid);
+            if (sidSubAuthCount > 0) {
+                integrityLevel = *GetSidSubAuthority(pIntegrity->Label.Sid, sidSubAuthCount - 1);
+            }
+        }
+        return integrityLevel;
+    } catch (...) {
+        return 0;
     }
-
-    CloseHandle(hToken);
-    return integrityLevel;
 }
 
 /**
  * @brief Check if process is elevated.
  */
 [[nodiscard]] bool IsProcessElevated(HANDLE hProcess) noexcept {
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    HANDLE hTokenRaw = nullptr;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hTokenRaw)) {
         return false;
     }
+    HandleGuard hToken(hTokenRaw);
 
-    TOKEN_ELEVATION elevation;
+    TOKEN_ELEVATION elevation{};
     DWORD dwSize = 0;
-    bool isElevated = false;
 
     if (GetTokenInformation(hToken, TokenElevation, &elevation, sizeof(elevation), &dwSize)) {
-        isElevated = (elevation.TokenIsElevated != 0);
+        return elevation.TokenIsElevated != 0;
     }
-
-    CloseHandle(hToken);
-    return isElevated;
+    return false;
 }
 
 /**
@@ -168,13 +186,15 @@ namespace {
 [[nodiscard]] std::pair<std::wstring, std::wstring> GetProcessUser(HANDLE hProcess) {
     std::wstring userName, domainName;
 
-    HANDLE hToken = nullptr;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    HANDLE hTokenRaw = nullptr;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hTokenRaw)) {
         return {userName, domainName};
     }
+    HandleGuard hToken(hTokenRaw);
 
     DWORD dwLength = 0;
     GetTokenInformation(hToken, TokenUser, nullptr, 0, &dwLength);
+    if (dwLength == 0 || dwLength > 4096) return {userName, domainName};
 
     std::vector<uint8_t> buffer(dwLength);
     auto pTokenUser = reinterpret_cast<TOKEN_USER*>(buffer.data());
@@ -191,7 +211,6 @@ namespace {
         }
     }
 
-    CloseHandle(hToken);
     return {userName, domainName};
 }
 
@@ -202,8 +221,8 @@ namespace {
     const std::wstring& processName,
     const std::wstring& processPath
 ) noexcept {
-    std::wstring lowerName = StringUtils::ToLowerCase(processName);
-    std::wstring lowerPath = StringUtils::ToLowerCase(processPath);
+    std::wstring lowerName = StringUtils::ToLowerCopy(processName);
+    std::wstring lowerPath = StringUtils::ToLowerCopy(processPath);
 
     // System critical
     if (lowerName == L"system" || lowerName == L"smss.exe" ||
@@ -360,6 +379,8 @@ void MonitorStatistics::Reset() noexcept {
 
     callbacksInvoked.store(0, std::memory_order_relaxed);
     callbackErrors.store(0, std::memory_order_relaxed);
+
+    startTime = std::chrono::system_clock::now();
 }
 
 [[nodiscard]] double MonitorStatistics::GetCacheHitRatio() const noexcept {
@@ -379,8 +400,12 @@ void MonitorStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] double MonitorStatistics::GetEventsPerSecond() const noexcept {
-    // This would need timing tracking - simplified for now
-    return 0.0;
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        std::chrono::system_clock::now() - startTime).count();
+    if (elapsed <= 0) return 0.0;
+
+    uint64_t processed = eventsProcessed.load(std::memory_order_relaxed);
+    return static_cast<double>(processed) / static_cast<double>(elapsed);
 }
 
 // ============================================================================
@@ -389,22 +414,27 @@ void MonitorStatistics::Reset() noexcept {
 
 [[nodiscard]] Utils::ProcessUtils::ProcessInfo ExtendedProcessInfo::ToProcessInfo() const {
     Utils::ProcessUtils::ProcessInfo info;
-    info.pid = uniqueId.pid;
-    info.processName = processName;
-    info.processPath = processPath;
-    info.commandLine = commandLine;
-    info.parentPid = parentPid;
-    info.sessionId = sessionId;
-    info.isWow64 = isWow64;
+    info.basic.pid = uniqueId.pid;
+    info.basic.name = processName;
+    info.basic.executablePath = processPath;
+    info.basic.commandLine = commandLine;
+    info.basic.parentPid = parentPid;
+    info.basic.sessionId = sessionId;
+    info.basic.isWow64 = isWow64;
+    info.basic.isSystemProcess = isSystemProcess;
+    info.basic.isProtected = isProtectedProcess;
     return info;
 }
 
 [[nodiscard]] Utils::ProcessUtils::ProcessBasicInfo ExtendedProcessInfo::ToBasicInfo() const {
     Utils::ProcessUtils::ProcessBasicInfo info;
     info.pid = uniqueId.pid;
-    info.processName = processName;
-    info.processPath = processPath;
+    info.name = processName;
+    info.executablePath = processPath;
     info.parentPid = parentPid;
+    info.sessionId = sessionId;
+    info.isWow64 = isWow64;
+    info.isSystemProcess = isSystemProcess;
     return info;
 }
 
@@ -445,8 +475,8 @@ public:
     // Configuration
     MonitorConfig m_config{};
 
-    // Statistics
-    MonitorStatistics m_stats{};
+    // Statistics (mutable — atomics are updated from const lookup paths)
+    mutable MonitorStatistics m_stats{};
 
     // Process cache (PID + start time -> full info)
     std::unordered_map<ProcessUniqueId, ExtendedProcessInfo, ProcessUniqueIdHash> m_processCache;
@@ -470,6 +500,13 @@ public:
     // Worker threads
     std::vector<std::jthread> m_workerThreads;
 
+    // Kernel wiring state
+    bool m_kernelHandlerRegistered = false;
+    system_clock::time_point m_initTime{};
+
+    // Optional WhitelistStore reference (set by caller, not owned)
+    Whitelist::WhitelistStore* m_whitelistStore = nullptr;
+
     // ========================================================================
     // CONSTRUCTOR / DESTRUCTOR
     // ========================================================================
@@ -492,11 +529,9 @@ public:
         try {
             SS_LOG_INFO(L"ProcessMonitor", L"Impl: Initializing");
 
-            // Store configuration
             m_config = config;
-
-            // Reset statistics
             m_stats.Reset();
+            m_initTime = system_clock::now();
 
             // Perform initial snapshot
             if (!TakeInitialSnapshot()) {
@@ -508,7 +543,15 @@ public:
             StartWorkerThreads();
 
             m_initialized.store(true, std::memory_order_release);
-            SS_LOG_INFO(L"ProcessMonitor", L"Impl: Initialization complete - %zu processes tracked", m_processCache.size());
+
+            // Wire kernel process callback via IPCManager.
+            // Must be done after m_initialized=true so our handler can process events.
+            if (m_config.useKernelCallback) {
+                RegisterKernelProcessHandler();
+            }
+
+            SS_LOG_INFO(L"ProcessMonitor", L"Impl: Initialization complete - %zu processes tracked",
+                m_processCache.size());
 
             return true;
 
@@ -571,43 +614,52 @@ public:
         try {
             SS_LOG_INFO(L"ProcessMonitor", L"Taking initial system snapshot");
 
-            // KERNEL DRIVER INTEGRATION WILL COME HERE
-            // For enterprise-grade visibility, we would use NtQuerySystemInformation
-            // or walk the EPROCESS list in the kernel to detect hidden processes (DKOM)
-            // that CreateToolhelp32Snapshot cannot see.
-
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
                 SS_LOG_ERROR(L"ProcessMonitor", L"CreateToolhelp32Snapshot failed: %lu", GetLastError());
                 return false;
             }
+            // RAII guard for snapshot handle
+            auto snapshotGuard = std::unique_ptr<void, decltype(&CloseHandle)>(hSnapshot, CloseHandle);
 
             PROCESSENTRY32W pe32{};
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-            uint32_t processCount = 0;
+            // Collect all entries, then batch-insert under a single lock
+            std::vector<ExtendedProcessInfo> entries;
+            entries.reserve(512);
+
             if (Process32FirstW(hSnapshot, &pe32)) {
                 do {
-                    // Create process info
                     ExtendedProcessInfo info = CreateProcessInfoFromSnapshot(pe32);
-
                     if (info.IsValid()) {
-                        std::unique_lock lock(m_cacheMutex);
-                        m_processCache[info.uniqueId] = info;
-                        m_pidToUniqueId[info.uniqueId.pid] = info.uniqueId;
-                        processCount++;
+                        entries.push_back(std::move(info));
                     }
-
                 } while (Process32NextW(hSnapshot, &pe32));
             }
 
-            CloseHandle(hSnapshot);
+            // Batch insert under single lock
+            {
+                std::unique_lock lock(m_cacheMutex);
+                for (auto& info : entries) {
+                    m_processCache[info.uniqueId] = std::move(info);
+                    m_pidToUniqueId[m_processCache[info.uniqueId].uniqueId.pid] =
+                        m_processCache.find(info.uniqueId) != m_processCache.end()
+                            ? info.uniqueId : info.uniqueId;
+                }
+                // Re-build pidToUniqueId cleanly from the cache
+                m_pidToUniqueId.clear();
+                for (const auto& [uid, pinfo] : m_processCache) {
+                    m_pidToUniqueId[uid.pid] = uid;
+                }
+            }
 
+            const uint32_t processCount = static_cast<uint32_t>(entries.size());
             m_stats.totalProcessesTracked.store(processCount, std::memory_order_relaxed);
             m_stats.currentActiveProcesses.store(processCount, std::memory_order_relaxed);
             m_stats.processesDiscoveredBySnapshot.store(processCount, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"ProcessMonitor", L"Initial snapshot complete - %zu processes", processCount);
+            SS_LOG_INFO(L"ProcessMonitor", L"Initial snapshot complete - %u processes", processCount);
             return true;
 
         } catch (const std::exception& e) {
@@ -635,6 +687,8 @@ public:
         );
 
         if (hProcess) {
+            auto handleGuard = std::unique_ptr<void, decltype(&CloseHandle)>(hProcess, CloseHandle);
+
             // Get start time
             info.uniqueId.startTime = GetProcessStartTime(hProcess);
             info.createTime = FileTimeToTimePoint(info.uniqueId.startTime);
@@ -670,8 +724,6 @@ public:
             if (IsWow64Process(hProcess, &isWow64)) {
                 info.isWow64 = (isWow64 != FALSE);
             }
-
-            CloseHandle(hProcess);
         } else {
             // Process inaccessible - likely system process or protected
             if (GetLastError() == ERROR_ACCESS_DENIED) {
@@ -679,8 +731,9 @@ public:
                 m_stats.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             }
 
-            // Use approximate start time
-            info.uniqueId.startTime = FileTimeToUint64(FILETIME{});
+            // Use a synthetic unique start time so IsValid() returns true.
+            // We use the PID shifted to guarantee uniqueness among inaccessible processes.
+            info.uniqueId.startTime = static_cast<uint64_t>(pe32.th32ProcessID) + 1;
         }
 
         // Categorize process
@@ -691,9 +744,13 @@ public:
         info.isLOLBin = (info.category == ProcessCategory::LOLBin);
 
         // Check whitelist if configured
-        if (m_config.enableWhitelistIntegration && !info.processPath.empty()) {
-            // Would integrate with WhitelistStore here
-            // info.isWhitelisted = WhitelistStore::Instance().IsWhitelisted(info.processPath);
+        if (m_config.enableWhitelistIntegration && !info.processPath.empty() && m_whitelistStore) {
+            try {
+                auto wlResult = m_whitelistStore->IsWhitelisted(info.processPath);
+                info.isWhitelisted = wlResult.found;
+            } catch (...) {
+                // WhitelistStore may not be initialized during early snapshot
+            }
         }
 
         info.metadataComplete = true;
@@ -778,6 +835,7 @@ public:
             m_stats.lookupErrors.fetch_add(1, std::memory_order_relaxed);
             return std::nullopt;
         }
+        auto handleGuard = std::unique_ptr<void, decltype(&CloseHandle)>(hProcess, CloseHandle);
 
         ExtendedProcessInfo info{};
         info.uniqueId.pid = pid;
@@ -802,9 +860,45 @@ public:
         info.lastSeenTime = system_clock::now();
         info.lastUpdateTime = system_clock::now();
         info.metadataComplete = false; // Minimal fetch
+        info.category = CategorizeProcess(info.processName, info.processPath);
 
-        CloseHandle(hProcess);
         return info;
+    }
+
+    /**
+     * @brief Evict the stalest terminated entry from cache. Caller must hold unique_lock on m_cacheMutex.
+     */
+    void EvictStalestEntryLocked() {
+        auto now = system_clock::now();
+        auto oldestTime = now;
+        ProcessUniqueId oldestId{};
+        bool found = false;
+
+        // Prefer evicting terminated processes first
+        for (const auto& [uid, pinfo] : m_processCache) {
+            if (pinfo.state == ProcessState::Terminated && pinfo.exitTime < oldestTime) {
+                oldestTime = pinfo.exitTime;
+                oldestId = uid;
+                found = true;
+            }
+        }
+
+        // If no terminated entries, evict least-recently-seen running process
+        if (!found) {
+            for (const auto& [uid, pinfo] : m_processCache) {
+                if (pinfo.lastSeenTime < oldestTime) {
+                    oldestTime = pinfo.lastSeenTime;
+                    oldestId = uid;
+                    found = true;
+                }
+            }
+        }
+
+        if (found) {
+            m_processCache.erase(oldestId);
+            m_pidToUniqueId.erase(oldestId.pid);
+            m_stats.cacheEvictions.fetch_add(1, std::memory_order_relaxed);
+        }
     }
 
     void UpdateMinMax(
@@ -831,10 +925,12 @@ public:
         AncestryChain chain{};
         m_stats.ancestryLookups.fetch_add(1, std::memory_order_relaxed);
 
+        // Take a single lock for the entire ancestry walk to avoid
+        // re-entrant lock attempts and provide a consistent snapshot.
         std::shared_lock lock(m_cacheMutex);
 
-        // Start with target process
-        auto processInfo = GetProcessInfoImpl(pid);
+        // Start with target process (lockless lookup since we hold the lock)
+        auto processInfo = LookupInCacheLocked(pid);
         if (!processInfo) {
             return chain;
         }
@@ -851,17 +947,16 @@ public:
         while (currentPid != 0 && depth < maxDepth) {
             // Cycle detection
             if (visitedPids.count(currentPid)) {
-                SS_LOG_WARN(L"ProcessMonitor", L"Cycle detected in ancestry for PID %u", pid);
+                SS_LOG_WARN(L"ProcessMonitor", L"Cycle detected in ancestry for PID %u at depth %u", pid, depth);
                 chain.hasOrphan = true;
                 chain.orphanAtDepth = depth;
                 break;
             }
             visitedPids.insert(currentPid);
 
-            // Get parent info
-            auto parentInfo = GetProcessInfoImpl(currentPid);
+            // Lockless lookup — we hold m_cacheMutex
+            auto parentInfo = LookupInCacheLocked(currentPid);
             if (!parentInfo) {
-                // Parent not found - orphan
                 m_stats.orphanProcessesDetected.fetch_add(1, std::memory_order_relaxed);
                 chain.hasOrphan = true;
                 chain.orphanAtDepth = depth;
@@ -901,13 +996,13 @@ public:
     [[nodiscard]] bool DetectPPIDSpoofingImpl(uint32_t pid) const {
         if (!m_config.detectPPIDSpoofing) return false;
 
+        // Use full locking lookups here since this is called outside lock
         auto processInfo = GetProcessInfoImpl(pid);
         if (!processInfo) return false;
 
-        // Get claimed parent
         auto parentInfo = GetProcessInfoImpl(processInfo->parentPid);
         if (!parentInfo) {
-            // Parent doesn't exist - possible spoofing or orphan
+            // Parent doesn't exist — possible spoofing or orphan
             return true;
         }
 
@@ -923,7 +1018,46 @@ public:
             return true;
         }
 
+        // Additional spoofing heuristic: validate parent can legitimately create children.
+        // System-critical processes (csrss, smss) don't normally spawn user apps.
+        // But svchost.exe children are common and legitimate.
+        if (parentInfo->category == ProcessCategory::SystemCritical &&
+            processInfo->category == ProcessCategory::UserApplication) {
+            // csrss.exe spawning user apps is normal (console hosting), but
+            // smss.exe directly spawning user apps is suspicious.
+            std::wstring parentLower = StringUtils::ToLowerCopy(parentInfo->processName);
+            if (parentLower == L"smss.exe") {
+                SS_LOG_WARN(L"ProcessMonitor",
+                    L"Suspicious ancestry: PID %u (%ls) claims parent smss.exe (PID %u)",
+                    pid, processInfo->processName.c_str(), processInfo->parentPid);
+                m_stats.ppidSpoofingDetected.fetch_add(1, std::memory_order_relaxed);
+                InvokeSuspiciousCallbacks(processInfo->uniqueId,
+                    L"PPID spoofing: User process claims smss.exe as parent");
+                return true;
+            }
+        }
+
         return false;
+    }
+
+    // ========================================================================
+    // INTERNAL CACHE LOOKUP (caller holds m_cacheMutex)
+    // ========================================================================
+
+    /**
+     * @brief Look up a process by PID while m_cacheMutex is already held.
+     * @note Caller MUST hold at least a shared_lock on m_cacheMutex.
+     */
+    [[nodiscard]] std::optional<ExtendedProcessInfo> LookupInCacheLocked(uint32_t pid) const {
+        auto pidIt = m_pidToUniqueId.find(pid);
+        if (pidIt == m_pidToUniqueId.end()) {
+            return std::nullopt;
+        }
+        auto cacheIt = m_processCache.find(pidIt->second);
+        if (cacheIt == m_processCache.end()) {
+            return std::nullopt;
+        }
+        return cacheIt->second;
     }
 
     // ========================================================================
@@ -932,11 +1066,6 @@ public:
 
     void OnProcessCreateImpl(const ProcessEvent& event) {
         try {
-            // KERNEL DRIVER INTEGRATION WILL COME HERE
-            // In a production environment, we would use PsSetCreateProcessNotifyRoutine
-            // to get synchronous callbacks from the kernel, ensuring we never miss a
-            // short-lived process and can block execution before the main thread starts.
-
             m_stats.eventsReceived.fetch_add(1, std::memory_order_relaxed);
             m_stats.processCreations.fetch_add(1, std::memory_order_relaxed);
 
@@ -958,10 +1087,29 @@ public:
             info.state = ProcessState::Starting;
             info.discoverySource = event.source;
             info.category = CategorizeProcess(info.processName, info.processPath);
+            info.isSystemProcess = (info.category == ProcessCategory::SystemCritical ||
+                                   info.category == ProcessCategory::SystemCore);
+            info.isCriticalProcess = (info.category == ProcessCategory::SystemCritical);
+            info.isLOLBin = (info.category == ProcessCategory::LOLBin);
 
-            // Add to cache
+            // WhitelistStore integration
+            if (m_config.enableWhitelistIntegration && !info.processPath.empty() && m_whitelistStore) {
+                try {
+                    auto wlResult = m_whitelistStore->IsWhitelisted(info.processPath);
+                    info.isWhitelisted = wlResult.found;
+                } catch (...) {
+                    SS_LOG_DEBUG(L"ProcessMonitor", L"WhitelistStore lookup failed for PID %u", info.uniqueId.pid);
+                }
+            }
+
+            // Cache capacity enforcement before insertion
             {
                 std::unique_lock lock(m_cacheMutex);
+
+                if (m_processCache.size() >= m_config.maxCachedProcesses) {
+                    EvictStalestEntryLocked();
+                }
+
                 m_processCache[info.uniqueId] = info;
                 m_pidToUniqueId[info.uniqueId.pid] = info.uniqueId;
 
@@ -969,20 +1117,26 @@ public:
                 ProcessUniqueId parentId = event.parentId;
                 auto parentIt = m_processCache.find(parentId);
                 if (parentIt != m_processCache.end()) {
-                    parentIt->second.childPids.push_back(info.uniqueId.pid);
+                    auto& childPids = parentIt->second.childPids;
+                    if (childPids.size() < MonitorConstants::MAX_CHILDREN_PER_PROCESS) {
+                        childPids.push_back(info.uniqueId.pid);
+                    }
                 }
             }
+            // Cache lock released — safe for callbacks
 
             m_stats.currentActiveProcesses.fetch_add(1, std::memory_order_relaxed);
             m_stats.totalProcessesTracked.fetch_add(1, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"ProcessMonitor", L"Process created - PID %u (%S)", info.uniqueId.pid, StringUtils::WideToUtf8(info.processName));
+            SS_LOG_INFO(L"ProcessMonitor", L"Process created - PID %u (%ls) parent %u src %u",
+                info.uniqueId.pid, info.processName.c_str(), info.parentPid,
+                static_cast<uint32_t>(event.source));
 
-            // Invoke callbacks
+            // Invoke callbacks outside cache lock
             InvokeProcessCallbacks(info, true);
             InvokeEventCallbacks(event);
 
-            // Check for PPID spoofing
+            // PPID spoofing detection
             if (m_config.detectPPIDSpoofing) {
                 DetectPPIDSpoofingImpl(info.uniqueId.pid);
             }
@@ -997,49 +1151,58 @@ public:
         try {
             m_stats.processTerminations.fetch_add(1, std::memory_order_relaxed);
 
-            std::unique_lock lock(m_cacheMutex);
+            ExtendedProcessInfo infoCopy;
 
-            // Find process in cache
-            auto pidIt = m_pidToUniqueId.find(pid);
-            if (pidIt == m_pidToUniqueId.end()) {
-                SS_LOG_DEBUG(L"ProcessMonitor", L"Terminate event for unknown PID %u", pid);
-                return;
+            // Phase 1: Update and remove from active cache
+            {
+                std::unique_lock lock(m_cacheMutex);
+
+                auto pidIt = m_pidToUniqueId.find(pid);
+                if (pidIt == m_pidToUniqueId.end()) {
+                    SS_LOG_DEBUG(L"ProcessMonitor", L"Terminate event for unknown PID %u", pid);
+                    return;
+                }
+
+                auto cacheIt = m_processCache.find(pidIt->second);
+                if (cacheIt == m_processCache.end()) {
+                    m_pidToUniqueId.erase(pidIt);
+                    return;
+                }
+
+                auto& info = cacheIt->second;
+                info.state = ProcessState::Terminated;
+                info.isTerminated = true;
+                info.exitCode = exitCode;
+                info.exitTime = system_clock::now();
+
+                // Copy before erasing — callbacks and history need this
+                infoCopy = info;
+
+                m_processCache.erase(cacheIt);
+                m_pidToUniqueId.erase(pidIt);
             }
+            // m_cacheMutex released — safe to acquire other locks and invoke callbacks
 
-            auto cacheIt = m_processCache.find(pidIt->second);
-            if (cacheIt == m_processCache.end()) {
-                return;
-            }
+            SS_LOG_INFO(L"ProcessMonitor", L"Process terminated - PID %u (%ls) exitCode: %u",
+                pid, infoCopy.processName.c_str(), exitCode);
 
-            auto& info = cacheIt->second;
-            info.state = ProcessState::Terminated;
-            info.isTerminated = true;
-            info.exitCode = exitCode;
-            info.exitTime = system_clock::now();
+            m_stats.currentActiveProcesses.fetch_sub(1, std::memory_order_relaxed);
 
-            SS_LOG_INFO(L"ProcessMonitor", L"Process terminated - PID %u (%S) exitCode: %ls", pid, StringUtils::WideToUtf8(info.processName), exitCode);
-
-            // Move to historical storage if configured
+            // Phase 2: Move to historical storage (separate lock)
             if (m_config.enableHistoricalTracking) {
                 std::unique_lock historyLock(m_historyMutex);
-                m_historicalCache[info.uniqueId] = info;
-                m_terminatedProcesses.push_back(info);
+                m_historicalCache[infoCopy.uniqueId] = infoCopy;
+                m_terminatedProcesses.push_back(infoCopy);
 
-                if (m_terminatedProcesses.size() > m_config.maxHistoricalEntries) {
+                while (m_terminatedProcesses.size() > m_config.maxHistoricalEntries) {
                     auto& oldest = m_terminatedProcesses.front();
                     m_historicalCache.erase(oldest.uniqueId);
                     m_terminatedProcesses.pop_front();
                 }
             }
 
-            // Invoke callbacks before removal
-            InvokeProcessCallbacks(info, false);
-
-            // Remove from active cache (but keep in historical)
-            m_processCache.erase(cacheIt);
-            m_pidToUniqueId.erase(pidIt);
-
-            m_stats.currentActiveProcesses.fetch_sub(1, std::memory_order_relaxed);
+            // Phase 3: Invoke callbacks outside ALL locks
+            InvokeProcessCallbacks(infoCopy, false);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ProcessMonitor", L"OnProcessTerminate exception: %S", e.what());
@@ -1124,8 +1287,31 @@ public:
             case ProcessEventType::Terminated:
                 OnProcessTerminateImpl(event.processId.pid, event.exitCode);
                 break;
+            case ProcessEventType::ModuleLoaded:
+            case ProcessEventType::ModuleUnloaded:
+            case ProcessEventType::ImageLoaded:
+                // Dispatch module events to registered event callbacks
+                InvokeEventCallbacks(event);
+                break;
+            case ProcessEventType::Suspended:
+            case ProcessEventType::Resumed: {
+                // Update process state in cache
+                std::unique_lock lock(m_cacheMutex);
+                auto pidIt = m_pidToUniqueId.find(event.processId.pid);
+                if (pidIt != m_pidToUniqueId.end()) {
+                    auto cacheIt = m_processCache.find(pidIt->second);
+                    if (cacheIt != m_processCache.end()) {
+                        cacheIt->second.state = (event.type == ProcessEventType::Suspended)
+                            ? ProcessState::Suspended : ProcessState::Running;
+                        cacheIt->second.lastSeenTime = system_clock::now();
+                    }
+                }
+                InvokeEventCallbacks(event);
+                break;
+            }
             default:
-                // Other event types would be handled here
+                // Forward unhandled event types to event callbacks for extensibility
+                InvokeEventCallbacks(event);
                 break;
         }
     }
@@ -1202,57 +1388,82 @@ public:
         try {
             HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
             if (hSnapshot == INVALID_HANDLE_VALUE) {
+                SS_LOG_ERROR(L"ProcessMonitor", L"Snapshot refresh CreateToolhelp32Snapshot failed: %lu", GetLastError());
                 return false;
             }
+            auto snapshotGuard = std::unique_ptr<void, decltype(&CloseHandle)>(hSnapshot, CloseHandle);
 
+            // Phase 1: Enumerate all current PIDs and collect new processes (no lock)
             std::unordered_set<uint32_t> currentPids;
+            std::vector<PROCESSENTRY32W> newEntries;
             PROCESSENTRY32W pe32{};
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
             if (Process32FirstW(hSnapshot, &pe32)) {
                 do {
                     currentPids.insert(pe32.th32ProcessID);
-
-                    // Check if new process
-                    std::shared_lock lock(m_cacheMutex);
-                    if (m_pidToUniqueId.find(pe32.th32ProcessID) == m_pidToUniqueId.end()) {
-                        lock.unlock();
-
-                        // New process discovered by snapshot
-                        ExtendedProcessInfo info = CreateProcessInfoFromSnapshot(pe32);
-                        if (info.IsValid()) {
-                            std::unique_lock writeLock(m_cacheMutex);
-                            m_processCache[info.uniqueId] = info;
-                            m_pidToUniqueId[info.uniqueId.pid] = info.uniqueId;
-
-                            m_stats.processesDiscoveredBySnapshot.fetch_add(1,
-                                std::memory_order_relaxed);
-
-                            SS_LOG_INFO(L"ProcessMonitor", L"Discovered process via snapshot - PID %u", info.uniqueId.pid);
-                        }
-                    }
-
                 } while (Process32NextW(hSnapshot, &pe32));
             }
 
-            CloseHandle(hSnapshot);
+            // Phase 2: Identify new and terminated PIDs under a single lock
+            std::vector<uint32_t> newPids;
+            std::vector<uint32_t> terminatedPids;
 
-            // Check for terminated processes
             {
-                std::unique_lock lock(m_cacheMutex);
-                std::vector<uint32_t> terminatedPids;
-
+                std::shared_lock lock(m_cacheMutex);
+                for (uint32_t pid : currentPids) {
+                    if (m_pidToUniqueId.find(pid) == m_pidToUniqueId.end()) {
+                        newPids.push_back(pid);
+                    }
+                }
                 for (const auto& [pid, uniqueId] : m_pidToUniqueId) {
                     if (currentPids.find(pid) == currentPids.end()) {
                         terminatedPids.push_back(pid);
                     }
                 }
+            }
 
-                lock.unlock();
+            // Phase 3: Fetch info for new processes (outside lock — calls OpenProcess)
+            // Re-enumerate to get PROCESSENTRY32W data for new PIDs
+            std::vector<ExtendedProcessInfo> newInfos;
+            if (!newPids.empty()) {
+                std::unordered_set<uint32_t> newPidSet(newPids.begin(), newPids.end());
 
-                for (uint32_t pid : terminatedPids) {
-                    OnProcessTerminateImpl(pid, 0);
+                HANDLE hSnap2 = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+                if (hSnap2 != INVALID_HANDLE_VALUE) {
+                    auto snap2Guard = std::unique_ptr<void, decltype(&CloseHandle)>(hSnap2, CloseHandle);
+                    PROCESSENTRY32W pe{};
+                    pe.dwSize = sizeof(PROCESSENTRY32W);
+
+                    if (Process32FirstW(hSnap2, &pe)) {
+                        do {
+                            if (newPidSet.count(pe.th32ProcessID)) {
+                                ExtendedProcessInfo info = CreateProcessInfoFromSnapshot(pe);
+                                if (info.IsValid()) {
+                                    newInfos.push_back(std::move(info));
+                                }
+                            }
+                        } while (Process32NextW(hSnap2, &pe));
+                    }
                 }
+            }
+
+            // Phase 4: Insert new processes
+            if (!newInfos.empty()) {
+                std::unique_lock lock(m_cacheMutex);
+                for (auto& info : newInfos) {
+                    // Re-check under write lock (another thread may have added it)
+                    if (m_pidToUniqueId.find(info.uniqueId.pid) == m_pidToUniqueId.end()) {
+                        m_pidToUniqueId[info.uniqueId.pid] = info.uniqueId;
+                        m_processCache[info.uniqueId] = std::move(info);
+                        m_stats.processesDiscoveredBySnapshot.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
+            }
+
+            // Phase 5: Handle terminated processes
+            for (uint32_t pid : terminatedPids) {
+                OnProcessTerminateImpl(pid, 0);
             }
 
             return true;
@@ -1310,6 +1521,192 @@ public:
                 m_stats.callbackErrors.fetch_add(1, std::memory_order_relaxed);
             }
         }
+    }
+
+    // ========================================================================
+    // KERNEL WIRING — IPCManager FilterPort integration
+    // ========================================================================
+
+    /**
+     * @brief Register with IPCManager to receive kernel PsSetCreateProcessNotifyRoutineEx
+     *        callbacks via the minifilter communication port.
+     *
+     * The kernel driver (PhantomSensor) receives synchronous process creation/termination
+     * notifications from PsSetCreateProcessNotifyRoutineEx and sends them to user-mode
+     * via FltSendMessage. IPCManager dispatches them to our handler.
+     *
+     * We process kernel events SYNCHRONOUSLY (no queueing) for minimal latency —
+     * critical for blocking malicious process creation before the main thread starts.
+     */
+    void RegisterKernelProcessHandler() {
+        try {
+            auto& ipc = Communication::IPCManager::Instance();
+
+            if (!ipc.IsInitialized()) {
+                SS_LOG_WARN(L"ProcessMonitor",
+                    L"IPCManager not initialized — kernel process callback deferred. "
+                    L"Snapshot-only mode until kernel wiring is established.");
+                return;
+            }
+
+            ipc.RegisterProcessHandler(
+                [this](const Communication::ProcessNotifyRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                    return OnKernelProcessNotify(req);
+                }
+            );
+
+            m_kernelHandlerRegistered = true;
+            SS_LOG_INFO(L"ProcessMonitor",
+                L"Kernel process handler registered via IPCManager FilterPort");
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ProcessMonitor",
+                L"Failed to register kernel process handler: %S", e.what());
+        }
+    }
+
+    /**
+     * @brief Handle a kernel process create/terminate notification.
+     *
+     * Called synchronously from IPCManager's IOCP worker thread.
+     * MUST be fast — the kernel is blocked waiting for our verdict.
+     */
+    [[nodiscard]] SHADOWSTRIKE_SCAN_VERDICT OnKernelProcessNotify(
+        const Communication::ProcessNotifyRequest& req
+    ) {
+        if (m_shuttingDown.load(std::memory_order_acquire)) {
+            return Verdict_Clean;
+        }
+
+        try {
+            if (req.isCreation) {
+                // Build ProcessEvent from kernel data
+                ProcessEvent event{};
+                event.type = ProcessEventType::Created;
+                event.source = EventSource::KernelCallback;
+                event.processId.pid = req.processId;
+                event.parentId.pid = req.parentProcessId;
+                event.sessionId = 0;
+                event.timestamp = system_clock::now();
+                event.sequenceNumber = m_eventSequence.fetch_add(1, std::memory_order_relaxed);
+                event.isElevated = false;
+                event.isWow64 = false;
+
+                // Extract variable-length image path
+                if (req.imagePathLength > 0 && req.imagePathCharLen() > 0) {
+                    event.processPath.assign(req.imagePathData(), req.imagePathCharLen());
+                    // Extract process name from full path
+                    auto lastSlash = event.processPath.find_last_of(L'\\');
+                    event.processName = (lastSlash != std::wstring::npos)
+                        ? event.processPath.substr(lastSlash + 1)
+                        : event.processPath;
+                }
+
+                // Extract command line
+                if (req.commandLineLength > 0 && req.commandLineCharLen() > 0) {
+                    event.commandLine.assign(req.commandLineData(), req.commandLineCharLen());
+                }
+
+                // Synchronous processing for kernel events — no queueing.
+                // This ensures we never miss short-lived processes and can
+                // provide a verdict to block malicious execution.
+                OnProcessCreateImpl(event);
+
+                // Enrich with live process data (start time, integrity, etc.)
+                EnrichFromLiveProcess(req.processId);
+
+            } else {
+                // Termination
+                OnProcessTerminateImpl(req.processId, 0);
+            }
+
+            return Verdict_Clean;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ProcessMonitor",
+                L"Kernel process notify handler exception for PID %u: %S",
+                req.processId, e.what());
+            m_stats.eventProcessingErrors.fetch_add(1, std::memory_order_relaxed);
+            return Verdict_Clean;
+        }
+    }
+
+    /**
+     * @brief Enrich a cached process entry with live data after kernel notification.
+     *
+     * Kernel callbacks provide PID/PPID/path but not start time, integrity,
+     * user context etc. We fetch these asynchronously from the live process.
+     */
+    void EnrichFromLiveProcess(uint32_t pid) {
+        HANDLE hProcess = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            FALSE, pid);
+
+        if (!hProcess) return;
+
+        auto handleGuard = std::unique_ptr<void, decltype(&CloseHandle)>(hProcess, CloseHandle);
+
+        std::unique_lock lock(m_cacheMutex);
+        auto pidIt = m_pidToUniqueId.find(pid);
+        if (pidIt == m_pidToUniqueId.end()) return;
+
+        auto cacheIt = m_processCache.find(pidIt->second);
+        if (cacheIt == m_processCache.end()) return;
+
+        auto& info = cacheIt->second;
+
+        // Update start time (critical for PID reuse detection)
+        uint64_t startTime = GetProcessStartTime(hProcess);
+        if (startTime != MonitorConstants::INVALID_START_TIME &&
+            info.uniqueId.startTime != startTime) {
+            // Update the unique ID with actual start time
+            ProcessUniqueId oldId = info.uniqueId;
+            info.uniqueId.startTime = startTime;
+            info.createTime = FileTimeToTimePoint(startTime);
+
+            // Re-key in cache if start time changed
+            if (oldId.startTime != startTime) {
+                ExtendedProcessInfo moved = std::move(info);
+                m_processCache.erase(cacheIt);
+                m_processCache[moved.uniqueId] = std::move(moved);
+                m_pidToUniqueId[pid] = m_processCache.find(
+                    ProcessUniqueId{pid, startTime})->first;
+                cacheIt = m_processCache.find(ProcessUniqueId{pid, startTime});
+                if (cacheIt == m_processCache.end()) return;
+            }
+        }
+
+        auto& enriched = cacheIt->second;
+
+        // Integrity and elevation
+        if (m_config.collectIntegrity) {
+            enriched.integrityLevel = GetProcessIntegrityLevel(hProcess);
+            enriched.isElevated = IsProcessElevated(hProcess);
+        }
+
+        // User info
+        if (m_config.collectUserInfo) {
+            auto [user, domain] = GetProcessUser(hProcess);
+            enriched.userName = std::move(user);
+            enriched.domainName = std::move(domain);
+        }
+
+        // WoW64 check
+        BOOL isWow64 = FALSE;
+        if (IsWow64Process(hProcess, &isWow64)) {
+            enriched.isWow64 = (isWow64 != FALSE);
+        }
+
+        // Session ID
+        DWORD sessionId = 0;
+        if (ProcessIdToSessionId(pid, &sessionId)) {
+            enriched.sessionId = sessionId;
+        }
+
+        enriched.state = ProcessState::Running;
+        enriched.lastUpdateTime = system_clock::now();
+        enriched.metadataComplete = true;
+        enriched.cacheVersion = m_cacheVersion.fetch_add(1, std::memory_order_relaxed);
     }
 };
 
@@ -1420,10 +1817,10 @@ bool ProcessMonitor::UpdateConfig(const MonitorConfig& config) {
     std::vector<ExtendedProcessInfo> result;
     std::shared_lock lock(m_impl->m_cacheMutex);
 
-    std::wstring lowerName = StringUtils::ToLowerCase(processName);
+    std::wstring lowerName = StringUtils::ToLowerCopy(processName);
 
     for (const auto& [uniqueId, info] : m_impl->m_processCache) {
-        if (StringUtils::ToLowerCase(info.processName) == lowerName) {
+        if (StringUtils::ToLowerCopy(info.processName) == lowerName) {
             result.push_back(info);
         }
     }
@@ -1442,7 +1839,7 @@ bool ProcessMonitor::UpdateConfig(const MonitorConfig& config) {
     std::shared_lock lock(m_impl->m_cacheMutex);
 
     for (const auto& [uniqueId, info] : m_impl->m_processCache) {
-        if (StringUtils::EqualsIgnoreCase(info.processPath, processPath)) {
+        if (StringUtils::IEquals(info.processPath, processPath)) {
             result.push_back(info);
         }
     }
@@ -1462,9 +1859,9 @@ bool ProcessMonitor::UpdateConfig(const MonitorConfig& config) {
     std::shared_lock lock(m_impl->m_cacheMutex);
 
     for (const auto& [uniqueId, info] : m_impl->m_processCache) {
-        bool userMatches = StringUtils::EqualsIgnoreCase(info.userName, userName);
+        bool userMatches = StringUtils::IEquals(info.userName, userName);
         bool domainMatches = domainName.empty() ||
-                            StringUtils::EqualsIgnoreCase(info.domainName, domainName);
+                            StringUtils::IEquals(info.domainName, domainName);
 
         if (userMatches && domainMatches) {
             result.push_back(info);
@@ -1687,13 +2084,21 @@ void ProcessMonitor::OnProcessCreate(const ProcessEvent& event) {
         return;
     }
 
-    // Queue event for processing
+    // Kernel-sourced events are processed synchronously for minimal latency.
+    // Other sources go through the async queue.
+    if (event.source == EventSource::KernelCallback) {
+        m_impl->OnProcessCreateImpl(event);
+        return;
+    }
+
+    // Queue event for async processing
     {
         std::unique_lock lock(m_impl->m_eventQueueMutex);
 
         if (m_impl->m_eventQueue.size() >= m_impl->m_config.eventQueueSize) {
             m_impl->m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
-            SS_LOG_WARN(L"ProcessMonitor", L"Event queue full, dropping event");
+            SS_LOG_WARN(L"ProcessMonitor", L"Event queue full (%zu), dropping event for PID %u",
+                m_impl->m_eventQueue.size(), event.processId.pid);
             return;
         }
 
@@ -1730,8 +2135,36 @@ void ProcessMonitor::OnModuleLoad(
     uintptr_t moduleBase,
     size_t moduleSize
 ) {
-    // Module tracking would be implemented here
-    SS_LOG_DEBUG(L"ProcessMonitor", L"Module loaded - PID %u module %S", pid, StringUtils::WideToUtf8(modulePath));
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    SS_LOG_DEBUG(L"ProcessMonitor", L"Module loaded - PID %u module %ls base 0x%llX size %zu",
+        pid, modulePath.c_str(), static_cast<uint64_t>(moduleBase), moduleSize);
+
+    // Build and dispatch module load event to all registered event callbacks
+    ProcessEvent event{};
+    event.type = ProcessEventType::ModuleLoaded;
+    event.source = EventSource::KernelCallback;
+    event.processId.pid = pid;
+    event.modulePath = modulePath;
+    event.moduleBase = moduleBase;
+    event.moduleSize = moduleSize;
+    event.timestamp = std::chrono::system_clock::now();
+    event.sequenceNumber = m_impl->m_eventSequence.fetch_add(1, std::memory_order_relaxed);
+
+    // Look up process unique ID for the event
+    {
+        std::shared_lock lock(m_impl->m_cacheMutex);
+        auto pidIt = m_impl->m_pidToUniqueId.find(pid);
+        if (pidIt != m_impl->m_pidToUniqueId.end()) {
+            event.processId = pidIt->second;
+        }
+    }
+
+    m_impl->InvokeEventCallbacks(event);
+    m_impl->m_stats.eventsReceived.fetch_add(1, std::memory_order_relaxed);
+    m_impl->m_stats.eventsProcessed.fetch_add(1, std::memory_order_relaxed);
 }
 
 void ProcessMonitor::SubmitEvents(std::vector<ProcessEvent> events) {
@@ -1953,9 +2386,38 @@ std::optional<ExtendedProcessInfo> ProcessMonitor::RefreshCacheEntry(uint32_t pi
 // STATISTICS & DIAGNOSTICS
 // ============================================================================
 
-[[nodiscard]] MonitorStatistics ProcessMonitor::GetStatistics() const {
-    if (!m_impl) return MonitorStatistics{};
-    return m_impl->m_stats;
+void ProcessMonitor::GetStatistics(MonitorStatistics& out) const {
+    out.Reset();
+    if (!m_impl) return;
+
+    const auto& s = m_impl->m_stats;
+    out.totalProcessesTracked.store(s.totalProcessesTracked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.currentActiveProcesses.store(s.currentActiveProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.processCreations.store(s.processCreations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.processTerminations.store(s.processTerminations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.processesDiscoveredBySnapshot.store(s.processesDiscoveredBySnapshot.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.eventsReceived.store(s.eventsReceived.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.eventsProcessed.store(s.eventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.eventsDropped.store(s.eventsDropped.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.eventQueueHighWatermark.store(s.eventQueueHighWatermark.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.cacheLookups.store(s.cacheLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.cacheHits.store(s.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.cacheMisses.store(s.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.cacheFetchedLive.store(s.cacheFetchedLive.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.cacheEvictions.store(s.cacheEvictions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.staleEntryDetections.store(s.staleEntryDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.totalLookupTimeUs.store(s.totalLookupTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.minLookupTimeUs.store(s.minLookupTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.maxLookupTimeUs.store(s.maxLookupTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.ancestryLookups.store(s.ancestryLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.orphanProcessesDetected.store(s.orphanProcessesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.ppidSpoofingDetected.store(s.ppidSpoofingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.lookupErrors.store(s.lookupErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.accessDeniedErrors.store(s.accessDeniedErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.eventProcessingErrors.store(s.eventProcessingErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.callbacksInvoked.store(s.callbacksInvoked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.callbackErrors.store(s.callbackErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    out.startTime = s.startTime;
 }
 
 [[nodiscard]] ProcessTreeStatistics ProcessMonitor::GetTreeStatistics() const {
