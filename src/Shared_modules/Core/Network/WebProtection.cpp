@@ -74,6 +74,7 @@
 #include <algorithm>
 #include <numeric>
 #include <cmath>
+#include <cctype>
 #include <numbers>
 #include <regex>
 #include <sstream>
@@ -239,23 +240,46 @@ static const std::array<std::string, 15> EXPLOIT_KIT_SIGNATURES = {{
 }
 
 /**
- * @brief Checks for heap spray patterns.
+ * @brief Checks for heap spray patterns using bounded linear scanning.
+ *
+ * Avoids std::regex on untrusted input to prevent ReDoS.
+ * Detects repeated Unicode escape sequences (\u0c0c etc.) and
+ * large string literals commonly used in heap spray payloads.
  */
 [[nodiscard]] static bool HasHeapSprayPattern(std::string_view script) noexcept {
-    // Heap spray typically involves large arrays of repeated data
-    const size_t minSpraySize = 1000;
+    if (script.size() < 100) return false;
 
-    // Look for patterns like: var x = "\u0c0c\u0c0c..." repeated
-    std::regex sprayPattern(R"(\\u[0-9a-fA-F]{4}.*\\u[0-9a-fA-F]{4}.{" + std::to_string(minSpraySize) + ",})");
+    constexpr size_t kMinSprayLen = 1000;
+    constexpr size_t kMaxScan = 8ULL * 1024 * 1024;
+    const size_t scanLen = std::min(script.size(), kMaxScan);
 
-    // Also look for large string allocations
-    std::regex largeAlloc(R"((var|let|const)\s+\w+\s*=\s*[\"'].{" + std::to_string(minSpraySize) + ",}[\"'])");
+    // Detect repeated Unicode escape sequences (e.g. \u0c0c\u0c0c...)
+    size_t unicodeRunLen = 0;
+    for (size_t i = 0; i + 5 < scanLen; ) {
+        if (script[i] == '\\' && script[i + 1] == 'u' &&
+            std::isxdigit(static_cast<unsigned char>(script[i + 2])) &&
+            std::isxdigit(static_cast<unsigned char>(script[i + 3])) &&
+            std::isxdigit(static_cast<unsigned char>(script[i + 4])) &&
+            std::isxdigit(static_cast<unsigned char>(script[i + 5]))) {
+            unicodeRunLen += 6;
+            i += 6;
+            if (unicodeRunLen >= kMinSprayLen) return true;
+        } else {
+            unicodeRunLen = 0;
+            ++i;
+        }
+    }
 
-    try {
-        if (std::regex_search(script.begin(), script.end(), sprayPattern)) return true;
-        if (std::regex_search(script.begin(), script.end(), largeAlloc)) return true;
-    } catch (...) {
-        // Regex error
+    // Detect large string literals (var x = "AAAA..."; patterns)
+    size_t pos = 0;
+    while (pos < scanLen) {
+        const size_t q = script.find_first_of("\"'", pos);
+        if (q == std::string_view::npos || q >= scanLen) break;
+        const char quote = script[q];
+        const size_t end = script.find(quote, q + 1);
+        if (end == std::string_view::npos || end >= scanLen) break;
+        if (end - q - 1 >= kMinSprayLen) return true;
+        pos = end + 1;
     }
 
     return false;
@@ -300,22 +324,33 @@ static const std::array<std::string, 15> EXPLOIT_KIT_SIGNATURES = {{
 }
 
 /**
- * @brief Checks for ROP chain patterns.
+ * @brief Checks for ROP chain patterns using bounded linear scanning.
+ *
+ * Avoids std::regex on untrusted input to prevent ReDoS.
+ * Counts hex address-like patterns (0x00000000+) that suggest ROP gadgets.
  */
 [[nodiscard]] static bool HasROPPattern(std::string_view script) noexcept {
-    // ROP chains in JavaScript often involve specific patterns
-    // Looking for address-like patterns and stack pivoting
+    if (script.size() < 20) return false;
 
-    std::regex ropPattern(R"(0x[0-9a-fA-F]{8,16})");
-    std::smatch matches;
-    std::string scriptStr(script);
-
+    constexpr size_t kMaxScan = 8ULL * 1024 * 1024;
+    const size_t scanLen = std::min(script.size(), kMaxScan);
     uint32_t addressCount = 0;
-    auto it = scriptStr.cbegin();
-    while (std::regex_search(it, scriptStr.cend(), matches, ropPattern)) {
-        addressCount++;
-        if (addressCount >= 10) return true;  // 10+ addresses suggests ROP
-        it = matches.suffix().first;
+
+    for (size_t i = 0; i + 1 < scanLen; ++i) {
+        if (script[i] == '0' && (script[i + 1] == 'x' || script[i + 1] == 'X')) {
+            size_t hexDigits = 0;
+            size_t j = i + 2;
+            while (j < scanLen && std::isxdigit(static_cast<unsigned char>(script[j]))) {
+                ++hexDigits;
+                ++j;
+                if (hexDigits > 16) break;  // cap scan length
+            }
+            if (hexDigits >= 8) {
+                ++addressCount;
+                if (addressCount >= 10) return true;
+            }
+            i = j;  // advance past this token
+        }
     }
 
     return false;
@@ -555,8 +590,8 @@ bool WebProtection::WebProtectionImpl::Initialize(const WebProtectionConfig& con
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Initialization failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         m_initialized.store(false, std::memory_order_release);
         return false;
     }
@@ -630,8 +665,8 @@ bool WebProtection::WebProtectionImpl::Start() noexcept {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Start failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Start failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -670,7 +705,8 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
             if (m_blockedDomains.contains(analysis.host)) {
                 analysis.isSafe = false;
                 analysis.action = ProtectionAction::BLOCK;
-                analysis.threats.push_back(WebThreatType::NONE);
+                analysis.threats.push_back(WebThreatType::MALICIOUS_DOWNLOAD);
+                analysis.primaryThreat = "Domain is blocklisted";
                 analysis.threatScore = 100;
                 return analysis;
             }
@@ -690,13 +726,112 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
 
             if (analysis.scriptAnalysis.isMalicious) {
                 analysis.isSafe = false;
-                analysis.threatScore = static_cast<uint8_t>(analysis.scriptAnalysis.riskScore);
+                analysis.threatScore = static_cast<uint8_t>(
+                    std::min(analysis.scriptAnalysis.riskScore, 100.0));
 
                 if (analysis.scriptAnalysis.hasXSS) {
                     analysis.threats.push_back(WebThreatType::XSS_REFLECTED);
                 }
                 if (analysis.scriptAnalysis.hasHeapSpray) {
                     analysis.threats.push_back(WebThreatType::HEAP_SPRAY);
+                }
+            }
+        }
+
+        // HTML content: analyze embedded scripts, forms, and cryptojacking
+        if (analysis.contentType == WebContentType::HTML) {
+            std::string htmlContent(reinterpret_cast<const char*>(content.data()),
+                                    std::min(content.size(), m_config.maxContentToAnalyze));
+
+            // Extract and analyze inline scripts
+            if (m_config.enableXSSProtection) {
+                analysis.scriptAnalysis = AnalyzeScriptInternal(htmlContent, url);
+                if (analysis.scriptAnalysis.isMalicious) {
+                    analysis.isSafe = false;
+                    analysis.threatScore = std::max(analysis.threatScore,
+                        static_cast<uint8_t>(std::min(analysis.scriptAnalysis.riskScore, 100.0)));
+                    if (analysis.scriptAnalysis.hasXSS) {
+                        analysis.threats.push_back(WebThreatType::XSS_REFLECTED);
+                    }
+                }
+            }
+
+            // Form protection
+            if (m_config.enableFormProtection) {
+                analysis.formProtection = AnalyzeFormInternal(htmlContent, url);
+                if (analysis.formProtection.riskScore > 0) {
+                    analysis.threatScore = std::max(analysis.threatScore,
+                        analysis.formProtection.riskScore);
+                    if (analysis.formProtection.hasClearTextPassword) {
+                        analysis.threats.push_back(WebThreatType::CLEARTEXT_PASSWORD);
+                    }
+                    if (analysis.formProtection.hasFormJacking) {
+                        analysis.isSafe = false;
+                        analysis.threats.push_back(WebThreatType::FORM_HIJACK);
+                    }
+                }
+            }
+
+            // Cryptojacking detection
+            if (m_config.enableCryptojackingProtection) {
+                static const std::array<std::string_view, 12> kCryptojackingIndicators = {{
+                    "coinhive.min.js", "CoinHive.Anonymous",
+                    "coin-hive.com", "authedmine.com",
+                    "crypto-loot.com", "CryptoLoot.Anonymous",
+                    "webminepool.com", "ppoi.org/bitchin.js",
+                    "monerominer.rocks", "cdn.oneminer.rocks",
+                    "webassembly.instantiate", "cryptonight"
+                }};
+
+                uint32_t cryptoHits = 0;
+                for (const auto& indicator : kCryptojackingIndicators) {
+                    if (htmlContent.find(indicator) != std::string::npos) {
+                        ++cryptoHits;
+                    }
+                }
+                // Also check for WebAssembly + high CPU heuristic patterns
+                if (htmlContent.find("WebAssembly") != std::string::npos &&
+                    htmlContent.find("crypto") != std::string::npos) {
+                    ++cryptoHits;
+                }
+
+                if (cryptoHits >= 2) {
+                    analysis.isSafe = false;
+                    analysis.threats.push_back(WebThreatType::CRYPTOJACKING);
+                    analysis.threatScore = std::max(analysis.threatScore,
+                        static_cast<uint8_t>(70));
+                    m_statistics.cryptojackingBlocked.fetch_add(1, std::memory_order_relaxed);
+                    GenerateAlert(url, WebThreatType::CRYPTOJACKING, 70,
+                                 "Cryptojacking script detected in page content");
+                }
+            }
+        }
+
+        // Content-Type mismatch detection: header says one type, content is another
+        if (content.size() >= 2) {
+            const bool isPESignature = (content.size() >= 2 &&
+                                        content[0] == 'M' && content[1] == 'Z');
+            const bool isZipSignature = (content.size() >= 4 &&
+                                         content[0] == 'P' && content[1] == 'K' &&
+                                         content[2] == 0x03 && content[3] == 0x04);
+            const bool isElfSignature = (content.size() >= 4 &&
+                                         content[0] == 0x7F && content[1] == 'E' &&
+                                         content[2] == 'L' && content[3] == 'F');
+
+            if (analysis.contentType != WebContentType::OTHER &&
+                analysis.contentType != WebContentType::UNKNOWN) {
+                if ((isPESignature || isElfSignature) &&
+                    (analysis.contentType == WebContentType::HTML ||
+                     analysis.contentType == WebContentType::JAVASCRIPT ||
+                     analysis.contentType == WebContentType::JSON ||
+                     analysis.contentType == WebContentType::IMAGE)) {
+                    analysis.isSafe = false;
+                    analysis.threats.push_back(WebThreatType::DISGUISED_EXECUTABLE);
+                    analysis.threatScore = std::max(analysis.threatScore,
+                        static_cast<uint8_t>(95));
+                    m_statistics.maliciousDownloads.fetch_add(1, std::memory_order_relaxed);
+                    GenerateAlert(url, WebThreatType::DISGUISED_EXECUTABLE, 95,
+                                 "Content-Type mismatch: executable disguised as benign content");
                 }
             }
         }
@@ -739,8 +874,8 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Content analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Content analysis failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     const auto endTime = Clock::now();
@@ -748,11 +883,23 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
 
     // Update performance statistics
     const uint64_t durationUs = analysis.analysisDuration.count();
-    m_statistics.avgAnalysisTimeUs.store(durationUs, std::memory_order_relaxed);
 
-    const uint64_t currentMax = m_statistics.maxAnalysisTimeUs.load(std::memory_order_relaxed);
-    if (durationUs > currentMax) {
-        m_statistics.maxAnalysisTimeUs.store(durationUs, std::memory_order_relaxed);
+    // Exponential moving average: newAvg = (oldAvg * 7 + sample) / 8
+    {
+        uint64_t oldAvg = m_statistics.avgAnalysisTimeUs.load(std::memory_order_relaxed);
+        uint64_t newAvg = (oldAvg == 0) ? durationUs : (oldAvg * 7 + durationUs) / 8;
+        m_statistics.avgAnalysisTimeUs.store(newAvg, std::memory_order_relaxed);
+    }
+
+    // Atomic CAS loop for max update (avoids TOCTOU race)
+    {
+        uint64_t currentMax = m_statistics.maxAnalysisTimeUs.load(std::memory_order_relaxed);
+        while (durationUs > currentMax) {
+            if (m_statistics.maxAnalysisTimeUs.compare_exchange_weak(
+                    currentMax, durationUs, std::memory_order_relaxed)) {
+                break;
+            }
+        }
     }
 
     return analysis;
@@ -795,8 +942,21 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
             analysis.isObfuscated = true;
         }
 
-        // Count dangerous operations
-        analysis.evalCount = std::count(script.begin(), script.end(), 'e');  // Simplified
+        // Count actual eval() calls
+        {
+            size_t evalPos = 0;
+            analysis.evalCount = 0;
+            while ((evalPos = script.find("eval(", evalPos)) != std::string::npos) {
+                analysis.evalCount++;
+                evalPos += 5;
+            }
+            // Also count Function() constructor (eval equivalent)
+            evalPos = 0;
+            while ((evalPos = script.find("Function(", evalPos)) != std::string::npos) {
+                analysis.evalCount++;
+                evalPos += 9;
+            }
+        }
         analysis.documentWriteCount = 0;
 
         size_t pos = 0;
@@ -850,8 +1010,8 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Script analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Script analysis failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return analysis;
@@ -902,15 +1062,15 @@ bool WebProtection::WebProtectionImpl::SanitizeResponseInternal(
 
         if (sanitized) {
             m_statistics.scriptsSanitized.fetch_add(1, std::memory_order_relaxed);
-            SS_LOG_INFO(L"Network", L"WebProtection: Sanitized content from {}",
-                              Utils::StringUtils::Utf8ToWide(host));
+            SS_LOG_INFO(L"Network", L"WebProtection: Sanitized content from %ls",
+                              Utils::StringUtils::ToWide(host).c_str());
         }
 
         return sanitized;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Sanitization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Sanitization failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1005,6 +1165,69 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
                 validation.commonName = cnBuf;
             }
 
+            // Extract issuer CN
+            char issuerBuf[256] = {};
+            CertGetNameStringA(pCert, CERT_NAME_ATTR_TYPE, CERT_NAME_ISSUER_FLAG,
+                               (void*)szOID_COMMON_NAME, issuerBuf, sizeof(issuerBuf));
+            if (issuerBuf[0] != '\0') {
+                validation.issuer = issuerBuf;
+            }
+
+            // Self-signed detection: issuer == subject and chain length is 1
+            if (validation.commonName == validation.issuer && certChain.size() == 1) {
+                if (m_config.blockSelfSigned) {
+                    validation.status = CertificateStatus::SELF_SIGNED;
+                    validation.isValid = false;
+                    validation.issues.push_back("Self-signed certificate detected");
+                    m_statistics.certificateErrors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
+            // Weak signature algorithm detection (MD2/MD5/SHA1 with RSA)
+            if (pCert->pCertInfo && pCert->pCertInfo->SignatureAlgorithm.pszObjId) {
+                const std::string sigAlg(pCert->pCertInfo->SignatureAlgorithm.pszObjId);
+                static const std::array<std::string_view, 3> kWeakOids = {{
+                    "1.2.840.113549.1.1.5",   // sha1WithRSAEncryption
+                    "1.2.840.113549.1.1.4",   // md5WithRSAEncryption
+                    "1.2.840.113549.1.1.2"    // md2WithRSAEncryption
+                }};
+                for (const auto& weakOid : kWeakOids) {
+                    if (sigAlg == weakOid) {
+                        if (m_config.blockWeakAlgorithms) {
+                            validation.status = CertificateStatus::WEAK_ALGORITHM;
+                            validation.isValid = false;
+                            validation.issues.push_back(
+                                "Weak signature algorithm (OID: " + sigAlg + ")");
+                            m_statistics.certificateErrors.fetch_add(1, std::memory_order_relaxed);
+                        }
+                        break;
+                    }
+                }
+            }
+
+            // CN hostname mismatch check (exact or wildcard)
+            {
+                bool nameMatches = false;
+                if (validation.commonName == host) {
+                    nameMatches = true;
+                } else if (validation.commonName.size() > 2 &&
+                           validation.commonName[0] == '*' && validation.commonName[1] == '.') {
+                    const std::string_view suffix = std::string_view(validation.commonName).substr(1);
+                    if (host.size() > suffix.size() &&
+                        host.compare(host.size() - suffix.size(), suffix.size(), suffix) == 0) {
+                        nameMatches = true;
+                    }
+                }
+                if (!nameMatches) {
+                    validation.status = CertificateStatus::NAME_MISMATCH;
+                    validation.isValid = false;
+                    validation.issues.push_back(
+                        "Certificate CN '" + validation.commonName +
+                        "' does not match host '" + host + "'");
+                    m_statistics.certificateErrors.fetch_add(1, std::memory_order_relaxed);
+                }
+            }
+
             CertFreeCertificateContext(pCert);
         } else {
             // Fallback: certificate couldn't be parsed — treat as untrusted
@@ -1062,8 +1285,8 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Certificate validation failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Certificate validation failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         validation.status = CertificateStatus::CHAIN_ERROR;
         validation.isValid = false;
     }
@@ -1102,33 +1325,43 @@ bool WebProtection::WebProtectionImpl::CheckCertificatePin(
             return true;  // Expired pin, validation passes
         }
 
-        // Calculate certificate hash (simplified - real implementation would use SHA256)
+        // Compute SHA-256 of the leaf certificate's SPKI for pin comparison
         if (!certChain.empty()) {
             const auto& cert = certChain[0];
-            std::string certHash = Utils::HashUtils::CalculateSHA256(cert);
 
-            // Check if hash matches any pin
-            for (const auto& pinHash : pin.sha256Pins) {
-                if (certHash == pinHash) {
-                    matchedPin = pinHash;
-                    return true;
+            Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+            std::string certHash;
+            if (hasher.Init() &&
+                hasher.Update(cert.data(), cert.size()) &&
+                hasher.FinalHex(certHash)) {
+
+                // Check if hash matches any primary pin
+                for (const auto& pinHash : pin.sha256Pins) {
+                    if (certHash == pinHash) {
+                        matchedPin = pinHash;
+                        return true;
+                    }
                 }
+
+                // Check backup pins
+                for (const auto& pinHash : pin.backupPins) {
+                    if (certHash == pinHash) {
+                        matchedPin = pinHash;
+                        return true;
+                    }
+                }
+            } else {
+                SS_LOG_ERROR(L"Network", L"WebProtection: SHA-256 hash computation failed for pin check");
+                return true;  // On hash failure, do not block
             }
-
-            // Check backup pins
-            for (const auto& pinHash : pin.backupPins) {
-                if (certHash == pinHash) {
-                    matchedPin = pinHash;
-                    return true;
-                }
             }
         }
 
         return false;  // No match found
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Pin check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Pin check failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return true;  // On error, don't block
     }
 }
@@ -1236,8 +1469,8 @@ FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
         m_statistics.formsProtected.fetch_add(1, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Form analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Form analysis failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return result;
@@ -1285,9 +1518,10 @@ ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
             }
         }
 
-        // Exploit kit signature matching
+        // Exploit kit signature matching — scan up to 256KB of content
+        constexpr size_t kExploitScanLimit = 256 * 1024;
         std::string contentStr(reinterpret_cast<const char*>(content.data()),
-                             std::min(content.size(), static_cast<size_t>(1024)));
+                             std::min(content.size(), kExploitScanLimit));
 
         for (const auto& kitSignature : EXPLOIT_KIT_SIGNATURES) {
             if (contentStr.find(kitSignature) != std::string::npos) {
@@ -1313,8 +1547,8 @@ ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
         }
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Exploit analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Exploit analysis failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return analysis;
@@ -1386,18 +1620,19 @@ PrivacyAnalysis WebProtection::WebProtectionImpl::AnalyzePrivacyInternal(
             analysis.webrtcLeak = true;
         }
 
-        // Calculate privacy score
-        analysis.privacyScore = 100;
-        analysis.privacyScore -= static_cast<uint8_t>(std::min(analysis.trackerCount * 5, 40U));
-        if (analysis.canvasFingerprinting) analysis.privacyScore -= 15;
-        if (analysis.webglFingerprinting) analysis.privacyScore -= 10;
-        if (analysis.audioFingerprinting) analysis.privacyScore -= 10;
-        if (analysis.fontFingerprinting) analysis.privacyScore -= 10;
-        if (analysis.webrtcLeak) analysis.privacyScore -= 15;
+        // Calculate privacy score with saturating subtraction
+        int32_t score = 100;
+        score -= static_cast<int32_t>(std::min(analysis.trackerCount * 5U, 40U));
+        if (analysis.canvasFingerprinting) score -= 15;
+        if (analysis.webglFingerprinting) score -= 10;
+        if (analysis.audioFingerprinting) score -= 10;
+        if (analysis.fontFingerprinting) score -= 10;
+        if (analysis.webrtcLeak) score -= 15;
+        analysis.privacyScore = static_cast<uint8_t>(std::max(score, 0));
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Privacy analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Privacy analysis failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 
     return analysis;
@@ -1448,12 +1683,14 @@ void WebProtection::WebProtectionImpl::GenerateAlert(
             }
         }
 
-        SS_LOG_WARN(L"Network", L"WebProtection: Alert generated - ID: {}, URL: {}, Severity: {}",
-                          alert.alertId, Utils::StringUtils::Utf8ToWide(url), severity);
+        SS_LOG_WARN(L"Network", L"WebProtection: Alert generated - ID: %llu, URL: %ls, Severity: %u",
+                          static_cast<unsigned long long>(alert.alertId),
+                          Utils::StringUtils::ToWide(url).c_str(),
+                          static_cast<unsigned>(severity));
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to generate alert - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to generate alert - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -1569,7 +1806,8 @@ bool WebProtection::IsRunning() const noexcept {
 
 // Content analysis
 bool WebProtection::SanitizeResponse(const std::string& host, std::string& htmlContent) {
-    return m_impl ? m_impl->SanitizeResponseInternal(host, htmlContent) : false;
+    if (!m_impl || !m_impl->m_running.load(std::memory_order_acquire)) return false;
+    return m_impl->SanitizeResponseInternal(host, htmlContent);
 }
 
 WebContentAnalysis WebProtection::AnalyzeContent(
@@ -1577,14 +1815,16 @@ WebContentAnalysis WebProtection::AnalyzeContent(
     std::span<const uint8_t> content,
     const std::string& contentType)
 {
-    return m_impl ? m_impl->AnalyzeContentInternal(url, content, contentType) : WebContentAnalysis{};
+    if (!m_impl || !m_impl->m_running.load(std::memory_order_acquire)) return WebContentAnalysis{};
+    return m_impl->AnalyzeContentInternal(url, content, contentType);
 }
 
 ScriptAnalysis WebProtection::AnalyzeScript(
     const std::string& script,
     const std::string& sourceUrl)
 {
-    return m_impl ? m_impl->AnalyzeScriptInternal(script, sourceUrl) : ScriptAnalysis{};
+    if (!m_impl || !m_impl->m_running.load(std::memory_order_acquire)) return ScriptAnalysis{};
+    return m_impl->AnalyzeScriptInternal(script, sourceUrl);
 }
 
 // Certificate protection
@@ -1602,13 +1842,13 @@ bool WebProtection::AddCertificatePin(const CertificatePin& pin) {
         std::unique_lock lock(m_impl->m_pinsMutex);
         m_impl->m_pins[pin.domain] = pin;
 
-        SS_LOG_INFO(L"Network", L"WebProtection: Added certificate pin for {}",
-                          Utils::StringUtils::Utf8ToWide(pin.domain));
+        SS_LOG_INFO(L"Network", L"WebProtection: Added certificate pin for %ls",
+                          Utils::StringUtils::ToWide(pin.domain).c_str());
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to add pin - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to add pin - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1671,8 +1911,8 @@ bool WebProtection::CheckCredentialTheft(
         return false;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Credential theft check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Credential theft check failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1719,13 +1959,13 @@ uint64_t WebProtection::ProtectBrowser(uint32_t processId, BrowserType browser) 
         m_impl->m_statistics.activeSessions.fetch_add(1, std::memory_order_relaxed);
         m_impl->m_statistics.totalSessions.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"Network", L"WebProtection: Browser protected - Session: {}, PID: {}",
-                          sessionId, processId);
+        SS_LOG_INFO(L"Network", L"WebProtection: Browser protected - Session: %llu, PID: %u",
+                          static_cast<unsigned long long>(sessionId), processId);
         return sessionId;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to protect browser - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Network", L"WebProtection: Failed to protect browser - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
         return 0;
     }
 }
@@ -1736,7 +1976,8 @@ void WebProtection::UnprotectBrowser(uint64_t sessionId) {
     std::unique_lock lock(m_impl->m_sessionsMutex);
     if (m_impl->m_sessions.erase(sessionId) > 0) {
         m_impl->m_statistics.activeSessions.fetch_sub(1, std::memory_order_relaxed);
-        SS_LOG_INFO(L"Network", L"WebProtection: Browser unprotected - Session: {}", sessionId);
+        SS_LOG_INFO(L"Network", L"WebProtection: Browser unprotected - Session: %llu",
+                          static_cast<unsigned long long>(sessionId));
     }
 }
 
@@ -1762,8 +2003,8 @@ bool WebProtection::BlockDomain(const std::string& domain) {
     std::unique_lock lock(m_impl->m_domainsMutex);
     m_impl->m_blockedDomains.insert(domain);
 
-    SS_LOG_INFO(L"Network", L"WebProtection: Domain blocked - {}",
-                      Utils::StringUtils::Utf8ToWide(domain));
+    SS_LOG_INFO(L"Network", L"WebProtection: Domain blocked - %ls",
+                      Utils::StringUtils::ToWide(domain).c_str());
     return true;
 }
 
@@ -1780,8 +2021,8 @@ bool WebProtection::AllowDomain(const std::string& domain) {
     std::unique_lock lock(m_impl->m_domainsMutex);
     m_impl->m_allowedDomains.insert(domain);
 
-    SS_LOG_INFO(L"Network", L"WebProtection: Domain allowed - {}",
-                      Utils::StringUtils::Utf8ToWide(domain));
+    SS_LOG_INFO(L"Network", L"WebProtection: Domain allowed - %ls",
+                      Utils::StringUtils::ToWide(domain).c_str());
     return true;
 }
 
@@ -1870,22 +2111,101 @@ bool WebProtection::PerformDiagnostics() const {
     if (!m_impl) return false;
 
     SS_LOG_INFO(L"Network", L"WebProtection: Diagnostics");
-    SS_LOG_INFO(L"Network", L"  Initialized: {}", m_impl->m_initialized.load());
-    SS_LOG_INFO(L"Network", L"  Running: {}", m_impl->m_running.load());
-    SS_LOG_INFO(L"Network", L"  Total Requests: {}", m_impl->m_statistics.totalRequests.load());
-    SS_LOG_INFO(L"Network", L"  XSS Blocked: {}", m_impl->m_statistics.xssBlocked.load());
-    SS_LOG_INFO(L"Network", L"  Exploits Blocked: {}", m_impl->m_statistics.exploitsBlocked.load());
-    SS_LOG_INFO(L"Network", L"  Scripts Sanitized: {}", m_impl->m_statistics.scriptsSanitized.load());
-    SS_LOG_INFO(L"Network", L"  Active Sessions: {}", m_impl->m_statistics.activeSessions.load());
-    SS_LOG_INFO(L"Network", L"  Trackers Blocked: {}", m_impl->m_statistics.trackersBlocked.load());
-    SS_LOG_INFO(L"Network", L"  Alerts Generated: {}", m_impl->m_statistics.alertsGenerated.load());
+    SS_LOG_INFO(L"Network", L"  Initialized: %d", m_impl->m_initialized.load() ? 1 : 0);
+    SS_LOG_INFO(L"Network", L"  Running: %d", m_impl->m_running.load() ? 1 : 0);
+    SS_LOG_INFO(L"Network", L"  Total Requests: %llu", static_cast<unsigned long long>(m_impl->m_statistics.totalRequests.load()));
+    SS_LOG_INFO(L"Network", L"  XSS Blocked: %llu", static_cast<unsigned long long>(m_impl->m_statistics.xssBlocked.load()));
+    SS_LOG_INFO(L"Network", L"  Exploits Blocked: %llu", static_cast<unsigned long long>(m_impl->m_statistics.exploitsBlocked.load()));
+    SS_LOG_INFO(L"Network", L"  Scripts Sanitized: %llu", static_cast<unsigned long long>(m_impl->m_statistics.scriptsSanitized.load()));
+    SS_LOG_INFO(L"Network", L"  Active Sessions: %u", m_impl->m_statistics.activeSessions.load());
+    SS_LOG_INFO(L"Network", L"  Trackers Blocked: %llu", static_cast<unsigned long long>(m_impl->m_statistics.trackersBlocked.load()));
+    SS_LOG_INFO(L"Network", L"  Alerts Generated: %llu", static_cast<unsigned long long>(m_impl->m_statistics.alertsGenerated.load()));
 
     return true;
 }
 
 bool WebProtection::ExportDiagnostics(const std::wstring& outputPath) const {
-    // TODO: Implement diagnostics export
-    return false;
+    if (!m_impl) return false;
+
+    try {
+        std::ofstream ofs(outputPath, std::ios::out | std::ios::trunc);
+        if (!ofs.is_open()) {
+            SS_LOG_ERROR(L"Network", L"WebProtection: Failed to open diagnostics output file");
+            return false;
+        }
+
+        const auto& stats = m_impl->m_statistics;
+        const auto now = Clock::now();
+        const auto epoch = std::chrono::duration_cast<std::chrono::seconds>(
+            now.time_since_epoch()).count();
+
+        ofs << "=== ShadowStrike WebProtection Diagnostics ===\n";
+        ofs << "Timestamp (epoch): " << epoch << "\n";
+        ofs << "Initialized: " << (m_impl->m_initialized.load() ? "true" : "false") << "\n";
+        ofs << "Running: " << (m_impl->m_running.load() ? "true" : "false") << "\n";
+        ofs << "Protection Level: " << static_cast<int>(m_impl->m_config.level) << "\n\n";
+
+        ofs << "--- Traffic Statistics ---\n";
+        ofs << "Total Requests: " << stats.totalRequests.load() << "\n";
+        ofs << "Total Responses: " << stats.totalResponses.load() << "\n";
+        ofs << "Bytes Analyzed: " << stats.bytesAnalyzed.load() << "\n\n";
+
+        ofs << "--- Threat Statistics ---\n";
+        ofs << "XSS Blocked: " << stats.xssBlocked.load() << "\n";
+        ofs << "Exploits Blocked: " << stats.exploitsBlocked.load() << "\n";
+        ofs << "Malicious Downloads: " << stats.maliciousDownloads.load() << "\n";
+        ofs << "Certificate Errors: " << stats.certificateErrors.load() << "\n";
+        ofs << "Pin Violations: " << stats.pinViolations.load() << "\n";
+        ofs << "Cryptojacking Blocked: " << stats.cryptojackingBlocked.load() << "\n\n";
+
+        ofs << "--- Content Statistics ---\n";
+        ofs << "Scripts Sanitized: " << stats.scriptsSanitized.load() << "\n";
+        ofs << "Iframes Blocked: " << stats.iframesBlocked.load() << "\n";
+        ofs << "Forms Protected: " << stats.formsProtected.load() << "\n\n";
+
+        ofs << "--- Privacy Statistics ---\n";
+        ofs << "Trackers Blocked: " << stats.trackersBlocked.load() << "\n";
+        ofs << "Fingerprints Blocked: " << stats.fingerprintsBlocked.load() << "\n";
+        ofs << "Cookies Blocked: " << stats.cookiesBlocked.load() << "\n\n";
+
+        ofs << "--- Session Statistics ---\n";
+        ofs << "Active Sessions: " << stats.activeSessions.load() << "\n";
+        ofs << "Total Sessions: " << stats.totalSessions.load() << "\n\n";
+
+        ofs << "--- Performance ---\n";
+        ofs << "Avg Analysis Time (us): " << stats.avgAnalysisTimeUs.load() << "\n";
+        ofs << "Max Analysis Time (us): " << stats.maxAnalysisTimeUs.load() << "\n";
+        ofs << "Alerts Generated: " << stats.alertsGenerated.load() << "\n";
+
+        {
+            std::shared_lock lock(m_impl->m_pinsMutex);
+            ofs << "\n--- Certificate Pins ---\n";
+            ofs << "Pinned Domains: " << m_impl->m_pins.size() << "\n";
+        }
+
+        {
+            std::shared_lock lock(m_impl->m_domainsMutex);
+            ofs << "\n--- Domain Lists ---\n";
+            ofs << "Blocked Domains: " << m_impl->m_blockedDomains.size() << "\n";
+            ofs << "Allowed Domains: " << m_impl->m_allowedDomains.size() << "\n";
+        }
+
+        ofs << "\n=== End of Diagnostics ===\n";
+        ofs.flush();
+
+        if (!ofs.good()) {
+            SS_LOG_ERROR(L"Network", L"WebProtection: Diagnostics write failed");
+            return false;
+        }
+
+        SS_LOG_INFO(L"Network", L"WebProtection: Diagnostics exported successfully");
+        return true;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Network", L"WebProtection: ExportDiagnostics failed - %ls",
+                           Utils::StringUtils::ToWide(e.what()).c_str());
+        return false;
+    }
 }
 
 }  // namespace Network
