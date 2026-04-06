@@ -1486,14 +1486,14 @@ public:
      * @param protocol Protocol type.
      * @return Protocol name string.
      */
-    [[nodiscard]] static std::wstring_view GetProtocolName(ProtocolType protocol) noexcept;
+    [[nodiscard]] static std::wstring GetProtocolName(ProtocolType protocol) noexcept;
 
     /**
      * @brief Gets the application protocol name.
      * @param protocol Application protocol.
      * @return Protocol name string.
      */
-    [[nodiscard]] static std::wstring_view GetAppProtocolName(ApplicationProtocol protocol) noexcept;
+    [[nodiscard]] static std::wstring GetAppProtocolName(ApplicationProtocol protocol) noexcept;
 
 private:
     // ========================================================================
