@@ -168,7 +168,6 @@ namespace Network {
 // ============================================================================
 // FORWARD DECLARATIONS
 // ============================================================================
-class BotnetDetectorImpl;  // PIMPL implementation
 
 // ============================================================================
 // NAMESPACE CONSTANTS
@@ -1043,6 +1042,8 @@ public:
     bool ExportAlerts(const std::wstring& outputPath, uint32_t lastHours = 24) const;
 
 private:
+    class BotnetDetectorImpl;
+
     BotnetDetector();
     ~BotnetDetector();
 
