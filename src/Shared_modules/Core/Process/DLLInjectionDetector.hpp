@@ -597,7 +597,7 @@ struct alignas(64) DLLInjectionStatistics {
     std::atomic<uint64_t> trustedModulesFound{0};
     std::atomic<uint64_t> untrustedModulesFound{0};
     std::atomic<uint64_t> suspiciousModulesFound{0};
-    
+
     // Detection counts
     std::atomic<uint64_t> injectionsDetected{0};
     std::atomic<uint64_t> remoteThreadInjections{0};
@@ -607,30 +607,102 @@ struct alignas(64) DLLInjectionStatistics {
     std::atomic<uint64_t> sideLoadingDetected{0};
     std::atomic<uint64_t> comHijackingDetected{0};
     std::atomic<uint64_t> searchOrderHijacks{0};
-    
+
     // Blocking
     std::atomic<uint64_t> loadsBlocked{0};
     std::atomic<uint64_t> injectionsBlocked{0};
-    
+
     // Real-time monitoring
     std::atomic<uint64_t> moduleLoadEventsProcessed{0};
     std::atomic<uint64_t> threadCreateEventsProcessed{0};
     std::atomic<uint64_t> hookEventsProcessed{0};
-    
+
     // Cache/performance
     std::atomic<uint64_t> hashLookups{0};
     std::atomic<uint64_t> hashCacheHits{0};
     std::atomic<uint64_t> whitelistHits{0};
-    
+
+    // APC events
+    std::atomic<uint64_t> apcEventsProcessed{0};
+
     // Errors
     std::atomic<uint64_t> analysisErrors{0};
     std::atomic<uint64_t> accessDeniedErrors{0};
-    
+
+    /**
+     * @brief Default constructor.
+     */
+    DLLInjectionStatistics() noexcept = default;
+
+    /**
+     * @brief Copy constructor - loads each atomic for snapshot semantics.
+     *
+     * std::atomic is non-copyable by design. This explicit copy constructor
+     * allows GetStatistics() to return a snapshot by value, which is the
+     * standard pattern for exposing atomic statistics counters.
+     */
+    DLLInjectionStatistics(const DLLInjectionStatistics& other) noexcept
+        : totalModulesAnalyzed(other.totalModulesAnalyzed.load(std::memory_order_relaxed))
+        , trustedModulesFound(other.trustedModulesFound.load(std::memory_order_relaxed))
+        , untrustedModulesFound(other.untrustedModulesFound.load(std::memory_order_relaxed))
+        , suspiciousModulesFound(other.suspiciousModulesFound.load(std::memory_order_relaxed))
+        , injectionsDetected(other.injectionsDetected.load(std::memory_order_relaxed))
+        , remoteThreadInjections(other.remoteThreadInjections.load(std::memory_order_relaxed))
+        , hookInjections(other.hookInjections.load(std::memory_order_relaxed))
+        , apcInjections(other.apcInjections.load(std::memory_order_relaxed))
+        , appInitInjections(other.appInitInjections.load(std::memory_order_relaxed))
+        , sideLoadingDetected(other.sideLoadingDetected.load(std::memory_order_relaxed))
+        , comHijackingDetected(other.comHijackingDetected.load(std::memory_order_relaxed))
+        , searchOrderHijacks(other.searchOrderHijacks.load(std::memory_order_relaxed))
+        , loadsBlocked(other.loadsBlocked.load(std::memory_order_relaxed))
+        , injectionsBlocked(other.injectionsBlocked.load(std::memory_order_relaxed))
+        , moduleLoadEventsProcessed(other.moduleLoadEventsProcessed.load(std::memory_order_relaxed))
+        , threadCreateEventsProcessed(other.threadCreateEventsProcessed.load(std::memory_order_relaxed))
+        , hookEventsProcessed(other.hookEventsProcessed.load(std::memory_order_relaxed))
+        , hashLookups(other.hashLookups.load(std::memory_order_relaxed))
+        , hashCacheHits(other.hashCacheHits.load(std::memory_order_relaxed))
+        , whitelistHits(other.whitelistHits.load(std::memory_order_relaxed))
+        , apcEventsProcessed(other.apcEventsProcessed.load(std::memory_order_relaxed))
+        , analysisErrors(other.analysisErrors.load(std::memory_order_relaxed))
+        , accessDeniedErrors(other.accessDeniedErrors.load(std::memory_order_relaxed)) {}
+
+    /**
+     * @brief Copy assignment - loads each atomic for snapshot semantics.
+     */
+    DLLInjectionStatistics& operator=(const DLLInjectionStatistics& other) noexcept {
+        if (this != &other) {
+            totalModulesAnalyzed.store(other.totalModulesAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            trustedModulesFound.store(other.trustedModulesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            untrustedModulesFound.store(other.untrustedModulesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousModulesFound.store(other.suspiciousModulesFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            injectionsDetected.store(other.injectionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            remoteThreadInjections.store(other.remoteThreadInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hookInjections.store(other.hookInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apcInjections.store(other.apcInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            appInitInjections.store(other.appInitInjections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sideLoadingDetected.store(other.sideLoadingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            comHijackingDetected.store(other.comHijackingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            searchOrderHijacks.store(other.searchOrderHijacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            loadsBlocked.store(other.loadsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            injectionsBlocked.store(other.injectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            moduleLoadEventsProcessed.store(other.moduleLoadEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threadCreateEventsProcessed.store(other.threadCreateEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hookEventsProcessed.store(other.hookEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hashLookups.store(other.hashLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hashCacheHits.store(other.hashCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            whitelistHits.store(other.whitelistHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apcEventsProcessed.store(other.apcEventsProcessed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            analysisErrors.store(other.analysisErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessDeniedErrors.store(other.accessDeniedErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+
     /**
      * @brief Reset all statistics.
      */
     void Reset() noexcept;
-    
+
     /**
      * @brief Get detection rate (detections per module analyzed).
      */
@@ -1113,6 +1185,22 @@ public:
      * @param processName Process name.
      */
     void IncludeProcess(const std::wstring& processName);
+
+    // ========================================================================
+    // EXTERNAL STORE INJECTION (called by orchestrator after Initialize)
+    // ========================================================================
+
+    /**
+     * @brief Connect an external HashStore for threat-intel hash lookups.
+     * @param store Non-owning pointer; caller must ensure lifetime >= detector.
+     */
+    void SetHashStore(HashStore::HashStore* store) noexcept;
+
+    /**
+     * @brief Connect an external WhitelistStore for path whitelist checks.
+     * @param store Non-owning pointer; caller must ensure lifetime >= detector.
+     */
+    void SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept;
 
     // ========================================================================
     // STATISTICS

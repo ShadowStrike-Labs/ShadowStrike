@@ -110,6 +110,9 @@
 #include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/QuarantineManager.hpp"
 #include "../Core/Process/ProcessInjectionDetector.hpp"
+#include "../Core/Process/AtomBombingDetector.hpp"
+#include "../Core/Process/ProcessMonitor.hpp"
+#include "../Core/Process/DLLInjectionDetector.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
@@ -1478,6 +1481,44 @@ public:
             Utils::Logger::Error("RealTimeProtection: BehaviorAnalyzer unknown startup exception");
         }
 
+        // AtomBombingDetector (singleton -- detect AtomBombing code injection attacks)
+        try {
+            auto& abd = Core::Process::AtomBombingDetector::Instance();
+            auto abdConfig = Core::Process::AtomBombingConfig::CreateDefault();
+            abdConfig.enableRealTimeMonitoring = true;
+            abdConfig.monitorAtomTable = true;
+            abdConfig.monitorAPCs = true;
+            abdConfig.correlateAtomAndAPC = true;
+            abdConfig.detectShellcodePatterns = true;
+            abdConfig.analyzeEntropy = true;
+            abdConfig.extractPayloads = true;
+            abdConfig.enableAutoResponse = m_config.enableBehaviorBlocking;
+            abdConfig.blockSuspiciousApcs = m_config.enableBehaviorBlocking;
+
+            if (!abd.Initialize(abdConfig)) {
+                Utils::Logger::Error("RealTimeProtection: AtomBombingDetector::Initialize failed");
+            } else {
+                // Register attack callback for centralized logging/alerting
+                abd.RegisterAttackCallback(
+                    [](const Core::Process::AtomBombingAttack& attack) {
+                        Utils::Logger::Warn(
+                            "RealTimeProtection: [ABD] AtomBombing attack detected: "
+                            "PID {} -> PID {} (confidence={}, risk={}, blocked={})",
+                            attack.attackerPid, attack.victimPid,
+                            static_cast<int>(attack.confidence),
+                            attack.riskScore,
+                            attack.wasBlocked ? "YES" : "NO");
+                    });
+
+                abd.StartMonitoring();
+                Utils::Logger::Info("RealTimeProtection: AtomBombingDetector initialized and monitoring");
+            }
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("RealTimeProtection: AtomBombingDetector startup exception: {}", ex.what());
+        } catch (...) {
+            Utils::Logger::Error("RealTimeProtection: AtomBombingDetector unknown startup exception");
+        }
+
         // ZeroHourProtection
         if (m_config.enableZeroHourProtection) {
             try {
@@ -1758,6 +1799,12 @@ public:
 
         // BehaviorAnalyzer — shut down after event sources (PCM/PID/BB) but before exploit detectors
         try { Core::Engine::BehaviorAnalyzer::Instance().Shutdown(); } catch (...) {}
+
+        // AtomBombingDetector — shut down after BehaviorAnalyzer
+        try {
+            Core::Process::AtomBombingDetector::Instance().StopMonitoring();
+            Core::Process::AtomBombingDetector::Instance().Shutdown();
+        } catch (...) {}
 
         try { Exploits::StackPivotDetector::Instance().Shutdown(); } catch (...) {}
         try { Exploits::BufferOverflowProtection::Instance().Shutdown(); } catch (...) {}
@@ -2712,6 +2759,28 @@ public:
             } catch (...) {}
         }
 
+        // ================================================================
+        // FORWARD TO PROCESS MONITOR → DLL INJECTION DETECTOR
+        // ProcessMonitor::OnModuleLoad forwards to DLLInjectionDetector::OnModuleLoad
+        // for injection correlation (remote thread + module load timing).
+        // This MUST happen for every allowed module load so the detector
+        // can correlate thread-creation events with DLL appearance.
+        // ================================================================
+        try {
+            auto& procMon = Core::Process::ProcessMonitor::Instance();
+            if (procMon.IsInitialized()) {
+                procMon.OnModuleLoad(
+                    req.processId,
+                    imagePath,
+                    static_cast<uintptr_t>(req.imageBase),
+                    static_cast<size_t>(req.imageSize));
+            }
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(
+                "RealTimeProtection: ProcessMonitor::OnModuleLoad exception PID {}: {}",
+                req.processId, e.what());
+        } catch (...) {}
+
         return Communication::KernelVerdict::Allow;
     }
 
@@ -2805,6 +2874,19 @@ public:
             case FilterMessageType_ThreadNotify: {
                 if (size >= sizeof(SHADOWSTRIKE_THREAD_NOTIFICATION)) {
                     auto* notif = static_cast<const SHADOWSTRIKE_THREAD_NOTIFICATION*>(data);
+
+                    // Forward ALL thread creation events to DLLInjectionDetector
+                    // for remote-thread + module-load correlation.
+                    try {
+                        auto& dllDetector = Core::Process::DLLInjectionDetector::Instance();
+                        if (dllDetector.IsInitialized() && dllDetector.IsMonitoring()) {
+                            dllDetector.OnThreadCreate(
+                                notif->ProcessId,
+                                notif->CreatorProcessId,
+                                0 /* startAddress not in this notification struct */);
+                        }
+                    } catch (...) {}
+
                     // Remote thread injection detection (MITRE T1055.003)
                     if (notif->IsRemote) {
                         Utils::Logger::Warn("RealTimeProtection: Remote thread detected  -  "

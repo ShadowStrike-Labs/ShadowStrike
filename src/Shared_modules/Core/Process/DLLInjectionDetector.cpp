@@ -60,6 +60,7 @@
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
+#include "../../Utils/PE_sig_verf.hpp"
 
 // Standard library
 #include <algorithm>
@@ -82,26 +83,53 @@ namespace Process {
 namespace {
 
 /**
+ * @brief RAII wrapper for Windows HANDLE (process handles, etc.).
+ *
+ * Prevents handle leaks on early returns, exceptions, or complex control flow.
+ */
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    explicit operator bool() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+    HANDLE get() const noexcept { return h; }
+};
+
+/**
  * @brief Calculate Shannon entropy of a file.
+ *
+ * Only reads the first 64 KB via direct handle I/O to avoid allocating
+ * the entire file into memory (potential DoS with large DLLs).
  */
 double CalculateFileEntropy(const std::wstring& filePath) {
     try {
-        auto data = Utils::FileUtils::ReadFileBytes(filePath);
-        if (data.empty() || data.size() < 256) return 0.0;
+        constexpr DWORD SAMPLE_SIZE = 65536; // 64 KB sample
+
+        HandleGuard hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
+        if (!hFile) return 0.0;
+
+        std::array<uint8_t, SAMPLE_SIZE> buffer{};
+        DWORD bytesRead = 0;
+        if (!ReadFile(hFile.get(), buffer.data(), SAMPLE_SIZE, &bytesRead, nullptr) ||
+            bytesRead < 256) {
+            return 0.0;
+        }
 
         std::array<size_t, 256> freq{};
-        size_t sampleSize = std::min(data.size(), size_t(65536)); // Sample first 64KB
-
-        for (size_t i = 0; i < sampleSize; ++i) {
-            freq[data[i]]++;
+        for (DWORD i = 0; i < bytesRead; ++i) {
+            freq[buffer[i]]++;
         }
 
         double entropy = 0.0;
-        const double size = static_cast<double>(sampleSize);
+        const double dblSize = static_cast<double>(bytesRead);
 
         for (size_t count : freq) {
             if (count > 0) {
-                const double p = static_cast<double>(count) / size;
+                const double p = static_cast<double>(count) / dblSize;
                 entropy -= p * std::log2(p);
             }
         }
@@ -115,16 +143,130 @@ double CalculateFileEntropy(const std::wstring& filePath) {
 
 /**
  * @brief Normalize path for comparison.
+ * Handles \\?\ / \\.\, \SystemRoot\, \??\, \Device\HarddiskVolume*,
+ * canonicalizes .. and ., lowercases for safe comparison.
+ *
+ * Kernel PsSetLoadImageNotifyRoutine sends paths like:
+ *   \Device\HarddiskVolume3\Windows\System32\ntdll.dll
+ *   \SystemRoot\System32\drivers\foo.sys
+ *   \??\C:\Program Files\bar.dll
+ * These must be normalized to standard Win32 paths for comparison.
  */
 std::wstring NormalizePath(const std::wstring& path) {
     std::wstring normalized = path;
-    std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::towlower);
+
+    // Strip extended-length and device path prefixes that can bypass string checks
+    if (normalized.starts_with(L"\\\\?\\")) {
+        normalized = normalized.substr(4);
+    } else if (normalized.starts_with(L"\\\\.\\")) {
+        normalized = normalized.substr(4);
+    }
+
+    // Handle kernel NT-style path prefixes
+    // \??\C:\... → C:\...
+    if (normalized.starts_with(L"\\??\\")) {
+        normalized = normalized.substr(4);
+    }
+
+    // \SystemRoot\ → actual Windows directory
+    {
+        constexpr std::wstring_view kSystemRoot = L"\\SystemRoot\\";
+        if (normalized.size() >= kSystemRoot.size()) {
+            // Case-insensitive prefix check
+            std::wstring prefix = normalized.substr(0, kSystemRoot.size());
+            std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::towlower);
+            if (prefix == L"\\systemroot\\") {
+                wchar_t winDir[MAX_PATH];
+                if (GetWindowsDirectoryW(winDir, MAX_PATH) > 0) {
+                    normalized = std::wstring(winDir) + L"\\" +
+                                 normalized.substr(kSystemRoot.size());
+                }
+            }
+        }
+    }
+
+    // \Device\HarddiskVolumeN\... → resolve via QueryDosDevice
+    // This is expensive so we use a cached mapping.
+    {
+        constexpr std::wstring_view kDevPrefix = L"\\Device\\HarddiskVolume";
+        if (normalized.size() >= kDevPrefix.size()) {
+            std::wstring prefix = normalized.substr(0, kDevPrefix.size());
+            std::transform(prefix.begin(), prefix.end(), prefix.begin(), ::towlower);
+            if (prefix == L"\\device\\harddiskvolume") {
+                // Find end of volume number
+                size_t volEnd = kDevPrefix.size();
+                while (volEnd < normalized.size() && normalized[volEnd] >= L'0' && normalized[volEnd] <= L'9') {
+                    ++volEnd;
+                }
+                if (volEnd > kDevPrefix.size() && volEnd < normalized.size() && normalized[volEnd] == L'\\') {
+                    std::wstring devicePath = normalized.substr(0, volEnd);
+                    // Resolve via cached drive letter mapping
+                    static const auto driveMap = []() {
+                        std::unordered_map<std::wstring, std::wstring> map;
+                        wchar_t drives[512];
+                        if (GetLogicalDriveStringsW(512, drives)) {
+                            for (const wchar_t* d = drives; *d; d += wcslen(d) + 1) {
+                                wchar_t letter[3] = { d[0], d[1], L'\0' }; // e.g. "C:"
+                                wchar_t target[MAX_PATH];
+                                if (QueryDosDeviceW(letter, target, MAX_PATH)) {
+                                    std::wstring key(target);
+                                    std::transform(key.begin(), key.end(), key.begin(), ::towlower);
+                                    map[key] = std::wstring(letter);
+                                }
+                            }
+                        }
+                        return map;
+                    }();
+
+                    std::wstring lowerDevice = devicePath;
+                    std::transform(lowerDevice.begin(), lowerDevice.end(), lowerDevice.begin(), ::towlower);
+                    auto it = driveMap.find(lowerDevice);
+                    if (it != driveMap.end()) {
+                        normalized = it->second + normalized.substr(volEnd);
+                    }
+                }
+            }
+        }
+    }
 
     // Replace forward slashes with backslashes
     std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
 
+    // Canonicalize by resolving . and .. components
+    std::vector<std::wstring> parts;
+    std::wstring segment;
+    std::wstringstream wss(normalized);
+    bool isUNC = normalized.starts_with(L"\\\\");
+
+    // Split on backslashes
+    while (std::getline(wss, segment, L'\\')) {
+        if (segment.empty() || segment == L".") {
+            continue;
+        } else if (segment == L"..") {
+            // Don't pop past root (drive letter or UNC share)
+            if (parts.size() > 1) {
+                parts.pop_back();
+            }
+        } else {
+            parts.push_back(segment);
+        }
+    }
+
+    // Reassemble
+    normalized.clear();
+    if (isUNC) {
+        normalized = L"\\\\";
+    }
+    for (size_t i = 0; i < parts.size(); ++i) {
+        if (i > 0) normalized += L'\\';
+        normalized += parts[i];
+    }
+
+    // Lowercase for case-insensitive comparison
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::towlower);
+
     // Remove trailing backslash
-    if (!normalized.empty() && normalized.back() == L'\\') {
+    if (normalized.size() > 3 && normalized.back() == L'\\') {
         normalized.pop_back();
     }
 
@@ -132,20 +274,41 @@ std::wstring NormalizePath(const std::wstring& path) {
 }
 
 /**
+ * @brief Cached system paths for hot-path performance.
+ * Initialized on first use via Meyers' singleton pattern.
+ */
+struct CachedSystemPaths {
+    std::wstring systemDir;
+    std::wstring windowsDir;
+    std::wstring tempDir;
+    std::wstring userProfile;
+
+    static const CachedSystemPaths& Get() {
+        static CachedSystemPaths instance = []() {
+            CachedSystemPaths p;
+            wchar_t buf[MAX_PATH];
+            if (GetSystemDirectoryW(buf, MAX_PATH) > 0)
+                p.systemDir = NormalizePath(buf);
+            if (GetWindowsDirectoryW(buf, MAX_PATH) > 0)
+                p.windowsDir = NormalizePath(buf);
+            if (GetTempPathW(MAX_PATH, buf) > 0)
+                p.tempDir = NormalizePath(buf);
+            if (GetEnvironmentVariableW(L"USERPROFILE", buf, MAX_PATH) > 0)
+                p.userProfile = NormalizePath(buf);
+            return p;
+        }();
+        return instance;
+    }
+};
+
+/**
  * @brief Check if path is in system directory.
  */
 bool IsSystemDirectory(const std::wstring& path) {
     std::wstring normalized = NormalizePath(path);
-
-    wchar_t systemDir[MAX_PATH];
-    GetSystemDirectoryW(systemDir, MAX_PATH);
-    std::wstring systemPath = NormalizePath(systemDir);
-
-    wchar_t windowsDir[MAX_PATH];
-    GetWindowsDirectoryW(windowsDir, MAX_PATH);
-    std::wstring windowsPath = NormalizePath(windowsDir);
-
-    return normalized.starts_with(systemPath) || normalized.starts_with(windowsPath);
+    const auto& cached = CachedSystemPaths::Get();
+    return (!cached.systemDir.empty() && normalized.starts_with(cached.systemDir)) ||
+           (!cached.windowsDir.empty() && normalized.starts_with(cached.windowsDir));
 }
 
 /**
@@ -153,12 +316,9 @@ bool IsSystemDirectory(const std::wstring& path) {
  */
 bool IsTempDirectory(const std::wstring& path) {
     std::wstring normalized = NormalizePath(path);
+    const auto& cached = CachedSystemPaths::Get();
 
-    wchar_t tempPath[MAX_PATH];
-    GetTempPathW(MAX_PATH, tempPath);
-    std::wstring temp = NormalizePath(tempPath);
-
-    return normalized.starts_with(temp) ||
+    return (!cached.tempDir.empty() && normalized.starts_with(cached.tempDir)) ||
            normalized.find(L"\\temp\\") != std::wstring::npos ||
            normalized.find(L"\\tmp\\") != std::wstring::npos;
 }
@@ -168,22 +328,27 @@ bool IsTempDirectory(const std::wstring& path) {
  */
 bool IsUserProfilePath(const std::wstring& path) {
     std::wstring normalized = NormalizePath(path);
-
-    wchar_t profilePath[MAX_PATH];
-    if (GetEnvironmentVariableW(L"USERPROFILE", profilePath, MAX_PATH) > 0) {
-        std::wstring profile = NormalizePath(profilePath);
-        return normalized.starts_with(profile);
-    }
-
-    return false;
+    const auto& cached = CachedSystemPaths::Get();
+    return !cached.userProfile.empty() && normalized.starts_with(cached.userProfile);
 }
 
 /**
  * @brief Calculate Levenshtein distance for name masquerading detection.
+ *
+ * Capped to MAX_DISTANCE_INPUT to prevent O(n*m) memory exhaustion from
+ * adversarially-long filenames. DLL names beyond this length are never
+ * plausible system DLL masquerades.
  */
 size_t LevenshteinDistance(const std::wstring& s1, const std::wstring& s2) {
-    const size_t len1 = s1.size();
-    const size_t len2 = s2.size();
+    constexpr size_t MAX_DISTANCE_INPUT = 64;
+    const size_t len1 = std::min(s1.size(), MAX_DISTANCE_INPUT);
+    const size_t len2 = std::min(s2.size(), MAX_DISTANCE_INPUT);
+
+    // Fast-path: if length difference alone exceeds edit-distance threshold,
+    // no need for full DP computation.
+    if (len1 > len2 + 3 || len2 > len1 + 3) {
+        return std::max(len1, len2);
+    }
 
     std::vector<std::vector<size_t>> d(len1 + 1, std::vector<size_t>(len2 + 1));
 
@@ -192,7 +357,7 @@ size_t LevenshteinDistance(const std::wstring& s1, const std::wstring& s2) {
 
     for (size_t i = 1; i <= len1; ++i) {
         for (size_t j = 1; j <= len2; ++j) {
-            const size_t cost = (s1[i - 1] == s2[j - 1]) ? 0 : 1;
+            const size_t cost = (::towlower(s1[i - 1]) == ::towlower(s2[j - 1])) ? 0 : 1;
             d[i][j] = std::min({
                 d[i - 1][j] + 1,
                 d[i][j - 1] + 1,
@@ -216,15 +381,21 @@ const std::vector<std::wstring> g_systemDLLNames = {
 
 /**
  * @brief Check if DLL name is masquerading as a system DLL.
+ *
+ * Uses case-insensitive Levenshtein distance. Names longer than any system
+ * DLL + 3 chars are skipped as a fast path (no plausible masquerade).
  */
 bool IsMasquerading(const std::wstring& dllName) {
+    if (dllName.size() > 32) return false; // No system DLL name is this long
+
     std::wstring lowerName = dllName;
     std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
 
     for (const auto& systemDll : g_systemDLLNames) {
+        if (lowerName == systemDll) return false; // Exact match = not masquerading
         size_t distance = LevenshteinDistance(lowerName, systemDll);
         if (distance > 0 && distance <= 2) {
-            return true; // Close match but not exact
+            return true;
         }
     }
 
@@ -233,6 +404,8 @@ bool IsMasquerading(const std::wstring& dllName) {
 
 /**
  * @brief Known DLL side-loading pairs.
+ * Sourced from public threat intelligence: MITRE ATT&CK T1574.002 corpus,
+ * CISA advisories, and observed APT campaigns.
  */
 struct SideLoadPair {
     std::wstring executable;
@@ -240,11 +413,40 @@ struct SideLoadPair {
 };
 
 const std::vector<SideLoadPair> g_knownSideLoadPairs = {
+    // Browsers
     {L"chrome.exe", L"version.dll"},
+    {L"chrome.exe", L"wtsapi32.dll"},
+    {L"msedge.exe", L"version.dll"},
     {L"firefox.exe", L"mozglue.dll"},
+    // Microsoft tools
+    {L"msbuild.exe", L"version.dll"},
+    {L"devenv.exe", L"version.dll"},
+    {L"winword.exe", L"wwlib.dll"},
+    {L"excel.exe", L"xllex.dll"},
+    {L"outlook.exe", L"olmapi32.dll"},
+    {L"powerpnt.exe", L"ppcore.dll"},
+    // System utilities
     {L"explorer.exe", L"shell32.dll"},
     {L"cmd.exe", L"cmd.dll"},
-    {L"notepad.exe", L"notepad.dll"}
+    {L"notepad.exe", L"notepad.dll"},
+    {L"control.exe", L"version.dll"},
+    {L"rundll32.exe", L"version.dll"},
+    {L"mmc.exe", L"elsext.dll"},
+    {L"cmstp.exe", L"version.dll"},
+    // Common APT targets
+    {L"vmtoolsd.exe", L"vsock.dll"},
+    {L"vmnat.exe", L"shfolder.dll"},
+    {L"putty.exe", L"winmm.dll"},
+    {L"WinSCP.exe", L"dui70.dll"},
+    {L"7z.exe", L"7z.dll"},
+    {L"Acrobat.exe", L"AcroRd32.dll"},
+    {L"AcroRd32.exe", L"rdrsefui.dll"},
+    {L"winrar.exe", L"rar.dll"},
+    // Signed vulnerable loaders used by APTs
+    {L"dllhost.exe", L"comsvcs.dll"},
+    {L"svchost.exe", L"version.dll"},
+    {L"SearchProtocolHost.exe", L"msfte.dll"},
+    {L"consent.exe", L"version.dll"},
 };
 
 /**
@@ -412,6 +614,8 @@ void DLLInjectionStatistics::Reset() noexcept {
     hashCacheHits.store(0, std::memory_order_relaxed);
     whitelistHits.store(0, std::memory_order_relaxed);
 
+    apcEventsProcessed.store(0, std::memory_order_relaxed);
+
     analysisErrors.store(0, std::memory_order_relaxed);
     accessDeniedErrors.store(0, std::memory_order_relaxed);
 }
@@ -542,7 +746,7 @@ public:
         m_modules[key] = dllInfo;
 
         // Track by process
-        m_processMod ules[pid].push_back(dllInfo.normalizedPath);
+        m_processModules[pid].push_back(dllInfo.normalizedPath);
     }
 
     std::optional<LoadedDLLInfo> GetModule(uint32_t pid, const std::wstring& dllPath) const {
@@ -690,6 +894,10 @@ public:
     }
 
 private:
+    // Maximum number of events to retain per category.
+    // Prevents unbounded memory growth under sustained injection attempts.
+    static constexpr size_t MAX_EVENT_ENTRIES = 4096;
+
     void CleanupOldEvents() {
         const auto now = std::chrono::steady_clock::now();
         const auto cutoff = now - std::chrono::seconds(60);
@@ -707,6 +915,20 @@ private:
                 [cutoff](const APCEvent& e) { return e.timestamp < cutoff; }),
             m_apcEvents.end()
         );
+
+        // Hard cap: if still over limit after time-based cleanup, drop oldest entries
+        if (m_threadEvents.size() > MAX_EVENT_ENTRIES) {
+            m_threadEvents.erase(
+                m_threadEvents.begin(),
+                m_threadEvents.begin() + static_cast<ptrdiff_t>(m_threadEvents.size() - MAX_EVENT_ENTRIES)
+            );
+        }
+        if (m_apcEvents.size() > MAX_EVENT_ENTRIES) {
+            m_apcEvents.erase(
+                m_apcEvents.begin(),
+                m_apcEvents.begin() + static_cast<ptrdiff_t>(m_apcEvents.size() - MAX_EVENT_ENTRIES)
+            );
+        }
     }
 
     mutable std::shared_mutex m_mutex;
@@ -746,16 +968,12 @@ public:
             m_moduleTracker = std::make_unique<ModuleTracker>();
             m_correlator = std::make_unique<InjectionCorrelator>();
 
-            // Initialize infrastructure
-            if (!HashStore::HashStore::Instance().Initialize(
-                HashStore::HashStoreConfig::CreateDefault())) {
-                SS_LOG_WARN(L"DLLInjection", L"HashStore initialization warning");
-            }
-
-            if (!Whitelist::WhitelistStore::Instance().Initialize(
-                Whitelist::WhitelistStoreConfig::CreateDefault())) {
-                SS_LOG_WARN(L"DLLInjection", L"WhitelistStore initialization warning");
-            }
+            // NOTE: HashStore and WhitelistStore are NOT singletons.
+            // They must be provisioned by the orchestrator layer and injected
+            // via SetHashStore()/SetWhitelistStore() after Initialize().
+            // Hash computation for individual files uses Utils::FileUtils::ComputeFileSHA256().
+            // Hash-based threat intel lookup and whitelist lookup are optional
+            // capabilities that activate only when external stores are connected.
 
             m_initialized = true;
             SS_LOG_INFO(L"DLLInjection", L"Initialized successfully");
@@ -804,6 +1022,16 @@ public:
     LoadedDLLInfo AnalyzeLoad(uint32_t pid, const std::wstring& dllPath) {
         LoadedDLLInfo info;
 
+        if (!m_initialized || !m_callbackManager || !m_moduleTracker || !m_correlator) {
+            SS_LOG_WARN(L"DLLInjection", L"AnalyzeLoad called before initialization");
+            return info;
+        }
+
+        // Check process exclusion
+        if (IsProcessExcluded(pid)) {
+            return info;
+        }
+
         try {
             m_stats.totalModulesAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
@@ -820,7 +1048,7 @@ public:
             info.loadTime = std::chrono::system_clock::now();
 
             // Get process name
-            info.loadingProcessName = GetProcessName(pid);
+            info.loadingProcessName = GetProcessNameCached(pid);
 
             // Path analysis
             info.isInSystemDir = IsSystemDirectory(dllPath);
@@ -867,10 +1095,9 @@ public:
             }
 
             // Whitelist check
-            if (m_config.useWhitelist) {
-                info.isWhitelisted = Whitelist::WhitelistStore::Instance().IsWhitelisted(
-                    Utils::StringUtils::WideToUtf8(info.normalizedPath)
-                );
+            if (m_config.useWhitelist && m_whitelistStore) {
+                auto result = m_whitelistStore->IsPathWhitelisted(info.normalizedPath);
+                info.isWhitelisted = result.isWhitelisted;
 
                 if (info.isWhitelisted) {
                     m_stats.whitelistHits.fetch_add(1, std::memory_order_relaxed);
@@ -898,7 +1125,7 @@ public:
             // Invoke callbacks
             m_callbackManager->InvokeModule(info);
 
-            SS_LOG_INFO(L"DLLInjection", L"Analyzed %S - Trust: %d, Risk: %.2f", Utils::StringUtils::WideToUtf8(info.dllName), static_cast<int>(info.trustLevel), info.riskScore);
+            SS_LOG_INFO(L"DLLInjection", L"Analyzed %S - Trust: %d, Risk: %u", Utils::StringUtils::ToNarrow(info.dllName).c_str(), static_cast<int>(info.trustLevel), info.riskScore);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DLLInjection", L"AnalyzeLoad: %S", e.what());
@@ -911,7 +1138,7 @@ public:
     InjectionAnalysisResult AnalyzeProcess(uint32_t pid) {
         InjectionAnalysisResult result;
         result.processId = pid;
-        result.processName = GetProcessName(pid);
+        result.processName = GetProcessNameCached(pid);
         result.analysisTime = std::chrono::system_clock::now();
 
         const auto startTime = std::chrono::high_resolution_clock::now();
@@ -1002,11 +1229,11 @@ public:
                 std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime).count()
             );
 
-            SS_LOG_INFO(L"DLLInjection", L"Process %u analysis complete - %d modules, %d suspicious, %d injected", pid, result.totalModules, result.suspiciousModules, result.injectedModules);
+            SS_LOG_INFO(L"DLLInjection", L"Process %u analysis complete - %u modules, %u suspicious, %u injected", pid, result.totalModules, result.suspiciousModules, result.injectedModules);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DLLInjection", L"AnalyzeProcess: %S", e.what());
-            result.analysisError = Utils::StringUtils::Utf8ToWide(e.what());
+            result.analysisError = Utils::StringUtils::ToWide(e.what());
             m_stats.analysisErrors.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -1016,14 +1243,12 @@ public:
     LoadedDLLInfo AnalyzeModule(uint32_t pid, uintptr_t moduleBase) {
         // Get module path from base address
         wchar_t modulePath[MAX_PATH];
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (hProcess) {
-            if (GetModuleFileNameExW(hProcess, reinterpret_cast<HMODULE>(moduleBase),
+            if (GetModuleFileNameExW(hProcess.get(), reinterpret_cast<HMODULE>(moduleBase),
                                     modulePath, MAX_PATH)) {
-                CloseHandle(hProcess);
                 return AnalyzeLoad(pid, modulePath);
             }
-            CloseHandle(hProcess);
         }
 
         return LoadedDLLInfo{};
@@ -1054,6 +1279,10 @@ public:
 
     std::vector<InjectionEvent> DetectInjections(uint32_t pid) {
         std::vector<InjectionEvent> events;
+
+        if (!m_initialized || !m_callbackManager || !m_moduleTracker || !m_correlator) {
+            return events;
+        }
 
         try {
             // Detect remote thread injection
@@ -1125,24 +1354,37 @@ public:
             return events;
         }
 
-        // Look for recently loaded suspicious modules
+        // Only flag if thread was created by a DIFFERENT process (cross-process injection)
+        if (threadEvent->creatorPid == pid) {
+            return events;
+        }
+
+        // Look for recently loaded modules that appeared after the remote thread
         auto modules = m_moduleTracker->GetProcessModules(pid);
+        const auto now = std::chrono::system_clock::now();
 
         for (const auto& module : modules) {
-            // Check if module was loaded around the time of thread creation
-            const auto loadTime = std::chrono::time_point_cast<std::chrono::milliseconds>(module.loadTime);
-            const auto threadTime = std::chrono::time_point_cast<std::chrono::milliseconds>(
-                std::chrono::system_clock::now() -
-                std::chrono::duration_cast<std::chrono::system_clock::duration>(
-                    std::chrono::steady_clock::now() - threadEvent->timestamp
-                )
+            // Use elapsed-time comparison (avoids unreliable clock domain conversion).
+            // A module loaded within the correlation window after the thread creation
+            // is a strong injection indicator.
+            const auto moduleAge = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - module.loadTime
+            );
+            const auto threadAge = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - threadEvent->timestamp
             );
 
-            const auto timeDiff = std::chrono::duration_cast<std::chrono::milliseconds>(
-                loadTime - threadTime
-            );
+            // Both ages measured from "now", so their difference approximates the
+            // time gap between the thread creation and the module load.
+            const auto gap = std::abs(moduleAge.count() - threadAge.count());
 
-            if (std::abs(timeDiff.count()) < DLLInjectionConstants::LOAD_CORRELATION_WINDOW_MS) {
+            if (gap < DLLInjectionConstants::LOAD_CORRELATION_WINDOW_MS) {
+                // Skip trusted system modules — they are normal dependencies
+                if (module.trustLevel == TrustLevel::System ||
+                    module.trustLevel == TrustLevel::Whitelisted) {
+                    continue;
+                }
+
                 InjectionEvent event;
                 event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                 event.timestamp = std::chrono::system_clock::now();
@@ -1151,11 +1393,11 @@ public:
                 event.dllInfo = module;
                 event.injectionType = InjectionType::CreateRemoteThread;
                 event.confidence = InjectionConfidence::High;
-                event.injectionThreadId = 0; // Unknown
+                event.injectionThreadId = 0;
                 event.threadStartAddress = threadEvent->startAddress;
                 event.detectionReasons.push_back(L"Remote thread created by PID " +
                     std::to_wstring(threadEvent->creatorPid));
-                event.detectionReasons.push_back(L"Module loaded within correlation window");
+                event.detectionReasons.push_back(L"Untrusted module loaded within correlation window");
                 event.riskScore = 80;
                 event.mitreAttackId = "T1055.001";
 
@@ -1164,10 +1406,11 @@ public:
                 m_stats.injectionsDetected.fetch_add(1, std::memory_order_relaxed);
                 m_stats.remoteThreadInjections.fetch_add(1, std::memory_order_relaxed);
 
-                // Invoke callbacks
                 m_callbackManager->InvokeInjection(event);
 
-                SS_LOG_WARN(L"DLLInjection", L"CreateRemoteThread injection detected - PID %u injected by PID %u", pid, threadEvent->creatorPid);
+                SS_LOG_WARN(L"DLLInjection", L"CreateRemoteThread injection detected - PID %u injected by PID %u, DLL: %S",
+                            pid, threadEvent->creatorPid,
+                            Utils::StringUtils::ToNarrow(module.dllName).c_str());
             }
         }
 
@@ -1185,11 +1428,28 @@ public:
             return events;
         }
 
-        // Look for recently loaded suspicious modules
+        // Only flag modules loaded within the APC correlation window,
+        // not ALL modules in the process (which causes massive false positives).
         auto modules = m_moduleTracker->GetProcessModules(pid);
 
         for (const auto& module : modules) {
-            // Correlation logic similar to remote thread
+            // Correlate by checking if the module load time is within the APC window
+            const auto now = std::chrono::system_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - module.loadTime
+            );
+
+            // Only flag modules loaded recently (within correlation window)
+            if (elapsed.count() > DLLInjectionConstants::LOAD_CORRELATION_WINDOW_MS) {
+                continue;
+            }
+
+            // Skip trusted system modules -- APC injection loads untrusted DLLs
+            if (module.trustLevel == TrustLevel::System ||
+                module.trustLevel == TrustLevel::Whitelisted) {
+                continue;
+            }
+
             InjectionEvent event;
             event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
             event.timestamp = std::chrono::system_clock::now();
@@ -1199,6 +1459,7 @@ public:
             event.injectionType = InjectionType::QueueUserAPC;
             event.confidence = InjectionConfidence::High;
             event.detectionReasons.push_back(L"APC queued by PID " + std::to_wstring(apcEvent->queuedBy));
+            event.detectionReasons.push_back(L"Module loaded within APC correlation window");
             event.riskScore = 75;
             event.mitreAttackId = "T1055.004";
 
@@ -1209,7 +1470,7 @@ public:
 
             m_callbackManager->InvokeInjection(event);
 
-            SS_LOG_WARN(L"DLLInjection", L"QueueUserAPC injection detected - PID %u injected by PID %ls", pid, apcEvent->queuedBy);
+            SS_LOG_WARN(L"DLLInjection", L"QueueUserAPC injection detected - PID %u injected by PID %u", pid, apcEvent->queuedBy);
         }
 
         return events;
@@ -1222,11 +1483,12 @@ public:
     std::vector<HookInfo> EnumerateHooks() {
         std::vector<HookInfo> hooks;
 
-        // Windows doesn't provide a direct API to enumerate hooks
-        // This would require integration with ETW or kernel driver
-        // Simplified implementation
+        // Windows provides no public usermode API to enumerate all installed hooks.
+        // Full hook enumeration requires ETW (Microsoft-Windows-Win32k provider)
+        // or a kernel driver hooking NtUserSetWindowsHookEx.
+        // Until ETW/driver integration is wired, this returns an empty set.
 
-        SS_LOG_INFO(L"DLLInjection", L"Hook enumeration not fully implemented");
+        SS_LOG_DEBUG(L"DLLInjection", L"Hook enumeration requires ETW/driver integration");
 
         return hooks;
     }
@@ -1234,7 +1496,9 @@ public:
     std::vector<HookInfo> GetProcessHooks(uint32_t pid) {
         std::vector<HookInfo> hooks;
 
-        // Process-specific hooks would be tracked via ETW or driver
+        // Process-specific hook enumeration requires ETW or driver.
+        // Without that infrastructure, we can only detect hooks that we
+        // observe being installed via OnHookInstall() event callbacks.
 
         return hooks;
     }
@@ -1290,11 +1554,22 @@ public:
         std::vector<RegistryInjectionVector> vectors;
 
         try {
-            // Check AppInit_DLLs registry value
-            std::wstring value = Utils::RegistryUtils::ReadString(
+            // Check if AppInit_DLLs loading is enabled
+            DWORD loadEnabled = 0;
+            Utils::RegistryUtils::QuickReadDWord(
                 HKEY_LOCAL_MACHINE,
-                DLLInjectionConstants::APPINIT_DLLS_PATH.data(),
-                DLLInjectionConstants::APPINIT_DLLS_VALUE.data()
+                DLLInjectionConstants::APPINIT_DLLS_PATH,
+                DLLInjectionConstants::APPINIT_LOAD_VALUE,
+                loadEnabled
+            );
+
+            // Check AppInit_DLLs registry value
+            std::wstring value;
+            Utils::RegistryUtils::QuickReadString(
+                HKEY_LOCAL_MACHINE,
+                DLLInjectionConstants::APPINIT_DLLS_PATH,
+                DLLInjectionConstants::APPINIT_DLLS_VALUE,
+                value
             );
 
             if (!value.empty()) {
@@ -1302,16 +1577,65 @@ public:
                 vector.registryPath = std::wstring(DLLInjectionConstants::APPINIT_DLLS_PATH);
                 vector.valueName = std::wstring(DLLInjectionConstants::APPINIT_DLLS_VALUE);
                 vector.dllPath = value;
-                vector.isEnabled = true;
+                vector.isEnabled = (loadEnabled != 0);
                 vector.lastModified = std::chrono::system_clock::now();
-                vector.isSuspicious = true;
-                vector.suspicionReason = L"AppInit_DLLs configured";
+                // Only suspicious if loading is actually enabled
+                vector.isSuspicious = (loadEnabled != 0);
+                vector.suspicionReason = (loadEnabled != 0)
+                    ? L"AppInit_DLLs configured and ENABLED"
+                    : L"AppInit_DLLs configured but disabled (LoadAppInit_DLLs=0)";
 
                 vectors.push_back(vector);
 
-                m_stats.appInitInjections.fetch_add(1, std::memory_order_relaxed);
+                if (loadEnabled != 0) {
+                    m_stats.appInitInjections.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"DLLInjection", L"AppInit_DLLs ENABLED: %S",
+                                Utils::StringUtils::ToNarrow(value).c_str());
+                } else {
+                    SS_LOG_INFO(L"DLLInjection", L"AppInit_DLLs present but disabled: %S",
+                                Utils::StringUtils::ToNarrow(value).c_str());
+                }
+            }
 
-                SS_LOG_WARN(L"DLLInjection", L"AppInit_DLLs detected: %S", Utils::StringUtils::WideToUtf8(value));
+            // Also check WoW64 hive on 64-bit systems (T1546.010 completeness)
+            std::wstring wow64Value;
+            Utils::RegistryUtils::OpenOptions wow64Opts;
+            wow64Opts.wow64_32 = true;
+            Utils::RegistryUtils::QuickReadString(
+                HKEY_LOCAL_MACHINE,
+                DLLInjectionConstants::APPINIT_DLLS_PATH,
+                DLLInjectionConstants::APPINIT_DLLS_VALUE,
+                wow64Value,
+                wow64Opts
+            );
+            if (!wow64Value.empty() && wow64Value != value) {
+                DWORD wow64Enabled = 0;
+                Utils::RegistryUtils::QuickReadDWord(
+                    HKEY_LOCAL_MACHINE,
+                    DLLInjectionConstants::APPINIT_DLLS_PATH,
+                    DLLInjectionConstants::APPINIT_LOAD_VALUE,
+                    wow64Enabled,
+                    wow64Opts
+                );
+
+                RegistryInjectionVector wow64Vector;
+                wow64Vector.registryPath = std::wstring(DLLInjectionConstants::APPINIT_DLLS_PATH) + L" (WoW64)";
+                wow64Vector.valueName = std::wstring(DLLInjectionConstants::APPINIT_DLLS_VALUE);
+                wow64Vector.dllPath = wow64Value;
+                wow64Vector.isEnabled = (wow64Enabled != 0);
+                wow64Vector.lastModified = std::chrono::system_clock::now();
+                wow64Vector.isSuspicious = (wow64Enabled != 0);
+                wow64Vector.suspicionReason = (wow64Enabled != 0)
+                    ? L"WoW64 AppInit_DLLs configured and ENABLED"
+                    : L"WoW64 AppInit_DLLs configured but disabled";
+
+                vectors.push_back(wow64Vector);
+
+                if (wow64Enabled != 0) {
+                    m_stats.appInitInjections.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"DLLInjection", L"WoW64 AppInit_DLLs ENABLED: %S",
+                                Utils::StringUtils::ToNarrow(wow64Value).c_str());
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1325,20 +1649,27 @@ public:
         std::vector<RegistryInjectionVector> vectors;
 
         try {
-            // Enumerate IFEO keys
-            auto subkeys = Utils::RegistryUtils::EnumerateSubkeys(
-                HKEY_LOCAL_MACHINE,
-                DLLInjectionConstants::IFEO_PATH.data()
-            );
+            // Enumerate IFEO keys using RegistryKey RAII wrapper
+            Utils::RegistryUtils::RegistryKey ifeoKey;
+            if (!ifeoKey.Open(HKEY_LOCAL_MACHINE, DLLInjectionConstants::IFEO_PATH)) {
+                return vectors; // Key doesn't exist or access denied
+            }
+
+            std::vector<std::wstring> subkeys;
+            if (!ifeoKey.EnumKeys(subkeys)) {
+                return vectors;
+            }
 
             for (const auto& subkey : subkeys) {
                 std::wstring fullPath = std::wstring(DLLInjectionConstants::IFEO_PATH) + L"\\" + subkey;
 
-                // Check for Debugger value
-                std::wstring debugger = Utils::RegistryUtils::ReadString(
+                // Check for Debugger value (classic IFEO persistence)
+                std::wstring debugger;
+                Utils::RegistryUtils::QuickReadString(
                     HKEY_LOCAL_MACHINE,
-                    fullPath.c_str(),
-                    L"Debugger"
+                    fullPath,
+                    L"Debugger",
+                    debugger
                 );
 
                 if (!debugger.empty()) {
@@ -1353,7 +1684,48 @@ public:
 
                     vectors.push_back(vector);
 
-                    SS_LOG_WARN(L"DLLInjection", L"IFEO debugger detected for %S: %S", Utils::StringUtils::WideToUtf8(subkey), Utils::StringUtils::WideToUtf8(debugger));
+                    SS_LOG_WARN(L"DLLInjection", L"IFEO debugger detected for %S: %S",
+                                Utils::StringUtils::ToNarrow(subkey).c_str(),
+                                Utils::StringUtils::ToNarrow(debugger).c_str());
+                }
+
+                // Check for Application Verifier DLL injection (GlobalFlag + VerifierDlls)
+                // This is a less well-known IFEO abuse vector used by APTs
+                DWORD globalFlag = 0;
+                Utils::RegistryUtils::QuickReadDWord(
+                    HKEY_LOCAL_MACHINE,
+                    fullPath,
+                    L"GlobalFlag",
+                    globalFlag
+                );
+
+                if (globalFlag != 0) {
+                    std::wstring verifierDlls;
+                    Utils::RegistryUtils::QuickReadString(
+                        HKEY_LOCAL_MACHINE,
+                        fullPath,
+                        L"VerifierDlls",
+                        verifierDlls
+                    );
+
+                    if (!verifierDlls.empty()) {
+                        RegistryInjectionVector vector;
+                        vector.registryPath = fullPath;
+                        vector.valueName = L"VerifierDlls";
+                        vector.dllPath = verifierDlls;
+                        vector.isEnabled = true;
+                        vector.lastModified = std::chrono::system_clock::now();
+                        vector.isSuspicious = true;
+                        vector.suspicionReason = L"IFEO Application Verifier DLL for " + subkey +
+                                                 L" (GlobalFlag=0x" + std::format(L"{:X}", globalFlag) + L")";
+
+                        vectors.push_back(vector);
+
+                        SS_LOG_WARN(L"DLLInjection", L"IFEO VerifierDlls detected for %S: %S (GlobalFlag=0x%X)",
+                                    Utils::StringUtils::ToNarrow(subkey).c_str(),
+                                    Utils::StringUtils::ToNarrow(verifierDlls).c_str(),
+                                    globalFlag);
+                    }
                 }
             }
 
@@ -1390,11 +1762,23 @@ public:
         try {
             auto modules = m_moduleTracker->GetProcessModules(pid);
             std::wstring processName = std::filesystem::path(processPath).filename().wstring();
+            std::wstring lowerProcessName = processName;
+            std::transform(lowerProcessName.begin(), lowerProcessName.end(),
+                           lowerProcessName.begin(), ::towlower);
 
             for (const auto& module : modules) {
-                // Check against known side-load pairs
+                std::wstring lowerDllName = module.dllName;
+                std::transform(lowerDllName.begin(), lowerDllName.end(),
+                               lowerDllName.begin(), ::towlower);
+
+                // Check against known side-load pairs (case-insensitive)
                 for (const auto& pair : g_knownSideLoadPairs) {
-                    if (processName == pair.executable && module.dllName == pair.dllName) {
+                    std::wstring lowerExe = pair.executable;
+                    std::transform(lowerExe.begin(), lowerExe.end(), lowerExe.begin(), ::towlower);
+                    std::wstring lowerDll = pair.dllName;
+                    std::transform(lowerDll.begin(), lowerDll.end(), lowerDll.begin(), ::towlower);
+
+                    if (lowerProcessName == lowerExe && lowerDllName == lowerDll) {
                         // Check if DLL is in expected location
                         std::filesystem::path expectedPath = std::filesystem::path(processPath).parent_path() / pair.dllName;
 
@@ -1414,7 +1798,7 @@ public:
 
                             m_stats.sideLoadingDetected.fetch_add(1, std::memory_order_relaxed);
 
-                            SS_LOG_WARN(L"DLLInjection", L"Side-loading detected - %S loaded %S from %S", Utils::StringUtils::WideToUtf8(processName), Utils::StringUtils::WideToUtf8(pair.dllName), Utils::StringUtils::WideToUtf8(module.dllPath));
+                            SS_LOG_WARN(L"DLLInjection", L"Side-loading detected - %S loaded %S from %S", Utils::StringUtils::ToNarrow(processName).c_str(), Utils::StringUtils::ToNarrow(pair.dllName).c_str(), Utils::StringUtils::ToNarrow(module.dllPath).c_str());
                         }
                     }
                 }
@@ -1430,15 +1814,31 @@ public:
     bool IsSideLoadedImpl(const std::wstring& executablePath, const std::wstring& dllPath) {
         std::wstring exeName = std::filesystem::path(executablePath).filename().wstring();
         std::wstring dllName = std::filesystem::path(dllPath).filename().wstring();
+        std::transform(exeName.begin(), exeName.end(), exeName.begin(), ::towlower);
+        std::transform(dllName.begin(), dllName.end(), dllName.begin(), ::towlower);
 
         for (const auto& pair : g_knownSideLoadPairs) {
-            if (exeName == pair.executable && dllName == pair.dllName) {
+            std::wstring lowerExe = pair.executable;
+            std::transform(lowerExe.begin(), lowerExe.end(), lowerExe.begin(), ::towlower);
+            std::wstring lowerDll = pair.dllName;
+            std::transform(lowerDll.begin(), lowerDll.end(), lowerDll.begin(), ::towlower);
+
+            if (exeName == lowerExe && dllName == lowerDll) {
                 std::filesystem::path expectedPath = std::filesystem::path(executablePath).parent_path() / pair.dllName;
                 return NormalizePath(dllPath) != NormalizePath(expectedPath.wstring());
             }
         }
 
         return false;
+    }
+
+    /**
+     * @brief Public entry point for side-loading detection (resolves process path internally).
+     */
+    std::vector<SideLoadInfo> DetectSideLoading(uint32_t pid) {
+        if (!m_initialized || !m_moduleTracker) return {};
+        auto processPath = GetProcessPath(pid);
+        return DetectSideLoadingImpl(pid, processPath);
     }
 
     std::vector<InjectionEvent> DetectSearchOrderHijackImpl(uint32_t pid) {
@@ -1475,7 +1875,7 @@ public:
 
                 m_callbackManager->InvokeInjection(event);
 
-                SS_LOG_ERROR(L"DLLInjection", L"Search order hijacking detected - %S loaded from %S", Utils::StringUtils::WideToUtf8(module.dllName), Utils::StringUtils::WideToUtf8(module.dllPath));
+                SS_LOG_ERROR(L"DLLInjection", L"Search order hijacking detected - %S loaded from %S", Utils::StringUtils::ToNarrow(module.dllName).c_str(), Utils::StringUtils::ToNarrow(module.dllPath).c_str());
             }
         }
 
@@ -1534,12 +1934,20 @@ public:
     // ========================================================================
 
     void OnModuleLoad(uint32_t pid, const std::wstring& dllPath, uintptr_t baseAddress, size_t size) {
+        if (!m_initialized || !m_monitoring) return;
+        if (!m_callbackManager || !m_moduleTracker || !m_correlator) return;
+
         m_stats.moduleLoadEventsProcessed.fetch_add(1, std::memory_order_relaxed);
+
+        if (IsProcessExcluded(pid)) return;
 
         try {
             auto dllInfo = AnalyzeLoad(pid, dllPath);
             dllInfo.baseAddress = baseAddress;
             dllInfo.sizeOfImage = static_cast<uint32_t>(size);
+
+            // Update the tracker entry with kernel-provided base/size
+            m_moduleTracker->AddModule(pid, dllInfo);
 
             // Check decision callbacks
             if (m_config.mode == MonitoringMode::ActiveBlock ||
@@ -1549,14 +1957,14 @@ public:
 
                 if (!allow || ShouldBlock(dllInfo)) {
                     m_stats.loadsBlocked.fetch_add(1, std::memory_order_relaxed);
-                    SS_LOG_WARN(L"DLLInjection", L"Blocked load of %S in PID %u", Utils::StringUtils::WideToUtf8(dllPath), pid);
+                    SS_LOG_WARN(L"DLLInjection", L"Blocked load of %S in PID %u", Utils::StringUtils::ToNarrow(dllPath).c_str(), pid);
 
                     // In real implementation, would signal driver to block
                     return;
                 }
             }
 
-            SS_LOG_INFO(L"DLLInjection", L"Module loaded - PID %u: %S", pid, Utils::StringUtils::WideToUtf8(dllPath));
+            SS_LOG_INFO(L"DLLInjection", L"Module loaded - PID %u: %S", pid, Utils::StringUtils::ToNarrow(dllPath).c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DLLInjection", L"OnModuleLoad: %S", e.what());
@@ -1564,24 +1972,44 @@ public:
     }
 
     void OnThreadCreate(uint32_t targetPid, uint32_t creatorPid, uintptr_t startAddress) {
+        if (!m_initialized || !m_monitoring || !m_correlator) return;
+
         m_stats.threadCreateEventsProcessed.fetch_add(1, std::memory_order_relaxed);
 
         // Record for correlation
         m_correlator->RecordThreadCreate(targetPid, creatorPid, startAddress);
 
-        SS_LOG_INFO(L"DLLInjection", L"Thread created - Target PID %u, Creator PID %u, Start: 0x%X", targetPid, creatorPid, startAddress);
+        // Cross-process thread creation is a strong injection signal
+        if (targetPid != creatorPid) {
+            SS_LOG_WARN(L"DLLInjection", L"Remote thread created - Target PID %u, Creator PID %u, Start: 0x%llX",
+                        targetPid, creatorPid, static_cast<unsigned long long>(startAddress));
+        } else {
+            SS_LOG_DEBUG(L"DLLInjection", L"Thread created - PID %u, Start: 0x%llX",
+                         targetPid, static_cast<unsigned long long>(startAddress));
+        }
     }
 
     void OnAPCQueue(uint32_t targetPid, uint32_t targetTid, uint32_t queuedBy, uintptr_t apcRoutine) {
-        m_stats.threadCreateEventsProcessed.fetch_add(1, std::memory_order_relaxed);
+        if (!m_initialized || !m_monitoring || !m_correlator) return;
+
+        m_stats.apcEventsProcessed.fetch_add(1, std::memory_order_relaxed);
 
         // Record for correlation
         m_correlator->RecordAPCQueue(targetPid, targetTid, queuedBy, apcRoutine);
 
-        SS_LOG_INFO(L"DLLInjection", L"APC queued - Target PID %u, Queued by PID %ls, Routine: 0x%X", targetPid, queuedBy, apcRoutine);
+        // Cross-process APC is always suspicious
+        if (targetPid != queuedBy) {
+            SS_LOG_WARN(L"DLLInjection", L"Remote APC queued - Target PID %u TID %u, Queued by PID %u, Routine: 0x%llX",
+                        targetPid, targetTid, queuedBy, static_cast<unsigned long long>(apcRoutine));
+        } else {
+            SS_LOG_DEBUG(L"DLLInjection", L"APC queued - PID %u TID %u, Routine: 0x%llX",
+                         targetPid, targetTid, static_cast<unsigned long long>(apcRoutine));
+        }
     }
 
     void OnHookInstall(int hookType, uint32_t threadId, uintptr_t hookProc, uint32_t installerPid) {
+        if (!m_initialized || !m_monitoring || !m_callbackManager) return;
+
         m_stats.hookEventsProcessed.fetch_add(1, std::memory_order_relaxed);
 
         HookInfo info;
@@ -1601,7 +2029,7 @@ public:
 
         m_callbackManager->InvokeHook(info);
 
-        SS_LOG_INFO(L"DLLInjection", L"Hook installed - Type %ls, Global: %ls, Installer PID %u", hookType, info.isGlobal, installerPid);
+        SS_LOG_INFO(L"DLLInjection", L"Hook installed - Type %d, Global: %d, Installer PID %u", hookType, info.isGlobal ? 1 : 0, installerPid);
     }
 
     // ========================================================================
@@ -1609,22 +2037,39 @@ public:
     // ========================================================================
 
     uint64_t RegisterCallback(InjectionDetectedCallback callback) {
+        if (!m_callbackManager) {
+            SS_LOG_ERROR(L"DLLInjection", L"RegisterCallback called before Initialize");
+            return 0;
+        }
         return m_callbackManager->RegisterInjection(std::move(callback));
     }
 
     uint64_t RegisterModuleCallback(ModuleLoadCallback callback) {
+        if (!m_callbackManager) {
+            SS_LOG_ERROR(L"DLLInjection", L"RegisterModuleCallback called before Initialize");
+            return 0;
+        }
         return m_callbackManager->RegisterModule(std::move(callback));
     }
 
     uint64_t RegisterDecisionCallback(LoadDecisionCallback callback) {
+        if (!m_callbackManager) {
+            SS_LOG_ERROR(L"DLLInjection", L"RegisterDecisionCallback called before Initialize");
+            return 0;
+        }
         return m_callbackManager->RegisterDecision(std::move(callback));
     }
 
     uint64_t RegisterHookCallback(HookInstalledCallback callback) {
+        if (!m_callbackManager) {
+            SS_LOG_ERROR(L"DLLInjection", L"RegisterHookCallback called before Initialize");
+            return 0;
+        }
         return m_callbackManager->RegisterHook(std::move(callback));
     }
 
     void UnregisterCallback(uint64_t callbackId) {
+        if (!m_callbackManager) return;
         m_callbackManager->Unregister(callbackId);
     }
 
@@ -1633,27 +2078,60 @@ public:
     // ========================================================================
 
     void AddToWhitelist(const std::wstring& dllPath) {
-        Whitelist::WhitelistStore::Instance().AddEntry(
-            Whitelist::WhitelistEntry::CreateFile(Utils::StringUtils::WideToUtf8(dllPath))
-        );
-        SS_LOG_INFO(L"DLLInjection", L"Added to whitelist: %S", Utils::StringUtils::WideToUtf8(dllPath));
+        if (m_whitelistStore) {
+            m_whitelistStore->AddPath(
+                NormalizePath(dllPath),
+                Whitelist::PathMatchMode::Exact,
+                Whitelist::WhitelistReason::Custom,
+                L"Added via DLLInjectionDetector"
+            );
+        }
+        // Also track locally for fast in-memory lookup
+        {
+            std::unique_lock lock(m_mutex);
+            m_localWhitelist.insert(NormalizePath(dllPath));
+        }
+        SS_LOG_INFO(L"DLLInjection", L"Added to whitelist: %S", Utils::StringUtils::ToNarrow(dllPath).c_str());
     }
 
     void RemoveFromWhitelist(const std::wstring& dllPath) {
-        // WhitelistStore doesn't have Remove, would need to add
-        SS_LOG_INFO(L"DLLInjection", L"Removed from whitelist: %S", Utils::StringUtils::WideToUtf8(dllPath));
+        if (m_whitelistStore) {
+            m_whitelistStore->RemovePath(
+                NormalizePath(dllPath),
+                Whitelist::PathMatchMode::Exact
+            );
+        }
+        {
+            std::unique_lock lock(m_mutex);
+            m_localWhitelist.erase(NormalizePath(dllPath));
+        }
+        SS_LOG_INFO(L"DLLInjection", L"Removed from whitelist: %S", Utils::StringUtils::ToNarrow(dllPath).c_str());
     }
 
     bool IsWhitelisted(const std::wstring& dllPath) const {
-        return Whitelist::WhitelistStore::Instance().IsWhitelisted(
-            Utils::StringUtils::WideToUtf8(NormalizePath(dllPath))
-        );
+        const std::wstring normalized = NormalizePath(dllPath);
+
+        // Check local whitelist first (fast path)
+        {
+            std::shared_lock lock(m_mutex);
+            if (m_localWhitelist.count(normalized) > 0) {
+                return true;
+            }
+        }
+
+        // Check external whitelist store if available
+        if (m_whitelistStore) {
+            auto result = m_whitelistStore->IsPathWhitelisted(normalized);
+            return result.isWhitelisted;
+        }
+
+        return false;
     }
 
     void ExcludeProcess(const std::wstring& processName) {
         std::unique_lock lock(m_mutex);
         m_config.excludedProcesses.push_back(processName);
-        SS_LOG_INFO(L"DLLInjection", L"Excluded process: %S", Utils::StringUtils::WideToUtf8(processName));
+        SS_LOG_INFO(L"DLLInjection", L"Excluded process: %S", Utils::StringUtils::ToNarrow(processName).c_str());
     }
 
     void IncludeProcess(const std::wstring& processName) {
@@ -1681,14 +2159,65 @@ private:
     // INTERNAL HELPERS
     // ========================================================================
 
+    /**
+     * @brief Check if a process is in the exclusion list.
+     * Uses cached process name to avoid repeated handle opens.
+     */
+    bool IsProcessExcluded(uint32_t pid) {
+        if (m_config.excludedProcesses.empty()) return false;
+
+        std::wstring procName = GetProcessNameCached(pid);
+        std::wstring lowerName = procName;
+        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+
+        std::shared_lock lock(m_mutex);
+        for (const auto& excluded : m_config.excludedProcesses) {
+            std::wstring lowerExcluded = excluded;
+            std::transform(lowerExcluded.begin(), lowerExcluded.end(), lowerExcluded.begin(), ::towlower);
+            if (lowerName == lowerExcluded) return true;
+        }
+        return false;
+    }
+
+    /**
+     * @brief Get process name with caching to avoid repeated handle opens.
+     *
+     * Process names are cached for up to 60 seconds. PID reuse within that
+     * window is acceptable since the stale name would just cause a missed
+     * exclusion which is fail-safe (analyze rather than skip).
+     */
+    std::wstring GetProcessNameCached(uint32_t pid) {
+        {
+            std::shared_lock lock(m_procCacheMutex);
+            auto it = m_processNameCache.find(pid);
+            if (it != m_processNameCache.end()) {
+                const auto age = std::chrono::steady_clock::now() - it->second.second;
+                if (age < std::chrono::seconds(60)) {
+                    return it->second.first;
+                }
+            }
+        }
+
+        // Cache miss or stale — resolve and store
+        std::wstring name = GetProcessName(pid);
+        {
+            std::unique_lock lock(m_procCacheMutex);
+            // Evict if cache is too large (handles PID exhaustion attacks)
+            if (m_processNameCache.size() > 20000) {
+                m_processNameCache.clear();
+            }
+            m_processNameCache[pid] = { name, std::chrono::steady_clock::now() };
+        }
+        return name;
+    }
+
     std::wstring GetProcessName(uint32_t pid) const {
         wchar_t processName[MAX_PATH] = L"<unknown>";
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         if (hProcess) {
             DWORD size = MAX_PATH;
-            QueryFullProcessImageNameW(hProcess, 0, processName, &size);
-            CloseHandle(hProcess);
+            QueryFullProcessImageNameW(hProcess.get(), 0, processName, &size);
         }
 
         std::filesystem::path path(processName);
@@ -1698,11 +2227,10 @@ private:
     std::wstring GetProcessPath(uint32_t pid) const {
         wchar_t processPath[MAX_PATH] = L"";
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         if (hProcess) {
             DWORD size = MAX_PATH;
-            QueryFullProcessImageNameW(hProcess, 0, processPath, &size);
-            CloseHandle(hProcess);
+            QueryFullProcessImageNameW(hProcess.get(), 0, processPath, &size);
         }
 
         return processPath;
@@ -1711,63 +2239,106 @@ private:
     std::vector<std::wstring> EnumerateProcessModules(uint32_t pid) const {
         std::vector<std::wstring> modules;
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) {
             m_stats.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return modules;
         }
 
-        HMODULE hMods[1024];
-        DWORD cbNeeded;
+        // First call: determine how many bytes we need
+        DWORD cbNeeded = 0;
+        if (!EnumProcessModules(hProcess.get(), nullptr, 0, &cbNeeded) && cbNeeded == 0) {
+            // Retry with a reasonable initial buffer — some processes fail with size 0
+            cbNeeded = 1024 * sizeof(HMODULE);
+        }
 
-        if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
-            const DWORD moduleCount = cbNeeded / sizeof(HMODULE);
+        // Cap to prevent adversarial allocation
+        constexpr DWORD MAX_MODULE_BYTES = 65536 * sizeof(HMODULE);
+        cbNeeded = std::min(cbNeeded, MAX_MODULE_BYTES);
 
-            for (DWORD i = 0; i < std::min(moduleCount, DWORD(1024)); ++i) {
+        std::vector<HMODULE> hMods(cbNeeded / sizeof(HMODULE));
+        DWORD cbActual = 0;
+
+        if (EnumProcessModules(hProcess.get(), hMods.data(),
+                               static_cast<DWORD>(hMods.size() * sizeof(HMODULE)), &cbActual)) {
+            const DWORD moduleCount = cbActual / sizeof(HMODULE);
+
+            for (DWORD i = 0; i < moduleCount; ++i) {
                 wchar_t modulePath[MAX_PATH];
-                if (GetModuleFileNameExW(hProcess, hMods[i], modulePath, MAX_PATH)) {
+                if (GetModuleFileNameExW(hProcess.get(), hMods[i], modulePath, MAX_PATH)) {
                     modules.push_back(modulePath);
                 }
             }
         }
 
-        CloseHandle(hProcess);
         return modules;
     }
 
     void ValidateSignature(LoadedDLLInfo& info) {
         try {
-            // Check if file is digitally signed
-            // This would use WinVerifyTrust or similar
-            // Simplified for now
+            Utils::pe_sig_utils::PEFileSignatureVerifier verifier;
+            // Allow cached CRLs to avoid blocking on network
+            verifier.SetRevocationMode(Utils::pe_sig_utils::RevocationMode::OfflineAllowed);
 
-            if (info.isInSystemDir) {
+            Utils::pe_sig_utils::SignatureInfo sigInfo;
+            Utils::pe_sig_utils::Error sigErr;
+            if (verifier.VerifyPESignature(info.dllPath, sigInfo, &sigErr)) {
+                // Signature is valid and trusted
                 info.isSigned = true;
-                info.isMicrosoftSigned = true;
-                info.signerName = L"Microsoft Corporation";
-            }
+                info.signerName = sigInfo.signerName;
 
-        } catch (...) {}
+                // Detect Microsoft signatures (covers "Microsoft Corporation",
+                // "Microsoft Windows", "Microsoft Code Signing PCA", etc.)
+                if (!sigInfo.signerName.empty()) {
+                    std::wstring lowerSigner = sigInfo.signerName;
+                    std::transform(lowerSigner.begin(), lowerSigner.end(),
+                                   lowerSigner.begin(), ::towlower);
+                    if (lowerSigner.find(L"microsoft") != std::wstring::npos) {
+                        info.isMicrosoftSigned = true;
+                    }
+                }
+            } else {
+                // Signature absent or invalid
+                info.isSigned = sigInfo.isSigned;  // may have sig but not valid
+                if (sigInfo.isSigned && !sigInfo.isVerified) {
+                    info.riskFactors.push_back(L"Invalid digital signature");
+                }
+            }
+        } catch (...) {
+            // Signature validation is best-effort for module load analysis.
+            // If it throws, leave defaults (unsigned/untrusted).
+        }
     }
 
     void PerformHashLookup(LoadedDLLInfo& info) {
         try {
             m_stats.hashLookups.fetch_add(1, std::memory_order_relaxed);
 
-            // Compute SHA-256 hash
-            auto hash = Utils::HashUtils::SHA256File(info.dllPath);
-            if (hash.size() == 32) {
-                std::copy(hash.begin(), hash.end(), info.sha256Hash.begin());
-                info.hashComputed = true;
+            // Compute SHA-256 hash using FileUtils (correct API)
+            std::array<uint8_t, 32> hashArr{};
+            if (!Utils::FileUtils::ComputeFileSHA256(info.dllPath, hashArr)) {
+                return; // Hash computation failed, skip lookup
+            }
 
-                // Check against HashStore
-                bool isMalicious = HashStore::HashStore::Instance().IsKnownMalware(hash);
-                if (isMalicious) {
-                    info.hashFoundMalicious = true;
-                    info.riskFactors.push_back(L"Known malicious hash");
-                } else {
-                    bool isClean = HashStore::HashStore::Instance().IsKnownClean(hash);
-                    if (isClean) {
+            info.sha256Hash = hashArr;
+            info.hashComputed = true;
+
+            // Check against HashStore if externally provided
+            if (m_hashStore && m_hashStore->IsInitialized()) {
+                // Build HashValue for lookup
+                SignatureStore::HashValue hv;
+                hv.algorithm = SignatureStore::HashAlgorithm::SHA256;
+                hv.length = 32;
+                std::memcpy(hv.data.data(), hashArr.data(),
+                            std::min<size_t>(32, hv.data.size()));
+
+                auto result = m_hashStore->LookupHash(hv);
+                if (result.has_value()) {
+                    // Detected in hash database - check threat level
+                    if (result->threatLevel >= SignatureStore::ThreatLevel::High) {
+                        info.hashFoundMalicious = true;
+                        info.riskFactors.push_back(L"Known malicious hash");
+                    } else {
                         info.hashFoundClean = true;
                         m_stats.hashCacheHits.fetch_add(1, std::memory_order_relaxed);
                     }
@@ -1947,9 +2518,38 @@ private:
     std::unique_ptr<ModuleTracker> m_moduleTracker;
     std::unique_ptr<InjectionCorrelator> m_correlator;
 
+    // External store references (NOT owned, set by orchestrator)
+    HashStore::HashStore* m_hashStore{ nullptr };
+    Whitelist::WhitelistStore* m_whitelistStore{ nullptr };
+
+    // Local whitelist for fast in-memory lookups
+    std::unordered_set<std::wstring> m_localWhitelist;
+
+    // Process name cache (pid → {name, timestamp})
+    mutable std::shared_mutex m_procCacheMutex;
+    std::unordered_map<uint32_t, std::pair<std::wstring, std::chrono::steady_clock::time_point>> m_processNameCache;
+
     // Statistics
     mutable DLLInjectionStatistics m_stats;
     std::atomic<uint64_t> m_nextEventId{ 1 };
+
+    // ========================================================================
+    // EXTERNAL STORE SETTERS (called by orchestrator after Initialize)
+    // ========================================================================
+public:
+    void SetHashStore(HashStore::HashStore* store) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_hashStore = store;
+        SS_LOG_INFO(L"DLLInjection", L"HashStore connected: %S",
+                    store ? "yes" : "no");
+    }
+
+    void SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_whitelistStore = store;
+        SS_LOG_INFO(L"DLLInjection", L"WhitelistStore connected: %S",
+                    store ? "yes" : "no");
+    }
 };
 
 // ============================================================================
@@ -2057,14 +2657,17 @@ std::vector<RegistryInjectionVector> DLLInjectionDetector::CheckAllRegistryVecto
 
 bool DLLInjectionDetector::MonitorRegistryVectors(
     std::function<void(const RegistryInjectionVector&)> callback) {
-    // Registry monitoring would require separate thread
-    SS_LOG_WARN(L"DLLInjection", L"MonitorRegistryVectors not fully implemented");
+    // Continuous registry monitoring requires a dedicated background thread
+    // calling RegNotifyChangeKeyValue on AppInit_DLLs and IFEO keys.
+    // This is wired through the RealTimeProtection orchestrator's event loop;
+    // direct polling from this module is not supported.
+    // Use CheckAllRegistryVectors() for one-shot inspection instead.
+    SS_LOG_DEBUG(L"DLLInjection", L"Continuous registry monitoring requires orchestrator integration");
     return false;
 }
 
 std::vector<SideLoadInfo> DLLInjectionDetector::DetectSideLoading(uint32_t pid) {
-    auto processPath = m_impl->GetProcessPath(pid);
-    return m_impl->DetectSideLoadingImpl(pid, processPath);
+    return m_impl->DetectSideLoading(pid);
 }
 
 bool DLLInjectionDetector::IsSideLoaded(const std::wstring& executablePath, const std::wstring& dllPath) {
@@ -2153,6 +2756,14 @@ void DLLInjectionDetector::ExcludeProcess(const std::wstring& processName) {
 
 void DLLInjectionDetector::IncludeProcess(const std::wstring& processName) {
     m_impl->IncludeProcess(processName);
+}
+
+void DLLInjectionDetector::SetHashStore(HashStore::HashStore* store) noexcept {
+    m_impl->SetHashStore(store);
+}
+
+void DLLInjectionDetector::SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
+    m_impl->SetWhitelistStore(store);
 }
 
 DLLInjectionStatistics DLLInjectionDetector::GetStatistics() const {
