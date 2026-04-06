@@ -69,7 +69,7 @@ This is not a wrapper around existing tools. This is not a PoC. This is a produc
 | **[PhantomCortex](#-phantomcortex--ondevice-aiml)** | On-device AI/ML threat classification — 5 neural network models | 23K LoC · 56 Python files |
 | **[PhantomDisassembler](#-phantomdisassembler--custom-instruction-decoder)** | In-house x86/x64 disassembler replacing third-party dependencies | In development |
 
-> **1.5 million lines** of C, C++20, x86 Assembly, and Python. One developer. Zero external contributions. Every commit mine.
+> **1.5 million lines** of C, C++20, x86 Assembly, and Python.
 
 > **Current state:** Alpha. Kernel driver is complete and Coverity-verified. User-mode infrastructure in active module-by-module security audit. AI models trained on 452K real PE samples (EMBER 2018). Emulation engine operational. On track for public beta early 2027.
 
