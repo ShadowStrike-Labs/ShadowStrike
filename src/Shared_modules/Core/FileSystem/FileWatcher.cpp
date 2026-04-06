@@ -53,6 +53,7 @@
 
 // Standard library
 #include <algorithm>
+#include <fstream>
 #include <queue>
 #include <deque>
 #include <map>
@@ -268,12 +269,13 @@ void FileWatcherStatistics::Reset() noexcept {
 
 struct WatchHandle {
     HANDLE directoryHandle{ INVALID_HANDLE_VALUE };
-    HANDLE completionPort{ INVALID_HANDLE_VALUE };
     OVERLAPPED overlapped{};
     std::vector<uint8_t> buffer;
     WatchEntry entry;
     std::atomic<bool> active{ false };
-    std::mutex mutex;
+    std::atomic<uint32_t> retryCount{ 0 };
+    static constexpr uint32_t MAX_RETRIES = 5;
+    std::chrono::steady_clock::time_point deathTime;
 
     WatchHandle(size_t bufferSize) : buffer(bufferSize) {
         ZeroMemory(&overlapped, sizeof(OVERLAPPED));
@@ -291,6 +293,7 @@ struct WatchHandle {
             CloseHandle(directoryHandle);
             directoryHandle = INVALID_HANDLE_VALUE;
         }
+        deathTime = std::chrono::steady_clock::now();
     }
 };
 
@@ -318,6 +321,12 @@ public:
 
         const auto now = std::chrono::steady_clock::now();
 
+        // Cap deque size to prevent unbounded memory growth under flood
+        constexpr size_t MAX_TRACKED_EVENTS = 10000;
+        if (m_events.size() >= MAX_TRACKED_EVENTS) {
+            m_events.pop_front();
+        }
+
         // Add event
         m_events.push_back({now, event.GetFullPath(), event.action});
 
@@ -333,7 +342,8 @@ public:
             m_lastDetectionTime = now;
             m_detectionCount++;
 
-            SS_LOG_WARN(L"FileWatcher", L"RapidChange: %llu events in %d ms - possible ransomware", m_events.size(), m_config.windowSizeMs);
+            SS_LOG_WARN(L"FileWatcher", L"RapidChange: %zu events in %u ms - possible ransomware",
+                        m_events.size(), m_config.windowSizeMs);
 
             return true;
         }
@@ -572,7 +582,7 @@ public:
             // Validate configuration
             if (m_config.workerThreads < FileWatcherConstants::MIN_WORKER_THREADS ||
                 m_config.workerThreads > FileWatcherConstants::MAX_WORKER_THREADS) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Invalid worker thread count: %d", m_config.workerThreads);
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Invalid worker thread count: %u", m_config.workerThreads);
                 return false;
             }
 
@@ -627,7 +637,7 @@ public:
                 m_workerThreads.emplace_back([this]() { WorkerThread(); });
             }
 
-            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Started with %d worker threads", m_config.workerThreads);
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Started with %u worker threads", m_config.workerThreads);
             return true;
 
         } catch (const std::exception& e) {
@@ -646,8 +656,25 @@ public:
             m_running = false;
         }
 
-        // Stop all watches
-        RemoveAll();
+        // Wake batch flush thread if running
+        m_batchCv.notify_all();
+        if (m_batchThread.joinable()) {
+            m_batchThread.join();
+        }
+
+        // Final batch flush
+        FlushBatchEvents();
+
+        // Stop all watches — move to zombie list to prevent use-after-free
+        {
+            std::unique_lock lock(m_mutex);
+            for (auto& [id, handle] : m_watches) {
+                handle->Close();
+                m_zombieHandles.push_back(std::move(handle));
+            }
+            m_watches.clear();
+            m_stats.activeWatches.store(0, std::memory_order_relaxed);
+        }
 
         // Signal worker threads to exit
         if (m_completionPort != nullptr) {
@@ -663,6 +690,12 @@ public:
             }
         }
         m_workerThreads.clear();
+
+        // Now safe to destroy zombies — all workers have exited
+        {
+            std::unique_lock lock(m_mutex);
+            m_zombieHandles.clear();
+        }
 
         // Cleanup IOCP
         if (m_completionPort != nullptr) {
@@ -696,72 +729,87 @@ public:
             }
 
             if (!fs::exists(directory) || !fs::is_directory(directory)) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Directory does not exist: %hs", Utils::StringUtils::ToNarrow(directory).c_str());
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Directory does not exist: %hs",
+                             Utils::StringUtils::ToNarrow(directory).c_str());
                 return 0;
             }
 
-            std::unique_lock lock(m_mutex);
-
-            // Check limit
-            if (m_watches.size() >= FileWatcherConstants::MAX_WATCHES) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Maximum watches reached");
+            // Security: reject reparse points (symlinks/junctions) to prevent monitoring manipulation
+            const DWORD attrs = GetFileAttributesW(directory.c_str());
+            if (attrs != INVALID_FILE_ATTRIBUTES && (attrs & FILE_ATTRIBUTE_REPARSE_POINT)) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Rejecting reparse point (symlink/junction): %hs",
+                            Utils::StringUtils::ToNarrow(directory).c_str());
                 return 0;
             }
 
-            // Create watch handle
-            auto handle = std::make_unique<WatchHandle>(m_config.watchBufferSize);
+            uint32_t watchId = 0;
 
-            // Open directory
-            handle->directoryHandle = CreateFileW(
-                directory.c_str(),
-                FILE_LIST_DIRECTORY,
-                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                nullptr,
-                OPEN_EXISTING,
-                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
-                nullptr
-            );
+            {
+                std::unique_lock lock(m_mutex);
 
-            if (handle->directoryHandle == INVALID_HANDLE_VALUE) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to open directory: %hs (error: %lu)", Utils::StringUtils::ToNarrow(directory).c_str(), GetLastError());
-                m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
-                return 0;
+                // Check limit
+                if (m_watches.size() >= FileWatcherConstants::MAX_WATCHES) {
+                    SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Maximum watches reached");
+                    return 0;
+                }
+
+                // Create watch handle
+                auto handle = std::make_unique<WatchHandle>(m_config.watchBufferSize);
+
+                // Open directory
+                handle->directoryHandle = CreateFileW(
+                    directory.c_str(),
+                    FILE_LIST_DIRECTORY,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    nullptr,
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OVERLAPPED,
+                    nullptr
+                );
+
+                if (handle->directoryHandle == INVALID_HANDLE_VALUE) {
+                    SS_LOG_LAST_ERROR(L"FileWatcher", L"FileWatcher: Failed to open directory: %hs",
+                                     Utils::StringUtils::ToNarrow(directory).c_str());
+                    m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
+                    return 0;
+                }
+
+                // Associate with IOCP
+                if (CreateIoCompletionPort(handle->directoryHandle, m_completionPort,
+                                          reinterpret_cast<ULONG_PTR>(handle.get()), 0) == nullptr) {
+                    SS_LOG_LAST_ERROR(L"FileWatcher", L"FileWatcher: Failed to associate with IOCP");
+                    m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
+                    return 0;
+                }
+
+                // Setup watch entry
+                watchId = m_nextWatchId++;
+                handle->entry.watchId = watchId;
+                handle->entry.directory = NormalizePath(directory);
+                handle->entry.recursive = recursive;
+                handle->entry.filter = filter;
+                handle->entry.priority = priority;
+                handle->entry.state = WatchState::Active;
+                handle->entry.createdTime = std::chrono::steady_clock::now();
+
+                // Start async read
+                if (!StartWatchRead(handle.get())) {
+                    SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to start watch read for ID %u", watchId);
+                    m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
+                    return 0;
+                }
+
+                handle->active.store(true, std::memory_order_release);
+
+                // Store watch
+                m_watches[watchId] = std::move(handle);
+                m_stats.activeWatches.fetch_add(1, std::memory_order_relaxed);
+
+                SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Added watch %u for: %hs",
+                            watchId, Utils::StringUtils::ToNarrow(directory).c_str());
             }
 
-            // Associate with IOCP
-            if (CreateIoCompletionPort(handle->directoryHandle, m_completionPort,
-                                      reinterpret_cast<ULONG_PTR>(handle.get()), 0) == nullptr) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to associate with IOCP: %lu", GetLastError());
-                m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
-                return 0;
-            }
-
-            // Setup watch entry
-            const uint32_t watchId = m_nextWatchId++;
-            handle->entry.watchId = watchId;
-            handle->entry.directory = NormalizePath(directory);
-            handle->entry.recursive = recursive;
-            handle->entry.filter = filter;
-            handle->entry.priority = priority;
-            handle->entry.state = WatchState::Active;
-            handle->entry.createdTime = std::chrono::steady_clock::now();
-
-            // Start async read
-            if (!StartWatchRead(handle.get())) {
-                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to start watch read");
-                m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
-                return 0;
-            }
-
-            handle->active.store(true, std::memory_order_release);
-
-            // Store watch
-            m_watches[watchId] = std::move(handle);
-            m_stats.activeWatches.fetch_add(1, std::memory_order_relaxed);
-
-            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Added watch %hs for: %hs", watchId, Utils::StringUtils::ToNarrow(directory).c_str());
-
-            // Invoke state callback
+            // Invoke state callback WITHOUT holding m_mutex to prevent deadlock
             m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Active);
 
             return watchId;
@@ -794,19 +842,25 @@ public:
     }
 
     bool RemoveWatch(uint32_t watchId) {
-        std::unique_lock lock(m_mutex);
+        {
+            std::unique_lock lock(m_mutex);
 
-        auto it = m_watches.find(watchId);
-        if (it == m_watches.end()) {
-            return false;
+            auto it = m_watches.find(watchId);
+            if (it == m_watches.end()) {
+                return false;
+            }
+
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing watch %u", watchId);
+
+            it->second->Close();
+            // Move to zombie list to prevent use-after-free from pending IOCP completions
+            m_zombieHandles.push_back(std::move(it->second));
+            m_watches.erase(it);
+
+            m_stats.activeWatches.fetch_sub(1, std::memory_order_relaxed);
         }
 
-        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing watch %hs", watchId);
-
-        it->second->Close();
-        m_watches.erase(it);
-
-        m_stats.activeWatches.fetch_sub(1, std::memory_order_relaxed);
+        // Invoke callback WITHOUT holding m_mutex to prevent deadlock
         m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Removed);
 
         return true;
@@ -815,10 +869,11 @@ public:
     void RemoveAll() noexcept {
         std::unique_lock lock(m_mutex);
 
-        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing all watches (%llu total)", m_watches.size());
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Removing all watches (%zu total)", m_watches.size());
 
         for (auto& [id, handle] : m_watches) {
             handle->Close();
+            m_zombieHandles.push_back(std::move(handle));
         }
 
         m_watches.clear();
@@ -826,33 +881,37 @@ public:
     }
 
     bool PauseWatch(uint32_t watchId) {
-        std::unique_lock lock(m_mutex);
+        {
+            std::unique_lock lock(m_mutex);
 
-        auto it = m_watches.find(watchId);
-        if (it == m_watches.end()) {
-            return false;
+            auto it = m_watches.find(watchId);
+            if (it == m_watches.end()) {
+                return false;
+            }
+
+            it->second->entry.state = WatchState::Paused;
         }
-
-        it->second->entry.state = WatchState::Paused;
         m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Paused);
         return true;
     }
 
     bool ResumeWatch(uint32_t watchId) {
-        std::unique_lock lock(m_mutex);
+        {
+            std::unique_lock lock(m_mutex);
 
-        auto it = m_watches.find(watchId);
-        if (it == m_watches.end()) {
-            return false;
-        }
+            auto it = m_watches.find(watchId);
+            if (it == m_watches.end()) {
+                return false;
+            }
 
-        if (it->second->entry.state == WatchState::Paused) {
+            if (it->second->entry.state != WatchState::Paused) {
+                return false;
+            }
+
             it->second->entry.state = WatchState::Active;
-            m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Active);
-            return true;
         }
-
-        return false;
+        m_callbackManager->InvokeStateCallbacks(watchId, WatchState::Active);
+        return true;
     }
 
     std::optional<WatchEntry> GetWatchInfo(uint32_t watchId) const {
@@ -976,6 +1035,96 @@ public:
         m_config.enableEventCoalescing = enable;
     }
 
+    void SetRateLimit(uint32_t eventsPerSecond) {
+        m_rateLimitPerSec.store(eventsPerSecond, std::memory_order_relaxed);
+        m_rateLimitCounter.store(0, std::memory_order_relaxed);
+        m_rateLimitWindowStart = std::chrono::steady_clock::now();
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Rate limit set to %u events/sec", eventsPerSecond);
+    }
+
+    bool StartBatch(BatchEventCallback callback, size_t batchSize, uint32_t batchTimeoutMs) {
+        if (!m_initialized) {
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Not initialized for batch start");
+            return false;
+        }
+
+        m_batchCallback = std::move(callback);
+        m_batchSize = (batchSize > 0) ? batchSize : 100;
+        m_batchTimeoutMs = (batchTimeoutMs > 0) ? batchTimeoutMs : 100;
+        m_batchMode.store(true, std::memory_order_release);
+
+        // Wrap with a no-op event callback; actual dispatch goes through batch accumulator
+        auto noopCallback = [](const FileEvent&) {};
+
+        // Start batch flush thread
+        m_batchThread = std::thread([this]() { BatchFlushThread(); });
+
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Starting batch mode (size=%zu, timeout=%u ms)",
+                    m_batchSize, m_batchTimeoutMs);
+
+        return Start(noopCallback);
+    }
+
+    bool ExportDiagnostics(const std::wstring& outputPath) const {
+        try {
+            std::wofstream out(outputPath);
+            if (!out.is_open()) {
+                SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Failed to open diagnostics output: %hs",
+                             Utils::StringUtils::ToNarrow(outputPath).c_str());
+                return false;
+            }
+
+            out << L"=== FileWatcher Diagnostics ===\n";
+            out << L"Running: " << (m_running.load() ? L"Yes" : L"No") << L"\n";
+            out << L"Active watches: " << m_stats.activeWatches.load() << L"\n";
+            out << L"Failed watches: " << m_stats.failedWatches.load() << L"\n";
+            out << L"Watch restarts: " << m_stats.watchRestarts.load() << L"\n\n";
+
+            out << L"=== Event Statistics ===\n";
+            out << L"Total received: " << m_stats.totalEventsReceived.load() << L"\n";
+            out << L"Processed: " << m_stats.eventsProcessed.load() << L"\n";
+            out << L"Dropped: " << m_stats.eventsDropped.load() << L"\n";
+            out << L"Coalesced: " << m_stats.eventsCoalesced.load() << L"\n\n";
+
+            out << L"=== By Type ===\n";
+            out << L"Added: " << m_stats.byType.added.load() << L"\n";
+            out << L"Removed: " << m_stats.byType.removed.load() << L"\n";
+            out << L"Modified: " << m_stats.byType.modified.load() << L"\n";
+            out << L"Renamed: " << m_stats.byType.renamed.load() << L"\n";
+            out << L"Security: " << m_stats.byType.securityChanged.load() << L"\n";
+            out << L"Attributes: " << m_stats.byType.attributesChanged.load() << L"\n\n";
+
+            out << L"=== Performance ===\n";
+            out << L"Peak events/sec: " << m_stats.peakEventsPerSecond.load() << L"\n";
+            out << L"Avg latency (us): " << m_stats.averageLatencyUs.load() << L"\n";
+            out << L"Max latency (us): " << m_stats.maxLatencyUs.load() << L"\n";
+            out << L"Memory usage: " << m_stats.memoryUsageBytes.load() << L" bytes\n\n";
+
+            out << L"=== Alerts ===\n";
+            out << L"Rapid change alerts: " << m_stats.rapidChangeAlerts.load() << L"\n";
+
+            // List active watches
+            {
+                std::shared_lock lock(m_mutex);
+                out << L"\n=== Active Watches ===\n";
+                for (const auto& [id, handle] : m_watches) {
+                    out << L"Watch " << id << L": " << handle->entry.directory
+                        << L" (events=" << handle->entry.eventsReceived.load()
+                        << L", state=" << static_cast<int>(handle->entry.state) << L")\n";
+                }
+            }
+
+            out.flush();
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Diagnostics exported to %hs",
+                        Utils::StringUtils::ToNarrow(outputPath).c_str());
+            return true;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: ExportDiagnostics failed: %hs", e.what());
+            return false;
+        }
+    }
+
     // ========================================================================
     // STATISTICS
     // ========================================================================
@@ -1054,6 +1203,8 @@ private:
                 const DWORD error = GetLastError();
 
                 if (error == WAIT_TIMEOUT) {
+                    // Periodic maintenance: clean up zombie handles
+                    CleanupZombies();
                     continue;
                 }
 
@@ -1063,14 +1214,14 @@ private:
                 }
 
                 if (overlapped == nullptr) {
-                    // No completion packet
                     continue;
                 }
 
-                // Error on specific watch
+                // Error on specific watch — validate handle is still alive
                 auto* handle = reinterpret_cast<WatchHandle*>(completionKey);
-                if (handle) {
-                    SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Error on watch %hs: %hs", handle->entry.watchId, error);
+                if (handle && handle->active.load(std::memory_order_acquire)) {
+                    SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Error on watch %u: Win32 error %lu",
+                                 handle->entry.watchId, error);
                     HandleWatchError(handle);
                 }
 
@@ -1083,7 +1234,7 @@ private:
                 break;
             }
 
-            // Process completion
+            // Process completion — check active flag to skip zombies
             auto* handle = reinterpret_cast<WatchHandle*>(completionKey);
             if (handle && handle->active.load(std::memory_order_acquire)) {
                 ProcessNotifications(handle, bytesTransferred);
@@ -1103,9 +1254,43 @@ private:
             return;
         }
 
-        const auto* notification = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(handle->buffer.data());
+        // Bounds checking: FILE_NOTIFY_INFORMATION has variable-length FileName at the end.
+        // Minimum size is the fixed header fields (without any filename characters).
+        constexpr size_t kMinNotificationSize = offsetof(FILE_NOTIFY_INFORMATION, FileName);
+
+        if (bytesTransferred < kMinNotificationSize) {
+            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Notification buffer too small: %lu bytes",
+                        bytesTransferred);
+            return;
+        }
+
+        const uint8_t* bufferStart = handle->buffer.data();
+        const uint8_t* bufferEnd = bufferStart + bytesTransferred;
+        const uint8_t* current = bufferStart;
 
         while (true) {
+            // Ensure the fixed header fits within bounds
+            if (current + kMinNotificationSize > bufferEnd) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Notification header extends past buffer");
+                break;
+            }
+
+            const auto* notification = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(current);
+
+            // Validate FileNameLength doesn't exceed remaining buffer
+            const size_t remainingAfterHeader = static_cast<size_t>(bufferEnd - current) - kMinNotificationSize;
+            if (notification->FileNameLength > remainingAfterHeader) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Notification filename exceeds buffer: nameLen=%lu, remaining=%zu",
+                            notification->FileNameLength, remainingAfterHeader);
+                break;
+            }
+
+            // FileNameLength must be even (it's measured in bytes for wchar_t pairs)
+            if (notification->FileNameLength % sizeof(wchar_t) != 0) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Odd FileNameLength: %lu", notification->FileNameLength);
+                break;
+            }
+
             try {
                 ProcessSingleNotification(handle, notification);
             } catch (const std::exception& e) {
@@ -1116,9 +1301,15 @@ private:
                 break;
             }
 
-            notification = reinterpret_cast<const FILE_NOTIFY_INFORMATION*>(
-                reinterpret_cast<const uint8_t*>(notification) + notification->NextEntryOffset
-            );
+            // Validate NextEntryOffset: must advance forward and stay in bounds
+            const uint8_t* next = current + notification->NextEntryOffset;
+            if (next <= current || next + kMinNotificationSize > bufferEnd) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Invalid NextEntryOffset: %lu at buffer offset %zu",
+                            notification->NextEntryOffset, static_cast<size_t>(current - bufferStart));
+                break;
+            }
+
+            current = next;
         }
     }
 
@@ -1188,10 +1379,14 @@ private:
             return true;
         }
 
-        // Check global exclusions
-        std::shared_lock lock(m_mutex);
-        if (ShouldExclude(filename, std::vector<std::wstring>(m_globalExclusions.begin(), m_globalExclusions.end()))) {
-            return true;
+        // Check global exclusions — iterate the set directly to avoid per-event allocation
+        {
+            std::shared_lock lock(m_mutex);
+            for (const auto& pattern : m_globalExclusions) {
+                if (MatchesGlobPattern(filename, pattern)) {
+                    return true;
+                }
+            }
         }
 
         // Check config exclusions
@@ -1283,10 +1478,30 @@ private:
     }
 
     void DispatchEvent(const FileEvent& event) {
+        // Rate limiting check
+        const uint32_t limit = m_rateLimitPerSec.load(std::memory_order_relaxed);
+        if (limit > 0) {
+            const auto now = std::chrono::steady_clock::now();
+            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_rateLimitWindowStart);
+            if (elapsed.count() >= 1) {
+                m_rateLimitCounter.store(0, std::memory_order_relaxed);
+                m_rateLimitWindowStart = now;
+            }
+            if (m_rateLimitCounter.fetch_add(1, std::memory_order_relaxed) >= limit) {
+                m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
+        }
+
         m_pendingEvents.fetch_add(1, std::memory_order_relaxed);
 
         try {
-            m_callbackManager->InvokeEventCallbacks(event);
+            // If batch mode, accumulate instead of dispatching directly
+            if (m_batchMode.load(std::memory_order_acquire)) {
+                AccumulateBatchEvent(event);
+            } else {
+                m_callbackManager->InvokeEventCallbacks(event);
+            }
             m_stats.eventsProcessed.fetch_add(1, std::memory_order_relaxed);
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Exception dispatching event: %hs", e.what());
@@ -1312,15 +1527,17 @@ private:
         alert.timeWindowMs = m_config.rapidChangeConfig.windowSizeMs;
         alert.affectedFiles = m_rapidChangeTracker->GetAffectedFiles();
 
-        Logger::Critical("FileWatcher: RAPID CHANGE ALERT - {} events in {} ms on watch {}",
-            alert.eventCount, alert.timeWindowMs, alert.watchId);
+        SS_LOG_FATAL(L"FileWatcher", L"RAPID CHANGE ALERT - %llu events in %u ms on watch %u",
+                     static_cast<unsigned long long>(alert.eventCount),
+                     alert.timeWindowMs, alert.watchId);
 
         // Invoke alert callbacks
         m_callbackManager->InvokeAlertCallbacks(alert);
 
         // Pause watch if configured
         if (m_config.rapidChangeConfig.pauseWatchOnDetection) {
-            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Pausing watch %hs due to rapid change", handle->entry.watchId);
+            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Pausing watch %u due to rapid change",
+                        handle->entry.watchId);
             handle->entry.state = WatchState::Paused;
             m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Paused);
         }
@@ -1329,17 +1546,28 @@ private:
     void HandleWatchError(WatchHandle* handle) {
         m_stats.failedWatches.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Watch %hs encountered error", handle->entry.watchId);
+        const uint32_t retries = handle->retryCount.fetch_add(1, std::memory_order_relaxed);
+
+        SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Watch %u encountered error (retry %u/%u)",
+                     handle->entry.watchId, retries + 1, WatchHandle::MAX_RETRIES);
+
+        if (retries >= WatchHandle::MAX_RETRIES) {
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Watch %u exceeded max retries, marking as error",
+                         handle->entry.watchId);
+            handle->entry.state = WatchState::Error;
+            m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Error);
+            return;
+        }
 
         handle->entry.state = WatchState::Error;
         m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Error);
 
-        // Attempt restart
-        std::this_thread::sleep_for(std::chrono::seconds(1));
-
+        // Attempt immediate restart without blocking the IOCP worker thread
         if (StartWatchRead(handle)) {
-            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Successfully restarted watch %hs", handle->entry.watchId);
+            SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Successfully restarted watch %u",
+                        handle->entry.watchId);
             handle->entry.state = WatchState::Active;
+            handle->retryCount.store(0, std::memory_order_relaxed);
             m_callbackManager->InvokeStateCallbacks(handle->entry.watchId, WatchState::Active);
             m_stats.watchRestarts.fetch_add(1, std::memory_order_relaxed);
         }
@@ -1362,6 +1590,9 @@ private:
     std::unordered_map<uint32_t, std::unique_ptr<WatchHandle>> m_watches;
     uint32_t m_nextWatchId{ 1 };
 
+    // Zombie handles: kept alive until IOCP cancellation notifications drain
+    std::vector<std::unique_ptr<WatchHandle>> m_zombieHandles;
+
     // Event management
     std::unique_ptr<EventDebouncer> m_debouncer;
     std::unique_ptr<RapidChangeTracker> m_rapidChangeTracker;
@@ -1370,12 +1601,88 @@ private:
     // Filtering
     std::unordered_set<std::wstring> m_globalExclusions;
 
+    // Rate limiting
+    std::atomic<uint32_t> m_rateLimitPerSec{ 0 };
+    std::atomic<uint64_t> m_rateLimitCounter{ 0 };
+    std::chrono::steady_clock::time_point m_rateLimitWindowStart{ std::chrono::steady_clock::now() };
+
+    // Batch mode
+    std::atomic<bool> m_batchMode{ false };
+    BatchEventCallback m_batchCallback;
+    size_t m_batchSize{ 100 };
+    uint32_t m_batchTimeoutMs{ 100 };
+    std::vector<FileEvent> m_batchBuffer;
+    std::mutex m_batchMutex;
+    std::condition_variable m_batchCv;
+    std::thread m_batchThread;
+
     // Statistics
     FileWatcherStatistics m_stats;
     std::atomic<uint64_t> m_nextEventId{ 1 };
     std::atomic<uint64_t> m_nextAlertId{ 1 };
     std::atomic<size_t> m_pendingEvents{ 0 };
     std::chrono::steady_clock::time_point m_startTime{ std::chrono::steady_clock::now() };
+
+    // ========================================================================
+    // BATCH PROCESSING HELPERS
+    // ========================================================================
+
+    void AccumulateBatchEvent(const FileEvent& event) {
+        bool shouldFlush = false;
+        {
+            std::lock_guard lock(m_batchMutex);
+            m_batchBuffer.push_back(event);
+            shouldFlush = (m_batchBuffer.size() >= m_batchSize);
+        }
+        if (shouldFlush) {
+            FlushBatchEvents();
+        }
+    }
+
+    void FlushBatchEvents() {
+        std::vector<FileEvent> batch;
+        {
+            std::lock_guard lock(m_batchMutex);
+            if (m_batchBuffer.empty()) return;
+            batch.swap(m_batchBuffer);
+        }
+        try {
+            if (m_batchCallback) {
+                m_batchCallback(batch);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Batch callback exception: %hs", e.what());
+        }
+    }
+
+    void BatchFlushThread() {
+        SS_LOG_DEBUG(L"FileWatcher", L"FileWatcher: Batch flush thread started");
+        while (m_running.load(std::memory_order_acquire)) {
+            {
+                std::unique_lock lock(m_batchMutex);
+                m_batchCv.wait_for(lock, std::chrono::milliseconds(m_batchTimeoutMs));
+            }
+            FlushBatchEvents();
+        }
+        FlushBatchEvents();
+        SS_LOG_DEBUG(L"FileWatcher", L"FileWatcher: Batch flush thread exited");
+    }
+
+    // ========================================================================
+    // ZOMBIE CLEANUP
+    // ========================================================================
+
+    void CleanupZombies() {
+        std::unique_lock lock(m_mutex);
+        if (m_zombieHandles.empty()) return;
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto safeAge = std::chrono::seconds(5);
+
+        std::erase_if(m_zombieHandles, [&](const std::unique_ptr<WatchHandle>& z) {
+            return (now - z->deathTime) > safeAge;
+        });
+    }
 };
 
 // ============================================================================
@@ -1400,9 +1707,7 @@ bool FileWatcher::Start(EventCallback callback) {
 }
 
 bool FileWatcher::StartBatch(BatchEventCallback callback, size_t batchSize, uint32_t batchTimeoutMs) {
-    // Batch processing not implemented in this version
-    // Would use event accumulator and timer
-    return false;
+    return m_impl->StartBatch(std::move(callback), batchSize, batchTimeoutMs);
 }
 
 void FileWatcher::Stop() noexcept {
@@ -1516,7 +1821,7 @@ void FileWatcher::SetDebounceTime(uint32_t debounceMs) {
 }
 
 void FileWatcher::SetRateLimit(uint32_t eventsPerSecond) {
-    // Rate limiting not implemented in this version
+    m_impl->SetRateLimit(eventsPerSecond);
 }
 
 void FileWatcher::SetEventCoalescing(bool enable) noexcept {
@@ -1540,8 +1845,7 @@ double FileWatcher::GetCurrentEventsPerSecond() const noexcept {
 }
 
 bool FileWatcher::ExportDiagnostics(const std::wstring& outputPath) const {
-    // Diagnostics export not implemented in this version
-    return false;
+    return m_impl->ExportDiagnostics(outputPath);
 }
 
 }  // namespace FileSystem

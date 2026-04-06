@@ -134,7 +134,8 @@ enum class MountPointMonitorStatus : uint8_t {
     Paused = 3,
     Error = 4,
     Stopping = 5,
-    Stopped = 6
+    Stopped = 6,
+    Initialized = 7    ///< Initialized and ready to start
 };
 
 /**

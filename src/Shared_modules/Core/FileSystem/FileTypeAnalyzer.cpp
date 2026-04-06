@@ -184,6 +184,348 @@ const char* GetCategoryName(FileCategory category) {
     }
 }
 
+// ============================================================================
+// FORMAT DISAMBIGUATION FUNCTIONS
+// ============================================================================
+// The magic database uses first-match for shared magic byte patterns (e.g., MZ
+// for all PE types, PK for all ZIP-based types). These functions refine the
+// initial match by parsing format-specific structures.
+// ============================================================================
+
+/**
+ * @brief Disambiguates PE files by parsing the PE header.
+ * Distinguishes EXE vs DLL vs SYS vs .NET assembly, and 32-bit vs 64-bit.
+ */
+FileFormat DisambiguatePE(std::span<const uint8_t> buffer) {
+    if (buffer.size() < 64) {
+        return FileFormat::PE32;
+    }
+
+    const uint32_t peOffset =
+        static_cast<uint32_t>(buffer[0x3C]) |
+        (static_cast<uint32_t>(buffer[0x3D]) << 8) |
+        (static_cast<uint32_t>(buffer[0x3E]) << 16) |
+        (static_cast<uint32_t>(buffer[0x3F]) << 24);
+
+    if (peOffset < 4 || peOffset > 1024 || peOffset + 24 > buffer.size()) {
+        return FileFormat::PE32;
+    }
+
+    if (buffer[peOffset] != 'P' || buffer[peOffset + 1] != 'E' ||
+        buffer[peOffset + 2] != 0 || buffer[peOffset + 3] != 0) {
+        return FileFormat::PE32;
+    }
+
+    const size_t coffOffset = peOffset + 4;
+    if (coffOffset + 20 > buffer.size()) {
+        return FileFormat::PE32;
+    }
+
+    const uint16_t machine =
+        static_cast<uint16_t>(buffer[coffOffset]) |
+        (static_cast<uint16_t>(buffer[coffOffset + 1]) << 8);
+    const uint16_t characteristics =
+        static_cast<uint16_t>(buffer[coffOffset + 18]) |
+        (static_cast<uint16_t>(buffer[coffOffset + 19]) << 8);
+
+    const bool is64bit = (machine == 0x8664);
+    const bool isDLL   = (characteristics & 0x2000) != 0;  // IMAGE_FILE_DLL
+    const bool isSys   = (characteristics & 0x1000) != 0;  // IMAGE_FILE_SYSTEM
+
+    // Check for .NET: CLR Runtime Header (data directory entry #14)
+    const uint16_t optHeaderSize =
+        static_cast<uint16_t>(buffer[coffOffset + 16]) |
+        (static_cast<uint16_t>(buffer[coffOffset + 17]) << 8);
+    const size_t optOffset = coffOffset + 20;
+
+    if (optHeaderSize > 0 && optOffset + 4 <= buffer.size()) {
+        const uint16_t optMagic =
+            static_cast<uint16_t>(buffer[optOffset]) |
+            (static_cast<uint16_t>(buffer[optOffset + 1]) << 8);
+
+        size_t dataDirBase = 0;
+        if (optMagic == 0x10B && optOffset + 96 <= buffer.size()) {
+            dataDirBase = optOffset + 96;   // PE32
+        } else if (optMagic == 0x20B && optOffset + 112 <= buffer.size()) {
+            dataDirBase = optOffset + 112;  // PE32+
+        }
+
+        if (dataDirBase > 0) {
+            const size_t clrEntry = dataDirBase + (14 * 8);  // CLR index = 14
+            if (clrEntry + 8 <= buffer.size()) {
+                const uint32_t clrRVA =
+                    static_cast<uint32_t>(buffer[clrEntry]) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 1]) << 8) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 2]) << 16) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 3]) << 24);
+                const uint32_t clrSize =
+                    static_cast<uint32_t>(buffer[clrEntry + 4]) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 5]) << 8) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 6]) << 16) |
+                    (static_cast<uint32_t>(buffer[clrEntry + 7]) << 24);
+
+                if (clrRVA != 0 && clrSize != 0) {
+                    return FileFormat::DotNetAssembly;
+                }
+            }
+        }
+    }
+
+    if (isSys) return is64bit ? FileFormat::SYS64 : FileFormat::SYS32;
+    if (isDLL) return is64bit ? FileFormat::DLL64 : FileFormat::DLL32;
+    return is64bit ? FileFormat::PE64 : FileFormat::PE32;
+}
+
+/**
+ * @brief Disambiguates RIFF containers (WAVE, AVI, WEBP).
+ */
+FileFormat DisambiguateRIFF(std::span<const uint8_t> buffer) {
+    if (buffer.size() < 12) return FileFormat::Unknown;
+
+    if (buffer[8] == 'W' && buffer[9] == 'A' && buffer[10] == 'V' && buffer[11] == 'E')
+        return FileFormat::WAV;
+    if (buffer[8] == 'A' && buffer[9] == 'V' && buffer[10] == 'I' && buffer[11] == ' ')
+        return FileFormat::AVI;
+    if (buffer[8] == 'W' && buffer[9] == 'E' && buffer[10] == 'B' && buffer[11] == 'P')
+        return FileFormat::WEBP;
+
+    return FileFormat::Unknown;
+}
+
+/**
+ * @brief Disambiguates ZIP-based containers by scanning local file headers.
+ */
+FileFormat DisambiguateZIP(std::span<const uint8_t> buffer,
+                           std::wstring_view diskExtension) {
+    auto contains = [&](const char* needle, size_t len) -> bool {
+        if (buffer.size() < len) return false;
+        const auto* nb = reinterpret_cast<const uint8_t*>(needle);
+        return std::search(buffer.begin(), buffer.end(), nb, nb + len) != buffer.end();
+    };
+
+    if (contains("[Content_Types].xml", 19)) {
+        if (contains("word/", 5))  return FileFormat::DOCX;
+        if (contains("xl/", 3))    return FileFormat::XLSX;
+        if (contains("ppt/", 4))   return FileFormat::PPTX;
+    }
+
+    if (contains("mimetype", 8) && contains("META-INF/", 9)) {
+        if (contains("application/vnd.oasis.opendocument.text", 39))
+            return FileFormat::ODT;
+        if (contains("application/vnd.oasis.opendocument.spreadsheet", 47))
+            return FileFormat::ODS;
+        if (contains("application/vnd.oasis.opendocument.presentation", 48))
+            return FileFormat::ODP;
+    }
+
+    if (contains("META-INF/MANIFEST.MF", 20))
+        return FileFormat::JavaJAR;
+
+    if (!diskExtension.empty()) {
+        std::wstring ext(diskExtension);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext == L".docx" || ext == L".docm") return FileFormat::DOCX;
+        if (ext == L".xlsx" || ext == L".xlsm" || ext == L".xlsb") return FileFormat::XLSX;
+        if (ext == L".pptx" || ext == L".pptm") return FileFormat::PPTX;
+        if (ext == L".odt") return FileFormat::ODT;
+        if (ext == L".ods") return FileFormat::ODS;
+        if (ext == L".odp") return FileFormat::ODP;
+        if (ext == L".jar")  return FileFormat::JavaJAR;
+    }
+
+    return FileFormat::ZIP;
+}
+
+/**
+ * @brief Disambiguates OLE Compound files using extension hint.
+ * Full OLE directory parsing is deferred to DocumentScanner.
+ */
+FileFormat DisambiguateOLE(std::span<const uint8_t> buffer,
+                           std::wstring_view diskExtension) {
+    (void)buffer;
+    if (!diskExtension.empty()) {
+        std::wstring ext(diskExtension);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext == L".doc" || ext == L".dot" || ext == L".wbk") return FileFormat::DOC;
+        if (ext == L".xls" || ext == L".xlt" || ext == L".xla") return FileFormat::XLS;
+        if (ext == L".ppt" || ext == L".pot" || ext == L".pps") return FileFormat::PPT;
+        if (ext == L".msi" || ext == L".msp" || ext == L".mst") return FileFormat::MSI;
+        if (ext == L".msg") return FileFormat::DOC;
+    }
+    return FileFormat::DOC;
+}
+
+/**
+ * @brief Disambiguates EBML containers (Matroska vs WebM).
+ */
+FileFormat DisambiguateEBML(std::span<const uint8_t> buffer) {
+    const size_t searchLen = std::min(buffer.size(), size_t(256));
+    auto contains = [&](const char* s, size_t len) -> bool {
+        const auto* sb = reinterpret_cast<const uint8_t*>(s);
+        return std::search(buffer.begin(), buffer.begin() + searchLen,
+                          sb, sb + len) != (buffer.begin() + searchLen);
+    };
+    if (contains("webm", 4))     return FileFormat::WEBM;
+    if (contains("matroska", 8)) return FileFormat::MKV;
+    return FileFormat::MKV;
+}
+
+/**
+ * @brief Disambiguates 0xCAFEBABE: Mach-O Universal vs Java Class.
+ */
+FileFormat DisambiguateCAFEBABE(std::span<const uint8_t> buffer) {
+    if (buffer.size() < 8) return FileFormat::JavaClass;
+
+    const uint16_t javaMajor =
+        (static_cast<uint16_t>(buffer[6]) << 8) | buffer[7];
+
+    // Java class major version range: 45 (JDK 1.1) through ~70 (JDK 26)
+    if (javaMajor >= 45 && javaMajor <= 70) {
+        return FileFormat::JavaClass;
+    }
+    return FileFormat::MachOUniversal;
+}
+
+/**
+ * @brief Disambiguates ftyp-based media containers (MP4, MOV, M4A).
+ */
+FileFormat DisambiguateFtyp(std::span<const uint8_t> buffer) {
+    if (buffer.size() < 12) return FileFormat::MP4;
+
+    for (size_t i = 0; i + 12 <= buffer.size() && i < 32; i += 4) {
+        if (buffer[i+4] == 'f' && buffer[i+5] == 't' &&
+            buffer[i+6] == 'y' && buffer[i+7] == 'p') {
+            const char b0 = static_cast<char>(buffer[i + 8]);
+            const char b1 = static_cast<char>(buffer[i + 9]);
+            const char b2 = static_cast<char>(buffer[i + 10]);
+
+            if (b0 == 'M' && b1 == '4' && b2 == 'A') return FileFormat::M4A;
+            if (b0 == 'q' && b1 == 't')               return FileFormat::MOV;
+            return FileFormat::MP4;
+        }
+    }
+    return FileFormat::MP4;
+}
+
+/**
+ * @brief Disambiguates DER/PFX certificates using extension hint.
+ */
+FileFormat DisambiguateDERPFX(std::wstring_view diskExtension) {
+    if (!diskExtension.empty()) {
+        std::wstring ext(diskExtension);
+        std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
+        if (ext == L".pfx" || ext == L".p12") return FileFormat::PFX;
+    }
+    return FileFormat::DER;
+}
+
+/**
+ * @brief Human-readable description for disambiguated formats.
+ */
+const char* GetDescriptionForFormat(FileFormat format) {
+    switch (format) {
+        case FileFormat::PE32:           return "PE32 Executable";
+        case FileFormat::PE64:           return "PE64 Executable";
+        case FileFormat::DLL32:          return "PE32 DLL";
+        case FileFormat::DLL64:          return "PE64 DLL";
+        case FileFormat::SYS32:          return "PE32 Kernel Driver";
+        case FileFormat::SYS64:          return "PE64 Kernel Driver";
+        case FileFormat::DotNetAssembly: return ".NET Managed Assembly";
+        case FileFormat::ELF32:          return "ELF 32-bit";
+        case FileFormat::ELF64:          return "ELF 64-bit";
+        case FileFormat::MachO32:        return "Mach-O 32-bit";
+        case FileFormat::MachO64:        return "Mach-O 64-bit";
+        case FileFormat::MachOUniversal: return "Mach-O Universal";
+        case FileFormat::JavaClass:      return "Java Class File";
+        case FileFormat::JavaJAR:        return "Java JAR Archive";
+        case FileFormat::WebAssembly:    return "WebAssembly Module";
+        case FileFormat::ZIP:            return "ZIP Archive";
+        case FileFormat::DOCX:           return "MS Word DOCX";
+        case FileFormat::XLSX:           return "MS Excel XLSX";
+        case FileFormat::PPTX:           return "MS PowerPoint PPTX";
+        case FileFormat::ODT:            return "OpenDocument Text";
+        case FileFormat::ODS:            return "OpenDocument Spreadsheet";
+        case FileFormat::ODP:            return "OpenDocument Presentation";
+        case FileFormat::DOC:            return "MS Word Document (OLE)";
+        case FileFormat::XLS:            return "MS Excel Spreadsheet (OLE)";
+        case FileFormat::PPT:            return "MS PowerPoint (OLE)";
+        case FileFormat::MSI:            return "Windows Installer (OLE)";
+        case FileFormat::PDF:            return "PDF Document";
+        case FileFormat::RTF:            return "RTF Document";
+        case FileFormat::WAV:            return "WAV Audio";
+        case FileFormat::AVI:            return "AVI Video";
+        case FileFormat::WEBP:           return "WebP Image";
+        case FileFormat::MKV:            return "Matroska Video";
+        case FileFormat::WEBM:           return "WebM Video";
+        case FileFormat::MP4:            return "MP4 Video";
+        case FileFormat::MOV:            return "QuickTime Movie";
+        case FileFormat::M4A:            return "M4A Audio";
+        case FileFormat::DER:            return "DER Certificate";
+        case FileFormat::PFX:            return "PFX/PKCS#12 Certificate";
+        case FileFormat::LNK:            return "Windows Shortcut (LNK)";
+        default:                         return "Unknown format";
+    }
+}
+
+/**
+ * @brief Master disambiguation: refines the initial magic-matched format
+ * using secondary header parsing and extension hints.
+ */
+FileFormat DisambiguateFormat(std::span<const uint8_t> buffer,
+                              FileFormat initialFormat,
+                              std::wstring_view diskExtension) {
+    switch (initialFormat) {
+        case FileFormat::PE32:
+        case FileFormat::PE64:
+        case FileFormat::DLL32:
+        case FileFormat::DLL64:
+        case FileFormat::SYS32:
+        case FileFormat::SYS64:
+            return DisambiguatePE(buffer);
+
+        case FileFormat::ZIP:
+        case FileFormat::DOCX:
+        case FileFormat::XLSX:
+        case FileFormat::PPTX:
+        case FileFormat::ODT:
+        case FileFormat::ODS:
+        case FileFormat::ODP:
+        case FileFormat::JavaJAR:
+            return DisambiguateZIP(buffer, diskExtension);
+
+        case FileFormat::WEBP:
+        case FileFormat::WAV:
+        case FileFormat::AVI:
+            return DisambiguateRIFF(buffer);
+
+        case FileFormat::DOC:
+        case FileFormat::XLS:
+        case FileFormat::PPT:
+        case FileFormat::MSI:
+            return DisambiguateOLE(buffer, diskExtension);
+
+        case FileFormat::MKV:
+        case FileFormat::WEBM:
+            return DisambiguateEBML(buffer);
+
+        case FileFormat::MachOUniversal:
+        case FileFormat::JavaClass:
+            return DisambiguateCAFEBABE(buffer);
+
+        case FileFormat::MP4:
+        case FileFormat::MOV:
+        case FileFormat::M4A:
+            return DisambiguateFtyp(buffer);
+
+        case FileFormat::DER:
+        case FileFormat::PFX:
+            return DisambiguateDERPFX(diskExtension);
+
+        default:
+            return initialFormat;
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -283,7 +625,7 @@ static const std::vector<MagicSignature> g_signatures = {
     SIG(BZIP2, "BZIP2 Archive", 0x42, 0x5A, 0x68),  // BZh
     SIG(XZ, "XZ Archive", 0xFD, 0x37, 0x7A, 0x58, 0x5A, 0x00),
     SIG(CAB, "Cabinet Archive", 0x4D, 0x53, 0x43, 0x46),  // MSCF
-    SIG(ISO, "ISO Disk Image", 0x43, 0x44, 0x30, 0x30, 0x31),  // CD001 at 32769
+    SIG_OFFSET(ISO, "ISO Disk Image", 32769, 0x43, 0x44, 0x30, 0x30, 0x31),  // CD001 at offset 0x8001 (requires headerSize >= 32774)
 
     // TAR (multiple formats)
     SIG_OFFSET(TAR, "TAR Archive (ustar)", 257, 0x75, 0x73, 0x74, 0x61, 0x72),
@@ -362,6 +704,9 @@ static const std::vector<MagicSignature> g_signatures = {
     SIG(WEBM, "WebM Video", 0x1A, 0x45, 0xDF, 0xA3),
     SIG(MOV, "QuickTime Movie", 0x00, 0x00, 0x00, 0x14, 0x66, 0x74, 0x79, 0x70, 0x71, 0x74),
     SIG(FLV, "Flash Video", 0x46, 0x4C, 0x56, 0x01),
+
+    // Universal ftyp entry — catches MP4/MOV/M4A with non-standard atom sizes
+    SIG_OFFSET(MP4, "ISO Base Media (ftyp)", 4, 0x66, 0x74, 0x79, 0x70),
 
     // ========================================================================
     // DATABASES
@@ -851,6 +1196,51 @@ public:
                 return info;
             }
 
+            // Security: Detect embedded null bytes (truncation attack)
+            if (filePath.find(L'\0') != std::wstring::npos) {
+                SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Embedded null byte in file path — possible truncation attack");
+                info.isSpoofed = true;
+                info.spoofingType = SpoofingType::UnicodeAbuse;
+                return info;
+            }
+
+            // Extract filename for early security checks
+            {
+                const size_t lastSlash = filePath.find_last_of(L"\\/");
+                const std::wstring_view filename = (lastSlash != std::wstring::npos)
+                    ? std::wstring_view(filePath).substr(lastSlash + 1)
+                    : std::wstring_view(filePath);
+
+                // Detect NTFS Alternate Data Streams (colon in filename)
+                const size_t colonPos = filename.find(L':');
+                if (colonPos != std::wstring_view::npos) {
+                    const bool isDriveLetter = (colonPos == 1 &&
+                        lastSlash == std::wstring::npos &&
+                        ((filename[0] >= L'A' && filename[0] <= L'Z') ||
+                         (filename[0] >= L'a' && filename[0] <= L'z')));
+                    if (!isDriveLetter) {
+                        SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: NTFS Alternate Data Stream detected in path");
+                        info.isSpoofed = true;
+                        info.spoofingType = SpoofingType::HiddenExtension;
+                    }
+                }
+
+                // Detect bidirectional control characters (RTLO attacks)
+                if (HasRTLOverrideImpl(filename)) {
+                    info.isSpoofed = true;
+                    info.spoofingType = SpoofingType::RTLOverride;
+                    m_stats.spoofingDetected.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Bidirectional control character in filename");
+                }
+
+                // Detect trailing spaces/dots (NTFS normalization evasion)
+                if (!filename.empty() && (filename.back() == L' ' || filename.back() == L'.')) {
+                    SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer::Analyze: Trailing space/dot in filename — NTFS evasion");
+                    info.isSpoofed = true;
+                    info.spoofingType = SpoofingType::HiddenExtension;
+                }
+            }
+
             // Extract disk extension
             info.diskExtension = ExtractExtension(filePath);
 
@@ -1123,6 +1513,22 @@ public:
                 indicators.hasScriptKeywords = true;
                 indicators.detectedKeywords.push_back("JavaScript");
             }
+
+            // Batch/CMD
+            if (content.find("@echo off") != std::string::npos ||
+                content.find("goto ") != std::string::npos ||
+                content.find("setlocal") != std::string::npos ||
+                content.find("%~") != std::string::npos) {
+                indicators.hasScriptKeywords = true;
+                indicators.detectedKeywords.push_back("Batch");
+            }
+
+            // HTA (HTML Application)
+            if (content.find("<hta:application") != std::string::npos ||
+                content.find("hta:application") != std::string::npos) {
+                indicators.hasScriptKeywords = true;
+                indicators.detectedKeywords.push_back("HTA");
+            }
         }
 
         return indicators;
@@ -1155,6 +1561,8 @@ public:
                 if (keyword == "VBScript") return FileFormat::VBScript;
                 if (keyword == "Python") return FileFormat::Python;
                 if (keyword == "JavaScript") return FileFormat::JavaScript;
+                if (keyword == "Batch") return FileFormat::Batch;
+                if (keyword == "HTA") return FileFormat::HTA;
             }
         }
 
@@ -1234,6 +1642,7 @@ private:
     // ========================================================================
 
     FileTypeInfo AnalyzeBufferImpl(std::span<const uint8_t> buffer, std::wstring_view diskExtension) const {
+        std::shared_lock lock(m_mutex);
         FileTypeInfo info;
         info.fileSize = buffer.size();
         info.diskExtension = diskExtension;
@@ -1249,12 +1658,13 @@ private:
         for (const auto& sig : m_signatures) {
             if (MatchesPattern(buffer, sig.offset, sig.pattern, sig.mask)) {
                 info.detected = true;
-                info.format = sig.format;
-                info.category = MagicDB::GetCategoryForFormat(sig.format);
-                info.riskLevel = MagicDB::GetRiskForFormat(sig.format);
-                info.description = sig.description;
-                info.mimeType = MagicDB::GetMimeForFormat(sig.format);
-                info.extension = GetExtensionForFormat(sig.format);
+                // Disambiguate formats sharing magic byte patterns
+                info.format = DisambiguateFormat(buffer, sig.format, diskExtension);
+                info.category = MagicDB::GetCategoryForFormat(info.format);
+                info.riskLevel = MagicDB::GetRiskForFormat(info.format);
+                info.description = GetDescriptionForFormat(info.format);
+                info.mimeType = MagicDB::GetMimeForFormat(info.format);
+                info.extension = GetExtensionForFormat(info.format);
                 info.confidence = 1.0;
                 info.magicOffset = sig.offset;
                 info.matchedSignature = sig.description;
@@ -1345,6 +1755,7 @@ private:
     }
 
     FileFormat DetectFormatImpl(std::span<const uint8_t> buffer) const {
+        std::shared_lock lock(m_mutex);
         if (buffer.empty()) {
             return FileFormat::Unknown;
         }
@@ -1352,7 +1763,7 @@ private:
         // Check magic numbers
         for (const auto& sig : m_signatures) {
             if (MatchesPattern(buffer, sig.offset, sig.pattern, sig.mask)) {
-                return sig.format;
+                return DisambiguateFormat(buffer, sig.format, L"");
             }
         }
 
@@ -1381,19 +1792,59 @@ private:
 
         // Check for mismatch
         if (!expectedExt.empty() && diskExt != expectedExt) {
-            // Special cases: PE can be .exe, .dll, .scr, .sys, etc.
+            // PE executables can have many valid extensions
             if (info.format == FileFormat::PE32 || info.format == FileFormat::PE64) {
-                if (diskExt == ".exe" || diskExt == ".scr" || diskExt == ".com") {
-                    // These are all valid PE extensions
+                if (diskExt == ".exe" || diskExt == ".scr" || diskExt == ".com" || diskExt == ".pif") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::DLL32 || info.format == FileFormat::DLL64) {
+                if (diskExt == ".dll" || diskExt == ".ocx" || diskExt == ".cpl" || diskExt == ".drv") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::SYS32 || info.format == FileFormat::SYS64) {
+                if (diskExt == ".sys") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::DotNetAssembly) {
+                if (diskExt == ".exe" || diskExt == ".dll") {
                     return;
                 }
             }
 
-            // ZIP-based formats (DOCX, XLSX, etc.)
+            // ZIP-based formats (many formats use ZIP as container)
             if (info.format == FileFormat::ZIP) {
-                if (diskExt == ".docx" || diskExt == ".xlsx" || diskExt == ".pptx" ||
-                    diskExt == ".jar" || diskExt == ".odt" || diskExt == ".ods") {
-                    // These are ZIP-based, not spoofing
+                static const std::unordered_set<std::string> validZipExts = {
+                    ".docx", ".docm", ".xlsx", ".xlsm", ".xlsb",
+                    ".pptx", ".pptm", ".odt", ".ods", ".odp",
+                    ".jar", ".war", ".ear", ".apk", ".xpi",
+                    ".epub", ".cbz", ".nupkg", ".vsix"
+                };
+                if (validZipExts.count(diskExt)) {
+                    return;
+                }
+            }
+
+            // OLE compound files
+            if (info.format == FileFormat::DOC) {
+                if (diskExt == ".doc" || diskExt == ".dot" || diskExt == ".wbk" || diskExt == ".msg") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::XLS) {
+                if (diskExt == ".xls" || diskExt == ".xlt" || diskExt == ".xla") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::PPT) {
+                if (diskExt == ".ppt" || diskExt == ".pot" || diskExt == ".pps") {
+                    return;
+                }
+            }
+            if (info.format == FileFormat::MSI) {
+                if (diskExt == ".msi" || diskExt == ".msp" || diskExt == ".mst") {
                     return;
                 }
             }
@@ -1405,15 +1856,18 @@ private:
 
             m_stats.spoofingDetected.fetch_add(1, std::memory_order_relaxed);
 
-            SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Extension spoofing detected - Disk: %hs, Actual: %hs", diskExt, expectedExt);
+            SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Extension spoofing detected - Disk: %hs, Actual: %hs", diskExt.c_str(), expectedExt.c_str());
         }
     }
 
     bool HasRTLOverrideImpl(std::wstring_view filename) const {
-        // RTLO character is U+202E
-        constexpr wchar_t RTLO = 0x202E;
-
-        return filename.find(RTLO) != std::wstring_view::npos;
+        // Check for bidirectional control characters used in evasion attacks
+        for (const wchar_t ch : filename) {
+            if (ch >= 0x202A && ch <= 0x202E) return true;  // LRE, RLE, PDF, LRO, RLO
+            if (ch >= 0x2066 && ch <= 0x2069) return true;  // LRI, RLI, FSI, PDI
+            if (ch == 0x200E || ch == 0x200F) return true;  // LRM, RLM
+        }
+        return false;
     }
 
     bool HasDoubleExtensionImpl(std::wstring_view filename) const {
