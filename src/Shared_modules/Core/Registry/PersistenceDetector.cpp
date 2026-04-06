@@ -40,6 +40,11 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
 #include "../../Utils/RegistryUtils.hpp"
+#include "../../Utils/Base64Utils.hpp"
+#include "../../Utils/CertUtils.hpp"
+#include "../../HashStore/HashStore.hpp"
+#include "../../ThreatIntel/ThreatIntelLookup.hpp"
+#include "../../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -118,7 +123,7 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
     { PersistenceType::Winlogon_Userinit, HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"Userinit", true, "T1547.004" },
     { PersistenceType::Winlogon_Taskman, HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"Taskman", false, "T1547.004" },
     { PersistenceType::Winlogon_System, HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"System", false, "T1547.004" },
-    { PersistenceType::Winlogon_VMApplet, HKEY_LOCAL_MACHINE, L"SYSTEM\\CurrentControlSet\\Control\\Session Manager", L"AppCertDlls", false, "T1547.004" },
+    { PersistenceType::Winlogon_VMApplet, HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Winlogon", L"VMApplet", false, "T1547.004" },
 
     // Image File Execution Options (T1546.012)
     { PersistenceType::IFEO_Debugger, HKEY_LOCAL_MACHINE, L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options", L"", true, "T1546.012" },
@@ -192,7 +197,7 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
 [[nodiscard]] std::wstring ExtractExecutablePath(const std::wstring& commandLine) {
     if (commandLine.empty()) return L"";
 
-    std::wstring trimmed = StringUtils::Trim(commandLine);
+    std::wstring trimmed = StringUtils::TrimCopy(commandLine);
 
     // Handle quoted path
     if (trimmed.starts_with(L'"')) {
@@ -215,7 +220,7 @@ const std::vector<PersistenceLocation> PERSISTENCE_LOCATIONS = {
  * @brief Check if path is suspicious.
  */
 [[nodiscard]] bool IsSuspiciousPath(const std::wstring& path) noexcept {
-    std::wstring lowerPath = StringUtils::ToLowerCase(path);
+    std::wstring lowerPath = StringUtils::ToLowerCopy(path);
 
     // Temp directories
     if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
@@ -438,6 +443,7 @@ public:
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_scanning{false};
     std::atomic<bool> m_cancelRequested{false};
+    bool m_comInitialized{false};  // Track whether WE initialized COM
 
     // Configuration
     PersistenceDetectorConfig m_config{};
@@ -486,7 +492,12 @@ public:
 
             // Initialize COM for Task Scheduler and WMI
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
+            if (SUCCEEDED(hr)) {
+                m_comInitialized = true;
+            } else if (hr == RPC_E_CHANGED_MODE) {
+                // COM was already initialized with a different threading model — acceptable
+                m_comInitialized = false;
+            } else {
                 Logger::Error("PersistenceDetector: COM initialization failed: {:#x}", static_cast<uint32_t>(hr));
                 return false;
             }
@@ -527,7 +538,10 @@ public:
             m_alertCallbacks.clear();
         }
 
-        CoUninitialize();
+        if (m_comInitialized) {
+            CoUninitialize();
+            m_comInitialized = false;
+        }
 
         m_initialized.store(false, std::memory_order_release);
         Logger::Info("PersistenceDetector::Impl: Shutdown complete");
@@ -538,16 +552,33 @@ public:
     // ========================================================================
 
     [[nodiscard]] ScanResult ScanImpl(ScanScope scope) {
+        // Prevent concurrent scans — only one scan at a time
+        std::unique_lock scanGuard(m_scanMutex, std::try_to_lock);
+        if (!scanGuard.owns_lock()) {
+            Logger::Warn("PersistenceDetector: Scan already in progress, rejecting concurrent scan");
+            ScanResult empty{};
+            empty.errorsEncountered = 1;
+            return empty;
+        }
+
         ScanResult result{};
         result.startTime = system_clock::now();
         result.scope = scope;
 
         const auto scanStart = steady_clock::now();
 
-        try {
-            m_scanning.store(true, std::memory_order_release);
-            m_cancelRequested.store(false, std::memory_order_release);
+        // RAII guard to ensure m_scanning is always reset
+        m_scanning.store(true, std::memory_order_release);
+        m_cancelRequested.store(false, std::memory_order_release);
+        auto scanCleanup = [this]() noexcept {
+            m_scanning.store(false, std::memory_order_release);
+        };
+        struct ScanGuardRAII {
+            std::function<void()> cleanup;
+            ~ScanGuardRAII() { cleanup(); }
+        } scanFlagGuard{scanCleanup};
 
+        try {
             Logger::Info("PersistenceDetector: Starting scan - Scope: {}", static_cast<int>(scope));
 
             // Select locations based on scope
@@ -629,6 +660,7 @@ public:
 
                 switch (entry.risk) {
                     case RiskLevel::Safe:
+                    case RiskLevel::Low:
                         result.safeEntries++;
                         break;
                     case RiskLevel::Suspicious:
@@ -639,8 +671,6 @@ public:
                         break;
                     case RiskLevel::Unknown:
                         result.unknownEntries++;
-                        break;
-                    default:
                         break;
                 }
 
@@ -662,13 +692,13 @@ public:
             Logger::Info("PersistenceDetector: Scan complete - {} entries, {} suspicious, {} malicious, {} ms",
                 result.totalEntries, result.suspiciousEntries, result.maliciousEntries, result.duration.count());
 
-            m_scanning.store(false, std::memory_order_release);
+            // m_scanning is reset by RAII guard
             return result;
 
         } catch (const std::exception& e) {
             Logger::Error("PersistenceDetector: Scan exception: {}", e.what());
             result.errorsEncountered++;
-            m_scanning.store(false, std::memory_order_release);
+            // m_scanning is reset by RAII guard
             return result;
         }
     }
@@ -677,47 +707,31 @@ public:
         std::vector<PersistenceEntry> entries;
 
         try {
-            HKEY hKey;
-            LONG result = RegOpenKeyExW(location.hive, location.subkey.c_str(), 0, KEY_READ | KEY_WOW64_64KEY, &hKey);
-            if (result != ERROR_SUCCESS) {
-                // Key doesn't exist - not an error
+            // RAII registry key via RegistryUtils
+            Utils::RegistryUtils::RegistryKey regKey;
+            Utils::RegistryUtils::OpenOptions opts;
+            opts.access = KEY_READ;
+            opts.wow64_64 = true;
+            if (!regKey.Open(location.hive, location.subkey, opts)) {
                 return entries;
             }
 
-            // Enumerate values
-            DWORD index = 0;
-            wchar_t valueName[16384];
-            DWORD valueNameSize;
-            DWORD valueType;
-            std::vector<uint8_t> valueData(65536);
-            DWORD valueDataSize;
+            // Enumerate all values using RAII-safe enumeration
+            std::vector<Utils::RegistryUtils::ValueInfo> values;
+            if (!regKey.EnumValues(values)) {
+                return entries;
+            }
 
-            while (true) {
-                valueNameSize = sizeof(valueName) / sizeof(wchar_t);
-                valueDataSize = static_cast<DWORD>(valueData.size());
-
-                result = RegEnumValueW(hKey, index, valueName, &valueNameSize, nullptr,
-                                      &valueType, valueData.data(), &valueDataSize);
-
-                if (result == ERROR_NO_MORE_ITEMS) {
-                    break;
-                }
-
-                if (result != ERROR_SUCCESS) {
-                    index++;
-                    continue;
-                }
-
+            for (const auto& valInfo : values) {
                 // Skip if looking for specific value and this isn't it
-                if (!location.valueName.empty() && location.valueName != valueName) {
-                    index++;
+                if (!location.valueName.empty() &&
+                    !StringUtils::IEquals(location.valueName, valInfo.name)) {
                     continue;
                 }
 
-                // Create entry
                 PersistenceEntry entry{};
                 entry.type = location.type;
-                entry.entryName = valueName;
+                entry.entryName = valInfo.name;
                 entry.location = std::format(L"{}\\{}",
                     (location.hive == HKEY_LOCAL_MACHINE) ? L"HKLM" :
                     (location.hive == HKEY_CURRENT_USER) ? L"HKCU" : L"HKCR",
@@ -725,40 +739,55 @@ public:
                 entry.isUserEntry = (location.hive == HKEY_CURRENT_USER);
                 entry.mitreTechnique = location.mitreTechnique;
 
-                // Extract command from value data
-                if (valueType == REG_SZ || valueType == REG_EXPAND_SZ) {
-                    entry.rawCommand = std::wstring(reinterpret_cast<const wchar_t*>(valueData.data()));
-                } else if (valueType == REG_MULTI_SZ) {
-                    // Parse multi-string
-                    const wchar_t* ptr = reinterpret_cast<const wchar_t*>(valueData.data());
-                    while (*ptr) {
-                        if (!entry.rawCommand.empty()) entry.rawCommand += L";";
-                        entry.rawCommand += ptr;
-                        ptr += wcslen(ptr) + 1;
+                // Extract command based on value type (with bounds safety)
+                if (valInfo.type == Utils::RegistryUtils::ValueType::String) {
+                    std::wstring val;
+                    if (regKey.ReadString(valInfo.name, val)) {
+                        entry.rawCommand = val;
+                    }
+                } else if (valInfo.type == Utils::RegistryUtils::ValueType::ExpandString) {
+                    std::wstring val;
+                    if (regKey.ReadExpandString(valInfo.name, val, true)) {
+                        entry.rawCommand = val;
+                    }
+                } else if (valInfo.type == Utils::RegistryUtils::ValueType::MultiString) {
+                    std::vector<std::wstring> multiVal;
+                    if (regKey.ReadMultiString(valInfo.name, multiVal)) {
+                        for (const auto& s : multiVal) {
+                            if (!entry.rawCommand.empty()) entry.rawCommand += L";";
+                            entry.rawCommand += s;
+                        }
                     }
                 }
 
                 entry.lastScanned = system_clock::now();
 
-                // Resolve target
+                // Resolve target and assess risk
                 if (m_config.resolveTargets && !entry.rawCommand.empty()) {
                     entry.target = ResolveTargetImpl(entry.rawCommand);
 
-                    // Assess risk
-                    entry.risk = AssessRisk(entry);
-                    entry.riskScore = CalculateRiskScore(entry);
+                    // Whitelist check before scoring
+                    if (IsWhitelisted(entry)) {
+                        entry.risk = RiskLevel::Safe;
+                        entry.riskScore = 0;
+                        entry.isKnownGood = true;
+                    } else {
+                        // Hash and threat intel integration
+                        EnrichWithHashLookup(entry);
+                        EnrichWithThreatIntel(entry);
+
+                        entry.risk = AssessRisk(entry);
+                        entry.riskScore = CalculateRiskScore(entry);
+                    }
                 }
 
                 entries.push_back(entry);
                 InvokeEntryCallbacks(entry);
-
-                index++;
             }
 
-            RegCloseKey(hKey);
-
         } catch (const std::exception& e) {
-            Logger::Error("PersistenceDetector: Registry scan exception: {}", e.what());
+            Logger::Error("PersistenceDetector: Registry scan exception at {}: {}",
+                StringUtils::ToNarrow(location.subkey), e.what());
         }
 
         return entries;
@@ -1151,6 +1180,305 @@ public:
     // TARGET RESOLUTION
     // ========================================================================
 
+    /**
+     * @brief Resolves a command line to a target binary with full file analysis.
+     *
+     * Handles:
+     * - Quoted and unquoted paths
+     * - Environment variable expansion
+     * - System PATH search
+     * - File existence/signature/hash verification
+     * - Short (8.3) path normalization
+     */
+    [[nodiscard]] TargetBinary ResolveTargetImpl(const std::wstring& command) {
+        TargetBinary target{};
+        if (command.empty()) return target;
+
+        target.originalPath = command;
+
+        try {
+            // Check cache first
+            if (m_config.useCache) {
+                std::shared_lock cacheLock(m_cacheMutex);
+                auto it = m_targetCache.find(command);
+                if (it != m_targetCache.end()) {
+                    m_stats.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    return it->second;
+                }
+            }
+
+            // Extract executable path (handles quoted paths and arguments)
+            std::wstring rawPath = ExtractExecutablePath(command);
+            if (rawPath.empty()) return target;
+
+            // Expand environment variables (critical for evasion resistance)
+            wchar_t expandedBuf[MAX_PATH * 2]{};
+            DWORD expandedLen = ExpandEnvironmentStringsW(rawPath.c_str(), expandedBuf,
+                                                          static_cast<DWORD>(std::size(expandedBuf)));
+            std::wstring expandedPath;
+            if (expandedLen > 0 && expandedLen < std::size(expandedBuf)) {
+                expandedPath = expandedBuf;
+            } else {
+                expandedPath = rawPath;
+            }
+
+            // Normalize short (8.3) paths to long form
+            wchar_t longPathBuf[MAX_PATH * 2]{};
+            DWORD longLen = GetLongPathNameW(expandedPath.c_str(), longPathBuf,
+                                              static_cast<DWORD>(std::size(longPathBuf)));
+            if (longLen > 0 && longLen < std::size(longPathBuf)) {
+                expandedPath = longPathBuf;
+            }
+
+            target.path = expandedPath;
+
+            // Extract arguments (everything after the executable path)
+            std::wstring trimmedCmd = StringUtils::TrimCopy(command);
+            if (trimmedCmd.starts_with(L'"')) {
+                size_t endQuote = trimmedCmd.find(L'"', 1);
+                if (endQuote != std::wstring::npos && endQuote + 1 < trimmedCmd.size()) {
+                    target.arguments = StringUtils::TrimCopy(trimmedCmd.substr(endQuote + 1));
+                }
+            } else {
+                size_t spacePos = trimmedCmd.find(L' ');
+                if (spacePos != std::wstring::npos) {
+                    target.arguments = StringUtils::TrimCopy(trimmedCmd.substr(spacePos + 1));
+                }
+            }
+
+            // File existence and metadata
+            std::error_code ec;
+            fs::path filePath(target.path);
+            target.exists = fs::exists(filePath, ec);
+
+            if (target.exists) {
+                target.fileSize = fs::file_size(filePath, ec);
+                auto lwt = fs::last_write_time(filePath, ec);
+                if (!ec) {
+                    auto sctp = std::chrono::clock_cast<std::chrono::system_clock>(lwt);
+                    target.modifiedTime = sctp;
+                }
+
+                // Determine file type from extension
+                std::wstring ext = StringUtils::ToLowerCopy(filePath.extension().wstring());
+                if (ext == L".exe" || ext == L".com" || ext == L".scr") {
+                    target.isExecutable = true;
+                    target.fileType = "PE_Executable";
+                } else if (ext == L".dll" || ext == L".ocx" || ext == L".cpl") {
+                    target.isDLL = true;
+                    target.fileType = "PE_DLL";
+                } else if (ext == L".sys") {
+                    target.isDLL = true;
+                    target.fileType = "PE_Driver";
+                } else if (ext == L".ps1" || ext == L".vbs" || ext == L".js" ||
+                           ext == L".bat" || ext == L".cmd" || ext == L".wsf" ||
+                           ext == L".hta" || ext == L".wsh") {
+                    target.isScript = true;
+                    target.fileType = "Script";
+                }
+
+                // Path classification
+                std::wstring lowerPath = StringUtils::ToLowerCopy(target.path);
+                target.inSystemPath = (lowerPath.find(L"\\windows\\") != std::wstring::npos ||
+                                       lowerPath.find(L"\\program files") != std::wstring::npos);
+                target.inTempPath = (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
+                                     lowerPath.find(L"\\tmp\\") != std::wstring::npos ||
+                                     lowerPath.find(L"\\appdata\\local\\temp\\") != std::wstring::npos);
+
+                // Check for hidden files and ADS
+                DWORD attrs = GetFileAttributesW(target.path.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES) {
+                    target.isHidden = (attrs & FILE_ATTRIBUTE_HIDDEN) != 0;
+                }
+
+                // Check for Alternate Data Streams (ADS) via ":" in path after drive letter
+                if (target.path.size() > 3) {
+                    auto adsPos = target.path.find(L':', 2);
+                    target.hasADS = (adsPos != std::wstring::npos);
+                }
+
+                // Signature verification (if enabled and file is PE)
+                if (m_config.verifySignatures && (target.isExecutable || target.isDLL)) {
+                    VerifyTargetSignature(target);
+                }
+
+                // Hash computation (if enabled)
+                if (m_config.checkHashes && target.fileSize > 0 &&
+                    target.fileSize < (512ULL * 1024 * 1024)) {
+                    ComputeTargetHash(target);
+                }
+
+                // Entropy analysis for packer detection (first 64KB)
+                if (target.isExecutable || target.isDLL) {
+                    AnalyzeTargetEntropy(target);
+                }
+            } else if (!target.path.empty()) {
+                // Mark as orphaned — target binary doesn't exist
+                // Could be deleted malware or ADS-hidden payload
+            }
+
+            // Cache result
+            if (m_config.useCache) {
+                std::unique_lock cacheLock(m_cacheMutex);
+                if (m_targetCache.size() < PersistenceDetectorConstants::SIGNATURE_CACHE_SIZE) {
+                    m_targetCache[command] = target;
+                }
+            }
+
+        } catch (const std::exception& e) {
+            Logger::Error("PersistenceDetector: ResolveTarget exception: {}", e.what());
+        }
+
+        return target;
+    }
+
+    // ========================================================================
+    // TARGET ENRICHMENT HELPERS
+    // ========================================================================
+
+    void VerifyTargetSignature(TargetBinary& target) {
+        try {
+            CertUtils::Certificate cert;
+            CertUtils::Error certErr;
+            if (cert.LoadFromFile(target.path, &certErr)) {
+                CertUtils::CertificateInfo info;
+                if (cert.GetInfo(info, &certErr)) {
+                    target.signerName = info.subject;
+                    target.issuerName = info.issuer;
+                }
+
+                if (cert.IsValid()) {
+                    target.signatureStatus = SignatureStatus::SignedValid;
+                    target.isTrusted = true;
+
+                    std::wstring lowerSigner = StringUtils::ToLowerCopy(target.signerName);
+                    target.isMicrosoftSigned = (lowerSigner.find(L"microsoft") != std::wstring::npos);
+                } else {
+                    target.signatureStatus = SignatureStatus::SignedInvalid;
+                }
+            } else {
+                target.signatureStatus = SignatureStatus::NotSigned;
+            }
+
+            m_stats.signaturesVerified.fetch_add(1, std::memory_order_relaxed);
+
+        } catch (const std::exception& e) {
+            Logger::Debug("PersistenceDetector: Signature verification exception for {}: {}",
+                StringUtils::ToNarrow(target.path), e.what());
+            target.signatureStatus = SignatureStatus::Unknown;
+        }
+    }
+
+    void ComputeTargetHash(TargetBinary& target) {
+        try {
+            FileUtils::Error fileErr;
+            if (FileUtils::ComputeFileSHA256(target.path, target.sha256, &fileErr)) {
+                target.sha256Hex = HashUtils::ToHexLower(target.sha256.data(), target.sha256.size());
+            }
+            m_stats.hashesChecked.fetch_add(1, std::memory_order_relaxed);
+        } catch (const std::exception& e) {
+            Logger::Debug("PersistenceDetector: Hash computation failed for {}: {}",
+                StringUtils::ToNarrow(target.path), e.what());
+        }
+    }
+
+    void AnalyzeTargetEntropy(TargetBinary& target) {
+        try {
+            constexpr size_t ENTROPY_SAMPLE_SIZE = 65536;
+            std::ifstream file(target.path, std::ios::binary);
+            if (!file.is_open()) return;
+
+            std::vector<uint8_t> buffer(ENTROPY_SAMPLE_SIZE);
+            file.read(reinterpret_cast<char*>(buffer.data()), ENTROPY_SAMPLE_SIZE);
+            auto bytesRead = file.gcount();
+            if (bytesRead > 0) {
+                buffer.resize(static_cast<size_t>(bytesRead));
+                target.entropy = CalculateEntropy(std::span<const uint8_t>(buffer));
+                target.isPacked = (target.entropy > PersistenceDetectorConstants::SUSPICIOUS_ENTROPY_THRESHOLD);
+            }
+        } catch (const std::exception&) {
+            // Non-critical: entropy analysis failure is acceptable
+        }
+    }
+
+    /**
+     * @brief Check if a persistence entry is whitelisted via config or WhiteListStore.
+     */
+    [[nodiscard]] bool IsWhitelisted(const PersistenceEntry& entry) const noexcept {
+        try {
+            // Check config-level path whitelist
+            std::wstring lowerPath = StringUtils::ToLowerCopy(entry.target.path);
+            for (const auto& wp : m_config.whitelistedPaths) {
+                if (StringUtils::IContains(lowerPath, StringUtils::ToLowerCopy(wp))) {
+                    return true;
+                }
+            }
+
+            // Check config-level signer whitelist
+            if (!entry.target.signerName.empty()) {
+                for (const auto& ws : m_config.whitelistedSigners) {
+                    if (StringUtils::IEquals(entry.target.signerName, ws)) {
+                        return true;
+                    }
+                }
+            }
+
+            // Check config-level hash whitelist
+            if (!entry.target.sha256Hex.empty()) {
+                for (const auto& wh : m_config.whitelistedHashes) {
+                    if (entry.target.sha256Hex == wh) {
+                        return true;
+                    }
+                }
+            }
+
+            // WhiteListStore path-based whitelist check is handled at a higher level
+            // (by the orchestrator that owns the WhitelistStore instance).
+            // Config-level whitelist checks above are sufficient for the detector.
+
+        } catch (const std::exception&) {
+            // Whitelist check failure — default to NOT whitelisted (safe default)
+        }
+        return false;
+    }
+
+    /**
+     * @brief Enrich entry with hash reputation from HashStore.
+     *
+     * The HashStore is not a singleton — it must be provided by the orchestrator.
+     * When wired, pass the HashStore reference through PersistenceDetectorConfig
+     * or a SetHashStore() method. For now, only config-level hash checks apply.
+     */
+    void EnrichWithHashLookup(PersistenceEntry& entry) noexcept {
+        try {
+            if (entry.target.sha256Hex.empty()) return;
+
+            // Check config-level known-bad hashes
+            for (const auto& badHash : m_config.whitelistedHashes) {
+                // whitelistedHashes is used for known-GOOD; known-bad comes from HashStore
+                // This is a no-op until HashStore reference is wired in.
+            }
+        } catch (const std::exception&) {
+            // Non-critical
+        }
+    }
+
+    /**
+     * @brief Enrich entry with threat intelligence data.
+     *
+     * ThreatIntelLookup is not a singleton — it must be provided by the orchestrator.
+     * When wired, pass through PersistenceDetectorConfig or a SetThreatIntel() method.
+     */
+    void EnrichWithThreatIntel(PersistenceEntry& entry) noexcept {
+        // Threat intel enrichment requires a ThreatIntelLookup reference.
+        // The orchestrator (e.g., RegistryMonitor or ScanEngine) should call
+        // EnrichWithThreatIntel after obtaining the lookup instance.
+    }
+
+    // ========================================================================
+    // COMPLEX COMMAND RESOLUTION
+    // ========================================================================
+
     [[nodiscard]] std::vector<TargetBinary> ResolveComplexCommandImpl(const std::wstring& command) {
         std::vector<TargetBinary> targets;
         if (command.empty()) return targets;
@@ -1159,7 +1487,7 @@ public:
         TargetBinary primary = ResolveTargetImpl(command);
         targets.push_back(primary);
 
-        std::wstring lowerCmd = StringUtils::ToLowerCase(command);
+        std::wstring lowerCmd = StringUtils::ToLowerCopy(command);
 
         // 2. Resolve LOLBins (Living Off The Land Binaries)
         try {
@@ -1169,7 +1497,7 @@ public:
                 std::wstring args = primary.arguments;
                 size_t commaPos = args.find(L',');
                 std::wstring dllPath = (commaPos != std::wstring::npos) ? args.substr(0, commaPos) : args;
-                dllPath = StringUtils::Trim(dllPath);
+                dllPath = StringUtils::TrimCopy(dllPath);
 
                 if (!dllPath.empty()) {
                     auto dllTarget = ResolveTargetImpl(dllPath);
@@ -1180,7 +1508,7 @@ public:
             // regsvr32.exe resolution
             else if (lowerCmd.find(L"regsvr32.exe") != std::wstring::npos) {
                 // Format: regsvr32.exe [/u] [/s] [/n] [/i[:cmdline]] <dllname>
-                std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L' ');
+                std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L" ");
                 for (const auto& token : tokens) {
                     if (!token.empty() && token[0] != L'/' && token[0] != L'-') {
                         auto dllTarget = ResolveTargetImpl(token);
@@ -1207,22 +1535,30 @@ public:
                 if (lowerCmd.find(L"-enc") != std::wstring::npos ||
                     lowerCmd.find(L"-encodedcommand") != std::wstring::npos) {
 
-                    std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L' ');
+                    std::vector<std::wstring> tokens = StringUtils::Split(primary.arguments, L" ");
                     for (size_t i = 0; i < tokens.size(); ++i) {
-                        if (StringUtils::EqualsIgnoreCase(tokens[i], L"-enc") ||
-                            StringUtils::EqualsIgnoreCase(tokens[i], L"-encodedcommand")) {
+                        if (StringUtils::IEquals(tokens[i], L"-enc") ||
+                            StringUtils::IEquals(tokens[i], L"-encodedcommand")) {
                             if (i + 1 < tokens.size()) {
-                                std::string encoded = StringUtils::WideToUtf8(tokens[i + 1]);
-                                std::string decoded = CryptoUtils::Base64Decode(encoded);
-                                std::wstring wDecoded = StringUtils::Utf8ToWide(decoded);
+                                std::string encoded = StringUtils::ToNarrow(tokens[i + 1]);
+                                std::vector<uint8_t> decodedBytes;
+                                if (Base64Decode(encoded, decodedBytes)) {
+                                    // PowerShell -EncodedCommand uses UTF-16LE encoding
+                                    std::wstring wDecoded;
+                                    if (decodedBytes.size() >= 2) {
+                                        wDecoded.assign(
+                                            reinterpret_cast<const wchar_t*>(decodedBytes.data()),
+                                            decodedBytes.size() / sizeof(wchar_t));
+                                    }
 
-                                TargetBinary encTarget;
-                                encTarget.originalPath = tokens[i + 1];
-                                encTarget.path = L"DECODED_SCRIPT";
-                                encTarget.arguments = wDecoded;
-                                encTarget.isScript = true;
-                                encTarget.description = L"De-obfuscated PowerShell command";
-                                targets.push_back(encTarget);
+                                    TargetBinary encTarget;
+                                    encTarget.originalPath = tokens[i + 1];
+                                    encTarget.path = L"DECODED_SCRIPT";
+                                    encTarget.arguments = wDecoded;
+                                    encTarget.isScript = true;
+                                    encTarget.description = L"De-obfuscated PowerShell command";
+                                    targets.push_back(encTarget);
+                                }
                             }
                         }
                     }
@@ -1237,7 +1573,7 @@ public:
 
     [[nodiscard]] std::vector<PersistenceEntry> ScanPathImpl(const std::wstring& targetPath) {
         std::vector<PersistenceEntry> results;
-        std::wstring lowerTarget = StringUtils::ToLowerCase(targetPath);
+        std::wstring lowerTarget = StringUtils::ToLowerCopy(targetPath);
 
         // Perform a standard scan to gather all entries
         // Note: In a performance-critical production environment, we would implement
@@ -1248,14 +1584,14 @@ public:
             bool match = false;
 
             // Check primary target
-            if (StringUtils::Contains(StringUtils::ToLowerCase(entry.target.path), lowerTarget)) {
+            if (StringUtils::Contains(StringUtils::ToLowerCopy(entry.target.path), lowerTarget)) {
                 match = true;
             }
 
             // Check additional targets (resolved from LOLBins/Scripts)
             if (!match) {
                 for (const auto& addTarget : entry.additionalTargets) {
-                    if (StringUtils::Contains(StringUtils::ToLowerCase(addTarget.path), lowerTarget)) {
+                    if (StringUtils::Contains(StringUtils::ToLowerCopy(addTarget.path), lowerTarget)) {
                         match = true;
                         break;
                     }
@@ -1263,7 +1599,7 @@ public:
             }
 
             // Check raw command if no path match yet (for obfuscated entries)
-            if (!match && StringUtils::Contains(StringUtils::ToLowerCase(entry.rawCommand), lowerTarget)) {
+            if (!match && StringUtils::Contains(StringUtils::ToLowerCopy(entry.rawCommand), lowerTarget)) {
                 match = true;
             }
 
@@ -1280,7 +1616,7 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool IsLOLBin(const std::wstring& path) const noexcept {
-        std::wstring lowerPath = StringUtils::ToLowerCase(path);
+        std::wstring lowerPath = StringUtils::ToLowerCopy(path);
         static const std::vector<std::wstring> lolbins = {
             L"rundll32.exe", L"regsvr32.exe", L"mshta.exe", L"powershell.exe",
             L"cmd.exe", L"certutil.exe", L"bitsadmin.exe", L"scrcons.exe",
@@ -1339,7 +1675,7 @@ public:
         // Non-Standard Extensions (+15)
         std::wstring ext = fs::path(entry.target.path).extension().wstring();
         if (!ext.empty() && entry.target.isExecutable) {
-            std::wstring lowerExt = StringUtils::ToLowerCase(ext);
+            std::wstring lowerExt = StringUtils::ToLowerCopy(ext);
             if (lowerExt != L".exe" && lowerExt != L".dll" && lowerExt != L".sys") {
                 score += 15;
             }
@@ -1381,17 +1717,50 @@ public:
                 TargetBinary target = ResolveTargetImpl(data);
                 analysis.resolvedTarget = target.path;
 
+                // Check whitelist before scoring
+                PersistenceEntry tempEntry{};
+                tempEntry.target = target;
+                tempEntry.type = analysis.detectedType;
+                if (IsWhitelisted(tempEntry)) {
+                    analysis.risk = RiskLevel::Safe;
+                    analysis.riskScore = 0;
+                    analysis.recommendation = "Allow (whitelisted)";
+                    return analysis;
+                }
+
+                // Hash/ThreatIntel check
+                if (!target.sha256Hex.empty()) {
+                    EnrichWithHashLookup(tempEntry);
+                    if (tempEntry.isKnownBad) {
+                        analysis.isKnownBad = true;
+                        analysis.indicators.push_back("Known malicious hash");
+                    }
+                }
+
                 // Assess risk
                 analysis.isSuspiciousLocation = IsSuspiciousPath(target.path);
                 analysis.isSuspiciousTarget = !target.exists || target.inTempPath;
                 analysis.isUnsigned = (target.signatureStatus == SignatureStatus::NotSigned);
 
+                // Build indicators list for forensic evidence
+                if (analysis.isSuspiciousLocation) analysis.indicators.push_back("Suspicious file path");
+                if (analysis.isSuspiciousTarget) analysis.indicators.push_back("Target missing or in temp directory");
+                if (analysis.isUnsigned) analysis.indicators.push_back("Unsigned binary");
+                if (target.isPacked) analysis.indicators.push_back("High entropy — possible packing");
+                if (target.hasADS) analysis.indicators.push_back("Alternate Data Stream detected");
+                if (IsLOLBin(target.path)) analysis.indicators.push_back("LOLBin usage detected");
+
                 // Calculate risk score
                 uint32_t score = 0;
-                if (analysis.isSuspiciousLocation) score += 30;
-                if (analysis.isSuspiciousTarget) score += 40;
-                if (analysis.isUnsigned) score += 20;
-                if (target.isPacked) score += 25;
+                if (analysis.isKnownBad) score = 100;
+                else {
+                    if (analysis.isSuspiciousLocation) score += 30;
+                    if (analysis.isSuspiciousTarget) score += 40;
+                    if (analysis.isUnsigned) score += 20;
+                    if (target.isPacked) score += 25;
+                    if (target.hasADS) score += 30;
+                    if (IsLOLBin(target.path)) score += 25;
+                }
 
                 analysis.riskScore = static_cast<uint8_t>(std::min(score, 100u));
 
@@ -1408,6 +1777,12 @@ public:
 
                 Logger::Info("PersistenceDetector: Real-time analysis - Type: {}, Risk: {}, Score: {}",
                     static_cast<int>(analysis.detectedType), static_cast<int>(analysis.risk), analysis.riskScore);
+
+                // Generate alert for suspicious+ events
+                if ((analysis.risk >= RiskLevel::Suspicious && m_config.alertOnSuspicious) ||
+                    (analysis.risk == RiskLevel::Unknown && m_config.alertOnUnknown)) {
+                    GenerateRealTimeAlert(keyPath, valueName, data, analysis);
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1417,8 +1792,59 @@ public:
         return analysis;
     }
 
+    /**
+     * @brief Generates a PersistenceAlert and dispatches it via registered callbacks.
+     */
+    void GenerateRealTimeAlert(
+        const std::wstring& keyPath,
+        const std::wstring& valueName,
+        const std::wstring& data,
+        const RealTimeAnalysis& analysis
+    ) {
+        PersistenceAlert alert{};
+        alert.alertId = m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
+        alert.timestamp = system_clock::now();
+        alert.type = analysis.detectedType;
+        alert.risk = analysis.risk;
+        alert.description = analysis.recommendation;
+        alert.location = keyPath;
+        alert.entryName = valueName;
+        alert.command = data;
+        alert.targetPath = analysis.resolvedTarget;
+        alert.analysis = analysis;
+        alert.mitreTechnique = GetMITRETechnique(analysis.detectedType);
+
+        // Capture process context
+        alert.processId = static_cast<uint32_t>(GetCurrentProcessId());
+
+        m_stats.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
+        InvokeAlertCallbacks(alert);
+
+        Logger::Warn("PersistenceDetector: ALERT - {} persistence attempt at {}/{} -> {} (Risk={})",
+            alert.mitreTechnique,
+            StringUtils::ToNarrow(keyPath),
+            StringUtils::ToNarrow(valueName),
+            StringUtils::ToNarrow(analysis.resolvedTarget),
+            static_cast<int>(analysis.risk));
+    }
+
     [[nodiscard]] PersistenceType IsPersistenceLocationImpl(const std::wstring& keyPath) const noexcept {
-        std::wstring upperPath = StringUtils::ToUpperCase(keyPath);
+        std::wstring upperPath = StringUtils::ToUpperCopy(keyPath);
+
+        // Normalize kernel-format paths to usermode format
+        // Kernel sends: \REGISTRY\MACHINE\..., usermode uses: HKEY_LOCAL_MACHINE\...
+        std::wstring normalizedPath = upperPath;
+        if (normalizedPath.find(L"\\REGISTRY\\MACHINE\\") != std::wstring::npos) {
+            size_t pos = normalizedPath.find(L"\\REGISTRY\\MACHINE\\");
+            normalizedPath.replace(pos, 18, L"HKEY_LOCAL_MACHINE\\");
+        } else if (normalizedPath.find(L"\\REGISTRY\\USER\\") != std::wstring::npos) {
+            // \REGISTRY\USER\<SID>\... → HKEY_CURRENT_USER\...
+            size_t pos = normalizedPath.find(L"\\REGISTRY\\USER\\");
+            size_t sidEnd = normalizedPath.find(L'\\', pos + 15);
+            if (sidEnd != std::wstring::npos) {
+                normalizedPath.replace(pos, sidEnd - pos + 1, L"HKEY_CURRENT_USER\\");
+            }
+        }
 
         for (const auto& loc : PERSISTENCE_LOCATIONS) {
             std::wstring checkPath = std::format(L"{}\\{}",
@@ -1426,10 +1852,34 @@ public:
                 (loc.hive == HKEY_CURRENT_USER) ? L"HKEY_CURRENT_USER" : L"HKEY_CLASSES_ROOT",
                 loc.subkey);
 
-            std::wstring upperCheckPath = StringUtils::ToUpperCase(checkPath);
+            std::wstring upperCheckPath = StringUtils::ToUpperCopy(checkPath);
 
-            if (upperPath.find(upperCheckPath) != std::wstring::npos) {
+            if (normalizedPath.find(upperCheckPath) != std::wstring::npos) {
                 return loc.type;
+            }
+        }
+
+        // Also handle short-form paths: HKLM\..., HKCU\...
+        std::wstring shortFormPath = normalizedPath;
+        if (shortFormPath.starts_with(L"HKLM\\")) {
+            shortFormPath = L"HKEY_LOCAL_MACHINE\\" + shortFormPath.substr(5);
+        } else if (shortFormPath.starts_with(L"HKCU\\")) {
+            shortFormPath = L"HKEY_CURRENT_USER\\" + shortFormPath.substr(5);
+        } else if (shortFormPath.starts_with(L"HKCR\\")) {
+            shortFormPath = L"HKEY_CLASSES_ROOT\\" + shortFormPath.substr(5);
+        }
+
+        if (shortFormPath != normalizedPath) {
+            for (const auto& loc : PERSISTENCE_LOCATIONS) {
+                std::wstring checkPath = std::format(L"{}\\{}",
+                    (loc.hive == HKEY_LOCAL_MACHINE) ? L"HKEY_LOCAL_MACHINE" :
+                    (loc.hive == HKEY_CURRENT_USER) ? L"HKEY_CURRENT_USER" : L"HKEY_CLASSES_ROOT",
+                    loc.subkey);
+
+                std::wstring upperCheckPath = StringUtils::ToUpperCopy(checkPath);
+                if (shortFormPath.find(upperCheckPath) != std::wstring::npos) {
+                    return loc.type;
+                }
             }
         }
 
@@ -1509,7 +1959,7 @@ PersistenceDetector::~PersistenceDetector() {
 
 bool PersistenceDetector::Initialize(const PersistenceDetectorConfig& config) {
     if (!m_impl) {
-        Logger::Critical("PersistenceDetector: Implementation is null");
+        Logger::Error("PersistenceDetector: Implementation is null");
         return false;
     }
 
@@ -1567,8 +2017,7 @@ void PersistenceDetector::Shutdown() noexcept {
         return {};
     }
 
-    // Not implemented in this version
-    return {};
+    return m_impl->ScanPathImpl(path);
 }
 
 void PersistenceDetector::CancelScan() {
@@ -1649,7 +2098,7 @@ void PersistenceDetector::CancelScan() {
 [[nodiscard]] std::optional<ServiceEntry> PersistenceDetector::GetService(const std::wstring& serviceName) {
     auto services = ScanServices();
     for (const auto& svc : services) {
-        if (StringUtils::EqualsIgnoreCase(svc.serviceName, serviceName)) {
+        if (StringUtils::IEquals(svc.serviceName, serviceName)) {
             return svc;
         }
     }
@@ -1798,15 +2247,106 @@ void PersistenceDetector::ResetStatistics() noexcept {
 }
 
 bool PersistenceDetector::ExportDiagnostics(const std::wstring& outputPath) const {
-    // Placeholder for export functionality
-    Logger::Info("PersistenceDetector: Diagnostics export not yet implemented");
-    return false;
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        Logger::Error("PersistenceDetector: Not initialized for diagnostics export");
+        return false;
+    }
+
+    try {
+        std::ofstream file(outputPath, std::ios::out | std::ios::trunc);
+        if (!file.is_open()) {
+            Logger::Error("PersistenceDetector: Cannot open diagnostics output: {}",
+                StringUtils::ToNarrow(outputPath));
+            return false;
+        }
+
+        const auto& stats = m_impl->m_stats;
+        file << "=== ShadowStrike PersistenceDetector Diagnostics ===\n";
+        file << "Total Scans: " << stats.totalScans.load() << "\n";
+        file << "Entries Scanned: " << stats.entriesScanned.load() << "\n";
+        file << "Locations Scanned: " << stats.locationsScanned.load() << "\n";
+        file << "Safe Entries: " << stats.safeEntriesFound.load() << "\n";
+        file << "Suspicious Entries: " << stats.suspiciousEntriesFound.load() << "\n";
+        file << "Malicious Entries: " << stats.maliciousEntriesFound.load() << "\n";
+        file << "Real-Time Analyses: " << stats.realTimeAnalyses.load() << "\n";
+        file << "Persistence Attempts: " << stats.persistenceAttempts.load() << "\n";
+        file << "Blocked Attempts: " << stats.blockedAttempts.load() << "\n";
+        file << "Signatures Verified: " << stats.signaturesVerified.load() << "\n";
+        file << "Hashes Checked: " << stats.hashesChecked.load() << "\n";
+        file << "Cache Hits: " << stats.cacheHits.load() << "\n";
+        file << "Alerts Generated: " << stats.alertsGenerated.load() << "\n";
+        file.flush();
+
+        Logger::Info("PersistenceDetector: Diagnostics exported to {}",
+            StringUtils::ToNarrow(outputPath));
+        return true;
+
+    } catch (const std::exception& e) {
+        Logger::Error("PersistenceDetector: Diagnostics export failed: {}", e.what());
+        return false;
+    }
 }
 
 bool PersistenceDetector::ExportScanReport(const ScanResult& result, const std::wstring& outputPath) const {
-    // Placeholder for report export
-    Logger::Info("PersistenceDetector: Report export not yet implemented");
-    return false;
+    if (!m_impl) {
+        Logger::Error("PersistenceDetector: Not initialized for report export");
+        return false;
+    }
+
+    try {
+        std::ofstream file(outputPath, std::ios::out | std::ios::trunc);
+        if (!file.is_open()) {
+            Logger::Error("PersistenceDetector: Cannot open report output: {}",
+                StringUtils::ToNarrow(outputPath));
+            return false;
+        }
+
+        file << "=== ShadowStrike Persistence Scan Report ===\n";
+        file << "Duration: " << result.duration.count() << " ms\n";
+        file << "Scope: " << static_cast<int>(result.scope) << "\n";
+        file << "Locations Scanned: " << result.locationsScanned << "\n";
+        file << "Total Entries: " << result.totalEntries << "\n";
+        file << "Safe: " << result.safeEntries << "\n";
+        file << "Suspicious: " << result.suspiciousEntries << "\n";
+        file << "Malicious: " << result.maliciousEntries << "\n";
+        file << "Unknown: " << result.unknownEntries << "\n";
+        file << "Orphaned: " << result.orphanedEntries << "\n";
+        file << "Errors: " << result.errorsEncountered << "\n\n";
+
+        for (const auto& entry : result.entries) {
+            if (entry.risk < RiskLevel::Suspicious && !m_impl->m_config.logAllEntries) {
+                continue;
+            }
+            file << "--- Entry ---\n";
+            file << "  Type: " << static_cast<int>(entry.type) << "\n";
+            file << "  Location: " << StringUtils::ToNarrow(entry.location) << "\n";
+            file << "  Name: " << StringUtils::ToNarrow(entry.entryName) << "\n";
+            file << "  Command: " << StringUtils::ToNarrow(entry.rawCommand) << "\n";
+            file << "  Target: " << StringUtils::ToNarrow(entry.target.path) << "\n";
+            file << "  Exists: " << (entry.target.exists ? "Yes" : "No") << "\n";
+            file << "  Risk: " << static_cast<int>(entry.risk) << " (Score: " << static_cast<int>(entry.riskScore) << ")\n";
+            file << "  MITRE: " << entry.mitreTechnique << "\n";
+            if (!entry.target.sha256Hex.empty()) {
+                file << "  SHA256: " << entry.target.sha256Hex << "\n";
+            }
+            if (!entry.target.signerName.empty()) {
+                file << "  Signer: " << StringUtils::ToNarrow(entry.target.signerName) << "\n";
+            }
+            for (const auto& factor : entry.riskFactors) {
+                file << "  RiskFactor: " << factor << "\n";
+            }
+            file << "\n";
+        }
+
+        file.flush();
+        Logger::Info("PersistenceDetector: Report exported to {}",
+            StringUtils::ToNarrow(outputPath));
+        return true;
+
+    } catch (const std::exception& e) {
+        Logger::Error("PersistenceDetector: Report export failed: {}", e.what());
+        return false;
+    }
 }
 
 } // namespace Registry
