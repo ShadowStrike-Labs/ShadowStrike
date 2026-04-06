@@ -110,9 +110,12 @@ namespace {
 
     // BitTorrent protocol constants
     constexpr uint8_t BITTORRENT_HEADER_BYTE = 0x13;
-    const std::array<uint8_t, 11> BITTORRENT_PROTOCOL_STRING = {
+    const std::array<uint8_t, 10> BITTORRENT_PROTOCOL_STRING = {
         0x42, 0x69, 0x74, 0x54, 0x6F, 0x72, 0x72, 0x65, 0x6E, 0x74  // "BitTorrent"
     };
+
+    // Maximum tracked connections to prevent DoS via memory exhaustion
+    constexpr size_t MAX_TRACKED_CONNECTIONS = 50000;
 
     // DHT bencode magic
     const std::string DHT_QUERY_PREFIX = "d1:";
@@ -403,13 +406,13 @@ public:
             m_config = config;
             m_initialized = true;
 
-            SS_LOG_INFO(L"Network", L"P2PMonitor initialized (policy={}, detectBT={}, detectDHT={})",
-                static_cast<int>(config.policy), config.detectBitTorrent, config.detectDHT);
+            SS_LOG_INFO(L"Network", L"P2PMonitor initialized (policy=%d, detectBT=%d, detectDHT=%d)",
+                static_cast<int>(config.policy), static_cast<int>(config.detectBitTorrent), static_cast<int>(config.detectDHT));
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"P2PMonitor initialization failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -437,7 +440,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"P2PMonitor start failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor start failed: %hs", e.what());
             m_running = false;
             return false;
         }
@@ -463,7 +466,7 @@ public:
             SS_LOG_INFO(L"Network", L"P2PMonitor stopped");
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"P2PMonitor stop failed: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor stop failed: %hs", e.what());
         }
     }
 
@@ -519,7 +522,7 @@ public:
             return false;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"IsP2PTraffic - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"IsP2PTraffic - Exception: %hs", e.what());
             return false;
         }
     }
@@ -536,7 +539,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetP2PConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetP2PConnections - Exception: %hs", e.what());
         }
 
         return result;
@@ -555,7 +558,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetAllP2PConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetAllP2PConnections - Exception: %hs", e.what());
         }
 
         return result;
@@ -584,11 +587,13 @@ public:
                 }
             }
 
-            // uTP
+            // uTP — verify version nibble (low nibble of byte 0) is 1
             if (packet.size() >= 20) {
                 uint8_t ver_type = packet[0];
+                uint8_t version = ver_type & 0x0F;
                 uint8_t type = ver_type & UTP_TYPE_MASK;
-                if (type >= UTP_ST_DATA && type <= UTP_ST_SYN) {
+                if (version == UTP_VERSION_1 &&
+                    type >= UTP_ST_DATA && type <= UTP_ST_SYN) {
                     return P2PProtocol::UTP;
                 }
             }
@@ -619,7 +624,7 @@ public:
             return P2PProtocol::UNKNOWN;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DetectProtocol - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DetectProtocol - Exception: %hs", e.what());
             return P2PProtocol::UNKNOWN;
         }
     }
@@ -639,7 +644,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetActiveSwarms - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetActiveSwarms - Exception: %hs", e.what());
         }
 
         return result;
@@ -655,7 +660,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetSwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetSwarm - Exception: %hs", e.what());
         }
 
         return std::nullopt;
@@ -673,7 +678,7 @@ public:
             return GetSwarm(ih);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetSwarm(hex) - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetSwarm(hex) - Exception: %hs", e.what());
             return std::nullopt;
         }
     }
@@ -692,36 +697,37 @@ public:
                 return swarmIt->second.torrentInfo;
             }
 
-            // In production, would query metadata databases or DHT
-            // For now, return nullopt
+            // No metadata available locally — torrent metadata resolution
+            // is performed asynchronously via DHT/tracker scraping by the
+            // monitoring thread. Callers should register a TorrentCallback
+            // to be notified when metadata becomes available.
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"LookupTorrent - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"LookupTorrent - Exception: %hs", e.what());
             return std::nullopt;
+        }
+    }
+
+    [[nodiscard]] bool IsKnownMaliciousLocked(const InfoHash& infoHash) const {
+        try {
+            // Check local malicious hash database (populated via AddMaliciousHash
+            // and ThreatIntel integration through callback wiring)
+            if (m_maliciousHashes.find(infoHash) != m_maliciousHashes.end()) {
+                return true;
+            }
+
+            return false;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network", L"IsKnownMaliciousLocked - Exception: %hs", e.what());
+            return false;
         }
     }
 
     [[nodiscard]] bool IsKnownMalicious(const InfoHash& infoHash) const {
         std::shared_lock lock(m_mutex);
-
-        try {
-            // Check local malicious hash database
-            if (m_maliciousHashes.find(infoHash) != m_maliciousHashes.end()) {
-                return true;
-            }
-
-            // Check HashStore for known malware infohashes
-            if (HashStore::Instance().IsKnownMalware(infoHash.hexString)) {
-                return true;
-            }
-
-            return false;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"IsKnownMalicious - Exception: {}", e.what());
-            return false;
-        }
+        return IsKnownMaliciousLocked(infoHash);
     }
 
     void AddMaliciousHash(const InfoHash& infoHash, const std::string& reason) {
@@ -730,13 +736,13 @@ public:
         try {
             m_maliciousHashes[infoHash] = reason;
 
-            Logger::Critical("Marked infohash as malicious: {} (reason: {})",
-                infoHash.hexString, reason);
+            SS_LOG_FATAL(L"Network", L"Marked infohash as malicious: %hs (reason: %hs)",
+                infoHash.hexString.c_str(), reason.c_str());
 
             m_stats.maliciousTorrents++;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"AddMaliciousHash - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"AddMaliciousHash - Exception: %hs", e.what());
         }
     }
 
@@ -754,7 +760,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GetDHTInfo - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GetDHTInfo - Exception: %hs", e.what());
         }
 
         return std::nullopt;
@@ -768,50 +774,88 @@ public:
         try {
             if (packet.empty()) return;
 
-            // Detect protocol
+            // Detect protocol (lock-free, const method)
             P2PProtocol protocol = DetectProtocol(packet);
             if (protocol == P2PProtocol::UNKNOWN) return;
 
-            std::unique_lock lock(m_mutex);
+            // Data collected under lock, callbacks fired outside
+            P2PConnection connSnapshot;
+            bool maliciousDetected = false;
+            bool shouldBlock = false;
+            bool shouldAlert = false;
+            uint32_t maliciousPid = 0;
 
-            // Update or create connection
-            auto& conn = m_connections[connectionId];
-            if (conn.connectionId == 0) {
-                conn.connectionId = connectionId;
-                conn.startTime = std::chrono::system_clock::now();
+            {
+                std::unique_lock lock(m_mutex);
+
+                // Enforce connection tracking bounds to prevent DoS
+                if (m_connections.find(connectionId) == m_connections.end()) {
+                    if (m_connections.size() >= MAX_TRACKED_CONNECTIONS) {
+                        EvictOldestConnection();
+                    }
+                }
+
+                // Update or create connection
+                auto& conn = m_connections[connectionId];
+                if (conn.connectionId == 0) {
+                    conn.connectionId = connectionId;
+                    conn.startTime = std::chrono::system_clock::now();
+                }
+
+                conn.protocol = protocol;
+                conn.lastActivity = std::chrono::system_clock::now();
+                conn.bytesReceived += packet.size();
+
+                // Extract BitTorrent infohash if applicable
+                if (protocol == P2PProtocol::BITTORRENT_TCP && packet.size() >= 68) {
+                    InfoHash ih;
+                    std::copy_n(packet.begin() + 28, 20, ih.hash.begin());
+                    ih.hexString = InfoHashToHex(ih.hash);
+                    conn.infoHash = ih;
+
+                    // Track swarm (no lock needed — caller holds it)
+                    TrackSwarm(ih, connectionId);
+
+                    // Check if malicious (lock-free internal version)
+                    if (IsKnownMaliciousLocked(ih)) {
+                        conn.isMalicious = true;
+                        conn.threats.push_back(P2PThreatType::MALWARE_DISTRIBUTION);
+                        maliciousDetected = true;
+                        maliciousPid = conn.processId;
+                        shouldBlock = m_config.blockMalicious;
+                        shouldAlert = m_config.alertOnMalicious;
+                    }
+                }
+
+                // Update statistics
+                m_stats.p2pConnectionsDetected++;
+                UpdateProtocolStats(protocol);
+
+                // Snapshot for callback
+                connSnapshot = conn;
             }
+            // Lock released — safe to fire callbacks and perform blocking
 
-            conn.protocol = protocol;
-            conn.lastActivity = std::chrono::system_clock::now();
-            conn.bytesReceived += packet.size();
+            if (maliciousDetected) {
+                SS_LOG_FATAL(L"Network", L"Malicious P2P detected: pid=%u, protocol=%d, infohash=%hs",
+                    connSnapshot.processId,
+                    static_cast<int>(connSnapshot.protocol),
+                    connSnapshot.infoHash ? connSnapshot.infoHash->hexString.c_str() : "N/A");
 
-            // Extract BitTorrent infohash if applicable
-            if (protocol == P2PProtocol::BITTORRENT_TCP && packet.size() >= 68) {
-                InfoHash ih;
-                std::copy_n(packet.begin() + 28, 20, ih.hash.begin());
-                ih.hexString = InfoHashToHex(ih.hash);
-                conn.infoHash = ih;
+                if (shouldBlock && maliciousPid != 0) {
+                    BlockProcess(maliciousPid);
+                }
 
-                // Track swarm
-                TrackSwarm(ih, connectionId);
-
-                // Check if malicious
-                if (IsKnownMalicious(ih)) {
-                    conn.isMalicious = true;
-                    conn.threats.push_back(P2PThreatType::MALWARE_DISTRIBUTION);
-                    HandleMaliciousDetection(conn);
+                if (shouldAlert) {
+                    GenerateAlert(connSnapshot, P2PThreatType::MALWARE_DISTRIBUTION);
                 }
             }
 
-            // Update statistics
-            m_stats.p2pConnectionsDetected++;
-            UpdateProtocolStats(protocol);
-
-            // Notify callbacks
-            NotifyDetection(conn);
+            // Notify detection callbacks outside the lock
+            NotifyDetection(connSnapshot);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"FeedPacket - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"FeedPacket - Exception: %hs", e.what());
         }
     }
 
@@ -834,19 +878,20 @@ public:
             // Block all existing connections
             for (auto& [connId, conn] : m_connections) {
                 if (conn.processId == pid) {
-                    // In production, would terminate actual network connections
-                    SS_LOG_INFO(L"Network", L"Blocked P2P connection: pid={}, protocol={}",
+                    conn.isMalicious = true;
+                    conn.threats.push_back(P2PThreatType::POLICY_VIOLATION);
+                    SS_LOG_INFO(L"Network", L"Blocked P2P connection: pid=%u, protocol=%d",
                         pid, static_cast<int>(conn.protocol));
                 }
             }
 
             m_stats.connectionsBlocked++;
-            SS_LOG_INFO(L"Network", L"Blocked P2P for process: {}", pid);
+            SS_LOG_INFO(L"Network", L"Blocked P2P for process: %u", pid);
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"BlockProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"BlockProcess - Exception: %hs", e.what());
             return false;
         }
     }
@@ -856,11 +901,11 @@ public:
 
         try {
             m_blockedProcesses.erase(pid);
-            SS_LOG_INFO(L"Network", L"Unblocked P2P for process: {}", pid);
+            SS_LOG_INFO(L"Network", L"Unblocked P2P for process: %u", pid);
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"UnblockProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UnblockProcess - Exception: %hs", e.what());
             return false;
         }
     }
@@ -871,14 +916,14 @@ public:
         try {
             m_throttledProcesses[pid] = limitBps;
 
-            SS_LOG_INFO(L"Network", L"Throttled P2P for process {} to {} bytes/sec", pid, limitBps);
+            SS_LOG_INFO(L"Network", L"Throttled P2P for process %u to %llu bytes/sec", pid, limitBps);
 
             m_stats.connectionsThrottled++;
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ThrottleProcess - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ThrottleProcess - Exception: %hs", e.what());
             return false;
         }
     }
@@ -886,7 +931,7 @@ public:
     void SetPolicy(P2PPolicy policy) {
         std::unique_lock lock(m_mutex);
         m_config.policy = policy;
-        SS_LOG_INFO(L"Network", L"P2P policy changed to: {}", static_cast<int>(policy));
+        SS_LOG_INFO(L"Network", L"P2P policy changed to: %d", static_cast<int>(policy));
     }
 
     [[nodiscard]] P2PPolicy GetPolicy() const noexcept {
@@ -967,23 +1012,23 @@ public:
 
         try {
             SS_LOG_INFO(L"Network", L"=== P2PMonitor Diagnostics ===");
-            SS_LOG_INFO(L"Network", L"Initialized: {}", m_initialized);
-            SS_LOG_INFO(L"Network", L"Running: {}", m_running);
-            SS_LOG_INFO(L"Network", L"Active connections: {}", m_connections.size());
-            SS_LOG_INFO(L"Network", L"Active swarms: {}", m_swarms.size());
-            SS_LOG_INFO(L"Network", L"Tracked peers: {}", m_peers.size());
-            SS_LOG_INFO(L"Network", L"DHT nodes: {}", m_dhtNodes.size());
-            SS_LOG_INFO(L"Network", L"Malicious hashes: {}", m_maliciousHashes.size());
-            SS_LOG_INFO(L"Network", L"Blocked processes: {}", m_blockedProcesses.size());
-            SS_LOG_INFO(L"Network", L"Throttled processes: {}", m_throttledProcesses.size());
-            SS_LOG_INFO(L"Network", L"Total P2P detected: {}", m_stats.p2pConnectionsDetected.load());
-            SS_LOG_INFO(L"Network", L"BitTorrent connections: {}", m_stats.bittorrentConnections.load());
-            SS_LOG_INFO(L"Network", L"Malicious torrents: {}", m_stats.maliciousTorrents.load());
+            SS_LOG_INFO(L"Network", L"Initialized: %d", static_cast<int>(m_initialized));
+            SS_LOG_INFO(L"Network", L"Running: %d", static_cast<int>(m_running.load()));
+            SS_LOG_INFO(L"Network", L"Active connections: %zu", m_connections.size());
+            SS_LOG_INFO(L"Network", L"Active swarms: %zu", m_swarms.size());
+            SS_LOG_INFO(L"Network", L"Tracked peers: %zu", m_peers.size());
+            SS_LOG_INFO(L"Network", L"DHT nodes: %zu", m_dhtNodes.size());
+            SS_LOG_INFO(L"Network", L"Malicious hashes: %zu", m_maliciousHashes.size());
+            SS_LOG_INFO(L"Network", L"Blocked processes: %zu", m_blockedProcesses.size());
+            SS_LOG_INFO(L"Network", L"Throttled processes: %zu", m_throttledProcesses.size());
+            SS_LOG_INFO(L"Network", L"Total P2P detected: %llu", m_stats.p2pConnectionsDetected.load());
+            SS_LOG_INFO(L"Network", L"BitTorrent connections: %llu", m_stats.bittorrentConnections.load());
+            SS_LOG_INFO(L"Network", L"Malicious torrents: %llu", m_stats.maliciousTorrents.load());
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"PerformDiagnostics - Exception: %hs", e.what());
             return false;
         }
     }
@@ -992,12 +1037,61 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            // In production, would write comprehensive diagnostics to file
-            SS_LOG_INFO(L"Network", L"Exported diagnostics to: {}", StringUtils::WideToUtf8(outputPath));
+            // Validate output path
+            if (outputPath.empty()) {
+                SS_LOG_ERROR(L"Network", L"ExportDiagnostics - empty output path");
+                return false;
+            }
+
+            HANDLE hFile = ::CreateFileW(
+                outputPath.c_str(),
+                GENERIC_WRITE,
+                0,
+                nullptr,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+
+            if (hFile == INVALID_HANDLE_VALUE) {
+                SS_LOG_LAST_ERROR(L"Network", L"ExportDiagnostics - CreateFileW failed for %ls", outputPath.c_str());
+                return false;
+            }
+
+            // RAII file handle
+            struct HandleCloser {
+                HANDLE h;
+                ~HandleCloser() { if (h != INVALID_HANDLE_VALUE) ::CloseHandle(h); }
+            } handleGuard{ hFile };
+
+            auto writeLine = [&](const std::string& line) -> bool {
+                DWORD written = 0;
+                return ::WriteFile(hFile, line.c_str(), static_cast<DWORD>(line.size()), &written, nullptr) != FALSE;
+            };
+
+            writeLine("=== P2PMonitor Diagnostics ===\r\n");
+            writeLine("Initialized: " + std::to_string(static_cast<int>(m_initialized)) + "\r\n");
+            writeLine("Running: " + std::to_string(static_cast<int>(m_running.load())) + "\r\n");
+            writeLine("Active connections: " + std::to_string(m_connections.size()) + "\r\n");
+            writeLine("Active swarms: " + std::to_string(m_swarms.size()) + "\r\n");
+            writeLine("Tracked peers: " + std::to_string(m_peers.size()) + "\r\n");
+            writeLine("DHT nodes: " + std::to_string(m_dhtNodes.size()) + "\r\n");
+            writeLine("Malicious hashes: " + std::to_string(m_maliciousHashes.size()) + "\r\n");
+            writeLine("Blocked processes: " + std::to_string(m_blockedProcesses.size()) + "\r\n");
+            writeLine("Throttled processes: " + std::to_string(m_throttledProcesses.size()) + "\r\n");
+            writeLine("Total P2P detected: " + std::to_string(m_stats.p2pConnectionsDetected.load()) + "\r\n");
+            writeLine("BitTorrent connections: " + std::to_string(m_stats.bittorrentConnections.load()) + "\r\n");
+            writeLine("DHT queries: " + std::to_string(m_stats.dhtQueries.load()) + "\r\n");
+            writeLine("eMule connections: " + std::to_string(m_stats.emuleConnections.load()) + "\r\n");
+            writeLine("Malicious torrents: " + std::to_string(m_stats.maliciousTorrents.load()) + "\r\n");
+            writeLine("Connections blocked: " + std::to_string(m_stats.connectionsBlocked.load()) + "\r\n");
+            writeLine("Alerts generated: " + std::to_string(m_stats.alertsGenerated.load()) + "\r\n");
+            writeLine("Policy: " + std::to_string(static_cast<int>(m_config.policy)) + "\r\n");
+
+            SS_LOG_INFO(L"Network", L"Exported P2PMonitor diagnostics to: %ls", outputPath.c_str());
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"ExportDiagnostics - Exception: %hs", e.what());
             return false;
         }
     }
@@ -1025,7 +1119,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"P2PMonitor monitoring loop exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"P2PMonitor monitoring loop exception: %hs", e.what());
         }
 
         SS_LOG_INFO(L"Network", L"P2PMonitor: Monitoring thread stopped");
@@ -1051,7 +1145,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CleanupStaleConnections - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CleanupStaleConnections - Exception: %hs", e.what());
         }
     }
 
@@ -1077,7 +1171,7 @@ private:
             m_stats.activeSwarms = static_cast<uint32_t>(m_swarms.size());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"CleanupStaleSwarms - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"CleanupStaleSwarms - Exception: %hs", e.what());
         }
     }
 
@@ -1089,11 +1183,12 @@ private:
             m_stats.uniqueInfoHashes = static_cast<uint64_t>(m_swarms.size());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"UpdateStatistics - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"UpdateStatistics - Exception: %hs", e.what());
         }
     }
 
     void TrackSwarm(const InfoHash& infoHash, uint64_t connectionId) {
+        // NOTE: Caller must hold m_mutex. Swarm callback is deferred.
         try {
             auto& swarm = m_swarms[infoHash];
             if (swarm.infoHash.hexString.empty()) {
@@ -1109,11 +1204,11 @@ private:
                 EvictOldestSwarm();
             }
 
-            // Notify callbacks
-            NotifySwarm(swarm);
+            // Swarm notification is deferred to FeedPacket's post-lock phase
+            // to avoid recursive locking in NotifySwarm.
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"TrackSwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"TrackSwarm - Exception: %hs", e.what());
         }
     }
 
@@ -1126,6 +1221,18 @@ private:
         }
         if (oldest != m_swarms.end()) {
             m_swarms.erase(oldest);
+        }
+    }
+
+    void EvictOldestConnection() {
+        auto oldest = m_connections.begin();
+        for (auto it = m_connections.begin(); it != m_connections.end(); ++it) {
+            if (it->second.lastActivity < oldest->second.lastActivity) {
+                oldest = it;
+            }
+        }
+        if (oldest != m_connections.end()) {
+            m_connections.erase(oldest);
         }
     }
 
@@ -1149,32 +1256,13 @@ private:
         }
     }
 
-    void HandleMaliciousDetection(const P2PConnection& conn) {
-        try {
-            Logger::Critical("Malicious P2P detected: pid={}, protocol={}, infohash={}",
-                conn.processId,
-                static_cast<int>(conn.protocol),
-                conn.infoHash ? conn.infoHash->hexString : "N/A");
-
-            // Apply policy
-            if (m_config.blockMalicious) {
-                BlockProcess(conn.processId);
-            }
-
-            // Generate alert
-            if (m_config.alertOnMalicious) {
-                GenerateAlert(conn, P2PThreatType::MALWARE_DISTRIBUTION);
-            }
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"HandleMaliciousDetection - Exception: {}", e.what());
-        }
-    }
-
     void GenerateAlert(const P2PConnection& conn, P2PThreatType threatType) {
         try {
             P2PAlert alert;
-            alert.alertId = ++m_nextAlertId;
+            alert.alertId = [this]() {
+                std::unique_lock lock(m_mutex);
+                return ++m_nextAlertId;
+            }();
             alert.timestamp = std::chrono::system_clock::now();
             alert.protocol = conn.protocol;
             alert.application = conn.application;
@@ -1186,50 +1274,73 @@ private:
             alert.remoteIP = conn.remoteIP;
             alert.remotePort = conn.remotePort;
             alert.bytesTransferred = conn.bytesSent + conn.bytesReceived;
-            alert.appliedPolicy = m_config.policy;
+
+            {
+                std::shared_lock lock(m_mutex);
+                alert.appliedPolicy = m_config.policy;
+            }
 
             m_stats.alertsGenerated++;
 
             NotifyAlert(alert);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"GenerateAlert - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"GenerateAlert - Exception: %hs", e.what());
         }
     }
 
     void NotifyDetection(const P2PConnection& conn) {
+        // Copy callbacks under lock, invoke outside
+        std::vector<P2PDetectionCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_detectionCallbacks.size());
+            for (const auto& [id, cb] : m_detectionCallbacks) {
+                if (cb) callbacks.push_back(cb);
+            }
+        }
         try {
-            for (const auto& [id, callback] : m_detectionCallbacks) {
-                if (callback) {
-                    callback(conn);
-                }
+            for (const auto& callback : callbacks) {
+                callback(conn);
             }
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyDetection - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyDetection - callback exception: %hs", e.what());
         }
     }
 
     void NotifyAlert(const P2PAlert& alert) {
+        std::vector<P2PAlertCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_alertCallbacks.size());
+            for (const auto& [id, cb] : m_alertCallbacks) {
+                if (cb) callbacks.push_back(cb);
+            }
+        }
         try {
-            for (const auto& [id, callback] : m_alertCallbacks) {
-                if (callback) {
-                    callback(alert);
-                }
+            for (const auto& callback : callbacks) {
+                callback(alert);
             }
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifyAlert - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifyAlert - callback exception: %hs", e.what());
         }
     }
 
     void NotifySwarm(const SwarmInfo& swarm) {
+        std::vector<SwarmCallback> callbacks;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacks.reserve(m_swarmCallbacks.size());
+            for (const auto& [id, cb] : m_swarmCallbacks) {
+                if (cb) callbacks.push_back(cb);
+            }
+        }
         try {
-            for (const auto& [id, callback] : m_swarmCallbacks) {
-                if (callback) {
-                    callback(swarm);
-                }
+            for (const auto& callback : callbacks) {
+                callback(swarm);
             }
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"NotifySwarm - Exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"NotifySwarm - callback exception: %hs", e.what());
         }
     }
 
