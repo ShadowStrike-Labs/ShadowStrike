@@ -104,6 +104,7 @@
 // Internal infrastructure
 #include "ProcessMonitor.hpp"
 #include "MemoryScanner.hpp"
+#include "ProcessAnalyzer.hpp"
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
@@ -118,6 +119,7 @@
 #include <vector>
 #include <map>
 #include <unordered_map>
+#include <unordered_set>
 #include <set>
 #include <optional>
 #include <memory>

@@ -58,6 +58,7 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
+#include "../../Utils/HashUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../HashStore/HashStore.hpp"
@@ -68,9 +69,12 @@
 #include <tlhelp32.h>
 #include <psapi.h>
 #include <algorithm>
+#include <numeric>
 #include <sstream>
 #include <fstream>
 #include <cmath>
+#include <cstdio>
+#include <condition_variable>
 
 #pragma comment(lib, "ntdll.lib")
 
@@ -269,38 +273,36 @@ double HollowingStatistics::GetDetectionRate() const noexcept {
 void HollowingDetectionResult::CalculateConfidence() noexcept {
     int score = 0;
 
-    // Strong indicators (worth 2 points each)
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::PEHeaderMismatch) != detectionMethods.end()) {
-        score += 2;
-    }
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::SectionMismatch) != detectionMethods.end()) {
-        score += 2;
-    }
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::CreationPatternAnomaly) != detectionMethods.end()) {
-        score += 2;
+    // Strong indicators (worth 3 points each)
+    for (auto method : detectionMethods) {
+        switch (method) {
+            case DetectionMethod::PEHeaderMismatch:      score += 3; break;
+            case DetectionMethod::SectionMismatch:        score += 3; break;
+            case DetectionMethod::CreationPatternAnomaly: score += 2; break;
+            case DetectionMethod::DeletePendingFile:      score += 3; break;
+            case DetectionMethod::TransactionAnomaly:     score += 3; break;
+            case DetectionMethod::SizeOfImageMismatch:    score += 2; break;
+
+            // Medium indicators (1-2 points)
+            case DetectionMethod::EntryPointAnomaly:      score += 2; break;
+            case DetectionMethod::ThreadContextAnomaly:   score += 2; break;
+            case DetectionMethod::UnbackedExecMemory:     score += 2; break;
+            case DetectionMethod::MemoryProtection:       score += 1; break;
+            case DetectionMethod::SectionCharacteristics: score += 1; break;
+            case DetectionMethod::EntropyAnomaly:         score += 1; break;
+            case DetectionMethod::ChecksumMismatch:       score += 1; break;
+            case DetectionMethod::TimestampMismatch:      score += 1; break;
+            case DetectionMethod::ImageBaseAnomaly:       score += 1; break;
+            case DetectionMethod::ImportTableAnomaly:     score += 1; break;
+            case DetectionMethod::DigitalSignatureBroken: score += 2; break;
+            default: break;
+        }
     }
 
-    // Medium indicators (worth 1 point each)
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::EntryPointAnomaly) != detectionMethods.end()) {
-        score += 1;
-    }
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::ThreadContextAnomaly) != detectionMethods.end()) {
-        score += 1;
-    }
-    if (std::find(detectionMethods.begin(), detectionMethods.end(),
-                  DetectionMethod::UnbackedExecMemory) != detectionMethods.end()) {
-        score += 1;
-    }
-
-    // Calculate confidence
-    if (score >= 5) {
+    // Calculate confidence from accumulated score
+    if (score >= 6) {
         confidence = HollowingConfidence::Confirmed;
-    } else if (score >= 3) {
+    } else if (score >= 4) {
         confidence = HollowingConfidence::High;
     } else if (score >= 2) {
         confidence = HollowingConfidence::Medium;
@@ -397,9 +399,8 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
     // Configuration
     HollowingDetectorConfig m_config;
 
-    // Infrastructure
-    std::shared_ptr<HashStore::HashStore> m_hashStore;
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
+    // Infrastructure (non-owning: singletons or externally managed)
+    std::atomic<ThreatIntel::ThreatIntelManager*> m_threatIntel{nullptr};
 
     // State
     std::atomic<bool> m_initialized{false};
@@ -443,7 +444,9 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
         std::chrono::system_clock::time_point cachedAt;
     };
     std::unordered_map<uint32_t, CacheEntry> m_scanCache;
+    std::unordered_set<uint32_t> m_scansInProgress;
     std::mutex m_cacheMutex;
+    std::condition_variable m_cacheCV;
 
     // Statistics
     HollowingStatistics m_statistics;
@@ -473,6 +476,13 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
 
             info.hasDosHeader = true;
             info.peHeaderOffset = dosHeader->e_lfanew;
+
+            // Validate e_lfanew against sane range to prevent OOB on crafted PEs
+            if (info.peHeaderOffset < sizeof(IMAGE_DOS_HEADER_CUSTOM) ||
+                info.peHeaderOffset > HollowingConstants::MAX_PE_HEADER_SIZE) {
+                info.validationError = L"PE header offset (e_lfanew) out of sane range";
+                return info;
+            }
 
             if (info.peHeaderOffset + sizeof(uint32_t) + sizeof(IMAGE_FILE_HEADER_CUSTOM) > buffer.size()) {
                 info.validationError = L"PE header offset out of bounds";
@@ -529,7 +539,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
                 info.dllCharacteristics = optHeader->DllCharacteristics;
                 info.numberOfDataDirectories = optHeader->NumberOfRvaAndSizes;
 
-                if (info.numberOfDataDirectories > 0) {
+                if (info.numberOfDataDirectories > 1) {
                     info.importTableRVA = optHeader->DataDirectory[1].VirtualAddress;
                     info.importTableSize = optHeader->DataDirectory[1].Size;
                 }
@@ -544,6 +554,10 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
                 if (info.numberOfDataDirectories > 6) {
                     info.debugDirectoryRVA = optHeader->DataDirectory[6].VirtualAddress;
                     info.debugDirectorySize = optHeader->DataDirectory[6].Size;
+                }
+                if (info.numberOfDataDirectories > 9) {
+                    info.tlsDirectoryRVA = optHeader->DataDirectory[9].VirtualAddress;
+                    info.tlsDirectorySize = optHeader->DataDirectory[9].Size;
                 }
 
             } else {
@@ -566,7 +580,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
                 info.dllCharacteristics = optHeader->DllCharacteristics;
                 info.numberOfDataDirectories = optHeader->NumberOfRvaAndSizes;
 
-                if (info.numberOfDataDirectories > 0) {
+                if (info.numberOfDataDirectories > 1) {
                     info.importTableRVA = optHeader->DataDirectory[1].VirtualAddress;
                     info.importTableSize = optHeader->DataDirectory[1].Size;
                 }
@@ -577,6 +591,14 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
                 if (info.numberOfDataDirectories > 5) {
                     info.relocationTableRVA = optHeader->DataDirectory[5].VirtualAddress;
                     info.relocationTableSize = optHeader->DataDirectory[5].Size;
+                }
+                if (info.numberOfDataDirectories > 6) {
+                    info.debugDirectoryRVA = optHeader->DataDirectory[6].VirtualAddress;
+                    info.debugDirectorySize = optHeader->DataDirectory[6].Size;
+                }
+                if (info.numberOfDataDirectories > 9) {
+                    info.tlsDirectoryRVA = optHeader->DataDirectory[9].VirtualAddress;
+                    info.tlsDirectorySize = optHeader->DataDirectory[9].Size;
                 }
             }
 
@@ -613,7 +635,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             info.isValid = true;
 
         } catch (const std::exception& e) {
-            info.validationError = Utils::StringUtils::Utf8ToWide(e.what());
+            info.validationError = Utils::StringUtils::ToWide(e.what());
             info.isValid = false;
         }
 
@@ -652,7 +674,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Hollowing", L"Detection callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Detection callback %llu failed - %hs", id, e.what());
             }
         }
     }
@@ -663,7 +685,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(pid, pattern);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Hollowing", L"Creation callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Creation callback %llu failed - %hs", id, e.what());
             }
         }
     }
@@ -674,7 +696,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
             try {
                 callback(pid, stage, percent);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Hollowing", L"Progress callback %llu failed - %S", id, Utils::StringUtils::Utf8ToWide(e.what()));
+                SS_LOG_ERROR(L"Hollowing", L"Progress callback %llu failed - %hs", id, e.what());
             }
         }
     }
@@ -720,12 +742,18 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
 
         {
             std::lock_guard<std::mutex> lock(m_alertsMutex);
+            // Cap alerts to prevent unbounded memory growth - drop oldest if at capacity
+            constexpr size_t MAX_ALERTS = 10000;
+            if (m_alerts.size() >= MAX_ALERTS) {
+                m_alerts.erase(m_alerts.begin(),
+                               m_alerts.begin() + static_cast<ptrdiff_t>(m_alerts.size() / 4));
+            }
             m_alerts.push_back(alert);
         }
 
         m_statistics.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_WARN(L"Hollowing", L"Alert %u - %ls (PID: %u, Risk: %.2f)", alert.alertId, alert.description, result.processId, result.riskScore);
+        SS_LOG_WARN(L"Hollowing", L"Alert %llu - %ls (PID: %u, Risk: %u)", alert.alertId, alert.description.c_str(), result.processId, result.riskScore);
     }
 };
 
@@ -771,9 +799,26 @@ bool ProcessHollowingDetector::Initialize(const HollowingDetectorConfig& config)
     try {
         m_impl->m_config = config;
 
-        // Initialize infrastructure
-        m_impl->m_hashStore = std::make_shared<HashStore::HashStore>();
-        m_impl->m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
+        // Reference ThreatIntel singleton (non-owning, atomic for thread safety)
+        m_impl->m_threatIntel.store(&ThreatIntel::ThreatIntelManager::Instance(),
+                                     std::memory_order_release);
+
+        // Load config exclusions into impl exclusion sets
+        {
+            std::unique_lock<std::shared_mutex> exLock(m_impl->m_exclusionsMutex);
+            m_impl->m_excludedProcessNames.clear();
+            for (const auto& proc : config.excludedProcesses) {
+                m_impl->m_excludedProcessNames.insert(proc);
+            }
+            m_impl->m_excludedPaths.clear();
+            for (const auto& path : config.excludedPaths) {
+                m_impl->m_excludedPaths.insert(path);
+            }
+            m_impl->m_excludedPids.clear();
+            for (auto pid : config.excludedPids) {
+                m_impl->m_excludedPids.insert(pid);
+            }
+        }
 
         m_impl->m_initialized.store(true, std::memory_order_release);
 
@@ -781,7 +826,7 @@ bool ProcessHollowingDetector::Initialize(const HollowingDetectorConfig& config)
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Hollowing", L"Initialization failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Initialization failed - %hs", e.what());
         return false;
     }
 }
@@ -808,18 +853,24 @@ void ProcessHollowingDetector::Shutdown() noexcept {
         }
 
         {
+            std::lock_guard<std::mutex> creationLock(m_impl->m_creationEventsMutex);
+            m_impl->m_creationEvents.clear();
+        }
+
+        {
             std::lock_guard<std::mutex> callbackLock(m_impl->m_callbacksMutex);
             m_impl->m_detectionCallbacks.clear();
             m_impl->m_creationCallbacks.clear();
             m_impl->m_progressCallbacks.clear();
         }
 
+        m_impl->m_threatIntel.store(nullptr, std::memory_order_release);
         m_impl->m_initialized.store(false, std::memory_order_release);
 
         SS_LOG_INFO(L"Hollowing", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Hollowing", L"Shutdown error - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Shutdown error - %hs", e.what());
     }
 }
 
@@ -852,6 +903,14 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
     result.scanTime = std::chrono::system_clock::now();
 
     try {
+        // Guard: must be initialized
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            result.scanError = L"Detector not initialized";
+            result.scanComplete = false;
+            SS_LOG_ERROR(L"Hollowing", L"ScanProcess called before Initialize() for PID %u", pid);
+            return result;
+        }
+
         m_impl->m_statistics.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         switch (mode) {
@@ -868,16 +927,77 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
             return result;
         }
 
+        // Check scan cache and in-progress tracking
+        if (m_impl->m_config.enableCaching) {
+            std::unique_lock<std::mutex> cacheLock(m_impl->m_cacheMutex);
+
+            // Check if result already cached and fresh
+            auto cacheIt = m_impl->m_scanCache.find(pid);
+            if (cacheIt != m_impl->m_scanCache.end()) {
+                auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                    std::chrono::system_clock::now() - cacheIt->second.cachedAt);
+                if (elapsed.count() < m_impl->m_config.cacheTTLSeconds) {
+                    m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    return cacheIt->second.result;
+                }
+                m_impl->m_scanCache.erase(cacheIt);
+            }
+
+            // Wait if another thread is already scanning this PID (max 30s)
+            if (m_impl->m_scansInProgress.count(pid) > 0) {
+                m_impl->m_cacheCV.wait_for(cacheLock, std::chrono::seconds(30),
+                    [this, pid]() { return m_impl->m_scansInProgress.count(pid) == 0; });
+                // Re-check cache after wakeup
+                auto it = m_impl->m_scanCache.find(pid);
+                if (it != m_impl->m_scanCache.end()) {
+                    m_impl->m_statistics.cacheHits.fetch_add(1, std::memory_order_relaxed);
+                    return it->second.result;
+                }
+            }
+
+            m_impl->m_scansInProgress.insert(pid);
+            m_impl->m_statistics.cacheMisses.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Helper lambda: check scan timeout
+        const uint32_t timeoutMs = m_impl->m_config.scanTimeoutMs;
+        auto isTimedOut = [&startTime, timeoutMs]() -> bool {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - startTime);
+            return static_cast<uint32_t>(elapsed.count()) >= timeoutMs;
+        };
+
         // Get process info
-        result.processName = Utils::ProcessUtils::GetProcessName(pid);
-        result.processPath = Utils::ProcessUtils::GetProcessPath(pid);
+        result.processName = Utils::ProcessUtils::GetProcessName(pid).value_or(L"");
+        result.processPath = Utils::ProcessUtils::GetProcessPath(pid).value_or(L"");
         result.imagePath = result.processPath;
 
         m_impl->InvokeProgressCallbacks(pid, L"Parsing PE headers", 10);
 
-        // Parse memory PE header
-        // (Simplified - would use ReadProcessMemory in production)
-        result.memoryHeader.isValid = false;  // Placeholder
+        // Determine the module base address for the main executable image
+        uintptr_t moduleBase = 0;
+        {
+            auto baseOpt = Utils::ProcessUtils::GetModuleBaseAddress(pid, L"");
+            if (baseOpt.has_value()) {
+                moduleBase = reinterpret_cast<uintptr_t>(baseOpt.value());
+            }
+        }
+
+        // If GetModuleBaseAddress with empty name didn't work, try the process name
+        if (moduleBase == 0 && !result.processName.empty()) {
+            auto baseOpt = Utils::ProcessUtils::GetModuleBaseAddress(pid, result.processName);
+            if (baseOpt.has_value()) {
+                moduleBase = reinterpret_cast<uintptr_t>(baseOpt.value());
+            }
+        }
+
+        // Parse memory PE header via ReadProcessMemory
+        if (moduleBase != 0) {
+            result.memoryHeader = ParseMemoryPE(pid, moduleBase);
+        } else {
+            result.memoryHeader.isValid = false;
+            result.memoryHeader.validationError = L"Could not determine module base address";
+        }
 
         // Parse disk PE header
         if (!result.processPath.empty()) {
@@ -897,6 +1017,13 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
             }
         }
 
+        if (isTimedOut()) {
+            result.scanError = L"Scan timeout after header comparison";
+            result.scanComplete = false;
+            m_impl->m_statistics.timeoutErrors.fetch_add(1, std::memory_order_relaxed);
+            goto finalize_scan;
+        }
+
         m_impl->InvokeProgressCallbacks(pid, L"Analyzing entry point", 70);
 
         // Entry point analysis
@@ -908,31 +1035,311 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
             }
         }
 
-        m_impl->InvokeProgressCallbacks(pid, L"Checking creation pattern", 90);
+        if (isTimedOut()) {
+            result.scanError = L"Scan timeout after entry point analysis";
+            result.scanComplete = false;
+            m_impl->m_statistics.timeoutErrors.fetch_add(1, std::memory_order_relaxed);
+            goto finalize_scan;
+        }
+
+        m_impl->InvokeProgressCallbacks(pid, L"Checking creation pattern", 80);
+
+        // Section-level analysis (Standard mode and above)
+        if (m_impl->m_config.enableSectionAnalysis &&
+            mode >= ScanMode::Standard &&
+            result.diskHeader.isValid && result.memoryHeader.isValid && moduleBase != 0) {
+
+            Utils::ProcessUtils::ProcessHandle hProcess(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+            if (hProcess.IsValid()) {
+                // Compare section content between disk and memory
+                auto minSections = std::min(result.diskHeader.sections.size(),
+                                            result.memoryHeader.sections.size());
+                for (size_t i = 0; i < minSections; ++i) {
+                    const auto& diskSec = result.diskHeader.sections[i];
+                    const auto& memSec = result.memoryHeader.sections[i];
+
+                    // Section characteristics changed = suspicious
+                    if (diskSec.characteristics != memSec.characteristics) {
+                        result.detectionMethods.push_back(DetectionMethod::SectionCharacteristics);
+                        result.detectionDetails.push_back(
+                            L"Section characteristics modified: " +
+                            std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                    }
+
+                    // For code sections, sample and compare content against disk
+                    if (diskSec.containsCode || diskSec.isExecutable) {
+                        size_t sampleSize = std::min(
+                            static_cast<size_t>(HollowingConstants::SAMPLE_SIZE_PER_SECTION),
+                            static_cast<size_t>(std::min(diskSec.virtualSize, memSec.virtualSize)));
+
+                        if (sampleSize > 0) {
+                            std::vector<uint8_t> memSample(sampleSize, 0);
+                            SIZE_T bytesRead = 0;
+                            uintptr_t sectionVA = moduleBase + memSec.virtualAddress;
+                            if (Utils::ProcessUtils::ReadProcessMemory(
+                                    pid,
+                                    reinterpret_cast<void*>(sectionVA),
+                                    memSample.data(),
+                                    sampleSize,
+                                    &bytesRead) && bytesRead > 0) {
+
+                                memSample.resize(bytesRead);
+
+                                // Entropy analysis
+                                double entropy = m_impl->CalculateEntropy(memSample);
+                                if (entropy > m_impl->m_config.entropyThreshold) {
+                                    result.detectionMethods.push_back(DetectionMethod::EntropyAnomaly);
+                                    result.detectionDetails.push_back(
+                                        L"High entropy in code section: " +
+                                        std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                                }
+
+                                // Disk vs memory content comparison (core hollowing detection)
+                                // Read the corresponding bytes from disk file
+                                if (!result.processPath.empty() &&
+                                    diskSec.pointerToRawData > 0 && diskSec.sizeOfRawData > 0) {
+
+                                    size_t diskReadSize = std::min(bytesRead,
+                                        static_cast<SIZE_T>(diskSec.sizeOfRawData));
+                                    std::vector<uint8_t> diskSample(diskReadSize, 0);
+
+                                    std::ifstream diskFile(result.processPath, std::ios::binary);
+                                    if (diskFile.is_open()) {
+                                        diskFile.seekg(diskSec.pointerToRawData, std::ios::beg);
+                                        diskFile.read(reinterpret_cast<char*>(diskSample.data()),
+                                                      static_cast<std::streamsize>(diskReadSize));
+                                        auto diskBytesRead = static_cast<size_t>(diskFile.gcount());
+                                        diskFile.close();
+
+                                        if (diskBytesRead > 0) {
+                                            // Compare byte-by-byte, count differences
+                                            size_t compareLen = std::min(bytesRead, diskBytesRead);
+                                            size_t diffCount = 0;
+                                            for (size_t b = 0; b < compareLen; ++b) {
+                                                if (memSample[b] != diskSample[b]) {
+                                                    ++diffCount;
+                                                }
+                                            }
+
+                                            double diffRatio = (compareLen > 0) ?
+                                                static_cast<double>(diffCount) / static_cast<double>(compareLen) : 0.0;
+
+                                            if (diffRatio > m_impl->m_config.sectionDifferenceThreshold) {
+                                                result.detectionMethods.push_back(DetectionMethod::SectionMismatch);
+                                                result.detectionDetails.push_back(
+                                                    L"Code section content mismatch (" +
+                                                    std::to_wstring(static_cast<int>(diffRatio * 100.0)) +
+                                                    L"% different): " +
+                                                    std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                                                result.isHollowed = true;
+                                            }
+
+                                            // Populate section comparison in header comparison
+                                            HeaderComparison::SectionComparison secComp;
+                                            secComp.name = std::string(diskSec.name.data(), strnlen(diskSec.name.data(), 8));
+                                            secComp.contentMatches = (diffCount == 0);
+                                            secComp.contentSimilarity = 1.0 - diffRatio;
+                                            secComp.sizeMatches = (diskSec.virtualSize == memSec.virtualSize);
+                                            secComp.characteristicsMatch = (diskSec.characteristics == memSec.characteristics);
+                                            result.headerComparison.sectionComparisons.push_back(std::move(secComp));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Detect unbacked executable memory regions (Comprehensive+)
+                if (mode >= ScanMode::Comprehensive) {
+                    uintptr_t addr = 0;
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    constexpr size_t MAX_REGIONS = 8192;
+                    size_t regionCount = 0;
+
+                    while (regionCount < MAX_REGIONS &&
+                           Utils::ProcessUtils::QueryProcessMemoryRegion(
+                               pid, reinterpret_cast<void*>(addr), mbi)) {
+                        ++regionCount;
+
+                        bool isExec = (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                                                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+                        bool isRWX = (mbi.Protect & PAGE_EXECUTE_READWRITE) != 0;
+                        bool isUnbacked = (mbi.Type == 0 || mbi.Type == MEM_PRIVATE);
+
+                        if (mbi.State == MEM_COMMIT && isExec && isUnbacked) {
+                            result.hasUnbackedExecutableMemory = true;
+                            result.detectionMethods.push_back(DetectionMethod::UnbackedExecMemory);
+                            result.detectionDetails.push_back(
+                                L"Unbacked executable memory at 0x" +
+                                std::to_wstring(reinterpret_cast<uintptr_t>(mbi.BaseAddress)));
+                        }
+                        if (mbi.State == MEM_COMMIT && isRWX) {
+                            result.hasRWXRegions = true;
+                        }
+
+                        uintptr_t nextAddr = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+                        if (nextAddr <= addr) break;  // Prevent infinite loop on overflow
+                        addr = nextAddr;
+                    }
+                }
+
+                // Module stomping detection
+                if (m_impl->m_config.enableModuleStompingDetection &&
+                    mode >= ScanMode::Standard) {
+                    std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
+                    if (Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
+                        for (const auto& mod : modules) {
+                            if (mod.baseAddress == nullptr || mod.path.empty()) continue;
+                            // Skip the main module (already checked above)
+                            uintptr_t modBase = reinterpret_cast<uintptr_t>(mod.baseAddress);
+                            if (modBase == moduleBase) continue;
+
+                            // Read first page of loaded module and compare against disk
+                            std::vector<uint8_t> modHeaderBuf(HollowingConstants::MAX_PE_HEADER_SIZE, 0);
+                            SIZE_T bytesRead = 0;
+                            if (Utils::ProcessUtils::ReadProcessMemory(
+                                    pid, mod.baseAddress, modHeaderBuf.data(),
+                                    modHeaderBuf.size(), &bytesRead) && bytesRead > 0) {
+                                modHeaderBuf.resize(bytesRead);
+                                auto modMemPE = m_impl->ParsePEFromBuffer(modHeaderBuf, true);
+
+                                if (modMemPE.isValid) {
+                                    auto modDiskPE = ParseFilePE(mod.path);
+                                    if (modDiskPE.isValid) {
+                                        // Check if entry point or section count changed
+                                        if (modDiskPE.entryPoint != modMemPE.entryPoint ||
+                                            modDiskPE.numberOfSections != modMemPE.numberOfSections) {
+                                            result.moduleStompingDetected = true;
+                                            result.stompedModuleName = mod.name;
+                                            result.stompedModuleBase = modBase;
+                                            result.isHollowed = true;
+                                            result.detectionMethods.push_back(DetectionMethod::SectionMismatch);
+                                            result.detectionDetails.push_back(
+                                                L"Module stomping detected: " + mod.name);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // File-state analysis for ghosting/herpaderping detection
+        if (!result.processPath.empty()) {
+            HANDLE hFile = CreateFileW(
+                result.processPath.c_str(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                nullptr,
+                OPEN_EXISTING,
+                FILE_ATTRIBUTE_NORMAL,
+                nullptr);
+
+            if (hFile == INVALID_HANDLE_VALUE) {
+                DWORD err = GetLastError();
+                if (err == ERROR_FILE_NOT_FOUND || err == ERROR_PATH_NOT_FOUND) {
+                    // File deleted while process runs - classic ghosting indicator
+                    result.creationPattern.fileDeletePending = true;
+                    result.detectionMethods.push_back(DetectionMethod::DeletePendingFile);
+                    result.detectionDetails.push_back(
+                        L"Process image file no longer exists on disk (ghosting indicator)");
+                    result.isHollowed = true;
+                } else if (err == ERROR_ACCESS_DENIED) {
+                    // Could be delete-pending state
+                    result.detectionDetails.push_back(
+                        L"Process image file access denied (possible delete-pending)");
+                }
+            } else {
+                // Check for delete-pending via NtQueryInformationFile FILE_STANDARD_INFO
+                FILE_STANDARD_INFO standardInfo{};
+                if (GetFileInformationByHandleEx(hFile, FileStandardInfo, &standardInfo, sizeof(standardInfo))) {
+                    if (standardInfo.DeletePending) {
+                        result.creationPattern.fileDeletePending = true;
+                        result.detectionMethods.push_back(DetectionMethod::DeletePendingFile);
+                        result.detectionDetails.push_back(
+                            L"Process image file is in delete-pending state (ghosting)");
+                        result.isHollowed = true;
+                    }
+                }
+                CloseHandle(hFile);
+            }
+        }
+
+        // Check for herpaderping: file content on disk no longer matches what was mapped
+        // We already did header comparison above; if the disk file has been modified
+        // AFTER the process was created, the disk PE will differ from memory PE but
+        // the memory PE will be the ORIGINAL. Herpaderping modifies the disk file after mapping.
+        if (result.diskHeader.isValid && result.memoryHeader.isValid &&
+            result.headerComparison.headersMatch == false) {
+            // If timestamps match but other fields don't, or if the entry point on disk
+            // differs from memory while the process was NOT created suspended,
+            // this suggests herpaderping (file modified post-map).
+            if (!result.creationPattern.createdSuspended &&
+                result.headerComparison.diskTimestamp != result.headerComparison.memoryTimestamp) {
+                result.creationPattern.fileModifiedAfterMap = true;
+                result.detectionDetails.push_back(
+                    L"Disk PE timestamp differs from memory - possible herpaderping");
+            }
+        }
 
         // Creation pattern analysis
         if (m_impl->m_config.enableCreationPatternMonitoring) {
+            // Preserve file-state flags set by earlier analysis
+            bool fileDeletePending = result.creationPattern.fileDeletePending;
+            bool fileModifiedAfterMap = result.creationPattern.fileModifiedAfterMap;
+
             result.creationPattern = AnalyzeCreationPattern(pid);
+
+            // Merge back file-state flags
+            result.creationPattern.fileDeletePending |= fileDeletePending;
+            result.creationPattern.fileModifiedAfterMap |= fileModifiedAfterMap;
+
             if (result.creationPattern.isSuspiciousPattern) {
                 result.detectionMethods.push_back(DetectionMethod::CreationPatternAnomaly);
             }
         }
 
+        m_impl->InvokeProgressCallbacks(pid, L"Computing confidence", 90);
+
         // Calculate confidence and risk
         result.CalculateConfidence();
         result.CalculateRiskScore();
 
-        // Determine hollowing type
+        // Determine hollowing type based on strongest available signal
         if (result.isHollowed) {
             if (result.creationPattern.involvedTransaction) {
                 result.hollowingType = HollowingType::ProcessDoppelganging;
                 m_impl->m_statistics.doppelgangingDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055.013");
             } else if (result.creationPattern.fileDeletePending) {
                 result.hollowingType = HollowingType::ProcessGhosting;
                 m_impl->m_statistics.ghostingDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055.012");
+            } else if (result.creationPattern.fileModifiedAfterMap) {
+                result.hollowingType = HollowingType::ProcessHerpaderping;
+                m_impl->m_statistics.herpaderpingDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055.012");
+            } else if (result.moduleStompingDetected) {
+                result.hollowingType = HollowingType::ModuleStomping;
+                m_impl->m_statistics.moduleStompingDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055");
+            } else if (result.entryPointAnalysis.threadContextModified &&
+                       result.creationPattern.createdSuspended) {
+                // Early bird: APC injection into suspended process before EP
+                result.hollowingType = HollowingType::EarlyBird;
+                m_impl->m_statistics.earlyBirdDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055.012");
+            } else if (result.entryPointAnalysis.threadContextModified) {
+                result.hollowingType = HollowingType::ThreadHijack;
+                m_impl->m_statistics.otherTypesDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055");
             } else {
                 result.hollowingType = HollowingType::ClassicHollowing;
                 m_impl->m_statistics.classicHollowingDetected.fetch_add(1, std::memory_order_relaxed);
+                result.mitreAttackTechniques.push_back("T1055.012");
             }
 
             m_impl->m_statistics.hollowingDetected.fetch_add(1, std::memory_order_relaxed);
@@ -962,17 +1369,50 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
             m_impl->InvokeDetectionCallbacks(result);
         }
 
+        // ThreatIntel correlation for detected payloads
+        auto* threatIntel = m_impl->m_threatIntel.load(std::memory_order_acquire);
+        if (result.isHollowed && threatIntel != nullptr &&
+            threatIntel->IsInitialized() &&
+            m_impl->m_config.enableThreatIntelCorrelation) {
+            // Compute hash of in-memory image for threat intel lookup
+            auto payloadHash = GetPayloadHash(pid);
+            bool allZero = std::all_of(payloadHash.begin(), payloadHash.end(),
+                                        [](uint8_t b) { return b == 0; });
+            if (!allZero) {
+                // Convert hash to hex string for lookup
+                std::string hexHash;
+                hexHash.reserve(64);
+                for (uint8_t b : payloadHash) {
+                    char buf[3];
+                    snprintf(buf, sizeof(buf), "%02x", b);
+                    hexHash += buf;
+                }
+
+                double riskScore = 0.0;
+                std::string threatName;
+                if (threatIntel->IsKnownMalicious(hexHash, riskScore, threatName)) {
+                    result.correlatedWithKnownThreat = true;
+                    result.threatFamily = threatName;
+                    result.threatName = Utils::StringUtils::ToWide(threatName);
+                    result.payloadHash = payloadHash;
+                    // Recalculate risk with threat intel correlation
+                    result.CalculateRiskScore();
+                }
+            }
+        }
+
         result.scanComplete = true;
         m_impl->InvokeProgressCallbacks(pid, L"Scan complete", 100);
 
     } catch (const std::exception& e) {
-        result.scanError = Utils::StringUtils::Utf8ToWide(e.what());
+        result.scanError = Utils::StringUtils::ToWide(e.what());
         result.scanComplete = false;
         m_impl->m_statistics.scanErrors.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_ERROR(L"Hollowing", L"Scan failed for PID %u - %d", pid, result.scanError);
+        SS_LOG_ERROR(L"Hollowing", L"Scan failed for PID %u - %ls", pid, result.scanError.c_str());
     }
 
+finalize_scan:
     // Update timing statistics
     auto endTime = std::chrono::steady_clock::now();
     auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
@@ -990,6 +1430,34 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
            !m_impl->m_statistics.maxScanTimeMs.compare_exchange_weak(maxTime, result.scanDurationMs)) {
     }
 
+    // Write result to scan cache and clear in-progress marker
+    if (m_impl->m_config.enableCaching) {
+        std::lock_guard<std::mutex> cacheLock(m_impl->m_cacheMutex);
+        m_impl->m_scansInProgress.erase(pid);
+
+        if (result.scanComplete) {
+            // Evict if over capacity
+            constexpr size_t MAX_CACHE_ENTRIES = 2048;
+            if (m_impl->m_scanCache.size() >= MAX_CACHE_ENTRIES) {
+                auto now = std::chrono::system_clock::now();
+                for (auto it = m_impl->m_scanCache.begin(); it != m_impl->m_scanCache.end(); ) {
+                    auto age = std::chrono::duration_cast<std::chrono::seconds>(now - it->second.cachedAt);
+                    if (age.count() > m_impl->m_config.cacheTTLSeconds) {
+                        it = m_impl->m_scanCache.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+            }
+            ProcessHollowingDetectorImpl::CacheEntry entry;
+            entry.result = result;
+            entry.cachedAt = std::chrono::system_clock::now();
+            m_impl->m_scanCache[pid] = std::move(entry);
+        }
+
+        m_impl->m_cacheCV.notify_all();
+    }
+
     return result;
 }
 
@@ -1003,7 +1471,24 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByPath(
     ScanMode mode)
 {
     std::vector<HollowingDetectionResult> results;
-    // Would enumerate processes by path in production
+
+    try {
+        std::vector<Utils::ProcessUtils::ProcessId> allPids;
+        if (!Utils::ProcessUtils::EnumerateProcesses(allPids)) {
+            SS_LOG_ERROR(L"Hollowing", L"ScanByPath: failed to enumerate processes");
+            return results;
+        }
+
+        for (auto pid : allPids) {
+            auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+            if (pathOpt.has_value() && _wcsicmp(pathOpt.value().c_str(), processPath.c_str()) == 0) {
+                results.push_back(ScanProcess(pid, mode));
+            }
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ScanByPath exception: %hs", e.what());
+    }
+
     return results;
 }
 
@@ -1012,7 +1497,17 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByName(
     ScanMode mode)
 {
     std::vector<HollowingDetectionResult> results;
-    // Would enumerate processes by name in production
+
+    try {
+        auto pids = Utils::ProcessUtils::GetProcessIdsByName(processName);
+        results.reserve(pids.size());
+        for (auto pid : pids) {
+            results.push_back(ScanProcess(pid, mode));
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ScanByName exception: %hs", e.what());
+    }
+
     return results;
 }
 
@@ -1021,7 +1516,35 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanAllProcesses
     uint32_t maxConcurrent)
 {
     std::vector<HollowingDetectionResult> results;
-    // Would enumerate all processes in production
+
+    try {
+        std::vector<Utils::ProcessUtils::ProcessId> allPids;
+        if (!Utils::ProcessUtils::EnumerateProcesses(allPids)) {
+            SS_LOG_ERROR(L"Hollowing", L"ScanAllProcesses: failed to enumerate processes");
+            return results;
+        }
+
+        // Cap process count per config
+        uint32_t limit = std::min(static_cast<uint32_t>(allPids.size()),
+                                  m_impl->m_config.maxProcessesToScan);
+
+        results.reserve(limit);
+
+        for (uint32_t i = 0; i < limit; ++i) {
+            auto pid = allPids[i];
+            // Skip system idle (PID 0) and System (PID 4) - they cannot be hollowed
+            if (pid == 0 || pid == 4) {
+                continue;
+            }
+            results.push_back(ScanProcess(pid, mode));
+        }
+
+        SS_LOG_INFO(L"Hollowing", L"ScanAllProcesses: scanned %u of %u processes",
+                    static_cast<uint32_t>(results.size()), static_cast<uint32_t>(allPids.size()));
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ScanAllProcesses exception: %hs", e.what());
+    }
+
     return results;
 }
 
@@ -1041,7 +1564,29 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanProcesses(
 
 std::vector<uint32_t> ProcessHollowingDetector::GetHollowedProcesses() {
     std::vector<uint32_t> hollowedPids;
-    // Would track detected hollowed processes
+
+    try {
+        std::vector<Utils::ProcessUtils::ProcessId> allPids;
+        if (!Utils::ProcessUtils::EnumerateProcesses(allPids)) {
+            return hollowedPids;
+        }
+
+        uint32_t limit = std::min(static_cast<uint32_t>(allPids.size()),
+                                  m_impl->m_config.maxProcessesToScan);
+
+        for (uint32_t i = 0; i < limit; ++i) {
+            auto pid = allPids[i];
+            if (pid == 0 || pid == 4) {
+                continue;
+            }
+            if (IsHollowed(pid)) {
+                hollowedPids.push_back(pid);
+            }
+        }
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"GetHollowedProcesses exception: %hs", e.what());
+    }
+
     return hollowedPids;
 }
 
@@ -1051,8 +1596,53 @@ std::vector<uint32_t> ProcessHollowingDetector::GetHollowedProcesses() {
 
 PEHeaderInfo ProcessHollowingDetector::ParseMemoryPE(uint32_t pid, uintptr_t moduleBase) {
     PEHeaderInfo info;
-    // Would read process memory and parse PE in production
-    info.isValid = false;
+
+    try {
+        // Open process with memory read access
+        Utils::ProcessUtils::ProcessHandle hProcess(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+        if (!hProcess.IsValid()) {
+            info.validationError = L"Failed to open process for memory reading";
+            SS_LOG_WARN(L"Hollowing", L"ParseMemoryPE: cannot open PID %u", pid);
+            return info;
+        }
+
+        // Read the DOS header first to determine PE header location
+        std::vector<uint8_t> headerBuffer(HollowingConstants::MAX_PE_HEADER_SIZE, 0);
+        SIZE_T bytesRead = 0;
+        if (!Utils::ProcessUtils::ReadProcessMemory(
+                pid,
+                reinterpret_cast<void*>(moduleBase),
+                headerBuffer.data(),
+                headerBuffer.size(),
+                &bytesRead)) {
+            info.validationError = L"ReadProcessMemory failed for PE header";
+            SS_LOG_WARN(L"Hollowing", L"ParseMemoryPE: ReadProcessMemory failed for PID %u at 0x%llX",
+                        pid, static_cast<unsigned long long>(moduleBase));
+            return info;
+        }
+
+        if (bytesRead < sizeof(IMAGE_DOS_HEADER_CUSTOM)) {
+            info.validationError = L"Insufficient data read for DOS header";
+            return info;
+        }
+
+        headerBuffer.resize(bytesRead);
+
+        // Parse using shared PE parser
+        info = m_impl->ParsePEFromBuffer(headerBuffer, true);
+
+        if (info.isValid) {
+            // For memory-loaded images, set actual addresses based on module base
+            for (auto& section : info.sections) {
+                section.memoryAddress = moduleBase + section.virtualAddress;
+            }
+        }
+    } catch (const std::exception& e) {
+        info.validationError = Utils::StringUtils::ToWide(e.what());
+        info.isValid = false;
+        SS_LOG_ERROR(L"Hollowing", L"ParseMemoryPE exception for PID %u: %hs", pid, e.what());
+    }
+
     return info;
 }
 
@@ -1069,8 +1659,20 @@ PEHeaderInfo ProcessHollowingDetector::ParseFilePE(const std::wstring& filePath)
 
         // Get file size
         file.seekg(0, std::ios::end);
-        size_t fileSize = file.tellg();
+        auto tellPos = file.tellg();
         file.seekg(0, std::ios::beg);
+
+        if (tellPos <= 0 || !file.good()) {
+            info.validationError = L"Failed to determine file size";
+            return info;
+        }
+
+        size_t fileSize = static_cast<size_t>(tellPos);
+
+        if (fileSize < HollowingConstants::DOS_HEADER_SIZE) {
+            info.validationError = L"File too small for PE";
+            return info;
+        }
 
         if (fileSize > HollowingConstants::MAX_COMPARISON_SIZE) {
             fileSize = HollowingConstants::MAX_COMPARISON_SIZE;
@@ -1078,14 +1680,21 @@ PEHeaderInfo ProcessHollowingDetector::ParseFilePE(const std::wstring& filePath)
 
         // Read into buffer
         std::vector<uint8_t> buffer(fileSize);
-        file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(fileSize));
+        auto bytesRead = file.gcount();
         file.close();
+
+        if (bytesRead <= 0) {
+            info.validationError = L"Failed to read file";
+            return info;
+        }
+        buffer.resize(static_cast<size_t>(bytesRead));
 
         // Parse PE
         info = m_impl->ParsePEFromBuffer(buffer, false);
 
     } catch (const std::exception& e) {
-        info.validationError = Utils::StringUtils::Utf8ToWide(e.what());
+        info.validationError = Utils::StringUtils::ToWide(e.what());
         info.isValid = false;
     }
 
@@ -1099,10 +1708,18 @@ HeaderComparison ProcessHollowingDetector::ComparePEHeaders(
     HeaderComparison comparison;
 
     // Compare basic fields
+    // Note: ImageBase mismatch is expected for ASLR-enabled binaries (DYNAMIC_BASE).
+    // Only flag it as anomalous if the disk PE does not have ASLR enabled.
+    bool diskHasASLR = (disk.dllCharacteristics & 0x0040) != 0;  // IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE
     comparison.imageBaseMatches = (disk.imageBase == memory.imageBase);
     comparison.entryPointMatches = (disk.entryPoint == memory.entryPoint);
     comparison.sizeOfImageMatches = (disk.sizeOfImage == memory.sizeOfImage);
-    comparison.checksumMatches = (disk.checksum == memory.checksum);
+
+    // PE loader zeroes the checksum field in memory. Only flag mismatch if
+    // both disk and memory have non-zero checksums that disagree.
+    comparison.checksumMatches = (memory.checksum == 0) ||
+                                 (disk.checksum == memory.checksum);
+
     comparison.timestampMatches = (disk.timeDateStamp == memory.timeDateStamp);
     comparison.sectionCountMatches = (disk.numberOfSections == memory.numberOfSections);
     comparison.machineMatches = (disk.machine == memory.machine);
@@ -1122,9 +1739,10 @@ HeaderComparison ProcessHollowingDetector::ComparePEHeaders(
     comparison.memorySectionCount = memory.numberOfSections;
 
     // Count mismatches
-    if (!comparison.imageBaseMatches) {
+    // ImageBase mismatch is only suspicious for non-ASLR binaries; ASLR relocation is normal
+    if (!comparison.imageBaseMatches && !diskHasASLR) {
         comparison.mismatchCount++;
-        comparison.anomalies.push_back(L"ImageBase mismatch");
+        comparison.anomalies.push_back(L"ImageBase mismatch (non-ASLR binary)");
     }
     if (!comparison.entryPointMatches) {
         comparison.mismatchCount++;
@@ -1147,9 +1765,18 @@ HeaderComparison ProcessHollowingDetector::ComparePEHeaders(
         comparison.anomalies.push_back(L"Section count mismatch");
     }
 
+    // Machine type mismatch is extremely suspicious
+    if (!comparison.machineMatches) {
+        comparison.mismatchCount++;
+        comparison.anomalies.push_back(L"Machine type mismatch");
+    }
+
     comparison.headersMatch = (comparison.mismatchCount == 0);
+
+    // 7 total fields compared (imageBase, entryPoint, sizeOfImage, checksum, timestamp, sectionCount, machine)
+    constexpr double totalComparisons = 7.0;
     comparison.overallSimilarity = comparison.headersMatch ? 1.0 :
-        1.0 - (static_cast<double>(comparison.mismatchCount) / 8.0);
+        1.0 - (static_cast<double>(comparison.mismatchCount) / totalComparisons);
 
     return comparison;
 }
@@ -1163,8 +1790,56 @@ bool ProcessHollowingDetector::ValidatePEHeader(const PEHeaderInfo& header) {
 }
 
 bool ProcessHollowingDetector::ValidateImageBase(uint32_t pid, uintptr_t moduleBase) {
-    // Would validate in production
-    return true;
+    try {
+        // Read the in-memory PEB to get the actual ImageBaseAddress
+        // and compare it against the module base we were given.
+        // If they differ, someone may have re-mapped the image.
+
+        auto memPE = ParseMemoryPE(pid, moduleBase);
+        if (!memPE.isValid) {
+            // Cannot read the PE at the claimed base - suspicious
+            SS_LOG_WARN(L"Hollowing", L"ValidateImageBase: cannot parse memory PE for PID %u at 0x%llX",
+                        pid, static_cast<unsigned long long>(moduleBase));
+            return false;
+        }
+
+        auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+        if (!pathOpt.has_value() || pathOpt.value().empty()) {
+            return true;  // Cannot compare
+        }
+
+        auto diskPE = ParseFilePE(pathOpt.value());
+        if (!diskPE.isValid) {
+            return true;  // Cannot compare
+        }
+
+        // For non-ASLR binaries, imageBase should match the disk preferred base.
+        // For ASLR binaries, the OS relocates - that's expected.
+        bool hasASLR = (diskPE.dllCharacteristics & 0x0040) != 0;
+
+        if (!hasASLR && diskPE.imageBase != static_cast<uintptr_t>(moduleBase)) {
+            SS_LOG_WARN(L"Hollowing", L"ValidateImageBase: non-ASLR binary loaded at unexpected base "
+                        L"(expected 0x%llX, actual 0x%llX) for PID %u",
+                        static_cast<unsigned long long>(diskPE.imageBase),
+                        static_cast<unsigned long long>(moduleBase), pid);
+            return false;
+        }
+
+        // Check that the entry point and section count match
+        if (diskPE.entryPoint != memPE.entryPoint) {
+            SS_LOG_WARN(L"Hollowing", L"ValidateImageBase: entry point mismatch for PID %u "
+                        L"(disk=0x%llX, memory=0x%llX)",
+                        pid,
+                        static_cast<unsigned long long>(diskPE.entryPoint),
+                        static_cast<unsigned long long>(memPE.entryPoint));
+            return false;
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ValidateImageBase exception for PID %u: %hs", pid, e.what());
+        return true;  // Cannot determine, err on side of caution
+    }
 }
 
 // ============================================================================
@@ -1173,8 +1848,177 @@ bool ProcessHollowingDetector::ValidateImageBase(uint32_t pid, uintptr_t moduleB
 
 EntryPointAnalysis ProcessHollowingDetector::AnalyzeEntryPoint(uint32_t pid) {
     EntryPointAnalysis analysis;
-    // Would analyze entry point in production
-    analysis.isAnomalous = false;
+
+    try {
+        // Get the module base and process path
+        auto pathOpt = Utils::ProcessUtils::GetProcessPath(pid);
+        if (!pathOpt.has_value() || pathOpt.value().empty()) {
+            analysis.isAnomalous = false;
+            return analysis;
+        }
+
+        // Parse the disk PE to get expected entry point
+        auto diskHeader = ParseFilePE(pathOpt.value());
+        if (!diskHeader.isValid) {
+            return analysis;
+        }
+
+        analysis.entryPointRVA = diskHeader.entryPoint;
+
+        // Get actual module base
+        uintptr_t moduleBase = 0;
+        {
+            auto nameOpt = Utils::ProcessUtils::GetProcessName(pid);
+            std::wstring modName = nameOpt.value_or(L"");
+            if (!modName.empty()) {
+                auto baseOpt = Utils::ProcessUtils::GetModuleBaseAddress(pid, modName);
+                if (baseOpt.has_value()) {
+                    moduleBase = reinterpret_cast<uintptr_t>(baseOpt.value());
+                }
+            }
+        }
+
+        if (moduleBase == 0) {
+            return analysis;
+        }
+
+        analysis.entryPointVA = moduleBase + analysis.entryPointRVA;
+
+        // Determine which section contains the entry point
+        for (const auto& section : diskHeader.sections) {
+            uint32_t secStart = section.virtualAddress;
+            uint32_t secEnd = secStart + std::max(section.virtualSize, section.sizeOfRawData);
+            if (analysis.entryPointRVA >= secStart && analysis.entryPointRVA < secEnd) {
+                analysis.containingSection = std::wstring(section.name.data(), strnlen(section.name.data(), 8));
+                analysis.isInCodeSection = section.isExecutable || section.containsCode;
+                analysis.isInExpectedRange = true;
+                break;
+            }
+        }
+
+        // Read entry point bytes for prologue analysis
+        Utils::ProcessUtils::ProcessHandle hProcess(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+        if (hProcess.IsValid()) {
+            SIZE_T bytesRead = 0;
+            if (Utils::ProcessUtils::ReadProcessMemory(
+                    pid,
+                    reinterpret_cast<void*>(analysis.entryPointVA),
+                    analysis.entryPointBytes.data(),
+                    analysis.entryPointBytes.size(),
+                    &bytesRead)) {
+
+                analysis.pointsToValidCode = (bytesRead >= 2);
+
+                // Check for standard function prologues (x64)
+                // push rbp; mov rbp,rsp  = 0x55 0x48 0x89 0xE5
+                // sub rsp, imm          = 0x48 0x83 0xEC xx
+                // push rbx              = 0x53
+                if (bytesRead >= 4) {
+                    uint8_t b0 = analysis.entryPointBytes[0];
+                    uint8_t b1 = analysis.entryPointBytes[1];
+                    uint8_t b2 = analysis.entryPointBytes[2];
+                    uint8_t b3 = analysis.entryPointBytes[3];
+
+                    // Standard CRT entry point patterns
+                    analysis.hasValidPrologue =
+                        (b0 == 0x48 && b1 == 0x83 && b2 == 0xEC) ||      // sub rsp, imm8
+                        (b0 == 0x48 && b1 == 0x89 && b2 == 0x5C) ||      // mov [rsp+...], rbx
+                        (b0 == 0x40 && b1 == 0x53) ||                     // push rbx (REX)
+                        (b0 == 0x55) ||                                    // push rbp
+                        (b0 == 0x53) ||                                    // push rbx
+                        (b0 == 0x48 && b1 == 0x8B && b2 == 0xC4) ||      // mov rax, rsp
+                        (b0 == 0xE9) ||                                    // jmp (thunk)
+                        (b0 == 0xFF && b1 == 0x25);                       // jmp [rip+...]
+
+                    // Detect common shellcode patterns
+                    // NOP sled, int3 sled, or GetPC (call next; pop reg)
+                    bool allNops = true;
+                    bool allInt3 = true;
+                    for (size_t i = 0; i < std::min(bytesRead, static_cast<SIZE_T>(16)); ++i) {
+                        if (analysis.entryPointBytes[i] != 0x90) allNops = false;
+                        if (analysis.entryPointBytes[i] != 0xCC) allInt3 = false;
+                    }
+
+                    analysis.hasShellcodePattern =
+                        allNops ||                                          // NOP sled
+                        (b0 == 0xE8 && b1 == 0x00 && b2 == 0x00 &&
+                         b3 == 0x00) ||                                    // call $+5 (GetPC)
+                        (b0 == 0xFC) ||                                    // cld (common shellcode)
+                        (b0 == 0x60) ||                                    // pushad (x86 shellcode)
+                        (b0 == 0x00 && b1 == 0x00 && b2 == 0x00 &&
+                         b3 == 0x00);                                      // Null bytes at EP = bad
+                }
+            }
+        }
+
+        // Check if entry point is outside any known section (very suspicious)
+        if (!analysis.isInExpectedRange && analysis.entryPointRVA != 0) {
+            analysis.isAnomalous = true;
+            analysis.anomalyReasons.push_back(L"Entry point outside all defined sections");
+        }
+
+        // Entry point in a writable section is suspicious
+        for (const auto& section : diskHeader.sections) {
+            uint32_t secStart = section.virtualAddress;
+            uint32_t secEnd = secStart + std::max(section.virtualSize, section.sizeOfRawData);
+            if (analysis.entryPointRVA >= secStart && analysis.entryPointRVA < secEnd) {
+                if (section.isWritable && section.isExecutable) {
+                    analysis.isAnomalous = true;
+                    analysis.anomalyReasons.push_back(L"Entry point in RWX section");
+                }
+                if (!section.isExecutable && !section.containsCode) {
+                    analysis.isAnomalous = true;
+                    analysis.anomalyReasons.push_back(L"Entry point in non-executable section");
+                }
+                break;
+            }
+        }
+
+        if (analysis.hasShellcodePattern) {
+            analysis.isAnomalous = true;
+            analysis.anomalyReasons.push_back(L"Shellcode pattern detected at entry point");
+        }
+
+        if (analysis.pointsToValidCode && !analysis.hasValidPrologue && !analysis.hasShellcodePattern) {
+            // Not a standard prologue but also not shellcode - could be custom CRT
+            // Flag as low-confidence anomaly only if other indicators present
+        }
+
+        // Analyze main thread start address vs entry point
+        std::vector<Utils::ProcessUtils::ProcessThreadInfo> threads;
+        if (Utils::ProcessUtils::EnumerateProcessThreads(pid, threads)) {
+            if (!threads.empty()) {
+                // Find the earliest thread (likely main thread)
+                auto mainThread = std::min_element(threads.begin(), threads.end(),
+                    [](const auto& a, const auto& b) {
+                        return CompareFileTime(&a.creationTime, &b.creationTime) < 0;
+                    });
+
+                if (mainThread != threads.end() && mainThread->startAddress != nullptr) {
+                    analysis.mainThreadRIP = reinterpret_cast<uintptr_t>(mainThread->startAddress);
+
+                    // The main thread start address should be within the module or at a known
+                    // system entry point (e.g. kernel32!BaseThreadInitThunk). If it points
+                    // to unbacked memory, that's very suspicious.
+                    MEMORY_BASIC_INFORMATION mbi{};
+                    if (Utils::ProcessUtils::QueryProcessMemoryRegion(
+                            pid, mainThread->startAddress, mbi)) {
+                        if (mbi.Type == 0 && (mbi.Protect & PAGE_EXECUTE_READWRITE)) {
+                            // Unbacked RWX memory - highly suspicious
+                            analysis.threadContextModified = true;
+                            analysis.isAnomalous = true;
+                            analysis.anomalyReasons.push_back(
+                                L"Main thread start address in unbacked RWX memory");
+                        }
+                    }
+                }
+            }
+        }
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"AnalyzeEntryPoint exception for PID %u: %hs", pid, e.what());
+    }
+
     return analysis;
 }
 
@@ -1184,8 +2028,39 @@ bool ProcessHollowingDetector::ValidateEntryPoint(uint32_t pid) {
 }
 
 bool ProcessHollowingDetector::ValidateMainThread(uint32_t pid) {
-    // Would validate main thread in production
-    return true;
+    try {
+        std::vector<Utils::ProcessUtils::ProcessThreadInfo> threads;
+        if (!Utils::ProcessUtils::EnumerateProcessThreads(pid, threads) || threads.empty()) {
+            return true;  // Cannot determine, assume ok
+        }
+
+        // Find earliest (main) thread
+        auto mainThread = std::min_element(threads.begin(), threads.end(),
+            [](const auto& a, const auto& b) {
+                return CompareFileTime(&a.creationTime, &b.creationTime) < 0;
+            });
+
+        if (mainThread == threads.end() || mainThread->startAddress == nullptr) {
+            return true;
+        }
+
+        // Check if start address is in file-backed executable memory
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (Utils::ProcessUtils::QueryProcessMemoryRegion(
+                pid, mainThread->startAddress, mbi)) {
+            // MEM_IMAGE = file-backed section; if not, suspicious
+            if (mbi.Type != MEM_IMAGE) {
+                SS_LOG_WARN(L"Hollowing", L"Main thread of PID %u starts in non-image memory (type=0x%lX)",
+                            pid, mbi.Type);
+                return false;
+            }
+        }
+
+        return true;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ValidateMainThread exception for PID %u: %hs", pid, e.what());
+        return true;  // Cannot determine, assume ok
+    }
 }
 
 // ============================================================================
@@ -1204,22 +2079,36 @@ CreationPatternAnalysis ProcessHollowingDetector::AnalyzeCreationPattern(uint32_
 
     const auto& event = it->second;
     analysis.creatorPid = event.creatorPid;
-    analysis.creatorPath = Utils::ProcessUtils::GetProcessPath(event.creatorPid);
+    analysis.creatorPath = Utils::ProcessUtils::GetProcessPath(event.creatorPid).value_or(L"");
     analysis.createdSuspended = event.createdSuspended;
     analysis.createTime = event.createTime;
     analysis.firstResumeTime = event.resumeTime;
 
     if (event.createdSuspended) {
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            event.resumeTime - event.createTime
-        );
-        analysis.suspendedDurationMs = static_cast<uint32_t>(duration.count());
+        // Only calculate duration if the process has actually been resumed
+        if (event.resumeTime > event.createTime) {
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(
+                event.resumeTime - event.createTime
+            );
+            analysis.suspendedDurationMs = static_cast<uint32_t>(duration.count());
+            analysis.firstResumeTime = event.resumeTime;
 
-        // Check for suspicious suspended duration
-        if (analysis.suspendedDurationMs > HollowingConstants::MIN_SUSPENDED_DURATION_MS &&
-            analysis.suspendedDurationMs < HollowingConstants::MAX_CREATION_TO_RESUME_MS) {
-            analysis.isSuspiciousPattern = true;
-            analysis.suspiciousIndicators.push_back(L"Suspicious suspended duration");
+            // Check for suspicious suspended duration
+            if (analysis.suspendedDurationMs > HollowingConstants::MIN_SUSPENDED_DURATION_MS &&
+                analysis.suspendedDurationMs < HollowingConstants::MAX_CREATION_TO_RESUME_MS) {
+                analysis.isSuspiciousPattern = true;
+                analysis.suspiciousIndicators.push_back(L"Suspicious suspended duration");
+            }
+        } else {
+            // Process was created suspended but not yet resumed - that's also suspicious
+            // if significant time has passed
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::system_clock::now() - event.createTime
+            );
+            if (elapsed.count() > HollowingConstants::MAX_CREATION_TO_RESUME_MS) {
+                analysis.isSuspiciousPattern = true;
+                analysis.suspiciousIndicators.push_back(L"Process suspended for extended duration");
+            }
         }
     }
 
@@ -1251,6 +2140,29 @@ void ProcessHollowingDetector::OnProcessCreated(
 
     std::lock_guard<std::mutex> lock(m_impl->m_creationEventsMutex);
 
+    // Evict stale entries to prevent unbounded growth
+    if (m_impl->m_creationEvents.size() >= HollowingConstants::CREATION_EVENT_QUEUE_SIZE) {
+        auto now = std::chrono::system_clock::now();
+        auto cutoff = std::chrono::milliseconds(HollowingConstants::CREATION_MONITOR_WINDOW_MS * 6);
+        for (auto it = m_impl->m_creationEvents.begin(); it != m_impl->m_creationEvents.end(); ) {
+            if ((now - it->second.createTime) > cutoff) {
+                it = m_impl->m_creationEvents.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // If still over capacity after time-based eviction, drop oldest
+        while (m_impl->m_creationEvents.size() >= HollowingConstants::CREATION_EVENT_QUEUE_SIZE) {
+            auto oldest = std::min_element(m_impl->m_creationEvents.begin(), m_impl->m_creationEvents.end(),
+                [](const auto& a, const auto& b) { return a.second.createTime < b.second.createTime; });
+            if (oldest != m_impl->m_creationEvents.end()) {
+                m_impl->m_creationEvents.erase(oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
     ProcessHollowingDetectorImpl::CreationEvent event;
     event.pid = pid;
     event.creatorPid = creatorPid;
@@ -1260,7 +2172,7 @@ void ProcessHollowingDetector::OnProcessCreated(
 
     m_impl->m_creationEvents[pid] = event;
 
-    SS_LOG_DEBUG(L"Hollowing", L"Process created - PID %u by %u (Suspended: %ls)", pid, creatorPid, createdSuspended);
+    SS_LOG_DEBUG(L"Hollowing", L"Process created - PID %u by %u (Suspended: %ls)", pid, creatorPid, createdSuspended ? L"true" : L"false");
 }
 
 void ProcessHollowingDetector::OnProcessResumed(uint32_t pid) {
@@ -1282,10 +2194,29 @@ void ProcessHollowingDetector::OnMemoryOperation(
 
     auto it = m_impl->m_creationEvents.find(pid);
     if (it != m_impl->m_creationEvents.end()) {
-        it->second.memoryOperations.push_back(operationType);
+        // Track specific hollowing-related operations with enrichment
+        if (operationType == L"NtUnmapViewOfSection" ||
+            operationType == L"ZwUnmapViewOfSection") {
+            it->second.memoryOperations.push_back(L"NtUnmapViewOfSection [SUSPICIOUS: Image unmap]");
+        } else if (operationType == L"NtMapViewOfSection" ||
+                   operationType == L"ZwMapViewOfSection") {
+            it->second.memoryOperations.push_back(L"NtMapViewOfSection [SUSPICIOUS: New section mapped]");
+        } else if (operationType == L"NtWriteVirtualMemory" ||
+                   operationType == L"WriteProcessMemory") {
+            it->second.memoryOperations.push_back(L"WriteProcessMemory [SUSPICIOUS: Remote memory write]");
+        } else if (operationType == L"NtSetContextThread" ||
+                   operationType == L"SetThreadContext") {
+            it->second.memoryOperations.push_back(L"SetThreadContext [SUSPICIOUS: Thread context modified]");
+        } else {
+            it->second.memoryOperations.push_back(operationType);
+        }
 
-        if (operationType == L"NtUnmapViewOfSection") {
-            it->second.memoryOperations.push_back(L"SUSPICIOUS: Memory unmap");
+        // Cap operations list to prevent unbounded growth
+        constexpr size_t MAX_OPS = 256;
+        if (it->second.memoryOperations.size() > MAX_OPS) {
+            it->second.memoryOperations.erase(
+                it->second.memoryOperations.begin(),
+                it->second.memoryOperations.begin() + static_cast<ptrdiff_t>(MAX_OPS / 2));
         }
     }
 }
@@ -1374,7 +2305,7 @@ void ProcessHollowingDetector::ClearAlerts() {
 
 void ProcessHollowingDetector::ReportFalsePositive(uint64_t alertId, const std::wstring& reason) {
     m_impl->m_statistics.falsePositivesReported.fetch_add(1, std::memory_order_relaxed);
-    SS_LOG_INFO(L"Hollowing", L"False positive reported - Alert %u: %ls", alertId, reason);
+    SS_LOG_INFO(L"Hollowing", L"False positive reported - Alert %llu: %ls", alertId, reason.c_str());
 }
 
 // ============================================================================
@@ -1426,20 +2357,105 @@ void ProcessHollowingDetector::UnregisterCallback(uint64_t callbackId) {
 
 std::vector<uint8_t> ProcessHollowingDetector::ExtractPayload(uint32_t pid) {
     std::vector<uint8_t> payload;
-    // Would extract payload from process memory in production
+
+    try {
+        Utils::ProcessUtils::ProcessHandle hProcess(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
+        if (!hProcess.IsValid()) {
+            SS_LOG_WARN(L"Hollowing", L"ExtractPayload: cannot open PID %u", pid);
+            return payload;
+        }
+
+        // Determine module base
+        uintptr_t moduleBase = 0;
+        {
+            auto nameOpt = Utils::ProcessUtils::GetProcessName(pid);
+            std::wstring modName = nameOpt.value_or(L"");
+            if (!modName.empty()) {
+                auto baseOpt = Utils::ProcessUtils::GetModuleBaseAddress(pid, modName);
+                if (baseOpt.has_value()) {
+                    moduleBase = reinterpret_cast<uintptr_t>(baseOpt.value());
+                }
+            }
+        }
+
+        if (moduleBase == 0) {
+            SS_LOG_WARN(L"Hollowing", L"ExtractPayload: cannot determine module base for PID %u", pid);
+            return payload;
+        }
+
+        auto memPE = ParseMemoryPE(pid, moduleBase);
+        if (!memPE.isValid || memPE.sizeOfImage == 0) {
+            return payload;
+        }
+
+        // Cap extraction size
+        size_t extractSize = std::min(static_cast<size_t>(memPE.sizeOfImage),
+                                       HollowingConstants::MAX_COMPARISON_SIZE);
+        payload.resize(extractSize, 0);
+
+        SIZE_T bytesRead = 0;
+        if (!Utils::ProcessUtils::ReadProcessMemory(
+                pid,
+                reinterpret_cast<void*>(moduleBase),
+                payload.data(),
+                extractSize,
+                &bytesRead)) {
+            SS_LOG_WARN(L"Hollowing", L"ExtractPayload: ReadProcessMemory failed for PID %u", pid);
+            payload.clear();
+            return payload;
+        }
+
+        payload.resize(bytesRead);
+        SS_LOG_INFO(L"Hollowing", L"ExtractPayload: extracted %llu bytes from PID %u",
+                    static_cast<unsigned long long>(bytesRead), pid);
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"ExtractPayload exception for PID %u: %hs", pid, e.what());
+        payload.clear();
+    }
+
     return payload;
 }
 
 bool ProcessHollowingDetector::DumpProcessMemory(uint32_t pid, const std::wstring& outputPath) {
-    // Would dump process memory in production
-    return false;
+    try {
+        auto payload = ExtractPayload(pid);
+        if (payload.empty()) {
+            SS_LOG_WARN(L"Hollowing", L"DumpProcessMemory: no data extracted from PID %u", pid);
+            return false;
+        }
+
+        std::ofstream outFile(outputPath, std::ios::binary | std::ios::trunc);
+        if (!outFile.is_open()) {
+            SS_LOG_ERROR(L"Hollowing", L"DumpProcessMemory: cannot open output file for PID %u", pid);
+            return false;
+        }
+
+        outFile.write(reinterpret_cast<const char*>(payload.data()),
+                      static_cast<std::streamsize>(payload.size()));
+        outFile.close();
+
+        SS_LOG_INFO(L"Hollowing", L"DumpProcessMemory: wrote %llu bytes for PID %u",
+                    static_cast<unsigned long long>(payload.size()), pid);
+        return true;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Hollowing", L"DumpProcessMemory exception for PID %u: %hs", pid, e.what());
+        return false;
+    }
 }
 
 std::array<uint8_t, 32> ProcessHollowingDetector::GetPayloadHash(uint32_t pid) {
     std::array<uint8_t, 32> hash{};
     auto payload = ExtractPayload(pid);
     if (!payload.empty()) {
-        // Would hash payload in production
+        std::vector<uint8_t> hashVec;
+        if (Utils::HashUtils::Compute(
+                Utils::HashUtils::Algorithm::SHA256,
+                payload.data(), payload.size(), hashVec)) {
+            size_t copyLen = std::min(hashVec.size(), hash.size());
+            std::memcpy(hash.data(), hashVec.data(), copyLen);
+        } else {
+            SS_LOG_WARN(L"Hollowing", L"GetPayloadHash: hash computation failed for PID %u", pid);
+        }
     }
     return hash;
 }
@@ -1467,11 +2483,12 @@ bool ProcessHollowingDetector::SelfTest() {
     try {
         SS_LOG_INFO(L"Hollowing", L"Starting self-test");
 
-        // Test PE parsing
+        // Test PE parsing - must have sections to be valid
         PEHeaderInfo testHeader;
         testHeader.isValid = true;
         testHeader.hasDosHeader = true;
         testHeader.hasPeHeader = true;
+        testHeader.numberOfSections = 1;
 
         if (!ValidatePEHeader(testHeader)) {
             SS_LOG_ERROR(L"Hollowing", L"PE validation test failed");
@@ -1496,7 +2513,7 @@ bool ProcessHollowingDetector::SelfTest() {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Hollowing", L"Self-test failed - %S", Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"Hollowing", L"Self-test failed - %hs", e.what());
         return false;
     }
 }
@@ -1537,9 +2554,22 @@ bool ProcessHollowingDetector::IsExcluded(uint32_t pid) const {
         return true;
     }
 
-    auto processName = Utils::ProcessUtils::GetProcessName(pid);
-    if (m_impl->m_excludedProcessNames.find(processName) != m_impl->m_excludedProcessNames.end()) {
+    auto processName = Utils::ProcessUtils::GetProcessName(pid).value_or(L"");
+    if (!processName.empty() &&
+        m_impl->m_excludedProcessNames.find(processName) != m_impl->m_excludedProcessNames.end()) {
         return true;
+    }
+
+    // Check path exclusions
+    if (!m_impl->m_excludedPaths.empty()) {
+        auto processPath = Utils::ProcessUtils::GetProcessPath(pid).value_or(L"");
+        if (!processPath.empty()) {
+            for (const auto& excludedPath : m_impl->m_excludedPaths) {
+                if (_wcsnicmp(processPath.c_str(), excludedPath.c_str(), excludedPath.size()) == 0) {
+                    return true;
+                }
+            }
+        }
     }
 
     return false;
