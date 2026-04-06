@@ -312,6 +312,15 @@ struct MountPointMonitor::Impl {
     HWND m_hMessageWindow = nullptr;
     HDEVNOTIFY m_hDeviceNotify = nullptr;
 
+    // Rapid mount/unmount cycle detection
+    static constexpr uint32_t RAPID_CYCLE_THRESHOLD = 3;
+    static constexpr uint32_t RAPID_CYCLE_WINDOW_SEC = 30;
+    struct MountCycleRecord {
+        std::vector<std::chrono::steady_clock::time_point> timestamps;
+    };
+    std::unordered_map<wchar_t, MountCycleRecord> m_mountCycles;
+    std::mutex m_cyclesMutex;
+
     // Constructor
     Impl() = default;
 
@@ -583,9 +592,12 @@ struct MountPointMonitor::Impl {
                 }
             }
 
-            // Check for type masquerading (e.g., USB claiming to be CD-ROM)
-            if (info.driveType == DriveType::CDRom && !info.vendorId.empty() &&
-                info.vendorId != L"Unknown") {
+            // Check for type masquerading: USB device presenting as CD-ROM
+            // with no actual optical media. A real USB CD-ROM with inserted
+            // media would have a file system and non-zero capacity.
+            if (info.driveType == DriveType::CDRom &&
+                info.vendorId != L"Unknown" && !info.vendorId.empty() &&
+                info.totalBytes == 0 && info.fileSystem.empty()) {
                 return DeviceThreatType::Masquerading;
             }
 
@@ -609,7 +621,8 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Threat detection failed - %ls",
                          Utils::StringUtils::ToWide(e.what()).c_str());
-            return DeviceThreatType::None;
+            // Fail closed: treat detection failure as suspicious
+            return DeviceThreatType::PolicyViolation;
         }
     }
 
@@ -646,7 +659,8 @@ struct MountPointMonitor::Impl {
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"MountPointMonitor", L"Policy determination failed - %ls",
                          Utils::StringUtils::ToWide(e.what()).c_str());
-            return DevicePolicy::Allow;
+            // Fail closed: block on policy determination failure
+            return DevicePolicy::BlockAndAlert;
         }
     }
 
@@ -678,6 +692,29 @@ struct MountPointMonitor::Impl {
                          NormalizeDriveLetter(driveLetter),
                          Utils::StringUtils::ToWide(e.what()).c_str());
         }
+    }
+
+    // Detect rapid mount/unmount cycles (evasion technique)
+    bool DetectRapidMountCycle(wchar_t driveLetter) {
+        std::lock_guard<std::mutex> lock(m_cyclesMutex);
+        auto now = std::chrono::steady_clock::now();
+        auto& record = m_mountCycles[driveLetter];
+
+        // Purge entries outside the detection window
+        auto cutoff = now - std::chrono::seconds(RAPID_CYCLE_WINDOW_SEC);
+        std::erase_if(record.timestamps, [&cutoff](const auto& ts) { return ts < cutoff; });
+
+        record.timestamps.push_back(now);
+
+        if (record.timestamps.size() >= RAPID_CYCLE_THRESHOLD) {
+            SS_LOG_WARN(L"MountPointMonitor",
+                        L"Rapid mount/unmount cycle detected on drive %c (%zu events in %u sec window)",
+                        driveLetter,
+                        record.timestamps.size(),
+                        RAPID_CYCLE_WINDOW_SEC);
+            return true;
+        }
+        return false;
     }
 
     // Update device history with cap enforcement
@@ -783,6 +820,13 @@ struct MountPointMonitor::Impl {
                 }
             }
 
+            // Detect rapid mount/unmount cycling (evasion pattern)
+            if (DetectRapidMountCycle(driveLetter) &&
+                info.threatType == DeviceThreatType::None) {
+                info.threatType = DeviceThreatType::PolicyViolation;
+                m_statistics.threatsDetected.fetch_add(1, std::memory_order_relaxed);
+            }
+
             // Determine and apply policy
             DevicePolicy policy = DeterminePolicy(info);
             bool blocked = false;
@@ -801,11 +845,13 @@ struct MountPointMonitor::Impl {
             // Update device history
             UpdateDeviceHistory(info);
 
-            // Store drive info
+            // Store drive info (only increment active count for genuinely new mounts)
             {
                 std::unique_lock<std::shared_mutex> lock(m_drivesMutex);
-                m_mountedDrives[driveLetter] = info;
-                m_statistics.activeMounts.fetch_add(1, std::memory_order_relaxed);
+                auto [it, inserted] = m_mountedDrives.insert_or_assign(driveLetter, info);
+                if (inserted) {
+                    m_statistics.activeMounts.fetch_add(1, std::memory_order_relaxed);
+                }
             }
 
             // Update per-type statistics
@@ -1040,6 +1086,10 @@ struct MountPointMonitor::Impl {
                 // WAIT_OBJECT_0+1 = new messages, WAIT_TIMEOUT = poll interval
             }
 
+            // Unregister the window class before thread exit
+            ::UnregisterClassW(L"ShadowStrikeMountPointMonitor",
+                               ::GetModuleHandleW(nullptr));
+
             return 0;
 
         } catch (const std::exception& e) {
@@ -1073,19 +1123,19 @@ bool MountPointMonitor::HasInstance() noexcept {
 MountPointMonitor::MountPointMonitor()
     : m_impl(std::make_unique<Impl>())
 {
-    Utils::Logger::Info(L"MountPointMonitor: Constructor called");
+    SS_LOG_INFO(L"MountPointMonitor", L"Constructor called");
 }
 
 MountPointMonitor::~MountPointMonitor() {
     Shutdown();
-    Utils::Logger::Info(L"MountPointMonitor: Destructor called");
+    SS_LOG_INFO(L"MountPointMonitor", L"Destructor called");
 }
 
 bool MountPointMonitor::Initialize(const MountPointMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"MountPointMonitor: Already initialized");
+        SS_LOG_WARN(L"MountPointMonitor", L"Already initialized");
         return true;
     }
 
@@ -1112,14 +1162,14 @@ bool MountPointMonitor::Initialize(const MountPointMonitorConfig& config) {
         m_impl->m_status.store(MountPointMonitorStatus::Initialized, std::memory_order_release);
         m_impl->m_initialized.store(true, std::memory_order_release);
 
-        Utils::Logger::Info(L"MountPointMonitor: Initialized successfully - {} drives detected",
-                          m_impl->m_mountedDrives.size());
+        SS_LOG_INFO(L"MountPointMonitor", L"Initialized successfully - %zu drives detected",
+                    m_impl->m_mountedDrives.size());
         return true;
 
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
-        Utils::Logger::Error(L"MountPointMonitor: Initialization failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Initialization failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1163,11 +1213,11 @@ void MountPointMonitor::Shutdown() noexcept {
         m_impl->m_status.store(MountPointMonitorStatus::Stopped, std::memory_order_release);
         m_impl->m_initialized.store(false, std::memory_order_release);
 
-        Utils::Logger::Info(L"MountPointMonitor: Shutdown complete");
+        SS_LOG_INFO(L"MountPointMonitor", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Shutdown error - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Shutdown error - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -1175,12 +1225,12 @@ bool MountPointMonitor::Start() {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
 
     if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Error(L"MountPointMonitor: Not initialized");
+        SS_LOG_ERROR(L"MountPointMonitor", L"Cannot start - not initialized");
         return false;
     }
 
     if (m_impl->m_running.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"MountPointMonitor: Already running");
+        SS_LOG_WARN(L"MountPointMonitor", L"Already running");
         return true;
     }
 
@@ -1188,7 +1238,7 @@ bool MountPointMonitor::Start() {
         // Create stop event
         m_impl->m_hStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (!m_impl->m_hStopEvent) {
-            Utils::Logger::Error(L"MountPointMonitor: Failed to create stop event");
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to create stop event");
             return false;
         }
 
@@ -1208,41 +1258,43 @@ bool MountPointMonitor::Start() {
             m_impl->m_running.store(false, std::memory_order_release);
             CloseHandle(m_impl->m_hStopEvent);
             m_impl->m_hStopEvent = nullptr;
-            Utils::Logger::Error(L"MountPointMonitor: Failed to create monitor thread");
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to create monitor thread");
             return false;
         }
 
         m_impl->m_status.store(MountPointMonitorStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"MountPointMonitor: Started successfully");
+        SS_LOG_INFO(L"MountPointMonitor", L"Started successfully");
         return true;
 
     } catch (const std::exception& e) {
         m_impl->m_status.store(MountPointMonitorStatus::Error, std::memory_order_release);
-        Utils::Logger::Error(L"MountPointMonitor: Start failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Start failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
 
 void MountPointMonitor::Stop() noexcept {
-    if (!m_impl->m_running.load(std::memory_order_acquire)) {
+    // Atomic CAS: only one thread enters StopMonitoring to prevent double-close
+    bool expected = true;
+    if (!m_impl->m_running.compare_exchange_strong(expected, false,
+            std::memory_order_acq_rel, std::memory_order_acquire)) {
         return;
     }
 
     try {
         m_impl->m_status.store(MountPointMonitorStatus::Stopping, std::memory_order_release);
-        m_impl->m_running.store(false, std::memory_order_release);
 
         m_impl->StopMonitoring();
 
         m_impl->m_status.store(MountPointMonitorStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"MountPointMonitor: Stopped");
+        SS_LOG_INFO(L"MountPointMonitor", L"Stopped");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Stop error - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Stop error - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -1276,6 +1328,7 @@ std::vector<DriveInfo> MountPointMonitor::GetMountedDrives() const {
 }
 
 std::optional<DriveInfo> MountPointMonitor::GetDriveInfo(wchar_t driveLetter) const {
+    driveLetter = NormalizeDriveLetter(driveLetter);
     std::shared_lock<std::shared_mutex> lock(m_impl->m_drivesMutex);
 
     auto it = m_impl->m_mountedDrives.find(driveLetter);
@@ -1318,43 +1371,40 @@ void MountPointMonitor::RefreshDriveList() {
     try {
         DWORD drives = GetLogicalDrives();
         std::unordered_set<wchar_t> currentDrives;
+        std::vector<wchar_t> newDrives;
+        std::vector<wchar_t> removedDrives;
 
-        // Enumerate all drives
-        for (wchar_t drive = L'A'; drive <= L'Z'; drive++) {
-            if (drives & (1 << (drive - L'A'))) {
-                currentDrives.insert(drive);
+        // Snapshot current drives and determine arrivals/removals under lock
+        {
+            std::shared_lock<std::shared_mutex> lock(m_impl->m_drivesMutex);
 
-                // Check if it's a new drive
-                std::shared_lock<std::shared_mutex> lock(m_impl->m_drivesMutex);
-                if (m_impl->m_mountedDrives.find(drive) == m_impl->m_mountedDrives.end()) {
-                    lock.unlock();
-                    // New drive detected
-                    m_impl->ProcessDriveArrival(drive);
+            for (wchar_t drive = L'A'; drive <= L'Z'; drive++) {
+                if (drives & (1 << (drive - L'A'))) {
+                    currentDrives.insert(drive);
+                    if (m_impl->m_mountedDrives.find(drive) == m_impl->m_mountedDrives.end()) {
+                        newDrives.push_back(drive);
+                    }
                 }
             }
-        }
-
-        // Check for removed drives
-        {
-            std::unique_lock<std::shared_mutex> lock(m_impl->m_drivesMutex);
-            std::vector<wchar_t> toRemove;
 
             for (const auto& [letter, info] : m_impl->m_mountedDrives) {
                 if (currentDrives.find(letter) == currentDrives.end()) {
-                    toRemove.push_back(letter);
+                    removedDrives.push_back(letter);
                 }
-            }
-
-            for (wchar_t letter : toRemove) {
-                lock.unlock();
-                m_impl->ProcessDriveRemoval(letter);
-                lock.lock();
             }
         }
 
+        // Process outside the lock to avoid holding drivesMutex during I/O
+        for (wchar_t drive : newDrives) {
+            m_impl->ProcessDriveArrival(drive);
+        }
+        for (wchar_t letter : removedDrives) {
+            m_impl->ProcessDriveRemoval(letter);
+        }
+
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Drive list refresh failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Drive list refresh failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
     }
 }
 
@@ -1395,7 +1445,7 @@ std::optional<DeviceHistoryEntry> MountPointMonitor::GetDeviceHistory(const std:
 void MountPointMonitor::ClearDeviceHistory() {
     std::lock_guard<std::mutex> lock(m_impl->m_historyMutex);
     m_impl->m_deviceHistory.clear();
-    Utils::Logger::Info(L"MountPointMonitor: Device history cleared");
+    SS_LOG_INFO(L"MountPointMonitor", L"Device history cleared");
 }
 
 // ============================================================================
@@ -1405,13 +1455,13 @@ void MountPointMonitor::ClearDeviceHistory() {
 void MountPointMonitor::WhitelistDevice(const std::wstring& serialNumber) {
     std::lock_guard<std::mutex> lock(m_impl->m_whitelistMutex);
     m_impl->m_whitelistedDevices.insert(serialNumber);
-    Utils::Logger::Info(L"MountPointMonitor: Device whitelisted - {}", serialNumber);
+    SS_LOG_INFO(L"MountPointMonitor", L"Device whitelisted - %ls", serialNumber.c_str());
 }
 
 void MountPointMonitor::RemoveFromWhitelist(const std::wstring& serialNumber) {
     std::lock_guard<std::mutex> lock(m_impl->m_whitelistMutex);
     m_impl->m_whitelistedDevices.erase(serialNumber);
-    Utils::Logger::Info(L"MountPointMonitor: Device removed from whitelist - {}", serialNumber);
+    SS_LOG_INFO(L"MountPointMonitor", L"Device removed from whitelist - %ls", serialNumber.c_str());
 }
 
 bool MountPointMonitor::IsWhitelisted(const std::wstring& serialNumber) const {
@@ -1438,10 +1488,16 @@ std::vector<std::wstring> MountPointMonitor::GetWhitelistedDevices() const {
 
 bool MountPointMonitor::EjectDrive(wchar_t driveLetter) {
     try {
-        wchar_t devicePath[MAX_PATH];
-        swprintf_s(devicePath, L"\\\\.\\%c:", driveLetter);
+        driveLetter = NormalizeDriveLetter(driveLetter);
+        if (!IsValidDriveLetter(driveLetter)) {
+            SS_LOG_ERROR(L"MountPointMonitor", L"Invalid drive letter for eject: 0x%04X",
+                         static_cast<unsigned>(driveLetter));
+            return false;
+        }
 
-        HANDLE hDevice = CreateFileW(
+        wchar_t devicePath[8] = { L'\\', L'\\', L'.', L'\\', driveLetter, L':', L'\0' };
+
+        ScopedHandle hDevice(CreateFileW(
             devicePath,
             GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE,
@@ -1449,16 +1505,17 @@ bool MountPointMonitor::EjectDrive(wchar_t driveLetter) {
             OPEN_EXISTING,
             0,
             nullptr
-        );
+        ));
 
-        if (hDevice == INVALID_HANDLE_VALUE) {
-            Utils::Logger::Error(L"MountPointMonitor: Failed to open device for eject - {}", driveLetter);
+        if (!hDevice.IsValid()) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to open device for eject - %c",
+                              driveLetter);
             return false;
         }
 
         DWORD bytesReturned = 0;
         BOOL result = DeviceIoControl(
-            hDevice,
+            hDevice.Get(),
             IOCTL_STORAGE_EJECT_MEDIA,
             nullptr, 0,
             nullptr, 0,
@@ -1466,52 +1523,125 @@ bool MountPointMonitor::EjectDrive(wchar_t driveLetter) {
             nullptr
         );
 
-        CloseHandle(hDevice);
-
         if (result) {
-            Utils::Logger::Info(L"MountPointMonitor: Drive {} ejected successfully", driveLetter);
+            SS_LOG_INFO(L"MountPointMonitor", L"Drive %c ejected successfully", driveLetter);
             return true;
         } else {
-            Utils::Logger::Error(L"MountPointMonitor: Failed to eject drive {} - Error: {}",
-                               driveLetter, GetLastError());
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to eject drive %c", driveLetter);
             return false;
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Eject failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Eject failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
 
 bool MountPointMonitor::BlockDrive(wchar_t driveLetter) {
     try {
-        // Implementation would involve:
-        // 1. Setting FILE_READ_ONLY_VOLUME flag
-        // 2. Or using minifilter driver to block I/O
-        // 3. Or denying access via ACLs
+        driveLetter = NormalizeDriveLetter(driveLetter);
+        if (!IsValidDriveLetter(driveLetter)) {
+            SS_LOG_ERROR(L"MountPointMonitor", L"Invalid drive letter for block: 0x%04X",
+                         static_cast<unsigned>(driveLetter));
+            return false;
+        }
 
-        Utils::Logger::Info(L"MountPointMonitor: Drive {} blocked", driveLetter);
+        wchar_t devicePath[8] = { L'\\', L'\\', L'.', L'\\', driveLetter, L':', L'\0' };
+
+        ScopedHandle hVolume(::CreateFileW(
+            devicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr));
+
+        if (!hVolume.IsValid()) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to open volume for block - %c",
+                              driveLetter);
+            return false;
+        }
+
+        // Lock the volume to prevent further I/O
+        DWORD bytesReturned = 0;
+        if (!::DeviceIoControl(hVolume.Get(), FSCTL_LOCK_VOLUME,
+                nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"FSCTL_LOCK_VOLUME failed for drive %c",
+                              driveLetter);
+            return false;
+        }
+
+        // Dismount the volume so no further access is possible
+        if (!::DeviceIoControl(hVolume.Get(), FSCTL_DISMOUNT_VOLUME,
+                nullptr, 0, nullptr, 0, &bytesReturned, nullptr)) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"FSCTL_DISMOUNT_VOLUME failed for drive %c",
+                              driveLetter);
+            // Volume is still locked — partial success
+        }
+
+        SS_LOG_INFO(L"MountPointMonitor", L"Drive %c blocked (locked and dismounted)", driveLetter);
         m_impl->m_statistics.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Block drive failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Block drive failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
 
 bool MountPointMonitor::SetReadOnly(wchar_t driveLetter, bool readOnly) {
     try {
-        // Implementation would use FSCTL_SET_VOLUME_READONLY or similar
-        Utils::Logger::Info(L"MountPointMonitor: Drive {} set to {}",
-                          driveLetter, readOnly ? L"read-only" : L"read-write");
+        driveLetter = NormalizeDriveLetter(driveLetter);
+        if (!IsValidDriveLetter(driveLetter)) {
+            SS_LOG_ERROR(L"MountPointMonitor", L"Invalid drive letter for SetReadOnly: 0x%04X",
+                         static_cast<unsigned>(driveLetter));
+            return false;
+        }
+
+        wchar_t devicePath[8] = { L'\\', L'\\', L'.', L'\\', driveLetter, L':', L'\0' };
+
+        ScopedHandle hVolume(::CreateFileW(
+            devicePath,
+            GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, 0, nullptr));
+
+        if (!hVolume.IsValid()) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor", L"Failed to open volume for SetReadOnly - %c",
+                              driveLetter);
+            return false;
+        }
+
+        // Attempt to set read-only attribute via disk attributes
+        SET_DISK_ATTRIBUTES attrs{};
+        attrs.Version = sizeof(SET_DISK_ATTRIBUTES);
+        attrs.AttributesMask = DISK_ATTRIBUTE_READ_ONLY;
+        attrs.Attributes = readOnly ? DISK_ATTRIBUTE_READ_ONLY : 0;
+
+        DWORD bytesReturned = 0;
+        if (!::DeviceIoControl(hVolume.Get(), IOCTL_DISK_SET_DISK_ATTRIBUTES,
+                &attrs, sizeof(attrs), nullptr, 0, &bytesReturned, nullptr)) {
+            SS_LOG_LAST_ERROR(L"MountPointMonitor",
+                              L"IOCTL_DISK_SET_DISK_ATTRIBUTES failed for drive %c", driveLetter);
+            return false;
+        }
+
+        // Update cached info
+        {
+            std::unique_lock<std::shared_mutex> lock(m_impl->m_drivesMutex);
+            auto it = m_impl->m_mountedDrives.find(driveLetter);
+            if (it != m_impl->m_mountedDrives.end()) {
+                it->second.isReadOnly = readOnly;
+            }
+        }
+
+        SS_LOG_INFO(L"MountPointMonitor", L"Drive %c set to %ls",
+                    driveLetter, readOnly ? L"read-only" : L"read-write");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Set read-only failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Set read-only failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1548,7 +1678,7 @@ MountPointMonitorConfig MountPointMonitor::GetConfiguration() const {
 void MountPointMonitor::SetConfiguration(const MountPointMonitorConfig& config) {
     std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
     m_impl->m_config = config;
-    Utils::Logger::Info(L"MountPointMonitor: Configuration updated");
+    SS_LOG_INFO(L"MountPointMonitor", L"Configuration updated");
 }
 
 // ============================================================================
@@ -1561,7 +1691,7 @@ const MountPointMonitorStatistics& MountPointMonitor::GetStatistics() const noex
 
 void MountPointMonitor::ResetStatistics() noexcept {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"MountPointMonitor: Statistics reset");
+    SS_LOG_INFO(L"MountPointMonitor", L"Statistics reset");
 }
 
 // ============================================================================
@@ -1570,36 +1700,36 @@ void MountPointMonitor::ResetStatistics() noexcept {
 
 bool MountPointMonitor::SelfTest() {
     try {
-        Utils::Logger::Info(L"MountPointMonitor: Starting self-test");
+        SS_LOG_INFO(L"MountPointMonitor", L"Starting self-test");
 
         // Test drive enumeration
         DWORD drives = GetLogicalDrives();
         if (drives == 0) {
-            Utils::Logger::Error(L"MountPointMonitor: Self-test failed - No drives detected");
+            SS_LOG_ERROR(L"MountPointMonitor", L"Self-test failed - no drives detected");
             return false;
         }
 
         // Test getting drive info for C:
         auto cDriveInfo = GetDriveInfo(L'C');
         if (!cDriveInfo.has_value()) {
-            Utils::Logger::Error(L"MountPointMonitor: Self-test failed - Cannot get C: drive info");
+            SS_LOG_ERROR(L"MountPointMonitor", L"Self-test failed - cannot get C: drive info");
             return false;
         }
 
         // Test whitelist operations
         WhitelistDevice(L"TEST_SERIAL_12345");
         if (!IsWhitelisted(L"TEST_SERIAL_12345")) {
-            Utils::Logger::Error(L"MountPointMonitor: Self-test failed - Whitelist operation failed");
+            SS_LOG_ERROR(L"MountPointMonitor", L"Self-test failed - whitelist operation failed");
             return false;
         }
         RemoveFromWhitelist(L"TEST_SERIAL_12345");
 
-        Utils::Logger::Info(L"MountPointMonitor: Self-test passed");
+        SS_LOG_INFO(L"MountPointMonitor", L"Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"MountPointMonitor: Self-test failed - {}",
-                            Utils::StringUtils::ToWide(e.what()));
+        SS_LOG_ERROR(L"MountPointMonitor", L"Self-test failed - %ls",
+                     Utils::StringUtils::ToWide(e.what()).c_str());
         return false;
     }
 }
@@ -1675,6 +1805,7 @@ std::string_view GetMonitorStatusName(MountPointMonitorStatus status) noexcept {
         case MountPointMonitorStatus::Error: return "Error";
         case MountPointMonitorStatus::Stopping: return "Stopping";
         case MountPointMonitorStatus::Stopped: return "Stopped";
+        case MountPointMonitorStatus::Initialized: return "Initialized";
         default: return "Unknown";
     }
 }
