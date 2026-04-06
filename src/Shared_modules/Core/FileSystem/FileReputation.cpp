@@ -62,6 +62,7 @@
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "FileHasher.hpp"
 
 // ============================================================================
 // SYSTEM INCLUDES
@@ -74,9 +75,15 @@
 #include <unordered_set>
 #include <future>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <cmath>
 
 namespace fs = std::filesystem;
+
+// Namespace aliases for infrastructure modules
+using ShadowStrike::Utils::StringUtils::ToNarrow;
+using ShadowStrike::Utils::StringUtils::ToWide;
 
 namespace ShadowStrike {
 namespace Core {
@@ -87,17 +94,18 @@ namespace FileSystem {
 // ============================================================================
 namespace {
 
-    // Score weights for reputation calculation
-    constexpr int8_t WEIGHT_WHITELIST = 100;
-    constexpr int8_t WEIGHT_BLACKLIST = -100;
-    constexpr int8_t WEIGHT_MICROSOFT_SIGNED = 90;
-    constexpr int8_t WEIGHT_TRUSTED_CERT = 70;
-    constexpr int8_t WEIGHT_VALID_CERT = 30;
-    constexpr int8_t WEIGHT_THREAT_INTEL_CRITICAL = -90;
-    constexpr int8_t WEIGHT_THREAT_INTEL_HIGH = -70;
-    constexpr int8_t WEIGHT_THREAT_INTEL_MEDIUM = -50;
-    constexpr int8_t WEIGHT_CLOUD_MALICIOUS = -80;
-    constexpr int8_t WEIGHT_HIGH_PREVALENCE = 40;
+    // Score weights for reputation calculation — use int to prevent int8_t overflow
+    // during intermediate arithmetic. Final score is clamped to [-100, 100].
+    constexpr int WEIGHT_WHITELIST = 100;
+    constexpr int WEIGHT_BLACKLIST = -100;
+    constexpr int WEIGHT_MICROSOFT_SIGNED = 90;
+    constexpr int WEIGHT_TRUSTED_CERT = 70;
+    constexpr int WEIGHT_VALID_CERT = 30;
+    constexpr int WEIGHT_THREAT_INTEL_CRITICAL = -90;
+    constexpr int WEIGHT_THREAT_INTEL_HIGH = -70;
+    constexpr int WEIGHT_THREAT_INTEL_MEDIUM = -50;
+    constexpr int WEIGHT_CLOUD_MALICIOUS = -80;
+    constexpr int WEIGHT_HIGH_PREVALENCE = 40;
 
     // Prevalence thresholds
     constexpr uint64_t HIGH_PREVALENCE_THRESHOLD = 10000;
@@ -109,9 +117,12 @@ namespace {
     constexpr uint32_t CLOUD_RETRY_DELAY_MS = 500;
 
     // Behavioral scoring
-    constexpr int8_t BEHAVIOR_C2_PENALTY = -40;
-    constexpr int8_t BEHAVIOR_RANSOMWARE_PENALTY = -50;
-    constexpr int8_t BEHAVIOR_CLEAN_HISTORY_BONUS = 20;
+    constexpr int BEHAVIOR_C2_PENALTY = -40;
+    constexpr int BEHAVIOR_RANSOMWARE_PENALTY = -50;
+    constexpr int BEHAVIOR_CLEAN_HISTORY_BONUS = 20;
+
+    // Maximum concurrent async reputation checks to prevent resource exhaustion
+    constexpr size_t MAX_CONCURRENT_ASYNC_CHECKS = 64;
 
     // Microsoft known publishers
     const std::unordered_set<std::wstring> MICROSOFT_PUBLISHERS = {
@@ -143,7 +154,23 @@ struct CacheEntry {
     ReputationResult result;
     std::chrono::system_clock::time_point insertTime;
     std::chrono::system_clock::time_point expiryTime;
-    uint32_t hitCount{ 0 };
+    std::atomic<uint32_t> hitCount{ 0 };
+
+    CacheEntry() = default;
+    CacheEntry(const CacheEntry& other)
+        : result(other.result)
+        , insertTime(other.insertTime)
+        , expiryTime(other.expiryTime)
+        , hitCount(other.hitCount.load(std::memory_order_relaxed)) {}
+    CacheEntry& operator=(const CacheEntry& other) {
+        if (this != &other) {
+            result = other.result;
+            insertTime = other.insertTime;
+            expiryTime = other.expiryTime;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
 
     [[nodiscard]] bool IsExpired() const noexcept {
         return std::chrono::system_clock::now() >= expiryTime;
@@ -181,7 +208,10 @@ public:
                 m_cloudAvailable = CheckCloudConnectivity();
             }
 
-            SS_LOG_INFO(L"FileReputation", L"FileReputation initialized (mode=%d, cloud=%hs, cache=%llu)", static_cast<int>(config.defaultMode), m_cloudAvailable, config.maxCacheSize);
+            SS_LOG_INFO(L"FileReputation", L"FileReputation initialized (mode=%d, cloud=%ls, cache=%llu)",
+                static_cast<int>(config.defaultMode),
+                m_cloudAvailable.load(std::memory_order_relaxed) ? L"yes" : L"no",
+                static_cast<unsigned long long>(config.maxCacheSize));
 
             return true;
 
@@ -195,13 +225,27 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
+            m_initialized = false;
+
+            // Signal async threads to not start new work
+            m_shuttingDown.store(true, std::memory_order_release);
+
             // Clear callbacks
             m_unknownFileCallbacks.clear();
+
+            // Wait for outstanding async operations
+            lock.unlock();
+            {
+                std::unique_lock asyncLock(m_asyncMutex);
+                m_asyncCv.wait(asyncLock, [this]() {
+                    return m_activeAsyncCount.load(std::memory_order_acquire) == 0;
+                });
+            }
+            lock.lock();
 
             // Clear cache
             m_cache.clear();
 
-            m_initialized = false;
             SS_LOG_INFO(L"FileReputation", L"FileReputation shutdown complete");
 
         } catch (...) {
@@ -219,29 +263,39 @@ public:
         result.queryTime = std::chrono::system_clock::now();
 
         try {
-            m_stats.totalQueries++;
+            if (!m_initialized) {
+                SS_LOG_ERROR(L"FileReputation", L"CheckFile called before Initialize");
+                result.level = ReputationLevel::Unknown;
+                result.recommendation = "Investigate";
+                result.reasons.push_back("Reputation service not initialized");
+                return result;
+            }
+
+            m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
 
             // Validate path
             if (filePath.empty()) {
-                SS_LOG_WARN(L"FileReputation", L"FileReputation::CheckFile - Empty file path");
+                SS_LOG_WARN(L"FileReputation", L"CheckFile - Empty file path");
                 result.level = ReputationLevel::Unknown;
                 result.recommendation = "Block";
                 result.reasons.push_back("Invalid file path");
                 return result;
             }
 
-            if (!fs::exists(filePath)) {
-                SS_LOG_WARN(L"FileReputation", L"FileReputation::CheckFile - File not found: %hs", StringUtils::ToNarrow(filePath).c_str());
+            // Compute hashes directly — do NOT check fs::exists first (TOCTOU).
+            // FileHasher handles missing files gracefully.
+            auto& hasher = FileHasher::Instance();
+            result.sha256 = hasher.ComputeSHA256(filePath);
+            if (result.sha256.empty()) {
+                SS_LOG_WARN(L"FileReputation", L"CheckFile - Hash computation failed: %ls",
+                    filePath.c_str());
                 result.level = ReputationLevel::Unknown;
                 result.recommendation = "Block";
-                result.reasons.push_back("File not found");
+                result.reasons.push_back("File inaccessible or hash computation failed");
                 return result;
             }
-
-            // Compute hashes
-            result.sha256 = HashStore::CalculateSHA256(filePath);
-            result.sha1 = HashStore::CalculateSHA1(filePath);
-            result.md5 = HashStore::CalculateMD5(filePath);
+            result.sha1 = hasher.ComputeSHA1(filePath);
+            result.md5 = hasher.ComputeMD5(filePath);
 
             // Build query
             ReputationQuery query;
@@ -255,7 +309,7 @@ public:
             result = QueryInternal(query);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileReputation", L"FileReputation::CheckFile - Exception: %hs", e.what());
+            SS_LOG_ERROR(L"FileReputation", L"CheckFile - Exception: %hs", e.what());
             result.level = ReputationLevel::Unknown;
             result.recommendation = "Investigate";
             result.reasons.push_back(std::string("Error: ") + e.what());
@@ -271,11 +325,19 @@ public:
     }
 
     [[nodiscard]] ReputationResult CheckHash(std::string_view sha256, QueryMode mode) {
+        if (!m_initialized) {
+            ReputationResult result;
+            result.level = ReputationLevel::Unknown;
+            result.recommendation = "Investigate";
+            result.reasons.push_back("Reputation service not initialized");
+            return result;
+        }
+
         ReputationQuery query;
         query.sha256 = std::string(sha256);
         query.mode = mode;
 
-        m_stats.totalQueries++;
+        m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
         return QueryInternal(query);
     }
 
@@ -283,30 +345,65 @@ public:
                                                std::string_view sha1,
                                                std::string_view md5,
                                                QueryMode mode) {
+        if (!m_initialized) {
+            ReputationResult result;
+            result.level = ReputationLevel::Unknown;
+            result.recommendation = "Investigate";
+            result.reasons.push_back("Reputation service not initialized");
+            return result;
+        }
+
         ReputationQuery query;
         query.sha256 = std::string(sha256);
         query.sha1 = std::string(sha1);
         query.md5 = std::string(md5);
         query.mode = mode;
 
-        m_stats.totalQueries++;
+        m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
         return QueryInternal(query);
     }
 
     [[nodiscard]] ReputationResult Query(const ReputationQuery& query) {
-        m_stats.totalQueries++;
+        if (!m_initialized) {
+            ReputationResult result;
+            result.level = ReputationLevel::Unknown;
+            result.recommendation = "Investigate";
+            result.reasons.push_back("Reputation service not initialized");
+            return result;
+        }
+
+        m_stats.totalQueries.fetch_add(1, std::memory_order_relaxed);
         return QueryInternal(query);
     }
 
     void CheckFileAsync(const std::wstring& filePath, ReputationCallback callback) {
         if (!callback) return;
+        if (m_shuttingDown.load(std::memory_order_acquire)) return;
 
-        std::thread([this, filePath, callback = std::move(callback)]() {
+        // Enforce concurrency limit to prevent resource exhaustion
+        if (m_activeAsyncCount.load(std::memory_order_acquire) >= MAX_CONCURRENT_ASYNC_CHECKS) {
+            SS_LOG_WARN(L"FileReputation", L"Async check limit reached (%zu), running synchronously",
+                static_cast<size_t>(MAX_CONCURRENT_ASYNC_CHECKS));
+            auto result = CheckFile(filePath, m_config.defaultMode);
+            callback(result);
+            return;
+        }
+
+        m_activeAsyncCount.fetch_add(1, std::memory_order_acq_rel);
+
+        std::thread([this, filePath, cb = std::move(callback)]() {
             try {
-                auto result = CheckFile(filePath, m_config.defaultMode);
-                callback(result);
+                if (!m_shuttingDown.load(std::memory_order_acquire)) {
+                    auto result = CheckFile(filePath, m_config.defaultMode);
+                    cb(result);
+                }
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(L"FileReputation", L"CheckFileAsync - Exception: %hs", e.what());
+            }
+
+            auto prev = m_activeAsyncCount.fetch_sub(1, std::memory_order_acq_rel);
+            if (prev == 1) {
+                m_asyncCv.notify_all();
             }
         }).detach();
     }
@@ -327,10 +424,27 @@ public:
     void CheckFilesAsync(const std::vector<std::wstring>& filePaths,
                         ReputationCallback callback) {
         if (!callback) return;
+        if (m_shuttingDown.load(std::memory_order_acquire)) return;
 
-        for (const auto& path : filePaths) {
-            CheckFileAsync(path, callback);
-        }
+        // Use a single async thread for batch to avoid thread explosion
+        m_activeAsyncCount.fetch_add(1, std::memory_order_acq_rel);
+
+        std::thread([this, filePaths, cb = std::move(callback)]() {
+            try {
+                for (const auto& path : filePaths) {
+                    if (m_shuttingDown.load(std::memory_order_acquire)) break;
+                    auto result = CheckFile(path, m_config.defaultMode);
+                    cb(result);
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"FileReputation", L"CheckFilesAsync - Exception: %hs", e.what());
+            }
+
+            auto prev = m_activeAsyncCount.fetch_sub(1, std::memory_order_acq_rel);
+            if (prev == 1) {
+                m_asyncCv.notify_all();
+            }
+        }).detach();
     }
 
     // ========================================================================
@@ -345,7 +459,9 @@ public:
 
             m_localWhitelist.insert(std::string(sha256));
 
-            SS_LOG_INFO(L"FileReputation", L"Added to whitelist: %hs (reason: %hs)", std::string(sha256).substr(0, 16), reason);
+            SS_LOG_INFO(L"FileReputation", L"Added to whitelist: %hs (reason: %hs)",
+                std::string(sha256).substr(0, 16).c_str(),
+                std::string(reason).c_str());
 
             // Invalidate cache entry
             m_cache.erase(std::string(sha256));
@@ -367,7 +483,8 @@ public:
             auto removed = m_localWhitelist.erase(std::string(sha256)) > 0;
             if (removed) {
                 m_cache.erase(std::string(sha256));
-                SS_LOG_INFO(L"FileReputation", L"Removed from whitelist: %hs", std::string(sha256).substr(0, 16));
+                SS_LOG_INFO(L"FileReputation", L"Removed from whitelist: %hs",
+                    std::string(sha256).substr(0, 16).c_str());
             }
 
             return removed;
@@ -386,8 +503,9 @@ public:
 
             m_localBlacklist[std::string(sha256)] = std::string(threatName);
 
-            Logger::Critical("Added to blacklist: {} (threat: {})",
-                std::string(sha256).substr(0, 16), threatName);
+            SS_LOG_FATAL(L"FileReputation", L"Added to blacklist: %hs (threat: %hs)",
+                std::string(sha256).substr(0, 16).c_str(),
+                std::string(threatName).c_str());
 
             // Invalidate cache entry
             m_cache.erase(std::string(sha256));
@@ -409,7 +527,8 @@ public:
             auto removed = m_localBlacklist.erase(std::string(sha256)) > 0;
             if (removed) {
                 m_cache.erase(std::string(sha256));
-                SS_LOG_INFO(L"FileReputation", L"Removed from blacklist: %hs", std::string(sha256).substr(0, 16));
+                SS_LOG_INFO(L"FileReputation", L"Removed from blacklist: %hs",
+                    std::string(sha256).substr(0, 16).c_str());
             }
 
             return removed;
@@ -440,21 +559,20 @@ public:
         CertificateReputation certRep;
 
         try {
-            // In production, this would use actual certificate verification API
-            // For now, provide placeholder logic
+            // TODO(cert-verification): Implement Authenticode verification via WinVerifyTrust.
+            // Production implementation must:
+            //   1. Call WinVerifyTrust with WINTRUST_ACTION_GENERIC_VERIFY_V2
+            //   2. Extract signer info via CryptMsgGetParam
+            //   3. Build and walk the certificate chain via CertGetCertificateChain
+            //   4. Check revocation via OCSP/CRL
+            //   5. Verify timestamp counter-signature
+            //
+            // Until implemented, all files appear unsigned — this is fail-safe
+            // because unsigned files get a score penalty, pushing toward deeper analysis.
 
-            // Check if file is signed (simplified check)
-            // Real implementation would use WinVerifyTrust API
-
-            certRep.isSigned = false; // Placeholder
+            certRep.isSigned = false;
             certRep.isValidSignature = false;
             certRep.trustLevel = TrustLevel::Unknown;
-
-            // Real implementation would extract and verify certificate chain
-            // certRep.signerName = GetSignerName(filePath);
-            // certRep.thumbprint = GetCertificateThumbprint(filePath);
-            // certRep.isExpired = CheckExpiration();
-            // certRep.isRevoked = CheckRevocation();
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"GetCertificateReputation - Exception: %hs", e.what());
@@ -489,7 +607,9 @@ public:
 
         try {
             m_trustedCertificates[std::string(thumbprint)] = std::string(reason);
-            SS_LOG_INFO(L"FileReputation", L"Added trusted certificate: %hs (reason: %hs)", thumbprint, reason);
+            SS_LOG_INFO(L"FileReputation", L"Added trusted certificate: %hs (reason: %hs)",
+                std::string(thumbprint).c_str(),
+                std::string(reason).c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -503,7 +623,9 @@ public:
 
         try {
             m_untrustedCertificates[std::string(thumbprint)] = std::string(reason);
-            SS_LOG_WARN(L"FileReputation", L"Added untrusted certificate: %hs (reason: %hs)", thumbprint, reason);
+            SS_LOG_WARN(L"FileReputation", L"Added untrusted certificate: %hs (reason: %hs)",
+                std::string(thumbprint).c_str(),
+                std::string(reason).c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -518,16 +640,23 @@ public:
 
     bool SubmitForAnalysis(const std::wstring& filePath) {
         try {
-            if (!m_cloudAvailable) {
+            if (!m_cloudAvailable.load(std::memory_order_acquire)) {
                 SS_LOG_WARN(L"FileReputation", L"Cloud service unavailable - cannot submit file");
                 return false;
             }
 
-            // In production, this would upload file to cloud service
-            // For now, just log the submission
+            // Compute hash for submission tracking
+            auto& hasher = FileHasher::Instance();
+            auto hash = hasher.ComputeSHA256(filePath);
+            if (hash.empty()) {
+                SS_LOG_WARN(L"FileReputation", L"SubmitForAnalysis - Hash computation failed for: %ls",
+                    filePath.c_str());
+                return false;
+            }
 
-            auto hash = HashStore::CalculateSHA256(filePath);
-            SS_LOG_INFO(L"FileReputation", L"Submitted file for cloud analysis: %hs", hash.substr(0, 16));
+            // TODO(cloud-integration): Implement actual cloud upload via NetworkUtils
+            SS_LOG_INFO(L"FileReputation", L"Submitted file for cloud analysis: %hs",
+                hash.substr(0, 16).c_str());
 
             return true;
 
@@ -539,13 +668,24 @@ public:
 
     bool SubmitMetadata(const std::wstring& filePath) {
         try {
-            if (!m_cloudAvailable) return false;
+            if (!m_cloudAvailable.load(std::memory_order_acquire)) return false;
 
-            // Submit only file metadata (hash, size, timestamps, etc.)
-            auto hash = HashStore::CalculateSHA256(filePath);
-            auto size = fs::file_size(filePath);
+            auto& hasher = FileHasher::Instance();
+            auto hash = hasher.ComputeSHA256(filePath);
+            if (hash.empty()) return false;
 
-            SS_LOG_INFO(L"FileReputation", L"Submitted metadata: %hs (%hs bytes)", hash.substr(0, 16), size);
+            std::error_code ec;
+            auto size = fs::file_size(filePath, ec);
+            if (ec) {
+                SS_LOG_WARN(L"FileReputation", L"SubmitMetadata - Cannot get file size: %ls",
+                    filePath.c_str());
+                return false;
+            }
+
+            // TODO(cloud-integration): Implement actual metadata submission
+            SS_LOG_INFO(L"FileReputation", L"Submitted metadata: %hs (%llu bytes)",
+                hash.substr(0, 16).c_str(),
+                static_cast<unsigned long long>(size));
 
             return true;
 
@@ -557,9 +697,12 @@ public:
 
     bool ReportFalsePositive(std::string_view sha256, std::string_view reason) {
         try {
-            if (!m_cloudAvailable) return false;
+            if (!m_cloudAvailable.load(std::memory_order_acquire)) return false;
 
-            SS_LOG_INFO(L"FileReputation", L"Reported false positive: %hs (reason: %hs)", std::string(sha256).substr(0, 16), reason);
+            // TODO(cloud-integration): Implement actual false positive reporting
+            SS_LOG_INFO(L"FileReputation", L"Reported false positive: %hs (reason: %hs)",
+                std::string(sha256).substr(0, 16).c_str(),
+                std::string(reason).c_str());
 
             return true;
 
@@ -571,10 +714,12 @@ public:
 
     bool ReportFalseNegative(std::string_view sha256, std::string_view threatName) {
         try {
-            if (!m_cloudAvailable) return false;
+            if (!m_cloudAvailable.load(std::memory_order_acquire)) return false;
 
-            Logger::Critical("Reported false negative: {} (threat: {})",
-                std::string(sha256).substr(0, 16), threatName);
+            // TODO(cloud-integration): Implement actual false negative reporting
+            SS_LOG_FATAL(L"FileReputation", L"Reported false negative: %hs (threat: %hs)",
+                std::string(sha256).substr(0, 16).c_str(),
+                std::string(threatName).c_str());
 
             return true;
 
@@ -603,10 +748,8 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            // In production, load from persistent cache file
-            // For now, return 0
-
-            SS_LOG_INFO(L"FileReputation", L"Preloaded cache from: %hs", StringUtils::ToNarrow(cachePath).c_str());
+            // TODO(persistence): Implement persistent cache file loading
+            SS_LOG_INFO(L"FileReputation", L"Preloaded cache from: %ls", cachePath.c_str());
             return 0;
 
         } catch (const std::exception& e) {
@@ -619,10 +762,10 @@ public:
         std::shared_lock lock(m_mutex);
 
         try {
-            // In production, save cache to persistent file
-            // For now, just log
-
-            SS_LOG_INFO(L"FileReputation", L"Saved cache to: %hs (%llu entries)", StringUtils::ToNarrow(cachePath).c_str(), m_cache.size());
+            // TODO(persistence): Implement persistent cache file saving
+            SS_LOG_INFO(L"FileReputation", L"Saved cache to: %ls (%llu entries)",
+                cachePath.c_str(),
+                static_cast<unsigned long long>(m_cache.size()));
 
             return true;
 
@@ -642,7 +785,8 @@ public:
         uint64_t callbackId = ++m_nextCallbackId;
         m_unknownFileCallbacks[callbackId] = std::move(callback);
 
-        SS_LOG_INFO(L"FileReputation", L"Registered unknown file callback: %hs", callbackId);
+        SS_LOG_INFO(L"FileReputation", L"Registered unknown file callback: %llu",
+            static_cast<unsigned long long>(callbackId));
         return callbackId;
     }
 
@@ -651,7 +795,8 @@ public:
 
         auto removed = m_unknownFileCallbacks.erase(callbackId) > 0;
         if (removed) {
-            SS_LOG_INFO(L"FileReputation", L"Unregistered callback: %hs", callbackId);
+            SS_LOG_INFO(L"FileReputation", L"Unregistered callback: %llu",
+                static_cast<unsigned long long>(callbackId));
         }
 
         return removed;
@@ -674,7 +819,7 @@ public:
     // ========================================================================
 
     [[nodiscard]] bool IsCloudAvailable() const noexcept {
-        return m_cloudAvailable;
+        return m_cloudAvailable.load(std::memory_order_acquire);
     }
 
     [[nodiscard]] uint32_t GetCloudLatency() const noexcept {
@@ -781,7 +926,8 @@ private:
             m_stats.localHits++;
             m_stats.trustedFiles++;
 
-            SS_LOG_INFO(L"FileReputation", L"Whitelist hit: %hs", query.sha256.substr(0, 16));
+            SS_LOG_INFO(L"FileReputation", L"Whitelist hit: %hs",
+                query.sha256.substr(0, 16).c_str());
             return true;
         }
 
@@ -807,8 +953,8 @@ private:
             m_stats.localHits++;
             m_stats.maliciousDetected++;
 
-            Logger::Critical("Blacklist hit: {} ({})",
-                query.sha256.substr(0, 16), it->second);
+            SS_LOG_FATAL(L"FileReputation", L"Blacklist hit: %hs (%hs)",
+                query.sha256.substr(0, 16).c_str(), it->second.c_str());
             return true;
         }
 
@@ -818,20 +964,16 @@ private:
     [[nodiscard]] bool CheckHashStore(const ReputationQuery& query,
                                      ReputationResult& result) {
         try {
-            if (HashStore::Instance().IsKnownMalware(query.sha256)) {
-                result.level = ReputationLevel::KnownMalware;
-                result.score = FileReputationConstants::SCORE_MALWARE;
-                result.confidence = 0.95;
-                result.isMalicious = true;
-                result.primarySource = ReputationSource::ThreatIntelligence;
-                result.recommendation = "Block";
-                result.reasons.push_back("Known malware hash in database");
+            if (query.sha256.empty()) return false;
 
-                m_stats.maliciousDetected++;
-
-                Logger::Critical("HashStore malware hit: {}", query.sha256.substr(0, 16));
-                return true;
-            }
+            // TODO(hashstore-wiring): HashStore lacks a singleton and must be
+            // provided during Initialize(). Add a HashStore* m_hashStore member
+            // and wire it via FileReputationConfig. Then call:
+            //   auto det = m_hashStore->LookupHashString(query.sha256, HashType::SHA256);
+            //   if (det.has_value()) { ... }
+            //
+            // Until wired, fall through to ThreatIntel and cloud layers.
+            return false;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"CheckHashStore - Exception: %hs", e.what());
@@ -844,13 +986,16 @@ private:
         try {
             result.certificate = GetCertificateReputation(query.filePath);
 
+            // Use int for intermediate score to prevent int8_t overflow
+            int intermediateScore = static_cast<int>(result.score);
+
             if (result.certificate.isSigned && result.certificate.isValidSignature) {
                 // Check if Microsoft signed
                 if (IsMicrosoftSigner(result.certificate.signerName)) {
                     result.certificate.trustLevel = TrustLevel::SystemTrust;
                     result.certificate.signerReputation = 100;
                     result.certificate.signerCategory = "Microsoft";
-                    result.score += WEIGHT_MICROSOFT_SIGNED;
+                    intermediateScore += WEIGHT_MICROSOFT_SIGNED;
                     result.reasons.push_back("Signed by Microsoft");
                     result.contributingSources.push_back(ReputationSource::CertificateAnalysis);
                 }
@@ -859,7 +1004,7 @@ private:
                     result.certificate.trustLevel = TrustLevel::ExtendedTrust;
                     result.certificate.signerReputation = 80;
                     result.certificate.signerCategory = "Trusted Vendor";
-                    result.score += WEIGHT_TRUSTED_CERT;
+                    intermediateScore += WEIGHT_TRUSTED_CERT;
                     result.reasons.push_back("Signed by trusted publisher");
                     result.contributingSources.push_back(ReputationSource::CertificateAnalysis);
                 }
@@ -867,29 +1012,32 @@ private:
                 else {
                     result.certificate.trustLevel = TrustLevel::BasicTrust;
                     result.certificate.signerReputation = 30;
-                    result.score += WEIGHT_VALID_CERT;
+                    intermediateScore += WEIGHT_VALID_CERT;
                     result.reasons.push_back("Valid digital signature");
                     result.contributingSources.push_back(ReputationSource::CertificateAnalysis);
                 }
 
                 // Check for certificate issues
                 if (result.certificate.isExpired) {
-                    result.score -= 20;
+                    intermediateScore -= 20;
                     result.reasons.push_back("Certificate expired");
-                    result.certificate.untristReasons.push_back("Expired");
+                    result.certificate.untrustReasons.push_back("Expired");
                 }
 
                 if (result.certificate.isRevoked) {
-                    result.score -= 50;
+                    intermediateScore -= 50;
                     result.isSuspicious = true;
                     result.reasons.push_back("Certificate revoked");
-                    result.certificate.untristReasons.push_back("Revoked");
+                    result.certificate.untrustReasons.push_back("Revoked");
                 }
             } else {
                 // Unsigned file
-                result.score -= 10;
+                intermediateScore -= 10;
                 result.reasons.push_back("File is not digitally signed");
             }
+
+            // Clamp and store back
+            result.score = static_cast<int8_t>(std::clamp(intermediateScore, -100, 100));
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"AnalyzeCertificate - Exception: %hs", e.what());
@@ -898,27 +1046,26 @@ private:
 
     void CheckThreatIntelligence(const ReputationQuery& query, ReputationResult& result) {
         try {
-            // Check ThreatIntel database for matches
-            // In production, this would query ThreatIntel infrastructure
-
-            // Placeholder: Check if hash exists in threat database
-            // Real implementation would use ThreatIntelLookup
-
-            // For demonstration, assume no threat intel match
-            // result.threatMatches = ThreatIntelLookup::Instance().CheckHash(query.sha256);
+            // TODO(threat-intel-wiring): Wire to ThreatIntelLookup for real IOC matching.
+            // Currently processes only pre-populated threatMatches (e.g., from caller context).
+            // Production integration:
+            //   auto& tiLookup = ShadowStrike::ThreatIntel::ThreatIntelLookup::Instance();
+            //   result.threatMatches = tiLookup.LookupHash(query.sha256, opts);
 
             if (!result.threatMatches.empty()) {
+                int intermediateScore = static_cast<int>(result.score);
+
                 for (const auto& match : result.threatMatches) {
                     result.contributingSources.push_back(ReputationSource::ThreatIntelligence);
 
                     if (match.severity == "Critical") {
-                        result.score += WEIGHT_THREAT_INTEL_CRITICAL;
+                        intermediateScore += WEIGHT_THREAT_INTEL_CRITICAL;
                         result.isMalicious = true;
                     } else if (match.severity == "High") {
-                        result.score += WEIGHT_THREAT_INTEL_HIGH;
+                        intermediateScore += WEIGHT_THREAT_INTEL_HIGH;
                         result.isMalicious = true;
                     } else if (match.severity == "Medium") {
-                        result.score += WEIGHT_THREAT_INTEL_MEDIUM;
+                        intermediateScore += WEIGHT_THREAT_INTEL_MEDIUM;
                         result.isSuspicious = true;
                     }
 
@@ -928,9 +1075,12 @@ private:
 
                     result.reasons.push_back("Threat Intelligence match: " + match.threatName);
 
-                    SS_LOG_WARN(L"FileReputation", L"Threat Intel match: %hs - %hs", query.sha256.substr(0, 16), match.threatName);
+                    SS_LOG_WARN(L"FileReputation", L"Threat Intel match: %hs - %hs",
+                        query.sha256.substr(0, 16).c_str(),
+                        match.threatName.c_str());
                 }
 
+                result.score = static_cast<int8_t>(std::clamp(intermediateScore, -100, 100));
                 m_stats.maliciousDetected++;
             }
 
@@ -941,7 +1091,7 @@ private:
 
     void QueryCloudReputation(const ReputationQuery& query, ReputationResult& result) {
         try {
-            if (!m_cloudAvailable) {
+            if (!m_cloudAvailable.load(std::memory_order_acquire)) {
                 SS_LOG_DEBUG(L"FileReputation", L"Cloud service unavailable");
                 return;
             }
@@ -958,27 +1108,27 @@ private:
 
             if (!querySuccess) {
                 m_stats.cloudFailures++;
-                SS_LOG_WARN(L"FileReputation", L"Cloud query failed for: %hs", query.sha256.substr(0, 16));
+                SS_LOG_WARN(L"FileReputation", L"Cloud query failed for: %hs",
+                    query.sha256.substr(0, 16).c_str());
                 return;
             }
 
             result.cloud.querySuccessful = true;
             result.contributingSources.push_back(ReputationSource::CloudMLScore);
 
+            int intermediateScore = static_cast<int>(result.score);
+
             // Process ML score
             if (result.cloud.mlScore > 0.8) {
-                // High malware probability
-                result.score += WEIGHT_CLOUD_MALICIOUS;
+                intermediateScore += WEIGHT_CLOUD_MALICIOUS;
                 result.isMalicious = true;
                 result.reasons.push_back("Cloud ML: High malware probability");
             } else if (result.cloud.mlScore > 0.5) {
-                // Suspicious
-                result.score -= 40;
+                intermediateScore -= 40;
                 result.isSuspicious = true;
                 result.reasons.push_back("Cloud ML: Suspicious characteristics");
             } else if (result.cloud.mlScore < 0.2) {
-                // Likely clean
-                result.score += 30;
+                intermediateScore += 30;
                 result.reasons.push_back("Cloud ML: Low malware probability");
             }
 
@@ -991,11 +1141,13 @@ private:
                 double maliciousRatio = static_cast<double>(result.cloud.communityMalicious) / totalVerdicts;
 
                 if (maliciousRatio > 0.5) {
-                    result.score -= 30;
+                    intermediateScore -= 30;
                     result.isSuspicious = true;
                     result.reasons.push_back("Community: Majority malicious verdicts");
                 }
             }
+
+            result.score = static_cast<int8_t>(std::clamp(intermediateScore, -100, 100));
 
             // Update cloud latency statistics
             UpdateCloudLatency(result.cloud.queryLatency.count());
@@ -1008,32 +1160,31 @@ private:
 
     void AnalyzeBehavior(const ReputationQuery& query, ReputationResult& result) {
         try {
-            // Behavioral analysis based on historical execution data
-            // In production, this would query execution history database
-
+            // TODO(behavioral-engine): Wire to execution history database.
+            // Currently uses a default-constructed context (all clean).
             BehavioralContext behavior;
 
-            // Check execution history
-            // behavior = GetExecutionHistory(query.filePath);
+            int intermediateScore = static_cast<int>(result.score);
 
             // Apply behavioral scoring
             if (behavior.hasC2Communication) {
-                result.score += BEHAVIOR_C2_PENALTY;
+                intermediateScore += BEHAVIOR_C2_PENALTY;
                 result.isMalicious = true;
                 result.reasons.push_back("Behavioral: C2 communication detected");
             }
 
             if (behavior.hasRansomwareBehavior) {
-                result.score += BEHAVIOR_RANSOMWARE_PENALTY;
+                intermediateScore += BEHAVIOR_RANSOMWARE_PENALTY;
                 result.isMalicious = true;
                 result.reasons.push_back("Behavioral: Ransomware-like activity");
             }
 
             if (behavior.cleanExecutions > 10 && behavior.suspiciousExecutions == 0) {
-                result.score += BEHAVIOR_CLEAN_HISTORY_BONUS;
+                intermediateScore += BEHAVIOR_CLEAN_HISTORY_BONUS;
                 result.reasons.push_back("Behavioral: Clean execution history");
             }
 
+            result.score = static_cast<int8_t>(std::clamp(intermediateScore, -100, 100));
             result.behavior = behavior;
             result.contributingSources.push_back(ReputationSource::BehavioralAnalysis);
 
@@ -1089,7 +1240,10 @@ private:
                 result.primarySource = result.contributingSources[0];
             }
 
-            SS_LOG_DEBUG(L"FileReputation", L"Final reputation: %u (score=%hs, confidence=%.2f)", static_cast<int>(result.level), result.score, result.confidence);
+            SS_LOG_DEBUG(L"FileReputation", L"Final reputation: level=%u score=%d confidence=%.2f",
+                static_cast<unsigned>(result.level),
+                static_cast<int>(result.score),
+                result.confidence);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"CalculateFinalScore - Exception: %hs", e.what());
@@ -1107,10 +1261,10 @@ private:
         if (it != m_cache.end()) {
             // Check expiration
             if (!it->second.IsExpired()) {
-                it->second.hitCount++;
+                it->second.hitCount.fetch_add(1, std::memory_order_relaxed);
                 return it->second.result;
             } else {
-                // Expired - will be removed on next cleanup
+                // Expired — will be removed on next cleanup
                 return std::nullopt;
             }
         }
@@ -1130,7 +1284,10 @@ private:
                     return;
 
                 case CachePolicy::CachePositive:
-                    shouldCache = result.isTrusted || !result.isSuspicious;
+                    // Only cache files determined to be safe or trusted
+                    shouldCache = result.isTrusted ||
+                                  result.level == ReputationLevel::KnownSafe ||
+                                  result.level == ReputationLevel::MicrosoftSigned;
                     break;
 
                 case CachePolicy::CacheNegative:
@@ -1142,7 +1299,7 @@ private:
                     break;
             }
 
-            if (!shouldCache) return;
+            if (!shouldCache || result.sha256.empty()) return;
 
             // Check cache size limit
             if (m_cache.size() >= m_config.maxCacheSize) {
@@ -1156,7 +1313,7 @@ private:
             entry.expiryTime = entry.insertTime +
                 std::chrono::hours(m_config.cacheTTLHours);
 
-            m_cache[result.sha256] = entry;
+            m_cache[result.sha256] = std::move(entry);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"CacheResult - Exception: %hs", e.what());
@@ -1164,12 +1321,22 @@ private:
     }
 
     void EvictOldestCacheEntry() {
-        // Simple eviction: remove first entry
-        // In production, would use LRU algorithm
+        // Evict the entry with the oldest insert time (approximation of LRU).
+        // Full LRU would require a linked-list overlay; this is acceptable for
+        // a cache that rarely hits the size limit due to TTL expiration.
+        if (m_cache.empty()) return;
 
-        if (!m_cache.empty()) {
-            m_cache.erase(m_cache.begin());
+        auto oldest = m_cache.begin();
+        auto oldestTime = oldest->second.insertTime;
+
+        for (auto it = m_cache.begin(); it != m_cache.end(); ++it) {
+            if (it->second.insertTime < oldestTime) {
+                oldest = it;
+                oldestTime = it->second.insertTime;
+            }
         }
+
+        m_cache.erase(oldest);
     }
 
     // ========================================================================
@@ -1178,9 +1345,7 @@ private:
 
     [[nodiscard]] bool CheckCloudConnectivity() noexcept {
         try {
-            // In production, ping cloud service endpoint
-            // For now, assume available if endpoint is configured
-
+            // TODO(cloud-integration): Implement actual health check ping to cloud endpoint
             if (!m_config.cloudEndpoint.empty()) {
                 SS_LOG_INFO(L"FileReputation", L"Cloud service connectivity check: OK");
                 return true;
@@ -1197,18 +1362,16 @@ private:
                                         CloudReputation& cloudRep,
                                         uint32_t timeoutMs) {
         try {
-            // In production, this would make actual HTTP/HTTPS request to cloud service
-            // Using async I/O with timeout protection
+            // TODO(cloud-integration): Implement actual HTTPS request to cloud reputation service.
+            // Must use async I/O with configurable timeout, TLS certificate pinning,
+            // request signing with apiKey, and retry logic with backoff.
+            //
+            // Until implemented, return false so callers know cloud data is unavailable
+            // rather than silently accepting fake hardcoded scores.
 
-            // Placeholder implementation
-            cloudRep.mlScore = 0.1; // Low malware probability
-            cloudRep.mlConfidence = 0.8;
-            cloudRep.mlModel = "ShadowStrike-ML-v3.0";
-            cloudRep.communityClean = 1000;
-            cloudRep.communitySuspicious = 10;
-            cloudRep.communityMalicious = 5;
-
-            return true;
+            SS_LOG_DEBUG(L"FileReputation", L"Cloud query not yet implemented for: %hs",
+                query.sha256.substr(0, 16).c_str());
+            return false;
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"FileReputation", L"PerformCloudQuery - Exception: %hs", e.what());
@@ -1251,38 +1414,48 @@ private:
     }
 
     void NotifyUnknownFile(const std::wstring& filePath, const std::string& hash) {
-        std::shared_lock lock(m_mutex);
-
-        try {
+        // Copy callbacks under lock, then invoke outside lock to prevent deadlock
+        // if a callback re-enters FileReputation methods.
+        std::vector<UnknownFileCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_unknownFileCallbacks.size());
             for (const auto& [id, callback] : m_unknownFileCallbacks) {
                 if (callback) {
-                    callback(filePath, hash);
+                    callbacksCopy.push_back(callback);
                 }
             }
+        }
 
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"FileReputation", L"NotifyUnknownFile - Exception: %hs", e.what());
+        for (const auto& callback : callbacksCopy) {
+            try {
+                callback(filePath, hash);
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"FileReputation", L"NotifyUnknownFile callback exception: %hs", e.what());
+            }
         }
     }
 
     void UpdatePerformanceStats(const std::chrono::milliseconds& latency) noexcept {
         try {
-            uint64_t latencyUs = latency.count() * 1000;
+            uint64_t latencyUs = static_cast<uint64_t>(latency.count()) * 1000;
 
-            // Update average
-            uint64_t currentAvg = m_stats.averageLatencyUs.load();
-            uint64_t queries = m_stats.totalQueries.load();
-            uint64_t newAvg = ((currentAvg * (queries - 1)) + latencyUs) / queries;
-            m_stats.averageLatencyUs.store(newAvg);
+            // Update average using exponential moving average (lock-free)
+            uint64_t currentAvg = m_stats.averageLatencyUs.load(std::memory_order_relaxed);
+            uint64_t newAvg = (currentAvg * 9 + latencyUs) / 10;
+            m_stats.averageLatencyUs.store(newAvg, std::memory_order_relaxed);
 
-            // Update max
-            uint64_t currentMax = m_stats.maxLatencyUs.load();
-            if (latencyUs > currentMax) {
-                m_stats.maxLatencyUs.store(latencyUs);
+            // Update max using CAS loop
+            uint64_t currentMax = m_stats.maxLatencyUs.load(std::memory_order_relaxed);
+            while (latencyUs > currentMax) {
+                if (m_stats.maxLatencyUs.compare_exchange_weak(
+                        currentMax, latencyUs, std::memory_order_relaxed)) {
+                    break;
+                }
             }
 
         } catch (...) {
-            // Suppress exceptions
+            // Suppress exceptions in stats path
         }
     }
 
@@ -1308,12 +1481,18 @@ private:
     std::unordered_map<std::string, CacheEntry> m_cache;
 
     // Cloud state
-    bool m_cloudAvailable{ false };
+    std::atomic<bool> m_cloudAvailable{ false };
     std::atomic<uint32_t> m_averageCloudLatency{ 0 };
 
     // Callbacks
     std::unordered_map<uint64_t, UnknownFileCallback> m_unknownFileCallbacks;
     uint64_t m_nextCallbackId{ 0 };
+
+    // Async operation tracking for graceful shutdown
+    std::atomic<bool> m_shuttingDown{ false };
+    std::atomic<size_t> m_activeAsyncCount{ 0 };
+    std::mutex m_asyncMutex;
+    std::condition_variable m_asyncCv;
 };
 
 // ============================================================================
