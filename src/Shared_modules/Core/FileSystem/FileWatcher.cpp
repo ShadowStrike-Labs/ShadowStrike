@@ -410,26 +410,25 @@ public:
             const auto elapsed = now - it->second.timestamp;
 
             if (elapsed < m_debounceTime) {
-                // Coalesce event
+                // Within debounce window: suppress duplicate
                 it->second.event.coalescedCount++;
                 it->second.timestamp = now;
                 return std::nullopt;
-            } else {
-                // Debounce period expired, emit old event
-                FileEvent emitEvent = it->second.event;
-                it->second.event = event;
-                it->second.timestamp = now;
-                return emitEvent;
             }
+
+            // Debounce window expired: new distinct occurrence, emit and restart window
+            it->second.event = event;
+            it->second.timestamp = now;
+            return event;
         }
 
-        // New event
+        // First occurrence: emit immediately, start debounce window for dedup
         m_pendingEvents[key] = {event, now};
 
         // Clean up old entries
         CleanupOldEntries(now);
 
-        return std::nullopt;
+        return event;
     }
 
     std::vector<FileEvent> Flush() {
@@ -633,6 +632,7 @@ public:
 
             // Start worker threads
             m_running = true;
+            m_startTime = std::chrono::steady_clock::now();
             for (uint32_t i = 0; i < m_config.workerThreads; ++i) {
                 m_workerThreads.emplace_back([this]() { WorkerThread(); });
             }
@@ -728,6 +728,13 @@ public:
                 return 0;
             }
 
+            // Security: reject UNC/network paths to prevent monitoring redirection
+            if (directory.starts_with(L"\\\\")) {
+                SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Rejecting UNC/network path: %hs",
+                            Utils::StringUtils::ToNarrow(directory).c_str());
+                return 0;
+            }
+
             if (!fs::exists(directory) || !fs::is_directory(directory)) {
                 SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Directory does not exist: %hs",
                              Utils::StringUtils::ToNarrow(directory).c_str());
@@ -751,6 +758,16 @@ public:
                 if (m_watches.size() >= FileWatcherConstants::MAX_WATCHES) {
                     SS_LOG_ERROR(L"FileWatcher", L"FileWatcher: Maximum watches reached");
                     return 0;
+                }
+
+                // Check for duplicate path
+                const std::wstring normalizedDir = NormalizePath(directory);
+                for (const auto& [existingId, existingHandle] : m_watches) {
+                    if (existingHandle->entry.directory == normalizedDir) {
+                        SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Directory already watched (ID %u): %hs",
+                                    existingId, Utils::StringUtils::ToNarrow(directory).c_str());
+                        return existingId;
+                    }
                 }
 
                 // Create watch handle
@@ -965,6 +982,17 @@ public:
         m_globalExclusions.erase(pattern);
     }
 
+    void AddExclusionPath(const std::wstring& path) {
+        std::unique_lock lock(m_mutex);
+        m_excludedPaths.insert(NormalizePath(path));
+        SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Added exclusion path: %hs", Utils::StringUtils::ToNarrow(path).c_str());
+    }
+
+    void RemoveExclusionPath(const std::wstring& path) {
+        std::unique_lock lock(m_mutex);
+        m_excludedPaths.erase(NormalizePath(path));
+    }
+
     std::vector<std::wstring> GetExclusionPatterns() const {
         std::shared_lock lock(m_mutex);
         return std::vector<std::wstring>(m_globalExclusions.begin(), m_globalExclusions.end());
@@ -1025,6 +1053,9 @@ public:
     // ========================================================================
 
     void SetDebounceTime(uint32_t debounceMs) {
+        debounceMs = std::clamp(debounceMs,
+                                FileWatcherConstants::MIN_DEBOUNCE_MS,
+                                FileWatcherConstants::MAX_DEBOUNCE_MS);
         if (m_debouncer) {
             m_debouncer->SetDebounceTime(debounceMs);
             m_config.debounceMs = debounceMs;
@@ -1038,7 +1069,9 @@ public:
     void SetRateLimit(uint32_t eventsPerSecond) {
         m_rateLimitPerSec.store(eventsPerSecond, std::memory_order_relaxed);
         m_rateLimitCounter.store(0, std::memory_order_relaxed);
-        m_rateLimitWindowStart = std::chrono::steady_clock::now();
+        m_rateLimitWindowTicks.store(
+            std::chrono::steady_clock::now().time_since_epoch().count(),
+            std::memory_order_relaxed);
         SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Rate limit set to %u events/sec", eventsPerSecond);
     }
 
@@ -1051,18 +1084,22 @@ public:
         m_batchCallback = std::move(callback);
         m_batchSize = (batchSize > 0) ? batchSize : 100;
         m_batchTimeoutMs = (batchTimeoutMs > 0) ? batchTimeoutMs : 100;
-        m_batchMode.store(true, std::memory_order_release);
 
         // Wrap with a no-op event callback; actual dispatch goes through batch accumulator
         auto noopCallback = [](const FileEvent&) {};
 
-        // Start batch flush thread
-        m_batchThread = std::thread([this]() { BatchFlushThread(); });
-
         SS_LOG_INFO(L"FileWatcher", L"FileWatcher: Starting batch mode (size=%zu, timeout=%u ms)",
                     m_batchSize, m_batchTimeoutMs);
 
-        return Start(noopCallback);
+        if (!Start(noopCallback)) {
+            return false;
+        }
+
+        // Enable batch mode and start flush thread AFTER Start succeeds
+        m_batchMode.store(true, std::memory_order_release);
+        m_batchThread = std::thread([this]() { BatchFlushThread(); });
+
+        return true;
     }
 
     bool ExportDiagnostics(const std::wstring& outputPath) const {
@@ -1109,8 +1146,8 @@ public:
                 out << L"\n=== Active Watches ===\n";
                 for (const auto& [id, handle] : m_watches) {
                     out << L"Watch " << id << L": " << handle->entry.directory
-                        << L" (events=" << handle->entry.eventsReceived.load()
-                        << L", state=" << static_cast<int>(handle->entry.state) << L")\n";
+                        << L" (events=" << handle->entry.eventsReceived.load(std::memory_order_relaxed)
+                        << L", state=" << static_cast<int>(handle->entry.state.load(std::memory_order_relaxed)) << L")\n";
                 }
             }
 
@@ -1251,6 +1288,9 @@ private:
 
     void ProcessNotifications(WatchHandle* handle, DWORD bytesTransferred) {
         if (bytesTransferred == 0) {
+            // Buffer overflow: too many changes happened — some events are lost
+            SS_LOG_WARN(L"FileWatcher", L"FileWatcher: Buffer overflow on watch %u (events lost), consider increasing buffer size",
+                        handle->entry.watchId);
             return;
         }
 
@@ -1379,12 +1419,24 @@ private:
             return true;
         }
 
-        // Check global exclusions — iterate the set directly to avoid per-event allocation
+        // Check global pattern exclusions and full-path exclusions
         {
             std::shared_lock lock(m_mutex);
+
             for (const auto& pattern : m_globalExclusions) {
                 if (MatchesGlobPattern(filename, pattern)) {
                     return true;
+                }
+            }
+
+            // Check full-path exclusions
+            if (!m_excludedPaths.empty()) {
+                const std::wstring fullPath = (fs::path(entry.directory) / filename).wstring();
+                const std::wstring normalizedFull = NormalizePath(fullPath);
+                for (const auto& excludedPath : m_excludedPaths) {
+                    if (normalizedFull == excludedPath || normalizedFull.starts_with(excludedPath + L"\\")) {
+                        return true;
+                    }
                 }
             }
         }
@@ -1392,6 +1444,20 @@ private:
         // Check config exclusions
         if (m_config.excludeTempFiles) {
             if (filename.ends_with(L".tmp") || filename.ends_with(L".temp") || filename.starts_with(L"~$")) {
+                return true;
+            }
+        }
+
+        // Enforce include patterns: if specified, file must match at least one
+        if (!entry.includePatterns.empty()) {
+            bool matchedAny = false;
+            for (const auto& pattern : entry.includePatterns) {
+                if (MatchesGlobPattern(filename, pattern)) {
+                    matchedAny = true;
+                    break;
+                }
+            }
+            if (!matchedAny) {
                 return true;
             }
         }
@@ -1478,15 +1544,22 @@ private:
     }
 
     void DispatchEvent(const FileEvent& event) {
-        // Rate limiting check
+        // Rate limiting check (lock-free using atomics)
         const uint32_t limit = m_rateLimitPerSec.load(std::memory_order_relaxed);
         if (limit > 0) {
-            const auto now = std::chrono::steady_clock::now();
-            const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - m_rateLimitWindowStart);
-            if (elapsed.count() >= 1) {
-                m_rateLimitCounter.store(0, std::memory_order_relaxed);
-                m_rateLimitWindowStart = now;
+            const auto nowTicks = std::chrono::steady_clock::now().time_since_epoch().count();
+            auto windowStart = m_rateLimitWindowTicks.load(std::memory_order_relaxed);
+            const auto oneSecTicks = std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                std::chrono::seconds(1)).count();
+
+            if (nowTicks - windowStart >= oneSecTicks) {
+                // Window expired: CAS to reset (only one thread wins)
+                if (m_rateLimitWindowTicks.compare_exchange_strong(
+                        windowStart, nowTicks, std::memory_order_relaxed)) {
+                    m_rateLimitCounter.store(0, std::memory_order_relaxed);
+                }
             }
+
             if (m_rateLimitCounter.fetch_add(1, std::memory_order_relaxed) >= limit) {
                 m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
                 return;
@@ -1600,11 +1673,13 @@ private:
 
     // Filtering
     std::unordered_set<std::wstring> m_globalExclusions;
+    std::unordered_set<std::wstring> m_excludedPaths;  // Full-path exclusions (normalized)
 
-    // Rate limiting
+    // Rate limiting (all atomics — accessed from multiple worker threads)
     std::atomic<uint32_t> m_rateLimitPerSec{ 0 };
     std::atomic<uint64_t> m_rateLimitCounter{ 0 };
-    std::chrono::steady_clock::time_point m_rateLimitWindowStart{ std::chrono::steady_clock::now() };
+    std::atomic<int64_t> m_rateLimitWindowTicks{
+        std::chrono::steady_clock::now().time_since_epoch().count() };
 
     // Batch mode
     std::atomic<bool> m_batchMode{ false };
@@ -1631,6 +1706,11 @@ private:
         bool shouldFlush = false;
         {
             std::lock_guard lock(m_batchMutex);
+            // Cap batch buffer to prevent unbounded growth under event flood
+            if (m_batchBuffer.size() >= FileWatcherConstants::MAX_PENDING_EVENTS) {
+                m_stats.eventsDropped.fetch_add(1, std::memory_order_relaxed);
+                return;
+            }
             m_batchBuffer.push_back(event);
             shouldFlush = (m_batchBuffer.size() >= m_batchSize);
         }
@@ -1777,11 +1857,11 @@ void FileWatcher::RemoveExclusionPattern(const std::wstring& pattern) {
 }
 
 void FileWatcher::AddExclusionPath(const std::wstring& path) {
-    m_impl->AddExclusionPattern(path);
+    m_impl->AddExclusionPath(path);
 }
 
 void FileWatcher::RemoveExclusionPath(const std::wstring& path) {
-    m_impl->RemoveExclusionPattern(path);
+    m_impl->RemoveExclusionPath(path);
 }
 
 std::vector<std::wstring> FileWatcher::GetExclusionPatterns() const {
