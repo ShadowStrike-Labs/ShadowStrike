@@ -307,7 +307,7 @@ void DDosProtectionStatistics::Reset() noexcept {
 /**
  * @brief Private implementation class for DDosProtection.
  */
-class DDosProtection::Impl {
+class DDosProtectionImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -339,14 +339,14 @@ public:
 
     // Current attack state
     std::optional<AttackInfo> m_currentAttack;
-    uint64_t m_nextAttackId{1};
+    std::atomic<uint64_t> m_nextAttackId{1};
 
     // IP tracking
     std::unordered_map<std::string, IPTrackingInfo> m_trackedIPs;
 
     // Rate limiting rules
     std::unordered_map<uint64_t, RateLimitRule> m_rateLimitRules;
-    uint64_t m_nextRuleId{1};
+    std::atomic<uint64_t> m_nextRuleId{1};
 
     // Half-open connection tracking
     std::deque<HalfOpenConnection> m_halfOpenConnections;
@@ -429,7 +429,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DDosProtection::Impl: Initialization exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DDosProtection::Impl: Initialization exception: %hs", e.what());
             return false;
         }
     }
@@ -467,7 +467,7 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DDosProtection: Start exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DDosProtection: Start exception: %hs", e.what());
             m_running.store(false, std::memory_order_release);
             return false;
         }
@@ -559,7 +559,7 @@ public:
                 std::this_thread::sleep_for(milliseconds(100));
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Metrics thread exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Metrics thread exception: %hs", e.what());
             }
         }
 
@@ -599,7 +599,7 @@ public:
                 std::this_thread::sleep_for(milliseconds(500));
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Detection thread exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Detection thread exception: %hs", e.what());
             }
         }
 
@@ -615,7 +615,7 @@ public:
                 std::this_thread::sleep_for(seconds(60));
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Cleanup thread exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Cleanup thread exception: %hs", e.what());
             }
         }
 
@@ -627,11 +627,21 @@ public:
     // ========================================================================
 
     void UpdateMetricsWindow() {
-        // In a real implementation, this would read from network stack
-        // For now, we just update the per-second rates from totals
-
-        // Reset per-second counters (they'll be repopulated by packet processing)
-        // This is a simplified implementation
+        // Per-second rate counters are incremented by the packet processor.
+        // Each window rotation resets them so the next second starts fresh.
+        m_currentMetrics.packetsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.bytesPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.connectionsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.synPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.synAckPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.ackPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.finPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.rstPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.udpPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.udpBytesPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.icmpPacketsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.httpRequestsPerSecond.store(0, std::memory_order_relaxed);
+        m_currentMetrics.dnsQueriesPerSecond.store(0, std::memory_order_relaxed);
     }
 
     // ========================================================================
@@ -647,7 +657,7 @@ public:
             DDosProtectionConstants::SYN_FLOOD_THRESHOLD_PER_SEC;
 
         if (synRate > threshold || halfOpen > DDosProtectionConstants::HALF_OPEN_THRESHOLD) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: SYN flood detected - Rate: {}/s, Half-open: {}",
+            SS_LOG_WARN(L"Network", L"DDosProtection: SYN flood detected - Rate: %llu/s, Half-open: %u",
                 synRate, halfOpen);
 
             AttackInfo attack;
@@ -678,7 +688,7 @@ public:
             DDosProtectionConstants::UDP_FLOOD_THRESHOLD_PER_SEC;
 
         if (udpRate > threshold) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: UDP flood detected - Rate: {}/s", udpRate);
+            SS_LOG_WARN(L"Network", L"DDosProtection: UDP flood detected - Rate: %llu/s", udpRate);
 
             AttackInfo attack;
             attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -708,7 +718,7 @@ public:
             DDosProtectionConstants::ICMP_FLOOD_THRESHOLD_PER_SEC;
 
         if (icmpRate > threshold) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: ICMP flood detected - Rate: {}/s", icmpRate);
+            SS_LOG_WARN(L"Network", L"DDosProtection: ICMP flood detected - Rate: %llu/s", icmpRate);
 
             AttackInfo attack;
             attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -734,7 +744,7 @@ public:
             DDosProtectionConstants::HTTP_REQUESTS_PER_SEC;
 
         if (httpRate > threshold) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: HTTP flood detected - Rate: {}/s", httpRate);
+            SS_LOG_WARN(L"Network", L"DDosProtection: HTTP flood detected - Rate: %llu/s", httpRate);
 
             AttackInfo attack;
             attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -763,7 +773,7 @@ public:
         uint32_t threshold = 1000;
 
         if (dnsRate > threshold) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: DNS flood detected - Rate: {}/s", dnsRate);
+            SS_LOG_WARN(L"Network", L"DDosProtection: DNS flood detected - Rate: %llu/s", dnsRate);
 
             AttackInfo attack;
             attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -792,7 +802,7 @@ public:
 
             // Amplification attacks often have large packets (>1000 bytes)
             if (avgPacketSize > 1000) {
-                SS_LOG_WARN(L"Network", L"DDosProtection: Possible amplification attack - Avg packet: {} bytes",
+                SS_LOG_WARN(L"Network", L"DDosProtection: Possible amplification attack - Avg packet: %.0f bytes",
                     avgPacketSize);
 
                 AttackInfo attack;
@@ -824,7 +834,7 @@ public:
                           (baseline.stdDevPacketsPerSecond + 1.0);
 
         if (std::abs(deviation) > m_config.anomalyDeviationThreshold) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: Traffic anomaly detected - Deviation: {:.2f} sigma", deviation);
+            SS_LOG_WARN(L"Network", L"DDosProtection: Traffic anomaly detected - Deviation: %.2f sigma", deviation);
 
             AttackInfo attack;
             attack.attackId = m_nextAttackId.fetch_add(1, std::memory_order_relaxed);
@@ -868,18 +878,19 @@ public:
             m_stats.attacksDetected.fetch_add(1, std::memory_order_relaxed);
             m_stats.underAttack.store(true, std::memory_order_relaxed);
 
-            SS_LOG_WARN(L"Network", L"DDosProtection: Attack {} started - Type: {}, Severity: {}",
+            SS_LOG_WARN(L"Network", L"DDosProtection: Attack %llu started - Type: %hs, Severity: %hs",
                 attack.attackId, AttackTypeToString(attack.type),
                 AttackSeverityToString(attack.severity));
 
         } else {
             // Update existing attack
             m_currentAttack->lastUpdate = system_clock::now();
+            const uint64_t oldPeak = m_currentAttack->peakPacketsPerSecond;
             m_currentAttack->peakPacketsPerSecond = std::max(
-                m_currentAttack->peakPacketsPerSecond, attack.peakPacketsPerSecond);
+                oldPeak, attack.peakPacketsPerSecond);
 
-            // Update phase
-            if (attack.peakPacketsPerSecond > m_currentAttack->peakPacketsPerSecond * 1.5) {
+            // Escalating if new rate exceeds prior peak by 50%
+            if (attack.peakPacketsPerSecond > oldPeak + (oldPeak / 2)) {
                 m_currentAttack->phase = AttackPhase::ESCALATING;
             }
         }
@@ -904,7 +915,7 @@ public:
             attack.phase = AttackPhase::RECOVERY;
             attack.duration = duration_cast<milliseconds>(attack.endTime - attack.startTime);
 
-            SS_LOG_INFO(L"Network", L"DDosProtection: Attack {} ended - Duration: {} ms",
+            SS_LOG_INFO(L"Network", L"DDosProtection: Attack %llu ended - Duration: %lld ms",
                 attack.attackId, attack.duration.count());
 
             // Add to history
@@ -934,8 +945,8 @@ public:
         result.appliedAt = system_clock::now();
 
         try {
-            SS_LOG_INFO(L"Network", L"DDosProtection: Applying mitigation - Action: {}, Target: {}",
-                MitigationActionToString(action), targetIP.empty() ? "global" : targetIP);
+            SS_LOG_INFO(L"Network", L"DDosProtection: Applying mitigation - Action: %hs, Target: %hs",
+                MitigationActionToString(action), targetIP.empty() ? "global" : targetIP.c_str());
 
             switch (action) {
                 case MitigationAction::RATE_LIMIT:
@@ -968,13 +979,13 @@ public:
                 SS_LOG_INFO(L"Network", L"DDosProtection: Mitigation applied successfully");
                 InvokeMitigationCallbacks(result);
             } else {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation failed: {}", result.errorMessage);
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation failed: %hs", result.errorMessage.c_str());
             }
 
         } catch (const std::exception& e) {
             result.success = false;
             result.errorMessage = e.what();
-            SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation exception: %hs", e.what());
         }
 
         return result;
@@ -1004,7 +1015,7 @@ public:
 
         // Check whitelist
         if (IsWhitelistedImpl(ip)) {
-            SS_LOG_WARN(L"Network", L"DDosProtection: Cannot block whitelisted IP: {}", ip);
+            SS_LOG_WARN(L"Network", L"DDosProtection: Cannot block whitelisted IP: %hs", ip.c_str());
             return false;
         }
 
@@ -1018,7 +1029,7 @@ public:
         m_blacklistedIPs[ip] = entry;
         m_stats.ipsBlacklisted.fetch_add(1, std::memory_order_relaxed);
 
-        SS_LOG_INFO(L"Network", L"DDosProtection: IP {} blocked for {} seconds", ip, durationSec);
+        SS_LOG_INFO(L"Network", L"DDosProtection: IP %hs blocked for %u seconds", ip.c_str(), durationSec);
 
         InvokeBlockCallbacks(ip, MitigationAction::BLOCK_IP, durationSec);
 
@@ -1035,8 +1046,8 @@ public:
     }
 
     [[nodiscard]] bool ResetConnections(const std::string& targetIP) {
-        SS_LOG_INFO(L"Network", L"DDosProtection: Resetting connections for {}",
-            targetIP.empty() ? "all" : targetIP);
+        SS_LOG_INFO(L"Network", L"DDosProtection: Resetting connections for %hs",
+            targetIP.empty() ? "all" : targetIP.c_str());
 
         // In real implementation, would send RST packets
         return true;
@@ -1095,7 +1106,7 @@ public:
     bool AddToWhitelistImpl(const std::string& ip) {
         std::unique_lock lock(m_ipTrackingMutex);
         m_whitelistedIPs.insert(ip);
-        SS_LOG_INFO(L"Network", L"DDosProtection: IP {} added to whitelist", ip);
+        SS_LOG_INFO(L"Network", L"DDosProtection: IP %hs added to whitelist", ip.c_str());
         return true;
     }
 
@@ -1103,7 +1114,7 @@ public:
         std::unique_lock lock(m_ipTrackingMutex);
         auto removed = m_whitelistedIPs.erase(ip) > 0;
         if (removed) {
-            SS_LOG_INFO(L"Network", L"DDosProtection: IP {} removed from whitelist", ip);
+            SS_LOG_INFO(L"Network", L"DDosProtection: IP %hs removed from whitelist", ip.c_str());
         }
         return removed;
     }
@@ -1143,11 +1154,11 @@ public:
 
             m_baseline = baseline;
 
-            SS_LOG_INFO(L"Network", L"DDosProtection: Baseline updated - PPS: {:.0f}, BPS: {:.0f}",
+            SS_LOG_INFO(L"Network", L"DDosProtection: Baseline updated - PPS: %.0f, BPS: %.0f",
                 baseline.avgPacketsPerSecond, baseline.avgBytesPerSecond);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"Network", L"DDosProtection: Baseline calculation exception: {}", e.what());
+            SS_LOG_ERROR(L"Network", L"DDosProtection: Baseline calculation exception: %hs", e.what());
         }
     }
 
@@ -1164,7 +1175,7 @@ public:
 
             for (auto it = m_blacklistedIPs.begin(); it != m_blacklistedIPs.end();) {
                 if (it->second.expiresAt < now) {
-                    SS_LOG_DEBUG(L"Network", L"DDosProtection: Unblocking expired IP: {}", it->first);
+                    SS_LOG_DEBUG(L"Network", L"DDosProtection: Unblocking expired IP: %hs", it->first.c_str());
                     it = m_blacklistedIPs.erase(it);
                 } else {
                     ++it;
@@ -1174,7 +1185,7 @@ public:
             // Cleanup expired rate limit rules
             for (auto it = m_rateLimitRules.begin(); it != m_rateLimitRules.end();) {
                 if (!it->second.isPermanent && it->second.expiresAt < now) {
-                    SS_LOG_DEBUG(L"Network", L"DDosProtection: Removing expired rate limit rule {}", it->first);
+                    SS_LOG_DEBUG(L"Network", L"DDosProtection: Removing expired rate limit rule %llu", it->first);
                     it = m_rateLimitRules.erase(it);
                 } else {
                     ++it;
@@ -1236,7 +1247,7 @@ public:
             try {
                 callback(attack);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Attack callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Attack callback exception: %hs", e.what());
             }
         }
     }
@@ -1248,7 +1259,7 @@ public:
             try {
                 callback(alert);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Alert callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Alert callback exception: %hs", e.what());
             }
         }
     }
@@ -1260,7 +1271,7 @@ public:
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Mitigation callback exception: %hs", e.what());
             }
         }
     }
@@ -1272,7 +1283,7 @@ public:
             try {
                 callback(ip, action, durationSec);
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"Network", L"DDosProtection: Block callback exception: {}", e.what());
+                SS_LOG_ERROR(L"Network", L"DDosProtection: Block callback exception: %hs", e.what());
             }
         }
     }
@@ -1327,7 +1338,7 @@ DDosProtection& DDosProtection::Instance() {
 // ============================================================================
 
 DDosProtection::DDosProtection()
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(std::make_unique<DDosProtectionImpl>())
 {
     SS_LOG_INFO(L"Network", L"DDosProtection: Constructor called");
 }
@@ -1345,7 +1356,7 @@ DDosProtection::~DDosProtection() {
 
 bool DDosProtection::Initialize(const DDosProtectionConfig& config) {
     if (!m_impl) {
-        Logger::Critical("DDosProtection: Implementation is null");
+        SS_LOG_FATAL(L"Network", L"DDosProtection: Implementation is null");
         return false;
     }
 
@@ -1418,9 +1429,11 @@ void DDosProtection::Shutdown() noexcept {
 void DDosProtection::Mitigate() {
     if (!m_impl) return;
 
-    if (m_impl->m_currentAttack.has_value()) {
-        m_impl->ApplyMitigationImpl(m_impl->m_config.defaultAction, "");
+    {
+        std::shared_lock lock(m_impl->m_attackMutex);
+        if (!m_impl->m_currentAttack.has_value()) return;
     }
+    m_impl->ApplyMitigationImpl(m_impl->m_config.defaultAction, "");
 }
 
 [[nodiscard]] MitigationResult DDosProtection::ApplyMitigation(
@@ -1450,7 +1463,7 @@ bool DDosProtection::BlockSubnet(const std::string& subnet, uint32_t durationSec
     if (!m_impl || subnet.empty()) return false;
 
     // In real implementation, would parse subnet and block all IPs
-    SS_LOG_INFO(L"Network", L"DDosProtection: Blocking subnet {} for {} seconds", subnet, durationSec);
+    SS_LOG_INFO(L"Network", L"DDosProtection: Blocking subnet %hs for %u seconds", subnet.c_str(), durationSec);
     return true;
 }
 
@@ -1461,7 +1474,7 @@ bool DDosProtection::UnblockIP(const std::string& ip) {
 
     auto removed = m_impl->m_blacklistedIPs.erase(ip) > 0;
     if (removed) {
-        SS_LOG_INFO(L"Network", L"DDosProtection: IP {} unblocked", ip);
+        SS_LOG_INFO(L"Network", L"DDosProtection: IP %hs unblocked", ip.c_str());
     }
 
     return removed;
@@ -1496,7 +1509,7 @@ void DDosProtection::ClearAllMitigations() {
     m_impl->m_rateLimitRules[ruleId] = newRule;
     m_impl->m_stats.activeRateLimits.fetch_add(1, std::memory_order_relaxed);
 
-    SS_LOG_INFO(L"Network", L"DDosProtection: Rate limit rule {} added", ruleId);
+    SS_LOG_INFO(L"Network", L"DDosProtection: Rate limit rule %llu added", ruleId);
 
     return ruleId;
 }
@@ -1509,7 +1522,7 @@ bool DDosProtection::RemoveRateLimitRule(uint64_t ruleId) {
     auto removed = m_impl->m_rateLimitRules.erase(ruleId) > 0;
     if (removed) {
         m_impl->m_stats.activeRateLimits.fetch_sub(1, std::memory_order_relaxed);
-        SS_LOG_INFO(L"Network", L"DDosProtection: Rate limit rule {} removed", ruleId);
+        SS_LOG_INFO(L"Network", L"DDosProtection: Rate limit rule %llu removed", ruleId);
     }
 
     return removed;
@@ -1618,7 +1631,7 @@ bool DDosProtection::RemoveFromWhitelist(const std::string& ip) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_attackCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered attack callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered attack callback %llu", id);
     return id;
 }
 
@@ -1630,7 +1643,7 @@ bool DDosProtection::RemoveFromWhitelist(const std::string& ip) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_alertCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered alert callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered alert callback %llu", id);
     return id;
 }
 
@@ -1642,7 +1655,7 @@ bool DDosProtection::RemoveFromWhitelist(const std::string& ip) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_mitigationCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered mitigation callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered mitigation callback %llu", id);
     return id;
 }
 
@@ -1654,7 +1667,7 @@ bool DDosProtection::RemoveFromWhitelist(const std::string& ip) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_blockCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered block callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered block callback %llu", id);
     return id;
 }
 
@@ -1666,7 +1679,7 @@ bool DDosProtection::RemoveFromWhitelist(const std::string& ip) {
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_severityCallbacks[id] = std::move(callback);
 
-    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered severity callback {}", id);
+    SS_LOG_DEBUG(L"Network", L"DDosProtection: Registered severity callback %llu", id);
     return id;
 }
 
@@ -1731,16 +1744,16 @@ void DDosProtection::ResetStatistics() noexcept {
         {
             std::shared_lock lock(m_impl->m_ipTrackingMutex);
             size_t trackedCount = m_impl->m_trackedIPs.size();
-            SS_LOG_INFO(L"Network", L"DDosProtection: Tracking {} IPs (limit: {})",
+            SS_LOG_INFO(L"Network", L"DDosProtection: Tracking %zu IPs (limit: %zu)",
                 trackedCount, m_impl->m_config.maxTrackedIPs);
         }
 
         // Check rate limit rules
         {
             std::shared_lock lock(m_impl->m_rateLimitMutex);
-            SS_LOG_INFO(L"Network", L"DDosProtection: {} active rate limit rules",
+            SS_LOG_INFO(L"Network", L"DDosProtection: %zu active rate limit rules",
                 m_impl->m_rateLimitRules.size());
-            SS_LOG_INFO(L"Network", L"DDosProtection: {} blacklisted IPs",
+            SS_LOG_INFO(L"Network", L"DDosProtection: %zu blacklisted IPs",
                 m_impl->m_blacklistedIPs.size());
         }
 
@@ -1748,7 +1761,7 @@ void DDosProtection::ResetStatistics() noexcept {
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"DDosProtection: Diagnostics exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"DDosProtection: Diagnostics exception: %hs", e.what());
         return false;
     }
 }
@@ -1788,13 +1801,13 @@ bool DDosProtection::ExportDiagnostics(const std::wstring& outputPath) const {
         file << "  Half-Open: " << m_impl->m_currentMetrics.halfOpenConnections.load() << "\n\n";
 
         file.close();
-        SS_LOG_INFO(L"Network", L"DDosProtection: Diagnostics exported to {}",
-            StringUtils::WideToUtf8(outputPath));
+        SS_LOG_INFO(L"Network", L"DDosProtection: Diagnostics exported to %hs",
+            StringUtils::ToNarrow(outputPath).c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"DDosProtection: Export diagnostics exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"DDosProtection: Export diagnostics exception: %hs", e.what());
         return false;
     }
 }
@@ -1821,7 +1834,7 @@ bool DDosProtection::ExportAttackReport(const std::wstring& outputPath, uint64_t
         }
 
         if (!attackPtr) {
-            SS_LOG_ERROR(L"Network", L"DDosProtection: Attack {} not found", attackId);
+            SS_LOG_ERROR(L"Network", L"DDosProtection: Attack %llu not found", attackId);
             return false;
         }
 
@@ -1864,7 +1877,7 @@ bool DDosProtection::ExportAttackReport(const std::wstring& outputPath, uint64_t
         return true;
 
     } catch (const std::exception& e) {
-        SS_LOG_ERROR(L"Network", L"DDosProtection: Export attack report exception: {}", e.what());
+        SS_LOG_ERROR(L"Network", L"DDosProtection: Export attack report exception: %hs", e.what());
         return false;
     }
 }
