@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -786,8 +787,8 @@ std::string FileScanRequest::ToJson() const {
     std::ostringstream oss;
     oss << "{"
         << "\"messageId\":" << messageId << ","
-        << "\"filePath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(filePath)) << "\","
-        << "\"processName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(processName)) << "\","
+        << "\"filePath\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(filePath)) << "\","
+        << "\"processName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(processName)) << "\","
         << "\"processId\":" << processId << ","
         << "\"fileSize\":" << fileSize << ","
         << "\"isDirectory\":" << (isDirectory ? "true" : "false") << ","
@@ -803,8 +804,8 @@ std::string ProcessNotification::ToJson() const {
         << "\"messageId\":" << messageId << ","
         << "\"processId\":" << processId << ","
         << "\"parentProcessId\":" << parentProcessId << ","
-        << "\"imagePath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(imagePath)) << "\","
-        << "\"commandLine\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(commandLine)) << "\","
+        << "\"imagePath\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(imagePath)) << "\","
+        << "\"commandLine\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(commandLine)) << "\","
         << "\"isWow64\":" << (isWow64 ? "true" : "false") << ","
         << "\"isElevated\":" << (isElevated ? "true" : "false") << ","
         << "\"requiresReply\":" << (requiresReply ? "true" : "false")
@@ -817,8 +818,8 @@ std::string RegistryNotification::ToJson() const {
     oss << "{"
         << "\"messageId\":" << messageId << ","
         << "\"processId\":" << processId << ","
-        << "\"keyPath\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(keyPath)) << "\","
-        << "\"valueName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(valueName)) << "\","
+        << "\"keyPath\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(keyPath)) << "\","
+        << "\"valueName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(valueName)) << "\","
         << "\"operationType\":" << operationType << ","
         << "\"valueType\":" << valueType << ","
         << "\"requiresReply\":" << (requiresReply ? "true" : "false")
@@ -836,7 +837,7 @@ std::string ScanVerdictReply::ToJson() const {
         << "\"threatScore\":" << static_cast<int>(threatScore) << ","
         << "\"shouldCache\":" << (shouldCache ? "true" : "false") << ","
         << "\"cacheTTL\":" << cacheTTL << ","
-        << "\"threatName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(threatName)) << "\""
+        << "\"threatName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(threatName)) << "\""
         << "}";
     return oss.str();
 }
@@ -844,7 +845,7 @@ std::string ScanVerdictReply::ToJson() const {
 std::string CommunicationConfig::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"portName\":\"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(portName)) << "\","
+        << "\"portName\":\"" << EscapeJsonString(Utils::StringUtils::ToNarrow(portName)) << "\","
         << "\"replyTimeoutMs\":" << replyTimeoutMs << ","
         << "\"reconnectIntervalMs\":" << reconnectIntervalMs << ","
         << "\"maxReconnectAttempts\":" << maxReconnectAttempts << ","

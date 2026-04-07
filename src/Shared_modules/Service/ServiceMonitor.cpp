@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -16,8 +17,8 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include "ServiceMonitor.hpp"
-#include "../../Utils/Logger.hpp"
-#include "../../Utils/SystemUtils.hpp"
+#include "../Utils/Logger.hpp"
+#include "../Utils/SystemUtils.hpp"
 
 #include <windows.h>
 #include <psapi.h>
@@ -34,6 +35,10 @@
 
 namespace ShadowStrike {
     namespace Service {
+
+        namespace {
+            constexpr const wchar_t* kServiceMonitorLogCategory = L"ServiceMonitor";
+        }
 
         // ------------------------------------------------------------------------------------------------
         // Implementation Class
@@ -132,10 +137,10 @@ namespace ShadowStrike {
 
             try {
                 m_monitorThread = std::thread(&ServiceMonitorImpl::MonitorLoop, this);
-                Logger::Info("ServiceMonitor: Monitoring thread started");
+                SS_LOG_INFO(kServiceMonitorLogCategory, L"Monitoring thread started");
                 return true;
             } catch (const std::exception& e) {
-                Logger::Critical("ServiceMonitor: Failed to start monitoring thread: {}", e.what());
+                SS_LOG_FATAL(kServiceMonitorLogCategory, L"Failed to start monitoring thread: %hs", e.what());
                 m_isRunning = false;
                 return false;
             }
@@ -150,7 +155,7 @@ namespace ShadowStrike {
             if (m_monitorThread.joinable()) {
                 m_monitorThread.join();
             }
-            Logger::Info("ServiceMonitor: Monitoring thread stopped");
+            SS_LOG_INFO(kServiceMonitorLogCategory, L"Monitoring thread stopped");
         }
 
         void ServiceMonitor::ServiceMonitorImpl::UpdateHeartbeat() {
@@ -190,19 +195,20 @@ namespace ShadowStrike {
 
                 return j.dump();
             } catch (const std::exception& e) {
-                Logger::Error("ServiceMonitor: Failed to generate diagnostics JSON: {}", e.what());
+                SS_LOG_ERROR(kServiceMonitorLogCategory, L"Failed to generate diagnostics JSON: %hs", e.what());
                 return "{}";
             }
         }
 
         void ServiceMonitor::ServiceMonitorImpl::SetMaxMemoryLimit(uint64_t bytes) {
             m_maxMemoryBytes = bytes;
-            Logger::Info("ServiceMonitor: Memory limit set to {} bytes", bytes);
+            SS_LOG_INFO(kServiceMonitorLogCategory, L"Memory limit set to %llu bytes",
+                static_cast<unsigned long long>(bytes));
         }
 
         void ServiceMonitor::ServiceMonitorImpl::SetMaxCpuLimit(double percent) {
             m_maxCpuPercent = percent;
-            Logger::Info("ServiceMonitor: CPU limit set to {:.2f}%", percent);
+            SS_LOG_INFO(kServiceMonitorLogCategory, L"CPU limit set to %.2f%%", percent);
         }
 
         void ServiceMonitor::ServiceMonitorImpl::SetHeartbeatTimeout(std::chrono::milliseconds timeout) {
@@ -307,7 +313,8 @@ namespace ShadowStrike {
                 healthy = false;
                 status.str("");
                 status << "High Memory Usage: " << (newStats.memoryUsageBytes / 1024 / 1024) << "MB";
-                Logger::Warn("ServiceMonitor: Memory limit exceeded: {} bytes", newStats.memoryUsageBytes);
+                SS_LOG_WARN(kServiceMonitorLogCategory, L"Memory limit exceeded: %llu bytes",
+                    static_cast<unsigned long long>(newStats.memoryUsageBytes));
             }
 
             if (newStats.cpuUsagePercent > m_maxCpuPercent) {
@@ -323,7 +330,8 @@ namespace ShadowStrike {
                 healthy = false;
                 status.str("");
                 status << "Service Hung (No Heartbeat for " << timeSinceLastHeartbeat.count() << "ms)";
-                Logger::Error("ServiceMonitor: Hang detected! No heartbeat for {} ms", timeSinceLastHeartbeat.count());
+                SS_LOG_ERROR(kServiceMonitorLogCategory, L"Hang detected: no heartbeat for %lld ms",
+                    static_cast<long long>(timeSinceLastHeartbeat.count()));
             }
 
             newStats.isHealthy = healthy;
