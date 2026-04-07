@@ -117,7 +117,7 @@
  */
 
 #include"pch.h"
-#include"Utils/StringUtils.hpp"
+#include"../Utils/StringUtils.hpp"
 #include "ConfigurationDB.hpp"
 #include"DatabaseManager.hpp"
 #include "../Utils/FileUtils.hpp"

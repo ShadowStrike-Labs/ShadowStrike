@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -416,7 +417,7 @@ namespace PEParser {
     if (magic == PE64_MAGIC) {
         outIs64Bit = true;
         // Minimum: base optional header without any data directories
-        constexpr size_t kMinPE64Header = offsetof(OptionalHeader64, DataDirectory);
+        constexpr size_t kMinPE64Header = sizeof(OptionalHeader64);
         if (outFileHeader.SizeOfOptionalHeader < kMinPE64Header) {
             if (err) {
                 err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,
@@ -427,7 +428,7 @@ namespace PEParser {
         }
     } else if (magic == PE32_MAGIC) {
         outIs64Bit = false;
-        constexpr size_t kMinPE32Header = offsetof(OptionalHeader32, DataDirectory);
+        constexpr size_t kMinPE32Header = sizeof(OptionalHeader32);
         if (outFileHeader.SizeOfOptionalHeader < kMinPE32Header) {
             if (err) {
                 err->Set(ValidationResult::SizeOfOptionalHeaderTooSmall,

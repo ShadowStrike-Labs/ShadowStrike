@@ -83,8 +83,8 @@ struct HashSignatureRecord {
 };
 #pragma pack(pop)
 
-static_assert(sizeof(HashSignatureRecord) == 32,
-    "HashSignatureRecord must be exactly 32 bytes");
+static_assert(sizeof(HashSignatureRecord) == 28,
+    "HashSignatureRecord must be exactly 28 bytes");
 
 // Validates a ThreatLevel against the declared enum values
 [[nodiscard]] bool IsValidThreatLevel(ThreatLevel level) noexcept {

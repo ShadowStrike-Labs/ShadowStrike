@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -451,7 +452,7 @@ public:
                 }
 
                 if (!sec.isExecutable) {
-                    m_info.anomalies.emplace_back(AnomalyType::EntryPointInNonExecutable,
+                    m_info.anomalies.emplace_back(AnomalyType::CodeOutsideCodeSection,
                                                   L"Entry point in non-executable section");
                 }
 
@@ -1038,7 +1039,7 @@ public:
                 if (tls.AddressOfCallBacks >= m_info.imageBase) {
                     const uint64_t callbacksRva = tls.AddressOfCallBacks - m_info.imageBase;
                     if (callbacksRva > static_cast<uint64_t>(UINT32_MAX)) {
-                        SS_LOG_WARNING(L"PEParser",
+                        SS_LOG_WARN(L"PEParser",
                             L"TLS callback VA exceeds 32-bit RVA range; skipping callbacks");
                         m_info.anomalies.emplace_back(AnomalyType::TLSCallbackPresent,
                             L"TLS callback address produces RVA > UINT32_MAX — possible crafted PE");
