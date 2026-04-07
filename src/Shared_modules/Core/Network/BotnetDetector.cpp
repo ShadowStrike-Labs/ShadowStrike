@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -292,7 +292,7 @@ public:
     std::atomic<bool> m_running{false};
 
     /// @brief Statistics
-    BotnetDetectorStatistics m_statistics;
+    mutable BotnetDetectorStatistics m_statistics;
 
     /// @brief Connection tracking
     struct ConnectionTracking {
@@ -315,7 +315,7 @@ public:
         uint64_t packetsReceived{0};
 
         BeaconAnalysis beaconAnalysis;
-        std::vector<DGAAnalysis> dgaAnalyses;
+        std::vector<BotnetDGAAnalysis> dgaAnalyses;
         std::vector<C2Detection> c2Detections;
 
         uint8_t riskScore{0};
@@ -327,7 +327,7 @@ public:
     std::atomic<uint64_t> m_nextConnectionId{1};
 
     /// @brief DGA cache
-    std::unordered_map<std::string, DGAAnalysis> m_dgaCache;
+    std::unordered_map<std::string, BotnetDGAAnalysis> m_dgaCache;
     mutable std::shared_mutex m_dgaCacheMutex;
 
     /// @brief Botnet signatures
@@ -343,7 +343,7 @@ public:
     /// @brief Callbacks
     std::unordered_map<uint64_t, BotnetAlertCallback> m_alertCallbacks;
     std::unordered_map<uint64_t, BeaconCallback> m_beaconCallbacks;
-    std::unordered_map<uint64_t, DGACallback> m_dgaCallbacks;
+    std::unordered_map<uint64_t, BotnetDGACallback> m_dgaCallbacks;
     std::unordered_map<uint64_t, C2Callback> m_c2Callbacks;
     std::unordered_map<uint64_t, FamilyCallback> m_familyCallbacks;
     mutable std::mutex m_callbacksMutex;
@@ -381,7 +381,7 @@ public:
     [[nodiscard]] double CalculateBeaconConfidence(const BeaconAnalysis& analysis) const;
 
     // DGA detection
-    [[nodiscard]] DGAAnalysis AnalyzeDGAInternal(const std::string& domain);
+    [[nodiscard]] BotnetDGAAnalysis AnalyzeDGAInternal(const std::string& domain);
     [[nodiscard]] double CalculateBigramFrequency(const std::string& domain) const;
     [[nodiscard]] double CalculateTrigramFrequency(const std::string& domain) const;
     [[nodiscard]] bool ContainsDictionaryWord(const std::string& domain) const;
@@ -832,8 +832,8 @@ double BotnetDetector::BotnetDetectorImpl::CalculateBeaconConfidence(const Beaco
 // IMPL: DGA DETECTION
 // ============================================================================
 
-DGAAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeDGAInternal(const std::string& domain) {
-    DGAAnalysis analysis;
+BotnetDGAAnalysis BotnetDetector::BotnetDetectorImpl::AnalyzeDGAInternal(const std::string& domain) {
+    BotnetDGAAnalysis analysis;
     analysis.domain = domain;
 
     try {
@@ -1562,8 +1562,8 @@ bool BotnetDetector::IsDGADomain(const std::string& domain) {
     return result;
 }
 
-DGAAnalysis BotnetDetector::AnalyzeDGA(const std::string& domain) {
-    if (!m_impl) return DGAAnalysis{};
+BotnetDGAAnalysis BotnetDetector::AnalyzeDGA(const std::string& domain) {
+    if (!m_impl) return BotnetDGAAnalysis{};
 
     // Check DGA cache first
     {
@@ -1587,10 +1587,10 @@ DGAAnalysis BotnetDetector::AnalyzeDGA(const std::string& domain) {
     return analysis;
 }
 
-std::unordered_map<std::string, DGAAnalysis> BotnetDetector::AnalyzeDGABatch(
+std::unordered_map<std::string, BotnetDGAAnalysis> BotnetDetector::AnalyzeDGABatch(
     const std::vector<std::string>& domains)
 {
-    std::unordered_map<std::string, DGAAnalysis> results;
+    std::unordered_map<std::string, BotnetDGAAnalysis> results;
 
     if (!m_impl) return results;
 
@@ -1873,7 +1873,7 @@ uint64_t BotnetDetector::RegisterBeaconCallback(BeaconCallback callback) {
     return id;
 }
 
-uint64_t BotnetDetector::RegisterDGACallback(DGACallback callback) {
+uint64_t BotnetDetector::RegisterDGACallback(BotnetDGACallback callback) {
     if (!m_impl) return 0;
 
     std::lock_guard lock(m_impl->m_callbacksMutex);

@@ -171,6 +171,113 @@ EmailAddress ParseEmailAddress(const std::string& input) {
     return addr;
 }
 
+[[nodiscard]] std::string ToLowerASCII(std::string value) {
+    std::transform(value.begin(), value.end(), value.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return value;
+}
+
+std::string NormalizeEmail(std::string_view input) {
+    auto parsed = ParseEmailAddress(std::string(input));
+    std::string normalized = parsed.localPart;
+    if (!parsed.domain.empty()) {
+        if (!normalized.empty()) {
+            normalized.push_back('@');
+        }
+        normalized += parsed.domain;
+    }
+    if (normalized.empty()) {
+        normalized.assign(input.begin(), input.end());
+    }
+
+    std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+        [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+    return normalized;
+}
+
+[[nodiscard]] std::vector<std::string> DetectHTMLExploits(std::string_view html) {
+    std::vector<std::string> findings;
+    if (html.empty()) {
+        return findings;
+    }
+
+    const auto lowerHtml = ToLowerASCII(std::string(html));
+    const auto addFinding = [&findings](const char* finding) {
+        const std::string value(finding);
+        if (std::find(findings.begin(), findings.end(), value) == findings.end()) {
+            findings.emplace_back(value);
+        }
+    };
+
+    if (lowerHtml.find("<script") != std::string::npos) {
+        addFinding("HTML body contains script tag");
+    }
+    if (lowerHtml.find("javascript:") != std::string::npos) {
+        addFinding("HTML body contains javascript URI");
+    }
+    if (lowerHtml.find("data:text/html") != std::string::npos ||
+        lowerHtml.find("data:application") != std::string::npos) {
+        addFinding("HTML body contains inline data URI payload");
+    }
+    if (lowerHtml.find("onload=") != std::string::npos ||
+        lowerHtml.find("onerror=") != std::string::npos ||
+        lowerHtml.find("onclick=") != std::string::npos) {
+        addFinding("HTML body contains inline event handler");
+    }
+    if (lowerHtml.find("<iframe") != std::string::npos ||
+        lowerHtml.find("<object") != std::string::npos ||
+        lowerHtml.find("<embed") != std::string::npos) {
+        addFinding("HTML body contains active embedded content");
+    }
+
+    return findings;
+}
+
+[[nodiscard]] bool ContainsEicar(std::span<const uint8_t> data) {
+    if (data.empty()) {
+        return false;
+    }
+
+    constexpr std::string_view kEicar =
+        "X5O!P%@AP[4\\PZX54(P^)7CC)7}$EICAR-STANDARD-ANTIVIRUS-TEST-FILE!$H+H*";
+
+    const std::string content(reinterpret_cast<const char*>(data.data()), data.size());
+    return content.find(kEicar) != std::string::npos;
+}
+
+[[nodiscard]] bool ContainsOLEObject(std::span<const uint8_t> data) {
+    static constexpr uint8_t kOleHeader[] = { 0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1 };
+    return data.size() >= std::size(kOleHeader) &&
+        std::equal(std::begin(kOleHeader), std::end(kOleHeader), data.begin());
+}
+
+[[nodiscard]] bool HasRTLOCharacter(std::string_view fileName) {
+    return fileName.find("\xE2\x80\xAE") != std::string_view::npos;
+}
+
+[[nodiscard]] bool HasDoubleExtension(std::string_view fileName) {
+    const auto firstDot = fileName.find('.');
+    if (firstDot == std::string_view::npos) {
+        return false;
+    }
+
+    const auto lastDot = fileName.rfind('.');
+    if (lastDot == std::string_view::npos || firstDot == lastDot || lastDot + 1 >= fileName.size()) {
+        return false;
+    }
+
+    const auto secondExt = ToLowerASCII(std::string(fileName.substr(lastDot + 1)));
+    static const std::array<std::string_view, 12> kExecutableExts = {
+        "exe", "scr", "com", "pif", "bat", "cmd", "js", "jse", "vbs", "vbe", "ps1", "hta"
+    };
+    for (const auto candidate : kExecutableExts) {
+        if (secondExt == candidate) {
+            return true;
+        }
+    }
+    return false;
+}
+
 /**
  * @brief Extract URLs from text content.
  */

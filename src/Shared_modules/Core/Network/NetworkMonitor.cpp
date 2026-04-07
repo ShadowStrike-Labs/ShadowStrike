@@ -488,7 +488,7 @@ uint64_t IPRange::GetAddressCount() const noexcept {
 // PIMPL Implementation
 // ============================================================================
 
-struct NetworkMonitor::NetworkMonitorImpl {
+struct NetworkMonitorImpl {
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 

@@ -156,6 +156,14 @@
 #include <shared_mutex>
 #include <span>
 
+// Undefine Windows macros that clash with our enum/constant names
+#ifdef TRANSPARENT
+#undef TRANSPARENT
+#endif
+#ifdef MAX_ADAPTER_NAME_LENGTH
+#undef MAX_ADAPTER_NAME_LENGTH
+#endif
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {

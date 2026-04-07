@@ -403,7 +403,7 @@ void WebProtectionStatistics::Reset() noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class WebProtection::WebProtectionImpl {
+class WebProtectionImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -526,7 +526,7 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool WebProtection::WebProtectionImpl::Initialize(const WebProtectionConfig& config) noexcept {
+bool WebProtectionImpl::Initialize(const WebProtectionConfig& config) noexcept {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
             SS_LOG_WARN(L"Network", L"WebProtection: Already initialized");
@@ -562,7 +562,7 @@ bool WebProtection::WebProtectionImpl::Initialize(const WebProtectionConfig& con
     }
 }
 
-void WebProtection::WebProtectionImpl::Shutdown() noexcept {
+void WebProtectionImpl::Shutdown() noexcept {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
@@ -614,7 +614,7 @@ void WebProtection::WebProtectionImpl::Shutdown() noexcept {
     }
 }
 
-bool WebProtection::WebProtectionImpl::Start() noexcept {
+bool WebProtectionImpl::Start() noexcept {
     try {
         if (!m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_ERROR(L"Network", L"WebProtection: Not initialized");
@@ -636,7 +636,7 @@ bool WebProtection::WebProtectionImpl::Start() noexcept {
     }
 }
 
-void WebProtection::WebProtectionImpl::Stop() noexcept {
+void WebProtectionImpl::Stop() noexcept {
     if (m_running.exchange(false, std::memory_order_acq_rel)) {
         SS_LOG_INFO(L"Network", L"WebProtection: Stopped");
     }
@@ -646,7 +646,7 @@ void WebProtection::WebProtectionImpl::Stop() noexcept {
 // IMPL: CONTENT ANALYSIS
 // ============================================================================
 
-WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
+WebContentAnalysis WebProtectionImpl::AnalyzeContentInternal(
     const std::string& url,
     std::span<const uint8_t> content,
     const std::string& contentType)
@@ -873,7 +873,7 @@ WebContentAnalysis WebProtection::WebProtectionImpl::AnalyzeContentInternal(
     return analysis;
 }
 
-ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
+ScriptAnalysis WebProtectionImpl::AnalyzeScriptInternal(
     const std::string& script,
     const std::string& sourceUrl)
 {
@@ -1030,7 +1030,7 @@ ScriptAnalysis WebProtection::WebProtectionImpl::AnalyzeScriptInternal(
     return analysis;
 }
 
-bool WebProtection::WebProtectionImpl::SanitizeResponseInternal(
+bool WebProtectionImpl::SanitizeResponseInternal(
     const std::string& host,
     std::string& htmlContent)
 {
@@ -1187,7 +1187,7 @@ bool WebProtection::WebProtectionImpl::SanitizeResponseInternal(
 // IMPL: CERTIFICATE VALIDATION
 // ============================================================================
 
-CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInternal(
+CertificateValidation WebProtectionImpl::ValidateCertificateInternal(
     const std::string& host,
     const std::vector<std::vector<uint8_t>>& certChain)
 {
@@ -1409,7 +1409,7 @@ CertificateValidation WebProtection::WebProtectionImpl::ValidateCertificateInter
     return validation;
 }
 
-bool WebProtection::WebProtectionImpl::CheckCertificatePin(
+bool WebProtectionImpl::CheckCertificatePin(
     const std::string& host,
     const std::vector<std::vector<uint8_t>>& certChain,
     std::string& matchedPin)
@@ -1484,7 +1484,7 @@ bool WebProtection::WebProtectionImpl::CheckCertificatePin(
 // IMPL: FORM PROTECTION
 // ============================================================================
 
-FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
+FormProtectionResult WebProtectionImpl::AnalyzeFormInternal(
     const std::string& formHtml,
     const std::string& pageUrl)
 {
@@ -1641,7 +1641,7 @@ FormProtectionResult WebProtection::WebProtectionImpl::AnalyzeFormInternal(
 // IMPL: EXPLOIT DETECTION
 // ============================================================================
 
-ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
+ExploitAnalysis WebProtectionImpl::AnalyzeExploitsInternal(
     std::span<const uint8_t> content,
     WebContentType contentType)
 {
@@ -1726,7 +1726,7 @@ ExploitAnalysis WebProtection::WebProtectionImpl::AnalyzeExploitsInternal(
 // IMPL: PRIVACY ANALYSIS
 // ============================================================================
 
-PrivacyAnalysis WebProtection::WebProtectionImpl::AnalyzePrivacyInternal(
+PrivacyAnalysis WebProtectionImpl::AnalyzePrivacyInternal(
     const std::string& content,
     const std::string& url)
 {
@@ -1810,7 +1810,7 @@ PrivacyAnalysis WebProtection::WebProtectionImpl::AnalyzePrivacyInternal(
 // IMPL: ALERT GENERATION
 // ============================================================================
 
-void WebProtection::WebProtectionImpl::GenerateAlert(
+void WebProtectionImpl::GenerateAlert(
     const std::string& url,
     WebThreatType threatType,
     uint8_t severity,
@@ -1873,7 +1873,7 @@ void WebProtection::WebProtectionImpl::GenerateAlert(
 // IMPL: HELPER METHODS
 // ============================================================================
 
-WebContentType WebProtection::WebProtectionImpl::DetermineContentType(const std::string& mimeType) const {
+WebContentType WebProtectionImpl::DetermineContentType(const std::string& mimeType) const {
     if (mimeType.empty()) return WebContentType::UNKNOWN;
 
     std::string lower = mimeType;
@@ -1895,7 +1895,7 @@ WebContentType WebProtection::WebProtectionImpl::DetermineContentType(const std:
     return WebContentType::OTHER;
 }
 
-std::string WebProtection::WebProtectionImpl::ExtractHost(const std::string& url) const {
+std::string WebProtectionImpl::ExtractHost(const std::string& url) const {
     try {
         // Simple host extraction (real implementation would be more robust)
         size_t hostStart = url.find("://");
@@ -1922,7 +1922,7 @@ std::string WebProtection::WebProtectionImpl::ExtractHost(const std::string& url
     }
 }
 
-bool WebProtection::WebProtectionImpl::IsTrackerDomain(const std::string& domain) const {
+bool WebProtectionImpl::IsTrackerDomain(const std::string& domain) const {
     for (const auto& tracker : TRACKER_DOMAINS) {
         if (domain.find(tracker) != std::string::npos) {
             return true;

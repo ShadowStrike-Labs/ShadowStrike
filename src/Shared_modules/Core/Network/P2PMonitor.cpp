@@ -1162,6 +1162,11 @@ public:
         }
     }
 
+    void SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
+        std::unique_lock lock(m_mutex);
+        m_threatIntel = store;
+    }
+
 private:
     // ========================================================================
     // INTERNAL HELPERS
@@ -1623,8 +1628,7 @@ bool P2PMonitor::ExportDiagnostics(const std::wstring& outputPath) const {
 
 void P2PMonitor::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
     if (!m_impl) return;
-    std::unique_lock lock(m_impl->m_mutex);
-    m_impl->m_threatIntel = store;
+    m_impl->SetThreatIntelStore(store);
     SS_LOG_INFO(L"Network", L"P2PMonitor: ThreatIntelStore %ls",
                 store ? L"wired" : L"cleared");
 }

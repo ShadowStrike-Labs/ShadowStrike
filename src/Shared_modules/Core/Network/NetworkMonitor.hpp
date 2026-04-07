@@ -620,6 +620,44 @@ struct alignas(64) BandwidthStats {
     std::chrono::steady_clock::time_point lastUpdate;
     std::chrono::steady_clock::time_point lastRateCalc;
 
+    BandwidthStats() = default;
+    BandwidthStats(const BandwidthStats& other) noexcept
+        : bytesReceived(other.bytesReceived.load(std::memory_order_relaxed)),
+          bytesSent(other.bytesSent.load(std::memory_order_relaxed)),
+          packetsReceived(other.packetsReceived.load(std::memory_order_relaxed)),
+          packetsSent(other.packetsSent.load(std::memory_order_relaxed)),
+          receiveRate(other.receiveRate.load(std::memory_order_relaxed)),
+          sendRate(other.sendRate.load(std::memory_order_relaxed)),
+          peakReceiveRate(other.peakReceiveRate.load(std::memory_order_relaxed)),
+          peakSendRate(other.peakSendRate.load(std::memory_order_relaxed)),
+          lastUpdate(other.lastUpdate),
+          lastRateCalc(other.lastRateCalc) {
+    }
+
+    BandwidthStats& operator=(const BandwidthStats& other) noexcept {
+        if (this != &other) {
+            bytesReceived.store(other.bytesReceived.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            bytesSent.store(other.bytesSent.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            packetsReceived.store(other.packetsReceived.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            packetsSent.store(other.packetsSent.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            receiveRate.store(other.receiveRate.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            sendRate.store(other.sendRate.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            peakReceiveRate.store(other.peakReceiveRate.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            peakSendRate.store(other.peakSendRate.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            lastUpdate = other.lastUpdate;
+            lastRateCalc = other.lastRateCalc;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
 };
 
@@ -742,6 +780,69 @@ struct alignas(64) ConnectionFilter {
     // Statistics
     std::atomic<uint64_t> hitCount{ 0 };
     std::chrono::system_clock::time_point lastHitTime;
+
+    ConnectionFilter() = default;
+    ConnectionFilter(const ConnectionFilter& other) noexcept
+        : filterId(other.filterId),
+          name(other.name),
+          description(other.description),
+          localIp(other.localIp),
+          localPort(other.localPort),
+          remoteIpRange(other.remoteIpRange),
+          remotePort(other.remotePort),
+          protocol(other.protocol),
+          appProtocol(other.appProtocol),
+          processPath(other.processPath),
+          processName(other.processName),
+          pid(other.pid),
+          userSid(other.userSid),
+          remoteHostname(other.remoteHostname),
+          countryCode(other.countryCode),
+          action(other.action),
+          reason(other.reason),
+          priority(other.priority),
+          isTemporary(other.isTemporary),
+          expiresAt(other.expiresAt),
+          createdAt(other.createdAt),
+          createdBy(other.createdBy),
+          isEnabled(other.isEnabled),
+          isBuiltIn(other.isBuiltIn),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)),
+          lastHitTime(other.lastHitTime) {
+    }
+
+    ConnectionFilter& operator=(const ConnectionFilter& other) noexcept {
+        if (this != &other) {
+            filterId = other.filterId;
+            name = other.name;
+            description = other.description;
+            localIp = other.localIp;
+            localPort = other.localPort;
+            remoteIpRange = other.remoteIpRange;
+            remotePort = other.remotePort;
+            protocol = other.protocol;
+            appProtocol = other.appProtocol;
+            processPath = other.processPath;
+            processName = other.processName;
+            pid = other.pid;
+            userSid = other.userSid;
+            remoteHostname = other.remoteHostname;
+            countryCode = other.countryCode;
+            action = other.action;
+            reason = other.reason;
+            priority = other.priority;
+            isTemporary = other.isTemporary;
+            expiresAt = other.expiresAt;
+            createdAt = other.createdAt;
+            createdBy = other.createdBy;
+            isEnabled = other.isEnabled;
+            isBuiltIn = other.isBuiltIn;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            lastHitTime = other.lastHitTime;
+        }
+        return *this;
+    }
 
     [[nodiscard]] bool Matches(const ConnectionInfo& conn) const;
 };

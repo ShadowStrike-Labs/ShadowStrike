@@ -240,7 +240,7 @@ public:
     std::atomic<bool> m_running{false};
 
     /// @brief Statistics
-    TorDetectorStatistics m_statistics;
+    mutable TorDetectorStatistics m_statistics;
 
     /// @brief Node database
     std::unordered_map<std::string, TorNodeInfo> m_nodes;  // Key: IP address
@@ -276,7 +276,7 @@ public:
 
         bool isTor{false};
         TorConfidence confidence{TorConfidence::NONE};
-        std::vector<DetectionMethod> detectionMethods;
+        std::vector<TorDetectionMethod> detectionMethods;
     };
 
     std::unordered_map<uint64_t, ConnectionTracking> m_connections;
@@ -335,7 +335,7 @@ public:
     [[nodiscard]] bool IsTorTLSFingerprint(const std::string& fingerprint) const;
 
     // Alert generation
-    void GenerateAlert(const ConnectionTracking& conn, DetectionMethod method);
+    void GenerateAlert(const ConnectionTracking& conn, TorDetectionMethod method);
 
     // Policy enforcement
     [[nodiscard]] bool ShouldBlock(const ConnectionTracking& conn) const;
@@ -641,7 +641,7 @@ void TorDetectorImpl::UpdateTrafficAnalysis(ConnectionTracking& conn) {
 
     if (highCellRatio && sufficientSamples && lowVariance) {
         analysis.isTor = true;
-        analysis.method = DetectionMethod::TRAFFIC_PATTERN;
+        analysis.method = TorDetectionMethod::TRAFFIC_PATTERN;
         analysis.confidence = CalculateTrafficConfidence(analysis);
 
         m_statistics.trafficPatternMatches.fetch_add(1, std::memory_order_relaxed);
@@ -839,7 +839,7 @@ PluggableTransport TorDetectorImpl::DetectPluggableTransport(
 // IMPL: ALERT GENERATION
 // ============================================================================
 
-void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, DetectionMethod method) {
+void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, TorDetectionMethod method) {
     try {
         TorAlert alert;
         alert.alertId = m_nextAlertId.fetch_add(1, std::memory_order_relaxed);
@@ -864,22 +864,22 @@ void TorDetectorImpl::GenerateAlert(const ConnectionTracking& conn, DetectionMet
         desc << "Tor connection detected via ";
 
         switch (method) {
-            case DetectionMethod::NODE_LIST:
+            case TorDetectionMethod::NODE_LIST:
                 desc << "node list match";
                 break;
-            case DetectionMethod::TRAFFIC_PATTERN:
+            case TorDetectionMethod::TRAFFIC_PATTERN:
                 desc << "traffic pattern analysis";
                 break;
-            case DetectionMethod::PROCESS_DETECTION:
+            case TorDetectionMethod::PROCESS_DETECTION:
                 desc << "process detection";
                 break;
-            case DetectionMethod::TLS_FINGERPRINT:
+            case TorDetectionMethod::TLS_FINGERPRINT:
                 desc << "TLS fingerprinting";
                 break;
-            case DetectionMethod::BEHAVIORAL:
+            case TorDetectionMethod::BEHAVIORAL:
                 desc << "behavioral analysis";
                 break;
-            case DetectionMethod::DIRECTORY_AUTH:
+            case TorDetectionMethod::DIRECTORY_AUTH:
                 desc << "directory authority communication";
                 break;
             default:
@@ -1107,7 +1107,7 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
     m_impl->m_statistics.totalConnectionsChecked.fetch_add(1, std::memory_order_relaxed);
 
     bool detected = false;
-    DetectionMethod method = DetectionMethod::NONE;
+    TorDetectionMethod method = TorDetectionMethod::NONE;
     TorConfidence confidence = TorConfidence::NONE;
     TorNodeInfo nodeInfo;
 
@@ -1117,9 +1117,9 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
         confidence = TorConfidence::DEFINITE;
 
         if (nodeInfo.type == TorNodeType::DIRECTORY_AUTHORITY) {
-            method = DetectionMethod::DIRECTORY_AUTH;
+            method = TorDetectionMethod::DIRECTORY_AUTH;
         } else {
-            method = DetectionMethod::NODE_LIST;
+            method = TorDetectionMethod::NODE_LIST;
         }
 
         switch (nodeInfo.type) {
@@ -1144,7 +1144,7 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
         for (const auto& [id, conn] : m_impl->m_connections) {
             if (conn.remoteIP == remoteIp && conn.analysis.isTor) {
                 detected = true;
-                method = DetectionMethod::TRAFFIC_PATTERN;
+                method = TorDetectionMethod::TRAFFIC_PATTERN;
                 confidence = conn.analysis.confidence;
                 break;
             }
@@ -1157,7 +1157,7 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
             auto result = m_impl->m_threatIntel->LookupIPv4(remoteIp);
             if (result.found && result.score >= 50) {
                 detected = true;
-                method = DetectionMethod::BEHAVIORAL;
+                method = TorDetectionMethod::BEHAVIORAL;
                 if (result.score >= 90) {
                     confidence = TorConfidence::HIGH;
                 } else {
@@ -1179,7 +1179,7 @@ bool TorDetector::IsTorTraffic(const std::string& remoteIp) {
         alertConn.isTor = true;
         alertConn.confidence = confidence;
         alertConn.detectionMethods.push_back(method);
-        if (method == DetectionMethod::NODE_LIST || method == DetectionMethod::DIRECTORY_AUTH) {
+        if (method == TorDetectionMethod::NODE_LIST || method == TorDetectionMethod::DIRECTORY_AUTH) {
             alertConn.nodeInfo = nodeInfo;
         }
 
@@ -1335,7 +1335,7 @@ void TorDetector::FeedPacket(uint64_t connectionId, size_t packetSize) {
         if (conn.analysis.isTor && !conn.isTor) {
             conn.isTor = true;
             conn.confidence = conn.analysis.confidence;
-            conn.detectionMethods.push_back(DetectionMethod::TRAFFIC_PATTERN);
+            conn.detectionMethods.push_back(TorDetectionMethod::TRAFFIC_PATTERN);
 
             needsAlert = true;
             alertSnapshot = conn;  // snapshot under lock
@@ -1350,7 +1350,7 @@ void TorDetector::FeedPacket(uint64_t connectionId, size_t packetSize) {
     // Generate alert and invoke callbacks OUTSIDE the connection lock
     // to preserve lock ordering: connectionsMutex < alertsMutex < callbacksMutex.
     if (needsAlert) {
-        m_impl->GenerateAlert(alertSnapshot, DetectionMethod::TRAFFIC_PATTERN);
+        m_impl->GenerateAlert(alertSnapshot, TorDetectionMethod::TRAFFIC_PATTERN);
 
         // Invoke detection callbacks
         TorConnection torConn{};
@@ -1360,7 +1360,7 @@ void TorDetector::FeedPacket(uint64_t connectionId, size_t packetSize) {
         torConn.remotePort = alertSnapshot.remotePort;
         torConn.isTor = true;
         torConn.confidence = alertSnapshot.confidence;
-        torConn.method = DetectionMethod::TRAFFIC_PATTERN;
+        torConn.method = TorDetectionMethod::TRAFFIC_PATTERN;
         torConn.trafficAnalysis = alertSnapshot.analysis;
         torConn.startTime = alertSnapshot.startTime;
         torConn.lastActivity = alertSnapshot.lastActivity;

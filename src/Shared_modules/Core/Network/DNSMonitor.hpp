@@ -158,6 +158,20 @@
 #include <shared_mutex>
 #include <span>
 
+// Undefine Windows macros that clash with our enum values
+#ifdef NOERROR
+#undef NOERROR
+#endif
+#ifdef IN
+#undef IN
+#endif
+#ifdef ERROR
+#undef ERROR
+#endif
+#ifdef OUT
+#undef OUT
+#endif
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
@@ -600,6 +614,39 @@ struct alignas(64) DNSCacheEntry {
     // Statistics
     std::atomic<uint64_t> hitCount{ 0 };
     std::chrono::system_clock::time_point lastAccess;
+
+    DNSCacheEntry() = default;
+    DNSCacheEntry(const DNSCacheEntry& other)
+        : domain(other.domain),
+          recordType(other.recordType),
+          records(other.records),
+          cachedAt(other.cachedAt),
+          expiresAt(other.expiresAt),
+          ttl(other.ttl),
+          resolverIp(other.resolverIp),
+          isNegativeCache(other.isNegativeCache),
+          lastValidation(other.lastValidation),
+          lastValidated(other.lastValidated),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)),
+          lastAccess(other.lastAccess) {}
+
+    DNSCacheEntry& operator=(const DNSCacheEntry& other) {
+        if (this != &other) {
+            domain = other.domain;
+            recordType = other.recordType;
+            records = other.records;
+            cachedAt = other.cachedAt;
+            expiresAt = other.expiresAt;
+            ttl = other.ttl;
+            resolverIp = other.resolverIp;
+            isNegativeCache = other.isNegativeCache;
+            lastValidation = other.lastValidation;
+            lastValidated = other.lastValidated;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastAccess = other.lastAccess;
+        }
+        return *this;
+    }
 };
 
 /**
@@ -667,6 +714,53 @@ struct alignas(64) DNSFilterRule {
 
     // Statistics
     std::atomic<uint64_t> hitCount{ 0 };
+
+    DNSFilterRule() = default;
+    DNSFilterRule(const DNSFilterRule& other)
+        : ruleId(other.ruleId),
+          name(other.name),
+          description(other.description),
+          domainPattern(other.domainPattern),
+          isRegex(other.isRegex),
+          categoryMatch(other.categoryMatch),
+          minRiskScore(other.minRiskScore),
+          pidMatch(other.pidMatch),
+          processMatch(other.processMatch),
+          action(other.action),
+          sinkholeTo(other.sinkholeTo),
+          redirectTo(other.redirectTo),
+          isTemporary(other.isTemporary),
+          expiresAt(other.expiresAt),
+          createdAt(other.createdAt),
+          createdBy(other.createdBy),
+          isEnabled(other.isEnabled),
+          priority(other.priority),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)) {}
+
+    DNSFilterRule& operator=(const DNSFilterRule& other) {
+        if (this != &other) {
+            ruleId = other.ruleId;
+            name = other.name;
+            description = other.description;
+            domainPattern = other.domainPattern;
+            isRegex = other.isRegex;
+            categoryMatch = other.categoryMatch;
+            minRiskScore = other.minRiskScore;
+            pidMatch = other.pidMatch;
+            processMatch = other.processMatch;
+            action = other.action;
+            sinkholeTo = other.sinkholeTo;
+            redirectTo = other.redirectTo;
+            isTemporary = other.isTemporary;
+            expiresAt = other.expiresAt;
+            createdAt = other.createdAt;
+            createdBy = other.createdBy;
+            isEnabled = other.isEnabled;
+            priority = other.priority;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
 
     [[nodiscard]] bool Matches(const std::string& domain) const;
 };

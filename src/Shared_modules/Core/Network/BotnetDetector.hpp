@@ -382,10 +382,10 @@ struct alignas(64) BeaconAnalysis {
 };
 
 /**
- * @struct DGAAnalysis
+ * @struct BotnetDGAAnalysis
  * @brief Domain Generation Algorithm analysis.
  */
-struct alignas(64) DGAAnalysis {
+struct alignas(64) BotnetDGAAnalysis {
     // Detection result
     bool isDGA{ false };
     double confidence{ 0.0 };
@@ -495,7 +495,7 @@ struct alignas(128) ConnectionBehavior {
 
     // Analysis results
     BeaconAnalysis beaconAnalysis;
-    std::vector<DGAAnalysis> dgaAnalyses;
+    std::vector<BotnetDGAAnalysis> dgaAnalyses;
     std::vector<C2Detection> c2Detections;
 
     // Risk
@@ -540,7 +540,7 @@ struct alignas(256) BotnetAlert {
     std::vector<std::string> indicators;
     std::vector<std::string> matchedSignatures;
     BeaconAnalysis beaconInfo;
-    DGAAnalysis dgaInfo;
+    BotnetDGAAnalysis dgaInfo;
 
     // MITRE ATT&CK
     std::vector<std::string> mitreTechniques;
@@ -711,9 +711,9 @@ using BeaconCallback = std::function<void(
 /**
  * @brief Callback for DGA detection.
  */
-using DGACallback = std::function<void(
+using BotnetDGACallback = std::function<void(
     const std::string& domain,
-    const DGAAnalysis& analysis
+    const BotnetDGAAnalysis& analysis
 )>;
 
 /**
@@ -860,14 +860,14 @@ public:
      * @param domain Domain name.
      * @return Detailed DGA analysis.
      */
-    [[nodiscard]] DGAAnalysis AnalyzeDGA(const std::string& domain);
+    [[nodiscard]] BotnetDGAAnalysis AnalyzeDGA(const std::string& domain);
 
     /**
      * @brief Batch DGA analysis.
      * @param domains Vector of domains.
      * @return Map of domain to analysis.
      */
-    [[nodiscard]] std::unordered_map<std::string, DGAAnalysis> AnalyzeDGABatch(
+    [[nodiscard]] std::unordered_map<std::string, BotnetDGAAnalysis> AnalyzeDGABatch(
         const std::vector<std::string>& domains
     );
 
@@ -1021,7 +1021,7 @@ public:
 
     [[nodiscard]] uint64_t RegisterAlertCallback(BotnetAlertCallback callback);
     [[nodiscard]] uint64_t RegisterBeaconCallback(BeaconCallback callback);
-    [[nodiscard]] uint64_t RegisterDGACallback(DGACallback callback);
+    [[nodiscard]] uint64_t RegisterDGACallback(BotnetDGACallback callback);
     [[nodiscard]] uint64_t RegisterC2Callback(C2Callback callback);
     [[nodiscard]] uint64_t RegisterFamilyCallback(FamilyCallback callback);
     bool UnregisterCallback(uint64_t callbackId);
