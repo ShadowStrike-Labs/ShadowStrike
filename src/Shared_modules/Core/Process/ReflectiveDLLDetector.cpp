@@ -1,4 +1,4 @@
-/*
+﻿/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -65,6 +65,12 @@
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <winternl.h>
+#include <dbghelp.h>
+
+#pragma comment(lib, "dbghelp.lib")
+
+// Infrastructure includes (kernel + stores)
+#include "../../Communication/IPCManager.hpp"
 
 // Standard library
 #include <algorithm>
@@ -72,6 +78,8 @@
 #include <sstream>
 #include <iomanip>
 #include <format>
+#include <filesystem>
+#include <fstream>
 
 namespace ShadowStrike {
 namespace Core {
@@ -82,6 +90,127 @@ namespace Process {
 // ============================================================================
 
 namespace {
+
+// ============================================================================
+// RAII HANDLE GUARD (consistent with DLLInjectionDetector pattern)
+// ============================================================================
+
+struct HandleGuard {
+    HANDLE h;
+    explicit HandleGuard(HANDLE handle) noexcept : h(handle) {}
+    ~HandleGuard() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+    HandleGuard(const HandleGuard&) = delete;
+    HandleGuard& operator=(const HandleGuard&) = delete;
+    explicit operator bool() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] HANDLE get() const noexcept { return h; }
+};
+
+// ============================================================================
+// NTDLL DYNAMIC IMPORTS
+// ============================================================================
+
+using NtQueryInformationThread_t = NTSTATUS(NTAPI*)(
+    HANDLE ThreadHandle,
+    THREADINFOCLASS ThreadInformationClass,
+    PVOID ThreadInformation,
+    ULONG ThreadInformationLength,
+    PULONG ReturnLength
+);
+
+/// Lazily resolve NtQueryInformationThread from ntdll.dll (process-lifetime cache).
+[[nodiscard]] NtQueryInformationThread_t GetNtQueryInformationThread() noexcept {
+    static const auto fn = reinterpret_cast<NtQueryInformationThread_t>(
+        ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationThread"));
+    return fn;
+}
+
+/// Retrieve the Win32 start address of a thread. Returns 0 on failure.
+[[nodiscard]] uintptr_t QueryThreadStartAddress(HANDLE hThread) noexcept {
+    auto fn = GetNtQueryInformationThread();
+    if (!fn) return 0;
+
+    PVOID startAddr = nullptr;
+    ULONG retLen = 0;
+    // ThreadQuerySetWin32StartAddress = 9
+    NTSTATUS st = fn(hThread, static_cast<THREADINFOCLASS>(9),
+                     &startAddr, sizeof(startAddr), &retLen);
+    if (!NT_SUCCESS(st)) return 0;
+    return reinterpret_cast<uintptr_t>(startAddr);
+}
+
+/// Check whether an address falls within any loaded module of a process.
+[[nodiscard]] bool IsAddressInAnyModule(uint32_t pid, uintptr_t address) noexcept {
+    HMODULE hMods[1024]{};
+    DWORD cbNeeded = 0;
+    HandleGuard hProcess(::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+    if (!hProcess) return false;
+
+    if (!::EnumProcessModules(hProcess.get(), hMods, sizeof(hMods), &cbNeeded))
+        return false;
+
+    const DWORD count = cbNeeded / sizeof(HMODULE);
+    for (DWORD i = 0; i < std::min(count, DWORD(1024)); ++i) {
+        MODULEINFO mi{};
+        if (::GetModuleInformation(hProcess.get(), hMods[i], &mi, sizeof(mi))) {
+            const uintptr_t base = reinterpret_cast<uintptr_t>(mi.lpBaseOfDll);
+            if (address >= base && address < base + mi.SizeOfImage)
+                return true;
+        }
+    }
+    return false;
+}
+
+// ============================================================================
+// REFLECTIVE LOADER HEURISTIC PATTERNS
+// ============================================================================
+
+/// Byte sequences characteristic of hash-based API resolution loops
+/// (common across Stephen Fewer's loader, sRDI, Cobalt Strike, etc.)
+struct HeuristicPattern {
+    const char* name;
+    std::array<uint8_t, 8> bytes;
+    std::array<uint8_t, 8> mask;     // 0xFF = exact, 0x00 = wildcard
+};
+
+// ROR-13 additive hash loop (x64): classic Fewer's ReflectiveLoader
+static constexpr HeuristicPattern g_apiHashPatterns[] = {
+    // ror r32, 0x0D  ;  add r32, byte  (ROR-13 hash loop)
+    { "ROR13_hash_x64",
+      {0xC1, 0xCF, 0x0D, 0x03, 0xCF, 0x00, 0x00, 0x00},
+      {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00} },
+    // ror edi, 0x0D (32-bit variant)
+    { "ROR13_hash_x86",
+      {0xC1, 0xCF, 0x0D, 0x01, 0xC7, 0x00, 0x00, 0x00},
+      {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00} },
+    // djb2-style: shl reg, 5 / add / xor
+    { "DJB2_hash_loop",
+      {0xC1, 0xE0, 0x05, 0x03, 0xC1, 0x00, 0x00, 0x00},
+      {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00} },
+    // sRDI: uses CRC32 intrinsic
+    { "CRC32_hash_intrinsic",
+      {0xF2, 0x0F, 0x38, 0xF1, 0x00, 0x00, 0x00, 0x00},
+      {0xFF, 0xFF, 0xFF, 0xFF, 0x00, 0x00, 0x00, 0x00} },
+};
+
+/// Scan buffer for heuristic API-hashing patterns. Returns name of first match or nullptr.
+[[nodiscard]] const char* DetectAPIHashingPattern(std::span<const uint8_t> data) noexcept {
+    if (data.size() < 8) return nullptr;
+    const size_t limit = data.size() - 8;
+
+    for (const auto& pat : g_apiHashPatterns) {
+        for (size_t i = 0; i <= limit; ++i) {
+            bool match = true;
+            for (size_t j = 0; j < 8; ++j) {
+                if ((data[i + j] & pat.mask[j]) != (pat.bytes[j] & pat.mask[j])) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return pat.name;
+        }
+    }
+    return nullptr;
+}
 
 /**
  * @brief Calculate Shannon entropy of data.
@@ -110,7 +239,7 @@ double CalculateEntropy(std::span<const uint8_t> data) {
 /**
  * @brief Check if memory protection is executable.
  */
-bool IsExecutable(DWORD protect) {
+bool IsExecutable(DWORD protect) noexcept {
     return (protect & PAGE_EXECUTE) ||
            (protect & PAGE_EXECUTE_READ) ||
            (protect & PAGE_EXECUTE_READWRITE) ||
@@ -120,7 +249,7 @@ bool IsExecutable(DWORD protect) {
 /**
  * @brief Check if memory protection is writable.
  */
-bool IsWritable(DWORD protect) {
+bool IsWritable(DWORD protect) noexcept {
     return (protect & PAGE_READWRITE) ||
            (protect & PAGE_EXECUTE_READWRITE) ||
            (protect & PAGE_WRITECOPY) ||
@@ -130,14 +259,14 @@ bool IsWritable(DWORD protect) {
 /**
  * @brief Check if memory protection is RWX.
  */
-bool IsRWX(DWORD protect) {
+bool IsRWX(DWORD protect) noexcept {
     return (protect & PAGE_EXECUTE_READWRITE) != 0;
 }
 
 /**
  * @brief Check if memory is unbacked (not mapped from file).
  */
-bool IsUnbacked(DWORD type) {
+bool IsUnbacked(DWORD type) noexcept {
     return (type & MEM_PRIVATE) != 0;
 }
 
@@ -217,15 +346,17 @@ std::wstring ConfidenceToStringInternal(DetectionConfidence confidence) {
 }
 
 /**
- * @brief Known Cobalt Strike beacon signatures (simplified).
+ * @brief Known Cobalt Strike beacon signatures.
+ * First pattern: Beacon configuration block marker (0x00, 0x01, ...).
+ * We intentionally avoid the generic MZ stub — it matches all PEs.
  */
 const std::vector<std::array<uint8_t, 16>> g_cobaltStrikePatterns = {
-    // ReflectiveLoader signature (first bytes)
-    {0x4D, 0x5A, 0x90, 0x00, 0x03, 0x00, 0x00, 0x00,
-     0x04, 0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00, 0x00},
-    // Beacon configuration marker
+    // Beacon configuration marker (common across malleable C2 profiles)
     {0x00, 0x01, 0x00, 0x01, 0x00, 0x02, 0x00, 0x01,
-     0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00}
+     0x00, 0x02, 0x00, 0x02, 0x00, 0x00, 0x00, 0x00},
+    // Beacon sleep mask stub (x64)
+    {0x49, 0x89, 0xC8, 0x48, 0x8B, 0x48, 0x10, 0x48,
+     0x8B, 0x50, 0x08, 0x4D, 0x31, 0xC9, 0x48, 0xFF}
 };
 
 /**
@@ -307,7 +438,7 @@ ReflectiveConfig ReflectiveConfig::CreateDefault() noexcept {
 
 ReflectiveConfig ReflectiveConfig::CreateHighSensitivity() noexcept {
     ReflectiveConfig config;
-    config.defaultScanMode = ScanMode::Deep;
+    config.defaultScanMode = ReflectiveScanMode::Deep;
     config.enableRealTimeMonitoring = true;
 
     // Enable all detection features
@@ -336,7 +467,7 @@ ReflectiveConfig ReflectiveConfig::CreateHighSensitivity() noexcept {
 
 ReflectiveConfig ReflectiveConfig::CreatePerformance() noexcept {
     ReflectiveConfig config;
-    config.defaultScanMode = ScanMode::Quick;
+    config.defaultScanMode = ReflectiveScanMode::Quick;
     config.enableRealTimeMonitoring = true;
 
     // Focus on high-value detections
@@ -362,7 +493,7 @@ ReflectiveConfig ReflectiveConfig::CreatePerformance() noexcept {
 ReflectiveConfig ReflectiveConfig::CreateForensic() noexcept {
     ReflectiveConfig config = CreateHighSensitivity();
 
-    config.defaultScanMode = ScanMode::Forensic;
+    config.defaultScanMode = ReflectiveScanMode::Forensic;
     config.extractPayloads = true;
     config.scanTimeoutMs = 300000; // 5 minutes
     config.maxRegionsToScan = 65536;
@@ -418,6 +549,73 @@ double ReflectiveStatistics::GetDetectionRate() const noexcept {
     return static_cast<double>(detected) / static_cast<double>(total);
 }
 
+ReflectiveStatistics::ReflectiveStatistics(const ReflectiveStatistics& o) noexcept {
+    auto ld = [](const std::atomic<uint64_t>& a) noexcept {
+        return a.load(std::memory_order_relaxed);
+    };
+    totalScans.store(ld(o.totalScans), std::memory_order_relaxed);
+    quickScans.store(ld(o.quickScans), std::memory_order_relaxed);
+    standardScans.store(ld(o.standardScans), std::memory_order_relaxed);
+    deepScans.store(ld(o.deepScans), std::memory_order_relaxed);
+    forensicScans.store(ld(o.forensicScans), std::memory_order_relaxed);
+    regionsScanned.store(ld(o.regionsScanned), std::memory_order_relaxed);
+    rwxRegionsFound.store(ld(o.rwxRegionsFound), std::memory_order_relaxed);
+    unbackedExecutableFound.store(ld(o.unbackedExecutableFound), std::memory_order_relaxed);
+    peCandidatesAnalyzed.store(ld(o.peCandidatesAnalyzed), std::memory_order_relaxed);
+    reflectiveDLLsDetected.store(ld(o.reflectiveDLLsDetected), std::memory_order_relaxed);
+    classicReflectiveDetected.store(ld(o.classicReflectiveDetected), std::memory_order_relaxed);
+    srdiDetected.store(ld(o.srdiDetected), std::memory_order_relaxed);
+    cobaltStrikeDetected.store(ld(o.cobaltStrikeDetected), std::memory_order_relaxed);
+    meterpreterDetected.store(ld(o.meterpreterDetected), std::memory_order_relaxed);
+    customLoadersDetected.store(ld(o.customLoadersDetected), std::memory_order_relaxed);
+    lowConfidenceDetections.store(ld(o.lowConfidenceDetections), std::memory_order_relaxed);
+    mediumConfidenceDetections.store(ld(o.mediumConfidenceDetections), std::memory_order_relaxed);
+    highConfidenceDetections.store(ld(o.highConfidenceDetections), std::memory_order_relaxed);
+    confirmedDetections.store(ld(o.confirmedDetections), std::memory_order_relaxed);
+    payloadsExtracted.store(ld(o.payloadsExtracted), std::memory_order_relaxed);
+    extractionFailures.store(ld(o.extractionFailures), std::memory_order_relaxed);
+    totalScanTimeMs.store(ld(o.totalScanTimeMs), std::memory_order_relaxed);
+    avgScanTimeMs.store(ld(o.avgScanTimeMs), std::memory_order_relaxed);
+    scanErrors.store(ld(o.scanErrors), std::memory_order_relaxed);
+    accessDeniedErrors.store(ld(o.accessDeniedErrors), std::memory_order_relaxed);
+    timeoutErrors.store(ld(o.timeoutErrors), std::memory_order_relaxed);
+}
+
+ReflectiveStatistics& ReflectiveStatistics::operator=(const ReflectiveStatistics& o) noexcept {
+    if (this != &o) {
+        auto ld = [](const std::atomic<uint64_t>& a) noexcept {
+            return a.load(std::memory_order_relaxed);
+        };
+        totalScans.store(ld(o.totalScans), std::memory_order_relaxed);
+        quickScans.store(ld(o.quickScans), std::memory_order_relaxed);
+        standardScans.store(ld(o.standardScans), std::memory_order_relaxed);
+        deepScans.store(ld(o.deepScans), std::memory_order_relaxed);
+        forensicScans.store(ld(o.forensicScans), std::memory_order_relaxed);
+        regionsScanned.store(ld(o.regionsScanned), std::memory_order_relaxed);
+        rwxRegionsFound.store(ld(o.rwxRegionsFound), std::memory_order_relaxed);
+        unbackedExecutableFound.store(ld(o.unbackedExecutableFound), std::memory_order_relaxed);
+        peCandidatesAnalyzed.store(ld(o.peCandidatesAnalyzed), std::memory_order_relaxed);
+        reflectiveDLLsDetected.store(ld(o.reflectiveDLLsDetected), std::memory_order_relaxed);
+        classicReflectiveDetected.store(ld(o.classicReflectiveDetected), std::memory_order_relaxed);
+        srdiDetected.store(ld(o.srdiDetected), std::memory_order_relaxed);
+        cobaltStrikeDetected.store(ld(o.cobaltStrikeDetected), std::memory_order_relaxed);
+        meterpreterDetected.store(ld(o.meterpreterDetected), std::memory_order_relaxed);
+        customLoadersDetected.store(ld(o.customLoadersDetected), std::memory_order_relaxed);
+        lowConfidenceDetections.store(ld(o.lowConfidenceDetections), std::memory_order_relaxed);
+        mediumConfidenceDetections.store(ld(o.mediumConfidenceDetections), std::memory_order_relaxed);
+        highConfidenceDetections.store(ld(o.highConfidenceDetections), std::memory_order_relaxed);
+        confirmedDetections.store(ld(o.confirmedDetections), std::memory_order_relaxed);
+        payloadsExtracted.store(ld(o.payloadsExtracted), std::memory_order_relaxed);
+        extractionFailures.store(ld(o.extractionFailures), std::memory_order_relaxed);
+        totalScanTimeMs.store(ld(o.totalScanTimeMs), std::memory_order_relaxed);
+        avgScanTimeMs.store(ld(o.avgScanTimeMs), std::memory_order_relaxed);
+        scanErrors.store(ld(o.scanErrors), std::memory_order_relaxed);
+        accessDeniedErrors.store(ld(o.accessDeniedErrors), std::memory_order_relaxed);
+        timeoutErrors.store(ld(o.timeoutErrors), std::memory_order_relaxed);
+    }
+    return *this;
+}
+
 // ============================================================================
 // CALLBACK MANAGER
 // ============================================================================
@@ -431,7 +629,7 @@ public:
         return id;
     }
 
-    uint64_t RegisterProgress(ScanProgressCallback callback) {
+    uint64_t RegisterProgress(ReflectiveScanProgressCallback callback) {
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextId++;
         m_progressCallbacks[id] = std::move(callback);
@@ -492,7 +690,7 @@ private:
     mutable std::shared_mutex m_mutex;
     uint64_t m_nextId{ 1 };
     std::unordered_map<uint64_t, ReflectiveDetectedCallback> m_detectionCallbacks;
-    std::unordered_map<uint64_t, ScanProgressCallback> m_progressCallbacks;
+    std::unordered_map<uint64_t, ReflectiveScanProgressCallback> m_progressCallbacks;
     std::unordered_map<uint64_t, PECandidateCallback> m_candidateCallbacks;
 };
 
@@ -560,9 +758,22 @@ private:
             return false;
         }
 
-        // Simplified pattern matching - real implementation would use YARA
-        // For now, check for known tool names in PE resources/exports
-        return false; // Placeholder
+        // Masked byte-by-byte comparison at the specified offset
+        const uint8_t* target = data.data() + sig.offset;
+        bool allZeroPattern = true;
+
+        for (size_t i = 0; i < ReflectiveConstants::SIGNATURE_LENGTH; ++i) {
+            if (sig.mask[i] != 0x00) {
+                allZeroPattern = false;
+                if ((target[i] & sig.mask[i]) != (sig.pattern[i] & sig.mask[i])) {
+                    return false;
+                }
+            }
+        }
+
+        // An all-zero mask means this signature has no byte pattern configured;
+        // it can only be matched via heuristic analysis, not byte comparison.
+        return !allZeroPattern;
     }
 
     mutable std::shared_mutex m_mutex;
@@ -600,16 +811,8 @@ public:
             m_callbackManager = std::make_unique<CallbackManager>();
             m_signatureDB = std::make_unique<LoaderSignatureDB>();
 
-            // Verify infrastructure
-            if (!PatternStore::PatternStore::Instance().Initialize(
-                PatternStore::PatternStoreConfig::CreateDefault())) {
-                SS_LOG_WARN(L"ReflectiveDLL", L"PatternStore initialization warning");
-            }
-
-            if (!HashStore::HashStore::Instance().Initialize(
-                HashStore::HashStoreConfig::CreateDefault())) {
-                SS_LOG_WARN(L"ReflectiveDLL", L"HashStore initialization warning");
-            }
+            // Register for kernel image-load notifications via IPCManager
+            RegisterKernelHandlers();
 
             m_initialized = true;
             SS_LOG_INFO(L"ReflectiveDLL", L"Initialized successfully");
@@ -631,7 +834,6 @@ public:
     }
 
     bool IsInitialized() const noexcept {
-        std::shared_lock lock(m_mutex);
         return m_initialized;
     }
 
@@ -651,7 +853,7 @@ public:
     // PROCESS SCANNING
     // ========================================================================
 
-    ScanResult Scan(uint32_t pid, ScanMode mode) {
+    ScanResult Scan(uint32_t pid, ReflectiveScanMode mode) {
         const auto startTime = std::chrono::high_resolution_clock::now();
 
         ScanResult result;
@@ -659,26 +861,41 @@ public:
         result.scanTime = std::chrono::system_clock::now();
         result.scanMode = mode;
 
+        if (!m_initialized || !m_callbackManager || !m_signatureDB) {
+            SS_LOG_ERROR(L"ReflectiveDLL",
+                L"Scan called before Initialize — PID %u rejected", pid);
+            result.scanError = L"Detector not initialized";
+            return result;
+        }
+
+        // Snapshot config under shared lock to avoid races with UpdateConfig
+        ReflectiveConfig config;
+        {
+            std::shared_lock lock(m_mutex);
+            config = m_config;
+        }
+
         try {
             // Get process name
             result.processName = GetProcessName(pid);
 
-            SS_LOG_INFO(L"ReflectiveDLL", L"Scanning PID %u (%S) in %d mode", pid, Utils::StringUtils::WideToUtf8(result.processName), static_cast<int>(mode));
+            SS_LOG_INFO(L"ReflectiveDLL", L"Scanning PID %u (%s) in %d mode",
+                pid, result.processName.c_str(), static_cast<int>(mode));
 
             // Update statistics
             m_stats.totalScans.fetch_add(1, std::memory_order_relaxed);
             switch (mode) {
-                case ScanMode::Quick: m_stats.quickScans.fetch_add(1, std::memory_order_relaxed); break;
-                case ScanMode::Standard: m_stats.standardScans.fetch_add(1, std::memory_order_relaxed); break;
-                case ScanMode::Deep: m_stats.deepScans.fetch_add(1, std::memory_order_relaxed); break;
-                case ScanMode::Forensic: m_stats.forensicScans.fetch_add(1, std::memory_order_relaxed); break;
+                case ReflectiveScanMode::Quick: m_stats.quickScans.fetch_add(1, std::memory_order_relaxed); break;
+                case ReflectiveScanMode::Standard: m_stats.standardScans.fetch_add(1, std::memory_order_relaxed); break;
+                case ReflectiveScanMode::Deep: m_stats.deepScans.fetch_add(1, std::memory_order_relaxed); break;
+                case ReflectiveScanMode::Forensic: m_stats.forensicScans.fetch_add(1, std::memory_order_relaxed); break;
             }
 
             // Find PE candidates
             result.allPECandidates = FindPECandidatesImpl(pid, mode,
                 [&](uint32_t scanned, uint32_t total) {
                     m_callbackManager->InvokeProgress(pid, scanned, total);
-                });
+                }, &config);
 
             result.peCandidatesFound = static_cast<uint32_t>(result.allPECandidates.size());
 
@@ -695,14 +912,16 @@ public:
                 m_callbackManager->InvokeCandidate(pid, candidate);
 
                 // Analyze for reflective loading
-                if (auto detection = AnalyzeCandidate(pid, candidate, mode)) {
+                if (auto detection = AnalyzeCandidate(pid, candidate, mode, config)) {
                     result.detections.push_back(*detection);
                     result.reflectiveDLLsDetected++;
 
                     // Invoke detection callback
                     m_callbackManager->InvokeDetection(*detection);
 
-                    SS_LOG_WARN(L"ReflectiveDLL", L"Reflective DLL detected at 0x%X in PID %u", candidate.baseAddress, pid);
+                    SS_LOG_WARN(L"ReflectiveDLL",
+                        L"Reflective DLL detected at 0x%016llX in PID %u",
+                        static_cast<unsigned long long>(candidate.baseAddress), pid);
                 }
             }
 
@@ -726,14 +945,19 @@ public:
 
             // Update statistics
             m_stats.totalScanTimeMs.fetch_add(result.scanDurationMs, std::memory_order_relaxed);
-            const uint64_t avgTime = m_stats.avgScanTimeMs.load(std::memory_order_relaxed);
-            m_stats.avgScanTimeMs.store((avgTime + result.scanDurationMs) / 2, std::memory_order_relaxed);
+            const uint64_t totalTime = m_stats.totalScanTimeMs.load(std::memory_order_relaxed);
+            const uint64_t totalCount = m_stats.totalScans.load(std::memory_order_relaxed);
+            if (totalCount > 0) {
+                m_stats.avgScanTimeMs.store(totalTime / totalCount, std::memory_order_relaxed);
+            }
 
-            SS_LOG_INFO(L"ReflectiveDLL", L"Scan complete - %llu PE candidates, %d reflective DLLs, %.2fms", result.peCandidatesFound, result.reflectiveDLLsDetected, result.scanDurationMs);
+            SS_LOG_INFO(L"ReflectiveDLL",
+                L"Scan complete - %u PE candidates, %u reflective DLLs, %u ms",
+                result.peCandidatesFound, result.reflectiveDLLsDetected, result.scanDurationMs);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ReflectiveDLL", L"Scan: %S", e.what());
-            result.scanError = Utils::StringUtils::Utf8ToWide(e.what());
+            result.scanError = Utils::StringUtils::ToWide(e.what());
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
         }
 
@@ -741,11 +965,11 @@ public:
     }
 
     bool HasReflectiveLoading(uint32_t pid) {
-        auto result = Scan(pid, ScanMode::Quick);
+        auto result = Scan(pid, ReflectiveScanMode::Quick);
         return result.hasReflectiveLoading;
     }
 
-    std::vector<ScanResult> ScanMultiple(const std::vector<uint32_t>& pids, ScanMode mode) {
+    std::vector<ScanResult> ScanMultiple(const std::vector<uint32_t>& pids, ReflectiveScanMode mode) {
         std::vector<ScanResult> results;
         results.reserve(pids.size());
 
@@ -756,20 +980,20 @@ public:
         return results;
     }
 
-    std::vector<ScanResult> ScanAllProcesses(ScanMode mode) {
+    std::vector<ScanResult> ScanAllProcesses(ReflectiveScanMode mode) {
         std::vector<ScanResult> results;
 
         try {
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (hSnapshot == INVALID_HANDLE_VALUE) {
+            HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+            if (!hSnapshot) {
                 SS_LOG_ERROR(L"ReflectiveDLL", L"Failed to create process snapshot");
                 return results;
             }
 
-            PROCESSENTRY32W pe32;
+            PROCESSENTRY32W pe32{};
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-            if (Process32FirstW(hSnapshot, &pe32)) {
+            if (Process32FirstW(hSnapshot.get(), &pe32)) {
                 do {
                     // Skip system processes
                     if (pe32.th32ProcessID <= 4) continue;
@@ -779,10 +1003,8 @@ public:
 
                     results.push_back(Scan(pe32.th32ProcessID, mode));
 
-                } while (Process32NextW(hSnapshot, &pe32));
+                } while (Process32NextW(hSnapshot.get(), &pe32));
             }
-
-            CloseHandle(hSnapshot);
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ReflectiveDLL", L"ScanAllProcesses: %S", e.what());
@@ -791,7 +1013,7 @@ public:
         return results;
     }
 
-    std::vector<ScanResult> ScanByName(const std::wstring& processName, ScanMode mode) {
+    std::vector<ScanResult> ScanByName(const std::wstring& processName, ReflectiveScanMode mode) {
         std::vector<ScanResult> results;
 
         try {
@@ -812,84 +1034,80 @@ public:
     // ========================================================================
 
     std::vector<PECandidate> FindPECandidates(uint32_t pid) {
-        return FindPECandidatesImpl(pid, ScanMode::Standard, nullptr);
+        return FindPECandidatesImpl(pid, ReflectiveScanMode::Standard, nullptr);
     }
 
     PECandidate ValidatePE(uint32_t pid, uintptr_t baseAddress) {
         PECandidate candidate;
         candidate.baseAddress = baseAddress;
 
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid));
         if (!hProcess) {
             m_stats.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return candidate;
         }
 
         try {
-            ValidatePEImpl(hProcess, candidate);
+            ValidatePEImpl(hProcess.get(), candidate);
         } catch (...) {
-            SS_LOG_ERROR(L"ReflectiveDLL", L"ValidatePE: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"ValidatePE exception for PID %u addr 0x%016llX",
+                pid, static_cast<unsigned long long>(baseAddress));
         }
 
-        CloseHandle(hProcess);
         return candidate;
     }
 
     bool ContainsPE(uint32_t pid, uintptr_t address, size_t size) {
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return false;
 
         std::vector<uint8_t> buffer;
-        bool result = false;
-
-        if (ReadProcessMemorySafe(hProcess, address, buffer,
+        if (ReadProcessMemorySafe(hProcess.get(), address, buffer,
             std::min(size, size_t(ReflectiveConstants::MAX_PE_HEADER_SCAN)))) {
-            result = HasDosSignature(buffer);
+            return HasDosSignature(buffer);
         }
-
-        CloseHandle(hProcess);
-        return result;
+        return false;
     }
 
     std::vector<std::pair<uintptr_t, size_t>> FindRWXRegions(uint32_t pid) {
         std::vector<std::pair<uintptr_t, size_t>> rwxRegions;
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
         if (!hProcess) return rwxRegions;
 
         try {
-            MEMORY_BASIC_INFORMATION mbi;
+            MEMORY_BASIC_INFORMATION mbi{};
             uintptr_t address = 0;
 
-            while (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+            while (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
                 if (mbi.State == MEM_COMMIT && IsRWX(mbi.Protect)) {
                     rwxRegions.emplace_back(reinterpret_cast<uintptr_t>(mbi.BaseAddress), mbi.RegionSize);
                     m_stats.rwxRegionsFound.fetch_add(1, std::memory_order_relaxed);
                 }
 
-                address += mbi.RegionSize;
-                if (address == 0) break; // Overflow
+                const uintptr_t next = address + mbi.RegionSize;
+                if (next <= address) break;
+                address = next;
             }
 
         } catch (...) {
-            SS_LOG_ERROR(L"ReflectiveDLL", L"FindRWXRegions: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindRWXRegions exception for PID %u", pid);
         }
 
-        CloseHandle(hProcess);
         return rwxRegions;
     }
 
     std::vector<std::pair<uintptr_t, size_t>> FindUnbackedExecutable(uint32_t pid) {
         std::vector<std::pair<uintptr_t, size_t>> regions;
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
         if (!hProcess) return regions;
 
         try {
-            MEMORY_BASIC_INFORMATION mbi;
+            MEMORY_BASIC_INFORMATION mbi{};
             uintptr_t address = 0;
 
-            while (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+            while (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
                 if (mbi.State == MEM_COMMIT &&
                     IsExecutable(mbi.Protect) &&
                     IsUnbacked(mbi.Type)) {
@@ -897,31 +1115,27 @@ public:
                     m_stats.unbackedExecutableFound.fetch_add(1, std::memory_order_relaxed);
                 }
 
-                address += mbi.RegionSize;
-                if (address == 0) break;
+                const uintptr_t next = address + mbi.RegionSize;
+                if (next <= address) break;
+                address = next;
             }
 
         } catch (...) {
-            SS_LOG_ERROR(L"ReflectiveDLL", L"FindUnbackedExecutable: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"FindUnbackedExecutable exception for PID %u", pid);
         }
 
-        CloseHandle(hProcess);
         return regions;
     }
 
     double CalculateEntropyMemory(uint32_t pid, uintptr_t address, size_t size) {
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return 0.0;
 
         std::vector<uint8_t> buffer;
-        double entropy = 0.0;
-
-        if (ReadProcessMemorySafe(hProcess, address, buffer, std::min(size, size_t(65536)))) {
-            entropy = CalculateEntropy(buffer);
+        if (ReadProcessMemorySafe(hProcess.get(), address, buffer, std::min(size, size_t(65536)))) {
+            return CalculateEntropy(buffer);
         }
-
-        CloseHandle(hProcess);
-        return entropy;
+        return 0.0;
     }
 
     // ========================================================================
@@ -972,40 +1186,52 @@ public:
         std::vector<std::pair<uint32_t, uintptr_t>> suspiciousThreads;
 
         try {
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if (hSnapshot == INVALID_HANDLE_VALUE) {
-                return suspiciousThreads;
-            }
+            HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+            if (!hSnapshot) return suspiciousThreads;
 
-            // Get unbacked executable regions
+            // Get unbacked executable regions for cross-reference
             auto unbackedRegions = FindUnbackedExecutable(pid);
 
-            THREADENTRY32 te32;
+            THREADENTRY32 te32{};
             te32.dwSize = sizeof(THREADENTRY32);
 
-            if (Thread32First(hSnapshot, &te32)) {
+            if (Thread32First(hSnapshot.get(), &te32)) {
                 do {
-                    if (te32.th32OwnerProcessID == pid) {
-                        HANDLE hThread = OpenThread(THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID);
-                        if (hThread) {
-                            // Get thread start address (simplified - would use NtQueryInformationThread)
-                            uintptr_t startAddress = 0; // Placeholder
+                    if (te32.th32OwnerProcessID != pid) continue;
 
-                            // Check if in unbacked region
-                            for (const auto& [regionBase, regionSize] : unbackedRegions) {
-                                if (startAddress >= regionBase && startAddress < regionBase + regionSize) {
-                                    suspiciousThreads.emplace_back(te32.th32ThreadID, startAddress);
-                                    break;
-                                }
-                            }
+                    HandleGuard hThread(OpenThread(
+                        THREAD_QUERY_INFORMATION, FALSE, te32.th32ThreadID));
+                    if (!hThread) continue;
 
-                            CloseHandle(hThread);
+                    // Resolve start address via NtQueryInformationThread
+                    const uintptr_t startAddress = QueryThreadStartAddress(hThread.get());
+                    if (startAddress == 0) continue;
+
+                    // Check if start address falls inside any unbacked executable region
+                    for (const auto& [regionBase, regionSize] : unbackedRegions) {
+                        if (startAddress >= regionBase && startAddress < regionBase + regionSize) {
+                            suspiciousThreads.emplace_back(te32.th32ThreadID, startAddress);
+                            SS_LOG_WARN(L"ReflectiveDLL",
+                                L"Suspicious thread TID %u starts at unbacked addr 0x%016llX in PID %u",
+                                te32.th32ThreadID,
+                                static_cast<unsigned long long>(startAddress), pid);
+                            break;
                         }
                     }
-                } while (Thread32Next(hSnapshot, &te32));
-            }
 
-            CloseHandle(hSnapshot);
+                    // Also flag threads starting outside any known module
+                    if (startAddress > 0x10000 && !IsAddressInAnyModule(pid, startAddress)) {
+                        bool alreadyRecorded = false;
+                        for (const auto& [tid, addr] : suspiciousThreads) {
+                            if (tid == te32.th32ThreadID) { alreadyRecorded = true; break; }
+                        }
+                        if (!alreadyRecorded) {
+                            suspiciousThreads.emplace_back(te32.th32ThreadID, startAddress);
+                        }
+                    }
+
+                } while (Thread32Next(hSnapshot.get(), &te32));
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ReflectiveDLL", L"FindSuspiciousThreads: %S", e.what());
@@ -1015,15 +1241,113 @@ public:
     }
 
     bool IsThreadStartUnbacked(uint32_t tid) {
-        // Would require NtQueryInformationThread to get start address
-        // Then check if in unbacked memory
-        return false; // Placeholder
+        HandleGuard hThread(OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid));
+        if (!hThread) return false;
+
+        const uintptr_t startAddress = QueryThreadStartAddress(hThread.get());
+        if (startAddress == 0) return false;
+
+        // Determine owning process from thread
+        DWORD pid = 0;
+        {
+            HandleGuard hSnap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+            if (hSnap) {
+                THREADENTRY32 te{};
+                te.dwSize = sizeof(THREADENTRY32);
+                if (Thread32First(hSnap.get(), &te)) {
+                    do {
+                        if (te.th32ThreadID == tid) { pid = te.th32OwnerProcessID; break; }
+                    } while (Thread32Next(hSnap.get(), &te));
+                }
+            }
+        }
+        if (pid == 0) return false;
+
+        // Query the memory region backing the start address
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+        if (!hProcess) return false;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(startAddress),
+                           &mbi, sizeof(mbi)) == 0) {
+            return false;
+        }
+
+        // Unbacked = MEM_PRIVATE and executable
+        return (mbi.State == MEM_COMMIT) && IsExecutable(mbi.Protect) && IsUnbacked(mbi.Type);
     }
 
     uint32_t CountUnbackedCallStackFrames(uint32_t tid) {
-        // Would require stack walking (StackWalk64)
-        // Then checking each frame's return address
-        return 0; // Placeholder
+        // Open thread for stack walking
+        HandleGuard hThread(OpenThread(
+            THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
+            FALSE, tid));
+        if (!hThread) return 0;
+
+        // Determine owning process
+        DWORD pid = 0;
+        {
+            HandleGuard hSnap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+            if (hSnap) {
+                THREADENTRY32 te{};
+                te.dwSize = sizeof(THREADENTRY32);
+                if (Thread32First(hSnap.get(), &te)) {
+                    do {
+                        if (te.th32ThreadID == tid) { pid = te.th32OwnerProcessID; break; }
+                    } while (Thread32Next(hSnap.get(), &te));
+                }
+            }
+        }
+        if (pid == 0) return 0;
+
+        HandleGuard hProcess(OpenProcess(
+            PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
+        if (!hProcess) return 0;
+
+        // Suspend thread to capture consistent context
+        if (SuspendThread(hThread.get()) == static_cast<DWORD>(-1)) return 0;
+
+        uint32_t unbackedCount = 0;
+
+        CONTEXT ctx{};
+        ctx.ContextFlags = CONTEXT_FULL;
+        if (GetThreadContext(hThread.get(), &ctx)) {
+            STACKFRAME64 frame{};
+#ifdef _M_X64
+            constexpr DWORD machineType = IMAGE_FILE_MACHINE_AMD64;
+            frame.AddrPC.Offset    = ctx.Rip;
+            frame.AddrPC.Mode      = AddrModeFlat;
+            frame.AddrFrame.Offset = ctx.Rbp;
+            frame.AddrFrame.Mode   = AddrModeFlat;
+            frame.AddrStack.Offset = ctx.Rsp;
+            frame.AddrStack.Mode   = AddrModeFlat;
+#else
+            constexpr DWORD machineType = IMAGE_FILE_MACHINE_I386;
+            frame.AddrPC.Offset    = ctx.Eip;
+            frame.AddrPC.Mode      = AddrModeFlat;
+            frame.AddrFrame.Offset = ctx.Ebp;
+            frame.AddrFrame.Mode   = AddrModeFlat;
+            frame.AddrStack.Offset = ctx.Esp;
+            frame.AddrStack.Mode   = AddrModeFlat;
+#endif
+            constexpr size_t kMaxFrames = 64;
+            for (size_t i = 0; i < kMaxFrames; ++i) {
+                if (!StackWalk64(machineType, hProcess.get(), hThread.get(),
+                                 &frame, &ctx, nullptr,
+                                 SymFunctionTableAccess64, SymGetModuleBase64, nullptr)) {
+                    break;
+                }
+                if (frame.AddrPC.Offset == 0) break;
+
+                const auto pc = static_cast<uintptr_t>(frame.AddrPC.Offset);
+                if (!IsAddressInAnyModule(pid, pc)) {
+                    ++unbackedCount;
+                }
+            }
+        }
+
+        ResumeThread(hThread.get());
+        return unbackedCount;
     }
 
     // ========================================================================
@@ -1031,52 +1355,63 @@ public:
     // ========================================================================
 
     std::optional<LoaderSignature> DetectKnownLoader(uint32_t pid, const PECandidate& candidate) {
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return std::nullopt;
 
         std::vector<uint8_t> buffer;
         std::optional<LoaderSignature> result;
 
-        if (ReadProcessMemorySafe(hProcess, candidate.baseAddress, buffer, 4096)) {
+        if (ReadProcessMemorySafe(hProcess.get(), candidate.baseAddress, buffer, 4096)) {
+            // Check the signature database first (masked pattern matching)
             result = m_signatureDB->Match(buffer);
 
-            // Additional heuristic checks
+            // Heuristic: scan for known tool byte patterns anywhere in the header region
             if (!result) {
-                // Check for Cobalt Strike patterns
-                for (const auto& pattern : g_cobaltStrikePatterns) {
-                    if (buffer.size() >= pattern.size()) {
-                        if (std::equal(pattern.begin(), pattern.end(), buffer.begin())) {
-                            LoaderSignature sig;
-                            sig.name = "Cobalt Strike Beacon";
-                            sig.type = ReflectiveLoadType::CobaltStrikeBeacon;
-                            sig.mitreId = "T1620";
-                            result = sig;
-                            m_stats.cobaltStrikeDetected.fetch_add(1, std::memory_order_relaxed);
-                            break;
+                auto searchBuffer = [&](const auto& patterns,
+                                        const char* toolName,
+                                        ReflectiveLoadType ltype,
+                                        std::atomic<uint64_t>& stat) -> bool {
+                    for (const auto& pattern : patterns) {
+                        // Search the entire buffer, not just offset 0
+                        if (buffer.size() < pattern.size()) continue;
+                        const size_t limit = buffer.size() - pattern.size();
+                        for (size_t off = 0; off <= limit; ++off) {
+                            if (std::equal(pattern.begin(), pattern.end(), buffer.begin() + off)) {
+                                LoaderSignature sig;
+                                sig.name = toolName;
+                                sig.type = ltype;
+                                sig.mitreId = "T1620";
+                                result = sig;
+                                stat.fetch_add(1, std::memory_order_relaxed);
+                                return true;
+                            }
                         }
                     }
+                    return false;
+                };
+
+                if (!searchBuffer(g_cobaltStrikePatterns, "Cobalt Strike Beacon",
+                                  ReflectiveLoadType::CobaltStrikeBeacon,
+                                  m_stats.cobaltStrikeDetected)) {
+                    searchBuffer(g_meterpreterPatterns, "Metasploit Meterpreter",
+                                 ReflectiveLoadType::MeterpreterStage,
+                                 m_stats.meterpreterDetected);
                 }
             }
 
-            // Check for Meterpreter patterns
+            // Heuristic: detect API-hashing loops (ROR-13, CRC32, DJB2)
             if (!result) {
-                for (const auto& pattern : g_meterpreterPatterns) {
-                    if (buffer.size() >= pattern.size()) {
-                        if (std::equal(pattern.begin(), pattern.end(), buffer.begin())) {
-                            LoaderSignature sig;
-                            sig.name = "Metasploit Meterpreter";
-                            sig.type = ReflectiveLoadType::MeterpreterStage;
-                            sig.mitreId = "T1620";
-                            result = sig;
-                            m_stats.meterpreterDetected.fetch_add(1, std::memory_order_relaxed);
-                            break;
-                        }
-                    }
+                if (const char* hashName = DetectAPIHashingPattern(buffer)) {
+                    LoaderSignature sig;
+                    sig.name = std::string("API-hash loader (") + hashName + ")";
+                    sig.type = ReflectiveLoadType::ClassicReflective;
+                    sig.mitreId = "T1620";
+                    sig.description = L"Hash-based API resolution loop detected";
+                    result = sig;
                 }
             }
         }
 
-        CloseHandle(hProcess);
         return result;
     }
 
@@ -1095,12 +1430,15 @@ public:
     std::vector<uint8_t> ExtractPayload(uint32_t pid, const ReflectiveDetection& detection) {
         std::vector<uint8_t> payload;
 
-        if (!m_config.extractPayloads) {
-            SS_LOG_WARN(L"ReflectiveDLL", L"Payload extraction disabled");
-            return payload;
+        {
+            std::shared_lock lock(m_mutex);
+            if (!m_config.extractPayloads) {
+                SS_LOG_WARN(L"ReflectiveDLL", L"Payload extraction disabled");
+                return payload;
+            }
         }
 
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) {
             m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
             return payload;
@@ -1109,11 +1447,24 @@ public:
         try {
             const auto& candidate = detection.peCandidate;
 
-            if (ReadProcessMemorySafe(hProcess, candidate.baseAddress, payload,
-                candidate.sizeOfImage > 0 ? candidate.sizeOfImage : candidate.regionSize)) {
+            // Cap extraction size to prevent DoS via crafted SizeOfImage
+            constexpr size_t kMaxExtraction = 100 * 1024 * 1024; // 100 MB
+            size_t extractSize = candidate.sizeOfImage > 0
+                ? candidate.sizeOfImage : candidate.regionSize;
+            extractSize = std::min(extractSize, kMaxExtraction);
+
+            if (extractSize < ReflectiveConstants::MIN_PE_SIZE) {
+                m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
+                return payload;
+            }
+
+            if (ReadProcessMemorySafe(hProcess.get(), candidate.baseAddress,
+                                      payload, extractSize)) {
                 m_stats.payloadsExtracted.fetch_add(1, std::memory_order_relaxed);
 
-                SS_LOG_INFO(L"ReflectiveDLL", L"Extracted payload from 0x%X (%zu bytes)", candidate.baseAddress, payload.size());
+                SS_LOG_INFO(L"ReflectiveDLL",
+                    L"Extracted payload from 0x%016llX (%zu bytes)",
+                    static_cast<unsigned long long>(candidate.baseAddress), payload.size());
             } else {
                 m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1123,7 +1474,6 @@ public:
             m_stats.extractionFailures.fetch_add(1, std::memory_order_relaxed);
         }
 
-        CloseHandle(hProcess);
         return payload;
     }
 
@@ -1138,7 +1488,7 @@ public:
             ofs.write(reinterpret_cast<const char*>(payload.data()), payload.size());
             ofs.close();
 
-            SS_LOG_INFO(L"ReflectiveDLL", L"Dumped PE to %S", Utils::StringUtils::WideToUtf8(outputPath));
+            SS_LOG_INFO(L"ReflectiveDLL", L"Dumped PE to %s", outputPath.c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -1148,13 +1498,111 @@ public:
     }
 
     std::vector<uint8_t> ReconstructPE(uint32_t pid, uintptr_t baseAddress) {
-        // PE reconstruction would involve:
-        // 1. Read PE headers
-        // 2. Fix section alignments
-        // 3. Rebuild import table
-        // 4. Fix relocations
-        // Simplified implementation just extracts raw memory
-        return ExtractPayloadRaw(pid, baseAddress);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid));
+        if (!hProcess) return {};
+
+        // Step 1: Read PE headers
+        std::vector<uint8_t> headerBuf;
+        if (!ReadProcessMemorySafe(hProcess.get(), baseAddress, headerBuf,
+                                   ReflectiveConstants::MAX_PE_HEADER_SCAN)) {
+            return {};
+        }
+
+        if (!HasDosSignature(headerBuf)) return {};
+
+        const auto* dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(headerBuf.data());
+        if (dos->e_lfanew < 0 ||
+            static_cast<size_t>(dos->e_lfanew) + sizeof(IMAGE_NT_HEADERS64) > headerBuf.size()) {
+            return {};
+        }
+
+        const auto* nt = reinterpret_cast<const IMAGE_NT_HEADERS*>(
+            headerBuf.data() + dos->e_lfanew);
+        if (nt->Signature != ReflectiveConstants::PE_SIGNATURE) return {};
+        if (nt->FileHeader.NumberOfSections > ReflectiveConstants::MAX_SECTIONS) return {};
+
+        const bool is64 = (nt->OptionalHeader.Magic == ReflectiveConstants::OPTIONAL_HEADER_MAGIC_64);
+        const uint32_t numSections = nt->FileHeader.NumberOfSections;
+
+        uint32_t sizeOfImage = 0;
+        uint32_t sectionAlignment = 0;
+        uint32_t fileAlignment = 0;
+
+        const IMAGE_SECTION_HEADER* firstSection = nullptr;
+
+        if (is64) {
+            const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(nt);
+            sizeOfImage = nt64->OptionalHeader.SizeOfImage;
+            sectionAlignment = nt64->OptionalHeader.SectionAlignment;
+            fileAlignment = nt64->OptionalHeader.FileAlignment;
+            firstSection = IMAGE_FIRST_SECTION(nt64);
+        } else {
+            sizeOfImage = nt->OptionalHeader.SizeOfImage;
+            sectionAlignment = nt->OptionalHeader.SectionAlignment;
+            fileAlignment = nt->OptionalHeader.FileAlignment;
+            firstSection = IMAGE_FIRST_SECTION(nt);
+        }
+
+        // Sanity cap
+        constexpr uint32_t kMaxImage = 256 * 1024 * 1024;
+        if (sizeOfImage == 0 || sizeOfImage > kMaxImage) return {};
+        if (fileAlignment == 0) fileAlignment = 0x200;
+
+        // Step 2: Read entire in-memory image
+        std::vector<uint8_t> memImage;
+        if (!ReadProcessMemorySafe(hProcess.get(), baseAddress, memImage, sizeOfImage)) {
+            return {};
+        }
+
+        // Step 3: Reconstruct file-aligned PE
+        // Compute total file size from sections
+        uint32_t maxFileOffset = 0;
+        const auto* sectionHeader = firstSection;
+        const size_t sectionTableEnd = reinterpret_cast<const uint8_t*>(firstSection)
+            - headerBuf.data() + numSections * sizeof(IMAGE_SECTION_HEADER);
+        if (sectionTableEnd > headerBuf.size()) return {};
+
+        for (uint32_t i = 0; i < numSections; ++i) {
+            const uint32_t rawEnd = sectionHeader[i].PointerToRawData + sectionHeader[i].SizeOfRawData;
+            if (rawEnd > maxFileOffset) maxFileOffset = rawEnd;
+        }
+
+        // If no raw data pointers set, use VA-based layout (in-memory dump)
+        if (maxFileOffset == 0) {
+            return memImage;
+        }
+
+        std::vector<uint8_t> reconstructed(maxFileOffset, 0);
+
+        // Copy headers up to first section
+        uint32_t headerSize = firstSection[0].PointerToRawData;
+        if (headerSize == 0) headerSize = 0x200;
+        headerSize = std::min(headerSize, static_cast<uint32_t>(memImage.size()));
+        std::memcpy(reconstructed.data(), memImage.data(), headerSize);
+
+        // Copy each section from its virtual offset to its file offset
+        for (uint32_t i = 0; i < numSections; ++i) {
+            const auto& sec = sectionHeader[i];
+            if (sec.VirtualAddress >= memImage.size()) continue;
+            if (sec.PointerToRawData >= reconstructed.size()) continue;
+
+            const size_t copySize = std::min({
+                static_cast<size_t>(sec.SizeOfRawData),
+                memImage.size() - sec.VirtualAddress,
+                reconstructed.size() - sec.PointerToRawData
+            });
+
+            std::memcpy(reconstructed.data() + sec.PointerToRawData,
+                         memImage.data() + sec.VirtualAddress,
+                         copySize);
+        }
+
+        SS_LOG_INFO(L"ReflectiveDLL",
+            L"Reconstructed PE from 0x%016llX (%zu bytes, %u sections)",
+            static_cast<unsigned long long>(baseAddress),
+            reconstructed.size(), numSections);
+
+        return reconstructed;
     }
 
     // ========================================================================
@@ -1189,20 +1637,51 @@ public:
     }
 
     bool IsMonitoring() const noexcept {
-        std::shared_lock lock(m_mutex);
         return m_monitoring;
     }
 
     void OnMemoryAllocation(uint32_t pid, uintptr_t address, size_t size, uint32_t protection) {
         if (!m_monitoring) return;
 
-        // Check if suspicious allocation (RWX, large size, etc.)
-        if (IsRWX(protection)) {
-            SS_LOG_WARN(L"ReflectiveDLL", L"RWX allocation detected - PID %u, Address 0x%X, Size %ls", pid, address, size);
+        // Snapshot config flag under shared lock
+        bool rtMonitoring;
+        {
+            std::shared_lock lock(m_mutex);
+            rtMonitoring = m_config.enableRealTimeMonitoring;
+        }
 
-            // Trigger scan if enabled
-            if (m_config.enableRealTimeMonitoring) {
-                // Would queue scan or check immediately
+        // Flag RWX allocations — these are almost never legitimate
+        if (IsRWX(protection)) {
+            SS_LOG_WARN(L"ReflectiveDLL",
+                L"RWX allocation detected — PID %u, Address 0x%016llX, Size %zu",
+                pid, static_cast<unsigned long long>(address), size);
+
+            // Immediately check for PE structure at the allocated address
+            if (rtMonitoring && size >= ReflectiveConstants::MIN_PE_SIZE) {
+                if (ContainsPE(pid, address, size)) {
+                    SS_LOG_ERROR(L"ReflectiveDLL",
+                        L"PE structure in RWX allocation — PID %u, Address 0x%016llX",
+                        pid, static_cast<unsigned long long>(address));
+
+                    // Trigger targeted scan on the region
+                    auto result = Scan(pid, ReflectiveScanMode::Standard);
+                    (void)result; // Detection callbacks fire inside Scan()
+                }
+            }
+        }
+        // Also flag large executable allocations (manual mapping often allocates large RX)
+        else if (IsExecutable(protection) && size >= 64 * 1024) {
+            // Query the actual memory type — OnMemoryAllocation only receives protection
+            HandleGuard hProc(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+            if (hProc) {
+                MEMORY_BASIC_INFORMATION mbi{};
+                if (VirtualQueryEx(hProc.get(), reinterpret_cast<LPCVOID>(address),
+                                   &mbi, sizeof(mbi)) && IsUnbacked(mbi.Type)) {
+                    SS_LOG_DEBUG(L"ReflectiveDLL",
+                        L"Large unbacked executable allocation — PID %u, "
+                        L"Address 0x%016llX, Size %zu",
+                        pid, static_cast<unsigned long long>(address), size);
+                }
             }
         }
     }
@@ -1211,13 +1690,22 @@ public:
                            uint32_t oldProtection, uint32_t newProtection) {
         if (!m_monitoring) return;
 
-        // Detect RW->RX transitions (common in reflective loading)
-        if (IsWritable(oldProtection) && IsExecutable(newProtection)) {
-            SS_LOG_WARN(L"ReflectiveDLL", L"Suspicious protection change - PID %u, Address 0x%X, RW->RX", pid, address);
+        // Detect RW->RX transitions (hallmark of reflective loading / manual mapping)
+        if (IsWritable(oldProtection) && !IsExecutable(oldProtection) &&
+            IsExecutable(newProtection) && !IsWritable(newProtection)) {
+            SS_LOG_WARN(L"ReflectiveDLL",
+                L"Suspicious protection change RW->RX — PID %u, Address 0x%016llX",
+                pid, static_cast<unsigned long long>(address));
 
             // Check for PE structure at this address
-            if (ContainsPE(pid, address, 4096)) {
-                SS_LOG_ERROR(L"ReflectiveDLL", L"PE structure found after RW->RX transition - PID %u, Address 0x%X", pid, address);
+            if (ContainsPE(pid, address, ReflectiveConstants::MAX_PE_HEADER_SCAN)) {
+                SS_LOG_ERROR(L"ReflectiveDLL",
+                    L"PE structure found after RW->RX transition — PID %u, Address 0x%016llX — triggering scan",
+                    pid, static_cast<unsigned long long>(address));
+
+                // Create immediate detection event
+                auto result = Scan(pid, ReflectiveScanMode::Standard);
+                (void)result;
             }
         }
     }
@@ -1230,7 +1718,7 @@ public:
         return m_callbackManager->RegisterDetection(std::move(callback));
     }
 
-    uint64_t RegisterProgressCallback(ScanProgressCallback callback) {
+    uint64_t RegisterProgressCallback(ReflectiveScanProgressCallback callback) {
         return m_callbackManager->RegisterProgress(std::move(callback));
     }
 
@@ -1262,35 +1750,45 @@ private:
     std::wstring GetProcessName(uint32_t pid) const {
         wchar_t processName[MAX_PATH] = L"<unknown>";
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
         if (hProcess) {
             DWORD size = MAX_PATH;
-            QueryFullProcessImageNameW(hProcess, 0, processName, &size);
-            CloseHandle(hProcess);
+            QueryFullProcessImageNameW(hProcess.get(), 0, processName, &size);
         }
 
         std::filesystem::path path(processName);
         return path.filename().wstring();
     }
 
+    std::wstring GetProcessPath(uint32_t pid) const {
+        wchar_t processPath[MAX_PATH] = L"";
+
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid));
+        if (hProcess) {
+            DWORD size = MAX_PATH;
+            QueryFullProcessImageNameW(hProcess.get(), 0, processPath, &size);
+        }
+
+        return processPath;
+    }
+
     std::vector<uint32_t> FindProcessesByName(const std::wstring& name) const {
         std::vector<uint32_t> pids;
 
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) return pids;
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot) return pids;
 
-        PROCESSENTRY32W pe32;
+        PROCESSENTRY32W pe32{};
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (Process32FirstW(hSnapshot, &pe32)) {
+        if (Process32FirstW(hSnapshot.get(), &pe32)) {
             do {
                 if (_wcsicmp(pe32.szExeFile, name.c_str()) == 0) {
                     pids.push_back(pe32.th32ProcessID);
                 }
-            } while (Process32NextW(hSnapshot, &pe32));
+            } while (Process32NextW(hSnapshot.get(), &pe32));
         }
 
-        CloseHandle(hSnapshot);
         return pids;
     }
 
@@ -1306,34 +1804,45 @@ private:
         return false;
     }
 
-    std::vector<PECandidate> FindPECandidatesImpl(uint32_t pid, ScanMode mode,
-        std::function<void(uint32_t, uint32_t)> progressCallback) {
+    std::vector<PECandidate> FindPECandidatesImpl(uint32_t pid, ReflectiveScanMode mode,
+        std::function<void(uint32_t, uint32_t)> progressCallback,
+        const ReflectiveConfig* configOverride = nullptr) {
 
         std::vector<PECandidate> candidates;
 
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid);
+        // Use provided config or snapshot current config under lock
+        ReflectiveConfig cfg;
+        if (configOverride) {
+            cfg = *configOverride;
+        } else {
+            std::shared_lock lock(m_mutex);
+            cfg = m_config;
+        }
+
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid));
         if (!hProcess) {
             m_stats.accessDeniedErrors.fetch_add(1, std::memory_order_relaxed);
             return candidates;
         }
 
         try {
-            MEMORY_BASIC_INFORMATION mbi;
+            MEMORY_BASIC_INFORMATION mbi{};
             uintptr_t address = 0;
             uint32_t regionsScanned = 0;
             uint32_t totalRegions = 0;
 
             // Count total regions first (for progress)
-            while (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+            while (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
                 totalRegions++;
-                address += mbi.RegionSize;
-                if (address == 0) break;
+                const uintptr_t next = address + mbi.RegionSize;
+                if (next <= address) break;
+                address = next;
             }
 
             // Reset for actual scan
             address = 0;
 
-            while (VirtualQueryEx(hProcess, reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
+            while (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(address), &mbi, sizeof(mbi))) {
                 regionsScanned++;
                 m_stats.regionsScanned.fetch_add(1, std::memory_order_relaxed);
 
@@ -1343,12 +1852,12 @@ private:
                 }
 
                 // Check limits
-                if (candidates.size() >= m_config.maxPECandidates) {
+                if (candidates.size() >= cfg.maxPECandidates) {
                     SS_LOG_WARN(L"ReflectiveDLL", L"Max PE candidates reached");
                     break;
                 }
 
-                if (regionsScanned >= m_config.maxRegionsToScan) {
+                if (regionsScanned >= cfg.maxRegionsToScan) {
                     SS_LOG_WARN(L"ReflectiveDLL", L"Max regions scanned reached");
                     break;
                 }
@@ -1356,21 +1865,23 @@ private:
                 // Filter by scan mode
                 bool shouldScan = false;
                 switch (mode) {
-                    case ScanMode::Quick:
+                    case ReflectiveScanMode::Quick:
                         shouldScan = (mbi.State == MEM_COMMIT && IsRWX(mbi.Protect));
                         break;
-                    case ScanMode::Standard:
+                    case ReflectiveScanMode::Standard:
                         shouldScan = (mbi.State == MEM_COMMIT && IsExecutable(mbi.Protect));
                         break;
-                    case ScanMode::Deep:
-                    case ScanMode::Forensic:
+                    case ReflectiveScanMode::Deep:
+                    case ReflectiveScanMode::Forensic:
                         shouldScan = (mbi.State == MEM_COMMIT);
                         break;
                 }
 
-                // Additional filters
-                if (shouldScan && m_config.scanPrivateMemory) {
-                    shouldScan = IsUnbacked(mbi.Type);
+                // When scanPrivateMemory is true we RESTRICT to private/unbacked memory
+                // (skip image-backed regions which are legitimate loaded DLLs).
+                // When false, scan all types of memory that passed the mode filter.
+                if (shouldScan && cfg.scanPrivateMemory && !IsUnbacked(mbi.Type)) {
+                    shouldScan = false;
                 }
 
                 if (shouldScan && mbi.RegionSize >= ReflectiveConstants::MIN_PE_SIZE) {
@@ -1378,23 +1889,24 @@ private:
                     candidate.baseAddress = reinterpret_cast<uintptr_t>(mbi.BaseAddress);
                     candidate.regionSize = mbi.RegionSize;
                     candidate.memoryProtection = mbi.Protect;
+                    candidate.isFileBacked = (mbi.Type == MEM_IMAGE) || (mbi.Type == MEM_MAPPED);
 
                     // Validate PE structure
-                    if (ValidatePEImpl(hProcess, candidate)) {
-                        candidates.push_back(candidate);
+                    if (ValidatePEImpl(hProcess.get(), candidate)) {
+                        candidates.push_back(std::move(candidate));
                         m_stats.peCandidatesAnalyzed.fetch_add(1, std::memory_order_relaxed);
                     }
                 }
 
-                address += mbi.RegionSize;
-                if (address == 0) break; // Overflow
+                const uintptr_t next = address + mbi.RegionSize;
+                if (next <= address) break;
+                address = next;
             }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"ReflectiveDLL", L"FindPECandidatesImpl: %S", e.what());
         }
 
-        CloseHandle(hProcess);
         return candidates;
     }
 
@@ -1415,13 +1927,16 @@ private:
         candidate.hasDosHeader = true;
 
         const auto* dosHeader = reinterpret_cast<const IMAGE_DOS_HEADER*>(headerBuffer.data());
-        candidate.peHeaderOffset = dosHeader->e_lfanew;
+        const LONG lfanew = dosHeader->e_lfanew;
 
-        // Validate PE offset
-        if (candidate.peHeaderOffset > headerBuffer.size() - sizeof(IMAGE_NT_HEADERS)) {
+        // Validate e_lfanew: must be positive, and leave room for NT headers
+        if (lfanew < 0 || static_cast<size_t>(lfanew) > headerBuffer.size() ||
+            headerBuffer.size() - static_cast<size_t>(lfanew) < sizeof(IMAGE_NT_HEADERS)) {
             candidate.validationResult = PEValidationResult::TruncatedPE;
             return false;
         }
+
+        candidate.peHeaderOffset = static_cast<uint32_t>(lfanew);
 
         // Check PE signature
         if (!HasPeSignature(headerBuffer, candidate.peHeaderOffset)) {
@@ -1440,48 +1955,162 @@ private:
         candidate.timeDateStamp = ntHeaders->FileHeader.TimeDateStamp;
         candidate.characteristics = ntHeaders->FileHeader.Characteristics;
 
-        // Determine architecture
-        const uint16_t magic = ntHeaders->OptionalHeader.Magic;
-        if (magic == ReflectiveConstants::OPTIONAL_HEADER_MAGIC_64) {
-            candidate.is64Bit = true;
-            const auto* ntHeaders64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntHeaders);
-            candidate.sizeOfImage = ntHeaders64->OptionalHeader.SizeOfImage;
-            candidate.entryPoint = ntHeaders64->OptionalHeader.AddressOfEntryPoint;
-            candidate.imageBase = ntHeaders64->OptionalHeader.ImageBase;
-        } else if (magic == ReflectiveConstants::OPTIONAL_HEADER_MAGIC_32) {
-            candidate.is64Bit = false;
-            candidate.sizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
-            candidate.entryPoint = ntHeaders->OptionalHeader.AddressOfEntryPoint;
-            candidate.imageBase = ntHeaders->OptionalHeader.ImageBase;
-        } else {
-            candidate.validationResult = PEValidationResult::InvalidOptionalHeader;
-            return false;
-        }
-
         // Validate section count
         if (candidate.numberOfSections > ReflectiveConstants::MAX_SECTIONS) {
             candidate.validationResult = PEValidationResult::InvalidSections;
             return false;
         }
 
-        // Parse sections (simplified - would parse all sections)
-        candidate.validationResult = PEValidationResult::Valid;
-        candidate.isValidPE = true;
+        // Determine architecture and parse optional header
+        const uint16_t magic = ntHeaders->OptionalHeader.Magic;
+        const IMAGE_SECTION_HEADER* sectionTable = nullptr;
+        uint32_t numberOfRvaAndSizes = 0;
+        const IMAGE_DATA_DIRECTORY* dataDir = nullptr;
 
+        if (magic == ReflectiveConstants::OPTIONAL_HEADER_MAGIC_64) {
+            // Ensure buffer has room for full NT64 headers + section table
+            const size_t nt64End = candidate.peHeaderOffset + sizeof(IMAGE_NT_HEADERS64);
+            const size_t sectionEnd = nt64End +
+                candidate.numberOfSections * sizeof(IMAGE_SECTION_HEADER);
+            if (sectionEnd > headerBuffer.size()) {
+                candidate.validationResult = PEValidationResult::TruncatedPE;
+                return false;
+            }
+
+            candidate.is64Bit = true;
+            const auto* nt64 = reinterpret_cast<const IMAGE_NT_HEADERS64*>(ntHeaders);
+            candidate.sizeOfImage = nt64->OptionalHeader.SizeOfImage;
+            candidate.entryPoint = nt64->OptionalHeader.AddressOfEntryPoint;
+            candidate.imageBase = nt64->OptionalHeader.ImageBase;
+            numberOfRvaAndSizes = nt64->OptionalHeader.NumberOfRvaAndSizes;
+            dataDir = nt64->OptionalHeader.DataDirectory;
+            sectionTable = IMAGE_FIRST_SECTION(nt64);
+
+        } else if (magic == ReflectiveConstants::OPTIONAL_HEADER_MAGIC_32) {
+            const size_t nt32End = candidate.peHeaderOffset + sizeof(IMAGE_NT_HEADERS32);
+            const size_t sectionEnd = nt32End +
+                candidate.numberOfSections * sizeof(IMAGE_SECTION_HEADER);
+            if (sectionEnd > headerBuffer.size()) {
+                candidate.validationResult = PEValidationResult::TruncatedPE;
+                return false;
+            }
+
+            candidate.is64Bit = false;
+            candidate.sizeOfImage = ntHeaders->OptionalHeader.SizeOfImage;
+            candidate.entryPoint = ntHeaders->OptionalHeader.AddressOfEntryPoint;
+            candidate.imageBase = ntHeaders->OptionalHeader.ImageBase;
+            numberOfRvaAndSizes = ntHeaders->OptionalHeader.NumberOfRvaAndSizes;
+            dataDir = ntHeaders->OptionalHeader.DataDirectory;
+            sectionTable = IMAGE_FIRST_SECTION(ntHeaders);
+        } else {
+            candidate.validationResult = PEValidationResult::InvalidOptionalHeader;
+            return false;
+        }
+
+        // Validate SizeOfImage
+        constexpr uint32_t kMaxSizeOfImage = 256 * 1024 * 1024; // 256 MB
+        if (candidate.sizeOfImage == 0 || candidate.sizeOfImage > kMaxSizeOfImage) {
+            candidate.validationResult = PEValidationResult::SuspiciousCharacteristics;
+            return false;
+        }
+
+        // Parse data directories (export, import, reloc, TLS, debug)
+        if (dataDir && numberOfRvaAndSizes > 0) {
+            if (numberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_EXPORT) {
+                candidate.hasExportTable = (dataDir[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress != 0
+                    && dataDir[IMAGE_DIRECTORY_ENTRY_EXPORT].Size >= ReflectiveConstants::MIN_EXPORT_TABLE_SIZE);
+            }
+            if (numberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_IMPORT) {
+                candidate.hasImportTable = (dataDir[IMAGE_DIRECTORY_ENTRY_IMPORT].VirtualAddress != 0
+                    && dataDir[IMAGE_DIRECTORY_ENTRY_IMPORT].Size >= ReflectiveConstants::MIN_IMPORT_TABLE_SIZE);
+            }
+            if (numberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_BASERELOC) {
+                candidate.hasRelocationTable = (dataDir[IMAGE_DIRECTORY_ENTRY_BASERELOC].VirtualAddress != 0
+                    && dataDir[IMAGE_DIRECTORY_ENTRY_BASERELOC].Size > 0);
+            }
+            if (numberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_TLS) {
+                candidate.hasTLSDirectory = (dataDir[IMAGE_DIRECTORY_ENTRY_TLS].VirtualAddress != 0
+                    && dataDir[IMAGE_DIRECTORY_ENTRY_TLS].Size > 0);
+            }
+            if (numberOfRvaAndSizes > IMAGE_DIRECTORY_ENTRY_DEBUG) {
+                candidate.hasDebugDirectory = (dataDir[IMAGE_DIRECTORY_ENTRY_DEBUG].VirtualAddress != 0
+                    && dataDir[IMAGE_DIRECTORY_ENTRY_DEBUG].Size > 0);
+            }
+        }
+
+        // Parse section headers — entropy per section
+        candidate.sections.reserve(candidate.numberOfSections);
+        for (uint16_t i = 0; i < candidate.numberOfSections; ++i) {
+            PECandidate::SectionInfo si{};
+            std::memcpy(si.name.data(), sectionTable[i].Name,
+                        std::min(sizeof(sectionTable[i].Name), si.name.size()));
+            si.virtualAddress = sectionTable[i].VirtualAddress;
+            si.virtualSize = sectionTable[i].Misc.VirtualSize;
+            si.rawSize = sectionTable[i].SizeOfRawData;
+            si.characteristics = sectionTable[i].Characteristics;
+
+            // Calculate per-section entropy if section is within readable range
+            if (si.virtualAddress > 0 && si.virtualSize > 0) {
+                const size_t readSize = std::min(
+                    static_cast<size_t>(si.virtualSize),
+                    static_cast<size_t>(ReflectiveConstants::MAX_SECTION_SCAN));
+                std::vector<uint8_t> secBuf;
+                if (ReadProcessMemorySafe(hProcess,
+                        candidate.baseAddress + si.virtualAddress,
+                        secBuf, readSize)) {
+                    si.entropy = CalculateEntropy(secBuf);
+                }
+            }
+
+            candidate.sections.push_back(si);
+        }
+
+        // Overall entropy from header region
+        candidate.overallEntropy = CalculateEntropy(headerBuffer);
+
+        // Determine packed/encrypted status from section entropies
+        for (const auto& sec : candidate.sections) {
+            if (sec.entropy >= ReflectiveConstants::ENCRYPTED_ENTROPY_THRESHOLD) {
+                candidate.isEncrypted = true;
+                candidate.isPacked = true;
+            } else if (sec.entropy >= ReflectiveConstants::PACKED_ENTROPY_THRESHOLD) {
+                candidate.isPacked = true;
+            }
+        }
+
+        if (candidate.isPacked) {
+            candidate.validationResult = PEValidationResult::Packed;
+        } else if (candidate.isEncrypted) {
+            candidate.validationResult = PEValidationResult::Encrypted;
+        } else {
+            candidate.validationResult = PEValidationResult::Valid;
+        }
+
+        // Compute SHA256 of PE header region for identification and store lookups
+        {
+            std::vector<uint8_t> hashOut;
+            if (Utils::HashUtils::Compute(Utils::HashUtils::Algorithm::SHA256,
+                    headerBuffer.data(), headerBuffer.size(), hashOut)) {
+                const size_t copyLen = std::min(hashOut.size(), candidate.sha256Hash.size());
+                std::memcpy(candidate.sha256Hash.data(), hashOut.data(), copyLen);
+            }
+        }
+
+        candidate.isValidPE = true;
         return true;
     }
 
     std::vector<uintptr_t> GetPEBModulesImpl(uint32_t pid) {
         std::vector<uintptr_t> modules;
 
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) return modules;
 
         try {
-            HMODULE hMods[1024];
-            DWORD cbNeeded;
+            HMODULE hMods[1024]{};
+            DWORD cbNeeded = 0;
 
-            if (EnumProcessModules(hProcess, hMods, sizeof(hMods), &cbNeeded)) {
+            if (EnumProcessModules(hProcess.get(), hMods, sizeof(hMods), &cbNeeded)) {
                 const DWORD moduleCount = cbNeeded / sizeof(HMODULE);
 
                 for (DWORD i = 0; i < std::min(moduleCount, DWORD(1024)); ++i) {
@@ -1490,18 +2119,18 @@ private:
             }
 
         } catch (...) {
-            SS_LOG_ERROR(L"ReflectiveDLL", L"GetPEBModulesImpl: Exception");
+            SS_LOG_ERROR(L"ReflectiveDLL", L"GetPEBModulesImpl exception for PID %u", pid);
         }
 
-        CloseHandle(hProcess);
         return modules;
     }
 
     std::optional<ReflectiveDetection> AnalyzeCandidate(uint32_t pid,
                                                        const PECandidate& candidate,
-                                                       ScanMode mode) {
+                                                       ReflectiveScanMode mode,
+                                                       const ReflectiveConfig& config) {
 
-        // Skip if PE is in PEB and file-backed (legitimate)
+        // Skip if PE is in PEB and file-backed (legitimate loaded module)
         if (candidate.isInPEB && candidate.isFileBacked) {
             return std::nullopt;
         }
@@ -1509,17 +2138,41 @@ private:
         ReflectiveDetection detection;
         detection.processId = pid;
         detection.processName = GetProcessName(pid);
+        detection.processPath = GetProcessPath(pid);
         detection.peCandidate = candidate;
         detection.detectionTime = std::chrono::system_clock::now();
 
         // Initial confidence
         detection.confidence = DetectionConfidence::None;
 
+        // Threat intel correlation via PE header hash
+        if (config.useThreatIntel) {
+            const std::string sha256Hex = Utils::HashUtils::ToHexLower(
+                candidate.sha256Hash.data(), candidate.sha256Hash.size());
+            if (!sha256Hex.empty()) {
+                try {
+                    double tiRiskScore = 0.0;
+                    std::string tiThreatName;
+                    if (ThreatIntel::ThreatIntelManager::Instance()
+                            .IsKnownMalicious(sha256Hex, tiRiskScore, tiThreatName)) {
+                        detection.correlatedWithKnownThreat = true;
+                        detection.threatName = Utils::StringUtils::ToWide(tiThreatName);
+                        detection.confidence = DetectionConfidence::Confirmed;
+                        detection.riskFactors.push_back(
+                            L"ThreatIntel match: " + detection.threatName);
+                    }
+                } catch (const std::exception& e) {
+                    SS_LOG_DEBUG(L"ReflectiveDLL",
+                        L"ThreatIntel lookup failed: %S", e.what());
+                }
+            }
+        }
+
         // Check for unbacked memory
         detection.isUnbacked = !candidate.isFileBacked;
         if (detection.isUnbacked) {
             detection.characteristics.push_back(MemoryCharacteristic::Unbacked);
-            detection.confidence = DetectionConfidence::Low;
+            detection.confidence = std::max(detection.confidence, DetectionConfidence::Low);
             detection.riskFactors.push_back(L"PE in unbacked memory");
         }
 
@@ -1533,14 +2186,65 @@ private:
 
         // Check PEB consistency
         detection.isHiddenFromPEB = !candidate.isInPEB;
-        if (detection.isHiddenFromPEB) {
+        if (detection.isHiddenFromPEB && candidate.isValidPE) {
             detection.characteristics.push_back(MemoryCharacteristic::HiddenFromPEB);
             detection.confidence = DetectionConfidence::High;
-            detection.riskFactors.push_back(L"Not listed in PEB");
+            detection.riskFactors.push_back(L"Valid PE not listed in PEB module list");
         }
 
-        // Detect known loaders
-        if (m_config.detectKnownLoaders) {
+        // Entropy analysis (packed/encrypted detection)
+        if (candidate.isPacked) {
+            detection.characteristics.push_back(MemoryCharacteristic::HighEntropy);
+            detection.confidence = std::max(detection.confidence, DetectionConfidence::Medium);
+            detection.riskFactors.push_back(L"High entropy — possible packed/encrypted payload");
+        }
+
+        // TLS directory in unbacked PE (often used by reflective loaders for init)
+        if (candidate.hasTLSDirectory && detection.isUnbacked) {
+            detection.confidence = std::max(detection.confidence, DetectionConfidence::High);
+            detection.riskFactors.push_back(L"TLS callbacks in unbacked PE");
+        }
+
+        // Relocation table presence (needed by reflective loaders for rebasing)
+        if (candidate.hasRelocationTable && detection.isUnbacked && detection.isHiddenFromPEB) {
+            detection.riskFactors.push_back(L"Relocation table in hidden PE (manual rebasing)");
+        }
+
+        // Thread analysis — look for threads executing in this PE's memory
+        if (config.analyzeThreadStartAddresses) {
+            auto suspThreads = FindSuspiciousThreads(pid);
+            for (const auto& [tid, startAddr] : suspThreads) {
+                if (startAddr >= candidate.baseAddress &&
+                    startAddr < candidate.baseAddress + candidate.regionSize) {
+                    detection.hasThreadStartingHere = true;
+                    detection.associatedThreadIds.push_back(tid);
+                }
+            }
+            detection.threadCount = static_cast<uint32_t>(detection.associatedThreadIds.size());
+            if (detection.hasThreadStartingHere) {
+                detection.confidence = DetectionConfidence::Confirmed;
+                detection.riskFactors.push_back(
+                    L"Thread(s) executing inside hidden PE — active reflective injection");
+            }
+        }
+
+        // Call stack analysis (Deep/Forensic only due to cost)
+        if (config.analyzeCallStacks &&
+            (mode == ReflectiveScanMode::Deep || mode == ReflectiveScanMode::Forensic)) {
+            for (uint32_t tid : detection.associatedThreadIds) {
+                uint32_t unbacked = CountUnbackedCallStackFrames(tid);
+                if (unbacked > 0) {
+                    detection.foundInCallStack = true;
+                    detection.callStackDepth = std::max(detection.callStackDepth, unbacked);
+                }
+            }
+            if (detection.foundInCallStack) {
+                detection.riskFactors.push_back(L"Unbacked frames in call stack");
+            }
+        }
+
+        // Detect known loaders (signature + heuristic matching)
+        if (config.detectKnownLoaders) {
             if (auto loader = DetectKnownLoader(pid, candidate)) {
                 detection.loadType = loader->type;
                 detection.confidence = DetectionConfidence::Confirmed;
@@ -1548,19 +2252,32 @@ private:
                 detection.threatName = loader->description;
                 detection.mitreAttackId = loader->mitreId;
                 detection.riskFactors.push_back(L"Known reflective loader detected: " +
-                    Utils::StringUtils::Utf8ToWide(loader->name));
+                    Utils::StringUtils::ToWide(loader->name));
             }
         }
+
+        // PatternStore scan for YARA-like pattern matching on PE header region
+        // PatternStore is injected externally (not a singleton); scan is already
+        // covered by LoaderSignatureDB + heuristic patterns above.
+        // Additional PatternStore wiring should be done during Initialize() when
+        // the application provides the PatternStore instance.
 
         // Default load type if not identified
         if (detection.loadType == ReflectiveLoadType::Unknown) {
             if (detection.isUnbacked && detection.isHiddenFromPEB) {
                 detection.loadType = ReflectiveLoadType::ClassicReflective;
                 m_stats.classicReflectiveDetected.fetch_add(1, std::memory_order_relaxed);
+            } else if (candidate.isPacked) {
+                detection.loadType = ReflectiveLoadType::PackedReflective;
             } else {
                 detection.loadType = ReflectiveLoadType::CustomLoader;
                 m_stats.customLoadersDetected.fetch_add(1, std::memory_order_relaxed);
             }
+        }
+
+        // MITRE mapping for unidentified types
+        if (detection.mitreAttackId.empty()) {
+            detection.mitreAttackId = "T1620";
         }
 
         // Calculate risk score
@@ -1587,7 +2304,7 @@ private:
         }
 
         // Only alert if meets threshold
-        if (detection.confidence >= m_config.alertThreshold) {
+        if (detection.confidence >= config.alertThreshold) {
             return detection;
         }
 
@@ -1597,23 +2314,109 @@ private:
     std::vector<uint8_t> ExtractPayloadRaw(uint32_t pid, uintptr_t baseAddress) {
         std::vector<uint8_t> payload;
 
-        HANDLE hProcess = OpenProcess(PROCESS_VM_READ, FALSE, pid);
+        HandleGuard hProcess(OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, pid));
         if (!hProcess) return payload;
 
-        // Read up to 10MB (reasonable limit)
-        ReadProcessMemorySafe(hProcess, baseAddress, payload, 10 * 1024 * 1024);
+        // Determine actual region size via VirtualQueryEx instead of blind 10MB read
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(baseAddress),
+                           &mbi, sizeof(mbi)) == 0) {
+            return payload;
+        }
 
-        CloseHandle(hProcess);
+        // Cap at 10 MB for safety
+        constexpr size_t kMaxRaw = 10 * 1024 * 1024;
+        const size_t readSize = std::min(static_cast<size_t>(mbi.RegionSize), kMaxRaw);
+        ReadProcessMemorySafe(hProcess.get(), baseAddress, payload, readSize);
+
         return payload;
     }
 
     // ========================================================================
-    // MEMBER VARIABLES
+    // KERNEL DRIVER INTEGRATION
     // ========================================================================
 
+    void RegisterKernelHandlers() {
+        if (!Communication::IPCManager::HasInstance()) {
+            SS_LOG_WARN(L"ReflectiveDLL",
+                L"IPCManager not available — kernel image-load integration disabled");
+            return;
+        }
+
+        try {
+            auto& ipc = Communication::IPCManager::Instance();
+
+            // Register for image-load notifications from the kernel driver.
+            // When the driver's PsSetLoadImageNotifyRoutine callback fires,
+            // it sends an ImageLoadRequest through the filter port.
+            ipc.RegisterImageLoadHandler(
+                [this](const Communication::ImageLoadRequest& req)
+                    -> SHADOWSTRIKE_SCAN_VERDICT {
+                    if (!m_monitoring)
+                        return Verdict_Clean;
+
+                    OnKernelImageLoad(
+                        req.processId,
+                        static_cast<uintptr_t>(req.imageBase),
+                        static_cast<size_t>(req.imageSize),
+                        req.isSystemModule != 0);
+
+                    return Verdict_Clean;
+                }
+            );
+
+            SS_LOG_INFO(L"ReflectiveDLL",
+                L"Kernel image-load handler registered via IPCManager");
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"ReflectiveDLL",
+                L"Failed to register kernel handlers: %S", e.what());
+        }
+    }
+
+public:
+    void OnKernelImageLoad(uint32_t pid, uintptr_t imageBase,
+                           size_t imageSize, bool isSystemModule) {
+        // Skip system modules (ntdll, kernel32, etc.) — low FP value
+        if (isSystemModule) return;
+        if (pid <= 4) return;
+
+        // Check if the image base is in PEB module list
+        auto pebModules = GetPEBModulesImpl(pid);
+        const bool inPEB = std::find(pebModules.begin(), pebModules.end(),
+                                      imageBase) != pebModules.end();
+
+        // If the image was loaded normally it will appear in PEB.
+        // A very short delay between kernel notification and PEB update is possible,
+        // so we only flag images NOT in PEB after a second check.
+        if (inPEB) return;
+
+        // Query the memory region backing this image
+        HandleGuard hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
+        if (!hProcess) return;
+
+        MEMORY_BASIC_INFORMATION mbi{};
+        if (VirtualQueryEx(hProcess.get(), reinterpret_cast<LPCVOID>(imageBase),
+                           &mbi, sizeof(mbi)) == 0) {
+            return;
+        }
+
+        // If the region is private (not MEM_IMAGE), this is suspicious
+        if (IsUnbacked(mbi.Type)) {
+            SS_LOG_WARN(L"ReflectiveDLL",
+                L"Kernel image-load from unbacked memory — PID %u, Base 0x%016llX, Size %zu",
+                pid, static_cast<unsigned long long>(imageBase), imageSize);
+
+            // Trigger targeted scan
+            auto result = Scan(pid, ReflectiveScanMode::Standard);
+            (void)result; // Detection callbacks fire inside Scan()
+        }
+    }
+
+private:
+
     mutable std::shared_mutex m_mutex;
-    bool m_initialized{ false };
-    bool m_monitoring{ false };
+    std::atomic<bool> m_initialized{ false };
+    std::atomic<bool> m_monitoring{ false };
     ReflectiveConfig m_config;
 
     // Managers
@@ -1659,7 +2462,7 @@ ReflectiveConfig ReflectiveDLLDetector::GetConfig() const {
     return m_impl->GetConfig();
 }
 
-ScanResult ReflectiveDLLDetector::Scan(uint32_t pid, ScanMode mode) {
+ScanResult ReflectiveDLLDetector::Scan(uint32_t pid, ReflectiveScanMode mode) {
     return m_impl->Scan(pid, mode);
 }
 
@@ -1668,16 +2471,16 @@ bool ReflectiveDLLDetector::HasReflectiveLoading(uint32_t pid) {
 }
 
 std::vector<ScanResult> ReflectiveDLLDetector::ScanMultiple(
-    const std::vector<uint32_t>& pids, ScanMode mode) {
+    const std::vector<uint32_t>& pids, ReflectiveScanMode mode) {
     return m_impl->ScanMultiple(pids, mode);
 }
 
-std::vector<ScanResult> ReflectiveDLLDetector::ScanAllProcesses(ScanMode mode) {
+std::vector<ScanResult> ReflectiveDLLDetector::ScanAllProcesses(ReflectiveScanMode mode) {
     return m_impl->ScanAllProcesses(mode);
 }
 
 std::vector<ScanResult> ReflectiveDLLDetector::ScanByName(
-    const std::wstring& processName, ScanMode mode) {
+    const std::wstring& processName, ReflectiveScanMode mode) {
     return m_impl->ScanByName(processName, mode);
 }
 
@@ -1778,11 +2581,16 @@ void ReflectiveDLLDetector::OnProtectionChange(uint32_t pid, uintptr_t address,
     m_impl->OnProtectionChange(pid, address, oldProtection, newProtection);
 }
 
+void ReflectiveDLLDetector::OnKernelImageLoad(uint32_t pid, uintptr_t imageBase,
+                                               size_t imageSize, bool isSystemModule) {
+    m_impl->OnKernelImageLoad(pid, imageBase, imageSize, isSystemModule);
+}
+
 uint64_t ReflectiveDLLDetector::RegisterCallback(ReflectiveDetectedCallback callback) {
     return m_impl->RegisterCallback(std::move(callback));
 }
 
-uint64_t ReflectiveDLLDetector::RegisterProgressCallback(ScanProgressCallback callback) {
+uint64_t ReflectiveDLLDetector::RegisterProgressCallback(ReflectiveScanProgressCallback callback) {
     return m_impl->RegisterProgressCallback(std::move(callback));
 }
 

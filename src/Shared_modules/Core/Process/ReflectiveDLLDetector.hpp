@@ -259,10 +259,13 @@ enum class MemoryCharacteristic : uint8_t {
 };
 
 /**
- * @enum ScanMode
+ * @enum ReflectiveScanMode
  * @brief Scanning mode for reflective DLL detection.
+ *
+ * Uses a distinct name to avoid collision with MemoryScanner::ScanMode
+ * which coexists in the same namespace.
  */
-enum class ScanMode : uint8_t {
+enum class ReflectiveScanMode : uint8_t {
     Quick = 0,            ///< RWX regions only
     Standard = 1,         ///< All executable regions
     Deep = 2,             ///< Full memory scan
@@ -397,7 +400,7 @@ struct ScanResult {
     uint32_t processId = 0;
     std::wstring processName;
     std::chrono::system_clock::time_point scanTime;
-    ScanMode scanMode = ScanMode::Standard;
+    ReflectiveScanMode scanMode = ReflectiveScanMode::Standard;
     
     // Scan statistics
     uint32_t regionsScanned = 0;
@@ -442,7 +445,7 @@ struct LoaderSignature {
  */
 struct ReflectiveConfig {
     // Scan settings
-    ScanMode defaultScanMode = ScanMode::Standard;
+    ReflectiveScanMode defaultScanMode = ReflectiveScanMode::Standard;
     bool enableRealTimeMonitoring = true;
     bool enableOnDemandScanning = true;
     
@@ -505,6 +508,12 @@ struct ReflectiveConfig {
  * @brief Runtime statistics for the detector.
  */
 struct alignas(64) ReflectiveStatistics {
+    ReflectiveStatistics() noexcept = default;
+
+    /// Thread-safe snapshot copy (loads each atomic individually).
+    ReflectiveStatistics(const ReflectiveStatistics& other) noexcept;
+    ReflectiveStatistics& operator=(const ReflectiveStatistics& other) noexcept;
+
     // Scan counts
     std::atomic<uint64_t> totalScans{0};
     std::atomic<uint64_t> quickScans{0};
@@ -569,12 +578,12 @@ using ReflectiveDetectedCallback = std::function<void(
 )>;
 
 /**
- * @brief Callback for scan progress.
+ * @brief Callback for reflective scan progress.
  * @param pid Process ID
  * @param regionsScanned Regions scanned so far
  * @param totalRegions Total regions to scan
  */
-using ScanProgressCallback = std::function<void(
+using ReflectiveScanProgressCallback = std::function<void(
     uint32_t pid,
     uint32_t regionsScanned,
     uint32_t totalRegions
@@ -606,7 +615,7 @@ using PECandidateCallback = std::function<void(
  * auto& detector = ReflectiveDLLDetector::Instance();
  * 
  * // Scan specific process
- * auto result = detector.Scan(targetPid, ScanMode::Standard);
+ * auto result = detector.Scan(targetPid, ReflectiveScanMode::Standard);
  * for (const auto& detection : result.detections) {
  *     std::wcout << L"Reflective DLL at 0x" << std::hex 
  *                << detection.peCandidate.baseAddress << std::endl;
@@ -690,7 +699,7 @@ public:
      */
     [[nodiscard]] ScanResult Scan(
         uint32_t pid,
-        ScanMode mode = ScanMode::Standard
+        ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );
 
     /**
@@ -708,7 +717,7 @@ public:
      */
     [[nodiscard]] std::vector<ScanResult> ScanMultiple(
         const std::vector<uint32_t>& pids,
-        ScanMode mode = ScanMode::Standard
+        ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );
 
     /**
@@ -717,7 +726,7 @@ public:
      * @return Scan results.
      */
     [[nodiscard]] std::vector<ScanResult> ScanAllProcesses(
-        ScanMode mode = ScanMode::Quick
+        ReflectiveScanMode mode = ReflectiveScanMode::Quick
     );
 
     /**
@@ -728,7 +737,7 @@ public:
      */
     [[nodiscard]] std::vector<ScanResult> ScanByName(
         const std::wstring& processName,
-        ScanMode mode = ScanMode::Standard
+        ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );
 
     // ========================================================================
@@ -962,6 +971,24 @@ public:
         uint32_t newProtection
     );
 
+    /**
+     * @brief Handle kernel driver image-load notification.
+     *
+     * Called when the kernel driver's PsSetLoadImageNotifyRoutine fires
+     * for a non-standard image load (potentially reflective injection).
+     *
+     * @param pid Process ID where image was loaded.
+     * @param imageBase Base address of the loaded image.
+     * @param imageSize Size of the loaded image.
+     * @param isSystemModule True if the image is a known system module.
+     */
+    void OnKernelImageLoad(
+        uint32_t pid,
+        uintptr_t imageBase,
+        size_t imageSize,
+        bool isSystemModule
+    );
+
     // ========================================================================
     // CALLBACK REGISTRATION
     // ========================================================================
@@ -978,7 +1005,7 @@ public:
      * @param callback Progress callback.
      * @return Callback ID.
      */
-    uint64_t RegisterProgressCallback(ScanProgressCallback callback);
+    uint64_t RegisterProgressCallback(ReflectiveScanProgressCallback callback);
 
     /**
      * @brief Register callback for PE candidates.
