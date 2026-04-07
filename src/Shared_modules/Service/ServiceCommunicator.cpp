@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -105,6 +106,27 @@ namespace {
 // STATISTICS IMPLEMENTATION
 // ============================================================================
 
+CommunicatorStats::CommunicatorStats(const CommunicatorStats& other) noexcept {
+    *this = other;
+}
+
+CommunicatorStats& CommunicatorStats::operator=(const CommunicatorStats& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    messagesReceived.store(other.messagesReceived.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    messagesSent.store(other.messagesSent.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    bytesReceived.store(other.bytesReceived.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    bytesSent.store(other.bytesSent.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    connectionAttempts.store(other.connectionAttempts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    activeConnections.store(other.activeConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    droppedPackets.store(other.droppedPackets.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    authFailures.store(other.authFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+
+    return *this;
+}
+
 void CommunicatorStats::Reset() noexcept {
     messagesReceived = 0;
     messagesSent = 0;
@@ -181,7 +203,7 @@ private:
     // Internal methods
     void ListenLoop();
     void HandleClient(std::shared_ptr<ClientContext> client);
-    bool ProcessMessage(const std::vector<uint8_t>& data, std::vector<uint8_t>& response);
+    bool ProcessMessage(CommandType cmd, const std::vector<uint8_t>& data, std::vector<uint8_t>& response);
     bool CreatePipeSecurityDescriptor();
     void CleanupDisconnectedClients();
 
@@ -458,7 +480,7 @@ void ServiceCommunicatorImpl::HandleClient(std::shared_ptr<ClientContext> client
 
                     m_stats.messagesReceived++;
 
-                    if (ProcessMessage(payload, response)) {
+                    if (ProcessMessage(cmd, payload, response)) {
                         // Send response
                         // Construct response header
                         WireHeader respHeader;
@@ -505,41 +527,25 @@ disconnect:
     SS_LOG_INFO(L"IPC", L"Client disconnected.");
 }
 
-bool ServiceCommunicatorImpl::ProcessMessage(const std::vector<uint8_t>& data, std::vector<uint8_t>& response) {
-    // In a real implementation, you'd deserialize the command from data first to get the type
-    // Here we assume the type is passed in the header (which it is in HandleClient logic)
-    // But ProcessMessage signature currently takes raw data.
-    // Let's adjust slightly: the HandleClient logic passes payload.
-    // The command type was extracted in HandleClient.
-    // Wait, the signature in header is ProcessMessage(data, response).
-    // We need to know the command type inside ProcessMessage or pass it.
-    // The current signature is slightly mismatched with the loop above.
-    // Refactoring to match: The handler map needs the command type.
-    // Let's assume the data passed to ProcessMessage is just payload, and we need to pass CommandType too.
-    // I will fix the caller in HandleClient to pass the command type or change this method.
-    // Actually, I can't change the PIMPL signature easily without changing PIMPL class.
-    // Let's update the caller logic.
+bool ServiceCommunicatorImpl::ProcessMessage(CommandType cmd, const std::vector<uint8_t>& data, std::vector<uint8_t>& response) {
+    CommandHandler handler;
+    {
+        std::shared_lock<std::shared_mutex> lock(m_mutex);
+        const auto it = m_handlers.find(cmd);
+        if (it == m_handlers.end()) {
+            SS_LOG_WARN(L"IPC", L"No handler registered for command %u", static_cast<uint32_t>(cmd));
+            return false;
+        }
 
-    // Correction: I'll overload ProcessMessage or change the call in HandleClient.
-    // Since I implemented the header already, I will implement ProcessMessage to take CommandType as well?
-    // The header doesn't expose ProcessMessage, it exposes RegisterHandler.
-    // ServiceCommunicatorImpl is private, so I can change it.
+        handler = it->second;
+    }
 
-    return false; // Placeholder, see logic update below
-}
-
-// Fixed Internal Helper
-bool ServiceCommunicatorImpl::ProcessMessage(const std::vector<uint8_t>&, std::vector<uint8_t>&) {
-    return false; // Not used
-}
-
-// Correct dispatch logic
-bool DispatchCommand(ServiceCommunicatorImpl* impl, CommandType cmd, const std::vector<uint8_t>& payload, std::vector<uint8_t>& response) {
-    // This helper would access the map
-    // Since we are inside the class implementation file, we can just make it a member function
-    // But I declared ProcessMessage differently in the class definition above.
-    // I will redefine ProcessMessage in the class definition.
-    return false;
+    try {
+        return handler(cmd, data, response);
+    } catch (...) {
+        SS_LOG_ERROR(L"IPC", L"Unhandled exception while processing command %u", static_cast<uint32_t>(cmd));
+        return false;
+    }
 }
 
 void ServiceCommunicatorImpl::RegisterHandler(CommandType type, CommandHandler handler) {

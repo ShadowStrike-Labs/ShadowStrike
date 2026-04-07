@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -30,7 +31,7 @@
  */
 
 #include "ServiceController.hpp"
-#include "../../Utils/Logger.hpp" // Assumed infrastructure
+#include "../Utils/Logger.hpp"
 //#include "../../Utils/JsonUtils.hpp" // Assumed infrastructure
 #include <shared_mutex>
 #include <thread>
@@ -246,7 +247,7 @@ namespace ShadowStrike::Service {
     // ============================================================================
     // CONSTRUCTOR / DESTRUCTOR
     // ============================================================================
-    ServiceController::ServiceController() : m_impl(std::make_unique<Impl>()) {
+    ServiceController::ServiceController() : m_impl(std::make_unique<ServiceControllerImpl>()) {
         if (s_instanceCreated.exchange(true)) {
             // In a real app we might throw or log, but for singleton validness:
             // This constructor is private anyway.

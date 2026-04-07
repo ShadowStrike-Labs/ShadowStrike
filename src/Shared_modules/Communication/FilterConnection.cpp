@@ -37,7 +37,7 @@
 #include "FilterConnection.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
-#include "../Security/CryptoManager.hpp"
+#include "../SelfProtection/CryptoManager.hpp"
 
 #include <algorithm>
 #include <array>

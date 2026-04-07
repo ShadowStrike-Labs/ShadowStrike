@@ -178,6 +178,12 @@ struct CommunicatorStats {
     std::atomic<uint64_t> droppedPackets{0};
     std::atomic<uint64_t> authFailures{0};
 
+    CommunicatorStats() noexcept = default;
+    CommunicatorStats(const CommunicatorStats& other) noexcept;
+    CommunicatorStats& operator=(const CommunicatorStats& other) noexcept;
+    CommunicatorStats(CommunicatorStats&&) = delete;
+    CommunicatorStats& operator=(CommunicatorStats&&) = delete;
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
