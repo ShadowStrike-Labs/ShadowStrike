@@ -126,7 +126,7 @@ enum class StegoTechnique : uint8_t {
     LSB = 1,                       // Least significant bit
     DCT = 2,                       // DCT coefficients
     Palette = 3,                   // Palette manipulation
-    EOF = 4,                       // End of file appended
+    EOFAppended = 4,               // End of file appended
     Metadata = 5,                  // Hidden in metadata
     AlphaChannel = 6               // Alpha channel hiding
 };

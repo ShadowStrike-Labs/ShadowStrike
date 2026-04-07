@@ -369,7 +369,7 @@ struct FileHasherStatistics {
  * @struct VersionInfo
  * @brief FileHasher build / dependency version information.
  */
-struct VersionInfo {
+struct FileHasherVersionInfo {
     std::string hasherVersion;
     std::string fuzzyHasherVersion;
     std::string tlshVersion;
@@ -555,7 +555,7 @@ public:
     void ResetStatistics() noexcept;
 
     [[nodiscard]] bool SelfTest();
-    [[nodiscard]] VersionInfo  GetVersionInfo() const;
+    [[nodiscard]] FileHasherVersionInfo  GetVersionInfo() const;
     [[nodiscard]] HardwareInfo GetHardwareInfo() const;
 
 private:

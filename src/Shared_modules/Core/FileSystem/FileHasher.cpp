@@ -354,7 +354,7 @@ std::string HashComparison::ToJson() const {
 /**
  * @brief Private implementation class for FileHasher.
  */
-class FileHasher::Impl {
+class FileHasherImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -383,7 +383,7 @@ public:
         FileHashes hashes;
         steady_clock::time_point timestamp;
         system_clock::time_point fileModTime;
-        std::atomic<uint32_t> hitCount{0};
+        mutable std::atomic<uint32_t> hitCount{0};
     };
     std::unordered_map<std::wstring, CachedHash> m_hashCache;
 
@@ -400,11 +400,11 @@ public:
     // CONSTRUCTOR / DESTRUCTOR
     // ========================================================================
 
-    Impl() {
+    FileHasherImpl() {
         m_stats.startTime = steady_clock::now();
     }
 
-    ~Impl() = default;
+    ~FileHasherImpl() = default;
 
     // ========================================================================
     // INITIALIZATION
@@ -1238,7 +1238,7 @@ FileHasher& FileHasher::Instance() {
 // ============================================================================
 
 FileHasher::FileHasher()
-    : m_impl(std::make_unique<Impl>())
+    : m_impl(std::make_unique<FileHasherImpl>())
 {
     SS_LOG_INFO(L"FileHasher", L"FileHasher: Constructor called");
 }
@@ -1666,8 +1666,8 @@ bool FileHasher::SelfTest() {
     }
 }
 
-VersionInfo FileHasher::GetVersionInfo() const {
-    VersionInfo info{};
+FileHasherVersionInfo FileHasher::GetVersionInfo() const {
+    FileHasherVersionInfo info{};
     info.hasherVersion = std::to_string(FileHasherConstants::VERSION_MAJOR) + "." +
                          std::to_string(FileHasherConstants::VERSION_MINOR) + "." +
                          std::to_string(FileHasherConstants::VERSION_PATCH);

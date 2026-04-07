@@ -63,6 +63,7 @@
 #include <iomanip>
 #include <map>
 #include <deque>
+#include <filesystem>
 #include <Windows.h>
 #include <shlobj.h>
 #include <Shlwapi.h>
@@ -73,6 +74,8 @@
 namespace ShadowStrike {
 namespace Core {
 namespace FileSystem {
+
+namespace fs = std::filesystem;
 
 // ============================================================================
 // Structure Implementations
