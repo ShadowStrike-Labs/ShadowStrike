@@ -103,10 +103,9 @@ namespace System {
 // ============================================================================
 class DriverAnalyzerImpl;
 
-// Infrastructure forward declarations for dependency injection
-namespace SignatureStore { class HashStore; }
-namespace ThreatIntel { class ThreatIntelLookup; }
-namespace Whitelist { class WhitelistStore; }
+// Forward declarations — actual types live in their own namespaces
+// (ShadowStrike::HashStore::HashStore, ShadowStrike::ThreatIntel::ThreatIntelLookup, etc.)
+// PIMPL impl holds concrete pointers; no forward decls needed here.
 
 // ============================================================================
 // ENUMERATIONS

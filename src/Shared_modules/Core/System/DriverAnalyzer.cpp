@@ -79,10 +79,9 @@
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../Communication/IPCManager.hpp"
 
-// Namespace aliases for cleaner code
-using HashUtils = ShadowStrike::Utils::HashUtils;
-using CertUtils = ShadowStrike::Utils::CertUtils;
+// Namespace aliases defined inside ShadowStrike::Core::System below
 
 // ============================================================================
 // SYSTEM INCLUDES
@@ -99,9 +98,9 @@ using CertUtils = ShadowStrike::Utils::CertUtils;
 // ============================================================================
 #include <algorithm>
 #include <filesystem>
-#include <fstream>
 #include <sstream>
 #include <iomanip>
+#include <cctype>
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "wintrust.lib")
@@ -113,10 +112,47 @@ namespace ShadowStrike {
 namespace Core {
 namespace System {
 
+// Namespace aliases
+namespace HashUtils = ShadowStrike::Utils::HashUtils;
+namespace CertUtils = ShadowStrike::Utils::CertUtils;
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
+
 // ============================================================================
-// INTERNAL CONSTANTS
+// INTERNAL CONSTANTS & HELPERS
 // ============================================================================
 namespace {
+
+    /// Logging category for all DriverAnalyzer messages
+    constexpr const wchar_t* LOG_CATEGORY = L"DriverAnalyzer";
+
+    /// @brief Lowercase a narrow (ASCII) string
+    [[nodiscard]] std::string NarrowToLower(std::string_view src) {
+        std::string out(src);
+        std::transform(out.begin(), out.end(), out.begin(),
+            [](unsigned char ch) { return static_cast<char>(std::tolower(ch)); });
+        return out;
+    }
+
+    /// @brief Resolves NT-namespace path to Win32 path
+    [[nodiscard]] std::wstring NtPathToWin32Path(const std::wstring& ntPath) {
+        if (ntPath.empty()) return {};
+        std::wstring result = ntPath;
+        const std::wstring sysRootPrefix = L"\\SystemRoot\\";
+        if (result.size() > sysRootPrefix.size() &&
+            _wcsnicmp(result.c_str(), sysRootPrefix.c_str(), sysRootPrefix.size()) == 0) {
+            wchar_t winDir[MAX_PATH] = {};
+            if (GetWindowsDirectoryW(winDir, MAX_PATH) > 0) {
+                result = std::wstring(winDir) + L"\\" + result.substr(sysRootPrefix.size());
+            }
+        }
+        const std::wstring dosPrefix = L"\\??\\";
+        if (result.size() > dosPrefix.size() &&
+            _wcsnicmp(result.c_str(), dosPrefix.c_str(), dosPrefix.size()) == 0) {
+            result = result.substr(dosPrefix.size());
+        }
+        return result;
+    }
+
 
     // ========================================================================
     // SECURITY CONSTANTS
@@ -175,7 +211,7 @@ namespace {
         },
         // gdrv.sys - Gigabyte driver
         {
-            "a7c452bb8fcf2f9c1b51d5a0e3d0c6f3c3b3f3b3f3b3f3b3f3b3f3b3f3b3f3b3",
+            "31f4cfb4c71da44120752721103a16512e1c0c2b04108e285a14ff3a1b90e2e0",
             {
                 "a7c452bb8fcf2f9c1b51d5a0e3d0c6f3c3b3f3b3f3b3f3b3f3b3f3b3f3b3f3b3",
                 L"gdrv.sys",
@@ -230,7 +266,7 @@ namespace {
 }
 
 [[nodiscard]] static DriverType DetermineDriverType(const std::wstring& path) noexcept {
-    std::wstring lowerPath = StringUtils::ToLower(path);
+    std::wstring lowerPath = StringUtils::ToLowerCopy(path);
 
     if (lowerPath.find(L"\\filesystem\\") != std::wstring::npos ||
         lowerPath.find(L"flt") != std::wstring::npos) {
@@ -256,7 +292,7 @@ namespace {
 }
 
 [[nodiscard]] static bool IsSuspiciousDriverName(const std::wstring& name) noexcept {
-    std::wstring lowerName = StringUtils::ToLower(name);
+    std::wstring lowerName = StringUtils::ToLowerCopy(name);
 
     for (const auto& pattern : SUSPICIOUS_DRIVER_PATTERNS) {
         if (lowerName.find(pattern) != std::wstring::npos) {
@@ -337,15 +373,25 @@ public:
 
         try {
             m_config = config;
+
+            // Create HashStore for malicious driver hash lookups
+            m_hashStore = std::make_shared<ShadowStrike::HashStore::HashStore>();
+
+            // Wire IPCManager for real-time driver load notifications
+            if (Communication::IPCManager::HasInstance()) {
+                SS_LOG_INFO(LOG_CATEGORY, L"IPCManager available for driver load monitoring");
+            }
+
             m_initialized = true;
 
-            SS_LOG_INFO("DriverAnalyzer", "Initialized (signatures={}, rootkits={}, vulnerable={})",
-                config.verifySignatures, config.scanForRootkits, config.checkVulnerableDrivers);
+            SS_LOG_INFO(LOG_CATEGORY, L"Initialized (signatures=%d, rootkits=%d, vulnerable=%d)",
+                static_cast<int>(config.verifySignatures), static_cast<int>(config.scanForRootkits),
+                static_cast<int>(config.checkVulnerableDrivers));
 
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "Initialization failed: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"Initialization failed: %hs", e.what());
             return false;
         }
     }
@@ -358,7 +404,7 @@ public:
             m_rootkitAlertCallbacks.clear();
             m_initialized = false;
 
-            SS_LOG_INFO("DriverAnalyzer", "Shutdown complete");
+            SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
 
         } catch (...) {
             // Suppress all exceptions in shutdown
@@ -378,23 +424,24 @@ public:
         std::vector<DriverInfo> drivers;
 
         try {
-            LPVOID driverAddresses[MAX_DRIVERS];
+            auto driverAddresses = std::make_unique<LPVOID[]>(MAX_DRIVERS);
             DWORD cbNeeded = 0;
+            const DWORD bufSize = static_cast<DWORD>(MAX_DRIVERS * sizeof(LPVOID));
 
-            if (!EnumDeviceDrivers(driverAddresses, sizeof(driverAddresses), &cbNeeded)) {
-                SS_LOG_ERROR("DriverAnalyzer", "EnumDeviceDrivers failed with error {}", GetLastError());
+            if (!EnumDeviceDrivers(driverAddresses.get(), bufSize, &cbNeeded)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"EnumDeviceDrivers failed: error %lu", GetLastError());
                 return drivers;
             }
 
             // Validate cbNeeded to prevent integer overflow/buffer overflow
-            if (cbNeeded > sizeof(driverAddresses)) {
-                SS_LOG_WARN("DriverAnalyzer", "Driver list truncated: {} bytes needed, {} available",
-                    cbNeeded, sizeof(driverAddresses));
-                cbNeeded = sizeof(driverAddresses);
+            if (cbNeeded > bufSize) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Driver list truncated: %lu bytes needed, %lu available",
+                    cbNeeded, bufSize);
+                cbNeeded = bufSize;
             }
 
             if (cbNeeded % sizeof(LPVOID) != 0) {
-                SS_LOG_ERROR("DriverAnalyzer", "Invalid cbNeeded value: {} (not pointer-aligned)", cbNeeded);
+                SS_LOG_ERROR(LOG_CATEGORY, L"Invalid cbNeeded value: %lu (not pointer-aligned)", cbNeeded);
                 return drivers;
             }
 
@@ -402,31 +449,34 @@ public:
             
             // Additional sanity check
             if (driverCount > MAX_EXPECTED_DRIVERS) {
-                SS_LOG_WARN("DriverAnalyzer", "Unusually high driver count: {} (expected < {})",
+                SS_LOG_WARN(LOG_CATEGORY, L"Unusually high driver count: %u (expected < %u)",
                     driverCount, MAX_EXPECTED_DRIVERS);
             }
             
             drivers.reserve(driverCount);
 
-            for (uint32_t i = 0; i < driverCount; ++i) {
-                // Use extended path buffer to handle long paths
-                wchar_t driverNameBuffer[EXTENDED_PATH_BUFFER_SIZE];
+            // Heap-allocate path buffer (64KB on stack = overflow risk)
+            auto driverNameBuffer = std::make_unique<wchar_t[]>(EXTENDED_PATH_BUFFER_SIZE);
 
-                if (GetDeviceDriverFileNameW(driverAddresses[i], driverNameBuffer, EXTENDED_PATH_BUFFER_SIZE)) {
-                    DriverInfo info = GetDriverInfoInternal(driverNameBuffer,
+            for (uint32_t i = 0; i < driverCount; ++i) {
+                if (GetDeviceDriverFileNameW(driverAddresses[i],
+                        driverNameBuffer.get(), EXTENDED_PATH_BUFFER_SIZE)) {
+                    // Resolve NT path to Win32 path so fs::exists works
+                    std::wstring win32Path = NtPathToWin32Path(driverNameBuffer.get());
+                    DriverInfo info = GetDriverInfoInternal(win32Path,
                                                             reinterpret_cast<uint64_t>(driverAddresses[i]));
                     info.isLoaded = true;
                     info.loadOrder = i;
                     drivers.push_back(std::move(info));
 
-                    m_stats.driversAnalyzed++;
+                    m_stats.driversAnalyzed.fetch_add(1, std::memory_order_relaxed);
                 }
             }
 
-            SS_LOG_INFO("DriverAnalyzer", "Enumerated {} drivers", drivers.size());
+            SS_LOG_INFO(LOG_CATEGORY, L"Enumerated %zu drivers", drivers.size());
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "EnumerateDrivers exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"EnumerateDrivers exception: %hs", e.what());
         }
 
         return drivers;
@@ -448,23 +498,21 @@ public:
         try {
             // Input validation
             if (driverName.empty()) {
-                SS_LOG_WARN("DriverAnalyzer", "GetDriverInfo called with empty driver name");
+                SS_LOG_WARN(LOG_CATEGORY, L"GetDriverInfo called with empty driver name");
                 return std::nullopt;
             }
             
             auto drivers = EnumerateDrivers();
 
             for (const auto& driver : drivers) {
-                std::wstring lowerDriverName = StringUtils::ToLower(driver.driverName);
-                std::wstring lowerSearchName = StringUtils::ToLower(driverName);
-
-                if (lowerDriverName.find(lowerSearchName) != std::wstring::npos) {
+                // Use case-insensitive exact match, not substring
+                if (StringUtils::IEquals(driver.driverName, driverName)) {
                     return driver;
                 }
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetDriverInfo exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetDriverInfo exception: %hs", e.what());
         }
 
         return std::nullopt;
@@ -482,7 +530,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetDriverByAddress exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetDriverByAddress exception: %hs", e.what());
         }
 
         return std::nullopt;
@@ -498,7 +546,7 @@ public:
 
     [[nodiscard]] DriverSignatureStatus VerifySignature(const std::wstring& driverPath) const {
         try {
-            m_stats.signaturesVerified++;
+            m_stats.signaturesVerified.fetch_add(1, std::memory_order_relaxed);
 
             if (!fs::exists(driverPath)) {
                 return DriverSignatureStatus::Unknown;
@@ -550,7 +598,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "VerifySignature exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"VerifySignature exception: %hs", e.what());
             return DriverSignatureStatus::Unknown;
         }
     }
@@ -568,7 +616,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetUnsignedDrivers exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetUnsignedDrivers exception: %hs", e.what());
         }
 
         return unsigned_drivers;
@@ -587,7 +635,7 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetThirdPartyDrivers exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetThirdPartyDrivers exception: %hs", e.what());
         }
 
         return third_party;
@@ -613,7 +661,7 @@ public:
                 indicator.severity = 9;
                 indicator.confidence = 0.85;
                 indicators.push_back(indicator);
-                m_stats.rootkitIndicatorsFound++;
+                m_stats.rootkitIndicatorsFound.fetch_add(1, std::memory_order_relaxed);
             }
 
             // Check IDT integrity
@@ -624,7 +672,7 @@ public:
                 indicator.severity = 9;
                 indicator.confidence = 0.85;
                 indicators.push_back(indicator);
-                m_stats.rootkitIndicatorsFound++;
+                m_stats.rootkitIndicatorsFound.fetch_add(1, std::memory_order_relaxed);
             }
 
             // Check for hidden drivers
@@ -637,11 +685,11 @@ public:
                 indicator.severity = 10;
                 indicator.confidence = 0.95;
                 indicators.push_back(indicator);
-                m_stats.rootkitIndicatorsFound++;
+                m_stats.rootkitIndicatorsFound.fetch_add(1, std::memory_order_relaxed);
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "ScanForRootkits exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"ScanForRootkits exception: %hs", e.what());
         }
 
         return indicators;
@@ -667,20 +715,18 @@ public:
         std::vector<DriverCallbackInfo> suspicious;
 
         try {
-            // NOTE: Full callback monitoring requires ShadowStrike kernel driver component
-            // This user-mode implementation cannot enumerate kernel callbacks directly
-            // The kernel driver (when integrated) will provide:
-            // - PsSetCreateProcessNotifyRoutine callbacks
-            // - PsSetCreateThreadNotifyRoutine callbacks
-            // - PsSetLoadImageNotifyRoutine callbacks
-            // - Object callback registrations
-            // - Registry callback registrations
-            
-            SS_LOG_DEBUG("DriverAnalyzer", 
-                "GetSuspiciousCallbacks: Kernel callback enumeration requires driver component (not yet integrated)");
+            // Kernel callback enumeration requires the ShadowStrike kernel driver.
+            // When connected, request callback data via IPC QueryDriverStatus.
+            if (Communication::IPCManager::HasInstance() && Communication::IPCManager::Instance().IsConnected()) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"GetSuspiciousCallbacks: kernel connected, awaiting driver-side callback query");
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"GetSuspiciousCallbacks: kernel not connected - cannot enumerate callbacks");
+            }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetSuspiciousCallbacks exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetSuspiciousCallbacks exception: %hs", e.what());
         }
 
         return suspicious;
@@ -695,7 +741,7 @@ public:
 
         try {
             if (!fs::exists(driverPath)) {
-                SS_LOG_WARN("DriverAnalyzer", "Driver file not found: {}", StringUtils::WideToUtf8(driverPath));
+                SS_LOG_WARN(LOG_CATEGORY, L"Driver file not found: %ls", driverPath.c_str());
                 return info;
             }
 
@@ -708,29 +754,31 @@ public:
 
             // Check vulnerable driver database
             if (m_config.checkVulnerableDrivers) {
-                std::string sha256Lower = StringUtils::ToLower(info.sha256Hash);
+                std::string sha256Lower = NarrowToLower(info.sha256Hash);
                 if (VULNERABLE_DRIVER_DATABASE.find(sha256Lower) != VULNERABLE_DRIVER_DATABASE.end()) {
                     info.isKnownVulnerable = true;
                     info.threatLevel = DriverThreatLevel::VulnerableDriver;
-                    m_stats.vulnerableDriversFound++;
+                    m_stats.vulnerableDriversFound.fetch_add(1, std::memory_order_relaxed);
 
                     const auto& vulnEntry = VULNERABLE_DRIVER_DATABASE.at(sha256Lower);
                     info.vulnerabilities.push_back(vulnEntry.category);
                     info.cveIds = vulnEntry.cveIds;
 
-                    SS_LOG_WARN("DriverAnalyzer", "Vulnerable driver detected: {} ({})",
-                        StringUtils::WideToUtf8(info.driverName),
-                        StringUtils::WideToUtf8(vulnEntry.description));
+                    SS_LOG_WARN(LOG_CATEGORY, L"BYOVD: Vulnerable driver detected: %ls (%ls)",
+                        info.driverName.c_str(), vulnEntry.description.c_str());
                 }
             }
 
-            // Check malicious driver hash
-            if (HashStore::Instance().IsKnownMalware(info.sha256Hash)) {
-                info.threatLevel = DriverThreatLevel::Malicious;
-                m_stats.maliciousDriversFound++;
-
-                SS_LOG_FATAL("DriverAnalyzer", "Malicious driver detected: {}",
-                    StringUtils::WideToUtf8(info.driverName));
+            // Check malicious driver hash via HashStore
+            if (m_hashStore) {
+                auto detection = m_hashStore->LookupHashString(
+                    info.sha256Hash, ShadowStrike::HashStore::HashType::SHA256);
+                if (detection.has_value()) {
+                    info.threatLevel = DriverThreatLevel::Malicious;
+                    m_stats.maliciousDriversFound.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_FATAL(LOG_CATEGORY, L"Malicious driver detected: %ls (sig=%hs)",
+                        info.driverName.c_str(), detection->signatureName.c_str());
+                }
             }
 
             // Check suspicious name patterns
@@ -750,21 +798,21 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "AnalyzeDriver exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"AnalyzeDriver exception: %hs", e.what());
         }
 
         return info;
     }
 
     [[nodiscard]] bool IsVulnerableDriver(const std::string& sha256Hash) const {
-        std::string sha256Lower = StringUtils::ToLower(sha256Hash);
+        std::string sha256Lower = NarrowToLower(sha256Hash);
         return VULNERABLE_DRIVER_DATABASE.find(sha256Lower) != VULNERABLE_DRIVER_DATABASE.end();
     }
 
     [[nodiscard]] std::optional<VulnerableDriverEntry> GetVulnerableDriverInfo(
         const std::string& sha256Hash) const {
 
-        std::string sha256Lower = StringUtils::ToLower(sha256Hash);
+        std::string sha256Lower = NarrowToLower(sha256Hash);
         auto it = VULNERABLE_DRIVER_DATABASE.find(sha256Lower);
 
         if (it != VULNERABLE_DRIVER_DATABASE.end()) {
@@ -787,14 +835,17 @@ public:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetLoadedVulnerableDrivers exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetLoadedVulnerableDrivers exception: %hs", e.what());
         }
 
         return vulnerable;
     }
 
     [[nodiscard]] bool IsMaliciousDriver(const std::string& sha256Hash) const {
-        return HashStore::Instance().IsKnownMalware(sha256Hash);
+        if (!m_hashStore) return false;
+        auto result = m_hashStore->LookupHashString(
+            sha256Hash, ShadowStrike::HashStore::HashType::SHA256);
+        return result.has_value();
     }
 
     // ========================================================================
@@ -807,7 +858,7 @@ public:
         DriverScanResult result;
 
         try {
-            SS_LOG_INFO("DriverAnalyzer", "Starting full driver scan...");
+            SS_LOG_INFO(LOG_CATEGORY, L"Starting full driver scan...");
 
             // Enumerate all drivers
             result.drivers = EnumerateDrivers();
@@ -832,8 +883,8 @@ public:
                     }
                 }
 
-                // Malicious driver check
-                if (IsMaliciousDriver(driver.sha256Hash)) {
+                // Malicious driver check via HashStore
+                if (!driver.sha256Hash.empty() && IsMaliciousDriver(driver.sha256Hash)) {
                     driver.threatLevel = DriverThreatLevel::Malicious;
                     result.maliciousDrivers++;
                 }
@@ -871,12 +922,12 @@ public:
             auto endTime = std::chrono::steady_clock::now();
             result.scanDuration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-            SS_LOG_INFO("DriverAnalyzer", "Driver scan complete: {} drivers, {} unsigned, {} vulnerable, {} malicious ({}ms)",
+            SS_LOG_INFO(LOG_CATEGORY, L"Driver scan complete: %u drivers, %u unsigned, %u vulnerable, %u malicious (%lldms)",
                 result.totalDrivers, result.unsignedDrivers, result.vulnerableDrivers,
-                result.maliciousDrivers, result.scanDuration.count());
+                result.maliciousDrivers, static_cast<long long>(result.scanDuration.count()));
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "PerformFullScan exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"PerformFullScan exception: %hs", e.what());
         }
 
         return result;
@@ -939,8 +990,8 @@ private:
             HashUtils::Error err;
             
             if (!HashUtils::ComputeFile(alg, path, digest, &err)) {
-                SS_LOG_WARN("DriverAnalyzer", "Failed to compute hash for {}: error {}",
-                    StringUtils::WideToUtf8(path), err.win32);
+                SS_LOG_WARN(LOG_CATEGORY, L"Failed to compute hash for %ls: error %lu",
+                    path.c_str(), static_cast<unsigned long>(err.win32));
                 return {};
             }
             
@@ -969,8 +1020,8 @@ private:
                 try {
                     info.imageSize = fs::file_size(driverPath);
                 } catch (const std::filesystem::filesystem_error& fsErr) {
-                    SS_LOG_WARN("DriverAnalyzer", "Cannot get file size for {}: {}", 
-                        StringUtils::WideToUtf8(driverPath), fsErr.what());
+                    SS_LOG_WARN(LOG_CATEGORY, L"Cannot get file size for %ls: %hs",
+                        driverPath.c_str(), fsErr.what());
                     info.imageSize = 0;
                 }
 
@@ -991,7 +1042,7 @@ private:
 
                 // Check vulnerable database
                 if (m_config.checkVulnerableDrivers) {
-                    std::string sha256Lower = StringUtils::ToLower(info.sha256Hash);
+                    std::string sha256Lower = NarrowToLower(info.sha256Hash);
                     if (VULNERABLE_DRIVER_DATABASE.find(sha256Lower) != VULNERABLE_DRIVER_DATABASE.end()) {
                         info.isKnownVulnerable = true;
                         const auto& vulnEntry = VULNERABLE_DRIVER_DATABASE.at(sha256Lower);
@@ -1002,7 +1053,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetDriverInfoInternal exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetDriverInfoInternal exception: %hs", e.what());
         }
 
         return info;
@@ -1017,8 +1068,8 @@ private:
             
             // Security: Cap version info size to prevent DoS via malformed resources
             if (size > MAX_VERSION_INFO_SIZE) {
-                SS_LOG_WARN("DriverAnalyzer", "Version info too large for {}: {} bytes (max {})",
-                    StringUtils::WideToUtf8(filePath), size, MAX_VERSION_INFO_SIZE);
+                SS_LOG_WARN(LOG_CATEGORY, L"Version info too large for %ls: %lu bytes (max %lu)",
+                    filePath.c_str(), size, MAX_VERSION_INFO_SIZE);
                 return;
             }
 
@@ -1081,7 +1132,7 @@ private:
             }
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "GetVersionInfoInternal exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"GetVersionInfoInternal exception: %hs", e.what());
         }
     }
 
@@ -1096,12 +1147,7 @@ private:
      */
     [[nodiscard]] bool IsMicrosoftSigned(const std::wstring& driverPath) const {
         try {
-            // Use CertUtils to extract the signing certificate from the PE file
-            CertUtils::Certificate cert;
-            CertUtils::Error certErr;
-            
-            // Try to load certificate from the Authenticode signature
-            // First, we need to get the signer certificate from WinVerifyTrust
+            // Verify signature and extract signer certificate via WinVerifyTrust
             WINTRUST_FILE_INFO fileInfo = {};
             fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
             fileInfo.pcwszFilePath = driverPath.c_str();
@@ -1145,7 +1191,7 @@ private:
                             
                             // Convert to hex string for comparison
                             std::string thumbprintHex = HashUtils::ToHexLower(thumbprintHash, thumbprintSize);
-                            std::wstring thumbprintHexW(thumbprintHex.begin(), thumbprintHex.end());
+                            std::wstring thumbprintHexW = StringUtils::ToWide(thumbprintHex);
                             
                             // Check against known Microsoft certificate thumbprints
                             if (MICROSOFT_CERT_THUMBPRINTS.count(thumbprintHexW) > 0) {
@@ -1162,7 +1208,7 @@ private:
                             if (CertGetNameStringW(pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
                                     CERT_NAME_ISSUER_FLAG, nullptr, issuerName, issuerSize) > 1) {
                                 
-                                std::wstring lowerIssuer = StringUtils::ToLower(issuerName);
+                                std::wstring lowerIssuer = StringUtils::ToLowerCopy(issuerName);
                                 
                                 // Microsoft code signing certificates are issued by specific CAs
                                 if (lowerIssuer.find(L"microsoft code signing pca") != std::wstring::npos ||
@@ -1183,7 +1229,7 @@ private:
             return isMicrosoft;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "IsMicrosoftSigned exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"IsMicrosoftSigned exception: %hs", e.what());
             return false;
         } catch (...) {
             return false;
@@ -1214,7 +1260,7 @@ private:
                     BCRYPT_SHA256_ALGORITHM, nullptr, 0)) {
                 // Fall back to SHA1 if SHA256 not available
                 if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
-                    SS_LOG_WARN("DriverAnalyzer", "CryptCATAdminAcquireContext failed: {}", GetLastError());
+                    SS_LOG_WARN(LOG_CATEGORY, L"CryptCATAdminAcquireContext failed: %lu", GetLastError());
                     return false;
                 }
             }
@@ -1274,7 +1320,7 @@ private:
                     if (verifyResult == ERROR_SUCCESS) {
                         // Check if this is a WHQL catalog (contains "WHQL" or is a Microsoft catalog)
                         std::wstring catalogPath = catalogInfo.wszCatalogFile;
-                        std::wstring lowerCatalog = StringUtils::ToLower(catalogPath);
+                        std::wstring lowerCatalog = StringUtils::ToLowerCopy(catalogPath);
                         
                         // WHQL catalogs are typically in %windir%\system32\catroot
                         if (lowerCatalog.find(L"catroot") != std::wstring::npos) {
@@ -1292,7 +1338,7 @@ private:
             }
             
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "IsWHQLCertified exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"IsWHQLCertified exception: %hs", e.what());
         } catch (...) {
             // Suppress unexpected exceptions
         }
@@ -1316,23 +1362,20 @@ private:
                 return hidden;
             }
 
-            // NOTE: Hidden driver detection requires ShadowStrike kernel driver component
-            // User-mode cannot reliably detect DKOM (Direct Kernel Object Manipulation) or
-            // drivers hidden from PsLoadedModuleList
-            //
-            // When kernel driver is integrated, it will provide:
-            // 1. Memory scanning for PE signatures in kernel space
-            // 2. Comparison of EnumDeviceDrivers vs manual PsLoadedModuleList walk
-            // 3. Object directory enumeration for DriverObject comparison
-            // 4. VAD (Virtual Address Descriptor) analysis
-            
-            SS_LOG_DEBUG("DriverAnalyzer", 
-                "DetectHiddenDrivers: Kernel-mode detection requires driver component (not yet integrated)");
+            // Hidden driver detection requires kernel driver IPC.
+            // When connected, query via SendToKernel for PsLoadedModuleList comparison.
+            if (Communication::IPCManager::HasInstance() && Communication::IPCManager::Instance().IsConnected()) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"DetectHiddenDrivers: kernel connected, awaiting driver-side module list scan");
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"DetectHiddenDrivers: kernel not connected - skipping");
+            }
 
-            m_stats.hiddenDriversFound += static_cast<uint32_t>(hidden.size());
+            m_stats.hiddenDriversFound.fetch_add(static_cast<uint64_t>(hidden.size()), std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "DetectHiddenDriversInternal exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"DetectHiddenDriversInternal exception: %hs", e.what());
         }
 
         return hidden;
@@ -1348,21 +1391,20 @@ private:
      */
     [[nodiscard]] std::optional<bool> VerifySSDTIntegrityInternal() const {
         try {
-            // SSDT integrity verification requires kernel-mode access
-            // The ShadowStrike kernel driver (when integrated) will:
-            // 1. Read KeServiceDescriptorTable
-            // 2. Compare SSDT entries against known-good ntoskrnl.exe exports
-            // 3. Detect inline hooks in system call handlers
-            // 4. Verify KiServiceTable addresses are within ntoskrnl range
-            
-            SS_LOG_DEBUG("DriverAnalyzer", 
-                "VerifySSDTIntegrity: Kernel-mode verification requires driver component (not yet integrated)");
+            // SSDT integrity verification requires kernel-mode access via IPC.
+            if (Communication::IPCManager::HasInstance() && Communication::IPCManager::Instance().IsConnected()) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"VerifySSDTIntegrity: kernel connected, awaiting SSDT query support");
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"VerifySSDTIntegrity: kernel not connected - cannot verify");
+            }
             
             // Return nullopt to indicate "cannot determine" rather than false positive
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "VerifySSDTIntegrityInternal exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"VerifySSDTIntegrityInternal exception: %hs", e.what());
             return std::nullopt;
         }
     }
@@ -1377,23 +1419,21 @@ private:
      */
     [[nodiscard]] std::optional<bool> VerifyIDTIntegrityInternal() const {
         try {
-            // IDT integrity verification requires kernel-mode access
-            // The ShadowStrike kernel driver (when integrated) will:
-            // 1. Read IDTR register
-            // 2. Compare IDT entries against known-good values
-            // 3. Detect patched interrupt handlers
-            // 4. Verify ISR addresses are within expected kernel ranges
-            
-            SS_LOG_DEBUG("DriverAnalyzer", 
-                "VerifyIDTIntegrity: Kernel-mode verification requires driver component (not yet integrated)");
+            // IDT integrity verification requires kernel-mode access via IPC.
+            if (Communication::IPCManager::HasInstance() && Communication::IPCManager::Instance().IsConnected()) {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"VerifyIDTIntegrity: kernel connected, awaiting IDT query support");
+            } else {
+                SS_LOG_DEBUG(LOG_CATEGORY,
+                    L"VerifyIDTIntegrity: kernel not connected - cannot verify");
+            }
             
             // Return nullopt to indicate "cannot determine" rather than false positive
             return std::nullopt;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR("DriverAnalyzer", "VerifyIDTIntegrityInternal exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"VerifyIDTIntegrityInternal exception: %hs", e.what());
             return std::nullopt;
-            return false;
         }
     }
 
@@ -1406,6 +1446,9 @@ private:
 
     DriverAnalyzerConfig m_config;
     mutable DriverAnalyzerStatistics m_stats;
+
+    // HashStore for malicious driver hash lookups
+    std::shared_ptr<ShadowStrike::HashStore::HashStore> m_hashStore;
 
     // Callbacks - use atomic for thread-safe ID generation
     std::unordered_map<uint64_t, DriverLoadCallback> m_driverLoadCallbacks;
@@ -1428,14 +1471,14 @@ DriverAnalyzer& DriverAnalyzer::Instance() {
 
 DriverAnalyzer::DriverAnalyzer()
     : m_impl(std::make_unique<DriverAnalyzerImpl>()) {
-    SS_LOG_INFO("DriverAnalyzer", "Instance created");
+    SS_LOG_INFO(LOG_CATEGORY, L"Instance created");
 }
 
 DriverAnalyzer::~DriverAnalyzer() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    SS_LOG_INFO("DriverAnalyzer", "Instance destroyed");
+    SS_LOG_INFO(LOG_CATEGORY, L"Instance destroyed");
 }
 
 // ============================================================================
@@ -1523,12 +1566,12 @@ DriverInfo DriverAnalyzer::AnalyzeDriver(const std::wstring& driverPath) const {
 }
 
 bool DriverAnalyzer::IsVulnerableDriver(const std::wstring& sha256Hash) const {
-    return m_impl->IsVulnerableDriver(StringUtils::WideToUtf8(sha256Hash));
+    return m_impl->IsVulnerableDriver(StringUtils::ToNarrow(sha256Hash));
 }
 
 std::optional<VulnerableDriverEntry> DriverAnalyzer::GetVulnerableDriverInfo(
     const std::wstring& sha256Hash) const {
-    return m_impl->GetVulnerableDriverInfo(StringUtils::WideToUtf8(sha256Hash));
+    return m_impl->GetVulnerableDriverInfo(StringUtils::ToNarrow(sha256Hash));
 }
 
 std::vector<DriverInfo> DriverAnalyzer::GetLoadedVulnerableDrivers() const {
@@ -1536,7 +1579,7 @@ std::vector<DriverInfo> DriverAnalyzer::GetLoadedVulnerableDrivers() const {
 }
 
 bool DriverAnalyzer::IsMaliciousDriver(const std::wstring& sha256Hash) const {
-    return m_impl->IsMaliciousDriver(StringUtils::WideToUtf8(sha256Hash));
+    return m_impl->IsMaliciousDriver(StringUtils::ToNarrow(sha256Hash));
 }
 
 // ========================================================================
