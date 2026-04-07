@@ -141,7 +141,11 @@ enum class EventCategory : uint16_t {
     License = 15,
     Performance = 16,
     SelfProtection = 17,
-    Forensic = 18
+    Forensic = 18,
+    KernelEvent = 19,             // Kernel driver minifilter events (process, file, registry, image load)
+    MemoryProtection = 20,        // Memory attack/injection detection
+    RansomwareProtection = 21,    // Ransomware-specific events
+    BehavioralAnalysis = 22       // Behavioral pattern detection
 };
 
 /**
@@ -255,7 +259,7 @@ struct alignas(64) SecurityEvent {
  * @struct AuditEvent
  * @brief Administrative audit event.
  */
-struct alignas(128) AuditEvent {
+struct alignas(64) AuditEvent {
     uint64_t eventId{ 0 };
     std::wstring action;              // e.g., "PolicyChanged", "ServiceStopped"
     std::wstring targetObject;        // What was affected
@@ -272,7 +276,7 @@ struct alignas(128) AuditEvent {
  * @struct ForensicEvent
  * @brief High-fidelity forensic event.
  */
-struct alignas(128) ForensicEvent {
+struct alignas(64) ForensicEvent {
     uint64_t eventId{ 0 };
     uint64_t sequenceNumber{ 0 };
     std::wstring eventType;
@@ -315,7 +319,7 @@ struct alignas(64) SIEMConfig {
  * @struct EventLoggerConfig
  * @brief Configuration for event logger.
  */
-struct alignas(128) EventLoggerConfig {
+struct alignas(64) EventLoggerConfig {
     // Destinations
     uint8_t destinations{ static_cast<uint8_t>(LogDestination::WindowsEventLog) |
                           static_cast<uint8_t>(LogDestination::InternalDB) };
@@ -380,7 +384,7 @@ struct alignas(128) EventLoggerConfig {
  * @struct EventLoggerStatistics
  * @brief Runtime statistics with integrity metrics.
  */
-struct alignas(128) EventLoggerStatistics {
+struct alignas(64) EventLoggerStatistics {
     std::atomic<uint64_t> eventsLogged{ 0 };
     std::atomic<uint64_t> eventsDropped{ 0 };
     std::atomic<uint64_t> criticalEventsDropped{ 0 };   // Should always be 0
@@ -500,6 +504,37 @@ public:
         uint32_t threatsFound,
         std::chrono::milliseconds duration);
     
+    // ========================================================================
+    // KERNEL EVENT LOGGING
+    // ========================================================================
+    
+    /**
+     * @brief Logs a kernel driver event (process/file/registry/image load from minifilter).
+     * Called by detection modules when processing kernel messages.
+     */
+    void LogKernelEvent(
+        EventCategory category,
+        EventSeverity severity,
+        const std::wstring& source,
+        const std::wstring& message,
+        uint32_t targetProcessId = 0,
+        const std::wstring& targetFilePath = L"",
+        const std::unordered_map<std::wstring, std::wstring>& properties = {});
+
+    /**
+     * @brief Logs a kernel-originated threat detection.
+     * Combines kernel context with threat intelligence for SIEM correlation.
+     */
+    void LogKernelThreatDetection(
+        const std::wstring& threatName,
+        const std::wstring& threatType,
+        const std::wstring& filePath,
+        const std::string& sha256Hash,
+        const std::wstring& action,
+        uint32_t targetProcessId,
+        const std::wstring& processImagePath,
+        EventSeverity severity = EventSeverity::Critical);
+
     // ========================================================================
     // AUDIT LOGGING
     // ========================================================================
@@ -652,37 +687,40 @@ private:
 
 // ============================================================================
 // CONVENIENCE MACROS
+// NOTE: These use SS_EVENT_* prefix to avoid collision with Logger.hpp's SS_LOG_* macros.
+// NEVER include both EventLogger.hpp and Logger.hpp in the same TU if you need both
+// macro families — use explicit calls instead.
 // ============================================================================
 
-#define SS_LOG_DEBUG(category, source, msg) \
+#define SS_EVENT_DEBUG(category, source, msg) \
     ShadowStrike::Core::System::EventLogger::Instance().Log( \
         ShadowStrike::Core::System::EventSeverity::Debug, \
         ShadowStrike::Core::System::EventCategory::category, \
-        L##source, L##msg)
+        source, msg)
 
-#define SS_LOG_INFO(category, source, msg) \
+#define SS_EVENT_INFO(category, source, msg) \
     ShadowStrike::Core::System::EventLogger::Instance().Log( \
         ShadowStrike::Core::System::EventSeverity::Info, \
         ShadowStrike::Core::System::EventCategory::category, \
-        L##source, L##msg)
+        source, msg)
 
-#define SS_LOG_WARNING(category, source, msg) \
+#define SS_EVENT_WARNING(category, source, msg) \
     ShadowStrike::Core::System::EventLogger::Instance().Log( \
         ShadowStrike::Core::System::EventSeverity::Warning, \
         ShadowStrike::Core::System::EventCategory::category, \
-        L##source, L##msg)
+        source, msg)
 
-#define SS_LOG_ERROR(category, source, msg) \
+#define SS_EVENT_ERROR(category, source, msg) \
     ShadowStrike::Core::System::EventLogger::Instance().Log( \
         ShadowStrike::Core::System::EventSeverity::Error, \
         ShadowStrike::Core::System::EventCategory::category, \
-        L##source, L##msg)
+        source, msg)
 
-#define SS_LOG_CRITICAL(category, source, msg) \
+#define SS_EVENT_CRITICAL(category, source, msg) \
     ShadowStrike::Core::System::EventLogger::Instance().Log( \
         ShadowStrike::Core::System::EventSeverity::Critical, \
         ShadowStrike::Core::System::EventCategory::category, \
-        L##source, L##msg)
+        source, msg)
 
 }  // namespace System
 }  // namespace Core
