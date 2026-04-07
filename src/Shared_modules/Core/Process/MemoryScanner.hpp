@@ -896,6 +896,29 @@ struct MemoryScannerStats {
     
     /// @brief Average scan time (milliseconds)
     std::atomic<uint64_t> avgScanTimeMs{ 0 };
+
+    MemoryScannerStats() = default;
+
+    MemoryScannerStats(const MemoryScannerStats& other) noexcept {
+        *this = other;
+    }
+
+    MemoryScannerStats& operator=(const MemoryScannerStats& other) noexcept {
+        if (this != &other) {
+            totalScans.store(other.totalScans.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            processesScanned.store(other.processesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            regionsScanned.store(other.regionsScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesScanned.store(other.bytesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threatsFound.store(other.threatsFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            shellcodeDetections.store(other.shellcodeDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            peDetections.store(other.peDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            yaraMatches.store(other.yaraMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            patternMatches.store(other.patternMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            scanErrors.store(other.scanErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            avgScanTimeMs.store(other.avgScanTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
     
     /**
      * @brief Reset all statistics.

@@ -157,21 +157,21 @@ using TimePoint = std::chrono::system_clock::time_point;
  * @brief Check if memory protection allows execution.
  */
 [[nodiscard]] static bool IsExecutableProtection(uint32_t protection) noexcept {
-    constexpr uint32_t PAGE_EXECUTE = 0x10;
-    constexpr uint32_t PAGE_EXECUTE_READ = 0x20;
-    constexpr uint32_t PAGE_EXECUTE_READWRITE = 0x40;
-    constexpr uint32_t PAGE_EXECUTE_WRITECOPY = 0x80;
+    constexpr uint32_t kPageExecute = 0x10;
+    constexpr uint32_t kPageExecuteRead = 0x20;
+    constexpr uint32_t kPageExecuteReadWrite = 0x40;
+    constexpr uint32_t kPageExecuteWriteCopy = 0x80;
 
-    return (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+    return (protection & (kPageExecute | kPageExecuteRead |
+                         kPageExecuteReadWrite | kPageExecuteWriteCopy)) != 0;
 }
 
 /**
  * @brief Check if memory protection is RWX.
  */
 [[nodiscard]] static bool IsRWXProtection(uint32_t protection) noexcept {
-    constexpr uint32_t PAGE_EXECUTE_READWRITE = 0x40;
-    return (protection & PAGE_EXECUTE_READWRITE) != 0;
+    constexpr uint32_t kPageExecuteReadWrite = 0x40;
+    return (protection & kPageExecuteReadWrite) != 0;
 }
 
 /**
@@ -337,6 +337,51 @@ AnalyzerConfig AnalyzerConfig::CreateRealTime() noexcept {
     return config;
 }
 
+AnalyzerStatistics::AnalyzerStatistics(const AnalyzerStatistics& other) noexcept {
+    *this = other;
+}
+
+AnalyzerStatistics& AnalyzerStatistics::operator=(const AnalyzerStatistics& other) noexcept {
+    if (this == &other) {
+        return *this;
+    }
+
+    totalAnalyses.store(other.totalAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    quickAnalyses.store(other.quickAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    standardAnalyses.store(other.standardAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    deepAnalyses.store(other.deepAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    forensicAnalyses.store(other.forensicAnalyses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    trustedProcesses.store(other.trustedProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    safeProcesses.store(other.safeProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    unknownProcesses.store(other.unknownProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    suspiciousProcesses.store(other.suspiciousProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    maliciousProcesses.store(other.maliciousProcesses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    modulesAnalyzed.store(other.modulesAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    handlesEnumerated.store(other.handlesEnumerated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    memoryRegionsScanned.store(other.memoryRegionsScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    threadsAnalyzed.store(other.threadsAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    signaturesVerified.store(other.signaturesVerified.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    unsignedModulesDetected.store(other.unsignedModulesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    suspiciousModulesDetected.store(other.suspiciousModulesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    rwxRegionsDetected.store(other.rwxRegionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    unbackedExecDetected.store(other.unbackedExecDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    suspiciousThreadsDetected.store(other.suspiciousThreadsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    parentAnomaliesDetected.store(other.parentAnomaliesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    ppidSpoofingDetected.store(other.ppidSpoofingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    injectionIndicatorsDetected.store(other.injectionIndicatorsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    analysisCacheHits.store(other.analysisCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    analysisCacheMisses.store(other.analysisCacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    signatureCacheHits.store(other.signatureCacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    signatureCacheMisses.store(other.signatureCacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    totalAnalysisTimeMs.store(other.totalAnalysisTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    minAnalysisTimeMs.store(other.minAnalysisTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    maxAnalysisTimeMs.store(other.maxAnalysisTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    analysisErrors.store(other.analysisErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    accessDeniedErrors.store(other.accessDeniedErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    timeoutErrors.store(other.timeoutErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    return *this;
+}
+
 void AnalyzerStatistics::Reset() noexcept {
     totalAnalyses.store(0, std::memory_order_relaxed);
     quickAnalyses.store(0, std::memory_order_relaxed);
@@ -465,7 +510,7 @@ void ProcessAnalysisResult::CalculateOverallRisk() noexcept {
 // PIMPL IMPLEMENTATION CLASS
 // ============================================================================
 
-class ProcessAnalyzer::ProcessAnalyzerImpl {
+class ProcessAnalyzerImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -620,7 +665,7 @@ public:
 // IMPL: INITIALIZATION
 // ============================================================================
 
-bool ProcessAnalyzer::ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
+bool ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& config) {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
             SS_LOG_WARN(L"ProcessAnalyzer", L"Already initialized");
@@ -676,7 +721,7 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::Initialize(const AnalyzerConfig& conf
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::Shutdown() {
+void ProcessAnalyzerImpl::Shutdown() {
     try {
         if (!m_initialized.exchange(false, std::memory_order_acq_rel)) {
             return;
@@ -712,7 +757,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::Shutdown() {
 // IMPL: CORE ANALYSIS
 // ============================================================================
 
-ProcessAnalysisResult ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeProcessInternal(
+ProcessAnalysisResult ProcessAnalyzerImpl::AnalyzeProcessInternal(
     uint32_t pid,
     AnalysisDepth depth)
 {
@@ -1022,7 +1067,7 @@ ProcessAnalysisResult ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeProcessIntern
     return result;
 }
 
-ProcessRiskLevel ProcessAnalyzer::ProcessAnalyzerImpl::QuickAssessRiskInternal(uint32_t pid) {
+ProcessRiskLevel ProcessAnalyzerImpl::QuickAssessRiskInternal(uint32_t pid) {
     try {
         // Whitelist check
         if (IsWhitelistedInternal(pid)) {
@@ -1067,7 +1112,7 @@ ProcessRiskLevel ProcessAnalyzer::ProcessAnalyzerImpl::QuickAssessRiskInternal(u
 // IMPL: MODULE ANALYSIS
 // ============================================================================
 
-std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetLoadedModulesInternal(uint32_t pid) {
+std::vector<ModuleInfo> ProcessAnalyzerImpl::GetLoadedModulesInternal(uint32_t pid) {
     std::vector<ModuleInfo> modules;
 
     try {
@@ -1106,13 +1151,13 @@ std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetLoadedModulesIn
     return modules;
 }
 
-std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindSuspiciousModulesInternal(uint32_t pid) {
+std::vector<ModuleInfo> ProcessAnalyzerImpl::FindSuspiciousModulesInternal(uint32_t pid) {
     // Delegate: enumerate modules, then analyze
     auto allModules = GetLoadedModulesInternal(pid);
     return FindSuspiciousModulesFromList(pid, allModules);
 }
 
-std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindSuspiciousModulesFromList(
+std::vector<ModuleInfo> ProcessAnalyzerImpl::FindSuspiciousModulesFromList(
     uint32_t pid,
     const std::vector<ModuleInfo>& allModules)
 {
@@ -1171,7 +1216,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindSuspiciousModu
     return suspiciousModules;
 }
 
-ModuleInfo ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeModuleInternal(
+ModuleInfo ProcessAnalyzerImpl::AnalyzeModuleInternal(
     uint32_t pid,
     uintptr_t moduleBase)
 {
@@ -1200,7 +1245,7 @@ ModuleInfo ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeModuleInternal(
 // IMPL: HANDLE ANALYSIS
 // ============================================================================
 
-HandleSummary ProcessAnalyzer::ProcessAnalyzerImpl::EnumerateHandlesInternal(uint32_t pid) {
+HandleSummary ProcessAnalyzerImpl::EnumerateHandlesInternal(uint32_t pid) {
     HandleSummary summary;
 
     try {
@@ -1267,7 +1312,7 @@ HandleSummary ProcessAnalyzer::ProcessAnalyzerImpl::EnumerateHandlesInternal(uin
 // IMPL: MEMORY ANALYSIS
 // ============================================================================
 
-MemorySummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32_t pid) {
+MemorySummary ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32_t pid) {
     MemorySummary summary;
 
     try {
@@ -1351,11 +1396,11 @@ MemorySummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeMemoryInternal(uint32
     return summary;
 }
 
-std::vector<MemoryRegionInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetMemoryRegionsInternal(uint32_t pid) {
+std::vector<MemoryRegionInfo> ProcessAnalyzerImpl::GetMemoryRegionsInternal(uint32_t pid) {
     return AnalyzeMemoryInternal(pid).suspiciousRegions;
 }
 
-std::vector<MemoryRegionInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindRWXRegionsInternal(uint32_t pid) {
+std::vector<MemoryRegionInfo> ProcessAnalyzerImpl::FindRWXRegionsInternal(uint32_t pid) {
     return AnalyzeMemoryInternal(pid).rwxRegions;
 }
 
@@ -1363,7 +1408,7 @@ std::vector<MemoryRegionInfo> ProcessAnalyzer::ProcessAnalyzerImpl::FindRWXRegio
 // IMPL: THREAD ANALYSIS
 // ============================================================================
 
-ThreadSummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeThreadsInternal(uint32_t pid) {
+ThreadSummary ProcessAnalyzerImpl::AnalyzeThreadsInternal(uint32_t pid) {
     ThreadSummary summary;
 
     try {
@@ -1416,7 +1461,7 @@ ThreadSummary ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeThreadsInternal(uint3
     return summary;
 }
 
-std::optional<ThreadInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetThreadInfoInternal(
+std::optional<ThreadInfo> ProcessAnalyzerImpl::GetThreadInfoInternal(
     uint32_t tid,
     const std::vector<Utils::ProcessUtils::ProcessModuleInfo>& cachedModules)
 {
@@ -1502,7 +1547,7 @@ std::optional<ThreadInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetThreadInfoInt
     }
 }
 
-std::optional<ThreadInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetThreadInfoInternal(
+std::optional<ThreadInfo> ProcessAnalyzerImpl::GetThreadInfoInternal(
     uint32_t tid)
 {
     // Resolve owning PID, enumerate its modules, then delegate to the
@@ -1523,7 +1568,7 @@ std::optional<ThreadInfo> ProcessAnalyzer::ProcessAnalyzerImpl::GetThreadInfoInt
     return GetThreadInfoInternal(tid, modules);
 }
 
-SignatureInfo ProcessAnalyzer::ProcessAnalyzerImpl::VerifyFileSignatureInternal(const std::wstring& filePath) {
+SignatureInfo ProcessAnalyzerImpl::VerifyFileSignatureInternal(const std::wstring& filePath) {
     SignatureInfo sigInfo;
 
     try {
@@ -1611,7 +1656,7 @@ SignatureInfo ProcessAnalyzer::ProcessAnalyzerImpl::VerifyFileSignatureInternal(
     return sigInfo;
 }
 
-bool ProcessAnalyzer::ProcessAnalyzerImpl::IsMicrosoftSignedInternal(const std::wstring& filePath) {
+bool ProcessAnalyzerImpl::IsMicrosoftSignedInternal(const std::wstring& filePath) {
     auto sigInfo = VerifyFileSignatureInternal(filePath);
     return (sigInfo.status == SignatureStatus::Valid &&
             sigInfo.trustLevel == CertificateTrust::Microsoft);
@@ -1621,7 +1666,7 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::IsMicrosoftSignedInternal(const std::
 // IMPL: SECURITY CONTEXT
 // ============================================================================
 
-SecurityContext ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeSecurityContextInternal(uint32_t pid) {
+SecurityContext ProcessAnalyzerImpl::AnalyzeSecurityContextInternal(uint32_t pid) {
     SecurityContext context;
 
     try {
@@ -1782,7 +1827,7 @@ SecurityContext ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeSecurityContextInte
     return context;
 }
 
-std::vector<std::pair<std::wstring, bool>> ProcessAnalyzer::ProcessAnalyzerImpl::GetProcessPrivilegesInternal(uint32_t pid) {
+std::vector<std::pair<std::wstring, bool>> ProcessAnalyzerImpl::GetProcessPrivilegesInternal(uint32_t pid) {
     auto context = AnalyzeSecurityContextInternal(pid);
     return context.privileges;
 }
@@ -1791,7 +1836,7 @@ std::vector<std::pair<std::wstring, bool>> ProcessAnalyzer::ProcessAnalyzerImpl:
 // IMPL: PARENT-CHILD ANALYSIS
 // ============================================================================
 
-ParentChildAnalysis ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeParentChildInternal(uint32_t pid) {
+ParentChildAnalysis ProcessAnalyzerImpl::AnalyzeParentChildInternal(uint32_t pid) {
     ParentChildAnalysis analysis;
 
     try {
@@ -1885,7 +1930,7 @@ ParentChildAnalysis ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeParentChildInte
     return analysis;
 }
 
-bool ProcessAnalyzer::ProcessAnalyzerImpl::DetectPPIDSpoofingInternal(uint32_t pid) {
+bool ProcessAnalyzerImpl::DetectPPIDSpoofingInternal(uint32_t pid) {
     try {
         auto procInfo = SafeGetProcessInfo(pid);
         if (!procInfo.has_value()) return false;
@@ -1942,7 +1987,7 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::DetectPPIDSpoofingInternal(uint32_t p
 // IMPL: NETWORK ANALYSIS
 // ============================================================================
 
-NetworkFootprint ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeNetworkFootprintInternal(uint32_t pid) {
+NetworkFootprint ProcessAnalyzerImpl::AnalyzeNetworkFootprintInternal(uint32_t pid) {
     NetworkFootprint footprint;
 
     try {
@@ -2066,7 +2111,7 @@ NetworkFootprint ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeNetworkFootprintIn
 // IMPL: BEHAVIORAL ANALYSIS
 // ============================================================================
 
-BehavioralIndicators ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeBehaviorInternal(uint32_t pid) {
+BehavioralIndicators ProcessAnalyzerImpl::AnalyzeBehaviorInternal(uint32_t pid) {
     BehavioralIndicators indicators;
 
     try {
@@ -2189,7 +2234,7 @@ BehavioralIndicators ProcessAnalyzer::ProcessAnalyzerImpl::AnalyzeBehaviorIntern
     return indicators;
 }
 
-bool ProcessAnalyzer::ProcessAnalyzerImpl::DetectProcessHollowingInternal(uint32_t pid) {
+bool ProcessAnalyzerImpl::DetectProcessHollowingInternal(uint32_t pid) {
     try {
         // Primary: use the dedicated ProcessHollowingDetector for thorough analysis
         auto& hollowingDetector = ProcessHollowingDetector::Instance();
@@ -2210,7 +2255,7 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::DetectProcessHollowingInternal(uint32
 // IMPL: CATEGORIZATION
 // ============================================================================
 
-ProcessCategory ProcessAnalyzer::ProcessAnalyzerImpl::CategorizeProcessInternal(uint32_t pid) {
+ProcessCategory ProcessAnalyzerImpl::CategorizeProcessInternal(uint32_t pid) {
     try {
         auto procInfo = SafeGetProcessInfo(pid);
         if (!procInfo.has_value()) {
@@ -2267,7 +2312,7 @@ ProcessCategory ProcessAnalyzer::ProcessAnalyzerImpl::CategorizeProcessInternal(
     return ProcessCategory::UserApplication;
 }
 
-bool ProcessAnalyzer::ProcessAnalyzerImpl::IsWhitelistedInternal(uint32_t pid) {
+bool ProcessAnalyzerImpl::IsWhitelistedInternal(uint32_t pid) {
     try {
         auto procInfo = SafeGetProcessInfo(pid);
         if (!procInfo.has_value()) return false;
@@ -2292,7 +2337,7 @@ bool ProcessAnalyzer::ProcessAnalyzerImpl::IsWhitelistedInternal(uint32_t pid) {
     return false;
 }
 
-std::pair<bool, std::wstring> ProcessAnalyzer::ProcessAnalyzerImpl::IsKnownMaliciousInternal(uint32_t pid) {
+std::pair<bool, std::wstring> ProcessAnalyzerImpl::IsKnownMaliciousInternal(uint32_t pid) {
     try {
         auto procInfo = SafeGetProcessInfo(pid);
         if (!procInfo.has_value()) {
@@ -2345,7 +2390,7 @@ std::pair<bool, std::wstring> ProcessAnalyzer::ProcessAnalyzerImpl::IsKnownMalic
 // IMPL: CACHE MANAGEMENT
 // ============================================================================
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::PurgeExpiredCacheEntries() {
+void ProcessAnalyzerImpl::PurgeExpiredCacheEntries() {
     try {
         const auto now = Clock::now();
         const auto maxAge = std::chrono::seconds(m_config.analysisCacheTTLSeconds);
@@ -2363,8 +2408,8 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::PurgeExpiredCacheEntries() {
     }
 }
 
-ProcessAnalyzer::ProcessAnalyzerImpl::CacheKey
-ProcessAnalyzer::ProcessAnalyzerImpl::MakeCacheKey(uint32_t pid) noexcept {
+ProcessAnalyzerImpl::CacheKey
+ProcessAnalyzerImpl::MakeCacheKey(uint32_t pid) noexcept {
     CacheKey key{};
     key.pid = pid;
     auto procInfo = SafeGetProcessInfo(pid);
@@ -2381,7 +2426,7 @@ ProcessAnalyzer::ProcessAnalyzerImpl::MakeCacheKey(uint32_t pid) noexcept {
 // IMPL: KERNEL NOTIFICATION HANDLERS
 // ============================================================================
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelProcessCreateInternal(
+void ProcessAnalyzerImpl::OnKernelProcessCreateInternal(
     uint32_t pid, uint32_t parentPid, uint32_t creatingPid,
     uint32_t creatingTid, const std::wstring& imagePath)
 {
@@ -2402,7 +2447,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelProcessCreateInternal(
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelProcessTerminateInternal(uint32_t pid) {
+void ProcessAnalyzerImpl::OnKernelProcessTerminateInternal(uint32_t pid) {
     // Remove from analysis cache on termination
     {
         std::unique_lock lock(m_cacheMutex);
@@ -2412,7 +2457,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelProcessTerminateInternal(uint
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelImageLoadInternal(
+void ProcessAnalyzerImpl::OnKernelImageLoadInternal(
     uint32_t pid, uintptr_t imageBase, size_t imageSize,
     const std::wstring& imageName, bool isSystemImage)
 {
@@ -2442,7 +2487,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelImageLoadInternal(
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelThreadCreateInternal(
+void ProcessAnalyzerImpl::OnKernelThreadCreateInternal(
     uint32_t targetPid, uint32_t threadId,
     uint32_t creatorPid, uint32_t creatorTid, bool isRemote)
 {
@@ -2477,7 +2522,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::OnKernelThreadCreateInternal(
 // IMPL: CALLBACKS
 // ============================================================================
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::InvokeProgressCallbacks(
+void ProcessAnalyzerImpl::InvokeProgressCallbacks(
     uint32_t pid,
     const std::wstring& stage,
     uint32_t percent)
@@ -2494,7 +2539,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::InvokeProgressCallbacks(
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::InvokeFindingCallbacks(
+void ProcessAnalyzerImpl::InvokeFindingCallbacks(
     uint32_t pid,
     const std::wstring& finding,
     uint32_t riskScore)
@@ -2509,7 +2554,7 @@ void ProcessAnalyzer::ProcessAnalyzerImpl::InvokeFindingCallbacks(
     }
 }
 
-void ProcessAnalyzer::ProcessAnalyzerImpl::InvokeModuleCallbacks(
+void ProcessAnalyzerImpl::InvokeModuleCallbacks(
     uint32_t pid,
     const ModuleInfo& module)
 {
@@ -2613,7 +2658,7 @@ void ProcessAnalyzer::WireToProcessMonitor() {
         // On creation: invalidate stale cache, detect immediate anomalies.
         // On termination: purge cache entry.
         m_monitorCallbackId = monitor.RegisterCallback(
-            [this](const ProcessMonitor::ExtendedProcessInfo& info, bool created) {
+            [this](const ExtendedProcessInfo& info, bool created) {
                 if (!m_impl) return;
 
                 const uint32_t pid = info.uniqueId.pid;
@@ -2629,13 +2674,13 @@ void ProcessAnalyzer::WireToProcessMonitor() {
 
         // Register for detailed process events (includes image loads).
         m_monitorEventCallbackId = monitor.RegisterEventCallback(
-            [this](const ProcessMonitor::ProcessEvent& event) {
+            [this](const ProcessEvent& event) {
                 if (!m_impl) return;
 
                 const uint32_t pid = event.processId.pid;
 
                 // React to module loads reported through ProcessMonitor
-                if (event.type == ProcessMonitor::ProcessEventType::ModuleLoad) {
+                if (event.type == ProcessEventType::ModuleLoaded) {
                     m_impl->OnKernelImageLoadInternal(
                         pid, event.moduleBase, event.moduleSize,
                         event.modulePath, false /* no system flag from PM */);
@@ -2828,7 +2873,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::DetectPhantomModules(uint32_t pid) {
         for (const auto& candidate : candidates) {
             ModuleInfo mod{};
             mod.baseAddress = candidate.baseAddress;
-            mod.sizeOfImage = static_cast<uint32_t>(candidate.imageSize);
+            mod.sizeOfImage = static_cast<uint32_t>(candidate.sizeOfImage);
             mod.isPhantom = true;
             mod.isHidden = true;
             mod.loadReason = ModuleLoadReason::Reflective;
@@ -2861,8 +2906,8 @@ std::vector<ModuleInfo> ProcessAnalyzer::DetectSideLoadedDLLs(uint32_t pid) {
         auto sideLoads = dllDetector.DetectSideLoading(pid);
         for (const auto& sl : sideLoads) {
             ModuleInfo mod{};
-            mod.moduleName = sl.dllName;
-            mod.modulePath = sl.dllPath;
+            mod.moduleName = sl.expectedDllName;
+            mod.modulePath = sl.actualDllPath;
             mod.isPotentialSideLoad = true;
             mod.loadReason = ModuleLoadReason::SideLoaded;
             mod.suspicionLevel = ModuleSuspicionLevel::HighlySupicious;
@@ -2870,7 +2915,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::DetectSideLoadedDLLs(uint32_t pid) {
 
             // Verify signature of the side-loaded DLL
             if (m_impl) {
-                auto sigInfo = m_impl->VerifyFileSignatureInternal(sl.dllPath);
+                auto sigInfo = m_impl->VerifyFileSignatureInternal(sl.actualDllPath);
                 mod.signatureStatus = sigInfo.status;
                 if (sigInfo.status == SignatureStatus::Unsigned) {
                     mod.riskScore = 70;
@@ -2884,7 +2929,7 @@ std::vector<ModuleInfo> ProcessAnalyzer::DetectSideLoadedDLLs(uint32_t pid) {
         auto hijacks = dllDetector.DetectSearchOrderHijack(pid);
         for (const auto& hijack : hijacks) {
             ModuleInfo mod{};
-            mod.modulePath = hijack.dllPath;
+            mod.modulePath = hijack.dllInfo.dllPath;
             mod.isPotentialSideLoad = true;
             mod.loadReason = ModuleLoadReason::SideLoaded;
             mod.suspicionLevel = ModuleSuspicionLevel::HighlySupicious;
@@ -3315,8 +3360,9 @@ bool ProcessAnalyzer::IsCertificateCompromised(const std::string& thumbprint) {
             }
             hv.length = static_cast<uint8_t>(byteLen);
 
-            auto detection = m_impl->m_signatureStore->LookupCertificate(hv);
-            if (detection.has_value() && detection->isBlacklisted) {
+            auto detection = m_impl->m_signatureStore->LookupHashString(
+                thumbprint, SignatureStore::HashType::SHA1);
+            if (detection.has_value()) {
                 SS_LOG_WARN(L"ProcessAnalyzer",
                     L"Blacklisted certificate in SignatureStore: %S", thumbprint.c_str());
                 return true;
@@ -3531,7 +3577,7 @@ bool ProcessAnalyzer::DetectDirectSyscalls(uint32_t pid) {
             // MemoryScanner should flag direct syscall patterns as threats.
             // We rely on its detection engine for the actual byte-level analysis.
             // If any threats are found, they indicate syscall-related anomalies.
-            if (threat.threatType != MemoryScanner::MemoryThreatType::None) {
+            if (threat.threatType != MemoryThreatType::None) {
                 return true;
             }
         }

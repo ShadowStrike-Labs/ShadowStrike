@@ -102,6 +102,7 @@
 // ============================================================================
 
 // Internal infrastructure
+#include "ProcessTypes.hpp"
 #include "ProcessMonitor.hpp"
 #include "MemoryScanner.hpp"
 #include "../../Utils/ProcessUtils.hpp"
@@ -205,18 +206,6 @@ enum class HijackType : uint8_t {
 };
 
 /**
- * @enum DetectionConfidence
- * @brief Confidence level of detection.
- */
-enum class DetectionConfidence : uint8_t {
-    None = 0,
-    Low = 1,              ///< Single weak indicator
-    Medium = 2,           ///< Multiple indicators
-    High = 3,             ///< Strong indicators
-    Confirmed = 4         ///< Definitive evidence
-};
-
-/**
  * @enum ThreadState
  * @brief Current state of a monitored thread.
  */
@@ -244,17 +233,6 @@ enum class ContextModificationType : uint8_t {
     DebugRegisters = 7,           ///< DR0-DR7 changed
     FloatingPoint = 8,            ///< FPU/SSE/AVX state
     Full = 9                      ///< Complete context replacement
-};
-
-/**
- * @enum MonitoringMode
- * @brief Real-time monitoring mode.
- */
-enum class MonitoringMode : uint8_t {
-    Disabled = 0,
-    PassiveOnly = 1,          ///< Monitor and alert
-    Active = 2,               ///< Can block suspicious modifications
-    Aggressive = 3            ///< Block all cross-process context changes
 };
 
 /**

@@ -108,7 +108,6 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
@@ -157,8 +156,8 @@ namespace HollowingConstants {
     // PE structure constants
     constexpr uint16_t DOS_MAGIC = 0x5A4D;                    ///< MZ
     constexpr uint32_t PE_SIGNATURE = 0x00004550;             ///< PE\0\0
-    constexpr uint16_t IMAGE_FILE_MACHINE_I386 = 0x014C;
-    constexpr uint16_t IMAGE_FILE_MACHINE_AMD64 = 0x8664;
+    constexpr uint16_t MACHINE_I386 = 0x014C;
+    constexpr uint16_t MACHINE_AMD64 = 0x8664;
     constexpr size_t DOS_HEADER_SIZE = 64;
     constexpr size_t PE_HEADER_MIN_SIZE = 24;
     constexpr size_t OPTIONAL_HEADER32_SIZE = 224;
@@ -191,13 +190,13 @@ namespace HollowingConstants {
     constexpr size_t CREATION_EVENT_QUEUE_SIZE = 4096;
     constexpr size_t SUSPECTED_PROCESS_CACHE_SIZE = 1024;
 
-    // Section characteristics (PE flags)
-    constexpr uint32_t IMAGE_SCN_CNT_CODE = 0x00000020;
-    constexpr uint32_t IMAGE_SCN_CNT_INITIALIZED_DATA = 0x00000040;
-    constexpr uint32_t IMAGE_SCN_CNT_UNINITIALIZED_DATA = 0x00000080;
-    constexpr uint32_t IMAGE_SCN_MEM_EXECUTE = 0x20000000;
-    constexpr uint32_t IMAGE_SCN_MEM_READ = 0x40000000;
-    constexpr uint32_t IMAGE_SCN_MEM_WRITE = 0x80000000;
+    // Section characteristics (PE flags) — prefixed to avoid Windows macro clash
+    constexpr uint32_t SCN_CNT_CODE = 0x00000020;
+    constexpr uint32_t SCN_CNT_INITIALIZED_DATA = 0x00000040;
+    constexpr uint32_t SCN_CNT_UNINITIALIZED_DATA = 0x00000080;
+    constexpr uint32_t SCN_MEM_EXECUTE = 0x20000000;
+    constexpr uint32_t SCN_MEM_READ = 0x40000000;
+    constexpr uint32_t SCN_MEM_WRITE = 0x80000000;
 
 } // namespace HollowingConstants
 
@@ -268,10 +267,10 @@ enum class DetectionMethod : uint8_t {
 };
 
 /**
- * @enum ScanMode
+ * @enum HollowingScanMode
  * @brief Mode for hollowing detection scans.
  */
-enum class ScanMode : uint8_t {
+enum class HollowingScanMode : uint8_t {
     Quick = 0,            ///< PE header comparison only
     Standard = 1,         ///< Header + entry point + key sections
     Comprehensive = 2,    ///< Full image comparison
@@ -530,7 +529,7 @@ struct alignas(64) HollowingDetectionResult {
     std::vector<std::wstring> riskFactors;
 
     // Scan metadata
-    ScanMode scanMode = ScanMode::Standard;
+    HollowingScanMode scanMode = HollowingScanMode::Standard;
     uint32_t scanDurationMs = 0;
     bool scanComplete = false;
     std::wstring scanError;
@@ -575,7 +574,7 @@ struct HollowingAlert {
  */
 struct HollowingDetectorConfig {
     // Detection settings
-    ScanMode defaultScanMode = ScanMode::Standard;
+    HollowingScanMode defaultScanMode = HollowingScanMode::Standard;
     MonitorMode monitorMode = MonitorMode::Active;
     bool enableRealTimeMonitoring = true;
     bool enableOnDemandScanning = true;
@@ -735,7 +734,7 @@ using SuspiciousCreationCallback = std::function<void(
  * @param stage Current scan stage
  * @param percentComplete 0-100
  */
-using ScanProgressCallback = std::function<void(
+using HollowingScanProgressCallback = std::function<void(
     uint32_t pid,
     const std::wstring& stage,
     uint32_t percentComplete
@@ -757,7 +756,7 @@ using ScanProgressCallback = std::function<void(
  * auto& detector = ProcessHollowingDetector::Instance();
  *
  * // Check specific process
- * auto result = detector.ScanProcess(targetPid, ScanMode::Standard);
+ * auto result = detector.ScanProcess(targetPid, HollowingScanMode::Standard);
  * if (result.isHollowed) {
  *     std::wcout << L"Hollowing detected: " << result.processName << std::endl;
  *     // Handle threat...
@@ -844,7 +843,7 @@ public:
      */
     [[nodiscard]] HollowingDetectionResult ScanProcess(
         uint32_t pid,
-        ScanMode mode = ScanMode::Standard
+        HollowingScanMode mode = HollowingScanMode::Standard
     );
 
     /**
@@ -862,7 +861,7 @@ public:
      */
     [[nodiscard]] std::vector<HollowingDetectionResult> ScanByPath(
         const std::wstring& processPath,
-        ScanMode mode = ScanMode::Standard
+        HollowingScanMode mode = HollowingScanMode::Standard
     );
 
     /**
@@ -873,7 +872,7 @@ public:
      */
     [[nodiscard]] std::vector<HollowingDetectionResult> ScanByName(
         const std::wstring& processName,
-        ScanMode mode = ScanMode::Standard
+        HollowingScanMode mode = HollowingScanMode::Standard
     );
 
     // ========================================================================
@@ -887,7 +886,7 @@ public:
      * @return Detection results for all processes.
      */
     [[nodiscard]] std::vector<HollowingDetectionResult> ScanAllProcesses(
-        ScanMode mode = ScanMode::Quick,
+        HollowingScanMode mode = HollowingScanMode::Quick,
         uint32_t maxConcurrent = 4
     );
 
@@ -899,7 +898,7 @@ public:
      */
     [[nodiscard]] std::vector<HollowingDetectionResult> ScanProcesses(
         const std::vector<uint32_t>& pids,
-        ScanMode mode = ScanMode::Standard
+        HollowingScanMode mode = HollowingScanMode::Standard
     );
 
     /**
@@ -1132,7 +1131,7 @@ public:
      * @param callback Progress callback.
      * @return Callback ID.
      */
-    [[nodiscard]] uint64_t RegisterProgressCallback(ScanProgressCallback callback);
+    [[nodiscard]] uint64_t RegisterProgressCallback(HollowingScanProgressCallback callback);
 
     /**
      * @brief Unregister a callback.
@@ -1253,7 +1252,7 @@ private:
 [[nodiscard]] std::string_view GetHollowingTypeName(HollowingType type) noexcept;
 [[nodiscard]] std::string_view GetConfidenceName(HollowingConfidence confidence) noexcept;
 [[nodiscard]] std::string_view GetDetectionMethodName(DetectionMethod method) noexcept;
-[[nodiscard]] std::string_view GetScanModeName(ScanMode mode) noexcept;
+[[nodiscard]] std::string_view GetScanModeName(HollowingScanMode mode) noexcept;
 [[nodiscard]] std::string_view GetMonitorModeName(MonitorMode mode) noexcept;
 
 } // namespace Process

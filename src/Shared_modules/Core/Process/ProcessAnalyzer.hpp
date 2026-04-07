@@ -168,7 +168,6 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/CryptoUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
@@ -554,32 +553,6 @@ enum class AntiAnalysisIndicator : uint8_t {
     IntegrityCheck = 12,              ///< Self-integrity verification
     EnvironmentCheck = 13,            ///< Checking environment variables
     FilesystemArtifacts = 14          ///< Looking for analysis files
-};
-
-/**
- * @enum ProcessCategory
- * @brief Categorization of process type/purpose.
- */
-enum class ProcessCategory : uint8_t {
-    Unknown = 0,
-    SystemCore = 1,               ///< Critical Windows process
-    SystemService = 2,            ///< Windows service
-    SecuritySoftware = 3,         ///< AV/EDR/Firewall
-    Browser = 4,
-    EmailClient = 5,
-    Office = 6,
-    Developer = 7,                ///< IDE, compiler, etc.
-    SystemUtility = 8,            ///< certutil, bitsadmin, etc.
-    ScriptHost = 9,               ///< powershell, cscript, python
-    RemoteAccess = 10,            ///< RDP, SSH, remote tools
-    NetworkTool = 11,             ///< ftp, curl, netcat
-    ArchiveTool = 12,
-    GameApplication = 13,
-    MediaPlayer = 14,
-    Installer = 15,
-    UserApplication = 16,
-    LOLBin = 17,                  ///< Living-off-the-land binary
-    Malware = 18
 };
 
 /**
@@ -1243,6 +1216,10 @@ struct alignas(64) AnalyzerStatistics {
     std::atomic<uint64_t> analysisErrors{0};
     std::atomic<uint64_t> accessDeniedErrors{0};
     std::atomic<uint64_t> timeoutErrors{0};
+
+    AnalyzerStatistics() = default;
+    AnalyzerStatistics(const AnalyzerStatistics& other) noexcept;
+    AnalyzerStatistics& operator=(const AnalyzerStatistics& other) noexcept;
 
     /**
      * @brief Reset all statistics.

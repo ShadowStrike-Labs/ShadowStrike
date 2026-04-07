@@ -450,36 +450,36 @@ const std::vector<SideLoadPair> g_knownSideLoadPairs = {
 };
 
 /**
- * @brief Convert InjectionType to string.
+ * @brief Convert DLLInjectionType to string.
  */
-std::wstring InjectionTypeToStringInternal(InjectionType type) {
+std::wstring InjectionTypeToStringInternal(DLLInjectionType type) {
     switch (type) {
-        case InjectionType::CreateRemoteThread: return L"CreateRemoteThread";
-        case InjectionType::CreateRemoteThreadEx: return L"CreateRemoteThreadEx";
-        case InjectionType::RtlCreateUserThread: return L"RtlCreateUserThread";
-        case InjectionType::NtCreateThreadEx: return L"NtCreateThreadEx";
-        case InjectionType::SetWindowsHookEx: return L"SetWindowsHookEx";
-        case InjectionType::QueueUserAPC: return L"QueueUserAPC";
-        case InjectionType::QueueUserAPC2: return L"QueueUserAPC2";
-        case InjectionType::SetThreadContext: return L"SetThreadContext";
-        case InjectionType::AppInitDLL: return L"AppInit_DLLs";
-        case InjectionType::IFEO: return L"IFEO";
-        case InjectionType::KnownDLLHijack: return L"KnownDLL Hijack";
-        case InjectionType::SearchOrderHijack: return L"Search Order Hijack";
-        case InjectionType::SideLoading: return L"DLL Side-Loading";
-        case InjectionType::PhantomDLL: return L"Phantom DLL";
-        case InjectionType::COMHijacking: return L"COM Hijacking";
-        case InjectionType::ApplicationShim: return L"Application Shim";
-        case InjectionType::ImportAddressTable: return L"IAT Hooking";
-        case InjectionType::ExportAddressTable: return L"EAT Hooking";
-        case InjectionType::TLSCallback: return L"TLS Callback";
-        case InjectionType::WindowSubclass: return L"Window Subclass";
-        case InjectionType::ThreadPoolWait: return L"Thread Pool";
-        case InjectionType::ETWCallback: return L"ETW Callback";
-        case InjectionType::ExceptionHandler: return L"Exception Handler";
-        case InjectionType::ModuleCallback: return L"Module Callback";
-        case InjectionType::ConfigOverride: return L"Config Override";
-        case InjectionType::PluginLoad: return L"Plugin Load";
+        case DLLInjectionType::CreateRemoteThread: return L"CreateRemoteThread";
+        case DLLInjectionType::CreateRemoteThreadEx: return L"CreateRemoteThreadEx";
+        case DLLInjectionType::RtlCreateUserThread: return L"RtlCreateUserThread";
+        case DLLInjectionType::NtCreateThreadEx: return L"NtCreateThreadEx";
+        case DLLInjectionType::SetWindowsHookEx: return L"SetWindowsHookEx";
+        case DLLInjectionType::QueueUserAPC: return L"QueueUserAPC";
+        case DLLInjectionType::QueueUserAPC2: return L"QueueUserAPC2";
+        case DLLInjectionType::SetThreadContext: return L"SetThreadContext";
+        case DLLInjectionType::AppInitDLL: return L"AppInit_DLLs";
+        case DLLInjectionType::IFEO: return L"IFEO";
+        case DLLInjectionType::KnownDLLHijack: return L"KnownDLL Hijack";
+        case DLLInjectionType::SearchOrderHijack: return L"Search Order Hijack";
+        case DLLInjectionType::SideLoading: return L"DLL Side-Loading";
+        case DLLInjectionType::PhantomDLL: return L"Phantom DLL";
+        case DLLInjectionType::COMHijacking: return L"COM Hijacking";
+        case DLLInjectionType::ApplicationShim: return L"Application Shim";
+        case DLLInjectionType::ImportAddressTable: return L"IAT Hooking";
+        case DLLInjectionType::ExportAddressTable: return L"EAT Hooking";
+        case DLLInjectionType::TLSCallback: return L"TLS Callback";
+        case DLLInjectionType::WindowSubclass: return L"Window Subclass";
+        case DLLInjectionType::ThreadPoolWait: return L"Thread Pool";
+        case DLLInjectionType::ETWCallback: return L"ETW Callback";
+        case DLLInjectionType::ExceptionHandler: return L"Exception Handler";
+        case DLLInjectionType::ModuleCallback: return L"Module Callback";
+        case DLLInjectionType::ConfigOverride: return L"Config Override";
+        case DLLInjectionType::PluginLoad: return L"Plugin Load";
         default: return L"Unknown";
     }
 }
@@ -530,7 +530,7 @@ DLLInjectionConfig DLLInjectionConfig::CreateDefault() noexcept {
 
 DLLInjectionConfig DLLInjectionConfig::CreateStrict() noexcept {
     DLLInjectionConfig config;
-    config.mode = MonitoringMode::ActiveBlock;
+    config.mode = DLLMonitoringMode::ActiveBlock;
     config.enableRealTimeMonitoring = true;
 
     // Enable all detection features
@@ -558,7 +558,7 @@ DLLInjectionConfig DLLInjectionConfig::CreateStrict() noexcept {
 
 DLLInjectionConfig DLLInjectionConfig::CreatePerformance() noexcept {
     DLLInjectionConfig config;
-    config.mode = MonitoringMode::PassiveOnly;
+    config.mode = DLLMonitoringMode::PassiveOnly;
     config.enableRealTimeMonitoring = true;
 
     // Enable only high-value detections
@@ -634,7 +634,7 @@ double DLLInjectionStatistics::GetDetectionRate() const noexcept {
 
 class CallbackManager {
 public:
-    uint64_t RegisterInjection(InjectionDetectedCallback callback) {
+    uint64_t RegisterInjection(DLLInjectionDetectedCallback callback) {
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextId++;
         m_injectionCallbacks[id] = std::move(callback);
@@ -673,7 +673,7 @@ public:
         return false;
     }
 
-    void InvokeInjection(const InjectionEvent& event) {
+    void InvokeInjection(const DLLInjectionEvent& event) {
         std::shared_lock lock(m_mutex);
         for (const auto& [id, callback] : m_injectionCallbacks) {
             try {
@@ -727,7 +727,7 @@ public:
 private:
     mutable std::shared_mutex m_mutex;
     uint64_t m_nextId{ 1 };
-    std::unordered_map<uint64_t, InjectionDetectedCallback> m_injectionCallbacks;
+    std::unordered_map<uint64_t, DLLInjectionDetectedCallback> m_injectionCallbacks;
     std::unordered_map<uint64_t, ModuleLoadCallback> m_moduleCallbacks;
     std::unordered_map<uint64_t, LoadDecisionCallback> m_decisionCallbacks;
     std::unordered_map<uint64_t, HookInstalledCallback> m_hookCallbacks;
@@ -1097,7 +1097,7 @@ public:
             // Whitelist check
             if (m_config.useWhitelist && m_whitelistStore) {
                 auto result = m_whitelistStore->IsPathWhitelisted(info.normalizedPath);
-                info.isWhitelisted = result.isWhitelisted;
+                info.isWhitelisted = result.found;
 
                 if (info.isWhitelisted) {
                     m_stats.whitelistHits.fetch_add(1, std::memory_order_relaxed);
@@ -1167,12 +1167,12 @@ public:
                 }
 
                 // Check for injection
-                if (dllInfo.detectedInjectionType != InjectionType::Unknown) {
+                if (dllInfo.detectedInjectionType != DLLInjectionType::Unknown) {
                     result.injectedModules++;
                     result.injectedModules_.push_back(dllInfo);
 
                     // Create injection event
-                    InjectionEvent event;
+                    DLLInjectionEvent event;
                     event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                     event.timestamp = std::chrono::system_clock::now();
                     event.targetPid = pid;
@@ -1277,8 +1277,8 @@ public:
     // INJECTION DETECTION
     // ========================================================================
 
-    std::vector<InjectionEvent> DetectInjections(uint32_t pid) {
-        std::vector<InjectionEvent> events;
+    std::vector<DLLInjectionEvent> DetectInjections(uint32_t pid) {
+        std::vector<DLLInjectionEvent> events;
 
         if (!m_initialized || !m_callbackManager || !m_moduleTracker || !m_correlator) {
             return events;
@@ -1320,7 +1320,7 @@ public:
 
     bool IsInjected(uint32_t pid, const std::wstring& dllPath) {
         auto info = AnalyzeLoad(pid, dllPath);
-        return info.detectedInjectionType != InjectionType::Unknown;
+        return info.detectedInjectionType != DLLInjectionType::Unknown;
     }
 
     uint32_t FindInjector(uint32_t pid, const std::wstring& dllPath) {
@@ -1343,8 +1343,8 @@ public:
         return 0; // Unknown
     }
 
-    std::vector<InjectionEvent> DetectRemoteThreadInjectionImpl(uint32_t pid) {
-        std::vector<InjectionEvent> events;
+    std::vector<DLLInjectionEvent> DetectRemoteThreadInjectionImpl(uint32_t pid) {
+        std::vector<DLLInjectionEvent> events;
 
         // Check if there was a recent remote thread creation
         auto threadEvent = m_correlator->FindRecentThreadCreate(pid,
@@ -1385,13 +1385,13 @@ public:
                     continue;
                 }
 
-                InjectionEvent event;
+                DLLInjectionEvent event;
                 event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                 event.timestamp = std::chrono::system_clock::now();
                 event.targetPid = pid;
                 event.injectorPid = threadEvent->creatorPid;
                 event.dllInfo = module;
-                event.injectionType = InjectionType::CreateRemoteThread;
+                event.injectionType = DLLInjectionType::CreateRemoteThread;
                 event.confidence = InjectionConfidence::High;
                 event.injectionThreadId = 0;
                 event.threadStartAddress = threadEvent->startAddress;
@@ -1417,8 +1417,8 @@ public:
         return events;
     }
 
-    std::vector<InjectionEvent> DetectAPCInjectionImpl(uint32_t pid) {
-        std::vector<InjectionEvent> events;
+    std::vector<DLLInjectionEvent> DetectAPCInjectionImpl(uint32_t pid) {
+        std::vector<DLLInjectionEvent> events;
 
         // Check for recent APC queue
         auto apcEvent = m_correlator->FindRecentAPC(pid,
@@ -1450,13 +1450,13 @@ public:
                 continue;
             }
 
-            InjectionEvent event;
+            DLLInjectionEvent event;
             event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
             event.timestamp = std::chrono::system_clock::now();
             event.targetPid = pid;
             event.injectorPid = apcEvent->queuedBy;
             event.dllInfo = module;
-            event.injectionType = InjectionType::QueueUserAPC;
+            event.injectionType = DLLInjectionType::QueueUserAPC;
             event.confidence = InjectionConfidence::High;
             event.detectionReasons.push_back(L"APC queued by PID " + std::to_wstring(apcEvent->queuedBy));
             event.detectionReasons.push_back(L"Module loaded within APC correlation window");
@@ -1516,19 +1516,19 @@ public:
         return suspicious;
     }
 
-    std::vector<InjectionEvent> DetectHookInjectionImpl(uint32_t pid) {
-        std::vector<InjectionEvent> events;
+    std::vector<DLLInjectionEvent> DetectHookInjectionImpl(uint32_t pid) {
+        std::vector<DLLInjectionEvent> events;
 
         auto hooks = GetProcessHooks(pid);
 
         for (const auto& hook : hooks) {
             if (hook.isSuspicious) {
-                InjectionEvent event;
+                DLLInjectionEvent event;
                 event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                 event.timestamp = std::chrono::system_clock::now();
                 event.targetPid = pid;
                 event.injectorPid = hook.installerPid;
-                event.injectionType = InjectionType::SetWindowsHookEx;
+                event.injectionType = DLLInjectionType::SetWindowsHookEx;
                 event.confidence = InjectionConfidence::Medium;
                 event.detectionReasons.push_back(L"Suspicious global hook installed");
                 event.riskScore = 60;
@@ -1841,8 +1841,8 @@ public:
         return DetectSideLoadingImpl(pid, processPath);
     }
 
-    std::vector<InjectionEvent> DetectSearchOrderHijackImpl(uint32_t pid) {
-        std::vector<InjectionEvent> events;
+    std::vector<DLLInjectionEvent> DetectSearchOrderHijackImpl(uint32_t pid) {
+        std::vector<DLLInjectionEvent> events;
 
         // Search order hijacking detection
         // Check if DLLs are loaded from current directory instead of system directory
@@ -1857,12 +1857,12 @@ public:
                 }) != g_systemDLLNames.end();
 
             if (isSystemDllName && !module.isInSystemDir) {
-                InjectionEvent event;
+                DLLInjectionEvent event;
                 event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                 event.timestamp = std::chrono::system_clock::now();
                 event.targetPid = pid;
                 event.dllInfo = module;
-                event.injectionType = InjectionType::SearchOrderHijack;
+                event.injectionType = DLLInjectionType::SearchOrderHijack;
                 event.confidence = InjectionConfidence::High;
                 event.detectionReasons.push_back(L"System DLL loaded from non-system directory");
                 event.riskScore = 85;
@@ -1918,13 +1918,13 @@ public:
         return m_monitoring;
     }
 
-    void SetMonitoringMode(MonitoringMode mode) {
+    void SetMonitoringMode(DLLMonitoringMode mode) {
         std::unique_lock lock(m_mutex);
         m_config.mode = mode;
         SS_LOG_INFO(L"DLLInjection", L"Monitoring mode set to %d", static_cast<int>(mode));
     }
 
-    MonitoringMode GetMonitoringMode() const noexcept {
+    DLLMonitoringMode GetMonitoringMode() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_config.mode;
     }
@@ -1950,8 +1950,8 @@ public:
             m_moduleTracker->AddModule(pid, dllInfo);
 
             // Check decision callbacks
-            if (m_config.mode == MonitoringMode::ActiveBlock ||
-                m_config.mode == MonitoringMode::Aggressive) {
+            if (m_config.mode == DLLMonitoringMode::ActiveBlock ||
+                m_config.mode == DLLMonitoringMode::Aggressive) {
 
                 bool allow = m_callbackManager->InvokeDecision(dllInfo);
 
@@ -2036,7 +2036,7 @@ public:
     // CALLBACKS
     // ========================================================================
 
-    uint64_t RegisterCallback(InjectionDetectedCallback callback) {
+    uint64_t RegisterCallback(DLLInjectionDetectedCallback callback) {
         if (!m_callbackManager) {
             SS_LOG_ERROR(L"DLLInjection", L"RegisterCallback called before Initialize");
             return 0;
@@ -2122,7 +2122,7 @@ public:
         // Check external whitelist store if available
         if (m_whitelistStore) {
             auto result = m_whitelistStore->IsPathWhitelisted(normalized);
-            return result.isWhitelisted;
+            return result.found;
         }
 
         return false;
@@ -2327,7 +2327,7 @@ private:
             if (m_hashStore && m_hashStore->IsInitialized()) {
                 // Build HashValue for lookup
                 SignatureStore::HashValue hv;
-                hv.algorithm = SignatureStore::HashAlgorithm::SHA256;
+                hv.type = SignatureStore::HashType::SHA256;
                 hv.length = 32;
                 std::memcpy(hv.data.data(), hashArr.data(),
                             std::min<size_t>(32, hv.data.size()));
@@ -2445,20 +2445,20 @@ private:
         // Determine injection type based on load reason and characteristics
 
         if (info.loadReason == LoadReason::RemoteThread) {
-            info.detectedInjectionType = InjectionType::CreateRemoteThread;
+            info.detectedInjectionType = DLLInjectionType::CreateRemoteThread;
             info.confidence = InjectionConfidence::High;
         } else if (info.loadReason == LoadReason::APCInjection) {
-            info.detectedInjectionType = InjectionType::QueueUserAPC;
+            info.detectedInjectionType = DLLInjectionType::QueueUserAPC;
             info.confidence = InjectionConfidence::High;
         } else if (info.loadReason == LoadReason::HookInjection) {
-            info.detectedInjectionType = InjectionType::SetWindowsHookEx;
+            info.detectedInjectionType = DLLInjectionType::SetWindowsHookEx;
             info.confidence = InjectionConfidence::Medium;
         } else if (info.loadReason == LoadReason::AppInitDLLs) {
-            info.detectedInjectionType = InjectionType::AppInitDLL;
+            info.detectedInjectionType = DLLInjectionType::AppInitDLL;
             info.confidence = InjectionConfidence::Confirmed;
         } else if (info.riskScore >= 80) {
             // Generic injection detection based on risk
-            info.detectedInjectionType = InjectionType::Unknown;
+            info.detectedInjectionType = DLLInjectionType::Unknown;
             info.confidence = InjectionConfidence::Medium;
         }
     }
@@ -2481,7 +2481,7 @@ private:
 
     bool ShouldBlock(const LoadedDLLInfo& info) const {
         // Aggressive mode blocks all untrusted
-        if (m_config.mode == MonitoringMode::Aggressive) {
+        if (m_config.mode == DLLMonitoringMode::Aggressive) {
             return info.trustLevel != TrustLevel::System &&
                    info.trustLevel != TrustLevel::Whitelisted;
         }
@@ -2607,7 +2607,7 @@ TrustLevel DLLInjectionDetector::GetTrustLevel(const std::wstring& dllPath) {
     return m_impl->GetTrustLevel(dllPath);
 }
 
-std::vector<InjectionEvent> DLLInjectionDetector::DetectInjections(uint32_t pid) {
+std::vector<DLLInjectionEvent> DLLInjectionDetector::DetectInjections(uint32_t pid) {
     return m_impl->DetectInjections(pid);
 }
 
@@ -2619,11 +2619,11 @@ uint32_t DLLInjectionDetector::FindInjector(uint32_t pid, const std::wstring& dl
     return m_impl->FindInjector(pid, dllPath);
 }
 
-std::vector<InjectionEvent> DLLInjectionDetector::DetectRemoteThreadInjection(uint32_t pid) {
+std::vector<DLLInjectionEvent> DLLInjectionDetector::DetectRemoteThreadInjection(uint32_t pid) {
     return m_impl->DetectRemoteThreadInjectionImpl(pid);
 }
 
-std::vector<InjectionEvent> DLLInjectionDetector::DetectAPCInjection(uint32_t pid) {
+std::vector<DLLInjectionEvent> DLLInjectionDetector::DetectAPCInjection(uint32_t pid) {
     return m_impl->DetectAPCInjectionImpl(pid);
 }
 
@@ -2639,7 +2639,7 @@ std::vector<HookInfo> DLLInjectionDetector::FindSuspiciousHooks() {
     return m_impl->FindSuspiciousHooks();
 }
 
-std::vector<InjectionEvent> DLLInjectionDetector::DetectHookInjection(uint32_t pid) {
+std::vector<DLLInjectionEvent> DLLInjectionDetector::DetectHookInjection(uint32_t pid) {
     return m_impl->DetectHookInjectionImpl(pid);
 }
 
@@ -2674,7 +2674,7 @@ bool DLLInjectionDetector::IsSideLoaded(const std::wstring& executablePath, cons
     return m_impl->IsSideLoadedImpl(executablePath, dllPath);
 }
 
-std::vector<InjectionEvent> DLLInjectionDetector::DetectSearchOrderHijack(uint32_t pid) {
+std::vector<DLLInjectionEvent> DLLInjectionDetector::DetectSearchOrderHijack(uint32_t pid) {
     return m_impl->DetectSearchOrderHijackImpl(pid);
 }
 
@@ -2690,11 +2690,11 @@ bool DLLInjectionDetector::IsMonitoring() const noexcept {
     return m_impl->IsMonitoring();
 }
 
-void DLLInjectionDetector::SetMonitoringMode(MonitoringMode mode) {
+void DLLInjectionDetector::SetMonitoringMode(DLLMonitoringMode mode) {
     m_impl->SetMonitoringMode(mode);
 }
 
-MonitoringMode DLLInjectionDetector::GetMonitoringMode() const noexcept {
+DLLMonitoringMode DLLInjectionDetector::GetMonitoringMode() const noexcept {
     return m_impl->GetMonitoringMode();
 }
 
@@ -2718,7 +2718,7 @@ void DLLInjectionDetector::OnHookInstall(int hookType, uint32_t threadId,
     m_impl->OnHookInstall(hookType, threadId, hookProc, installerPid);
 }
 
-uint64_t DLLInjectionDetector::RegisterCallback(InjectionDetectedCallback callback) {
+uint64_t DLLInjectionDetector::RegisterCallback(DLLInjectionDetectedCallback callback) {
     return m_impl->RegisterCallback(std::move(callback));
 }
 
@@ -2781,7 +2781,7 @@ std::wstring DLLInjectionDetector::GetVersion() noexcept {
         DLLInjectionConstants::VERSION_PATCH);
 }
 
-std::wstring DLLInjectionDetector::InjectionTypeToString(InjectionType type) noexcept {
+std::wstring DLLInjectionDetector::InjectionTypeToString(DLLInjectionType type) noexcept {
     return InjectionTypeToStringInternal(type);
 }
 

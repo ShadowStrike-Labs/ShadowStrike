@@ -81,9 +81,9 @@
 // ============================================================================
 
 // Internal infrastructure
+#include "ProcessTypes.hpp"
 #include "ProcessMonitor.hpp"
 #include "../../Utils/ProcessUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelManager.hpp"
 
@@ -146,8 +146,9 @@ namespace AtomBombingConstants {
     constexpr size_t MAX_PATTERNS = 64;
 
     // Windows API function hashes (for ROP detection)
-    constexpr uint32_t HASH_GlobalGetAtomNameA = 0x2C5B8D4A;
-    constexpr uint32_t HASH_GlobalGetAtomNameW = 0x3E7C9F5B;
+    // Prefixed to avoid clashes with Windows API macros GlobalGetAtomNameA/W
+    constexpr uint32_t HASH_AtomGetNameA = 0x2C5B8D4A;
+    constexpr uint32_t HASH_AtomGetNameW = 0x3E7C9F5B;
     constexpr uint32_t HASH_NtQueueApcThread = 0x4D8E0A6C;
     constexpr uint32_t HASH_NtQueueApcThreadEx = 0x5E9F1B7D;
 
@@ -201,37 +202,18 @@ enum class APCType : uint8_t {
  */
 enum class APCTargetType : uint8_t {
     Unknown = 0,
-    GlobalGetAtomNameA = 1,
-    GlobalGetAtomNameW = 2,
-    GlobalGetAtomName = 3,        ///< Unspecified variant
+    AtomGetNameA = 1,
+    AtomGetNameW = 2,
+    AtomGetName = 3,              ///< Unspecified variant
     NtdllGadget = 4,              ///< ROP gadget in ntdll
     ShellcodeEntry = 5,           ///< Direct shellcode execution
     LoadLibrary = 6,              ///< LoadLibrary injection
     OtherSuspicious = 7
 };
 
-/**
- * @enum DetectionConfidence
- * @brief Confidence level of detection.
- */
-enum class DetectionConfidence : uint8_t {
-    None = 0,
-    Low = 1,              ///< Single indicator
-    Medium = 2,           ///< Multiple indicators
-    High = 3,             ///< Strong correlation
-    Confirmed = 4         ///< Attack chain confirmed
-};
+// DetectionConfidence — defined in ProcessTypes.hpp
 
-/**
- * @enum MonitoringMode
- * @brief Real-time monitoring mode.
- */
-enum class MonitoringMode : uint8_t {
-    Disabled = 0,
-    PassiveOnly = 1,          ///< Monitor and alert
-    Active = 2,               ///< Can block suspicious APCs
-    Aggressive = 3            ///< Block all cross-process APCs to atom functions
-};
+// MonitoringMode — defined in ProcessTypes.hpp
 
 // ============================================================================
 // DATA STRUCTURES
@@ -364,10 +346,10 @@ struct AtomBombingAttack {
 };
 
 /**
- * @struct ScanResult
+ * @struct AtomBombingScanResult
  * @brief Result of scanning for AtomBombing.
  */
-struct ScanResult {
+struct AtomBombingScanResult {
     std::chrono::system_clock::time_point scanTime;
     
     // Scope
@@ -491,7 +473,41 @@ struct alignas(64) AtomBombingStatistics {
     // Errors
     std::atomic<uint64_t> scanErrors{0};
     std::atomic<uint64_t> accessDeniedErrors{0};
-    
+
+    AtomBombingStatistics() = default;
+
+    AtomBombingStatistics(const AtomBombingStatistics& other) noexcept {
+        *this = other;
+    }
+
+    AtomBombingStatistics& operator=(const AtomBombingStatistics& other) noexcept {
+        if (this != &other) {
+            atomsMonitored.store(other.atomsMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            atomCreations.store(other.atomCreations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            atomDeletions.store(other.atomDeletions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousAtomsDetected.store(other.suspiciousAtomsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            highEntropyAtomsDetected.store(other.highEntropyAtomsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            shellcodePatternsDetected.store(other.shellcodePatternsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apcsMonitored.store(other.apcsMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            crossProcessApcs.store(other.crossProcessApcs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousApcsDetected.store(other.suspiciousApcsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            atomTargetingApcs.store(other.atomTargetingApcs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            attacksDetected.store(other.attacksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            attacksBlocked.store(other.attacksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lowConfidenceDetections.store(other.lowConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            mediumConfidenceDetections.store(other.mediumConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            highConfidenceDetections.store(other.highConfidenceDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            confirmedAttacks.store(other.confirmedAttacks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            payloadsExtracted.store(other.payloadsExtracted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            extractionFailures.store(other.extractionFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalScanTimeMs.store(other.totalScanTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            scansPerformed.store(other.scansPerformed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            scanErrors.store(other.scanErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessDeniedErrors.store(other.accessDeniedErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
+     
     /**
      * @brief Reset all statistics.
      */
@@ -626,7 +642,7 @@ public:
      * @brief Scan the Global Atom Table for suspicious entries.
      * @return Scan result.
      */
-    [[nodiscard]] ScanResult ScanAtomTable();
+    [[nodiscard]] AtomBombingScanResult ScanAtomTable();
 
     /**
      * @brief Analyze a specific atom.
@@ -726,7 +742,7 @@ public:
      * @param pid Process ID.
      * @return Scan result.
      */
-    [[nodiscard]] ScanResult ScanProcess(uint32_t pid);
+    [[nodiscard]] AtomBombingScanResult ScanProcess(uint32_t pid);
 
     // ========================================================================
     // REAL-TIME MONITORING

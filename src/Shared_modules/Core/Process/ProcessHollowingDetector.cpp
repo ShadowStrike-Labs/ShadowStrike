@@ -1,4 +1,4 @@
-﻿/*
+/*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
@@ -342,7 +342,7 @@ void HollowingDetectionResult::CalculateRiskScore() noexcept {
 
 HollowingDetectorConfig HollowingDetectorConfig::CreateDefault() noexcept {
     HollowingDetectorConfig config;
-    config.defaultScanMode = ScanMode::Standard;
+    config.defaultScanMode = HollowingScanMode::Standard;
     config.monitorMode = MonitorMode::Active;
     config.enableRealTimeMonitoring = true;
     config.enableHeaderComparison = true;
@@ -356,7 +356,7 @@ HollowingDetectorConfig HollowingDetectorConfig::CreateDefault() noexcept {
 
 HollowingDetectorConfig HollowingDetectorConfig::CreateParanoid() noexcept {
     HollowingDetectorConfig config = CreateDefault();
-    config.defaultScanMode = ScanMode::Paranoid;
+    config.defaultScanMode = HollowingScanMode::Paranoid;
     config.monitorMode = MonitorMode::Aggressive;
     config.alertOnLowConfidence = true;
     config.sectionDifferenceThreshold = 0.05;  // 5% difference
@@ -369,7 +369,7 @@ HollowingDetectorConfig HollowingDetectorConfig::CreateParanoid() noexcept {
 
 HollowingDetectorConfig HollowingDetectorConfig::CreatePerformance() noexcept {
     HollowingDetectorConfig config = CreateDefault();
-    config.defaultScanMode = ScanMode::Quick;
+    config.defaultScanMode = HollowingScanMode::Quick;
     config.monitorMode = MonitorMode::PassiveOnly;
     config.enableSectionAnalysis = false;
     config.enablePayloadExtraction = false;
@@ -380,7 +380,7 @@ HollowingDetectorConfig HollowingDetectorConfig::CreatePerformance() noexcept {
 
 HollowingDetectorConfig HollowingDetectorConfig::CreateForensic() noexcept {
     HollowingDetectorConfig config = CreateParanoid();
-    config.defaultScanMode = ScanMode::Comprehensive;
+    config.defaultScanMode = HollowingScanMode::Comprehensive;
     config.enablePayloadExtraction = true;
     config.quarantinePayload = true;
     config.reportToThreatIntel = true;
@@ -392,7 +392,7 @@ HollowingDetectorConfig HollowingDetectorConfig::CreateForensic() noexcept {
 // PIMPL IMPLEMENTATION
 // ============================================================================
 
-struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
+struct ProcessHollowingDetectorImpl {
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 
@@ -428,7 +428,7 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
     // Callbacks
     std::vector<std::pair<uint64_t, HollowingDetectedCallback>> m_detectionCallbacks;
     std::vector<std::pair<uint64_t, SuspiciousCreationCallback>> m_creationCallbacks;
-    std::vector<std::pair<uint64_t, ScanProgressCallback>> m_progressCallbacks;
+    std::vector<std::pair<uint64_t, HollowingScanProgressCallback>> m_progressCallbacks;
     std::mutex m_callbacksMutex;
     std::atomic<uint64_t> m_nextCallbackId{1};
 
@@ -623,11 +623,11 @@ struct ProcessHollowingDetector::ProcessHollowingDetectorImpl {
                 section.pointerToRawData = secHeader->PointerToRawData;
                 section.characteristics = secHeader->Characteristics;
 
-                section.isExecutable = (section.characteristics & HollowingConstants::IMAGE_SCN_MEM_EXECUTE) != 0;
-                section.isWritable = (section.characteristics & HollowingConstants::IMAGE_SCN_MEM_WRITE) != 0;
-                section.isReadable = (section.characteristics & HollowingConstants::IMAGE_SCN_MEM_READ) != 0;
-                section.containsCode = (section.characteristics & HollowingConstants::IMAGE_SCN_CNT_CODE) != 0;
-                section.containsData = (section.characteristics & HollowingConstants::IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
+                section.isExecutable = (section.characteristics & HollowingConstants::SCN_MEM_EXECUTE) != 0;
+                section.isWritable = (section.characteristics & HollowingConstants::SCN_MEM_WRITE) != 0;
+                section.isReadable = (section.characteristics & HollowingConstants::SCN_MEM_READ) != 0;
+                section.containsCode = (section.characteristics & HollowingConstants::SCN_CNT_CODE) != 0;
+                section.containsData = (section.characteristics & HollowingConstants::SCN_CNT_INITIALIZED_DATA) != 0;
 
                 info.sections.push_back(section);
             }
@@ -894,7 +894,7 @@ HollowingDetectorConfig ProcessHollowingDetector::GetConfig() const {
 // SCANNING - CORE IMPLEMENTATION
 // ============================================================================
 
-HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, ScanMode mode) {
+HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, HollowingScanMode mode) {
     auto startTime = std::chrono::steady_clock::now();
 
     HollowingDetectionResult result;
@@ -914,10 +914,10 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
         m_impl->m_statistics.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         switch (mode) {
-            case ScanMode::Quick: m_impl->m_statistics.quickScans.fetch_add(1, std::memory_order_relaxed); break;
-            case ScanMode::Standard: m_impl->m_statistics.standardScans.fetch_add(1, std::memory_order_relaxed); break;
-            case ScanMode::Comprehensive: m_impl->m_statistics.comprehensiveScans.fetch_add(1, std::memory_order_relaxed); break;
-            case ScanMode::Paranoid: m_impl->m_statistics.paranoidScans.fetch_add(1, std::memory_order_relaxed); break;
+            case HollowingScanMode::Quick: m_impl->m_statistics.quickScans.fetch_add(1, std::memory_order_relaxed); break;
+            case HollowingScanMode::Standard: m_impl->m_statistics.standardScans.fetch_add(1, std::memory_order_relaxed); break;
+            case HollowingScanMode::Comprehensive: m_impl->m_statistics.comprehensiveScans.fetch_add(1, std::memory_order_relaxed); break;
+            case HollowingScanMode::Paranoid: m_impl->m_statistics.paranoidScans.fetch_add(1, std::memory_order_relaxed); break;
         }
 
         // Check exclusions
@@ -1046,7 +1046,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
 
         // Section-level analysis (Standard mode and above)
         if (m_impl->m_config.enableSectionAnalysis &&
-            mode >= ScanMode::Standard &&
+            mode >= HollowingScanMode::Standard &&
             result.diskHeader.isValid && result.memoryHeader.isValid && moduleBase != 0) {
 
             Utils::ProcessUtils::ProcessHandle hProcess(pid, PROCESS_VM_READ | PROCESS_QUERY_INFORMATION);
@@ -1063,7 +1063,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
                         result.detectionMethods.push_back(DetectionMethod::SectionCharacteristics);
                         result.detectionDetails.push_back(
                             L"Section characteristics modified: " +
-                            std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                            Utils::StringUtils::ToWide(std::string(diskSec.name.data(), strnlen(diskSec.name.data(), 8))));
                     }
 
                     // For code sections, sample and compare content against disk
@@ -1091,7 +1091,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
                                     result.detectionMethods.push_back(DetectionMethod::EntropyAnomaly);
                                     result.detectionDetails.push_back(
                                         L"High entropy in code section: " +
-                                        std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                                        Utils::StringUtils::ToWide(std::string(diskSec.name.data(), strnlen(diskSec.name.data(), 8))));
                                 }
 
                                 // Disk vs memory content comparison (core hollowing detection)
@@ -1130,7 +1130,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
                                                     L"Code section content mismatch (" +
                                                     std::to_wstring(static_cast<int>(diffRatio * 100.0)) +
                                                     L"% different): " +
-                                                    std::wstring(diskSec.name.data(), strnlen(diskSec.name.data(), 8)));
+                                                    Utils::StringUtils::ToWide(std::string(diskSec.name.data(), strnlen(diskSec.name.data(), 8))));
                                                 result.isHollowed = true;
                                             }
 
@@ -1151,7 +1151,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
                 }
 
                 // Detect unbacked executable memory regions (Comprehensive+)
-                if (mode >= ScanMode::Comprehensive) {
+                if (mode >= HollowingScanMode::Comprehensive) {
                     uintptr_t addr = 0;
                     MEMORY_BASIC_INFORMATION mbi{};
                     constexpr size_t MAX_REGIONS = 8192;
@@ -1186,7 +1186,7 @@ HollowingDetectionResult ProcessHollowingDetector::ScanProcess(uint32_t pid, Sca
 
                 // Module stomping detection
                 if (m_impl->m_config.enableModuleStompingDetection &&
-                    mode >= ScanMode::Standard) {
+                    mode >= HollowingScanMode::Standard) {
                     std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
                     if (Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
                         for (const auto& mod : modules) {
@@ -1462,13 +1462,13 @@ finalize_scan:
 }
 
 bool ProcessHollowingDetector::IsHollowed(uint32_t pid) {
-    auto result = ScanProcess(pid, ScanMode::Quick);
+    auto result = ScanProcess(pid, HollowingScanMode::Quick);
     return result.isHollowed;
 }
 
 std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByPath(
     const std::wstring& processPath,
-    ScanMode mode)
+    HollowingScanMode mode)
 {
     std::vector<HollowingDetectionResult> results;
 
@@ -1494,7 +1494,7 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByPath(
 
 std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByName(
     const std::wstring& processName,
-    ScanMode mode)
+    HollowingScanMode mode)
 {
     std::vector<HollowingDetectionResult> results;
 
@@ -1512,7 +1512,7 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanByName(
 }
 
 std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanAllProcesses(
-    ScanMode mode,
+    HollowingScanMode mode,
     uint32_t maxConcurrent)
 {
     std::vector<HollowingDetectionResult> results;
@@ -1550,7 +1550,7 @@ std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanAllProcesses
 
 std::vector<HollowingDetectionResult> ProcessHollowingDetector::ScanProcesses(
     const std::vector<uint32_t>& pids,
-    ScanMode mode)
+    HollowingScanMode mode)
 {
     std::vector<HollowingDetectionResult> results;
     results.reserve(pids.size());
@@ -1889,7 +1889,8 @@ EntryPointAnalysis ProcessHollowingDetector::AnalyzeEntryPoint(uint32_t pid) {
             uint32_t secStart = section.virtualAddress;
             uint32_t secEnd = secStart + std::max(section.virtualSize, section.sizeOfRawData);
             if (analysis.entryPointRVA >= secStart && analysis.entryPointRVA < secEnd) {
-                analysis.containingSection = std::wstring(section.name.data(), strnlen(section.name.data(), 8));
+                analysis.containingSection = Utils::StringUtils::ToWide(
+                    std::string(section.name.data(), strnlen(section.name.data(), 8)));
                 analysis.isInCodeSection = section.isExecutable || section.containsCode;
                 analysis.isInExpectedRange = true;
                 break;
@@ -2326,7 +2327,7 @@ uint64_t ProcessHollowingDetector::RegisterCreationCallback(SuspiciousCreationCa
     return id;
 }
 
-uint64_t ProcessHollowingDetector::RegisterProgressCallback(ScanProgressCallback callback) {
+uint64_t ProcessHollowingDetector::RegisterProgressCallback(HollowingScanProgressCallback callback) {
     std::lock_guard<std::mutex> lock(m_impl->m_callbacksMutex);
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_progressCallbacks.emplace_back(id, std::move(callback));
@@ -2644,12 +2645,12 @@ std::string_view GetDetectionMethodName(DetectionMethod method) noexcept {
     }
 }
 
-std::string_view GetScanModeName(ScanMode mode) noexcept {
+std::string_view GetScanModeName(HollowingScanMode mode) noexcept {
     switch (mode) {
-        case ScanMode::Quick: return "Quick";
-        case ScanMode::Standard: return "Standard";
-        case ScanMode::Comprehensive: return "Comprehensive";
-        case ScanMode::Paranoid: return "Paranoid";
+        case HollowingScanMode::Quick: return "Quick";
+        case HollowingScanMode::Standard: return "Standard";
+        case HollowingScanMode::Comprehensive: return "Comprehensive";
+        case HollowingScanMode::Paranoid: return "Paranoid";
         default: return "Unknown";
     }
 }

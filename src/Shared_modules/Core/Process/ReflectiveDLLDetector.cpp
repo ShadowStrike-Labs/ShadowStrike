@@ -853,10 +853,10 @@ public:
     // PROCESS SCANNING
     // ========================================================================
 
-    ScanResult Scan(uint32_t pid, ReflectiveScanMode mode) {
+    ReflectiveScanResult Scan(uint32_t pid, ReflectiveScanMode mode) {
         const auto startTime = std::chrono::high_resolution_clock::now();
 
-        ScanResult result;
+        ReflectiveScanResult result;
         result.processId = pid;
         result.scanTime = std::chrono::system_clock::now();
         result.scanMode = mode;
@@ -969,8 +969,8 @@ public:
         return result.hasReflectiveLoading;
     }
 
-    std::vector<ScanResult> ScanMultiple(const std::vector<uint32_t>& pids, ReflectiveScanMode mode) {
-        std::vector<ScanResult> results;
+    std::vector<ReflectiveScanResult> ScanMultiple(const std::vector<uint32_t>& pids, ReflectiveScanMode mode) {
+        std::vector<ReflectiveScanResult> results;
         results.reserve(pids.size());
 
         for (uint32_t pid : pids) {
@@ -980,8 +980,8 @@ public:
         return results;
     }
 
-    std::vector<ScanResult> ScanAllProcesses(ReflectiveScanMode mode) {
-        std::vector<ScanResult> results;
+    std::vector<ReflectiveScanResult> ScanAllProcesses(ReflectiveScanMode mode) {
+        std::vector<ReflectiveScanResult> results;
 
         try {
             HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
@@ -1013,8 +1013,8 @@ public:
         return results;
     }
 
-    std::vector<ScanResult> ScanByName(const std::wstring& processName, ReflectiveScanMode mode) {
-        std::vector<ScanResult> results;
+    std::vector<ReflectiveScanResult> ScanByName(const std::wstring& processName, ReflectiveScanMode mode) {
+        std::vector<ReflectiveScanResult> results;
 
         try {
             auto pids = FindProcessesByName(processName);
@@ -2462,7 +2462,7 @@ ReflectiveConfig ReflectiveDLLDetector::GetConfig() const {
     return m_impl->GetConfig();
 }
 
-ScanResult ReflectiveDLLDetector::Scan(uint32_t pid, ReflectiveScanMode mode) {
+ReflectiveScanResult ReflectiveDLLDetector::Scan(uint32_t pid, ReflectiveScanMode mode) {
     return m_impl->Scan(pid, mode);
 }
 
@@ -2470,16 +2470,16 @@ bool ReflectiveDLLDetector::HasReflectiveLoading(uint32_t pid) {
     return m_impl->HasReflectiveLoading(pid);
 }
 
-std::vector<ScanResult> ReflectiveDLLDetector::ScanMultiple(
+std::vector<ReflectiveScanResult> ReflectiveDLLDetector::ScanMultiple(
     const std::vector<uint32_t>& pids, ReflectiveScanMode mode) {
     return m_impl->ScanMultiple(pids, mode);
 }
 
-std::vector<ScanResult> ReflectiveDLLDetector::ScanAllProcesses(ReflectiveScanMode mode) {
+std::vector<ReflectiveScanResult> ReflectiveDLLDetector::ScanAllProcesses(ReflectiveScanMode mode) {
     return m_impl->ScanAllProcesses(mode);
 }
 
-std::vector<ScanResult> ReflectiveDLLDetector::ScanByName(
+std::vector<ReflectiveScanResult> ReflectiveDLLDetector::ScanByName(
     const std::wstring& processName, ReflectiveScanMode mode) {
     return m_impl->ScanByName(processName, mode);
 }
