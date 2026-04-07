@@ -309,10 +309,10 @@ enum class PersistenceType : uint16_t {
 };
 
 /**
- * @enum RiskLevel
+ * @enum PersistenceRiskLevel
  * @brief Risk assessment level.
  */
-enum class RiskLevel : uint8_t {
+enum class PersistenceRiskLevel : uint8_t {
     Safe = 0,                      // Signed Microsoft/Known vendor
     Low = 1,                       // Signed third-party
     Unknown = 2,                   // Unsigned but normal location
@@ -434,7 +434,7 @@ struct alignas(256) PersistenceEntry {
     std::wstring userName;
 
     // Risk assessment
-    RiskLevel risk{ RiskLevel::Unknown };
+    PersistenceRiskLevel risk{ PersistenceRiskLevel::Unknown };
     uint8_t riskScore{ 0 };                // 0-100
     std::vector<std::string> riskFactors;
 
@@ -580,7 +580,7 @@ struct alignas(128) ScanResult {
  * @brief Real-time persistence analysis result.
  */
 struct alignas(64) RealTimeAnalysis {
-    RiskLevel risk{ RiskLevel::Unknown };
+    PersistenceRiskLevel risk{ PersistenceRiskLevel::Unknown };
     uint8_t riskScore{ 0 };
 
     PersistenceType detectedType{ PersistenceType::Unknown };
@@ -609,7 +609,7 @@ struct alignas(256) PersistenceAlert {
 
     // Detection
     PersistenceType type{ PersistenceType::Unknown };
-    RiskLevel risk{ RiskLevel::Unknown };
+    PersistenceRiskLevel risk{ PersistenceRiskLevel::Unknown };
     std::string description;
 
     // Entry
@@ -841,7 +841,7 @@ public:
      * @param data Value data.
      * @return Risk level.
      */
-    [[nodiscard]] RiskLevel AnalyzeRealTime(
+    [[nodiscard]] PersistenceRiskLevel AnalyzeRealTime(
         const std::wstring& keyPath,
         const std::wstring& valueName,
         const std::wstring& data

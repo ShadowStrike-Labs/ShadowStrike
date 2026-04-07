@@ -454,7 +454,7 @@ public:
     // Caches
     std::unordered_map<std::wstring, TargetBinary> m_targetCache;
     std::unordered_map<std::string, SignatureStatus> m_signatureCache;
-    std::unordered_map<std::string, RiskLevel> m_hashReputationCache;
+    std::unordered_map<std::string, PersistenceRiskLevel> m_hashReputationCache;
 
     // Callbacks
     std::atomic<uint64_t> m_nextCallbackId{1};
@@ -659,17 +659,17 @@ public:
                 result.entriesByType[entry.type]++;
 
                 switch (entry.risk) {
-                    case RiskLevel::Safe:
-                    case RiskLevel::Low:
+                    case PersistenceRiskLevel::Safe:
+                    case PersistenceRiskLevel::Low:
                         result.safeEntries++;
                         break;
-                    case RiskLevel::Suspicious:
+                    case PersistenceRiskLevel::Suspicious:
                         result.suspiciousEntries++;
                         break;
-                    case RiskLevel::Malicious:
+                    case PersistenceRiskLevel::Malicious:
                         result.maliciousEntries++;
                         break;
-                    case RiskLevel::Unknown:
+                    case PersistenceRiskLevel::Unknown:
                         result.unknownEntries++;
                         break;
                 }
@@ -768,7 +768,7 @@ public:
 
                     // Whitelist check before scoring
                     if (IsWhitelisted(entry)) {
-                        entry.risk = RiskLevel::Safe;
+                        entry.risk = PersistenceRiskLevel::Safe;
                         entry.riskScore = 0;
                         entry.isKnownGood = true;
                     } else {
@@ -1629,20 +1629,20 @@ public:
         return false;
     }
 
-    [[nodiscard]] RiskLevel AssessRisk(const PersistenceEntry& entry) const noexcept {
+    [[nodiscard]] PersistenceRiskLevel AssessRisk(const PersistenceEntry& entry) const noexcept {
         uint32_t riskScore = CalculateRiskScore(entry);
 
         // Known bad/good overrides
-        if (entry.isKnownBad) return RiskLevel::Malicious;
-        if (entry.isKnownGood || entry.target.isMicrosoftSigned) return RiskLevel::Safe;
+        if (entry.isKnownBad) return PersistenceRiskLevel::Malicious;
+        if (entry.isKnownGood || entry.target.isMicrosoftSigned) return PersistenceRiskLevel::Safe;
 
         // Calculate final risk level based on score
-        if (riskScore >= 75) return RiskLevel::Malicious;
-        if (riskScore >= 45) return RiskLevel::Suspicious;
-        if (riskScore >= 20) return RiskLevel::Unknown;
-        if (entry.target.isTrusted) return RiskLevel::Safe;
+        if (riskScore >= 75) return PersistenceRiskLevel::Malicious;
+        if (riskScore >= 45) return PersistenceRiskLevel::Suspicious;
+        if (riskScore >= 20) return PersistenceRiskLevel::Unknown;
+        if (entry.target.isTrusted) return PersistenceRiskLevel::Safe;
 
-        return RiskLevel::Low;
+        return PersistenceRiskLevel::Low;
     }
 
     [[nodiscard]] uint8_t CalculateRiskScore(const PersistenceEntry& entry) const noexcept {
@@ -1722,7 +1722,7 @@ public:
                 tempEntry.target = target;
                 tempEntry.type = analysis.detectedType;
                 if (IsWhitelisted(tempEntry)) {
-                    analysis.risk = RiskLevel::Safe;
+                    analysis.risk = PersistenceRiskLevel::Safe;
                     analysis.riskScore = 0;
                     analysis.recommendation = "Allow (whitelisted)";
                     return analysis;
@@ -1765,13 +1765,13 @@ public:
                 analysis.riskScore = static_cast<uint8_t>(std::min(score, 100u));
 
                 if (analysis.riskScore >= 70) {
-                    analysis.risk = RiskLevel::Malicious;
+                    analysis.risk = PersistenceRiskLevel::Malicious;
                     analysis.recommendation = "Block this persistence attempt";
                 } else if (analysis.riskScore >= 40) {
-                    analysis.risk = RiskLevel::Suspicious;
+                    analysis.risk = PersistenceRiskLevel::Suspicious;
                     analysis.recommendation = "Alert and monitor";
                 } else {
-                    analysis.risk = RiskLevel::Low;
+                    analysis.risk = PersistenceRiskLevel::Low;
                     analysis.recommendation = "Allow";
                 }
 
@@ -1779,8 +1779,8 @@ public:
                     static_cast<int>(analysis.detectedType), static_cast<int>(analysis.risk), analysis.riskScore);
 
                 // Generate alert for suspicious+ events
-                if ((analysis.risk >= RiskLevel::Suspicious && m_config.alertOnSuspicious) ||
-                    (analysis.risk == RiskLevel::Unknown && m_config.alertOnUnknown)) {
+                if ((analysis.risk >= PersistenceRiskLevel::Suspicious && m_config.alertOnSuspicious) ||
+                    (analysis.risk == PersistenceRiskLevel::Unknown && m_config.alertOnUnknown)) {
                     GenerateRealTimeAlert(keyPath, valueName, data, analysis);
                 }
             }
@@ -2030,7 +2030,7 @@ void PersistenceDetector::CancelScan() {
 // REAL-TIME ANALYSIS
 // ============================================================================
 
-[[nodiscard]] RiskLevel PersistenceDetector::AnalyzeRealTime(
+[[nodiscard]] PersistenceRiskLevel PersistenceDetector::AnalyzeRealTime(
     const std::wstring& keyPath,
     const std::wstring& valueName,
     const std::wstring& data
@@ -2314,7 +2314,7 @@ bool PersistenceDetector::ExportScanReport(const ScanResult& result, const std::
         file << "Errors: " << result.errorsEncountered << "\n\n";
 
         for (const auto& entry : result.entries) {
-            if (entry.risk < RiskLevel::Suspicious && !m_impl->m_config.logAllEntries) {
+            if (entry.risk < PersistenceRiskLevel::Suspicious && !m_impl->m_config.logAllEntries) {
                 continue;
             }
             file << "--- Entry ---\n";
