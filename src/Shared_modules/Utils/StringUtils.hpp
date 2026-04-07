@@ -83,6 +83,15 @@ namespace ShadowStrike {
             [[nodiscard]] std::string ToNarrow(std::wstring_view wide) noexcept;
 
             /**
+             * @brief Legacy compatibility wrapper for older call sites.
+             * @param wide UTF-16 encoded wide string view.
+             * @return UTF-8 encoded string, or empty string on failure.
+             */
+            [[nodiscard]] inline std::string WStringToString(std::wstring_view wide) noexcept {
+                return ToNarrow(wide);
+            }
+
+            /**
              * @brief Converts null-terminated UTF-8 C-string to wide string.
              * @param utf8str Null-terminated UTF-8 string (can be nullptr).
              * @return UTF-16 encoded wide string, or empty string on failure.

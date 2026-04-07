@@ -139,7 +139,7 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/HashUtils.hpp"
-#include "../Security/CryptoManager.hpp"
+#include "../SelfProtection/CryptoManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS

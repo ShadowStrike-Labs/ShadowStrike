@@ -39,7 +39,7 @@
 #include "../Core/Engine/ScanEngine.hpp"
 #include "../Core/Engine/ThreatDetector.hpp"
 #include "../Core/Engine/BehaviorAnalyzer.hpp"
-#include "../Security/DigitalSignatureValidator.hpp"
+#include "../SelfProtection/DigitalSignatureValidator.hpp"
 #include "../AI/PhantomCortex.hpp"
 
 #include <algorithm>
@@ -707,7 +707,7 @@ struct ProcessCreationMonitor::Impl {
 
             // Revoked certificate → block
             if (sigAnalysis.signatureInfo.result ==
-                Security::SignatureResult::Revoked) {
+                Security::SignatureValidationResult::Revoked) {
                 SS_LOG_WARN(L"ProcessCreationMonitor",
                     L"BLOCKED process with revoked certificate: PID=%u Path=%ls",
                     event.processId, event.imagePath.c_str());

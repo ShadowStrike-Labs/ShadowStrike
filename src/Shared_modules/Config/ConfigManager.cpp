@@ -20,7 +20,7 @@
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
-#include "../Security/CryptoManager.hpp"
+#include "../SelfProtection/CryptoManager.hpp"
 #include "../Database/ConfigurationDB.hpp"
 
 #include <sstream>

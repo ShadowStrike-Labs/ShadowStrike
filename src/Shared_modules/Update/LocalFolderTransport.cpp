@@ -130,8 +130,22 @@ std::vector<RemotePackageInfo> LocalFolderTransport::QueryAvailablePackages(
 
         // Compute checksum for integrity metadata
         try {
-            using ShadowStrike::Utils::Hasher;
-            info.checksum = Hasher::ComputeFileHex(entry.path(), Hasher::Algorithm::SHA256);
+            std::vector<uint8_t> digest;
+            ShadowStrike::Utils::HashUtils::Error hashErr;
+            if (ShadowStrike::Utils::HashUtils::ComputeFile(
+                    ShadowStrike::Utils::HashUtils::Algorithm::SHA256,
+                    entry.path().wstring(),
+                    digest,
+                    &hashErr))
+            {
+                info.checksum = ShadowStrike::Utils::HashUtils::ToHexLower(digest);
+            } else {
+                SS_LOG_WARN(kLogCategory,
+                    L"Failed to compute SHA-256 for %s (win32=%lu, nt=0x%08X)",
+                    entry.path().wstring().c_str(),
+                    static_cast<unsigned long>(hashErr.win32),
+                    static_cast<unsigned int>(hashErr.ntstatus));
+            }
         } catch (...) {
             SS_LOG_WARN(kLogCategory, L"Failed to compute hash for: %s",
                 entry.path().wstring().c_str());
