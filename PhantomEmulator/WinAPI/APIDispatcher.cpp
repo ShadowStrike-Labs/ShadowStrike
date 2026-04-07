@@ -32,6 +32,7 @@
 #include "Bcrypt\BcryptAPI.hpp"
 #include "Amsi\AmsiAPI.hpp"
 #include "Ole32\COMAPI.hpp"
+#include "Vss\VssAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -177,6 +178,7 @@ void APIDispatcher::RegisterAll() noexcept {
     RegisterShell32();
     RegisterOle32();
     RegisterUrlmon();
+    RegisterVss();
 }
 
 // DLL registration stubs — will be filled by DLL handler modules.
@@ -208,6 +210,9 @@ void APIDispatcher::RegisterBcrypt() noexcept {
 }
 void APIDispatcher::RegisterAmsi() noexcept {
     WinAPI::Amsi::RegisterAmsiAPI(*this);
+}
+void APIDispatcher::RegisterVss() noexcept {
+    WinAPI::Vss::RegisterVssAPI(*this);
 }
 
 // ============================================================================

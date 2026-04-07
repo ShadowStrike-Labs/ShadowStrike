@@ -39,6 +39,10 @@
 // WinAPI
 #include "../WinAPI/APIDispatcher.hpp"
 #include "../WinAPI/Bcrypt/BcryptAPI.hpp"
+#include "../WinAPI/Amsi/AmsiAPI.hpp"
+#include "../WinAPI/Ntdll/EtwAPI.hpp"
+#include "../WinAPI/Vss/VssAPI.hpp"
+#include "../WinAPI/Ole32/WmiEmulation.hpp"
 
 // VirtualOS
 #include "../VirtualOS/EnvironmentBuilder.hpp"
@@ -538,6 +542,12 @@ struct EmulationSession::Impl {
         // Reset the singleton environment builder for this session
         auto& envBuilder = VirtualOS::EnvironmentBuilder::Instance();
         envBuilder.Reset();
+
+        // Reset Phase 4 module singletons so each session starts clean
+        WinAPI::Amsi::AmsiState::Instance().Reset();
+        WinAPI::Ntdll::EtwState::Instance().Reset();
+        WinAPI::Vss::VssDetector::Instance().Reset();
+        WinAPI::Ole32::WmiState::Instance().Reset();
 
         // Build the full virtual environment: filesystem, registry, process
         // table, network, timing, anti-evasion subsystems
@@ -1452,6 +1462,25 @@ struct EmulationSession::Impl {
         //     Collect Heaven's Gate transition events and FS/Registry redirection
         //     bypass attempts. These indicate deliberate WoW64 exploitation.
         CollectWoW64Results();
+
+        // 5o: AMSI bypass detection — collect scan content and bypass events.
+        //     Malware that patches AmsiScanBuffer or returns AMSI_RESULT_CLEAN
+        //     triggers bypass events with high threat weight.
+        CollectAmsiForensics();
+
+        // 5p: ETW telemetry blinding — collect provider patching events.
+        //     Attackers disable ETW to blind EDR sensors (T1562.006).
+        CollectEtwForensics();
+
+        // 5q: VSS shadow copy deletion — strong ransomware indicator.
+        //     Correlates vssadmin/wmic/bcdedit/wbadmin/diskshadow/COM and
+        //     registry-based disabling of System Restore and backup services.
+        CollectVssForensics();
+
+        // 5r: WMI reconnaissance and persistence — track WQL queries,
+        //     anti-VM checks, shadow copy deletion via WMI, and WMI event
+        //     subscriptions used for fileless persistence (T1546.003).
+        CollectWmiForensics();
     }
 
     // ========================================================================
@@ -1916,6 +1945,195 @@ struct EmulationSession::Impl {
                 // T1106 (Native API) + T1055 (Process Injection, specifically for
                 // WoW64 Heaven's Gate abuse in malware like Dridex, TrickBot)
                 m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+    }
+
+    // ========================================================================
+    // 5o: AMSI Bypass Detection Forensics
+    // ========================================================================
+    // Collects AMSI scan content and bypass events. Malware that patches
+    // AmsiScanBuffer or returns AMSI_RESULT_CLEAN without scanning triggers
+    // bypass events — strong evasion indicator (T1562.001).
+
+    void CollectAmsiForensics() noexcept {
+        if (!m_config.enableAMSI) return;
+
+        auto& amsi = WinAPI::Amsi::AmsiState::Instance();
+        const auto bypassEvents = amsi.GetBypassEvents();
+        if (bypassEvents.empty()) return;
+
+        for (const auto& evt : bypassEvents) {
+            const char* desc = "amsi_bypass_detected";
+
+            m_evasionDetector.OnEnvironmentQuery("amsi-bypass", desc);
+
+            m_threatScorer.AddEvasionAttempt(desc, 0.85f);
+
+            if (m_config.enableMITREMapping) {
+                // T1562.001 — Impair Defenses: Disable or Modify Tools
+                m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+
+        // If AMSI was patched (force-return bypass), add extra scoring weight
+        if (amsi.WasAmsiPatched()) {
+            ScoringFactor amsiFactor;
+            amsiFactor.source = "AmsiAPI";
+            amsiFactor.description = "AMSI scan interface patched (defense evasion)";
+            amsiFactor.weight = 0.85f;
+            amsiFactor.score = 0.85f;
+            amsiFactor.confidence = 0.9f;
+            m_threatScorer.AddCustomFactor(amsiFactor);
+        }
+    }
+
+    // ========================================================================
+    // 5p: ETW Telemetry Blinding Forensics
+    // ========================================================================
+    // Collects ETW provider patching/blinding events. Attackers disable ETW
+    // to blind EDR sensors from receiving process, thread, image load, and
+    // network events (T1562.006 — Indicator Blocking).
+
+    void CollectEtwForensics() noexcept {
+        if (!m_config.enableETW) return;
+
+        auto& etw = WinAPI::Ntdll::EtwState::Instance();
+        const auto blindingEvents = etw.GetBlindingEvents();
+        if (blindingEvents.empty()) return;
+
+        for (const auto& evt : blindingEvents) {
+            const char* desc = "etw_telemetry_blinding";
+
+            m_evasionDetector.OnEnvironmentQuery("etw-blinding", desc);
+
+            m_threatScorer.AddEvasionAttempt(desc, 0.80f);
+
+            if (m_config.enableMITREMapping) {
+                // T1562.006 — Impair Defenses: Indicator Blocking
+                m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+
+        if (etw.WasEtwPatched()) {
+            ScoringFactor etwFactor;
+            etwFactor.source = "EtwAPI";
+            etwFactor.description = "ETW provider patched/disabled (telemetry blinding)";
+            etwFactor.weight = 0.80f;
+            etwFactor.score = 0.80f;
+            etwFactor.confidence = 0.85f;
+            m_threatScorer.AddCustomFactor(etwFactor);
+        }
+    }
+
+    // ========================================================================
+    // 5q: VSS Shadow Copy Deletion Forensics
+    // ========================================================================
+    // Collects VSS deletion events across all detection vectors: command-line
+    // (vssadmin/wmic/bcdedit/wbadmin/cipher/diskshadow/PowerShell), COM CLSID
+    // creation, and registry disabling. Multiple independent deletion methods
+    // is a very strong ransomware indicator (T1490 — Inhibit System Recovery).
+
+    void CollectVssForensics() noexcept {
+        if (!m_config.enableVSS) return;
+
+        auto& vss = WinAPI::Vss::VssDetector::Instance();
+        if (vss.GetDeleteAttemptCount() == 0) return;
+
+        // HasRansomwareBehavior() checks for ≥2 distinct deletion methods
+        if (vss.HasRansomwareBehavior()) {
+            ScoringFactor vssFactor;
+            vssFactor.source = "VssDetector";
+            vssFactor.description = "Shadow copy deletion via multiple methods (ransomware)";
+            vssFactor.weight = 0.95f;
+            vssFactor.score = vss.GetRansomwareScore();
+            vssFactor.confidence = 0.95f;
+            m_threatScorer.AddCustomFactor(vssFactor);
+        } else {
+            // Single method — still suspicious but lower confidence
+            ScoringFactor vssFactor;
+            vssFactor.source = "VssDetector";
+            vssFactor.description = "Shadow copy deletion attempt detected";
+            vssFactor.weight = 0.70f;
+            vssFactor.score = 0.70f;
+            vssFactor.confidence = 0.7f;
+            m_threatScorer.AddCustomFactor(vssFactor);
+        }
+
+        if (m_config.enableMITREMapping) {
+            // T1490 — Inhibit System Recovery
+            m_mitreMapper.OnEvasionAttempt("vss_shadow_copy_deletion");
+        }
+    }
+
+    // ========================================================================
+    // 5r: WMI Reconnaissance & Persistence Forensics
+    // ========================================================================
+    // Collects WMI query events for system reconnaissance (anti-VM, hardware
+    // enumeration), shadow copy deletion via WMI, and WMI event subscription
+    // persistence (T1047, T1546.003, T1518, T1082).
+
+    void CollectWmiForensics() noexcept {
+        if (!m_config.enableWMI) return;
+
+        auto& wmi = WinAPI::Ole32::WmiState::Instance();
+
+        // Anti-VM WMI queries (SELECT * FROM Win32_ComputerSystem WHERE Manufacturer LIKE '%VMware%')
+        if (wmi.HasAntiVMQuery()) {
+            m_evasionDetector.OnEnvironmentQuery("wmi-antivm", "wmi_anti_vm_query");
+
+            ScoringFactor vmFactor;
+            vmFactor.source = "WmiEmulation";
+            vmFactor.description = "WMI anti-VM/sandbox enumeration detected";
+            vmFactor.weight = 0.65f;
+            vmFactor.score = 0.65f;
+            vmFactor.confidence = 0.75f;
+            m_threatScorer.AddCustomFactor(vmFactor);
+
+            if (m_config.enableMITREMapping) {
+                m_mitreMapper.OnEvasionAttempt("wmi_anti_vm_recon");
+            }
+        }
+
+        // Shadow copy deletion via WMI (WMIC invocation or ExecQuery)
+        if (wmi.HasShadowCopyDeletion()) {
+            ScoringFactor wmiVssFactor;
+            wmiVssFactor.source = "WmiEmulation";
+            wmiVssFactor.description = "WMI-based shadow copy deletion (ransomware)";
+            wmiVssFactor.weight = 0.90f;
+            wmiVssFactor.score = 0.90f;
+            wmiVssFactor.confidence = 0.9f;
+            m_threatScorer.AddCustomFactor(wmiVssFactor);
+        }
+
+        // WMI event subscription persistence (T1546.003)
+        if (wmi.HasPersistenceAttempt()) {
+            ScoringFactor persistFactor;
+            persistFactor.source = "WmiEmulation";
+            persistFactor.description = "WMI event subscription persistence (fileless)";
+            persistFactor.weight = 0.85f;
+            persistFactor.score = 0.85f;
+            persistFactor.confidence = 0.8f;
+            m_threatScorer.AddCustomFactor(persistFactor);
+
+            if (m_config.enableMITREMapping) {
+                m_mitreMapper.OnEvasionAttempt("wmi_event_subscription_persistence");
+            }
+        }
+
+        // System reconnaissance via WMI queries
+        uint32_t reconCount = wmi.GetReconQueryCount();
+        if (reconCount >= 3) {
+            ScoringFactor reconFactor;
+            reconFactor.source = "WmiEmulation";
+            reconFactor.description = "Extensive WMI system reconnaissance";
+            reconFactor.weight = 0.50f;
+            reconFactor.score = std::min(0.70f, 0.30f + (reconCount * 0.05f));
+            reconFactor.confidence = 0.6f;
+            m_threatScorer.AddCustomFactor(reconFactor);
+
+            if (m_config.enableMITREMapping) {
+                m_mitreMapper.OnEvasionAttempt("wmi_system_reconnaissance");
             }
         }
     }
