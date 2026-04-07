@@ -55,6 +55,8 @@
 
 #include "pch.h"
 #include "HardwareMonitor.hpp"
+#include "EventLogger.hpp"
+#include "DriverAnalyzer.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
@@ -80,6 +82,8 @@
 #include <thread>
 #include <deque>
 #include <unordered_set>
+#include <unordered_map>
+#include <condition_variable>
 
 #pragma comment(lib, "setupapi.lib")
 #pragma comment(lib, "powrprof.lib")
@@ -266,8 +270,9 @@ public:
             return false;
         }
         
+        _bstr_t bstrNamespace(namespacePath);
         hr = pLoc->ConnectServer(
-            ::SysAllocString(namespacePath),
+            bstrNamespace,
             nullptr, nullptr, nullptr, 0, nullptr, nullptr, &m_pSvc
         );
         
@@ -442,6 +447,13 @@ public:
     // Device tracking for change detection
     std::unordered_set<std::wstring> m_knownDeviceIds;
     std::mutex m_deviceTrackingMutex;
+
+    // Firmware version tracking (devicePath -> firmwareVersion)
+    std::unordered_map<std::wstring, std::wstring> m_knownFirmwareVersions;
+
+    // Interruptible sleep for fast shutdown
+    std::mutex m_sleepMutex;
+    std::condition_variable m_stopCV;
 
     // Exponential backoff for error recovery
     std::atomic<uint32_t> m_consecutiveErrors{0};
@@ -979,9 +991,11 @@ public:
 
             // Query thermal zone temperatures
             IEnumWbemClassObject* pEnumerator = nullptr;
+            _bstr_t bstrWQL(L"WQL");
+            _bstr_t bstrThermalQuery(L"SELECT * FROM MSAcpi_ThermalZoneTemperature");
             HRESULT hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM MSAcpi_ThermalZoneTemperature"),
+                bstrWQL,
+                bstrThermalQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -989,20 +1003,23 @@ public:
 
             if (FAILED(hr) || !pEnumerator) {
                 // Try alternative query for thermal sensors
+                _bstr_t bstrTempProbeQuery(L"SELECT * FROM Win32_TemperatureProbe");
                 hr = wmi.Get()->ExecQuery(
-                    ::SysAllocString(L"WQL"),
-                    ::SysAllocString(L"SELECT * FROM Win32_TemperatureProbe"),
+                    bstrWQL,
+                    bstrTempProbeQuery,
                     WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                     nullptr,
                     &pEnumerator
                 );
             }
 
+            constexpr long WMI_QUERY_TIMEOUT_MS = 5000;
+
             if (SUCCEEDED(hr) && pEnumerator) {
                 IWbemClassObject* pClassObject = nullptr;
                 ULONG uReturn = 0;
 
-                while (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+                while (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                     VARIANT vtTemp;
                     VariantInit(&vtTemp);
 
@@ -1011,13 +1028,12 @@ public:
                     if (SUCCEEDED(hr) && vtTemp.vt == VT_I4) {
                         // MSAcpi reports in tenths of Kelvin
                         int32_t tempTenthsKelvin = vtTemp.lVal;
-                        uint32_t tempCelsius = static_cast<uint32_t>(
-                            (tempTenthsKelvin / 10) - 273
-                        );
+                        // Guard against underflow: must be > 2730 (0°C in tenths of Kelvin)
+                        int32_t tempCelsius = (tempTenthsKelvin / 10) - 273;
                         
                         // Sanity check temperature (0-150°C reasonable range)
-                        if (tempCelsius < 150) {
-                            info.coreTemperatures.push_back(tempCelsius);
+                        if (tempCelsius >= 0 && tempCelsius <= 150) {
+                            info.coreTemperatures.push_back(static_cast<uint32_t>(tempCelsius));
                         }
                     }
 
@@ -1149,9 +1165,11 @@ public:
 
             // Query video controller information
             IEnumWbemClassObject* pEnumerator = nullptr;
+            _bstr_t bstrWQL(L"WQL");
+            _bstr_t bstrGpuQuery(L"SELECT * FROM Win32_VideoController");
             HRESULT hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM Win32_VideoController"),
+                bstrWQL,
+                bstrGpuQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -1161,12 +1179,13 @@ public:
                 return std::nullopt;
             }
 
+            constexpr long WMI_QUERY_TIMEOUT_MS = 5000;
             GPUThermalInfo gpuInfo;
             IWbemClassObject* pClassObject = nullptr;
             ULONG uReturn = 0;
 
             // Get first GPU
-            if (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+            if (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                 VARIANT vtName;
                 VariantInit(&vtName);
 
@@ -1192,9 +1211,10 @@ public:
 
             // Try to query GPU thermal zones (vendor-specific)
             pEnumerator = nullptr;
+            _bstr_t bstrGpuThermalQuery(L"SELECT * FROM MSAcpi_ThermalZoneTemperature");
             hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM MSAcpi_ThermalZoneTemperature"),
+                bstrWQL,
+                bstrGpuThermalQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -1203,7 +1223,7 @@ public:
             if (SUCCEEDED(hr) && pEnumerator) {
                 // Look for GPU-associated thermal zones
                 // Note: This is system-dependent; full implementation needs NVML/ADL
-                while (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+                while (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                     VARIANT vtInstance, vtTemp;
                     VariantInit(&vtInstance);
                     VariantInit(&vtTemp);
@@ -1220,20 +1240,21 @@ public:
                             hr = pClassObject->Get(L"CurrentTemperature", 0, &vtTemp, nullptr, nullptr);
                             if (SUCCEEDED(hr) && vtTemp.vt == VT_I4) {
                                 int32_t tempTenthsKelvin = vtTemp.lVal;
-                                gpuInfo.temperature = static_cast<uint32_t>(
-                                    (tempTenthsKelvin / 10) - 273
-                                );
+                                int32_t tempCelsius = (tempTenthsKelvin / 10) - 273;
                                 
-                                // Set thermal status
-                                if (gpuInfo.temperature >= 90) {
-                                    gpuInfo.thermalStatus = ThermalStatus::Critical;
-                                    gpuInfo.isThrottling = true;
-                                } else if (gpuInfo.temperature >= 80) {
-                                    gpuInfo.thermalStatus = ThermalStatus::Hot;
-                                } else if (gpuInfo.temperature >= 70) {
-                                    gpuInfo.thermalStatus = ThermalStatus::Warm;
-                                } else {
-                                    gpuInfo.thermalStatus = ThermalStatus::Normal;
+                                if (tempCelsius >= 0 && tempCelsius <= 150) {
+                                    gpuInfo.temperature = static_cast<uint32_t>(tempCelsius);
+                                    
+                                    if (gpuInfo.temperature >= 90) {
+                                        gpuInfo.thermalStatus = ThermalStatus::Critical;
+                                        gpuInfo.isThrottling = true;
+                                    } else if (gpuInfo.temperature >= 80) {
+                                        gpuInfo.thermalStatus = ThermalStatus::Hot;
+                                    } else if (gpuInfo.temperature >= 70) {
+                                        gpuInfo.thermalStatus = ThermalStatus::Warm;
+                                    } else {
+                                        gpuInfo.thermalStatus = ThermalStatus::Normal;
+                                    }
                                 }
                             }
                         }
@@ -1343,11 +1364,15 @@ public:
                 return;
             }
 
+            constexpr long WMI_QUERY_TIMEOUT_MS = 5000;
+            _bstr_t bstrWQL(L"WQL");
+
             // Query BatteryFullChargedCapacity for health calculation
             IEnumWbemClassObject* pEnumerator = nullptr;
+            _bstr_t bstrCapQuery(L"SELECT * FROM BatteryFullChargedCapacity");
             HRESULT hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM BatteryFullChargedCapacity"),
+                bstrWQL,
+                bstrCapQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -1357,7 +1382,7 @@ public:
                 IWbemClassObject* pClassObject = nullptr;
                 ULONG uReturn = 0;
 
-                if (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+                if (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                     VARIANT vtCapacity;
                     VariantInit(&vtCapacity);
 
@@ -1374,9 +1399,10 @@ public:
 
             // Query BatteryStaticData for design capacity
             pEnumerator = nullptr;
+            _bstr_t bstrStaticQuery(L"SELECT * FROM BatteryStaticData");
             hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM BatteryStaticData"),
+                bstrWQL,
+                bstrStaticQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -1386,7 +1412,7 @@ public:
                 IWbemClassObject* pClassObject = nullptr;
                 ULONG uReturn = 0;
 
-                if (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+                if (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                     VARIANT vtDesign;
                     VariantInit(&vtDesign);
 
@@ -1403,9 +1429,10 @@ public:
 
             // Query BatteryCycleCount
             pEnumerator = nullptr;
+            _bstr_t bstrCycleQuery(L"SELECT * FROM BatteryCycleCount");
             hr = wmi.Get()->ExecQuery(
-                ::SysAllocString(L"WQL"),
-                ::SysAllocString(L"SELECT * FROM BatteryCycleCount"),
+                bstrWQL,
+                bstrCycleQuery,
                 WBEM_FLAG_FORWARD_ONLY | WBEM_FLAG_RETURN_IMMEDIATELY,
                 nullptr,
                 &pEnumerator
@@ -1415,7 +1442,7 @@ public:
                 IWbemClassObject* pClassObject = nullptr;
                 ULONG uReturn = 0;
 
-                if (pEnumerator->Next(WBEM_INFINITE, 1, &pClassObject, &uReturn) == S_OK) {
+                if (pEnumerator->Next(WMI_QUERY_TIMEOUT_MS, 1, &pClassObject, &uReturn) == S_OK) {
                     VARIANT vtCycles;
                     VariantInit(&vtCycles);
 
@@ -1435,7 +1462,6 @@ public:
                 battery.healthPercent = static_cast<uint8_t>(
                     (battery.fullChargeCapacityMWh * 100) / battery.designCapacityMWh
                 );
-                // Cap at 100% (some batteries report > 100% when new)
                 if (battery.healthPercent > 100) {
                     battery.healthPercent = 100;
                 }
@@ -1474,7 +1500,6 @@ public:
             devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
 
             for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo.Get(), i, &devInfoData); ++i) {
-                // Get device instance ID
                 wchar_t deviceId[MAX_DEVICE_ID_LEN];
                 if (CM_Get_Device_IDW(devInfoData.DevInst, deviceId, 
                                       MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
@@ -1488,18 +1513,13 @@ public:
             // Detect new devices
             for (const auto& deviceId : currentDevices) {
                 if (m_knownDeviceIds.find(deviceId) == m_knownDeviceIds.end()) {
-                    // New device detected
                     HardwareChangeEvent event;
                     event.changeType = L"DeviceAdded";
                     event.deviceId = deviceId;
                     event.timestamp = std::chrono::system_clock::now();
 
-                    // Parse device class from ID
                     ParseDeviceInfo(deviceId, event);
-
-                    // Check for suspicious characteristics
                     CheckDeviceSuspicion(event);
-
                     RecordHardwareChange(event);
                 }
             }
@@ -1507,7 +1527,6 @@ public:
             // Detect removed devices
             for (const auto& knownId : m_knownDeviceIds) {
                 if (currentDevices.find(knownId) == currentDevices.end()) {
-                    // Device removed
                     HardwareChangeEvent event;
                     event.changeType = L"DeviceRemoved";
                     event.deviceId = knownId;
@@ -1521,8 +1540,62 @@ public:
             // Update known devices
             m_knownDeviceIds = std::move(currentDevices);
 
+            // === Firmware change tracking for storage devices ===
+            DetectFirmwareChanges();
+
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"HardwareMonitor", L"Hardware change detection failed - %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+            SS_LOG_ERROR(L"HardwareMonitor", L"Hardware change detection failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
+        }
+    }
+
+    /**
+     * @brief Detect firmware version changes on storage devices.
+     * A firmware change outside a known update window is a strong indicator
+     * of firmware-level tampering (e.g., firmware rootkits, BadUSB reprogramming).
+     */
+    void DetectFirmwareChanges() {
+        try {
+            std::shared_lock<std::shared_mutex> dataLock(m_dataMutex);
+            for (const auto& disk : m_disks) {
+                if (disk.firmwareVersion.empty() || disk.devicePath.empty()) {
+                    continue;
+                }
+
+                auto it = m_knownFirmwareVersions.find(disk.devicePath);
+                if (it != m_knownFirmwareVersions.end()) {
+                    if (it->second != disk.firmwareVersion) {
+                        // Firmware version changed
+                        HardwareChangeEvent event;
+                        event.changeType = L"FirmwareChanged";
+                        event.deviceId = disk.devicePath;
+                        event.deviceName = disk.model;
+                        event.deviceClass = L"DiskDrive";
+                        event.timestamp = std::chrono::system_clock::now();
+                        event.isSuspicious = true;
+                        event.threatType = DeviceThreatType::FirmwareTamper;
+                        event.firmwareVersion = disk.firmwareVersion;
+                        event.previousFirmwareVersion = it->second;
+                        event.suspicionReason =
+                            L"Firmware version changed from [" + it->second +
+                            L"] to [" + disk.firmwareVersion + L"] on " + disk.model;
+
+                        SS_LOG_ERROR(L"HardwareMonitor",
+                            L"CRITICAL: Firmware version change detected on %ls - was [%ls] now [%ls]",
+                            disk.devicePath.c_str(), it->second.c_str(),
+                            disk.firmwareVersion.c_str());
+
+                        it->second = disk.firmwareVersion;
+                        RecordHardwareChange(event);
+                    }
+                } else {
+                    // First time seeing this device, record firmware baseline
+                    m_knownFirmwareVersions[disk.devicePath] = disk.firmwareVersion;
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(L"HardwareMonitor", L"Firmware change detection error - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
@@ -1549,12 +1622,13 @@ public:
 
     /**
      * @brief Check if device has suspicious characteristics.
-     * Detects potential BadUSB, HID attacks, etc.
+     * Detects BadUSB, DMA attack devices, composite HID anomalies,
+     * and known attack tool signatures.
      */
     void CheckDeviceSuspicion(HardwareChangeEvent& event) {
-        // Known BadUSB / attack device signatures
+        // === PHASE 1: Known attack tool VID/PID signatures ===
         static const std::vector<std::pair<std::wstring, std::wstring>> suspiciousPatterns = {
-            // USB Rubber Ducky
+            // USB Rubber Ducky (multiple revisions)
             {L"VID_1FC9&PID_000C", L"Known BadUSB device signature (USB Rubber Ducky)"},
             // Bash Bunny MK2
             {L"VID_2E8A&PID_000A", L"Known BadUSB device signature (Bash Bunny)"},
@@ -1566,44 +1640,271 @@ public:
             {L"VID_203A", L"HAK5 vendor ID detected"},
             // O.MG Cable
             {L"VID_2341", L"Arduino/O.MG vendor ID"},
+            // LAN Turtle
+            {L"VID_0B95&PID_772B", L"Possible LAN Turtle network implant"},
+            // WiFi Pineapple USB
+            {L"VID_0CF3&PID_9271", L"Possible WiFi Pineapple wireless implant"},
         };
 
         for (const auto& [pattern, reason] : suspiciousPatterns) {
             if (event.deviceId.find(pattern) != std::wstring::npos) {
                 event.isSuspicious = true;
+                event.threatType = DeviceThreatType::BadUSB_KnownSignature;
                 event.suspicionReason = reason;
-                SS_LOG_WARN(L"HardwareMonitor", L"Suspicious device detected - %ls (%ls)", event.deviceId, reason);
+                SS_LOG_WARN(L"HardwareMonitor",
+                    L"THREAT: Known attack device detected - %ls (%ls)",
+                    event.deviceId.c_str(), reason.c_str());
                 break;
             }
         }
 
-        // Check for USB devices presenting as HID keyboards
-        if (!event.isSuspicious && 
-            event.deviceClass == L"USB" &&
-            event.deviceName.find(L"HID") != std::wstring::npos) {
-            // USB HID keyboard - flag for monitoring but not necessarily suspicious
-            // The actual BadUSB detection should be done by the USB_Protection module
+        // === PHASE 2: DMA attack device detection ===
+        // Thunderbolt, FireWire (IEEE 1394), PCMCIA — all allow direct memory access
+        if (!event.isSuspicious) {
+            std::wstring upperClass = Utils::StringUtils::ToUpperCopy(event.deviceClass);
+            bool isDmaCapable = false;
+            std::wstring dmaReason;
+
+            if (upperClass == L"1394" || upperClass == L"SBP2" ||
+                event.deviceId.find(L"1394") != std::wstring::npos) {
+                isDmaCapable = true;
+                dmaReason = L"FireWire (IEEE 1394) DMA-capable device";
+            } else if (event.deviceId.find(L"THUNDERBOLT") != std::wstring::npos ||
+                       event.deviceId.find(L"PCI\\VEN_8086&DEV_15") != std::wstring::npos) {
+                isDmaCapable = true;
+                dmaReason = L"Thunderbolt DMA-capable device";
+            } else if (upperClass == L"PCMCIA" || upperClass == L"CARDBUS") {
+                isDmaCapable = true;
+                dmaReason = L"PCMCIA/CardBus DMA-capable device";
+            }
+
+            if (isDmaCapable) {
+                event.isSuspicious = true;
+                event.threatType = DeviceThreatType::DMA_Attack;
+                event.suspicionReason = dmaReason;
+                SS_LOG_WARN(L"HardwareMonitor",
+                    L"THREAT: DMA-capable device insertion detected - %ls (%ls)",
+                    event.deviceId.c_str(), dmaReason.c_str());
+            }
         }
+
+        // === PHASE 3: USB composite device anomaly (BadUSB hallmark) ===
+        // A device claiming to be both HID (keyboard/mouse) AND mass storage is
+        // the primary indicator of a BadUSB attack — legitimate devices rarely do this.
+        if (!event.isSuspicious && event.deviceClass == L"USB") {
+            bool hasHID = false;
+            bool hasStorage = false;
+
+            // Query USB interface descriptors via SetupAPI
+            ScopedDeviceInfoSet hDevInfo(SetupDiGetClassDevsW(
+                nullptr, event.deviceId.c_str(), nullptr,
+                DIGCF_PRESENT | DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE
+            ));
+
+            if (hDevInfo.IsValid()) {
+                SP_DEVINFO_DATA devInfoData{};
+                devInfoData.cbSize = sizeof(SP_DEVINFO_DATA);
+
+                for (DWORD i = 0; SetupDiEnumDeviceInfo(hDevInfo.Get(), i, &devInfoData); ++i) {
+                    wchar_t childId[MAX_DEVICE_ID_LEN]{};
+                    if (CM_Get_Device_IDW(devInfoData.DevInst, childId,
+                                          MAX_DEVICE_ID_LEN, 0) == CR_SUCCESS) {
+                        std::wstring childIdStr(childId);
+                        event.deviceInterfaces.push_back(childIdStr);
+
+                        std::wstring upperChildId = Utils::StringUtils::ToUpperCopy(childIdStr);
+                        if (upperChildId.find(L"HID") != std::wstring::npos ||
+                            upperChildId.find(L"MI_00") != std::wstring::npos) {
+                            hasHID = true;
+                        }
+                        if (upperChildId.find(L"USBSTOR") != std::wstring::npos ||
+                            upperChildId.find(L"MI_01") != std::wstring::npos) {
+                            hasStorage = true;
+                        }
+                    }
+                }
+            }
+
+            if (hasHID && hasStorage) {
+                event.isSuspicious = true;
+                event.threatType = DeviceThreatType::BadUSB_CompositeHID;
+                event.suspicionReason =
+                    L"USB composite device presents as both HID and storage — "
+                    L"BadUSB signature. VID/PID: " + event.deviceName;
+                SS_LOG_WARN(L"HardwareMonitor",
+                    L"THREAT: BadUSB composite device detected (HID+Storage) - %ls",
+                    event.deviceId.c_str());
+            }
+        }
+
+        // === PHASE 4: Wire to DriverAnalyzer for new device driver check ===
+        if (event.changeType == L"DeviceAdded") {
+            try {
+                auto& driverAnalyzer = DriverAnalyzer::Instance();
+                std::wstring serviceName = QueryDeviceServiceName(event.deviceId);
+                if (!serviceName.empty()) {
+                    event.driverName = serviceName;
+                    auto driverInfo = driverAnalyzer.GetDriverInfo(serviceName);
+                    if (driverInfo.has_value()) {
+                        event.driverPath = driverInfo->driverPath;
+                        event.driverSignatureValid =
+                            (driverInfo->signatureStatus == DriverSignatureStatus::SignedValid ||
+                             driverInfo->signatureStatus == DriverSignatureStatus::WHQLCertified ||
+                             driverInfo->signatureStatus == DriverSignatureStatus::MicrosoftSigned);
+
+                        if (driverInfo->threatLevel >= DriverThreatLevel::Suspicious) {
+                            event.isSuspicious = true;
+                            if (event.threatType == DeviceThreatType::None) {
+                                event.threatType = DeviceThreatType::SuspiciousDeviceClass;
+                            }
+                            event.suspicionReason +=
+                                (event.suspicionReason.empty() ? L"" : L"; ") +
+                                std::wstring(L"Driver threat level elevated: ") +
+                                event.driverName;
+                            SS_LOG_WARN(L"HardwareMonitor",
+                                L"THREAT: Suspicious driver for new device - driver=%ls threat=%u device=%ls",
+                                event.driverName.c_str(),
+                                static_cast<unsigned>(driverInfo->threatLevel),
+                                event.deviceId.c_str());
+                        }
+
+                        if (!event.driverSignatureValid) {
+                            event.isSuspicious = true;
+                            event.suspicionReason +=
+                                (event.suspicionReason.empty() ? L"" : L"; ") +
+                                std::wstring(L"Unsigned/invalid driver signature: ") +
+                                event.driverName;
+                            SS_LOG_WARN(L"HardwareMonitor",
+                                L"ALERT: Unsigned driver loaded for device - driver=%ls device=%ls",
+                                event.driverName.c_str(), event.deviceId.c_str());
+                        }
+
+                        if (driverInfo->isKnownVulnerable) {
+                            event.isSuspicious = true;
+                            event.suspicionReason +=
+                                (event.suspicionReason.empty() ? L"" : L"; ") +
+                                std::wstring(L"Known vulnerable driver (BYOVD): ") +
+                                event.driverName;
+                            SS_LOG_ERROR(L"HardwareMonitor",
+                                L"CRITICAL: Known vulnerable driver loaded via device insertion - %ls",
+                                event.driverName.c_str());
+                        }
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_DEBUG(L"HardwareMonitor",
+                    L"DriverAnalyzer check skipped for device %ls - %ls",
+                    event.deviceId.c_str(), Utils::StringUtils::ToWide(e.what()).c_str());
+            }
+        }
+    }
+
+    /**
+     * @brief Query the service name (driver) associated with a device instance ID.
+     */
+    [[nodiscard]] std::wstring QueryDeviceServiceName(const std::wstring& deviceId) {
+        DEVINST devInst = 0;
+        CONFIGRET cr = CM_Locate_DevNodeW(&devInst, const_cast<DEVINSTID_W>(deviceId.c_str()),
+                                           CM_LOCATE_DEVNODE_NORMAL);
+        if (cr != CR_SUCCESS) {
+            return L"";
+        }
+
+        wchar_t serviceName[256]{};
+        ULONG serviceNameLen = static_cast<ULONG>(std::size(serviceName));
+        cr = CM_Get_DevNode_Registry_PropertyW(devInst, CM_DRP_SERVICE,
+                                                nullptr, serviceName, &serviceNameLen, 0);
+        if (cr != CR_SUCCESS) {
+            return L"";
+        }
+
+        return std::wstring(serviceName);
     }
 
     void RecordHardwareChange(const HardwareChangeEvent& event) {
         try {
-            std::lock_guard<std::mutex> lock(m_historyMutex);
+            {
+                std::lock_guard<std::mutex> lock(m_historyMutex);
 
-            m_changeHistory.push_back(event);
+                m_changeHistory.push_back(event);
 
-            // Limit history size
-            if (m_changeHistory.size() > MAX_HISTORY_SIZE) {
-                m_changeHistory.pop_front();
+                // Limit history size
+                if (m_changeHistory.size() > MAX_HISTORY_SIZE) {
+                    m_changeHistory.pop_front();
+                }
             }
 
             m_statistics.deviceChanges.fetch_add(1, std::memory_order_relaxed);
 
-            // Invoke callbacks
+            // Invoke callbacks (outside history lock to avoid deadlock)
             InvokeHardwareChangeCallbacks(event);
 
+            // === SIEM Integration via EventLogger ===
+            ForwardToEventLogger(event);
+
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"HardwareMonitor", L"Change recording failed - %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+            SS_LOG_ERROR(L"HardwareMonitor", L"Change recording failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
+        }
+    }
+
+    /**
+     * @brief Forward hardware change events to EventLogger for SIEM/forensic pipeline.
+     * Suspicious events are logged at Warning/Error severity; routine events at Info.
+     */
+    void ForwardToEventLogger(const HardwareChangeEvent& event) {
+        try {
+            auto& eventLogger = EventLogger::Instance();
+
+            EventSeverity severity = EventSeverity::Info;
+            if (event.isSuspicious) {
+                severity = (event.threatType == DeviceThreatType::DMA_Attack ||
+                            event.threatType == DeviceThreatType::BadUSB_KnownSignature)
+                    ? EventSeverity::Error
+                    : EventSeverity::Warning;
+            }
+
+            std::unordered_map<std::wstring, std::wstring> props;
+            props[L"changeType"] = event.changeType;
+            props[L"deviceClass"] = event.deviceClass;
+            props[L"deviceName"] = event.deviceName;
+            props[L"deviceId"] = event.deviceId;
+            props[L"isSuspicious"] = event.isSuspicious ? L"true" : L"false";
+            props[L"threatType"] = std::to_wstring(static_cast<uint8_t>(event.threatType));
+            if (!event.suspicionReason.empty()) {
+                props[L"suspicionReason"] = event.suspicionReason;
+            }
+            if (!event.driverName.empty()) {
+                props[L"driverName"] = event.driverName;
+                props[L"driverPath"] = event.driverPath;
+                props[L"driverSignatureValid"] = event.driverSignatureValid ? L"true" : L"false";
+            }
+            if (!event.firmwareVersion.empty()) {
+                props[L"firmwareVersion"] = event.firmwareVersion;
+            }
+            if (!event.previousFirmwareVersion.empty()) {
+                props[L"previousFirmwareVersion"] = event.previousFirmwareVersion;
+            }
+
+            std::wstring message = event.changeType + L": " + event.deviceId;
+            if (event.isSuspicious) {
+                message += L" [SUSPICIOUS: " + event.suspicionReason + L"]";
+            }
+
+            eventLogger.Log(severity, EventCategory::DriverControl,
+                           L"HardwareMonitor", message, props);
+
+            // For high-severity threats, also capture forensic event
+            if (event.isSuspicious &&
+                (event.threatType == DeviceThreatType::DMA_Attack ||
+                 event.threatType == DeviceThreatType::BadUSB_KnownSignature ||
+                 event.threatType == DeviceThreatType::BadUSB_CompositeHID)) {
+                eventLogger.CaptureForensicEvent(L"SuspiciousHardwareDevice", props);
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_DEBUG(L"HardwareMonitor", L"EventLogger forwarding failed - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
@@ -1616,29 +1917,47 @@ public:
 
         while (m_monitoring.load(std::memory_order_acquire)) {
             try {
+                // Snapshot config under lock to avoid data race with UpdateConfig()
+                HardwareMonitorConfig configSnapshot;
+                {
+                    std::shared_lock<std::shared_mutex> lock(m_mutex);
+                    configSnapshot = m_config;
+                }
+
                 // Refresh all hardware data
-                RefreshHardwareData();
+                RefreshHardwareData(configSnapshot);
 
                 // Reset error counter on success
                 m_consecutiveErrors.store(0, std::memory_order_relaxed);
                 m_statistics.pollingCycles.fetch_add(1, std::memory_order_relaxed);
 
-                // Sleep for polling interval
-                std::this_thread::sleep_for(
-                    std::chrono::milliseconds(m_config.pollingIntervalMs)
-                );
+                // Interruptible sleep — wakes immediately on StopMonitoring()
+                {
+                    std::unique_lock<std::mutex> sleepLock(m_sleepMutex);
+                    m_stopCV.wait_for(sleepLock,
+                        std::chrono::milliseconds(configSnapshot.pollingIntervalMs),
+                        [this] { return !m_monitoring.load(std::memory_order_acquire); });
+                }
 
             } catch (const std::exception& e) {
-                SS_LOG_ERROR(L"HardwareMonitor", L"Monitoring loop error - %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+                SS_LOG_ERROR(L"HardwareMonitor", L"Monitoring loop error - %ls",
+                            Utils::StringUtils::ToWide(e.what()).c_str());
 
                 // Exponential backoff on consecutive errors
                 uint32_t errors = m_consecutiveErrors.fetch_add(1, std::memory_order_relaxed) + 1;
                 uint32_t backoffMultiplier = std::min(errors, MAX_BACKOFF_MULTIPLIER);
                 uint32_t sleepMs = m_config.pollingIntervalMs * backoffMultiplier;
 
-                SS_LOG_WARN(L"HardwareMonitor", L"Backing off for %lsms after %ls errors", sleepMs, errors);
+                SS_LOG_WARN(L"HardwareMonitor",
+                    L"Backing off for %ums after %u consecutive errors", sleepMs, errors);
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(sleepMs));
+                // Interruptible backoff sleep
+                {
+                    std::unique_lock<std::mutex> sleepLock(m_sleepMutex);
+                    m_stopCV.wait_for(sleepLock,
+                        std::chrono::milliseconds(sleepMs),
+                        [this] { return !m_monitoring.load(std::memory_order_acquire); });
+                }
             }
         }
 
@@ -1646,9 +1965,19 @@ public:
     }
 
     void RefreshHardwareData() {
+        // Snapshot config under lock for thread safety
+        HardwareMonitorConfig configSnapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_mutex);
+            configSnapshot = m_config;
+        }
+        RefreshHardwareData(configSnapshot);
+    }
+
+    void RefreshHardwareData(const HardwareMonitorConfig& configSnapshot) {
         try {
             // Monitor disks
-            if (m_config.monitorDisks) {
+            if (configSnapshot.monitorDisks) {
                 auto disks = EnumerateDisks();
                 for (auto& disk : disks) {
                     AnalyzeDiskHealth(disk);
@@ -1666,7 +1995,7 @@ public:
             }
 
             // Monitor thermals
-            if (m_config.monitorThermals) {
+            if (configSnapshot.monitorThermals) {
                 auto cpuThermal = GetCPUThermalInfo();
                 auto gpuThermal = GetGPUThermalInfo();
 
@@ -1683,7 +2012,7 @@ public:
             }
 
             // Monitor power
-            if (m_config.monitorPower) {
+            if (configSnapshot.monitorPower) {
                 auto powerInfo = GetPowerInformation();
 
                 // Check for power state changes
@@ -1705,7 +2034,7 @@ public:
             }
 
             // Detect hardware changes
-            if (m_config.monitorDeviceChanges) {
+            if (configSnapshot.monitorDeviceChanges) {
                 DetectHardwareChanges();
             }
 
@@ -1746,6 +2075,9 @@ public:
         try {
             m_monitoring.store(false, std::memory_order_release);
 
+            // Wake the monitoring thread from interruptible sleep
+            m_stopCV.notify_all();
+
             if (m_monitorThread && m_monitorThread->joinable()) {
                 m_monitorThread->join();
             }
@@ -1755,7 +2087,8 @@ public:
             SS_LOG_INFO(L"HardwareMonitor", L"Monitoring stopped");
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(L"HardwareMonitor", L"Failed to stop monitoring - %ls", Utils::StringUtils::ToWide(e.what()).c_str());
+            SS_LOG_ERROR(L"HardwareMonitor", L"Failed to stop monitoring - %ls",
+                        Utils::StringUtils::ToWide(e.what()).c_str());
         }
     }
 
@@ -1958,6 +2291,10 @@ HardwareMonitorConfig HardwareMonitor::GetConfig() const {
 // ============================================================================
 
 void HardwareMonitor::StartMonitoring() {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"HardwareMonitor", L"Cannot start monitoring - not initialized");
+        return;
+    }
     m_impl->StartMonitoring();
 }
 
@@ -1966,6 +2303,10 @@ void HardwareMonitor::StopMonitoring() {
 }
 
 void HardwareMonitor::Refresh() {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_WARN(L"HardwareMonitor", L"Cannot refresh - not initialized");
+        return;
+    }
     m_impl->RefreshHardwareData();
 }
 
