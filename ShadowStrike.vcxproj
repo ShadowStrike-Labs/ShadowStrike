@@ -404,7 +404,6 @@
     <ClCompile Include="src\Shared_modules\Scripts\VBScriptScanner.cpp" />
     <ClCompile Include="src\Shared_modules\SelfProtection\AntiDebug.cpp" />
     <ClCompile Include="src\Shared_modules\SelfProtection\CertificateValidator.cpp" />
-    <ClCompile Include="src\Shared_modules\Security\CodeObfuscation.cpp" />
     <ClCompile Include="src\Shared_modules\SelfProtection\CryptoManager.cpp" />
     <ClCompile Include="src\Shared_modules\SelfProtection\DigitalSignatureValidator.cpp" />
     <ClCompile Include="src\Shared_modules\SelfProtection\FileProtection.cpp" />
