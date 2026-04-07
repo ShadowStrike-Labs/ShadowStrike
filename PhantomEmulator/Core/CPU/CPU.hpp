@@ -16,10 +16,12 @@
 #include "../../Common/Types.hpp"
 #include "../../Common/Errors.hpp"
 #include "../../Common/Config.hpp"
+#include "../JIT/JITCompiler.hpp"
 #include <cstdint>
 #include <functional>
 #include <optional>
 #include <atomic>
+#include <unordered_map>
 
 namespace Phantom {
 
@@ -117,6 +119,12 @@ public:
     // Request abort (can be called from another thread)
     void RequestAbort() noexcept;
 
+    // === JIT Control ===
+
+    void EnableJIT(JITStrategy strategy, uint32_t cacheSize, uint32_t hotThreshold) noexcept;
+    void DisableJIT() noexcept;
+    [[nodiscard]] const JITCompiler& GetJIT() const noexcept;
+
     // === State Access ===
 
     [[nodiscard]] CPUState& State() noexcept { return m_state; }
@@ -152,6 +160,17 @@ private:
 
     // Instruction fetch buffer (avoid repeated memory reads)
     alignas(16) uint8_t m_fetchBuffer[Encoding::kMaxInstructionLength]{};
+
+    // === JIT state ===
+    JITCompiler m_jit;
+    bool        m_jitEnabled      = false;
+    uint32_t    m_jitHotThreshold = 64;
+
+    // Block execution profile — tracks how many times each address is visited.
+    // Bounded to kMaxBlockProfileEntries to prevent unbounded growth from
+    // highly polymorphic code or address-space spraying.
+    static constexpr uint32_t kMaxBlockProfileEntries = 65536;
+    std::unordered_map<GuestAddress, uint32_t> m_blockProfile;
 
     // === Execution internals ===
 

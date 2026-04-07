@@ -9,6 +9,7 @@
 #pragma once
 
 #include "Types.hpp"
+#include "../Core/JIT/JITCompiler.hpp"
 #include <cstdint>
 #include <string>
 #include <chrono>
@@ -67,6 +68,12 @@ struct EmulationConfig {
     bool      enableMITREMapping      = true;
     bool      enableIOCExtraction     = true;
     uint32_t  yaraScansPerSession     = 4;          // Periodic YARA scans during emulation
+
+    // === JIT compilation ===
+    bool        enableJIT          = false;              // Disabled by default (opt-in)
+    JITStrategy jitStrategy        = JITStrategy::BasicBlock;
+    uint32_t    jitCodeCacheSize   = 4 * 1024 * 1024;   // 4 MB
+    uint32_t    jitHotThreshold    = 64;                 // Interpret N times before compiling
 
     // === Performance tuning ===
     uint32_t  instructionCacheSize = 4096;          // Decoded instruction cache entries
