@@ -45,6 +45,10 @@ struct EmulationConfig {
     bool      enableRegistry     = true;            // Virtual registry
     bool      enableNetwork      = false;           // Virtual network (disabled: security)
     bool      enableCOM          = false;           // COM object emulation
+    bool      enableETW          = true;            // ETW telemetry blinding detection
+    bool      enableAMSI         = true;            // AMSI bypass detection
+    bool      enableVSS          = true;            // VSS deletion detection (ransomware)
+    bool      enableWMI          = true;            // WMI query tracking (recon/persistence)
     bool      blockExternalCalls = true;            // Block unrecognized API calls
 
     // === Anti-evasion ===
@@ -116,6 +120,10 @@ struct EmulationConfig {
     cfg.enableMemoryTrace = false;
     cfg.enableBehaviorMonitor = false;
     cfg.enableAPISequenceAnalysis = false;
+    cfg.enableETW = false;
+    cfg.enableAMSI = false;
+    cfg.enableVSS = false;
+    cfg.enableWMI = false;
     cfg.yaraScansPerSession = 1;
     return cfg;
 }
@@ -129,6 +137,11 @@ struct EmulationConfig {
     cfg.enableInstructionTrace = true;
     cfg.enableAPITrace = true;
     cfg.enableNetwork = true;
+    cfg.enableCOM = true;
+    cfg.enableETW = true;
+    cfg.enableAMSI = true;
+    cfg.enableVSS = true;
+    cfg.enableWMI = true;
     cfg.yaraScansPerSession = 8;
     return cfg;
 }
