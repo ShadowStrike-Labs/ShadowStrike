@@ -482,8 +482,8 @@ struct alignas(128) RegistryRule {
     std::chrono::system_clock::time_point expiresAt;
     bool isPermanent{ true };
 
-    // Statistics
-    std::atomic<uint64_t> matchCount{ 0 };
+    // Statistics (non-atomic: always accessed under lock in Impl)
+    uint64_t matchCount{ 0 };
 };
 
 /**
