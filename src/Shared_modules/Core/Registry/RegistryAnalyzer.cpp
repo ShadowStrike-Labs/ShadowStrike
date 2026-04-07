@@ -1064,7 +1064,7 @@ public:
 
                 // High entropy check
                 if (m_config.analyzeEntropy && actualDataSize >= RegistryAnalyzerConstants::MIN_BLOB_SIZE_FOR_ANALYSIS) {
-                    double entropy = CalculateEntropy(dataSpan);
+                    double entropy = ::ShadowStrike::Core::Registry::CalculateEntropy(dataSpan);
                     if (entropy >= RegistryAnalyzerConstants::HIGH_ENTROPY_THRESHOLD) {
                         anomalies.push_back(RecordAnomaly(
                             AnomalyType::HighEntropy,
@@ -1816,7 +1816,7 @@ public:
         anomaly.rawData = rawData;
 
         if (!rawData.empty()) {
-            anomaly.entropy = CalculateEntropy(rawData);
+            anomaly.entropy = ::ShadowStrike::Core::Registry::CalculateEntropy(rawData);
 
             // Compute SHA-256 using the correct HashUtils API
             std::vector<uint8_t> hashResult;
