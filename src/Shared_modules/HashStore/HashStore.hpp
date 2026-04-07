@@ -78,6 +78,11 @@ using SignatureStore::QueryOptions;
 using SignatureStore::SignatureIndex;
 using SignatureStore::PAGE_SIZE;
 using SignatureStore::CACHE_LINE_SIZE;
+using SignatureStore::SIGNATURE_DB_MAGIC;
+using SignatureStore::SIGNATURE_DB_VERSION_MAJOR;
+using SignatureStore::SIGNATURE_DB_VERSION_MINOR;
+namespace Format = ShadowStrike::SignatureStore::Format;
+namespace MemoryMapping = ShadowStrike::SignatureStore::MemoryMapping;
 
 // ============================================================================
 // BLOOM FILTER (Fast Negative Lookups)

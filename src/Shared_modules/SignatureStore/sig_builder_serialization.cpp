@@ -977,7 +977,7 @@ namespace SignatureStore {
                 PatternMode mode;
                 std::vector<uint8_t> mask;
 
-                auto compiledPattern = PatternCompiler::CompilePattern(
+                auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
                     pattern.patternString, mode, mask
                 );
 
@@ -1416,7 +1416,7 @@ namespace SignatureStore {
                 PatternMode mode;
                 std::vector<uint8_t> mask;
 
-                auto compiledPattern = PatternCompiler::CompilePattern(
+                auto compiledPattern = PatternStore::PatternCompiler::CompilePattern(
                     pattern.patternString, mode, mask
                 );
 

@@ -33,8 +33,8 @@
 #include"ThreatIntelFeedManager_Util.hpp"
 #include "ThreatIntelDatabase.hpp"
 #include "ThreatIntelStore.hpp"
-#include"../../src/Utils/Base64Utils.hpp"
-#include"../../src/Utils/Logger.hpp"
+#include "../Utils/Base64Utils.hpp"
+#include "../Utils/Logger.hpp"
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX

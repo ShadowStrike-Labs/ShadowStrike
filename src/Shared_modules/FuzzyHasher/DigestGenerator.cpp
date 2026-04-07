@@ -1,3 +1,4 @@
+#include "pch.h"
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
@@ -278,10 +279,10 @@ namespace ShadowStrike::FuzzyHasher {
 
         const auto& str = digest.value();
 
-        // BUG-7: use kMaxResultLength constant instead of the magic number 148.
-        // kMaxResultLength includes the null terminator, so str.size() must be
-        // strictly less than kMaxResultLength to leave room for '\0'.
-        if (str.size() >= kMaxResultLength) {
+        // BUG-7: use kDigestGeneratorMaxResultLength constant instead of the magic number 148.
+        // kDigestGeneratorMaxResultLength includes the null terminator, so str.size() must be
+        // strictly less than kDigestGeneratorMaxResultLength to leave room for '\0'.
+        if (str.size() >= kDigestGeneratorMaxResultLength) {
             return -1;
         }
 

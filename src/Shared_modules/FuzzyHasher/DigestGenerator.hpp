@@ -53,7 +53,7 @@ namespace ShadowStrike::FuzzyHasher {
     ///   sig2:      up to kHalfDigestLength = 32 chars
     ///   colons/null: 3 chars
     ///   Total: 10 + 64 + 32 + 3 = 109; 148 is a conservative ceiling.
-    inline constexpr size_t kMaxResultLength = 148;
+    inline constexpr size_t kDigestGeneratorMaxResultLength = 148;
 
     /**
      * @brief Generate a CTPH digest from a byte buffer.

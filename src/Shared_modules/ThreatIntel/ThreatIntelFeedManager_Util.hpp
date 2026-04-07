@@ -23,7 +23,7 @@
 #include <random>
 #include <thread>
 #include "ThreatIntelFormat.hpp"  // For Format:: utilities
-#include "../../src/Utils/Base64Utils.hpp"
+#include "../Utils/Base64Utils.hpp"
 
 
 namespace ShadowStrike {

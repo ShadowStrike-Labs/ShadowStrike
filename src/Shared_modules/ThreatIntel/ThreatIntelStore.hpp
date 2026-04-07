@@ -48,7 +48,6 @@
 #include"ThreatIntelImporter.hpp"
 #include"ThreatIntelFeedManager.hpp"
 #include "ThreatIntelExporter.hpp"
-#include"ThreatIntelLookup.hpp"
 #include "ReputationCache.hpp"
 
 #include <string>
@@ -73,6 +72,7 @@ namespace ThreatIntel {
 // ============================================================================
 
 class ThreatIntelStore;
+class ThreatIntelLookup;
 class FeedManager;
 class STIXParser;
 class TAXIIClient;
