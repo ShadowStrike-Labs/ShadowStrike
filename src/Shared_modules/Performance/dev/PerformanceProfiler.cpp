@@ -31,6 +31,7 @@
 #include <sstream>
 #include <fstream>
 #include <algorithm>
+#include <format>
 #include <intrin.h>
 #include <nlohmann/json.hpp>
 
@@ -40,6 +41,32 @@ namespace nl = nlohmann;
 
 namespace ShadowStrike {
 namespace Performance {
+
+    namespace Logger {
+        template <typename... Args>
+        void Error(std::format_string<Args...> fmt, Args&&... args) {
+            const auto message = std::format(fmt, std::forward<Args>(args)...);
+            SS_LOG_ERROR(L"PerformanceProfiler", L"%hs", message.c_str());
+        }
+
+        template <typename... Args>
+        void Warn(std::format_string<Args...> fmt, Args&&... args) {
+            const auto message = std::format(fmt, std::forward<Args>(args)...);
+            SS_LOG_WARN(L"PerformanceProfiler", L"%hs", message.c_str());
+        }
+
+        template <typename... Args>
+        void Info(std::format_string<Args...> fmt, Args&&... args) {
+            const auto message = std::format(fmt, std::forward<Args>(args)...);
+            SS_LOG_INFO(L"PerformanceProfiler", L"%hs", message.c_str());
+        }
+
+        template <typename... Args>
+        void Debug(std::format_string<Args...> fmt, Args&&... args) {
+            const auto message = std::format(fmt, std::forward<Args>(args)...);
+            SS_LOG_DEBUG(L"PerformanceProfiler", L"%hs", message.c_str());
+        }
+    }
 
     // -------------------------------------------------------------------------
     // Module-scoped hard limits — prevents unbounded memory growth
