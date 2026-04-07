@@ -185,15 +185,15 @@ namespace DLLInjectionConstants {
     constexpr std::wstring_view KNOWNDLLS_PATH = 
         L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\KnownDLLs";
 
-    // Hook types (SetWindowsHookEx)
-    constexpr int WH_KEYBOARD = 2;
-    constexpr int WH_KEYBOARD_LL = 13;
-    constexpr int WH_MOUSE = 7;
-    constexpr int WH_MOUSE_LL = 14;
-    constexpr int WH_CBT = 5;
-    constexpr int WH_GETMESSAGE = 3;
-    constexpr int WH_CALLWNDPROC = 4;
-    constexpr int WH_SHELL = 10;
+    // Hook types (SetWindowsHookEx) — prefixed SS_ to avoid Windows macro clashes
+    constexpr int SS_WH_KEYBOARD = 2;
+    constexpr int SS_WH_KEYBOARD_LL = 13;
+    constexpr int SS_WH_MOUSE = 7;
+    constexpr int SS_WH_MOUSE_LL = 14;
+    constexpr int SS_WH_CBT = 5;
+    constexpr int SS_WH_GETMESSAGE = 3;
+    constexpr int SS_WH_CALLWNDPROC = 4;
+    constexpr int SS_WH_SHELL = 10;
 
     // Known legitimate loaders
     constexpr std::wstring_view LEGITIMATE_LOADERS[] = {
@@ -209,10 +209,10 @@ namespace DLLInjectionConstants {
 // ============================================================================
 
 /**
- * @enum InjectionType
+ * @enum DLLInjectionType
  * @brief Types of DLL injection detected.
  */
-enum class InjectionType : uint8_t {
+enum class DLLInjectionType : uint8_t {
     Unknown = 0,
     CreateRemoteThread = 1,       ///< Classic CreateRemoteThread+LoadLibrary
     CreateRemoteThreadEx = 2,     ///< Extended version
@@ -278,10 +278,10 @@ enum class LoadReason : uint8_t {
 };
 
 /**
- * @enum MonitoringMode
- * @brief Real-time monitoring mode.
+ * @enum DLLMonitoringMode
+ * @brief Real-time monitoring mode for DLL injection detector.
  */
-enum class MonitoringMode : uint8_t {
+enum class DLLMonitoringMode : uint8_t {
     Disabled = 0,
     PassiveOnly = 1,          ///< Monitor and alert
     ActiveBlock = 2,          ///< Block suspicious loads
@@ -384,17 +384,17 @@ struct alignas(64) LoadedDLLInfo {
     double entropy = 0.0;
     
     // Verdict
-    InjectionType detectedInjectionType = InjectionType::Unknown;
+    DLLInjectionType detectedInjectionType = DLLInjectionType::Unknown;
     InjectionConfidence confidence = InjectionConfidence::None;
     uint32_t riskScore = 0;
     std::vector<std::wstring> riskFactors;
 };
 
 /**
- * @struct InjectionEvent
+ * @struct DLLInjectionEvent
  * @brief Event representing a detected DLL injection.
  */
-struct InjectionEvent {
+struct DLLInjectionEvent {
     uint64_t eventId = 0;
     std::chrono::system_clock::time_point timestamp;
     
@@ -412,7 +412,7 @@ struct InjectionEvent {
     LoadedDLLInfo dllInfo;
     
     // Detection details
-    InjectionType injectionType = InjectionType::Unknown;
+    DLLInjectionType injectionType = DLLInjectionType::Unknown;
     InjectionConfidence confidence = InjectionConfidence::None;
     std::vector<std::wstring> detectionReasons;
     
@@ -506,7 +506,7 @@ struct InjectionAnalysisResult {
     uint32_t suspiciousHookCount = 0;
     
     // Injection events
-    std::vector<InjectionEvent> detectedInjections;
+    std::vector<DLLInjectionEvent> detectedInjections;
     
     // Side-load analysis
     std::vector<SideLoadInfo> potentialSideLoads;
@@ -516,7 +516,7 @@ struct InjectionAnalysisResult {
     
     // Overall assessment
     bool hasInjection = false;
-    InjectionType primaryInjectionType = InjectionType::Unknown;
+    DLLInjectionType primaryInjectionType = DLLInjectionType::Unknown;
     InjectionConfidence overallConfidence = InjectionConfidence::None;
     uint32_t riskScore = 0;
     
@@ -532,7 +532,7 @@ struct InjectionAnalysisResult {
  */
 struct DLLInjectionConfig {
     // Monitoring mode
-    MonitoringMode mode = MonitoringMode::PassiveOnly;
+    DLLMonitoringMode mode = DLLMonitoringMode::PassiveOnly;
     bool enableRealTimeMonitoring = true;
     bool enableOnDemandAnalysis = true;
     
@@ -717,8 +717,8 @@ struct alignas(64) DLLInjectionStatistics {
  * @brief Callback when DLL injection is detected.
  * @param event Injection event details
  */
-using InjectionDetectedCallback = std::function<void(
-    const InjectionEvent& event
+using DLLInjectionDetectedCallback = std::function<void(
+    const DLLInjectionEvent& event
 )>;
 
 /**
@@ -768,7 +768,7 @@ using HookInstalledCallback = std::function<void(
  * }
  * 
  * // Start real-time monitoring
- * detector.RegisterCallback([](const InjectionEvent& event) {
+ * detector.RegisterCallback([](const DLLInjectionEvent& event) {
  *     // Handle injection event
  * });
  * detector.StartMonitoring();
@@ -893,7 +893,7 @@ public:
      * @param pid Process ID.
      * @return Vector of detected injections.
      */
-    [[nodiscard]] std::vector<InjectionEvent> DetectInjections(uint32_t pid);
+    [[nodiscard]] std::vector<DLLInjectionEvent> DetectInjections(uint32_t pid);
 
     /**
      * @brief Check if a specific DLL was injected.
@@ -919,7 +919,7 @@ public:
      * @param pid Process ID.
      * @return Injection events.
      */
-    [[nodiscard]] std::vector<InjectionEvent> DetectRemoteThreadInjection(
+    [[nodiscard]] std::vector<DLLInjectionEvent> DetectRemoteThreadInjection(
         uint32_t pid
     );
 
@@ -928,7 +928,7 @@ public:
      * @param pid Process ID.
      * @return Injection events.
      */
-    [[nodiscard]] std::vector<InjectionEvent> DetectAPCInjection(uint32_t pid);
+    [[nodiscard]] std::vector<DLLInjectionEvent> DetectAPCInjection(uint32_t pid);
 
     // ========================================================================
     // HOOK DETECTION
@@ -958,7 +958,7 @@ public:
      * @param pid Target process ID.
      * @return Injection events.
      */
-    [[nodiscard]] std::vector<InjectionEvent> DetectHookInjection(uint32_t pid);
+    [[nodiscard]] std::vector<DLLInjectionEvent> DetectHookInjection(uint32_t pid);
 
     // ========================================================================
     // REGISTRY-BASED VECTORS
@@ -1018,7 +1018,7 @@ public:
      * @param pid Process ID.
      * @return Injection events.
      */
-    [[nodiscard]] std::vector<InjectionEvent> DetectSearchOrderHijack(
+    [[nodiscard]] std::vector<DLLInjectionEvent> DetectSearchOrderHijack(
         uint32_t pid
     );
 
@@ -1047,13 +1047,13 @@ public:
      * @brief Set monitoring mode.
      * @param mode New monitoring mode.
      */
-    void SetMonitoringMode(MonitoringMode mode);
+    void SetMonitoringMode(DLLMonitoringMode mode);
 
     /**
      * @brief Get current monitoring mode.
      * @return Current mode.
      */
-    [[nodiscard]] MonitoringMode GetMonitoringMode() const noexcept;
+    [[nodiscard]] DLLMonitoringMode GetMonitoringMode() const noexcept;
 
     // ========================================================================
     // EVENT HANDLERS (from kernel/ETW)
@@ -1122,7 +1122,7 @@ public:
      * @param callback Callback function.
      * @return Callback ID.
      */
-    uint64_t RegisterCallback(InjectionDetectedCallback callback);
+    uint64_t RegisterCallback(DLLInjectionDetectedCallback callback);
 
     /**
      * @brief Register callback for module loads.
@@ -1233,7 +1233,7 @@ public:
      * @return String representation.
      */
     [[nodiscard]] static std::wstring InjectionTypeToString(
-        InjectionType type
+        DLLInjectionType type
     ) noexcept;
 
     /**

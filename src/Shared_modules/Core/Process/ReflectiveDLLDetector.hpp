@@ -108,6 +108,7 @@
 // ============================================================================
 
 // Internal infrastructure
+#include "ProcessTypes.hpp"
 #include "MemoryScanner.hpp"
 #include "ProcessMonitor.hpp"
 #include "../../Utils/ProcessUtils.hpp"
@@ -211,17 +212,7 @@ enum class ReflectiveLoadType : uint8_t {
     CustomLoader = 11             ///< Custom/unknown loader
 };
 
-/**
- * @enum DetectionConfidence
- * @brief Confidence level of detection.
- */
-enum class DetectionConfidence : uint8_t {
-    None = 0,
-    Low = 1,              ///< Single weak indicator
-    Medium = 2,           ///< Multiple indicators
-    High = 3,             ///< Strong indicators
-    Confirmed = 4         ///< Definitive evidence
-};
+// DetectionConfidence — defined in ProcessTypes.hpp
 
 /**
  * @enum PEValidationResult
@@ -393,10 +384,10 @@ struct alignas(64) ReflectiveDetection {
 };
 
 /**
- * @struct ScanResult
+ * @struct ReflectiveScanResult
  * @brief Complete scan result for a process.
  */
-struct ScanResult {
+struct ReflectiveScanResult {
     uint32_t processId = 0;
     std::wstring processName;
     std::chrono::system_clock::time_point scanTime;
@@ -697,7 +688,7 @@ public:
      * @param mode Scan mode.
      * @return Scan result.
      */
-    [[nodiscard]] ScanResult Scan(
+    [[nodiscard]] ReflectiveScanResult Scan(
         uint32_t pid,
         ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );
@@ -715,7 +706,7 @@ public:
      * @param mode Scan mode.
      * @return Scan results.
      */
-    [[nodiscard]] std::vector<ScanResult> ScanMultiple(
+    [[nodiscard]] std::vector<ReflectiveScanResult> ScanMultiple(
         const std::vector<uint32_t>& pids,
         ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );
@@ -725,7 +716,7 @@ public:
      * @param mode Scan mode.
      * @return Scan results.
      */
-    [[nodiscard]] std::vector<ScanResult> ScanAllProcesses(
+    [[nodiscard]] std::vector<ReflectiveScanResult> ScanAllProcesses(
         ReflectiveScanMode mode = ReflectiveScanMode::Quick
     );
 
@@ -735,7 +726,7 @@ public:
      * @param mode Scan mode.
      * @return Scan results.
      */
-    [[nodiscard]] std::vector<ScanResult> ScanByName(
+    [[nodiscard]] std::vector<ReflectiveScanResult> ScanByName(
         const std::wstring& processName,
         ReflectiveScanMode mode = ReflectiveScanMode::Standard
     );

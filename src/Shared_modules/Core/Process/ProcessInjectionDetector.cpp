@@ -244,26 +244,26 @@ using TimePoint = std::chrono::system_clock::time_point;
 }
 
 [[nodiscard]] bool IsSuspiciousHandleAccess(uint32_t accessRights) noexcept {
-    constexpr uint32_t PROCESS_VM_WRITE = 0x0020;
-    constexpr uint32_t PROCESS_VM_OPERATION = 0x0008;
-    constexpr uint32_t PROCESS_CREATE_THREAD = 0x0002;
+    constexpr uint32_t kProcessVmWrite = 0x0020;
+    constexpr uint32_t kProcessVmOperation = 0x0008;
+    constexpr uint32_t kProcessCreateThread = 0x0002;
 
     // Combination of write + operation + thread creation is highly suspicious
-    const bool hasWrite = (accessRights & PROCESS_VM_WRITE) != 0;
-    const bool hasOperation = (accessRights & PROCESS_VM_OPERATION) != 0;
-    const bool hasCreateThread = (accessRights & PROCESS_CREATE_THREAD) != 0;
+    const bool hasWrite = (accessRights & kProcessVmWrite) != 0;
+    const bool hasOperation = (accessRights & kProcessVmOperation) != 0;
+    const bool hasCreateThread = (accessRights & kProcessCreateThread) != 0;
 
     return (hasWrite && hasOperation) || (hasWrite && hasCreateThread);
 }
 
 [[nodiscard]] bool IsExecutableProtection(uint32_t protection) noexcept {
-    constexpr uint32_t PAGE_EXECUTE = 0x10;
-    constexpr uint32_t PAGE_EXECUTE_READ = 0x20;
-    constexpr uint32_t PAGE_EXECUTE_READWRITE = 0x40;
-    constexpr uint32_t PAGE_EXECUTE_WRITECOPY = 0x80;
+    constexpr uint32_t kPageExecute = 0x10;
+    constexpr uint32_t kPageExecuteRead = 0x20;
+    constexpr uint32_t kPageExecuteReadWrite = 0x40;
+    constexpr uint32_t kPageExecuteWriteCopy = 0x80;
 
-    return (protection & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+    return (protection & (kPageExecute | kPageExecuteRead |
+                         kPageExecuteReadWrite | kPageExecuteWriteCopy)) != 0;
 }
 
 [[nodiscard]] bool IsAddressInModule(uint32_t pid, uintptr_t address) noexcept {
@@ -1659,7 +1659,7 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         if (ProcessHollowingDetector::HasInstance() &&
             ProcessHollowingDetector::Instance().IsInitialized()) {
             ProcessHollowingDetector::Instance().RegisterDetectionCallback(
-                [this](const ProcessHollowingDetector::HollowingDetectionResult& result) {
+                [this](const HollowingDetectionResult& result) {
                     if (!m_running.load(std::memory_order_acquire)) return;
                     if (!result.isHollowed) return;
 
@@ -1695,7 +1695,7 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         auto& rdd = ReflectiveDLLDetector::Instance();
         if (rdd.IsInitialized()) {
             rdd.RegisterCallback(
-                [this](const ReflectiveDLLDetector::ReflectiveDetection& detection) {
+                [this](const ReflectiveDetection& detection) {
                     if (!m_running.load(std::memory_order_acquire)) return;
 
                     InjectionEvent event;
@@ -1729,20 +1729,20 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         auto& thd = ThreadHijackDetector::Instance();
         if (thd.IsInitialized()) {
             thd.RegisterCallback(
-                [this](const ThreadHijackDetector::HijackEvent& hijackEvent) {
+                [this](const HijackEvent& hijackEvent) {
                     if (!m_running.load(std::memory_order_acquire)) return;
 
                     InjectionEvent event;
                     event.eventId = m_nextEventId.fetch_add(1, std::memory_order_relaxed);
                     event.timestamp = Clock::now();
                     event.injectionType = InjectionType::ThreadHijacking;
-                    event.targetProcessId = hijackEvent.processId;
-                    event.targetThreadId = hijackEvent.threadId;
+                    event.targetProcessId = hijackEvent.victimPid;
+                    event.targetThreadId = hijackEvent.victimTid;
                     event.confidence = 85.0;
                     event.mitreTechnique = "T1055";
                     event.mitreSubTechnique = "T1055.003";
 
-                    if (auto name = Utils::ProcessUtils::GetProcessName(hijackEvent.processId)) {
+                    if (auto name = Utils::ProcessUtils::GetProcessName(hijackEvent.victimPid)) {
                         event.targetProcessName = *name;
                     }
 
@@ -1761,7 +1761,7 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         auto& abd = AtomBombingDetector::Instance();
         if (abd.IsInitialized()) {
             abd.RegisterAttackCallback(
-                [this](const AtomBombingDetector::AtomBombingAttack& attack) {
+                [this](const AtomBombingAttack& attack) {
                     if (!m_running.load(std::memory_order_acquire)) return;
 
                     InjectionEvent event;
@@ -1796,7 +1796,7 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         auto& ms = MemoryScanner::Instance();
         if (ms.IsInitialized()) {
             ms.RegisterThreatCallback(
-                [this](const MemoryScanner::MemoryThreat& threat) {
+                [this](const MemoryThreat& threat) {
                     if (!m_running.load(std::memory_order_acquire)) return;
 
                     // Only process injection-related memory threats
@@ -1805,8 +1805,8 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
                     event.timestamp = Clock::now();
                     event.injectionType = InjectionType::ShellcodeInjection;
                     event.targetProcessId = threat.processId;
-                    event.targetAddress = threat.address;
-                    event.dataSize = threat.size;
+                    event.targetAddress = threat.regionBase;
+                    event.dataSize = threat.regionSize;
                     event.confidence = 70.0;
                     event.mitreTechnique = "T1055";
                     event.mitreSubTechnique = "T1055.002";
@@ -1830,7 +1830,7 @@ void ProcessInjectionDetector::Impl::WireSubDetectorCallbacks() {
         auto& did = DLLInjectionDetector::Instance();
         if (did.IsInitialized()) {
             did.RegisterCallback(
-                [this](const DLLInjectionDetector::InjectionEvent& dllEvent) {
+                [this](const DLLInjectionEvent& dllEvent) {
                     if (!m_running.load(std::memory_order_acquire)) return;
 
                     InjectionEvent event;

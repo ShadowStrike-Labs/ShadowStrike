@@ -613,8 +613,8 @@ public:
     // ATOM TABLE SCANNING
     // ========================================================================
 
-    [[nodiscard]] ScanResult ScanAtomTableImpl() {
-        ScanResult result{};
+    [[nodiscard]] AtomBombingScanResult ScanAtomTableImpl() {
+        AtomBombingScanResult result{};
         const auto scanStart = steady_clock::now();
         const auto config = SnapshotConfig();
 
@@ -923,7 +923,7 @@ public:
             // Check if APC targets atom-related functions by resolving exports
             event.targetsAtomFunction = TargetsAtomRetrievalImpl(apcRoutine, targetPid);
             if (event.targetsAtomFunction) {
-                event.targetType = APCTargetType::GlobalGetAtomName;
+                event.targetType = APCTargetType::AtomGetNameA;
             }
 
             // Risk assessment
@@ -1521,10 +1521,10 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
 // ATOM TABLE SCANNING
 // ============================================================================
 
-[[nodiscard]] ScanResult AtomBombingDetector::ScanAtomTable() {
+[[nodiscard]] AtomBombingScanResult AtomBombingDetector::ScanAtomTable() {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
         SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
-        return ScanResult{};
+        return AtomBombingScanResult{};
     }
 
     return m_impl->ScanAtomTableImpl();
@@ -1651,14 +1651,14 @@ bool AtomBombingDetector::UpdateConfig(const AtomBombingConfig& config) {
     return std::nullopt;
 }
 
-[[nodiscard]] ScanResult AtomBombingDetector::ScanProcess(uint32_t pid) {
+[[nodiscard]] AtomBombingScanResult AtomBombingDetector::ScanProcess(uint32_t pid) {
     if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
         SS_LOG_ERROR(L"AtomBombing", L"Not initialized");
-        return ScanResult{};
+        return AtomBombingScanResult{};
     }
 
     // Process-specific scan
-    ScanResult result{};
+    AtomBombingScanResult result{};
     result.scanTime = system_clock::now();
     result.systemWideScan = false;
     result.targetPid = pid;
