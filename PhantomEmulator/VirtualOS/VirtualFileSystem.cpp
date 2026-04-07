@@ -36,6 +36,7 @@
  */
 
 #include "VirtualFileSystem.hpp"
+#include "SystemDLLContent.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -1358,18 +1359,24 @@ bool VirtualFileSystem::CloseFile(uint32_t fileId) noexcept {
 // ReadFile
 // ============================================================================
 //
-// Three content paths:
+// Five content paths (checked in order):
 //
 // 1. Real content (malware-written files): serves bytes from the content
 //    vector, zero-fills beyond stored content up to fileSize.
 //
-// 2. Pre-populated PE files (.dll, .exe, .sys, .drv): generates a 512-byte
-//    PE stub on demand containing valid MZ and PE signatures, returns
-//    zeroes for the remainder up to the file's declared size.  This is
-//    sufficient for malware that reads the PE header to validate a DLL
-//    before calling LoadLibrary / LdrLoadDll.
+// 2. Known system DLLs (ntdll.dll, kernel32.dll, etc.): generates a
+//    4096-byte realistic PE image via GenerateRealisticContent() with
+//    correct export directory, version resources, section table, and
+//    profile-specific ImageBase/SizeOfImage.  Returns zeroes for the
+//    remainder up to the file's declared size.
 //
-// 3. Non-PE pre-populated files: returns zeroes.
+// 3. Unknown PE files (.dll, .exe, .sys, .drv): generates a 512-byte
+//    generic PE stub with valid MZ/PE signatures, returns zeroes beyond.
+//
+// 4. Known non-PE files (hosts, system.ini, win.ini): returns static
+//    file content matching a real Windows installation.
+//
+// 5. Other pre-populated files: returns zeroes.
 //
 // The read position is advanced by the number of bytes returned.
 // Reading past EOF returns 0 bytes (no error).
@@ -1416,22 +1423,55 @@ uint32_t VirtualFileSystem::ReadFile(
             std::memset(buffer + contentAvail, 0, toRead - contentAvail);
         }
     } else if (entry.isPrePopulated && IsPEExtension(entry.fullPath)) {
-        // Generate PE stub on demand for system executables
-        bool inWow64 = entry.fullPath.find(L"syswow64") != std::wstring::npos;
-        bool isDll   = !entry.fullPath.ends_with(L".exe");
-        auto stub    = GeneratePEStub(isDll, !inWow64);
+        // --- Realistic DLL content for known system DLLs ---
+        auto* dllProfile = GetDLLProfile(entry.fullPath);
+        if (dllProfile) {
+            bool inWow64 = entry.fullPath.find(L"syswow64") != std::wstring::npos;
+            auto realistic = GenerateRealisticContent(*dllProfile, !inWow64);
 
-        uint32_t stubRead = 0;
-        if (pos < stub.size()) {
-            stubRead = static_cast<uint32_t>(
-                std::min<uint64_t>(toRead, stub.size() - pos));
-            std::memcpy(buffer, stub.data() + pos, stubRead);
+            uint32_t realRead = 0;
+            if (pos < realistic.size()) {
+                realRead = static_cast<uint32_t>(
+                    std::min<uint64_t>(toRead, realistic.size() - pos));
+                std::memcpy(buffer, realistic.data() + pos, realRead);
+            }
+            if (realRead < toRead) {
+                std::memset(buffer + realRead, 0, toRead - realRead);
+            }
+        } else {
+            // Fall through to generic PE stub for unknown DLLs
+            bool inWow64 = entry.fullPath.find(L"syswow64") != std::wstring::npos;
+            bool isDll   = !entry.fullPath.ends_with(L".exe");
+            auto stub    = GeneratePEStub(isDll, !inWow64);
+
+            uint32_t stubRead = 0;
+            if (pos < stub.size()) {
+                stubRead = static_cast<uint32_t>(
+                    std::min<uint64_t>(toRead, stub.size() - pos));
+                std::memcpy(buffer, stub.data() + pos, stubRead);
+            }
+            if (stubRead < toRead) {
+                std::memset(buffer + stubRead, 0, toRead - stubRead);
+            }
         }
-        if (stubRead < toRead) {
-            std::memset(buffer + stubRead, 0, toRead - stubRead);
+    } else if (entry.isPrePopulated) {
+        // --- Static file content for known non-PE files ---
+        auto staticContent = GetStaticFileContent(entry.fullPath);
+        if (!staticContent.empty()) {
+            uint32_t staticRead = 0;
+            if (pos < staticContent.size()) {
+                staticRead = static_cast<uint32_t>(
+                    std::min<uint64_t>(toRead, staticContent.size() - pos));
+                std::memcpy(buffer, staticContent.data() + pos, staticRead);
+            }
+            if (staticRead < toRead) {
+                std::memset(buffer + staticRead, 0, toRead - staticRead);
+            }
+        } else {
+            // Non-PE pre-populated files with no known content → zeroes
+            std::memset(buffer, 0, toRead);
         }
     } else {
-        // Non-PE pre-populated files or empty files → zeroes
         std::memset(buffer, 0, toRead);
     }
 
