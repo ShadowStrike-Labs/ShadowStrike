@@ -82,6 +82,7 @@
 #include <cstdint>
 #include <string>
 #include <vector>
+#include <unordered_map>
 #include <optional>
 #include <memory>
 #include <functional>
@@ -264,6 +265,34 @@ struct alignas(128) StartupItem {
 };
 
 /**
+ * @enum BCDTamperType
+ * @brief Type of BCD tampering detected.
+ */
+enum class BCDTamperType : uint8_t {
+    None = 0,
+    SecureBootDisabled = 1,
+    TestSigningEnabled = 2,
+    KernelDebuggingEnabled = 3,
+    BootIntegrityDisabled = 4,
+    HVCIPolicyWeakened = 5,
+    CustomBootLoader = 6,
+    RecoveryDisabled = 7
+};
+
+/**
+ * @struct BCDTamperIndicator
+ * @brief A single BCD tampering indicator.
+ */
+struct BCDTamperIndicator {
+    BCDTamperType type{ BCDTamperType::None };
+    std::wstring description;
+    std::wstring bcdElement;
+    std::wstring currentValue;
+    std::wstring expectedValue;
+    std::chrono::system_clock::time_point detectedAt;
+};
+
+/**
  * @struct BootSecurityStatus
  * @brief Boot chain security status.
  */
@@ -277,6 +306,11 @@ struct alignas(64) BootSecurityStatus {
     bool bitLockerEnabled{ false };
     bool tpmPresent{ false };
     uint8_t tpmVersion{ 0 };           // 12 = 1.2, 20 = 2.0
+    bool testSigningEnabled{ false };
+    bool kernelDebuggingEnabled{ false };
+    bool elamDriverLoaded{ false };
+    bool codeIntegrityEnabled{ true };
+    std::vector<BCDTamperIndicator> bcdTamperIndicators;
 };
 
 /**
@@ -353,6 +387,9 @@ struct alignas(64) BootTimeAnalyzerStatistics {
     std::atomic<uint64_t> startupItemsScanned{ 0 };
     std::atomic<uint64_t> suspiciousItemsFound{ 0 };
     std::atomic<uint64_t> optimizationsSuggested{ 0 };
+    std::atomic<uint64_t> bcdTamperDetections{ 0 };
+    std::atomic<uint64_t> kernelQueriesPerformed{ 0 };
+    std::atomic<uint64_t> bootDriversAnalyzed{ 0 };
     
     void Reset() noexcept;
 };
@@ -520,6 +557,27 @@ public:
      * @brief Verifies boot chain integrity.
      */
     [[nodiscard]] bool VerifyBootChainIntegrity() const;
+
+    /**
+     * @brief Detect BCD store tampering (bcdedit abuse, testsigning, debugging).
+     */
+    [[nodiscard]] std::vector<BCDTamperIndicator> DetectBCDTampering() const;
+
+    /**
+     * @brief Query kernel driver for early-boot telemetry (ELAM, image load order).
+     * @return True if kernel data was successfully retrieved.
+     */
+    [[nodiscard]] bool QueryKernelBootTelemetry();
+
+    /**
+     * @brief Wire to DriverAnalyzer to cross-reference boot driver integrity.
+     */
+    void CrossReferenceDriverAnalyzer() const;
+
+    /**
+     * @brief Wire to RegistryMonitor for BCD store change alerts.
+     */
+    void RegisterBCDChangeCallback();
     
     // ========================================================================
     // OPTIMIZATION

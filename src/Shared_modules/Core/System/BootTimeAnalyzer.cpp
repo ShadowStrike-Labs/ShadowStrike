@@ -56,6 +56,7 @@
 
 #include "pch.h"
 #include "BootTimeAnalyzer.hpp"
+#include "DriverAnalyzer.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/RegistryUtils.hpp"
 #include "../../Utils/FileUtils.hpp"
@@ -65,6 +66,8 @@
 #include "../../Utils/Logger.hpp"
 #include "../../HashStore/HashStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../Communication/IPCManager.hpp"
+#include "../../Core/Registry/RegistryMonitor.hpp"
 
 #include <Windows.h>
 #include <winternl.h>
@@ -104,7 +107,7 @@ namespace fs = std::filesystem;
 
 namespace BootTimeAnalyzerConstants {
     constexpr uint32_t VERSION_MAJOR = 3;
-    constexpr uint32_t VERSION_MINOR = 1;
+    constexpr uint32_t VERSION_MINOR = 2;
     constexpr uint32_t VERSION_PATCH = 0;
 
     // Performance thresholds (milliseconds)
@@ -123,9 +126,16 @@ namespace BootTimeAnalyzerConstants {
     constexpr wchar_t BOOT_PERF_REG_PATH[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Environment";
     constexpr wchar_t BOOT_TIMESTAMP_REG_PATH[] = L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power";
     
+    // BCD store registry paths (for tampering detection)
+    constexpr wchar_t BCD_STORE_REG_PATH[] = L"BCD00000000";
+    constexpr wchar_t SYSTEM_POLICIES_CI[] = L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config";
+    constexpr wchar_t CODE_INTEGRITY_PATH[] = L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard\\Scenarios\\HypervisorEnforcedCodeIntegrity";
+
     // Maximum buffer sizes for safety
     constexpr size_t MAX_REG_VALUE_SIZE = 32768;  // 32KB max registry value
     constexpr size_t MAX_PATH_EXPANDED = 4096;    // Expanded path buffer
+    constexpr size_t MAX_ENUM_VALUE_NAME = 512;   // Registry value name (heap-safe)
+    constexpr size_t MAX_DRIVERS_ENUMERATED = 2048; // Cap driver enumeration
     
     // Known legitimate AppData applications (partial match)
     const std::unordered_set<std::wstring> KNOWN_APPDATA_APPS = {
@@ -149,6 +159,9 @@ void BootTimeAnalyzerStatistics::Reset() noexcept {
     startupItemsScanned.store(0, std::memory_order_relaxed);
     suspiciousItemsFound.store(0, std::memory_order_relaxed);
     optimizationsSuggested.store(0, std::memory_order_relaxed);
+    bcdTamperDetections.store(0, std::memory_order_relaxed);
+    kernelQueriesPerformed.store(0, std::memory_order_relaxed);
+    bootDriversAnalyzed.store(0, std::memory_order_relaxed);
 }
 
 // ============================================================================
@@ -183,30 +196,51 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
     // State
     std::atomic<bool> m_initialized{false};
 
-    // Cached analysis result
+    // Cached analysis result (protected by m_analysisMutex)
     std::optional<BootAnalysisResult> m_lastAnalysis;
     mutable std::shared_mutex m_analysisMutex;
 
     // Statistics (mutable for const methods to update)
     mutable BootTimeAnalyzerStatistics m_statistics;
     
-    // COM initialization flag (thread-local for WMI/TaskScheduler)
+    // COM initialization tracking (thread-local for WMI/TaskScheduler)
     static thread_local bool s_comInitialized;
 
-    // Constructor
+    // Kernel-reported boot telemetry (populated by QueryKernelBootTelemetry)
+    struct KernelBootData {
+        bool hasData{ false };
+        std::vector<DriverBootMetric> elamClassifiedDrivers;
+        std::chrono::milliseconds kernelReportedBootTime{ 0 };
+        bool elamDriverLoaded{ false };
+    };
+    KernelBootData m_kernelBootData;
+    mutable std::shared_mutex m_kernelDataMutex;
+
     BootTimeAnalyzerImpl() = default;
     
+    // ========================================================================
+    // INITIALIZATION GUARD
+    // ========================================================================
+    
+    [[nodiscard]] bool IsReady() const noexcept {
+        return m_initialized.load(std::memory_order_acquire);
+    }
+
     // ========================================================================
     // COM INITIALIZATION HELPER
     // ========================================================================
     
-    /// @brief Initialize COM for current thread if not already done
-    /// @return True if COM is available
     bool EnsureCOMInitialized() const {
         if (!s_comInitialized) {
             HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-            if (SUCCEEDED(hr) || hr == RPC_E_CHANGED_MODE) {
+            if (SUCCEEDED(hr)) {
                 s_comInitialized = true;
+            } else if (hr == RPC_E_CHANGED_MODE) {
+                // Already initialized with different threading model — still usable
+                s_comInitialized = true;
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY, L"COM initialization failed - HRESULT 0x%08X",
+                            static_cast<unsigned>(hr));
             }
         }
         return s_comInitialized;
@@ -460,84 +494,88 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             std::unordered_map<std::wstring, ELAMDriverStatus> elamClassifications;
             LoadELAMClassifications(elamClassifications);
             
-            // Enumerate loaded drivers
-            LPVOID driversBuffer[1024];
-            DWORD cbNeeded;
+            // Heap-allocate driver buffer to avoid large stack allocation
+            constexpr DWORD maxDriverSlots = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_DRIVERS_ENUMERATED);
+            auto driversBuffer = std::make_unique<LPVOID[]>(maxDriverSlots);
+            DWORD cbNeeded = 0;
 
-            if (EnumDeviceDrivers(driversBuffer, sizeof(driversBuffer), &cbNeeded)) {
+            if (EnumDeviceDrivers(driversBuffer.get(),
+                                  maxDriverSlots * sizeof(LPVOID), &cbNeeded)) {
                 DWORD numDrivers = cbNeeded / sizeof(LPVOID);
+                if (numDrivers > maxDriverSlots) {
+                    numDrivers = maxDriverSlots;
+                    SS_LOG_WARN(LOG_CATEGORY, L"Driver enumeration capped at %u (system has more)",
+                               maxDriverSlots);
+                }
 
                 for (DWORD i = 0; i < numDrivers; i++) {
-                    wchar_t driverName[MAX_PATH];
-                    if (GetDeviceDriverBaseNameW(driversBuffer[i], driverName, MAX_PATH)) {
-                        DriverBootMetric driver;
-                        driver.driverName = driverName;
+                    wchar_t driverName[MAX_PATH]{};
+                    if (GetDeviceDriverBaseNameW(driversBuffer[i], driverName, MAX_PATH) == 0)
+                        continue;
 
-                        // Get full path
-                        wchar_t driverPath[MAX_PATH];
-                        if (GetDeviceDriverFileNameW(driversBuffer[i], driverPath, MAX_PATH)) {
-                            driver.driverPath = driverPath;
-                            
-                            // Convert \SystemRoot\ to actual path for analysis
-                            std::wstring fullPath = driverPath;
-                            if (fullPath.find(L"\\SystemRoot\\") == 0) {
-                                wchar_t windowsDir[MAX_PATH];
-                                if (GetWindowsDirectoryW(windowsDir, MAX_PATH)) {
-                                    fullPath = std::wstring(windowsDir) + fullPath.substr(11);
-                                }
-                            }
-                            driver.driverPath = fullPath;
-                        }
+                    DriverBootMetric driver;
+                    driver.driverName = driverName;
 
-                        // Query actual driver load timing from registry if available
-                        // Windows stores some driver performance data in:
-                        // HKLM\SYSTEM\CurrentControlSet\Services\<driver>\Performance
-                        HKEY hKey;
-                        std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" + 
-                                               std::wstring(driverName);
-                        
-                        driver.initDuration = std::chrono::microseconds(50000);  // 50ms default
-                        driver.loadOrder = i;
-                        driver.isCritical = false;
-                        driver.delayedBoot = false;
-                        
-                        if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
-                            DWORD startType = 0;
-                            DWORD size = sizeof(startType);
-                            
-                            if (RegQueryValueExW(hKey, L"Start", nullptr, nullptr,
-                                               reinterpret_cast<LPBYTE>(&startType), &size) == ERROR_SUCCESS) {
-                                // SERVICE_BOOT_START = 0, SERVICE_SYSTEM_START = 1
-                                driver.isCritical = (startType == 0 || startType == 1);
-                                driver.delayedBoot = (startType > 2);
+                    // Get full path
+                    wchar_t driverPath[MAX_PATH]{};
+                    if (GetDeviceDriverFileNameW(driversBuffer[i], driverPath, MAX_PATH)) {
+                        std::wstring fullPath = driverPath;
+                        // Convert \SystemRoot\ to actual path
+                        if (fullPath.find(L"\\SystemRoot\\") == 0) {
+                            wchar_t windowsDir[MAX_PATH]{};
+                            if (GetWindowsDirectoryW(windowsDir, MAX_PATH)) {
+                                fullPath = std::wstring(windowsDir) + fullPath.substr(11);
                             }
-                            
-                            // Try to get actual timing from performance counters
-                            DWORD loadTime = 0;
-                            size = sizeof(loadTime);
-                            if (RegQueryValueExW(hKey, L"LoadTime", nullptr, nullptr,
-                                               reinterpret_cast<LPBYTE>(&loadTime), &size) == ERROR_SUCCESS) {
-                                driver.initDuration = std::chrono::microseconds(loadTime);
-                            }
-                            
-                            RegCloseKey(hKey);
                         }
-                        
-                        // Check ELAM classification
-                        std::wstring lowerName = driver.driverName;
-                        std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
-                        
-                        auto elamIt = elamClassifications.find(lowerName);
-                        if (elamIt != elamClassifications.end()) {
-                            driver.elamStatus = elamIt->second;
-                        } else {
-                            driver.elamStatus = ELAMDriverStatus::Unknown_;
-                        }
-
-                        drivers.push_back(driver);
+                        driver.driverPath = std::move(fullPath);
                     }
+
+                    // Query actual driver load timing from registry
+                    HKEY hKey;
+                    std::wstring regPath = L"SYSTEM\\CurrentControlSet\\Services\\" + 
+                                           std::wstring(driverName);
+                    
+                    driver.initDuration = std::chrono::microseconds(50000);  // 50ms default
+                    driver.loadOrder = i;
+                    driver.isCritical = false;
+                    driver.delayedBoot = false;
+                    
+                    if (RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                        DWORD startType = 0;
+                        DWORD size = sizeof(startType);
+                        
+                        if (RegQueryValueExW(hKey, L"Start", nullptr, nullptr,
+                                           reinterpret_cast<LPBYTE>(&startType), &size) == ERROR_SUCCESS) {
+                            // SERVICE_BOOT_START = 0, SERVICE_SYSTEM_START = 1
+                            driver.isCritical = (startType == 0 || startType == 1);
+                            driver.delayedBoot = (startType > 2);
+                        }
+                        
+                        DWORD loadTime = 0;
+                        size = sizeof(loadTime);
+                        if (RegQueryValueExW(hKey, L"LoadTime", nullptr, nullptr,
+                                           reinterpret_cast<LPBYTE>(&loadTime), &size) == ERROR_SUCCESS) {
+                            driver.initDuration = std::chrono::microseconds(loadTime);
+                        }
+                        
+                        RegCloseKey(hKey);
+                    }
+                    
+                    // Check ELAM classification using infrastructure
+                    std::wstring lowerName = Utils::StringUtils::ToLowerCopy(driver.driverName);
+                        
+                    auto elamIt = elamClassifications.find(lowerName);
+                    if (elamIt != elamClassifications.end()) {
+                        driver.elamStatus = elamIt->second;
+                    } else {
+                        driver.elamStatus = ELAMDriverStatus::Unknown_;
+                    }
+
+                    drivers.push_back(std::move(driver));
                 }
             }
+
+            m_statistics.bootDriversAnalyzed.fetch_add(drivers.size(), std::memory_order_relaxed);
 
             // Sort by init duration (slowest first)
             std::sort(drivers.begin(), drivers.end(),
@@ -582,8 +620,8 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
                         if (RegQueryValueExW(hDriverKey, L"Classification", nullptr, nullptr,
                                             reinterpret_cast<LPBYTE>(&classification), &size) == ERROR_SUCCESS) {
                             
-                            std::wstring lowerName = driverName;
-                            std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
+                            std::wstring lowerName = Utils::StringUtils::ToLowerCopy(
+                                std::wstring_view(driverName, driverNameSize));
                             
                             // ELAM classifications: 0=Unknown, 1=Good, 2=Bad, 3=BadButRequired
                             switch (classification) {
@@ -792,26 +830,27 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             HKEY hKey;
             if (RegOpenKeyExW(hRoot, keyPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 DWORD index = 0;
-                wchar_t valueName[16384];
-                BYTE data[BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE];
+                // Heap-allocate to avoid stack overflow in recursive/loop contexts
+                auto valueName = std::make_unique<wchar_t[]>(BootTimeAnalyzerConstants::MAX_ENUM_VALUE_NAME);
+                auto data = std::make_unique<BYTE[]>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
 
                 while (true) {
-                    DWORD valueNameSize = _countof(valueName);
-                    DWORD dataSize = sizeof(data);
+                    DWORD valueNameSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_ENUM_VALUE_NAME);
+                    DWORD dataSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
                     DWORD type_reg;
 
-                    LONG result = RegEnumValueW(hKey, index++, valueName, &valueNameSize,
-                                               nullptr, &type_reg, data, &dataSize);
+                    LONG result = RegEnumValueW(hKey, index++, valueName.get(), &valueNameSize,
+                                               nullptr, &type_reg, data.get(), &dataSize);
 
                     if (result == ERROR_NO_MORE_ITEMS) break;
                     if (result != ERROR_SUCCESS) continue;
 
                     if (type_reg == REG_SZ || type_reg == REG_EXPAND_SZ) {
                         ApplicationBootMetric app;
-                        app.appName = valueName;
+                        app.appName = valueName.get();
                         
                         // SECURITY FIX: Safely extract null-terminated string
-                        app.appPath = SafeExtractRegString(data, dataSize);
+                        app.appPath = SafeExtractRegString(data.get(), dataSize);
                         if (app.appPath.empty()) continue;  // Skip invalid entries
                         
                         app.launchType = type;
@@ -855,8 +894,7 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             }
             
             // Check if it's a known heavy application
-            std::wstring lowerPath = fullPath;
-            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+            std::wstring lowerPath = Utils::StringUtils::ToLowerCopy(fullPath);
             
             if (lowerPath.find(L"java") != std::wstring::npos) score += 15;
             if (lowerPath.find(L"node") != std::wstring::npos) score += 10;
@@ -972,26 +1010,26 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             HKEY hKey;
             if (RegOpenKeyExW(hRoot, keyPath.c_str(), 0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 DWORD index = 0;
-                wchar_t valueName[16384];
-                BYTE data[BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE];
+                auto valueName = std::make_unique<wchar_t[]>(BootTimeAnalyzerConstants::MAX_ENUM_VALUE_NAME);
+                auto data = std::make_unique<BYTE[]>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
 
                 while (true) {
-                    DWORD valueNameSize = _countof(valueName);
-                    DWORD dataSize = sizeof(data);
+                    DWORD valueNameSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_ENUM_VALUE_NAME);
+                    DWORD dataSize = static_cast<DWORD>(BootTimeAnalyzerConstants::MAX_REG_VALUE_SIZE);
                     DWORD type_reg;
 
-                    LONG result = RegEnumValueW(hKey, index++, valueName, &valueNameSize,
-                                               nullptr, &type_reg, data, &dataSize);
+                    LONG result = RegEnumValueW(hKey, index++, valueName.get(), &valueNameSize,
+                                               nullptr, &type_reg, data.get(), &dataSize);
 
                     if (result == ERROR_NO_MORE_ITEMS) break;
                     if (result != ERROR_SUCCESS) continue;
 
                     if (type_reg == REG_SZ || type_reg == REG_EXPAND_SZ) {
                         StartupItem item;
-                        item.name = valueName;
+                        item.name = valueName.get();
                         
                         // SECURITY FIX: Use safe string extraction
-                        item.commandLine = SafeExtractRegString(data, dataSize);
+                        item.commandLine = SafeExtractRegString(data.get(), dataSize);
                         if (item.commandLine.empty()) continue;
                         
                         item.type = type;
@@ -1558,8 +1596,7 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             item.riskLevel = item.isVerified ? StartupItemRisk::Safe : StartupItemRisk::Low;
 
             // Check for suspicious patterns with CONTEXT-AWARE analysis
-            std::wstring lowerPath = item.path;
-            std::transform(lowerPath.begin(), lowerPath.end(), lowerPath.begin(), ::towlower);
+            std::wstring lowerPath = Utils::StringUtils::ToLowerCopy(item.path);
             
             // TRUE SUSPICIOUS: Temp folders are always suspicious for startup items
             if (lowerPath.find(L"\\temp\\") != std::wstring::npos ||
@@ -1625,23 +1662,37 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
         BootSecurityStatus status;
 
         try {
-            // Check Secure Boot
+            // Core security checks
             status.secureBoot = CheckSecureBoot();
-
-            // Check TPM
             CheckTPM(status);
-
-            // Check VBS/HVCI
             CheckVBS(status);
-
-            // Check Credential Guard
             status.credentialGuardEnabled = CheckCredentialGuard();
-
-            // Check BitLocker
             status.bitLockerEnabled = CheckBitLocker();
-
-            // Check Kernel DMA Protection
             status.kernelDMAProtection = CheckKernelDMAProtection();
+
+            // Extended security checks (new)
+            CheckTestSigning(status);
+            CheckCodeIntegrity(status);
+            CheckELAMLoaded(status);
+            CheckKernelDebugging(status);
+
+            // BCD tamper detection
+            status.bcdTamperIndicators = DetectBCDTampering();
+
+            // Measured Boot: check if TCG log path exists
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Control\\IntegrityServices",
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD tbEnabled = 0;
+                DWORD size = sizeof(tbEnabled);
+                if (RegQueryValueExW(hKey, L"WBCL", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&tbEnabled),
+                                    &size) == ERROR_SUCCESS) {
+                    status.measuredBootEnabled = true;
+                }
+                RegCloseKey(hKey);
+            }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"BootTimeAnalyzer: Security status check failed - %hs", e.what());
@@ -1681,23 +1732,30 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
     void CheckTPM(BootSecurityStatus& status) const {
         try {
-            // Check TPM presence and version via registry
             HKEY hKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                             L"SYSTEM\\CurrentControlSet\\Services\\TPM\\WMI",
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
                 status.tpmPresent = true;
 
-                // Try to get TPM version
-                DWORD specVersion = 0;
-                DWORD size = sizeof(specVersion);
-                if (RegQueryValueExW(hKey, L"SpecVersion", nullptr, nullptr,
-                                    reinterpret_cast<LPBYTE>(&specVersion),
+                // SpecVersion is a REG_SZ string like "2.0" or "1.2", NOT a DWORD
+                wchar_t specVersionStr[64]{};
+                DWORD size = sizeof(specVersionStr);
+                DWORD type = 0;
+                if (RegQueryValueExW(hKey, L"SpecVersion", nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(specVersionStr),
                                     &size) == ERROR_SUCCESS) {
-                    if (specVersion >= 0x200) {
-                        status.tpmVersion = 20;  // TPM 2.0
-                    } else {
-                        status.tpmVersion = 12;  // TPM 1.2
+                    if (type == REG_SZ || type == REG_EXPAND_SZ) {
+                        std::wstring ver(specVersionStr);
+                        if (ver.find(L"2.") == 0) {
+                            status.tpmVersion = 20;  // TPM 2.0
+                        } else if (ver.find(L"1.2") == 0) {
+                            status.tpmVersion = 12;  // TPM 1.2
+                        }
+                    } else if (type == REG_DWORD && size == sizeof(DWORD)) {
+                        // Fallback: some systems store it as DWORD
+                        DWORD specVersion = *reinterpret_cast<const DWORD*>(specVersionStr);
+                        status.tpmVersion = (specVersion >= 0x200) ? 20 : 12;
                     }
                 }
 
@@ -1766,13 +1824,39 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
     bool CheckBitLocker() const {
         try {
-            // Simplified check - would use BitLocker WMI in production
+            // Check BitLocker status via registry (ProtectionStatus on system drive)
             HKEY hKey;
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                            L"SYSTEM\\CurrentControlSet\\Control\\BitLockerStatus",
+                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\BitLocker",
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                // Check for OSVolume encryption state
+                DWORD protectionStatus = 0;
+                DWORD size = sizeof(protectionStatus);
+                bool found = false;
+
+                if (RegQueryValueExW(hKey, L"OSVolumeProtectionStatus", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&protectionStatus),
+                                    &size) == ERROR_SUCCESS) {
+                    found = true;
+                }
                 RegCloseKey(hKey);
-                return true;
+
+                if (found) {
+                    // 0 = off, 1 = on, 2 = suspended
+                    return (protectionStatus == 1 || protectionStatus == 2);
+                }
+            }
+
+            // Fallback: Check FVE (Full Volume Encryption) service state
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Services\\BDESVC",
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD startType = 4; // disabled
+                DWORD size = sizeof(startType);
+                RegQueryValueExW(hKey, L"Start", nullptr, nullptr,
+                               reinterpret_cast<LPBYTE>(&startType), &size);
+                RegCloseKey(hKey);
+                return (startType <= 2);  // Automatic or manual
             }
             return false;
         } catch (...) {
@@ -1786,8 +1870,15 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
             if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
                             L"SYSTEM\\CurrentControlSet\\Control\\DmaSecurity",
                             0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD dmaGuardEnabled = 0;
+                DWORD size = sizeof(dmaGuardEnabled);
+                if (RegQueryValueExW(hKey, L"DmaGuardPolicyEnabled", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&dmaGuardEnabled),
+                                    &size) == ERROR_SUCCESS) {
+                    RegCloseKey(hKey);
+                    return (dmaGuardEnabled != 0);
+                }
                 RegCloseKey(hKey);
-                return true;
             }
             return false;
         } catch (...) {
@@ -1865,6 +1956,353 @@ struct BootTimeAnalyzer::BootTimeAnalyzerImpl {
 
         return suggestions;
     }
+
+    // ========================================================================
+    // BCD STORE TAMPERING DETECTION
+    // ========================================================================
+
+    std::vector<BCDTamperIndicator> DetectBCDTampering() const {
+        std::vector<BCDTamperIndicator> indicators;
+        auto now = std::chrono::system_clock::now();
+
+        try {
+            // 1. Check testsigning (allows unsigned drivers — critical for BYOVD attacks)
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SYSTEM\\CurrentControlSet\\Control\\CI",
+                                0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    DWORD testSigningEnabled = 0;
+                    DWORD size = sizeof(testSigningEnabled);
+                    if (RegQueryValueExW(hKey, L"TestSigning", nullptr, nullptr,
+                                        reinterpret_cast<LPBYTE>(&testSigningEnabled),
+                                        &size) == ERROR_SUCCESS && testSigningEnabled != 0) {
+                        BCDTamperIndicator ind;
+                        ind.type = BCDTamperType::TestSigningEnabled;
+                        ind.description = L"Test Signing is ENABLED — unsigned kernel drivers can load. "
+                                         L"This is a critical security risk (BYOVD/rootkit vector).";
+                        ind.bcdElement = L"TESTSIGNING";
+                        ind.currentValue = L"ON";
+                        ind.expectedValue = L"OFF";
+                        ind.detectedAt = now;
+                        indicators.push_back(std::move(ind));
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+
+            // 2. Check kernel debugging (enables attacker to attach debugger — APT technique)
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SYSTEM\\CurrentControlSet\\Control",
+                                0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    wchar_t debugMode[64]{};
+                    DWORD size = sizeof(debugMode);
+                    DWORD type = 0;
+                    if (RegQueryValueExW(hKey, L"SystemStartOptions", nullptr, &type,
+                                        reinterpret_cast<LPBYTE>(debugMode),
+                                        &size) == ERROR_SUCCESS) {
+                        std::wstring opts = Utils::StringUtils::ToLowerCopy(debugMode);
+                        if (opts.find(L"debug") != std::wstring::npos) {
+                            BCDTamperIndicator ind;
+                            ind.type = BCDTamperType::KernelDebuggingEnabled;
+                            ind.description = L"Kernel debugging is ENABLED — allows attacher "
+                                             L"to read/write kernel memory.";
+                            ind.bcdElement = L"DEBUG";
+                            ind.currentValue = L"ON";
+                            ind.expectedValue = L"OFF";
+                            ind.detectedAt = now;
+                            indicators.push_back(std::move(ind));
+                        }
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+
+            // 3. Check code integrity policy (HVCI weakening)
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                BootTimeAnalyzerConstants::CODE_INTEGRITY_PATH,
+                                0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    DWORD enabled = 0;
+                    DWORD size = sizeof(enabled);
+                    if (RegQueryValueExW(hKey, L"Enabled", nullptr, nullptr,
+                                        reinterpret_cast<LPBYTE>(&enabled),
+                                        &size) == ERROR_SUCCESS && enabled == 0) {
+                        BCDTamperIndicator ind;
+                        ind.type = BCDTamperType::HVCIPolicyWeakened;
+                        ind.description = L"HVCI scenario is DISABLED in DeviceGuard — "
+                                         L"hypervisor code integrity enforcement is off.";
+                        ind.bcdElement = L"HypervisorEnforcedCodeIntegrity\\Enabled";
+                        ind.currentValue = L"0";
+                        ind.expectedValue = L"1";
+                        ind.detectedAt = now;
+                        indicators.push_back(std::move(ind));
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+
+            // 4. Check for recovery options disabled (prevents forensic recovery)
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SYSTEM\\CurrentControlSet\\Control\\SafeBoot",
+                                0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    // Presence of key is normal; check for suspiciously altered AlternateShell
+                    wchar_t altShell[MAX_PATH]{};
+                    DWORD size = sizeof(altShell);
+                    DWORD type = 0;
+                    if (RegQueryValueExW(hKey, L"AlternateShell", nullptr, &type,
+                                        reinterpret_cast<LPBYTE>(altShell),
+                                        &size) == ERROR_SUCCESS) {
+                        std::wstring shell = Utils::StringUtils::ToLowerCopy(altShell);
+                        if (shell.find(L"cmd.exe") == std::wstring::npos &&
+                            !shell.empty()) {
+                            BCDTamperIndicator ind;
+                            ind.type = BCDTamperType::RecoveryDisabled;
+                            ind.description = L"SafeBoot AlternateShell is set to a non-standard "
+                                             L"executable — possible persistence or tamper.";
+                            ind.bcdElement = L"AlternateShell";
+                            ind.currentValue = altShell;
+                            ind.expectedValue = L"cmd.exe";
+                            ind.detectedAt = now;
+                            indicators.push_back(std::move(ind));
+                        }
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+
+            // 5. Check boot integrity disable (nointegritychecks)
+            {
+                HKEY hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SYSTEM\\CurrentControlSet\\Control\\CI\\Config",
+                                0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                    DWORD vulnDriverBlocklist = 0;
+                    DWORD size = sizeof(vulnDriverBlocklist);
+                    if (RegQueryValueExW(hKey, L"VulnerableDriverBlocklistEnable", nullptr, nullptr,
+                                        reinterpret_cast<LPBYTE>(&vulnDriverBlocklist),
+                                        &size) == ERROR_SUCCESS && vulnDriverBlocklist == 0) {
+                        BCDTamperIndicator ind;
+                        ind.type = BCDTamperType::BootIntegrityDisabled;
+                        ind.description = L"Vulnerable driver blocklist is DISABLED — "
+                                         L"known-vulnerable drivers (BYOVD) can load.";
+                        ind.bcdElement = L"VulnerableDriverBlocklistEnable";
+                        ind.currentValue = L"0";
+                        ind.expectedValue = L"1";
+                        ind.detectedAt = now;
+                        indicators.push_back(std::move(ind));
+                    }
+                    RegCloseKey(hKey);
+                }
+            }
+
+            m_statistics.bcdTamperDetections.fetch_add(indicators.size(), std::memory_order_relaxed);
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"BCD tampering detection failed - %hs", e.what());
+        }
+
+        return indicators;
+    }
+
+    // ========================================================================
+    // KERNEL DRIVER TELEMETRY QUERY
+    // ========================================================================
+
+    bool QueryKernelBootTelemetryImpl() {
+        try {
+            auto& ipcMgr = Communication::IPCManager::Instance();
+            if (!ipcMgr.IsConnected()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Cannot query kernel boot telemetry — IPC not connected");
+                return false;
+            }
+
+            // Query driver status to get ELAM and boot driver info from kernel
+            SHADOWSTRIKE_MESSAGE_HEADER queryMsg{};
+            queryMsg.Magic = SHADOWSTRIKE_MESSAGE_MAGIC;
+            queryMsg.Version = SHADOWSTRIKE_PROTOCOL_VERSION;
+            queryMsg.MessageType = static_cast<UINT16>(FilterMessageType_QueryDriverStatus);
+            queryMsg.TotalSize = sizeof(queryMsg);
+            queryMsg.DataSize = 0;
+            queryMsg.Flags = SHADOWSTRIKE_MSG_FLAG_PRIORITY_HIGH;
+
+            // Send query and receive kernel response
+            struct DriverStatusReply {
+                UINT32 driverVersion;
+                UINT32 driverState;
+                UINT32 elamActive;
+                UINT32 bootDriverCount;
+                UINT64 kernelBootTimeMs;
+            } reply{};
+
+            size_t replySize = sizeof(reply);
+            bool sent = ipcMgr.SendToKernel(&queryMsg, sizeof(queryMsg), &reply, &replySize,
+                                            Communication::IPCConstants::REPLY_TIMEOUT_MS);
+            
+            if (sent && replySize >= sizeof(reply)) {
+                std::unique_lock<std::shared_mutex> lock(m_kernelDataMutex);
+                m_kernelBootData.hasData = true;
+                m_kernelBootData.elamDriverLoaded = (reply.elamActive != 0);
+                m_kernelBootData.kernelReportedBootTime = std::chrono::milliseconds(reply.kernelBootTimeMs);
+                
+                SS_LOG_INFO(LOG_CATEGORY, L"Kernel boot telemetry: ELAM=%s, BootDrivers=%u, BootTimeMs=%llu",
+                           m_kernelBootData.elamDriverLoaded ? L"Active" : L"Inactive",
+                           reply.bootDriverCount, reply.kernelBootTimeMs);
+            } else {
+                SS_LOG_WARN(LOG_CATEGORY, L"Kernel boot telemetry query returned no data");
+                return false;
+            }
+
+            m_statistics.kernelQueriesPerformed.fetch_add(1, std::memory_order_relaxed);
+            return true;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Kernel boot telemetry query failed - %hs", e.what());
+            return false;
+        }
+    }
+
+    // ========================================================================
+    // DRIVER ANALYZER CROSS-REFERENCE
+    // ========================================================================
+
+    void CrossReferenceWithDriverAnalyzer() const {
+        try {
+            auto& driverAnalyzer = DriverAnalyzer::Instance();
+
+            // Get boot-start drivers from DriverAnalyzer's analysis
+            auto allDrivers = driverAnalyzer.EnumerateDrivers();
+            if (allDrivers.empty()) {
+                SS_LOG_DEBUG(LOG_CATEGORY, L"DriverAnalyzer returned no drivers — may not be initialized");
+                return;
+            }
+
+            uint32_t unsignedBootDrivers = 0;
+            uint32_t vulnerableBootDrivers = 0;
+
+            for (const auto& drv : allDrivers) {
+                if (!drv.isBootStart && !drv.isSystemStart)
+                    continue;
+
+                // Flag unsigned boot-start drivers (critical security issue)
+                if (drv.signatureStatus == DriverSignatureStatus::Unsigned ||
+                    drv.signatureStatus == DriverSignatureStatus::TestSigned) {
+                    ++unsignedBootDrivers;
+                    SS_LOG_WARN(LOG_CATEGORY,
+                               L"BOOT DRIVER SECURITY: Unsigned/test-signed boot driver '%ls' [%ls]",
+                               drv.driverName.c_str(), drv.driverPath.c_str());
+                }
+
+                // Check known-vulnerable drivers (BYOVD attack surface)
+                if (drv.isKnownVulnerable) {
+                    ++vulnerableBootDrivers;
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                                L"BOOT DRIVER VULNERABILITY: Known-vulnerable boot driver '%ls' loaded at boot",
+                                drv.driverName.c_str());
+                }
+            }
+
+            if (unsignedBootDrivers > 0 || vulnerableBootDrivers > 0) {
+                SS_LOG_WARN(LOG_CATEGORY,
+                           L"Boot driver integrity: %u unsigned, %u vulnerable (of %zu total boot drivers)",
+                           unsignedBootDrivers, vulnerableBootDrivers, allDrivers.size());
+            } else {
+                SS_LOG_INFO(LOG_CATEGORY, L"Boot driver integrity: All boot drivers signed and clean");
+            }
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"DriverAnalyzer cross-reference failed - %hs", e.what());
+        }
+    }
+
+    // ========================================================================
+    // EXTENDED SECURITY STATUS (populates new fields)
+    // ========================================================================
+
+    void CheckTestSigning(BootSecurityStatus& status) const {
+        try {
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Control\\CI",
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD val = 0;
+                DWORD size = sizeof(val);
+                if (RegQueryValueExW(hKey, L"TestSigning", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&val), &size) == ERROR_SUCCESS) {
+                    status.testSigningEnabled = (val != 0);
+                }
+                RegCloseKey(hKey);
+            }
+        } catch (...) { /* non-fatal */ }
+    }
+
+    void CheckCodeIntegrity(BootSecurityStatus& status) const {
+        try {
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Control\\DeviceGuard",
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                DWORD ciEnabled = 0;
+                DWORD size = sizeof(ciEnabled);
+                if (RegQueryValueExW(hKey, L"RequirePlatformSecurityFeatures", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&ciEnabled), &size) == ERROR_SUCCESS) {
+                    status.codeIntegrityEnabled = (ciEnabled != 0);
+                }
+                RegCloseKey(hKey);
+            }
+        } catch (...) { /* non-fatal */ }
+    }
+
+    void CheckELAMLoaded(BootSecurityStatus& status) const {
+        try {
+            std::shared_lock<std::shared_mutex> lock(m_kernelDataMutex);
+            if (m_kernelBootData.hasData) {
+                status.elamDriverLoaded = m_kernelBootData.elamDriverLoaded;
+                return;
+            }
+        } catch (...) { /* fall through */ }
+
+        // Fallback: Check if ShadowStrike ELAM driver is registered
+        try {
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            BootTimeAnalyzerConstants::ELAM_REG_PATH,
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                // If the ELAM key exists with subkeys, an ELAM driver is registered
+                DWORD subKeyCount = 0;
+                if (RegQueryInfoKeyW(hKey, nullptr, nullptr, nullptr, &subKeyCount,
+                                    nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
+                                    nullptr) == ERROR_SUCCESS) {
+                    status.elamDriverLoaded = (subKeyCount > 0);
+                }
+                RegCloseKey(hKey);
+            }
+        } catch (...) { /* non-fatal */ }
+    }
+
+    void CheckKernelDebugging(BootSecurityStatus& status) const {
+        try {
+            HKEY hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SYSTEM\\CurrentControlSet\\Control",
+                            0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                wchar_t opts[256]{};
+                DWORD size = sizeof(opts);
+                DWORD type = 0;
+                if (RegQueryValueExW(hKey, L"SystemStartOptions", nullptr, &type,
+                                    reinterpret_cast<LPBYTE>(opts), &size) == ERROR_SUCCESS) {
+                    std::wstring optStr = Utils::StringUtils::ToLowerCopy(opts);
+                    status.kernelDebuggingEnabled = (optStr.find(L"debug") != std::wstring::npos);
+                }
+                RegCloseKey(hKey);
+            }
+        } catch (...) { /* non-fatal */ }
+    }
 };
 
 // ============================================================================
@@ -1928,22 +2366,34 @@ bool BootTimeAnalyzer::Initialize(const BootTimeAnalyzerConfig& config) {
 }
 
 void BootTimeAnalyzer::Shutdown() noexcept {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
-
-    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
-        return;
-    }
-
     try {
-        // Clear cached analysis
+        // First check if initialized (relaxed — just a hint)
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            return;
+        }
+
+        // Clear cached analysis under its own lock (avoid nested lock deadlock)
         {
             std::unique_lock<std::shared_mutex> analysisLock(m_impl->m_analysisMutex);
             m_impl->m_lastAnalysis.reset();
         }
 
+        // Now take the main mutex for infrastructure teardown
+        std::unique_lock<std::shared_mutex> lock(m_impl->m_mutex);
+
+        if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+            return;  // Double-check after lock
+        }
+
         // Release infrastructure
         m_impl->m_hashStore.reset();
         m_impl->m_whitelist.reset();
+
+        // Clear kernel data
+        {
+            std::unique_lock<std::shared_mutex> kdLock(m_impl->m_kernelDataMutex);
+            m_impl->m_kernelBootData = {};
+        }
 
         m_impl->m_initialized.store(false, std::memory_order_release);
 
@@ -1977,6 +2427,11 @@ BootTimeAnalyzerConfig BootTimeAnalyzer::GetConfig() const {
 BootAnalysisResult BootTimeAnalyzer::AnalyzeLastBoot() const {
     BootAnalysisResult result;
 
+    if (!m_impl->IsReady()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"BootTimeAnalyzer: AnalyzeLastBoot called before initialization");
+        return result;
+    }
+
     try {
         m_impl->m_statistics.analysesPerformed.fetch_add(1, std::memory_order_relaxed);
 
@@ -1986,9 +2441,16 @@ BootAnalysisResult BootTimeAnalyzer::AnalyzeLastBoot() const {
         // Get total boot time
         result.totalBootTime = m_impl->GetTotalBootTimeMs();
 
+        // Snapshot config under shared lock to avoid race
+        BootTimeAnalyzerConfig configSnapshot;
+        {
+            std::shared_lock<std::shared_mutex> lock(m_impl->m_mutex);
+            configSnapshot = m_impl->m_config;
+        }
+
         // Analyze boot phases
-        if (m_impl->m_config.analyzeDrivers || m_impl->m_config.analyzeServices ||
-            m_impl->m_config.analyzeApplications) {
+        if (configSnapshot.analyzeDrivers || configSnapshot.analyzeServices ||
+            configSnapshot.analyzeApplications) {
             result.phases = m_impl->AnalyzeBootPhases();
 
             // Calculate phase totals
@@ -2016,7 +2478,7 @@ BootAnalysisResult BootTimeAnalyzer::AnalyzeLastBoot() const {
         }
 
         // Analyze drivers
-        if (m_impl->m_config.analyzeDrivers) {
+        if (configSnapshot.analyzeDrivers) {
             result.drivers = m_impl->AnalyzeDrivers();
 
             for (const auto& driver : result.drivers) {
@@ -2029,7 +2491,7 @@ BootAnalysisResult BootTimeAnalyzer::AnalyzeLastBoot() const {
         }
 
         // Analyze services
-        if (m_impl->m_config.analyzeServices) {
+        if (configSnapshot.analyzeServices) {
             result.services = m_impl->AnalyzeServices();
 
             for (const auto& service : result.services) {
@@ -2040,19 +2502,43 @@ BootAnalysisResult BootTimeAnalyzer::AnalyzeLastBoot() const {
         }
 
         // Analyze applications
-        if (m_impl->m_config.analyzeApplications) {
+        if (configSnapshot.analyzeApplications) {
             result.applications = m_impl->AnalyzeApplications();
         }
 
         // Evaluate security
-        if (m_impl->m_config.evaluateSecurity) {
+        if (configSnapshot.evaluateSecurity) {
             result.security = m_impl->GetSecurityStatus();
+
+            // Cross-reference with DriverAnalyzer for boot driver integrity
+            m_impl->CrossReferenceWithDriverAnalyzer();
         }
 
-        // Calculate ShadowStrike impact (simplified)
-        result.shadowStrikeImpact = std::chrono::milliseconds(150);
-        result.shadowStrikeDriverTime = L"50ms";
-        result.shadowStrikeServiceTime = L"100ms";
+        // Calculate ShadowStrike impact from kernel telemetry if available
+        {
+            std::shared_lock<std::shared_mutex> lock(m_impl->m_kernelDataMutex);
+            if (m_impl->m_kernelBootData.hasData) {
+                result.shadowStrikeImpact = m_impl->m_kernelBootData.kernelReportedBootTime;
+                result.shadowStrikeDriverTime = std::to_wstring(
+                    m_impl->m_kernelBootData.kernelReportedBootTime.count()) + L"ms";
+                result.shadowStrikeServiceTime = L"N/A (kernel-measured)";
+            } else {
+                // Estimate from registered ShadowStrike service timing
+                result.shadowStrikeImpact = std::chrono::milliseconds(0);
+                result.shadowStrikeDriverTime = L"N/A (no kernel data)";
+                result.shadowStrikeServiceTime = L"N/A (no kernel data)";
+            }
+        }
+
+        // Count suspicious startup items
+        if (configSnapshot.evaluateSecurity) {
+            auto suspicious = m_impl->EnumerateAndAnalyzeStartupItems();
+            for (const auto& item : suspicious) {
+                if (item.isSuspicious) {
+                    result.suspiciousStartupItems++;
+                }
+            }
+        }
 
         // Cache result
         {
@@ -2448,26 +2934,147 @@ bool BootTimeAnalyzer::IsSecureBootEnabled() const {
 }
 
 bool BootTimeAnalyzer::VerifyBootChainIntegrity() const {
+    if (!m_impl->IsReady()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"BootTimeAnalyzer: VerifyBootChainIntegrity called before init");
+        return false;
+    }
+
     try {
         auto security = m_impl->GetSecurityStatus();
 
-        // Boot chain is secure if:
-        // 1. Secure Boot is enabled
-        // 2. VBS is enabled
-        // 3. HVCI is enabled
+        bool isSecure = true;
+        std::wstring reasons;
 
-        bool isSecure = (security.secureBoot == SecureBootStatus::Enabled) &&
-                       security.vbsEnabled &&
-                       security.hvciEnabled;
+        // 1. Secure Boot must be enabled
+        if (security.secureBoot != SecureBootStatus::Enabled) {
+            isSecure = false;
+            reasons += L"SecureBoot=OFF; ";
+        }
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Boot chain integrity = %ls",
-                   isSecure ? L"VERIFIED" : L"COMPROMISED");
+        // 2. VBS must be enabled
+        if (!security.vbsEnabled) {
+            isSecure = false;
+            reasons += L"VBS=OFF; ";
+        }
+
+        // 3. HVCI must be enabled
+        if (!security.hvciEnabled) {
+            isSecure = false;
+            reasons += L"HVCI=OFF; ";
+        }
+
+        // 4. Test signing must be disabled
+        if (security.testSigningEnabled) {
+            isSecure = false;
+            reasons += L"TestSigning=ON; ";
+        }
+
+        // 5. Kernel debugging must be disabled
+        if (security.kernelDebuggingEnabled) {
+            isSecure = false;
+            reasons += L"KernelDebug=ON; ";
+        }
+
+        // 6. ELAM driver should be loaded
+        if (!security.elamDriverLoaded) {
+            // Not a hard failure, but concerning
+            SS_LOG_WARN(LOG_CATEGORY, L"Boot chain: No ELAM driver detected");
+        }
+
+        // 7. Check BCD tampering
+        if (!security.bcdTamperIndicators.empty()) {
+            isSecure = false;
+            reasons += L"BCD_TAMPER(" + std::to_wstring(security.bcdTamperIndicators.size()) + L"); ";
+        }
+
+        if (isSecure) {
+            SS_LOG_INFO(LOG_CATEGORY, L"Boot chain integrity: VERIFIED (SecureBoot+VBS+HVCI+ELAM)");
+        } else {
+            SS_LOG_WARN(LOG_CATEGORY, L"Boot chain integrity: COMPROMISED — %ls", reasons.c_str());
+        }
 
         return isSecure;
 
     } catch (const std::exception& e) {
         SS_LOG_ERROR(LOG_CATEGORY, L"Boot chain verification failed - %hs", e.what());
         return false;
+    }
+}
+
+// ============================================================================
+// BCD TAMPERING & KERNEL WIRING
+// ============================================================================
+
+std::vector<BCDTamperIndicator> BootTimeAnalyzer::DetectBCDTampering() const {
+    if (!m_impl->IsReady()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"DetectBCDTampering called before initialization");
+        return {};
+    }
+    return m_impl->DetectBCDTampering();
+}
+
+bool BootTimeAnalyzer::QueryKernelBootTelemetry() {
+    if (!m_impl->IsReady()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"QueryKernelBootTelemetry called before initialization");
+        return false;
+    }
+    return m_impl->QueryKernelBootTelemetryImpl();
+}
+
+void BootTimeAnalyzer::CrossReferenceDriverAnalyzer() const {
+    if (!m_impl->IsReady()) {
+        return;
+    }
+    m_impl->CrossReferenceWithDriverAnalyzer();
+}
+
+void BootTimeAnalyzer::RegisterBCDChangeCallback() {
+    if (!m_impl->IsReady()) {
+        SS_LOG_WARN(LOG_CATEGORY, L"RegisterBCDChangeCallback called before initialization");
+        return;
+    }
+
+    try {
+        // Wire into RegistryMonitor for real-time BCD store change alerts
+        auto& regMon = Registry::RegistryMonitor::Instance();
+        if (!regMon.IsRunning()) {
+            SS_LOG_WARN(LOG_CATEGORY, L"RegistryMonitor not running — BCD change monitoring deferred");
+            return;
+        }
+
+        // Register a policy callback that intercepts BCD-related registry writes.
+        // The RegistryMonitor kernel callback (CmRegisterCallback) will fire for any
+        // write to HKLM\BCD00000000 or HKLM\SYSTEM\...\Control\CI\Config.
+        regMon.SetPolicyCallback([](const Registry::RegistryEvent& event) -> Registry::RegistryVerdict {
+            // Only intercept SetValue operations on BCD-critical paths
+            if (event.operation != Registry::RegistryOp::SetValue &&
+                event.operation != Registry::RegistryOp::DeleteValue) {
+                return Registry::RegistryVerdict::Allow;
+            }
+
+            auto lowerPath = Utils::StringUtils::ToLowerCopy(event.keyPath);
+
+            // Detect BCD store writes
+            if (lowerPath.find(L"bcd00000000") != std::wstring::npos ||
+                lowerPath.find(L"control\\ci") != std::wstring::npos ||
+                lowerPath.find(L"control\\deviceguard") != std::wstring::npos ||
+                lowerPath.find(L"control\\earlylunch") != std::wstring::npos) {
+
+                SS_LOG_WARN(LOG_CATEGORY,
+                           L"BCD CHANGE ALERT: PID=%u writing to '%ls' value='%ls'",
+                           event.processId, event.keyPath.c_str(), event.valueName.c_str());
+
+                // Alert but don't block — let the existing policy engine decide
+                return Registry::RegistryVerdict::Alert;
+            }
+
+            return Registry::RegistryVerdict::Allow;
+        });
+
+        SS_LOG_INFO(LOG_CATEGORY, L"BCD change monitoring callback registered with RegistryMonitor");
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Failed to register BCD change callback - %hs", e.what());
     }
 }
 
@@ -2577,6 +3184,9 @@ std::vector<std::wstring> BootTimeAnalyzer::RunDiagnostics() const {
     diagnostics.push_back(L"Startup Items Scanned: " + std::to_wstring(m_impl->m_statistics.startupItemsScanned.load()));
     diagnostics.push_back(L"Suspicious Items Found: " + std::to_wstring(m_impl->m_statistics.suspiciousItemsFound.load()));
     diagnostics.push_back(L"Optimizations Suggested: " + std::to_wstring(m_impl->m_statistics.optimizationsSuggested.load()));
+    diagnostics.push_back(L"BCD Tamper Detections: " + std::to_wstring(m_impl->m_statistics.bcdTamperDetections.load()));
+    diagnostics.push_back(L"Kernel Queries: " + std::to_wstring(m_impl->m_statistics.kernelQueriesPerformed.load()));
+    diagnostics.push_back(L"Boot Drivers Analyzed: " + std::to_wstring(m_impl->m_statistics.bootDriversAnalyzed.load()));
 
     auto totalBootTime = m_impl->GetTotalBootTimeMs();
     diagnostics.push_back(L"Total Boot Time: " + std::to_wstring(totalBootTime.count()) + L"ms");
