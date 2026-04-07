@@ -1718,6 +1718,563 @@ RansomwareFamily RansomwareDecryptor::IdentifyFamilyEnum(std::wstring_view folde
 }
 
 // ============================================================================
+// FILE ANALYSIS & DIRECTORY SCANNING
+// ============================================================================
+
+EncryptedFileInfo RansomwareDecryptor::AnalyzeFile(std::wstring_view filePath) {
+    EncryptedFileInfo info;
+    info.filePath = std::wstring(filePath);
+
+    try {
+        fs::path p(filePath);
+        std::error_code ec;
+
+        if (!ValidateFilePath(p)) {
+            SS_LOG_WARN(LOG_CAT, L"AnalyzeFile: invalid path rejected: %ls",
+                        std::wstring(filePath).c_str());
+            return info;
+        }
+
+        if (!fs::exists(p, ec) || ec || !fs::is_regular_file(p, ec) || ec) {
+            return info;
+        }
+
+        info.fileSize = fs::file_size(p, ec);
+        if (ec || info.fileSize == 0) {
+            return info;
+        }
+
+        if (info.fileSize > DecryptorConstants::MAX_FILE_SIZE) {
+            SS_LOG_WARN(LOG_CAT, L"AnalyzeFile: file exceeds size limit: %ls (%llu bytes)",
+                        std::wstring(filePath).c_str(), info.fileSize);
+            return info;
+        }
+
+        info.encryptedExtension = p.extension().wstring();
+        info.family = IdentifyFamilyFromExtension(info.encryptedExtension);
+
+        // Read file header (first 64 bytes) for magic analysis
+        HANDLE hFile = ::CreateFileW(
+            p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+        if (hFile != INVALID_HANDLE_VALUE) {
+            constexpr DWORD kHeaderSize = 64;
+            info.header.resize(kHeaderSize, 0);
+            DWORD bytesRead = 0;
+            if (::ReadFile(hFile, info.header.data(), kHeaderSize, &bytesRead, nullptr)
+                && bytesRead > 0) {
+                info.header.resize(bytesRead);
+            } else {
+                info.header.clear();
+            }
+            ::CloseHandle(hFile);
+        }
+
+        // Attempt to recover original extension from compound paths
+        // (e.g., "report.docx.locky" → originalExtension = ".docx")
+        const std::wstring stem = p.stem().wstring();
+        if (const auto dotPos = stem.rfind(L'.'); dotPos != std::wstring::npos) {
+            info.originalExtension = stem.substr(dotPos);
+            info.originalName = stem.substr(0, dotPos) + info.originalExtension;
+        }
+
+        // Try to extract victim ID from path patterns
+        // e.g., "file.[victimID].dharma" or "[id-XXXXXX].phobos"
+        const std::wstring filename = p.filename().wstring();
+        if (const auto openBracket = filename.find(L'[');
+            openBracket != std::wstring::npos) {
+            if (const auto closeBracket = filename.find(L']', openBracket);
+                closeBracket != std::wstring::npos && closeBracket > openBracket + 1) {
+                std::wstring wid = filename.substr(openBracket + 1,
+                                                   closeBracket - openBracket - 1);
+                info.victimId.assign(wid.begin(), wid.end());
+            }
+        }
+
+        // Compute file hash (SHA-256)
+        std::vector<uint8_t> hashVec;
+        if (ComputeFileHash(filePath, hashVec) && hashVec.size() == info.fileHash.size()) {
+            std::copy_n(hashVec.begin(), info.fileHash.size(), info.fileHash.begin());
+        }
+
+        // Determine if decryption is possible
+        if (info.family != RansomwareFamily::Unknown) {
+            info.canDecrypt = IsDecryptionAvailable(info.family);
+            info.confidence = 0.8;
+
+            // Boost confidence if we have a victim ID and matching key
+            if (!info.victimId.empty()) {
+                auto keys = GetKeysForFamily(info.family);
+                for (const auto& key : keys) {
+                    if (key.IsValidFor(info)) {
+                        info.confidence = 0.95;
+                        break;
+                    }
+                }
+            }
+        }
+
+        // Heuristic algorithm identification from known family defaults
+        if (info.algorithm == EncryptionAlgorithm::Unknown) {
+            switch (info.family) {
+                case RansomwareFamily::WannaCry:
+                    info.algorithm = EncryptionAlgorithm::AES128CBC;
+                    break;
+                case RansomwareFamily::TeslaCrypt:
+                case RansomwareFamily::TeslaCryptV2:
+                case RansomwareFamily::TeslaCryptV3:
+                case RansomwareFamily::TeslaCryptV4:
+                    info.algorithm = EncryptionAlgorithm::AES256CBC;
+                    break;
+                case RansomwareFamily::GandCrabV4:
+                case RansomwareFamily::GandCrabV5:
+                    info.algorithm = EncryptionAlgorithm::Salsa20;
+                    break;
+                case RansomwareFamily::Conti:
+                case RansomwareFamily::LockBit:
+                    info.algorithm = EncryptionAlgorithm::ChaCha20;
+                    break;
+                case RansomwareFamily::Ryuk:
+                case RansomwareFamily::REvil:
+                    info.algorithm = EncryptionAlgorithm::AES256CTR;
+                    break;
+                default:
+                    break;
+            }
+        }
+
+        m_impl->m_stats.filesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+        if (info.family != RansomwareFamily::Unknown) {
+            const auto idx = static_cast<size_t>(info.family);
+            if (idx < m_impl->m_stats.familiesIdentified.size()) {
+                m_impl->m_stats.familiesIdentified[idx].fetch_add(
+                    1, std::memory_order_relaxed);
+            }
+        }
+
+        SS_LOG_DEBUG(LOG_CAT, L"Analyzed %ls: family=%hs algo=%hs canDecrypt=%hs",
+                     std::wstring(filePath).c_str(),
+                     std::string(GetFamilyName(info.family)).c_str(),
+                     std::string(GetAlgorithmName(info.algorithm)).c_str(),
+                     info.canDecrypt ? "yes" : "no");
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"AnalyzeFile exception for %ls: %hs",
+                     std::wstring(filePath).c_str(), ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CAT, L"AnalyzeFile unknown exception for %ls",
+                     std::wstring(filePath).c_str());
+    }
+    return info;
+}
+
+std::vector<EncryptedFileInfo> RansomwareDecryptor::ScanDirectory(
+    std::wstring_view dirPath, bool recursive) {
+    std::vector<EncryptedFileInfo> results;
+
+    try {
+        fs::path root(dirPath);
+        std::error_code ec;
+
+        if (!ValidateFilePath(root)) {
+            SS_LOG_WARN(LOG_CAT, L"ScanDirectory: invalid path rejected: %ls",
+                        std::wstring(dirPath).c_str());
+            return results;
+        }
+
+        if (!fs::exists(root, ec) || ec || !fs::is_directory(root, ec) || ec) {
+            SS_LOG_WARN(LOG_CAT, L"ScanDirectory: not a directory: %ls",
+                        std::wstring(dirPath).c_str());
+            return results;
+        }
+
+        results.reserve(256);
+        const auto options = fs::directory_options::skip_permission_denied;
+
+        auto processEntry = [&](const fs::directory_entry& entry) {
+            if (results.size() >= MAX_SCAN_FILES) return;
+            if (ec) { ec.clear(); return; }
+            if (!entry.is_regular_file(ec) || ec) return;
+
+            const std::wstring ext = NormalizeExtension(
+                entry.path().extension().wstring());
+            if (EXTENSION_MAP.count(ext)) {
+                EncryptedFileInfo info = AnalyzeFile(
+                    entry.path().wstring());
+                if (info.family != RansomwareFamily::Unknown) {
+                    results.push_back(std::move(info));
+                }
+            }
+        };
+
+        if (recursive) {
+            for (auto it = fs::recursive_directory_iterator(root, options, ec);
+                 it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                if (results.size() >= MAX_SCAN_FILES) break;
+                if (ec) { ec.clear(); continue; }
+                if (it.depth() > static_cast<int>(MAX_DIRECTORY_DEPTH)) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                processEntry(*it);
+            }
+        } else {
+            for (auto it = fs::directory_iterator(root, options, ec);
+                 it != fs::directory_iterator(); it.increment(ec)) {
+                if (results.size() >= MAX_SCAN_FILES) break;
+                if (ec) { ec.clear(); continue; }
+                processEntry(*it);
+            }
+        }
+
+        SS_LOG_INFO(LOG_CAT, L"ScanDirectory: found %zu encrypted files in %ls",
+                    results.size(), std::wstring(dirPath).c_str());
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"ScanDirectory exception for %ls: %hs",
+                     std::wstring(dirPath).c_str(), ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CAT, L"ScanDirectory unknown exception for %ls",
+                     std::wstring(dirPath).c_str());
+    }
+    return results;
+}
+
+// ============================================================================
+// RANSOM NOTE ANALYSIS
+// ============================================================================
+
+std::vector<RansomNoteInfo> RansomwareDecryptor::FindRansomNotes(
+    std::wstring_view dirPath, bool recursive) {
+    std::vector<RansomNoteInfo> results;
+
+    try {
+        fs::path root(dirPath);
+        std::error_code ec;
+
+        if (!ValidateFilePath(root) || !fs::exists(root, ec) || ec ||
+            !fs::is_directory(root, ec) || ec) {
+            return results;
+        }
+
+        // Build a set of known ransom note filenames (case-insensitive)
+        std::unordered_set<std::wstring> noteNames;
+        for (const auto& name : RANSOM_NOTE_FILENAMES) {
+            std::wstring lower = name;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+            noteNames.insert(std::move(lower));
+        }
+
+        // Common ransom note substrings for heuristic matching
+        static constexpr const wchar_t* kNoteKeywords[] = {
+            L"decrypt", L"ransom", L"readme", L"restore",
+            L"help_decrypt", L"how_to", L"recovery", L"!readme"
+        };
+
+        constexpr size_t kMaxNotes = 10000;
+        const auto options = fs::directory_options::skip_permission_denied;
+
+        auto processEntry = [&](const fs::directory_entry& entry) {
+            if (results.size() >= kMaxNotes) return;
+            if (!entry.is_regular_file(ec) || ec) return;
+
+            const std::wstring filename = entry.path().filename().wstring();
+            std::wstring lowerName = filename;
+            std::transform(lowerName.begin(), lowerName.end(),
+                           lowerName.begin(), ::towlower);
+
+            bool isNote = noteNames.count(lowerName) > 0;
+
+            // Heuristic: .txt or .html with ransom-like keywords
+            if (!isNote) {
+                const std::wstring ext = NormalizeExtension(
+                    entry.path().extension().wstring());
+                if (ext == L".txt" || ext == L".html" || ext == L".htm" ||
+                    ext == L".hta") {
+                    for (const auto* kw : kNoteKeywords) {
+                        if (lowerName.find(kw) != std::wstring::npos) {
+                            isNote = true;
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if (isNote) {
+                // Cap note file size to prevent abuse (max 1 MB)
+                const auto noteSize = entry.file_size(ec);
+                if (ec || noteSize > 1024 * 1024) return;
+
+                RansomNoteInfo note = ParseRansomNote(entry.path().wstring());
+                if (!note.filePath.empty()) {
+                    results.push_back(std::move(note));
+                }
+            }
+        };
+
+        if (recursive) {
+            for (auto it = fs::recursive_directory_iterator(root, options, ec);
+                 it != fs::recursive_directory_iterator(); it.increment(ec)) {
+                if (results.size() >= kMaxNotes) break;
+                if (ec) { ec.clear(); continue; }
+                if (it.depth() > static_cast<int>(MAX_DIRECTORY_DEPTH)) {
+                    it.disable_recursion_pending();
+                    continue;
+                }
+                processEntry(*it);
+            }
+        } else {
+            for (auto it = fs::directory_iterator(root, options, ec);
+                 it != fs::directory_iterator(); it.increment(ec)) {
+                if (results.size() >= kMaxNotes) break;
+                if (ec) { ec.clear(); continue; }
+                processEntry(*it);
+            }
+        }
+
+        SS_LOG_INFO(LOG_CAT, L"FindRansomNotes: found %zu notes in %ls",
+                    results.size(), std::wstring(dirPath).c_str());
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"FindRansomNotes exception for %ls: %hs",
+                     std::wstring(dirPath).c_str(), ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CAT, L"FindRansomNotes unknown exception for %ls",
+                     std::wstring(dirPath).c_str());
+    }
+    return results;
+}
+
+RansomNoteInfo RansomwareDecryptor::ParseRansomNote(std::wstring_view filePath) {
+    RansomNoteInfo info;
+
+    try {
+        fs::path p(filePath);
+        std::error_code ec;
+
+        if (!ValidateFilePath(p) || !fs::exists(p, ec) || ec ||
+            !fs::is_regular_file(p, ec) || ec) {
+            return info;
+        }
+
+        const auto noteSize = fs::file_size(p, ec);
+        if (ec || noteSize == 0 || noteSize > 1024 * 1024) {
+            return info;
+        }
+
+        info.filePath = std::wstring(filePath);
+
+        // Read note contents via Win32 for reliable encoding handling
+        HANDLE hFile = ::CreateFileW(
+            p.c_str(), GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE,
+            nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+        if (hFile == INVALID_HANDLE_VALUE) {
+            return info;
+        }
+
+        std::vector<char> rawBuf(static_cast<size_t>(noteSize) + 1, '\0');
+        DWORD bytesRead = 0;
+        const BOOL readOk = ::ReadFile(hFile, rawBuf.data(),
+            static_cast<DWORD>(noteSize), &bytesRead, nullptr);
+        ::CloseHandle(hFile);
+
+        if (!readOk || bytesRead == 0) {
+            return info;
+        }
+
+        rawBuf.resize(bytesRead);
+        std::string noteContent(rawBuf.begin(), rawBuf.end());
+
+        // Store widestring version for the noteText field
+        info.noteText.assign(noteContent.begin(), noteContent.end());
+
+        // Identify family from note filename first
+        const std::wstring filename = p.filename().wstring();
+        if (filename.find(L"Wana") != std::wstring::npos ||
+            filename.find(L"wana") != std::wstring::npos) {
+            info.family = RansomwareFamily::WannaCry;
+        } else if (filename.find(L"Locky") != std::wstring::npos) {
+            info.family = RansomwareFamily::Locky;
+        } else if (filename.find(L"Ryuk") != std::wstring::npos) {
+            info.family = RansomwareFamily::Ryuk;
+        }
+
+        // Extract Bitcoin addresses (legacy P2PKH: 1xxx, P2SH: 3xxx, Bech32: bc1)
+        // Simple pattern extraction — not full regex to avoid std::regex overhead
+        for (size_t i = 0; i < noteContent.size(); ++i) {
+            const char ch = noteContent[i];
+
+            // Legacy BTC addresses: start with '1' or '3', 26-35 chars
+            if ((ch == '1' || ch == '3') && i + 25 < noteContent.size()) {
+                size_t end = i + 1;
+                while (end < noteContent.size() && end - i <= 35) {
+                    const char c = noteContent[end];
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z')) {
+                        ++end;
+                    } else {
+                        break;
+                    }
+                }
+                const size_t len = end - i;
+                if (len >= 26 && len <= 35 && info.bitcoinAddress.empty()) {
+                    info.bitcoinAddress = noteContent.substr(i, len);
+                    i = end - 1;
+                }
+            }
+
+            // Bech32 BTC addresses: start with "bc1"
+            if (ch == 'b' && i + 2 < noteContent.size() &&
+                noteContent[i + 1] == 'c' && noteContent[i + 2] == '1') {
+                size_t end = i + 3;
+                while (end < noteContent.size() && end - i <= 62) {
+                    const char c = noteContent[end];
+                    if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') ||
+                        (c >= 'A' && c <= 'Z')) {
+                        ++end;
+                    } else {
+                        break;
+                    }
+                }
+                const size_t len = end - i;
+                if (len >= 42 && len <= 62 && info.bitcoinAddress.empty()) {
+                    info.bitcoinAddress = noteContent.substr(i, len);
+                    i = end - 1;
+                }
+            }
+        }
+
+        // Extract .onion URLs
+        if (const auto onionPos = noteContent.find(".onion");
+            onionPos != std::string::npos) {
+            // Walk backwards to find URL start
+            size_t urlStart = onionPos;
+            while (urlStart > 0 && noteContent[urlStart - 1] != ' ' &&
+                   noteContent[urlStart - 1] != '\n' &&
+                   noteContent[urlStart - 1] != '\r' &&
+                   noteContent[urlStart - 1] != '\t' &&
+                   noteContent[urlStart - 1] != '<' &&
+                   noteContent[urlStart - 1] != '"') {
+                --urlStart;
+            }
+            // Walk forward to find URL end
+            size_t urlEnd = onionPos + 6; // past ".onion"
+            while (urlEnd < noteContent.size() &&
+                   noteContent[urlEnd] != ' ' && noteContent[urlEnd] != '\n' &&
+                   noteContent[urlEnd] != '\r' && noteContent[urlEnd] != '"' &&
+                   noteContent[urlEnd] != '>') {
+                ++urlEnd;
+            }
+            if (urlEnd > urlStart && urlEnd - urlStart < 512) {
+                info.torUrl = noteContent.substr(urlStart, urlEnd - urlStart);
+            }
+        }
+
+        // Extract email addresses (look for x@y.z patterns)
+        for (size_t i = 1; i < noteContent.size(); ++i) {
+            if (noteContent[i] != '@') continue;
+
+            // Walk backwards for local part
+            size_t localStart = i;
+            while (localStart > 0) {
+                const char c = noteContent[localStart - 1];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '_' ||
+                    c == '-' || c == '+') {
+                    --localStart;
+                } else {
+                    break;
+                }
+            }
+            // Walk forward for domain
+            size_t domainEnd = i + 1;
+            bool hasDot = false;
+            while (domainEnd < noteContent.size()) {
+                const char c = noteContent[domainEnd];
+                if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                    (c >= '0' && c <= '9') || c == '.' || c == '-') {
+                    if (c == '.') hasDot = true;
+                    ++domainEnd;
+                } else {
+                    break;
+                }
+            }
+
+            if (hasDot && i - localStart >= 1 && domainEnd - i >= 4 &&
+                domainEnd - localStart < 256 && info.contactEmail.empty()) {
+                info.contactEmail = noteContent.substr(
+                    localStart, domainEnd - localStart);
+                break;
+            }
+        }
+
+        // Content-based family identification if not yet determined
+        if (info.family == RansomwareFamily::Unknown) {
+            const std::string lower = [&] {
+                std::string s = noteContent;
+                std::transform(s.begin(), s.end(), s.begin(),
+                    [](unsigned char c) { return static_cast<char>(::tolower(c)); });
+                return s;
+            }();
+
+            if (lower.find("wannacry") != std::string::npos ||
+                lower.find("wanacrypt") != std::string::npos) {
+                info.family = RansomwareFamily::WannaCry;
+            } else if (lower.find("gandcrab") != std::string::npos) {
+                info.family = RansomwareFamily::GandCrabV4;
+            } else if (lower.find("lockbit") != std::string::npos) {
+                info.family = RansomwareFamily::LockBit;
+            } else if (lower.find("conti") != std::string::npos) {
+                info.family = RansomwareFamily::Conti;
+            } else if (lower.find("revil") != std::string::npos ||
+                       lower.find("sodinokibi") != std::string::npos) {
+                info.family = RansomwareFamily::REvil;
+            } else if (lower.find("ryuk") != std::string::npos) {
+                info.family = RansomwareFamily::Ryuk;
+            } else if (lower.find("maze") != std::string::npos) {
+                info.family = RansomwareFamily::Maze;
+            } else if (lower.find("blackcat") != std::string::npos ||
+                       lower.find("alphv") != std::string::npos) {
+                info.family = RansomwareFamily::BlackCat;
+            } else if (lower.find("hive") != std::string::npos) {
+                info.family = RansomwareFamily::Hive;
+            } else if (lower.find("dharma") != std::string::npos) {
+                info.family = RansomwareFamily::Dharma;
+            } else if (lower.find("phobos") != std::string::npos) {
+                info.family = RansomwareFamily::Phobos;
+            } else if (lower.find("stop") != std::string::npos &&
+                       lower.find("djvu") != std::string::npos) {
+                info.family = RansomwareFamily::STOP;
+            } else if (lower.find("cerber") != std::string::npos) {
+                info.family = RansomwareFamily::Cerber;
+            } else if (lower.find("teslacrypt") != std::string::npos) {
+                info.family = RansomwareFamily::TeslaCrypt;
+            } else if (lower.find("jigsaw") != std::string::npos) {
+                info.family = RansomwareFamily::Jigsaw;
+            }
+        }
+
+        SS_LOG_DEBUG(LOG_CAT, L"ParseRansomNote: %ls family=%hs btc=%hs tor=%hs email=%hs",
+                     std::wstring(filePath).c_str(),
+                     std::string(GetFamilyName(info.family)).c_str(),
+                     info.bitcoinAddress.empty() ? "(none)" : info.bitcoinAddress.c_str(),
+                     info.torUrl.empty() ? "(none)" : info.torUrl.c_str(),
+                     info.contactEmail.empty() ? "(none)" : info.contactEmail.c_str());
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(LOG_CAT, L"ParseRansomNote exception for %ls: %hs",
+                     std::wstring(filePath).c_str(), ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(LOG_CAT, L"ParseRansomNote unknown exception for %ls",
+                     std::wstring(filePath).c_str());
+    }
+    return info;
+}
+
+// ============================================================================
 // KEY MANAGEMENT
 // ============================================================================
 
@@ -2048,6 +2605,35 @@ std::string RansomwareDecryptor::GetVersionString() noexcept {
     return std::string(buf);
 }
 
+std::vector<RansomwareFamily> RansomwareDecryptor::GetSupportedFamilies() const {
+    // Collect all families that we can identify (from extension map)
+    // plus all families with loaded decryption keys
+    std::unordered_set<RansomwareFamily> familySet;
+
+    // All families from the extension map (identifiable)
+    for (const auto& [ext, fam] : EXTENSION_MAP) {
+        familySet.insert(fam);
+    }
+
+    // All families with loaded keys (decryptable)
+    {
+        std::shared_lock lock(m_impl->m_keyMutex);
+        for (const auto& [fam, keyIds] : m_impl->m_familyKeys) {
+            if (!keyIds.empty()) {
+                familySet.insert(fam);
+            }
+        }
+    }
+
+    // Convert to sorted vector for deterministic output
+    std::vector<RansomwareFamily> result(familySet.begin(), familySet.end());
+    std::sort(result.begin(), result.end(),
+              [](RansomwareFamily a, RansomwareFamily b) {
+                  return static_cast<uint16_t>(a) < static_cast<uint16_t>(b);
+              });
+    return result;
+}
+
 // ============================================================================
 // STRUCT IMPLEMENTATIONS
 // ============================================================================
@@ -2144,6 +2730,19 @@ std::string EncryptedFileInfo::ToJson() const {
     j["algorithm"] = static_cast<int>(algorithm);
     j["canDecrypt"] = canDecrypt;
     j["confidence"] = confidence;
+    return j.dump();
+}
+
+std::string RansomNoteInfo::ToJson() const {
+    nlohmann::json j;
+    j["filePath"] = std::string(filePath.begin(), filePath.end());
+    j["family"] = static_cast<int>(family);
+    j["familyName"] = std::string(RansomwareDecryptor::GetFamilyName(family));
+    if (!bitcoinAddress.empty()) j["bitcoinAddress"] = bitcoinAddress;
+    if (!contactEmail.empty())   j["contactEmail"]   = contactEmail;
+    if (!torUrl.empty())         j["torUrl"]          = torUrl;
+    if (!victimId.empty())       j["victimId"]        = victimId;
+    if (!ransomAmount.empty())   j["ransomAmount"]    = ransomAmount;
     return j.dump();
 }
 
