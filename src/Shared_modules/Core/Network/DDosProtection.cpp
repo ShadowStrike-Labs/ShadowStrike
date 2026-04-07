@@ -387,8 +387,8 @@ public:
     // CONSTRUCTOR / DESTRUCTOR
     // ========================================================================
 
-    Impl() = default;
-    ~Impl() = default;
+    DDosProtectionImpl() = default;
+    ~DDosProtectionImpl() = default;
 
     // ========================================================================
     // INITIALIZATION
@@ -409,7 +409,18 @@ public:
             m_config = config;
 
             // Create thread pool
-            m_threadPool = std::make_shared<ThreadPool>(4);
+            constexpr size_t kThreadPoolConcurrency = 4;
+            ThreadPoolConfig threadPoolConfig;
+            threadPoolConfig.minThreads = std::max(
+                ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+                kThreadPoolConcurrency
+            );
+            threadPoolConfig.maxThreads = std::max(
+                threadPoolConfig.minThreads,
+                kThreadPoolConcurrency
+            );
+            threadPoolConfig.threadNamePrefix = L"ShadowStrike-DDos";
+            m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
 
             // Initialize whitelists from config
             for (const auto& ip : m_config.whitelistedIPs) {

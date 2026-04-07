@@ -210,6 +210,11 @@
 #include <condition_variable>
 #include <span>
 
+// Undefine Windows macros that clash with enum values exposed by this API.
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace ShadowStrike {
 namespace RealTime {
 
@@ -331,23 +336,23 @@ enum class ScanPriority : uint8_t {
  * @brief Type of kernel event.
  */
 enum class EventType : uint8_t {
-    FILE_CREATE = 0,         ///< File creation
-    FILE_OPEN = 1,           ///< File open
-    FILE_WRITE = 2,          ///< File write/modify
-    FILE_RENAME = 3,         ///< File rename
-    FILE_DELETE = 4,         ///< File deletion
-    FILE_EXECUTE = 5,        ///< File execution
-    PROCESS_CREATE = 6,      ///< Process creation
-    PROCESS_TERMINATE = 7,   ///< Process termination
-    THREAD_CREATE = 8,       ///< Thread creation
-    IMAGE_LOAD = 9,          ///< DLL/module load
-    REGISTRY_CREATE_KEY = 10, ///< Registry key creation
-    REGISTRY_SET_VALUE = 11, ///< Registry value modification
-    REGISTRY_DELETE = 12,    ///< Registry deletion
-    NETWORK_CONNECT = 13,    ///< Network connection
-    NETWORK_LISTEN = 14,     ///< Network listen
-    MEMORY_ALLOCATE = 15,    ///< Memory allocation (RWX)
-    MEMORY_PROTECT = 16      ///< Memory protection change
+    FileCreate = 0,          ///< File creation
+    FileOpen = 1,            ///< File open
+    FileWrite = 2,           ///< File write/modify
+    FileRename = 3,          ///< File rename
+    FileDelete = 4,          ///< File deletion
+    FileExecute = 5,         ///< File execution
+    ProcessCreate = 6,       ///< Process creation
+    ProcessTerminate = 7,    ///< Process termination
+    ThreadCreate = 8,        ///< Thread creation
+    ImageLoad = 9,           ///< DLL/module load
+    RegistryCreateKey = 10,  ///< Registry key creation
+    RegistrySetValue = 11,   ///< Registry value modification
+    RegistryDelete = 12,     ///< Registry deletion
+    NetworkConnect = 13,     ///< Network connection
+    NetworkListen = 14,      ///< Network listen
+    MemoryAllocate = 15,     ///< Memory allocation (RWX)
+    MemoryProtect = 16       ///< Memory protection change
 };
 
 /**
@@ -382,10 +387,10 @@ enum class ComponentType : uint8_t {
 };
 
 /**
- * @enum ComponentState
- * @brief State of a protection component.
+ * @enum ProtectionComponentState
+ * @brief Orchestrator-owned state of a RealTimeProtection managed component.
  */
-enum class ComponentState : uint8_t {
+enum class ProtectionComponentState : uint8_t {
     UNINITIALIZED = 0,
     INITIALIZING = 1,
     RUNNING = 2,
@@ -523,10 +528,10 @@ struct alignas(64) RTPConfig {
 };
 
 /**
- * @struct FileScanRequest
+ * @struct RTPFileScanRequest
  * @brief Request to scan a file from kernel.
  */
-struct alignas(64) FileScanRequest {
+struct alignas(64) RTPFileScanRequest {
     // File information
     std::wstring filePath;
     std::wstring dosPath;                    ///< DOS device path from kernel
@@ -538,7 +543,7 @@ struct alignas(64) FileScanRequest {
     bool hashValid{ false };
 
     // Operation context
-    EventType eventType{ EventType::FILE_OPEN };
+    EventType eventType{ EventType::FileOpen };
     uint32_t desiredAccess{ 0 };
     uint32_t createDisposition{ 0 };
     uint32_t createOptions{ 0 };
@@ -563,10 +568,10 @@ struct alignas(64) FileScanRequest {
 };
 
 /**
- * @struct ProcessNotifyRequest
+ * @struct RTPProcessNotifyRequest
  * @brief Process creation/termination notification from kernel.
  */
-struct alignas(64) ProcessNotifyRequest {
+struct alignas(64) RTPProcessNotifyRequest {
     // Process information
     uint32_t pid{ 0 };
     uint32_t parentPid{ 0 };
@@ -636,7 +641,7 @@ struct alignas(64) ImageLoadRequest {
  */
 struct alignas(64) RegistryNotifyRequest {
     // Operation
-    EventType eventType{ EventType::REGISTRY_SET_VALUE };
+    EventType eventType{ EventType::RegistrySetValue };
 
     // Key information
     std::wstring keyPath;
@@ -666,7 +671,7 @@ struct alignas(64) RegistryNotifyRequest {
  */
 struct alignas(64) NetworkNotifyRequest {
     // Operation
-    EventType eventType{ EventType::NETWORK_CONNECT };
+    EventType eventType{ EventType::NetworkConnect };
 
     // Connection information
     std::wstring localAddress;
@@ -738,7 +743,7 @@ struct alignas(64) ScanResult {
  */
 struct alignas(8) ComponentStatus {
     ComponentType type{ ComponentType::COMPONENT_COUNT };
-    ComponentState state{ ComponentState::UNINITIALIZED };
+    ProtectionComponentState state{ ProtectionComponentState::UNINITIALIZED };
     uint32_t errorCode{ 0 };
     std::wstring errorMessage;
     std::chrono::system_clock::time_point lastStateChange;
@@ -920,8 +925,8 @@ struct alignas(64) RTPStatistics {
  * @param result The scan result (can be modified)
  * @return True to use modified result, false to use original
  */
-using FileScanCallback = std::function<bool(
-    const FileScanRequest& request,
+using RTPFileScanCallback = std::function<bool(
+    const RTPFileScanRequest& request,
     ScanResult& result
 )>;
 
@@ -930,8 +935,8 @@ using FileScanCallback = std::function<bool(
  * @param request The process notification
  * @param shouldBlock Set to true to block process creation
  */
-using ProcessCreateCallback = std::function<void(
-    const ProcessNotifyRequest& request,
+using RTPProcessCreateCallback = std::function<void(
+    const RTPProcessNotifyRequest& request,
     bool& shouldBlock
 )>;
 
@@ -963,8 +968,8 @@ using StateChangeCallback = std::function<void(
  */
 using ComponentStatusCallback = std::function<void(
     ComponentType component,
-    ComponentState previousState,
-    ComponentState newState
+    ProtectionComponentState previousState,
+    ProtectionComponentState newState
 )>;
 
 /**
@@ -1313,14 +1318,14 @@ public:
      * @param callback The callback function.
      * @return Callback ID for unregistration.
      */
-    [[nodiscard]] uint64_t RegisterFileScanCallback(FileScanCallback callback);
+    [[nodiscard]] uint64_t RegisterFileScanCallback(RTPFileScanCallback callback);
 
     /**
      * @brief Registers a callback for process creation events.
      * @param callback The callback function.
      * @return Callback ID for unregistration.
      */
-    [[nodiscard]] uint64_t RegisterProcessCreateCallback(ProcessCreateCallback callback);
+    [[nodiscard]] uint64_t RegisterProcessCreateCallback(RTPProcessCreateCallback callback);
 
     /**
      * @brief Registers a callback for threat detection events.

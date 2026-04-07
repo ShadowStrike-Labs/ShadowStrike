@@ -140,14 +140,14 @@ public:
     std::unique_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::unique_ptr<Whitelist::WhitelistStore> m_whitelistStore;
     std::unique_ptr<ThreatIntel::ThreatIntelDatabase> m_threatIntelDB;
-    std::unique_ptr<HeuristicAnalyzer> m_heuristicAnalyzer;
+    HeuristicAnalyzer* m_heuristicAnalyzer{ nullptr };
     std::unique_ptr<BehaviorAnalyzer> m_behaviorAnalyzer;
-    std::unique_ptr<MachineLearningDetector> m_mlDetector;
-    std::unique_ptr<PackerUnpacker> m_packerUnpacker;
-    std::unique_ptr<PolymorphicDetector> m_polymorphicDetector;
-    std::unique_ptr<SandboxAnalyzer> m_sandboxAnalyzer;
-    std::unique_ptr<EmulationEngine> m_emulationEngine;
-    std::unique_ptr<ZeroDayDetector> m_zeroDayDetector;
+    MachineLearningDetector* m_mlDetector{ nullptr };
+    PackerUnpacker* m_packerUnpacker{ nullptr };
+    PolymorphicDetector* m_polymorphicDetector{ nullptr };
+    SandboxAnalyzer* m_sandboxAnalyzer{ nullptr };
+    EmulationEngine* m_emulationEngine{ nullptr };
+    ZeroDayDetector* m_zeroDayDetector{ nullptr };
 
     // Result cache with LRU eviction
     struct CachedResult {
@@ -283,13 +283,21 @@ public:
             // Store configuration
             m_config = config;
 
-            // Initialize thread pool
-            uint32_t threadCount = config.scanThreads > 0
-                ? config.scanThreads
-                : std::thread::hardware_concurrency();
+            // Initialize thread pool with a bounded, explicit configuration.
+            const size_t desiredThreadCount = std::max<size_t>(
+                ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+                config.scanThreads > 0
+                    ? static_cast<size_t>(config.scanThreads)
+                    : static_cast<size_t>(std::max(1u, std::thread::hardware_concurrency()))
+            );
 
-            m_threadPool = std::make_shared<ThreadPool>(threadCount);
-            SS_LOG_INFO(L"ScanEngine", L"Thread pool initialized with %u threads", threadCount);
+            ThreadPoolConfig threadPoolConfig;
+            threadPoolConfig.minThreads = desiredThreadCount;
+            threadPoolConfig.maxThreads = desiredThreadCount;
+            threadPoolConfig.threadNamePrefix = L"ShadowStrike-Scan";
+
+            m_threadPool = std::make_shared<ThreadPool>(threadPoolConfig);
+            SS_LOG_INFO(L"ScanEngine", L"Thread pool initialized with %zu threads", desiredThreadCount);
 
             // Initialize SignatureStore (YARA + Patterns + Hashes)
             if (!m_config.signatureDbPath.empty()) {
@@ -350,7 +358,7 @@ public:
             if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing HeuristicAnalyzer");
 
-                m_heuristicAnalyzer = std::make_unique<HeuristicAnalyzer>();
+                m_heuristicAnalyzer = &HeuristicAnalyzer::Instance();
 
                 HeuristicAnalyzerConfig hConfig = HeuristicAnalyzerConfig::CreateDefault();
                 hConfig.enablePEAnalysis = true;
@@ -391,7 +399,7 @@ public:
             // Initialize PackerUnpacker
             if (m_config.enableCompressedScanning) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing PackerUnpacker");
-                m_packerUnpacker = std::make_unique<PackerUnpacker>();
+                m_packerUnpacker = &PackerUnpacker::Instance();
                 
                 if (!m_packerUnpacker->Initialize()) {
                     SS_LOG_ERROR(L"ScanEngine", L"PackerUnpacker initialization failed");
@@ -404,7 +412,7 @@ public:
             // Initialize PolymorphicDetector
             if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing PolymorphicDetector");
-                m_polymorphicDetector = std::make_unique<PolymorphicDetector>();
+                m_polymorphicDetector = &PolymorphicDetector::Instance();
                 
                 PolymorphicConfiguration polyConfig{};
                 polyConfig.enabled = true;
@@ -420,7 +428,7 @@ public:
             // Initialize SandboxAnalyzer  
             if (m_config.enableBehaviorAnalysis) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing SandboxAnalyzer");
-                m_sandboxAnalyzer = std::make_unique<SandboxAnalyzer>();
+                m_sandboxAnalyzer = &SandboxAnalyzer::Instance();
                 
                 SandboxAnalyzerConfiguration sbConfig{};
                 sbConfig.enabled = true;
@@ -436,7 +444,7 @@ public:
             // Initialize EmulationEngine
             if (m_config.enableMemoryScanning) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing EmulationEngine");
-                m_emulationEngine = std::make_unique<EmulationEngine>();
+                m_emulationEngine = &EmulationEngine::Instance();
                 
                 if (!m_emulationEngine->Initialize(m_threadPool)) {
                     SS_LOG_ERROR(L"ScanEngine", L"EmulationEngine initialization failed");
@@ -449,7 +457,7 @@ public:
             // Initialize ZeroDayDetector
             if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing ZeroDayDetector");
-                m_zeroDayDetector = std::make_unique<ZeroDayDetector>();
+                m_zeroDayDetector = &ZeroDayDetector::Instance();
                 
                 ZeroDayConfiguration zdConfig{};
                 zdConfig.enabled = true;
@@ -515,12 +523,13 @@ public:
 
         // Shutdown subsystems in reverse order
         if (m_packerUnpacker) {
-            m_packerUnpacker.reset();
+            m_packerUnpacker->Shutdown();
+            m_packerUnpacker = nullptr;
         }
 
         if (m_mlDetector) {
             m_mlDetector->Shutdown();
-            m_mlDetector.reset();
+            m_mlDetector = nullptr;
         }
 
         if (m_behaviorAnalyzer) {
@@ -530,7 +539,27 @@ public:
 
         if (m_heuristicAnalyzer) {
             m_heuristicAnalyzer->Shutdown();
-            m_heuristicAnalyzer.reset();
+            m_heuristicAnalyzer = nullptr;
+        }
+
+        if (m_zeroDayDetector) {
+            m_zeroDayDetector->Shutdown();
+            m_zeroDayDetector = nullptr;
+        }
+
+        if (m_emulationEngine) {
+            m_emulationEngine->Shutdown();
+            m_emulationEngine = nullptr;
+        }
+
+        if (m_sandboxAnalyzer) {
+            m_sandboxAnalyzer->Shutdown();
+            m_sandboxAnalyzer = nullptr;
+        }
+
+        if (m_polymorphicDetector) {
+            m_polymorphicDetector->Shutdown();
+            m_polymorphicDetector = nullptr;
         }
 
         // Shutdown ExecutableAnalyzer singleton
@@ -1204,12 +1233,20 @@ EngineResult ScanEngine::ScanFile(
                         if (docResult.verdict == FileSystem::ScanVerdict::HighlyMalicious ||
                             docResult.verdict == FileSystem::ScanVerdict::Malicious) {
 
+                            const double aiConfidence =
+                                static_cast<double>(docResult.aiMaliciousConfidence.value_or(0.0f));
+
                             result.verdict = ScanVerdict::Infected;
-                            result.threatName = docResult.detectedThreat.empty() ?
-                                "Doc.Malware.Generic" : docResult.detectedThreat;
+                            if (!docResult.threats.empty() && !docResult.threats.front().description.empty()) {        
+                                result.threatName = docResult.threats.front().description;
+                            } else if (!docResult.aiClassification.empty()) {
+                                result.threatName = docResult.aiClassification;
+                            } else {
+                                result.threatName = "Doc.Malware.Generic";
+                            }
                             result.detectionSource = "DocumentScanner";
                             result.sha256 = fileHash;
-                            result.confidence = docResult.aiMaliciousConfidence;
+                            result.confidence = static_cast<float>(aiConfidence);
 
                             for (const auto& threat : docResult.threats) {
                                 if (!threat.mitreId.empty()) {
@@ -1223,7 +1260,7 @@ EngineResult ScanEngine::ScanFile(
                             SS_LOG_WARN(L"ScanEngine",
                                 L"Document malware detected: %ls (risk=%u, AI=%.2f)",
                                 StringUtils::ToWide(result.threatName).c_str(),
-                                docResult.riskScore, docResult.aiMaliciousConfidence);
+                                docResult.riskScore, aiConfidence);
 
                             m_impl->InvokeDetectionCallbacks(result);
                             goto finalize_scan;
@@ -1232,8 +1269,13 @@ EngineResult ScanEngine::ScanFile(
 
                             if (result.verdict != ScanVerdict::Infected) {
                                 result.verdict = ScanVerdict::Suspicious;
-                                result.threatName = docResult.detectedThreat.empty() ?
-                                    "Doc.Suspicious.Generic" : docResult.detectedThreat;
+                                if (!docResult.threats.empty() && !docResult.threats.front().description.empty()) {
+                                    result.threatName = docResult.threats.front().description;
+                                } else if (!docResult.aiClassification.empty()) {
+                                    result.threatName = docResult.aiClassification;
+                                } else {
+                                    result.threatName = "Doc.Suspicious.Generic";
+                                }
                                 result.detectionSource = "DocumentScanner";
                                 result.sha256 = fileHash;
                                 result.threatScore = static_cast<float>(docResult.riskScore);

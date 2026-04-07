@@ -241,7 +241,7 @@ public:
     bool Initialize(const NotificationConfiguration& config);
     void Shutdown();
     bool IsInitialized() const noexcept { return m_initialized.load(std::memory_order_acquire); }
-    ModuleStatus GetStatus() const noexcept { return m_status.load(std::memory_order_acquire); }
+    NotificationManagerStatus GetStatus() const noexcept { return m_status.load(std::memory_order_acquire); }
 
     bool UpdateConfiguration(const NotificationConfiguration& config);
     NotificationConfiguration GetConfiguration() const;
@@ -310,7 +310,7 @@ private:
     mutable std::shared_mutex m_configMutex;
 
     // State
-    std::atomic<ModuleStatus> m_status{ModuleStatus::Uninitialized};
+    std::atomic<NotificationManagerStatus> m_status{NotificationManagerStatus::Uninitialized};
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_running{false};
 
@@ -365,8 +365,8 @@ private:
 // ============================================================================
 
 bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config) {
-    ModuleStatus expected = ModuleStatus::Uninitialized;
-    if (!m_status.compare_exchange_strong(expected, ModuleStatus::Initializing,
+    NotificationManagerStatus expected = NotificationManagerStatus::Uninitialized;
+    if (!m_status.compare_exchange_strong(expected, NotificationManagerStatus::Initializing,
                                           std::memory_order_acq_rel)) {
         Utils::Logger::Warn("Already initialized (status={})",
                     static_cast<int>(expected));
@@ -375,7 +375,7 @@ bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config
 
     if (!config.IsValid()) {
         SS_LOG_ERROR(L"NotifyMgr", L"Invalid configuration");
-        m_status.store(ModuleStatus::Error, std::memory_order_release);
+        m_status.store(NotificationManagerStatus::Error, std::memory_order_release);
         return false;
     }
 
@@ -400,7 +400,7 @@ bool NotificationManagerImpl::Initialize(const NotificationConfiguration& config
     m_quietModeThread = std::thread([this] { QuietModeMonitorLoop(); });
 
     m_initialized.store(true, std::memory_order_release);
-    m_status.store(ModuleStatus::Running, std::memory_order_release);
+    m_status.store(NotificationManagerStatus::Running, std::memory_order_release);
 
     Utils::Logger::Info("Initialized — rate_limit={}/min, dedup={}s, game_detect={}, meeting_detect={}",
                 config.rateLimitPerMinute, config.dedupWindowSeconds,
@@ -412,7 +412,7 @@ void NotificationManagerImpl::Shutdown() {
     if (!m_running.exchange(false, std::memory_order_acq_rel))
         return;
 
-    m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+    m_status.store(NotificationManagerStatus::Stopping, std::memory_order_release);
 
     // Wake dispatch thread
     {
@@ -448,7 +448,7 @@ void NotificationManagerImpl::Shutdown() {
         m_queue.clear();
     }
 
-    m_status.store(ModuleStatus::Stopped, std::memory_order_release);
+    m_status.store(NotificationManagerStatus::Stopped, std::memory_order_release);
     SS_LOG_INFO(L"NotifyMgr", L"Shutdown complete");
 }
 
@@ -1384,7 +1384,7 @@ bool NotificationManager::IsInitialized() const noexcept {
     return m_impl->IsInitialized();
 }
 
-ModuleStatus NotificationManager::GetStatus() const noexcept {
+NotificationManagerStatus NotificationManager::GetStatus() const noexcept {
     return m_impl->GetStatus();
 }
 

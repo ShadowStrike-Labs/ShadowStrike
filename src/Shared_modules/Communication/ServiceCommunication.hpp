@@ -123,7 +123,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
-#include "../Security/CryptoManager.hpp"
+#include "../SelfProtection/CryptoManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -692,7 +692,7 @@ struct ServiceCommConfiguration {
 
 using MessageCallback = std::function<void(const std::string&)>;
 using ServiceMessageCallback = std::function<void(const ServiceMessage&, const std::string& sessionId)>;
-using ConnectionCallback = std::function<void(const ClientSession&, bool connected)>;
+using ServiceClientConnectionCallback = std::function<void(const ClientSession&, bool connected)>;
 using CommandCallback = std::function<bool(MessageType cmd, const std::vector<uint8_t>& payload, std::vector<uint8_t>& response)>;
 using ServiceErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -840,7 +840,7 @@ public:
     void SetMessageCallback(std::function<void(const std::string&)> cb);
     
     void RegisterMessageCallback(ServiceMessageCallback callback);
-    void RegisterConnectionCallback(ConnectionCallback callback);
+    void RegisterConnectionCallback(ServiceClientConnectionCallback callback);
     void RegisterCommandCallback(CommandCallback callback);
     void RegisterErrorCallback(ServiceErrorCallback callback);
     void UnregisterCallbacks();

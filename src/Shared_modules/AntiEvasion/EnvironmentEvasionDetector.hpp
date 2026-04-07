@@ -1424,7 +1424,7 @@ namespace ShadowStrike {
         /**
          * @brief Network configuration information
          */
-        struct NetworkConfigInfo {
+        struct EnvironmentNetworkConfigInfo {
             /// @brief Network adapters
             struct AdapterInfo {
                 std::wstring name;
@@ -1758,7 +1758,7 @@ namespace ShadowStrike {
         /**
          * @brief Disassembled instruction with anti-debug context
          */
-        struct DisassembledInstruction {
+        struct EnvironmentDisassembledInstruction {
             /// @brief Virtual address of instruction
             uint64_t address = 0;
 
@@ -1798,10 +1798,10 @@ namespace ShadowStrike {
          */
         struct EnvironmentCodeAnalysisResult {
             /// @brief Instructions identified as anti-debug
-            std::vector<DisassembledInstruction> antiDebugInstructions;
+            std::vector<EnvironmentDisassembledInstruction> antiDebugInstructions;
 
             /// @brief Instructions identified as anti-sandbox
-            std::vector<DisassembledInstruction> antiSandboxInstructions;
+            std::vector<EnvironmentDisassembledInstruction> antiSandboxInstructions;
 
             /// @brief Total instructions analyzed
             size_t totalInstructionsAnalyzed = 0;
@@ -2270,7 +2270,7 @@ namespace ShadowStrike {
             SystemIdentityInfo identityInfo;
 
             /// @brief Network configuration
-            NetworkConfigInfo networkInfo;
+            EnvironmentNetworkConfigInfo networkInfo;
 
             /// @brief User activity artifacts
             UserActivityInfo activityInfo;
@@ -2731,7 +2731,7 @@ namespace ShadowStrike {
              * @note NOT a detection source.
              */
             [[nodiscard]] bool CheckNetworkConfiguration(
-                NetworkConfigInfo& outNetworkInfo,
+                EnvironmentNetworkConfigInfo& outNetworkInfo,
                 std::vector<EnvironmentDetectedTechnique>& outDetections,
                 EnvironmentError* err = nullptr
             ) noexcept;
@@ -3061,7 +3061,7 @@ namespace ShadowStrike {
             ) noexcept;
 
             void CollectNetworkInfo(
-                NetworkConfigInfo& info
+                EnvironmentNetworkConfigInfo& info
             ) noexcept;
 
             void CollectUserActivityInfo(

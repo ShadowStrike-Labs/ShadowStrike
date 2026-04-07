@@ -178,6 +178,7 @@
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -186,6 +187,10 @@
 namespace ShadowStrike::Security {
     class MemoryProtectionImpl;
     class SecureAllocatorImpl;
+}
+
+namespace ShadowStrike::Service {
+    class AntivirusServiceImpl;
 }
 
 namespace ShadowStrike {
@@ -312,7 +317,7 @@ using Milliseconds = std::chrono::milliseconds;
 /**
  * @brief Memory protection level
  */
-enum class ProtectionLevel : uint8_t {
+enum class MemoryProtectionLevel : uint8_t {
     Disabled    = 0,    ///< No protection (testing only)
     Minimal     = 1,    ///< Basic protection
     Standard    = 2,    ///< Standard protection
@@ -376,7 +381,7 @@ enum class AllocationType : uint8_t {
 /**
  * @brief Integrity status
  */
-enum class IntegrityStatus : uint8_t {
+enum class MemoryIntegrityStatus : uint8_t {
     Unknown     = 0,
     Valid       = 1,
     Modified    = 2,
@@ -387,7 +392,7 @@ enum class IntegrityStatus : uint8_t {
 /**
  * @brief Protection event type
  */
-enum class ProtectionEventType : uint32_t {
+enum class MemoryProtectionEventType : uint32_t {
     None                = 0x00000000,
     MemoryWrite         = 0x00000001,
     MemoryRead          = 0x00000002,
@@ -405,14 +410,14 @@ enum class ProtectionEventType : uint32_t {
     All                 = 0xFFFFFFFF
 };
 
-inline constexpr ProtectionEventType operator|(ProtectionEventType a, ProtectionEventType b) noexcept {
-    return static_cast<ProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr MemoryProtectionEventType operator|(MemoryProtectionEventType a, MemoryProtectionEventType b) noexcept {
+    return static_cast<MemoryProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
 /**
  * @brief Response to protection event
  */
-enum class ProtectionResponse : uint32_t {
+enum class MemoryProtectionResponse : uint32_t {
     None        = 0x00000000,
     Log         = 0x00000001,
     Alert       = 0x00000002,
@@ -426,27 +431,14 @@ enum class ProtectionResponse : uint32_t {
     Aggressive  = Log | Alert | Block | Repair | Terminate
 };
 
-inline constexpr ProtectionResponse operator|(ProtectionResponse a, ProtectionResponse b) noexcept {
-    return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr MemoryProtectionResponse operator|(MemoryProtectionResponse a, MemoryProtectionResponse b) noexcept {
+    return static_cast<MemoryProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-inline constexpr ProtectionResponse operator&(ProtectionResponse a, ProtectionResponse b) noexcept {
-    return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+inline constexpr MemoryProtectionResponse operator&(MemoryProtectionResponse a, MemoryProtectionResponse b) noexcept {
+    return static_cast<MemoryProtectionResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -457,7 +449,7 @@ enum class ModuleStatus : uint8_t {
  */
 struct MemoryProtectionConfiguration {
     /// @brief Protection level
-    ProtectionLevel level = ProtectionLevel::Standard;
+    MemoryProtectionLevel level = MemoryProtectionLevel::Standard;
     
     /// @brief Enable ASLR enforcement
     bool enableASLR = true;
@@ -499,7 +491,7 @@ struct MemoryProtectionConfiguration {
     bool enableAntiScan = true;
     
     /// @brief Default protection response
-    ProtectionResponse defaultResponse = ProtectionResponse::Active;
+    MemoryProtectionResponse defaultResponse = MemoryProtectionResponse::Active;
     
     /// @brief Verbose logging
     bool verboseLogging = false;
@@ -515,7 +507,7 @@ struct MemoryProtectionConfiguration {
     /**
      * @brief Create from protection level
      */
-    static MemoryProtectionConfiguration FromLevel(ProtectionLevel level);
+    static MemoryProtectionConfiguration FromLevel(MemoryProtectionLevel level);
 };
 
 /**
@@ -547,7 +539,7 @@ struct ProtectedRegion {
     uint32_t currentCrc32 = 0;
     
     /// @brief Integrity status
-    IntegrityStatus status = IntegrityStatus::Unknown;
+    MemoryIntegrityStatus status = MemoryIntegrityStatus::Unknown;
     
     /// @brief Is critical region
     bool isCritical = false;
@@ -611,7 +603,7 @@ struct ProtectionEvent {
     uint64_t eventId = 0;
     
     /// @brief Event type
-    ProtectionEventType type = ProtectionEventType::None;
+    MemoryProtectionEventType type = MemoryProtectionEventType::None;
     
     /// @brief Event timestamp
     TimePoint timestamp = Clock::now();
@@ -635,7 +627,7 @@ struct ProtectionEvent {
     std::wstring sourceProcessName;
     
     /// @brief Response taken
-    ProtectionResponse responseTaken = ProtectionResponse::None;
+    MemoryProtectionResponse responseTaken = MemoryProtectionResponse::None;
     
     /// @brief Was blocked
     bool wasBlocked = false;
@@ -754,6 +746,10 @@ struct StackInfo {
  * @brief Memory protection statistics
  */
 struct MemoryProtectionStatistics {
+    MemoryProtectionStatistics() noexcept = default;
+    MemoryProtectionStatistics(const MemoryProtectionStatistics& other) noexcept;
+    MemoryProtectionStatistics& operator=(const MemoryProtectionStatistics& other) noexcept;
+
     /// @brief Total protected regions
     std::atomic<uint64_t> totalProtectedRegions{0};
     
@@ -812,7 +808,7 @@ struct MemoryProtectionStatistics {
 using ProtectionEventCallback = std::function<void(const ProtectionEvent&)>;
 
 /// @brief Callback for integrity violations
-using IntegrityCallback = std::function<void(const ProtectedRegion&)>;
+using MemoryIntegrityCallback = std::function<void(const ProtectedRegion&)>;
 
 /// @brief Callback for heap corruption
 using HeapCorruptionCallback = std::function<void(const HeapInfo&)>;
@@ -908,7 +904,7 @@ using SecureBytes = std::vector<uint8_t, SecureAllocator<uint8_t>>;
  *     auto& memProtection = MemoryProtection::Instance();
  *     
  *     MemoryProtectionConfiguration config;
- *     config.level = ProtectionLevel::Enhanced;
+ *     config.level = MemoryProtectionLevel::Enhanced;
  *     config.enableMemoryEncryption = true;
  *     
  *     if (!memProtection.Initialize(config)) {
@@ -961,7 +957,7 @@ public:
     /**
      * @brief Initialize with protection level
      */
-    [[nodiscard]] bool Initialize(ProtectionLevel level);
+    [[nodiscard]] bool Initialize(MemoryProtectionLevel level);
     
     /**
      * @brief Shutdown memory protection
@@ -995,12 +991,12 @@ public:
     /**
      * @brief Set protection level
      */
-    void SetProtectionLevel(ProtectionLevel level);
+    void SetProtectionLevel(MemoryProtectionLevel level);
     
     /**
      * @brief Get protection level
      */
-    [[nodiscard]] ProtectionLevel GetProtectionLevel() const noexcept;
+    [[nodiscard]] MemoryProtectionLevel GetProtectionLevel() const noexcept;
     
     // ========================================================================
     // PROCESS HARDENING
@@ -1166,12 +1162,12 @@ public:
     /**
      * @brief Verify memory region integrity
      */
-    [[nodiscard]] IntegrityStatus VerifyRegionIntegrity(std::string_view id);
+    [[nodiscard]] MemoryIntegrityStatus VerifyRegionIntegrity(std::string_view id);
     
     /**
      * @brief Verify all protected regions
      */
-    [[nodiscard]] std::vector<std::pair<std::string, IntegrityStatus>> VerifyAllIntegrity();
+    [[nodiscard]] std::vector<std::pair<std::string, MemoryIntegrityStatus>> VerifyAllIntegrity();
     
     /**
      * @brief Force integrity check
@@ -1306,7 +1302,7 @@ public:
     /**
      * @brief Register integrity callback
      */
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(MemoryIntegrityCallback callback);
     
     /**
      * @brief Unregister integrity callback
@@ -1387,12 +1383,19 @@ public:
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
 private:
+    friend class ::ShadowStrike::Service::AntivirusServiceImpl;
+
     // ========================================================================
     // PRIVATE CONSTRUCTOR
     // ========================================================================
     
     MemoryProtection();
     ~MemoryProtection();
+
+    /**
+     * @brief Get the internal authorization token for trusted shutdown paths
+     */
+    [[nodiscard]] std::string GetInternalAuthToken() const;
     
     // ========================================================================
     // PIMPL
@@ -1414,7 +1417,7 @@ private:
 /**
  * @brief Get protection level name
  */
-[[nodiscard]] std::string_view GetProtectionLevelName(ProtectionLevel level) noexcept;
+[[nodiscard]] std::string_view GetProtectionLevelName(MemoryProtectionLevel level) noexcept;
 
 /**
  * @brief Get memory region type name
@@ -1424,7 +1427,7 @@ private:
 /**
  * @brief Get integrity status name
  */
-[[nodiscard]] std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept;
+[[nodiscard]] std::string_view GetIntegrityStatusName(MemoryIntegrityStatus status) noexcept;
 
 /**
  * @brief Get allocation type name
@@ -1441,20 +1444,20 @@ private:
 // ============================================================================
 
 /**
- * @class SecureBuffer
+ * @class MemorySecureBuffer
  * @brief RAII wrapper for secure memory allocation
  */
-class SecureBuffer final {
+class MemorySecureBuffer final {
 public:
-    explicit SecureBuffer(size_t size);
-    SecureBuffer(size_t size, AllocationType type);
-    ~SecureBuffer();
+    explicit MemorySecureBuffer(size_t size);
+    MemorySecureBuffer(size_t size, AllocationType type);
+    ~MemorySecureBuffer();
     
-    SecureBuffer(const SecureBuffer&) = delete;
-    SecureBuffer& operator=(const SecureBuffer&) = delete;
+    MemorySecureBuffer(const MemorySecureBuffer&) = delete;
+    MemorySecureBuffer& operator=(const MemorySecureBuffer&) = delete;
     
-    SecureBuffer(SecureBuffer&& other) noexcept;
-    SecureBuffer& operator=(SecureBuffer&& other) noexcept;
+    MemorySecureBuffer(MemorySecureBuffer&& other) noexcept;
+    MemorySecureBuffer& operator=(MemorySecureBuffer&& other) noexcept;
     
     [[nodiscard]] void* Data() noexcept { return m_data; }
     [[nodiscard]] const void* Data() const noexcept { return m_data; }
@@ -1516,4 +1519,4 @@ private:
  * @brief Allocate secure buffer on stack (compile-time size)
  */
 #define SS_SECURE_BUFFER(name, size) \
-    ::ShadowStrike::Security::SecureBuffer name(size)
+    ::ShadowStrike::Security::MemorySecureBuffer name(size)

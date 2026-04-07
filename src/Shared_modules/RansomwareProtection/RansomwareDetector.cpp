@@ -195,8 +195,11 @@ public:
         ptr->pid = pid;
         ptr->firstActivity = Clock::now();
         ptr->lastActivity  = ptr->firstActivity;
-        try { ptr->processName = Utils::ProcessUtils::GetProcessName(pid); }
-        catch (...) { ptr->processName = L"Unknown"; }
+        try {
+            ptr->processName = Utils::ProcessUtils::GetProcessName(pid).value_or(L"Unknown");
+        } catch (...) {
+            ptr->processName = L"Unknown";
+        }
         auto& ref = *ptr;
         m_processStats.emplace(pid, std::move(ptr));
         if (m_processStats.size() > RansomwareConstants::MAX_TRACKED_PROCESSES)
@@ -295,8 +298,9 @@ public:
                 data["action"] = std::string(GetActionName(event.action));
                 data["family"] = std::string(GetFamilyName(event.family));
                 data["confidence"] = std::to_string(event.confidence);
-                data["entropy"] = std::to_string(event.entropy.shannon);
-                data["techniques"] = std::to_string(event.techniques);
+                data["entropy"] = std::to_string(
+                    event.entropyResult ? event.entropyResult->shannonEntropy : 0.0);
+                data["techniques"] = std::to_string(event.detectionFlags);
                 TelemetryCollector::Instance().RecordCustom("ransomware_detection", data);
             }
         } catch (...) {}
@@ -972,7 +976,7 @@ std::optional<IOStats> RansomwareDetector::GetProcessStats(uint32_t pid) const {
     std::shared_lock lk(m_impl->m_statsMutex);
     auto it = m_impl->m_processStats.find(pid);
     if (it != m_impl->m_processStats.end())
-        return IOStats(*it->second);  // explicit copy via copy ctor
+        return std::optional<IOStats>{std::in_place, *it->second};
     return std::nullopt;
 }
 
@@ -1673,7 +1677,8 @@ void RansomwareDetector::ReportDetectionTelemetry(const DetectionEvent& event) {
         data["action"] = std::string(GetActionName(event.action));
         data["family"] = std::string(GetFamilyName(event.family));
         data["confidence"] = std::to_string(event.confidence);
-        data["entropy"] = std::to_string(event.entropy.shannon);
+        data["entropy"] = std::to_string(
+            event.entropyResult ? event.entropyResult->shannonEntropy : 0.0);
         data["event_id"] = std::to_string(event.eventId);
 
         TelemetryCollector::Instance().RecordCustom("ransomware_detection", data);

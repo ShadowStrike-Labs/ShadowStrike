@@ -347,7 +347,7 @@ namespace ShadowStrike::AntiEvasion {
     /**
      * @brief Detected evasion technique
      */
-    struct DetectedTechnique {
+    struct ProcessDetectedTechnique {
         ProcessEvasionTechnique technique = ProcessEvasionTechnique::Unknown;
         ProcessEvasionSeverity severity = ProcessEvasionSeverity::Low;
         double confidence = 0.0;
@@ -355,8 +355,8 @@ namespace ShadowStrike::AntiEvasion {
         std::wstring technicalDetails;
         std::chrono::system_clock::time_point timestamp;
 
-        DetectedTechnique() = default;
-        explicit DetectedTechnique(ProcessEvasionTechnique tech) : technique(tech) {
+        ProcessDetectedTechnique() = default;
+        explicit ProcessDetectedTechnique(ProcessEvasionTechnique tech) : technique(tech) {
             timestamp = std::chrono::system_clock::now();
         }
     };
@@ -407,7 +407,7 @@ namespace ShadowStrike::AntiEvasion {
     /**
      * @brief Memory region information
      */
-    struct MemoryRegionInfo {
+    struct ProcessMemoryRegionInfo {
         uint64_t baseAddress = 0;
         uint64_t size = 0;
         uint32_t protection = 0;
@@ -450,7 +450,7 @@ namespace ShadowStrike::AntiEvasion {
     /**
      * @brief Analysis configuration
      */
-    struct ProcessAnalysisConfig {
+    struct ProcessEvasionAnalysisConfig {
         ProcessAnalysisFlags flags = ProcessAnalysisFlags::Default;
         uint32_t cacheTtlSeconds = ProcessEvasionConstants::CACHE_TTL_SECONDS;
         bool enableDeepScan = false;
@@ -482,15 +482,15 @@ namespace ShadowStrike::AntiEvasion {
         ProcessInjectionInfo injectionInfo;
         ProcessMasqueradingInfo masqueradingInfo;
         AntiDebugInfo antiDebugInfo;
-        std::vector<MemoryRegionInfo> suspiciousMemoryRegions;
+        std::vector<ProcessMemoryRegionInfo> suspiciousMemoryRegions;
 
         // Detected techniques
-        std::vector<DetectedTechnique> detectedTechniques;
+        std::vector<ProcessDetectedTechnique> detectedTechniques;
         uint32_t totalDetections = 0;
         uint32_t detectedCategories = 0; // Bitmask
 
         // Analysis metadata
-        ProcessAnalysisConfig config;
+        ProcessEvasionAnalysisConfig config;
         std::chrono::system_clock::time_point analysisStartTime;
         std::chrono::system_clock::time_point analysisEndTime;
         uint64_t analysisDurationMs = 0;
@@ -500,7 +500,7 @@ namespace ShadowStrike::AntiEvasion {
         /**
          * @brief Get technique with highest confidence
          */
-        [[nodiscard]] const DetectedTechnique* GetHighestConfidence() const noexcept {
+        [[nodiscard]] const ProcessDetectedTechnique* GetHighestConfidence() const noexcept {
             if (detectedTechniques.empty()) return nullptr;
 
             const auto* best = &detectedTechniques[0];
@@ -517,7 +517,7 @@ namespace ShadowStrike::AntiEvasion {
     // CALLBACKS
     // ========================================================================
 
-    using ProcessDetectionCallback = std::function<void(uint32_t processId, const DetectedTechnique& technique)>;
+    using ProcessDetectionCallback = std::function<void(uint32_t processId, const ProcessDetectedTechnique& technique)>;
 
     // ========================================================================
     // MAIN DETECTOR CLASS
@@ -572,7 +572,7 @@ namespace ShadowStrike::AntiEvasion {
          */
         [[nodiscard]] ProcessEvasionResult AnalyzeProcess(
             uint32_t processId,
-            const ProcessAnalysisConfig& config = ProcessAnalysisConfig{},
+            const ProcessEvasionAnalysisConfig& config = ProcessEvasionAnalysisConfig{},
             ProcessEvasionError* err = nullptr
         ) noexcept;
 
@@ -581,7 +581,7 @@ namespace ShadowStrike::AntiEvasion {
          */
         [[nodiscard]] ProcessEvasionResult AnalyzeProcess(
             HANDLE hProcess,
-            const ProcessAnalysisConfig& config = ProcessAnalysisConfig{},
+            const ProcessEvasionAnalysisConfig& config = ProcessEvasionAnalysisConfig{},
             ProcessEvasionError* err = nullptr
         ) noexcept;
 
@@ -590,7 +590,7 @@ namespace ShadowStrike::AntiEvasion {
          */
         [[nodiscard]] std::vector<ProcessEvasionResult> AnalyzeProcesses(
             const std::vector<uint32_t>& processIds,
-            const ProcessAnalysisConfig& config = ProcessAnalysisConfig{},
+            const ProcessEvasionAnalysisConfig& config = ProcessEvasionAnalysisConfig{},
             ProcessEvasionError* err = nullptr
         ) noexcept;
 
@@ -630,7 +630,7 @@ namespace ShadowStrike::AntiEvasion {
          */
         [[nodiscard]] bool ScanMemory(
             uint32_t processId,
-            std::vector<MemoryRegionInfo>& outRegions,
+            std::vector<ProcessMemoryRegionInfo>& outRegions,
             ProcessEvasionError* err = nullptr
         ) noexcept;
 
@@ -716,7 +716,7 @@ namespace ShadowStrike::AntiEvasion {
         void AnalyzeProcessInternal(
             HANDLE hProcess,
             uint32_t processId,
-            const ProcessAnalysisConfig& config,
+            const ProcessEvasionAnalysisConfig& config,
             ProcessEvasionResult& result
         ) noexcept;
 
@@ -740,7 +740,7 @@ namespace ShadowStrike::AntiEvasion {
 
         void AddDetection(
             ProcessEvasionResult& result,
-            DetectedTechnique detection
+            ProcessDetectedTechnique detection
         ) noexcept;
 
         void UpdateCache(

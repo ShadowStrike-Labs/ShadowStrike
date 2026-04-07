@@ -368,8 +368,8 @@ public:
     std::chrono::system_clock::time_point m_lastRateCalcTime{ std::chrono::system_clock::now() };
 
     // Callbacks
-    std::unordered_map<uint64_t, FileScanCallback> m_fileScanCallbacks;
-    std::unordered_map<uint64_t, ProcessCreateCallback> m_processCreateCallbacks;
+    std::unordered_map<uint64_t, RTPFileScanCallback> m_fileScanCallbacks;
+    std::unordered_map<uint64_t, RTPProcessCreateCallback> m_processCreateCallbacks;
     std::unordered_map<uint64_t, ThreatDetectionCallback> m_threatDetectionCallbacks;
     std::unordered_map<uint64_t, StateChangeCallback> m_stateChangeCallbacks;
     std::unordered_map<uint64_t, ComponentStatusCallback> m_componentStatusCallbacks;
@@ -415,7 +415,7 @@ public:
         // Initialize component status array
         for (size_t i = 0; i < m_componentStatus.size(); ++i) {
             m_componentStatus[i].type = static_cast<ComponentType>(i);
-            m_componentStatus[i].state = ComponentState::UNINITIALIZED;
+            m_componentStatus[i].state = ProtectionComponentState::UNINITIALIZED;
         }
     }
 
@@ -461,18 +461,18 @@ public:
             if (!InitializeScanEngine()) {
                 Utils::Logger::Error("RealTimeProtection: Failed to initialize ScanEngine");
                 // Continue in degraded mode
-                SetComponentState(ComponentType::SCAN_ENGINE, ComponentState::ERROR);
+                SetComponentState(ComponentType::SCAN_ENGINE, ProtectionComponentState::ERROR);
             } else {
-                SetComponentState(ComponentType::SCAN_ENGINE, ComponentState::RUNNING);
+                SetComponentState(ComponentType::SCAN_ENGINE, ProtectionComponentState::RUNNING);
             }
 
             // 3. Initialize IPC Manager and connect to kernel driver
             if (!InitializeIPCManager()) {
                 Utils::Logger::Warn("RealTimeProtection: IPC Manager not available. Running in user-mode only.");
-                SetComponentState(ComponentType::IPC_MANAGER, ComponentState::ERROR);
+                SetComponentState(ComponentType::IPC_MANAGER, ProtectionComponentState::ERROR);
                 m_protectionStatus.driverConnected = false;
             } else {
-                SetComponentState(ComponentType::IPC_MANAGER, ComponentState::RUNNING);
+                SetComponentState(ComponentType::IPC_MANAGER, ProtectionComponentState::RUNNING);
                 m_protectionStatus.driverConnected = true;
 
                 // Push threat intelligence to kernel after driver connection
@@ -482,9 +482,9 @@ public:
             // 4. Initialize Quarantine Manager
             if (!InitializeQuarantineManager()) {
                 Utils::Logger::Warn("RealTimeProtection: QuarantineManager initialization failed");
-                SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::ERROR);
+                SetComponentState(ComponentType::QUARANTINE_MANAGER, ProtectionComponentState::ERROR);
             } else {
-                SetComponentState(ComponentType::QUARANTINE_MANAGER, ComponentState::RUNNING);
+                SetComponentState(ComponentType::QUARANTINE_MANAGER, ProtectionComponentState::RUNNING);
             }
 
             // 4.5. Initialize TamperProtection — self-defense and integrity monitoring
@@ -596,11 +596,11 @@ public:
         auto& ipc = Communication::IPCManager::Instance();
         ipc.DisconnectFilterPort();
         ipc.Stop();
-        SetComponentState(ComponentType::IPC_MANAGER, ComponentState::STOPPED);
+        SetComponentState(ComponentType::IPC_MANAGER, ProtectionComponentState::STOPPED);
 
         // 4. Shutdown scan engine
         Core::Engine::ScanEngine::Instance().Shutdown();
-        SetComponentState(ComponentType::SCAN_ENGINE, ComponentState::STOPPED);
+        SetComponentState(ComponentType::SCAN_ENGINE, ProtectionComponentState::STOPPED);
 
         // 4.5. Shutdown PhantomCortex AI/ML engine
         try {
@@ -846,7 +846,7 @@ public:
             } else {
                 // Wire detection callback for per-technique SOC/SIEM telemetry
                 m_processDetector->SetDetectionCallback(
-                    [](uint32_t pid, const ShadowStrike::AntiEvasion::DetectedTechnique& detection) {
+                    [](uint32_t pid, const ShadowStrike::AntiEvasion::ProcessDetectedTechnique& detection) {
                         if (detection.severity >= ShadowStrike::AntiEvasion::ProcessEvasionSeverity::High) {
                             Utils::Logger::Warn(
                                 "[PED-CB] PID={} technique={} confidence={:.2f} severity={} details={}",
@@ -1064,7 +1064,7 @@ public:
             auto& fsf = FileSystemFilter::Instance();
             if (fsf.Initialize(m_threadPool)) {
                 fsf.Start();
-                SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::RUNNING);
+                SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::RUNNING);
 
                 // Wire up scan engine
                 fsf.SetScanEngine(&Core::Engine::ScanEngine::Instance());
@@ -1075,7 +1075,7 @@ public:
                 }
             }
         } catch (...) {
-            SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::ERROR);
+            SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::ERROR);
         }
 
         // ProcessCreationMonitor
@@ -1096,21 +1096,21 @@ public:
             pcmCfg.alertThreshold = 40.0;
             if (!pcm.Initialize(m_threadPool, pcmCfg)) {
                 Utils::Logger::Error("RealTimeProtection: ProcessCreationMonitor::Initialize failed");
-                SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
+                SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::ERROR);
             } else {
                 pcm.SetScanEngine(&Core::Engine::ScanEngine::Instance());
                 if (m_sharedHashStore) {
                     pcm.SetHashStore(m_sharedHashStore.get());
                 }
                 pcm.Start();
-                SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::RUNNING);
+                SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::RUNNING);
                 Utils::Logger::Info("RealTimeProtection: ProcessCreationMonitor initialized and started");
             }
         } catch (const std::exception& ex) {
             Utils::Logger::Error("RealTimeProtection: ProcessCreationMonitor startup exception: {}", ex.what());
-            SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
+            SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::ERROR);
         } catch (...) {
-            SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::ERROR);
+            SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::ERROR);
         }
 
         // MemoryProtection
@@ -1126,13 +1126,13 @@ public:
                 mpConfig.enableBehaviorFeedback = true;
                 mp.Configure(mpConfig);
                 mp.Start();
-                SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::RUNNING);
+                SetComponentState(ComponentType::MEMORY_PROTECTION, ProtectionComponentState::RUNNING);
                 Utils::Logger::Info("RealTimeProtection: MemoryProtection configured and started");
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: MemoryProtection startup exception: {}", ex.what());
-                SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::ERROR);
+                SetComponentState(ComponentType::MEMORY_PROTECTION, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::ERROR);
+                SetComponentState(ComponentType::MEMORY_PROTECTION, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1143,21 +1143,21 @@ public:
                 BehaviorBlockerConfig bbConfig = BehaviorBlockerConfig::CreateDefault();
                 if (!bb.Initialize(bbConfig)) {
                     Utils::Logger::Error("RealTimeProtection: BehaviorBlocker::Initialize failed");
-                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
+                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::ERROR);
                 } else {
                     bb.LoadDefaultRules();
                     bb.Start();
                     bb.PushRulesToKernel();
-                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::RUNNING);
+                    SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::RUNNING);
                     Utils::Logger::Info("RealTimeProtection: BehaviorBlocker initialized with {} default rules",
                         bb.GetStatistics().activeRuleCount);
                 }
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: BehaviorBlocker startup exception: {}",
                     ex.what());
-                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
+                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::ERROR);
+                SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1167,18 +1167,18 @@ public:
                 auto& ntf = NetworkTrafficFilter::Instance();
                 if (!ntf.Initialize(m_threadPool, NetworkFilterConfig::CreateDefault())) {
                     Utils::Logger::Error("RealTimeProtection: NetworkTrafficFilter::Initialize failed");
-                    SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
+                    SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::ERROR);
                 } else {
                     ntf.Start();
                     ntf.LoadBlockListFromFile(L"data/ip_blocklist.txt");
-                    SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::RUNNING);
+                    SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::RUNNING);
                     Utils::Logger::Info("RealTimeProtection: NetworkTrafficFilter initialized and started");
                 }
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: NetworkTrafficFilter startup exception: {}", ex.what());
-                SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
+                SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::ERROR);
+                SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1387,23 +1387,23 @@ public:
                 auto epConfig = ExploitPreventionConfig::CreateDefault();
                 if (!ep.Initialize(m_threadPool, epConfig)) {
                     Utils::Logger::Error("RealTimeProtection: ExploitPrevention::Initialize failed");
-                    SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                    SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::ERROR);
                 } else {
                     if (ep.Start()) {
                         ep.PushMitigationsToKernel();
-                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::RUNNING);
+                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::RUNNING);
                         Utils::Logger::Info("RealTimeProtection: ExploitPrevention initialized and running");
                     } else {
                         Utils::Logger::Error("RealTimeProtection: ExploitPrevention::Start failed");
-                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::ERROR);
                     }
                 }
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: ExploitPrevention startup exception: {}",
                     ex.what());
-                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::ERROR);
+                SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1414,11 +1414,11 @@ public:
                 auto fimConfig = FIMConfig::CreateDefault();
                 if (!fim.Initialize(m_threadPool, fimConfig)) {
                     Utils::Logger::Error("RealTimeProtection: FileIntegrityMonitor::Initialize failed");
-                    SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
+                    SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::ERROR);
                 } else {
                     fim.StartMonitoring();
                     fim.CreateSystemBaselines();
-                    SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::RUNNING);
+                    SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::RUNNING);
                     auto fimStats = fim.GetStats();
                     Utils::Logger::Info("RealTimeProtection: FIM initialized - {} files monitored, {} dirs",
                         fimStats.monitoredFiles, fimStats.monitoredDirectories);
@@ -1426,9 +1426,9 @@ public:
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: FIM startup exception: {}",
                     ex.what());
-                SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
+                SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::ERROR);
+                SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1436,9 +1436,9 @@ public:
         try {
             auto& acm = AccessControlManager::Instance();
             acm.Initialize(AccessControlManagerConfig::CreateEnterprise());
-            SetComponentState(ComponentType::ACCESS_CONTROL, ComponentState::RUNNING);
+            SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::RUNNING);
         } catch (...) {
-            SetComponentState(ComponentType::ACCESS_CONTROL, ComponentState::ERROR);
+            SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::ERROR);
         }
 
         // BehaviorAnalyzer — central behavioral engine wired into TD, PCM, PID
@@ -1525,7 +1525,7 @@ public:
                 auto& zhp = ZeroHourProtection::Instance();
                 if (!zhp.Start()) {
                     Utils::Logger::Error("RealTimeProtection: ZeroHourProtection::Start failed");
-                    SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
+                    SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::ERROR);
                 } else {
                     // Register verdict callback for SOC/SIEM integration
                     zhp.RegisterVerdictCallback(
@@ -1563,14 +1563,14 @@ public:
                                 package.removals.size(),
                                 package.isEmergency ? "yes" : "no");
                         });
-                    SetComponentState(ComponentType::ZERO_HOUR, ComponentState::RUNNING);
+                    SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::RUNNING);
                     Utils::Logger::Info("RealTimeProtection: ZeroHourProtection started with callbacks registered");
                 }
             } catch (const std::exception& ex) {
                 Utils::Logger::Error("RealTimeProtection: ZeroHourProtection startup exception: {}", ex.what());
-                SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
+                SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::ERROR);
             } catch (...) {
-                SetComponentState(ComponentType::ZERO_HOUR, ComponentState::ERROR);
+                SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::ERROR);
             }
         }
 
@@ -1751,19 +1751,19 @@ public:
         Utils::Logger::Info("RealTimeProtection: Stopping protection components...");
 
         try { FileSystemFilter::Instance().Shutdown(); } catch (...) {}
-        SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ComponentState::STOPPED);
+        SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::STOPPED);
 
         try { ProcessCreationMonitor::Instance().Stop(); } catch (...) {}
-        SetComponentState(ComponentType::PROCESS_MONITOR, ComponentState::STOPPED);
+        SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::STOPPED);
 
         try { MemoryProtection::Instance().Stop(); } catch (...) {}
-        SetComponentState(ComponentType::MEMORY_PROTECTION, ComponentState::STOPPED);
+        SetComponentState(ComponentType::MEMORY_PROTECTION, ProtectionComponentState::STOPPED);
 
         try {
             BehaviorBlocker::Instance().Stop();
             BehaviorBlocker::Instance().Shutdown();
         } catch (...) {}
-        SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ComponentState::STOPPED);
+        SetComponentState(ComponentType::BEHAVIOR_BLOCKER, ProtectionComponentState::STOPPED);
 
         // ====================================================================
         // CORE NETWORK MODULES — shutdown in reverse initialization order
@@ -1780,22 +1780,22 @@ public:
         Utils::Logger::Info("RealTimeProtection: Core Network modules stopped");
 
         try { NetworkTrafficFilter::Instance().Stop(); NetworkTrafficFilter::Instance().Shutdown(); } catch (...) {}
-        SetComponentState(ComponentType::NETWORK_FILTER, ComponentState::STOPPED);
+        SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::STOPPED);
 
         try { ExploitPrevention::Instance().Shutdown(); } catch (...) {}
-        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ComponentState::STOPPED);
+        SetComponentState(ComponentType::EXPLOIT_PREVENTION, ProtectionComponentState::STOPPED);
 
         try {
             FileIntegrityMonitor::Instance().StopMonitoring();
             FileIntegrityMonitor::Instance().Shutdown();
         } catch (...) {}
-        SetComponentState(ComponentType::FILE_INTEGRITY, ComponentState::STOPPED);
+        SetComponentState(ComponentType::FILE_INTEGRITY, ProtectionComponentState::STOPPED);
 
         try { AccessControlManager::Instance().Shutdown(); } catch (...) {}
-        SetComponentState(ComponentType::ACCESS_CONTROL, ComponentState::STOPPED);
+        SetComponentState(ComponentType::ACCESS_CONTROL, ProtectionComponentState::STOPPED);
 
         try { ZeroHourProtection::Instance().Stop(); } catch (...) {}
-        SetComponentState(ComponentType::ZERO_HOUR, ComponentState::STOPPED);
+        SetComponentState(ComponentType::ZERO_HOUR, ProtectionComponentState::STOPPED);
 
         // BehaviorAnalyzer — shut down after event sources (PCM/PID/BB) but before exploit detectors
         try { Core::Engine::BehaviorAnalyzer::Instance().Shutdown(); } catch (...) {}
@@ -1980,7 +1980,7 @@ public:
         // 6. Invoke file scan callbacks
         {
             std::shared_lock lock(m_callbackMutex);
-            FileScanRequest rtpReq;
+            RTPFileScanRequest rtpReq;
             rtpReq.filePath = filePath;
             rtpReq.pid = req.header.processId;
 
@@ -2469,7 +2469,7 @@ public:
         bool shouldBlock = false;
         {
             std::shared_lock lock(m_callbackMutex);
-            ProcessNotifyRequest rtpReq;
+            RTPProcessNotifyRequest rtpReq;
             rtpReq.pid = req.processId;
             rtpReq.parentPid = req.parentProcessId;
             rtpReq.imagePath = imagePath;
@@ -3711,10 +3711,10 @@ public:
         // Check each component
         for (size_t i = 0; i < static_cast<size_t>(ComponentType::COMPONENT_COUNT); ++i) {
             auto& status = m_componentStatus[i];
-            if (status.state == ComponentState::ERROR) {
+            if (status.state == ProtectionComponentState::ERROR) {
                 allHealthy = false;
                 status.isHealthy = false;
-            } else if (status.state == ComponentState::RUNNING) {
+            } else if (status.state == ProtectionComponentState::RUNNING) {
                 status.isHealthy = true;
             }
         }
@@ -3727,7 +3727,7 @@ public:
         if (!allHealthy && m_state == ProtectionState::ACTIVE) {
             int errorCount = 0;
             for (const auto& status : m_componentStatus) {
-                if (status.state == ComponentState::ERROR) errorCount++;
+                if (status.state == ProtectionComponentState::ERROR) errorCount++;
             }
 
             if (errorCount >= 3) {
@@ -3788,11 +3788,11 @@ public:
         }
     }
 
-    void SetComponentState(ComponentType component, ComponentState state) {
+    void SetComponentState(ComponentType component, ProtectionComponentState state) {
         size_t idx = static_cast<size_t>(component);
         if (idx >= m_componentStatus.size()) return;
 
-        ComponentState oldState = m_componentStatus[idx].state;
+        ProtectionComponentState oldState = m_componentStatus[idx].state;
         m_componentStatus[idx].state = state;
         m_componentStatus[idx].lastStateChange = Now();
 
@@ -3878,7 +3878,7 @@ public:
 
         // Check components
         for (const auto& status : m_componentStatus) {
-            if (status.state == ComponentState::ERROR) {
+            if (status.state == ProtectionComponentState::ERROR) {
                 Utils::Logger::Warn("RealTimeProtection: Component {} in ERROR state",
                     ComponentTypeToString(status.type));
                 passed = false;
@@ -4304,14 +4304,14 @@ size_t RealTimeProtection::GetCacheSize() const noexcept {
 // CALLBACK REGISTRATION
 // ============================================================================
 
-uint64_t RealTimeProtection::RegisterFileScanCallback(FileScanCallback callback) {
+uint64_t RealTimeProtection::RegisterFileScanCallback(RTPFileScanCallback callback) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_fileScanCallbacks[id] = std::move(callback);
     return id;
 }
 
-uint64_t RealTimeProtection::RegisterProcessCreateCallback(ProcessCreateCallback callback) {
+uint64_t RealTimeProtection::RegisterProcessCreateCallback(RTPProcessCreateCallback callback) {
     std::unique_lock lock(m_impl->m_callbackMutex);
     uint64_t id = GenerateCallbackId();
     m_impl->m_processCreateCallbacks[id] = std::move(callback);

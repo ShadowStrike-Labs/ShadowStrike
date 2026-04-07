@@ -371,10 +371,10 @@ enum class HeuristicMode : uint8_t {
 };
 
 /**
- * @enum FileCategory
+ * @enum ZeroHourFileCategory
  * @brief Category of file for differentiated handling.
  */
-enum class FileCategory : uint8_t {
+enum class ZeroHourFileCategory : uint8_t {
     UNKNOWN = 0,
     EXECUTABLE = 1,          ///< PE, ELF, Mach-O
     SCRIPT = 2,              ///< PS1, BAT, VBS, JS
@@ -480,7 +480,7 @@ struct alignas(64) HeldFile {
     uint32_t requestingTid{ 0 };
 
     // File metadata
-    FileCategory category{ FileCategory::UNKNOWN };
+    ZeroHourFileCategory category{ ZeroHourFileCategory::UNKNOWN };
     uint64_t fileSize{ 0 };
     std::wstring originalName;
     std::wstring publisher;
@@ -565,7 +565,7 @@ struct alignas(64) MicroSignature {
     uint64_t relatedOutbreakId{ 0 };
 
     // Targeting
-    std::vector<FileCategory> targetCategories;
+    std::vector<ZeroHourFileCategory> targetCategories;
     std::vector<std::wstring> targetExtensions;
 };
 
@@ -605,7 +605,7 @@ struct alignas(64) AdaptiveHeuristicConfig {
     bool autoAdjust{ true };                   ///< Auto-adjust based on threat level
 
     // Sensitivity multipliers by category
-    std::unordered_map<FileCategory, float> categoryMultipliers;
+    std::unordered_map<ZeroHourFileCategory, float> categoryMultipliers;
 
     // ML thresholds
     float mlDetectionThreshold{ ZeroHourConstants::DEFAULT_ML_THRESHOLD };
@@ -786,7 +786,7 @@ struct alignas(64) FileAnalysisRequest {
     // File information
     std::wstring filePath;
     FileHash hash;
-    FileCategory category{ FileCategory::UNKNOWN };
+    ZeroHourFileCategory category{ ZeroHourFileCategory::UNKNOWN };
     uint64_t fileSize{ 0 };
 
     // Context

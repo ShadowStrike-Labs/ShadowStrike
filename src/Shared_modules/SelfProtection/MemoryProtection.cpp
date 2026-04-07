@@ -93,13 +93,13 @@ std::atomic<bool> MemoryProtection::s_instanceCreated{false};
 // UTILITY FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetProtectionLevelName(ProtectionLevel level) noexcept {
+[[nodiscard]] std::string_view GetProtectionLevelName(MemoryProtectionLevel level) noexcept {
     switch (level) {
-        case ProtectionLevel::Disabled: return "Disabled";
-        case ProtectionLevel::Minimal:  return "Minimal";
-        case ProtectionLevel::Standard: return "Standard";
-        case ProtectionLevel::Enhanced: return "Enhanced";
-        case ProtectionLevel::Maximum:  return "Maximum";
+        case MemoryProtectionLevel::Disabled: return "Disabled";
+        case MemoryProtectionLevel::Minimal:  return "Minimal";
+        case MemoryProtectionLevel::Standard: return "Standard";
+        case MemoryProtectionLevel::Enhanced: return "Enhanced";
+        case MemoryProtectionLevel::Maximum:  return "Maximum";
         default:                        return "Unknown";
     }
 }
@@ -119,13 +119,13 @@ std::atomic<bool> MemoryProtection::s_instanceCreated{false};
     }
 }
 
-[[nodiscard]] std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept {
+[[nodiscard]] std::string_view GetIntegrityStatusName(MemoryIntegrityStatus status) noexcept {
     switch (status) {
-        case IntegrityStatus::Unknown:   return "Unknown";
-        case IntegrityStatus::Valid:     return "Valid";
-        case IntegrityStatus::Modified:  return "Modified";
-        case IntegrityStatus::Corrupted: return "Corrupted";
-        case IntegrityStatus::Hooked:    return "Hooked";
+        case MemoryIntegrityStatus::Unknown:   return "Unknown";
+        case MemoryIntegrityStatus::Valid:     return "Valid";
+        case MemoryIntegrityStatus::Modified:  return "Modified";
+        case MemoryIntegrityStatus::Corrupted: return "Corrupted";
+        case MemoryIntegrityStatus::Hooked:    return "Hooked";
         default:                         return "Unknown";
     }
 }
@@ -176,12 +176,12 @@ bool MemoryProtectionConfiguration::IsValid() const noexcept {
     return true;
 }
 
-MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(ProtectionLevel level) {
+MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(MemoryProtectionLevel level) {
     MemoryProtectionConfiguration config;
     config.level = level;
 
     switch (level) {
-        case ProtectionLevel::Disabled:
+        case MemoryProtectionLevel::Disabled:
             config.enableASLR = false;
             config.enableDEP = false;
             config.enableCFG = false;
@@ -193,10 +193,10 @@ MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(Protectio
             config.enableGuardPages = false;
             config.enableMemoryEncryption = false;
             config.enableAntiScan = false;
-            config.defaultResponse = ProtectionResponse::Log;
+            config.defaultResponse = MemoryProtectionResponse::Log;
             break;
 
-        case ProtectionLevel::Minimal:
+        case MemoryProtectionLevel::Minimal:
             config.enableASLR = true;
             config.enableDEP = true;
             config.enableCFG = false;
@@ -208,10 +208,10 @@ MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(Protectio
             config.enableGuardPages = false;
             config.enableMemoryEncryption = false;
             config.enableAntiScan = false;
-            config.defaultResponse = ProtectionResponse::Passive;
+            config.defaultResponse = MemoryProtectionResponse::Passive;
             break;
 
-        case ProtectionLevel::Standard:
+        case MemoryProtectionLevel::Standard:
             config.enableASLR = true;
             config.enableDEP = true;
             config.enableCFG = true;
@@ -223,10 +223,10 @@ MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(Protectio
             config.enableGuardPages = false;
             config.enableMemoryEncryption = false;
             config.enableAntiScan = false;
-            config.defaultResponse = ProtectionResponse::Active;
+            config.defaultResponse = MemoryProtectionResponse::Active;
             break;
 
-        case ProtectionLevel::Enhanced:
+        case MemoryProtectionLevel::Enhanced:
             config.enableASLR = true;
             config.enableDEP = true;
             config.enableCFG = true;
@@ -238,10 +238,10 @@ MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(Protectio
             config.enableGuardPages = true;
             config.enableMemoryEncryption = true;
             config.enableAntiScan = true;
-            config.defaultResponse = ProtectionResponse::Active;
+            config.defaultResponse = MemoryProtectionResponse::Active;
             break;
 
-        case ProtectionLevel::Maximum:
+        case MemoryProtectionLevel::Maximum:
             config.enableASLR = true;
             config.enableDEP = true;
             config.enableCFG = true;
@@ -254,7 +254,7 @@ MemoryProtectionConfiguration MemoryProtectionConfiguration::FromLevel(Protectio
             config.enableMemoryEncryption = true;
             config.enableAntiScan = true;
             config.integrityCheckIntervalMs = 15000; // More frequent checks
-            config.defaultResponse = ProtectionResponse::Aggressive;
+            config.defaultResponse = MemoryProtectionResponse::Aggressive;
             break;
     }
 
@@ -266,34 +266,34 @@ std::string ProtectionEvent::GetSummary() const {
     oss << "Event #" << eventId << ": ";
 
     switch (type) {
-        case ProtectionEventType::MemoryWrite:
+        case MemoryProtectionEventType::MemoryWrite:
             oss << "Memory write attempt";
             break;
-        case ProtectionEventType::MemoryRead:
+        case MemoryProtectionEventType::MemoryRead:
             oss << "Memory read attempt";
             break;
-        case ProtectionEventType::PermissionChange:
+        case MemoryProtectionEventType::PermissionChange:
             oss << "Permission change attempt";
             break;
-        case ProtectionEventType::IntegrityViolation:
+        case MemoryProtectionEventType::IntegrityViolation:
             oss << "Integrity violation";
             break;
-        case ProtectionEventType::CanaryCorruption:
+        case MemoryProtectionEventType::CanaryCorruption:
             oss << "Canary corruption";
             break;
-        case ProtectionEventType::HeapCorruption:
+        case MemoryProtectionEventType::HeapCorruption:
             oss << "Heap corruption";
             break;
-        case ProtectionEventType::StackOverflow:
+        case MemoryProtectionEventType::StackOverflow:
             oss << "Stack overflow";
             break;
-        case ProtectionEventType::HookDetected:
+        case MemoryProtectionEventType::HookDetected:
             oss << "Hook detected";
             break;
-        case ProtectionEventType::DumpAttempt:
+        case MemoryProtectionEventType::DumpAttempt:
             oss << "Dump attempt";
             break;
-        case ProtectionEventType::ScanDetected:
+        case MemoryProtectionEventType::ScanDetected:
             oss << "Scan detected";
             break;
         default:
@@ -354,6 +354,42 @@ std::string ProtectionEvent::ToJson() const {
     oss << "\"description\":\"" << escapeJson(description) << "\"";
     oss << "}";
     return oss.str();
+}
+
+MemoryProtectionStatistics::MemoryProtectionStatistics(const MemoryProtectionStatistics& other) noexcept
+    : startTime(other.startTime)
+    , lastEventTime(other.lastEventTime) {
+    totalProtectedRegions.store(other.totalProtectedRegions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    totalSecureAllocations.store(other.totalSecureAllocations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    totalSecureBytes.store(other.totalSecureBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    memoryWritesBlocked.store(other.memoryWritesBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    heapCorruptionsDetected.store(other.heapCorruptionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    stackOverflowsDetected.store(other.stackOverflowsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    hooksDetected.store(other.hooksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    dumpAttemptsBlocked.store(other.dumpAttemptsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    scanAttemptsDetected.store(other.scanAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+}
+
+MemoryProtectionStatistics& MemoryProtectionStatistics::operator=(
+    const MemoryProtectionStatistics& other) noexcept {
+    if (this != &other) {
+        totalProtectedRegions.store(other.totalProtectedRegions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalSecureAllocations.store(other.totalSecureAllocations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalSecureBytes.store(other.totalSecureBytes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        totalIntegrityChecks.store(other.totalIntegrityChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        integrityViolations.store(other.integrityViolations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        memoryWritesBlocked.store(other.memoryWritesBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        heapCorruptionsDetected.store(other.heapCorruptionsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        stackOverflowsDetected.store(other.stackOverflowsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        hooksDetected.store(other.hooksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dumpAttemptsBlocked.store(other.dumpAttemptsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        scanAttemptsDetected.store(other.scanAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        startTime = other.startTime;
+        lastEventTime = other.lastEventTime;
+    }
+    return *this;
 }
 
 void MemoryProtectionStatistics::Reset() noexcept {
@@ -603,12 +639,12 @@ public:
         return m_config;
     }
 
-    void SetProtectionLevel(ProtectionLevel level) noexcept {
+    void SetProtectionLevel(MemoryProtectionLevel level) noexcept {
         auto config = MemoryProtectionConfiguration::FromLevel(level);
         SetConfiguration(config);
     }
 
-    [[nodiscard]] ProtectionLevel GetProtectionLevel() const noexcept {
+    [[nodiscard]] MemoryProtectionLevel GetProtectionLevel() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_config.level;
     }
@@ -922,7 +958,7 @@ public:
         region.type = type;
         region.protectedSince = Clock::now();
         region.lastVerified = Clock::now();
-        region.status = IntegrityStatus::Valid;
+        region.status = MemoryIntegrityStatus::Valid;
 
         // Calculate initial hash
         if (!calculateRegionHash(address, size, region.expectedCrc32, region.expectedSha256)) {
@@ -1109,13 +1145,13 @@ public:
     // INTEGRITY VERIFICATION
     // ========================================================================
 
-    [[nodiscard]] IntegrityStatus VerifyRegionIntegrity(std::string_view id) noexcept {
+    [[nodiscard]] MemoryIntegrityStatus VerifyRegionIntegrity(std::string_view id) noexcept {
         ProtectionEvent event;
         bool hasViolation = false;
-        IntegrityStatus resultStatus = IntegrityStatus::Unknown;
+        MemoryIntegrityStatus resultStatus = MemoryIntegrityStatus::Unknown;
 
         // Snapshot of callbacks to invoke outside the lock
-        std::vector<IntegrityCallback> integrityCallbacksCopy;
+        std::vector<MemoryIntegrityCallback> integrityCallbacksCopy;
         ProtectedRegion regionCopy;
 
         {
@@ -1123,7 +1159,7 @@ public:
 
             auto it = m_protectedRegions.find(std::string(id));
             if (it == m_protectedRegions.end()) {
-                return IntegrityStatus::Unknown;
+                return MemoryIntegrityStatus::Unknown;
             }
 
             ProtectedRegion& region = it->second;
@@ -1135,8 +1171,8 @@ public:
             std::array<uint8_t, 32> currentSha256{};
 
             if (!calculateRegionHash(region.baseAddress, region.size, currentCrc32, currentSha256)) {
-                region.status = IntegrityStatus::Corrupted;
-                return IntegrityStatus::Corrupted;
+                region.status = MemoryIntegrityStatus::Corrupted;
+                return MemoryIntegrityStatus::Corrupted;
             }
 
             region.currentCrc32 = currentCrc32;
@@ -1144,7 +1180,7 @@ public:
 
             // Compare with expected
             if (currentCrc32 != region.expectedCrc32 || currentSha256 != region.expectedSha256) {
-                region.status = IntegrityStatus::Modified;
+                region.status = MemoryIntegrityStatus::Modified;
                 region.violationCount++;
                 m_stats.integrityViolations++;
 
@@ -1166,14 +1202,14 @@ public:
                 }
 
                 if (isHook) {
-                    region.status = IntegrityStatus::Hooked;
+                    region.status = MemoryIntegrityStatus::Hooked;
                     m_stats.hooksDetected++;
                 }
 
                 // Prepare event (will be fired after releasing lock)
                 hasViolation = true;
                 event.eventId = m_nextEventId++;
-                event.type = ProtectionEventType::IntegrityViolation;
+                event.type = MemoryProtectionEventType::IntegrityViolation;
                 event.address = region.baseAddress;
                 event.size = region.size;
                 event.regionId = region.id;
@@ -1198,8 +1234,8 @@ public:
                 SS_LOG_WARN(LOG_CATEGORY, L"Integrity violation in region '%hs'", region.id.c_str());
                 resultStatus = region.status;
             } else {
-                region.status = IntegrityStatus::Valid;
-                resultStatus = IntegrityStatus::Valid;
+                region.status = MemoryIntegrityStatus::Valid;
+                resultStatus = MemoryIntegrityStatus::Valid;
             }
         }
         // Lock released — safe to invoke callbacks
@@ -1221,8 +1257,8 @@ public:
         return resultStatus;
     }
 
-    [[nodiscard]] std::vector<std::pair<std::string, IntegrityStatus>> VerifyAllIntegrity() noexcept {
-        std::vector<std::pair<std::string, IntegrityStatus>> results;
+    [[nodiscard]] std::vector<std::pair<std::string, MemoryIntegrityStatus>> VerifyAllIntegrity() noexcept {
+        std::vector<std::pair<std::string, MemoryIntegrityStatus>> results;
 
         // Copy region IDs under lock to avoid iterator invalidation
         std::vector<std::string> regionIds;
@@ -1268,7 +1304,7 @@ public:
             return false;
         }
 
-        region.status = IntegrityStatus::Valid;
+        region.status = MemoryIntegrityStatus::Valid;
         region.currentCrc32 = region.expectedCrc32;
         region.lastVerified = Clock::now();
 
@@ -1437,7 +1473,7 @@ public:
                 // Fire event
                 ProtectionEvent event;
                 event.eventId = m_nextEventId++;
-                event.type = ProtectionEventType::HeapCorruption;
+                event.type = MemoryProtectionEventType::HeapCorruption;
                 event.address = reinterpret_cast<uintptr_t>(heaps[i]);
                 event.timestamp = Clock::now();
                 event.description = "Heap corruption detected";
@@ -1785,7 +1821,7 @@ public:
         m_eventCallbacks.erase(callbackId);
     }
 
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback) noexcept {
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(MemoryIntegrityCallback callback) noexcept {
         std::unique_lock lock(m_mutex);
         uint64_t id = m_nextCallbackId++;
         m_integrityCallbacks[id] = std::move(callback);
@@ -1923,7 +1959,7 @@ public:
                     passed = false;
                 } else {
                     auto status = VerifyRegionIntegrity("selftest_region");
-                    if (status != IntegrityStatus::Valid) {
+                    if (status != MemoryIntegrityStatus::Valid) {
                         SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: Integrity check failed");
                         passed = false;
                     }
@@ -2153,7 +2189,7 @@ private:
                 auto results = VerifyAllIntegrity();
 
                 for (const auto& [id, status] : results) {
-                    if (status != IntegrityStatus::Valid) {
+                    if (status != MemoryIntegrityStatus::Valid) {
                         SS_LOG_WARN(LOG_CATEGORY, L"Integrity issue in region '%hs': %hs",
                             id.c_str(), std::string(GetIntegrityStatusName(status)).c_str());
                     }
@@ -2362,7 +2398,7 @@ private:
     // Callbacks
     std::atomic<uint64_t> m_nextCallbackId;
     std::unordered_map<uint64_t, ProtectionEventCallback> m_eventCallbacks;
-    std::unordered_map<uint64_t, IntegrityCallback> m_integrityCallbacks;
+    std::unordered_map<uint64_t, MemoryIntegrityCallback> m_integrityCallbacks;
     std::unordered_map<uint64_t, HeapCorruptionCallback> m_heapCorruptionCallbacks;
     std::unordered_map<uint64_t, StackOverflowCallback> m_stackOverflowCallbacks;
 };
@@ -2395,12 +2431,16 @@ bool MemoryProtection::Initialize(const MemoryProtectionConfiguration& config) {
     return m_impl->Initialize(config);
 }
 
-bool MemoryProtection::Initialize(ProtectionLevel level) {
+bool MemoryProtection::Initialize(MemoryProtectionLevel level) {
     return Initialize(MemoryProtectionConfiguration::FromLevel(level));
 }
 
 void MemoryProtection::Shutdown(std::string_view authorizationToken) {
     m_impl->Shutdown(authorizationToken);
+}
+
+std::string MemoryProtection::GetInternalAuthToken() const {
+    return std::string(INTERNAL_AUTH_TOKEN);
 }
 
 bool MemoryProtection::IsInitialized() const noexcept {
@@ -2419,11 +2459,11 @@ MemoryProtectionConfiguration MemoryProtection::GetConfiguration() const {
     return m_impl->GetConfiguration();
 }
 
-void MemoryProtection::SetProtectionLevel(ProtectionLevel level) {
+void MemoryProtection::SetProtectionLevel(MemoryProtectionLevel level) {
     m_impl->SetProtectionLevel(level);
 }
 
-ProtectionLevel MemoryProtection::GetProtectionLevel() const noexcept {
+MemoryProtectionLevel MemoryProtection::GetProtectionLevel() const noexcept {
     return m_impl->GetProtectionLevel();
 }
 
@@ -2536,11 +2576,11 @@ std::vector<ProtectedRegion> MemoryProtection::GetAllProtectedRegions() const {
     return m_impl->GetAllProtectedRegions();
 }
 
-IntegrityStatus MemoryProtection::VerifyRegionIntegrity(std::string_view id) {
+MemoryIntegrityStatus MemoryProtection::VerifyRegionIntegrity(std::string_view id) {
     return m_impl->VerifyRegionIntegrity(id);
 }
 
-std::vector<std::pair<std::string, IntegrityStatus>> MemoryProtection::VerifyAllIntegrity() {
+std::vector<std::pair<std::string, MemoryIntegrityStatus>> MemoryProtection::VerifyAllIntegrity() {
     return m_impl->VerifyAllIntegrity();
 }
 
@@ -2634,7 +2674,7 @@ void MemoryProtection::UnregisterEventCallback(uint64_t callbackId) {
     m_impl->UnregisterEventCallback(callbackId);
 }
 
-uint64_t MemoryProtection::RegisterIntegrityCallback(IntegrityCallback callback) {
+uint64_t MemoryProtection::RegisterIntegrityCallback(MemoryIntegrityCallback callback) {
     return m_impl->RegisterIntegrityCallback(std::move(callback));
 }
 
@@ -2702,19 +2742,19 @@ std::string MemoryProtection::GetVersionString() noexcept {
 // RAII HELPER IMPLEMENTATIONS
 // ============================================================================
 
-SecureBuffer::SecureBuffer(size_t size)
-    : SecureBuffer(size, AllocationType::Secure)
+MemorySecureBuffer::MemorySecureBuffer(size_t size)
+    : MemorySecureBuffer(size, AllocationType::Secure)
 {
 }
 
-SecureBuffer::SecureBuffer(size_t size, AllocationType type)
+MemorySecureBuffer::MemorySecureBuffer(size_t size, AllocationType type)
     : m_size(size)
     , m_type(type)
 {
     m_data = MemoryProtection::Instance().AllocateSecure(size, type);
 }
 
-SecureBuffer::~SecureBuffer() {
+MemorySecureBuffer::~MemorySecureBuffer() {
     if (m_data) {
         MemoryProtection::Instance().FreeSecure(m_data, m_size);
         m_data = nullptr;
@@ -2722,7 +2762,7 @@ SecureBuffer::~SecureBuffer() {
     }
 }
 
-SecureBuffer::SecureBuffer(SecureBuffer&& other) noexcept
+MemorySecureBuffer::MemorySecureBuffer(MemorySecureBuffer&& other) noexcept
     : m_data(other.m_data)
     , m_size(other.m_size)
     , m_type(other.m_type)
@@ -2731,7 +2771,7 @@ SecureBuffer::SecureBuffer(SecureBuffer&& other) noexcept
     other.m_size = 0;
 }
 
-SecureBuffer& SecureBuffer::operator=(SecureBuffer&& other) noexcept {
+MemorySecureBuffer& MemorySecureBuffer::operator=(MemorySecureBuffer&& other) noexcept {
     if (this != &other) {
         if (m_data) {
             MemoryProtection::Instance().FreeSecure(m_data, m_size);

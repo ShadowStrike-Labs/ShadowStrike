@@ -160,6 +160,11 @@
 #include <shared_mutex>
 #include <span>
 
+// Undefine Windows macros that clash with our enum values
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
@@ -341,10 +346,10 @@ enum class Protocol : uint16_t {
 };
 
 /**
- * @enum TLSVersion
- * @brief TLS protocol version.
+ * @enum TrafficAnalyzerTLSVersion
+ * @brief TrafficAnalyzer-owned TLS protocol version model.
  */
-enum class TLSVersion : uint16_t {
+enum class TrafficAnalyzerTLSVersion : uint16_t {
     UNKNOWN = 0,
     SSL_3_0 = 0x0300,
     TLS_1_0 = 0x0301,
@@ -396,10 +401,10 @@ enum class AnomalyType : uint8_t {
 };
 
 /**
- * @enum ThreatIndicator
- * @brief Threat indicator from traffic analysis.
+ * @enum TrafficThreatIndicator
+ * @brief Threat indicator emitted by the TrafficAnalyzer module.
  */
-enum class ThreatIndicator : uint8_t {
+enum class TrafficThreatIndicator : uint8_t {
     NONE = 0,
     SHELLCODE_DETECTED = 1,
     MALWARE_SIGNATURE = 2,
@@ -422,7 +427,7 @@ enum class HTTPMethod : uint8_t {
     GET = 1,
     POST = 2,
     PUT = 3,
-    DELETE = 4,
+    HTTP_DELETE = 4,
     HEAD = 5,
     OPTIONS = 6,
     PATCH = 7,
@@ -531,15 +536,15 @@ struct alignas(32) StreamKey {
 };
 
 /**
- * @struct JA3Fingerprint
- * @brief TLS client fingerprint.
+ * @struct TrafficAnalyzerJA3Fingerprint
+ * @brief TrafficAnalyzer-owned TLS client fingerprint.
  */
-struct alignas(64) JA3Fingerprint {
+struct alignas(64) TrafficAnalyzerJA3Fingerprint {
     std::string hash;                    // MD5 hash
     std::string rawString;               // Full fingerprint string
 
     // Components
-    TLSVersion version{ TLSVersion::UNKNOWN };
+    TrafficAnalyzerTLSVersion version{ TrafficAnalyzerTLSVersion::UNKNOWN };
     std::vector<uint16_t> cipherSuites;
     std::vector<uint16_t> extensions;
     std::vector<uint16_t> ellipticCurves;
@@ -552,14 +557,14 @@ struct alignas(64) JA3Fingerprint {
 };
 
 /**
- * @struct JA3SFingerprint
- * @brief TLS server fingerprint.
+ * @struct TrafficAnalyzerJA3SFingerprint
+ * @brief TrafficAnalyzer-owned TLS server fingerprint.
  */
-struct alignas(64) JA3SFingerprint {
+struct alignas(64) TrafficAnalyzerJA3SFingerprint {
     std::string hash;
     std::string rawString;
 
-    TLSVersion version{ TLSVersion::UNKNOWN };
+    TrafficAnalyzerTLSVersion version{ TrafficAnalyzerTLSVersion::UNKNOWN };
     uint16_t selectedCipher{ 0 };
     std::vector<uint16_t> extensions;
 
@@ -568,10 +573,10 @@ struct alignas(64) JA3SFingerprint {
 };
 
 /**
- * @struct CertificateInfo
- * @brief Extracted certificate information.
+ * @struct TrafficAnalyzerCertificateInfo
+ * @brief TrafficAnalyzer-owned extracted certificate information.
  */
-struct alignas(128) CertificateInfo {
+struct alignas(128) TrafficAnalyzerCertificateInfo {
     // Subject
     std::string commonName;
     std::string organization;
@@ -610,12 +615,12 @@ struct alignas(128) CertificateInfo {
 };
 
 /**
- * @struct TLSInfo
- * @brief Complete TLS session information.
+ * @struct TrafficAnalyzerTLSInfo
+ * @brief TrafficAnalyzer-owned complete TLS session information.
  */
-struct alignas(256) TLSInfo {
+struct alignas(256) TrafficAnalyzerTLSInfo {
     // Version and cipher
-    TLSVersion version{ TLSVersion::UNKNOWN };
+    TrafficAnalyzerTLSVersion version{ TrafficAnalyzerTLSVersion::UNKNOWN };
     uint16_t cipherSuite{ 0 };
     std::string cipherSuiteName;
 
@@ -626,11 +631,11 @@ struct alignas(256) TLSInfo {
     std::string alpnProtocol;
 
     // Fingerprints
-    JA3Fingerprint ja3;
-    JA3SFingerprint ja3s;
+    TrafficAnalyzerJA3Fingerprint ja3;
+    TrafficAnalyzerJA3SFingerprint ja3s;
 
     // Certificates
-    std::vector<CertificateInfo> certificateChain;
+    std::vector<TrafficAnalyzerCertificateInfo> certificateChain;
 
     // Session info
     std::array<uint8_t, 32> sessionId{ 0 };
@@ -782,7 +787,7 @@ struct alignas(256) StreamInfo {
     uint32_t retransmissions{ 0 };
 
     // Protocol-specific info
-    std::optional<TLSInfo> tlsInfo;
+    std::optional<TrafficAnalyzerTLSInfo> tlsInfo;
     std::optional<HTTPInfo> httpInfo;
     std::optional<DNSInfo> dnsInfo;
     std::optional<SMBInfo> smbInfo;
@@ -792,7 +797,7 @@ struct alignas(256) StreamInfo {
 
     // Anomalies
     std::vector<AnomalyType> anomalies;
-    std::vector<ThreatIndicator> threats;
+    std::vector<TrafficThreatIndicator> threats;
     uint8_t riskScore{ 0 };               // 0-100
 
     // Metadata
@@ -813,7 +818,7 @@ struct alignas(128) AnalysisResult {
     bool newProtocolIdentified{ false };
 
     // Threats
-    std::vector<ThreatIndicator> threats;
+    std::vector<TrafficThreatIndicator> threats;
     std::vector<std::string> signatures;
     uint8_t threatScore{ 0 };
 
@@ -821,7 +826,7 @@ struct alignas(128) AnalysisResult {
     std::vector<AnomalyType> anomalies;
 
     // Extracted data
-    std::optional<TLSInfo> tlsInfo;
+    std::optional<TrafficAnalyzerTLSInfo> tlsInfo;
     std::optional<HTTPInfo> httpInfo;
     std::optional<DNSInfo> dnsInfo;
     PayloadAnalysis payloadAnalysis;
@@ -944,7 +949,7 @@ using ProtocolDetectionCallback = std::function<void(
  */
 using ThreatCallback = std::function<void(
     uint64_t streamId,
-    ThreatIndicator threat,
+    TrafficThreatIndicator threat,
     const AnalysisResult& result
 )>;
 
@@ -953,7 +958,7 @@ using ThreatCallback = std::function<void(
  */
 using TLSCallback = std::function<void(
     uint64_t streamId,
-    const TLSInfo& tlsInfo
+    const TrafficAnalyzerTLSInfo& tlsInfo
 )>;
 
 // ============================================================================
@@ -977,7 +982,7 @@ using TLSCallback = std::function<void(
  * 
  * // Register threat callback
  * analyzer.RegisterThreatCallback(
- *     [](uint64_t streamId, ThreatIndicator threat, const auto& result) {
+ *     [](uint64_t streamId, TrafficThreatIndicator threat, const auto& result) {
  *         HandleThreat(streamId, threat);
  *     }
  * );
@@ -1125,14 +1130,14 @@ public:
      * @param streamId Stream ID.
      * @return TLS info, or nullopt.
      */
-    [[nodiscard]] std::optional<TLSInfo> GetTLSInfo(uint64_t streamId) const;
+    [[nodiscard]] std::optional<TrafficAnalyzerTLSInfo> GetTLSInfo(uint64_t streamId) const;
 
     /**
      * @brief Calculates JA3 fingerprint.
      * @param clientHello Raw ClientHello data.
      * @return JA3 fingerprint.
      */
-    [[nodiscard]] JA3Fingerprint CalculateJA3(std::span<const uint8_t> clientHello) const;
+    [[nodiscard]] TrafficAnalyzerJA3Fingerprint CalculateJA3(std::span<const uint8_t> clientHello) const;
 
     /**
      * @brief Checks if JA3 is known malicious.
