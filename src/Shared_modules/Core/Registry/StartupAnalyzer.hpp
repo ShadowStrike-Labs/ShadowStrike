@@ -119,10 +119,11 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../../Utils/RegistryUtils.hpp"      // Registry operations
-#include "../../Utils/FileUtils.hpp"          // Startup folders
-#include "../../Utils/CertUtils.hpp"          // Binary verification
+#include "../../Utils/RegistryUtils.hpp"      // RAII RegistryKey wrapper
+#include "../../Utils/FileUtils.hpp"          // File ops, ComputeFileSHA256
+#include "../../Utils/CertUtils.hpp"          // Certificate validation
 #include "../../Utils/ProcessUtils.hpp"       // Process enumeration
+#include "../../Utils/PE_sig_verf.hpp"        // Authenticode signature verification
 #include "../../Whitelist/WhiteListStore.hpp" // Trusted startup items
 
 // ============================================================================
@@ -133,6 +134,7 @@
 #include <string_view>
 #include <vector>
 #include <array>
+#include <deque>
 #include <unordered_map>
 #include <unordered_set>
 #include <set>
@@ -198,7 +200,43 @@ enum class StartupSource : uint8_t {
     Service = 8,
     ShellExtension = 9,
     GroupPolicy = 10,
-    AppXPackage = 11
+    AppXPackage = 11,
+
+    // Extended autostart locations (APT/nation-state coverage)
+    RegistryRun_Wow64_HKLM = 12,
+    RegistryRun_Wow64_HKCU = 13,
+    RegistryRunOnce_Wow64_HKLM = 14,
+    RegistryRunOnce_Wow64_HKCU = 15,
+    RegistryRunServices_HKLM = 16,
+    RegistryRunServices_HKCU = 17,
+    Winlogon_Shell = 18,
+    Winlogon_Userinit = 19,
+    Winlogon_Notify = 20,
+    IFEO = 21,                         // Image File Execution Options
+    AppInit_DLLs = 22,
+    LSA_AuthenticationPackages = 23,
+    LSA_SecurityPackages = 24,
+    PrintMonitor = 25,
+    BootExecute = 26,
+    KnownDLLs = 27,
+    Winsock_Provider = 28,
+    COM_Hijack = 29,
+    ShellServiceObjectDelay = 30,
+    BrowserHelper = 31,
+    ExplorerRun = 32,
+    ActiveSetup = 33,
+    UserShellFolders = 34,
+    SessionManager_Execute = 35,
+    TerminalServer_Startup = 36,
+    NaturalLanguage_DLL = 37,
+    NetworkProvider = 38,
+    ProtocolHandler = 39,
+    ScreenSaver = 40,
+    WMI_Subscription = 41,
+    BITS_Job = 42,
+    OfficeAddin = 43,
+    DomainPolicy = 44,
+    DriverService = 45
 };
 
 /**
@@ -707,6 +745,46 @@ public:
     void RefreshItems();
 
     // ========================================================================
+    // WIRING - REGISTRY MONITOR INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Wires to RegistryMonitor for real-time autostart change detection.
+     * Registers a callback for registry events on persistence keys.
+     */
+    void WireRegistryMonitor();
+
+    /**
+     * @brief Wires to PersistenceDetector for comprehensive ASEP coverage.
+     * Leverages PersistenceDetector's 120+ ASEP type scanning.
+     */
+    void WirePersistenceDetector();
+
+    /**
+     * @brief Handles incoming registry event from RegistryMonitor.
+     * Called when registry changes are detected on autostart keys.
+     * @param keyPath Registry key path that changed.
+     * @param valueName Value name that was modified.
+     * @param data Raw registry data.
+     * @param processId PID of the process making the change.
+     * @param processPath Path of the process making the change.
+     */
+    void OnRegistryChange(const std::wstring& keyPath, const std::wstring& valueName,
+                          const std::vector<uint8_t>& data, uint32_t processId,
+                          const std::wstring& processPath);
+
+    /**
+     * @brief Handles kernel-mode registry callback notification.
+     * Called by IPCManager when kernel driver detects autostart key modification.
+     * @param keyPath The registry key modified from ring-0.
+     * @param valueName The value name.
+     * @param processId PID of the writing process.
+     */
+    void OnKernelRegistryNotification(const std::wstring& keyPath,
+                                      const std::wstring& valueName,
+                                      uint32_t processId);
+
+    // ========================================================================
     // ITEM MANAGEMENT
     // ========================================================================
 
@@ -892,6 +970,7 @@ private:
     StartupAnalyzer();
     ~StartupAnalyzer();
 
+    struct StartupAnalyzerImpl;
     std::unique_ptr<StartupAnalyzerImpl> m_impl;
     static std::atomic<bool> s_instanceCreated;
 };
