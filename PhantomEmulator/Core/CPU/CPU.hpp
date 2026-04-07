@@ -25,8 +25,9 @@
 
 namespace Phantom {
 
-// Forward declaration — ExceptionDispatcher is owned by EmulationSession
+// Forward declarations — owned by EmulationSession, non-owning ptrs here
 class ExceptionDispatcher;
+class HardwareBreakpoints;
 
 // ============================================================================
 // CPU Execution Callbacks
@@ -95,6 +96,11 @@ public:
     // Ownership remains with the caller (typically EmulationSession).
     void SetExceptionDispatcher(ExceptionDispatcher* dispatcher) noexcept;
 
+    // Set the optional hardware breakpoint engine for DR0-DR7 emulation.
+    // When set, execute/data breakpoints and single-step traps are checked
+    // on every instruction. Ownership remains with the caller.
+    void SetHardwareBreakpoints(HardwareBreakpoints* hwbp) noexcept;
+
     // Add a breakpoint at a guest address
     void AddBreakpoint(GuestAddress addr) noexcept;
     void RemoveBreakpoint(GuestAddress addr) noexcept;
@@ -157,6 +163,9 @@ private:
 
     // Optional SEH/VEH exception dispatcher (non-owning, set by EmulationSession)
     ExceptionDispatcher* m_exceptionDispatcher = nullptr;
+
+    // Optional hardware breakpoint engine (non-owning, set by EmulationSession)
+    HardwareBreakpoints* m_hwBreakpoints = nullptr;
 
     // Instruction fetch buffer (avoid repeated memory reads)
     alignas(16) uint8_t m_fetchBuffer[Encoding::kMaxInstructionLength]{};
