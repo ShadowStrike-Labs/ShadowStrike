@@ -557,6 +557,7 @@ private:
     CrashHandler(const CrashHandler&) = delete;
     CrashHandler& operator=(const CrashHandler&) = delete;
     
+    friend class CrashHandlerImpl;
     std::unique_ptr<CrashHandlerImpl> m_impl;
 };
 

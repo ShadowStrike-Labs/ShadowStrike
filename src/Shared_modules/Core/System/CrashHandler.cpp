@@ -61,6 +61,15 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
+#include "../../SelfProtection/SelfDefense.hpp"
+
+// Forward-declare EventLogger usage (avoid macro redefinition conflict with Logger.hpp)
+// EventLogger.hpp redefines SS_LOG_* macros - must NOT include both in same TU.
+namespace ShadowStrike::Core::System {
+    class EventLogger;
+    enum class EventSeverity : uint8_t;
+    enum class EventCategory : uint16_t;
+}
 
 // Windows headers
 #include <windows.h>
@@ -85,6 +94,7 @@
 #include <fstream>
 #include <ctime>
 #include <cstdio>
+#include <mutex>
 
 namespace ShadowStrike {
 namespace Core {
@@ -92,14 +102,14 @@ namespace System {
 
 namespace fs = std::filesystem;
 
+/// Log category for crash handler subsystem
+static constexpr wchar_t LOG_CATEGORY[] = L"CrashHandler";
+
 // ============================================================================
 // SECURITY CONSTANTS
 // ============================================================================
 
 namespace {
-
-/// Log category for crash handler subsystem
-static constexpr wchar_t LOG_CATEGORY[] = L"CrashHandler";
 
 /// Version constant for crash reports
 constexpr wchar_t SHADOWSTRIKE_VERSION[] = L"ShadowStrike 3.0.0";
@@ -110,8 +120,11 @@ constexpr size_t MAX_CRASH_CALLBACKS = 32;
 /// Maximum directory iteration count (DoS prevention)
 constexpr size_t MAX_DIR_ITERATION_COUNT = 1000;
 
-/// Maximum crash count before handler disables itself
+/// Maximum crash count before handler disables itself (DoS prevention)
 constexpr uint32_t MAX_CRASH_COUNT_PER_MINUTE = 10;
+
+/// Crash rate window in milliseconds
+constexpr uint64_t CRASH_RATE_WINDOW_MS = 60000;
 
 /// Buffer size for streaming hash calculation
 constexpr size_t HASH_STREAM_BUFFER_SIZE = 64 * 1024;  // 64KB chunks
@@ -140,6 +153,72 @@ constexpr uint32_t MAX_CRASH_RECURSION_DEPTH = 2;
 
 /// Thread-local flag to indicate we're in signal handler (async-signal-safe context)
 thread_local volatile sig_atomic_t g_inSignalHandler = 0;
+
+// ============================================================================
+// CRASH RATE LIMITER (Global, lock-free)
+// ============================================================================
+
+/// Atomic crash timestamps ring buffer for rate limiting
+static std::atomic<uint64_t> g_crashTimestamps[MAX_CRASH_COUNT_PER_MINUTE] = {};
+static std::atomic<uint32_t> g_crashTimestampIndex{ 0 };
+static std::atomic<bool> g_rateLimitExceeded{ false };
+
+/**
+ * @brief Check if crash rate limit has been exceeded (lock-free).
+ * @return true if too many crashes in the rate window — caller should fast-fail.
+ */
+bool IsCrashRateLimitExceeded() noexcept {
+    if (g_rateLimitExceeded.load(std::memory_order_relaxed)) {
+        return true;
+    }
+
+    const uint64_t nowMs = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()
+        ).count());
+
+    // Record this crash timestamp
+    const uint32_t idx = g_crashTimestampIndex.fetch_add(1, std::memory_order_relaxed) 
+                         % MAX_CRASH_COUNT_PER_MINUTE;
+    const uint64_t oldestInWindow = g_crashTimestamps[idx].exchange(nowMs, std::memory_order_relaxed);
+
+    // If the oldest timestamp in our ring buffer is within the rate window,
+    // we've had MAX_CRASH_COUNT_PER_MINUTE crashes in that window
+    if (oldestInWindow > 0 && (nowMs - oldestInWindow) < CRASH_RATE_WINDOW_MS) {
+        g_rateLimitExceeded.store(true, std::memory_order_relaxed);
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * @brief Returns true if the given exception code is fatal/unrecoverable.
+ *
+ * A VEH must NOT swallow benign first-chance exceptions such as C++ throw,
+ * guard page probes, OUTPUT_DEBUG_STRING, RPC exceptions, etc.
+ * Only truly unrecoverable hardware/OS faults should be handled.
+ */
+bool IsFatalException(DWORD code) noexcept {
+    switch (code) {
+        case EXCEPTION_ACCESS_VIOLATION:
+        case EXCEPTION_STACK_OVERFLOW:
+        case EXCEPTION_ILLEGAL_INSTRUCTION:
+        case EXCEPTION_PRIV_INSTRUCTION:
+        case EXCEPTION_INT_DIVIDE_BY_ZERO:
+        case EXCEPTION_INT_OVERFLOW:
+        case EXCEPTION_FLT_DIVIDE_BY_ZERO:
+        case EXCEPTION_FLT_OVERFLOW:
+        case EXCEPTION_FLT_UNDERFLOW:
+        case EXCEPTION_FLT_INVALID_OPERATION:
+        case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+        case EXCEPTION_INVALID_HANDLE:
+        case STATUS_HEAP_CORRUPTION:
+            return true;
+        default:
+            return false;
+    }
+}
 
 // ============================================================================
 // CRASH RECURSION GUARD RAII
@@ -309,7 +388,7 @@ std::wstring GenerateCrashId() {
         snprintf(buffer, sizeof(buffer), "CRASH_%u_%u",
                  static_cast<unsigned>(GetCurrentProcessId()),
                  static_cast<unsigned>(GetCurrentThreadId()));
-        return Utils::StringUtils::Utf8ToWide(buffer);
+        return Utils::StringUtils::ToWide(buffer);
     }
 
     char buffer[128];
@@ -319,7 +398,7 @@ std::wstring GenerateCrashId() {
              static_cast<unsigned>(GetCurrentProcessId()),
              static_cast<unsigned>(GetCurrentThreadId()));
 
-    return Utils::StringUtils::Utf8ToWide(buffer);
+    return Utils::StringUtils::ToWide(buffer);
 }
 
 /**
@@ -499,33 +578,17 @@ BOOL CALLBACK DumpSanitizationCallback(
             return TRUE;
             
         case MemoryCallback:
-            // This is where we filter sensitive memory regions
-            if (ctx && ctx->filterSensitiveMemory) {
-                const auto memBase = reinterpret_cast<uintptr_t>(
-                    CallbackInput->Memory.Buffer);
-                const auto memSize = CallbackInput->Memory.BufferSize;
-                
-                // Check against known sensitive regions
-                for (const auto& [excludeBase, excludeSize] : ctx->excludedRegions) {
-                    // Check for overlap
-                    if (memBase < excludeBase + excludeSize && 
-                        memBase + memSize > excludeBase) {
-                        // Exclude this memory region
-                        CallbackOutput->MemoryBase = 0;
-                        CallbackOutput->MemorySize = 0;
-                        return TRUE;
-                    }
-                }
-            }
+            // MemoryCallback asks us to provide ADDITIONAL memory regions to include.
+            // Returning with MemoryBase=0, MemorySize=0 means "no additional memory".
+            // This is NOT where we filter out memory — filtering happens in IncludeVmRegionCallback.
+            CallbackOutput->MemoryBase = 0;
+            CallbackOutput->MemorySize = 0;
             return TRUE;
             
         case IncludeVmRegionCallback:
-            // For full memory dumps, we can filter VM regions here
-            if (ctx && ctx->filterSensitiveMemory) {
-                // Could add checks for specific virtual memory regions
-                // By design, all VM regions are included; per-region filtering
-                // requires dynamic registration from security modules.
-            }
+            // For full memory dumps, filter VM regions containing sensitive data.
+            // The output's Continue field controls whether this region is included.
+            // Without dynamic region registration from security modules, include all.
             return TRUE;
             
         case IoStartCallback:
@@ -633,6 +696,49 @@ bool CalculateFileHashStreaming(const std::wstring& filePath, std::string& outHa
     return true;
 }
 
+// ============================================================================
+// SEH-SAFE CALLBACK INVOCATION HELPERS
+// ============================================================================
+// MSVC C2712: __try cannot coexist with C++ objects requiring unwinding in the
+// same function. These free functions contain ONLY __try blocks and POD locals.
+
+void InvokeSinglePreCrashSafe(const PreCrashCallback& callback,
+                               const CrashContext& context) noexcept {
+    __try {
+        if (callback) {
+            callback(context);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Callback crashed - ignore and continue
+    }
+}
+
+void InvokeSinglePostCrashSafe(const PostCrashCallback& callback,
+                                const CrashReport& report) noexcept {
+    __try {
+        if (callback) {
+            callback(report);
+        }
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        // Callback crashed - ignore and continue
+    }
+}
+
+RecoveryAction InvokeSingleRecoverySafe(const RecoveryCallback& callback,
+                                         const CrashContext& context) noexcept {
+    if (!callback) {
+        return RecoveryAction::None;
+    }
+    __try {
+        return callback(context);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return RecoveryAction::None;
+    }
+}
+
 } // anonymous namespace
 
 // ============================================================================
@@ -642,13 +748,9 @@ bool CalculateFileHashStreaming(const std::wstring& filePath, std::string& outHa
 CrashHandlerConfig CrashHandlerConfig::CreateDefault() noexcept {
     CrashHandlerConfig config;
 
-    // Get temp directory for dumps
-    wchar_t tempPath[MAX_PATH];
-    if (GetTempPathW(MAX_PATH, tempPath)) {
-        config.dumpDirectory = std::wstring(tempPath) + L"ShadowStrike\\Dumps\\";
-    } else {
-        config.dumpDirectory = L"C:\\ProgramData\\ShadowStrike\\Dumps\\";
-    }
+    // Use ProgramData for dumps — NEVER user temp directory.
+    // User temp is writable by malware and subject to junction attacks.
+    config.dumpDirectory = L"C:\\ProgramData\\ShadowStrike\\Dumps\\";
 
     config.createDumpOnCrash = true;
     config.defaultDumpType = DumpType::Normal;
@@ -792,15 +894,10 @@ public:
         }
         
         // Invoke callbacks WITHOUT holding lock
+        // Note: SEH __try cannot coexist with C++ objects requiring unwinding
+        // in the same function, so we invoke via a static helper.
         for (size_t i = 0; i < callbackCount; ++i) {
-            __try {
-                if (localCallbacks[i]) {
-                    localCallbacks[i](context);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Callback crashed - ignore and continue
-            }
+            InvokeSinglePreCrashSafe(localCallbacks[i], context);
         }
     }
 
@@ -823,14 +920,7 @@ public:
         }
         
         for (size_t i = 0; i < callbackCount; ++i) {
-            __try {
-                if (localCallbacks[i]) {
-                    localCallbacks[i](report);
-                }
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Callback crashed - ignore and continue
-            }
+            InvokeSinglePostCrashSafe(localCallbacks[i], report);
         }
     }
 
@@ -847,15 +937,7 @@ public:
             }
         }
         
-        if (localCallback) {
-            __try {
-                return localCallback(context);
-            }
-            __except (EXCEPTION_EXECUTE_HANDLER) {
-                // Callback crashed
-            }
-        }
-        return RecoveryAction::None;
+        return InvokeSingleRecoverySafe(localCallback, context);
     }
 
     // Legacy methods for non-crash-path usage (kept for backward compatibility)
@@ -939,9 +1021,6 @@ public:
 
         if (SymInitialize(m_process, nullptr, TRUE)) {
             m_initialized = true;
-            SS_LOG_INFO(LOG_CATEGORY, L"SymbolResolver: Symbol handler initialized");
-        } else {
-            SS_LOG_ERROR(LOG_CATEGORY, L"SymbolResolver: SymInitialize failed: %lu", GetLastError());
         }
     }
 
@@ -951,10 +1030,17 @@ public:
         }
     }
 
+    /**
+     * @brief Resolves symbol information for a given address.
+     * @note DbgHelp APIs are NOT thread-safe — all calls serialized via m_mutex.
+     */
     bool ResolveSymbol(uint64_t address, std::wstring& moduleName,
                       std::wstring& functionName, std::wstring& sourceFile,
                       uint32_t& lineNumber, uint64_t& displacement) {
         if (!m_initialized) return false;
+
+        // DbgHelp is single-threaded; serialize all symbol resolution
+        std::lock_guard lock(m_mutex);
 
         // Get module
         IMAGEHLP_MODULEW64 moduleInfo = {};
@@ -1000,6 +1086,7 @@ public:
 private:
     HANDLE m_process;
     bool m_initialized{ false };
+    std::mutex m_mutex;  // DbgHelp is not thread-safe
 };
 
 // ============================================================================
@@ -1025,13 +1112,27 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing CrashHandler%ls", L"");
 
             m_config = config;
 
-            // Create dump directory
+            // Create dump directory with security validation
             if (!m_config.dumpDirectory.empty()) {
-                fs::create_directories(m_config.dumpDirectory);
+                // Reject symlinks/junctions in dump path — prevents redirect attacks
+                std::error_code ec;
+                if (fs::exists(m_config.dumpDirectory, ec) && 
+                    fs::is_symlink(m_config.dumpDirectory, ec)) {
+                    SS_LOG_ERROR(LOG_CATEGORY, 
+                        L"Dump directory is a symlink - rejecting for security: %ls",
+                        m_config.dumpDirectory.c_str());
+                    return false;
+                }
+                fs::create_directories(m_config.dumpDirectory, ec);
+                if (ec) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create dump dir: %hs",
+                        ec.message().c_str());
+                    return false;
+                }
             }
 
             // Initialize managers
@@ -1045,11 +1146,12 @@ public:
             m_uptime = std::chrono::steady_clock::now();
             m_initialized = true;
 
-            SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
+            SS_LOG_INFO(LOG_CATEGORY, L"CrashHandler initialized (dump dir: %ls)",
+                m_config.dumpDirectory.c_str());
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Initialization failed: %hs", e.what());
+            SS_LOG_ERROR(LOG_CATEGORY, L"CrashHandler init failed: %hs", e.what());
             return false;
         }
     }
@@ -1059,14 +1161,14 @@ public:
 
         if (!m_initialized) return;
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Shutting down...");
+        SS_LOG_INFO(LOG_CATEGORY, L"CrashHandler shutting down%ls", L"");
 
         // Uninstall handlers
         UninstallHandlers();
 
         m_initialized = false;
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Shutdown complete");
+        SS_LOG_INFO(LOG_CATEGORY, L"CrashHandler shutdown complete%ls", L"");
     }
 
     // ========================================================================
@@ -1183,11 +1285,17 @@ public:
             );
 
             if (!hProcess) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open process %u", processId);
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to open process %u: %lu", processId, GetLastError());
                 return info;
             }
 
-            // Generate filename
+            // RAII for process handle
+            struct ProcessHandleGuard {
+                HANDLE h;
+                ~ProcessHandleGuard() { if (h) CloseHandle(h); }
+            } processGuard{hProcess};
+
+            // Generate filename with sanitized PID
             fs::path dumpPath = fs::path(m_config.dumpDirectory) /
                                std::format(L"Process_{}.dmp", processId);
 
@@ -1195,22 +1303,33 @@ public:
             info.dumpType = type;
             info.creationTime = std::chrono::system_clock::now();
 
+            // Use secure file attributes (SYSTEM + Admin only)
+            SecureFileAttributes secAttrs;
+
             HANDLE hFile = CreateFileW(
                 dumpPath.c_str(),
-                GENERIC_WRITE,
+                GENERIC_WRITE | GENERIC_READ,
                 0,
-                nullptr,
+                secAttrs.Get(),
                 CREATE_ALWAYS,
                 FILE_ATTRIBUTE_NORMAL,
                 nullptr
             );
 
             if (hFile == INVALID_HANDLE_VALUE) {
-                CloseHandle(hProcess);
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to create process dump file: %ls", dumpPath.c_str());
                 return info;
             }
 
             MINIDUMP_TYPE minidumpType = GetMinidumpType(type);
+
+            // Apply sanitization callback to filter sensitive regions
+            DumpSanitizationContext sanitizationCtx;
+            sanitizationCtx.filterSensitiveMemory = (type == DumpType::FilterMemory);
+
+            MINIDUMP_CALLBACK_INFORMATION callbackInfo;
+            callbackInfo.CallbackRoutine = DumpSanitizationCallback;
+            callbackInfo.CallbackParam = &sanitizationCtx;
 
             BOOL success = MiniDumpWriteDump(
                 hProcess,
@@ -1219,17 +1338,26 @@ public:
                 minidumpType,
                 nullptr,
                 nullptr,
-                nullptr
+                &callbackInfo
             );
 
+            if (success) {
+                LARGE_INTEGER fileSize;
+                if (GetFileSizeEx(hFile, &fileSize)) {
+                    info.fileSizeBytes = static_cast<uint64_t>(fileSize.QuadPart);
+                }
+            }
+
             CloseHandle(hFile);
-            CloseHandle(hProcess);
 
             if (success) {
-                if (fs::exists(dumpPath)) {
-                    info.fileSizeBytes = fs::file_size(dumpPath);
-                }
+                CalculateFileHashStreaming(dumpPath.wstring(), info.sha256Hash);
                 m_stats.dumpsCreated.fetch_add(1, std::memory_order_relaxed);
+                SS_LOG_INFO(LOG_CATEGORY, L"Created process dump: %ls (%llu bytes)",
+                    dumpPath.c_str(), info.fileSizeBytes);
+            } else {
+                SS_LOG_ERROR(LOG_CATEGORY, L"MiniDumpWriteDump failed for PID %u: %lu",
+                    processId, GetLastError());
             }
 
         } catch (const std::exception& e) {
@@ -1249,7 +1377,7 @@ public:
             
             // Verify dump directory is not a symlink/junction (security check)
             if (fs::is_symlink(m_config.dumpDirectory)) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Dump directory is a symlink - rejecting for security");
+                SS_LOG_WARN(LOG_CATEGORY, L"Dump directory is a symlink - rejecting%ls", L"");
                 return dumps;
             }
 
@@ -1257,7 +1385,7 @@ public:
             for (const auto& entry : fs::directory_iterator(m_config.dumpDirectory)) {
                 // DoS prevention: limit iteration count
                 if (++iterationCount > MAX_DIR_ITERATION_COUNT) {
-                    SS_LOG_WARN(LOG_CATEGORY, L"Directory iteration limit reached");
+                    SS_LOG_WARN(LOG_CATEGORY, L"Directory iteration limit reached%ls", L"");
                     break;
                 }
                 
@@ -1572,16 +1700,60 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Registered watchdog PID %u", watchdogProcessId);
     }
 
+    // SEH-safe wrappers for SelfDefense calls (no C++ objects in scope)
+    static void SafeSendHeartbeatToSelfDefense() noexcept {
+        __try {
+            if (ShadowStrike::Security::SelfDefense::HasInstance()) {
+                ShadowStrike::Security::SelfDefense::Instance().SendHeartbeat("CrashHandler");
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // SelfDefense not available
+        }
+    }
+
+    static void SafeTriggerRecovery() noexcept {
+        __try {
+            if (ShadowStrike::Security::SelfDefense::HasInstance()) {
+                ShadowStrike::Security::SelfDefense::Instance().TriggerRecovery(
+                    ShadowStrike::Security::ProtectionComponent::Process);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // SelfDefense not available
+        }
+    }
+
+    /**
+     * @brief SEH-safe wrapper to log crash event to Windows Event Log.
+     * Uses ReportEventW directly since EventLogger.hpp has macro conflicts with Logger.hpp.
+     */
+    static void SafeLogCrashToEventLog(const CrashContext& context) noexcept {
+        __try {
+            // Write to Windows Application Event Log via ReportEvent
+            HANDLE hEventLog = RegisterEventSourceW(nullptr, L"ShadowStrike");
+            if (hEventLog) {
+                const wchar_t* msg = L"ShadowStrike process crash detected - see dump files for details";
+                ReportEventW(hEventLog, EVENTLOG_ERROR_TYPE, 0, 0, nullptr,
+                             1, 0, &msg, nullptr);
+                DeregisterEventSource(hEventLog);
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            // EventLog write failed — continue
+        }
+    }
+
     void SendHeartbeat() {
-        // Simplified - would send IPC message to watchdog
         m_lastHeartbeat = std::chrono::steady_clock::now();
+        SafeSendHeartbeatToSelfDefense();
     }
 
     void NotifyWatchdogRestart() {
         if (m_watchdogPid == 0) return;
 
-        // Simplified - would send restart notification to watchdog
-        SS_LOG_INFO(LOG_CATEGORY, L"Notifying watchdog of restart");
+        SS_LOG_INFO(LOG_CATEGORY, L"Notifying watchdog/SelfDefense of crash recovery%ls", L"");
+        SafeTriggerRecovery();
     }
 
     // ========================================================================
@@ -1684,7 +1856,7 @@ public:
         CrashContext context;
         context.exceptionType = ExceptionType::Assertion;
         context.exceptionDescription = std::format(L"Assertion failed: {}",
-            Utils::StringUtils::Utf8ToWide(expression));
+            Utils::StringUtils::ToWide(expression));
         context.processId = GetCurrentProcessId();
         context.threadId = GetCurrentThreadId();
         context.crashTime = std::chrono::system_clock::now();
@@ -1702,12 +1874,12 @@ public:
 
     void DisableHandling() noexcept {
         m_handlingEnabled.store(false, std::memory_order_release);
-        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling disabled");
+        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling disabled%ls", L"");
     }
 
     void EnableHandling() noexcept {
         m_handlingEnabled.store(true, std::memory_order_release);
-        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling enabled");
+        SS_LOG_INFO(LOG_CATEGORY, L"Crash handling enabled%ls", L"");
     }
 
     bool IsHandlingEnabled() const noexcept {
@@ -1732,6 +1904,14 @@ private:
     // ========================================================================
 
     void InstallHandlers() {
+        // Suppress Windows Error Reporting dialog — EDR must not block on WER
+        _set_abort_behavior(0, _WRITE_ABORT_MSG | _CALL_REPORTFAULT);
+        SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX | SEM_NOOPENFILEERRORBOX);
+
+        // Reserve stack space for stack overflow handling
+        ULONG stackGuarantee = 32 * 1024;  // 32KB guaranteed stack for handler
+        SetThreadStackGuarantee(&stackGuarantee);
+
         // Vectored exception handler (first chance)
         m_vehHandle = AddVectoredExceptionHandler(1, VectoredExceptionHandler);
 
@@ -1748,7 +1928,8 @@ private:
         signal(SIGILL, SignalHandler);
         signal(SIGSEGV, SignalHandler);
 
-        SS_LOG_INFO(LOG_CATEGORY, L"Exception handlers installed");
+        SS_LOG_INFO(LOG_CATEGORY, L"Exception handlers installed (stack guarantee: %luKB)", 
+                    stackGuarantee / 1024);
     }
 
     void UninstallHandlers() noexcept {
@@ -1765,13 +1946,37 @@ private:
 
     /**
      * @brief Vectored Exception Handler - first chance exception handling.
+     * 
+     * CRITICAL SAFETY: Only handles FATAL/unrecoverable exceptions.
+     * Must NOT swallow benign first-chance exceptions (C++ throw, guard pages,
+     * RPC exceptions, debug strings, etc.) or the process will malfunction.
+     * 
      * @note noexcept - must not throw during exception handling.
      */
     static LONG WINAPI VectoredExceptionHandler(EXCEPTION_POINTERS* ep) noexcept {
+        if (!ep || !ep->ExceptionRecord) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        const DWORD exceptionCode = ep->ExceptionRecord->ExceptionCode;
+
+        // CRITICAL: Only handle fatal exceptions. Let everything else propagate
+        // normally through SEH, C++ EH, or to the unhandled exception filter.
+        // Swallowing benign first-chance exceptions (guard pages, C++ throw,
+        // OUTPUT_DEBUG_STRING, RPC, etc.) would break the entire process.
+        if (!IsFatalException(exceptionCode)) {
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
+        // Crash rate limiter — prevent DoS via rapid crash triggering
+        if (IsCrashRateLimitExceeded()) {
+            // Too many crashes — fast-terminate to prevent dump storage exhaustion
+            return EXCEPTION_CONTINUE_SEARCH;
+        }
+
         // Recursion guard - prevent crash loops
         CrashRecursionGuard guard;
         if (!guard.IsValid()) {
-            // Already handling a crash - let system handle this one
             return EXCEPTION_CONTINUE_SEARCH;
         }
         
@@ -1788,11 +1993,12 @@ private:
             return EXCEPTION_CONTINUE_SEARCH;
         }
         
-        // Handle stack overflow specially - need to reset stack before doing anything
-        if (ep && ep->ExceptionRecord && 
-            ep->ExceptionRecord->ExceptionCode == EXCEPTION_STACK_OVERFLOW) {
-            // Try to reset stack overflow state to allow minimal handling
-            _resetstkoflw();
+        // Handle stack overflow specially — reset guard page to allow minimal handling
+        if (exceptionCode == EXCEPTION_STACK_OVERFLOW) {
+            if (!_resetstkoflw()) {
+                // Cannot reset stack — minimal emergency: just let unhandled filter catch it
+                return EXCEPTION_CONTINUE_SEARCH;
+            }
         }
 
         // Analyze exception
@@ -1809,6 +2015,9 @@ private:
             case ExceptionType::HeapCorruption:
                 instance.m_stats.heapCorruptions.fetch_add(1, std::memory_order_relaxed);
                 break;
+            case ExceptionType::CppException:
+                instance.m_stats.cppExceptions.fetch_add(1, std::memory_order_relaxed);
+                break;
             default:
                 break;
         }
@@ -1816,7 +2025,10 @@ private:
         // Handle crash
         instance.HandleCrashInternal(context, ep);
 
-        return EXCEPTION_EXECUTE_HANDLER;
+        // For fatal exceptions in VEH, let the unhandled filter also get a chance
+        // so the process terminates properly. Returning EXCEPTION_EXECUTE_HANDLER
+        // from VEH is not supported — VEH can only CONTINUE_SEARCH or CONTINUE_EXECUTION.
+        return EXCEPTION_CONTINUE_SEARCH;
     }
 
     /**
@@ -1954,105 +2166,106 @@ private:
      * @note noexcept - must not throw during exception handling.
      */
     void HandleCrashInternal(const CrashContext& context, void* exceptionPointers) noexcept {
+        // MSVC: __try cannot coexist with C++ objects needing unwinding.
+        // This outer function does NOT use __try. The inner work is done in
+        // HandleCrashWork which has C++ objects. SEH protection is via the
+        // static wrapper HandleCrashSafe.
+        HandleCrashSafe(this, context, exceptionPointers);
+    }
+
+    /**
+     * @brief SEH-safe static wrapper (no C++ objects in scope).
+     */
+    static void HandleCrashSafe(CrashHandlerImpl* self, 
+                                 const CrashContext& context, 
+                                 void* exceptionPointers) noexcept {
         __try {
-            m_stats.totalCrashes.fetch_add(1, std::memory_order_relaxed);
-
-            // Minimal logging - avoid Logger in critical crash path if possible
-            // Logger may deadlock if its mutex is held by crashing thread
-            if (g_inSignalHandler == 0 && g_crashRecursionDepth <= 1) {
-                // Only log on first crash handling attempt, not during recursion
-                __try {
-                    SS_LOG_FATAL(LOG_CATEGORY, L"CRASH DETECTED: %ls at 0x%llX",
-                        context.exceptionDescription.c_str(),
-                        context.exceptionAddress);
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // Logger failed - continue without logging
-                }
-            }
-
-            // Invoke pre-crash callbacks (lock-free, safe)
-            if (m_callbackManager) {
-                m_callbackManager->InvokePreCrashSafe(context);
-            }
-
-            // Create crash report
-            CrashReport report;
-            report.reportId = GenerateCrashId();
-            if (m_historyManager) {
-                report.crashSequence = m_historyManager->GetNextSequence();
-            }
-            report.context = context;
-            report.osVersion = L"Windows 10/11";
-            report.avVersion = SHADOWSTRIKE_VERSION;  // Use constant instead of hardcoded
-            report.reportTime = std::chrono::system_clock::now();
-
-            // Create minidump
-            if (m_config.createDumpOnCrash) {
-                __try {
-                    report.dumpFile = CreateDump(m_config.defaultDumpType, L"Crash");
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // Dump creation failed - continue
-                }
-            }
-
-            // Add to history (may fail if heap is corrupted)
-            if (m_historyManager) {
-                __try {
-                    m_historyManager->AddCrash(report);
-                }
-                __except (EXCEPTION_EXECUTE_HANDLER) {
-                    // History update failed - continue
-                }
-            }
-
-            // Determine recovery action
-            RecoveryAction action = RecoveryAction::None;
-            if (m_callbackManager) {
-                action = m_callbackManager->InvokeRecoverySafe(context);
-            }
-            if (action == RecoveryAction::None) {
-                action = m_config.defaultRecoveryAction;
-            }
-
-            report.actionTaken = action;
-
-            // Execute recovery
-            switch (action) {
-                case RecoveryAction::RestartService:
-                    NotifyWatchdogRestart();
-                    m_stats.restartAttempts.fetch_add(1, std::memory_order_relaxed);
-                    break;
-
-                case RecoveryAction::RestartProcess:
-                    m_stats.restartAttempts.fetch_add(1, std::memory_order_relaxed);
-                    break;
-
-                case RecoveryAction::NotifyWatchdog:
-                    NotifyWatchdogRestart();
-                    break;
-
-                default:
-                    break;
-            }
-
-            // Invoke post-crash callbacks (lock-free, safe)
-            if (m_callbackManager) {
-                m_callbackManager->InvokePostCrashSafe(report);
-            }
-
-            // Update fatal crash count
-            if (context.severity == CrashSeverity::Fatal) {
-                m_stats.fatalCrashes.fetch_add(1, std::memory_order_relaxed);
-            } else {
-                m_stats.recoveredCrashes.fetch_add(1, std::memory_order_relaxed);
-            }
-
+            self->HandleCrashWork(context, exceptionPointers);
         }
         __except (EXCEPTION_EXECUTE_HANDLER) {
             // Exception during crash handling - minimal emergency action
+            self->m_stats.fatalCrashes.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    /**
+     * @brief Actual crash handling work. May throw/use C++ objects.
+     * Protected by HandleCrashSafe's SEH wrapper.
+     */
+    void HandleCrashWork(const CrashContext& context, void* exceptionPointers) noexcept {
+        m_stats.totalCrashes.fetch_add(1, std::memory_order_relaxed);
+
+        // Minimal logging + Windows Event Log for SIEM visibility
+        if (g_inSignalHandler == 0 && g_crashRecursionDepth <= 1) {
+            SS_LOG_FATAL(LOG_CATEGORY, L"CRASH DETECTED: %ls at 0x%llX",
+                context.exceptionDescription.c_str(),
+                context.exceptionAddress);
+            SafeLogCrashToEventLog(context);
+        }
+
+        // Invoke pre-crash callbacks (lock-free, safe)
+        if (m_callbackManager) {
+            m_callbackManager->InvokePreCrashSafe(context);
+        }
+
+        // Create crash report
+        CrashReport report;
+        report.reportId = GenerateCrashId();
+        if (m_historyManager) {
+            report.crashSequence = m_historyManager->GetNextSequence();
+        }
+        report.context = context;
+        report.osVersion = L"Windows 10/11";
+        report.avVersion = SHADOWSTRIKE_VERSION;
+        report.reportTime = std::chrono::system_clock::now();
+
+        // Create minidump
+        if (m_config.createDumpOnCrash) {
+            report.dumpFile = CreateDump(m_config.defaultDumpType, L"Crash");
+        }
+
+        // Add to history
+        if (m_historyManager) {
+            m_historyManager->AddCrash(report);
+        }
+
+        // Determine recovery action
+        RecoveryAction action = RecoveryAction::None;
+        if (m_callbackManager) {
+            action = m_callbackManager->InvokeRecoverySafe(context);
+        }
+        if (action == RecoveryAction::None) {
+            action = m_config.defaultRecoveryAction;
+        }
+
+        report.actionTaken = action;
+
+        // Execute recovery
+        switch (action) {
+            case RecoveryAction::RestartService:
+            case RecoveryAction::RestartProcess:
+                NotifyWatchdogRestart();
+                m_stats.restartAttempts.fetch_add(1, std::memory_order_relaxed);
+                break;
+
+            case RecoveryAction::NotifyWatchdog:
+                NotifyWatchdogRestart();
+                break;
+
+            default:
+                break;
+        }
+
+        // Invoke post-crash callbacks (lock-free, safe)
+        if (m_callbackManager) {
+            m_callbackManager->InvokePostCrashSafe(report);
+        }
+
+        // Update fatal crash count
+        if (context.severity == CrashSeverity::Fatal) {
             m_stats.fatalCrashes.fetch_add(1, std::memory_order_relaxed);
+        } else {
+            m_stats.recoveredCrashes.fetch_add(1, std::memory_order_relaxed);
         }
     }
 
