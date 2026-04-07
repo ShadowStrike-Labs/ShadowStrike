@@ -1519,7 +1519,55 @@ struct ThreatDetectorStats {
     
     /// @brief Average processing time (microseconds)
     std::atomic<uint64_t> avgProcessingTimeUs{ 0 };
-    
+
+    ThreatDetectorStats() = default;
+
+    ThreatDetectorStats(const ThreatDetectorStats& other) noexcept {
+        *this = other;
+    }
+
+    ThreatDetectorStats& operator=(const ThreatDetectorStats& other) noexcept {
+        if (this != &other) {
+            totalEventsProcessed.store(other.totalEventsProcessed.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            for (size_t i = 0; i < eventsByCategory.size(); ++i) {
+                eventsByCategory[i].store(other.eventsByCategory[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            totalThreatsDetected.store(other.totalThreatsDetected.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            for (size_t i = 0; i < threatsBySeverity.size(); ++i) {
+                threatsBySeverity[i].store(other.threatsBySeverity[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < threatsByCategory.size(); ++i) {
+                threatsByCategory[i].store(other.threatsByCategory[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < detectionsBySource.size(); ++i) {
+                detectionsBySource[i].store(other.detectionsBySource[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            for (size_t i = 0; i < actionsTaken.size(); ++i) {
+                actionsTaken[i].store(other.actionsTaken[i].load(std::memory_order_relaxed),
+                    std::memory_order_relaxed);
+            }
+            activeAttackChains.store(other.activeAttackChains.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            eventsPerSecond.store(other.eventsPerSecond.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            peakEventsPerSecond.store(other.peakEventsPerSecond.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            eventsDropped.store(other.eventsDropped.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            falsePositives.store(other.falsePositives.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+            avgProcessingTimeUs.store(other.avgProcessingTimeUs.load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        return *this;
+    }
+     
     /**
      * @brief Reset all statistics.
      */

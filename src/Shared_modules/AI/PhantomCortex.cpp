@@ -148,7 +148,7 @@ namespace {
     }
 
     /// @brief Clamp a float to [0.0, 1.0], treating NaN as 0.0
-    [[nodiscard]] constexpr float ClampProbability(float p) noexcept {
+    [[nodiscard]] float ClampProbability(float p) noexcept {
         if (std::isnan(p) || p < 0.0f) return 0.0f;
         if (p > 1.0f) return 1.0f;
         return p;
@@ -521,7 +521,6 @@ CortexVerdict PhantomCortex::AnalyzeBehavior(
     constexpr auto kSource = CortexModelType::Behavioral;
 
     if (!m_impl) {
-    if (!m_impl) {
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }
 
@@ -620,7 +619,6 @@ CortexVerdict PhantomCortex::AnalyzeMemory(
 {
     constexpr auto kSource = CortexModelType::Memory;
 
-    if (!m_impl) {
     if (!m_impl) {
         return MakeErrorVerdict(kSource, L"PhantomCortex not constructed");
     }

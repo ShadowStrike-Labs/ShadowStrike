@@ -149,7 +149,7 @@ constexpr size_t kNgramFeatures        = 128;
 constexpr size_t kTemporalFeatures     = 128;
 
 // Known suspicious strings for PE string analysis.
-// Indices 12..91 of the string feature vector.
+// Stored in the fixed string-analysis block that starts at feature index 12.
 constexpr const char* kSuspiciousStrings[] = {
     "cmd.exe", "powershell", "WScript", "CreateRemoteThread",
     "VirtualAlloc", "WriteProcessMemory", "NtProtectVirtualMemory",
@@ -181,7 +181,9 @@ constexpr const char* kSuspiciousStrings[] = {
     "Wow64SetThreadContext", "EnumProcesses"
 };
 constexpr size_t kNumSuspiciousStrings = sizeof(kSuspiciousStrings) / sizeof(kSuspiciousStrings[0]);
-static_assert(kNumSuspiciousStrings <= 80, "Suspicious string list must fit within 80 feature slots");
+constexpr size_t kSuspiciousStringFeatureSlots = 602;
+static_assert(kNumSuspiciousStrings <= kSuspiciousStringFeatureSlots,
+              "Suspicious string list exceeds the fixed PE string-analysis feature block");
 
 // Known section names for presence flags.
 constexpr const char* kKnownSectionNames[] = {

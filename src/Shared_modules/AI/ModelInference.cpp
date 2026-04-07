@@ -47,7 +47,12 @@
 // ONNX Runtime C API
 // ============================================================================
 
+#if __has_include(<onnxruntime_c_api.h>)
 #include <onnxruntime_c_api.h>
+#define SHADOWSTRIKE_HAS_ONNXRUNTIME 1
+#else
+#define SHADOWSTRIKE_HAS_ONNXRUNTIME 0
+#endif
 
 // ============================================================================
 // Windows / SIMD intrinsics
@@ -72,6 +77,8 @@
 #include <cstring>
 #include <thread>
 #include <fstream>
+
+#if SHADOWSTRIKE_HAS_ONNXRUNTIME
 
 namespace ShadowStrike {
 namespace AI {
@@ -1623,3 +1630,103 @@ bool ModelInference::HasDirectML() const noexcept {
 
 }  // namespace AI
 }  // namespace ShadowStrike
+
+#else
+
+namespace ShadowStrike {
+namespace AI {
+
+namespace {
+    static constexpr const wchar_t* kLogTag = L"PhantomCortex";
+
+    [[nodiscard]] const wchar_t* ModelTypeName(CortexModelType type) noexcept {
+        switch (type) {
+            case CortexModelType::Static: return L"Static";
+            case CortexModelType::Behavioral: return L"Behavioral";
+            case CortexModelType::Memory: return L"Memory";
+            case CortexModelType::Network: return L"Network";
+            case CortexModelType::Emulation: return L"Emulation";
+            default: return L"Unknown";
+        }
+    }
+}
+
+struct ModelInference::Impl {};
+
+ModelInference& ModelInference::Instance() noexcept {
+    static ModelInference instance;
+    return instance;
+}
+
+ModelInference::ModelInference()
+    : m_impl(std::make_unique<Impl>()) {}
+
+ModelInference::~ModelInference() = default;
+
+bool ModelInference::Initialize(const CortexConfig&) noexcept {
+    SS_LOG_ERROR(kLogTag, L"ONNX Runtime SDK is not available; ModelInference remains disabled");
+    return false;
+}
+
+void ModelInference::Shutdown() noexcept {}
+
+bool ModelInference::IsInitialized() const noexcept {
+    return false;
+}
+
+bool ModelInference::LoadModel(CortexModelType type, const std::filesystem::path& onnxPath) noexcept {
+    SS_LOG_ERROR(kLogTag,
+        L"Cannot load model %ls from %ls because ONNX Runtime SDK is not available",
+        ModelTypeName(type),
+        onnxPath.c_str());
+    return false;
+}
+
+void ModelInference::UnloadModel(CortexModelType) noexcept {}
+
+std::optional<std::vector<float>> ModelInference::Infer(
+    CortexModelType type,
+    std::span<const float>,
+    std::span<const int64_t>) noexcept
+{
+    SS_LOG_ERROR(kLogTag,
+        L"Infer(%ls) rejected because ONNX Runtime SDK is not available",
+        ModelTypeName(type));
+    return std::nullopt;
+}
+
+std::optional<std::vector<std::vector<float>>> ModelInference::InferBatch(
+    CortexModelType type,
+    std::span<const float>,
+    std::span<const int64_t>) noexcept
+{
+    SS_LOG_ERROR(kLogTag,
+        L"InferBatch(%ls) rejected because ONNX Runtime SDK is not available",
+        ModelTypeName(type));
+    return std::nullopt;
+}
+
+std::optional<ModelVersion> ModelInference::GetModelVersion(CortexModelType) const noexcept {
+    return std::nullopt;
+}
+
+bool ModelInference::IsModelLoaded(CortexModelType) const noexcept {
+    return false;
+}
+
+bool ModelInference::HasAVX2() const noexcept {
+    return false;
+}
+
+bool ModelInference::HasAVX512() const noexcept {
+    return false;
+}
+
+bool ModelInference::HasDirectML() const noexcept {
+    return false;
+}
+
+}  // namespace AI
+}  // namespace ShadowStrike
+
+#endif
