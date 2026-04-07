@@ -8,6 +8,7 @@
 
 #include "CPU.hpp"
 #include "ExceptionDispatcher.hpp"
+#include "HardwareBreakpoints.hpp"
 #include "../../Common/Constants.hpp"
 #include "../../Common/Platform.hpp"
 #include <chrono>
@@ -37,6 +38,7 @@ void CPU::SetAPICallCallback(APICallCallback cb) noexcept                { m_api
 void CPU::SetSyscallCallback(SyscallCallback cb) noexcept                { m_syscallCallback = std::move(cb); }
 void CPU::SetInterruptCallback(InterruptCallback cb) noexcept            { m_interruptCallback = std::move(cb); }
 void CPU::SetExceptionDispatcher(ExceptionDispatcher* dispatcher) noexcept { m_exceptionDispatcher = dispatcher; }
+void CPU::SetHardwareBreakpoints(HardwareBreakpoints* hwbp) noexcept { m_hwBreakpoints = hwbp; }
 
 void CPU::AddBreakpoint(GuestAddress addr) noexcept    { m_breakpoints.insert(addr); }
 void CPU::RemoveBreakpoint(GuestAddress addr) noexcept  { m_breakpoints.erase(addr); }
@@ -124,10 +126,30 @@ ExecutionResult CPU::Execute(
             }
         }
 
-        // === Check breakpoint ===
+        // === Check software breakpoint ===
         if (PHANTOM_UNLIKELY(!m_breakpoints.empty() && m_breakpoints.contains(m_state.rip))) {
             result.reason = StopReason::Breakpoint;
             break;
+        }
+
+        // === Check hardware breakpoints (DR0-DR3 execute breakpoints) ===
+        // This is the hot path for anti-debug detection — malware that sets
+        // hardware breakpoints to detect analysis tools triggers DR6/INT1.
+        if (PHANTOM_UNLIKELY(m_hwBreakpoints && m_hwBreakpoints->HasActiveBreakpoints())) {
+            if (m_hwBreakpoints->CheckExecuteBreakpoint(m_state.rip)) {
+                // Hardware execute breakpoint fired — generate INT1 (#DB).
+                // Route through the interrupt callback so the ExceptionDispatcher
+                // can dispatch to VEH/SEH handlers if registered by the sample.
+                if (m_interruptCallback) {
+                    if (!m_interruptCallback(m_state, memory, 1)) {
+                        result.reason = StopReason::Breakpoint;
+                        break;
+                    }
+                    continue;
+                }
+                result.reason = StopReason::Breakpoint;
+                break;
+            }
         }
 
         // === Check API hook ===
@@ -281,6 +303,22 @@ ExecutionResult CPU::Execute(
         // === Post-instruction callback ===
         if (m_postCallback) {
             m_postCallback(m_state, inst);
+        }
+
+        // === Hardware single-step (Trap Flag) processing ===
+        // If the Trap Flag is set in EFLAGS, generate a #DB exception after
+        // the instruction completes. This models x86 single-step behaviour
+        // used by debuggers — and exploited by malware for anti-debug checks.
+        if (PHANTOM_UNLIKELY(m_hwBreakpoints &&
+                             m_hwBreakpoints->IsSingleStepActive(m_state.eflags))) {
+            if (m_hwBreakpoints->ProcessSingleStep(m_state)) {
+                if (m_interruptCallback) {
+                    if (!m_interruptCallback(m_state, memory, 1)) {
+                        result.reason = StopReason::Breakpoint;
+                        break;
+                    }
+                }
+            }
         }
 
         // === Update counters ===

@@ -34,6 +34,7 @@
 
 // Exception Handling
 #include "../Core/CPU/ExceptionDispatcher.hpp"
+#include "../Core/CPU/HardwareBreakpoints.hpp"
 
 // WinAPI
 #include "../WinAPI/APIDispatcher.hpp"
@@ -44,6 +45,10 @@
 
 // Integration
 #include "YaraScanner.hpp"
+#include "ProcessManager.hpp"
+
+// WoW64
+#include "../Core/WoW64/WoW64Layer.hpp"
 
 // Analysis (all 11 modules)
 #include "../Analysis/BehaviorMonitor.hpp"
@@ -304,6 +309,11 @@ struct EmulationSession::Impl {
     YaraScanner             m_yaraScanner;
     ExceptionDispatcher     m_exceptionDispatcher;
 
+    // Phase 3 modules — hardware breakpoints, multi-process, WoW64
+    HardwareBreakpoints     m_hwBreakpoints;
+    ProcessManager          m_processManager;
+    WoW64Layer              m_wow64Layer;
+
     // Session state
     std::atomic<bool> m_abortRequested{false};
     bool              m_executed = false;
@@ -337,6 +347,7 @@ struct EmulationSession::Impl {
         , m_cryptoDetector(config)
         , m_networkAnalyzer(config)
         , m_evasionDetector(config)
+        , m_processManager(config)
     {}
 
     // ========================================================================
@@ -913,6 +924,15 @@ struct EmulationSession::Impl {
         // stopping. Enables analysis of malware that uses structured
         // exception handling for anti-debug or control-flow obfuscation.
         m_cpu.SetExceptionDispatcher(&m_exceptionDispatcher);
+
+        // === Hardware Breakpoints ===
+        // Wire the debug register engine into the CPU loop. This enables
+        // DR0-DR3 execute/data breakpoint checks on every instruction and
+        // Trap Flag single-step processing. Critical for:
+        // - Anti-debug detection (malware reading/clearing DR7)
+        // - Analysis tool support (analyst-set hardware BPs)
+        // - INT1 exception generation for VEH/SEH dispatch
+        m_cpu.SetHardwareBreakpoints(&m_hwBreakpoints);
     }
 
     // ========================================================================
@@ -950,6 +970,7 @@ struct EmulationSession::Impl {
         RouteCryptoEvents(call);
         RouteIOCEvents(call);
         RouteEvasionEvents(call, cpu);
+        RouteProcessEvents(call, cpu);
 
         // Step 5: Check for abort between API calls
         if (m_abortRequested.load(std::memory_order_relaxed)) {
@@ -1130,10 +1151,113 @@ struct EmulationSession::Impl {
     }
 
     // ========================================================================
+    // Route Process/Injection Events to ProcessManager
+    // ========================================================================
+    // Detects cross-process operations used by sophisticated injection chains:
+    // process hollowing, DLL injection, APC injection, thread hijacking.
+    // Each matched API is routed to the ProcessManager's specialized handler.
+
+    void RouteProcessEvents(const APICallDetail& call,
+                            const CPUState& cpu) noexcept {
+        if (!m_config.enableMultiProcess || !call.funcName) return;
+
+        const std::string_view fn{call.funcName};
+
+        // === Process creation ===
+        if (fn == "CreateProcessW" || fn == "CreateProcessA" ||
+            fn == "CreateProcessInternalW" || fn == "NtCreateUserProcess") {
+            // args[4] = dwCreationFlags (CREATE_SUSPENDED = 0x4)
+            ProcessCreationFlags flags = ProcessCreationFlags::None;
+            if (call.argCount > 4 && (call.args[4] & 0x4u)) {
+                flags = ProcessCreationFlags::CreateSuspended;
+            }
+            m_processManager.CreateChildProcess(
+                L"<unknown>",   // imagePath (extracted by IOCExtractor)
+                L"<unknown>",   // commandLine
+                flags,
+                1);             // parentPid = emulated process
+            return;
+        }
+
+        // === Cross-process memory write (classic DLL/shellcode injection) ===
+        // OnCrossProcessWrite takes ByteSpan — we construct an empty span here
+        // because the actual data lives in guest memory. The ProcessManager
+        // captures it internally using the injected region tracking.
+        if (fn == "WriteProcessMemory" || fn == "NtWriteVirtualMemory") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            m_processManager.OnCrossProcessWrite(targetPid, call.args[1], {});
+            return;
+        }
+
+        // === Cross-process memory allocation ===
+        if (fn == "VirtualAllocEx" || fn == "NtAllocateVirtualMemory") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            GuestAddress addr = call.returnValue;
+            auto size = static_cast<GuestSize>(call.args[2] & 0xFFFFFFFF);
+            uint32_t protect = static_cast<uint32_t>(call.args[3] & 0xFFFFFFFF);
+            m_processManager.OnCrossProcessAlloc(targetPid, addr, size, protect);
+            return;
+        }
+
+        // === Section unmap (process hollowing step) ===
+        if (fn == "NtUnmapViewOfSection" || fn == "NtUnmapViewOfSectionEx") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            m_processManager.OnSectionUnmap(targetPid, call.args[1]);
+            return;
+        }
+
+        // === Thread context modification (process hollowing / thread hijack) ===
+        if (fn == "SetThreadContext" || fn == "NtSetContextThread" ||
+            fn == "Wow64SetThreadContext") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            uint32_t threadId  = static_cast<uint32_t>(call.args[1] & 0xFFFFFFFF);
+            GuestAddress newRip = call.args[2];
+            m_processManager.OnContextModification(targetPid, threadId, newRip);
+            return;
+        }
+
+        // === Remote thread creation (classic DLL injection finale) ===
+        if (fn == "CreateRemoteThread" || fn == "CreateRemoteThreadEx" ||
+            fn == "NtCreateThreadEx" || fn == "RtlCreateUserThread") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            GuestAddress startAddr = call.args[2];
+            uint64_t parameter = call.args[3];
+            m_processManager.OnRemoteThreadCreation(targetPid, startAddr, parameter);
+            return;
+        }
+
+        // === APC queue (early-bird injection, atom bombing step) ===
+        if (fn == "QueueUserAPC" || fn == "NtQueueApcThread" ||
+            fn == "NtQueueApcThreadEx") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            uint32_t threadId  = static_cast<uint32_t>(call.args[1] & 0xFFFFFFFF);
+            GuestAddress apcRoutine = call.args[2];
+            m_processManager.OnAPCQueue(targetPid, threadId, apcRoutine);
+            return;
+        }
+
+        // === Resume thread (final step for many injection chains) ===
+        if (fn == "ResumeThread" || fn == "NtResumeThread") {
+            uint32_t targetPid = static_cast<uint32_t>(call.args[0] & 0xFFFFFFFF);
+            m_processManager.ResumeProcess(targetPid);
+            return;
+        }
+    }
+
+    // ========================================================================
     // CPU Callback: Syscall
     // ========================================================================
 
     bool OnSyscall(CPUState& cpu, VirtualMemory& mem) noexcept {
+        // WoW64 syscall thunking: 32-bit processes on 64-bit Windows use a
+        // translation layer. If the sample is a WoW64 process, intercept
+        // and translate the syscall number through the thunk table before
+        // dispatching to the standard 64-bit syscall handler.
+        if (m_config.enableWoW64 && m_wow64Layer.IsInitialized()) {
+            // Thunk 32-bit syscall number to 64-bit equivalent
+            m_wow64Layer.ThunkSyscall(cpu, mem);
+        }
+
         bool handled = m_dispatcher->DispatchSyscall(cpu, mem);
 
         // After syscall dispatch, feed the call to analysis modules the same
@@ -1148,6 +1272,7 @@ struct EmulationSession::Impl {
                 RouteCryptoEvents(call);
                 RouteIOCEvents(call);
                 RouteEvasionEvents(call, cpu);
+                RouteProcessEvents(call, cpu);
             }
         }
 
@@ -1310,6 +1435,23 @@ struct EmulationSession::Impl {
 
         // 5k: Feed post-analysis results to MITRE mapper
         FeedMITREMapper();
+
+        // 5l: Hardware breakpoint anti-debug analysis
+        //     Collects DR7 manipulation events from the CPU loop. Malware that
+        //     reads/writes debug registers to detect or evade analysis tools
+        //     triggers these events. Feed them to EvasionDetector + ThreatScorer.
+        CollectHWBPDetections();
+
+        // 5m: Process injection chain analysis
+        //     Finalize injection chain detection — correlate all cross-process
+        //     operations (VirtualAllocEx→WriteProcessMemory→CreateRemoteThread)
+        //     into classified injection techniques.
+        CollectProcessInjectionResults();
+
+        // 5n: WoW64 evasion analysis
+        //     Collect Heaven's Gate transition events and FS/Registry redirection
+        //     bypass attempts. These indicate deliberate WoW64 exploitation.
+        CollectWoW64Results();
     }
 
     // ========================================================================
@@ -1630,6 +1772,155 @@ struct EmulationSession::Impl {
     }
 
     // ========================================================================
+    // 5l: Hardware Breakpoint Anti-Debug Collection
+    // ========================================================================
+
+    void CollectHWBPDetections() noexcept {
+        // Retrieve all anti-debug detection events accumulated during
+        // emulation: DR7 reads, DR7 writes, INT1 generation, TF manipulation
+        const auto& detections = m_hwBreakpoints.GetDetections();
+        if (detections.empty()) return;
+
+        // Map DebugDetectionEvent::Type to a human-readable description
+        // for the EvasionDetector and MITRE mapper
+        auto typeToString = [](DebugDetectionEvent::Type type) -> const char* {
+            switch (type) {
+                case DebugDetectionEvent::Type::ReadDR0_DR3:
+                    return "read_dr0_dr3";
+                case DebugDetectionEvent::Type::ReadDR6:
+                    return "read_dr6";
+                case DebugDetectionEvent::Type::ReadDR7:
+                    return "read_dr7";
+                case DebugDetectionEvent::Type::WriteDR7_Clear:
+                    return "write_dr7_clear";
+                case DebugDetectionEvent::Type::WriteDR0_DR3_Set:
+                    return "write_dr0_dr3_set";
+                case DebugDetectionEvent::Type::CheckTrapFlag:
+                    return "check_trap_flag";
+                case DebugDetectionEvent::Type::TimingCheck:
+                    return "rdtsc_timing_check";
+                case DebugDetectionEvent::Type::ExceptionBasedDetect:
+                    return "exception_based_detect";
+                default:
+                    return "unknown_dr_event";
+            }
+        };
+
+        for (const auto& det : detections) {
+            const char* desc = typeToString(det.type);
+
+            // Feed to EvasionDetector — these are strong anti-debug indicators
+            m_evasionDetector.OnEnvironmentQuery("hwbp-antidebug", desc);
+
+            // Feed to ThreatScorer — DR manipulation is almost always malicious
+            if (m_config.enableThreatScoring) {
+                // Severity: write/clear operations are more suspicious than reads
+                float severity = (det.type == DebugDetectionEvent::Type::WriteDR7_Clear ||
+                                  det.type == DebugDetectionEvent::Type::WriteDR0_DR3_Set)
+                                     ? 0.85f : 0.6f;
+                m_threatScorer.AddEvasionAttempt(desc, severity);
+            }
+
+            // Feed to MITRE mapper: T1622 (Debugger Evasion)
+            if (m_config.enableMITREMapping) {
+                m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+    }
+
+    // ========================================================================
+    // 5m: Process Injection Chain Analysis
+    // ========================================================================
+
+    void CollectProcessInjectionResults() noexcept {
+        if (!m_config.enableMultiProcess) return;
+
+        // Iterate all child processes and collect injection technique detections
+        auto childPids = m_processManager.GetChildProcessIds();
+        if (childPids.empty()) return;
+
+        // Map InjectionTechnique to a human-readable string for MITRE mapping
+        auto techniqueToString = [](InjectionTechnique tech) -> const char* {
+            switch (tech) {
+                case InjectionTechnique::ProcessHollowing:       return "T1055.012_process_hollowing";
+                case InjectionTechnique::ClassicDLLInjection:    return "T1055.001_dll_injection";
+                case InjectionTechnique::ReflectiveDLLInjection: return "T1055.001_reflective_dll_injection";
+                case InjectionTechnique::APCInjection:           return "T1055.004_apc_injection";
+                case InjectionTechnique::AtomBombing:            return "T1055_atom_bombing";
+                case InjectionTechnique::ProcessDoppelganging:   return "T1055.013_process_doppelganging";
+                case InjectionTechnique::EarlyBirdInjection:     return "T1055.004_early_bird_injection";
+                case InjectionTechnique::ThreadHijacking:        return "T1055.003_thread_hijacking";
+                case InjectionTechnique::ParentPIDSpoof:         return "T1134.004_parent_pid_spoof";
+                default: return nullptr;
+            }
+        };
+
+        for (uint32_t pid : childPids) {
+            InjectionTechnique tech = m_processManager.GetDetectedTechnique(pid);
+            if (tech == InjectionTechnique::None) continue;
+
+            const char* desc = techniqueToString(tech);
+            if (!desc) continue;
+
+            // Feed to ThreatScorer — injection chains are HIGH confidence malicious
+            if (m_config.enableThreatScoring) {
+                m_threatScorer.AddEvasionAttempt(desc, 0.95f);
+            }
+
+            // Feed to MITRE mapper — process injection maps to T1055 sub-techniques
+            if (m_config.enableMITREMapping) {
+                m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+
+        // Collect inter-process events for result reporting
+        const auto& events = m_processManager.GetEvents();
+        for (const auto& evt : events) {
+            if (evt.type == ProcessEvent::Type::HollowingDetected ||
+                evt.type == ProcessEvent::Type::InjectionDetected) {
+                m_evasionDetector.OnEnvironmentQuery(
+                    "process-injection",
+                    evt.type == ProcessEvent::Type::HollowingDetected
+                        ? "hollowing_detected" : "injection_detected");
+            }
+        }
+    }
+
+    // ========================================================================
+    // 5n: WoW64 Evasion Analysis
+    // ========================================================================
+
+    void CollectWoW64Results() noexcept {
+        if (!m_config.enableWoW64 || !m_wow64Layer.IsInitialized()) return;
+
+        const auto& events = m_wow64Layer.GetHeavensGateEvents();
+        if (events.empty()) return;
+
+        for (const auto& evt : events) {
+            // Only flag evasion attempts — normal WoW64 transitions are expected
+            if (!evt.isEvasionAttempt) continue;
+
+            const char* desc =
+                (evt.direction == WoW64Transition::HeavensGate32to64)
+                    ? "heavens_gate_32to64_evasion"
+                    : "heavens_gate_64to32_evasion";
+
+            // Heaven's Gate transitions → strong evasion indicator
+            m_evasionDetector.OnEnvironmentQuery("wow64-evasion", desc);
+
+            if (m_config.enableThreatScoring) {
+                m_threatScorer.AddEvasionAttempt(desc, 0.80f);
+            }
+
+            if (m_config.enableMITREMapping) {
+                // T1106 (Native API) + T1055 (Process Injection, specifically for
+                // WoW64 Heaven's Gate abuse in malware like Dridex, TrickBot)
+                m_mitreMapper.OnEvasionAttempt(desc);
+            }
+        }
+    }
+
+    // ========================================================================
     // Phase 6: Collect Results
     // ========================================================================
 
@@ -1845,6 +2136,17 @@ struct EmulationSession::Impl {
     [[nodiscard]] PhantomEmulationResult ExecutePipeline(
         const LoadedTarget& target) noexcept
     {
+        // Phase 2.5: Initialize WoW64 layer for 32-bit samples
+        // Must run after environment setup and before CPU callbacks,
+        // because it modifies segment descriptors and CS selector.
+        if (m_config.enableWoW64 && !target.is64Bit) {
+            if (m_wow64Layer.Initialize(m_memory, m_cpu.State())) {
+                m_wow64Layer.SetupFor32BitPE(
+                    m_memory, m_cpu.State(),
+                    target.imageBase, target.entryPoint);
+            }
+        }
+
         // Phase 3: Wire CPU callbacks to analysis modules
         WireCPUCallbacks(target);
 
