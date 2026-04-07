@@ -193,6 +193,7 @@
 #include "../Utils/ThreadPool.hpp"
 #include "../PatternStore/PatternStore.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -622,7 +623,7 @@ enum class MonitoringMode : uint8_t {
 /**
  * @brief Protection level presets
  */
-enum class ProtectionLevel : uint8_t {
+enum class AntiDebugProtectionLevel : uint8_t {
     Disabled    = 0,    ///< No protection
     Minimal     = 1,    ///< Basic checks only
     Standard    = 2,    ///< Standard protection
@@ -665,7 +666,7 @@ enum class HookType : uint8_t {
 /**
  * @brief Integrity check status
  */
-enum class IntegrityStatus : uint8_t {
+enum class AntiDebugIntegrityStatus : uint8_t {
     Unknown     = 0,
     Valid       = 1,    ///< Integrity verified
     Modified    = 2,    ///< Code has been modified
@@ -673,18 +674,7 @@ enum class IntegrityStatus : uint8_t {
     Corrupted   = 4     ///< Code is corrupted
 };
 
-/**
- * @brief Anti-debug module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -695,7 +685,7 @@ enum class ModuleStatus : uint8_t {
  */
 struct AntiDebugConfiguration {
     /// @brief Protection level preset
-    ProtectionLevel protectionLevel = ProtectionLevel::Standard;
+    AntiDebugProtectionLevel protectionLevel = AntiDebugProtectionLevel::Standard;
     
     /// @brief Monitoring mode
     MonitoringMode monitoringMode = MonitoringMode::Periodic;
@@ -757,7 +747,7 @@ struct AntiDebugConfiguration {
     /**
      * @brief Create configuration from protection level preset
      */
-    static AntiDebugConfiguration FromProtectionLevel(ProtectionLevel level);
+    static AntiDebugConfiguration FromProtectionLevel(AntiDebugProtectionLevel level);
     
     /**
      * @brief Validate configuration
@@ -976,7 +966,7 @@ struct IntegrityRegion {
     uint32_t currentCrc32 = 0;
     
     /// @brief Integrity status
-    IntegrityStatus status = IntegrityStatus::Unknown;
+    AntiDebugIntegrityStatus status = AntiDebugIntegrityStatus::Unknown;
     
     /// @brief Last verification timestamp
     TimePoint lastVerified;
@@ -988,7 +978,7 @@ struct IntegrityRegion {
      * @brief Check if integrity is valid
      */
     [[nodiscard]] bool IsValid() const noexcept {
-        return status == IntegrityStatus::Valid;
+        return status == AntiDebugIntegrityStatus::Valid;
     }
 };
 
@@ -1199,7 +1189,7 @@ using DetectionCallback = std::function<void(const DetectionEvent&)>;
 using ResponseCallback = std::function<bool(ResponseAction action, const DetectionResult&)>;
 
 /// @brief Callback for integrity violations
-using IntegrityCallback = std::function<void(const IntegrityRegion&)>;
+using AntiDebugIntegrityCallback = std::function<void(const IntegrityRegion&)>;
 
 /// @brief Callback for hook detection
 using HookCallback = std::function<void(const HookInfo&)>;
@@ -1246,7 +1236,7 @@ concept ResponseHandler = requires(T handler, ResponseAction action, const Detec
  *     auto& antiDebug = AntiDebug::Instance();
  *     
  *     AntiDebugConfiguration config;
- *     config.protectionLevel = ProtectionLevel::Enhanced;
+ *     config.protectionLevel = AntiDebugProtectionLevel::Enhanced;
  *     config.monitoringMode = MonitoringMode::Continuous;
  *     
  *     if (!antiDebug.Initialize(config)) {
@@ -1308,7 +1298,7 @@ public:
      * @param level Protection level preset
      * @return true if initialization succeeded
      */
-    [[nodiscard]] bool Initialize(ProtectionLevel level);
+    [[nodiscard]] bool Initialize(AntiDebugProtectionLevel level);
     
     /**
      * @brief Shutdown the anti-debug engine
@@ -1358,13 +1348,13 @@ public:
      * @brief Set protection level
      * @param level Protection level preset
      */
-    void SetProtectionLevel(ProtectionLevel level);
+    void SetProtectionLevel(AntiDebugProtectionLevel level);
     
     /**
      * @brief Get current protection level
      * @return Current protection level
      */
-    [[nodiscard]] ProtectionLevel GetProtectionLevel() const noexcept;
+    [[nodiscard]] AntiDebugProtectionLevel GetProtectionLevel() const noexcept;
     
     /**
      * @brief Set monitoring mode
@@ -1875,13 +1865,13 @@ public:
      * @param id Region identifier
      * @return Integrity status
      */
-    [[nodiscard]] IntegrityStatus VerifyIntegrity(std::string_view id);
+    [[nodiscard]] AntiDebugIntegrityStatus VerifyIntegrity(std::string_view id);
     
     /**
      * @brief Verify all registered regions
      * @return Map of region ID to integrity status
      */
-    [[nodiscard]] std::unordered_map<std::string, IntegrityStatus> VerifyAllIntegrity();
+    [[nodiscard]] std::unordered_map<std::string, AntiDebugIntegrityStatus> VerifyAllIntegrity();
     
     /**
      * @brief Get integrity region info
@@ -1950,7 +1940,7 @@ public:
      * @param callback Callback function
      * @return Callback ID for removal
      */
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(AntiDebugIntegrityCallback callback);
     
     /**
      * @brief Unregister integrity callback
@@ -2172,7 +2162,7 @@ private:
  * @param level Protection level enum value
  * @return Human-readable name
  */
-[[nodiscard]] std::string_view GetProtectionLevelName(ProtectionLevel level) noexcept;
+[[nodiscard]] std::string_view GetProtectionLevelName(AntiDebugProtectionLevel level) noexcept;
 
 // ============================================================================
 // RAII HELPERS
@@ -2294,7 +2284,7 @@ public:
      * @brief Verify integrity now
      * @return Current integrity status
      */
-    [[nodiscard]] IntegrityStatus Verify();
+    [[nodiscard]] AntiDebugIntegrityStatus Verify();
     
     /**
      * @brief Get region ID

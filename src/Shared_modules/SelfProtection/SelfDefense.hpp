@@ -158,6 +158,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "SecurityEnums.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
@@ -414,7 +415,7 @@ inline constexpr ThreatType operator|(ThreatType a, ThreatType b) noexcept {
 /**
  * @brief Response to detected threat
  */
-enum class ThreatResponse : uint32_t {
+enum class SelfDefenseThreatResponse : uint32_t {
     None        = 0x00000000,   ///< No action (monitoring only)
     Log         = 0x00000001,   ///< Log the event
     Alert       = 0x00000002,   ///< Send alert
@@ -431,9 +432,14 @@ enum class ThreatResponse : uint32_t {
     Aggressive  = Log | Alert | Block | Terminate | Recover
 };
 
-inline constexpr ThreatResponse operator|(ThreatResponse a, ThreatResponse b) noexcept {
-    return static_cast<ThreatResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr SelfDefenseThreatResponse operator|(SelfDefenseThreatResponse a, SelfDefenseThreatResponse b) noexcept {
+    return static_cast<SelfDefenseThreatResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_THREAT_RESPONSE_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_THREAT_RESPONSE_DEFINED
+using ThreatResponse = SelfDefenseThreatResponse;
+#endif
 
 /**
  * @brief Protected entity type
@@ -462,27 +468,12 @@ enum class ComponentHealth : uint8_t {
     Protected   = 5
 };
 
-#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-/**
- * @brief Self-defense module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,    ///< Running with reduced functionality
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 /**
  * @brief Access request type
  */
-enum class AccessRequestType : uint8_t {
+enum class SelfDefenseAccessRequestType : uint8_t {
     ProcessOpen     = 0,
     ThreadOpen      = 1,
     HandleDuplicate = 2,
@@ -496,7 +487,7 @@ enum class AccessRequestType : uint8_t {
 /**
  * @brief Access decision
  */
-enum class AccessDecision : uint8_t {
+enum class SelfDefenseAccessDecision : uint8_t {
     Allow       = 0,    ///< Allow the access
     Deny        = 1,    ///< Deny the access
     StripRights = 2,    ///< Allow with reduced rights
@@ -518,7 +509,7 @@ struct SelfDefenseConfiguration {
     ProtectionComponent enabledComponents = ProtectionComponent::All;
     
     /// @brief Default threat response
-    ThreatResponse defaultResponse = ThreatResponse::Active;
+    SelfDefenseThreatResponse defaultResponse = SelfDefenseThreatResponse::Active;
     
     /// @brief Enable kernel-mode protection (requires driver)
     bool enableKernelProtection = true;
@@ -707,7 +698,7 @@ struct ThreatEvent {
     uint32_t blockedAccess = 0;
     
     /// @brief Action taken
-    ThreatResponse actionTaken = ThreatResponse::None;
+    SelfDefenseThreatResponse actionTaken = SelfDefenseThreatResponse::None;
     
     /// @brief Was the threat blocked
     bool wasBlocked = false;
@@ -735,9 +726,9 @@ struct ThreatEvent {
 /**
  * @brief Access request for filtering
  */
-struct AccessRequest {
+struct SelfDefenseAccessRequest {
     /// @brief Request type
-    AccessRequestType type = AccessRequestType::ProcessOpen;
+    SelfDefenseAccessRequestType type = SelfDefenseAccessRequestType::ProcessOpen;
     
     /// @brief Caller process ID
     uint32_t callerProcessId = 0;
@@ -773,9 +764,9 @@ struct AccessRequest {
 /**
  * @brief Access decision result
  */
-struct AccessDecisionResult {
+struct SelfDefenseAccessDecisionResult {
     /// @brief Decision
-    AccessDecision decision = AccessDecision::Allow;
+    SelfDefenseAccessDecision decision = SelfDefenseAccessDecision::Allow;
     
     /// @brief Modified access rights (if StripRights)
     uint32_t grantedAccess = 0;
@@ -789,6 +780,26 @@ struct AccessDecisionResult {
     /// @brief Associated threat event (if any)
     std::optional<ThreatEvent> threatEvent;
 };
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_TYPE_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_TYPE_DEFINED
+using AccessRequestType = SelfDefenseAccessRequestType;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_DEFINED
+using AccessDecision = SelfDefenseAccessDecision;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_DEFINED
+using AccessRequest = SelfDefenseAccessRequest;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_RESULT_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_RESULT_DEFINED
+using AccessDecisionResult = SelfDefenseAccessDecisionResult;
+#endif
 
 /**
  * @brief Component status information
@@ -904,10 +915,15 @@ struct HeartbeatMessage {
 // ============================================================================
 
 /// @brief Callback for threat events
-using ThreatCallback = std::function<void(const ThreatEvent&)>;
+using SelfDefenseThreatCallback = std::function<void(const ThreatEvent&)>;
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_THREAT_CALLBACK_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_THREAT_CALLBACK_DEFINED
+using ThreatCallback = SelfDefenseThreatCallback;
+#endif
 
 /// @brief Callback for access decisions (can override)
-using AccessCallback = std::function<AccessDecisionResult(const AccessRequest&)>;
+using AccessCallback = std::function<SelfDefenseAccessDecisionResult(const SelfDefenseAccessRequest&)>;
 
 /// @brief Callback for component status changes
 using ComponentStatusCallback = std::function<void(ProtectionComponent, ComponentHealth)>;
@@ -1075,12 +1091,12 @@ public:
      * @param threatType Threat type
      * @param response Response action
      */
-    void SetThreatResponse(ThreatType threatType, ThreatResponse response);
+    void SetThreatResponse(ThreatType threatType, SelfDefenseThreatResponse response);
     
     /**
      * @brief Get threat response policy
      */
-    [[nodiscard]] ThreatResponse GetThreatResponse(ThreatType threatType) const;
+    [[nodiscard]] SelfDefenseThreatResponse GetThreatResponse(ThreatType threatType) const;
     
     // ========================================================================
     // PROCESS PROTECTION
@@ -1131,7 +1147,7 @@ public:
      * @param request Access request details
      * @return Access decision result
      */
-    [[nodiscard]] AccessDecisionResult FilterAccessRequest(const AccessRequest& request);
+    [[nodiscard]] SelfDefenseAccessDecisionResult FilterAccessRequest(const SelfDefenseAccessRequest& request);
     
     /**
      * @brief Register process as ShadowStrike component
@@ -1407,7 +1423,7 @@ public:
      * @param callback Callback function
      * @return Callback ID
      */
-    [[nodiscard]] uint64_t RegisterThreatCallback(ThreatCallback callback);
+    [[nodiscard]] uint64_t RegisterThreatCallback(SelfDefenseThreatCallback callback);
     
     /**
      * @brief Unregister threat callback

@@ -359,7 +359,7 @@ enum class RegistryIntegrityStatus : uint8_t {
 /**
  * @brief Operation decision
  */
-enum class OperationDecision : uint8_t {
+enum class RegistryOperationDecision : uint8_t {
     Allow       = 0,
     Block       = 1,
     AllowLogged = 2,
@@ -370,7 +370,7 @@ enum class OperationDecision : uint8_t {
 /**
  * @brief Protection event type
  */
-enum class ProtectionEventType : uint32_t {
+enum class RegistryProtectionEventType : uint32_t {
     None                    = 0x00000000,
     OperationBlocked        = 0x00000001,
     OperationAllowed        = 0x00000002,
@@ -387,14 +387,14 @@ enum class ProtectionEventType : uint32_t {
     All                     = 0xFFFFFFFF
 };
 
-inline constexpr ProtectionEventType operator|(ProtectionEventType a, ProtectionEventType b) noexcept {
-    return static_cast<ProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr RegistryProtectionEventType operator|(RegistryProtectionEventType a, RegistryProtectionEventType b) noexcept {
+    return static_cast<RegistryProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
 /**
  * @brief Protection response
  */
-enum class ProtectionResponse : uint32_t {
+enum class RegistryProtectionResponse : uint32_t {
     None            = 0x00000000,
     Log             = 0x00000001,
     Alert           = 0x00000002,
@@ -409,8 +409,8 @@ enum class ProtectionResponse : uint32_t {
     Aggressive      = Log | Alert | Block | Rollback | TerminateSource
 };
 
-inline constexpr ProtectionResponse operator|(ProtectionResponse a, ProtectionResponse b) noexcept {
-    return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr RegistryProtectionResponse operator|(RegistryProtectionResponse a, RegistryProtectionResponse b) noexcept {
+    return static_cast<RegistryProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
 // ModuleStatus is provided by SecurityEnums.hpp (canonical definition)
@@ -451,7 +451,7 @@ struct RegistryProtectionConfiguration {
     uint32_t maxSnapshotsPerKey = RegistryProtectionConstants::MAX_SNAPSHOTS_PER_KEY;
     
     /// @brief Default protection response
-    ProtectionResponse defaultResponse = ProtectionResponse::Active;
+    RegistryProtectionResponse defaultResponse = RegistryProtectionResponse::Active;
     
     /// @brief Protected key paths
     std::vector<std::wstring> protectedKeys;
@@ -649,9 +649,9 @@ struct RegistryOperationRequest {
 /**
  * @brief Operation decision result
  */
-struct OperationDecisionResult {
+struct RegistryOperationDecisionResult {
     /// @brief Decision
-    OperationDecision decision = OperationDecision::Allow;
+    RegistryOperationDecision decision = RegistryOperationDecision::Allow;
     
     /// @brief Reason for decision
     std::string reason;
@@ -677,7 +677,7 @@ struct RegistryProtectionEvent {
     uint64_t eventId = 0;
     
     /// @brief Event type
-    ProtectionEventType type = ProtectionEventType::None;
+    RegistryProtectionEventType type = RegistryProtectionEventType::None;
     
     /// @brief Event timestamp
     TimePoint timestamp = Clock::now();
@@ -692,7 +692,7 @@ struct RegistryProtectionEvent {
     RegistryOperation operation = RegistryOperation::None;
     
     /// @brief Operation decision
-    OperationDecision decision = OperationDecision::Allow;
+    RegistryOperationDecision decision = RegistryOperationDecision::Allow;
     
     /// @brief Source process ID
     uint32_t sourceProcessId = 0;
@@ -704,7 +704,7 @@ struct RegistryProtectionEvent {
     std::wstring sourceProcessPath;
     
     /// @brief Response taken
-    ProtectionResponse responseTaken = ProtectionResponse::None;
+    RegistryProtectionResponse responseTaken = RegistryProtectionResponse::None;
     
     /// @brief Was blocked
     bool wasBlocked = false;
@@ -769,11 +769,11 @@ struct RegistryProtectionStatistics {
 using RegistryEventCallback = std::function<void(const RegistryProtectionEvent&)>;
 
 /// @brief Callback for operation decisions (can override)
-using OperationDecisionCallback = std::function<std::optional<OperationDecisionResult>(
+using RegistryOperationDecisionCallback = std::function<std::optional<RegistryOperationDecisionResult>(
     const RegistryOperationRequest&)>;
 
 /// @brief Callback for integrity violations
-using IntegrityCallback = std::function<void(const ProtectedKey&)>;
+using RegistryIntegrityCallback = std::function<void(const ProtectedKey&)>;
 
 /// @brief Callback for value changes
 using ValueChangeCallback = std::function<void(const ProtectedValue&, 
@@ -995,12 +995,12 @@ public:
     /**
      * @brief Filter registry operation request
      */
-    [[nodiscard]] OperationDecisionResult FilterOperation(const RegistryOperationRequest& request);
+    [[nodiscard]] RegistryOperationDecisionResult FilterOperation(const RegistryOperationRequest& request);
     
     /**
      * @brief Set custom decision callback
      */
-    void SetDecisionCallback(OperationDecisionCallback callback);
+    void SetDecisionCallback(RegistryOperationDecisionCallback callback);
     
     /**
      * @brief Clear custom decision callback
@@ -1126,7 +1126,7 @@ public:
     /**
      * @brief Register integrity callback
      */
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(RegistryIntegrityCallback callback);
     
     /**
      * @brief Unregister integrity callback

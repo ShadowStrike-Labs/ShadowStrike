@@ -471,9 +471,9 @@ public:
 
     [[nodiscard]] bool ElevateToPPL();
     [[nodiscard]] bool IsPPLProtected() const;
-    [[nodiscard]] ProtectionLevel GetProtectionLevel(uint32_t processId);
+    [[nodiscard]] ProcessProtectionLevel GetProtectionLevel(uint32_t processId);
     [[nodiscard]] uint32_t GetProtectionLevelRaw(uint32_t processId);
-    [[nodiscard]] bool HasRequiredProtectionLevel(uint32_t processId, ProtectionLevel required);
+    [[nodiscard]] bool HasRequiredProtectionLevel(uint32_t processId, ProcessProtectionLevel required);
 
     // ========================================================================
     // PROCESS PROTECTION
@@ -833,7 +833,7 @@ void ProcessProtectionImpl::SetThreatResponse(ThreatAction action, ThreatRespons
 bool ProcessProtectionImpl::ElevateToPPL() {
 #ifdef _WIN32
     // Check if already PPL protected
-    ProtectionLevel level = GetProtectionLevel(GetCurrentProcessIdSafe());
+    ProcessProtectionLevel level = GetProtectionLevel(GetCurrentProcessIdSafe());
     if (level.IsPPL()) {
         m_isPPL.store(true, std::memory_order_release);
         Utils::Logger::Info("[ProcessProtection] Already PPL protected");
@@ -866,8 +866,8 @@ bool ProcessProtectionImpl::IsPPLProtected() const {
     return m_isPPL.load(std::memory_order_acquire);
 }
 
-ProtectionLevel ProcessProtectionImpl::GetProtectionLevel(uint32_t processId) {
-    ProtectionLevel level;
+ProcessProtectionLevel ProcessProtectionImpl::GetProtectionLevel(uint32_t processId) {
+    ProcessProtectionLevel level;
 
 #ifdef _WIN32
     if (!m_pNtQueryInformationProcess) {
@@ -892,7 +892,7 @@ ProtectionLevel ProcessProtectionImpl::GetProtectionLevel(uint32_t processId) {
 
     if (NT_SUCCESS(status)) {
         level.rawLevel = protection.Level;
-        level.type = static_cast<ProtectionType>(protection.Type);
+        level.type = static_cast<ProcessProtectionType>(protection.Type);
         level.signer = static_cast<ProtectionSigner>(protection.Signer);
     }
 #endif
@@ -901,12 +901,12 @@ ProtectionLevel ProcessProtectionImpl::GetProtectionLevel(uint32_t processId) {
 }
 
 uint32_t ProcessProtectionImpl::GetProtectionLevelRaw(uint32_t processId) {
-    ProtectionLevel level = GetProtectionLevel(processId);
+    ProcessProtectionLevel level = GetProtectionLevel(processId);
     return level.rawLevel;
 }
 
-bool ProcessProtectionImpl::HasRequiredProtectionLevel(uint32_t processId, ProtectionLevel required) {
-    ProtectionLevel current = GetProtectionLevel(processId);
+bool ProcessProtectionImpl::HasRequiredProtectionLevel(uint32_t processId, ProcessProtectionLevel required) {
+    ProcessProtectionLevel current = GetProtectionLevel(processId);
     return current >= required;
 }
 
@@ -1404,8 +1404,8 @@ AccessDecisionResult ProcessProtectionImpl::FilterAccessRequest(const AccessRequ
     }
 
     // Check if caller has higher or equal protection level
-    ProtectionLevel callerLevel = GetProtectionLevel(request.callerProcessId);
-    ProtectionLevel targetLevel;
+    ProcessProtectionLevel callerLevel = GetProtectionLevel(request.callerProcessId);
+    ProcessProtectionLevel targetLevel;
 
     {
         std::shared_lock lock(m_mutex);
@@ -1933,7 +1933,7 @@ bool ProcessProtectionImpl::SelfTest() {
 
     // Test 2: Protection level query
     try {
-        ProtectionLevel level = GetProtectionLevel(GetCurrentProcessIdSafe());
+        ProcessProtectionLevel level = GetProtectionLevel(GetCurrentProcessIdSafe());
         Utils::Logger::Info("[ProcessProtection] Self-test: Current protection level type={}",
                            static_cast<int>(level.type));
     } catch (const std::exception& e) {
@@ -2477,7 +2477,7 @@ bool ProcessProtection::IsPPLProtected() const {
     return m_impl->IsPPLProtected();
 }
 
-ProtectionLevel ProcessProtection::GetProtectionLevel(uint32_t processId) {
+ProcessProtectionLevel ProcessProtection::GetProtectionLevel(uint32_t processId) {
     return m_impl->GetProtectionLevel(processId);
 }
 
@@ -2485,7 +2485,7 @@ uint32_t ProcessProtection::GetProtectionLevelRaw(uint32_t processId) {
     return m_impl->GetProtectionLevelRaw(processId);
 }
 
-bool ProcessProtection::HasRequiredProtectionLevel(uint32_t processId, ProtectionLevel required) {
+bool ProcessProtection::HasRequiredProtectionLevel(uint32_t processId, ProcessProtectionLevel required) {
     return m_impl->HasRequiredProtectionLevel(processId, required);
 }
 
@@ -2773,11 +2773,11 @@ std::string ProcessProtectionStatistics::ToJson() const {
 // UTILITY FUNCTIONS
 // ============================================================================
 
-std::string_view GetProtectionTypeName(ProtectionType type) noexcept {
+std::string_view GetProtectionTypeName(ProcessProtectionType type) noexcept {
     switch (type) {
-        case ProtectionType::None: return "None";
-        case ProtectionType::ProtectedLight: return "Protected Light";
-        case ProtectionType::Protected: return "Protected";
+        case ProcessProtectionType::None: return "None";
+        case ProcessProtectionType::ProtectedLight: return "Protected Light";
+        case ProcessProtectionType::Protected: return "Protected";
         default: return "Unknown";
     }
 }

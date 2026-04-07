@@ -151,6 +151,7 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/StringUtils.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -328,9 +329,12 @@ enum class CertificateEncoding : uint8_t {
 };
 
 /**
- * @brief Key type
+ * @brief Certificate public-key type
+ *
+ * Certificate validation owns this narrower key taxonomy so it can coexist
+ * with CryptoManager::KeyType in the same translation unit.
  */
-enum class KeyType : uint8_t {
+enum class CertificateKeyType : uint8_t {
     Unknown     = 0,
     RSA         = 1,
     DSA         = 2,
@@ -442,9 +446,12 @@ enum class RevocationReason : uint8_t {
 };
 
 /**
- * @brief Validation flags
+ * @brief Certificate validation policy flags
+ *
+ * Kept certificate-specific to avoid colliding with other self-protection
+ * validation flag domains when headers are aggregated by service code.
  */
-enum class ValidationFlags : uint32_t {
+enum class CertificateValidationFlags : uint32_t {
     None                    = 0x00000000,
     IgnoreRevocation        = 0x00000001,
     IgnoreNotYetValid       = 0x00000002,
@@ -463,12 +470,18 @@ enum class ValidationFlags : uint32_t {
     Lenient                 = IgnoreRevocation | IgnoreNotYetValid | CacheResult
 };
 
-inline constexpr ValidationFlags operator|(ValidationFlags a, ValidationFlags b) noexcept {
-    return static_cast<ValidationFlags>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr CertificateValidationFlags operator|(
+    CertificateValidationFlags a,
+    CertificateValidationFlags b) noexcept {
+    return static_cast<CertificateValidationFlags>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-inline constexpr ValidationFlags operator&(ValidationFlags a, ValidationFlags b) noexcept {
-    return static_cast<ValidationFlags>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+inline constexpr CertificateValidationFlags operator&(
+    CertificateValidationFlags a,
+    CertificateValidationFlags b) noexcept {
+    return static_cast<CertificateValidationFlags>(
+        static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
 /**
@@ -484,22 +497,7 @@ enum class TrustLevel : uint8_t {
     EVValidated     = 6
 };
 
-/**
- * @brief Module status — defined once per namespace; guarded to avoid ODR violations
- *        when multiple Security headers are included in the same translation unit.
- */
-__if_not_exists(ModuleStatus) {
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-}
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -546,7 +544,7 @@ struct SubjectAltName {
  * @brief Public key information
  */
 struct PublicKeyInfo {
-    KeyType type = KeyType::Unknown;
+    CertificateKeyType type = CertificateKeyType::Unknown;
     uint32_t keySizeBits = 0;
     std::string algorithmOID;
     std::vector<uint8_t> publicKeyData;
@@ -688,7 +686,7 @@ struct CertificateInfo {
  */
 struct ValidationOptions {
     /// @brief Validation flags
-    ValidationFlags flags = ValidationFlags::Strict;
+    CertificateValidationFlags flags = CertificateValidationFlags::Strict;
     
     /// @brief Expected hostname (for SSL validation)
     std::string expectedHostname;
@@ -799,7 +797,7 @@ struct CertificateValidatorConfiguration {
     uint32_t crlCacheDurationSecs = CertificateConstants::CRL_CACHE_DURATION_SECS;
     
     /// @brief Default validation flags
-    ValidationFlags defaultFlags = ValidationFlags::Strict;
+    CertificateValidationFlags defaultFlags = CertificateValidationFlags::Strict;
     
     /// @brief Allow weak algorithms
     bool allowWeakAlgorithms = false;
@@ -1403,7 +1401,7 @@ private:
 /**
  * @brief Get key type name
  */
-[[nodiscard]] std::string_view GetKeyTypeName(KeyType type) noexcept;
+[[nodiscard]] std::string_view GetKeyTypeName(CertificateKeyType type) noexcept;
 
 /**
  * @brief Get signature algorithm name

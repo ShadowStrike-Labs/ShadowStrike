@@ -392,8 +392,8 @@ public:
 
     [[nodiscard]] bool SetConfiguration(const AntiDebugConfiguration& config);
     [[nodiscard]] AntiDebugConfiguration GetConfiguration() const;
-    void SetProtectionLevel(ProtectionLevel level);
-    [[nodiscard]] ProtectionLevel GetProtectionLevel() const noexcept;
+    void SetProtectionLevel(AntiDebugProtectionLevel level);
+    [[nodiscard]] AntiDebugProtectionLevel GetProtectionLevel() const noexcept;
     void SetMonitoringMode(MonitoringMode mode);
     [[nodiscard]] MonitoringMode GetMonitoringMode() const noexcept;
     void SetMonitoringInterval(uint32_t intervalMs);
@@ -523,8 +523,8 @@ public:
     [[nodiscard]] bool RegisterIntegrityRegion(std::string_view id, uintptr_t address, size_t size);
     [[nodiscard]] bool RegisterSelfIntegrity();
     void UnregisterIntegrityRegion(std::string_view id);
-    [[nodiscard]] IntegrityStatus VerifyIntegrity(std::string_view id);
-    [[nodiscard]] std::unordered_map<std::string, IntegrityStatus> VerifyAllIntegrity();
+    [[nodiscard]] AntiDebugIntegrityStatus VerifyIntegrity(std::string_view id);
+    [[nodiscard]] std::unordered_map<std::string, AntiDebugIntegrityStatus> VerifyAllIntegrity();
     [[nodiscard]] std::optional<IntegrityRegion> GetIntegrityRegion(std::string_view id) const;
     [[nodiscard]] std::vector<IntegrityRegion> GetAllIntegrityRegions() const;
 
@@ -543,7 +543,7 @@ public:
     void UnregisterDetectionCallback(uint64_t callbackId);
     [[nodiscard]] uint64_t RegisterResponseCallback(ResponseCallback callback);
     void UnregisterResponseCallback(uint64_t callbackId);
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(AntiDebugIntegrityCallback callback);
     void UnregisterIntegrityCallback(uint64_t callbackId);
     [[nodiscard]] uint64_t RegisterHookCallback(HookCallback callback);
     void UnregisterHookCallback(uint64_t callbackId);
@@ -595,7 +595,7 @@ private:
     [[nodiscard]] DetectionResult AggregateResults(const std::vector<DetectionCheckResult>& checks);
     [[nodiscard]] ResponseAction DetermineRecommendedAction(const DetectionResult& result) const;
     [[nodiscard]] bool ValidateConfiguration(const AntiDebugConfiguration& config) const;
-    void ApplyProtectionLevel(ProtectionLevel level);
+    void ApplyProtectionLevel(AntiDebugProtectionLevel level);
     [[nodiscard]] bool LoadNtdllFunctions();
     [[nodiscard]] std::vector<uint32_t> EnumerateThreadIds() const;
     [[nodiscard]] std::vector<std::pair<uint32_t, std::wstring>> EnumerateProcesses() const;
@@ -652,7 +652,7 @@ private:
     // Callbacks
     std::unordered_map<uint64_t, DetectionCallback> m_detectionCallbacks;
     std::unordered_map<uint64_t, ResponseCallback> m_responseCallbacks;
-    std::unordered_map<uint64_t, IntegrityCallback> m_integrityCallbacks;
+    std::unordered_map<uint64_t, AntiDebugIntegrityCallback> m_integrityCallbacks;
     std::unordered_map<uint64_t, HookCallback> m_hookCallbacks;
     std::unordered_map<uint64_t, StatusCallback> m_statusCallbacks;
     std::atomic<uint64_t> m_nextCallbackId{1};
@@ -848,13 +848,13 @@ AntiDebugConfiguration AntiDebugImpl::GetConfiguration() const {
     return m_config;
 }
 
-void AntiDebugImpl::SetProtectionLevel(ProtectionLevel level) {
+void AntiDebugImpl::SetProtectionLevel(AntiDebugProtectionLevel level) {
     std::unique_lock lock(m_mutex);
     m_config.protectionLevel = level;
     ApplyProtectionLevel(level);
 }
 
-ProtectionLevel AntiDebugImpl::GetProtectionLevel() const noexcept {
+AntiDebugProtectionLevel AntiDebugImpl::GetProtectionLevel() const noexcept {
     std::shared_lock lock(m_mutex);
     return m_config.protectionLevel;
 }
@@ -2520,7 +2520,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_CodeIntegrity() {
             region.lastVerified = Clock::now();
 
             if (currentCrc != region.expectedCrc32) {
-                region.status = IntegrityStatus::Modified;
+                region.status = AntiDebugIntegrityStatus::Modified;
                 region.failureCount++;
                 anyViolation = true;
 
@@ -2531,7 +2531,7 @@ DetectionCheckResult AntiDebugImpl::CheckMemory_CodeIntegrity() {
 
                 m_stats.integrityViolations += 1;
             } else {
-                region.status = IntegrityStatus::Valid;
+                region.status = AntiDebugIntegrityStatus::Valid;
             }
         }
     }
@@ -3394,7 +3394,7 @@ bool AntiDebugImpl::RegisterIntegrityRegion(std::string_view id, uintptr_t addre
     std::span<const uint8_t> data(pData, size);
     region.expectedCrc32 = CalculateCRC32(data);
     region.currentCrc32 = region.expectedCrc32;
-    region.status = IntegrityStatus::Valid;
+    region.status = AntiDebugIntegrityStatus::Valid;
     region.lastVerified = Clock::now();
 
     m_integrityRegions[std::string(id)] = region;
@@ -3453,12 +3453,12 @@ void AntiDebugImpl::UnregisterIntegrityRegion(std::string_view id) {
     m_integrityRegions.erase(std::string(id));
 }
 
-IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
+AntiDebugIntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
     std::unique_lock lock(m_mutex);
 
     auto it = m_integrityRegions.find(std::string(id));
     if (it == m_integrityRegions.end()) {
-        return IntegrityStatus::Unknown;
+        return AntiDebugIntegrityStatus::Unknown;
     }
 
     auto& region = it->second;
@@ -3470,7 +3470,7 @@ IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
     region.lastVerified = Clock::now();
 
     if (region.currentCrc32 != region.expectedCrc32) {
-        region.status = IntegrityStatus::Modified;
+        region.status = AntiDebugIntegrityStatus::Modified;
         region.failureCount++;
 
         m_stats.integrityViolations += 1;
@@ -3478,14 +3478,14 @@ IntegrityStatus AntiDebugImpl::VerifyIntegrity(std::string_view id) {
         SS_LOG_WARN(L"AntiDebug", L"Integrity violation in '%.*hs': expected 0x%08X, got 0x%08X",
                            static_cast<int>(id.size()), id.data(), region.expectedCrc32, region.currentCrc32);
     } else {
-        region.status = IntegrityStatus::Valid;
+        region.status = AntiDebugIntegrityStatus::Valid;
     }
 
     return region.status;
 }
 
-std::unordered_map<std::string, IntegrityStatus> AntiDebugImpl::VerifyAllIntegrity() {
-    std::unordered_map<std::string, IntegrityStatus> results;
+std::unordered_map<std::string, AntiDebugIntegrityStatus> AntiDebugImpl::VerifyAllIntegrity() {
+    std::unordered_map<std::string, AntiDebugIntegrityStatus> results;
 
     // Collect IDs under lock, then verify each outside to avoid iterator invalidation
     std::vector<std::string> ids;
@@ -3626,7 +3626,7 @@ void AntiDebugImpl::UnregisterResponseCallback(uint64_t callbackId) {
     m_responseCallbacks.erase(callbackId);
 }
 
-uint64_t AntiDebugImpl::RegisterIntegrityCallback(IntegrityCallback callback) {
+uint64_t AntiDebugImpl::RegisterIntegrityCallback(AntiDebugIntegrityCallback callback) {
     std::lock_guard lock(m_callbackMutex);
     uint64_t id = m_nextCallbackId += 1;
     m_integrityCallbacks[id] = std::move(callback);
@@ -4037,26 +4037,26 @@ bool AntiDebugImpl::ValidateConfiguration(const AntiDebugConfiguration& config) 
     return true;
 }
 
-void AntiDebugImpl::ApplyProtectionLevel(ProtectionLevel level) {
+void AntiDebugImpl::ApplyProtectionLevel(AntiDebugProtectionLevel level) {
     switch (level) {
-        case ProtectionLevel::Disabled:
+        case AntiDebugProtectionLevel::Disabled:
             m_config.enabledTechniques = DetectionTechnique::None;
             m_config.responseActions = ResponseAction::None;
             break;
 
-        case ProtectionLevel::Minimal:
+        case AntiDebugProtectionLevel::Minimal:
             m_config.enabledTechniques = DetectionTechnique::API_IsDebuggerPresent |
                                          DetectionTechnique::PEB_BeingDebugged;
             m_config.responseActions = ResponseAction::Log;
             break;
 
-        case ProtectionLevel::Standard:
+        case AntiDebugProtectionLevel::Standard:
             m_config.enabledTechniques = DetectionTechnique::All_PEB |
                                          DetectionTechnique::All_API;
             m_config.responseActions = ResponseAction::Passive;
             break;
 
-        case ProtectionLevel::Enhanced:
+        case AntiDebugProtectionLevel::Enhanced:
             m_config.enabledTechniques = DetectionTechnique::All_PEB |
                                          DetectionTechnique::All_API |
                                          DetectionTechnique::All_Hardware |
@@ -4064,8 +4064,8 @@ void AntiDebugImpl::ApplyProtectionLevel(ProtectionLevel level) {
             m_config.responseActions = ResponseAction::Moderate;
             break;
 
-        case ProtectionLevel::Maximum:
-        case ProtectionLevel::Paranoid:
+        case AntiDebugProtectionLevel::Maximum:
+        case AntiDebugProtectionLevel::Paranoid:
             m_config.enabledTechniques = DetectionTechnique::All;
             m_config.responseActions = ResponseAction::Aggressive;
             break;
@@ -4183,7 +4183,7 @@ bool AntiDebug::Initialize(const AntiDebugConfiguration& config) {
     return m_impl->Initialize(config);
 }
 
-bool AntiDebug::Initialize(ProtectionLevel level) {
+bool AntiDebug::Initialize(AntiDebugProtectionLevel level) {
     return m_impl->Initialize(AntiDebugConfiguration::FromProtectionLevel(level));
 }
 
@@ -4215,11 +4215,11 @@ AntiDebugConfiguration AntiDebug::GetConfiguration() const {
     return m_impl->GetConfiguration();
 }
 
-void AntiDebug::SetProtectionLevel(ProtectionLevel level) {
+void AntiDebug::SetProtectionLevel(AntiDebugProtectionLevel level) {
     m_impl->SetProtectionLevel(level);
 }
 
-ProtectionLevel AntiDebug::GetProtectionLevel() const noexcept {
+AntiDebugProtectionLevel AntiDebug::GetProtectionLevel() const noexcept {
     return m_impl->GetProtectionLevel();
 }
 
@@ -4519,11 +4519,11 @@ void AntiDebug::UnregisterIntegrityRegion(std::string_view id) {
     m_impl->UnregisterIntegrityRegion(id);
 }
 
-IntegrityStatus AntiDebug::VerifyIntegrity(std::string_view id) {
+AntiDebugIntegrityStatus AntiDebug::VerifyIntegrity(std::string_view id) {
     return m_impl->VerifyIntegrity(id);
 }
 
-std::unordered_map<std::string, IntegrityStatus> AntiDebug::VerifyAllIntegrity() {
+std::unordered_map<std::string, AntiDebugIntegrityStatus> AntiDebug::VerifyAllIntegrity() {
     return m_impl->VerifyAllIntegrity();
 }
 
@@ -4559,7 +4559,7 @@ void AntiDebug::UnregisterResponseCallback(uint64_t callbackId) {
     m_impl->UnregisterResponseCallback(callbackId);
 }
 
-uint64_t AntiDebug::RegisterIntegrityCallback(IntegrityCallback callback) {
+uint64_t AntiDebug::RegisterIntegrityCallback(AntiDebugIntegrityCallback callback) {
     return m_impl->RegisterIntegrityCallback(std::move(callback));
 }
 
@@ -4902,32 +4902,32 @@ void AntiDebugImpl::ReportScanTelemetry(const DetectionResult& result) {
 // CONFIGURATION METHODS
 // ============================================================================
 
-AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(ProtectionLevel level) {
+AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(AntiDebugProtectionLevel level) {
     AntiDebugConfiguration config;
     config.protectionLevel = level;
 
     switch (level) {
-        case ProtectionLevel::Disabled:
+        case AntiDebugProtectionLevel::Disabled:
             config.enabledTechniques = DetectionTechnique::None;
             config.responseActions = ResponseAction::None;
             config.monitoringMode = MonitoringMode::Disabled;
             break;
 
-        case ProtectionLevel::Minimal:
+        case AntiDebugProtectionLevel::Minimal:
             config.enabledTechniques = DetectionTechnique::API_IsDebuggerPresent |
                                        DetectionTechnique::PEB_BeingDebugged;
             config.responseActions = ResponseAction::Log;
             config.monitoringMode = MonitoringMode::OnDemand;
             break;
 
-        case ProtectionLevel::Standard:
+        case AntiDebugProtectionLevel::Standard:
             config.enabledTechniques = DetectionTechnique::All_PEB |
                                        DetectionTechnique::All_API;
             config.responseActions = ResponseAction::Passive;
             config.monitoringMode = MonitoringMode::Periodic;
             break;
 
-        case ProtectionLevel::Enhanced:
+        case AntiDebugProtectionLevel::Enhanced:
             config.enabledTechniques = DetectionTechnique::All_PEB |
                                        DetectionTechnique::All_API |
                                        DetectionTechnique::All_Hardware |
@@ -4938,8 +4938,8 @@ AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(ProtectionLev
             config.enableHookDetection = true;
             break;
 
-        case ProtectionLevel::Maximum:
-        case ProtectionLevel::Paranoid:
+        case AntiDebugProtectionLevel::Maximum:
+        case AntiDebugProtectionLevel::Paranoid:
             config.enabledTechniques = DetectionTechnique::All;
             config.responseActions = ResponseAction::Aggressive;
             config.monitoringMode = MonitoringMode::Continuous;
@@ -4972,7 +4972,7 @@ bool AntiDebugConfiguration::IsValid() const noexcept {
 }
 
 void AntiDebugConfiguration::Merge(const AntiDebugConfiguration& other) {
-    if (other.protectionLevel != ProtectionLevel::Standard) {
+    if (other.protectionLevel != AntiDebugProtectionLevel::Standard) {
         protectionLevel = other.protectionLevel;
     }
 
@@ -5145,14 +5145,14 @@ std::string_view GetHookTypeName(HookType type) noexcept {
     }
 }
 
-std::string_view GetProtectionLevelName(ProtectionLevel level) noexcept {
+std::string_view GetProtectionLevelName(AntiDebugProtectionLevel level) noexcept {
     switch (level) {
-        case ProtectionLevel::Disabled: return "Disabled";
-        case ProtectionLevel::Minimal: return "Minimal";
-        case ProtectionLevel::Standard: return "Standard";
-        case ProtectionLevel::Enhanced: return "Enhanced";
-        case ProtectionLevel::Maximum: return "Maximum";
-        case ProtectionLevel::Paranoid: return "Paranoid";
+        case AntiDebugProtectionLevel::Disabled: return "Disabled";
+        case AntiDebugProtectionLevel::Minimal: return "Minimal";
+        case AntiDebugProtectionLevel::Standard: return "Standard";
+        case AntiDebugProtectionLevel::Enhanced: return "Enhanced";
+        case AntiDebugProtectionLevel::Maximum: return "Maximum";
+        case AntiDebugProtectionLevel::Paranoid: return "Paranoid";
         default: return "Unknown";
     }
 }
@@ -5225,11 +5225,11 @@ IntegrityGuard& IntegrityGuard::operator=(IntegrityGuard&& other) noexcept {
     return *this;
 }
 
-IntegrityStatus IntegrityGuard::Verify() {
+AntiDebugIntegrityStatus IntegrityGuard::Verify() {
     if (m_registered && AntiDebug::HasInstance()) {
         return AntiDebug::Instance().VerifyIntegrity(m_id);
     }
-    return IntegrityStatus::Unknown;
+    return AntiDebugIntegrityStatus::Unknown;
 }
 
 }  // namespace Security

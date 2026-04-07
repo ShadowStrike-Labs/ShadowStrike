@@ -1,11 +1,9 @@
 /**
  * @file SecurityEnums.hpp
- * @brief Common enum types shared across Security/ module headers.
+ * @brief Canonical ownership point for shared self-protection enums.
  *
- * Multiple Security headers (TamperProtection, ProcessProtection, RegistryProtection,
- * CertificateValidator, etc.) each define their own identical copy of ModuleStatus.
- * This header and all defining headers use #ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
- * guards to ensure only the first inclusion defines the enum.
+ * Security modules that need a common lifecycle state must include this header
+ * instead of re-declaring ModuleStatus in their own public headers.
  *
  * @copyright Copyright (C) 2026 ShadowStrike Security
  * @license AGPL-3.0-or-later
