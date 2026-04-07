@@ -265,10 +265,10 @@ enum class PluggableTransport : uint8_t {
 };
 
 /**
- * @enum DetectionMethod
+ * @enum TorDetectionMethod
  * @brief How Tor was detected.
  */
-enum class DetectionMethod : uint8_t {
+enum class TorDetectionMethod : uint8_t {
     NONE = 0,
     NODE_LIST = 1,                 // IP matched known node
     TRAFFIC_PATTERN = 2,           // Cell size/timing
@@ -361,7 +361,7 @@ struct alignas(64) TorTrafficAnalysis {
     // Detection
     bool isTor{ false };
     TorConfidence confidence{ TorConfidence::NONE };
-    DetectionMethod method{ DetectionMethod::NONE };
+    TorDetectionMethod method{ TorDetectionMethod::NONE };
 
     // Cell analysis
     uint64_t totalPackets{ 0 };
@@ -437,8 +437,8 @@ struct alignas(128) TorConnection {
     // Detection
     bool isTor{ false };
     TorConfidence confidence{ TorConfidence::NONE };
-    DetectionMethod method{ DetectionMethod::NONE };
-    std::vector<DetectionMethod> allMethods;
+    TorDetectionMethod method{ TorDetectionMethod::NONE };
+    std::vector<TorDetectionMethod> allMethods;
 
     // Node info (if identified)
     std::optional<TorNodeInfo> nodeInfo;
@@ -476,7 +476,7 @@ struct alignas(256) TorAlert {
     std::chrono::system_clock::time_point timestamp;
 
     // Detection
-    DetectionMethod method{ DetectionMethod::NONE };
+    TorDetectionMethod method{ TorDetectionMethod::NONE };
     TorConfidence confidence{ TorConfidence::NONE };
 
     // Subject

@@ -150,6 +150,11 @@
 #include <shared_mutex>
 #include <span>
 
+// Undefine Windows macros that clash with our enum values
+#ifdef STRICT
+#undef STRICT
+#endif
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {

@@ -109,6 +109,7 @@
 #include <sstream>
 #include <iomanip>
 #include <cmath>
+#include <cwctype>
 #include <fstream>
 
 #pragma comment(lib, "iphlpapi.lib")
@@ -118,6 +119,8 @@
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
+
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
 
 using namespace Utils;
 
@@ -945,7 +948,7 @@ public:
                 ? connection.virtualIP : connection.remoteServerIP;
 
             // Query ThreatIntelLookup for known VPN provider IP ranges and ASN data
-            auto& threatIntel = ThreatIntel::ThreatIntelLookup::Instance();
+            ThreatIntel::ThreatIntelLookup threatIntel;
             if (threatIntel.IsInitialized()) {
                 auto result = threatIntel.LookupIPv4(queryIP);
                 if (result.found) {
@@ -1429,7 +1432,7 @@ public:
                 Utils::RegistryUtils::Error regErr;
 
                 Utils::RegistryUtils::OpenOptions opts;
-                opts.desiredAccess = KEY_READ;
+                opts.access = KEY_READ;
 
                 if (key.Open(HKEY_LOCAL_MACHINE, regPath, opts, &regErr)) {
                     // Registry key exists = VPN software installed

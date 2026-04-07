@@ -611,8 +611,8 @@ public:
     // CONSTRUCTOR / DESTRUCTOR
     // ========================================================================
 
-    Impl() = default;
-    ~Impl() = default;
+    FirewallManagerImpl() = default;
+    ~FirewallManagerImpl() = default;
 
     // ========================================================================
     // INITIALIZATION

@@ -240,7 +240,7 @@ void DNSStatistics::Reset() noexcept {
 // PIMPL Implementation
 // ============================================================================
 
-struct DNSMonitor::DNSMonitorImpl {
+struct DNSMonitorImpl {
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 
@@ -667,15 +667,15 @@ struct DNSMonitor::DNSMonitorImpl {
                                           rule->name);
 
                         // Invoke event callbacks
-                        InvokeEventCallbacks(DNSEvent{
-                            .eventId = 0,
-                            .timestamp = std::chrono::system_clock::now(),
-                            .type = DNSEvent::Type::BLOCKED,
-                            .domain = query.domain,
-                            .pid = query.pid,
-                            .processName = query.processName,
-                            .details = *rule
-                        });
+                        DNSEvent event{};
+                        event.eventId = 0;
+                        event.timestamp = std::chrono::system_clock::now();
+                        event.type = DNSEvent::Type::BLOCKED;
+                        event.domain = query.domain;
+                        event.pid = query.pid;
+                        event.processName = query.processName;
+                        event.details = *rule;
+                        InvokeEventCallbacks(event);
 
                         return;
                     }

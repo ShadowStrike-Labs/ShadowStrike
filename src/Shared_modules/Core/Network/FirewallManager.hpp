@@ -174,6 +174,14 @@
 #include <shared_mutex>
 #include <span>
 
+// Undefine Windows macros that clash with our enum values
+#ifdef DOMAIN
+#undef DOMAIN
+#endif
+#ifdef ERROR
+#undef ERROR
+#endif
+
 namespace ShadowStrike {
 namespace Core {
 namespace Network {
@@ -544,6 +552,95 @@ struct alignas(128) FirewallRule {
     std::atomic<uint64_t> bytesMatched{ 0 };
     std::chrono::system_clock::time_point lastHitTime;
 
+    FirewallRule() = default;
+    FirewallRule(const FirewallRule& other)
+        : ruleId(other.ruleId),
+          name(other.name),
+          description(other.description),
+          type(other.type),
+          action(other.action),
+          direction(other.direction),
+          protocol(other.protocol),
+          priority(other.priority),
+          weight(other.weight),
+          localAddress(other.localAddress),
+          remoteAddress(other.remoteAddress),
+          localPorts(other.localPorts),
+          remotePorts(other.remotePorts),
+          application(other.application),
+          geoMatch(other.geoMatch),
+          profile(other.profile),
+          applyToIPv4(other.applyToIPv4),
+          applyToIPv6(other.applyToIPv6),
+          userSid(other.userSid),
+          userGroup(other.userGroup),
+          hasSchedule(other.hasSchedule),
+          scheduleStart(other.scheduleStart),
+          scheduleEnd(other.scheduleEnd),
+          activeDays(other.activeDays),
+          activeHours(other.activeHours),
+          persistence(other.persistence),
+          isTemporary(other.isTemporary),
+          expiresAt(other.expiresAt),
+          createdAt(other.createdAt),
+          modifiedAt(other.modifiedAt),
+          createdBy(other.createdBy),
+          groupName(other.groupName),
+          isEnabled(other.isEnabled),
+          isBuiltIn(other.isBuiltIn),
+          isLocked(other.isLocked),
+          wfpFilterId(other.wfpFilterId),
+          wfpFilterId6(other.wfpFilterId6),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)),
+          bytesMatched(other.bytesMatched.load(std::memory_order_relaxed)),
+          lastHitTime(other.lastHitTime) {}
+
+    FirewallRule& operator=(const FirewallRule& other) {
+        if (this != &other) {
+            ruleId = other.ruleId;
+            name = other.name;
+            description = other.description;
+            type = other.type;
+            action = other.action;
+            direction = other.direction;
+            protocol = other.protocol;
+            priority = other.priority;
+            weight = other.weight;
+            localAddress = other.localAddress;
+            remoteAddress = other.remoteAddress;
+            localPorts = other.localPorts;
+            remotePorts = other.remotePorts;
+            application = other.application;
+            geoMatch = other.geoMatch;
+            profile = other.profile;
+            applyToIPv4 = other.applyToIPv4;
+            applyToIPv6 = other.applyToIPv6;
+            userSid = other.userSid;
+            userGroup = other.userGroup;
+            hasSchedule = other.hasSchedule;
+            scheduleStart = other.scheduleStart;
+            scheduleEnd = other.scheduleEnd;
+            activeDays = other.activeDays;
+            activeHours = other.activeHours;
+            persistence = other.persistence;
+            isTemporary = other.isTemporary;
+            expiresAt = other.expiresAt;
+            createdAt = other.createdAt;
+            modifiedAt = other.modifiedAt;
+            createdBy = other.createdBy;
+            groupName = other.groupName;
+            isEnabled = other.isEnabled;
+            isBuiltIn = other.isBuiltIn;
+            isLocked = other.isLocked;
+            wfpFilterId = other.wfpFilterId;
+            wfpFilterId6 = other.wfpFilterId6;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesMatched.store(other.bytesMatched.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lastHitTime = other.lastHitTime;
+        }
+        return *this;
+    }
+
     // Validation
     [[nodiscard]] bool IsValid() const;
 
@@ -639,6 +736,31 @@ struct alignas(64) ApplicationNetworkStats {
 
     std::chrono::system_clock::time_point firstSeen;
     std::chrono::system_clock::time_point lastActivity;
+
+    ApplicationNetworkStats() = default;
+    ApplicationNetworkStats(const ApplicationNetworkStats& other)
+        : applicationPath(other.applicationPath),
+          pid(other.pid),
+          connectionsAllowed(other.connectionsAllowed.load(std::memory_order_relaxed)),
+          connectionsBlocked(other.connectionsBlocked.load(std::memory_order_relaxed)),
+          bytesIn(other.bytesIn.load(std::memory_order_relaxed)),
+          bytesOut(other.bytesOut.load(std::memory_order_relaxed)),
+          firstSeen(other.firstSeen),
+          lastActivity(other.lastActivity) {}
+
+    ApplicationNetworkStats& operator=(const ApplicationNetworkStats& other) {
+        if (this != &other) {
+            applicationPath = other.applicationPath;
+            pid = other.pid;
+            connectionsAllowed.store(other.connectionsAllowed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            connectionsBlocked.store(other.connectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesIn.store(other.bytesIn.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bytesOut.store(other.bytesOut.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            firstSeen = other.firstSeen;
+            lastActivity = other.lastActivity;
+        }
+        return *this;
+    }
 
     void Reset() noexcept;
 };
