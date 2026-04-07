@@ -80,6 +80,12 @@ struct EmulationConfig {
     uint32_t  maxChildProcesses         = 8;           // Max child processes per session
     GuestSize maxInjectedPayloadCapture = 64 * 1024;   // 64 KB capture per injection
 
+    // === WoW64 emulation ===
+    bool enableWoW64 = true;                // Enable WoW64 thunking for 32-bit samples
+    bool detectHeavensGate = true;          // Detect 32↔64 bit transitions
+    bool enableFsRedirection = true;        // WoW64 file system redirection
+    bool enableRegistryRedirection = true;  // WoW64 registry redirection
+
     // === Performance tuning ===
     uint32_t  instructionCacheSize = 4096;          // Decoded instruction cache entries
     bool      enableInstructionTrace = false;       // Full trace (very slow, debug only)
