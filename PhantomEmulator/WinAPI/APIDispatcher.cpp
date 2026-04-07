@@ -28,6 +28,7 @@
 #include "Ntdll\NtThread.hpp"
 #include "Ntdll\NtToken.hpp"
 #include "Ntdll\NtSync.hpp"
+#include "Ntdll\EtwAPI.hpp"
 #include "Bcrypt\BcryptAPI.hpp"
 #include "Amsi\AmsiAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
@@ -188,6 +189,7 @@ void APIDispatcher::RegisterNtdll() noexcept {
     WinAPI::Ntdll::RegisterNtToken(*this);
     WinAPI::Ntdll::RegisterNtSync(*this);
     WinAPI::Ntdll::RegisterLdrHandlers(*this);
+    WinAPI::Ntdll::RegisterEtwAPI(*this);
 }
 void APIDispatcher::RegisterKernel32() noexcept {}
 void APIDispatcher::RegisterAdvapi32() noexcept {}
