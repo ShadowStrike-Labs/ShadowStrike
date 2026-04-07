@@ -341,6 +341,56 @@ struct alignas(64) SecuritySettings {
 };
 
 /**
+ * @struct DomainInfo
+ * @brief Domain membership and computer identity.
+ */
+struct alignas(64) DomainInfo {
+    bool isDomainJoined{ false };
+    std::wstring domainName;
+    std::wstring computerName;
+    std::wstring fqdn;
+    bool isDomainController{ false };
+};
+
+/**
+ * @struct UserContext
+ * @brief Current execution context identity and privilege level.
+ */
+struct alignas(64) UserContext {
+    std::wstring userName;
+    std::wstring userSID;
+    bool isElevated{ false };
+    bool isSystem{ false };
+    bool isLocalAdmin{ false };
+    bool isNetworkService{ false };
+    bool isLocalService{ false };
+    uint32_t integrityLevel{ 0 };
+};
+
+/**
+ * @struct PatchAssessment
+ * @brief OS patch level risk assessment.
+ */
+struct alignas(64) PatchAssessment {
+    uint32_t daysSinceLastPatch{ 0 };
+    bool isPatchCurrent{ false };
+    bool isHighRisk{ false };
+    std::wstring lastInstalledKB;
+    std::wstring osRevision;
+};
+
+/**
+ * @struct OSVersionValidation
+ * @brief Cross-validates OS version to detect spoofing (T1497).
+ */
+struct alignas(32) OSVersionValidation {
+    bool isSpoofDetected{ false };
+    uint32_t rtlBuildNumber{ 0 };
+    uint32_t registryBuildNumber{ 0 };
+    std::wstring details;
+};
+
+/**
  * @struct SystemSnapshot
  * @brief Complete system snapshot.
  */
@@ -355,6 +405,10 @@ struct alignas(256) SystemSnapshot {
     DebuggerInfo debugger;
     MachineFingerprint fingerprint;
     SecuritySettings security;
+    DomainInfo domain;
+    UserContext userContext;
+    PatchAssessment patchAssessment;
+    OSVersionValidation osValidation;
     BootMode bootMode{ BootMode::Normal };
     PowerState powerState{ PowerState::Unknown };
     std::chrono::system_clock::time_point bootTime;
@@ -429,12 +483,12 @@ public:
     /**
      * @brief Gets OS version information.
      */
-    [[nodiscard]] const OSVersion& GetOSVersion() const noexcept;
+    [[nodiscard]] OSVersion GetOSVersion() const noexcept;
     
     /**
      * @brief Gets CPU information.
      */
-    [[nodiscard]] const CPUInfo& GetCPUInfo() const noexcept;
+    [[nodiscard]] CPUInfo GetCPUInfo() const noexcept;
     
     /**
      * @brief Gets current memory status.
@@ -527,6 +581,26 @@ public:
      * @brief Checks if running with admin privileges.
      */
     [[nodiscard]] bool IsElevated() const;
+    
+    /**
+     * @brief Gets domain membership information.
+     */
+    [[nodiscard]] DomainInfo GetDomainInfo() const;
+    
+    /**
+     * @brief Gets current user execution context and privilege level.
+     */
+    [[nodiscard]] UserContext GetUserContext() const;
+    
+    /**
+     * @brief Assesses OS patch level risk.
+     */
+    [[nodiscard]] PatchAssessment AssessPatchLevel() const;
+    
+    /**
+     * @brief Cross-validates OS version to detect spoofing.
+     */
+    [[nodiscard]] OSVersionValidation ValidateOSVersion() const;
     
     /**
      * @brief Gets system uptime.

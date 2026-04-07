@@ -73,6 +73,8 @@
 #include <iphlpapi.h>
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <lm.h>
+#include <Sddl.h>
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
@@ -83,6 +85,7 @@
 #pragma comment(lib, "powrprof.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "ws2_32.lib")
+#pragma comment(lib, "netapi32.lib")
 
 namespace ShadowStrike {
 namespace Core {
@@ -427,15 +430,21 @@ struct SystemInfo::SystemInfoImpl {
             *reinterpret_cast<int*>(vendor + 8) = cpuInfo[2];
             cpu.vendor = Utils::StringUtils::ToWide(vendor);
 
-            // Get brand string (3 CPUID calls)
-            char brand[49] = {0};
-            __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_1);
-            memcpy(brand, cpuInfo, sizeof(cpuInfo));
-            __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_2);
-            memcpy(brand + 16, cpuInfo, sizeof(cpuInfo));
-            __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_3);
-            memcpy(brand + 32, cpuInfo, sizeof(cpuInfo));
-            cpu.brand = Utils::StringUtils::ToWide(brand);
+            // Get brand string - validate max extended leaf first
+            __cpuid(cpuInfo, 0x80000000);
+            uint32_t maxExtLeaf = static_cast<uint32_t>(cpuInfo[0]);
+            if (maxExtLeaf >= SystemInfoConstants::CPUID_BRAND_STRING_3) {
+                char brand[49] = {0};
+                __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_1);
+                memcpy(brand, cpuInfo, sizeof(cpuInfo));
+                __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_2);
+                memcpy(brand + 16, cpuInfo, sizeof(cpuInfo));
+                __cpuid(cpuInfo, SystemInfoConstants::CPUID_BRAND_STRING_3);
+                memcpy(brand + 32, cpuInfo, sizeof(cpuInfo));
+                cpu.brand = Utils::StringUtils::ToWide(brand);
+            } else {
+                cpu.brand = L"Unknown CPU";
+            }
 
             // Get feature flags
             __cpuid(cpuInfo, SystemInfoConstants::CPUID_FEATURES);
@@ -620,6 +629,13 @@ struct SystemInfo::SystemInfoImpl {
             // Enumerate logical drives
             DWORD drives = GetLogicalDrives();
 
+            // Detect actual system drive letter (not hardcoded to C:)
+            wchar_t systemDriveLetter = L'C';
+            wchar_t sysDirBuf[MAX_PATH] = {0};
+            if (GetSystemDirectoryW(sysDirBuf, MAX_PATH) > 0) {
+                systemDriveLetter = static_cast<wchar_t>(::towupper(sysDirBuf[0]));
+            }
+
             for (int i = 0; i < 26; i++) {
                 if (drives & (1 << i)) {
                     wchar_t driveLetter = L'A' + i;
@@ -633,7 +649,7 @@ struct SystemInfo::SystemInfoImpl {
                     StorageInfo info;
                     info.devicePath = drivePath;
                     info.isRemovable = (driveType == DRIVE_REMOVABLE);
-                    info.isSystemDrive = (driveLetter == L'C');
+                    info.isSystemDrive = (::towupper(driveLetter) == systemDriveLetter);
 
                     // Get capacity
                     ULARGE_INTEGER freeBytesAvailable, totalBytes, freeBytes;
@@ -1468,6 +1484,253 @@ struct SystemInfo::SystemInfoImpl {
 
         return PowerState::Unknown;
     }
+
+    // ========================================================================
+    // DOMAIN MEMBERSHIP DETECTION
+    // ========================================================================
+
+    DomainInfo DetectDomain() const {
+        DomainInfo info;
+        try {
+            wchar_t computerName[MAX_COMPUTERNAME_LENGTH + 1] = {0};
+            DWORD nameSize = MAX_COMPUTERNAME_LENGTH + 1;
+            if (GetComputerNameW(computerName, &nameSize)) {
+                info.computerName = computerName;
+            }
+
+            LPWSTR domainBuffer = nullptr;
+            NETSETUP_JOIN_STATUS joinStatus = NetSetupUnknownStatus;
+            if (NetGetJoinInformation(nullptr, &domainBuffer, &joinStatus) == NERR_Success) {
+                if (domainBuffer) {
+                    info.domainName = domainBuffer;
+                    NetApiBufferFree(domainBuffer);
+                }
+                info.isDomainJoined = (joinStatus == NetSetupDomainName);
+            }
+
+            wchar_t fqdn[256] = {0};
+            DWORD fqdnSize = 256;
+            if (GetComputerNameExW(ComputerNameDnsFullyQualified, fqdn, &fqdnSize)) {
+                info.fqdn = fqdn;
+            }
+
+            // Domain controller detection via ProductType registry
+            if (info.isDomainJoined) {
+                RegKeyGuard hKey;
+                if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                L"SYSTEM\\CurrentControlSet\\Control\\ProductOptions",
+                                0, KEY_READ, hKey.addressof()) == ERROR_SUCCESS) {
+                    BYTE buffer[256];
+                    DWORD bufferSize = sizeof(buffer);
+                    if (RegQueryValueExW(hKey.get(), L"ProductType", nullptr, nullptr,
+                                        buffer, &bufferSize) == ERROR_SUCCESS) {
+                        std::wstring productType = SafeExtractRegString(buffer, bufferSize);
+                        info.isDomainController = Utils::StringUtils::IEquals(productType, L"LanmanNT");
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Domain detection failed - %hs", e.what());
+        }
+        return info;
+    }
+
+    // ========================================================================
+    // USER CONTEXT DETECTION
+    // ========================================================================
+
+    UserContext DetectUserContext() const {
+        UserContext ctx;
+        try {
+            wchar_t userName[256] = {0};
+            DWORD userNameSize = 256;
+            if (GetUserNameW(userName, &userNameSize)) {
+                ctx.userName = userName;
+            }
+
+            HANDLE rawToken = nullptr;
+            if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
+                HandleGuard hToken(rawToken);
+
+                TOKEN_ELEVATION elevation{};
+                DWORD retSize = 0;
+                if (GetTokenInformation(hToken.get(), TokenElevation, &elevation,
+                                       sizeof(elevation), &retSize)) {
+                    ctx.isElevated = (elevation.TokenIsElevated != 0);
+                }
+
+                BYTE tokenUserBuf[256] = {0};
+                if (GetTokenInformation(hToken.get(), TokenUser, tokenUserBuf,
+                                       sizeof(tokenUserBuf), &retSize)) {
+                    auto* tokenUser = reinterpret_cast<TOKEN_USER*>(tokenUserBuf);
+                    LPWSTR sidStr = nullptr;
+                    if (ConvertSidToStringSidW(tokenUser->User.Sid, &sidStr)) {
+                        ctx.userSID = sidStr;
+                        LocalFree(sidStr);
+                        ctx.isSystem = (ctx.userSID == L"S-1-5-18");
+                        ctx.isLocalService = (ctx.userSID == L"S-1-5-19");
+                        ctx.isNetworkService = (ctx.userSID == L"S-1-5-20");
+                    }
+                }
+
+                // Integrity level (mandatory label)
+                BYTE ilBuf[256] = {0};
+                if (GetTokenInformation(hToken.get(), TokenIntegrityLevel, ilBuf,
+                                       sizeof(ilBuf), &retSize)) {
+                    auto* til = reinterpret_cast<TOKEN_MANDATORY_LABEL*>(ilBuf);
+                    DWORD subAuthCount = *GetSidSubAuthorityCount(til->Label.Sid);
+                    if (subAuthCount > 0) {
+                        ctx.integrityLevel = *GetSidSubAuthority(til->Label.Sid, subAuthCount - 1);
+                    }
+                }
+            }
+
+            // Local admin group membership check
+            SID_IDENTIFIER_AUTHORITY ntAuthority = SECURITY_NT_AUTHORITY;
+            PSID adminSid = nullptr;
+            if (AllocateAndInitializeSid(&ntAuthority, 2,
+                                        SECURITY_BUILTIN_DOMAIN_RID,
+                                        DOMAIN_ALIAS_RID_ADMINS,
+                                        0, 0, 0, 0, 0, 0, &adminSid)) {
+                BOOL isMember = FALSE;
+                if (CheckTokenMembership(nullptr, adminSid, &isMember)) {
+                    ctx.isLocalAdmin = (isMember != FALSE);
+                }
+                FreeSid(adminSid);
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"User context detection failed - %hs", e.what());
+        }
+        return ctx;
+    }
+
+    // ========================================================================
+    // PATCH LEVEL ASSESSMENT
+    // ========================================================================
+
+    PatchAssessment AssessPatchLevel() const {
+        PatchAssessment assessment;
+        try {
+            // OS revision (UBR = Update Build Revision)
+            RegKeyGuard hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                            0, KEY_READ, hKey.addressof()) == ERROR_SUCCESS) {
+                DWORD ubr = 0;
+                DWORD size = sizeof(ubr);
+                if (RegQueryValueExW(hKey.get(), L"UBR", nullptr, nullptr,
+                                    reinterpret_cast<LPBYTE>(&ubr), &size) == ERROR_SUCCESS) {
+                    assessment.osRevision = std::to_wstring(ubr);
+                }
+            }
+
+            // Use ntoskrnl.exe last write time as patch recency proxy
+            wchar_t sysDir[MAX_PATH] = {0};
+            if (GetSystemDirectoryW(sysDir, MAX_PATH) > 0) {
+                std::wstring kernelPath = std::wstring(sysDir) + L"\\ntoskrnl.exe";
+                WIN32_FILE_ATTRIBUTE_DATA fileInfo{};
+                if (GetFileAttributesExW(kernelPath.c_str(), GetFileExInfoStandard, &fileInfo)) {
+                    FILETIME nowFt;
+                    GetSystemTimeAsFileTime(&nowFt);
+                    ULARGE_INTEGER fileUli, nowUli;
+                    fileUli.LowPart = fileInfo.ftLastWriteTime.dwLowDateTime;
+                    fileUli.HighPart = fileInfo.ftLastWriteTime.dwHighDateTime;
+                    nowUli.LowPart = nowFt.dwLowDateTime;
+                    nowUli.HighPart = nowFt.dwHighDateTime;
+                    if (nowUli.QuadPart > fileUli.QuadPart) {
+                        uint64_t diffDays = (nowUli.QuadPart - fileUli.QuadPart) /
+                                            (10000000ULL * 60ULL * 60ULL * 24ULL);
+                        assessment.daysSinceLastPatch = static_cast<uint32_t>(
+                            std::min(diffDays, static_cast<uint64_t>(UINT32_MAX)));
+                    }
+                    assessment.isPatchCurrent = (assessment.daysSinceLastPatch <= 30);
+                    assessment.isHighRisk = (assessment.daysSinceLastPatch > 90);
+                    if (assessment.isHighRisk) {
+                        SS_LOG_WARN(LOG_CATEGORY, L"System HIGH RISK: %u days since last OS patch",
+                                   assessment.daysSinceLastPatch);
+                    }
+                }
+            }
+
+            // Find most recent KB from Component Based Servicing
+            RegKeyGuard hCbsKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Component Based Servicing\\Packages",
+                            0, KEY_READ | KEY_ENUMERATE_SUB_KEYS, hCbsKey.addressof()) == ERROR_SUCCESS) {
+                DWORD subKeyCount = 0;
+                RegQueryInfoKeyW(hCbsKey.get(), nullptr, nullptr, nullptr,
+                                &subKeyCount, nullptr, nullptr, nullptr,
+                                nullptr, nullptr, nullptr, nullptr);
+                wchar_t subKeyName[512];
+                for (DWORD idx = subKeyCount; idx > 0 && idx > subKeyCount - 10; --idx) {
+                    DWORD nameLen = 512;
+                    if (RegEnumKeyExW(hCbsKey.get(), idx - 1, subKeyName, &nameLen,
+                                     nullptr, nullptr, nullptr, nullptr) == ERROR_SUCCESS) {
+                        std::wstring name(subKeyName, nameLen);
+                        auto kbPos = name.find(L"KB");
+                        if (kbPos != std::wstring::npos) {
+                            auto endPos = name.find(L'~', kbPos);
+                            if (endPos == std::wstring::npos) endPos = name.length();
+                            assessment.lastInstalledKB = name.substr(kbPos, endPos - kbPos);
+                            break;
+                        }
+                    }
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Patch assessment failed - %hs", e.what());
+        }
+        return assessment;
+    }
+
+    // ========================================================================
+    // OS VERSION SPOOFING DETECTION
+    // ========================================================================
+
+    OSVersionValidation ValidateOSVersion() const {
+        OSVersionValidation validation;
+        try {
+            // Source 1: RtlGetVersion (kernel-level, hard to spoof from user mode)
+            RTL_OSVERSIONINFOEXW osInfo{};
+            osInfo.dwOSVersionInfoSize = sizeof(RTL_OSVERSIONINFOEXW);
+            if (RtlGetVersion(reinterpret_cast<PRTL_OSVERSIONINFOW>(&osInfo)) == 0) {
+                validation.rtlBuildNumber = osInfo.dwBuildNumber;
+            }
+
+            // Source 2: Registry (easier to tamper from user mode)
+            RegKeyGuard hKey;
+            if (RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                            L"SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion",
+                            0, KEY_READ, hKey.addressof()) == ERROR_SUCCESS) {
+                BYTE buffer[256];
+                DWORD bufferSize = sizeof(buffer);
+                if (RegQueryValueExW(hKey.get(), L"CurrentBuildNumber", nullptr, nullptr,
+                                    buffer, &bufferSize) == ERROR_SUCCESS) {
+                    std::wstring buildStr = SafeExtractRegString(buffer, bufferSize);
+                    try {
+                        validation.registryBuildNumber = static_cast<uint32_t>(std::stoul(buildStr));
+                    } catch (...) {
+                        validation.registryBuildNumber = 0;
+                    }
+                }
+            }
+
+            // Cross-validate: mismatch indicates potential tampering
+            if (validation.rtlBuildNumber != 0 && validation.registryBuildNumber != 0) {
+                if (validation.rtlBuildNumber != validation.registryBuildNumber) {
+                    validation.isSpoofDetected = true;
+                    validation.details = L"Build mismatch: RtlGetVersion=" +
+                        std::to_wstring(validation.rtlBuildNumber) + L" Registry=" +
+                        std::to_wstring(validation.registryBuildNumber);
+                    SS_LOG_WARN(LOG_CATEGORY, L"OS version spoofing detected - %ls",
+                               validation.details.c_str());
+                }
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"OS version validation failed - %hs", e.what());
+        }
+        return validation;
+    }
 };
 
 // ============================================================================
@@ -1581,12 +1844,12 @@ void SystemInfo::Refresh() {
 // BASIC SYSTEM INFORMATION
 // ============================================================================
 
-const OSVersion& SystemInfo::GetOSVersion() const noexcept {
+OSVersion SystemInfo::GetOSVersion() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
     return m_impl->m_osVersion;
 }
 
-const CPUInfo& SystemInfo::GetCPUInfo() const noexcept {
+CPUInfo SystemInfo::GetCPUInfo() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_impl->m_cacheMutex);
     return m_impl->m_cpuInfo;
 }
@@ -1646,8 +1909,8 @@ BootMode SystemInfo::GetBootMode() const {
 }
 
 bool SystemInfo::IsSafeMode() const {
-    return m_impl->GetBootMode() == BootMode::SafeMode ||
-           m_impl->GetBootMode() == BootMode::SafeModeWithNetworking;
+    auto mode = m_impl->GetBootMode();
+    return mode == BootMode::SafeMode || mode == BootMode::SafeModeWithNetworking;
 }
 
 // ============================================================================
@@ -1699,6 +1962,26 @@ bool SystemInfo::IsElevated() const {
     return (elevated != FALSE);
 }
 
+DomainInfo SystemInfo::GetDomainInfo() const {
+    m_impl->m_statistics.queriesExecuted.fetch_add(1, std::memory_order_relaxed);
+    return m_impl->DetectDomain();
+}
+
+UserContext SystemInfo::GetUserContext() const {
+    m_impl->m_statistics.queriesExecuted.fetch_add(1, std::memory_order_relaxed);
+    return m_impl->DetectUserContext();
+}
+
+PatchAssessment SystemInfo::AssessPatchLevel() const {
+    m_impl->m_statistics.queriesExecuted.fetch_add(1, std::memory_order_relaxed);
+    return m_impl->AssessPatchLevel();
+}
+
+OSVersionValidation SystemInfo::ValidateOSVersion() const {
+    m_impl->m_statistics.queriesExecuted.fetch_add(1, std::memory_order_relaxed);
+    return m_impl->ValidateOSVersion();
+}
+
 std::chrono::milliseconds SystemInfo::GetUptime() const {
     return std::chrono::milliseconds(GetTickCount64());
 }
@@ -1731,6 +2014,10 @@ SystemSnapshot SystemInfo::GetSnapshot() const {
         snapshot.debugger = DetectDebugger();
         snapshot.fingerprint = GetMachineFingerprint();
         snapshot.security = GetSecuritySettings();
+        snapshot.domain = GetDomainInfo();
+        snapshot.userContext = GetUserContext();
+        snapshot.patchAssessment = AssessPatchLevel();
+        snapshot.osValidation = ValidateOSVersion();
         snapshot.bootMode = GetBootMode();
         snapshot.powerState = GetPowerState();
         snapshot.bootTime = GetBootTime();
@@ -1827,7 +2114,7 @@ std::vector<std::wstring> SystemInfo::RunDiagnostics() const {
     diagnostics.push_back(L"Cores: " + std::to_wstring(cpuInfo.logicalCores));
 
     auto memInfo = GetMemoryInfo();
-    diagnostics.push_back(L"Memory: " + std::to_wstring(memInfo.totalPhysicalBytes / (1024 * 1024 * 1024)) + L" GB");
+    diagnostics.push_back(L"Memory: " + std::to_wstring(memInfo.totalPhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) + L" GB");
 
     auto vmInfo = DetectVirtualization();
     diagnostics.push_back(L"Virtualized: " + std::wstring(vmInfo.isVirtualized ? L"Yes" : L"No"));
@@ -1844,8 +2131,20 @@ std::vector<std::wstring> SystemInfo::RunDiagnostics() const {
 
 bool SystemInfo::ExportSnapshot(const std::wstring& outputPath) const {
     try {
+        // Validate output path
+        if (outputPath.empty() || outputPath.length() > MAX_PATH) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: invalid path length");
+            return false;
+        }
+        if (outputPath.find(L"..") != std::wstring::npos) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: path traversal rejected");
+            return false;
+        }
+        SS_LOG_INFO(LOG_CATEGORY, L"Exporting system snapshot to: %ls", outputPath.c_str());
+
         std::wofstream file(outputPath);
         if (!file.is_open()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot: failed to open output file");
             return false;
         }
 
@@ -1877,8 +2176,8 @@ bool SystemInfo::ExportSnapshot(const std::wstring& outputPath) const {
 
         // Memory
         file << L"Memory:\n";
-        file << L"  Total: " << (snapshot.memory.totalPhysicalBytes / (1024 * 1024 * 1024)) << L" GB\n";
-        file << L"  Available: " << (snapshot.memory.availablePhysicalBytes / (1024 * 1024 * 1024)) << L" GB\n";
+        file << L"  Total: " << (snapshot.memory.totalPhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
+        file << L"  Available: " << (snapshot.memory.availablePhysicalBytes / (1024ULL * 1024ULL * 1024ULL)) << L" GB\n";
         file << L"  Load: " << snapshot.memory.memoryLoad << L"%\n\n";
 
         // Virtualization
@@ -1911,12 +2210,47 @@ bool SystemInfo::ExportSnapshot(const std::wstring& outputPath) const {
         // Machine ID
         file << L"Machine Identification:\n";
         file << L"  Machine ID: " << snapshot.fingerprint.machineId << L"\n";
-        file << L"  Hardware Fingerprint: " << snapshot.fingerprint.hardwareFingerprint << L"\n";
+        file << L"  Hardware Fingerprint: " << snapshot.fingerprint.hardwareFingerprint << L"\n\n";
+
+        // Domain Info
+        file << L"Domain:\n";
+        file << L"  Computer Name: " << snapshot.domain.computerName << L"\n";
+        file << L"  Domain Joined: " << (snapshot.domain.isDomainJoined ? L"Yes" : L"No") << L"\n";
+        if (snapshot.domain.isDomainJoined) {
+            file << L"  Domain: " << snapshot.domain.domainName << L"\n";
+            file << L"  FQDN: " << snapshot.domain.fqdn << L"\n";
+        }
+        file << L"\n";
+
+        // User Context
+        file << L"User Context:\n";
+        file << L"  User: " << snapshot.userContext.userName << L"\n";
+        file << L"  Elevated: " << (snapshot.userContext.isElevated ? L"Yes" : L"No") << L"\n";
+        file << L"  System Account: " << (snapshot.userContext.isSystem ? L"Yes" : L"No") << L"\n";
+        file << L"  Local Admin: " << (snapshot.userContext.isLocalAdmin ? L"Yes" : L"No") << L"\n";
+        file << L"\n";
+
+        // Patch Assessment
+        file << L"Patch Assessment:\n";
+        file << L"  Days Since Last Patch: " << snapshot.patchAssessment.daysSinceLastPatch << L"\n";
+        file << L"  Patch Current: " << (snapshot.patchAssessment.isPatchCurrent ? L"Yes" : L"No") << L"\n";
+        file << L"  High Risk: " << (snapshot.patchAssessment.isHighRisk ? L"Yes" : L"No") << L"\n";
+        file << L"\n";
+
+        // OS Validation
+        if (snapshot.osValidation.isSpoofDetected) {
+            file << L"WARNING: OS version spoofing detected!\n";
+            file << L"  Details: " << snapshot.osValidation.details << L"\n\n";
+        }
 
         file.close();
         return true;
 
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot failed - %hs", e.what());
+        return false;
     } catch (...) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"ExportSnapshot failed - unknown exception");
         return false;
     }
 }
