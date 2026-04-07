@@ -58,15 +58,20 @@
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 
-// Windows headers
+// Windows headers (order matters: winsock2 before iphlpapi for GetIfTable2)
+#include <winsock2.h>
+#include <ws2tcpip.h>
 #include <windows.h>
 #include <psapi.h>
 #include <tlhelp32.h>
 #include <pdh.h>
 #include <pdhmsg.h>
+#include <iphlpapi.h>
 
 #pragma comment(lib, "pdh.lib")
 #pragma comment(lib, "psapi.lib")
+#pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "ws2_32.lib")
 
 // Standard library
 #include <algorithm>
@@ -473,9 +478,8 @@ public:
 
         m_systemHistory.push_back(usage);
 
-        // Limit history size
-        const auto maxSamples = static_cast<size_t>(m_maxHistorySeconds);
-        if (m_systemHistory.size() > maxSamples) {
+        // Cap history size based on configured maximum
+        if (m_systemHistory.size() > m_maxSamples) {
             m_systemHistory.pop_front();
         }
     }
@@ -487,8 +491,7 @@ public:
         history.push_back(usage);
 
         // Limit per-process history
-        const auto maxSamples = static_cast<size_t>(m_maxHistorySeconds);
-        if (history.size() > maxSamples) {
+        if (history.size() > m_maxSamples) {
             history.pop_front();
         }
     }
@@ -531,9 +534,12 @@ public:
         return result;
     }
 
-    void SetMaxHistorySeconds(uint32_t seconds) {
+    void SetMaxHistorySeconds(uint32_t seconds, uint32_t samplingIntervalMs = 1000) {
         std::unique_lock lock(m_mutex);
         m_maxHistorySeconds = seconds;
+        // Calculate max samples: seconds / (intervalMs / 1000), capped at reasonable limit
+        const uint32_t intervalSec = std::max(samplingIntervalMs / 1000u, 1u);
+        m_maxSamples = static_cast<size_t>(std::min(seconds / intervalSec, 86400u)); // Cap at 24h
     }
 
     void Clear() {
@@ -542,9 +548,32 @@ public:
         m_processHistory.clear();
     }
 
+    /**
+     * @brief Removes process history entries for PIDs with no recent samples.
+     *
+     * Prevents unbounded memory growth as processes start and terminate.
+     * Entries with no samples in the last 5 minutes are considered stale.
+     */
+    void CleanStaleProcessHistory() {
+        std::unique_lock lock(m_mutex);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto staleThreshold = std::chrono::minutes(5);
+
+        for (auto it = m_processHistory.begin(); it != m_processHistory.end();) {
+            if (it->second.empty() ||
+                (now - it->second.back().sampleTime > staleThreshold)) {
+                it = m_processHistory.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
+
 private:
     mutable std::shared_mutex m_mutex;
     uint32_t m_maxHistorySeconds{ 300 };
+    size_t m_maxSamples{ 300 };
     std::deque<SystemResourceUsage> m_systemHistory;
     std::unordered_map<uint32_t, std::deque<ProcessResourceUsage>> m_processHistory;
 };
@@ -569,9 +598,9 @@ public:
         tracker.lastUpdate = std::chrono::steady_clock::now();
         tracker.samples.push_back(usage);
 
-        // Limit sample history
-        if (tracker.samples.size() > 60) {  // 1 minute at 1Hz
-            tracker.samples.erase(tracker.samples.begin());
+        // Limit sample history (O(1) with deque)
+        while (tracker.samples.size() > 60) {
+            tracker.samples.pop_front();
         }
 
         // Check for anomalies
@@ -579,6 +608,8 @@ public:
         CheckMemoryLeak(pid, usage, tracker);
         CheckHandleLeak(pid, usage, tracker);
         CheckCryptomining(pid, usage, tracker);
+        CheckIOFlood(pid, usage, tracker);
+        CheckNetworkFlood(pid, usage, tracker);
     }
 
     /**
@@ -683,7 +714,7 @@ public:
 private:
     struct ProcessTracker {
         std::chrono::steady_clock::time_point lastUpdate;
-        std::vector<ProcessResourceUsage> samples;
+        std::deque<ProcessResourceUsage> samples;
         std::chrono::steady_clock::time_point highCpuStart;
         uint64_t baselineMemory{ 0 };
         uint32_t baselineHandles{ 0 };
@@ -747,7 +778,7 @@ private:
                                          static_cast<double>(timeDelta.count());
 
             if (growthMBPerMin >= m_thresholds.memoryLeakGrowthMBPerMin &&
-                timeDelta.count() >= m_thresholds.memoryLeakDurationMin) {
+                static_cast<uint32_t>(timeDelta.count()) >= m_thresholds.memoryLeakDurationMin) {
                 AddAnomaly(pid, PerformanceAnomalyType::MemoryLeak, usage.processName,
                           std::format(L"Memory leak detected: {:.2f} MB/min growth", growthMBPerMin),
                           growthMBPerMin, m_thresholds.memoryLeakGrowthMBPerMin, 80);
@@ -796,6 +827,114 @@ private:
         }
     }
 
+    /**
+     * @brief Detect I/O flood patterns (ransomware, wipers).
+     *
+     * Ransomware encrypts files at maximum I/O bandwidth. We detect
+     * sustained high write rates that exceed the configured threshold.
+     * Combines write rate with write operation count to reduce false
+     * positives from legitimate bulk operations (e.g., database backup).
+     */
+    void CheckIOFlood(uint32_t pid, const ProcessResourceUsage& usage, ProcessTracker& tracker) {
+        const double totalIOBytesPerSec = usage.ioReadBytesPerSec + usage.ioWriteBytesPerSec;
+        if (totalIOBytesPerSec < m_thresholds.highIOBytesPerSec) {
+            return;
+        }
+
+        if (tracker.samples.size() < 5) return;
+
+        // Check for sustained high I/O across recent samples
+        uint32_t highIOCount = 0;
+        for (const auto& sample : tracker.samples) {
+            const double sampleIO = sample.ioReadBytesPerSec + sample.ioWriteBytesPerSec;
+            if (sampleIO >= m_thresholds.highIOBytesPerSec * 0.8) {
+                highIOCount++;
+            }
+        }
+
+        const double consistencyRatio = static_cast<double>(highIOCount) /
+                                       static_cast<double>(tracker.samples.size());
+
+        // Require sustained high I/O (>70% of samples) to avoid false positives
+        if (consistencyRatio >= 0.7) {
+            // Ransomware heuristic: high write rate + many small write ops
+            const bool ransomwarePattern =
+                usage.ioWriteBytesPerSec > m_thresholds.highIOBytesPerSec * 0.6 &&
+                usage.ioWriteOps > 100;
+
+            const uint8_t severity = ransomwarePattern ? 90 : 70;
+
+            AddAnomaly(pid, PerformanceAnomalyType::HighIO, usage.processName,
+                      std::format(L"I/O flood: {:.1f} MB/s (write: {:.1f} MB/s, {} ops)",
+                                  totalIOBytesPerSec / (1024.0 * 1024.0),
+                                  usage.ioWriteBytesPerSec / (1024.0 * 1024.0),
+                                  usage.ioWriteOps),
+                      totalIOBytesPerSec, m_thresholds.highIOBytesPerSec, severity);
+        }
+    }
+
+    /**
+     * @brief Detect network flood patterns (data exfiltration, C2 beaconing).
+     *
+     * Detects sustained high outbound network traffic that may indicate
+     * data exfiltration by APTs or C2 communication. Threshold-based
+     * with consistency check to avoid false positives from legitimate
+     * uploads/streaming.
+     */
+    void CheckNetworkFlood(uint32_t pid, const ProcessResourceUsage& usage, ProcessTracker& tracker) {
+        // Network flood: sustained high send rate
+        // Threshold: 10 MB/s outbound sustained
+        constexpr double kNetworkFloodThreshold = 10.0 * 1024.0 * 1024.0;
+
+        if (usage.networkSendBytes == 0 && usage.networkRecvBytes == 0) {
+            return;  // No network data available for this process
+        }
+
+        if (tracker.samples.size() < 5) return;
+
+        // Calculate send rate from deltas
+        const auto& prevSample = tracker.samples[tracker.samples.size() - 2];
+        const auto timeDelta = std::chrono::duration_cast<std::chrono::seconds>(
+            usage.sampleTime - prevSample.sampleTime
+        );
+
+        if (timeDelta.count() <= 0) return;
+
+        const double sendRate = (usage.networkSendBytes > prevSample.networkSendBytes)
+            ? static_cast<double>(usage.networkSendBytes - prevSample.networkSendBytes) /
+              static_cast<double>(timeDelta.count())
+            : 0.0;
+
+        if (sendRate < kNetworkFloodThreshold) return;
+
+        // Check consistency across samples
+        uint32_t highNetCount = 0;
+        for (size_t i = 1; i < tracker.samples.size(); ++i) {
+            const auto& prev = tracker.samples[i - 1];
+            const auto& curr = tracker.samples[i];
+            const auto dt = std::chrono::duration_cast<std::chrono::seconds>(
+                curr.sampleTime - prev.sampleTime
+            );
+            if (dt.count() > 0 && curr.networkSendBytes > prev.networkSendBytes) {
+                const double rate = static_cast<double>(curr.networkSendBytes - prev.networkSendBytes) /
+                                   static_cast<double>(dt.count());
+                if (rate >= kNetworkFloodThreshold * 0.7) {
+                    highNetCount++;
+                }
+            }
+        }
+
+        const double consistency = static_cast<double>(highNetCount) /
+                                  static_cast<double>(tracker.samples.size() - 1);
+
+        if (consistency >= 0.6) {
+            AddAnomaly(pid, PerformanceAnomalyType::NetworkFlood, usage.processName,
+                      std::format(L"Network flood: {:.1f} MB/s outbound sustained",
+                                  sendRate / (1024.0 * 1024.0)),
+                      sendRate, kNetworkFloodThreshold, 85);
+        }
+    }
+
     void AddAnomaly(uint32_t pid, PerformanceAnomalyType type, const std::wstring& processName,
                    const std::wstring& description, double value, double threshold, uint8_t severity) {
         // Check if already in active anomalies list
@@ -835,36 +974,105 @@ private:
 // PROCESS TRACKER
 // ============================================================================
 
-class ProcessTracker {
+class ProcessResourceTracker {
 public:
     /**
      * @brief Constructor with processor count validation.
-     * 
+     *
      * SECURITY FIX: std::thread::hardware_concurrency() can return 0
      * per C++ spec if the value is "not computable or well defined".
      * We default to 1 to prevent division by zero in CPU calculations.
      */
-    ProcessTracker() {
+    ProcessResourceTracker() {
         m_processorCount = std::thread::hardware_concurrency();
         if (m_processorCount == 0) {
-            SS_LOG_WARN(LOG_CATEGORY, L"ProcessTracker: hardware_concurrency returned 0, defaulting to 1");
+            SS_LOG_WARN(LOG_CATEGORY, L"ProcessResourceTracker: hardware_concurrency returned 0, defaulting to 1");
             m_processorCount = 1;
         }
+        m_selfPid = GetCurrentProcessId();
     }
-    
+
     /**
-     * @brief Gets resource usage for a specific process.
-     * 
-     * SECURITY FIX: Uses RAII UniqueHandle to prevent handle leaks on
-     * exception paths. All exceptions are caught and the handle is
-     * guaranteed to be closed.
+     * @brief Gets resource usage for a specific process (thread-safe).
      */
     ProcessResourceUsage GetUsage(uint32_t pid) {
+        std::unique_lock lock(m_mutex);
+        return GetUsageUnlocked(pid);
+    }
+
+    /**
+     * @brief Gets resource usage for all processes (thread-safe).
+     */
+    std::vector<ProcessResourceUsage> GetAllProcessUsage() {
+        std::unique_lock lock(m_mutex);
+
+        std::vector<ProcessResourceUsage> result;
+
+        UniqueHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot) {
+            return result;
+        }
+
+        PROCESSENTRY32W pe32;
+        pe32.dwSize = sizeof(PROCESSENTRY32W);
+
+        if (Process32FirstW(hSnapshot.Get(), &pe32)) {
+            do {
+                if (pe32.th32ProcessID > 4) {  // Skip System/Idle
+                    auto usage = GetUsageUnlocked(pe32.th32ProcessID);
+                    if (!usage.processName.empty()) {
+                        result.push_back(std::move(usage));
+                    }
+                }
+            } while (Process32NextW(hSnapshot.Get(), &pe32));
+        }
+
+        // Periodically clean stale entries from m_previousTimes
+        CleanStalePreviousTimes();
+
+        return result;
+    }
+
+    /**
+     * @brief Gets the EDR's own resource usage for self-monitoring.
+     */
+    SelfResourceUsage GetSelfUsage() {
+        std::unique_lock lock(m_mutex);
+
+        SelfResourceUsage self;
+        self.sampleTime = std::chrono::steady_clock::now();
+
+        auto procUsage = GetUsageUnlocked(m_selfPid);
+        self.cpuPercent = procUsage.cpuPercent;
+        self.workingSetBytes = procUsage.workingSetBytes;
+        self.privateBytes = procUsage.privateBytes;
+        self.handleCount = procUsage.handleCount;
+        self.threadCount = procUsage.threadCount;
+
+        return self;
+    }
+
+private:
+    /**
+     * @brief Gets resource usage without locking (caller must hold m_mutex).
+     *
+     * CRITICAL FIX: Previous version stored m_previousTimes[pid] BEFORE
+     * I/O counters were read, causing I/O rate calculations to always
+     * compare against the current sample (elapsed ≈ 0) → rates always 0.
+     * Now stores AFTER all metrics are collected.
+     */
+    ProcessResourceUsage GetUsageUnlocked(uint32_t pid) {
         ProcessResourceUsage usage;
         usage.processId = pid;
         usage.sampleTime = std::chrono::steady_clock::now();
 
-        // SECURITY FIX: Use RAII wrapper to prevent handle leak on exception
+        // Look up previous sample for delta calculations BEFORE overwriting
+        const ProcessResourceUsage* prevUsage = nullptr;
+        auto prevIt = m_previousTimes.find(pid);
+        if (prevIt != m_previousTimes.end()) {
+            prevUsage = &prevIt->second;
+        }
+
         UniqueHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, pid));
         if (!hProcess) {
             return usage;
@@ -886,25 +1094,22 @@ public:
                 usage.kernelTimeMs = FileTimeToMs(kernelTime);
                 usage.userTimeMs = FileTimeToMs(userTime);
 
-                // Calculate CPU percentage
-                auto it = m_previousTimes.find(pid);
-                if (it != m_previousTimes.end()) {
+                // Calculate CPU percentage from delta against previous sample
+                if (prevUsage) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        usage.sampleTime - it->second.sampleTime
+                        usage.sampleTime - prevUsage->sampleTime
                     );
 
                     usage.cpuPercent = CalculateCPUUsage(
-                        it->second.kernelTimeMs,
-                        it->second.userTimeMs,
+                        prevUsage->kernelTimeMs,
+                        prevUsage->userTimeMs,
                         usage.kernelTimeMs,
                         usage.userTimeMs,
                         elapsed.count(),
                         m_processorCount
                     );
                 }
-
-                // Store for next calculation
-                m_previousTimes[pid] = usage;
+                // DO NOT store m_previousTimes here — must wait until all metrics collected
             }
 
             // Get memory info
@@ -926,33 +1131,26 @@ public:
                 usage.ioReadOps = ioCounters.ReadOperationCount;
                 usage.ioWriteOps = ioCounters.WriteOperationCount;
 
-                // Calculate I/O rates with underflow protection
-                auto it = m_previousTimes.find(pid);
-                if (it != m_previousTimes.end()) {
+                // Calculate I/O rates using PREVIOUS sample (not the one we just stored)
+                if (prevUsage) {
                     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
-                        usage.sampleTime - it->second.sampleTime
+                        usage.sampleTime - prevUsage->sampleTime
                     );
 
                     if (elapsed.count() > 0) {
                         const double elapsedSec = static_cast<double>(elapsed.count()) / 1000.0;
-                        
-                        // SECURITY FIX: Protect against I/O counter underflow on PID reuse
-                        // When a PID is reused, the new process has lower counters than
-                        // our tracking. Subtracting would cause uint64_t underflow to a
-                        // huge positive value, triggering false "high I/O" anomalies.
-                        if (usage.ioReadBytes >= it->second.ioReadBytes) {
+
+                        if (usage.ioReadBytes >= prevUsage->ioReadBytes) {
                             usage.ioReadBytesPerSec = static_cast<double>(
-                                usage.ioReadBytes - it->second.ioReadBytes) / elapsedSec;
+                                usage.ioReadBytes - prevUsage->ioReadBytes) / elapsedSec;
                         } else {
-                            // Counter went backwards - likely PID reuse, clamp to 0
                             usage.ioReadBytesPerSec = 0.0;
                         }
-                        
-                        if (usage.ioWriteBytes >= it->second.ioWriteBytes) {
+
+                        if (usage.ioWriteBytes >= prevUsage->ioWriteBytes) {
                             usage.ioWriteBytesPerSec = static_cast<double>(
-                                usage.ioWriteBytes - it->second.ioWriteBytes) / elapsedSec;
+                                usage.ioWriteBytes - prevUsage->ioWriteBytes) / elapsedSec;
                         } else {
-                            // Counter went backwards - likely PID reuse, clamp to 0
                             usage.ioWriteBytesPerSec = 0.0;
                         }
                     }
@@ -973,42 +1171,38 @@ public:
             usage.userObjectCount = GetGuiResources(hProcess.Get(), GR_USEROBJECTS);
 
         } catch (const std::exception& e) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"ProcessTracker::GetUsage exception for PID %u: %hs", pid, e.what());
-            // UniqueHandle destructor will close handle automatically
+            SS_LOG_ERROR(LOG_CATEGORY, L"ProcessResourceTracker::GetUsage exception for PID %u: %hs", pid, e.what());
         }
 
-        // UniqueHandle destructor closes handle - no manual CloseHandle needed
+        // Store AFTER all metrics collected for correct delta calculations next time
+        m_previousTimes[pid] = usage;
         return usage;
     }
 
-    std::vector<ProcessResourceUsage> GetAllProcessUsage() {
-        std::vector<ProcessResourceUsage> result;
+    /**
+     * @brief Removes stale entries from m_previousTimes to prevent unbounded growth.
+     *
+     * Called periodically during GetAllProcessUsage. Entries older than
+     * 2 minutes are removed (the process likely terminated and the PID
+     * may be reused with stale baseline data).
+     */
+    void CleanStalePreviousTimes() {
+        const auto now = std::chrono::steady_clock::now();
+        const auto staleThreshold = std::chrono::minutes(2);
 
-        // Use RAII for snapshot handle as well
-        UniqueHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
-        if (!hSnapshot) {
-            return result;
+        // Only clean every 30 seconds
+        if (now - m_lastCleanupTime < std::chrono::seconds(30)) return;
+        m_lastCleanupTime = now;
+
+        for (auto it = m_previousTimes.begin(); it != m_previousTimes.end();) {
+            if (now - it->second.sampleTime > staleThreshold) {
+                it = m_previousTimes.erase(it);
+            } else {
+                ++it;
+            }
         }
-
-        PROCESSENTRY32W pe32;
-        pe32.dwSize = sizeof(PROCESSENTRY32W);
-
-        if (Process32FirstW(hSnapshot.Get(), &pe32)) {
-            do {
-                if (pe32.th32ProcessID > 4) {  // Skip System/Idle
-                    auto usage = GetUsage(pe32.th32ProcessID);
-                    if (!usage.processName.empty()) {
-                        result.push_back(usage);
-                    }
-                }
-            } while (Process32NextW(hSnapshot.Get(), &pe32));
-        }
-
-        // UniqueHandle destructor closes snapshot - no manual CloseHandle needed
-        return result;
     }
 
-private:
     uint64_t FileTimeToMs(const FILETIME& ft) const {
         ULARGE_INTEGER uli;
         uli.LowPart = ft.dwLowDateTime;
@@ -1019,7 +1213,6 @@ private:
     uint32_t GetProcessThreadCount(uint32_t pid) const {
         uint32_t count = 0;
 
-        // Use RAII for snapshot handle
         UniqueHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
         if (!hSnapshot) {
             return count;
@@ -1036,30 +1229,44 @@ private:
             } while (Thread32Next(hSnapshot.Get(), &te32));
         }
 
-        // UniqueHandle destructor closes snapshot - no manual CloseHandle needed
         return count;
     }
 
+    mutable std::shared_mutex m_mutex;
     std::unordered_map<uint32_t, ProcessResourceUsage> m_previousTimes;
-    uint32_t m_processorCount{ 1 };  // Set in constructor with validation
+    uint32_t m_processorCount{ 1 };
+    uint32_t m_selfPid{ 0 };
+    std::chrono::steady_clock::time_point m_lastCleanupTime;
 };
 
 // ============================================================================
 // SYSTEM TRACKER
 // ============================================================================
 
-class SystemTracker {
+class SystemResourceTracker {
 public:
-    SystemTracker() {
+    SystemResourceTracker() {
         SYSTEM_INFO sysInfo;
         GetSystemInfo(&sysInfo);
         m_processorCount = sysInfo.dwNumberOfProcessors;
 
         // Initialize previous system times
         UpdateSystemTimes();
+        InitializePDHCounters();
+        InitializeNetworkBaseline();
     }
 
+    ~SystemResourceTracker() {
+        CleanupPDHCounters();
+    }
+
+    // Non-copyable
+    SystemResourceTracker(const SystemResourceTracker&) = delete;
+    SystemResourceTracker& operator=(const SystemResourceTracker&) = delete;
+
     SystemResourceUsage GetUsage() {
+        std::unique_lock lock(m_mutex);
+
         SystemResourceUsage usage;
         usage.sampleTime = std::chrono::steady_clock::now();
 
@@ -1072,9 +1279,16 @@ public:
         // Get process counts
         UpdateProcessCounts(usage);
 
+        // Update disk I/O via PDH
+        UpdateDiskMetrics(usage);
+
+        // Update network metrics via interface table
+        UpdateNetworkMetrics(usage);
+
         // Calculate pressure levels
         usage.cpuPressure = CalculatePressure(usage.totalCpuPercent);
         usage.memoryPressure = CalculatePressure(usage.memoryUsagePercent);
+        usage.ioPressure = CalculatePressure(usage.diskTimePercent);
 
         // Get idle state
         UpdateIdleState(usage);
@@ -1083,6 +1297,94 @@ public:
     }
 
 private:
+    // ====================================================================
+    // PDH COUNTER INITIALIZATION
+    // ====================================================================
+
+    /**
+     * @brief Initializes PDH counters for disk I/O metrics.
+     *
+     * Uses PdhAddEnglishCounterW which accepts English counter names
+     * regardless of OS locale, ensuring portability across all Windows
+     * language packs. Gracefully degrades if PDH service is unavailable.
+     */
+    void InitializePDHCounters() {
+        PDH_STATUS status = PdhOpenQueryW(nullptr, 0, &m_pdhQuery);
+        if (status != ERROR_SUCCESS) {
+            SS_LOG_WARN(LOG_CATEGORY, L"PDH query open failed: 0x%08X - disk metrics unavailable", status);
+            m_pdhQuery = nullptr;
+            return;
+        }
+
+        // Disk counters (English names, locale-independent)
+        auto addCounter = [this](const wchar_t* path, PDH_HCOUNTER& counter) -> bool {
+            PDH_STATUS s = PdhAddEnglishCounterW(m_pdhQuery, path, 0, &counter);
+            if (s != ERROR_SUCCESS) {
+                SS_LOG_WARN(LOG_CATEGORY, L"PDH counter add failed for '%ls': 0x%08X", path, s);
+                counter = nullptr;
+                return false;
+            }
+            return true;
+        };
+
+        addCounter(L"\\PhysicalDisk(_Total)\\Disk Read Bytes/sec", m_diskReadCounter);
+        addCounter(L"\\PhysicalDisk(_Total)\\Disk Write Bytes/sec", m_diskWriteCounter);
+        addCounter(L"\\PhysicalDisk(_Total)\\Current Disk Queue Length", m_diskQueueCounter);
+        addCounter(L"\\PhysicalDisk(_Total)\\% Disk Time", m_diskTimeCounter);
+
+        // Collect initial sample (PDH rate counters require two samples)
+        PdhCollectQueryData(m_pdhQuery);
+
+        SS_LOG_INFO(LOG_CATEGORY, L"PDH disk I/O counters initialized");
+    }
+
+    void CleanupPDHCounters() {
+        if (m_pdhQuery) {
+            PdhCloseQuery(m_pdhQuery);
+            m_pdhQuery = nullptr;
+        }
+        m_diskReadCounter = nullptr;
+        m_diskWriteCounter = nullptr;
+        m_diskQueueCounter = nullptr;
+        m_diskTimeCounter = nullptr;
+    }
+
+    // ====================================================================
+    // NETWORK BASELINE
+    // ====================================================================
+
+    void InitializeNetworkBaseline() {
+        MIB_IF_TABLE2* rawTable = nullptr;
+        if (GetIfTable2(&rawTable) != NO_ERROR || !rawTable) {
+            SS_LOG_WARN(LOG_CATEGORY, L"GetIfTable2 failed - network metrics unavailable");
+            return;
+        }
+
+        uint64_t totalSend = 0, totalRecv = 0;
+        for (ULONG i = 0; i < rawTable->NumEntries; i++) {
+            const auto& row = rawTable->Table[i];
+            if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK ||
+                row.Type == IF_TYPE_TUNNEL ||
+                row.OperStatus != IfOperStatusUp) {
+                continue;
+            }
+            totalSend += row.OutOctets;
+            totalRecv += row.InOctets;
+        }
+        FreeMibTable(rawTable);
+
+        m_prevNetworkSendBytes = totalSend;
+        m_prevNetworkRecvBytes = totalRecv;
+        m_prevNetworkSampleTime = std::chrono::steady_clock::now();
+        m_networkInitialized = true;
+
+        SS_LOG_INFO(LOG_CATEGORY, L"Network baseline initialized");
+    }
+
+    // ====================================================================
+    // CPU METRICS
+    // ====================================================================
+
     void UpdateSystemTimes() {
         GetSystemTimes(&m_prevIdleTime, &m_prevKernelTime, &m_prevUserTime);
         m_prevSampleTime = std::chrono::steady_clock::now();
@@ -1124,6 +1426,10 @@ private:
         m_prevSampleTime = usage.sampleTime;
     }
 
+    // ====================================================================
+    // MEMORY METRICS
+    // ====================================================================
+
     void UpdateMemoryInfo(SystemResourceUsage& usage) {
         MEMORYSTATUSEX memStatus = {};
         memStatus.dwLength = sizeof(memStatus);
@@ -1149,9 +1455,122 @@ private:
     }
 
     void UpdateProcessCounts(SystemResourceUsage& usage) {
-        // Already set by GetPerformanceInfo
-        // Additional counting if needed
+        // Already set by GetPerformanceInfo in UpdateMemoryInfo
     }
+
+    // ====================================================================
+    // DISK I/O METRICS (PDH)
+    // ====================================================================
+
+    /**
+     * @brief Collects disk I/O metrics via PDH counters.
+     *
+     * PDH handles are validated before use: disconnected or invalidated
+     * counters return PDH_INVALID_DATA which we handle gracefully.
+     */
+    void UpdateDiskMetrics(SystemResourceUsage& usage) {
+        if (!m_pdhQuery) return;
+
+        PDH_STATUS status = PdhCollectQueryData(m_pdhQuery);
+        if (status != ERROR_SUCCESS) {
+            // PDH query can fail if counters become invalid (e.g., disk removed)
+            SS_LOG_DEBUG(LOG_CATEGORY, L"PDH collect failed: 0x%08X", status);
+            return;
+        }
+
+        PDH_FMT_COUNTERVALUE value;
+        DWORD counterType = 0;
+
+        if (m_diskReadCounter) {
+            status = PdhGetFormattedCounterValue(m_diskReadCounter, PDH_FMT_DOUBLE, &counterType, &value);
+            if (status == ERROR_SUCCESS && (value.CStatus == PDH_CSTATUS_VALID_DATA ||
+                                             value.CStatus == PDH_CSTATUS_NEW_DATA)) {
+                usage.diskReadBytesPerSec = std::max(0.0, value.doubleValue);
+            }
+        }
+
+        if (m_diskWriteCounter) {
+            status = PdhGetFormattedCounterValue(m_diskWriteCounter, PDH_FMT_DOUBLE, &counterType, &value);
+            if (status == ERROR_SUCCESS && (value.CStatus == PDH_CSTATUS_VALID_DATA ||
+                                             value.CStatus == PDH_CSTATUS_NEW_DATA)) {
+                usage.diskWriteBytesPerSec = std::max(0.0, value.doubleValue);
+            }
+        }
+
+        if (m_diskQueueCounter) {
+            status = PdhGetFormattedCounterValue(m_diskQueueCounter, PDH_FMT_DOUBLE, &counterType, &value);
+            if (status == ERROR_SUCCESS && (value.CStatus == PDH_CSTATUS_VALID_DATA ||
+                                             value.CStatus == PDH_CSTATUS_NEW_DATA)) {
+                usage.diskQueueLength = std::max(0.0, value.doubleValue);
+            }
+        }
+
+        if (m_diskTimeCounter) {
+            status = PdhGetFormattedCounterValue(m_diskTimeCounter, PDH_FMT_DOUBLE, &counterType, &value);
+            if (status == ERROR_SUCCESS && (value.CStatus == PDH_CSTATUS_VALID_DATA ||
+                                             value.CStatus == PDH_CSTATUS_NEW_DATA)) {
+                usage.diskTimePercent = std::clamp(value.doubleValue, 0.0, 100.0);
+            }
+        }
+    }
+
+    // ====================================================================
+    // NETWORK METRICS (GetIfTable2)
+    // ====================================================================
+
+    /**
+     * @brief Collects network throughput via GetIfTable2.
+     *
+     * Sums byte counters across all non-loopback, non-tunnel, operational
+     * interfaces. Calculates rates from deltas against previous sample.
+     * More reliable than PDH wildcard counters for network metrics.
+     */
+    void UpdateNetworkMetrics(SystemResourceUsage& usage) {
+        MIB_IF_TABLE2* rawTable = nullptr;
+        if (GetIfTable2(&rawTable) != NO_ERROR || !rawTable) {
+            return;
+        }
+
+        uint64_t totalSend = 0, totalRecv = 0;
+        for (ULONG i = 0; i < rawTable->NumEntries; i++) {
+            const auto& row = rawTable->Table[i];
+            if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK ||
+                row.Type == IF_TYPE_TUNNEL ||
+                row.OperStatus != IfOperStatusUp) {
+                continue;
+            }
+            totalSend += row.OutOctets;
+            totalRecv += row.InOctets;
+        }
+        FreeMibTable(rawTable);
+
+        const auto now = std::chrono::steady_clock::now();
+        const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+            now - m_prevNetworkSampleTime
+        );
+
+        if (elapsed.count() > 0 && m_networkInitialized) {
+            const double elapsedSec = static_cast<double>(elapsed.count()) / 1000.0;
+
+            if (totalSend >= m_prevNetworkSendBytes) {
+                usage.networkSendBytesPerSec = static_cast<double>(
+                    totalSend - m_prevNetworkSendBytes) / elapsedSec;
+            }
+            if (totalRecv >= m_prevNetworkRecvBytes) {
+                usage.networkRecvBytesPerSec = static_cast<double>(
+                    totalRecv - m_prevNetworkRecvBytes) / elapsedSec;
+            }
+        }
+
+        m_prevNetworkSendBytes = totalSend;
+        m_prevNetworkRecvBytes = totalRecv;
+        m_prevNetworkSampleTime = now;
+        m_networkInitialized = true;
+    }
+
+    // ====================================================================
+    // IDLE STATE
+    // ====================================================================
 
     void UpdateIdleState(SystemResourceUsage& usage) {
         const uint64_t idleMs = GetSystemIdleTime();
@@ -1175,11 +1594,29 @@ private:
         return uli.QuadPart;
     }
 
+    // ====================================================================
+    // MEMBER VARIABLES
+    // ====================================================================
+
+    mutable std::shared_mutex m_mutex;
     uint32_t m_processorCount;
     FILETIME m_prevIdleTime{};
     FILETIME m_prevKernelTime{};
     FILETIME m_prevUserTime{};
     std::chrono::steady_clock::time_point m_prevSampleTime;
+
+    // PDH disk I/O counters
+    PDH_HQUERY m_pdhQuery{ nullptr };
+    PDH_HCOUNTER m_diskReadCounter{ nullptr };
+    PDH_HCOUNTER m_diskWriteCounter{ nullptr };
+    PDH_HCOUNTER m_diskQueueCounter{ nullptr };
+    PDH_HCOUNTER m_diskTimeCounter{ nullptr };
+
+    // Network tracking state
+    uint64_t m_prevNetworkSendBytes{ 0 };
+    uint64_t m_prevNetworkRecvBytes{ 0 };
+    std::chrono::steady_clock::time_point m_prevNetworkSampleTime;
+    bool m_networkInitialized{ false };
 };
 
 // ============================================================================
@@ -1205,7 +1642,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            SS_LOG_INFO(L"PerformanceMonitor:",L"Initializing...");
+            SS_LOG_INFO(LOG_CATEGORY, L"Initializing...");
 
             m_config = config;
 
@@ -1213,10 +1650,10 @@ public:
             m_callbackManager = std::make_unique<CallbackManager>();
             m_historyManager = std::make_unique<HistoryManager>();
             m_anomalyDetector = std::make_unique<AnomalyDetector>(config.thresholds);
-            m_processTracker = std::make_unique<ProcessTracker>();
-            m_systemTracker = std::make_unique<SystemTracker>();
+            m_processTracker = std::make_unique<ProcessResourceTracker>();
+            m_systemTracker = std::make_unique<SystemResourceTracker>();
 
-            m_historyManager->SetMaxHistorySeconds(config.historyDepthSeconds);
+            m_historyManager->SetMaxHistorySeconds(config.historyDepthSeconds, config.samplingIntervalMs);
 
             m_initialized = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Initialized successfully");
@@ -1430,11 +1867,6 @@ public:
     bool IsGoodTimeForIntensiveScan() const {
         std::shared_lock lock(m_mutex);
 
-        // Good time if:
-        // 1. System is idle
-        // 2. Low resource pressure
-        // 3. No critical anomalies
-
         const bool isIdle = m_currentSystemUsage.idleState == SystemIdleState::DeepIdle ||
                            m_currentSystemUsage.idleState == SystemIdleState::Sleeping;
 
@@ -1451,6 +1883,45 @@ public:
         }
 
         return isIdle && lowPressure && noCriticalAnomalies;
+    }
+
+    // ========================================================================
+    // SELF-MONITORING
+    // ========================================================================
+
+    /**
+     * @brief Gets the EDR's own resource usage for self-monitoring.
+     */
+    SelfResourceUsage GetSelfResourceUsage() const {
+        return m_processTracker->GetSelfUsage();
+    }
+
+    // ========================================================================
+    // KERNEL METRICS INTEGRATION
+    // ========================================================================
+
+    /**
+     * @brief Accepts kernel-reported resource metrics.
+     *
+     * Called by the kernel IPC bridge when the driver pushes metrics.
+     * Thread-safe: can be called from any thread.
+     */
+    void UpdateKernelMetrics(const KernelResourceMetrics& metrics) {
+        std::unique_lock lock(m_kernelMetricsMutex);
+        m_kernelMetrics = metrics;
+        m_kernelMetrics.hasKernelData = true;
+        m_kernelMetrics.sampleTime = std::chrono::steady_clock::now();
+
+        SS_LOG_TRACE(LOG_CATEGORY, L"Kernel metrics updated: nonPagedPool=%llu, interrupts=%u, DPCs=%u",
+                     metrics.nonPagedPoolUsageBytes, metrics.interruptRate, metrics.dpcRate);
+    }
+
+    /**
+     * @brief Returns the latest kernel resource metrics.
+     */
+    KernelResourceMetrics GetKernelMetrics() const {
+        std::shared_lock lock(m_kernelMetricsMutex);
+        return m_kernelMetrics;
     }
 
     // ========================================================================
@@ -1512,9 +1983,16 @@ private:
     // ========================================================================
 
     void MonitorThreadFunc() {
-        SS_LOG_INFO(L"PerformanceMonitor:", L"Monitor thread started.");
+        SS_LOG_INFO(LOG_CATEGORY, L"Monitor thread started");
 
         const auto samplingInterval = std::chrono::milliseconds(m_config.samplingIntervalMs);
+        uint32_t iterationCount = 0;
+
+        // EDR self-monitoring thresholds
+        constexpr double kSelfCpuWarnThreshold = 15.0;   // EDR using >15% CPU
+        constexpr double kSelfCpuCritThreshold = 30.0;   // EDR using >30% CPU
+        constexpr uint64_t kSelfMemWarnBytes = 512ULL * 1024 * 1024;  // 512 MB
+        constexpr uint64_t kSelfMemCritBytes = 1024ULL * 1024 * 1024; // 1 GB
 
         while (m_monitoring.load(std::memory_order_acquire)) {
             try {
@@ -1561,23 +2039,13 @@ private:
                 }
 
                 // Check for new anomalies - ONLY invoke callbacks for NEW anomalies
-                // CALLBACK STORM FIX: Previously, we called GetActiveAnomalies() which
-                // returns ALL active anomalies, causing callbacks to fire repeatedly
-                // for the same anomalies. Now we use GetNewAnomalies() which only
-                // returns anomalies that haven't been reported to callbacks yet.
                 if (m_config.detectAnomalies) {
-                    // Get only NEW anomalies that haven't been reported yet
                     auto newAnomalies = m_anomalyDetector->GetNewAnomalies();
-                    
-                    // Update total active count for status reporting
+
                     auto allAnomalies = m_anomalyDetector->GetActiveAnomalies();
                     m_stats.anomaliesDetected.store(allAnomalies.size(), std::memory_order_relaxed);
 
-                    // STATS FIX: Only increment counters for NEW anomalies
-                    // Previously we incremented on every iteration for every active anomaly,
-                    // causing counter overflow and misleading statistics.
                     for (const auto& anomaly : newAnomalies) {
-                        // Update type-specific stats ONCE per anomaly
                         switch (anomaly.type) {
                             case PerformanceAnomalyType::HighCPU:
                                 m_stats.highCpuDetections.fetch_add(1, std::memory_order_relaxed);
@@ -1592,12 +2060,50 @@ private:
                                 break;
                         }
 
-                        // Invoke callbacks ONLY for new anomalies
                         m_callbackManager->InvokeAnomaly(anomaly);
                     }
 
                     // Clean stale tracking
                     m_anomalyDetector->ClearStaleTracking();
+                }
+
+                // ============================================================
+                // EDR SELF-MONITORING (every 5 iterations to reduce overhead)
+                // ============================================================
+                if (++iterationCount % 5 == 0) {
+                    auto selfUsage = m_processTracker->GetSelfUsage();
+
+                    if (selfUsage.cpuPercent >= kSelfCpuCritThreshold) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"EDR self-monitoring CRITICAL: CPU %.1f%% exceeds %.1f%% - engaging throttle",
+                            selfUsage.cpuPercent, kSelfCpuCritThreshold);
+                        // Force throttle engagement
+                        if (!m_lastThrottleState.load(std::memory_order_acquire)) {
+                            m_lastThrottleState.store(true, std::memory_order_release);
+                            m_stats.throttleEngagements.fetch_add(1, std::memory_order_relaxed);
+                            m_callbackManager->InvokeThrottle(true, selfUsage.cpuPercent);
+                        }
+                    } else if (selfUsage.cpuPercent >= kSelfCpuWarnThreshold) {
+                        SS_LOG_DEBUG(LOG_CATEGORY,
+                            L"EDR self-monitoring: CPU %.1f%% approaching threshold",
+                            selfUsage.cpuPercent);
+                    }
+
+                    if (selfUsage.workingSetBytes >= kSelfMemCritBytes) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"EDR self-monitoring CRITICAL: memory %llu MB exceeds %llu MB limit",
+                            selfUsage.workingSetBytes / (1024 * 1024),
+                            kSelfMemCritBytes / (1024 * 1024));
+                    } else if (selfUsage.workingSetBytes >= kSelfMemWarnBytes) {
+                        SS_LOG_DEBUG(LOG_CATEGORY,
+                            L"EDR self-monitoring: memory %llu MB approaching limit",
+                            selfUsage.workingSetBytes / (1024 * 1024));
+                    }
+
+                    // Periodically clean stale process history (every 60 iterations)
+                    if (iterationCount % 60 == 0) {
+                        m_historyManager->CleanStaleProcessHistory();
+                    }
                 }
 
                 m_stats.samplesTaken.fetch_add(1, std::memory_order_relaxed);
@@ -1639,8 +2145,12 @@ private:
     std::unique_ptr<CallbackManager> m_callbackManager;
     std::unique_ptr<HistoryManager> m_historyManager;
     std::unique_ptr<AnomalyDetector> m_anomalyDetector;
-    std::unique_ptr<ProcessTracker> m_processTracker;
-    std::unique_ptr<SystemTracker> m_systemTracker;
+    std::unique_ptr<ProcessResourceTracker> m_processTracker;
+    std::unique_ptr<SystemResourceTracker> m_systemTracker;
+
+    // Kernel metrics (updated via UpdateKernelMetrics from IPC bridge)
+    mutable std::shared_mutex m_kernelMetricsMutex;
+    KernelResourceMetrics m_kernelMetrics;
 
     // Monitoring thread
     std::thread m_monitorThread;
@@ -1758,6 +2268,18 @@ double PerformanceMonitor::GetRecommendedThrottleLevel() const {
 
 bool PerformanceMonitor::IsGoodTimeForIntensiveScan() const {
     return m_impl->IsGoodTimeForIntensiveScan();
+}
+
+SelfResourceUsage PerformanceMonitor::GetSelfResourceUsage() const {
+    return m_impl->GetSelfResourceUsage();
+}
+
+void PerformanceMonitor::UpdateKernelMetrics(const KernelResourceMetrics& metrics) {
+    m_impl->UpdateKernelMetrics(metrics);
+}
+
+KernelResourceMetrics PerformanceMonitor::GetKernelMetrics() const {
+    return m_impl->GetKernelMetrics();
 }
 
 std::vector<SystemResourceUsage> PerformanceMonitor::GetUsageHistory(

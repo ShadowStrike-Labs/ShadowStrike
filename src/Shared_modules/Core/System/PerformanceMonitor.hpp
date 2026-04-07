@@ -319,6 +319,50 @@ struct alignas(128) PerformanceMonitorStatistics {
 };
 
 // ============================================================================
+// KERNEL RESOURCE METRICS
+// ============================================================================
+
+/**
+ * @struct KernelResourceMetrics
+ * @brief Resource metrics reported by the kernel driver.
+ *
+ * Populated by the kernel driver via IOCTL and pushed into
+ * PerformanceMonitor for correlation with usermode metrics.
+ * Enables detection of kernel-level resource exhaustion attacks
+ * that are invisible from usermode alone.
+ */
+struct alignas(64) KernelResourceMetrics {
+    uint64_t nonPagedPoolUsageBytes{ 0 };
+    uint64_t pagedPoolUsageBytes{ 0 };
+    uint64_t systemPteUsage{ 0 };
+    uint32_t interruptRate{ 0 };
+    uint32_t contextSwitchRate{ 0 };
+    uint32_t dpcRate{ 0 };
+    uint32_t dpcQueueDepth{ 0 };
+    uint64_t kernelHandleCount{ 0 };
+    bool hasKernelData{ false };
+    std::chrono::steady_clock::time_point sampleTime;
+};
+
+/**
+ * @struct SelfResourceUsage
+ * @brief Resource usage of the EDR process itself.
+ *
+ * Used for self-monitoring to ensure the EDR does not
+ * degrade endpoint performance. Triggers throttling when
+ * the EDR's own footprint exceeds configured limits.
+ */
+struct alignas(64) SelfResourceUsage {
+    double cpuPercent{ 0.0 };
+    uint64_t workingSetBytes{ 0 };
+    uint64_t privateBytes{ 0 };
+    uint32_t handleCount{ 0 };
+    uint32_t threadCount{ 0 };
+    bool isThrottled{ false };
+    std::chrono::steady_clock::time_point sampleTime;
+};
+
+// ============================================================================
 // CALLBACK TYPES
 // ============================================================================
 
@@ -476,6 +520,34 @@ public:
      * @brief Checks if conditions are good for intensive scanning.
      */
     [[nodiscard]] bool IsGoodTimeForIntensiveScan() const;
+    
+    // ========================================================================
+    // SELF-MONITORING
+    // ========================================================================
+    
+    /**
+     * @brief Gets the EDR's own resource usage.
+     */
+    [[nodiscard]] SelfResourceUsage GetSelfResourceUsage() const;
+    
+    // ========================================================================
+    // KERNEL INTEGRATION
+    // ========================================================================
+    
+    /**
+     * @brief Updates kernel-reported resource metrics.
+     *
+     * Called by the kernel IPC bridge when the driver reports
+     * system-level resource metrics (pool usage, interrupt rates, etc.).
+     * These metrics are correlated with usermode data for deeper
+     * anomaly detection.
+     */
+    void UpdateKernelMetrics(const KernelResourceMetrics& metrics);
+    
+    /**
+     * @brief Gets the latest kernel resource metrics.
+     */
+    [[nodiscard]] KernelResourceMetrics GetKernelMetrics() const;
     
     // ========================================================================
     // HISTORY
