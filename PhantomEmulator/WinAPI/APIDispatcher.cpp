@@ -27,6 +27,7 @@
 #include "Ntdll\NtSystem.hpp"
 #include "Ntdll\NtThread.hpp"
 #include "Ntdll\NtToken.hpp"
+#include "Ntdll\NtSync.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -181,6 +182,7 @@ void APIDispatcher::RegisterNtdll() noexcept {
     WinAPI::Ntdll::RegisterNtRegistry(*this);
     WinAPI::Ntdll::RegisterNtSystem(*this);
     WinAPI::Ntdll::RegisterNtToken(*this);
+    WinAPI::Ntdll::RegisterNtSync(*this);
     WinAPI::Ntdll::RegisterLdrHandlers(*this);
 }
 void APIDispatcher::RegisterKernel32() noexcept {}
