@@ -111,8 +111,8 @@
 #include "ProcessMonitor.hpp"
 #include "../../Utils/ProcessUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
-#include "../../Utils/ErrorUtils.hpp"
 #include "../../Whitelist/WhiteListStore.hpp" // Protected process list
+#include "../../Communication/IPCManager.hpp" // Kernel driver communication
 
 // Standard library
 #include <string>
@@ -133,6 +133,11 @@
 #include <cstdint>
 
 namespace ShadowStrike {
+
+namespace Whitelist {
+    class WhitelistStore;
+} // namespace Whitelist
+
 namespace Core {
 namespace Process {
 
@@ -270,7 +275,8 @@ enum class ProcessCriticality : uint8_t {
     SystemService = 1,    ///< May affect system features
     SecuritySoftware = 2, ///< Security product
     Critical = 3,         ///< Termination causes BSOD
-    Forbidden = 4         ///< Never terminate (csrss, smss)
+    Forbidden = 4,        ///< Never terminate (csrss, smss)
+    Unknown = 5           ///< Could not determine criticality
 };
 
 /**
@@ -487,6 +493,61 @@ struct alignas(64) KillerStatistics {
     std::atomic<uint64_t> timeoutErrors{0};
     std::atomic<uint64_t> resurrectionsDetected{0};
 
+    KillerStatistics() noexcept = default;
+
+    // Atomics are not copyable; provide a relaxed-load copy for snapshots
+    KillerStatistics(const KillerStatistics& o) noexcept
+        : totalKillAttempts(o.totalKillAttempts.load(std::memory_order_relaxed))
+        , successfulKills(o.successfulKills.load(std::memory_order_relaxed))
+        , failedKills(o.failedKills.load(std::memory_order_relaxed))
+        , escalatedKills(o.escalatedKills.load(std::memory_order_relaxed))
+        , standardKills(o.standardKills.load(std::memory_order_relaxed))
+        , privilegedKills(o.privilegedKills.load(std::memory_order_relaxed))
+        , freezeKills(o.freezeKills.load(std::memory_order_relaxed))
+        , jobObjectKills(o.jobObjectKills.load(std::memory_order_relaxed))
+        , kernelKills(o.kernelKills.load(std::memory_order_relaxed))
+        , treeKillAttempts(o.treeKillAttempts.load(std::memory_order_relaxed))
+        , processesInTreesKilled(o.processesInTreesKilled.load(std::memory_order_relaxed))
+        , suspendAttempts(o.suspendAttempts.load(std::memory_order_relaxed))
+        , successfulSuspends(o.successfulSuspends.load(std::memory_order_relaxed))
+        , resumeAttempts(o.resumeAttempts.load(std::memory_order_relaxed))
+        , watchdogsDetected(o.watchdogsDetected.load(std::memory_order_relaxed))
+        , watchdogsDefeated(o.watchdogsDefeated.load(std::memory_order_relaxed))
+        , protectedProcessesEncountered(o.protectedProcessesEncountered.load(std::memory_order_relaxed))
+        , criticalProcessesBlocked(o.criticalProcessesBlocked.load(std::memory_order_relaxed))
+        , accessDeniedErrors(o.accessDeniedErrors.load(std::memory_order_relaxed))
+        , timeoutErrors(o.timeoutErrors.load(std::memory_order_relaxed))
+        , resurrectionsDetected(o.resurrectionsDetected.load(std::memory_order_relaxed))
+    {}
+
+    KillerStatistics& operator=(const KillerStatistics&) = delete;
+
+    KillerStatistics(KillerStatistics&& o) noexcept
+        : totalKillAttempts(o.totalKillAttempts.load(std::memory_order_relaxed))
+        , successfulKills(o.successfulKills.load(std::memory_order_relaxed))
+        , failedKills(o.failedKills.load(std::memory_order_relaxed))
+        , escalatedKills(o.escalatedKills.load(std::memory_order_relaxed))
+        , standardKills(o.standardKills.load(std::memory_order_relaxed))
+        , privilegedKills(o.privilegedKills.load(std::memory_order_relaxed))
+        , freezeKills(o.freezeKills.load(std::memory_order_relaxed))
+        , jobObjectKills(o.jobObjectKills.load(std::memory_order_relaxed))
+        , kernelKills(o.kernelKills.load(std::memory_order_relaxed))
+        , treeKillAttempts(o.treeKillAttempts.load(std::memory_order_relaxed))
+        , processesInTreesKilled(o.processesInTreesKilled.load(std::memory_order_relaxed))
+        , suspendAttempts(o.suspendAttempts.load(std::memory_order_relaxed))
+        , successfulSuspends(o.successfulSuspends.load(std::memory_order_relaxed))
+        , resumeAttempts(o.resumeAttempts.load(std::memory_order_relaxed))
+        , watchdogsDetected(o.watchdogsDetected.load(std::memory_order_relaxed))
+        , watchdogsDefeated(o.watchdogsDefeated.load(std::memory_order_relaxed))
+        , protectedProcessesEncountered(o.protectedProcessesEncountered.load(std::memory_order_relaxed))
+        , criticalProcessesBlocked(o.criticalProcessesBlocked.load(std::memory_order_relaxed))
+        , accessDeniedErrors(o.accessDeniedErrors.load(std::memory_order_relaxed))
+        , timeoutErrors(o.timeoutErrors.load(std::memory_order_relaxed))
+        , resurrectionsDetected(o.resurrectionsDetected.load(std::memory_order_relaxed))
+    {}
+
+    KillerStatistics& operator=(KillerStatistics&&) = delete;
+
     /**
      * @brief Reset all statistics.
      */
@@ -640,6 +701,12 @@ public:
      * @return True if initialization succeeded.
      */
     [[nodiscard]] bool Initialize();
+
+    /**
+     * @brief Set the whitelist store for process exclusion checks.
+     * @param store Pointer to an initialized WhitelistStore. Caller retains ownership.
+     */
+    void SetWhitelistStore(ShadowStrike::Whitelist::WhitelistStore* store) noexcept;
 
     /**
      * @brief Shutdown and cleanup.
