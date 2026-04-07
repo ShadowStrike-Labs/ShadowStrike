@@ -75,6 +75,11 @@ struct EmulationConfig {
     uint32_t    jitCodeCacheSize   = 4 * 1024 * 1024;   // 4 MB
     uint32_t    jitHotThreshold    = 64;                 // Interpret N times before compiling
 
+    // === Multi-process emulation ===
+    bool      enableMultiProcess        = true;
+    uint32_t  maxChildProcesses         = 8;           // Max child processes per session
+    GuestSize maxInjectedPayloadCapture = 64 * 1024;   // 64 KB capture per injection
+
     // === Performance tuning ===
     uint32_t  instructionCacheSize = 4096;          // Decoded instruction cache entries
     bool      enableInstructionTrace = false;       // Full trace (very slow, debug only)
