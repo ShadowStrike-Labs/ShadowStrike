@@ -162,6 +162,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "SecurityEnums.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
@@ -178,6 +179,10 @@ namespace ShadowStrike::Security {
     class ProcessProtectionImpl;
     class SelfDefense;
     class TamperProtection;
+}
+
+namespace ShadowStrike::Service {
+    class AntivirusServiceImpl;
 }
 
 namespace ShadowStrike {
@@ -323,7 +328,7 @@ using Milliseconds = std::chrono::milliseconds;
 /**
  * @brief Protection type (PPL level)
  */
-enum class ProtectionType : uint8_t {
+enum class ProcessProtectionType : uint8_t {
     None            = 0,    ///< No protection
     ProtectedLight  = 1,    ///< Protected Process Light
     Protected       = 2     ///< Full Protected Process
@@ -345,7 +350,7 @@ enum class ProtectionSigner : uint8_t {
 /**
  * @brief Access request type
  */
-enum class AccessRequestType : uint8_t {
+enum class ProcessProtectionAccessRequestType : uint8_t {
     ProcessOpen     = 0,
     ProcessDuplicate= 1,
     ThreadOpen      = 2,
@@ -360,7 +365,7 @@ enum class AccessRequestType : uint8_t {
 /**
  * @brief Access decision
  */
-enum class AccessDecision : uint8_t {
+enum class ProcessProtectionAccessDecision : uint8_t {
     Allow           = 0,    ///< Allow full access
     AllowReduced    = 1,    ///< Allow with reduced rights
     Deny            = 2,    ///< Deny access
@@ -417,7 +422,7 @@ inline constexpr ThreatAction operator~(ThreatAction a) noexcept {
 /**
  * @brief Response to threat
  */
-enum class ThreatResponse : uint32_t {
+enum class ProcessProtectionThreatResponse : uint32_t {
     None            = 0x00000000,
     Log             = 0x00000001,
     Alert           = 0x00000002,
@@ -431,33 +436,27 @@ enum class ThreatResponse : uint32_t {
     Aggressive      = Log | Alert | Block | TerminateSource
 };
 
-inline constexpr ThreatResponse operator|(ThreatResponse a, ThreatResponse b) noexcept {
-    return static_cast<ThreatResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr ProcessProtectionThreatResponse operator|(ProcessProtectionThreatResponse a, ProcessProtectionThreatResponse b) noexcept {
+    return static_cast<ProcessProtectionThreatResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-inline constexpr ThreatResponse operator&(ThreatResponse a, ThreatResponse b) noexcept {
-    return static_cast<ThreatResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+inline constexpr ProcessProtectionThreatResponse operator&(ProcessProtectionThreatResponse a, ProcessProtectionThreatResponse b) noexcept {
+    return static_cast<ProcessProtectionThreatResponse>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
-inline constexpr ThreatResponse operator~(ThreatResponse a) noexcept {
-    return static_cast<ThreatResponse>(~static_cast<uint32_t>(a));
+inline constexpr ProcessProtectionThreatResponse operator~(ProcessProtectionThreatResponse a) noexcept {
+    return static_cast<ProcessProtectionThreatResponse>(~static_cast<uint32_t>(a));
 }
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_THREAT_RESPONSE_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_THREAT_RESPONSE_DEFINED
+using ThreatResponse = ProcessProtectionThreatResponse;
+#endif
 
 /**
  * @brief Module status (guarded to prevent ODR redefinition across Security headers)
  */
-__if_not_exists(ModuleStatus) {
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-}
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -466,9 +465,9 @@ enum class ModuleStatus : uint8_t {
 /**
  * @brief Process protection level information
  */
-struct ProtectionLevel {
+struct ProcessProtectionLevel {
     /// @brief Protection type (None, Light, Full)
-    ProtectionType type = ProtectionType::None;
+    ProcessProtectionType type = ProcessProtectionType::None;
     
     /// @brief Protection signer
     ProtectionSigner signer = ProtectionSigner::None;
@@ -478,7 +477,7 @@ struct ProtectionLevel {
     
     /// @brief Is PPL active
     [[nodiscard]] bool IsPPL() const noexcept {
-        return type != ProtectionType::None;
+        return type != ProcessProtectionType::None;
     }
     
     /// @brief Is antimalware protection
@@ -492,7 +491,7 @@ struct ProtectionLevel {
     }
     
     /// @brief Compare protection levels
-    [[nodiscard]] bool operator>=(const ProtectionLevel& other) const noexcept {
+    [[nodiscard]] bool operator>=(const ProcessProtectionLevel& other) const noexcept {
         return GetCombinedLevel() >= other.GetCombinedLevel();
     }
 };
@@ -526,7 +525,7 @@ struct ProcessProtectionConfiguration {
     bool setCriticalProcess = false;
     
     /// @brief Default threat response
-    ThreatResponse defaultResponse = ThreatResponse::Active;
+    ProcessProtectionThreatResponse defaultResponse = ProcessProtectionThreatResponse::Active;
     
     /// @brief Block dangerous access rights
     uint32_t blockedProcessAccess = ProcessProtectionConstants::DANGEROUS_PROCESS_ACCESS;
@@ -575,7 +574,7 @@ struct ProtectedProcessInfo {
     void* processHandle = nullptr;
     
     /// @brief Protection level
-    ProtectionLevel protectionLevel;
+    ProcessProtectionLevel protectionLevel;
     
     /// @brief Protection status
     ProtectionStatus status = ProtectionStatus::Unprotected;
@@ -646,9 +645,9 @@ struct ProtectedThreadInfo {
 /**
  * @brief Access request details
  */
-struct AccessRequest {
+struct ProcessProtectionAccessRequest {
     /// @brief Request type
-    AccessRequestType type = AccessRequestType::ProcessOpen;
+    ProcessProtectionAccessRequestType type = ProcessProtectionAccessRequestType::ProcessOpen;
     
     /// @brief Caller process ID
     uint32_t callerProcessId = 0;
@@ -684,15 +683,15 @@ struct AccessRequest {
     bool callerIsWhitelisted = false;
     
     /// @brief Caller protection level
-    ProtectionLevel callerProtectionLevel;
+    ProcessProtectionLevel callerProtectionLevel;
 };
 
 /**
  * @brief Access decision result
  */
-struct AccessDecisionResult {
+struct ProcessProtectionAccessDecisionResult {
     /// @brief Decision
-    AccessDecision decision = AccessDecision::Allow;
+    ProcessProtectionAccessDecision decision = ProcessProtectionAccessDecision::Allow;
     
     /// @brief Granted access rights (if reduced)
     uint32_t grantedAccess = 0;
@@ -718,16 +717,16 @@ struct BlockedAccessEvent {
     uint64_t eventId = 0;
     
     /// @brief Access request
-    AccessRequest request;
+    ProcessProtectionAccessRequest request;
     
     /// @brief Decision made
-    AccessDecisionResult decision;
+    ProcessProtectionAccessDecisionResult decision;
     
     /// @brief Threat action attempted
     ThreatAction threatAction = ThreatAction::None;
     
     /// @brief Response taken
-    ThreatResponse responseTaken = ThreatResponse::None;
+    ProcessProtectionThreatResponse responseTaken = ProcessProtectionThreatResponse::None;
     
     /// @brief Event timestamp
     TimePoint timestamp = Clock::now();
@@ -817,7 +816,7 @@ struct ProcessProtectionStatistics {
 // ============================================================================
 
 /// @brief Callback for access decisions (can override)
-using AccessDecisionCallback = std::function<std::optional<AccessDecisionResult>(const AccessRequest&)>;
+using AccessDecisionCallback = std::function<std::optional<ProcessProtectionAccessDecisionResult>(const ProcessProtectionAccessRequest&)>;
 
 /// @brief Callback for blocked access events
 using BlockedAccessCallback = std::function<void(const BlockedAccessEvent&)>;
@@ -826,7 +825,12 @@ using BlockedAccessCallback = std::function<void(const BlockedAccessEvent&)>;
 using ProtectionStatusCallback = std::function<void(uint32_t processId, ProtectionStatus newStatus)>;
 
 /// @brief Callback for threat detection
-using ThreatCallback = std::function<void(ThreatAction action, const AccessRequest& request)>;
+using ProcessProtectionThreatCallback = std::function<void(ThreatAction action, const ProcessProtectionAccessRequest& request)>;
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_THREAT_CALLBACK_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_THREAT_CALLBACK_DEFINED
+using ThreatCallback = ProcessProtectionThreatCallback;
+#endif
 
 // ============================================================================
 // PROCESS PROTECTION ENGINE CLASS
@@ -930,12 +934,12 @@ public:
     /**
      * @brief Set default threat response
      */
-    void SetDefaultResponse(ThreatResponse response);
+    void SetDefaultResponse(ProcessProtectionThreatResponse response);
     
     /**
      * @brief Set response for specific threat action
      */
-    void SetThreatResponse(ThreatAction action, ThreatResponse response);
+    void SetThreatResponse(ThreatAction action, ProcessProtectionThreatResponse response);
     
     // ========================================================================
     // PPL PROTECTION
@@ -955,7 +959,7 @@ public:
     /**
      * @brief Get protection level of a process
      */
-    [[nodiscard]] ProtectionLevel GetProtectionLevel(uint32_t processId);
+    [[nodiscard]] ProcessProtectionLevel GetProtectionLevel(uint32_t processId);
     
     /**
      * @brief Get protection level (raw value)
@@ -965,7 +969,7 @@ public:
     /**
      * @brief Check if process has required protection level
      */
-    [[nodiscard]] bool HasRequiredProtectionLevel(uint32_t processId, ProtectionLevel required);
+    [[nodiscard]] bool HasRequiredProtectionLevel(uint32_t processId, ProcessProtectionLevel required);
     
     // ========================================================================
     // PROCESS PROTECTION
@@ -1058,7 +1062,7 @@ public:
     /**
      * @brief Filter access request (detailed)
      */
-    [[nodiscard]] AccessDecisionResult FilterAccessRequest(const AccessRequest& request);
+    [[nodiscard]] ProcessProtectionAccessDecisionResult FilterAccessRequest(const ProcessProtectionAccessRequest& request);
     
     /**
      * @brief Strip dangerous access rights
@@ -1162,7 +1166,7 @@ public:
     /**
      * @brief Register threat callback
      */
-    [[nodiscard]] uint64_t RegisterThreatCallback(ThreatCallback callback);
+    [[nodiscard]] uint64_t RegisterThreatCallback(ProcessProtectionThreatCallback callback);
     
     /**
      * @brief Unregister threat callback
@@ -1269,10 +1273,12 @@ public:
      * @brief Record an access-filter decision as a telemetry event.
      *        Routes through Communication::TelemetryCollector.
      */
-    void ReportAccessTelemetry(const AccessRequest& request,
-                               const AccessDecisionResult& decision);
+    void ReportAccessTelemetry(const ProcessProtectionAccessRequest& request,
+                               const ProcessProtectionAccessDecisionResult& decision);
 
 private:
+    friend class ::ShadowStrike::Service::AntivirusServiceImpl;
+
     // ========================================================================
     // FRIEND DECLARATIONS
     // ========================================================================
@@ -1289,10 +1295,10 @@ private:
     // ========================================================================
     // PRIVATE METHODS
     // ========================================================================
-    
-    /// @brief Get internal authorization token (for trusted RAII guards only)
+
+    /// @brief Get internal authorization token (for trusted service + RAII guards only)
     [[nodiscard]] std::string GetInternalAuthToken() const;
-    
+
     // ========================================================================
     // PIMPL
     // ========================================================================
@@ -1313,7 +1319,7 @@ private:
 /**
  * @brief Get protection type name
  */
-[[nodiscard]] std::string_view GetProtectionTypeName(ProtectionType type) noexcept;
+[[nodiscard]] std::string_view GetProtectionTypeName(ProcessProtectionType type) noexcept;
 
 /**
  * @brief Get protection signer name
@@ -1328,7 +1334,27 @@ private:
 /**
  * @brief Get access request type name
  */
-[[nodiscard]] std::string_view GetAccessRequestTypeName(AccessRequestType type) noexcept;
+[[nodiscard]] std::string_view GetAccessRequestTypeName(ProcessProtectionAccessRequestType type) noexcept;
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_TYPE_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_TYPE_DEFINED
+using AccessRequestType = ProcessProtectionAccessRequestType;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_DEFINED
+using AccessDecision = ProcessProtectionAccessDecision;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_REQUEST_DEFINED
+using AccessRequest = ProcessProtectionAccessRequest;
+#endif
+
+#ifndef SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_RESULT_DEFINED
+#define SHADOWSTRIKE_SELF_PROTECTION_ACCESS_DECISION_RESULT_DEFINED
+using AccessDecisionResult = ProcessProtectionAccessDecisionResult;
+#endif
 
 /**
  * @brief Get threat action name

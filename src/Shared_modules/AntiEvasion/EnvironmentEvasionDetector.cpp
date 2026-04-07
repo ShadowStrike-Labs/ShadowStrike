@@ -1160,7 +1160,7 @@ namespace ShadowStrike::AntiEvasion {
 
         void CollectHardwareInfo(HardwareFingerprintInfo& info) noexcept;
         void CollectIdentityInfo(SystemIdentityInfo& info) noexcept;
-        void CollectNetworkInfo(NetworkConfigInfo& info) noexcept;
+        void CollectNetworkInfo(EnvironmentNetworkConfigInfo& info) noexcept;
         void CollectUserActivityInfo(UserActivityInfo& info) noexcept;
         void CollectProcessEnvironmentInfo(uint32_t processId, ProcessEnvironmentInfo& info) noexcept;
         void AnalyzeFileNaming(std::wstring_view filePath, FileNamingInfo& info) noexcept;
@@ -1540,9 +1540,9 @@ namespace ShadowStrike::AntiEvasion {
         }
     }
 
-    void EnvironmentEvasionDetector::Impl::CollectNetworkInfo(NetworkConfigInfo& info) noexcept {
+    void EnvironmentEvasionDetector::Impl::CollectNetworkInfo(EnvironmentNetworkConfigInfo& info) noexcept {
         try {
-            info = NetworkConfigInfo{};
+            info = EnvironmentNetworkConfigInfo{};
 
             // Get adapter info with TOCTOU-safe retry loop
             // The buffer size may change between the size query and the actual call
@@ -1590,7 +1590,7 @@ namespace ShadowStrike::AntiEvasion {
             PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
 
             while (pAdapter) {
-                NetworkConfigInfo::AdapterInfo adapter;
+                EnvironmentNetworkConfigInfo::AdapterInfo adapter;
                 adapter.name = Utils::StringUtils::ToWide(pAdapter->AdapterName);
                 adapter.description = Utils::StringUtils::ToWide(pAdapter->Description);
 
@@ -1844,7 +1844,7 @@ namespace ShadowStrike::AntiEvasion {
                 reinterpret_cast<LPBYTE>(buffer), &bufferSize) == ERROR_SUCCESS) {
                 RegCloseKey(hOpenKey);
                 // Force null-termination: bufferSize is in bytes, may not include terminator
-                buffer[min(bufferSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
+                buffer[std::min<DWORD>(bufferSize / sizeof(wchar_t), 510)] = L'\0';
                 return buffer;
             }
 
@@ -3247,7 +3247,7 @@ namespace ShadowStrike::AntiEvasion {
 
                 // Check disk 0
                 if (RegQueryValueExW(hDiskEnumKey, L"0", nullptr, &type, reinterpret_cast<LPBYTE>(diskIdBuffer), &bufSize) == ERROR_SUCCESS) {
-                    diskIdBuffer[min(bufSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
+                    diskIdBuffer[std::min<DWORD>(bufSize / sizeof(wchar_t), 510)] = L'\0';
                     std::wstring diskId(diskIdBuffer);
                     const std::vector<std::pair<std::wstring, std::wstring>> vmDiskPatterns = {
                         {L"VBOX", L"VirtualBox"},
@@ -3588,7 +3588,7 @@ namespace ShadowStrike::AntiEvasion {
     // ========================================================================
 
     bool EnvironmentEvasionDetector::CheckNetworkConfiguration(
-        NetworkConfigInfo& outNetworkInfo,
+        EnvironmentNetworkConfigInfo& outNetworkInfo,
         std::vector<EnvironmentDetectedTechnique>& outDetections,
         EnvironmentError* err
     ) noexcept {
@@ -4574,7 +4574,7 @@ namespace ShadowStrike::AntiEvasion {
                 if (RegQueryValueExW(hVideoKey, L"\\Device\\Video0", nullptr, &type, 
                     reinterpret_cast<LPBYTE>(valueData), &dataSize) == ERROR_SUCCESS) {
                     // Force null-termination: dataSize is in bytes, may not include terminator
-                    valueData[min(dataSize / sizeof(wchar_t), static_cast<DWORD>(510))] = L'\0';
+                    valueData[std::min<DWORD>(dataSize / sizeof(wchar_t), 510)] = L'\0';
                     std::wstring videoPath(valueData);
                     
                     for (const auto& [pattern, vendor] : vmDisplayPatterns) {
@@ -5316,7 +5316,7 @@ namespace ShadowStrike::AntiEvasion {
         m_impl->CollectIdentityInfo(info);
     }
 
-    void EnvironmentEvasionDetector::CollectNetworkInfo(NetworkConfigInfo& info) noexcept {
+    void EnvironmentEvasionDetector::CollectNetworkInfo(EnvironmentNetworkConfigInfo& info) noexcept {
         m_impl->CollectNetworkInfo(info);
     }
 

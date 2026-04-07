@@ -72,7 +72,7 @@ namespace ShadowStrike {
 namespace Ransomware {
 
 namespace fs = std::filesystem;
-using Utils::StringUtils;
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
 
 static constexpr const wchar_t* kLogCat = L"BackupProtector";
 
@@ -417,7 +417,7 @@ private:
     InternalStats                                   m_stats;
     std::atomic<bool>                               m_vssLocked{false};
 
-    Whitelist::WhiteListStore*                      m_whitelistStore = nullptr;
+    Whitelist::WhitelistStore*                      m_whitelistStore = nullptr;
 };
 // ============================================================================
 // LIFECYCLE
@@ -442,13 +442,9 @@ bool BackupProtectorImpl::Initialize(const BackupProtectorConfiguration& config)
     try {
         m_config = config;
 
-        // Resolve WhiteListStore (non-fatal if unavailable)
-        try {
-            m_whitelistStore = &Whitelist::WhiteListStore::Instance();
-        } catch (const std::exception& e) {
-            SS_LOG_WARN(kLogCat, L"WhiteListStore unavailable: %hs", e.what());
-            m_whitelistStore = nullptr;
-        }
+        // The current WhitelistStore API is explicitly constructed/injected;
+        // there is no singleton accessor to resolve here.
+        m_whitelistStore = nullptr;
 
         // Load built-in patterns, then append user-supplied patterns
         m_patterns = CreateBuiltInPatterns();
@@ -478,8 +474,10 @@ bool BackupProtectorImpl::Initialize(const BackupProtectorConfiguration& config)
                 if (proc.size() > 0 && m_whitelistedPaths.size() < BackupProtectorConstants::MAX_WHITELIST_SIZE)
                     m_whitelistedPaths.insert(NormalizePathForWhitelist(proc));
             }
-            for (const auto& signer : m_config.whitelistedSigners)
-                m_whitelistedSigners.insert(StringUtils::ToLowerCopy(signer));
+            for (const auto& signer : m_config.whitelistedSigners) {
+                std::wstring normalizedSigner = StringUtils::ToLowerCopy(signer);
+                m_whitelistedSigners.emplace(std::move(normalizedSigner));
+            }
         }
 
         // If no custom protected extensions, load defaults
@@ -950,9 +948,8 @@ bool BackupProtectorImpl::IsWhitelisted(std::wstring_view processPath) const {
     // Fallback to central WhiteListStore
     if (m_whitelistStore) {
         try {
-            auto result = m_whitelistStore->IsWhitelisted(processPath);
-            // LookupResult's implicit bool indicates a positive match
-            if (static_cast<bool>(result))
+            const auto result = m_whitelistStore->IsPathWhitelisted(processPath);
+            if (result.found)
                 return true;
         } catch (const std::exception& e) {
             SS_LOG_WARN(kLogCat, L"WhiteListStore query failed: %hs", e.what());
@@ -969,7 +966,8 @@ void BackupProtectorImpl::WhitelistSigner(std::wstring_view signerName) {
         return;
 
     std::unique_lock lock(m_whitelistMutex);
-    m_whitelistedSigners.insert(StringUtils::ToLowerCopy(std::wstring(signerName)));
+    std::wstring normalizedSigner = StringUtils::ToLowerCopy(signerName);
+    m_whitelistedSigners.emplace(std::move(normalizedSigner));
     SS_LOG_INFO(kLogCat, L"Whitelisted signer: %ls",
                 std::wstring(signerName).c_str());
 }
@@ -1220,19 +1218,17 @@ bool BackupProtectorImpl::IsRegistryKeyProtected(std::wstring_view keyPath) {
 }
 
 std::wstring BackupProtectorImpl::GetProcessImagePath(uint32_t pid) {
-    try {
-        return Utils::ProcessUtils::GetProcessImagePath(pid);
-    } catch (...) {
-        return {};
+    if (const auto processPath = Utils::ProcessUtils::GetProcessPath(pid)) {
+        return *processPath;
     }
+    return {};
 }
 
 uint32_t BackupProtectorImpl::GetParentProcessId(uint32_t pid) {
-    try {
-        return Utils::ProcessUtils::GetParentProcessId(pid);
-    } catch (...) {
-        return 0;
+    if (const auto parentPid = Utils::ProcessUtils::GetParentProcessId(pid)) {
+        return *parentPid;
     }
+    return 0;
 }
 
 void BackupProtectorImpl::ExecuteTermination(uint32_t pid, const BlockedAttempt& attempt) {

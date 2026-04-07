@@ -340,7 +340,7 @@ public:
     // Callbacks
     void SetMessageCallback(std::function<void(const std::string&)> cb);
     void RegisterMessageCallback(ServiceMessageCallback cb);
-    void RegisterConnectionCallback(ConnectionCallback cb);
+    void RegisterConnectionCallback(ServiceClientConnectionCallback cb);
     void RegisterCommandCallback(CommandCallback cb);
     void RegisterErrorCallback(ServiceErrorCallback cb);
     void UnregisterCallbacks();
@@ -439,7 +439,7 @@ private:
     // Callbacks
     std::function<void(const std::string&)> m_legacyCb;
     ServiceMessageCallback m_messageCb;
-    ConnectionCallback m_connectionCb;
+    ServiceClientConnectionCallback m_connectionCb;
     CommandCallback m_commandCb;
     ServiceErrorCallback m_errorCb;
     mutable std::mutex m_callbackMutex;
@@ -1126,7 +1126,7 @@ void ServiceCommunicationImpl::RegisterMessageCallback(ServiceMessageCallback cb
     m_messageCb = std::move(cb);
 }
 
-void ServiceCommunicationImpl::RegisterConnectionCallback(ConnectionCallback cb) {
+void ServiceCommunicationImpl::RegisterConnectionCallback(ServiceClientConnectionCallback cb) {
     std::lock_guard lock(m_callbackMutex);
     m_connectionCb = std::move(cb);
 }
@@ -1407,7 +1407,7 @@ void ServiceCommunicationImpl::ClientReaderLoop(const std::string& sessionId) {
             session.clientType = client->clientType;
             session.processId = client->processId;
 
-            ConnectionCallback cb;
+            ServiceClientConnectionCallback cb;
             {
                 std::lock_guard cbLock(m_callbackMutex);
                 cb = m_connectionCb;
@@ -2495,7 +2495,7 @@ void ServiceCommunicationImpl::NotifyError(const std::string& msg, int code) {
 }
 
 void ServiceCommunicationImpl::NotifyConnection(const ClientSession& session, bool connected) {
-    ConnectionCallback cb;
+    ServiceClientConnectionCallback cb;
     {
         std::lock_guard lock(m_callbackMutex);
         cb = m_connectionCb;
@@ -2633,7 +2633,7 @@ void ServiceCommunication::DisconnectAllClients() { m_impl->DisconnectAllClients
 
 void ServiceCommunication::SetMessageCallback(std::function<void(const std::string&)> cb) { m_impl->SetMessageCallback(std::move(cb)); }
 void ServiceCommunication::RegisterMessageCallback(ServiceMessageCallback cb) { m_impl->RegisterMessageCallback(std::move(cb)); }
-void ServiceCommunication::RegisterConnectionCallback(ConnectionCallback cb) { m_impl->RegisterConnectionCallback(std::move(cb)); }
+void ServiceCommunication::RegisterConnectionCallback(ServiceClientConnectionCallback cb) { m_impl->RegisterConnectionCallback(std::move(cb)); }
 void ServiceCommunication::RegisterCommandCallback(CommandCallback cb) { m_impl->RegisterCommandCallback(std::move(cb)); }
 void ServiceCommunication::RegisterErrorCallback(ServiceErrorCallback cb) { m_impl->RegisterErrorCallback(std::move(cb)); }
 void ServiceCommunication::UnregisterCallbacks() { m_impl->UnregisterCallbacks(); }

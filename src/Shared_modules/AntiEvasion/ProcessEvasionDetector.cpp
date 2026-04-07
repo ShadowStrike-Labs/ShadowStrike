@@ -462,7 +462,7 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] bool IsProcess64Bit(HANDLE hProcess) const noexcept;
 
         // Memory scanning
-        [[nodiscard]] bool ScanProcessMemory(HANDLE hProcess, std::vector<MemoryRegionInfo>& regions) const noexcept;
+        [[nodiscard]] bool ScanProcessMemory(HANDLE hProcess, std::vector<ProcessMemoryRegionInfo>& regions) const noexcept;
         [[nodiscard]] bool IsMemoryRegionSuspicious(const MEMORY_BASIC_INFORMATION& mbi) const noexcept;
         [[nodiscard]] bool DetectShellcodePatterns(const uint8_t* data, size_t size, std::wstring& patternName) const noexcept;
 
@@ -470,7 +470,7 @@ namespace ShadowStrike::AntiEvasion {
         [[nodiscard]] bool HasRemoteThreads(HANDLE hProcess, uint32_t& threadCount, std::vector<std::wstring>& details) const noexcept;
         [[nodiscard]] bool HasSuspiciousDLLs(HANDLE hProcess, std::vector<std::wstring>& suspiciousDLLs) const noexcept;
         [[nodiscard]] bool DetectProcessHollowing(HANDLE hProcess, uint32_t processId) const noexcept;
-        [[nodiscard]] bool DetectReflectiveDLLInjection(HANDLE hProcess, std::vector<MemoryRegionInfo>& regions) const noexcept;
+        [[nodiscard]] bool DetectReflectiveDLLInjection(HANDLE hProcess, std::vector<ProcessMemoryRegionInfo>& regions) const noexcept;
 
         // Hook detection using Zydis
         [[nodiscard]] bool DetectInlineHooks(HANDLE hProcess, bool is64Bit, std::vector<std::wstring>& hookedFunctions) const noexcept;
@@ -731,7 +731,7 @@ namespace ShadowStrike::AntiEvasion {
 
     bool ProcessEvasionDetector::Impl::ScanProcessMemory(
         HANDLE hProcess,
-        std::vector<MemoryRegionInfo>& regions
+        std::vector<ProcessMemoryRegionInfo>& regions
     ) const noexcept {
         try {
             regions.clear();
@@ -773,7 +773,7 @@ namespace ShadowStrike::AntiEvasion {
                 if (mbi.State == MEM_COMMIT) {
                     totalScannedSize += mbi.RegionSize;
 
-                    MemoryRegionInfo region;
+                    ProcessMemoryRegionInfo region;
                     region.baseAddress = reinterpret_cast<uint64_t>(mbi.BaseAddress);
                     region.size = mbi.RegionSize;
                     region.protection = mbi.Protect;
@@ -1291,7 +1291,7 @@ namespace ShadowStrike::AntiEvasion {
 
     bool ProcessEvasionDetector::Impl::DetectReflectiveDLLInjection(
         HANDLE hProcess,
-        std::vector<MemoryRegionInfo>& regions
+        std::vector<ProcessMemoryRegionInfo>& regions
     ) const noexcept {
         // Already detected in ScanProcessMemory - check for floating PE headers
         for (const auto& region : regions) {
@@ -2291,7 +2291,7 @@ namespace ShadowStrike::AntiEvasion {
 
     ProcessEvasionResult ProcessEvasionDetector::AnalyzeProcess(
         uint32_t processId,
-        const ProcessAnalysisConfig& config,
+        const ProcessEvasionAnalysisConfig& config,
         ProcessEvasionError* err
     ) noexcept {
         ProcessEvasionResult result;
@@ -2402,7 +2402,7 @@ namespace ShadowStrike::AntiEvasion {
 
     ProcessEvasionResult ProcessEvasionDetector::AnalyzeProcess(
         HANDLE hProcess,
-        const ProcessAnalysisConfig& config,
+        const ProcessEvasionAnalysisConfig& config,
         ProcessEvasionError* err
     ) noexcept {
         ProcessEvasionResult result;
@@ -2479,7 +2479,7 @@ namespace ShadowStrike::AntiEvasion {
 
     std::vector<ProcessEvasionResult> ProcessEvasionDetector::AnalyzeProcesses(
         const std::vector<uint32_t>& processIds,
-        const ProcessAnalysisConfig& config,
+        const ProcessEvasionAnalysisConfig& config,
         ProcessEvasionError* err
     ) noexcept {
         std::vector<ProcessEvasionResult> results;
@@ -2655,7 +2655,7 @@ namespace ShadowStrike::AntiEvasion {
 
     bool ProcessEvasionDetector::ScanMemory(
         uint32_t processId,
-        std::vector<MemoryRegionInfo>& outRegions,
+        std::vector<ProcessMemoryRegionInfo>& outRegions,
         ProcessEvasionError* err
     ) noexcept {
         try {
@@ -2768,7 +2768,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Scan memory for suspicious regions
-            std::vector<MemoryRegionInfo> regions;
+            std::vector<ProcessMemoryRegionInfo> regions;
             if (m_impl->ScanProcessMemory(hProcess, regions)) {
                 for (const auto& region : regions) {
                     if (region.isSuspicious) {
@@ -2904,7 +2904,7 @@ namespace ShadowStrike::AntiEvasion {
     void ProcessEvasionDetector::AnalyzeProcessInternal(
         HANDLE hProcess,
         uint32_t processId,
-        const ProcessAnalysisConfig& config,
+        const ProcessEvasionAnalysisConfig& config,
         ProcessEvasionResult& result
     ) noexcept {
         try {
@@ -2944,7 +2944,7 @@ namespace ShadowStrike::AntiEvasion {
                 std::vector<std::wstring> hookedFunctions;
                 if (m_impl->DetectInlineHooks(hProcess, is64Bit, hookedFunctions)) {
                     for (const auto& hook : hookedFunctions) {
-                        DetectedTechnique detection(ProcessEvasionTechnique::CODE_InlineHooking);
+                        ProcessDetectedTechnique detection(ProcessEvasionTechnique::CODE_InlineHooking);
                         detection.severity = ProcessEvasionSeverity::High;
                         detection.confidence = 0.85;
                         detection.description = L"Inline hook detected";
@@ -2959,7 +2959,7 @@ namespace ShadowStrike::AntiEvasion {
                     if (m_impl->AnalyzeSuspiciousImports(result.processPath, suspiciousImports)) {
                         for (const auto& imp : suspiciousImports) {
                             if (imp.find(L"[INJECTION]") != std::wstring::npos) {
-                                DetectedTechnique detection(ProcessEvasionTechnique::CODE_CrossProcessWrite);
+                                ProcessDetectedTechnique detection(ProcessEvasionTechnique::CODE_CrossProcessWrite);
                                 detection.severity = ProcessEvasionSeverity::Medium;
                                 detection.confidence = 0.6;
                                 detection.description = L"Injection-related API imported";
@@ -2984,7 +2984,7 @@ namespace ShadowStrike::AntiEvasion {
                     kctx.parentProcessId != 0 &&
                     kctx.creatingProcessId != kctx.parentProcessId) {
 
-                    DetectedTechnique detection(ProcessEvasionTechnique::MASK_ParentProcessSpoofing);
+                    ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_ParentProcessSpoofing);
                     detection.severity = ProcessEvasionSeverity::Critical;
                     detection.confidence = 0.98;
                     detection.description = L"Kernel-verified PPID spoofing detected";
@@ -3009,7 +3009,7 @@ namespace ShadowStrike::AntiEvasion {
                     if (m_impl->IsPathAnomaly(result.processName, lowerKernelPath)) {
                         // Only add if user-mode masquerading check didn't already catch it
                         if (!result.masqueradingInfo.hasPathAnomaly) {
-                            DetectedTechnique detection(ProcessEvasionTechnique::MASK_PathAnomaly);
+                            ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_PathAnomaly);
                             detection.severity = ProcessEvasionSeverity::High;
                             detection.confidence = 0.95;
                             detection.description = L"Kernel-verified path anomaly";
@@ -3037,7 +3037,7 @@ namespace ShadowStrike::AntiEvasion {
                          lowerCmd.find(L"-nop") != std::wstring::npos ||
                          lowerCmd.find(L"-w hidden") != std::wstring::npos)) {
 
-                        DetectedTechnique detection(ProcessEvasionTechnique::MASK_CommandLineInconsistency);
+                        ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_CommandLineInconsistency);
                         detection.severity = ProcessEvasionSeverity::Critical;
                         detection.confidence = 0.92;
                         detection.description = L"Injection-capable process with obfuscated command line";
@@ -3066,7 +3066,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             // Classic DLL injection
             if (result.injectionInfo.hasRemoteThreads && !result.injectionInfo.injectedDLLs.empty()) {
-                DetectedTechnique detection(ProcessEvasionTechnique::INJ_ClassicDLLInjection);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::INJ_ClassicDLLInjection);
                 detection.severity = ProcessEvasionSeverity::High;
                 detection.confidence = 0.85;
                 detection.description = L"Classic DLL injection detected";
@@ -3079,7 +3079,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // RWX memory regions (shellcode)
             if (!result.injectionInfo.rwxMemoryAddresses.empty()) {
-                DetectedTechnique detection(ProcessEvasionTechnique::CODE_SuspiciousMemoryAlloc);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::CODE_SuspiciousMemoryAlloc);
                 detection.severity = ProcessEvasionSeverity::Critical;
                 detection.confidence = 0.95;
                 detection.description = L"RWX memory regions detected (potential shellcode)";
@@ -3091,7 +3091,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Process hollowing
             if (result.injectionInfo.hasHollowedImage) {
-                DetectedTechnique detection(ProcessEvasionTechnique::INJ_ProcessHollowing);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::INJ_ProcessHollowing);
                 detection.severity = ProcessEvasionSeverity::Critical;
                 detection.confidence = 0.9;
                 detection.description = L"Process hollowing detected";
@@ -3102,7 +3102,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Reflective DLL injection
             if (result.injectionInfo.method == InjectionMethod::ReflectiveDLL) {
-                DetectedTechnique detection(ProcessEvasionTechnique::INJ_ReflectiveDLLInjection);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::INJ_ReflectiveDLLInjection);
                 detection.severity = ProcessEvasionSeverity::Critical;
                 detection.confidence = 0.9;
                 detection.description = L"Reflective DLL injection detected";
@@ -3124,7 +3124,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             // Path anomaly
             if (result.masqueradingInfo.hasPathAnomaly) {
-                DetectedTechnique detection(ProcessEvasionTechnique::MASK_PathAnomaly);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_PathAnomaly);
                 detection.severity = ProcessEvasionSeverity::High;
                 detection.confidence = 0.9;
                 detection.description = L"Process path anomaly detected";
@@ -3137,7 +3137,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Parent spoofing
             if (result.masqueradingInfo.hasParentSpoof) {
-                DetectedTechnique detection(ProcessEvasionTechnique::MASK_ParentProcessSpoofing);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_ParentProcessSpoofing);
                 detection.severity = ProcessEvasionSeverity::High;
                 detection.confidence = 0.85;
                 detection.description = L"Parent process spoofing detected";
@@ -3150,7 +3150,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Signature failure
             if (result.masqueradingInfo.hasSignatureFailure) {
-                DetectedTechnique detection(ProcessEvasionTechnique::MASK_SignatureValidationFailure);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::MASK_SignatureValidationFailure);
                 detection.severity = ProcessEvasionSeverity::Medium;
                 detection.confidence = 0.7;
                 detection.description = L"Digital signature validation failed";
@@ -3170,7 +3170,7 @@ namespace ShadowStrike::AntiEvasion {
         try {
             // Debugger present
             if (result.antiDebugInfo.isDebuggerPresent) {
-                DetectedTechnique detection(ProcessEvasionTechnique::ANTI_CheckRemoteDebugger);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::ANTI_CheckRemoteDebugger);
                 detection.severity = ProcessEvasionSeverity::Medium;
                 detection.confidence = 0.8;
                 detection.description = L"Debugger presence check detected";
@@ -3180,7 +3180,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Hardware breakpoints
             if (result.antiDebugInfo.hasHardwareBreakpoints) {
-                DetectedTechnique detection(ProcessEvasionTechnique::ANTI_HardwareBreakpointDetection);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::ANTI_HardwareBreakpointDetection);
                 detection.severity = ProcessEvasionSeverity::Medium;
                 detection.confidence = 0.75;
                 detection.description = L"Hardware breakpoint detection";
@@ -3190,7 +3190,7 @@ namespace ShadowStrike::AntiEvasion {
 
             // Debug privilege
             if (result.antiDebugInfo.hasDebugPrivilege) {
-                DetectedTechnique detection(ProcessEvasionTechnique::PRIV_SeDebugPrivilege);
+                ProcessDetectedTechnique detection(ProcessEvasionTechnique::PRIV_SeDebugPrivilege);
                 detection.severity = ProcessEvasionSeverity::High;
                 detection.confidence = 0.8;
                 detection.description = L"SeDebugPrivilege acquisition detected";
@@ -3201,7 +3201,7 @@ namespace ShadowStrike::AntiEvasion {
             // Add detected techniques from deep analysis
             for (const auto& tech : result.antiDebugInfo.detectedTechniques) {
                 if (tech.find(L"RDTSC") != std::wstring::npos) {
-                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_TimingBasedDebuggerDetection);
+                    ProcessDetectedTechnique detection(ProcessEvasionTechnique::ANTI_TimingBasedDebuggerDetection);
                     detection.severity = ProcessEvasionSeverity::High;
                     detection.confidence = 0.8;
                     detection.description = L"Timing-based debugger detection";
@@ -3209,7 +3209,7 @@ namespace ShadowStrike::AntiEvasion {
                     AddDetection(result, std::move(detection));
                 }
                 else if (tech.find(L"TLS callbacks") != std::wstring::npos) {
-                    DetectedTechnique detection(ProcessEvasionTechnique::ANTI_TLSCallbackAntiDebug);
+                    ProcessDetectedTechnique detection(ProcessEvasionTechnique::ANTI_TLSCallbackAntiDebug);
                     detection.severity = ProcessEvasionSeverity::Medium;
                     detection.confidence = 0.7;
                     detection.description = L"TLS callbacks detected (potential anti-debug)";
@@ -3273,7 +3273,7 @@ namespace ShadowStrike::AntiEvasion {
 
     void ProcessEvasionDetector::AddDetection(
         ProcessEvasionResult& result,
-        DetectedTechnique detection
+        ProcessDetectedTechnique detection
     ) noexcept {
         try {
             // Set category bit

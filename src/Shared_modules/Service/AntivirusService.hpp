@@ -118,7 +118,7 @@ public:
      * @param argc Argument count
      * @param argv Argument vector
      */
-    static void WINAPI ServiceMain(DWORD argc, LPTSTR* argv);
+    static void WINAPI ServiceMain(DWORD argc, LPWSTR* argv);
 
     /**
      * @brief Control handler callback for SCM
@@ -177,7 +177,7 @@ private:
     ~AntivirusService();
 
     // Internal handlers called by static wrappers
-    void OnStart(DWORD argc, LPTSTR* argv);
+    void OnStart(DWORD argc, LPWSTR* argv);
     void OnStop();
     void OnPause();
     void OnContinue();

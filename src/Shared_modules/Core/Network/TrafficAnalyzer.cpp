@@ -620,7 +620,7 @@ public:
         }
     }
 
-    void InvokeThreatCallbacks(uint64_t streamId, ThreatIndicator threat, const AnalysisResult& result) {
+    void InvokeThreatCallbacks(uint64_t streamId, TrafficThreatIndicator threat, const AnalysisResult& result) {
         std::shared_lock lock(m_mutex);
         for (const auto& [id, callback] : m_threatCallbacks) {
             try {
@@ -631,7 +631,7 @@ public:
         }
     }
 
-    void InvokeTLSCallbacks(uint64_t streamId, const TLSInfo& tlsInfo) {
+    void InvokeTLSCallbacks(uint64_t streamId, const TrafficAnalyzerTLSInfo& tlsInfo) {
         std::shared_lock lock(m_mutex);
         for (const auto& [id, callback] : m_tlsCallbacks) {
             try {
@@ -1088,7 +1088,7 @@ public:
     // TLS ANALYSIS
     // ========================================================================
 
-    std::optional<TLSInfo> GetTLSInfo(uint64_t streamId) const {
+    std::optional<TrafficAnalyzerTLSInfo> GetTLSInfo(uint64_t streamId) const {
         auto stream = m_streamManager->GetStream(streamId);
         if (stream && stream->tlsInfo) {
             return stream->tlsInfo;
@@ -1096,8 +1096,8 @@ public:
         return std::nullopt;
     }
 
-    JA3Fingerprint CalculateJA3(std::span<const uint8_t> clientHello) const {
-        JA3Fingerprint ja3;
+    TrafficAnalyzerJA3Fingerprint CalculateJA3(std::span<const uint8_t> clientHello) const {
+        TrafficAnalyzerJA3Fingerprint ja3;
 
         if (clientHello.size() < 43) {
             return ja3;
@@ -1117,7 +1117,7 @@ public:
 
             if (offset + 2 > clientHello.size()) return ja3;
             uint16_t version = (static_cast<uint16_t>(clientHello[offset]) << 8) | clientHello[offset + 1];
-            ja3.version = static_cast<TLSVersion>(version);
+            ja3.version = static_cast<TrafficAnalyzerTLSVersion>(version);
             offset += 2;
 
             offset += 32;  // Skip random
@@ -1673,7 +1673,7 @@ private:
                         result.payloadAnalysis = AnalyzePayload(result.packet.payload);
 
                         if (result.payloadAnalysis.hasShellcode) {
-                            result.threats.push_back(ThreatIndicator::SHELLCODE_DETECTED);
+                            result.threats.push_back(TrafficThreatIndicator::SHELLCODE_DETECTED);
                             accumulatedThreatScore += 80;
                             m_stats.shellcodeDetected.fetch_add(1, std::memory_order_relaxed);
                             m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
@@ -1692,7 +1692,7 @@ private:
                         // XOR-encoded payload detection
                         if (result.payloadAnalysis.isPossiblyXORed) {
                             result.anomalies.push_back(AnomalyType::ENCODING_ANOMALY);
-                            result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                            result.threats.push_back(TrafficThreatIndicator::C2_PATTERN);
                             accumulatedThreatScore += 40;
                         }
                     }
@@ -1714,7 +1714,7 @@ private:
                                     m_stats.ja3Fingerprints.fetch_add(1, std::memory_order_relaxed);
 
                                     if (IsJA3Malicious(ja3.hash)) {
-                                        result.threats.push_back(ThreatIndicator::KNOWN_BAD_JA3);
+                                        result.threats.push_back(TrafficThreatIndicator::KNOWN_BAD_JA3);
                                         accumulatedThreatScore += 70;
                                         m_stats.maliciousJA3.fetch_add(1, std::memory_order_relaxed);
                                         m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
@@ -1727,7 +1727,7 @@ private:
 
                                     m_streamManager->UpdateStream(result.streamId, [&](StreamInfo& s) {
                                         if (!s.tlsInfo) {
-                                            s.tlsInfo = TLSInfo{};
+                                            s.tlsInfo = TrafficAnalyzerTLSInfo{};
                                         }
                                         s.tlsInfo->ja3 = ja3;
                                         s.isEncrypted = true;
@@ -1988,7 +1988,7 @@ private:
             // DNS payloads over 512 bytes (without EDNS) or with long labels suggest tunneling
             if (pkt.payloadLength > 512) {
                 result.anomalies.push_back(AnomalyType::TUNNELING);
-                result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                result.threats.push_back(TrafficThreatIndicator::C2_PATTERN);
                 accScore += 50;
                 m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
 
@@ -2006,7 +2006,7 @@ private:
                     if ((labelLen & 0xC0) == 0xC0) break;  // Compression pointer
                     if (labelLen > 40) {
                         result.anomalies.push_back(AnomalyType::COVERT_CHANNEL);
-                        result.threats.push_back(ThreatIndicator::EXFILTRATION_PATTERN);
+                        result.threats.push_back(TrafficThreatIndicator::EXFILTRATION_PATTERN);
                         accScore += 60;
                         break;
                     }
@@ -2020,7 +2020,7 @@ private:
         if (pkt.protocol == 1 || pkt.protocol == 58) {  // ICMP/ICMPv6
             if (pkt.payloadLength > 64) {
                 result.anomalies.push_back(AnomalyType::COVERT_CHANNEL);
-                result.threats.push_back(ThreatIndicator::C2_PATTERN);
+                result.threats.push_back(TrafficThreatIndicator::C2_PATTERN);
                 accScore += 45;
                 m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2050,7 +2050,7 @@ private:
             if (streamOpt && streamOpt->bytesClient > 5 * 1024 * 1024 &&
                 streamOpt->bytesClient > streamOpt->bytesServer * 10) {
                 result.anomalies.push_back(AnomalyType::EXFILTRATION);
-                result.threats.push_back(ThreatIndicator::EXFILTRATION_PATTERN);
+                result.threats.push_back(TrafficThreatIndicator::EXFILTRATION_PATTERN);
                 accScore += 55;
                 m_stats.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
             }
@@ -2122,7 +2122,7 @@ private:
 
                     m_streamManager->UpdateStream(streamId, [&](StreamInfo& s) {
                         if (!s.tlsInfo) {
-                            s.tlsInfo = TLSInfo{};
+                            s.tlsInfo = TrafficAnalyzerTLSInfo{};
                         }
                         s.tlsInfo->sni = std::move(sni);
                     });
@@ -2234,9 +2234,9 @@ private:
                 auto& botnetDetector = BotnetDetector::Instance();
                 if (botnetDetector.IsRunning() && !result.packet.payload.empty()) {
                     for (const auto& threat : result.threats) {
-                        if (threat == ThreatIndicator::C2_PATTERN ||
-                            threat == ThreatIndicator::BEACONING ||
-                            threat == ThreatIndicator::KNOWN_BAD_JA3) {
+                        if (threat == TrafficThreatIndicator::C2_PATTERN ||
+                            threat == TrafficThreatIndicator::BEACONING ||
+                            threat == TrafficThreatIndicator::KNOWN_BAD_JA3) {
                             (void)botnetDetector.AnalyzePayloadForC2(
                                 result.packet.payload,
                                 C2Protocol::UNKNOWN);
@@ -2278,7 +2278,7 @@ private:
     ShadowStrike::SignatureStore::SignatureStore* m_signatureStore{ nullptr };
 
     // Statistics
-    TrafficAnalyzerStatistics m_stats;
+    mutable TrafficAnalyzerStatistics m_stats;
 };
 
 // ============================================================================
@@ -2359,11 +2359,11 @@ std::string_view TrafficAnalyzer::GetProtocolName(Protocol protocol) noexcept {
     return ProtocolToString(protocol);
 }
 
-std::optional<TLSInfo> TrafficAnalyzer::GetTLSInfo(uint64_t streamId) const {
+std::optional<TrafficAnalyzerTLSInfo> TrafficAnalyzer::GetTLSInfo(uint64_t streamId) const {
     return m_impl->GetTLSInfo(streamId);
 }
 
-JA3Fingerprint TrafficAnalyzer::CalculateJA3(std::span<const uint8_t> clientHello) const {
+TrafficAnalyzerJA3Fingerprint TrafficAnalyzer::CalculateJA3(std::span<const uint8_t> clientHello) const {
     return m_impl->CalculateJA3(clientHello);
 }
 

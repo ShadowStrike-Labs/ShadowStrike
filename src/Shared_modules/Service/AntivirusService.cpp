@@ -68,6 +68,7 @@
 #include "../Update/ProgramUpdater.hpp"
 #include "../Core/Engine/ScanEngine.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Config/ConfigManager.hpp"
 
 // ============================================================================
@@ -114,7 +115,10 @@ public:
 
         try {
             // 1. Initialize Logging
-            Utils::Logger::Instance().Initialize(L"ShadowStrikeService");
+            Utils::LoggerConfig loggerConfig{};
+            loggerConfig.baseFileName = ServiceConstants::SERVICE_NAME;
+            loggerConfig.eventLogSource = ServiceConstants::SERVICE_NAME;
+            Utils::Logger::Instance().Initialize(loggerConfig);
             SS_LOG_INFO(LOG_CATEGORY, L"ShadowStrike NGAV Service initializing...");
 
             // 2. Initialize ConfigManager (must be available before any module reads config)
@@ -124,8 +128,16 @@ public:
             }
 
             // 3. Initialize Infrastructure
-            if (!Utils::ThreadPool::Instance().Initialize(4, 8)) {
-                SS_LOG_CRITICAL(LOG_CATEGORY, L"Failed to initialize ThreadPool");
+            if (!m_threadPool) {
+                Utils::ThreadPoolConfig threadPoolConfig{};
+                threadPoolConfig.minThreads = 4;
+                threadPoolConfig.maxThreads = 8;
+                threadPoolConfig.threadNamePrefix = L"ShadowStrike-Service";
+                m_threadPool = std::make_unique<Utils::ThreadPool>(threadPoolConfig);
+            }
+
+            if (!m_threadPool->Initialize()) {
+                SS_LOG_FATAL(LOG_CATEGORY, L"Failed to initialize ThreadPool");
                 return false;
             }
 
@@ -137,12 +149,18 @@ public:
             // 5. Initialize Security Subsystems
             SS_LOG_INFO(LOG_CATEGORY, L"Initializing security subsystems...");
 
-            // Threat Intel (Database)
-            if (!ThreatIntel::ThreatIntelManager::Instance().Initialize()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelManager");
+            // Threat Intel (database-backed IOC store + facade binding)
+            if (!m_threatIntelStore) {
+                m_threatIntelStore = std::make_unique<ThreatIntel::ThreatIntelStore>();
+            }
+
+            if (!m_threatIntelStore->IsInitialized() && !m_threatIntelStore->Initialize()) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize ThreatIntelStore");
                 // Continue? Depending on policy. Critical failure usually.
                 return false;
             }
+
+            ThreatIntel::ThreatIntelManager::Instance().Bind(m_threatIntelStore.get());
 
             // CryptoManager (foundation — used by ConfigManager, CertificateValidator,
             // and secure IPC; must be available before other security modules)
@@ -230,9 +248,9 @@ public:
             // Digital Signature Validator (used by RealTimeProtection and
             // ProcessCreationMonitor for Authenticode verification)
             Security::SignatureValidatorConfiguration dsvConfig;
-            dsvConfig.enableCache = true;
-            dsvConfig.enableCatalogValidation = true;
-            dsvConfig.enableTimestampValidation = true;
+            dsvConfig.enableCaching = true;
+            dsvConfig.allowCatalogSignatures = true;
+            dsvConfig.requireTimestamps = true;
             if (!Security::DigitalSignatureValidator::Instance().Initialize(dsvConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize DigitalSignatureValidator");
                 // Non-fatal: signature validation degrades
@@ -255,12 +273,6 @@ public:
             if (!Security::SelfDefense::Instance().Initialize(sdConfig)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize SelfDefense orchestrator");
                 // Non-fatal: watchdog/heartbeat monitoring degrades
-            }
-
-            // Real-Time Protection
-            if (!RealTime::RealTimeProtection::Instance().Initialize()) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize RealTimeProtection");
-                return false;
             }
 
             // AMSI Integration
@@ -347,10 +359,10 @@ public:
             return true;
 
         } catch (const std::exception& e) {
-            SS_LOG_CRITICAL(LOG_CATEGORY, L"Exception during initialization: %hs", e.what());
+            SS_LOG_FATAL(LOG_CATEGORY, L"Exception during initialization: %hs", e.what());
             return false;
         } catch (...) {
-            SS_LOG_CRITICAL(LOG_CATEGORY, L"Unknown exception during initialization");
+            SS_LOG_FATAL(LOG_CATEGORY, L"Unknown exception during initialization");
             return false;
         }
     }
@@ -363,8 +375,15 @@ public:
 
         // Start Subsystems
         Security::TamperProtection::Instance().SetEnabled(true);
-        RealTime::RealTimeProtection::Instance().Start();
-        Communication::IPCManager::Instance().StartListening();
+        if (!RealTime::RealTimeProtection::Instance().Start()) {
+            SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start RealTimeProtection");
+            return;
+        }
+        if (!Communication::IPCManager::Instance().Start()) {
+            SS_LOG_FATAL(LOG_CATEGORY, L"Failed to start IPCManager");
+            RealTime::RealTimeProtection::Instance().Stop();
+            return;
+        }
 
         // Start Communication subsystems
         Communication::ServiceCommunication::Instance().Start(true);
@@ -421,7 +440,7 @@ public:
         Communication::TelemetryCollector::Instance().Shutdown();
         Communication::AlertSystem::Instance().Shutdown();
 
-        Communication::IPCManager::Instance().StopListening();
+        Communication::IPCManager::Instance().Stop();
 
         // Shutdown UpdateManager (stop any pending downloads/installations)
         if (Update::UpdateManager::HasInstance() &&
@@ -433,13 +452,13 @@ public:
         Scripts::AMSIIntegration::Instance().Shutdown();
 
         RealTime::RealTimeProtection::Instance().Stop();
-        RealTime::RealTimeProtection::Instance().Shutdown();
 
         // SelfDefense shutdown (stops watchdog/heartbeat first so it
         // doesn't trigger false recovery during orderly teardown)
         if (Security::SelfDefense::HasInstance() &&
             Security::SelfDefense::Instance().IsInitialized()) {
-            Security::SelfDefense::Instance().Shutdown();
+            Security::SelfDefense::Instance().Shutdown(
+                Security::SelfDefense::Instance().GenerateAuthorizationToken("service_shutdown", 60));
         }
 
         // CertificateValidator shutdown
@@ -457,7 +476,8 @@ public:
         // FileProtection shutdown
         if (Security::FileProtection::HasInstance() &&
             Security::FileProtection::Instance().IsInitialized()) {
-            Security::FileProtection::Instance().Shutdown();
+            Security::FileProtection::Instance().Shutdown(
+                Security::FileProtection::Instance().GenerateAuthorizationToken());
         }
 
         // RegistryProtection shutdown (before ProcessProtection so registry
@@ -482,7 +502,8 @@ public:
         // monitors are no longer checking our protected regions)
         if (Security::MemoryProtection::HasInstance() &&
             Security::MemoryProtection::Instance().IsInitialized()) {
-            Security::MemoryProtection::Instance().Shutdown();
+            Security::MemoryProtection::Instance().Shutdown(
+                Security::MemoryProtection::Instance().GetInternalAuthToken());
         }
 
         // AntiDebug shutdown
@@ -498,9 +519,17 @@ public:
             Security::CryptoManager::Instance().Shutdown();
         }
 
-        ThreatIntel::ThreatIntelManager::Instance().Shutdown();
+        ThreatIntel::ThreatIntelManager::Instance().Bind(nullptr);
+        if (m_threatIntelStore) {
+            if (m_threatIntelStore->IsInitialized()) {
+                m_threatIntelStore->Shutdown();
+            }
+            m_threatIntelStore.reset();
+        }
 
-        Utils::ThreadPool::Instance().Shutdown();
+        if (m_threadPool) {
+            m_threadPool->Shutdown();
+        }
 
         // ConfigManager shutdown (after all modules that read config are down)
         if (Config::ConfigManager::HasInstance()) {
@@ -596,15 +625,15 @@ public:
 
     // Service Installation Helpers
     [[nodiscard]] bool InstallService() {
-        SC_HANDLE hSCManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
+        SC_HANDLE hSCManager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CREATE_SERVICE);
         if (!hSCManager) {
             SS_LOG_ERROR(LOG_CATEGORY, L"OpenSCManager failed: %u", GetLastError());
             return false;
         }
 
         // Get executable path
-        TCHAR szPath[MAX_PATH];
-        if (!GetModuleFileName(nullptr, szPath, MAX_PATH)) {
+        wchar_t szPath[MAX_PATH];
+        if (!GetModuleFileNameW(nullptr, szPath, MAX_PATH)) {
             CloseServiceHandle(hSCManager);
             return false;
         }
@@ -614,7 +643,7 @@ public:
         binaryPath += szPath;
         binaryPath += L"\"";
 
-        SC_HANDLE hService = CreateService(
+        SC_HANDLE hService = CreateServiceW(
             hSCManager,
             ServiceConstants::SERVICE_NAME,
             ServiceConstants::DISPLAY_NAME,
@@ -637,12 +666,12 @@ public:
         }
 
         // Set description
-        SERVICE_DESCRIPTION sd;
+        SERVICE_DESCRIPTIONW sd;
         sd.lpDescription = const_cast<LPWSTR>(ServiceConstants::DESCRIPTION);
-        ChangeServiceConfig2(hService, SERVICE_CONFIG_DESCRIPTION, &sd);
+        ChangeServiceConfig2W(hService, SERVICE_CONFIG_DESCRIPTION, &sd);
 
         // Set recovery options
-        SERVICE_FAILURE_ACTIONS sfa;
+        SERVICE_FAILURE_ACTIONSW sfa;
         SC_ACTION actions[3];
         actions[0].Type = SC_ACTION_RESTART;
         actions[0].Delay = 60000; // 1 min
@@ -657,7 +686,7 @@ public:
         sfa.cActions = 3;
         sfa.lpsaActions = actions;
 
-        ChangeServiceConfig2(hService, SERVICE_CONFIG_FAILURE_ACTIONS, &sfa);
+        ChangeServiceConfig2W(hService, SERVICE_CONFIG_FAILURE_ACTIONS, &sfa);
 
         SS_LOG_INFO(LOG_CATEGORY, L"Service installed successfully");
 
@@ -667,10 +696,10 @@ public:
     }
 
     [[nodiscard]] bool UninstallService() {
-        SC_HANDLE hSCManager = OpenSCManager(nullptr, nullptr, SC_MANAGER_CONNECT);
+        SC_HANDLE hSCManager = OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
         if (!hSCManager) return false;
 
-        SC_HANDLE hService = OpenService(hSCManager, ServiceConstants::SERVICE_NAME, DELETE);
+        SC_HANDLE hService = OpenServiceW(hSCManager, ServiceConstants::SERVICE_NAME, DELETE);
         if (!hService) {
             CloseServiceHandle(hSCManager);
             return false;
@@ -694,6 +723,8 @@ private:
     std::recursive_mutex m_mutex;
     bool m_initialized = false;
     bool m_running = false;
+    std::unique_ptr<Utils::ThreadPool> m_threadPool;
+    std::unique_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
     std::thread m_maintenanceThread;
     std::mutex m_shutdownMutex;
     std::condition_variable m_shutdownCv;
@@ -758,7 +789,7 @@ AntivirusService::~AntivirusService() = default;
 // SCM ENTRY POINTS
 // ============================================================================
 
-void WINAPI AntivirusService::ServiceMain(DWORD argc, LPTSTR* argv) {
+void WINAPI AntivirusService::ServiceMain(DWORD argc, LPWSTR* argv) {
     Instance().OnStart(argc, argv);
 }
 
@@ -796,12 +827,12 @@ DWORD WINAPI AntivirusService::ServiceCtrlHandler(DWORD control, DWORD eventType
 // ============================================================================
 
 bool AntivirusService::Run() {
-    SERVICE_TABLE_ENTRY dispatchTable[] = {
-        { const_cast<LPWSTR>(ServiceConstants::SERVICE_NAME), static_cast<LPSERVICE_MAIN_FUNCTION>(ServiceMain) },
+    SERVICE_TABLE_ENTRYW dispatchTable[] = {
+        { const_cast<LPWSTR>(ServiceConstants::SERVICE_NAME), static_cast<LPSERVICE_MAIN_FUNCTIONW>(ServiceMain) },
         { nullptr, nullptr }
     };
 
-    if (!StartServiceCtrlDispatcher(dispatchTable)) {
+    if (!StartServiceCtrlDispatcherW(dispatchTable)) {
         // If it failed, it might be running as a console app for debug
         if (GetLastError() == ERROR_FAILED_SERVICE_CONTROLLER_CONNECT) {
             // Debug mode
@@ -829,8 +860,8 @@ bool AntivirusService::Uninstall() {
     return m_impl->UninstallService();
 }
 
-void AntivirusService::OnStart(DWORD argc, LPTSTR* argv) {
-    m_statusHandle = RegisterServiceCtrlHandlerEx(
+void AntivirusService::OnStart(DWORD argc, LPWSTR* argv) {
+    m_statusHandle = RegisterServiceCtrlHandlerExW(
         ServiceConstants::SERVICE_NAME,
         ServiceCtrlHandler,
         nullptr
@@ -892,8 +923,8 @@ void AntivirusService::OnSessionChange(DWORD eventType, WTSSESSION_NOTIFICATION*
             case WTS_SESSION_LOGOFF:         eventName = "SessionLogoff"; break;
             case WTS_SESSION_LOCK:           eventName = "SessionLock"; break;
             case WTS_SESSION_UNLOCK:         eventName = "SessionUnlock"; break;
-            case WTS_SESSION_REMOTE_CONNECT: eventName = "RemoteConnect"; break;
-            case WTS_SESSION_REMOTE_DISCONNECT: eventName = "RemoteDisconnect"; break;
+            case WTS_REMOTE_CONNECT:         eventName = "RemoteConnect"; break;
+            case WTS_REMOTE_DISCONNECT:      eventName = "RemoteDisconnect"; break;
             case WTS_CONSOLE_CONNECT:        eventName = "ConsoleConnect"; break;
             case WTS_CONSOLE_DISCONNECT:     eventName = "ConsoleDisconnect"; break;
             default: break;

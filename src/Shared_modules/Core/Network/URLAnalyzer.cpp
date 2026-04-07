@@ -640,7 +640,7 @@ public:
                 if (!m_initialized) {
                     SS_LOG_WARN(L"Network", L"ScanURL called before initialization");
                     verdict.category = URLCategory::UNKNOWN;
-                    verdict.recommendedAction = FilterAction::ALLOW;
+                    verdict.recommendedAction = URLFilterAction::ALLOW;
                     return verdict;
                 }
                 configSnapshot = m_config;
@@ -651,7 +651,7 @@ public:
             // Input validation
             if (url.empty() || url.length() > URLAnalyzerConstants::MAX_URL_LENGTH) {
                 verdict.category = URLCategory::UNKNOWN;
-                verdict.recommendedAction = FilterAction::BLOCK;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
                 m_stats.parseErrors++;
                 return verdict;
             }
@@ -662,7 +662,7 @@ public:
                 verdict.isBlocked = true;
                 verdict.category = URLCategory::SUSPICIOUS;
                 verdict.severity = VerdictSeverity::HIGH;
-                verdict.recommendedAction = FilterAction::BLOCK;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
                 verdict.threatName = "URL.EmbeddedNull";
                 m_stats.urlsBlocked++;
                 return verdict;
@@ -684,7 +684,7 @@ public:
             ParsedURL parsed = ParseURL(url);
             if (!parsed.isValid) {
                 verdict.category = URLCategory::UNKNOWN;
-                verdict.recommendedAction = FilterAction::BLOCK;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
                 m_stats.parseErrors++;
                 return verdict;
             }
@@ -699,7 +699,7 @@ public:
                 if (IsWhitelistedInternal(parsed.hostNormalized)) {
                     verdict.category = URLCategory::SAFE;
                     verdict.severity = VerdictSeverity::CLEAN;
-                    verdict.recommendedAction = FilterAction::ALLOW;
+                    verdict.recommendedAction = URLFilterAction::ALLOW;
                     verdict.detectionMethod = DetectionMethod::UNKNOWN;
                     // Cache after releasing the shared lock
                     lock.unlock();
@@ -712,7 +712,7 @@ public:
                     verdict.isBlocked = true;
                     verdict.category = URLCategory::MALWARE_DIST;
                     verdict.severity = VerdictSeverity::CRITICAL;
-                    verdict.recommendedAction = FilterAction::BLOCK;
+                    verdict.recommendedAction = URLFilterAction::BLOCK;
                     verdict.detectionMethod = DetectionMethod::MANUAL;
                     verdict.threatName = GetBlacklistThreat(parsed.hostNormalized);
                     // Cache after releasing the shared lock
@@ -760,16 +760,16 @@ public:
             if (totalScore >= configSnapshot.blockThreshold) {
                 verdict.isBlocked = true;
                 verdict.severity = VerdictSeverity::HIGH;
-                verdict.recommendedAction = FilterAction::BLOCK;
+                verdict.recommendedAction = URLFilterAction::BLOCK;
                 m_stats.urlsBlocked++;
             } else if (totalScore >= configSnapshot.warnThreshold) {
                 verdict.isSuspicious = true;
                 verdict.severity = VerdictSeverity::MEDIUM;
-                verdict.recommendedAction = FilterAction::WARN;
+                verdict.recommendedAction = URLFilterAction::WARN;
                 m_stats.urlsWarned++;
             } else {
                 verdict.severity = VerdictSeverity::LOW;
-                verdict.recommendedAction = FilterAction::ALLOW;
+                verdict.recommendedAction = URLFilterAction::ALLOW;
                 m_stats.urlsAllowed++;
             }
 
@@ -785,7 +785,7 @@ public:
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"Network", L"ScanURL - Exception: %hs", e.what());
             verdict.category = URLCategory::UNKNOWN;
-            verdict.recommendedAction = FilterAction::BLOCK;
+            verdict.recommendedAction = URLFilterAction::BLOCK;
             m_stats.analysisErrors++;
         }
 

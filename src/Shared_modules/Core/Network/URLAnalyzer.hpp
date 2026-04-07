@@ -363,10 +363,10 @@ enum class URLScheme : uint8_t {
 };
 
 /**
- * @enum FilterAction
- * @brief Action to take based on analysis.
+ * @enum URLFilterAction
+ * @brief URLAnalyzer-owned action to take based on analysis.
  */
-enum class FilterAction : uint8_t {
+enum class URLFilterAction : uint8_t {
     ALLOW = 0,
     BLOCK = 1,
     WARN = 2,                  ///< Allow with warning
@@ -554,7 +554,7 @@ struct alignas(128) URLVerdict {
     bool isSuspicious{ false };
     URLCategory category{ URLCategory::UNKNOWN };
     VerdictSeverity severity{ VerdictSeverity::CLEAN };
-    FilterAction recommendedAction{ FilterAction::ALLOW };
+    URLFilterAction recommendedAction{ URLFilterAction::ALLOW };
 
     // Threat details
     ThreatType threatType{ ThreatType::NONE };
