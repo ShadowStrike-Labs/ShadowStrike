@@ -11,7 +11,9 @@
  * ENTERPRISE CRITICAL:
  *   - CoCreateInstance: reads CLSID from guest, matches against known-bad
  *     list (ShellLink, WScript.Shell, MSXML2.XMLHTTP, etc.)
- *   - ALL COM object creation is blocked with E_NOINTERFACE
+ *   - WbemLocator CLSID: returns fake vtable with S_OK to enable WMI
+ *     query tracking and anti-VM detection
+ *   - All other COM object creation is blocked with E_NOINTERFACE
  *   - CLSID values are logged as IOCs for behavioral analysis
  *   - CoInitialize/CoUninitialize: no-op stubs (return S_OK)
  *
@@ -20,6 +22,7 @@
  */
 
 #include "COMAPI.hpp"
+#include "WmiEmulation.hpp"
 #include "../APIDispatcher.hpp"
 #include "../HandleTable.hpp"
 #include "../../Core/Memory/VirtualMemory.hpp"
@@ -192,8 +195,8 @@ bool HandleCoUninitialize(APIContext& ctx) {
 // ENTERPRISE CRITICAL:
 //   1. Read CLSID (16 bytes) from guest address in arg0
 //   2. Match against known-bad CLSID table
-//   3. Write NULL to *ppv (arg4)
-//   4. Return E_NOINTERFACE — block all COM object creation
+//   3. WbemLocator CLSID → return S_OK with fake vtable for WMI tracking
+//   4. All other CLSIDs → write NULL to *ppv, return E_NOINTERFACE
 //   5. Flag COMAbuse (SuspiciousAPI) for known-bad CLSIDs
 
 bool HandleCoCreateInstance(APIContext& ctx) {
@@ -216,6 +219,28 @@ bool HandleCoCreateInstance(APIContext& ctx) {
     if (badMatch != nullptr) {
         // SuspiciousAPI flag raised via APIDatabase entry
         (void)badMatch;
+    }
+
+    // ----------------------------------------------------------------
+    // WbemLocator CLSID: {4590F811-1D3A-11D0-891F-00AA004B2E24}
+    // Instead of blocking with E_NOINTERFACE, return a fake vtable so
+    // WMI code paths continue executing — we capture the queries.
+    // ----------------------------------------------------------------
+    if (IsWbemLocatorCLSID(clsid)) {
+        ctx.AddBehaviorFlag(BehaviorFlag::WMIExecution);
+
+        auto fakeObj = AllocateFakeWbemVtable(mem);
+        if (fakeObj.has_value() && ppvAddr != 0) {
+            if (ctx.Is64Bit()) {
+                mem.WriteU64(ppvAddr, fakeObj.value());
+            } else {
+                mem.WriteU32(ppvAddr, static_cast<uint32_t>(fakeObj.value()));
+            }
+            WmiState::Instance().OnWbemLocatorCreated(0);
+            ctx.SetReturn32(static_cast<uint32_t>(kS_OK));
+            return true;
+        }
+        // If allocation failed, fall through to normal E_NOINTERFACE path
     }
 
     // Write NULL to *ppv — no COM object created
@@ -383,6 +408,9 @@ void RegisterCOMAPI(APIDispatcher& dispatcher) noexcept {
     };
 
     dispatcher.RegisterBatch(kRegs, static_cast<uint32_t>(std::size(kRegs)));
+
+    // Register OLE Automation (oleaut32.dll) handlers for BSTR/VARIANT support
+    RegisterOleAutAPI(dispatcher);
 }
 
 } // namespace Phantom::WinAPI::Ole32

@@ -12,7 +12,9 @@
  *   - CoCreateInstance with known-bad CLSIDs detects COM-based attacks:
  *     ShellLink (LNK abuse), InternetExplorer (COM hijack),
  *     WScript.Shell, MSXML2.XMLHTTP (C2 comms)
- *   - All COM object creation is blocked (E_NOINTERFACE) to prevent
+ *   - WbemLocator CLSID returns a fake vtable (S_OK) to enable WMI
+ *     code path execution and query capture
+ *   - All other COM object creation is blocked (E_NOINTERFACE) to prevent
  *     malware from progressing through COM chains
  *   - CLSID logging provides IOC for behavioral analysis
  *
