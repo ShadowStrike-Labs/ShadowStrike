@@ -31,6 +31,7 @@
 #include "Ntdll\EtwAPI.hpp"
 #include "Bcrypt\BcryptAPI.hpp"
 #include "Amsi\AmsiAPI.hpp"
+#include "Ole32\COMAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -198,7 +199,9 @@ void APIDispatcher::RegisterWininet()  noexcept {}
 void APIDispatcher::RegisterWinhttp()  noexcept {}
 void APIDispatcher::RegisterUser32()   noexcept {}
 void APIDispatcher::RegisterShell32()  noexcept {}
-void APIDispatcher::RegisterOle32()    noexcept {}
+void APIDispatcher::RegisterOle32()    noexcept {
+    WinAPI::Ole32::RegisterCOMAPI(*this);
+}
 void APIDispatcher::RegisterUrlmon()   noexcept {}
 void APIDispatcher::RegisterBcrypt() noexcept {
     WinAPI::Bcrypt::RegisterBcrypt(*this);
