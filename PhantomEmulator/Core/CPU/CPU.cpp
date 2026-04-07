@@ -52,6 +52,28 @@ void CPU::RequestAbort() noexcept {
 }
 
 // ============================================================================
+// JIT Control
+// ============================================================================
+
+void CPU::EnableJIT(JITStrategy strategy, uint32_t cacheSize, uint32_t hotThreshold) noexcept {
+    if (m_jit.Initialize(cacheSize)) {
+        m_jit.SetStrategy(strategy);
+        m_jitHotThreshold = hotThreshold;
+        m_jitEnabled = true;
+    }
+}
+
+void CPU::DisableJIT() noexcept {
+    m_jitEnabled = false;
+    m_jit.Shutdown();
+    m_blockProfile.clear();
+}
+
+const JITCompiler& CPU::GetJIT() const noexcept {
+    return m_jit;
+}
+
+// ============================================================================
 // Main Execution Loop
 // ============================================================================
 
@@ -62,6 +84,13 @@ ExecutionResult CPU::Execute(
 {
     ExecutionResult result{};
     m_abortRequested.store(false, std::memory_order_relaxed);
+
+    // === JIT initialization from config ===
+    if (config.enableJIT && !m_jitEnabled) {
+        EnableJIT(config.jitStrategy, config.jitCodeCacheSize, config.jitHotThreshold);
+    } else if (!config.enableJIT && m_jitEnabled) {
+        DisableJIT();
+    }
 
     auto startTime = std::chrono::steady_clock::now();
     uint64_t maxInstr = config.maxInstructions;
@@ -121,6 +150,41 @@ ExecutionResult CPU::Execute(
             break;
         }
 
+        // === JIT Fast Path ===
+        // If JIT is enabled, try the code cache first. On cache hit,
+        // execute the compiled native block and skip the interpreter for
+        // all instructions in that block. Breakpoints, API hooks, and
+        // abort checks above are always evaluated first — compiled blocks
+        // are only reachable for addresses that passed all those guards.
+        if (m_jitEnabled) {
+            CompiledBlock* block = m_jit.Lookup(m_state.rip);
+            if (block && block->isValid) {
+                uint32_t instrExecuted = m_jit.Execute(*block, m_state, memory);
+
+                m_state.instructionCount += instrExecuted;
+                m_state.tsc += static_cast<uint64_t>(instrExecuted) * m_state.tscIncrement;
+                result.instructionsExecuted = m_state.instructionCount;
+                result.lastRIP = m_state.rip;
+
+                if (PHANTOM_UNLIKELY(m_state.instructionCount >= maxInstr)) {
+                    result.reason = StopReason::InstructionLimit;
+                    break;
+                }
+
+                continue; // Skip interpreter for this block
+            }
+
+            // Track block execution count for profiling.
+            // Only allocate a new entry if the map hasn't hit the cap —
+            // this prevents unbounded growth from polymorphic code.
+            auto profileIt = m_blockProfile.find(m_state.rip);
+            if (profileIt != m_blockProfile.end()) {
+                ++profileIt->second;
+            } else if (m_blockProfile.size() < kMaxBlockProfileEntries) {
+                m_blockProfile.emplace(m_state.rip, 1u);
+            }
+        }
+
         // === Fetch instruction bytes ===
         uint32_t bytesRead = 0;
         auto fetchErr = memory.FetchInstruction(
@@ -136,6 +200,13 @@ ExecutionResult CPU::Execute(
         // Track instruction fetch for W→X detection
         if (tracker) {
             tracker->RecordExecute(m_state.rip);
+
+            // Invalidate JIT cache for self-modifying code.
+            // If this page was previously written and is now being executed,
+            // any compiled blocks covering it are stale.
+            if (m_jitEnabled && tracker->IsWriteExecuteTransition(PageBase(m_state.rip))) {
+                m_jit.Invalidate(PageBase(m_state.rip), kPageSize);
+            }
         }
 
         // === Decode ===
@@ -215,6 +286,18 @@ ExecutionResult CPU::Execute(
         // === Update counters ===
         m_state.instructionCount++;
         m_state.tsc += m_state.tscIncrement;
+
+        // === JIT Compilation Check ===
+        // After successful interpretation, check if the basic block at the
+        // starting RIP has been interpreted enough times to warrant compilation.
+        // We only compile after jitHotThreshold interpretations to avoid
+        // wasting cycles compiling cold or one-shot code.
+        if (m_jitEnabled) {
+            auto profIt = m_blockProfile.find(result.lastRIP);
+            if (profIt != m_blockProfile.end() && profIt->second == m_jitHotThreshold) {
+                m_jit.CompileBlock(result.lastRIP, &inst, 1);
+            }
+        }
     }
 
     result.instructionsExecuted = m_state.instructionCount;
