@@ -54,6 +54,7 @@
 #include "../../HashStore/HashStore.hpp"
 #include "../../PatternStore/PatternStore.hpp"
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"
+#include <pugixml/pugixml.hpp>
 
 // ============================================================================
 // SYSTEM INCLUDES
@@ -70,6 +71,8 @@ namespace fs = std::filesystem;
 namespace ShadowStrike {
 namespace Core {
 namespace FileSystem {
+
+namespace StringUtils = ShadowStrike::Utils::StringUtils;
 
 // ============================================================================
 // INTERNAL CONSTANTS
@@ -150,6 +153,12 @@ public:
 
         try {
             m_config = config;
+            if (!m_hashStore) {
+                m_hashStore = std::make_shared<HashStore::HashStore>();
+            }
+            if (!m_patternStore) {
+                m_patternStore = std::make_shared<PatternStore::PatternStore>();
+            }
             m_initialized = true;
 
             SS_LOG_INFO(L"DocumentScanner", L"DocumentScanner initialized (macros=%d, ole=%d, pdf=%d, cve=%d)", config.analyzeMacros, config.analyzeOLEObjects, config.analyzePDFJavaScript, config.detectCVEs);
@@ -411,22 +420,22 @@ public:
             // Hash-based detection via FileHasher
             auto& hasher = FileHasher::Instance();
             auto hash = hasher.ComputeSHA256(filePath);
-            if (!hash.empty()) {
-                auto& hashStore = HashStore::HashStore::Instance();
-                auto lookupResult = hashStore.LookupHashString(hash, HashStore::HashType::SHA256);
+            if (!hash.empty() && m_hashStore) {
+                auto lookupResult = m_hashStore->LookupHashString(hash, HashStore::HashType::SHA256);
                 if (lookupResult.has_value()) {
                     return true;
                 }
             }
 
             // PatternStore YARA-based exploit detection
-            auto& patterns = PatternStore::PatternStore::Instance();
-            auto patternResults = patterns.ScanFile(filePath);
-            if (!patternResults.empty()) {
-                for (const auto& det : patternResults) {
-                    if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
-                        SS_LOG_WARN(L"DocumentScanner", L"Pattern match: %hs", det.signatureName.c_str());
-                        return true;
+            if (m_patternStore) {
+                auto patternResults = m_patternStore->ScanFile(filePath);
+                if (!patternResults.empty()) {
+                    for (const auto& det : patternResults) {
+                        if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
+                            SS_LOG_WARN(L"DocumentScanner", L"Pattern match: %hs", det.signatureName.c_str());
+                            return true;
+                        }
                     }
                 }
             }
@@ -867,34 +876,35 @@ private:
             if (hash.empty()) return false;
 
             // Check against HashStore known malware database
-            auto& hashStore = HashStore::HashStore::Instance();
-            auto lookupResult = hashStore.LookupHashString(hash, HashStore::HashType::SHA256);
-            if (lookupResult.has_value()) {
-                DocumentThreat threat;
-                threat.type = ThreatType::CVEExploit;
-                threat.severity = 100;
-                threat.description = "Known malware hash match: " + hash;
-                threat.evidence = hash;
-                threat.location = "File hash";
-                threat.mitreId = "T1566.001";
+            if (m_hashStore) {
+                auto lookupResult = m_hashStore->LookupHashString(hash, HashStore::HashType::SHA256);
+                if (lookupResult.has_value()) {
+                    DocumentThreat threat;
+                    threat.type = ThreatType::CVEExploit;
+                    threat.severity = 100;
+                    threat.description = "Known malware hash match: " + hash;
+                    threat.evidence = hash;
+                    threat.location = "File hash";
+                    threat.mitreId = "T1566.001";
 
-                result.threats.push_back(threat);
-                result.criticalThreats++;
-                ReportThreat(threat);
+                    result.threats.push_back(threat);
+                    result.criticalThreats++;
+                    ReportThreat(threat);
 
-                SS_LOG_FATAL(L"DocumentScanner", L"Known malware detected: %hs", hash.c_str());
-                return true;
+                    SS_LOG_FATAL(L"DocumentScanner", L"Known malware detected: %hs", hash.c_str());
+                    return true;
+                }
             }
 
             // Check file reputation
             auto& reputation = FileReputation::Instance();
-            auto repScore = reputation.QueryReputation(hash);
-            if (repScore.has_value() && repScore.value() <= 10) {
+            const auto reputationResult = reputation.CheckHash(hash, QueryMode::CloudEnabled);
+            if (reputationResult.isMalicious || reputationResult.score <= -80) {
                 DocumentThreat threat;
                 threat.type = ThreatType::CVEExploit;
                 threat.severity = 85;
                 threat.description = "Very low file reputation score";
-                threat.evidence = "Reputation: " + std::to_string(repScore.value());
+                threat.evidence = "Reputation: " + std::to_string(reputationResult.score);
                 threat.location = "Cloud reputation";
                 threat.mitreId = "T1566.001";
 
@@ -1718,7 +1728,7 @@ private:
 
             // List archive entries to find all .rels files
             try {
-                auto archiveInfo = archiveExtractor.ListArchive(filePath);
+                auto archiveInfo = archiveExtractor.ListContents(filePath);
 
                 // Common .rels paths to check
                 const std::vector<std::wstring> relsPaths = {
@@ -2096,22 +2106,23 @@ private:
             // PatternStore YARA-based detection
             if (!result.filePath.empty()) {
                 try {
-                    auto& patterns = PatternStore::PatternStore::Instance();
-                    auto patternResults = patterns.ScanFile(result.filePath);
-                    for (const auto& det : patternResults) {
-                        if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
-                            totalRisk += 30;
-                            m_stats.cvesDetected.fetch_add(1, std::memory_order_relaxed);
+                    if (m_patternStore) {
+                        auto patternResults = m_patternStore->ScanFile(result.filePath);
+                        for (const auto& det : patternResults) {
+                            if (det.threatLevel >= SignatureStore::ThreatLevel::High) {
+                                totalRisk += 30;
+                                m_stats.cvesDetected.fetch_add(1, std::memory_order_relaxed);
 
-                            DocumentThreat threat;
-                            threat.type = ThreatType::CVEExploit;
-                            threat.severity = 90;
-                            threat.description = "YARA pattern match: " + det.signatureName;
-                            threat.location = "PatternStore";
-                            threat.mitreId = "T1203";
-                            result.threats.push_back(threat);
-                            result.criticalThreats++;
-                            ReportThreat(threat);
+                                DocumentThreat threat;
+                                threat.type = ThreatType::CVEExploit;
+                                threat.severity = 90;
+                                threat.description = "YARA pattern match: " + det.signatureName;
+                                threat.location = "PatternStore";
+                                threat.mitreId = "T1203";
+                                result.threats.push_back(threat);
+                                result.criticalThreats++;
+                                ReportThreat(threat);
+                            }
                         }
                     }
                 } catch (...) {
@@ -2206,6 +2217,8 @@ private:
 
     DocumentScannerConfig m_config;
     DocumentScannerStatistics m_stats;
+    std::shared_ptr<HashStore::HashStore> m_hashStore;
+    std::shared_ptr<PatternStore::PatternStore> m_patternStore;
 
     DocumentProgressCallback m_progressCallback;
     ThreatCallback m_threatCallback;

@@ -148,7 +148,7 @@ namespace SafeRead {
         case StegoTechnique::LSB: return "Least Significant Bit";
         case StegoTechnique::DCT: return "DCT Coefficients";
         case StegoTechnique::Palette: return "Palette Manipulation";
-        case StegoTechnique::EOF: return "End-of-File Appended";
+        case StegoTechnique::EOFAppended: return "End-of-File Appended";
         case StegoTechnique::Metadata: return "Metadata Hiding";
         case StegoTechnique::AlphaChannel: return "Alpha Channel Hiding";
         default: return "Unknown";
@@ -819,7 +819,7 @@ public:
             size_t appendedSize = data.size() - eoiPos;
             if (appendedSize <= MIN_APPENDED_THRESHOLD) return result;
 
-            result.technique = StegoTechnique::EOF;
+            result.technique = StegoTechnique::EOFAppended;
             result.confidence = 0.9;
             result.estimatedPayloadSize = appendedSize;
             result.analysisDetails = std::format(

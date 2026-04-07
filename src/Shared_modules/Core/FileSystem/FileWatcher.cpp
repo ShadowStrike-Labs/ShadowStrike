@@ -397,7 +397,7 @@ public:
         : m_debounceTime(std::chrono::milliseconds(debounceMs)) {
     }
 
-    std::optional<FileEvent> ProcessEvent(FileEvent event) {
+    std::optional<FileEvent> ProcessEvent(const FileEvent& event) {
         std::lock_guard lock(m_mutex);
 
         const auto now = std::chrono::steady_clock::now();
