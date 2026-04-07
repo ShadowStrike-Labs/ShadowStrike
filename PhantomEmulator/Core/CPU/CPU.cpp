@@ -7,6 +7,7 @@
  */
 
 #include "CPU.hpp"
+#include "ExceptionDispatcher.hpp"
 #include "../../Common/Constants.hpp"
 #include "../../Common/Platform.hpp"
 #include <chrono>
@@ -35,6 +36,7 @@ void CPU::SetPostInstructionCallback(PostInstructionCallback cb) noexcept { m_po
 void CPU::SetAPICallCallback(APICallCallback cb) noexcept                { m_apiCallback = std::move(cb); }
 void CPU::SetSyscallCallback(SyscallCallback cb) noexcept                { m_syscallCallback = std::move(cb); }
 void CPU::SetInterruptCallback(InterruptCallback cb) noexcept            { m_interruptCallback = std::move(cb); }
+void CPU::SetExceptionDispatcher(ExceptionDispatcher* dispatcher) noexcept { m_exceptionDispatcher = dispatcher; }
 
 void CPU::AddBreakpoint(GuestAddress addr) noexcept    { m_breakpoints.insert(addr); }
 void CPU::RemoveBreakpoint(GuestAddress addr) noexcept  { m_breakpoints.erase(addr); }
@@ -162,6 +164,23 @@ ExecutionResult CPU::Execute(
 
         auto execErr = DispatchInstruction(inst, memory, tracker);
         if (execErr != ErrorCode::Success) {
+            // Attempt exception dispatch through SEH/VEH if available.
+            // This models the Windows exception dispatch mechanism —
+            // malware that uses VEH for anti-debug or SEH for control flow
+            // will have its handlers analyzed before we decide to stop.
+            if (m_exceptionDispatcher) {
+                bool handled = m_exceptionDispatcher->DispatchFromError(
+                    m_state, memory, execErr, m_state.rip);
+                if (handled) {
+                    // Exception was handled — continue execution.
+                    // The dispatcher may have modified RIP to resume at
+                    // a handler, or the heuristic indicates continuation.
+                    m_state.instructionCount++;
+                    m_state.tsc += m_state.tscIncrement;
+                    continue;
+                }
+            }
+
             // Map error to stop reason
             switch (execErr) {
                 case ErrorCode::DivideByZero:
@@ -498,6 +517,24 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
+        // === VEX-encoded AVX/AVX2 instructions ===
+        // Route VEX-prefixed instructions to the AVX2 executor before
+        // falling through to legacy SSE. ExecuteAVX2 handles both
+        // VEX.L=1 (256-bit) and VEX.L=0 (128-bit with upper zeroing).
+        if (inst.prefixes.hasVEX) {
+            auto err = ExecuteAVX2(inst, memory);
+            if (err == ErrorCode::Success) {
+                m_state.AdvanceRIP(inst.length);
+                return ErrorCode::Success;
+            }
+            // If AVX2 didn't handle it (UnimplementedOpcode), fall through
+            // to SSE2 which may handle VEX.L=0 forms for legacy SSE ops
+            if (err != ErrorCode::UnimplementedOpcode &&
+                err != ErrorCode::UnsupportedOpcode) {
+                return err;
+            }
+        }
+
         // === Jcc near (0x80-0x8F) ===
         if (op >= 0x80 && op <= 0x8F) {
             return ExecuteControlFlow(inst, memory);
@@ -651,6 +688,21 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
+        // === VEX-encoded AVX2 instructions in 0F 38 map ===
+        // Covers VPSHUFB, VPMOVSXBW/WD/DQ, VPMOVZXBW/WD/DQ, VPMASKMOVD,
+        // VPGATHERDD, VPERMD, VPBROADCAST*, and other AVX2 ops.
+        if (inst.prefixes.hasVEX) {
+            auto err = ExecuteAVX2(inst, memory);
+            if (err == ErrorCode::Success) {
+                m_state.AdvanceRIP(inst.length);
+                return ErrorCode::Success;
+            }
+            if (err != ErrorCode::UnimplementedOpcode &&
+                err != ErrorCode::UnsupportedOpcode) {
+                return err;
+            }
+        }
+
         // AES-NI instructions: 0xDB-0xDF with 66 prefix
         if (op >= 0xDB && op <= 0xDF && inst.prefixes.hasOpSizeOverride) {
             auto err = ExecuteAESNI(inst, memory);
@@ -676,6 +728,20 @@ ErrorCode CPU::DispatchInstruction(
             auto err = ExecuteSSE4(inst, memory);
             if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
             return err;
+        }
+
+        // === VEX-encoded AVX2 instructions in 0F 3A map ===
+        // Covers VPERM2I128, VINSERTI128, VEXTRACTI128, VPBLENDD, etc.
+        if (inst.prefixes.hasVEX) {
+            auto err = ExecuteAVX2(inst, memory);
+            if (err == ErrorCode::Success) {
+                m_state.AdvanceRIP(inst.length);
+                return ErrorCode::Success;
+            }
+            if (err != ErrorCode::UnimplementedOpcode &&
+                err != ErrorCode::UnsupportedOpcode) {
+                return err;
+            }
         }
 
         // AES-NI: PCLMULQDQ (0x44) and AESKEYGENASSIST (0xDF) with 66 prefix
@@ -886,6 +952,7 @@ uint64_t CPU::SignExtendToSize(uint64_t value, OperandSize fromSize, OperandSize
 // - Executor/SSE2Ops.cpp       → ExecuteSSE2
 // - Executor/SSE4Ops.cpp       → ExecuteSSE4
 // - Executor/AESNIOps.cpp      → ExecuteAESNI
+// - Executor/AVX2Ops.cpp       → ExecuteAVX2
 // - Executor/FPUOps.cpp        → ExecuteFPU
 // ============================================================================
 

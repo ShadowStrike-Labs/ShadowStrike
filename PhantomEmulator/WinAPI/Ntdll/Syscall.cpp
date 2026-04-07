@@ -29,6 +29,7 @@
 #include "NtRegistry.hpp"
 #include "NtSystem.hpp"
 #include "NtToken.hpp"
+#include "NtSync.hpp"
 #include "../APIDispatcher.hpp"
 #include "../APIDatabase.hpp"
 #include "../HandleTable.hpp"
@@ -105,21 +106,21 @@ static constexpr SyscallMapping kSyscallMap[] = {
     { Syscall::NtDeleteValueKey,          HandleNtDeleteValueKey         }, // Shares 0x0041 with NtAdjustPrivilegesToken in APIDatabase.
     { Syscall::NtEnumerateKey,            HandleNtEnumerateKey           },
     { Syscall::NtEnumerateValueKey,       HandleNtEnumerateValueKey      },
-    { Syscall::NtOpenKeyEx,               nullptr                        }, // No dedicated NtOpenKeyEx handler is implemented yet.
+    { Syscall::NtOpenKeyEx,               HandleNtOpenKeyEx              },
 
     // System / timing / object
     { Syscall::NtQuerySystemInformation,  HandleNtQuerySystemInformation },
     { Syscall::NtQueryPerformanceCounter, HandleNtQueryPerformanceCounter },
     { Syscall::NtDelayExecution,          HandleNtDelayExecution         },
-    { Syscall::NtWaitForSingleObject,     nullptr                        }, // Synchronization wait handler not implemented yet.
-    { Syscall::NtWaitForMultipleObjects,  nullptr                        }, // Synchronization wait handler not implemented yet.
-    { Syscall::NtCreateEvent,             nullptr                        }, // Event creation handler not implemented yet.
-    { Syscall::NtSetEvent,                nullptr                        }, // Event signaling handler not implemented yet.
-    { Syscall::NtCreateMutant,            nullptr                        }, // Mutant creation handler not implemented yet.
-    { Syscall::NtOpenMutant,              nullptr                        }, // NtOpenMutant handler not implemented yet.
+    { Syscall::NtWaitForSingleObject,     HandleNtWaitForSingleObject    },
+    { Syscall::NtWaitForMultipleObjects,  HandleNtWaitForMultipleObjects },
+    { Syscall::NtCreateEvent,             HandleNtCreateEvent            },
+    { Syscall::NtSetEvent,                HandleNtSetEvent               },
+    { Syscall::NtCreateMutant,            HandleNtCreateMutant           },
+    { Syscall::NtOpenMutant,              HandleNtOpenMutant             },
     { Syscall::NtQueryObject,             HandleNtQueryObject            },
     { Syscall::NtDuplicateObject,         HandleNtDuplicateObject        },
-    { Syscall::NtOpenSection,             nullptr                        }, // NtOpenSection handler not implemented yet.
+    { Syscall::NtOpenSection,             HandleNtOpenSection            },
 
     // Token / security
     { Syscall::NtOpenProcessToken,        HandleNtOpenProcessToken       },

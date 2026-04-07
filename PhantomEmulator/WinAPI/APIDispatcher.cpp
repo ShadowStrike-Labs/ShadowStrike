@@ -28,6 +28,7 @@
 #include "Ntdll\NtThread.hpp"
 #include "Ntdll\NtToken.hpp"
 #include "Ntdll\NtSync.hpp"
+#include "Bcrypt\BcryptAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -164,6 +165,7 @@ void APIDispatcher::RegisterAll() noexcept {
     RegisterNtdll();
     RegisterKernel32();
     RegisterAdvapi32();
+    RegisterBcrypt();
     RegisterWs2_32();
     RegisterWininet();
     RegisterWinhttp();
@@ -194,6 +196,9 @@ void APIDispatcher::RegisterUser32()   noexcept {}
 void APIDispatcher::RegisterShell32()  noexcept {}
 void APIDispatcher::RegisterOle32()    noexcept {}
 void APIDispatcher::RegisterUrlmon()   noexcept {}
+void APIDispatcher::RegisterBcrypt() noexcept {
+    WinAPI::Bcrypt::RegisterBcrypt(*this);
+}
 
 // ============================================================================
 // WireImports — Bind all registered hooks into the ImportResolver

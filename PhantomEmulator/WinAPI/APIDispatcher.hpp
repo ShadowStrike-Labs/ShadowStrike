@@ -203,6 +203,7 @@ private:
     void RegisterUser32() noexcept;
     void RegisterShell32() noexcept;
     void RegisterOle32() noexcept;
+    void RegisterBcrypt() noexcept;
     void RegisterUrlmon() noexcept;
 };
 

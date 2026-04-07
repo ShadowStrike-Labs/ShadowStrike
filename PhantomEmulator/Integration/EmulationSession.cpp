@@ -30,12 +30,20 @@
 #include "../Core/Loader/ShellcodeLoader.hpp"
 #include "../Core/Loader/ExportResolver.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
+#include "../Core/Loader/HashResolver.hpp"
+
+// Exception Handling
+#include "../Core/CPU/ExceptionDispatcher.hpp"
 
 // WinAPI
 #include "../WinAPI/APIDispatcher.hpp"
+#include "../WinAPI/Bcrypt/BcryptAPI.hpp"
 
 // VirtualOS
 #include "../VirtualOS/EnvironmentBuilder.hpp"
+
+// Integration
+#include "YaraScanner.hpp"
 
 // Analysis (all 11 modules)
 #include "../Analysis/BehaviorMonitor.hpp"
@@ -290,6 +298,11 @@ struct EmulationSession::Impl {
     CryptoDetector          m_cryptoDetector;
     NetworkBehaviorAnalyzer m_networkAnalyzer;
     EvasionDetector         m_evasionDetector;
+
+    // Phase 2 modules — API hash resolution, YARA scanning, exception dispatch
+    HashResolver            m_hashResolver;
+    YaraScanner             m_yaraScanner;
+    ExceptionDispatcher     m_exceptionDispatcher;
 
     // Session state
     std::atomic<bool> m_abortRequested{false};
@@ -638,6 +651,11 @@ struct EmulationSession::Impl {
         // if unpacking fails or the sample is not packed.
         RunPackerDetection(image.imageBase, image.totalMapped);
 
+        // Build the API hash table from resolved exports. This enables
+        // detection of hash-based import resolution used by shellcode
+        // and packers (e.g., CRC32-rotate, DJB2, FNV-1a lookups).
+        m_hashResolver.BuildFromExports(m_exports);
+
         // Notify MemoryForensics about the initial allocations for baseline
         NotifyInitialAllocations(image);
 
@@ -685,6 +703,9 @@ struct EmulationSession::Impl {
 
         // Configure CPU registers for shellcode entry
         loader.PrepareCPUState(m_cpu, sc, m_config);
+
+        // Build hash table for shellcode's hash-based import resolution
+        m_hashResolver.BuildFromExports(m_exports);
 
         return true;
     }
@@ -736,6 +757,9 @@ struct EmulationSession::Impl {
 
         // Configure CPU manually (no PE/shellcode loader to do this)
         SetupCPUForBuffer(entry, is64Bit, errorOut);
+
+        // Build hash table for buffer's hash-based import resolution
+        m_hashResolver.BuildFromExports(m_exports);
 
         return true;
     }
@@ -882,6 +906,13 @@ struct EmulationSession::Impl {
             [this](CPUState& cpu, VirtualMemory& mem, uint8_t vector) -> bool {
                 return OnInterrupt(cpu, mem, vector);
             });
+
+        // === Exception Dispatcher ===
+        // Wire the ExceptionDispatcher into the CPU so that faults
+        // (AV, divide-by-zero, etc.) route through VEH/SEH before
+        // stopping. Enables analysis of malware that uses structured
+        // exception handling for anti-debug or control-flow obfuscation.
+        m_cpu.SetExceptionDispatcher(&m_exceptionDispatcher);
     }
 
     // ========================================================================
@@ -1265,10 +1296,19 @@ struct EmulationSession::Impl {
         // 5g: Unpacking post-processing
         RunUnpackingPostProcess(target);
 
-        // 5h: Feed all accumulated signals to ThreatScorer
+        // 5h: YARA rule scanning — scan all guest memory regions
+        //     against built-in and user-supplied YARA rules.
+        //     This runs after unpacking so we scan unpacked content.
+        RunYaraScan();
+
+        // 5i: BCrypt forensic data — extract any cryptographic keys
+        //     captured during emulation (ransomware detection heuristic).
+        CollectBcryptForensics();
+
+        // 5j: Feed all accumulated signals to ThreatScorer
         FeedThreatScorer();
 
-        // 5i: Feed post-analysis results to MITRE mapper
+        // 5k: Feed post-analysis results to MITRE mapper
         FeedMITREMapper();
     }
 
@@ -1401,7 +1441,57 @@ struct EmulationSession::Impl {
     }
 
     // ========================================================================
-    // 5h: Feed Accumulated Signals to ThreatScorer
+    // 5h: YARA Rule Scanning
+    // ========================================================================
+    // Scan all guest memory with built-in detection rules. Runs after
+    // unpacking so we catch both packed and unpacked payloads.
+
+    void RunYaraScan() noexcept {
+        // Initialize the YARA scanner (loads built-in rules on first call)
+        if (!m_yaraScanner.Initialize()) {
+            return; // Non-fatal — continue analysis without YARA
+        }
+
+        // Scan using built-in rules (always available, no external deps)
+        auto results = m_yaraScanner.ScanWithBuiltinRules(m_memory);
+
+        // Feed YARA matches into the threat scorer and MITRE mapper
+        for (const auto& match : results) {
+            // Each YARA match contributes to the threat score
+            m_threatScorer.AddYaraMatch(match.ruleName, match.score);
+
+            // YARA rule tags often map directly to MITRE techniques
+            for (const auto& tag : match.tags) {
+                m_mitreMapper.OnYaraTag(tag);
+            }
+        }
+    }
+
+    // ========================================================================
+    // 5i: BCrypt Forensic Data Collection
+    // ========================================================================
+    // Collect crypto keys, algorithms, and usage patterns captured by the
+    // BCrypt API emulation layer during execution.
+
+    void CollectBcryptForensics() noexcept {
+        auto& bcryptState = WinAPI::Bcrypt::BCryptState::Instance();
+
+        // Check for ransomware-like crypto patterns:
+        // >= 100 encrypt operations + AES key presence + RSA public key
+        if (bcryptState.IsRansomwareBehavior()) {
+            m_threatScorer.AddCryptoFlag(
+                ThreatScorer::CryptoFlag::RansomwareCryptoPattern);
+
+            // Extract captured keys for potential decryption
+            auto capturedKeys = bcryptState.GetCapturedKeys();
+            for (const auto& key : capturedKeys) {
+                m_cryptoDetector.OnKeyCapture(key.algorithm, key.keyData);
+            }
+        }
+    }
+
+    // ========================================================================
+    // 5j: Feed Accumulated Signals to ThreatScorer
     // ========================================================================
 
     void FeedThreatScorer() noexcept {

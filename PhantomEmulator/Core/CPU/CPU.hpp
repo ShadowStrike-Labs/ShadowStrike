@@ -23,6 +23,9 @@
 
 namespace Phantom {
 
+// Forward declaration — ExceptionDispatcher is owned by EmulationSession
+class ExceptionDispatcher;
+
 // ============================================================================
 // CPU Execution Callbacks
 // ============================================================================
@@ -85,6 +88,11 @@ public:
     void SetSyscallCallback(SyscallCallback cb) noexcept;
     void SetInterruptCallback(InterruptCallback cb) noexcept;
 
+    // Set the optional exception dispatcher for SEH/VEH-aware fault handling.
+    // When set, CPU faults are routed through the dispatcher before stopping.
+    // Ownership remains with the caller (typically EmulationSession).
+    void SetExceptionDispatcher(ExceptionDispatcher* dispatcher) noexcept;
+
     // Add a breakpoint at a guest address
     void AddBreakpoint(GuestAddress addr) noexcept;
     void RemoveBreakpoint(GuestAddress addr) noexcept;
@@ -138,6 +146,9 @@ private:
 
     // Abort flag (cross-thread safe)
     std::atomic<bool> m_abortRequested{ false };
+
+    // Optional SEH/VEH exception dispatcher (non-owning, set by EmulationSession)
+    ExceptionDispatcher* m_exceptionDispatcher = nullptr;
 
     // Instruction fetch buffer (avoid repeated memory reads)
     alignas(16) uint8_t m_fetchBuffer[Encoding::kMaxInstructionLength]{};
