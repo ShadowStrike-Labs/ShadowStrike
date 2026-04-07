@@ -161,6 +161,21 @@ enum class ThermalStatus : uint8_t {
     Critical = 4                   // Thermal emergency
 };
 
+/**
+ * @enum DeviceThreatType
+ * @brief Classification of hardware-based threat vectors.
+ */
+enum class DeviceThreatType : uint8_t {
+    None = 0,
+    BadUSB_KnownSignature = 1,     // Known attack tool VID/PID
+    BadUSB_CompositeHID = 2,       // Suspicious HID+storage composite device
+    DMA_Attack = 3,                // Thunderbolt/FireWire/PCMCIA DMA-capable device
+    FirmwareTamper = 4,            // Firmware version changed unexpectedly
+    UnauthorizedMassStorage = 5,   // USB mass storage policy violation
+    RogueWireless = 6,             // Unauthorized wireless adapter detected
+    SuspiciousDeviceClass = 7      // Device class mismatch or anomaly
+};
+
 // ============================================================================
 // DATA STRUCTURES
 // ============================================================================
@@ -305,6 +320,15 @@ struct alignas(64) HardwareChangeEvent {
     std::chrono::system_clock::time_point timestamp;
     bool isSuspicious{ false };
     std::wstring suspicionReason;
+
+    // Enhanced threat context
+    DeviceThreatType threatType{ DeviceThreatType::None };
+    std::wstring driverName;               // Driver loaded for this device
+    std::wstring driverPath;               // Path to driver binary
+    bool driverSignatureValid{ true };     // Is the driver properly signed?
+    std::wstring firmwareVersion;          // Current firmware version
+    std::wstring previousFirmwareVersion;  // Previous firmware (for change tracking)
+    std::vector<std::wstring> deviceInterfaces; // USB interface class GUIDs
 };
 
 /**
