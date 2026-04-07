@@ -581,14 +581,14 @@ void CertificateValidatorStatistics::Reset() noexcept {
     }
 }
 
-[[nodiscard]] std::string_view GetKeyTypeName(KeyType type) noexcept {
+[[nodiscard]] std::string_view GetKeyTypeName(CertificateKeyType type) noexcept {
     switch (type) {
-        case KeyType::Unknown:  return "Unknown";
-        case KeyType::RSA:      return "RSA";
-        case KeyType::DSA:      return "DSA";
-        case KeyType::ECDSA:    return "ECDSA";
-        case KeyType::ECDH:     return "ECDH";
-        case KeyType::EdDSA:    return "EdDSA";
+        case CertificateKeyType::Unknown:  return "Unknown";
+        case CertificateKeyType::RSA:      return "RSA";
+        case CertificateKeyType::DSA:      return "DSA";
+        case CertificateKeyType::ECDSA:    return "ECDSA";
+        case CertificateKeyType::ECDH:     return "ECDH";
+        case CertificateKeyType::EdDSA:    return "EdDSA";
         default:                return "Unknown";
     }
 }
@@ -1176,7 +1176,7 @@ public:
         }
 
         // Check cache
-        if ((options.flags & ValidationFlags::CacheResult) != ValidationFlags::None) {
+        if ((options.flags & CertificateValidationFlags::CacheResult) != CertificateValidationFlags::None) {
             std::shared_lock lock(m_mutex);
             auto it = m_validationCache.find(certInfo->sha256Fingerprint);
             if (it != m_validationCache.end()) {
@@ -1220,7 +1220,7 @@ public:
         m_stats.UpdateAvgValidationTime(static_cast<uint64_t>(durationUs));
 
         // Cache result and populate serial index for O(1) IsRevoked lookups
-        if ((options.flags & ValidationFlags::CacheResult) != ValidationFlags::None) {
+        if ((options.flags & CertificateValidationFlags::CacheResult) != CertificateValidationFlags::None) {
             std::unique_lock lock(m_mutex);
             if (m_validationCache.size() < CertificateConstants::MAX_CACHED_CERTIFICATES) {
                 m_validationCache[certInfo->sha256Fingerprint] = details;
@@ -1272,7 +1272,7 @@ public:
 
             // Check validity period
             if (cert.validity.IsExpired()) {
-                if ((options.flags & ValidationFlags::IgnoreExpired) == ValidationFlags::None) {
+                if ((options.flags & CertificateValidationFlags::IgnoreExpired) == CertificateValidationFlags::None) {
                     details.result = ValidationResult::Expired;
                     details.errorMessage = "Certificate at index " + std::to_string(i) + " is expired";
                     return details;
@@ -1282,7 +1282,7 @@ public:
             }
 
             if (cert.validity.IsNotYetValid()) {
-                if ((options.flags & ValidationFlags::IgnoreNotYetValid) == ValidationFlags::None) {
+                if ((options.flags & CertificateValidationFlags::IgnoreNotYetValid) == CertificateValidationFlags::None) {
                     details.result = ValidationResult::NotYetValid;
                     details.errorMessage = "Certificate at index " + std::to_string(i) + " is not yet valid";
                     return details;
@@ -1301,7 +1301,7 @@ public:
             // Check weak algorithms
             if (!m_config.allowWeakAlgorithms &&
                 CertificateValidator::IsWeakAlgorithm(cert.signatureAlgorithm)) {
-                if ((options.flags & ValidationFlags::IgnoreWeakAlgorithm) == ValidationFlags::None) {
+                if ((options.flags & CertificateValidationFlags::IgnoreWeakAlgorithm) == CertificateValidationFlags::None) {
                     details.result = ValidationResult::WeakAlgorithm;
                     details.errorMessage = "Certificate uses weak algorithm";
                     return details;
@@ -1316,7 +1316,7 @@ public:
         details.trustLevel = GetTrustLevelInternal(root);
 
         if (details.trustLevel == TrustLevel::Untrusted) {
-            if ((options.flags & ValidationFlags::IgnoreUntrustedRoot) == ValidationFlags::None) {
+            if ((options.flags & CertificateValidationFlags::IgnoreUntrustedRoot) == CertificateValidationFlags::None) {
                 details.result = ValidationResult::UntrustedRoot;
                 details.errorMessage = "Root certificate is not trusted";
                 return details;
@@ -1326,7 +1326,7 @@ public:
         }
 
         // Revocation checking
-        if ((options.flags & ValidationFlags::IgnoreRevocation) == ValidationFlags::None) {
+        if ((options.flags & CertificateValidationFlags::IgnoreRevocation) == CertificateValidationFlags::None) {
             for (size_t i = 0; i < chain.size() - 1; ++i) {
                 auto revStatus = CheckRevocationInternal(chain[i]);
                 if (revStatus == RevocationStatus::Revoked) {
@@ -2068,12 +2068,12 @@ public:
 
     [[nodiscard]] bool IsKeySizeSufficient(const PublicKeyInfo& keyInfo) const {
         switch (keyInfo.type) {
-            case KeyType::RSA:
-            case KeyType::DSA:
+            case CertificateKeyType::RSA:
+            case CertificateKeyType::DSA:
                 return keyInfo.keySizeBits >= m_config.minRSAKeySize;
-            case KeyType::ECDSA:
-            case KeyType::ECDH:
-            case KeyType::EdDSA:
+            case CertificateKeyType::ECDSA:
+            case CertificateKeyType::ECDH:
+            case CertificateKeyType::EdDSA:
                 return keyInfo.keySizeBits >= m_config.minECCKeySize;
             default:
                 return true;
@@ -2354,15 +2354,15 @@ private:
 
         // Determine key type from OID
         if (keyInfo.algorithmOID.find("1.2.840.113549.1.1") == 0) {
-            keyInfo.type = KeyType::RSA;
+            keyInfo.type = CertificateKeyType::RSA;
         } else if (keyInfo.algorithmOID.find("1.2.840.10045") == 0) {
-            keyInfo.type = KeyType::ECDSA;
+            keyInfo.type = CertificateKeyType::ECDSA;
         } else if (keyInfo.algorithmOID.find("1.2.840.10040.4.1") == 0) {
-            keyInfo.type = KeyType::DSA;
+            keyInfo.type = CertificateKeyType::DSA;
         } else if (keyInfo.algorithmOID.find("1.3.101.112") == 0) {
-            keyInfo.type = KeyType::EdDSA;  // Ed25519
+            keyInfo.type = CertificateKeyType::EdDSA;  // Ed25519
         } else if (keyInfo.algorithmOID.find("1.3.101.113") == 0) {
-            keyInfo.type = KeyType::EdDSA;  // Ed448
+            keyInfo.type = CertificateKeyType::EdDSA;  // Ed448
         }
 
         // Use CertGetPublicKeyLength for accurate key size in bits
@@ -2373,7 +2373,7 @@ private:
             keyInfo.keySizeBits = keyBitLen;
         } else {
             // Fallback estimate for key types not handled by CertGetPublicKeyLength
-            if (keyInfo.type == KeyType::ECDSA && pKeyInfo->PublicKey.cbData > 0) {
+            if (keyInfo.type == CertificateKeyType::ECDSA && pKeyInfo->PublicKey.cbData > 0) {
                 // Uncompressed EC point: 0x04 || x || y, key size = (cbData - 1) * 8 / 2
                 keyInfo.keySizeBits = ((pKeyInfo->PublicKey.cbData - 1) * 8) / 2;
             }
@@ -2647,7 +2647,7 @@ private:
 
         // Check validity period
         if (certInfo.validity.IsExpired()) {
-            if ((options.flags & ValidationFlags::IgnoreExpired) == ValidationFlags::None) {
+            if ((options.flags & CertificateValidationFlags::IgnoreExpired) == CertificateValidationFlags::None) {
                 details.result = ValidationResult::Expired;
                 details.errorMessage = "Certificate has expired";
                 return details;
@@ -2657,7 +2657,7 @@ private:
         }
 
         if (certInfo.validity.IsNotYetValid()) {
-            if ((options.flags & ValidationFlags::IgnoreNotYetValid) == ValidationFlags::None) {
+            if ((options.flags & CertificateValidationFlags::IgnoreNotYetValid) == CertificateValidationFlags::None) {
                 details.result = ValidationResult::NotYetValid;
                 details.errorMessage = "Certificate is not yet valid";
                 return details;
@@ -2669,7 +2669,7 @@ private:
         // Check weak algorithms
         if (!m_config.allowWeakAlgorithms &&
             CertificateValidator::IsWeakAlgorithm(certInfo.signatureAlgorithm)) {
-            if ((options.flags & ValidationFlags::IgnoreWeakAlgorithm) == ValidationFlags::None) {
+            if ((options.flags & CertificateValidationFlags::IgnoreWeakAlgorithm) == CertificateValidationFlags::None) {
                 details.result = ValidationResult::WeakAlgorithm;
                 details.errorMessage = "Certificate uses weak signature algorithm";
                 return details;
@@ -2781,7 +2781,7 @@ private:
     }
 
     [[nodiscard]] RevocationStatus CheckRevocationInternal(const CertificateInfo& cert) {
-        if ((m_config.defaultFlags & ValidationFlags::IgnoreRevocation) != ValidationFlags::None) {
+        if ((m_config.defaultFlags & CertificateValidationFlags::IgnoreRevocation) != CertificateValidationFlags::None) {
             return RevocationStatus::Unknown;
         }
 
@@ -3291,7 +3291,7 @@ void CertificateValidator::OnKernelImageLoad(
         // Use CacheResult flag so repeat loads resolve from in-memory cache.
         // VerifyFile reads the Authenticode signature and checks the cache internally.
         ValidationOptions opts;
-        opts.flags = opts.flags | ValidationFlags::CacheResult;
+        opts.flags = opts.flags | CertificateValidationFlags::CacheResult;
         auto details = m_impl->VerifyFile(path, opts);
 
         // For revoked / untrusted certs, block synchronously BEFORE returning to kernel
@@ -3342,7 +3342,7 @@ void CertificateValidator::OnKernelProcessCreate(
         if (path.empty()) return;
 
         ValidationOptions opts;
-        opts.flags = opts.flags | ValidationFlags::CacheResult;
+        opts.flags = opts.flags | CertificateValidationFlags::CacheResult;
         auto details = m_impl->VerifyFile(path, opts);
 
         // Synchronous block for revoked certs — must happen before kernel returns

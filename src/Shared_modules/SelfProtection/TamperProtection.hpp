@@ -169,6 +169,7 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
+#include "SecurityEnums.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/ProcessUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
@@ -487,21 +488,7 @@ enum class TamperSubsystem : uint8_t {
     SelfDefense         = 8
 };
 
-#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-// ModuleStatus: canonical definition lives in SecurityEnums.hpp.
-// Kept here with preprocessor guard for backward compatibility.
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,    ///< Running with reduced functionality
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 /**
  * @brief Verification method
@@ -875,7 +862,7 @@ using RepairCallback = std::function<void(const RepairResult&)>;
 using SubsystemStatusCallback = std::function<void(TamperSubsystem, ModuleStatus)>;
 
 /// @brief Custom response handler (can override default response)
-using ResponseHandler = std::function<TamperResponse(const TamperEvent&)>;
+using TamperResponseHandler = std::function<TamperResponse(const TamperEvent&)>;
 
 // ============================================================================
 // TAMPER PROTECTION ENGINE CLASS
@@ -1339,7 +1326,7 @@ public:
     /**
      * @brief Set custom response handler
      */
-    void SetResponseHandler(ResponseHandler handler);
+    void SetResponseHandler(TamperResponseHandler handler);
     
     // ========================================================================
     // STATISTICS AND REPORTING

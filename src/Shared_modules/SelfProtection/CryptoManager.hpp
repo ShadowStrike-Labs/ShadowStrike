@@ -148,6 +148,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/CryptoUtils.hpp"
 #include "../Utils/HashUtils.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -434,19 +435,8 @@ enum class CryptoResult : uint8_t {
     InternalError       = 255
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is owned centrally by SecurityEnums.hpp to keep shared
+// self-protection state enums canonical across headers.
 
 // ============================================================================
 // STRUCTURES

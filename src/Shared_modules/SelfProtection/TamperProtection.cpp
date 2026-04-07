@@ -46,6 +46,7 @@
 #include <Psapi.h>
 #include <TlHelp32.h>
 #include <AclAPI.h>
+#include <ShlObj.h>
 #include <winternl.h>  // PROCESS_BASIC_INFORMATION for parent chain validation
 
 // ============================================================================
@@ -89,10 +90,12 @@ namespace {
 // Format time point to ISO 8601 — converts steady_clock delta to wall-clock time
 [[nodiscard]] std::string FormatTimePoint(const TimePoint& tp) {
     // Convert steady_clock offset to system_clock by computing the delta from now
-    auto steadyNow = std::chrono::steady_clock::now();
-    auto sysNow = std::chrono::system_clock::now();
-    auto delta = tp - steadyNow;
-    auto sysTime = sysNow + delta;
+    const auto steadyNow = std::chrono::steady_clock::now();
+    const auto sysNow = std::chrono::system_clock::now();
+    const auto delta = tp - steadyNow;
+    const auto sysDelta =
+        std::chrono::duration_cast<std::chrono::system_clock::duration>(delta);
+    const auto sysTime = sysNow + sysDelta;
 
     auto time_t_val = std::chrono::system_clock::to_time_t(sysTime);
     std::tm tm_val{};
@@ -1288,7 +1291,7 @@ public:
         // Compute current memory hash
         HANDLE hProcess = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
         if (!hProcess) {
-            result.status = IntegrityStatus::Error;
+            result.status = IntegrityStatus::Unknown;
             result.errorMessage = "Cannot open process for memory verification";
             return result;
         }
@@ -1329,7 +1332,7 @@ public:
         CloseHandle(hProcess);
 
         if (!hashOk) {
-            result.status = IntegrityStatus::Error;
+            result.status = IntegrityStatus::Corrupted;
             result.errorMessage = "Failed to compute memory hash";
             return result;
         }
@@ -1754,7 +1757,7 @@ public:
         m_statusCallbacks.push_back(std::move(callback));
     }
 
-    void SetResponseHandler(ResponseHandler handler) {
+    void SetResponseHandler(TamperResponseHandler handler) {
         std::unique_lock lock(m_mutex);
         m_responseHandler = std::move(handler);
     }
@@ -1805,7 +1808,7 @@ public:
     [[nodiscard]] std::vector<TamperEvent> GetEventHistory(size_t maxCount) const {
         std::shared_lock lock(m_mutex);
         std::vector<TamperEvent> result;
-        size_t count = std::min(maxCount, m_eventHistory.size());
+        const size_t count = (std::min)(maxCount, static_cast<size_t>(m_eventHistory.size()));
         result.reserve(count);
 
         auto it = m_eventHistory.rbegin();
@@ -1919,7 +1922,8 @@ public:
             auto moduleBase = reinterpret_cast<uintptr_t>(hMod);
             auto moduleEnd = moduleBase + ntHeaders->OptionalHeader.SizeOfImage;
 
-            uint32_t numFunctions = std::min(exportTable->NumberOfFunctions, 4096u);
+            const uint32_t numFunctions =
+                (std::min)(static_cast<uint32_t>(exportTable->NumberOfFunctions), 4096u);
             for (uint32_t i = 0; i < numFunctions; ++i) {
                 if (functions[i] == 0) continue;
 
@@ -2112,28 +2116,32 @@ public:
 
                     // Check for SeDebugPrivilege — EDR critical privilege
                     LUID debugLuid{};
-                    LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &debugLuid);
-
-                    bool hasDebug = false;
-                    for (DWORD i = 0; i < privileges->PrivilegeCount; ++i) {
-                        if (privileges->Privileges[i].Luid.LowPart == debugLuid.LowPart &&
-                            privileges->Privileges[i].Luid.HighPart == debugLuid.HighPart) {
-                            hasDebug = true;
-                            if (!(privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)) {
-                                SS_LOG_WARN(LOG_CATEGORY,
-                                    L"APT HANDLE STRIP: SeDebugPrivilege present but disabled — "
-                                    L"possible privilege degradation");
-                                strippedCount++;
+                    if (!::LookupPrivilegeValueW(nullptr, L"SeDebugPrivilege", &debugLuid)) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"APT HANDLE STRIP: LookupPrivilegeValueW failed for "
+                            L"SeDebugPrivilege");
+                    } else {
+                        bool hasDebug = false;
+                        for (DWORD i = 0; i < privileges->PrivilegeCount; ++i) {
+                            if (privileges->Privileges[i].Luid.LowPart == debugLuid.LowPart &&
+                                privileges->Privileges[i].Luid.HighPart == debugLuid.HighPart) {
+                                hasDebug = true;
+                                if (!(privileges->Privileges[i].Attributes & SE_PRIVILEGE_ENABLED)) {
+                                    SS_LOG_WARN(LOG_CATEGORY,
+                                        L"APT HANDLE STRIP: SeDebugPrivilege present but disabled — "
+                                        L"possible privilege degradation");
+                                    strippedCount++;
+                                }
+                                break;
                             }
-                            break;
                         }
-                    }
 
-                    if (!hasDebug) {
-                        SS_LOG_ERROR(LOG_CATEGORY,
-                            L"APT HANDLE STRIP: SeDebugPrivilege MISSING from token — "
-                            L"privilege stripped");
-                        strippedCount++;
+                        if (!hasDebug) {
+                            SS_LOG_ERROR(LOG_CATEGORY,
+                                L"APT HANDLE STRIP: SeDebugPrivilege MISSING from token — "
+                                L"privilege stripped");
+                            strippedCount++;
+                        }
                     }
                 }
             }
@@ -2186,7 +2194,7 @@ public:
         uint32_t hooks = ScanForInlineHooks();
         if (hooks > 0) {
             allClean = false;
-            RecordAPTEvent(TamperEventType::ProcessTampering, 10,
+            RecordAPTEvent(TamperEventType::ProcessHooked, 10,
                 L"APT inline hooks detected",
                 "IAT/EAT integrity compromised: " + std::to_string(hooks) + " hooks found");
         }
@@ -2194,7 +2202,7 @@ public:
         // Phase 2: Parent process validation
         if (!ValidateParentProcessChain()) {
             allClean = false;
-            RecordAPTEvent(TamperEventType::ProcessTampering, 8,
+            RecordAPTEvent(TamperEventType::ProcessCodeModified, 8,
                 L"APT parent chain anomaly",
                 "Agent parent process chain is invalid — possible injection or re-parenting");
         }
@@ -2203,7 +2211,7 @@ public:
         uint32_t stripped = DetectHandleStripping();
         if (stripped > 0) {
             allClean = false;
-            RecordAPTEvent(TamperEventType::ProcessTampering, 10,
+            RecordAPTEvent(TamperEventType::ProcessCodeModified, 10,
                 L"APT handle stripping detected",
                 "Handle/privilege degradation: " + std::to_string(stripped) + " indicators");
         }
@@ -2521,14 +2529,16 @@ private:
         // Determine response
         TamperResponse response = GetEventResponse(eventType);
         event.responseTaken = response;
+        const auto responseFlags = static_cast<uint32_t>(response);
 
         // Execute response
-        if ((response & TamperResponse::Block) != TamperResponse::None) {
+        if ((responseFlags & static_cast<uint32_t>(TamperResponse::Block)) != 0u) {
             event.wasBlocked = true;
             m_stats.totalTamperingBlocked.fetch_add(1, std::memory_order_relaxed);
         }
 
-        if ((response & TamperResponse::Repair) != TamperResponse::None && m_config.enableAutoRepair) {
+        if ((responseFlags & static_cast<uint32_t>(TamperResponse::Repair)) != 0u &&
+            m_config.enableAutoRepair) {
             // Attempt repair
             std::shared_lock lock(m_mutex);
             auto it = m_protectedFiles.find(resourcePath);
@@ -2750,7 +2760,7 @@ private:
     std::vector<VerificationCallback> m_verificationCallbacks;
     std::vector<RepairCallback> m_repairCallbacks;
     std::vector<SubsystemStatusCallback> m_statusCallbacks;
-    ResponseHandler m_responseHandler;
+    TamperResponseHandler m_responseHandler;
 
     // Monitor thread
     std::atomic<bool> m_monitorRunning{false};
@@ -3056,7 +3066,7 @@ void TamperProtection::RegisterStatusCallback(SubsystemStatusCallback callback) 
     m_impl->RegisterStatusCallback(std::move(callback));
 }
 
-void TamperProtection::SetResponseHandler(ResponseHandler handler) {
+void TamperProtection::SetResponseHandler(TamperResponseHandler handler) {
     m_impl->SetResponseHandler(std::move(handler));
 }
 

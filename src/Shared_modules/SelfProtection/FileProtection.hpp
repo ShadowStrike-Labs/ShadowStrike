@@ -170,6 +170,7 @@
 #include "../Utils/CertUtils.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 #include "../HashStore/HashStore.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -335,7 +336,7 @@ enum class ProtectionType : uint8_t {
 /**
  * @brief Integrity status
  */
-enum class IntegrityStatus : uint8_t {
+enum class FileIntegrityStatus : uint8_t {
     Unknown     = 0,
     Valid       = 1,
     Modified    = 2,
@@ -362,7 +363,7 @@ enum class SignatureStatus : uint8_t {
 /**
  * @brief File operation decision
  */
-enum class OperationDecision : uint8_t {
+enum class FileOperationDecision : uint8_t {
     Allow       = 0,
     Block       = 1,
     AllowLogged = 2,    ///< Allow but log
@@ -372,7 +373,7 @@ enum class OperationDecision : uint8_t {
 /**
  * @brief Protection event type
  */
-enum class ProtectionEventType : uint32_t {
+enum class FileProtectionEventType : uint32_t {
     None                    = 0x00000000,
     OperationBlocked        = 0x00000001,
     OperationAllowed        = 0x00000002,
@@ -391,14 +392,14 @@ enum class ProtectionEventType : uint32_t {
     All                     = 0xFFFFFFFF
 };
 
-inline constexpr ProtectionEventType operator|(ProtectionEventType a, ProtectionEventType b) noexcept {
-    return static_cast<ProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr FileProtectionEventType operator|(FileProtectionEventType a, FileProtectionEventType b) noexcept {
+    return static_cast<FileProtectionEventType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
 /**
  * @brief Protection response
  */
-enum class ProtectionResponse : uint32_t {
+enum class FileProtectionResponse : uint32_t {
     None            = 0x00000000,
     Log             = 0x00000001,
     Alert           = 0x00000002,
@@ -414,23 +415,10 @@ enum class ProtectionResponse : uint32_t {
     Aggressive      = Log | Alert | Block | Backup | TerminateSource
 };
 
-inline constexpr ProtectionResponse operator|(ProtectionResponse a, ProtectionResponse b) noexcept {
-    return static_cast<ProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr FileProtectionResponse operator|(FileProtectionResponse a, FileProtectionResponse b) noexcept {
+    return static_cast<FileProtectionResponse>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -471,7 +459,7 @@ struct FileProtectionConfiguration {
     bool enableRealTimeMonitoring = true;
     
     /// @brief Default protection response
-    ProtectionResponse defaultResponse = ProtectionResponse::Active;
+    FileProtectionResponse defaultResponse = FileProtectionResponse::Active;
     
     /// @brief Protected directories
     std::vector<std::wstring> protectedDirectories;
@@ -528,7 +516,7 @@ struct ProtectedFile {
     Hash256 currentHash{};
     
     /// @brief Integrity status
-    IntegrityStatus integrity = IntegrityStatus::Unknown;
+    FileIntegrityStatus integrity = FileIntegrityStatus::Unknown;
     
     /// @brief Signature status
     SignatureStatus signature = SignatureStatus::Unknown;
@@ -646,9 +634,9 @@ struct FileOperationRequest {
 /**
  * @brief Operation decision result
  */
-struct OperationDecisionResult {
+struct FileOperationDecisionResult {
     /// @brief Decision
-    OperationDecision decision = OperationDecision::Allow;
+    FileOperationDecision decision = FileOperationDecision::Allow;
     
     /// @brief Reason for decision
     std::string reason;
@@ -671,7 +659,7 @@ struct FileProtectionEvent {
     uint64_t eventId = 0;
     
     /// @brief Event type
-    ProtectionEventType type = ProtectionEventType::None;
+    FileProtectionEventType type = FileProtectionEventType::None;
     
     /// @brief Event timestamp
     TimePoint timestamp = Clock::now();
@@ -686,7 +674,7 @@ struct FileProtectionEvent {
     FileOperation operation = FileOperation::None;
     
     /// @brief Operation decision
-    OperationDecision decision = OperationDecision::Allow;
+    FileOperationDecision decision = FileOperationDecision::Allow;
     
     /// @brief Source process ID
     uint32_t sourceProcessId = 0;
@@ -698,7 +686,7 @@ struct FileProtectionEvent {
     std::wstring sourceProcessPath;
     
     /// @brief Response taken
-    ProtectionResponse responseTaken = ProtectionResponse::None;
+    FileProtectionResponse responseTaken = FileProtectionResponse::None;
     
     /// @brief Was blocked
     bool wasBlocked = false;
@@ -802,7 +790,7 @@ struct RansomwareDetection {
     uint32_t confidence = 0;
     
     /// @brief Response taken
-    ProtectionResponse responseTaken = ProtectionResponse::None;
+    FileProtectionResponse responseTaken = FileProtectionResponse::None;
 };
 
 /**
@@ -838,14 +826,14 @@ struct FileProtectionStatistics {
 using FileProtectionEventCallback = std::function<void(const FileProtectionEvent&)>;
 
 /// @brief Callback for operation decisions (can override)
-using OperationDecisionCallback = std::function<std::optional<OperationDecisionResult>(
+using FileOperationDecisionCallback = std::function<std::optional<FileOperationDecisionResult>(
     const FileOperationRequest&)>;
 
 /// @brief Callback for ransomware detection
 using RansomwareCallback = std::function<void(const RansomwareDetection&)>;
 
 /// @brief Callback for integrity violations
-using IntegrityCallback = std::function<void(const ProtectedFile&)>;
+using FileIntegrityCallback = std::function<void(const ProtectedFile&)>;
 
 // ============================================================================
 // FILE PROTECTION ENGINE CLASS
@@ -1054,12 +1042,12 @@ public:
     /**
      * @brief Filter file operation request
      */
-    [[nodiscard]] OperationDecisionResult FilterOperation(const FileOperationRequest& request);
+    [[nodiscard]] FileOperationDecisionResult FilterOperation(const FileOperationRequest& request);
     
     /**
      * @brief Set custom decision callback
      */
-    void SetDecisionCallback(OperationDecisionCallback callback);
+    void SetDecisionCallback(FileOperationDecisionCallback callback);
     
     /**
      * @brief Clear custom decision callback
@@ -1097,12 +1085,12 @@ public:
     /**
      * @brief Verify file integrity
      */
-    [[nodiscard]] IntegrityStatus VerifyFileIntegrity(std::wstring_view path);
+    [[nodiscard]] FileIntegrityStatus VerifyFileIntegrity(std::wstring_view path);
     
     /**
      * @brief Verify all protected files
      */
-    [[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>> VerifyAllIntegrity();
+    [[nodiscard]] std::vector<std::pair<std::wstring, FileIntegrityStatus>> VerifyAllIntegrity();
     
     /**
      * @brief Update file baseline
@@ -1231,7 +1219,7 @@ public:
     /**
      * @brief Register integrity callback
      */
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(FileIntegrityCallback callback);
     
     /**
      * @brief Unregister integrity callback
@@ -1366,7 +1354,7 @@ private:
 /**
  * @brief Get integrity status name
  */
-[[nodiscard]] std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept;
+[[nodiscard]] std::string_view GetIntegrityStatusName(FileIntegrityStatus status) noexcept;
 
 /**
  * @brief Get signature status name

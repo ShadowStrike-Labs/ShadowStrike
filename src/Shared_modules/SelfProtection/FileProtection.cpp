@@ -144,15 +144,15 @@ static std::string JsonEscape(std::string_view input) {
     }
 }
 
-[[nodiscard]] std::string_view GetIntegrityStatusName(IntegrityStatus status) noexcept {
+[[nodiscard]] std::string_view GetIntegrityStatusName(FileIntegrityStatus status) noexcept {
     switch (status) {
-        case IntegrityStatus::Unknown:   return "Unknown";
-        case IntegrityStatus::Valid:     return "Valid";
-        case IntegrityStatus::Modified:  return "Modified";
-        case IntegrityStatus::Missing:   return "Missing";
-        case IntegrityStatus::Corrupted: return "Corrupted";
-        case IntegrityStatus::New:       return "New";
-        case IntegrityStatus::Restored:  return "Restored";
+        case FileIntegrityStatus::Unknown:   return "Unknown";
+        case FileIntegrityStatus::Valid:     return "Valid";
+        case FileIntegrityStatus::Modified:  return "Modified";
+        case FileIntegrityStatus::Missing:   return "Missing";
+        case FileIntegrityStatus::Corrupted: return "Corrupted";
+        case FileIntegrityStatus::New:       return "New";
+        case FileIntegrityStatus::Restored:  return "Restored";
         default:                         return "Unknown";
     }
 }
@@ -224,7 +224,7 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
             config.enableAutoBackup = false;
             config.enableRansomwareProtection = false;
             config.enableRealTimeMonitoring = false;
-            config.defaultResponse = ProtectionResponse::None;
+            config.defaultResponse = FileProtectionResponse::None;
             break;
 
         case FileProtectionMode::Monitor:
@@ -234,7 +234,7 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
             config.enableAutoBackup = false;
             config.enableRansomwareProtection = true;
             config.enableRealTimeMonitoring = true;
-            config.defaultResponse = ProtectionResponse::Passive;
+            config.defaultResponse = FileProtectionResponse::Passive;
             break;
 
         case FileProtectionMode::Protect:
@@ -244,7 +244,7 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
             config.enableAutoBackup = true;
             config.enableRansomwareProtection = true;
             config.enableRealTimeMonitoring = true;
-            config.defaultResponse = ProtectionResponse::Active;
+            config.defaultResponse = FileProtectionResponse::Active;
             break;
 
         case FileProtectionMode::Strict:
@@ -255,7 +255,7 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
             config.enableAutoBackup = true;
             config.enableRansomwareProtection = true;
             config.enableRealTimeMonitoring = true;
-            config.defaultResponse = ProtectionResponse::Aggressive;
+            config.defaultResponse = FileProtectionResponse::Aggressive;
             break;
     }
 
@@ -267,13 +267,13 @@ FileProtectionConfiguration FileProtectionConfiguration::FromMode(FileProtection
     oss << "Event[" << eventId << "]: ";
 
     switch (type) {
-        case ProtectionEventType::OperationBlocked:
+        case FileProtectionEventType::OperationBlocked:
             oss << "Blocked " << GetFileOperationName(operation) << " on ";
             break;
-        case ProtectionEventType::IntegrityViolation:
+        case FileProtectionEventType::IntegrityViolation:
             oss << "Integrity violation on ";
             break;
-        case ProtectionEventType::RansomwareDetected:
+        case FileProtectionEventType::RansomwareDetected:
             oss << "Ransomware detected targeting ";
             break;
         default:
@@ -382,8 +382,8 @@ public:
 
     // Operation filtering
     [[nodiscard]] bool IsOperationAllowed(const std::wstring& path, uint32_t desiredAccess);
-    [[nodiscard]] OperationDecisionResult FilterOperation(const FileOperationRequest& request);
-    void SetDecisionCallback(OperationDecisionCallback callback);
+    [[nodiscard]] FileOperationDecisionResult FilterOperation(const FileOperationRequest& request);
+    void SetDecisionCallback(FileOperationDecisionCallback callback);
     void ClearDecisionCallback();
 
     // Signature validation
@@ -393,8 +393,8 @@ public:
     [[nodiscard]] bool VerifyFileCatalog(std::wstring_view path);
 
     // Integrity management
-    [[nodiscard]] IntegrityStatus VerifyFileIntegrity(std::wstring_view path);
-    [[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>> VerifyAllIntegrity();
+    [[nodiscard]] FileIntegrityStatus VerifyFileIntegrity(std::wstring_view path);
+    [[nodiscard]] std::vector<std::pair<std::wstring, FileIntegrityStatus>> VerifyAllIntegrity();
     [[nodiscard]] bool UpdateFileBaseline(std::wstring_view path,
                                           std::string_view authorizationToken);
     void ForceIntegrityCheck();
@@ -427,7 +427,7 @@ public:
     // Callbacks
     [[nodiscard]] uint64_t RegisterEventCallback(FileProtectionEventCallback callback);
     void UnregisterEventCallback(uint64_t callbackId);
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback);
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(FileIntegrityCallback callback);
     void UnregisterIntegrityCallback(uint64_t callbackId);
 
     // Statistics
@@ -583,8 +583,8 @@ private:
 
     // Callbacks
     std::unordered_map<uint64_t, FileProtectionEventCallback> m_eventCallbacks;
-    std::unordered_map<uint64_t, IntegrityCallback> m_integrityCallbacks;
-    OperationDecisionCallback m_decisionCallback;
+    std::unordered_map<uint64_t, FileIntegrityCallback> m_integrityCallbacks;
+    FileOperationDecisionCallback m_decisionCallback;
     RansomwareCallback m_ransomwareCallback;
     std::atomic<uint64_t> m_nextCallbackId{1};
 
@@ -1085,7 +1085,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     protFile.fileSize = fileSize;
     protFile.expectedHash = hash;
     protFile.currentHash = hash;
-    protFile.integrity = IntegrityStatus::Valid;
+    protFile.integrity = FileIntegrityStatus::Valid;
     protFile.lastVerified = Clock::now();
     protFile.signature = sig;
     protFile.isShadowStrikeFile = (sig == SignatureStatus::ShadowStrike);
@@ -1235,15 +1235,15 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     request.timestamp = Clock::now();
 
     auto result = FilterOperation(request);
-    return (result.decision == OperationDecision::Allow ||
-            result.decision == OperationDecision::AllowLogged);
+    return (result.decision == FileOperationDecision::Allow ||
+            result.decision == FileOperationDecision::AllowLogged);
 }
 
-[[nodiscard]] OperationDecisionResult FileProtectionImpl::FilterOperation(
+[[nodiscard]] FileOperationDecisionResult FileProtectionImpl::FilterOperation(
     const FileOperationRequest& request) {
 
-    OperationDecisionResult result;
-    result.decision = OperationDecision::Allow;
+    FileOperationDecisionResult result;
+    result.decision = FileOperationDecision::Allow;
     m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
 
     std::wstring normalizedPath = NormalizePath(request.filePath);
@@ -1251,7 +1251,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     // Snapshot all shared state under a single lock acquisition to avoid
     // multiple lock cycles and data-race on m_config / m_decisionCallback.
     FileProtectionMode currentMode;
-    OperationDecisionCallback callbackCopy;
+    FileOperationDecisionCallback callbackCopy;
     bool isWhitelisted = false;
     bool isProtected = false;
     FileOperation blockedOps = FileOperation::None;
@@ -1333,11 +1333,11 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     // Check if operation is blocked
     if (IsOperationBlocked(request.operation, blockedOps)) {
         if (currentMode == FileProtectionMode::Monitor) {
-            result.decision = OperationDecision::AllowLogged;
+            result.decision = FileOperationDecision::AllowLogged;
             result.shouldLog = true;
             result.reason = "Operation logged (monitor mode)";
         } else {
-            result.decision = OperationDecision::Block;
+            result.decision = FileOperationDecision::Block;
             result.shouldLog = true;
             result.shouldAlert = true;
             result.reason = "Protected file operation blocked";
@@ -1347,11 +1347,11 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
             // Record event
             FileProtectionEvent event;
             event.eventId = m_nextEventId++;
-            event.type = ProtectionEventType::OperationBlocked;
+            event.type = FileProtectionEventType::OperationBlocked;
             event.timestamp = Clock::now();
             event.filePath = normalizedPath;
             event.operation = request.operation;
-            event.decision = OperationDecision::Block;
+            event.decision = FileOperationDecision::Block;
             event.sourceProcessId = request.processId;
             event.sourceProcessName = request.processName;
             event.sourceProcessPath = request.processPath;
@@ -1371,7 +1371,7 @@ void FileProtectionImpl::ProtectDirectory(const std::wstring& path) {
     return result;
 }
 
-void FileProtectionImpl::SetDecisionCallback(OperationDecisionCallback callback) {
+void FileProtectionImpl::SetDecisionCallback(FileOperationDecisionCallback callback) {
     std::unique_lock lock(m_mutex);
     m_decisionCallback = std::move(callback);
 }
@@ -1501,7 +1501,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
 #endif
 }
 
-[[nodiscard]] IntegrityStatus FileProtectionImpl::VerifyFileIntegrity(std::wstring_view path) {
+[[nodiscard]] FileIntegrityStatus FileProtectionImpl::VerifyFileIntegrity(std::wstring_view path) {
     std::wstring normalizedPath = NormalizePath(path);
 
     m_stats.totalIntegrityChecks.fetch_add(1, std::memory_order_relaxed);
@@ -1509,7 +1509,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
     // Check if file exists
     Utils::FileUtils::Error fileErr;
     if (!Utils::FileUtils::Exists(normalizedPath, &fileErr)) {
-        return IntegrityStatus::Missing;
+        return FileIntegrityStatus::Missing;
     }
 
     // Copy expected hash under lock; iterator is invalid after unlock
@@ -1525,14 +1525,14 @@ void FileProtectionImpl::ClearDecisionCallback() {
     }
 
     if (!found) {
-        return IntegrityStatus::Unknown;
+        return FileIntegrityStatus::Unknown;
     }
 
     // Compute current hash (I/O-heavy — done outside lock)
     Hash256 currentHash = ComputeFileHash(normalizedPath);
 
     if (currentHash == expectedHash) {
-        return IntegrityStatus::Valid;
+        return FileIntegrityStatus::Valid;
     }
 
     m_stats.integrityViolations.fetch_add(1, std::memory_order_relaxed);
@@ -1540,7 +1540,7 @@ void FileProtectionImpl::ClearDecisionCallback() {
     // Create and record event
     FileProtectionEvent event;
     event.eventId = m_nextEventId++;
-    event.type = ProtectionEventType::IntegrityViolation;
+    event.type = FileProtectionEventType::IntegrityViolation;
     event.timestamp = Clock::now();
     event.filePath = normalizedPath;
     event.previousHash = expectedHash;
@@ -1559,13 +1559,13 @@ void FileProtectionImpl::ClearDecisionCallback() {
         }
     }
 
-    return IntegrityStatus::Modified;
+    return FileIntegrityStatus::Modified;
 }
 
-[[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>>
+[[nodiscard]] std::vector<std::pair<std::wstring, FileIntegrityStatus>>
 FileProtectionImpl::VerifyAllIntegrity() {
 
-    std::vector<std::pair<std::wstring, IntegrityStatus>> results;
+    std::vector<std::pair<std::wstring, FileIntegrityStatus>> results;
 
     std::shared_lock lock(m_mutex);
     std::vector<std::wstring> paths;
@@ -1575,7 +1575,7 @@ FileProtectionImpl::VerifyAllIntegrity() {
     lock.unlock();
 
     for (const auto& path : paths) {
-        IntegrityStatus status = VerifyFileIntegrity(path);
+        FileIntegrityStatus status = VerifyFileIntegrity(path);
         results.emplace_back(path, status);
     }
 
@@ -1603,7 +1603,7 @@ FileProtectionImpl::VerifyAllIntegrity() {
 
     it->second.expectedHash = newHash;
     it->second.currentHash = newHash;
-    it->second.integrity = IntegrityStatus::Valid;
+    it->second.integrity = FileIntegrityStatus::Valid;
     it->second.lastVerified = Clock::now();
 
     SS_LOG_INFO(L"FileProtection", L"Updated baseline for: %ls", normalizedPath.c_str());
@@ -1616,7 +1616,7 @@ void FileProtectionImpl::ForceIntegrityCheck() {
     auto results = VerifyAllIntegrity();
 
     for (const auto& [path, status] : results) {
-        if (status == IntegrityStatus::Modified || status == IntegrityStatus::Missing) {
+        if (status == FileIntegrityStatus::Modified || status == FileIntegrityStatus::Missing) {
             SS_LOG_WARN(L"FileProtection", L"Integrity issue: %ls - %hs",
                         path.c_str(),
                         std::string(GetIntegrityStatusName(status)).c_str());
@@ -1747,14 +1747,14 @@ void FileProtectionImpl::ForceIntegrityCheck() {
         if (fileIt != m_protectedFiles.end()) {
             fileIt->second.currentHash = backupToRestore->originalHash;
             fileIt->second.expectedHash = backupToRestore->originalHash;
-            fileIt->second.integrity = IntegrityStatus::Restored;
+            fileIt->second.integrity = FileIntegrityStatus::Restored;
             fileIt->second.lastVerified = Clock::now();
         }
 
         // Record event
         FileProtectionEvent event;
         event.eventId = m_nextEventId++;
-        event.type = ProtectionEventType::FileRestored;
+        event.type = FileProtectionEventType::FileRestored;
         event.timestamp = Clock::now();
         event.filePath = normalizedPath;
         event.wasRestored = true;
@@ -1977,7 +1977,7 @@ void FileProtectionImpl::UnregisterEventCallback(uint64_t callbackId) {
     m_eventCallbacks.erase(callbackId);
 }
 
-[[nodiscard]] uint64_t FileProtectionImpl::RegisterIntegrityCallback(IntegrityCallback callback) {
+[[nodiscard]] uint64_t FileProtectionImpl::RegisterIntegrityCallback(FileIntegrityCallback callback) {
     std::unique_lock lock(m_mutex);
     uint64_t callbackId = m_nextCallbackId++;
     m_integrityCallbacks[callbackId] = std::move(callback);
@@ -2766,12 +2766,12 @@ void FileProtectionImpl::OnKernelBlockEventInternal(const void* data, uint32_t s
     // Record the event
     FileProtectionEvent event;
     event.eventId = m_nextEventId.fetch_add(1);
-    event.type = ProtectionEventType::OperationBlocked;
+    event.type = FileProtectionEventType::OperationBlocked;
     event.timestamp = Clock::now();
     event.filePath = filePath;
     event.operation = static_cast<FileOperation>(operation);
     event.sourceProcessId = processId;
-    event.decision = OperationDecision::Block;
+    event.decision = FileOperationDecision::Block;
     event.wasBlocked = true;
     event.description = "Blocked by kernel file protection driver";
 
@@ -2921,12 +2921,12 @@ void FileProtection::ProtectDirectory(const std::wstring& path) {
     return m_impl->IsOperationAllowed(path, desiredAccess);
 }
 
-[[nodiscard]] OperationDecisionResult FileProtection::FilterOperation(
+[[nodiscard]] FileOperationDecisionResult FileProtection::FilterOperation(
     const FileOperationRequest& request) {
     return m_impl->FilterOperation(request);
 }
 
-void FileProtection::SetDecisionCallback(OperationDecisionCallback callback) {
+void FileProtection::SetDecisionCallback(FileOperationDecisionCallback callback) {
     m_impl->SetDecisionCallback(std::move(callback));
 }
 
@@ -2950,11 +2950,11 @@ void FileProtection::ClearDecisionCallback() {
     return m_impl->VerifyFileCatalog(path);
 }
 
-[[nodiscard]] IntegrityStatus FileProtection::VerifyFileIntegrity(std::wstring_view path) {
+[[nodiscard]] FileIntegrityStatus FileProtection::VerifyFileIntegrity(std::wstring_view path) {
     return m_impl->VerifyFileIntegrity(path);
 }
 
-[[nodiscard]] std::vector<std::pair<std::wstring, IntegrityStatus>>
+[[nodiscard]] std::vector<std::pair<std::wstring, FileIntegrityStatus>>
 FileProtection::VerifyAllIntegrity() {
     return m_impl->VerifyAllIntegrity();
 }
@@ -3048,7 +3048,7 @@ void FileProtection::UnregisterEventCallback(uint64_t callbackId) {
     m_impl->UnregisterEventCallback(callbackId);
 }
 
-[[nodiscard]] uint64_t FileProtection::RegisterIntegrityCallback(IntegrityCallback callback) {
+[[nodiscard]] uint64_t FileProtection::RegisterIntegrityCallback(FileIntegrityCallback callback) {
     return m_impl->RegisterIntegrityCallback(std::move(callback));
 }
 

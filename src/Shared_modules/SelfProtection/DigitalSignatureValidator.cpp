@@ -117,25 +117,25 @@ std::atomic<bool> DigitalSignatureValidator::s_instanceCreated{false};
 // UTILITY FUNCTION IMPLEMENTATIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetSignatureResultName(SignatureResult result) noexcept {
+[[nodiscard]] std::string_view GetSignatureResultName(SignatureValidationResult result) noexcept {
     switch (result) {
-        case SignatureResult::Valid:              return "Valid";
-        case SignatureResult::InvalidSignature:   return "InvalidSignature";
-        case SignatureResult::InvalidHash:        return "InvalidHash";
-        case SignatureResult::Unsigned:           return "Unsigned";
-        case SignatureResult::UntrustedRoot:      return "UntrustedRoot";
-        case SignatureResult::Revoked:            return "Revoked";
-        case SignatureResult::Expired:            return "Expired";
-        case SignatureResult::NotYetValid:        return "NotYetValid";
-        case SignatureResult::BadTimestamp:       return "BadTimestamp";
-        case SignatureResult::TamperedFile:       return "TamperedFile";
-        case SignatureResult::InvalidCertificate: return "InvalidCertificate";
-        case SignatureResult::ChainError:         return "ChainError";
-        case SignatureResult::PolicyViolation:    return "PolicyViolation";
-        case SignatureResult::CatalogError:       return "CatalogError";
-        case SignatureResult::BlockedSigner:      return "BlockedSigner";
-        case SignatureResult::WeakAlgorithm:      return "WeakAlgorithm";
-        case SignatureResult::Error:              return "Error";
+        case SignatureValidationResult::Valid:              return "Valid";
+        case SignatureValidationResult::InvalidSignature:   return "InvalidSignature";
+        case SignatureValidationResult::InvalidHash:        return "InvalidHash";
+        case SignatureValidationResult::Unsigned:           return "Unsigned";
+        case SignatureValidationResult::UntrustedRoot:      return "UntrustedRoot";
+        case SignatureValidationResult::Revoked:            return "Revoked";
+        case SignatureValidationResult::Expired:            return "Expired";
+        case SignatureValidationResult::NotYetValid:        return "NotYetValid";
+        case SignatureValidationResult::BadTimestamp:       return "BadTimestamp";
+        case SignatureValidationResult::TamperedFile:       return "TamperedFile";
+        case SignatureValidationResult::InvalidCertificate: return "InvalidCertificate";
+        case SignatureValidationResult::ChainError:         return "ChainError";
+        case SignatureValidationResult::PolicyViolation:    return "PolicyViolation";
+        case SignatureValidationResult::CatalogError:       return "CatalogError";
+        case SignatureValidationResult::BlockedSigner:      return "BlockedSigner";
+        case SignatureValidationResult::WeakAlgorithm:      return "WeakAlgorithm";
+        case SignatureValidationResult::Error:              return "Error";
         default:                                  return "Unknown";
     }
 }
@@ -155,14 +155,14 @@ std::atomic<bool> DigitalSignatureValidator::s_instanceCreated{false};
     }
 }
 
-[[nodiscard]] std::string_view GetHashAlgorithmName(HashAlgorithm algorithm) noexcept {
+[[nodiscard]] std::string_view GetHashAlgorithmName(SignatureHashAlgorithm algorithm) noexcept {
     switch (algorithm) {
-        case HashAlgorithm::Unknown: return "Unknown";
-        case HashAlgorithm::MD5:     return "MD5";
-        case HashAlgorithm::SHA1:    return "SHA1";
-        case HashAlgorithm::SHA256:  return "SHA256";
-        case HashAlgorithm::SHA384:  return "SHA384";
-        case HashAlgorithm::SHA512:  return "SHA512";
+        case SignatureHashAlgorithm::Unknown: return "Unknown";
+        case SignatureHashAlgorithm::MD5:     return "MD5";
+        case SignatureHashAlgorithm::SHA1:    return "SHA1";
+        case SignatureHashAlgorithm::SHA256:  return "SHA256";
+        case SignatureHashAlgorithm::SHA384:  return "SHA384";
+        case SignatureHashAlgorithm::SHA512:  return "SHA512";
         default:                     return "Unknown";
     }
 }
@@ -504,7 +504,7 @@ public:
             // Validate path
             if (filePath.empty()) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Empty file path");
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Empty file path";
                 return finalizeResult(result, startTime);
             }
@@ -514,7 +514,7 @@ public:
             // Check path length
             if (pathStr.length() > 32767) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Path too long");
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Path too long";
                 return finalizeResult(result, startTime);
             }
@@ -522,13 +522,13 @@ public:
             // Check file existence
             if (!std::filesystem::exists(pathStr)) {
                 SS_LOG_WARN(LOG_CATEGORY, L"File does not exist: %ls", pathStr.c_str());
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "File does not exist";
                 return finalizeResult(result, startTime);
             }
 
             // Check cache if enabled
-            bool useCache = (options.flags & ValidationFlags::CacheResult) != ValidationFlags::None;
+            bool useCache = (options.flags & SignatureValidationFlags::CacheResult) != SignatureValidationFlags::None;
             if (useCache) {
                 auto cached = getCachedResult(pathStr);
                 if (cached.has_value()) {
@@ -548,14 +548,14 @@ public:
             result = verifyWithWinTrust(pathStr, options);
 
             // If embedded signature not found, try catalog
-            if (result.result == SignatureResult::Unsigned &&
-                (options.flags & ValidationFlags::AllowCatalogSignatures) != ValidationFlags::None) {
+            if (result.result == SignatureValidationResult::Unsigned &&
+                (options.flags & SignatureValidationFlags::AllowCatalogSignatures) != SignatureValidationFlags::None) {
                 result = verifyCatalogSignature(pathStr);
             }
 
             // Check blocked signers
             if (result.isValid && isBlockedSigner(result.signer)) {
-                result.result = SignatureResult::BlockedSigner;
+                result.result = SignatureValidationResult::BlockedSigner;
                 result.isValid = false;
                 m_stats.blockedSigners++;
 
@@ -567,20 +567,20 @@ public:
             // Update statistics
             if (result.isValid) {
                 m_stats.validSignatures++;
-            } else if (result.result == SignatureResult::Unsigned) {
+            } else if (result.result == SignatureValidationResult::Unsigned) {
                 m_stats.unsignedFiles++;
             } else {
                 m_stats.invalidSignatures++;
             }
 
             // Cache result
-            if (useCache && result.result != SignatureResult::Error) {
+            if (useCache && result.result != SignatureValidationResult::Error) {
                 cacheResult(pathStr, result);
             }
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Exception during verification: %hs", ex.what());
-            result.result = SignatureResult::Error;
+            result.result = SignatureValidationResult::Error;
             result.errorMessage = ex.what();
         }
 
@@ -599,7 +599,7 @@ public:
 
         try {
             if (fileData.empty()) {
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Empty file data";
                 return finalizeResult(result, startTime);
             }
@@ -608,7 +608,7 @@ public:
             if (fileData.size() > MAX_MEMORY_VERIFY_SIZE) {
                 SS_LOG_WARN(LOG_CATEGORY, L"VerifyMemory: data size %zu exceeds %zu limit",
                     fileData.size(), MAX_MEMORY_VERIFY_SIZE);
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "File data exceeds maximum size for memory verification";
                 return finalizeResult(result, startTime);
             }
@@ -620,13 +620,13 @@ public:
             wchar_t tempFile[MAX_PATH];
 
             if (GetTempPathW(MAX_PATH, tempPath) == 0) {
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to get temp path";
                 return finalizeResult(result, startTime);
             }
 
             if (GetTempFileNameW(tempPath, L"SIG", 0, tempFile) == 0) {
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to create temp file";
                 return finalizeResult(result, startTime);
             }
@@ -641,7 +641,7 @@ public:
                 nullptr);
 
             if (hFile == INVALID_HANDLE_VALUE) {
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to open temp file";
                 DeleteFileW(tempFile);
                 return finalizeResult(result, startTime);
@@ -653,7 +653,7 @@ public:
 
             if (!writeOk || bytesWritten != fileData.size()) {
                 CloseHandle(hFile);  // DELETE_ON_CLOSE removes it
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to write temp file";
                 return finalizeResult(result, startTime);
             }
@@ -665,7 +665,7 @@ public:
             // cannot be replaced while our handle holds the share lock)
             SignatureValidationOptions options;
             options.fileTypeHint = fileType;
-            options.flags = options.flags & ~ValidationFlags::CacheResult; // Don't cache temp files
+            options.flags = options.flags & ~SignatureValidationFlags::CacheResult; // Don't cache temp files
             result = VerifyFile(tempFile, options);
 
             // Close handle → DELETE_ON_CLOSE triggers automatic deletion
@@ -673,7 +673,7 @@ public:
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Exception during memory verification: %hs", ex.what());
-            result.result = SignatureResult::Error;
+            result.result = SignatureValidationResult::Error;
             result.errorMessage = ex.what();
         }
 
@@ -696,35 +696,35 @@ public:
             // First verify the catalog file itself
             auto catalogResult = verifyWithWinTrust(catalogPathStr, {});
             if (!catalogResult.isValid) {
-                result.result = SignatureResult::CatalogError;
+                result.result = SignatureValidationResult::CatalogError;
                 result.errorMessage = "Catalog signature invalid";
                 return finalizeResult(result, startTime);
             }
 
             // Calculate file hash
-            auto fileHash = CalculateAuthenticodeHash(filePath, HashAlgorithm::SHA256);
+            auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
             if (!fileHash.has_value()) {
-                result.result = SignatureResult::Error;
+                result.result = SignatureValidationResult::Error;
                 result.errorMessage = "Failed to calculate file hash";
                 return finalizeResult(result, startTime);
             }
 
             // Verify hash is in catalog
             if (verifyHashInCatalog(catalogPathStr, fileHash.value())) {
-                result.result = SignatureResult::Valid;
+                result.result = SignatureValidationResult::Valid;
                 result.isValid = true;
                 result.catalogPath = catalogPathStr;
                 result.signer = catalogResult.signer;
                 result.fileHash = fileHash.value();
                 result.isMicrosoftSigned = catalogResult.isMicrosoftSigned;
             } else {
-                result.result = SignatureResult::InvalidHash;
+                result.result = SignatureValidationResult::InvalidHash;
                 result.errorMessage = "File hash not found in catalog";
             }
 
         } catch (const std::exception& ex) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Exception during catalog verification: %hs", ex.what());
-            result.result = SignatureResult::Error;
+            result.result = SignatureValidationResult::Error;
             result.errorMessage = ex.what();
         }
 
@@ -744,7 +744,7 @@ public:
         if (!m_initialized.load(std::memory_order_acquire)) {
             SS_LOG_WARN(LOG_CATEGORY, L"Cannot enqueue async verification: not initialized");
             SignatureInfo errResult;
-            errResult.result = SignatureResult::Error;
+            errResult.result = SignatureValidationResult::Error;
             errResult.errorMessage = "Validator not initialized";
             callback(errResult);
             return;
@@ -795,9 +795,9 @@ public:
 
     [[nodiscard]] bool IsSigned(std::wstring_view filePath) noexcept {
         SignatureValidationOptions options;
-        options.flags = ValidationFlags::VerifyHashOnly;
+        options.flags = SignatureValidationFlags::VerifyHashOnly;
         auto result = VerifyFile(filePath, options);
-        return result.result != SignatureResult::Unsigned;
+        return result.result != SignatureValidationResult::Unsigned;
     }
 
     [[nodiscard]] bool IsMicrosoftSigned(std::wstring_view filePath) noexcept {
@@ -826,15 +826,15 @@ public:
 
     [[nodiscard]] bool VerifyIntegrity(std::wstring_view filePath) noexcept {
         SignatureValidationOptions options;
-        options.flags = ValidationFlags::VerifyHashOnly;
+        options.flags = SignatureValidationFlags::VerifyHashOnly;
         auto result = VerifyFile(filePath, options);
-        return result.result != SignatureResult::TamperedFile &&
-               result.result != SignatureResult::InvalidHash;
+        return result.result != SignatureValidationResult::TamperedFile &&
+               result.result != SignatureValidationResult::InvalidHash;
     }
 
     [[nodiscard]] std::optional<FileHash> CalculateAuthenticodeHash(
         std::wstring_view filePath,
-        HashAlgorithm algorithm
+        SignatureHashAlgorithm algorithm
     ) noexcept {
         try {
             std::wstring pathStr(filePath);
@@ -864,10 +864,10 @@ public:
 
             ALG_ID algId = CALG_SHA_256;
             switch (algorithm) {
-                case HashAlgorithm::SHA1:   algId = CALG_SHA1; break;
-                case HashAlgorithm::SHA256: algId = CALG_SHA_256; break;
-                case HashAlgorithm::SHA384: algId = CALG_SHA_384; break;
-                case HashAlgorithm::SHA512: algId = CALG_SHA_512; break;
+                case SignatureHashAlgorithm::SHA1:   algId = CALG_SHA1; break;
+                case SignatureHashAlgorithm::SHA256: algId = CALG_SHA_256; break;
+                case SignatureHashAlgorithm::SHA384: algId = CALG_SHA_384; break;
+                case SignatureHashAlgorithm::SHA512: algId = CALG_SHA_512; break;
                 default: algId = CALG_SHA_256; break;
             }
 
@@ -925,7 +925,7 @@ public:
     [[nodiscard]] bool VerifyHash(
         std::wstring_view filePath,
         std::span<const uint8_t> expectedHash,
-        HashAlgorithm algorithm
+        SignatureHashAlgorithm algorithm
     ) noexcept {
         auto calculatedHash = CalculateAuthenticodeHash(filePath, algorithm);
         if (!calculatedHash.has_value()) {
@@ -1065,7 +1065,7 @@ public:
     [[nodiscard]] std::optional<std::wstring> FindCatalogForFile(
         std::wstring_view filePath
     ) noexcept {
-        auto fileHash = CalculateAuthenticodeHash(filePath, HashAlgorithm::SHA256);
+        auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
         if (!fileHash.has_value()) {
             return std::nullopt;
         }
@@ -1350,7 +1350,7 @@ public:
             std::wstring ntdll = L"C:\\Windows\\System32\\ntdll.dll";
             if (std::filesystem::exists(ntdll)) {
                 auto result = VerifyFile(ntdll);
-                if (result.result != SignatureResult::Valid) {
+                if (result.result != SignatureValidationResult::Valid) {
                     SS_LOG_WARN(LOG_CATEGORY, L"Self-test: ntdll.dll verification unexpected result");
                     // Don't fail - system may have modified files
                 }
@@ -1430,14 +1430,14 @@ private:
         winTrustData.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
 
         // Set revocation check if enabled
-        if ((options.flags & ValidationFlags::CheckRevocation) != ValidationFlags::None) {
+        if ((options.flags & SignatureValidationFlags::CheckRevocation) != SignatureValidationFlags::None) {
             winTrustData.fdwRevocationChecks = WTD_REVOKE_WHOLECHAIN;
             winTrustData.dwProvFlags |= WTD_REVOCATION_CHECK_CHAIN;
             m_stats.revocationChecks++;
         }
 
         // Set online check if enabled
-        if ((options.flags & ValidationFlags::OnlineCheck) != ValidationFlags::None) {
+        if ((options.flags & SignatureValidationFlags::OnlineCheck) != SignatureValidationFlags::None) {
             winTrustData.dwProvFlags &= ~WTD_CACHE_ONLY_URL_RETRIEVAL;
         }
 
@@ -1545,47 +1545,47 @@ private:
         // Interpret WinVerifyTrust result
         switch (status) {
             case ERROR_SUCCESS:
-                result.result = SignatureResult::Valid;
+                result.result = SignatureValidationResult::Valid;
                 result.isValid = true;
                 result.isEV = result.signer.isEV;
                 break;
 
             case TRUST_E_NOSIGNATURE:
-                result.result = SignatureResult::Unsigned;
+                result.result = SignatureValidationResult::Unsigned;
                 break;
 
             case TRUST_E_EXPLICIT_DISTRUST:
-                result.result = SignatureResult::BlockedSigner;
+                result.result = SignatureValidationResult::BlockedSigner;
                 break;
 
             case TRUST_E_SUBJECT_NOT_TRUSTED:
-                result.result = SignatureResult::UntrustedRoot;
+                result.result = SignatureValidationResult::UntrustedRoot;
                 break;
 
             case CRYPT_E_SECURITY_SETTINGS:
-                result.result = SignatureResult::PolicyViolation;
+                result.result = SignatureValidationResult::PolicyViolation;
                 break;
 
             case TRUST_E_BAD_DIGEST:
-                result.result = SignatureResult::TamperedFile;
+                result.result = SignatureValidationResult::TamperedFile;
                 break;
 
             case CERT_E_EXPIRED:
-                result.result = SignatureResult::Expired;
+                result.result = SignatureValidationResult::Expired;
                 m_stats.expiredCertificates++;
                 break;
 
             case CERT_E_REVOKED:
-                result.result = SignatureResult::Revoked;
+                result.result = SignatureValidationResult::Revoked;
                 m_stats.revokedCertificates++;
                 break;
 
             case CERT_E_CHAINING:
-                result.result = SignatureResult::ChainError;
+                result.result = SignatureValidationResult::ChainError;
                 break;
 
             default:
-                result.result = SignatureResult::InvalidSignature;
+                result.result = SignatureValidationResult::InvalidSignature;
                 result.errorCode = static_cast<int32_t>(status);
                 break;
         }
@@ -1604,9 +1604,9 @@ private:
         result.type = SignatureType::Catalog;
 
         // Calculate file hash
-        auto fileHash = CalculateAuthenticodeHash(filePath, HashAlgorithm::SHA256);
+        auto fileHash = CalculateAuthenticodeHash(filePath, SignatureHashAlgorithm::SHA256);
         if (!fileHash.has_value()) {
-            result.result = SignatureResult::Error;
+            result.result = SignatureValidationResult::Error;
             result.errorMessage = "Failed to calculate file hash";
             return result;
         }
@@ -1618,7 +1618,7 @@ private:
         if (!CryptCATAdminAcquireContext(&hCatAdmin, &driverActionGuid, 0)) {
             // Try without driver action
             if (!CryptCATAdminAcquireContext(&hCatAdmin, nullptr, 0)) {
-                result.result = SignatureResult::Unsigned;
+                result.result = SignatureValidationResult::Unsigned;
                 return result;
             }
         }
@@ -1640,21 +1640,21 @@ private:
                 // Verify the catalog file itself
                 auto catalogResult = verifyWithWinTrust(catInfo.wszCatalogFile, {});
                 if (catalogResult.isValid) {
-                    result.result = SignatureResult::Valid;
+                    result.result = SignatureValidationResult::Valid;
                     result.isValid = true;
                     result.signer = catalogResult.signer;
                     result.isMicrosoftSigned = catalogResult.isMicrosoftSigned;
                     result.timestamps = catalogResult.timestamps;
                     result.fileHash = fileHash.value();
                 } else {
-                    result.result = SignatureResult::CatalogError;
+                    result.result = SignatureValidationResult::CatalogError;
                     result.errorMessage = "Catalog signature invalid";
                 }
             }
 
             CryptCATAdminReleaseCatalogContext(hCatAdmin, hCatInfo, 0);
         } else {
-            result.result = SignatureResult::Unsigned;
+            result.result = SignatureValidationResult::Unsigned;
         }
 
         CryptCATAdminReleaseContext(hCatAdmin, 0);
@@ -1929,7 +1929,7 @@ public:
         SignatureAnalysisResult analysis;
         analysis.signatureInfo = VerifyFile(std::wstring(filePath));
 
-        if (analysis.signatureInfo.result == SignatureResult::Error) {
+        if (analysis.signatureInfo.result == SignatureValidationResult::Error) {
             return analysis;
         }
 
@@ -2032,8 +2032,8 @@ public:
         }
 
         // === Check 5: Weak algorithm (MD5 or SHA-1 only) ===
-        if (sigInfo.fileHashAlgorithm == HashAlgorithm::MD5 ||
-            sigInfo.fileHashAlgorithm == HashAlgorithm::SHA1) {
+        if (sigInfo.fileHashAlgorithm == SignatureHashAlgorithm::MD5 ||
+            sigInfo.fileHashAlgorithm == SignatureHashAlgorithm::SHA1) {
             if (!m_config.allowWeakAlgorithms) {
                 SignatureAnomaly anomaly;
                 anomaly.type = AnomalyType::WeakHashAlgorithm;
@@ -2048,7 +2048,7 @@ public:
         }
 
         // === Check 6: Test signature in production ===
-        if (sigInfo.result == SignatureResult::UntrustedRoot && sigInfo.isValid) {
+        if (sigInfo.result == SignatureValidationResult::UntrustedRoot && sigInfo.isValid) {
             SignatureAnomaly anomaly;
             anomaly.type = AnomalyType::TestSignatureInProd;
             anomaly.severity = AnomalySeverity::High;
@@ -2095,7 +2095,7 @@ public:
         }
 
         // === Check 9: Revoked certificate still being loaded ===
-        if (sigInfo.result == SignatureResult::Revoked) {
+        if (sigInfo.result == SignatureValidationResult::Revoked) {
             SignatureAnomaly anomaly;
             anomaly.type = AnomalyType::RevokedButStillUsed;
             anomaly.severity = AnomalySeverity::Critical;
@@ -2154,7 +2154,7 @@ public:
         auto analysis = AnalyzeSignature(imagePath);
 
         // Unsigned driver loading is always Critical
-        if (analysis.signatureInfo.result == SignatureResult::Unsigned) {
+        if (analysis.signatureInfo.result == SignatureValidationResult::Unsigned) {
             std::wstring ext = std::filesystem::path(std::wstring(imagePath)).extension().wstring();
             std::transform(ext.begin(), ext.end(), ext.begin(), ::towlower);
             if (ext == L".sys") {
@@ -2204,7 +2204,7 @@ public:
         // Additional process-specific checks:
         // If the process image is unsigned AND the parent is a signed system process,
         // this is suspicious (possible process hollowing / injection).
-        if (analysis.signatureInfo.result == SignatureResult::Unsigned) {
+        if (analysis.signatureInfo.result == SignatureValidationResult::Unsigned) {
             analysis.riskScore = std::max(analysis.riskScore, 60u);
 
             SS_LOG_WARN(LOG_CATEGORY,
@@ -2330,7 +2330,7 @@ bool DigitalSignatureValidator::VerifyIntegrity(std::wstring_view filePath) {
 
 std::optional<FileHash> DigitalSignatureValidator::CalculateAuthenticodeHash(
     std::wstring_view filePath,
-    HashAlgorithm algorithm
+    SignatureHashAlgorithm algorithm
 ) {
     return m_impl->CalculateAuthenticodeHash(filePath, algorithm);
 }
@@ -2338,7 +2338,7 @@ std::optional<FileHash> DigitalSignatureValidator::CalculateAuthenticodeHash(
 bool DigitalSignatureValidator::VerifyHash(
     std::wstring_view filePath,
     std::span<const uint8_t> expectedHash,
-    HashAlgorithm algorithm
+    SignatureHashAlgorithm algorithm
 ) {
     return m_impl->VerifyHash(filePath, expectedHash, algorithm);
 }

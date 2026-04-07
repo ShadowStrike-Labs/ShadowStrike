@@ -161,6 +161,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../PEParser/PEParser.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "SecurityEnums.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -264,9 +265,12 @@ using CertificateHash = std::array<uint8_t, 32>;
 // ============================================================================
 
 /**
- * @brief Signature validation result
+ * @brief Digital-signature validation result
+ *
+ * Signature validation owns this result domain; CryptoManager keeps the
+ * cryptographic signing result type.
  */
-enum class SignatureResult : uint8_t {
+enum class SignatureValidationResult : uint8_t {
     Valid               = 0,    ///< Signature is valid
     InvalidSignature    = 1,    ///< Signature verification failed
     InvalidHash         = 2,    ///< File hash doesn't match
@@ -302,9 +306,12 @@ enum class SignatureType : uint8_t {
 };
 
 /**
- * @brief Hash algorithm used
+ * @brief Hash algorithm used by signature validation
+ *
+ * This remains scoped to signature verification semantics rather than the
+ * broader CryptoManager hash-selection domain.
  */
-enum class HashAlgorithm : uint8_t {
+enum class SignatureHashAlgorithm : uint8_t {
     Unknown     = 0,
     MD5         = 1,    ///< Deprecated
     SHA1        = 2,    ///< Deprecated but still common
@@ -338,9 +345,12 @@ enum class TimestampStatus : uint8_t {
 };
 
 /**
- * @brief Validation flags
+ * @brief Digital-signature validation policy flags
+ *
+ * The validator keeps its own policy flag space so operator overloads remain
+ * distinct from certificate-validation flags in shared service builds.
  */
-enum class ValidationFlags : uint32_t {
+enum class SignatureValidationFlags : uint32_t {
     None                    = 0x00000000,
     VerifyChain             = 0x00000001,
     CheckRevocation         = 0x00000002,
@@ -362,16 +372,22 @@ enum class ValidationFlags : uint32_t {
     Permissive              = VerifyChain | AllowExpiredTimestamp | AllowCatalogSignatures | CacheResult
 };
 
-inline constexpr ValidationFlags operator|(ValidationFlags a, ValidationFlags b) noexcept {
-    return static_cast<ValidationFlags>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+inline constexpr SignatureValidationFlags operator|(
+    SignatureValidationFlags a,
+    SignatureValidationFlags b) noexcept {
+    return static_cast<SignatureValidationFlags>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
 }
 
-inline constexpr ValidationFlags operator&(ValidationFlags a, ValidationFlags b) noexcept {
-    return static_cast<ValidationFlags>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+inline constexpr SignatureValidationFlags operator&(
+    SignatureValidationFlags a,
+    SignatureValidationFlags b) noexcept {
+    return static_cast<SignatureValidationFlags>(
+        static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
 }
 
-inline constexpr ValidationFlags operator~(ValidationFlags a) noexcept {
-    return static_cast<ValidationFlags>(~static_cast<uint32_t>(a));
+inline constexpr SignatureValidationFlags operator~(SignatureValidationFlags a) noexcept {
+    return static_cast<SignatureValidationFlags>(~static_cast<uint32_t>(a));
 }
 
 /**
@@ -392,20 +408,7 @@ enum class SignedFileType : uint8_t {
     CABArchive      = 11    ///< .cab
 };
 
-#ifndef SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-#define SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
-// ModuleStatus: canonical definition lives in SecurityEnums.hpp.
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
-#endif // SHADOWSTRIKE_SECURITY_MODULESTATUS_DEFINED
+// ModuleStatus is provided by SecurityEnums.hpp (canonical definition).
 
 // ============================================================================
 // STRUCTURES
@@ -486,7 +489,7 @@ struct TimestampInfo {
     bool isRFC3161 = false;
     
     /// @brief Hash algorithm used
-    HashAlgorithm hashAlgorithm = HashAlgorithm::Unknown;
+    SignatureHashAlgorithm hashAlgorithm = SignatureHashAlgorithm::Unknown;
     
     /// @brief Status
     TimestampStatus status = TimestampStatus::None;
@@ -507,7 +510,7 @@ struct TimestampInfo {
  */
 struct SignatureInfo {
     /// @brief Validation result
-    SignatureResult result = SignatureResult::Unsigned;
+    SignatureValidationResult result = SignatureValidationResult::Unsigned;
     
     /// @brief Is signature valid
     bool isValid = false;
@@ -528,7 +531,7 @@ struct SignatureInfo {
     SignatureType type = SignatureType::None;
     
     /// @brief Hash algorithm used for file
-    HashAlgorithm fileHashAlgorithm = HashAlgorithm::Unknown;
+    SignatureHashAlgorithm fileHashAlgorithm = SignatureHashAlgorithm::Unknown;
     
     /// @brief File hash
     FileHash fileHash{};
@@ -597,7 +600,7 @@ struct SignatureInfo {
  */
 struct SignatureValidatorConfiguration {
     /// @brief Default validation flags
-    ValidationFlags defaultFlags = ValidationFlags::Standard;
+    SignatureValidationFlags defaultFlags = SignatureValidationFlags::Standard;
     
     /// @brief Enable signature caching
     bool enableCaching = true;
@@ -649,7 +652,7 @@ struct SignatureValidatorConfiguration {
  */
 struct SignatureValidationOptions {
     /// @brief Validation flags
-    ValidationFlags flags = ValidationFlags::Standard;
+    SignatureValidationFlags flags = SignatureValidationFlags::Standard;
     
     /// @brief Expected signer name (for pinning)
     std::wstring expectedSigner;
@@ -952,14 +955,15 @@ public:
      * @brief Calculate Authenticode hash
      */
     [[nodiscard]] std::optional<FileHash> CalculateAuthenticodeHash(
-        std::wstring_view filePath, HashAlgorithm algorithm = HashAlgorithm::SHA256);
+        std::wstring_view filePath,
+        SignatureHashAlgorithm algorithm = SignatureHashAlgorithm::SHA256);
     
     /**
      * @brief Compare file hash with expected
      */
     [[nodiscard]] bool VerifyHash(std::wstring_view filePath, 
                                   std::span<const uint8_t> expectedHash,
-                                  HashAlgorithm algorithm = HashAlgorithm::SHA256);
+                                  SignatureHashAlgorithm algorithm = SignatureHashAlgorithm::SHA256);
     
     // ========================================================================
     // TRUSTED PUBLISHER MANAGEMENT
@@ -1216,7 +1220,7 @@ private:
 /**
  * @brief Get signature result name
  */
-[[nodiscard]] std::string_view GetSignatureResultName(SignatureResult result) noexcept;
+[[nodiscard]] std::string_view GetSignatureResultName(SignatureValidationResult result) noexcept;
 
 /**
  * @brief Get signature type name
@@ -1226,7 +1230,7 @@ private:
 /**
  * @brief Get hash algorithm name
  */
-[[nodiscard]] std::string_view GetHashAlgorithmName(HashAlgorithm algorithm) noexcept;
+[[nodiscard]] std::string_view GetHashAlgorithmName(SignatureHashAlgorithm algorithm) noexcept;
 
 /**
  * @brief Get signer trust level name

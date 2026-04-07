@@ -787,13 +787,13 @@ public:
         request.timestamp = Clock::now();
 
         const auto decision = FilterOperation(request);
-        return decision.decision == OperationDecision::Allow ||
-               decision.decision == OperationDecision::AllowLogged;
+        return decision.decision == RegistryOperationDecision::Allow ||
+               decision.decision == RegistryOperationDecision::AllowLogged;
     }
 
-    [[nodiscard]] OperationDecisionResult FilterOperation(const RegistryOperationRequest& request) {
-        OperationDecisionResult result;
-        result.decision = OperationDecision::Allow;
+    [[nodiscard]] RegistryOperationDecisionResult FilterOperation(const RegistryOperationRequest& request) {
+        RegistryOperationDecisionResult result;
+        result.decision = RegistryOperationDecision::Allow;
 
         m_stats.totalOperations.fetch_add(1, std::memory_order_relaxed);
 
@@ -804,7 +804,7 @@ public:
 
         // Check if process is whitelisted
         if (IsProcessWhitelisted(request.processId)) {
-            result.decision = OperationDecision::AllowLogged;
+            result.decision = RegistryOperationDecision::AllowLogged;
             result.reason = "Process is whitelisted";
             return result;
         }
@@ -850,7 +850,7 @@ public:
         const auto reqOp = static_cast<uint32_t>(request.operation);
 
         if ((blockedOps & reqOp) != 0) {
-            result.decision = OperationDecision::Block;
+            result.decision = RegistryOperationDecision::Block;
             result.reason = "Operation blocked by protection policy";
             result.shouldLog = true;
             result.shouldAlert = true;
@@ -866,14 +866,14 @@ public:
             lock.unlock();
             FireBlockedOperationEvent(request, result);
         } else if (m_mode == RegistryProtectionMode::Monitor) {
-            result.decision = OperationDecision::AllowLogged;
+            result.decision = RegistryOperationDecision::AllowLogged;
             result.shouldLog = true;
         }
 
         return result;
     }
 
-    void SetDecisionCallback(OperationDecisionCallback callback) {
+    void SetDecisionCallback(RegistryOperationDecisionCallback callback) {
         std::unique_lock lock(m_mutex);
         m_decisionCallback = std::move(callback);
     }
@@ -1394,7 +1394,7 @@ public:
         m_eventCallbacks.erase(callbackId);
     }
 
-    [[nodiscard]] uint64_t RegisterIntegrityCallback(IntegrityCallback callback) {
+    [[nodiscard]] uint64_t RegisterIntegrityCallback(RegistryIntegrityCallback callback) {
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextCallbackId++;
         m_integrityCallbacks[id] = std::move(callback);
@@ -2068,10 +2068,10 @@ private:
     }
 
     void FireBlockedOperationEvent(const RegistryOperationRequest& request,
-                                   const OperationDecisionResult& decision) {
+                                   const RegistryOperationDecisionResult& decision) {
         RegistryProtectionEvent event;
         event.eventId = m_nextEventId++;
-        event.type = ProtectionEventType::OperationBlocked;
+        event.type = RegistryProtectionEventType::OperationBlocked;
         event.timestamp = Clock::now();
         event.keyPath = request.keyPath;
         event.valueName = request.valueName;
@@ -2190,7 +2190,7 @@ private:
         }
 
         // Fire registered callbacks
-        std::vector<IntegrityCallback> callbacks;
+        std::vector<RegistryIntegrityCallback> callbacks;
         {
             std::shared_lock lock(m_mutex);
             callbacks.reserve(m_integrityCallbacks.size());
@@ -2503,9 +2503,9 @@ private:
 
     // Callbacks
     std::unordered_map<uint64_t, RegistryEventCallback> m_eventCallbacks;
-    std::unordered_map<uint64_t, IntegrityCallback> m_integrityCallbacks;
+    std::unordered_map<uint64_t, RegistryIntegrityCallback> m_integrityCallbacks;
     std::unordered_map<uint64_t, ValueChangeCallback> m_valueChangeCallbacks;
-    OperationDecisionCallback m_decisionCallback;
+    RegistryOperationDecisionCallback m_decisionCallback;
     std::atomic<uint64_t> m_nextCallbackId;
 
     // Events
@@ -2663,11 +2663,11 @@ bool RegistryProtection::IsOperationAllowed(const std::wstring& keyPath, uint32_
     return m_impl->IsOperationAllowed(keyPath, opType);
 }
 
-OperationDecisionResult RegistryProtection::FilterOperation(const RegistryOperationRequest& request) {
+RegistryOperationDecisionResult RegistryProtection::FilterOperation(const RegistryOperationRequest& request) {
     return m_impl->FilterOperation(request);
 }
 
-void RegistryProtection::SetDecisionCallback(OperationDecisionCallback callback) {
+void RegistryProtection::SetDecisionCallback(RegistryOperationDecisionCallback callback) {
     m_impl->SetDecisionCallback(std::move(callback));
 }
 
@@ -2756,7 +2756,7 @@ void RegistryProtection::UnregisterEventCallback(uint64_t callbackId) {
     m_impl->UnregisterEventCallback(callbackId);
 }
 
-uint64_t RegistryProtection::RegisterIntegrityCallback(IntegrityCallback callback) {
+uint64_t RegistryProtection::RegisterIntegrityCallback(RegistryIntegrityCallback callback) {
     return m_impl->RegisterIntegrityCallback(std::move(callback));
 }
 
@@ -2848,7 +2848,7 @@ RegistryProtectionConfiguration RegistryProtectionConfiguration::FromMode(Regist
             config.enableIntegrityMonitoring = false;
             config.enableAutoRollback = false;
             config.enableSnapshots = false;
-            config.defaultResponse = ProtectionResponse::None;
+            config.defaultResponse = RegistryProtectionResponse::None;
             break;
 
         case RegistryProtectionMode::Monitor:
@@ -2857,7 +2857,7 @@ RegistryProtectionConfiguration RegistryProtectionConfiguration::FromMode(Regist
             config.enableIntegrityMonitoring = true;
             config.enableAutoRollback = false;
             config.enableSnapshots = true;
-            config.defaultResponse = ProtectionResponse::Passive;
+            config.defaultResponse = RegistryProtectionResponse::Passive;
             break;
 
         case RegistryProtectionMode::Protect:
@@ -2866,7 +2866,7 @@ RegistryProtectionConfiguration RegistryProtectionConfiguration::FromMode(Regist
             config.enableIntegrityMonitoring = true;
             config.enableAutoRollback = false;
             config.enableSnapshots = true;
-            config.defaultResponse = ProtectionResponse::Active;
+            config.defaultResponse = RegistryProtectionResponse::Active;
             break;
 
         case RegistryProtectionMode::Rollback:
@@ -2875,7 +2875,7 @@ RegistryProtectionConfiguration RegistryProtectionConfiguration::FromMode(Regist
             config.enableIntegrityMonitoring = true;
             config.enableAutoRollback = true;
             config.enableSnapshots = true;
-            config.defaultResponse = ProtectionResponse::Active | ProtectionResponse::Rollback;
+            config.defaultResponse = RegistryProtectionResponse::Active | RegistryProtectionResponse::Rollback;
             break;
 
         case RegistryProtectionMode::Strict:
@@ -2886,7 +2886,7 @@ RegistryProtectionConfiguration RegistryProtectionConfiguration::FromMode(Regist
             config.enableSnapshots = true;
             config.pollingIntervalMs = 2000;
             config.integrityCheckIntervalMs = 10000;
-            config.defaultResponse = ProtectionResponse::Aggressive;
+            config.defaultResponse = RegistryProtectionResponse::Aggressive;
             break;
     }
 
