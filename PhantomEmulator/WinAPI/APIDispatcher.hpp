@@ -205,6 +205,7 @@ private:
     void RegisterOle32() noexcept;
     void RegisterBcrypt() noexcept;
     void RegisterUrlmon() noexcept;
+    void RegisterAmsi() noexcept;
 };
 
 } // namespace Phantom

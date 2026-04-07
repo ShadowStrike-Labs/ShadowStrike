@@ -29,6 +29,7 @@
 #include "Ntdll\NtToken.hpp"
 #include "Ntdll\NtSync.hpp"
 #include "Bcrypt\BcryptAPI.hpp"
+#include "Amsi\AmsiAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -166,6 +167,7 @@ void APIDispatcher::RegisterAll() noexcept {
     RegisterKernel32();
     RegisterAdvapi32();
     RegisterBcrypt();
+    RegisterAmsi();
     RegisterWs2_32();
     RegisterWininet();
     RegisterWinhttp();
@@ -198,6 +200,9 @@ void APIDispatcher::RegisterOle32()    noexcept {}
 void APIDispatcher::RegisterUrlmon()   noexcept {}
 void APIDispatcher::RegisterBcrypt() noexcept {
     WinAPI::Bcrypt::RegisterBcrypt(*this);
+}
+void APIDispatcher::RegisterAmsi() noexcept {
+    WinAPI::Amsi::RegisterAmsiAPI(*this);
 }
 
 // ============================================================================
