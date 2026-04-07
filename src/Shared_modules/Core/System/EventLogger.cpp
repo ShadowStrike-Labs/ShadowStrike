@@ -72,11 +72,14 @@
 // WINDOWS INCLUDES
 // ============================================================================
 #ifdef _WIN32
+#  include <WinSock2.h>
+#  include <WS2tcpip.h>
 #  include <Windows.h>
 #  include <evntprov.h>
 #  include <AclAPI.h>
 #  include <Sddl.h>
 #  pragma comment(lib, "advapi32.lib")
+#  pragma comment(lib, "ws2_32.lib")
 #endif
 
 namespace ShadowStrike {
@@ -110,6 +113,15 @@ namespace EventIds {
     constexpr uint32_t FORENSIC_CAPTURE     = 1080;
     constexpr uint32_t LOG_ROTATION         = 1090;
     constexpr uint32_t INTEGRITY_VIOLATION  = 1099;
+    // Kernel event IDs
+    constexpr uint32_t KERNEL_PROCESS       = 2000;
+    constexpr uint32_t KERNEL_FILE_OP       = 2001;
+    constexpr uint32_t KERNEL_REGISTRY_OP   = 2002;
+    constexpr uint32_t KERNEL_IMAGE_LOAD    = 2003;
+    constexpr uint32_t KERNEL_THREAT        = 2010;
+    constexpr uint32_t MEMORY_ATTACK        = 2020;
+    constexpr uint32_t RANSOMWARE_DETECTED  = 2030;
+    constexpr uint32_t BEHAVIORAL_ALERT     = 2040;
 }
 
 // ============================================================================
@@ -129,6 +141,18 @@ namespace SecurityLimits {
 // ============================================================================
 
 namespace {
+
+/**
+ * @brief Get current Windows user name.
+ */
+[[nodiscard]] std::wstring GetCurrentUserNameSafe() noexcept {
+    wchar_t buf[256]{};
+    DWORD sz = static_cast<DWORD>(std::size(buf));
+    if (::GetUserNameW(buf, &sz)) {
+        return std::wstring(buf);
+    }
+    return L"UNKNOWN";
+}
 
 /**
  * @brief Get high-resolution timestamp using QueryPerformanceCounter.
@@ -200,6 +224,10 @@ namespace {
         case EventCategory::Performance: return L"Performance";
         case EventCategory::SelfProtection: return L"SelfProtection";
         case EventCategory::Forensic: return L"Forensic";
+        case EventCategory::KernelEvent: return L"KernelEvent";
+        case EventCategory::MemoryProtection: return L"MemoryProtection";
+        case EventCategory::RansomwareProtection: return L"RansomwareProtection";
+        case EventCategory::BehavioralAnalysis: return L"BehavioralAnalysis";
         default: return L"Unknown";
     }
 }
@@ -216,6 +244,8 @@ namespace {
         category == EventCategory::ThreatDetection ||
         category == EventCategory::ExploitPrevention ||
         category == EventCategory::SelfProtection ||
+        category == EventCategory::RansomwareProtection ||
+        category == EventCategory::MemoryProtection ||
         severity == EventSeverity::AuditFailure ||
         severity == EventSeverity::AuditSuccess) {
         return EventPriority::Critical;
@@ -224,7 +254,9 @@ namespace {
     // High priority events
     if (severity == EventSeverity::Error ||
         category == EventCategory::Quarantine ||
-        category == EventCategory::PolicyChange) {
+        category == EventCategory::PolicyChange ||
+        category == EventCategory::KernelEvent ||
+        category == EventCategory::BehavioralAnalysis) {
         return EventPriority::High;
     }
     
@@ -348,7 +380,7 @@ namespace {
     if (input.empty()) return input;
     
     // Convert to UTF-8 to check byte length
-    std::string utf8 = StringUtils::WideToUtf8(input);
+    std::string utf8 = StringUtils::ToNarrow(input);
     if (utf8.size() <= maxBytes) return input;
     
     // Truncate at UTF-8 boundary
@@ -482,20 +514,20 @@ bool FlushFileToDisk(std::ofstream& file) {
     // CEF:Version|Device Vendor|Device Product|Device Version|Signature ID|Name|Severity|Extension
     oss << "CEF:0|ShadowStrike|NGAV|3.0.0|"
         << event.windowsEventId << "|"
-        << SanitizeForCEF(StringUtils::WideToUtf8(event.message)) << "|"
+        << SanitizeForCEF(StringUtils::ToNarrow(event.message)) << "|"
         << static_cast<int>(event.severity) << "|";
 
     // Extensions (all values sanitized)
-    oss << "cat=" << SanitizeForCEF(StringUtils::WideToUtf8(CategoryToString(event.category))) << " ";
-    oss << "shost=" << SanitizeForCEF(StringUtils::WideToUtf8(event.context.machineName)) << " ";
-    oss << "suser=" << SanitizeForCEF(StringUtils::WideToUtf8(event.context.userName)) << " ";
-    oss << "sproc=" << SanitizeForCEF(StringUtils::WideToUtf8(event.context.processName)) << " ";
+    oss << "cat=" << SanitizeForCEF(StringUtils::ToNarrow(CategoryToString(event.category))) << " ";
+    oss << "shost=" << SanitizeForCEF(StringUtils::ToNarrow(event.context.machineName)) << " ";
+    oss << "suser=" << SanitizeForCEF(StringUtils::ToNarrow(event.context.userName)) << " ";
+    oss << "sproc=" << SanitizeForCEF(StringUtils::ToNarrow(event.context.processName)) << " ";
     oss << "spid=" << event.context.processId << " ";
     oss << "eventId=" << event.eventId << " ";
     oss << "seqNum=" << event.sequenceNumber << " ";
 
     if (!event.filePath.empty()) {
-        oss << "fname=" << SanitizeForCEF(StringUtils::WideToUtf8(event.filePath)) << " ";
+        oss << "fname=" << SanitizeForCEF(StringUtils::ToNarrow(event.filePath)) << " ";
     }
 
     if (!event.sha256Hash.empty()) {
@@ -503,7 +535,7 @@ bool FlushFileToDisk(std::ofstream& file) {
     }
 
     if (!event.threatName.empty()) {
-        oss << "cs1Label=ThreatName cs1=" << SanitizeForCEF(StringUtils::WideToUtf8(event.threatName)) << " ";
+        oss << "cs1Label=ThreatName cs1=" << SanitizeForCEF(StringUtils::ToNarrow(event.threatName)) << " ";
     }
     
     // Add integrity signature if present
@@ -524,17 +556,17 @@ bool FlushFileToDisk(std::ofstream& file) {
     oss << "LEEF:2.0|ShadowStrike|NGAV|3.0.0|"
         << event.windowsEventId << "\t";
 
-    oss << "cat=" << SanitizeForLEEF(StringUtils::WideToUtf8(CategoryToString(event.category))) << "\t";
-    oss << "sev=" << SanitizeForLEEF(StringUtils::WideToUtf8(SeverityToString(event.severity))) << "\t";
-    oss << "msg=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.message)) << "\t";
-    oss << "src=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.source)) << "\t";
-    oss << "shost=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.context.machineName)) << "\t";
-    oss << "suser=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.context.userName)) << "\t";
+    oss << "cat=" << SanitizeForLEEF(StringUtils::ToNarrow(CategoryToString(event.category))) << "\t";
+    oss << "sev=" << SanitizeForLEEF(StringUtils::ToNarrow(SeverityToString(event.severity))) << "\t";
+    oss << "msg=" << SanitizeForLEEF(StringUtils::ToNarrow(event.message)) << "\t";
+    oss << "src=" << SanitizeForLEEF(StringUtils::ToNarrow(event.source)) << "\t";
+    oss << "shost=" << SanitizeForLEEF(StringUtils::ToNarrow(event.context.machineName)) << "\t";
+    oss << "suser=" << SanitizeForLEEF(StringUtils::ToNarrow(event.context.userName)) << "\t";
     oss << "eventId=" << event.eventId << "\t";
     oss << "seqNum=" << event.sequenceNumber << "\t";
 
     if (!event.filePath.empty()) {
-        oss << "filePath=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.filePath)) << "\t";
+        oss << "filePath=" << SanitizeForLEEF(StringUtils::ToNarrow(event.filePath)) << "\t";
     }
 
     if (!event.sha256Hash.empty()) {
@@ -542,7 +574,7 @@ bool FlushFileToDisk(std::ofstream& file) {
     }
 
     if (!event.threatName.empty()) {
-        oss << "threat=" << SanitizeForLEEF(StringUtils::WideToUtf8(event.threatName)) << "\t";
+        oss << "threat=" << SanitizeForLEEF(StringUtils::ToNarrow(event.threatName)) << "\t";
     }
     
     if (!event.hmacSignature.empty()) {
@@ -575,10 +607,10 @@ bool FlushFileToDisk(std::ofstream& file) {
     oss << timeBuffer << "." << std::setfill('0') << std::setw(6) << micros.count() << "Z ";
 
     // Hostname (sanitized)
-    oss << SanitizeForSyslog(StringUtils::WideToUtf8(event.context.machineName)) << " ";
+    oss << SanitizeForSyslog(StringUtils::ToNarrow(event.context.machineName)) << " ";
 
     // App-Name (sanitized)
-    oss << SanitizeForSyslog(StringUtils::WideToUtf8(config.appName)) << " ";
+    oss << SanitizeForSyslog(StringUtils::ToNarrow(config.appName)) << " ";
 
     // ProcID
     oss << event.context.processId << " ";
@@ -588,8 +620,8 @@ bool FlushFileToDisk(std::ofstream& file) {
 
     // Structured-Data (all values sanitized)
     oss << "[shadowstrike@12345 ";
-    oss << "category=\"" << SanitizeForSyslog(StringUtils::WideToUtf8(CategoryToString(event.category))) << "\" ";
-    oss << "severity=\"" << SanitizeForSyslog(StringUtils::WideToUtf8(SeverityToString(event.severity))) << "\" ";
+    oss << "category=\"" << SanitizeForSyslog(StringUtils::ToNarrow(CategoryToString(event.category))) << "\" ";
+    oss << "severity=\"" << SanitizeForSyslog(StringUtils::ToNarrow(SeverityToString(event.severity))) << "\" ";
     oss << "eventId=\"" << event.eventId << "\" ";
     oss << "seqNum=\"" << event.sequenceNumber << "\"";
     if (!event.hmacSignature.empty()) {
@@ -598,7 +630,7 @@ bool FlushFileToDisk(std::ofstream& file) {
     oss << "] ";
 
     // Message (sanitized - newlines replaced with spaces)
-    oss << SanitizeForSyslog(StringUtils::WideToUtf8(event.message));
+    oss << SanitizeForSyslog(StringUtils::ToNarrow(event.message));
 
     return oss.str();
 }
@@ -730,7 +762,7 @@ void EventLoggerStatistics::Reset() noexcept {
  * - m_rotationMutex: Protects log rotation
  * - m_windowsEventMutex: Protects Windows Event Log writes
  */
-class EventLogger::EventLoggerImpl {
+class EventLoggerImpl {
 public:
     // ========================================================================
     // MEMBERS
@@ -741,6 +773,7 @@ public:
     mutable std::shared_mutex m_eventQueueMutex;
     mutable std::shared_mutex m_forensicMutex;
     mutable std::shared_mutex m_callbackMutex;
+    std::mutex m_callbackFailureMutex;   // Protects m_callbackFailureCounts independently
     std::mutex m_windowsEventMutex;
     std::mutex m_fileMutex;          // CRITICAL: Dedicated mutex for file I/O
     std::mutex m_rotationMutex;      // Protects log rotation operations
@@ -751,6 +784,7 @@ public:
     std::atomic<bool> m_initialized{false};
     std::atomic<bool> m_paused{false};
     std::atomic<bool> m_shutdown{false};
+    std::atomic<bool> m_hasWork{false};    // Worker wake-up signal (avoids reading queues under wrong mutex)
     std::atomic<uint64_t> m_nextEventId{1};
     std::atomic<uint64_t> m_sequenceNumber{1};
 
@@ -951,7 +985,7 @@ public:
                 m_logFile.open(m_config.logFilePath, std::ios::app | std::ios::binary);
                 if (!m_logFile) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Failed to open log file: %hs",
-                        StringUtils::WideToUtf8(m_config.logFilePath).c_str());
+                        StringUtils::ToNarrow(m_config.logFilePath).c_str());
                     return false;
                 }
                 
@@ -1021,9 +1055,9 @@ public:
                 << system_clock::to_time_t(event.timestamp) << "|"
                 << static_cast<int>(event.severity) << "|"
                 << static_cast<int>(event.category) << "|"
-                << StringUtils::WideToUtf8(event.source) << "|"
-                << StringUtils::WideToUtf8(event.message) << "|"
-                << StringUtils::WideToUtf8(event.filePath) << "|"
+                << StringUtils::ToNarrow(event.source) << "|"
+                << StringUtils::ToNarrow(event.message) << "|"
+                << StringUtils::ToNarrow(event.filePath) << "|"
                 << event.sha256Hash << "|"
                 << event.previousEventHash;
 
@@ -1072,7 +1106,7 @@ public:
         
         std::string newHash;
         HashUtils::Error err;
-        if (HashUtils::ComputeHashHex(
+        if (HashUtils::ComputeHex(
                 HashUtils::Algorithm::SHA256,
                 eventData.data(),
                 eventData.size(),
@@ -1091,6 +1125,20 @@ public:
 
     void LogImpl(SecurityEvent event) {
         try {
+            // Guard: must be initialized and not shut down
+            if (!m_initialized.load(std::memory_order_acquire) ||
+                m_shutdown.load(std::memory_order_acquire)) {
+                return;
+            }
+
+            // When paused, only allow Critical events through (never drop critical)
+            if (m_paused.load(std::memory_order_acquire)) {
+                EventPriority prio = DetermineEventPriority(event.severity, event.category);
+                if (prio != EventPriority::Critical) {
+                    return;
+                }
+            }
+
             // Check severity filter
             if (event.severity < m_config.minimumSeverity) {
                 return;
@@ -1136,14 +1184,15 @@ public:
             if (event.context.processId == 0) {
                 event.context.processId = GetCurrentProcessId();
                 event.context.threadId = GetCurrentThreadId();
-                event.context.machineName = SystemUtils::GetMachineName();
-                event.context.userName = SystemUtils::GetCurrentUserName();
+                event.context.machineName = SystemUtils::GetComputerNameDnsHostname();
+                event.context.userName = GetCurrentUserNameSafe();
             }
 
             // Compute integrity signature
+            // Order: 1) HMAC first (covers event content), 2) then chain (includes HMAC)
             if (m_config.enableTamperProtection) {
-                event.previousEventHash = GetAndUpdateHashChain(event);
                 event.hmacSignature = ComputeEventHmac(event);
+                event.previousEventHash = GetAndUpdateHashChain(event);
             }
 
             // Invoke callbacks (with timeout protection)
@@ -1153,6 +1202,7 @@ public:
             QueueEvent(std::move(event));
 
             m_stats.eventsLogged.fetch_add(1, std::memory_order_relaxed);
+            m_hasWork.store(true, std::memory_order_release);
             m_workerCV.notify_one();
 
         } catch (const std::exception& e) {
@@ -1160,7 +1210,7 @@ public:
         }
     }
 
-    void QueueEvent(SecurityEvent event) {
+    void QueueEvent(SecurityEvent&& event) {
         std::unique_lock lock(m_eventQueueMutex);
         
         // Critical events go to separate queue that never drops
@@ -1211,8 +1261,8 @@ public:
             // Fill in context if empty
             if (event.context.processId == 0) {
                 event.context.processId = GetCurrentProcessId();
-                event.context.machineName = SystemUtils::GetMachineName();
-                event.context.userName = SystemUtils::GetCurrentUserName();
+                event.context.machineName = SystemUtils::GetComputerNameDnsHostname();
+                event.context.userName = GetCurrentUserNameSafe();
             }
 
             // Invoke callbacks
@@ -1225,6 +1275,7 @@ public:
             }
 
             m_stats.auditEventsLogged.fetch_add(1, std::memory_order_relaxed);
+            m_hasWork.store(true, std::memory_order_release);
             m_workerCV.notify_one();
 
         } catch (const std::exception& e) {
@@ -1256,7 +1307,7 @@ public:
             // Fill context
             event.context.processId = GetCurrentProcessId();
             event.context.threadId = GetCurrentThreadId();
-            event.context.machineName = SystemUtils::GetMachineName();
+            event.context.machineName = SystemUtils::GetComputerNameDnsHostname();
 
             // Estimate memory usage
             size_t eventMemory = sizeof(ForensicEvent) + event.eventType.size() * sizeof(wchar_t);
@@ -1309,15 +1360,17 @@ public:
 
         while (!stoken.stop_requested() && !m_shutdown.load(std::memory_order_acquire)) {
             try {
-                // Wait for events
-                std::unique_lock lock(m_workerMutex);
-                m_workerCV.wait_for(lock, milliseconds(1000), [this, &stoken] {
-                    return stoken.stop_requested() ||
-                           m_shutdown.load(std::memory_order_acquire) ||
-                           !m_eventQueue.empty() ||
-                           !m_criticalEventQueue.empty() ||
-                           !m_auditQueue.empty();
-                });
+                // Wait for events or timeout - use atomic flag for wake-up signaling
+                // to avoid checking queues under the wrong mutex
+                {
+                    std::unique_lock lock(m_workerMutex);
+                    m_workerCV.wait_for(lock, milliseconds(500), [this, &stoken] {
+                        return stoken.stop_requested() ||
+                               m_shutdown.load(std::memory_order_acquire) ||
+                               m_hasWork.load(std::memory_order_acquire);
+                    });
+                    m_hasWork.store(false, std::memory_order_release);
+                }
 
                 // Process critical events first (they must never be dropped)
                 ProcessCriticalEventQueue();
@@ -1551,11 +1604,11 @@ public:
             nlohmann::json metadata;
             metadata["eventId"] = event.eventId;
             metadata["sequenceNumber"] = event.sequenceNumber;
-            metadata["eventGuid"] = StringUtils::WideToUtf8(event.eventGuid);
-            metadata["category"] = StringUtils::WideToUtf8(CategoryToString(event.category));
+            metadata["eventGuid"] = StringUtils::ToNarrow(event.eventGuid);
+            metadata["category"] = StringUtils::ToNarrow(CategoryToString(event.category));
             if (!event.threatName.empty()) {
-                metadata["threatName"] = StringUtils::WideToUtf8(event.threatName);
-                metadata["threatType"] = StringUtils::WideToUtf8(event.threatType);
+                metadata["threatName"] = StringUtils::ToNarrow(event.threatName);
+                metadata["threatType"] = StringUtils::ToNarrow(event.threatType);
             }
             if (!event.sha256Hash.empty()) {
                 metadata["sha256"] = event.sha256Hash;
@@ -1597,14 +1650,14 @@ public:
 
             std::ostringstream oss;
             oss << "[" << timeBuffer << "." << std::setfill('0') << std::setw(6) << micros.count() << "] "
-                << "[" << SanitizeForFile(StringUtils::WideToUtf8(SeverityToString(event.severity))) << "] "
-                << "[" << SanitizeForFile(StringUtils::WideToUtf8(CategoryToString(event.category))) << "] "
-                << "[" << SanitizeForFile(StringUtils::WideToUtf8(event.source)) << "] "
+                << "[" << SanitizeForFile(StringUtils::ToNarrow(SeverityToString(event.severity))) << "] "
+                << "[" << SanitizeForFile(StringUtils::ToNarrow(CategoryToString(event.category))) << "] "
+                << "[" << SanitizeForFile(StringUtils::ToNarrow(event.source)) << "] "
                 << "[seq:" << event.sequenceNumber << "] "
-                << SanitizeForFile(StringUtils::WideToUtf8(event.message));
+                << SanitizeForFile(StringUtils::ToNarrow(event.message));
 
             if (!event.details.empty()) {
-                oss << " - " << SanitizeForFile(StringUtils::WideToUtf8(event.details));
+                oss << " - " << SanitizeForFile(StringUtils::ToNarrow(event.details));
             }
             
             // Include HMAC for tamper evidence
@@ -1618,7 +1671,7 @@ public:
             m_logFile << logLine;
             
             // Track sanitization
-            std::string unsanitized = StringUtils::WideToUtf8(event.message);
+            std::string unsanitized = StringUtils::ToNarrow(event.message);
             if (logLine.find("\\n") != std::string::npos || logLine.find("\\r") != std::string::npos) {
                 m_stats.sanitizationApplied.fetch_add(1, std::memory_order_relaxed);
             }
@@ -1657,35 +1710,95 @@ public:
             }
 
             std::string syslogMessage = FormatAsSyslog(event, m_config.syslog);
+            std::vector<uint8_t> postData(syslogMessage.begin(), syslogMessage.end());
 
-            // Use NetworkUtils for actual forwarding
             NetworkUtils::Error netErr;
             
             if (m_config.syslog.useTCP) {
-                // TCP syslog (more reliable)
-                auto result = NetworkUtils::HttpPost(
-                    StringUtils::WideToUtf8(m_config.syslog.serverAddress),
-                    m_config.syslog.port,
-                    "/",
-                    syslogMessage,
-                    "text/plain",
-                    {},
-                    m_config.syslog.useTLS,
-                    5000,  // 5 second timeout
-                    &netErr
-                );
+                // Build URL: scheme://host:port
+                std::wstring scheme = m_config.syslog.useTLS ? L"https" : L"http";
+                std::wstring url = std::format(L"{}://{}:{}/",
+                    scheme, m_config.syslog.serverAddress, m_config.syslog.port);
                 
-                if (result.statusCode >= 200 && result.statusCode < 300) {
+                NetworkUtils::HttpRequestOptions opts;
+                opts.method = NetworkUtils::HttpMethod::POST;
+                opts.contentType = L"text/plain";
+                opts.timeoutMs = 5000;
+                opts.verifySSL = m_config.syslog.useTLS;
+                
+                std::vector<uint8_t> response;
+                if (NetworkUtils::HttpPost(url, postData, response, opts, &netErr)) {
                     m_stats.syslogEventsForwarded.fetch_add(1, std::memory_order_relaxed);
                 }
             } else {
-                // UDP syslog (fire and forget - best effort)
-                // Note: For production, implement proper UDP socket send
-                m_stats.syslogEventsForwarded.fetch_add(1, std::memory_order_relaxed);
+                // UDP syslog (RFC 5426) - direct socket send
+                SendUdpDatagram(
+                    m_config.syslog.serverAddress,
+                    m_config.syslog.port,
+                    postData);
             }
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Syslog forward exception: %hs", e.what());
+        }
+    }
+
+    // UDP datagram send for syslog (RFC 5426)
+    void SendUdpDatagram(
+        const std::wstring& host,
+        uint16_t port,
+        const std::vector<uint8_t>& data
+    ) noexcept {
+        try {
+            // Cap UDP datagram to RFC 5426 max (65535 - headers, practical max ~8192)
+            constexpr size_t MAX_UDP_SYSLOG = 8192;
+            size_t sendSize = std::min(data.size(), MAX_UDP_SYSLOG);
+
+            std::string hostNarrow = StringUtils::ToNarrow(host);
+            std::string portStr = std::to_string(port);
+
+            WSADATA wsaData{};
+            int wsaRc = WSAStartup(MAKEWORD(2, 2), &wsaData);
+            if (wsaRc != 0) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: WSAStartup failed: %d", wsaRc);
+                return;
+            }
+
+            struct addrinfo hints{}, *result = nullptr;
+            hints.ai_family = AF_UNSPEC;
+            hints.ai_socktype = SOCK_DGRAM;
+            hints.ai_protocol = IPPROTO_UDP;
+
+            if (getaddrinfo(hostNarrow.c_str(), portStr.c_str(), &hints, &result) != 0 || !result) {
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: UDP syslog DNS resolution failed for %ls", host.c_str());
+                WSACleanup();
+                return;
+            }
+
+            SOCKET sock = socket(result->ai_family, result->ai_socktype, result->ai_protocol);
+            if (sock != INVALID_SOCKET) {
+                // Set send timeout to 2 seconds
+                DWORD timeout = 2000;
+                setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+                int sent = sendto(sock, reinterpret_cast<const char*>(data.data()),
+                    static_cast<int>(sendSize), 0, result->ai_addr,
+                    static_cast<int>(result->ai_addrlen));
+
+                if (sent > 0) {
+                    m_stats.syslogEventsForwarded.fetch_add(1, std::memory_order_relaxed);
+                } else {
+                    SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: UDP syslog sendto failed: %d", WSAGetLastError());
+                }
+
+                closesocket(sock);
+            }
+
+            freeaddrinfo(result);
+            WSACleanup();
+
+        } catch (...) {
+            // UDP is best-effort - never let it crash the logger
         }
     }
 
@@ -1714,43 +1827,61 @@ public:
                     return;
             }
 
-            // Compress payload if configured
-            std::string payload = formattedEvent;
+            // Prepare payload
+            std::vector<uint8_t> postData;
+            
             if (m_config.siem.compressPayload) {
-                std::vector<uint8_t> compressed;
-                if (CompressionUtils::CompressBuffer(
-                        CompressionUtils::Algorithm::XPRESS_HUFF,
-                        formattedEvent.data(),
-                        formattedEvent.size(),
-                        compressed)) {
-                    payload = std::string(compressed.begin(), compressed.end());
+                // Compress then send
+                std::vector<uint8_t> uncompressed(formattedEvent.begin(), formattedEvent.end());
+                if (!CompressionUtils::CompressBuffer(
+                        CompressionUtils::Algorithm::XpressHuff,
+                        uncompressed.data(),
+                        uncompressed.size(),
+                        postData)) {
+                    // Fall back to uncompressed
+                    postData = std::move(uncompressed);
                 }
+            } else {
+                postData.assign(formattedEvent.begin(), formattedEvent.end());
             }
 
-            // Send to SIEM endpoint
-            NetworkUtils::Error netErr;
-            std::unordered_map<std::string, std::string> headers;
-            headers["Authorization"] = "Bearer " + StringUtils::WideToUtf8(m_config.siem.apiKey);
-            if (m_config.siem.compressPayload) {
-                headers["Content-Encoding"] = "deflate";
+            // Build SIEM URL
+            std::wstring url = m_config.siem.endpoint;
+            if (url.find(L"/api/") == std::wstring::npos) {
+                if (url.back() != L'/') url += L'/';
+                url += L"api/v1/events";
+            }
+
+            // Configure request
+            NetworkUtils::HttpRequestOptions opts;
+            opts.method = NetworkUtils::HttpMethod::POST;
+            opts.contentType = m_config.siem.format == SIEMFormat::JSON
+                ? L"application/json" : L"text/plain";
+            opts.timeoutMs = 10000;
+            opts.verifySSL = true;
+            
+            // Auth header
+            if (!m_config.siem.apiKey.empty()) {
+                NetworkUtils::HttpHeader authHeader;
+                authHeader.name = L"Authorization";
+                authHeader.value = L"Bearer " + m_config.siem.apiKey;
+                opts.headers.push_back(std::move(authHeader));
             }
             
-            auto result = NetworkUtils::HttpPost(
-                StringUtils::WideToUtf8(m_config.siem.endpoint),
-                443,
-                "/api/v1/events",
-                payload,
-                m_config.siem.format == SIEMFormat::JSON ? "application/json" : "text/plain",
-                headers,
-                true,   // Use TLS
-                10000,  // 10 second timeout
-                &netErr
-            );
-            
-            if (result.statusCode >= 200 && result.statusCode < 300) {
+            if (m_config.siem.compressPayload) {
+                NetworkUtils::HttpHeader encodingHeader;
+                encodingHeader.name = L"Content-Encoding";
+                encodingHeader.value = L"deflate";
+                opts.headers.push_back(std::move(encodingHeader));
+            }
+
+            // Send
+            NetworkUtils::Error netErr;
+            std::vector<uint8_t> response;
+            if (NetworkUtils::HttpPost(url, postData, response, opts, &netErr)) {
                 m_stats.siemEventsForwarded.fetch_add(1, std::memory_order_relaxed);
             } else {
-                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: SIEM forward failed with status %d", result.statusCode);
+                SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: SIEM forward failed: %ls", netErr.message.c_str());
             }
 
         } catch (const std::exception& e) {
@@ -1763,26 +1894,26 @@ public:
 
         j["eventId"] = event.eventId;
         j["sequenceNumber"] = event.sequenceNumber;
-        j["eventGuid"] = SanitizeForFile(StringUtils::WideToUtf8(event.eventGuid));
+        j["eventGuid"] = SanitizeForFile(StringUtils::ToNarrow(event.eventGuid));
         j["timestamp"] = system_clock::to_time_t(event.timestamp);
         j["timestampMicros"] = duration_cast<microseconds>(event.timestamp.time_since_epoch()).count();
         j["highResolutionTicks"] = event.highResolutionTicks;
-        j["severity"] = SanitizeForFile(StringUtils::WideToUtf8(SeverityToString(event.severity)));
-        j["category"] = SanitizeForFile(StringUtils::WideToUtf8(CategoryToString(event.category)));
-        j["source"] = SanitizeForFile(StringUtils::WideToUtf8(event.source));
-        j["message"] = SanitizeForFile(StringUtils::WideToUtf8(event.message));
+        j["severity"] = SanitizeForFile(StringUtils::ToNarrow(SeverityToString(event.severity)));
+        j["category"] = SanitizeForFile(StringUtils::ToNarrow(CategoryToString(event.category)));
+        j["source"] = SanitizeForFile(StringUtils::ToNarrow(event.source));
+        j["message"] = SanitizeForFile(StringUtils::ToNarrow(event.message));
 
         if (!event.details.empty()) {
-            j["details"] = SanitizeForFile(StringUtils::WideToUtf8(event.details));
+            j["details"] = SanitizeForFile(StringUtils::ToNarrow(event.details));
         }
 
         if (!event.threatName.empty()) {
-            j["threatName"] = SanitizeForFile(StringUtils::WideToUtf8(event.threatName));
-            j["threatType"] = SanitizeForFile(StringUtils::WideToUtf8(event.threatType));
+            j["threatName"] = SanitizeForFile(StringUtils::ToNarrow(event.threatName));
+            j["threatType"] = SanitizeForFile(StringUtils::ToNarrow(event.threatType));
         }
 
         if (!event.filePath.empty()) {
-            j["filePath"] = SanitizeForFile(StringUtils::WideToUtf8(event.filePath));
+            j["filePath"] = SanitizeForFile(StringUtils::ToNarrow(event.filePath));
         }
 
         if (!event.sha256Hash.empty()) {
@@ -1791,9 +1922,9 @@ public:
 
         j["context"]["processId"] = event.context.processId;
         j["context"]["threadId"] = event.context.threadId;
-        j["context"]["processName"] = SanitizeForFile(StringUtils::WideToUtf8(event.context.processName));
-        j["context"]["userName"] = SanitizeForFile(StringUtils::WideToUtf8(event.context.userName));
-        j["context"]["machineName"] = SanitizeForFile(StringUtils::WideToUtf8(event.context.machineName));
+        j["context"]["processName"] = SanitizeForFile(StringUtils::ToNarrow(event.context.processName));
+        j["context"]["userName"] = SanitizeForFile(StringUtils::ToNarrow(event.context.userName));
+        j["context"]["machineName"] = SanitizeForFile(StringUtils::ToNarrow(event.context.machineName));
 
         // Integrity fields
         if (!event.hmacSignature.empty()) {
@@ -1895,7 +2026,7 @@ public:
             // Compress using infrastructure
             std::vector<uint8_t> compressed;
             if (CompressionUtils::CompressBuffer(
-                    CompressionUtils::Algorithm::XPRESS_HUFF,
+                    CompressionUtils::Algorithm::XpressHuff,
                     content.data(),
                     content.size(),
                     compressed)) {
@@ -2107,7 +2238,7 @@ public:
                 // Parse metadata JSON to recover original fields
                 if (!entry.metadata.empty()) {
                     try {
-                        auto metadata = nlohmann::json::parse(StringUtils::WideToUtf8(entry.metadata));
+                        auto metadata = nlohmann::json::parse(StringUtils::ToNarrow(entry.metadata));
                         if (metadata.contains("eventGuid")) {
                             event.eventGuid = StringUtils::ToWide(metadata["eventGuid"].get<std::string>());
                         }
@@ -2158,10 +2289,10 @@ public:
                 return false;
             }
 
-            // Stream events in batches instead of loading all at once
-            constexpr uint32_t BATCH_SIZE = 1000;
-            uint32_t offset = 0;
-            uint64_t totalExported = 0;
+            // Single query - the LogDB Query() returns up to maxResults in one call.
+            // No pagination needed since QueryFilter.maxResults controls the cap.
+            // Using a safety limit to avoid unbounded memory use.
+            constexpr uint32_t MAX_EXPORT_EVENTS = 100000;
             
             std::ofstream outFile(filePath, std::ios::trunc);
             if (!outFile) {
@@ -2174,51 +2305,38 @@ public:
                 SetLogFileACL(filePath);
             }
 
-            // Stream events in batches
-            while (true) {
-                auto events = QueryEventsImpl(startTime, endTime, std::nullopt, std::nullopt, BATCH_SIZE);
-                
-                if (events.empty()) {
-                    break;
+            auto events = QueryEventsImpl(startTime, endTime, std::nullopt, std::nullopt, MAX_EXPORT_EVENTS);
+            uint64_t totalExported = 0;
+
+            for (const auto& event : events) {
+                std::string formatted;
+
+                switch (format) {
+                    case SIEMFormat::JSON:
+                        formatted = FormatAsJSON(event);
+                        break;
+                    case SIEMFormat::CEF:
+                        formatted = FormatAsCEF(event);
+                        break;
+                    case SIEMFormat::LEEF:
+                        formatted = FormatAsLEEF(event);
+                        break;
+                    case SIEMFormat::Syslog:
+                        formatted = FormatAsSyslog(event, m_config.syslog);
+                        break;
+                    default:
+                        continue;
                 }
 
-                for (const auto& event : events) {
-                    std::string formatted;
-
-                    switch (format) {
-                        case SIEMFormat::JSON:
-                            formatted = FormatAsJSON(event);
-                            break;
-                        case SIEMFormat::CEF:
-                            formatted = FormatAsCEF(event);
-                            break;
-                        case SIEMFormat::LEEF:
-                            formatted = FormatAsLEEF(event);
-                            break;
-                        case SIEMFormat::Syslog:
-                            formatted = FormatAsSyslog(event, m_config.syslog);
-                            break;
-                        default:
-                            continue;
-                    }
-
-                    outFile << formatted << "\n";
-                    ++totalExported;
-                }
-                
-                offset += static_cast<uint32_t>(events.size());
-                
-                // If we got less than batch size, we're done
-                if (events.size() < BATCH_SIZE) {
-                    break;
-                }
+                outFile << formatted << "\n";
+                ++totalExported;
             }
 
             outFile.flush();
             outFile.close();
             
             SS_LOG_INFO(LOG_CATEGORY, L"EventLogger: Exported %llu events to %hs", static_cast<unsigned long long>(totalExported), 
-                StringUtils::WideToUtf8(filePath).c_str());
+                StringUtils::ToNarrow(filePath).c_str());
             return true;
 
         } catch (const std::exception& e) {
@@ -2268,16 +2386,16 @@ public:
                 nlohmann::json j;
                 j["eventId"] = event.eventId;
                 j["sequenceNumber"] = event.sequenceNumber;
-                j["eventType"] = SanitizeForFile(StringUtils::WideToUtf8(event.eventType));
+                j["eventType"] = SanitizeForFile(StringUtils::ToNarrow(event.eventType));
                 j["timestamp"] = system_clock::to_time_t(event.timestamp);
                 j["timestampTicks"] = event.timestampTicks;
                 j["context"]["processId"] = event.context.processId;
                 j["context"]["threadId"] = event.context.threadId;
-                j["context"]["machineName"] = SanitizeForFile(StringUtils::WideToUtf8(event.context.machineName));
+                j["context"]["machineName"] = SanitizeForFile(StringUtils::ToNarrow(event.context.machineName));
 
                 for (const auto& [key, value] : event.data) {
-                    j["data"][SanitizeForFile(StringUtils::WideToUtf8(key))] = 
-                        SanitizeForFile(StringUtils::WideToUtf8(value));
+                    j["data"][SanitizeForFile(StringUtils::ToNarrow(key))] = 
+                        SanitizeForFile(StringUtils::ToNarrow(value));
                 }
 
                 outFile << j.dump() << "\n";
@@ -2297,48 +2415,55 @@ public:
     // ========================================================================
 
     void InvokeEventCallbacks(const SecurityEvent& event) {
-        std::shared_lock lock(m_callbackMutex);
+        // Take a snapshot of callbacks under shared_lock to minimize contention.
+        // Failure tracking uses its own mutex to avoid const_cast UB.
+        std::vector<std::pair<uint64_t, EventCallback>> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_eventCallbacks.size());
+            for (const auto& [id, cb] : m_eventCallbacks) {
+                snapshot.emplace_back(id, cb);
+            }
+        }
+
         std::vector<uint64_t> callbacksToRemove;
 
-        for (const auto& [id, callback] : m_eventCallbacks) {
+        for (const auto& [id, callback] : snapshot) {
             try {
-                // Execute callback with timeout tracking
                 auto startTime = steady_clock::now();
                 callback(event);
                 auto elapsed = duration_cast<milliseconds>(steady_clock::now() - startTime);
                 
-                if (elapsed.count() > m_config.callbackTimeoutMs) {
+                if (elapsed.count() > static_cast<long long>(m_config.callbackTimeoutMs)) {
                     SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Callback %llu exceeded timeout (%lld ms)", static_cast<unsigned long long>(id), static_cast<long long>(elapsed.count()));
                     m_stats.callbackTimeouts.fetch_add(1, std::memory_order_relaxed);
                     
-                    // Track failures for this callback
-                    auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
-                    failures[id]++;
-                    
-                    if (failures[id] >= m_config.maxCallbackFailures) {
+                    std::unique_lock failLock(m_callbackFailureMutex);
+                    auto& count = m_callbackFailureCounts[id];
+                    ++count;
+                    if (count >= m_config.maxCallbackFailures) {
                         callbacksToRemove.push_back(id);
                         SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Callback %llu will be unregistered after %lu failures", 
-                            static_cast<unsigned long long>(id), static_cast<unsigned long>(failures[id]));
+                            static_cast<unsigned long long>(id), static_cast<unsigned long>(count));
                     }
                 }
                 
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Event callback %llu exception: %hs", static_cast<unsigned long long>(id), e.what());
                 
-                // Track failures
-                auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
-                failures[id]++;
-                
-                if (failures[id] >= m_config.maxCallbackFailures) {
+                std::unique_lock failLock(m_callbackFailureMutex);
+                auto& count = m_callbackFailureCounts[id];
+                ++count;
+                if (count >= m_config.maxCallbackFailures) {
                     callbacksToRemove.push_back(id);
                 }
             }
         }
         
-        // Remove failed callbacks (need to upgrade lock)
+        // Remove failed callbacks
         if (!callbacksToRemove.empty()) {
-            lock.unlock();
             std::unique_lock writeLock(m_callbackMutex);
+            std::unique_lock failLock(m_callbackFailureMutex);
             for (uint64_t id : callbacksToRemove) {
                 m_eventCallbacks.erase(id);
                 m_callbackFailureCounts.erase(id);
@@ -2348,23 +2473,31 @@ public:
     }
 
     void InvokeAuditCallbacks(const AuditEvent& event) {
-        std::shared_lock lock(m_callbackMutex);
+        std::vector<std::pair<uint64_t, AuditCallback>> snapshot;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            snapshot.reserve(m_auditCallbacks.size());
+            for (const auto& [id, cb] : m_auditCallbacks) {
+                snapshot.emplace_back(id, cb);
+            }
+        }
+
         std::vector<uint64_t> callbacksToRemove;
 
-        for (const auto& [id, callback] : m_auditCallbacks) {
+        for (const auto& [id, callback] : snapshot) {
             try {
                 auto startTime = steady_clock::now();
                 callback(event);
                 auto elapsed = duration_cast<milliseconds>(steady_clock::now() - startTime);
                 
-                if (elapsed.count() > m_config.callbackTimeoutMs) {
+                if (elapsed.count() > static_cast<long long>(m_config.callbackTimeoutMs)) {
                     SS_LOG_WARN(LOG_CATEGORY, L"EventLogger: Audit callback %llu exceeded timeout", static_cast<unsigned long long>(id));
                     m_stats.callbackTimeouts.fetch_add(1, std::memory_order_relaxed);
                     
-                    auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
-                    failures[id]++;
-                    
-                    if (failures[id] >= m_config.maxCallbackFailures) {
+                    std::unique_lock failLock(m_callbackFailureMutex);
+                    auto& count = m_callbackFailureCounts[id];
+                    ++count;
+                    if (count >= m_config.maxCallbackFailures) {
                         callbacksToRemove.push_back(id);
                     }
                 }
@@ -2372,18 +2505,18 @@ public:
             } catch (const std::exception& e) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"EventLogger: Audit callback %llu exception: %hs", static_cast<unsigned long long>(id), e.what());
                 
-                auto& failures = const_cast<std::unordered_map<uint64_t, uint32_t>&>(m_callbackFailureCounts);
-                failures[id]++;
-                
-                if (failures[id] >= m_config.maxCallbackFailures) {
+                std::unique_lock failLock(m_callbackFailureMutex);
+                auto& count = m_callbackFailureCounts[id];
+                ++count;
+                if (count >= m_config.maxCallbackFailures) {
                     callbacksToRemove.push_back(id);
                 }
             }
         }
         
         if (!callbacksToRemove.empty()) {
-            lock.unlock();
             std::unique_lock writeLock(m_callbackMutex);
+            std::unique_lock failLock(m_callbackFailureMutex);
             for (uint64_t id : callbacksToRemove) {
                 m_auditCallbacks.erase(id);
                 m_callbackFailureCounts.erase(id);
@@ -2396,8 +2529,16 @@ public:
     // ========================================================================
 
     void FlushImpl() {
-        // Process all pending events (critical first)
-        while (!m_criticalEventQueue.empty() || !m_eventQueue.empty() || !m_auditQueue.empty()) {
+        // Process all pending events (critical first).
+        // Check under lock to avoid data race on queue state.
+        for (int rounds = 0; rounds < 100; ++rounds) {  // Safety bound to prevent infinite loop
+            bool hasWork = false;
+            {
+                std::unique_lock lock(m_eventQueueMutex);
+                hasWork = !m_criticalEventQueue.empty() || !m_eventQueue.empty() || !m_auditQueue.empty();
+            }
+            if (!hasWork) break;
+
             ProcessCriticalEventQueue();
             ProcessEventQueue();
             ProcessAuditQueue();
@@ -2584,8 +2725,83 @@ void EventLogger::LogScanResult(
 }
 
 // ============================================================================
-// AUDIT LOGGING
+// KERNEL EVENT LOGGING
 // ============================================================================
+
+void EventLogger::LogKernelEvent(
+    EventCategory category,
+    EventSeverity severity,
+    const std::wstring& source,
+    const std::wstring& message,
+    uint32_t targetProcessId,
+    const std::wstring& targetFilePath,
+    const std::unordered_map<std::wstring, std::wstring>& properties
+) {
+    SecurityEvent event{};
+    event.severity = severity;
+    event.category = category;
+    event.source = source;
+    event.message = message;
+    event.filePath = targetFilePath;
+    event.properties = properties;
+
+    // Set appropriate Windows Event ID based on category
+    switch (category) {
+        case EventCategory::KernelEvent:
+            event.windowsEventId = EventIds::KERNEL_PROCESS;
+            break;
+        case EventCategory::MemoryProtection:
+            event.windowsEventId = EventIds::MEMORY_ATTACK;
+            break;
+        case EventCategory::RansomwareProtection:
+            event.windowsEventId = EventIds::RANSOMWARE_DETECTED;
+            break;
+        case EventCategory::BehavioralAnalysis:
+            event.windowsEventId = EventIds::BEHAVIORAL_ALERT;
+            break;
+        default:
+            event.windowsEventId = EventIds::KERNEL_PROCESS;
+            break;
+    }
+
+    if (targetProcessId != 0) {
+        event.properties[L"TargetProcessId"] = std::to_wstring(targetProcessId);
+    }
+
+    Log(event);
+}
+
+void EventLogger::LogKernelThreatDetection(
+    const std::wstring& threatName,
+    const std::wstring& threatType,
+    const std::wstring& filePath,
+    const std::string& sha256Hash,
+    const std::wstring& action,
+    uint32_t targetProcessId,
+    const std::wstring& processImagePath,
+    EventSeverity severity
+) {
+    SecurityEvent event{};
+    event.severity = severity;
+    event.category = EventCategory::ThreatDetection;
+    event.priority = EventPriority::Critical;
+    event.source = L"ShadowStrike.KernelDetection";
+    event.message = std::format(L"Kernel threat: {} in {}", threatName, filePath);
+    event.details = std::format(L"Type: {}, Action: {}, Process: {} (PID: {})",
+        threatType, action, processImagePath, targetProcessId);
+    event.threatName = threatName;
+    event.threatType = threatType;
+    event.filePath = filePath;
+    event.sha256Hash = sha256Hash;
+    event.action = action;
+    event.windowsEventId = EventIds::KERNEL_THREAT;
+
+    event.properties[L"TargetProcessId"] = std::to_wstring(targetProcessId);
+    event.properties[L"ProcessImagePath"] = processImagePath;
+    event.properties[L"DetectionOrigin"] = L"Kernel";
+
+    Log(event);
+}
 
 void EventLogger::LogAudit(const AuditEvent& event) {
     if (m_impl) {
