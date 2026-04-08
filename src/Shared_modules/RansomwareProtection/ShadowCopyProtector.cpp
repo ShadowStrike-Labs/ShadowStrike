@@ -1997,6 +1997,7 @@ void ShadowCopyStatistics::Reset() noexcept {
     for (auto& counter : byAttackType) {
         counter.store(0, std::memory_order_relaxed);
     }
+    startTime = Clock::now();
 }
 
 [[nodiscard]] std::string ShadowCopyStatistics::ToJson() const {

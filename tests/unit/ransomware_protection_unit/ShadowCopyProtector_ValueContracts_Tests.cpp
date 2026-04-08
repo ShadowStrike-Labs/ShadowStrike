@@ -41,6 +41,10 @@ TEST(ShadowCopyProtectorValueContractTests, ConfigStatisticsSerializationHelpers
     invalidLimit.whitelist.assign(ShadowCopyConstants::MAX_WHITELIST_ENTRIES + 1, L"C:\\safe.exe");
     EXPECT_FALSE(invalidLimit.IsValid());
 
+    auto validLimit = config;
+    validLimit.whitelist.assign(ShadowCopyConstants::MAX_WHITELIST_ENTRIES, L"C:\\safe.exe");
+    EXPECT_TRUE(validLimit.IsValid());
+
     ShadowCopyStatistics stats;
     stats.attacksBlocked.store(3, std::memory_order_relaxed);
     stats.processesKilled.store(2, std::memory_order_relaxed);
@@ -61,20 +65,36 @@ TEST(ShadowCopyProtectorValueContractTests, ConfigStatisticsSerializationHelpers
         stats.byAttackType[static_cast<size_t>(VSSAttackType::CommandLineDelete)].load(
             std::memory_order_relaxed),
         0u);
+    EXPECT_LT(
+        std::chrono::duration_cast<std::chrono::seconds>(Clock::now() - stats.startTime).count(),
+        2);
 
     ShadowCopyInfo info;
     info.shadowId = L"shadow-1";
     info.volume = L"C:\\";
     info.isProtected = true;
+    info.providerId = L"provider-1";
     EXPECT_THAT(info.ToJson(), HasSubstr("\"shadowId\": \"shadow-1\""));
+    EXPECT_THAT(info.ToJson(), HasSubstr("\"providerId\": \"provider-1\""));
 
     VSSAttackEvent event;
     event.attackType = VSSAttackType::WMIDelete;
     event.processName = L"wmic.exe";
+    event.details = L"delete shadow copies";
     EXPECT_THAT(event.ToJson(), HasSubstr("\"attackTypeName\": \"WMIDelete\""));
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"details\": \"delete shadow copies\""));
+
+    ShadowCopyStatisticsSnapshot snapshot;
+    snapshot.attacksBlocked = 5;
+    snapshot.currentShadowCopies = 3;
+    snapshot.uptimeSeconds = 11;
+    snapshot.byAttackType[static_cast<size_t>(VSSAttackType::WMIDelete)] = 2;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"WMIDelete\": 2"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\": 11"));
 
     EXPECT_EQ(GetVSSAttackTypeName(VSSAttackType::ProviderDisable), "ProviderDisable");
     EXPECT_EQ(GetShadowCopyStateName(ShadowCopyState::Corrupted), "Corrupted");
+    EXPECT_EQ(GetVSSAttackTypeName(static_cast<VSSAttackType>(0xFF)), "Unknown");
     EXPECT_EQ(ShadowCopyProtector::GetVersionString(), "3.1.0");
 }
 

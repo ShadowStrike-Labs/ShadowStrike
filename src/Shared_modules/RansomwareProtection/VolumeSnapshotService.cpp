@@ -382,7 +382,7 @@ std::string VolumeSnapshotStatistics::ToJson() const {
     j["totalDeletionTimeMs"]    = totalDeletionTimeMs.load();
     j["totalRestorationTimeMs"] = totalRestorationTimeMs.load();
     j["currentOperations"]      = currentOperations.load();
-    j["emergencySnapshots"]     = emergencySnapshotsCreated.load();
+    j["emergencySnapshotsCreated"] = emergencySnapshotsCreated.load();
     return j.dump();
 }
 

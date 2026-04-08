@@ -116,6 +116,32 @@ namespace {
         return ext;
     }
 
+    std::wstring NormalizeComparablePath(std::wstring_view path) {
+        std::wstring normalized(path);
+        std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(), ::towlower);
+        return normalized;
+    }
+
+    bool HasProtectedPathPrefix(std::wstring_view normalizedPath,
+                                std::wstring_view normalizedDirectory) {
+        if (normalizedDirectory.empty() || normalizedPath.size() < normalizedDirectory.size()) {
+            return false;
+        }
+        if (normalizedPath.compare(0, normalizedDirectory.size(), normalizedDirectory) != 0) {
+            return false;
+        }
+        if (normalizedPath.size() == normalizedDirectory.size()) {
+            return true;
+        }
+        const wchar_t trailing = normalizedDirectory.back();
+        if (trailing == L'\\') {
+            return true;
+        }
+        const wchar_t boundary = normalizedPath[normalizedDirectory.size()];
+        return boundary == L'\\';
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -856,17 +882,17 @@ void RansomwareDetector::OnHoneypotTouched(uint32_t pid, const std::wstring& fil
 
 void RansomwareDetector::RegisterHoneypot(std::wstring_view filePath) {
     std::unique_lock lk(m_impl->m_honeypotMutex);
-    m_impl->m_honeypots.emplace(filePath);
+    m_impl->m_honeypots.emplace(NormalizeComparablePath(filePath));
 }
 
 void RansomwareDetector::UnregisterHoneypot(std::wstring_view filePath) {
     std::unique_lock lk(m_impl->m_honeypotMutex);
-    m_impl->m_honeypots.erase(std::wstring(filePath));
+    m_impl->m_honeypots.erase(NormalizeComparablePath(filePath));
 }
 
 bool RansomwareDetector::IsHoneypot(std::wstring_view filePath) const {
     std::shared_lock lk(m_impl->m_honeypotMutex);
-    return m_impl->m_honeypots.count(std::wstring(filePath)) > 0;
+    return m_impl->m_honeypots.count(NormalizeComparablePath(filePath)) > 0;
 }
 
 // ============================================================================
@@ -1267,11 +1293,12 @@ bool RansomwareDetector::IsCompressedType(std::wstring_view filePath) const {
 }
 
 bool RansomwareDetector::IsProtectedPath(std::wstring_view filePath) const {
+    const auto normalizedPath = NormalizeComparablePath(filePath);
     std::shared_lock lk(m_impl->m_mutex);
     for (const auto& dir : m_impl->m_config.protectedDirectories) {
-        if (filePath.size() >= dir.size() &&
-            _wcsnicmp(filePath.data(), dir.data(), dir.size()) == 0)
+        if (HasProtectedPathPrefix(normalizedPath, NormalizeComparablePath(dir))) {
             return true;
+        }
     }
     return false;
 }

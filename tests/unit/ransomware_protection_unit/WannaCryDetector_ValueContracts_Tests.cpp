@@ -47,6 +47,7 @@ TEST(WannaCryDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemain
 
     WannaCryStatistics stats;
     stats.totalDetections.store(3, std::memory_order_relaxed);
+    stats.byVariant[static_cast<size_t>(WannaCryVariant::BadRabbit)].store(9, std::memory_order_relaxed);
     stats.smbExploitsBlocked.store(1, std::memory_order_relaxed);
     stats.killSwitchQueries.store(2, std::memory_order_relaxed);
     stats.processesTerminated.store(4, std::memory_order_relaxed);
@@ -65,20 +66,37 @@ TEST(WannaCryDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemain
     EXPECT_EQ(stats.smbScansDetected.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.mutexDetections.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.serviceDetections.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(
+        stats.byVariant[static_cast<size_t>(WannaCryVariant::BadRabbit)].load(
+            std::memory_order_relaxed),
+        0u);
 
     WannaCryDetectionResult result;
     result.variant = WannaCryVariant::BadRabbit;
     result.phase = WannaCryPhase::Propagation;
     result.confidence = DetectionConfidence::High;
+    result.processName = L"tasksche.exe";
+    result.killSwitchDomain = "iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com";
     EXPECT_THAT(result.ToJson(), HasSubstr("BadRabbit"));
     EXPECT_THAT(result.ToJson(), HasSubstr("Propagation"));
     EXPECT_THAT(result.ToJson(), HasSubstr("High"));
+    EXPECT_THAT(result.ToJson(), HasSubstr("\"processName\":\"tasksche.exe\""));
+    EXPECT_THAT(result.ToJson(), HasSubstr("\"killSwitchDomain\":\"iuqerfsodp9ifjaposdfjhgosurijfaewrwergwea.com\""));
+
+    WannaCryStatisticsSnapshot snapshot;
+    snapshot.totalDetections = 4;
+    snapshot.hostsProtected = 2;
+    snapshot.uptimeSeconds = 10;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"hostsProtected\":2"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":10"));
 
     EXPECT_EQ(GetWannaCryVariantName(WannaCryVariant::WannaCryNoKill),
               "WannaCry (No Kill-Switch)");
     EXPECT_EQ(GetWannaCryPhaseName(WannaCryPhase::MBROverwrite), "MBR Overwrite");
     EXPECT_EQ(GetDetectionConfidenceName(DetectionConfidence::Confirmed), "Confirmed");
     EXPECT_EQ(GetDetectionConfidenceName(static_cast<DetectionConfidence>(0xFF)), "Unknown");
+    EXPECT_EQ(GetWannaCryVariantName(static_cast<WannaCryVariant>(0xFF)), "Unknown");
+    EXPECT_EQ(GetWannaCryPhaseName(static_cast<WannaCryPhase>(0xFF)), "Unknown");
     EXPECT_EQ(WannaCryDetector::GetVersionString(), "3.2.0");
 }
 

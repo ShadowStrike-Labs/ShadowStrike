@@ -70,6 +70,21 @@ TEST(BackupProtectorValueTests, ConfigurationStatisticsUtilitiesAndVersionRemain
     invalidWhitelistEntry.whitelistedProcesses.push_back(L"");
     EXPECT_FALSE(invalidWhitelistEntry.IsValid());
 
+    auto invalidWhitelistLimit = defaults;
+    invalidWhitelistLimit.whitelistedProcesses.assign(
+        BackupProtectorConstants::MAX_WHITELIST_SIZE + 1, L"C:\\safe.exe");
+    EXPECT_FALSE(invalidWhitelistLimit.IsValid());
+
+    auto disabledNoProtections = invalidProtections;
+    disabledNoProtections.enabled = false;
+    EXPECT_TRUE(disabledNoProtections.IsValid());
+
+    defaults.LoadDefaultPatterns();
+    EXPECT_FALSE(defaults.commandPatterns.empty());
+    defaults.LoadDefaultServices();
+    ASSERT_FALSE(defaults.protectedServices.empty());
+    EXPECT_EQ(defaults.protectedServices.front().serviceName, L"VSS");
+
     CommandPattern pattern;
     pattern.patternName = "delete-shadows";
     pattern.regexPattern = L"delete\\s+shadows";
@@ -98,6 +113,15 @@ TEST(BackupProtectorValueTests, ConfigurationStatisticsUtilitiesAndVersionRemain
     EXPECT_EQ(stats.whitelistedAllowed, 0u);
     EXPECT_EQ(stats.byThreatType[static_cast<size_t>(BackupThreatType::VSSDelete)], 0u);
     EXPECT_THAT(stats.ToJson(), HasSubstr("\"attemptsBlocked\":0"));
+
+    BlockedAttempt attempt;
+    attempt.attemptId = 7;
+    attempt.pid = 77;
+    attempt.processName = L"wmic.exe";
+    attempt.commandLine = L"wmic shadowcopy delete";
+    attempt.target = L"shadowcopy";
+    EXPECT_THAT(attempt.ToJson(), HasSubstr("\"attemptId\":7"));
+    EXPECT_THAT(attempt.ToJson(), HasSubstr("\"commandLine\":\"wmic shadowcopy delete\""));
 
     EXPECT_EQ(GetThreatTypeName(BackupThreatType::WMIShadowDelete), "WMIShadowDelete");
     EXPECT_EQ(GetProtectionActionName(ProtectionAction::Quarantine), "Quarantine");
@@ -146,6 +170,26 @@ TEST_F(BackupProtectorTest, ProtectedBackupFileChecksReflectRuntimeConfiguration
     EXPECT_FALSE(protector.IsProtectedBackupFile(L"C:\\Backups\\server-image.vhdx"));
 }
 
+TEST_F(BackupProtectorTest, FileServiceAndRegistryProtectionHelpersRejectDestructiveOperations) {
+    auto& protector = BackupProtector::Instance();
+
+    EXPECT_TRUE(protector.ShouldBlockFileAccess(
+        L"C:\\Backups\\server-image.vhdx", ::GetCurrentProcessId(), DELETE));
+    EXPECT_FALSE(protector.ShouldBlockFileAccess(
+        L"C:\\Backups\\notes.txt", ::GetCurrentProcessId(), DELETE));
+    EXPECT_FALSE(protector.ShouldBlockFileAccess(
+        L"C:\\Backups\\server-image.vhdx", ::GetCurrentProcessId(), FILE_READ_DATA));
+
+    EXPECT_TRUE(protector.ShouldBlockServiceOperation(L"VSS", 0x0020, ::GetCurrentProcessId()));
+    EXPECT_FALSE(protector.ShouldBlockServiceOperation(L"Spooler", 0x0020, ::GetCurrentProcessId()));
+
+    EXPECT_TRUE(protector.ShouldBlockRegistryOperation(
+        LR"(SYSTEM\CurrentControlSet\Services\VSS)", L"Start", KEY_SET_VALUE,
+        ::GetCurrentProcessId()));
+    EXPECT_FALSE(protector.ShouldBlockRegistryOperation(
+        LR"(SOFTWARE\ShadowStrike)", L"Test", KEY_SET_VALUE, ::GetCurrentProcessId()));
+}
+
 TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInvokesCallback) {
     auto& protector = BackupProtector::Instance();
 
@@ -184,6 +228,17 @@ TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInv
     const auto recent = protector.GetRecentBlocks(10);
     ASSERT_FALSE(recent.empty());
     EXPECT_EQ(recent.front().attemptId, result->attemptId);
+
+    const auto secondResult = protector.AnalyzeProcess(
+        ::GetCurrentProcessId(),
+        L"C:\\Windows\\System32\\wmic.exe",
+        L"wmic shadowcopy delete");
+    ASSERT_TRUE(secondResult.has_value());
+
+    const auto newestOnly = protector.GetRecentBlocks(1);
+    ASSERT_EQ(newestOnly.size(), 1u);
+    EXPECT_EQ(newestOnly.front().attemptId, secondResult->attemptId);
+    EXPECT_TRUE(protector.GetRecentBlocks(0).empty());
 }
 
 }  // namespace
