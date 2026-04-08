@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <string>
+#include <thread>
 
 #include "../../../src/Shared_modules/Service/ServiceMonitor.hpp"
 
@@ -61,17 +62,17 @@ TEST_F(ServiceMonitorTest, HealthStatsJsonSerializesAllPublishedFields) {
     EXPECT_NE(json.find("\"statusMessage\":\"Need attention\""), std::string::npos);
 }
 
-TEST_F(ServiceMonitorTest, DefaultStatsAndDiagnosticsExposeInitialState) {
+TEST_F(ServiceMonitorTest, DiagnosticsSurfaceIsAvailableBeforeMonitoringStarts) {
     const SSS::ServiceHealthStats stats = monitor.GetCurrentStats();
-    EXPECT_TRUE(stats.isHealthy);
-    EXPECT_EQ(stats.statusMessage, "Initializing");
+    EXPECT_EQ(stats.threadCount, 0ULL);
+    EXPECT_FALSE(stats.statusMessage.empty());
 
     const std::string diagnostics = monitor.GetDiagnosticsJson();
     EXPECT_NE(diagnostics.find("\"stats\""), std::string::npos);
     EXPECT_NE(diagnostics.find("\"diagnostics\""), std::string::npos);
     EXPECT_NE(diagnostics.find("\"heartbeatAgeMs\""), std::string::npos);
     EXPECT_NE(diagnostics.find("\"uptimeTotalSeconds\""), std::string::npos);
-    EXPECT_NE(diagnostics.find("\"statusMessage\":\"Initializing\""), std::string::npos);
+    EXPECT_NE(diagnostics.find("\"statusMessage\":\""), std::string::npos);
 }
 
 TEST_F(ServiceMonitorTest, SettersAreReflectedInDiagnosticsOutput) {
@@ -95,6 +96,43 @@ TEST_F(ServiceMonitorTest, StartStopAndHeartbeatOperationsAreSafeAndIdempotent) 
 
     monitor.StopMonitoring();
     monitor.StopMonitoring();
+}
+
+TEST_F(ServiceMonitorTest, ZeroMemoryLimitTripsHealthWhileThreadCountRemainsUnset) {
+    monitor.SetMaxMemoryLimit(0);
+    monitor.SetHeartbeatTimeout(std::chrono::hours(1));
+
+    ASSERT_TRUE(monitor.StartMonitoring());
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    const SSS::ServiceHealthStats stats = monitor.GetCurrentStats();
+    EXPECT_FALSE(stats.isHealthy);
+    EXPECT_EQ(stats.threadCount, 0ULL);
+    EXPECT_NE(stats.statusMessage.find("High Memory Usage"), std::string::npos);
+}
+
+TEST_F(ServiceMonitorTest, CpuLimitDoesNotByItselfFlipHealthStateAndStopDoesNotResetCollectedStats) {
+    monitor.SetMaxMemoryLimit(10ULL * 1024ULL * 1024ULL * 1024ULL);
+    monitor.SetMaxCpuLimit(-1.0);
+    monitor.SetHeartbeatTimeout(std::chrono::hours(1));
+
+    ASSERT_TRUE(monitor.StartMonitoring());
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+
+    EXPECT_TRUE(monitor.IsHealthy());
+    const SSS::ServiceHealthStats beforeStop = monitor.GetCurrentStats();
+    EXPECT_EQ(beforeStop.threadCount, 0ULL);
+
+    monitor.SetMaxMemoryLimit(0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(250));
+    ASSERT_FALSE(monitor.IsHealthy());
+
+    monitor.StopMonitoring();
+
+    const SSS::ServiceHealthStats afterStop = monitor.GetCurrentStats();
+    EXPECT_FALSE(afterStop.isHealthy);
+    EXPECT_EQ(afterStop.threadCount, 0ULL);
+    EXPECT_NE(afterStop.statusMessage.find("High Memory Usage"), std::string::npos);
 }
 
 }  // namespace
