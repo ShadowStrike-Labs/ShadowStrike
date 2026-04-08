@@ -94,6 +94,8 @@ TEST_F(PolymorphicDetectorTest, JsonAndValidationHelpersRemainStable) {
     const std::string resultJson = result.ToJson();
     EXPECT_TRUE(Contains(resultJson, "\"mutations\":2"));
     EXPECT_TRUE(Contains(resultJson, "\"threatFamily\":\"ShadowFamily\""));
+    EXPECT_TRUE(Contains(resultJson, "\"fuzzyHash\":\"BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB...\""));
+    EXPECT_TRUE(Contains(resultJson, "\"tlshHash\":\"CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC...\""));
 
     Engine::PolyAnalysisOptions options;
     EXPECT_TRUE(options.IsValid());
@@ -154,6 +156,7 @@ TEST_F(PolymorphicDetectorTest, PreInitializationGuardsReturnSafeDefaults) {
         EXPECT_FALSE(asyncResult.isPolymorphic);
     });
     EXPECT_TRUE(callbackInvoked.load(std::memory_order_relaxed));
+    detector.AnalyzeAsync(code, nullptr);
 
     EXPECT_EQ(detector.NormalizeInstructions(code), code);
     EXPECT_TRUE(detector.NormalizeCode(code).normalizedCode.empty());
@@ -181,12 +184,22 @@ TEST_F(PolymorphicDetectorTest, InitializedHelpersSupportDeterministicDecryption
     const auto decrypted = detector.DecryptPayload(encrypted, {0x01, 0x02});
     ASSERT_TRUE(decrypted.has_value());
     EXPECT_EQ(*decrypted, (std::vector<uint8_t>{0x11, 0x13, 0x13, 0x11}));
+    EXPECT_FALSE(detector.DecryptPayload({}, {0x01}).has_value());
+    EXPECT_FALSE(detector.DecryptPayload(encrypted, {}).has_value());
 
     const std::vector<uint8_t> junkHeavyCode = {0x90, 0x90, 0xEB, 0x00, 0xCC, 0x58, 0xC3};
     const std::vector<uint8_t> cleaned = detector.RemoveJunkCode(junkHeavyCode);
-    EXPECT_LT(cleaned.size(), junkHeavyCode.size());
+    EXPECT_EQ(cleaned, (std::vector<uint8_t>{0xCC, 0x58, 0xC3}));
 
     EXPECT_EQ(detector.GetEngineName(Engine::PolyEngineType::MtE), "MtE");
+    EXPECT_FALSE(Engine::IsPotentiallyPolymorphic(std::span<const uint8_t>{}));
+    EXPECT_FLOAT_EQ(Engine::GetCodeEntropy(std::span<const uint8_t>{}), 0.0f);
+
+    std::vector<uint8_t> highEntropyCode(256);
+    for (size_t i = 0; i < highEntropyCode.size(); ++i) {
+        highEntropyCode[i] = static_cast<uint8_t>(i);
+    }
+    EXPECT_TRUE(Engine::IsPotentiallyPolymorphic(highEntropyCode));
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test

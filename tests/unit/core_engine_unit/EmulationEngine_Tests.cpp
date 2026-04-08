@@ -14,6 +14,7 @@
 
 #include <gtest/gtest.h>
 
+#include <array>
 #include <optional>
 #include <string_view>
 #include <vector>
@@ -72,10 +73,15 @@ TEST_F(EmulationEngineTest, ResultHelpersSummarizeAndSelectHighestSeverityApi) {
     ASSERT_TRUE(highest.has_value());
     EXPECT_EQ(highest->functionName, "WriteProcessMemory");
     EXPECT_EQ(highest->severity, Engine::APISeverity::Critical);
+    EXPECT_FALSE(Engine::EmulationResult{}.GetHighestSeverityAPI().has_value());
 
     result.Clear();
     EXPECT_EQ(result.sessionId, 0u);
+    EXPECT_EQ(result.state, Engine::EmulationState::Uninitialized);
+    EXPECT_EQ(result.backend, Engine::EmulationBackend::Auto);
     EXPECT_FALSE(result.isMalicious);
+    EXPECT_TRUE(result.threatName.empty());
+    EXPECT_EQ(result.instructionsExecuted, 0u);
     EXPECT_TRUE(result.apiCalls.empty());
 }
 
@@ -109,6 +115,67 @@ TEST_F(EmulationEngineTest, ConfigurationFactoriesExpressIntendedExecutionProfil
     EXPECT_FALSE(shellcodeConfig.enableUnpacking);
 }
 
+TEST_F(EmulationEngineTest, FreeHelpersPreservePackedPeOepAndApiClassificationContracts) {
+    EXPECT_DOUBLE_EQ(Engine::CalculateEntropy(nullptr, 0), 0.0);
+
+    const std::array<uint8_t, 64> zeros{};
+    EXPECT_DOUBLE_EQ(Engine::CalculateEntropy(zeros.data(), zeros.size()), 0.0);
+
+    std::array<uint8_t, 256> highEntropy{};
+    for (size_t i = 0; i < highEntropy.size(); ++i) {
+        highEntropy[i] = static_cast<uint8_t>(i);
+    }
+    EXPECT_GT(Engine::CalculateEntropy(highEntropy.data(), highEntropy.size()), 7.9);
+
+    const std::vector<uint8_t> invalidPe(8, 0x00);
+    EXPECT_FALSE(Engine::IsPELikelyPacked(invalidPe));
+
+    std::vector<uint8_t> upxMarkedPe(sizeof(IMAGE_DOS_HEADER) + 32, 0x00);
+    auto* dos = reinterpret_cast<IMAGE_DOS_HEADER*>(upxMarkedPe.data());
+    dos->e_magic = IMAGE_DOS_SIGNATURE;
+    dos->e_lfanew = static_cast<LONG>(sizeof(IMAGE_DOS_HEADER));
+    upxMarkedPe[sizeof(IMAGE_DOS_HEADER) + 4] = 'U';
+    upxMarkedPe[sizeof(IMAGE_DOS_HEADER) + 5] = 'P';
+    upxMarkedPe[sizeof(IMAGE_DOS_HEADER) + 6] = 'X';
+    upxMarkedPe[sizeof(IMAGE_DOS_HEADER) + 7] = '!';
+    EXPECT_TRUE(Engine::IsPELikelyPacked(upxMarkedPe));
+
+    const std::vector<uint8_t> memoryDump = {0x90, 0x90, 0x55, 0x8B, 0xEC, 0x90};
+    EXPECT_EQ(Engine::DetectOEP(memoryDump, 0x140000000ULL), 0x140000002ULL);
+
+    std::vector<uint8_t> oversizedDump(1024 * 1024 + 8, 0x90);
+    oversizedDump[1024 * 1024 + 1] = 0x55;
+    oversizedDump[1024 * 1024 + 2] = 0x8B;
+    oversizedDump[1024 * 1024 + 3] = 0xEC;
+    EXPECT_EQ(Engine::DetectOEP(oversizedDump, 0x180000000ULL), 0ULL);
+
+    EXPECT_EQ(
+        Engine::CategorizeAPI("KERNEL32.dll", "WriteProcessMemory"),
+        Engine::APICategory::Injection);
+    EXPECT_EQ(
+        Engine::CategorizeAPI("wininet.dll", "HttpOpenRequestW"),
+        Engine::APICategory::Network);
+    EXPECT_EQ(
+        Engine::CategorizeAPI("kernel32.dll", "LoadLibraryA"),
+        Engine::APICategory::DynamicCode);
+
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("kernel32.dll", "WriteProcessMemory", {}),
+        Engine::APISeverity::Critical);
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("kernel32.dll", "VirtualProtect", {"PAGE_EXECUTE_READWRITE"}),
+        Engine::APISeverity::High);
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("kernel32.dll", "VirtualProtect", {"PAGE_READWRITE"}),
+        Engine::APISeverity::Medium);
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("kernel32.dll", "CreateFileW", {}),
+        Engine::APISeverity::Low);
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("kernel32.dll", "GetTickCount", {}),
+        Engine::APISeverity::Benign);
+}
+
 TEST_F(EmulationEngineTest, SessionAndStatsSnapshotsCopyAtomicStateCorrectly) {
     Engine::EmulationSession originalSession;
     originalSession.sessionId = 99;
@@ -138,6 +205,7 @@ TEST_F(EmulationEngineTest, SessionAndStatsSnapshotsCopyAtomicStateCorrectly) {
     EXPECT_EQ(copiedStats.totalSessions.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(copiedStats.totalInstructions.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(copiedStats.avgEmulationTimeUs.load(std::memory_order_relaxed), 0u);
+    EXPECT_FALSE(copiedStats.phantomEmulatorAvailable);
 }
 
 TEST_F(EmulationEngineTest, NonOperationalSessionAndCallbackSurfacesRemainSafe) {
@@ -151,6 +219,11 @@ TEST_F(EmulationEngineTest, NonOperationalSessionAndCallbackSurfacesRemainSafe) 
     const Engine::EmulationConfig storedConfig = engine.GetDefaultConfig();
     EXPECT_EQ(storedConfig.mode, Engine::EmulationMode::Debug);
     EXPECT_TRUE(storedConfig.debugLogging);
+
+    EXPECT_EQ(engine.RegisterAPICallback(Engine::APICallCallback{}), 0u);
+    EXPECT_EQ(engine.RegisterFileDropCallback(Engine::FileDropCallback{}), 0u);
+    EXPECT_EQ(engine.RegisterNetworkCallback(Engine::NetworkActivityCallback{}), 0u);
+    EXPECT_EQ(engine.RegisterUnpackCallback(Engine::UnpackLayerCallback{}), 0u);
 
     EXPECT_EQ(engine.EmulatePEAsync({0x4D, 0x5A, 0x90, 0x00}, Engine::EmulationConfig::CreateDefault(), nullptr), 0u);
     EXPECT_FALSE(engine.GetSession(1).has_value());
@@ -170,6 +243,10 @@ TEST_F(EmulationEngineTest, NonOperationalSessionAndCallbackSurfacesRemainSafe) 
     EXPECT_TRUE(engine.UnregisterFileDropCallback(fileCallbackId));
     EXPECT_TRUE(engine.UnregisterNetworkCallback(netCallbackId));
     EXPECT_TRUE(engine.UnregisterUnpackCallback(unpackCallbackId));
+    EXPECT_FALSE(engine.UnregisterAPICallback(apiCallbackId));
+    EXPECT_FALSE(engine.UnregisterFileDropCallback(fileCallbackId));
+    EXPECT_FALSE(engine.UnregisterNetworkCallback(netCallbackId));
+    EXPECT_FALSE(engine.UnregisterUnpackCallback(unpackCallbackId));
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test
