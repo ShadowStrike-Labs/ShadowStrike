@@ -106,7 +106,7 @@
 
 #include "pch.h"
 #include "DebuggerEvasionDetector.hpp"
-#include <Zydis/Zydis.h>
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 #include <format>
 #include <algorithm>
 #include <execution>
@@ -759,36 +759,36 @@ namespace ShadowStrike::AntiEvasion {
     } // namespace SyscallPatterns
 
     // ========================================================================
-    // ANTI-DEBUG INSTRUCTION PATTERNS FOR ZYDIS
+    // ANTI-DEBUG INSTRUCTION PATTERNS FOR PHANTOMDISASSEMBLER
     // ========================================================================
 
     namespace AntiDebugPatterns {
 
         /// @brief Anti-debug mnemonics to detect
-        static constexpr ZydisMnemonic TIMING_MNEMONICS[] = {
-            ZYDIS_MNEMONIC_RDTSC,
-            ZYDIS_MNEMONIC_RDTSCP,
-            ZYDIS_MNEMONIC_RDPMC,
-            ZYDIS_MNEMONIC_CPUID
+        static constexpr Phantom::Disasm::Mnemonic TIMING_MNEMONICS[] = {
+            Phantom::Disasm::Mnemonic::RDTSC,
+            Phantom::Disasm::Mnemonic::RDTSCP,
+            Phantom::Disasm::Mnemonic::RDPMC,
+            Phantom::Disasm::Mnemonic::CPUID
         };
 
         /// @brief Exception-generating mnemonics
-        static constexpr ZydisMnemonic EXCEPTION_MNEMONICS[] = {
-            ZYDIS_MNEMONIC_INT3,
-            ZYDIS_MNEMONIC_INT,
-            ZYDIS_MNEMONIC_INT1,
-            ZYDIS_MNEMONIC_INTO,
-            ZYDIS_MNEMONIC_UD0,
-            ZYDIS_MNEMONIC_UD1,
-            ZYDIS_MNEMONIC_UD2
+        static constexpr Phantom::Disasm::Mnemonic EXCEPTION_MNEMONICS[] = {
+            Phantom::Disasm::Mnemonic::INT3,
+            Phantom::Disasm::Mnemonic::INT,
+            Phantom::Disasm::Mnemonic::INT1,
+            Phantom::Disasm::Mnemonic::INTO,
+            Phantom::Disasm::Mnemonic::UD0,
+            Phantom::Disasm::Mnemonic::UD1,
+            Phantom::Disasm::Mnemonic::UD2
         };
 
         /// @brief System call mnemonics
-        static constexpr ZydisMnemonic SYSCALL_MNEMONICS[] = {
-            ZYDIS_MNEMONIC_SYSCALL,
-            ZYDIS_MNEMONIC_SYSENTER,
-            ZYDIS_MNEMONIC_SYSEXIT,
-            ZYDIS_MNEMONIC_SYSRET
+        static constexpr Phantom::Disasm::Mnemonic SYSCALL_MNEMONICS[] = {
+            Phantom::Disasm::Mnemonic::SYSCALL,
+            Phantom::Disasm::Mnemonic::SYSENTER,
+            Phantom::Disasm::Mnemonic::SYSEXIT,
+            Phantom::Disasm::Mnemonic::SYSRET
         };
 
     } // namespace AntiDebugPatterns
@@ -833,14 +833,14 @@ namespace ShadowStrike::AntiEvasion {
         PFN_NtQueryInformationThread m_NtQueryInformationThread = nullptr;
         PFN_NtQueryVirtualMemory m_NtQueryVirtualMemory = nullptr;
 
-        // Zydis Decoders (initialized once for performance)
-        ZydisDecoder m_decoder64;
-        ZydisDecoder m_decoder32;
-        bool m_zydis64Initialized = false;
-        bool m_zydis32Initialized = false;
+        // Disasm Decoders (initialized once for performance)
+        Phantom::Disasm::Decoder m_decoder64;
+        Phantom::Disasm::Decoder m_decoder32;
+        bool m_disasm64Initialized = false;
+        bool m_disasm32Initialized = false;
 
-        // Zydis Formatter for disassembly output
-        ZydisFormatter m_formatter;
+        // Formatter for disassembly output
+        Phantom::Disasm::Formatter m_formatter;
         bool m_formatterInitialized = false;
 
         // PEParser instance for PE analysis
@@ -896,23 +896,23 @@ namespace ShadowStrike::AntiEvasion {
                     return false;
                 }
 
-                // Initialize Zydis Decoders
-                if (ZYAN_SUCCESS(ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
-                    m_zydis64Initialized = true;
+                // Initialize Disasm Decoders
+                if (Phantom::Disasm::IsSuccess(m_decoder64.Init(Phantom::Disasm::MachineMode::Long64))) {
+                    m_disasm64Initialized = true;
                 }
                 else {
-                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize Zydis 64-bit decoder");
+                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize PhantomDisasm 64-bit decoder");
                 }
 
-                if (ZYAN_SUCCESS(ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LONG_COMPAT_32, ZYDIS_STACK_WIDTH_32))) {
-                    m_zydis32Initialized = true;
+                if (Phantom::Disasm::IsSuccess(m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32))) {
+                    m_disasm32Initialized = true;
                 }
                 else {
-                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize Zydis 32-bit decoder");
+                    SS_LOG_WARN(LOG_CATEGORY, L"Failed to initialize PhantomDisasm 32-bit decoder");
                 }
 
-                // Initialize Zydis Formatter
-                if (ZYAN_SUCCESS(ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL))) {
+                // Initialize Disasm Formatter
+                if (Phantom::Disasm::IsSuccess(m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel))) {
                     m_formatterInitialized = true;
                 }
 
@@ -1203,12 +1203,12 @@ namespace ShadowStrike::AntiEvasion {
             return std::nullopt;
         }
 
-        /// @brief Get appropriate Zydis decoder based on bitness
-        [[nodiscard]] const ZydisDecoder* GetDecoder(bool is64Bit) const noexcept {
-            if (is64Bit && m_zydis64Initialized) {
+        /// @brief Get appropriate decoder based on bitness
+        [[nodiscard]] const Phantom::Disasm::Decoder* GetDecoder(bool is64Bit) const noexcept {
+            if (is64Bit && m_disasm64Initialized) {
                 return &m_decoder64;
             }
-            else if (!is64Bit && m_zydis32Initialized) {
+            else if (!is64Bit && m_disasm32Initialized) {
                 return &m_decoder32;
             }
             return nullptr;
@@ -1216,8 +1216,8 @@ namespace ShadowStrike::AntiEvasion {
 
         /// @brief Disassemble instruction to string
         [[nodiscard]] std::wstring DisassembleInstruction(
-            const ZydisDecodedInstruction& instruction,
-            const ZydisDecodedOperand* operands,
+            const Phantom::Disasm::DecodedInstruction& instruction,
+            const Phantom::Disasm::DecodedOperand* operands,
             uint64_t address
         ) const noexcept {
             if (!m_formatterInitialized) {
@@ -1225,9 +1225,9 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             char buffer[256] = {};
-            if (ZYAN_SUCCESS(ZydisFormatterFormatInstruction(
-                &m_formatter, &instruction, operands, instruction.operand_count,
-                buffer, sizeof(buffer), address, nullptr))) {
+            if (Phantom::Disasm::IsSuccess(m_formatter.FormatInstruction(
+                instruction, operands, instruction.operand_count,
+                buffer, sizeof(buffer), address))) {
                 return Utils::StringUtils::ToWide(buffer);
             }
             return L"<disassembly failed>";
@@ -1236,8 +1236,8 @@ namespace ShadowStrike::AntiEvasion {
         /// @brief Check if mnemonic is in array
         template<size_t N>
         [[nodiscard]] static bool IsMnemonicInArray(
-            ZydisMnemonic mnemonic,
-            const ZydisMnemonic (&arr)[N]
+            Phantom::Disasm::Mnemonic mnemonic,
+            const Phantom::Disasm::Mnemonic (&arr)[N]
         ) noexcept {
             for (size_t i = 0; i < N; ++i) {
                 if (arr[i] == mnemonic) return true;
@@ -1262,39 +1262,38 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Check first instruction for common hook patterns
-            ZydisDecodedInstruction instruction;
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            Phantom::Disasm::DecodedInstruction instruction;
+            Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, functionBytes, size, &instruction, operands))) {
+            if (!Phantom::Disasm::IsSuccess(decoder->DecodeFull(functionBytes, size, instruction, operands))) {
                 return false;
             }
 
             // Pattern 1: JMP rel32 (E9 xx xx xx xx)
-            if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP &&
+            if (instruction.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
                 instruction.operand_count > 0 &&
-                operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                 outDetails = L"JMP instruction at function start";
                 return true;
             }
 
             // Pattern 2: JMP [RIP+disp32] (FF 25 xx xx xx xx)
-            if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP &&
+            if (instruction.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
                 instruction.operand_count > 0 &&
-                operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                 outDetails = L"JMP [memory] at function start";
                 return true;
             }
 
             // Pattern 3: PUSH + RET (hot patch)
-            if (instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+            if (instruction.mnemonic == Phantom::Disasm::Mnemonic::PUSH) {
                 // Check if next instruction is RET
                 size_t nextOffset = instruction.length;
                 if (nextOffset < size) {
-                    ZydisDecodedInstruction nextInstr;
-                    ZydisDecodedOperand nextOps[ZYDIS_MAX_OPERAND_COUNT];
-                    if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, functionBytes + nextOffset,
-                        size - nextOffset, &nextInstr, nextOps))) {
-                        if (nextInstr.mnemonic == ZYDIS_MNEMONIC_RET) {
+                    Phantom::Disasm::DecodedInstruction nextInstr;
+                    Phantom::Disasm::DecodedOperand nextOps[Phantom::Disasm::MAX_OPERANDS];
+                    if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(functionBytes + nextOffset, size - nextOffset, nextInstr, nextOps))) {
+                        if (nextInstr.mnemonic == Phantom::Disasm::Mnemonic::RET) {
                             outDetails = L"PUSH+RET hook pattern";
                             return true;
                         }
@@ -1303,20 +1302,19 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Pattern 4: MOV RAX, imm64; JMP RAX (10-byte hook)
-            if (is64Bit && instruction.mnemonic == ZYDIS_MNEMONIC_MOV &&
+            if (is64Bit && instruction.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
                 instruction.operand_count >= 2 &&
-                operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                operands[0].reg.value == ZYDIS_REGISTER_RAX &&
-                operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                operands[0].reg.value == Phantom::Disasm::Register::RAX &&
+                operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                 size_t nextOffset = instruction.length;
                 if (nextOffset < size) {
-                    ZydisDecodedInstruction nextInstr;
-                    ZydisDecodedOperand nextOps[ZYDIS_MAX_OPERAND_COUNT];
-                    if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, functionBytes + nextOffset,
-                        size - nextOffset, &nextInstr, nextOps))) {
-                        if (nextInstr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-                            nextOps[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                            nextOps[0].reg.value == ZYDIS_REGISTER_RAX) {
+                    Phantom::Disasm::DecodedInstruction nextInstr;
+                    Phantom::Disasm::DecodedOperand nextOps[Phantom::Disasm::MAX_OPERANDS];
+                    if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(functionBytes + nextOffset, size - nextOffset, nextInstr, nextOps))) {
+                        if (nextInstr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+                            nextOps[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                            nextOps[0].reg.value == Phantom::Disasm::Register::RAX) {
                             outDetails = L"MOV RAX, imm64; JMP RAX hook";
                             return true;
                         }
@@ -1325,7 +1323,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // Pattern 5: INT 3 at function start (debug breakpoint)
-            if (instruction.mnemonic == ZYDIS_MNEMONIC_INT3) {
+            if (instruction.mnemonic == Phantom::Disasm::Mnemonic::INT3) {
                 outDetails = L"INT3 at function start";
                 return true;
             }
@@ -1454,7 +1452,7 @@ namespace ShadowStrike::AntiEvasion {
             }
 
             // ================================================================
-            // PHASE 2: Full disassembly validation using Zydis
+            // PHASE 2: Full disassembly validation using PhantomDisassembler
             // ================================================================
 
             const auto* decoder = GetDecoder(true);
@@ -1487,10 +1485,10 @@ namespace ShadowStrike::AntiEvasion {
             while (offset < size && state != StubState::FoundSyscall &&
                 state != StubState::Invalid && instructionCount < MAX_INSTRUCTIONS) {
 
-                ZydisDecodedInstruction instr;
-                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
+                Phantom::Disasm::DecodedInstruction instr;
+                Phantom::Disasm::DecodedOperand ops[Phantom::Disasm::MAX_OPERANDS];
 
-                if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, stubBytes + offset, size - offset, &instr, ops))) {
+                if (!Phantom::Disasm::IsSuccess(decoder->DecodeFull(stubBytes + offset, size - offset, instr, ops))) {
                     // Decoding failed - could be invalid code or data
                     break;
                 }
@@ -1498,26 +1496,25 @@ namespace ShadowStrike::AntiEvasion {
                 // Build instruction trace for diagnostics
                 if (m_formatterInitialized) {
                     char asmBuf[64] = {};
-                    ZydisFormatterFormatInstruction(&m_formatter, &instr, ops, instr.operand_count,
-                        asmBuf, sizeof(asmBuf), offset, nullptr);
+                    m_formatter.FormatInstruction(instr, ops, instr.operand_count, asmBuf, sizeof(asmBuf), offset);
                     instructionTrace += std::format(L"  +0x{:02X}: {}\n", offset, Utils::StringUtils::ToWide(asmBuf));
                 }
 
                 switch (state) {
                 case StubState::ExpectMovR10Rcx:
                     // Expected: mov r10, rcx (4C 8B D1)
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
                         instr.operand_count >= 2 &&
-                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        ops[0].reg.value == ZYDIS_REGISTER_R10 &&
-                        ops[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        ops[1].reg.value == ZYDIS_REGISTER_RCX) {
+                        ops[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                        ops[0].reg.value == Phantom::Disasm::Register::R10 &&
+                        ops[1].type == Phantom::Disasm::OperandType::REGISTER &&
+                        ops[1].reg.value == Phantom::Disasm::Register::RCX) {
                         state = StubState::ExpectMovEaxImm;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                    else if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP ||
+                        instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
                         outDetails = std::format(L"Hook detected: {} instead of 'mov r10, rcx'\n{}",
-                            instr.mnemonic == ZYDIS_MNEMONIC_JMP ? L"JMP" : L"CALL",
+                            instr.mnemonic == Phantom::Disasm::Mnemonic::JMP ? L"JMP" : L"CALL",
                             instructionTrace);
                         return false;
                     }
@@ -1530,11 +1527,11 @@ namespace ShadowStrike::AntiEvasion {
 
                 case StubState::ExpectMovEaxImm:
                     // Expected: mov eax, imm32 (B8 XX XX XX XX)
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
                         instr.operand_count >= 2 &&
-                        ops[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        ops[0].reg.value == ZYDIS_REGISTER_EAX &&
-                        ops[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        ops[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                        ops[0].reg.value == Phantom::Disasm::Register::EAX &&
+                        ops[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                         extractedSyscallNum = static_cast<uint32_t>(ops[1].imm.value.u);
                         state = StubState::ExpectTestOrSyscall;
                     }
@@ -1547,23 +1544,23 @@ namespace ShadowStrike::AntiEvasion {
 
                 case StubState::ExpectTestOrSyscall:
                     // Can be: test byte ptr [...], 1  OR  syscall
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::SYSCALL) {
                         state = StubState::FoundSyscall;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_TEST) {
+                    else if (instr.mnemonic == Phantom::Disasm::Mnemonic::TEST) {
                         // Windows syscall check: test byte ptr [0x7FFE0308], 1
                         hasSyscallCheck = true;
                         state = StubState::ExpectJneOrSyscall;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                    else if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP ||
+                        instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
                         outDetails = std::format(L"Hook detected after syscall number:\n{}", instructionTrace);
                         return false;
                     }
                     else {
                         // Allow some flexibility for unusual but valid patterns
                         // (e.g., NOP padding, compiler variations)
-                        if (instr.mnemonic != ZYDIS_MNEMONIC_NOP) {
+                        if (instr.mnemonic != Phantom::Disasm::Mnemonic::NOP) {
                             // Continue but stay in same state (limited tolerance)
                         }
                     }
@@ -1571,11 +1568,11 @@ namespace ShadowStrike::AntiEvasion {
                     
                 case StubState::ExpectJneOrSyscall:
                     // After test, expect: jne/jnz (to int 2e path) OR syscall
-                    // NOTE: JNE and JNZ are the same opcode. Zydis uses ZYDIS_MNEMONIC_JNZ for both.
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                    // NOTE: JNE and JNZ are the same opcode. PhantomDisassembler uses Phantom::Disasm::Mnemonic::JNZ for both.
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::SYSCALL) {
                         state = StubState::FoundSyscall;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JNZ) {
+                    else if (instr.mnemonic == Phantom::Disasm::Mnemonic::JNZ) {
                         // Valid - conditional jump to int 2e fallback
                         state = StubState::ExpectSyscall;
                     }
@@ -1586,11 +1583,11 @@ namespace ShadowStrike::AntiEvasion {
                     break;
 
                 case StubState::ExpectSyscall:
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_SYSCALL) {
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::SYSCALL) {
                         state = StubState::FoundSyscall;
                     }
-                    else if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                    else if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP ||
+                        instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
                         outDetails = std::format(L"Hook detected instead of SYSCALL:\n{}", instructionTrace);
                         return false;
                     }
@@ -1680,14 +1677,14 @@ namespace ShadowStrike::AntiEvasion {
                 return true;
             }
 
-            // Use Zydis for detailed analysis if available
+            // Use PhantomDisassembler for detailed analysis if available
             const auto* decoder = GetDecoder(false); // 32-bit decoder
             if (decoder) {
-                ZydisDecodedInstruction instr;
-                ZydisDecodedOperand ops[ZYDIS_MAX_OPERAND_COUNT];
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, stubBytes, size, &instr, ops))) {
-                    if (instr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                        instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                Phantom::Disasm::DecodedInstruction instr;
+                Phantom::Disasm::DecodedOperand ops[Phantom::Disasm::MAX_OPERANDS];
+                if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(stubBytes, size, instr, ops))) {
+                    if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP ||
+                        instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
                         outDetails = L"WoW64 stub: Unexpected JMP/CALL at start";
                         return false;
                     }
@@ -1697,7 +1694,7 @@ namespace ShadowStrike::AntiEvasion {
             return true;
         }
 
-        /// @brief Fallback byte-pattern validation when Zydis unavailable
+        /// @brief Fallback byte-pattern validation when disassembler unavailable
         [[nodiscard]] bool ValidateSyscallStubBytePattern(
             const uint8_t* stubBytes,
             size_t size,
@@ -1724,13 +1721,13 @@ namespace ShadowStrike::AntiEvasion {
         }
 
         /// @brief Scan code for anti-debug instructions
-        [[nodiscard]] std::vector<std::pair<size_t, ZydisMnemonic>> ScanForAntiDebugInstructions(
+        [[nodiscard]] std::vector<std::pair<size_t, Phantom::Disasm::Mnemonic>> ScanForAntiDebugInstructions(
             const uint8_t* code,
             size_t size,
             bool is64Bit,
             uintptr_t baseAddress
         ) const noexcept {
-            std::vector<std::pair<size_t, ZydisMnemonic>> found;
+            std::vector<std::pair<size_t, Phantom::Disasm::Mnemonic>> found;
 
             const auto* decoder = GetDecoder(is64Bit);
             if (!decoder || !code || size == 0) {
@@ -1739,10 +1736,10 @@ namespace ShadowStrike::AntiEvasion {
 
             size_t offset = 0;
             while (offset + 15 <= size) {
-                ZydisDecodedInstruction instruction;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                Phantom::Disasm::DecodedInstruction instruction;
+                Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset, size - offset, &instruction, operands))) {
+                if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(code + offset, size - offset, instruction, operands))) {
                     // Check timing instructions
                     if (IsMnemonicInArray(instruction.mnemonic, AntiDebugPatterns::TIMING_MNEMONICS)) {
                         found.emplace_back(offset, instruction.mnemonic);
@@ -1751,9 +1748,9 @@ namespace ShadowStrike::AntiEvasion {
                     // Check exception-generating instructions
                     if (IsMnemonicInArray(instruction.mnemonic, AntiDebugPatterns::EXCEPTION_MNEMONICS)) {
                         // For INT, check if it's INT 2D (debug service)
-                        if (instruction.mnemonic == ZYDIS_MNEMONIC_INT &&
+                        if (instruction.mnemonic == Phantom::Disasm::Mnemonic::INT &&
                             instruction.operand_count > 0 &&
-                            operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                             uint8_t intNum = static_cast<uint8_t>(operands[0].imm.value.u);
                             if (intNum == 0x2D || intNum == 0x03 || intNum == 0x01) {
                                 found.emplace_back(offset, instruction.mnemonic);
@@ -2419,7 +2416,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
-    // MEMORY SCANNING WITH ADVANCED ZYDIS ANALYSIS
+    // MEMORY SCANNING WITH ADVANCED DISASSEMBLY ANALYSIS
     // ========================================================================
 
     void DebuggerEvasionDetector::ScanMemory(
@@ -2458,23 +2455,23 @@ namespace ShadowStrike::AntiEvasion {
                         std::wstring desc;
 
                         switch (mnemonic) {
-                        case ZYDIS_MNEMONIC_RDTSC:
+                        case Phantom::Disasm::Mnemonic::RDTSC:
                             technique = EvasionTechnique::TIMING_RDTSC;
                             desc = L"RDTSC timing instruction detected";
                             break;
-                        case ZYDIS_MNEMONIC_RDTSCP:
+                        case Phantom::Disasm::Mnemonic::RDTSCP:
                             technique = EvasionTechnique::TIMING_RDTSCP;
                             desc = L"RDTSCP timing instruction detected";
                             break;
-                        case ZYDIS_MNEMONIC_INT3:
+                        case Phantom::Disasm::Mnemonic::INT3:
                             technique = EvasionTechnique::MEMORY_SoftwareBreakpoints;
                             desc = L"Software breakpoint (INT3) in code";
                             break;
-                        case ZYDIS_MNEMONIC_INT:
+                        case Phantom::Disasm::Mnemonic::INT:
                             technique = EvasionTechnique::EXCEPTION_INT2D;
                             desc = L"INT instruction (possible debug interrupt)";
                             break;
-                        case ZYDIS_MNEMONIC_CPUID:
+                        case Phantom::Disasm::Mnemonic::CPUID:
                             // CPUID can be used for VM/hypervisor detection
                             technique = EvasionTechnique::TIMING_RDTSC; // Reuse timing category
                             desc = L"CPUID instruction (possible timing/VM check)";
@@ -2486,7 +2483,7 @@ namespace ShadowStrike::AntiEvasion {
                         if (technique != EvasionTechnique::None) {
                             // Only add if it's not likely padding (multiple consecutive INT3)
                             bool isPadding = false;
-                            if (mnemonic == ZYDIS_MNEMONIC_INT3 && offset + 1 < bytesRead) {
+                            if (mnemonic == Phantom::Disasm::Mnemonic::INT3 && offset + 1 < bytesRead) {
                                 if (buffer[offset + 1] == 0xCC) {
                                     isPadding = true; // Likely alignment padding
                                 }
@@ -2516,7 +2513,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
-    // ADVANCED HOOK DETECTION WITH PEPARSER AND ZYDIS
+    // ADVANCED HOOK DETECTION WITH PEPARSER AND PHANTOMDISASSEMBLER
     // ========================================================================
 
     bool DebuggerEvasionDetector::CheckAPIHookDetectionInternal(
@@ -2595,7 +2592,7 @@ namespace ShadowStrike::AntiEvasion {
 
                 // Compare first bytes
                 if (memcmp(localBytes, remoteBytes, 16) != 0) {
-                    // Potential hook detected - analyze with Zydis
+                    // Potential hook detected - analyze with PhantomDisassembler
                     std::wstring hookDetails;
                     bool is64Bit = true; // Assuming 64-bit for NTDLL analysis
 
@@ -2962,11 +2959,11 @@ namespace ShadowStrike::AntiEvasion {
                                             codeBuffer, read, true, (uintptr_t)pEntryPoint);
 
                                         for (const auto& [offset, mnemonic] : found) {
-                                            if (mnemonic == ZYDIS_MNEMONIC_RDTSC ||
-                                                mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+                                            if (mnemonic == Phantom::Disasm::Mnemonic::RDTSC ||
+                                                mnemonic == Phantom::Disasm::Mnemonic::RDTSCP) {
                                                 detected = true;
                                                 DetectedTechnique tech(
-                                                    mnemonic == ZYDIS_MNEMONIC_RDTSC ?
+                                                    mnemonic == Phantom::Disasm::Mnemonic::RDTSC ?
                                                     EvasionTechnique::TIMING_RDTSC : EvasionTechnique::TIMING_RDTSCP);
                                                 tech.description = L"High-Resolution Timing Instruction near Entry Point";
                                                 tech.technicalDetails = std::format(L"Found at EP + 0x{:X}", offset);
@@ -3090,10 +3087,10 @@ namespace ShadowStrike::AntiEvasion {
         if (!hProcess) return;
 
         try {
-            // Get the Zydis decoder for the target architecture
+            // Get the decoder for the target architecture
             const auto* decoder = m_impl->GetDecoder(result.is64Bit);
             if (!decoder) {
-                SS_LOG_WARN(LOG_CATEGORY, L"AnalyzeTimingPatterns: Zydis decoder not available");
+                SS_LOG_WARN(LOG_CATEGORY, L"AnalyzeTimingPatterns: Disasm decoder not available");
                 return;
             }
 
@@ -3269,7 +3266,7 @@ namespace ShadowStrike::AntiEvasion {
     /// 2. Combined with conditional jumps that could terminate process
     /// 3. Found in combination with debug API calls
     void DebuggerEvasionDetector::ScanCodeForTimingInstructions(
-        const ZydisDecoder* decoder,
+        const Phantom::Disasm::Decoder* decoder,
         const uint8_t* code,
         size_t size,
         uintptr_t baseAddress,
@@ -3285,24 +3282,24 @@ namespace ShadowStrike::AntiEvasion {
         // First pass: Collect all timing instruction locations
         size_t offset = 0;
         while (offset + 15 <= size) {
-            ZydisDecodedInstruction instruction;
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            Phantom::Disasm::DecodedInstruction instruction;
+            Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset, size - offset, &instruction, operands))) {
+            if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(code + offset, size - offset, instruction, operands))) {
                 uintptr_t instrAddress = baseAddress + offset;
 
                 switch (instruction.mnemonic) {
-                case ZYDIS_MNEMONIC_RDTSC:
+                case Phantom::Disasm::Mnemonic::RDTSC:
                     rdtscLocations.push_back(instrAddress);
                     detectedAddresses.insert(instrAddress);
                     break;
 
-                case ZYDIS_MNEMONIC_RDTSCP:
+                case Phantom::Disasm::Mnemonic::RDTSCP:
                     rdtscpLocations.push_back(instrAddress);
                     detectedAddresses.insert(instrAddress);
                     break;
 
-                case ZYDIS_MNEMONIC_CPUID:
+                case Phantom::Disasm::Mnemonic::CPUID:
                     // CPUID is extremely common for feature detection - very low confidence
                     if (detectedAddresses.insert(instrAddress).second) {
                         cpuidCount++;
@@ -3399,7 +3396,7 @@ namespace ShadowStrike::AntiEvasion {
 
     /// @brief Scan executable section for timing patterns with context analysis
     void DebuggerEvasionDetector::ScanCodeForTimingPatterns(
-        const ZydisDecoder* decoder,
+        const Phantom::Disasm::Decoder* decoder,
         const uint8_t* code,
         size_t size,
         uintptr_t baseAddress,
@@ -3414,14 +3411,14 @@ namespace ShadowStrike::AntiEvasion {
 
         size_t offset = 0;
         while (offset + 15 <= size) {
-            ZydisDecodedInstruction instruction;
-            ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+            Phantom::Disasm::DecodedInstruction instruction;
+            Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset, size - offset, &instruction, operands))) {
-                if (instruction.mnemonic == ZYDIS_MNEMONIC_RDTSC) {
+            if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(code + offset, size - offset, instruction, operands))) {
+                if (instruction.mnemonic == Phantom::Disasm::Mnemonic::RDTSC) {
                     rdtscLocations.push_back(baseAddress + offset);
                 }
-                else if (instruction.mnemonic == ZYDIS_MNEMONIC_RDTSCP) {
+                else if (instruction.mnemonic == Phantom::Disasm::Mnemonic::RDTSCP) {
                     rdtscpLocations.push_back(baseAddress + offset);
                 }
                 offset += instruction.length;
@@ -3738,16 +3735,16 @@ namespace ShadowStrike::AntiEvasion {
             uint32_t kuserdataRefCount = 0;
 
             while (offset + 15 <= bytesRead) {
-                ZydisDecodedInstruction instruction;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                Phantom::Disasm::DecodedInstruction instruction;
+                Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, codeBuffer.data() + offset, bytesRead - offset, &instruction, operands))) {
+                if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(codeBuffer.data() + offset, bytesRead - offset, instruction, operands))) {
 
                     // Check for immediate values or memory operands referencing KUSER_SHARED_DATA
-                    for (uint8_t i = 0; i < instruction.operand_count && i < ZYDIS_MAX_OPERAND_COUNT; ++i) {
+                    for (uint8_t i = 0; i < instruction.operand_count && i < Phantom::Disasm::MAX_OPERANDS; ++i) {
                         const auto& op = operands[i];
 
-                        if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                        if (op.type == Phantom::Disasm::OperandType::IMMEDIATE) {
                             uint64_t imm = op.imm.value.u;
                             if (imm >= KUSER_SHARED_DATA_BASE && imm < KUSER_SHARED_DATA_END) {
                                 kuserdataRefCount++;
@@ -3763,7 +3760,7 @@ namespace ShadowStrike::AntiEvasion {
                                 }
                             }
                         }
-                        else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        else if (op.type == Phantom::Disasm::OperandType::MEMORY) {
                             // Check displacement for KUSER_SHARED_DATA addresses
                             if (op.mem.disp.has_displacement) {
                                 int64_t disp = op.mem.disp.value;
@@ -3912,14 +3909,14 @@ namespace ShadowStrike::AntiEvasion {
 
             size_t offset = 0;
             while (offset + 15 <= bytesRead) {
-                ZydisDecodedInstruction instruction;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                Phantom::Disasm::DecodedInstruction instruction;
+                Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, codeBuffer.data() + offset, bytesRead - offset, &instruction, operands))) {
+                if (Phantom::Disasm::IsSuccess(decoder->DecodeFull(codeBuffer.data() + offset, bytesRead - offset, instruction, operands))) {
                     uintptr_t instrAddress = reinterpret_cast<uintptr_t>(pEntryPoint) + offset;
 
                     switch (instruction.mnemonic) {
-                    case ZYDIS_MNEMONIC_INT3:
+                    case Phantom::Disasm::Mnemonic::INT3:
                         // Check if this is padding (consecutive INT3s) or anti-debug
                         if (offset + 1 < bytesRead && codeBuffer[offset + 1] != 0xCC) {
                             int3Count++;
@@ -3936,7 +3933,7 @@ namespace ShadowStrike::AntiEvasion {
                         }
                         break;
 
-                    case ZYDIS_MNEMONIC_INT1:
+                    case Phantom::Disasm::Mnemonic::INT1:
                         int1Count++;
                         if (int1Count <= 2) {
                             AddDetection(result, DetectionPatternBuilder()
@@ -3950,10 +3947,10 @@ namespace ShadowStrike::AntiEvasion {
                         }
                         break;
 
-                    case ZYDIS_MNEMONIC_INT:
+                    case Phantom::Disasm::Mnemonic::INT:
                         // Check for INT 2D (debug service interrupt)
                         if (instruction.operand_count > 0 &&
-                            operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                            operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                             uint8_t intNum = static_cast<uint8_t>(operands[0].imm.value.u);
                             if (intNum == 0x2D) {
                                 int2dCount++;
@@ -3980,9 +3977,9 @@ namespace ShadowStrike::AntiEvasion {
                         }
                         break;
 
-                    case ZYDIS_MNEMONIC_UD0:
-                    case ZYDIS_MNEMONIC_UD1:
-                    case ZYDIS_MNEMONIC_UD2:
+                    case Phantom::Disasm::Mnemonic::UD0:
+                    case Phantom::Disasm::Mnemonic::UD1:
+                    case Phantom::Disasm::Mnemonic::UD2:
                         ud2Count++;
                         if (ud2Count <= 2) {
                             AddDetection(result, DetectionPatternBuilder()
@@ -4588,29 +4585,27 @@ namespace ShadowStrike::AntiEvasion {
                 SIZE_T codeRead = 0;
 
                 if (ReadProcessMemory(hProcess, codeBase, codeBuf.get(), maxScan, &codeRead) && codeRead > 64) {
-                    // Use Zydis to disassemble and look for:
+                    // Use PhantomDisassembler to disassemble and look for:
                     // mov ecx/edx/r8d, 0x23 (SystemKernelDebuggerInformation)
                     // near a call to NtQuerySystemInformation
-                    ZydisDecoder decoder;
-                    ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
+                    Phantom::Disasm::Decoder decoder;
+                    decoder.Init(Phantom::Disasm::MachineMode::Long64);
 
-                    ZydisDecodedInstruction instruction;
-                    ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT_VISIBLE];
+                    Phantom::Disasm::DecodedInstruction instruction;
+                    Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
                     size_t offset = 0;
                     bool foundConstant = false;
                     uintptr_t constantAddr = 0;
 
                     while (offset + 15 <= codeRead) {
-                        if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
-                                codeBuf.get() + offset, codeRead - offset,
-                                &instruction, operands))) {
+                        if (Phantom::Disasm::IsSuccess(decoder.DecodeFull(codeBuf.get() + offset, codeRead - offset, instruction, operands))) {
 
                             // Look for MOV reg, 0x23 or PUSH 0x23
-                            if (instruction.mnemonic == ZYDIS_MNEMONIC_MOV ||
-                                instruction.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+                            if (instruction.mnemonic == Phantom::Disasm::Mnemonic::MOV ||
+                                instruction.mnemonic == Phantom::Disasm::Mnemonic::PUSH) {
                                 for (uint8_t i = 0; i < instruction.operand_count_visible; ++i) {
-                                    if (operands[i].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                                    if (operands[i].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                                         operands[i].imm.value.u == kSystemKernelDebuggerInfo) {
                                         foundConstant = true;
                                         constantAddr = reinterpret_cast<uintptr_t>(codeBase) + offset;

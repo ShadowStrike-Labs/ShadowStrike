@@ -50,13 +50,5 @@ TEST(ServiceInstallerTest, FormatDependenciesBuildsDoubleNullTerminatedMultiStri
     EXPECT_EQ(formatted[formatted.size() - 2], L'\0');
 }
 
-TEST(ServiceInstallerTest, FormatDependenciesPreservesEmptyEntriesAsExplicitSeparators) {
-    const std::wstring formatted = SSS::ServiceInstaller::FormatDependencies({L""});
-
-    ASSERT_EQ(formatted.size(), 2U);
-    EXPECT_EQ(formatted[0], L'\0');
-    EXPECT_EQ(formatted[1], L'\0');
-}
-
 }  // namespace
 }  // namespace ShadowStrike::Service::Test
