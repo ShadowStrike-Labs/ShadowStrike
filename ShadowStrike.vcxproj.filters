@@ -1080,6 +1080,15 @@
     <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestComparer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestGenerator_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\FuzzyHasher_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
