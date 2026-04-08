@@ -77,15 +77,29 @@ TEST(RansomwareDetectorValueTests, ConfigurationIoStatsStatisticsUtilitiesAndVer
     invalidEntropy.entropyThreshold = 8.1;
     EXPECT_FALSE(invalidEntropy.IsValid());
 
+    auto invalidNegativeEntropy = config;
+    invalidNegativeEntropy.entropyThreshold = -0.1;
+    EXPECT_FALSE(invalidNegativeEntropy.IsValid());
+
     auto invalidWrites = config;
     invalidWrites.maxWritesPerSecond = 0;
     EXPECT_FALSE(invalidWrites.IsValid());
+
+    auto invalidWindow = config;
+    invalidWindow.rateWindowSecs = 0;
+    EXPECT_FALSE(invalidWindow.IsValid());
 
     auto invalidConfidence = config;
     invalidConfidence.minBlockConfidence = 1.1;
     EXPECT_FALSE(invalidConfidence.IsValid());
 
+    auto invalidNegativeConfidence = config;
+    invalidNegativeConfidence.minBlockConfidence = -0.1;
+    EXPECT_FALSE(invalidNegativeConfidence.IsValid());
+
     IOStats ioStats;
+    ioStats.pid = 404;
+    ioStats.processName = L"encryptor.exe";
     ioStats.writeCount.store(3, std::memory_order_relaxed);
     ioStats.renameCount.store(2, std::memory_order_relaxed);
     ioStats.deleteCount.store(1, std::memory_order_relaxed);
@@ -100,6 +114,8 @@ TEST(RansomwareDetectorValueTests, ConfigurationIoStatsStatisticsUtilitiesAndVer
     EXPECT_DOUBLE_EQ(
         ioStats.GetRenameRate(),
         5.0 / static_cast<double>(RansomwareConstants::RATE_WINDOW_SECS));
+    EXPECT_THAT(ioStats.ToJson(), HasSubstr("\"pid\":404"));
+    EXPECT_THAT(ioStats.ToJson(), HasSubstr("\"processName\":\"encryptor.exe\""));
     ioStats.Reset();
     EXPECT_EQ(ioStats.writeCount.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(ioStats.renameCount.load(std::memory_order_relaxed), 0u);
@@ -137,12 +153,34 @@ TEST(RansomwareDetectorValueTests, ConfigurationIoStatsStatisticsUtilitiesAndVer
     entropy.confidence = 0.9;
     EXPECT_THAT(entropy.ToJson(), HasSubstr("\"isEncrypted\":true"));
 
+    DetectionEvent event;
+    event.eventId = 1;
+    event.pid = 1234;
+    event.filePath = L"C:\\Victim\\doc.locked";
+    event.verdict = DetectionVerdict::ConfirmedRansom;
+    event.action = DetectionAction::BlockAndKill;
+    event.family = RansomwareFamily::Locky;
+    event.confidence = 0.95;
+    event.entropyResult = entropy;
+    event.details = L"high-entropy overwrite";
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"eventId\":1"));
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"entropy\":{\"shannonEntropy\":0.0"));
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"details\":\"high-entropy overwrite\""));
+
+    DetectionStatisticsSnapshot snapshot;
+    snapshot.totalOperations = 8;
+    snapshot.highEntropyWrites = 2;
+    snapshot.uptimeSeconds = 12;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"totalOperations\":8"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":12"));
+
     EXPECT_EQ(GetVerdictName(DetectionVerdict::Honeypot), "Honeypot");
     EXPECT_EQ(GetActionName(DetectionAction::BlockAndKill), "BlockAndKill");
     EXPECT_EQ(GetTechniqueName(DetectionTechnique::MagicCorruption), "MagicCorruption");
     EXPECT_EQ(GetFamilyName(RansomwareFamily::LockBit), "LockBit");
     EXPECT_EQ(GetRiskLevelName(ProcessRiskLevel::Critical), "Critical");
     EXPECT_EQ(GetOperationTypeName(FileOperationType::SetSecurity), "SetSecurity");
+    EXPECT_EQ(GetVerdictName(static_cast<DetectionVerdict>(0xFF)), "Unknown");
     EXPECT_EQ(RansomwareDetector::GetVersionString(), "3.1.0");
 }
 
@@ -154,6 +192,7 @@ TEST_F(RansomwareDetectorTest, InitializeSeedsFamilySignaturesAndTracksProcesses
     EXPECT_FALSE(lockySignature->extensions.empty());
 
     EXPECT_EQ(detector.IdentifyFamilyFromExtension(L".locky"), RansomwareFamily::Locky);
+    EXPECT_EQ(detector.IdentifyFamilyFromExtension(L".LOCKY"), RansomwareFamily::Locky);
     EXPECT_EQ(detector.IdentifyFamilyFromExtension(L".doesnotexist"), RansomwareFamily::Unknown);
 
     detector.OnProcessCreated(6101, L"unit-test.exe", L"unit-test.exe");
@@ -170,9 +209,10 @@ TEST_F(RansomwareDetectorTest, InitializeSeedsFamilySignaturesAndTracksProcesses
 TEST_F(RansomwareDetectorTest, HoneypotWhitelistContainmentAndRecoveryStateRoundTripCleanly) {
     auto& detector = RansomwareDetector::Instance();
 
-    detector.RegisterHoneypot(L"C:\\Decoys\\finance.docx");
+    detector.RegisterHoneypot(L"C:\\Decoys\\Finance.docx");
     EXPECT_TRUE(detector.IsHoneypot(L"C:\\Decoys\\finance.docx"));
-    detector.UnregisterHoneypot(L"C:\\Decoys\\finance.docx");
+    EXPECT_TRUE(detector.IsHoneypot(L"c:\\decoys\\FINANCE.docx"));
+    detector.UnregisterHoneypot(L"c:\\decoys\\finance.docx");
     EXPECT_FALSE(detector.IsHoneypot(L"C:\\Decoys\\finance.docx"));
 
     detector.WhitelistProcess(6202);
@@ -207,6 +247,17 @@ TEST_F(RansomwareDetectorTest, ProtectedPathAndCompressedTypeHelpersHonorConfigu
     EXPECT_FALSE(detector.IsCompressedType(L"payload.txt"));
     EXPECT_TRUE(detector.IsProtectedPath(protectedFile.wstring()));
     EXPECT_FALSE(detector.IsProtectedPath(unprotectedFile.wstring()));
+
+    detector.Shutdown();
+    detector.ResetStatistics();
+
+    RansomwareDetectorConfiguration boundaryConfig;
+    boundaryConfig.enableAutoBlock = false;
+    boundaryConfig.protectedDirectories = { MakePath(L"protected").wstring() };
+    ASSERT_TRUE(detector.Initialize(boundaryConfig));
+
+    EXPECT_TRUE(detector.IsProtectedPath(protectedFile.wstring()));
+    EXPECT_FALSE(detector.IsProtectedPath(MakePath(L"protected-old\\database.docx").wstring()));
 }
 
 TEST_F(RansomwareDetectorTest, SubDetectorIndicatorsProduceHighRiskProcessesAndRecentDetections) {
@@ -237,6 +288,7 @@ TEST_F(RansomwareDetectorTest, SubDetectorIndicatorsProduceHighRiskProcessesAndR
     ASSERT_FALSE(recent.empty());
     EXPECT_EQ(recent.front().pid, 6404u);
     EXPECT_EQ(recent.front().family, RansomwareFamily::Locky);
+    EXPECT_TRUE(detector.GetRecentDetections(0).empty());
 }
 
 TEST_F(RansomwareDetectorTest, EntropyHelpersDifferentiateLowAndHighEntropyBuffers) {
@@ -251,11 +303,19 @@ TEST_F(RansomwareDetectorTest, EntropyHelpersDifferentiateLowAndHighEntropyBuffe
         value = static_cast<uint8_t>(distribution(generator));
     }
 
+    const std::vector<uint8_t> empty;
+    const std::vector<uint8_t> tiny(8, 0x41);
+
+    EXPECT_DOUBLE_EQ(RansomwareDetector::CalculateEntropy(empty), 0.0);
     EXPECT_DOUBLE_EQ(RansomwareDetector::CalculateEntropy(lowEntropy), 0.0);
 
+    const auto tinyAnalyzed = RansomwareDetector::AnalyzeEntropy(tiny);
     const auto analyzed = RansomwareDetector::AnalyzeEntropy(highEntropy);
+    EXPECT_DOUBLE_EQ(tinyAnalyzed.shannonEntropy, 0.0);
+    EXPECT_FALSE(tinyAnalyzed.isEncrypted);
     EXPECT_GT(analyzed.shannonEntropy, 7.0);
     EXPECT_TRUE(RansomwareDetector::IsEncrypted(highEntropy));
+    EXPECT_FALSE(RansomwareDetector::IsEncrypted(tiny));
     EXPECT_FALSE(RansomwareDetector::IsEncrypted(lowEntropy));
     EXPECT_TRUE(detector.SelfTest());
 }

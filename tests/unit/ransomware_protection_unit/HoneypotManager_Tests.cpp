@@ -95,6 +95,10 @@ TEST(HoneypotManagerValueTests, ConfigurationDefaultsStatisticsUtilitiesAndVersi
     invalidHigh.maxTotalHoneypots = 10001;
     EXPECT_FALSE(invalidHigh.IsValid());
 
+    auto validBoundary = config;
+    validBoundary.maxTotalHoneypots = 10000;
+    EXPECT_TRUE(validBoundary.IsValid());
+
     HoneypotManagerConfiguration defaults;
     defaults.LoadDefaultLocations();
     ASSERT_EQ(defaults.locations.size(), 4u);
@@ -145,6 +149,37 @@ TEST(HoneypotManagerValueTests, ConfigurationDefaultsStatisticsUtilitiesAndVersi
     const auto defaultTemplate = GetDefaultTemplate(HoneypotFileType::Document);
     EXPECT_FALSE(defaultTemplate.extension.empty());
     EXPECT_GE(defaultTemplate.minSize, HoneypotConstants::MIN_HONEYPOT_SIZE);
+    EXPECT_EQ(GetDefaultTemplate(HoneypotFileType::Text).extension, L".txt");
+
+    HoneyFile honeyFile;
+    honeyFile.honeypotId = "hp-1";
+    honeyFile.path = L"C:\\Decoys\\budget.txt";
+    honeyFile.status = HoneypotStatus::Active;
+    honeyFile.fileType = HoneypotFileType::Text;
+    honeyFile.fileSize = 128;
+    honeyFile.isHidden = true;
+    honeyFile.autoRegenerate = true;
+    EXPECT_THAT(honeyFile.ToJson(), HasSubstr("\"id\":\"hp-1\""));
+    EXPECT_THAT(honeyFile.ToJson(), HasSubstr("\"path\":\"C:\\\\Decoys\\\\budget.txt\""));
+
+    HoneypotAccessEvent accessEvent;
+    accessEvent.eventId = 42;
+    accessEvent.honeypotPath = L"C:\\Decoys\\budget.txt";
+    accessEvent.processId = 321;
+    accessEvent.processName = L"locker.exe";
+    accessEvent.actionTaken = "Block";
+    EXPECT_THAT(accessEvent.ToJson(), HasSubstr("\"eventId\":42"));
+    EXPECT_THAT(accessEvent.ToJson(), HasSubstr("\"action\":\"Block\""));
+
+    HoneypotStatisticsSnapshot snapshot;
+    snapshot.totalDeployed = 4;
+    snapshot.currentlyActive = 3;
+    snapshot.accessEvents = 2;
+    snapshot.falsePositives = 1;
+    snapshot.uptimeSeconds = 9;
+    snapshot.eventsByType[static_cast<size_t>(HoneypotAccessType::Write)] = 5;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":9"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"eventsByType\":[0,0,5"));
 
     EXPECT_EQ(HoneypotManager::GetVersionString(), "3.1.0");
 }
@@ -246,17 +281,21 @@ TEST_F(HoneypotManagerTest, AccessCallbacksFalsePositiveFlowAndKernelVerdictsAre
     EXPECT_EQ(statsAfterAccess.eventsByType[static_cast<size_t>(HoneypotAccessType::Write)], 1u);
 
     manager.ReportFalsePositive(event.eventId, "expected unit-test access");
+    manager.ReportFalsePositive(event.eventId, "repeat false positive");
 
     const auto updatedEvents = manager.GetRecentAccessEvents(1);
     ASSERT_EQ(updatedEvents.size(), 1u);
     EXPECT_FALSE(updatedEvents.front().isSuspicious);
     EXPECT_THAT(updatedEvents.front().details, HasSubstr(L"False Positive"));
     EXPECT_EQ(manager.GetStatistics().falsePositives, 1u);
+    EXPECT_TRUE(manager.GetRecentAccessEvents(0).empty());
 
     EXPECT_TRUE(manager.ProcessKernelNotification(
         honeypot->path, 5303, 1, HoneypotAccessType::Write));
     EXPECT_FALSE(manager.ProcessKernelNotification(
         honeypot->path, 5303, 2, HoneypotAccessType::Read));
+    EXPECT_FALSE(manager.ProcessKernelNotification(
+        MakePath(L"other\\not-a-trap.txt").wstring(), 5303, 1, HoneypotAccessType::Write));
 }
 
 }  // namespace

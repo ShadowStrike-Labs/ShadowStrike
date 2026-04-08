@@ -85,9 +85,18 @@ TEST(RansomwareDecryptorValueContractTests, ConfigCompatibilityRulesHelpersAndVe
     key.isMasterKey = true;
     EXPECT_TRUE(key.IsValidFor(file));
 
+    key.isMasterKey = false;
+    key.victimIds.clear();
+    key.algorithm = EncryptionAlgorithm::Unknown;
+    EXPECT_TRUE(key.IsValidFor(file));
+
+    key.algorithm = EncryptionAlgorithm::AES128CBC;
+    EXPECT_FALSE(key.IsValidFor(file));
+
     const auto keyJson = key.ToJson();
     EXPECT_THAT(keyJson, HasSubstr("\"keyId\":\"locky-key-1\""));
     EXPECT_EQ(keyJson.find("PRIVATE-KEY-MATERIAL"), std::string::npos);
+    EXPECT_THAT(file.ToJson(), HasSubstr("\"filePath\":\"C:\\\\Victim\\\\ledger.locky\""));
 
     BatchDecryptionResult batch;
     batch.batchId = "batch-7";
@@ -98,11 +107,49 @@ TEST(RansomwareDecryptorValueContractTests, ConfigCompatibilityRulesHelpersAndVe
     EXPECT_DOUBLE_EQ(batch.GetSuccessRate(), 0.75);
     EXPECT_THAT(batch.ToJson(), HasSubstr("\"successRate\":0.75"));
 
+    BatchDecryptionResult emptyBatch;
+    EXPECT_DOUBLE_EQ(emptyBatch.GetSuccessRate(), 0.0);
+
+    DecryptionResult decryption;
+    decryption.originalPath = L"C:\\Victim\\ledger.locky";
+    decryption.decryptedPath = L"C:\\Victim\\ledger.txt";
+    decryption.status = DecryptionStatus::Success;
+    decryption.keyId = "locky-key-1";
+    decryption.validationPassed = true;
+    decryption.errorMessage = "integrity warning";
+    EXPECT_THAT(decryption.ToJson(), HasSubstr("\"decryptedPath\":\"C:\\\\Victim\\\\ledger.txt\""));
+    EXPECT_THAT(decryption.ToJson(), HasSubstr("\"error\":\"integrity warning\""));
+
+    RecoveryResult recovery;
+    recovery.encryptedPath = L"C:\\Victim\\ledger.locky";
+    recovery.recoveredPath = L"C:\\Victim\\ledger.txt";
+    recovery.forensicCopyPath = L"C:\\Forensics\\ledger.locky";
+    recovery.status = DecryptionStatus::PartialSuccess;
+    recovery.integrityVerified = true;
+    EXPECT_THAT(recovery.ToJson(), HasSubstr("\"forensicCopyPath\":\"C:\\\\Forensics\\\\ledger.locky\""));
+
+    RansomNoteInfo note;
+    note.filePath = L"C:\\Victim\\@WanaDecryptor@.txt";
+    note.family = RansomwareFamily::WannaCry;
+    note.contactEmail = "ops@example.invalid";
+    note.victimId = "victim-1";
+    EXPECT_THAT(note.ToJson(), HasSubstr("\"familyName\":\"WannaCry\""));
+    EXPECT_THAT(note.ToJson(), HasSubstr("\"contactEmail\":\"ops@example.invalid\""));
+
+    DecryptorStatisticsSnapshot snapshot;
+    snapshot.filesAnalyzed = 8;
+    snapshot.keysLoaded = 2;
+    snapshot.uptimeSeconds = 9;
+    snapshot.familiesIdentified[static_cast<size_t>(RansomwareFamily::Locky)] = 4;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"family\":\"Locky\""));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":9"));
+
     EXPECT_EQ(RansomwareDecryptor::GetFamilyName(RansomwareFamily::Ryuk), "Ryuk");
     EXPECT_EQ(GetDecryptionStatusName(DecryptionStatus::AlreadyDecrypted), "AlreadyDecrypted");
     EXPECT_EQ(GetKeyTypeName(KeyType::OfflineKey), "OfflineKey");
     EXPECT_EQ(GetAlgorithmName(EncryptionAlgorithm::ChaCha20), "ChaCha20");
     EXPECT_EQ(GetKeySourceName(KeySource::LawEnforcement), "LawEnforcement");
+    EXPECT_EQ(GetAlgorithmName(static_cast<EncryptionAlgorithm>(0xFF)), "Unknown");
 
     const auto lockyExtensions = GetFamilyExtensions(RansomwareFamily::Locky);
     EXPECT_FALSE(lockyExtensions.empty());

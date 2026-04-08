@@ -1003,6 +1003,9 @@ void FileBackupManager::CommitChanges(uint32_t pid) {
 
 void FileBackupManager::CommitBackup(const std::string& backupId) {
     std::unique_lock lock(m_impl->m_mutex);
+    if (m_impl->m_backups.find(backupId) == m_impl->m_backups.end()) {
+        return;
+    }
     m_impl->DeleteBackupUnlocked(backupId);
     m_impl->m_stats.filesCommitted.fetch_add(1, std::memory_order_relaxed);
 }

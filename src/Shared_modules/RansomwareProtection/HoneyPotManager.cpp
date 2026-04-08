@@ -1021,6 +1021,12 @@ void HoneypotManagerImpl::ReportFalsePositive(uint64_t eventId, const std::strin
     std::lock_guard lock(m_eventMutex);
     for (auto& event : m_recentEvents) {
         if (event.eventId == eventId) {
+            if (!event.isSuspicious) {
+                if (!reason.empty()) {
+                    event.details = StringUtils::ToWide("False Positive: " + reason);
+                }
+                break;
+            }
             event.isSuspicious = false;
             event.details = StringUtils::ToWide("False Positive: " + reason);
             m_stats.falsePositives.fetch_add(1, std::memory_order_relaxed);

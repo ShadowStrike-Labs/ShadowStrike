@@ -37,6 +37,10 @@ TEST(VolumeSnapshotServiceValueContractTests, ConfigStatisticsHelpersAndVersionR
     invalidMaxSnapshots.maxSnapshotsPerVolume = 0;
     EXPECT_FALSE(invalidMaxSnapshots.IsValid());
 
+    auto invalidMaxSnapshotsHigh = config;
+    invalidMaxSnapshotsHigh.maxSnapshotsPerVolume = 513;
+    EXPECT_FALSE(invalidMaxSnapshotsHigh.IsValid());
+
     auto invalidStoragePercent = config;
     invalidStoragePercent.defaultStorageLimitPercent = 81;
     EXPECT_FALSE(invalidStoragePercent.IsValid());
@@ -44,6 +48,16 @@ TEST(VolumeSnapshotServiceValueContractTests, ConfigStatisticsHelpersAndVersionR
     auto invalidInterval = config;
     invalidInterval.monitoringIntervalSeconds = 0;
     EXPECT_FALSE(invalidInterval.IsValid());
+
+    auto invalidIntervalHigh = config;
+    invalidIntervalHigh.monitoringIntervalSeconds = 86401;
+    EXPECT_FALSE(invalidIntervalHigh.IsValid());
+
+    auto validBoundary = config;
+    validBoundary.maxSnapshotsPerVolume = 512;
+    validBoundary.defaultStorageLimitPercent = 80;
+    validBoundary.monitoringIntervalSeconds = 86400;
+    EXPECT_TRUE(validBoundary.IsValid());
 
     VolumeSnapshotStatistics stats;
     stats.snapshotsCreated.store(1, std::memory_order_relaxed);
@@ -57,7 +71,10 @@ TEST(VolumeSnapshotServiceValueContractTests, ConfigStatisticsHelpersAndVersionR
     stats.totalRestorationTimeMs.store(9, std::memory_order_relaxed);
     stats.currentOperations.store(10, std::memory_order_relaxed);
     stats.emergencySnapshotsCreated.store(11, std::memory_order_relaxed);
+    stats.byType[static_cast<size_t>(SnapshotType::Transportable)].store(12, std::memory_order_relaxed);
+    stats.byResult[static_cast<size_t>(VSSResult::Timeout)].store(13, std::memory_order_relaxed);
     EXPECT_THAT(stats.ToJson(), HasSubstr("\"snapshotsCreated\":1"));
+    EXPECT_THAT(stats.ToJson(), HasSubstr("\"emergencySnapshotsCreated\":11"));
     stats.Reset();
 
     EXPECT_EQ(stats.snapshotsCreated.load(std::memory_order_relaxed), 0u);
@@ -71,11 +88,61 @@ TEST(VolumeSnapshotServiceValueContractTests, ConfigStatisticsHelpersAndVersionR
     EXPECT_EQ(stats.totalRestorationTimeMs.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.currentOperations.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.emergencySnapshotsCreated.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(
+        stats.byType[static_cast<size_t>(SnapshotType::Transportable)].load(std::memory_order_relaxed),
+        0u);
+    EXPECT_EQ(
+        stats.byResult[static_cast<size_t>(VSSResult::Timeout)].load(std::memory_order_relaxed),
+        0u);
+
+    SnapshotInfo snapshotInfo;
+    snapshotInfo.snapshotId = L"shadow-1";
+    snapshotInfo.volumeName = L"\\\\?\\Volume{abc}\\";
+    snapshotInfo.type = SnapshotType::Transportable;
+    snapshotInfo.state = SnapshotState::Committed;
+    snapshotInfo.sizeBytes = 4096;
+    EXPECT_THAT(snapshotInfo.ToJson(), HasSubstr("\"snapshotId\":\"shadow-1\""));
+    EXPECT_THAT(snapshotInfo.ToJson(), HasSubstr("\"sizeBytes\":4096"));
+
+    VolumeInfo volumeInfo;
+    volumeInfo.volumeName = L"\\\\?\\Volume{abc}\\";
+    volumeInfo.mountPoint = L"C:\\";
+    volumeInfo.fileSystem = L"NTFS";
+    volumeInfo.snapshotCount = 3;
+    volumeInfo.vssSupported = true;
+    EXPECT_THAT(volumeInfo.ToJson(), HasSubstr("\"mountPoint\":\"C:\\\\\""));
+    EXPECT_THAT(volumeInfo.ToJson(), HasSubstr("\"snapshotCount\":3"));
+
+    WriterInfo writerInfo;
+    writerInfo.writerName = L"Shadow Writer";
+    writerInfo.state = WriterState::Failed;
+    writerInfo.lastError = E_ACCESSDENIED;
+    EXPECT_THAT(writerInfo.ToJson(), HasSubstr("\"writerName\":\"Shadow Writer\""));
+    EXPECT_THAT(writerInfo.ToJson(), HasSubstr("\"state\":5"));
+
+    SnapshotOperation operation;
+    operation.operationId = L"op-1";
+    operation.type = OperationType::Create;
+    operation.state = OperationState::Failed;
+    operation.progressPercent = 25;
+    operation.errorMessage = "timeout";
+    EXPECT_THAT(operation.ToJson(), HasSubstr("\"operationId\":\"op-1\""));
+    EXPECT_THAT(operation.ToJson(), HasSubstr("\"errorMessage\":\"timeout\""));
+
+    VolumeSnapshotStatisticsSnapshot snapshot;
+    snapshot.snapshotsCreated = 2;
+    snapshot.currentOperations = 1;
+    snapshot.emergencySnapshotsCreated = 4;
+    snapshot.uptimeSeconds = 6;
+    snapshot.byType[static_cast<size_t>(SnapshotType::Transportable)] = 5;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"type\":\"Transportable\""));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":6"));
 
     EXPECT_EQ(GetVSSResultName(VSSResult::ProviderVeto), "ProviderVeto");
     EXPECT_EQ(GetSnapshotTypeName(SnapshotType::Transportable), "Transportable");
     EXPECT_EQ(GetSnapshotStateName(SnapshotState::Committed), "Committed");
     EXPECT_EQ(GetWriterStateName(WriterState::Failed), "Failed");
+    EXPECT_EQ(GetVSSResultName(static_cast<VSSResult>(0xFF)), "Unknown");
     EXPECT_EQ(VolumeSnapshotService::GetVersionString(), "3.1.0");
 }
 

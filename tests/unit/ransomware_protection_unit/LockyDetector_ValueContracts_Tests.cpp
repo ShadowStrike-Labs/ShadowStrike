@@ -37,13 +37,29 @@ TEST(LockyDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemainSta
     invalidWindow.correlationWindowSecs = 0;
     EXPECT_FALSE(invalidWindow.IsValid());
 
+    auto invalidWindowHigh = config;
+    invalidWindowHigh.correlationWindowSecs = 3601;
+    EXPECT_FALSE(invalidWindowHigh.IsValid());
+
     auto invalidRenameThreshold = config;
     invalidRenameThreshold.massRenameThreshold = 0;
     EXPECT_FALSE(invalidRenameThreshold.IsValid());
 
+    auto invalidWriteThreshold = config;
+    invalidWriteThreshold.massWriteThreshold = 0;
+    EXPECT_FALSE(invalidWriteThreshold.IsValid());
+
     auto invalidScoreRange = config;
     invalidScoreRange.scoreBlockThreshold = invalidScoreRange.scoreAlertThreshold - 1.0;
     EXPECT_FALSE(invalidScoreRange.IsValid());
+
+    auto invalidAlertThreshold = config;
+    invalidAlertThreshold.scoreAlertThreshold = 200.1;
+    EXPECT_FALSE(invalidAlertThreshold.IsValid());
+
+    auto equalThresholds = config;
+    equalThresholds.scoreBlockThreshold = equalThresholds.scoreAlertThreshold;
+    EXPECT_TRUE(equalThresholds.IsValid());
 
     LockyStatistics stats;
     stats.totalDetections.store(2, std::memory_order_relaxed);
@@ -59,12 +75,37 @@ TEST(LockyDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemainSta
         stats.byVariant[static_cast<size_t>(LockyVariant::Zepto)].load(std::memory_order_relaxed),
         0u);
 
+    LockyDetectionResult result;
+    result.detected = true;
+    result.variant = LockyVariant::Thor;
+    result.confidence = DetectionConfidence::High;
+    result.pid = 77;
+    result.processName = L"locker.exe";
+    result.indicators = {"mass-rename"};
+    result.extensionsObserved = {L".thor"};
+    result.ransomNotesFound = {L"_WHAT_is.bmp"};
+    result.c2Domains = {"c2.example"};
+    result.filesEncrypted = 9;
+    result.score = 87.5;
+    EXPECT_THAT(result.ToJson(), HasSubstr("\"variant\":\"Thor\""));
+    EXPECT_THAT(result.ToJson(), HasSubstr("\"processName\":\"locker.exe\""));
+
+    LockyStatisticsSnapshot snapshot;
+    snapshot.totalDetections = 4;
+    snapshot.processesTerminated = 1;
+    snapshot.byVariant[static_cast<size_t>(LockyVariant::Zepto)] = 2;
+    snapshot.uptimeSeconds = 7;
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"variant\":\"Zepto\""));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":7"));
+
     EXPECT_EQ(GetLockyVariantName(LockyVariant::Original), "Original (.locky)");
     EXPECT_EQ(GetLockyVariantName(LockyVariant::Lukitus), "Lukitus");
     EXPECT_EQ(GetDetectionConfidenceName(DetectionConfidence::Confirmed), "Confirmed");
     EXPECT_EQ(GetDetectionConfidenceName(static_cast<DetectionConfidence>(0xFF)), "None");
     EXPECT_EQ(GetLockyExtension(LockyVariant::Thor), L".thor");
     EXPECT_EQ(GetLockyExtension(LockyVariant::Ykcol), L".ykcol");
+    EXPECT_EQ(GetLockyVariantName(static_cast<LockyVariant>(0xFF)), "Unknown");
+    EXPECT_TRUE(GetLockyExtension(static_cast<LockyVariant>(0xFF)).empty());
     EXPECT_EQ(LockyDetector::GetVersionString(), "3.1.0");
 }
 

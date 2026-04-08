@@ -82,9 +82,16 @@ TEST(FileBackupManagerValueTests, ConfigurationPoliciesStatisticsUtilitiesAndVer
     invalidCleanup.cleanupIntervalSecs = 0;
     EXPECT_FALSE(invalidCleanup.IsValid());
 
+    auto invalidCleanupHigh = config;
+    invalidCleanupHigh.cleanupIntervalSecs = 86401;
+    EXPECT_FALSE(invalidCleanupHigh.IsValid());
+
     BackupPolicy policy;
     EXPECT_TRUE(policy.ShouldBackup(L"C:\\Data\\report.docx", 128));
     EXPECT_FALSE(policy.ShouldBackup(L"C:\\Data\\report.docx", 0));
+    policy.maxFileSize = 128;
+    EXPECT_TRUE(policy.ShouldBackup(L"C:\\Data\\report.docx", 128));
+    EXPECT_FALSE(policy.ShouldBackup(L"C:\\Data\\report.docx", 129));
     policy.enabled = false;
     EXPECT_FALSE(policy.ShouldBackup(L"C:\\Data\\report.docx", 128));
 
@@ -120,18 +127,33 @@ TEST(FileBackupManagerValueTests, ConfigurationPoliciesStatisticsUtilitiesAndVer
     entry.storageType = BackupStorageType::Disk;
     entry.status = BackupStatus::Completed;
     EXPECT_THAT(entry.ToJson(), HasSubstr("\"backupId\": \"backup-1\""));
+    EXPECT_THAT(entry.ToJson(), HasSubstr("\"originalPath\": \"C:\\\\Data\\\\important.txt\""));
 
     RestoreResult restore;
     restore.originalPath = L"C:\\Data\\important.txt";
     restore.backupId = "backup-1";
     restore.status = RestoreStatus::Success;
     restore.bytesRestored = 17;
+    restore.errorMessage = "permission denied";
     EXPECT_THAT(restore.ToJson(), HasSubstr("\"bytesRestored\": 17"));
+    EXPECT_THAT(restore.ToJson(), HasSubstr("\"error\": \"permission denied\""));
 
     RollbackResult rollback;
     rollback.pid = 9001;
+    rollback.filesAttempted = 3;
     rollback.filesRestored = 2;
+    rollback.filesFailed = 1;
     EXPECT_THAT(rollback.ToJson(), HasSubstr("\"pid\": 9001"));
+    EXPECT_THAT(rollback.ToJson(), HasSubstr("\"filesFailed\": 1"));
+
+    BackupStatisticsSnapshot snapshot;
+    snapshot.filesBackedUp = 4;
+    snapshot.currentRamUsage = 8;
+    snapshot.currentDiskUsage = 2;
+    snapshot.startTime = Clock::now() - std::chrono::seconds(2);
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"filesBackedUp\": 4"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"ramUsage\": 8"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":"));
 
     EXPECT_EQ(GetStorageTypeName(BackupStorageType::Encrypted), "Encrypted");
     EXPECT_EQ(GetBackupStatusName(BackupStatus::Expired), "Expired");
@@ -232,6 +254,11 @@ TEST_F(FileBackupManagerTest, DiskBackupsRollbackModifiedFilesAndCommitRemovesCa
     EXPECT_EQ(manager.GetDiskCacheUsage(), 0u);
     EXPECT_FALSE(std::filesystem::exists(backup->backupPath));
 
+    const auto missingAfterCommit = manager.RestoreFile(source.wstring(), pid);
+    EXPECT_EQ(missingAfterCommit.status, RestoreStatus::NotFound);
+
+    manager.CommitChanges(pid);
+
     const auto stats = manager.GetStatistics();
     EXPECT_EQ(stats.filesBackedUp, 1u);
     EXPECT_EQ(stats.filesRestored, 1u);
@@ -252,6 +279,10 @@ TEST_F(FileBackupManagerTest, CacheInternalPathsExcludedPoliciesAndMissingRestor
     const auto missing = manager.RestoreFile("missing-backup-id");
     EXPECT_EQ(missing.status, RestoreStatus::NotFound);
     EXPECT_THAT(missing.errorMessage, HasSubstr("not found"));
+
+    const auto statsBeforeCommit = manager.GetStatistics();
+    manager.CommitBackup("missing-backup-id");
+    EXPECT_EQ(manager.GetStatistics().filesCommitted, statsBeforeCommit.filesCommitted);
 }
 
 }  // namespace
