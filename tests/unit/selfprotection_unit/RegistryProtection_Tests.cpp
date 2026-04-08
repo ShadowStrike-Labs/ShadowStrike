@@ -67,6 +67,18 @@ TEST(RegistryProtectionTests, EventsSerializeOperationAndDecisionFieldsPredictab
               static_cast<int>(RegistryOperationDecision::Block));
     EXPECT_TRUE(payload.at("wasBlocked").get<bool>());
     EXPECT_TRUE(payload.at("wasRolledBack").get<bool>());
+
+    event.eventId = 52;
+    event.valueName.clear();
+    event.sourceProcessId = 0;
+    event.sourceProcessName.clear();
+    event.wasBlocked = false;
+    event.wasRolledBack = false;
+
+    const std::string pidlessSummary = event.GetSummary();
+    EXPECT_THAT(pidlessSummary, ::testing::HasSubstr("ALLOWED SetValue on HKLM\\Software\\ShadowStrike"));
+    EXPECT_THAT(pidlessSummary, ::testing::Not(::testing::HasSubstr("\\Config")));
+    EXPECT_THAT(pidlessSummary, ::testing::HasSubstr("by PID 0"));
 }
 
 TEST(RegistryProtectionTests, StatisticsAndHelperNamesPreservePublicContracts) {
@@ -89,7 +101,7 @@ TEST(RegistryProtectionTests, StatisticsAndHelperNamesPreservePublicContracts) {
     EXPECT_EQ(GetRegistryOperationName(RegistryOperation::RestoreKey), "RestoreKey");
     EXPECT_EQ(GetProtectionTypeName(KeyProtectionType::ValuesOnly), "ValuesOnly");
     EXPECT_EQ(GetIntegrityStatusName(RegistryIntegrityStatus::Restored), "Restored");
-    EXPECT_EQ(GetValueTypeName(RegistryValueType::MultiString), "MultiString");
+    EXPECT_EQ(GetValueTypeName(RegistryValueType::MultiString), "REG_MULTI_SZ");
 }
 
 }  // namespace

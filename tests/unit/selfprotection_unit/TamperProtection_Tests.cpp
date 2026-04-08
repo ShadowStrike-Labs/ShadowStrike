@@ -75,6 +75,18 @@ TEST(TamperProtectionTests, TamperEventsSummariesAndJsonTrackRepairActions) {
     EXPECT_EQ(payload.at("severityLevel").get<int>(), 9);
     EXPECT_EQ(payload.at("expectedHash").get<std::string>().size(), 64U);
     EXPECT_EQ(payload.at("actualHash").get<std::string>().size(), 64U);
+
+    event.eventId = 72;
+    event.resourcePath.clear();
+    event.sourceProcessId = 0;
+    event.sourceProcessName = L"hidden.exe";
+    event.wasBlocked = false;
+    event.wasRepaired = false;
+
+    const std::string pidlessSummary = event.GetSummary();
+    EXPECT_THAT(pidlessSummary, ::testing::HasSubstr("FileModified on File"));
+    EXPECT_THAT(pidlessSummary, ::testing::Not(::testing::HasSubstr("by PID")));
+    EXPECT_THAT(pidlessSummary, ::testing::Not(::testing::HasSubstr("hidden.exe")));
 }
 
 TEST(TamperProtectionTests, StatisticsAndHelperNamesRemainStable) {
@@ -98,6 +110,7 @@ TEST(TamperProtectionTests, StatisticsAndHelperNamesRemainStable) {
     EXPECT_EQ(GetEventTypeName(TamperEventType::DebuggerAttached), "DebuggerAttached");
     EXPECT_EQ(GetIntegrityStatusName(IntegrityStatus::Unauthorized), "Unauthorized");
     EXPECT_EQ(GetResponseName(TamperResponse::Repair), "Repair");
+    EXPECT_EQ(GetResponseName(TamperResponse::Standard), "Multiple");
     EXPECT_EQ(GetSubsystemName(TamperSubsystem::FileProtection), "FileProtection");
 }
 
