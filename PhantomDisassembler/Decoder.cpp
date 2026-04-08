@@ -1027,6 +1027,10 @@ uint8_t Decoder::OpcodeImmediateSize(uint8_t map, uint8_t opcode,
 // ============================================================================
 
 Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
+    // VEX/EVEX dispatch — must be checked before legacy path
+    if (ctx.hasVEX)  return ResolveVEXMnemonic(ctx);
+    if (ctx.hasEVEX) return ResolveEVEXMnemonic(ctx);
+
     const uint8_t map = ctx.opcodeMap;
     const uint8_t op  = ctx.opcode;
     const uint8_t ext = ctx.opcodeExt;
@@ -1296,12 +1300,14 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
             // mod==3 special cases
             uint8_t rm = ModRM_RM(ctx.modrm);
             if (ext == 0) {
-                if (rm == 1) return Mnemonic::UNKNOWN; // VMCALL
-                if (rm == 2) return Mnemonic::UNKNOWN; // VMLAUNCH
+                if (rm == 1) return Mnemonic::VMCALL;
+                if (rm == 2) return Mnemonic::VMLAUNCH;
+                if (rm == 3) return Mnemonic::VMRESUME;
+                if (rm == 4) return Mnemonic::VMXOFF;
             }
             if (ext == 1) {
-                if (rm == 0) return Mnemonic::UNKNOWN; // MONITOR
-                if (rm == 1) return Mnemonic::UNKNOWN; // MWAIT
+                if (rm == 0) return Mnemonic::MONITOR_INST;
+                if (rm == 1) return Mnemonic::MWAIT_INST;
             }
             if (ext == 2) {
                 if (rm == 0) return Mnemonic::XGETBV;
@@ -1816,6 +1822,895 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         default: return Mnemonic::UNKNOWN;
         }
     }
+
+    return Mnemonic::UNKNOWN;
+}
+
+// ============================================================================
+// ResolveVEXMnemonic — AVX / AVX2 / FMA / BMI mnemonic resolution
+// ============================================================================
+//
+// VEX prefix already decoded: ctx.vexPP → mandatory prefix (NP/66/F3/F2),
+// ctx.vexMMMMM → opcode map (1=0F, 2=0F38, 3=0F3A), ctx.vexW → REX.W,
+// ctx.vexL → vector length (0=128, 1=256). This function resolves V* mnemonics
+// for all VEX-encoded instruction families.
+
+Mnemonic Decoder::ResolveVEXMnemonic(const DecodeContext& ctx) const noexcept {
+    const uint8_t map = ctx.opcodeMap;
+    const uint8_t op  = ctx.opcode;
+    const uint8_t pp  = ctx.vexPP;   // 0=NP, 1=66, 2=F3, 3=F2
+
+    // ---- VEX Map 1 (0F) ----
+    if (map == 1) {
+        // SSE data movement (10-17)
+        if (op >= 0x10 && op <= 0x17) {
+            if (pp == 3) { // F2
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVSD_AVX;
+                case 0x12: return Mnemonic::VMOVDDUP;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVSS;
+                case 0x12: return Mnemonic::VMOVSLDUP;
+                case 0x16: return Mnemonic::VMOVSHDUP;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVUPD;
+                case 0x12: case 0x13: return Mnemonic::VMOVLPD;
+                case 0x14: return Mnemonic::VUNPCKLPD;
+                case 0x15: return Mnemonic::VUNPCKHPD;
+                case 0x16: case 0x17: return Mnemonic::VMOVHPD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP
+            switch (op) {
+            case 0x10: case 0x11: return Mnemonic::VMOVUPS;
+            case 0x12: {
+                uint8_t mod = ModRM_Mod(ctx.modrm);
+                return (mod == kMod_Register) ? Mnemonic::VMOVHLPS : Mnemonic::VMOVLPS;
+            }
+            case 0x13: return Mnemonic::VMOVLPS;
+            case 0x14: return Mnemonic::VUNPCKLPS;
+            case 0x15: return Mnemonic::VUNPCKHPS;
+            case 0x16: {
+                uint8_t mod = ModRM_Mod(ctx.modrm);
+                return (mod == kMod_Register) ? Mnemonic::VMOVLHPS : Mnemonic::VMOVHPS;
+            }
+            case 0x17: return Mnemonic::VMOVHPS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Moves/converts (28-2F)
+        if (op >= 0x28 && op <= 0x2F) {
+            if (pp == 3) { // F2
+                switch (op) {
+                case 0x2A: return Mnemonic::VCVTSI2SD;
+                case 0x2C: return Mnemonic::VCVTTSD2SI;
+                case 0x2D: return Mnemonic::VCVTSD2SI;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                switch (op) {
+                case 0x2A: return Mnemonic::VCVTSI2SS;
+                case 0x2C: return Mnemonic::VCVTTSS2SI;
+                case 0x2D: return Mnemonic::VCVTSS2SI;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0x28: case 0x29: return Mnemonic::VMOVAPD;
+                case 0x2B: return Mnemonic::VMOVNTPD;
+                case 0x2E: return Mnemonic::VUCOMISD;
+                case 0x2F: return Mnemonic::VCOMISD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP
+            switch (op) {
+            case 0x28: case 0x29: return Mnemonic::VMOVAPS;
+            case 0x2B: return Mnemonic::VMOVNTPS;
+            case 0x2E: return Mnemonic::VUCOMISS;
+            case 0x2F: return Mnemonic::VCOMISS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Packed integer (50-5F) — major SSE arithmetic block
+        if (op >= 0x50 && op <= 0x5F) {
+            if (pp == 3) { // F2 — scalar double
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTSD;
+                case 0x58: return Mnemonic::VADDSD;
+                case 0x59: return Mnemonic::VMULSD;
+                case 0x5A: return Mnemonic::VCVTSD2SS;
+                case 0x5C: return Mnemonic::VSUBSD;
+                case 0x5D: return Mnemonic::VMINSD;
+                case 0x5E: return Mnemonic::VDIVSD;
+                case 0x5F: return Mnemonic::VMAXSD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3 — scalar single
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTSS;
+                case 0x52: return Mnemonic::VRSQRTSS;
+                case 0x53: return Mnemonic::VRCPSS;
+                case 0x58: return Mnemonic::VADDSS;
+                case 0x59: return Mnemonic::VMULSS;
+                case 0x5A: return Mnemonic::VCVTSS2SD;
+                case 0x5B: return Mnemonic::VCVTTPS2DQ;
+                case 0x5C: return Mnemonic::VSUBSS;
+                case 0x5D: return Mnemonic::VMINSS;
+                case 0x5E: return Mnemonic::VDIVSS;
+                case 0x5F: return Mnemonic::VMAXSS;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66 — packed double
+                switch (op) {
+                case 0x50: return Mnemonic::VMOVMSKPD;
+                case 0x51: return Mnemonic::VSQRTPD;
+                case 0x54: return Mnemonic::VANDPD;
+                case 0x55: return Mnemonic::VANDNPD;
+                case 0x56: return Mnemonic::VORPD;
+                case 0x57: return Mnemonic::VXORPD;
+                case 0x58: return Mnemonic::VADDPD;
+                case 0x59: return Mnemonic::VMULPD;
+                case 0x5A: return Mnemonic::VCVTPD2PS;
+                case 0x5B: return Mnemonic::VCVTPS2DQ;
+                case 0x5C: return Mnemonic::VSUBPD;
+                case 0x5D: return Mnemonic::VMINPD;
+                case 0x5E: return Mnemonic::VDIVPD;
+                case 0x5F: return Mnemonic::VMAXPD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP — packed single
+            switch (op) {
+            case 0x50: return Mnemonic::VMOVMSKPS;
+            case 0x51: return Mnemonic::VSQRTPS;
+            case 0x52: return Mnemonic::VRSQRTPS;
+            case 0x53: return Mnemonic::VRCPPS;
+            case 0x54: return Mnemonic::VANDPS;
+            case 0x55: return Mnemonic::VANDNPS;
+            case 0x56: return Mnemonic::VORPS;
+            case 0x57: return Mnemonic::VXORPS;
+            case 0x58: return Mnemonic::VADDPS;
+            case 0x59: return Mnemonic::VMULPS;
+            case 0x5A: return Mnemonic::VCVTPS2PD;
+            case 0x5B: return Mnemonic::VCVTDQ2PS;
+            case 0x5C: return Mnemonic::VSUBPS;
+            case 0x5D: return Mnemonic::VMINPS;
+            case 0x5E: return Mnemonic::VDIVPS;
+            case 0x5F: return Mnemonic::VMAXPS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Packed integer 60-6F
+        if (op >= 0x60 && op <= 0x6F) {
+            if (pp == 1) { // 66 — packed integer
+                switch (op) {
+                case 0x60: return Mnemonic::VPUNPCKLBW;
+                case 0x61: return Mnemonic::VPUNPCKLWD;
+                case 0x62: return Mnemonic::VPUNPCKLDQ;
+                case 0x63: return Mnemonic::VPACKSSWB;
+                case 0x64: return Mnemonic::VPCMPGTB;
+                case 0x65: return Mnemonic::VPCMPGTW;
+                case 0x66: return Mnemonic::VPCMPGTD;
+                case 0x67: return Mnemonic::VPACKUSWB;
+                case 0x68: return Mnemonic::VPUNPCKHBW;
+                case 0x69: return Mnemonic::VPUNPCKHWD;
+                case 0x6A: return Mnemonic::VPUNPCKHDQ;
+                case 0x6B: return Mnemonic::VPACKSSDW;
+                case 0x6C: return Mnemonic::VPUNPCKLQDQ;
+                case 0x6D: return Mnemonic::VPUNPCKHQDQ;
+                case 0x6E: return ctx.vexW ? Mnemonic::VMOVQ : Mnemonic::VMOVD;
+                case 0x6F: return Mnemonic::VMOVDQA;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                if (op == 0x6F) return Mnemonic::VMOVDQU;
+                if (op == 0x7E) return Mnemonic::VMOVQ;
+                return Mnemonic::UNKNOWN;
+            }
+            return Mnemonic::UNKNOWN;
+        }
+
+        // Packed integer 70-7F
+        if (op >= 0x70 && op <= 0x7F) {
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0x70: return Mnemonic::VPSHUFD;
+                case 0x71:
+                    switch (ctx.opcodeExt) {
+                    case 2: return Mnemonic::VPSRLW;
+                    case 4: return Mnemonic::VPSRAW;
+                    case 6: return Mnemonic::VPSLLW;
+                    default: return Mnemonic::UNKNOWN;
+                    }
+                case 0x72:
+                    switch (ctx.opcodeExt) {
+                    case 2: return Mnemonic::VPSRLD;
+                    case 4: return Mnemonic::VPSRAD;
+                    case 6: return Mnemonic::VPSLLD;
+                    default: return Mnemonic::UNKNOWN;
+                    }
+                case 0x73:
+                    switch (ctx.opcodeExt) {
+                    case 2: return Mnemonic::VPSRLQ;
+                    case 3: return Mnemonic::VPSRLDQ;
+                    case 6: return Mnemonic::VPSLLQ;
+                    case 7: return Mnemonic::VPSLLDQ;
+                    default: return Mnemonic::UNKNOWN;
+                    }
+                case 0x74: return Mnemonic::VPCMPEQB;
+                case 0x75: return Mnemonic::VPCMPEQW;
+                case 0x76: return Mnemonic::VPCMPEQD;
+                case 0x77:
+                    return ctx.vexL ? Mnemonic::VZEROALL : Mnemonic::VZEROUPPER;
+                case 0x7C: return Mnemonic::VHADDPD;
+                case 0x7D: return Mnemonic::VHSUBPD;
+                case 0x7E: return ctx.vexW ? Mnemonic::VMOVQ : Mnemonic::VMOVD;
+                case 0x7F: return Mnemonic::VMOVDQA;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                switch (op) {
+                case 0x70: return Mnemonic::VPSHUFHW;
+                case 0x7E: return Mnemonic::VMOVQ;
+                case 0x7F: return Mnemonic::VMOVDQU;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 3) { // F2
+                switch (op) {
+                case 0x70: return Mnemonic::VPSHUFLW;
+                case 0x7C: return Mnemonic::VHADDPS;
+                case 0x7D: return Mnemonic::VHSUBPS;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP
+            if (op == 0x77) return ctx.vexL ? Mnemonic::VZEROALL : Mnemonic::VZEROUPPER;
+            return Mnemonic::UNKNOWN;
+        }
+
+        // SSE2 compare/cvt (C0-CF)
+        if (op >= 0xC0 && op <= 0xCF) {
+            if (pp == 3) { // F2
+                switch (op) {
+                case 0xC2: return Mnemonic::VCMPSD_CMP;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                switch (op) {
+                case 0xC2: return Mnemonic::VCMPSS;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0xC2: return Mnemonic::VCMPPD;
+                case 0xC4: return Mnemonic::VPINSRW;
+                case 0xC5: return Mnemonic::VPEXTRW;
+                case 0xC6: return Mnemonic::VSHUFPD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP
+            switch (op) {
+            case 0xC2: return Mnemonic::VCMPPS;
+            case 0xC6: return Mnemonic::VSHUFPS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Packed integer D0-DF
+        if (op >= 0xD0 && op <= 0xDF) {
+            if (pp == 3 && op == 0xD0) return Mnemonic::VADDSUBPS;
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0xD0: return Mnemonic::VADDSUBPD;
+                case 0xD1: return Mnemonic::VPSRLW;
+                case 0xD2: return Mnemonic::VPSRLD;
+                case 0xD3: return Mnemonic::VPSRLQ;
+                case 0xD4: return Mnemonic::VPADDQ;
+                case 0xD5: return Mnemonic::VPMULLW;
+                case 0xD6: return Mnemonic::VMOVQ;
+                case 0xD7: return Mnemonic::VPMOVMSKB;
+                case 0xD8: return Mnemonic::VPSUBUSB;
+                case 0xD9: return Mnemonic::VPSUBUSW;
+                case 0xDA: return Mnemonic::VPMINUB;
+                case 0xDB: return Mnemonic::VPAND;
+                case 0xDC: return Mnemonic::VPADDUSB;
+                case 0xDD: return Mnemonic::VPADDUSW;
+                case 0xDE: return Mnemonic::VPMAXUB;
+                case 0xDF: return Mnemonic::VPANDN;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            return Mnemonic::UNKNOWN;
+        }
+
+        // Packed integer E0-EF
+        if (op >= 0xE0 && op <= 0xEF) {
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0xE0: return Mnemonic::VPAVGB;
+                case 0xE1: return Mnemonic::VPSRAW;
+                case 0xE2: return Mnemonic::VPSRAD;
+                case 0xE3: return Mnemonic::VPAVGW;
+                case 0xE4: return Mnemonic::VPMULHUW;
+                case 0xE5: return Mnemonic::VPMULHW;
+                case 0xE6: return Mnemonic::VCVTTPD2DQ;
+                case 0xE7: return Mnemonic::VMOVNTDQ;
+                case 0xE8: return Mnemonic::VPSUBSB;
+                case 0xE9: return Mnemonic::VPSUBSW;
+                case 0xEA: return Mnemonic::VPMINSW;
+                case 0xEB: return Mnemonic::VPOR;
+                case 0xEC: return Mnemonic::VPADDSB;
+                case 0xED: return Mnemonic::VPADDSW;
+                case 0xEE: return Mnemonic::VPMAXSW;
+                case 0xEF: return Mnemonic::VPXOR;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2 && op == 0xE6) return Mnemonic::VCVTDQ2PD;   // F3
+            if (pp == 3 && op == 0xE6) return Mnemonic::VCVTPD2DQ;   // F2
+            return Mnemonic::UNKNOWN;
+        }
+
+        // Packed integer F0-FF
+        if (op >= 0xF0 && op <= 0xFF) {
+            if (pp == 3 && op == 0xF0) return Mnemonic::VLDDQU;     // F2
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0xF1: return Mnemonic::VPSLLW;
+                case 0xF2: return Mnemonic::VPSLLD;
+                case 0xF3: return Mnemonic::VPSLLQ;
+                case 0xF4: return Mnemonic::VPMULUDQ;
+                case 0xF5: return Mnemonic::VPMADDWD;
+                case 0xF6: return Mnemonic::VPSADBW;
+                case 0xF8: return Mnemonic::VPSUBB;
+                case 0xF9: return Mnemonic::VPSUBW;
+                case 0xFA: return Mnemonic::VPSUBD;
+                case 0xFB: return Mnemonic::VPSUBQ;
+                case 0xFC: return Mnemonic::VPADDB;
+                case 0xFD: return Mnemonic::VPADDW;
+                case 0xFE: return Mnemonic::VPADDD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            return Mnemonic::UNKNOWN;
+        }
+
+        // VMOVNTDQ 0F E7 (already in E0 block above for 66)
+        // LDMXCSR / STMXCSR — VEX-encoded
+        if (op == 0xAE && pp == 0) {
+            if (ctx.opcodeExt == 2) return Mnemonic::VLDMXCSR;
+            if (ctx.opcodeExt == 3) return Mnemonic::VSTMXCSR;
+            return Mnemonic::UNKNOWN;
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end VEX map 1
+
+    // ---- VEX Map 2 (0F38) ----
+    if (map == 2) {
+        // BMI1/BMI2 — VEX-only, distinguished by pp and vexW
+        if (pp == 0) { // NP
+            switch (op) {
+            case 0xF2: return Mnemonic::ANDN;
+            case 0xF3:
+                switch (ctx.opcodeExt) {
+                case 1: return Mnemonic::BLSR;
+                case 2: return Mnemonic::BLSMSK;
+                case 3: return Mnemonic::BLSI;
+                default: return Mnemonic::UNKNOWN;
+                }
+            case 0xF5: return Mnemonic::BZHI;
+            case 0xF7: return Mnemonic::BEXTR;
+            default: break;
+            }
+        }
+        if (pp == 2) { // F3
+            switch (op) {
+            case 0xF5: return Mnemonic::PEXT;
+            case 0xF7: return Mnemonic::SARX;
+            default: break;
+            }
+        }
+        if (pp == 3) { // F2
+            switch (op) {
+            case 0xF5: return Mnemonic::PDEP;
+            case 0xF6: return Mnemonic::MULX;
+            case 0xF7: return Mnemonic::SHRX;
+            default: break;
+            }
+        }
+        if (pp == 1 && op == 0xF7) return Mnemonic::SHLX; // 66
+
+        // SSSE3/SSE4 V* equivalents (pp=66)
+        if (pp == 1) { // 66
+            switch (op) {
+            case 0x00: return Mnemonic::VPSHUFB;
+            case 0x01: return Mnemonic::VPHADDW;
+            case 0x02: return Mnemonic::VPHADDD;
+            case 0x03: return Mnemonic::VPHADDSW;
+            case 0x04: return Mnemonic::VPMADDUBSW;
+            case 0x05: return Mnemonic::VPHSUBW;
+            case 0x06: return Mnemonic::VPHSUBD;
+            case 0x07: return Mnemonic::VPHSUBSW;
+            case 0x08: return Mnemonic::VPSIGNB;
+            case 0x09: return Mnemonic::VPSIGNW;
+            case 0x0A: return Mnemonic::VPSIGND;
+            case 0x0B: return Mnemonic::VPMULHRSW;
+            case 0x0C: return Mnemonic::VPERMILPS;
+            case 0x0D: return Mnemonic::VPERMILPD;
+            case 0x0E: return Mnemonic::VPTEST;
+            case 0x13: return Mnemonic::VCVTPH2PS;
+            case 0x17: return Mnemonic::VPTEST;
+            case 0x18: return Mnemonic::VBROADCASTSS;
+            case 0x19: return Mnemonic::VBROADCASTSD;
+            case 0x1A: return Mnemonic::VBROADCASTF128;
+            case 0x1C: return Mnemonic::VPABSB;
+            case 0x1D: return Mnemonic::VPABSW;
+            case 0x1E: return Mnemonic::VPABSD;
+            case 0x20: return Mnemonic::VPMOVSXBW;
+            case 0x21: return Mnemonic::VPMOVSXBD;
+            case 0x22: return Mnemonic::VPMOVSXBQ;
+            case 0x23: return Mnemonic::VPMOVSXWD;
+            case 0x24: return Mnemonic::VPMOVSXWQ;
+            case 0x25: return Mnemonic::VPMOVSXDQ;
+            case 0x28: return Mnemonic::VPMULDQ;
+            case 0x29: return Mnemonic::VPCMPEQQ;
+            case 0x2A: return Mnemonic::VMOVNTDQ; // movntdqa
+            case 0x2B: return Mnemonic::VPACKUSDW;
+            case 0x2C: return Mnemonic::VMASKMOVPS;
+            case 0x2D: return Mnemonic::VMASKMOVPD;
+            case 0x2E: return Mnemonic::VMASKMOVPS; // store form
+            case 0x2F: return Mnemonic::VMASKMOVPD; // store form
+            case 0x30: return Mnemonic::VPMOVZXBW;
+            case 0x31: return Mnemonic::VPMOVZXBD;
+            case 0x32: return Mnemonic::VPMOVZXBQ;
+            case 0x33: return Mnemonic::VPMOVZXWD;
+            case 0x34: return Mnemonic::VPMOVZXWQ;
+            case 0x35: return Mnemonic::VPMOVZXDQ;
+            case 0x36: return Mnemonic::VPERMD;
+            case 0x37: return Mnemonic::VPCMPGTQ;
+            case 0x38: return Mnemonic::VPMINSB;
+            case 0x39: return Mnemonic::VPMINSD;
+            case 0x3A: return Mnemonic::VPMINUW;
+            case 0x3B: return Mnemonic::VPMINUD;
+            case 0x3C: return Mnemonic::VPMAXSB;
+            case 0x3D: return Mnemonic::VPMAXSD;
+            case 0x3E: return Mnemonic::VPMAXUW;
+            case 0x3F: return Mnemonic::VPMAXUD;
+            case 0x40: return Mnemonic::VPMULLD;
+            case 0x41: return Mnemonic::VPHMINPOSUW;
+            case 0x45: return Mnemonic::VPSRLVD; // vpsrlvd/q by vexW
+            case 0x46: return Mnemonic::VPSRAVD;
+            case 0x47: return Mnemonic::VPSLLVD; // vpsllvd/q by vexW
+            case 0x58: return Mnemonic::VPBROADCASTD;
+            case 0x59: return Mnemonic::VPBROADCASTQ;
+            case 0x5A: return Mnemonic::VBROADCASTI128;
+            case 0x78: return Mnemonic::VPBROADCASTB;
+            case 0x79: return Mnemonic::VPBROADCASTW;
+            case 0x8C: return ctx.vexW ? Mnemonic::VPMASKMOVQ : Mnemonic::VPMASKMOVD;
+            case 0x8E: return ctx.vexW ? Mnemonic::VPMASKMOVQ : Mnemonic::VPMASKMOVD;
+            case 0x90: return ctx.vexW ? Mnemonic::VPGATHERDQ : Mnemonic::VPGATHERDD;
+            case 0x91: return ctx.vexW ? Mnemonic::VPGATHERQQ : Mnemonic::VPGATHERQD;
+            case 0x92: return ctx.vexW ? Mnemonic::VGATHERDPD : Mnemonic::VGATHERDPS;
+            case 0x93: return ctx.vexW ? Mnemonic::VGATHERQPD : Mnemonic::VGATHERQPS;
+            // FMA3 — 0F38 96-9F, A6-AF, B6-BF
+            case 0x96: return Mnemonic::UNKNOWN; // fmaddsub132ps/pd (not yet defined)
+            case 0x98: return ctx.vexW ? Mnemonic::VFMADD132PD : Mnemonic::VFMADD132PS;
+            case 0x99: return ctx.vexW ? Mnemonic::VFMADD132SD : Mnemonic::VFMADD132SS;
+            case 0x9A: return ctx.vexW ? Mnemonic::VFMSUB132PD : Mnemonic::VFMSUB132PS;
+            case 0x9B: return ctx.vexW ? Mnemonic::VFMSUB132SD : Mnemonic::VFMSUB132SS;
+            case 0x9C: return ctx.vexW ? Mnemonic::VFNMADD132PD : Mnemonic::VFNMADD132PS;
+            case 0x9D: return ctx.vexW ? Mnemonic::VFNMADD132SD : Mnemonic::VFNMADD132SS;
+            case 0x9E: return ctx.vexW ? Mnemonic::VFNMSUB132PD : Mnemonic::VFNMSUB132PS;
+            case 0x9F: return ctx.vexW ? Mnemonic::VFNMSUB132SD : Mnemonic::VFNMSUB132SS;
+            case 0xA8: return ctx.vexW ? Mnemonic::VFMADD213PD : Mnemonic::VFMADD213PS;
+            case 0xA9: return ctx.vexW ? Mnemonic::VFMADD213SD : Mnemonic::VFMADD213SS;
+            case 0xAA: return ctx.vexW ? Mnemonic::VFMSUB213PD : Mnemonic::VFMSUB213PS;
+            case 0xAB: return ctx.vexW ? Mnemonic::VFMSUB213SD : Mnemonic::VFMSUB213SS;
+            case 0xAC: return ctx.vexW ? Mnemonic::VFNMADD213PD : Mnemonic::VFNMADD213PS;
+            case 0xAD: return ctx.vexW ? Mnemonic::VFNMADD213SD : Mnemonic::VFNMADD213SS;
+            case 0xAE: return ctx.vexW ? Mnemonic::VFNMSUB213PD : Mnemonic::VFNMSUB213PS;
+            case 0xAF: return ctx.vexW ? Mnemonic::VFNMSUB213SD : Mnemonic::VFNMSUB213SS;
+            case 0xB8: return ctx.vexW ? Mnemonic::VFMADD231PD : Mnemonic::VFMADD231PS;
+            case 0xB9: return ctx.vexW ? Mnemonic::VFMADD231SD : Mnemonic::VFMADD231SS;
+            case 0xBA: return ctx.vexW ? Mnemonic::VFMSUB231PD : Mnemonic::VFMSUB231PS;
+            case 0xBB: return ctx.vexW ? Mnemonic::VFMSUB231SD : Mnemonic::VFMSUB231SS;
+            case 0xBC: return ctx.vexW ? Mnemonic::VFNMADD231PD : Mnemonic::VFNMADD231PS;
+            case 0xBD: return ctx.vexW ? Mnemonic::VFNMADD231SD : Mnemonic::VFNMADD231SS;
+            case 0xBE: return ctx.vexW ? Mnemonic::VFNMSUB231PD : Mnemonic::VFNMSUB231PS;
+            case 0xBF: return ctx.vexW ? Mnemonic::VFNMSUB231SD : Mnemonic::VFNMSUB231SS;
+            // AES-NI VEX
+            case 0xDC: return Mnemonic::VAESENC;
+            case 0xDD: return Mnemonic::VAESENCLAST;
+            case 0xDE: return Mnemonic::VAESDEC;
+            case 0xDF: return Mnemonic::VAESDECLAST;
+            case 0xDB: return Mnemonic::VAESIMC;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end VEX map 2
+
+    // ---- VEX Map 3 (0F3A) ----
+    if (map == 3) {
+        // BMI2 RORX
+        if (pp == 3 && op == 0xF0) return Mnemonic::RORX; // F2
+
+        if (pp == 1) { // 66
+            switch (op) {
+            case 0x00: return ctx.vexW ? Mnemonic::VPERMQ : Mnemonic::UNKNOWN;
+            case 0x01: return ctx.vexW ? Mnemonic::VPERMPD : Mnemonic::UNKNOWN;
+            case 0x02: return Mnemonic::VPBLENDD;
+            case 0x04: return Mnemonic::VPERMILPS;
+            case 0x05: return Mnemonic::VPERMILPD;
+            case 0x06: return Mnemonic::VPERM2F128;
+            case 0x08: return Mnemonic::VROUNDPS;
+            case 0x09: return Mnemonic::VROUNDPD;
+            case 0x0A: return Mnemonic::VROUNDSS;
+            case 0x0B: return Mnemonic::VROUNDSD;
+            case 0x0C: return Mnemonic::VBLENDPS;
+            case 0x0D: return Mnemonic::VBLENDPD;
+            case 0x0E: return Mnemonic::VPBLENDW;
+            case 0x0F: return Mnemonic::VPALIGNR;
+            case 0x14: return Mnemonic::VPEXTRB;
+            case 0x15: return Mnemonic::VPEXTRW;
+            case 0x16: return ctx.vexW ? Mnemonic::VPEXTRQ : Mnemonic::VPEXTRD;
+            case 0x17: return Mnemonic::VEXTRACTPS;
+            case 0x18: return Mnemonic::VINSERTF128;
+            case 0x19: return Mnemonic::VEXTRACTF128;
+            case 0x1D: return Mnemonic::VCVTPS2PH;
+            case 0x20: return Mnemonic::VPINSRB;
+            case 0x21: return Mnemonic::VINSERTPS;
+            case 0x22: return ctx.vexW ? Mnemonic::VPINSRQ : Mnemonic::VPINSRD;
+            case 0x38: return Mnemonic::VINSERTI128;
+            case 0x39: return Mnemonic::VEXTRACTI128;
+            case 0x40: return Mnemonic::VDPPS;
+            case 0x41: return Mnemonic::VDPPD;
+            case 0x42: return Mnemonic::VMPSADBW;
+            case 0x44: return Mnemonic::VPCLMULQDQ;
+            case 0x46: return Mnemonic::VPERM2I128;
+            case 0x4A: return Mnemonic::VBLENDVPS;
+            case 0x4B: return Mnemonic::VBLENDVPD;
+            case 0x4C: return Mnemonic::VPBLENDVB;
+            case 0x60: return Mnemonic::VPCMPESTRM;
+            case 0x61: return Mnemonic::VPCMPESTRI;
+            case 0x62: return Mnemonic::VPCMPISTRM;
+            case 0x63: return Mnemonic::VPCMPISTRI;
+            case 0xDF: return Mnemonic::VAESKEYGENASSIST;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end VEX map 3
+
+    return Mnemonic::UNKNOWN;
+}
+
+// ============================================================================
+// ResolveEVEXMnemonic — AVX-512 mnemonic resolution
+// ============================================================================
+//
+// EVEX builds on VEX: ctx.evexLL (0=128,1=256,2=512), ctx.evexZ (zeroing),
+// ctx.evexB (broadcast/rounding), ctx.evexAAA (opmask register).
+// Many opcodes share the same map slots as VEX; EVEX adds new instructions
+// and extended vector lengths.
+
+Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
+    const uint8_t map = ctx.opcodeMap;
+    const uint8_t op  = ctx.opcode;
+    const uint8_t pp  = ctx.vexPP;
+
+    // ---- EVEX Map 1 (0F) ----
+    if (map == 1) {
+        // Data movement 10-17
+        if (op >= 0x10 && op <= 0x17) {
+            if (pp == 3) { // F2
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVSD_AVX;
+                case 0x12: return Mnemonic::VMOVDDUP;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) { // F3
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVSS;
+                case 0x12: return Mnemonic::VMOVSLDUP;
+                case 0x16: return Mnemonic::VMOVSHDUP;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66
+                switch (op) {
+                case 0x10: case 0x11: return Mnemonic::VMOVUPD;
+                case 0x14: return Mnemonic::VUNPCKLPD;
+                case 0x15: return Mnemonic::VUNPCKHPD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP
+            switch (op) {
+            case 0x10: case 0x11: return Mnemonic::VMOVUPS;
+            case 0x14: return Mnemonic::VUNPCKLPS;
+            case 0x15: return Mnemonic::VUNPCKHPS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Moves/converts 28-2F
+        if (op >= 0x28 && op <= 0x2F) {
+            if (pp == 3) {
+                switch (op) {
+                case 0x2A: return Mnemonic::VCVTSI2SD;
+                case 0x2C: return Mnemonic::VCVTTSD2SI;
+                case 0x2D: return Mnemonic::VCVTSD2SI;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) {
+                switch (op) {
+                case 0x2A: return Mnemonic::VCVTSI2SS;
+                case 0x2C: return Mnemonic::VCVTTSS2SI;
+                case 0x2D: return Mnemonic::VCVTSS2SI;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) {
+                switch (op) {
+                case 0x28: case 0x29: return Mnemonic::VMOVAPD;
+                case 0x2E: return Mnemonic::VUCOMISD;
+                case 0x2F: return Mnemonic::VCOMISD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            switch (op) {
+            case 0x28: case 0x29: return Mnemonic::VMOVAPS;
+            case 0x2E: return Mnemonic::VUCOMISS;
+            case 0x2F: return Mnemonic::VCOMISS;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // Arithmetic 50-5F — use zeroing-masking aware mnemonics for 512-bit
+        if (op >= 0x50 && op <= 0x5F) {
+            if (pp == 3) {
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTSD;
+                case 0x58: return Mnemonic::VADDSD;
+                case 0x59: return Mnemonic::VMULSD;
+                case 0x5A: return Mnemonic::VCVTSD2SS;
+                case 0x5C: return Mnemonic::VSUBSD;
+                case 0x5D: return Mnemonic::VMINSD;
+                case 0x5E: return Mnemonic::VDIVSD;
+                case 0x5F: return Mnemonic::VMAXSD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 2) {
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTSS;
+                case 0x58: return Mnemonic::VADDSS;
+                case 0x59: return Mnemonic::VMULSS;
+                case 0x5A: return Mnemonic::VCVTSS2SD;
+                case 0x5C: return Mnemonic::VSUBSS;
+                case 0x5D: return Mnemonic::VMINSS;
+                case 0x5E: return Mnemonic::VDIVSS;
+                case 0x5F: return Mnemonic::VMAXSS;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            if (pp == 1) { // 66 double
+                bool z512 = (ctx.evexLL == 2);
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTPD;
+                case 0x54: return z512 ? Mnemonic::VANDPD_Z : Mnemonic::VANDPD;
+                case 0x55: return Mnemonic::VANDNPD;
+                case 0x56: return z512 ? Mnemonic::VORPD_Z : Mnemonic::VORPD;
+                case 0x57: return z512 ? Mnemonic::VXORPD_Z : Mnemonic::VXORPD;
+                case 0x58: return z512 ? Mnemonic::VADDPD_Z : Mnemonic::VADDPD;
+                case 0x59: return z512 ? Mnemonic::VMULPD_Z : Mnemonic::VMULPD;
+                case 0x5A: return Mnemonic::VCVTPD2PS;
+                case 0x5C: return z512 ? Mnemonic::VSUBPD_Z : Mnemonic::VSUBPD;
+                case 0x5D: return Mnemonic::VMINPD;
+                case 0x5E: return z512 ? Mnemonic::VDIVPD_Z : Mnemonic::VDIVPD;
+                case 0x5F: return Mnemonic::VMAXPD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+            // NP single
+            {
+                bool z512 = (ctx.evexLL == 2);
+                switch (op) {
+                case 0x51: return Mnemonic::VSQRTPS;
+                case 0x54: return z512 ? Mnemonic::VANDPS_Z : Mnemonic::VANDPS;
+                case 0x55: return Mnemonic::VANDNPS;
+                case 0x56: return z512 ? Mnemonic::VORPS_Z : Mnemonic::VORPS;
+                case 0x57: return z512 ? Mnemonic::VXORPS_Z : Mnemonic::VXORPS;
+                case 0x58: return z512 ? Mnemonic::VADDPS_Z : Mnemonic::VADDPS;
+                case 0x59: return z512 ? Mnemonic::VMULPS_Z : Mnemonic::VMULPS;
+                case 0x5A: return Mnemonic::VCVTPS2PD;
+                case 0x5C: return z512 ? Mnemonic::VSUBPS_Z : Mnemonic::VSUBPS;
+                case 0x5D: return Mnemonic::VMINPS;
+                case 0x5E: return z512 ? Mnemonic::VDIVPS_Z : Mnemonic::VDIVPS;
+                case 0x5F: return Mnemonic::VMAXPS;
+                default: return Mnemonic::UNKNOWN;
+                }
+            }
+        }
+
+        // Packed integer (66 prefix) — EVEX versions
+        if (pp == 1) {
+            switch (op) {
+            case 0x6F: return ctx.vexW ? Mnemonic::VMOVDQA64 : Mnemonic::VMOVDQA32;
+            case 0x7F: return ctx.vexW ? Mnemonic::VMOVDQA64 : Mnemonic::VMOVDQA32;
+            case 0x72:
+                switch (ctx.opcodeExt) {
+                case 0: return ctx.vexW ? Mnemonic::VPROLQ : Mnemonic::VPROLD;
+                case 1: return ctx.vexW ? Mnemonic::VPRORQ : Mnemonic::VPRORD;
+                case 2: return Mnemonic::VPSRLD;
+                case 4: return Mnemonic::VPSRAD;
+                case 6: return Mnemonic::VPSLLD;
+                default: return Mnemonic::UNKNOWN;
+                }
+            default: break;
+            }
+        }
+        if (pp == 2 && op == 0x6F) {
+            return ctx.vexW ? Mnemonic::VMOVDQU16 : Mnemonic::VMOVDQU8;
+        }
+        if (pp == 2 && op == 0x7F) {
+            return ctx.vexW ? Mnemonic::VMOVDQU16 : Mnemonic::VMOVDQU8;
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end EVEX map 1
+
+    // ---- EVEX Map 2 (0F38) ----
+    if (map == 2) {
+        if (pp == 1) { // 66
+            switch (op) {
+            // AVX-512 unique instructions
+            case 0x14: return ctx.vexW ? Mnemonic::VPROLVQ : Mnemonic::VPROLVD;
+            case 0x15: return ctx.vexW ? Mnemonic::VPRORVQ : Mnemonic::VPRORVD;
+            case 0x25: return Mnemonic::VPTERNLOGD; // vpternlogd/q by W
+            case 0x26: return Mnemonic::VPTESTMD;   // vptestmd/q by W
+            case 0x27: return Mnemonic::VPTESTNMD;  // vptestnmd/q by W
+            case 0x2C: return Mnemonic::VSCALEFPS;
+            case 0x2D: return Mnemonic::VSCALEFSD;
+            case 0x30: return Mnemonic::VPMOVZXBW;  // also EVEX VPMOVWB (reverse)
+            case 0x31: return Mnemonic::VPMOVZXBD;
+            case 0x32: return Mnemonic::VPMOVZXBQ;
+            case 0x33: return Mnemonic::VPMOVZXWD;
+            case 0x34: return Mnemonic::VPMOVZXWQ;
+            case 0x35: return Mnemonic::VPMOVZXDQ;
+            case 0x36: return Mnemonic::VPERMD;
+            case 0x38: return Mnemonic::VPMINSB;
+            case 0x39: return Mnemonic::VPMINSD;
+            case 0x3A: return Mnemonic::VPMINUW;
+            case 0x3B: return Mnemonic::VPMINUD;
+            case 0x3C: return Mnemonic::VPMAXSB;
+            case 0x3D: return Mnemonic::VPMAXSD;
+            case 0x3E: return Mnemonic::VPMAXUW;
+            case 0x3F: return Mnemonic::VPMAXUD;
+            case 0x40: return Mnemonic::VPMULLD;
+            case 0x42: return Mnemonic::VGETEXPPS;
+            case 0x43: return Mnemonic::VGETEXPSD;
+            case 0x44: return Mnemonic::VPLZCNTD;
+            case 0x45: return ctx.vexW ? Mnemonic::VPSRLVQ : Mnemonic::VPSRLVD;
+            case 0x46: return Mnemonic::VPSRAVD;
+            case 0x47: return ctx.vexW ? Mnemonic::VPSLLVQ : Mnemonic::VPSLLVD;
+            case 0x4C: return Mnemonic::VRCP14PS;
+            case 0x4D: return Mnemonic::VRCP14SD;
+            case 0x4E: return Mnemonic::VRSQRT14PS;
+            case 0x4F: return Mnemonic::VRSQRT14SD;
+            case 0x58: return Mnemonic::VPBROADCASTD;
+            case 0x59: return Mnemonic::VPBROADCASTQ;
+            case 0x5A: return Mnemonic::VBROADCASTI128;
+            case 0x63: return ctx.vexW ? Mnemonic::VPCOMPRESSQ : Mnemonic::VPCOMPRESSD;
+            case 0x64: return Mnemonic::VPCONFLICTD;
+            case 0x78: return Mnemonic::VPBROADCASTB;
+            case 0x79: return Mnemonic::VPBROADCASTW;
+            case 0x88: return ctx.vexW ? Mnemonic::VPEXPANDQ : Mnemonic::VPEXPANDD;
+            case 0x89: return ctx.vexW ? Mnemonic::VPCOMPRESSQ : Mnemonic::VPCOMPRESSD;
+            case 0x8D: return ctx.vexW ? Mnemonic::VPERMQ : Mnemonic::UNKNOWN;
+            case 0x90: return ctx.vexW ? Mnemonic::VPGATHERDQ : Mnemonic::VPGATHERDD;
+            case 0x91: return ctx.vexW ? Mnemonic::VPGATHERQQ : Mnemonic::VPGATHERQD;
+            case 0x92: return ctx.vexW ? Mnemonic::VGATHERDPD : Mnemonic::VGATHERDPS;
+            case 0x93: return ctx.vexW ? Mnemonic::VGATHERQPD : Mnemonic::VGATHERQPS;
+            case 0xA0: return ctx.vexW ? Mnemonic::VPSCATTERDQ : Mnemonic::VPSCATTERDD;
+            case 0xA1: return ctx.vexW ? Mnemonic::VPSCATTERQQ : Mnemonic::VPSCATTERQD;
+            case 0xA2: return ctx.vexW ? Mnemonic::VSCATTERDPD : Mnemonic::VSCATTERDPS;
+            case 0xA3: return ctx.vexW ? Mnemonic::VSCATTERQPD : Mnemonic::VSCATTERQPS;
+            // FMA3 (same as VEX)
+            case 0x98: return ctx.vexW ? Mnemonic::VFMADD132PD : Mnemonic::VFMADD132PS;
+            case 0x99: return ctx.vexW ? Mnemonic::VFMADD132SD : Mnemonic::VFMADD132SS;
+            case 0x9A: return ctx.vexW ? Mnemonic::VFMSUB132PD : Mnemonic::VFMSUB132PS;
+            case 0x9B: return ctx.vexW ? Mnemonic::VFMSUB132SD : Mnemonic::VFMSUB132SS;
+            case 0x9C: return ctx.vexW ? Mnemonic::VFNMADD132PD : Mnemonic::VFNMADD132PS;
+            case 0x9D: return ctx.vexW ? Mnemonic::VFNMADD132SD : Mnemonic::VFNMADD132SS;
+            case 0x9E: return ctx.vexW ? Mnemonic::VFNMSUB132PD : Mnemonic::VFNMSUB132PS;
+            case 0x9F: return ctx.vexW ? Mnemonic::VFNMSUB132SD : Mnemonic::VFNMSUB132SS;
+            case 0xA8: return ctx.vexW ? Mnemonic::VFMADD213PD : Mnemonic::VFMADD213PS;
+            case 0xA9: return ctx.vexW ? Mnemonic::VFMADD213SD : Mnemonic::VFMADD213SS;
+            case 0xAA: return ctx.vexW ? Mnemonic::VFMSUB213PD : Mnemonic::VFMSUB213PS;
+            case 0xAB: return ctx.vexW ? Mnemonic::VFMSUB213SD : Mnemonic::VFMSUB213SS;
+            case 0xAC: return ctx.vexW ? Mnemonic::VFNMADD213PD : Mnemonic::VFNMADD213PS;
+            case 0xAD: return ctx.vexW ? Mnemonic::VFNMADD213SD : Mnemonic::VFNMADD213SS;
+            case 0xAE: return ctx.vexW ? Mnemonic::VFNMSUB213PD : Mnemonic::VFNMSUB213PS;
+            case 0xAF: return ctx.vexW ? Mnemonic::VFNMSUB213SD : Mnemonic::VFNMSUB213SS;
+            case 0xB8: return ctx.vexW ? Mnemonic::VFMADD231PD : Mnemonic::VFMADD231PS;
+            case 0xB9: return ctx.vexW ? Mnemonic::VFMADD231SD : Mnemonic::VFMADD231SS;
+            case 0xBA: return ctx.vexW ? Mnemonic::VFMSUB231PD : Mnemonic::VFMSUB231PS;
+            case 0xBB: return ctx.vexW ? Mnemonic::VFMSUB231SD : Mnemonic::VFMSUB231SS;
+            case 0xBC: return ctx.vexW ? Mnemonic::VFNMADD231PD : Mnemonic::VFNMADD231PS;
+            case 0xBD: return ctx.vexW ? Mnemonic::VFNMADD231SD : Mnemonic::VFNMADD231SS;
+            case 0xBE: return ctx.vexW ? Mnemonic::VFNMSUB231PD : Mnemonic::VFNMSUB231PS;
+            case 0xBF: return ctx.vexW ? Mnemonic::VFNMSUB231SD : Mnemonic::VFNMSUB231SS;
+            case 0xC4: return Mnemonic::VPCONFLICTD; // vpconflictd/q by W
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end EVEX map 2
+
+    // ---- EVEX Map 3 (0F3A) ----
+    if (map == 3) {
+        if (pp == 1) { // 66
+            switch (op) {
+            case 0x00: return ctx.vexW ? Mnemonic::VPERMQ : Mnemonic::UNKNOWN;
+            case 0x01: return ctx.vexW ? Mnemonic::VPERMPD : Mnemonic::UNKNOWN;
+            case 0x03: return Mnemonic::VPALIGNR;
+            case 0x08: return Mnemonic::VROUNDPS;
+            case 0x09: return Mnemonic::VROUNDPD;
+            case 0x0A: return Mnemonic::VROUNDSS;
+            case 0x0B: return Mnemonic::VROUNDSD;
+            case 0x18: return Mnemonic::VINSERTF32X4;
+            case 0x19: return Mnemonic::VEXTRACTF32X4;
+            case 0x1D: return Mnemonic::VCVTPS2PH;
+            case 0x25: return Mnemonic::VPTERNLOGD; // vpternlogd/q by W
+            case 0x38: return Mnemonic::VINSERTI32X4;
+            case 0x39: return Mnemonic::VEXTRACTI32X4;
+            case 0x42: return Mnemonic::VDBPSADBW;
+            case 0x43: return Mnemonic::UNKNOWN; // vshufi32x4/i64x2
+            case 0x50: return Mnemonic::VRANGEPS;
+            case 0x51: return Mnemonic::VRANGESD;
+            case 0x54: return Mnemonic::VFIXUPIMMPS;
+            case 0x55: return Mnemonic::VFIXUPIMMSD;
+            case 0x56: return Mnemonic::VREDUCEPS;
+            case 0x57: return Mnemonic::VREDUCESD;
+            case 0x66: return Mnemonic::UNKNOWN; // vfpclassps (not yet defined)
+            case 0x67: return Mnemonic::UNKNOWN;     // vfpclasssd
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        return Mnemonic::UNKNOWN;
+    } // end EVEX map 3
 
     return Mnemonic::UNKNOWN;
 }

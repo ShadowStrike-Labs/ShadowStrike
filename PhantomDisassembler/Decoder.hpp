@@ -327,6 +327,12 @@ private:
     /// @brief Resolve the mnemonic from the current opcode + prefix state.
     [[nodiscard]] Mnemonic ResolveMnemonic(const DecodeContext& ctx) const noexcept;
 
+    /// @brief Resolve VEX-encoded mnemonic (AVX/AVX2/FMA/BMI).
+    [[nodiscard]] Mnemonic ResolveVEXMnemonic(const DecodeContext& ctx) const noexcept;
+
+    /// @brief Resolve EVEX-encoded mnemonic (AVX-512).
+    [[nodiscard]] Mnemonic ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept;
+
     /// @brief Map a mnemonic to its instruction category.
     [[nodiscard]] InstructionCategory ResolveCategory(Mnemonic mnem) const noexcept;
 
