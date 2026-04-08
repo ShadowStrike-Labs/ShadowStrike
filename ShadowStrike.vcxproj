@@ -923,6 +923,11 @@
     <ClCompile Include="tests\unit\perf_unit\CPUMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\perf_unit\DiskMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\perf_unit\NetworkPerformanceMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\AntivirusService_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\ServiceCommunicator_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\ServiceController_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\ServiceInstaller_Tests.cpp" />
+    <ClCompile Include="tests\unit\service_unit\ServiceMonitor_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
