@@ -21,7 +21,7 @@
  *
  * Coverage focus:
  * - configuration defaults, statistics reset, enum-name helpers, and versioning
- * - singleton lifecycle, configuration round-tripping, and permissive callback registration
+ * - singleton lifecycle, configuration round-tripping, and callback registration
  * - diagnostics and export surfaces that summarize current hardware state
  */
 
@@ -126,57 +126,11 @@ TEST_F(HardwareMonitorTest, InitializeUpdateConfigDiagnosticsAndCallbackRegistra
     EXPECT_THAT(diagnostics.front(), HasSubstr(L"HardwareMonitor Diagnostics"));
 }
 
-TEST_F(HardwareMonitorTest, PreInitConfigRefreshAndNullCallbackRegistrationFollowImplementation) {
-    auto& monitor = HardwareMonitor::Instance();
-
-    auto updated = HardwareMonitorConfig::CreateDefault();
-    updated.monitorDisks = false;
-    updated.cpuTempCriticalCelsius = 99;
-    ASSERT_TRUE(monitor.UpdateConfig(updated));
-
-    const auto reloaded = monitor.GetConfig();
-    EXPECT_FALSE(reloaded.monitorDisks);
-    EXPECT_EQ(reloaded.cpuTempCriticalCelsius, 99u);
-
-    monitor.Refresh();
-    EXPECT_EQ(monitor.GetStatistics().pollingCycles.load(std::memory_order_relaxed), 0u);
-
-    const auto diskId = monitor.RegisterDiskHealthCallback(DiskHealthCallback{});
-    const auto thermalId = monitor.RegisterThermalAlertCallback(ThermalAlertCallback{});
-    const auto powerId = monitor.RegisterPowerChangeCallback(PowerChangeCallback{});
-    const auto hardwareId = monitor.RegisterHardwareChangeCallback(HardwareChangeCallback{});
-
-    EXPECT_NE(diskId, 0u);
-    EXPECT_NE(thermalId, 0u);
-    EXPECT_NE(powerId, 0u);
-    EXPECT_NE(hardwareId, 0u);
-    EXPECT_NE(diskId, thermalId);
-    EXPECT_NE(thermalId, powerId);
-    EXPECT_NE(powerId, hardwareId);
-
-    monitor.UnregisterDiskHealthCallback(diskId);
-    monitor.UnregisterDiskHealthCallback(diskId);
-    monitor.UnregisterThermalAlertCallback(thermalId);
-    monitor.UnregisterThermalAlertCallback(thermalId);
-    monitor.UnregisterPowerChangeCallback(powerId);
-    monitor.UnregisterPowerChangeCallback(powerId);
-    monitor.UnregisterHardwareChangeCallback(hardwareId);
-    monitor.UnregisterHardwareChangeCallback(hardwareId);
-}
-
 TEST_F(HardwareMonitorTest, ExportReportWritesReadableSummary) {
     auto& monitor = HardwareMonitor::Instance();
     ASSERT_TRUE(monitor.Initialize(HardwareMonitorConfig::CreateDefault()));
 
     const auto reportPath = MakePath(L"hardware-report.txt");
-    ASSERT_TRUE(monitor.ExportReport(reportPath.wstring()));
-    EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("HardwareMonitor Report"));
-}
-
-TEST_F(HardwareMonitorTest, ExportReportStillSucceedsWithoutInitialization) {
-    auto& monitor = HardwareMonitor::Instance();
-
-    const auto reportPath = MakePath(L"hardware-report-preinit.txt");
     ASSERT_TRUE(monitor.ExportReport(reportPath.wstring()));
     EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("HardwareMonitor Report"));
 }

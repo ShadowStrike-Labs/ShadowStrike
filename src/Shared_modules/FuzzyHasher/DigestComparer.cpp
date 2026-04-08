@@ -101,7 +101,8 @@ namespace ShadowStrike::FuzzyHasher {
             out.sig2 = std::string_view(colon2 + 1);
 
             // Validate component lengths
-            if (out.sig1.size() > kMaxSignatureComponentLength ||
+            if (out.sig1.empty() || out.sig2.empty() ||
+                out.sig1.size() > kMaxSignatureComponentLength ||
                 out.sig2.size() > kMaxSignatureComponentLength) {
                 return false;
             }
@@ -289,6 +290,10 @@ namespace ShadowStrike::FuzzyHasher {
 
     int CompareDigests(const char* digest1, const char* digest2) noexcept {
         try {
+            if (!digest1 || !digest2) {
+                return -1;
+            }
+
             // BUG-3 FIX: bound the strchr scan in ParseDigest by verifying that
             // both strings are within a safe maximum length before touching them.
             // A null-terminator-less string passed by a hostile caller would

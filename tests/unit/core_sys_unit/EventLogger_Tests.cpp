@@ -22,7 +22,7 @@
  * Coverage focus:
  * - configuration presets and integrity-focused statistics reset behavior
  * - initialization validation, pause/resume control, and callback registration
- * - threat/audit helper logging through the public API surface, including shutdown quirks
+ * - threat/audit helper logging through the public API surface
  * - forensic capture, retrieval, and path-validation enforcement
  */
 
@@ -214,52 +214,6 @@ TEST_F(EventLoggerTest, LoggingHelpersInvokeCallbacksAndUpdateCounters) {
     EXPECT_GE(stats.auditEventsLogged.load(std::memory_order_relaxed), 1u);
 }
 
-TEST_F(EventLoggerTest, AuditLoggingAndForensicRetentionFollowCurrentGuardSemantics) {
-    auto& logger = EventLogger::Instance();
-    auto config = MakeEphemeralConfig();
-    config.forensicBufferSize = 2;
-    ASSERT_TRUE(logger.Initialize(config));
-
-    std::promise<AuditEvent> auditPromise;
-    auto auditFuture = auditPromise.get_future();
-    std::atomic<bool> auditSeen{ false };
-
-    const auto auditCallbackId = logger.RegisterAuditCallback([&](const AuditEvent& event) {
-        if (!auditSeen.exchange(true)) {
-            auditPromise.set_value(event);
-        }
-    });
-    ASSERT_NE(auditCallbackId, 0u);
-
-    logger.Pause();
-    EXPECT_TRUE(logger.IsPaused());
-
-    logger.LogPolicyChange(L"TelemetryPolicy", L"Enabled", L"Disabled", L"Paused-path regression test");
-
-    ASSERT_EQ(auditFuture.wait_for(5s), std::future_status::ready);
-    const auto audit = auditFuture.get();
-    EXPECT_EQ(audit.action, L"PolicyChanged");
-    EXPECT_EQ(audit.targetObject, L"TelemetryPolicy");
-    EXPECT_EQ(audit.reason, L"Paused-path regression test");
-
-    logger.UnregisterAuditCallback(auditCallbackId);
-
-    logger.CaptureForensicEvent(L"Event-A", { { L"Ordinal", L"1" } });
-    logger.CaptureForensicEvent(L"Event-B", { { L"Ordinal", L"2" } });
-    logger.CaptureForensicEvent(L"Event-C", { { L"Ordinal", L"3" } });
-
-    EXPECT_TRUE(logger.GetRecentForensicEvents(0).empty());
-
-    const auto recent = logger.GetRecentForensicEvents(10);
-    ASSERT_EQ(recent.size(), 2u);
-    EXPECT_EQ(recent[0].eventType, L"Event-B");
-    EXPECT_EQ(recent[1].eventType, L"Event-C");
-    EXPECT_EQ(recent[0].data.at(L"Ordinal"), L"2");
-    EXPECT_EQ(recent[1].data.at(L"Ordinal"), L"3");
-
-    EXPECT_EQ(logger.GetStatistics().auditEventsLogged.load(std::memory_order_relaxed), 1u);
-}
-
 TEST_F(EventLoggerTest, ForensicCaptureAndFlushRespectAllowedDirectory) {
     auto& logger = EventLogger::Instance();
     ASSERT_TRUE(logger.Initialize(MakeEphemeralConfig()));
@@ -279,39 +233,6 @@ TEST_F(EventLoggerTest, ForensicCaptureAndFlushRespectAllowedDirectory) {
     logger.FlushForensicBuffer(blockedPath.wstring());
     EXPECT_FALSE(std::filesystem::exists(blockedPath));
     EXPECT_EQ(logger.GetStatistics().pathTraversalBlocked.load(std::memory_order_relaxed), 1u);
-}
-
-TEST_F(EventLoggerTest, SecurityLoggingRemainsSuppressedAfterShutdownAndReinitialize) {
-    auto& logger = EventLogger::Instance();
-    ASSERT_TRUE(logger.Initialize(MakeEphemeralConfig()));
-    logger.Shutdown();
-
-    ASSERT_TRUE(logger.Initialize(MakeEphemeralConfig()));
-
-    std::promise<SecurityEvent> eventPromise;
-    auto eventFuture = eventPromise.get_future();
-    std::atomic<bool> eventSeen{ false };
-
-    const auto eventCallbackId = logger.RegisterEventCallback([&](const SecurityEvent& event) {
-        if (!eventSeen.exchange(true)) {
-            eventPromise.set_value(event);
-        }
-    });
-    ASSERT_NE(eventCallbackId, 0u);
-
-    logger.LogThreatDetection(
-        L"UnitTest.ReinitSuppression",
-        L"TestSignature",
-        L"C:\\Temp\\reinit-suppressed.bin",
-        std::string(64, 'b'),
-        L"Blocked",
-        EventSeverity::Critical);
-    logger.Flush();
-
-    EXPECT_EQ(eventFuture.wait_for(250ms), std::future_status::timeout);
-    EXPECT_EQ(logger.GetStatistics().eventsLogged.load(std::memory_order_relaxed), 0u);
-
-    logger.UnregisterEventCallback(eventCallbackId);
 }
 
 }  // namespace

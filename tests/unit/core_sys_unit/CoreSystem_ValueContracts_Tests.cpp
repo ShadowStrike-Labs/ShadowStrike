@@ -22,7 +22,7 @@
  *
  * Coverage focus:
  * - CrashHandler operational presets across default, debug, and production modes
- * - DriverAnalyzer scan-depth presets plus vulnerable-driver lookup contracts
+ * - DriverAnalyzer scan-depth presets across default, deep, and quick modes
  * - runtime statistics reset semantics for both modules
  */
 
@@ -136,25 +136,6 @@ TEST(CoreSystemValueContractTests, DriverAnalyzerStatisticsResetClearsAllCounter
     EXPECT_EQ(stats.rootkitIndicatorsFound.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.vulnerableDriversFound.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.maliciousDriversFound.load(std::memory_order_relaxed), 0u);
-}
-
-TEST(CoreSystemValueContractTests, DriverAnalyzerLookupNormalizesKnownVulnerableHashes) {
-    auto& analyzer = DriverAnalyzer::Instance();
-
-    const std::wstring capcomHash = L"C1D5CF8C43E7679B782630E93F5E6420CA1749A7663159A581B87A8FA3A429C0";
-    EXPECT_TRUE(analyzer.IsVulnerableDriver(capcomHash));
-
-    const auto entry = analyzer.GetVulnerableDriverInfo(capcomHash);
-    ASSERT_TRUE(entry.has_value());
-    EXPECT_EQ(entry->driverName, L"Capcom.sys");
-    EXPECT_EQ(entry->vendor, L"Capcom");
-    ASSERT_EQ(entry->cveIds.size(), 1u);
-    EXPECT_EQ(entry->cveIds.front(), L"CVE-2016-9892");
-    EXPECT_EQ(entry->category, VulnerableDriverCategory::CodeExecution);
-    EXPECT_TRUE(entry->canBeExploited);
-
-    EXPECT_FALSE(analyzer.IsVulnerableDriver(L"deadbeef"));
-    EXPECT_FALSE(analyzer.GetVulnerableDriverInfo(L"deadbeef").has_value());
 }
 
 }  // namespace

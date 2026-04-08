@@ -74,9 +74,12 @@ std::string MakeMinorVariant(std::string digest) {
 }  // namespace
 
 TEST(DigestComparerTest, CompareDigestsRejectsMalformedAndOverlongInputs) {
+    EXPECT_EQ(FH::CompareDigests(nullptr, "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("bad-digest", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("0:ABCDEFG:HIJKLMN", "3:ABCDEFG:HIJKLMN"), -1);
+    EXPECT_EQ(FH::CompareDigests("3::HIJKLMN", "3:ABCDEFG:HIJKLMN"), -1);
+    EXPECT_EQ(FH::CompareDigests("3:ABCDEFG:", "3:ABCDEFG:HIJKLMN"), -1);
 
     const std::string oversized(201, 'A');
     EXPECT_EQ(FH::CompareDigests(oversized.c_str(), "3:ABCDEFG:HIJKLMN"), -1);
@@ -88,6 +91,8 @@ TEST(DigestComparerTest, CompareDigestsRejectsMalformedAndOverlongInputs) {
 TEST(DigestComparerTest, CompareDigestsHandlesExactNearAndIncompatibleComparisons) {
     const auto digest = FH::HashBuffer(MakePatternData(4096));
     ASSERT_TRUE(digest.has_value());
+    const auto parts = ParseDigest(*digest);
+    ASSERT_TRUE(parts.has_value());
 
     EXPECT_EQ(FH::CompareDigests(digest->c_str(), digest->c_str()), 100);
 
@@ -97,6 +102,11 @@ TEST(DigestComparerTest, CompareDigestsHandlesExactNearAndIncompatibleComparison
     EXPECT_LT(nearScore, 100);
 
     EXPECT_EQ(FH::CompareDigests("3:ABCDEFG:HIJKLMN", "5:ABCDEFG:HIJKLMN"), 0);
+
+    ASSERT_GE(parts->sig2.size(), 7u);
+    const std::string doubledBlockCompatible =
+        std::to_string(parts->blockSize * 2u) + ":" + parts->sig2 + ":" + parts->sig2;
+    EXPECT_EQ(FH::CompareDigests(digest->c_str(), doubledBlockCompatible.c_str()), 100);
 }
 
 TEST(DigestComparerTest, PublicCompareOverloadsMirrorComparerSemanticsAndValidateBoundaries) {
