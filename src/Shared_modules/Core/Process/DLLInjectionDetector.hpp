@@ -704,7 +704,7 @@ struct alignas(64) DLLInjectionStatistics {
     void Reset() noexcept;
 
     /**
-     * @brief Get detection rate (detections per module analyzed).
+     * @brief Get detection rate percentage (detections per module analyzed).
      */
     [[nodiscard]] double GetDetectionRate() const noexcept;
 };

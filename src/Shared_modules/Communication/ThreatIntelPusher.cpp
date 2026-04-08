@@ -30,7 +30,96 @@
 // Shared protocol definitions (kernel/user-mode compatible)
 #include "../../../PhantomSensor/Shared/MessageProtocol.h"
 #include "../../../PhantomSensor/Shared/MessageTypes.h"
-#include "../../PhantomSensor/PhantomSensor/Behavioral/RuleEngine.h"
+
+// ---------------------------------------------------------------------------
+// User-mode mirrors of RuleEngine.h types needed for behavioral-rule
+// serialization. RuleEngine.h itself pulls <ntifs.h>/<ntddk.h> so we cannot
+// include it from user-mode code.  These MUST stay in sync with the kernel
+// definitions in PhantomSensor/Behavioral/RuleEngine.h.
+// ---------------------------------------------------------------------------
+#ifndef RE_MAX_CONDITIONS
+#define RE_MAX_CONDITIONS       16
+#endif
+#ifndef RE_MAX_ACTIONS
+#define RE_MAX_ACTIONS          8
+#endif
+#ifndef RE_MAX_VALUE_LEN
+#define RE_MAX_VALUE_LEN        255
+#endif
+#ifndef RE_MAX_PARAMETER_LEN
+#define RE_MAX_PARAMETER_LEN    255
+#endif
+
+#ifndef _RE_CONDITION_TYPE_DEFINED
+#define _RE_CONDITION_TYPE_DEFINED
+typedef enum _RE_CONDITION_TYPE {
+    ReCondition_ProcessName = 0,
+    ReCondition_ParentName,
+    ReCondition_CommandLine,
+    ReCondition_FilePath,
+    ReCondition_FileHash,
+    ReCondition_RegistryPath,
+    ReCondition_NetworkAddress,
+    ReCondition_Domain,
+    ReCondition_ThreatScore,
+    ReCondition_MITRETechnique,
+    ReCondition_BehaviorFlag,
+    ReCondition_TimeOfDay,
+    ReCondition_Custom,
+    ReCondition_MaxValue
+} RE_CONDITION_TYPE;
+#endif
+
+#ifndef _RE_OPERATOR_DEFINED
+#define _RE_OPERATOR_DEFINED
+typedef enum _RE_OPERATOR {
+    ReOp_Equals = 0,
+    ReOp_NotEquals,
+    ReOp_Contains,
+    ReOp_StartsWith,
+    ReOp_EndsWith,
+    ReOp_Wildcard,
+    ReOp_GreaterThan,
+    ReOp_LessThan,
+    ReOp_InList,
+    ReOp_MaxValue
+} RE_OPERATOR;
+#endif
+
+#ifndef _RE_ACTION_TYPE_DEFINED
+#define _RE_ACTION_TYPE_DEFINED
+typedef enum _RE_ACTION_TYPE {
+    ReAction_None = 0,
+    ReAction_Allow,
+    ReAction_Block,
+    ReAction_Quarantine,
+    ReAction_Terminate,
+    ReAction_Alert,
+    ReAction_Log,
+    ReAction_Investigate,
+    ReAction_Custom,
+    ReAction_MaxValue
+} RE_ACTION_TYPE;
+#endif
+
+#ifndef _RE_CONDITION_DEFINED
+#define _RE_CONDITION_DEFINED
+typedef struct _RE_CONDITION {
+    RE_CONDITION_TYPE Type;
+    RE_OPERATOR Operator;
+    CHAR Value[RE_MAX_VALUE_LEN + 1];
+    BOOLEAN Negate;
+    UCHAR Reserved[3];
+} RE_CONDITION, *PRE_CONDITION;
+#endif
+
+#ifndef _RE_ACTION_DEFINED
+#define _RE_ACTION_DEFINED
+typedef struct _RE_ACTION {
+    RE_ACTION_TYPE Type;
+    CHAR Parameter[RE_MAX_PARAMETER_LEN + 1];
+} RE_ACTION, *PRE_ACTION;
+#endif
 
 namespace ShadowStrike {
 namespace Communication {
@@ -40,7 +129,6 @@ namespace Communication {
 // ============================================================================
 
 static constexpr uint32_t DEFAULT_MAX_BATCH_SIZE = SHADOWSTRIKE_PUSH_MAX_BATCH_ENTRIES;
-static constexpr uint32_t DEFAULT_REPLY_TIMEOUT_MS = 30000;
 static constexpr uint32_t MAX_MESSAGE_BUFFER_SIZE = 64 * 1024; // 64KB per message
 
 // ============================================================================

@@ -551,7 +551,7 @@ struct alignas(64) ReflectiveStatistics {
     void Reset() noexcept;
     
     /**
-     * @brief Get detection rate.
+     * @brief Get detection rate percentage.
      */
     [[nodiscard]] double GetDetectionRate() const noexcept;
 };

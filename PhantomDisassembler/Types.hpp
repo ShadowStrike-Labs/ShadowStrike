@@ -83,7 +83,7 @@ enum class Mnemonic : uint16_t {
     // --- System / privileged ---
     SYSCALL, SYSENTER, SYSEXIT, SYSRET,
     RDTSC, RDTSCP, RDPMC, CPUID, HLT,
-    IN, OUT, INS, OUTS,
+    IN_INST, OUT_INST, INS_INST, OUTS_INST,
 
     // --- Flags ---
     PUSHF, PUSHFQ, PUSHFD, POPF, POPFQ, POPFD,
@@ -637,10 +637,10 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::RDPMC:         return "rdpmc";
     case Mnemonic::CPUID:         return "cpuid";
     case Mnemonic::HLT:           return "hlt";
-    case Mnemonic::IN:            return "in";
-    case Mnemonic::OUT:           return "out";
-    case Mnemonic::INS:           return "ins";
-    case Mnemonic::OUTS:          return "outs";
+    case Mnemonic::IN_INST:       return "in";
+    case Mnemonic::OUT_INST:      return "out";
+    case Mnemonic::INS_INST:      return "ins";
+    case Mnemonic::OUTS_INST:     return "outs";
     case Mnemonic::PUSHF:         return "pushf";
     case Mnemonic::PUSHFQ:        return "pushfq";
     case Mnemonic::PUSHFD:        return "pushfd";
@@ -2021,13 +2021,13 @@ enum class Register : uint16_t {
 // ============================================================================
 
 enum class OperandType : uint8_t {
-    NONE      = 0,
-    REGISTER  = 1,
-    MEMORY    = 2,
-    IMMEDIATE = 3,
-    RELATIVE  = 4,
-    POINTER   = 5,   ///< Far pointer (ptr16:16/ptr16:32)
-    FAR_PTR   = 5,   ///< Alias for POINTER (Zydis compat)
+    NONE            = 0,
+    REGISTER        = 1,
+    MEMORY          = 2,
+    IMMEDIATE       = 3,
+    RELATIVE_OFFSET = 4,   ///< RIP-relative / branch-relative (renamed from RELATIVE to avoid Windows SDK macro clash)
+    POINTER         = 5,   ///< Far pointer (ptr16:16/ptr16:32)
+    FAR_PTR         = 5,   ///< Alias for POINTER (Zydis compat)
 };
 
 // ============================================================================

@@ -150,7 +150,7 @@ Status Decoder::Init(MachineMode mode) noexcept {
 // ResolveEffectiveSizes
 // ============================================================================
 
-void Decoder::ResolveEffectiveSizes(DecodeContext& ctx) noexcept {
+void Decoder::ResolveEffectiveSizes(DecodeContext& ctx) const noexcept {
     switch (m_mode) {
     case MachineMode::Long64:
         if (ctx.rexW || ctx.vexW)
@@ -179,7 +179,7 @@ void Decoder::ResolveEffectiveSizes(DecodeContext& ctx) noexcept {
 
 Status Decoder::DecodeFull(
     const uint8_t* buffer, size_t length,
-    DecodedInstruction& instruction, DecodedOperand* operands) noexcept
+    DecodedInstruction& instruction, DecodedOperand* operands) const noexcept
 {
     if (!buffer || length == 0) return Status::InvalidInput;
     if (!m_initialized) return Status::InternalError;
@@ -679,7 +679,7 @@ vex_done:
 // Phase 1: DecodePrefixes
 // ============================================================================
 
-Status Decoder::DecodePrefixes(DecodeContext& ctx) noexcept {
+Status Decoder::DecodePrefixes(DecodeContext& ctx) const noexcept {
     while (ctx.offset < ctx.bufferLength && ctx.offset < MAX_INSTRUCTION_LENGTH) {
         uint8_t b = ctx.buffer[ctx.offset];
         if (m_mode == MachineMode::Long64 && b >= kREXBase && b <= kREXMax) {
@@ -714,7 +714,7 @@ Status Decoder::DecodePrefixes(DecodeContext& ctx) noexcept {
 // Phase 1b: DecodeVEX
 // ============================================================================
 
-Status Decoder::DecodeVEX(DecodeContext& ctx) noexcept {
+Status Decoder::DecodeVEX(DecodeContext& ctx) const noexcept {
     if (ctx.offset >= ctx.bufferLength) return Status::TruncatedInput;
     uint8_t lead = ctx.buffer[ctx.offset];
 
@@ -760,7 +760,7 @@ Status Decoder::DecodeVEX(DecodeContext& ctx) noexcept {
 // Phase 1c: DecodeEVEX
 // ============================================================================
 
-Status Decoder::DecodeEVEX(DecodeContext& ctx) noexcept {
+Status Decoder::DecodeEVEX(DecodeContext& ctx) const noexcept {
     if (ctx.offset + 3 >= ctx.bufferLength) return Status::TruncatedInput;
     uint8_t p1 = ctx.buffer[ctx.offset + 1];
     uint8_t p2 = ctx.buffer[ctx.offset + 2];
@@ -793,7 +793,7 @@ Status Decoder::DecodeEVEX(DecodeContext& ctx) noexcept {
 // Phase 2: DecodeOpcode
 // ============================================================================
 
-Status Decoder::DecodeOpcode(DecodeContext& ctx) noexcept {
+Status Decoder::DecodeOpcode(DecodeContext& ctx) const noexcept {
     if (ctx.offset >= ctx.bufferLength) return Status::TruncatedInput;
     uint8_t b = ctx.buffer[ctx.offset++];
     if (b != kTwoByteEscape) { ctx.opcodeMap = 0; ctx.opcode = b; return Status::Success; }
@@ -816,7 +816,7 @@ Status Decoder::DecodeOpcode(DecodeContext& ctx) noexcept {
 // Phase 3-6: ModRM, SIB, Displacement, Immediate
 // ============================================================================
 
-Status Decoder::DecodeModRM(DecodeContext& ctx) noexcept {
+Status Decoder::DecodeModRM(DecodeContext& ctx) const noexcept {
     if (ctx.offset >= ctx.bufferLength) return Status::TruncatedInput;
     ctx.modrm = ctx.buffer[ctx.offset++];
     ctx.hasModRM = true;
@@ -824,14 +824,14 @@ Status Decoder::DecodeModRM(DecodeContext& ctx) noexcept {
     return Status::Success;
 }
 
-Status Decoder::DecodeSIB(DecodeContext& ctx) noexcept {
+Status Decoder::DecodeSIB(DecodeContext& ctx) const noexcept {
     if (ctx.offset >= ctx.bufferLength) return Status::TruncatedInput;
     ctx.sib = ctx.buffer[ctx.offset++];
     ctx.hasSIB = true;
     return Status::Success;
 }
 
-Status Decoder::DecodeDisplacement(DecodeContext& ctx, uint8_t dispSize, int64_t& disp) noexcept {
+Status Decoder::DecodeDisplacement(DecodeContext& ctx, uint8_t dispSize, int64_t& disp) const noexcept {
     disp = 0;
     switch (dispSize) {
     case 1: { uint8_t v; if (!ReadByte(ctx,ctx.offset,v)) return Status::TruncatedInput; disp=SignExtend8(v); ctx.offset+=1; break; }
@@ -842,7 +842,7 @@ Status Decoder::DecodeDisplacement(DecodeContext& ctx, uint8_t dispSize, int64_t
     return Status::Success;
 }
 
-Status Decoder::DecodeImmediate(DecodeContext& ctx, uint8_t immSize, int64_t& imm) noexcept {
+Status Decoder::DecodeImmediate(DecodeContext& ctx, uint8_t immSize, int64_t& imm) const noexcept {
     imm = 0;
     switch (immSize) {
     case 1: { uint8_t v; if (!ReadByte(ctx,ctx.offset,v)) return Status::TruncatedInput; imm=SignExtend8(v); ctx.offset+=1; break; }
@@ -1080,10 +1080,10 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
             return (m_mode == MachineMode::Long64) ? Mnemonic::MOVSXD : Mnemonic::UNKNOWN;
         case 0x68: case 0x6A: return Mnemonic::PUSH;
         case 0x69: case 0x6B: return Mnemonic::IMUL;
-        case 0x6C: return Mnemonic::INS;
-        case 0x6D: return Mnemonic::INS;
-        case 0x6E: return Mnemonic::OUTS;
-        case 0x6F: return Mnemonic::OUTS;
+        case 0x6C: return Mnemonic::INS_INST;
+        case 0x6D: return Mnemonic::INS_INST;
+        case 0x6E: return Mnemonic::OUTS_INST;
+        case 0x6F: return Mnemonic::OUTS_INST;
         }
 
         // Jcc short (70-7F)
@@ -1232,8 +1232,8 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
             if (m_mode == MachineMode::Long64) return Mnemonic::JRCXZ;
             if (ctx.effectiveAddressWidth == 32) return Mnemonic::JECXZ;
             return Mnemonic::JCXZ;
-        case 0xE4: case 0xE5: case 0xEC: case 0xED: return Mnemonic::IN;
-        case 0xE6: case 0xE7: case 0xEE: case 0xEF: return Mnemonic::OUT;
+        case 0xE4: case 0xE5: case 0xEC: case 0xED: return Mnemonic::IN_INST;
+        case 0xE6: case 0xE7: case 0xEE: case 0xEF: return Mnemonic::OUT_INST;
         case 0xE8: return Mnemonic::CALL;
         case 0xE9: case 0xEB: return Mnemonic::JMP;
         case 0xEA: return Mnemonic::JMP; // far
@@ -2970,14 +2970,14 @@ InstructionCategory Decoder::ResolveCategory(Mnemonic mnemonic) const noexcept {
     case Mnemonic::STOSB: case Mnemonic::STOSW: case Mnemonic::STOSD: case Mnemonic::STOSQ:
     case Mnemonic::LODSB: case Mnemonic::LODSW: case Mnemonic::LODSD: case Mnemonic::LODSQ:
     case Mnemonic::SCASB: case Mnemonic::SCASW: case Mnemonic::SCASD: case Mnemonic::SCASQ:
-    case Mnemonic::INS: case Mnemonic::OUTS:
+    case Mnemonic::INS_INST: case Mnemonic::OUTS_INST:
         return InstructionCategory::STRING;
 
     case Mnemonic::CLC: case Mnemonic::STC: case Mnemonic::CLI: case Mnemonic::STI:
     case Mnemonic::CLD: case Mnemonic::STD: case Mnemonic::SAHF: case Mnemonic::LAHF:
         return InstructionCategory::FLAG;
 
-    case Mnemonic::IN: case Mnemonic::OUT:
+    case Mnemonic::IN_INST: case Mnemonic::OUT_INST:
         return InstructionCategory::IO;
 
     case Mnemonic::INT: case Mnemonic::INT1: case Mnemonic::INT3: case Mnemonic::INTO:
@@ -3308,14 +3308,14 @@ Register Decoder::DefaultSegment(uint8_t baseReg) const noexcept {
 // Operand builders
 // ============================================================================
 
-void Decoder::BuildRegOperand(DecodedOperand& op, Register reg, uint16_t sizeBits) noexcept {
+void Decoder::BuildRegOperand(DecodedOperand& op, Register reg, uint16_t sizeBits) const noexcept {
     op.type = OperandType::REGISTER;
     op.size = sizeBits;
     op.reg.value = reg;
 }
 
 void Decoder::BuildMemOperand(DecodedOperand& op, const DecodeContext& ctx,
-                               int64_t displacement, uint16_t sizeBits) noexcept {
+                               int64_t displacement, uint16_t sizeBits) const noexcept {
     op.type = OperandType::MEMORY;
     op.size = sizeBits;
 
@@ -3417,8 +3417,8 @@ void Decoder::BuildMemOperand(DecodedOperand& op, const DecodeContext& ctx,
 }
 
 void Decoder::BuildImmOperand(DecodedOperand& op, int64_t value, uint16_t sizeBits,
-                               bool isSigned, bool isRelative) noexcept {
-    op.type = isRelative ? OperandType::RELATIVE : OperandType::IMMEDIATE;
+                               bool isSigned, bool isRelative) const noexcept {
+    op.type = isRelative ? OperandType::RELATIVE_OFFSET : OperandType::IMMEDIATE;
     op.size = sizeBits;
     op.imm.is_signed = isSigned;
     op.imm.is_relative = isRelative;
@@ -3432,7 +3432,7 @@ void Decoder::BuildImmOperand(DecodedOperand& op, int64_t value, uint16_t sizeBi
 
 void Decoder::DecodeModRMOperands(DecodeContext& ctx,
     DecodedInstruction& inst, DecodedOperand* operands,
-    uint16_t regSizeBits, uint16_t rmSizeBits, bool regIsDst) noexcept
+    uint16_t regSizeBits, uint16_t rmSizeBits, bool regIsDst) const noexcept
 {
     uint8_t mod = ModRM_Mod(ctx.modrm);
     uint8_t reg = ModRM_Reg(ctx.modrm);
@@ -3516,7 +3516,7 @@ void Decoder::DecodeModRMOperands(DecodeContext& ctx,
 
 void Decoder::DecodeAccumImm(DecodeContext& ctx,
     DecodedInstruction& inst, DecodedOperand* operands,
-    uint16_t sizeBits) noexcept
+    uint16_t sizeBits) const noexcept
 {
     BuildRegOperand(operands[0], ResolveGPR(0, sizeBits, ctx.hasREX), sizeBits);
     operands[1].type = OperandType::IMMEDIATE;
@@ -3527,7 +3527,7 @@ void Decoder::DecodeAccumImm(DecodeContext& ctx,
 
 void Decoder::DecodeOpcodeReg(DecodeContext& ctx,
     DecodedInstruction& inst, DecodedOperand* operands,
-    uint16_t sizeBits) noexcept
+    uint16_t sizeBits) const noexcept
 {
     uint8_t reg = ctx.opcode & 0x07;
     if (ctx.rexB) reg |= 0x08;

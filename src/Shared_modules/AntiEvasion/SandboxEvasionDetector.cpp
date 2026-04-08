@@ -3757,7 +3757,7 @@ namespace ShadowStrike {
                                 }
                                 break;
 
-                            case Phantom::Disasm::Mnemonic::IN:
+                            case Phantom::Disasm::Mnemonic::IN_INST:
                                 // IN instruction — check for VMware backdoor port 0x5658
                                 if (instruction.operand_count >= 2 &&
                                     operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&

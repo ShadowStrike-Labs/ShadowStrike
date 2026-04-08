@@ -7,7 +7,7 @@
  * Coverage focus:
  * - report and resource-usage serialization
  * - session/profile lifecycle and disabled-mode guards
- * - scoped RAII profiling behavior
+ * - scoped RAII profiling behavior plus aggregate-only profiling quirks
  * - report persistence and self-test behavior
  */
 
@@ -129,6 +129,19 @@ TEST_F(PerformanceProfilerTest, ScopedProfileRecordsEventsAndClearHistoryResetsA
     EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
 }
 
+TEST_F(PerformanceProfilerTest, ProfilesOutsideSessionsStillAccumulateAggregateStatistics) {
+    profiler.StartProfile("aggregate-only");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    profiler.StopProfile("aggregate-only");
+
+    const double averageMs = profiler.GetAverageExecutionTimeMs("aggregate-only");
+    const json report = ParseJson(profiler.GenerateReport());
+    EXPECT_GT(averageMs, 0.0);
+    EXPECT_EQ(report["total_samples"], 0);
+    EXPECT_TRUE(report["events"].empty());
+    EXPECT_EQ(report["statistics"]["aggregate-only"]["count"], 1);
+}
+
 TEST_F(PerformanceProfilerTest, SessionReplacementAndNameLengthLimitsResetStateDeterministically) {
     profiler.StartSession("first-session");
     {
@@ -198,7 +211,9 @@ TEST_F(PerformanceProfilerTest, SaveReportRejectsUnsafePathsAndWritesTempReport)
     const std::filesystem::path nestedDir =
         std::filesystem::temp_directory_path() / "shadowstrike-profiler-nested";
     const std::filesystem::path nestedReportPath = nestedDir / "report.txt";
+    const std::filesystem::path unexpectedExtensionPath = nestedDir / "report.weird";
     std::filesystem::remove(nestedReportPath, ec);
+    std::filesystem::remove(unexpectedExtensionPath, ec);
     std::filesystem::remove_all(nestedDir, ec);
 
     ASSERT_TRUE(profiler.SaveReport(nestedReportPath));
@@ -210,7 +225,11 @@ TEST_F(PerformanceProfilerTest, SaveReportRejectsUnsafePathsAndWritesTempReport)
     EXPECT_NE(nestedContent.find("save-report"), std::string::npos);
     nestedInput.close();
 
+    ASSERT_TRUE(profiler.SaveReport(unexpectedExtensionPath));
+    EXPECT_TRUE(std::filesystem::exists(unexpectedExtensionPath));
+
     std::filesystem::remove(nestedReportPath, ec);
+    std::filesystem::remove(unexpectedExtensionPath, ec);
     std::filesystem::remove_all(nestedDir, ec);
 }
 
@@ -225,10 +244,35 @@ TEST_F(PerformanceProfilerTest, ClearHistoryRemovesInflightProfilesAndLateStopsR
     EXPECT_EQ(profiler.GetAverageExecutionTimeMs("inflight"), 0.0);
 }
 
+TEST_F(PerformanceProfilerTest, DisablingBeforeStopLeavesInflightProfileUntilReenabled) {
+    profiler.StartSession("disable-inflight");
+    profiler.StartProfile("stuck-profile");
+    ASSERT_EQ(profiler.GetActiveProfileCount(), 1u);
+
+    profiler.SetEnabled(false);
+    profiler.StopProfile("stuck-profile");
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 1u);
+
+    profiler.SetEnabled(true);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    profiler.StopProfile("stuck-profile");
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
+    EXPECT_GT(profiler.GetAverageExecutionTimeMs("stuck-profile"), 0.0);
+}
+
 TEST_F(PerformanceProfilerTest, SelfTestPassesAndRestoresEnabledState) {
     profiler.SetEnabled(false);
     EXPECT_TRUE(profiler.SelfTest());
     EXPECT_FALSE(profiler.IsEnabled());
+}
+
+TEST_F(PerformanceProfilerTest, SelfTestEndsAnyActiveSessionAsPartOfDiagnostics) {
+    profiler.StartSession("preexisting-session");
+    ASSERT_TRUE(profiler.IsSessionActive());
+
+    EXPECT_TRUE(profiler.SelfTest());
+    EXPECT_FALSE(profiler.IsSessionActive());
+    EXPECT_TRUE(profiler.IsEnabled());
 }
 
 }  // namespace

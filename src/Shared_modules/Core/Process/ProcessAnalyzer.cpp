@@ -441,6 +441,7 @@ void ProcessAnalysisResult::CalculateOverallRisk() noexcept {
     // Signature-based detection
     if (isKnownMalicious) {
         risk = 100;
+        overallRiskScore = risk;
         riskLevel = ProcessRiskLevel::Malicious;
         return;
     }
@@ -448,6 +449,7 @@ void ProcessAnalysisResult::CalculateOverallRisk() noexcept {
     // Hash-based detection
     if (hashFoundMalicious) {
         risk = 95;
+        overallRiskScore = risk;
         riskLevel = ProcessRiskLevel::Malicious;
         return;
     }
@@ -455,6 +457,7 @@ void ProcessAnalysisResult::CalculateOverallRisk() noexcept {
     // Whitelisted processes
     if (isWhitelisted) {
         risk = 0;
+        overallRiskScore = risk;
         riskLevel = ProcessRiskLevel::Trusted;
         return;
     }

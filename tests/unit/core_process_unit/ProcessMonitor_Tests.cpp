@@ -89,15 +89,16 @@ TEST(ProcessMonitorValueTests, StatisticsHelpersComputeRatiosRatesAndResetSentin
     stats.cacheLookups.store(4, std::memory_order_relaxed);
     stats.cacheHits.store(3, std::memory_order_relaxed);
     stats.totalLookupTimeUs.store(100, std::memory_order_relaxed);
-    stats.eventsProcessed.store(10, std::memory_order_relaxed);
+    stats.eventsProcessed.store(100, std::memory_order_relaxed);
     stats.minLookupTimeUs.store(8, std::memory_order_relaxed);
     stats.maxLookupTimeUs.store(60, std::memory_order_relaxed);
-    stats.startTime = std::chrono::system_clock::now() - 2s;
+    stats.startTime = std::chrono::system_clock::now() - 20s;
 
     EXPECT_DOUBLE_EQ(stats.GetCacheHitRatio(), 75.0);
     EXPECT_DOUBLE_EQ(stats.GetAverageLookupTimeUs(), 25.0);
-    EXPECT_GE(stats.GetEventsPerSecond(), 4.0);
-    EXPECT_LE(stats.GetEventsPerSecond(), 6.0);
+    const double eventsPerSecond = stats.GetEventsPerSecond();
+    EXPECT_GE(eventsPerSecond, 4.5);
+    EXPECT_LE(eventsPerSecond, 5.1);
 
     stats.Reset();
     EXPECT_DOUBLE_EQ(stats.GetCacheHitRatio(), 0.0);
@@ -151,6 +152,22 @@ TEST(ProcessMonitorValueTests, ExtendedProcessInfoConversionsPreserveIdentityAnd
 
     info.metadataComplete = false;
     EXPECT_TRUE(info.IsStale(30s));
+}
+
+TEST(ProcessMonitorValueTests, ExtendedProcessInfoRejectsInvalidStartTimesAndIncompleteFreshMetadata) {
+    ExtendedProcessInfo info;
+    info.uniqueId = { 7777, MonitorConstants::INVALID_START_TIME };
+    info.processName = L"fresh-but-invalid.exe";
+    info.metadataComplete = true;
+    info.lastUpdateTime = std::chrono::system_clock::now();
+
+    EXPECT_FALSE(info.IsValid());
+    EXPECT_EQ(info.ToBasicInfo().pid, 7777u);
+
+    info.uniqueId.startTime = 0x1000;
+    info.metadataComplete = false;
+    EXPECT_TRUE(info.IsValid());
+    EXPECT_TRUE(info.IsStale(24h));
 }
 
 }  // namespace

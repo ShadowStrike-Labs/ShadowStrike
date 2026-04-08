@@ -249,4 +249,19 @@ TEST_F(ProcessInjectionValueTest, ConfidenceCalculationAppliesBoostsWhitelistRed
         55.0);
 }
 
+TEST_F(ProcessInjectionValueTest, ClassificationAndConfidenceRemainDeterministicForEmptyAndWhitelistedSignals) {
+    auto& detector = ProcessInjectionDetector::Instance();
+
+    EXPECT_EQ(detector.ClassifyInjection({}, {}, {}), InjectionType::Unknown);
+
+    InjectionEvent whitelistedUnknown;
+    whitelistedUnknown.sourceProcessName = L"csrss.exe";
+    whitelistedUnknown.targetProcessName = L"shadowstrike-test.exe";
+    whitelistedUnknown.startAddressLegitimate = true;
+
+    EXPECT_DOUBLE_EQ(
+        detector.CalculateConfidence(InjectionType::Unknown, whitelistedUnknown),
+        20.0);
+}
+
 }  // namespace

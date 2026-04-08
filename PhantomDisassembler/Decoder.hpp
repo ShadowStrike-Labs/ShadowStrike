@@ -176,7 +176,7 @@ public:
         const uint8_t* buffer,
         size_t length,
         DecodedInstruction& instruction,
-        DecodedOperand* operands) noexcept;
+        DecodedOperand* operands) const noexcept;
 
     // === Accessors =====
 
@@ -268,32 +268,32 @@ private:
     // ========================================================================
 
     /// @brief Decode legacy prefix bytes (groups 1–4, REX).
-    Status DecodePrefixes(DecodeContext& ctx) noexcept;
+    Status DecodePrefixes(DecodeContext& ctx) const noexcept;
 
     /// @brief Decode 2-byte (C5h) or 3-byte (C4h) VEX prefix.
-    Status DecodeVEX(DecodeContext& ctx) noexcept;
+    Status DecodeVEX(DecodeContext& ctx) const noexcept;
 
     /// @brief Decode 4-byte EVEX prefix (62h).
-    Status DecodeEVEX(DecodeContext& ctx) noexcept;
+    Status DecodeEVEX(DecodeContext& ctx) const noexcept;
 
     /// @brief Decode primary opcode byte and escape sequences (0Fh, 0F38h, 0F3Ah).
-    Status DecodeOpcode(DecodeContext& ctx) noexcept;
+    Status DecodeOpcode(DecodeContext& ctx) const noexcept;
 
     /// @brief Decode ModR/M byte and extract mod, reg, rm fields.
-    Status DecodeModRM(DecodeContext& ctx) noexcept;
+    Status DecodeModRM(DecodeContext& ctx) const noexcept;
 
     /// @brief Decode SIB byte (scale-index-base addressing).
-    Status DecodeSIB(DecodeContext& ctx) noexcept;
+    Status DecodeSIB(DecodeContext& ctx) const noexcept;
 
     /// @brief Read and sign-extend a displacement of the given byte size.
     /// @param dispSize  Displacement size in bytes (0, 1, 2, or 4)
     /// @param disp      Output: sign-extended displacement value
-    Status DecodeDisplacement(DecodeContext& ctx, uint8_t dispSize, int64_t& disp) noexcept;
+    Status DecodeDisplacement(DecodeContext& ctx, uint8_t dispSize, int64_t& disp) const noexcept;
 
     /// @brief Read and optionally sign-extend an immediate of the given byte size.
     /// @param immSize   Immediate size in bytes (1, 2, 4, or 8)
     /// @param imm       Output: sign-extended immediate value
-    Status DecodeImmediate(DecodeContext& ctx, uint8_t immSize, int64_t& imm) noexcept;
+    Status DecodeImmediate(DecodeContext& ctx, uint8_t immSize, int64_t& imm) const noexcept;
 
     // ========================================================================
     // Operand building — populate DecodedOperand from decode context
@@ -301,16 +301,16 @@ private:
 
     /// @brief Build a register operand.
     void BuildRegOperand(DecodedOperand& op, Register reg,
-                         uint16_t sizeBits) noexcept;
+                         uint16_t sizeBits) const noexcept;
 
     /// @brief Build a memory operand from ModRM/SIB decode state.
     void BuildMemOperand(DecodedOperand& op, const DecodeContext& ctx,
-                         int64_t displacement, uint16_t sizeBits) noexcept;
+                         int64_t displacement, uint16_t sizeBits) const noexcept;
 
     /// @brief Build an immediate operand.
     /// @param isRelative  True for RIP-relative branch targets
     void BuildImmOperand(DecodedOperand& op, int64_t value, uint16_t sizeBits,
-                         bool isSigned, bool isRelative = false) noexcept;
+                         bool isSigned, bool isRelative = false) const noexcept;
 
     // ========================================================================
     // Resolution helpers — opcode tables and mnemonic lookup
@@ -371,15 +371,15 @@ private:
     /// @param regIsDst  True if reg field is the destination operand
     void DecodeModRMOperands(DecodeContext& ctx, DecodedInstruction& inst,
                              DecodedOperand* operands, uint16_t regSize,
-                             uint16_t rmSize, bool regIsDst) noexcept;
+                             uint16_t rmSize, bool regIsDst) const noexcept;
 
     /// @brief Decode accumulator + immediate form (e.g., ADD AL, imm8).
     void DecodeAccumImm(DecodeContext& ctx, DecodedInstruction& inst,
-                        DecodedOperand* operands, uint16_t size) noexcept;
+                        DecodedOperand* operands, uint16_t size) const noexcept;
 
     /// @brief Decode opcode-embedded register form (e.g., PUSH r64, MOV r32, imm32).
     void DecodeOpcodeReg(DecodeContext& ctx, DecodedInstruction& inst,
-                         DecodedOperand* operands, uint16_t size) noexcept;
+                         DecodedOperand* operands, uint16_t size) const noexcept;
 
     // ========================================================================
     // Bounds-checked byte reading from decode buffer
@@ -423,7 +423,7 @@ private:
     /// Must be called after prefix decoding and before operand building.
     /// Takes into account: machine mode, REX.W, 66h override, 67h override,
     /// VEX.W, and default operand/address sizes for the current mode.
-    void ResolveEffectiveSizes(DecodeContext& ctx) noexcept;
+    void ResolveEffectiveSizes(DecodeContext& ctx) const noexcept;
 };
 
 } // namespace Phantom::Disasm

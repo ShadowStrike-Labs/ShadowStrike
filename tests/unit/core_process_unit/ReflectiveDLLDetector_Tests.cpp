@@ -72,7 +72,7 @@ TEST(ReflectiveDLLValueTests, StatisticsSnapshotDetectionRateAndResetRemainDeter
     stats.payloadsExtracted.store(1, std::memory_order_relaxed);
 
     const ReflectiveStatistics snapshot = stats;
-    EXPECT_DOUBLE_EQ(snapshot.GetDetectionRate(), 0.25);
+    EXPECT_DOUBLE_EQ(snapshot.GetDetectionRate(), 25.0);
     EXPECT_EQ(snapshot.regionsScanned.load(std::memory_order_relaxed), 40u);
     EXPECT_EQ(snapshot.payloadsExtracted.load(std::memory_order_relaxed), 1u);
 
@@ -107,6 +107,18 @@ TEST(ReflectiveDLLValueTests, RiskScoreWeightsConfidenceIndicatorsThreatIntelAnd
         highSignal.CalculateRiskScore();
         EXPECT_EQ(highSignal.riskScore, 100u);
     }
+}
+
+TEST(ReflectiveDLLValueTests, RiskScorePreservesIntermediateWeightedPathsWithoutClamping) {
+    ReflectiveDetection mediumSignal;
+    mediumSignal.confidence = DetectionConfidence::Medium;
+    mediumSignal.isUnbacked = true;
+    mediumSignal.loadType = ReflectiveLoadType::ManualMapping;
+    mediumSignal.hasThreadStartingHere = true;
+
+    mediumSignal.CalculateRiskScore();
+
+    EXPECT_EQ(mediumSignal.riskScore, 65u);
 }
 
 }  // namespace

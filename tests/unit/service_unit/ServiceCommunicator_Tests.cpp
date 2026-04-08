@@ -87,6 +87,8 @@ TEST_F(ServiceCommunicatorTest, IpcMessageJsonIncludesTypeSizeAndTimestamp) {
     EXPECT_NE(json.find("\"type\":30"), std::string::npos);
     EXPECT_NE(json.find("\"size\":123"), std::string::npos);
     EXPECT_NE(json.find("\"timestamp\":456789"), std::string::npos);
+    EXPECT_EQ(json.find("\"magic\""), std::string::npos);
+    EXPECT_EQ(json.find("\"payload\""), std::string::npos);
 }
 
 TEST_F(ServiceCommunicatorTest, DefaultsAndStatsAccessorsAreSafeWithoutClients) {
@@ -117,6 +119,25 @@ TEST_F(ServiceCommunicatorTest, InitializeStartStopAndSelfTestSucceed) {
     EXPECT_FALSE(communicator.IsRunning());
 
     EXPECT_TRUE(communicator.SelfTest());
+}
+
+TEST_F(ServiceCommunicatorTest, ResetStatsDoesNotAffectRunningStateOrClientlessBroadcastSemantics) {
+    ASSERT_TRUE(communicator.Start());
+    EXPECT_TRUE(communicator.IsRunning());
+
+    EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::string("status")), 0u);
+    EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::vector<uint8_t>{9, 8, 7}), 0u);
+
+    communicator.ResetStats();
+
+    const SSS::CommunicatorStats stats = communicator.GetStats();
+    EXPECT_TRUE(communicator.IsRunning());
+    EXPECT_EQ(stats.messagesSent.load(), 0u);
+    EXPECT_EQ(stats.bytesSent.load(), 0u);
+    EXPECT_EQ(stats.connectionAttempts.load(), 0u);
+
+    communicator.Stop();
+    EXPECT_FALSE(communicator.IsRunning());
 }
 
 }  // namespace

@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include"pch.h"
+#ifdef SHADOWSTRIKE_HAS_YARA  // Entire TU requires libyara SDK
 /*
  * ============================================================================
  * ShadowStrike SignatureBuilder - IMPLEMENTATION
@@ -2909,3 +2910,4 @@ void SignatureBuilder::SetBuildPriority(int priority) noexcept {
 
 } // namespace SignatureStore
 } // namespace ShadowStrike
+#endif // SHADOWSTRIKE_HAS_YARA

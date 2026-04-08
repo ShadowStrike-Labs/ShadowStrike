@@ -196,4 +196,23 @@ TEST(ProcessAnalyzerValueTests, RiskScoringCapsExploitHeavyProcessesAtMaximumRis
     EXPECT_EQ(result.riskLevel, ProcessRiskLevel::Critical);
 }
 
+TEST(ProcessAnalyzerValueTests, RiskScoringPreservesSafeBandAndExactParentAnomalyWeights) {
+    {
+        auto result = MakeSignedBaselineResult();
+        result.unsignedModuleCount = 1;
+        result.CalculateOverallRisk();
+        EXPECT_EQ(result.overallRiskScore, 2u);
+        EXPECT_EQ(result.riskLevel, ProcessRiskLevel::Safe);
+    }
+
+    {
+        auto result = MakeSignedBaselineResult();
+        result.parentChildAnalysis.anomaly = ParentChildAnomaly::UnexpectedParent;
+        result.parentChildAnalysis.isPPIDSpoofed = true;
+        result.CalculateOverallRisk();
+        EXPECT_EQ(result.overallRiskScore, 65u);
+        EXPECT_EQ(result.riskLevel, ProcessRiskLevel::HighRisk);
+    }
+}
+
 }  // namespace

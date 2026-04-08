@@ -141,6 +141,21 @@ enum class ScanVerdict : uint8_t {
     Block = Malicious
 };
 
+//=============================================================================
+// Kernel verdict — action returned to kernel driver for callback decisions.
+// Maps to higher-level scan results for kernel-side enforcement.
+//=============================================================================
+
+enum class KernelVerdict : uint8_t {
+    Allow      = 0,   // Allow the operation
+    Block      = 1,   // Block the operation
+    Quarantine = 2,   // Block and quarantine the file
+    Log        = 3,   // Allow but log for monitoring
+    Monitor    = 3,   // Alias for Log (monitor = log + allow)
+    Delay      = 4,   // Defer decision (async scan pending)
+    Error      = 5    // Processing error
+};
+
 enum class FileAccessType : uint8_t {
     Read = 0,
     Write = 1,

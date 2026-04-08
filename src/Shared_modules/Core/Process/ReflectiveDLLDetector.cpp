@@ -546,7 +546,7 @@ double ReflectiveStatistics::GetDetectionRate() const noexcept {
     if (total == 0) return 0.0;
 
     const uint64_t detected = reflectiveDLLsDetected.load(std::memory_order_relaxed);
-    return static_cast<double>(detected) / static_cast<double>(total);
+    return (static_cast<double>(detected) / static_cast<double>(total)) * 100.0;
 }
 
 ReflectiveStatistics::ReflectiveStatistics(const ReflectiveStatistics& o) noexcept {

@@ -77,6 +77,7 @@ TEST(AntiDebugTests, DetectionResultJsonAndDebugRegistersCaptureCoreSignals) {
     EXPECT_THAT(summary, ::testing::HasSubstr("DEBUGGER DETECTED"));
     EXPECT_THAT(summary, ::testing::HasSubstr("Score: 87"));
     EXPECT_THAT(summary, ::testing::HasSubstr("Checks: 3/8"));
+    EXPECT_THAT(summary, ::testing::HasSubstr("Confidence: 3"));
 
     const json payload = ParseJson(result.ToJson());
     EXPECT_TRUE(payload.at("debuggerDetected").get<bool>());
@@ -103,8 +104,12 @@ TEST(AntiDebugTests, DetectionResultJsonAndDebugRegistersCaptureCoreSignals) {
 
 TEST(AntiDebugTests, StatisticsResetAndHelperNamesRemainStable) {
     AntiDebugStatistics stats{};
+    const auto lastDetection = Clock::now();
+    const auto lastCheck = lastDetection - std::chrono::seconds{1};
     stats.totalChecks = 41;
     stats.totalDetections = 9;
+    stats.detectionsByTechnique[DetectionTechnique::Timing_RDTSC] = 2;
+    stats.detectionsByType[DebuggerType::KernelMode] = 1;
     stats.falsePositives = 2;
     stats.actionsExecuted = 4;
     stats.threadsHidden = 3;
@@ -113,6 +118,8 @@ TEST(AntiDebugTests, StatisticsResetAndHelperNamesRemainStable) {
     stats.integrityViolations = 1;
     stats.avgCheckDurationUs = 900;
     stats.maxCheckDurationUs = 1300;
+    stats.lastDetectionTime = lastDetection;
+    stats.lastCheckTime = lastCheck;
 
     stats.Reset();
 
@@ -122,6 +129,10 @@ TEST(AntiDebugTests, StatisticsResetAndHelperNamesRemainStable) {
     EXPECT_EQ(stats.actionsExecuted, 0ULL);
     EXPECT_EQ(stats.threadsHidden, 0ULL);
     EXPECT_EQ(stats.maxCheckDurationUs, 0ULL);
+    EXPECT_EQ(stats.detectionsByTechnique.at(DetectionTechnique::Timing_RDTSC), 2ULL);
+    EXPECT_EQ(stats.detectionsByType.at(DebuggerType::KernelMode), 1ULL);
+    EXPECT_EQ(stats.lastDetectionTime, lastDetection);
+    EXPECT_EQ(stats.lastCheckTime, lastCheck);
 
     const json payload = ParseJson(stats.ToJson());
     EXPECT_EQ(payload.at("threadsHidden").get<int>(), 0);

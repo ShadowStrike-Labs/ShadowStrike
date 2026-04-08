@@ -21,8 +21,8 @@
  *
  * Coverage focus:
  * - configuration defaults, statistics reset, enum-name helpers, and versioning
- * - singleton lifecycle and configuration round-tripping
- * - startup-folder disable/enable flows on real temporary files
+ * - singleton lifecycle and configuration round-tripping, including pre-init updates
+ * - startup-folder disable/enable flows on real temporary files plus negative-path analysis
  * - diagnostics, export surfaces, and self-test behavior
  */
 
@@ -114,6 +114,43 @@ TEST_F(BootTimeAnalyzerTest, InitializeUpdateConfigAndDiagnosticsExposePublicSta
     EXPECT_THAT(diagnostics.front(), HasSubstr(L"BootTimeAnalyzer Diagnostics"));
 }
 
+TEST_F(BootTimeAnalyzerTest, PreInitConfigAndNegativeStartupAnalysisReflectCurrentGuards) {
+    auto& analyzer = BootTimeAnalyzer::Instance();
+
+    auto updated = BootTimeAnalyzerConfig::CreateDefault();
+    updated.analyzeDrivers = false;
+    updated.generateRecommendations = false;
+    ASSERT_TRUE(analyzer.UpdateConfig(updated));
+
+    const auto reloaded = analyzer.GetConfig();
+    EXPECT_FALSE(reloaded.analyzeDrivers);
+    EXPECT_FALSE(reloaded.generateRecommendations);
+
+    const auto emptyItem = analyzer.AnalyzeStartupItem(L"");
+    EXPECT_TRUE(emptyItem.path.empty());
+    EXPECT_TRUE(emptyItem.name.empty());
+    EXPECT_EQ(emptyItem.type, StartupItemType::Unknown);
+    EXPECT_EQ(emptyItem.riskLevel, StartupItemRisk::Medium);
+    EXPECT_TRUE(emptyItem.isSuspicious);
+    EXPECT_EQ(emptyItem.suspicionReason, L"No executable path found");
+
+    const auto missingPath = MakePath(L"missing-startup.exe");
+    const auto missingItem = analyzer.AnalyzeStartupItem(missingPath.wstring());
+    EXPECT_EQ(missingItem.path, missingPath.wstring());
+    EXPECT_EQ(missingItem.name, L"missing-startup.exe");
+    EXPECT_EQ(missingItem.type, StartupItemType::Unknown);
+    EXPECT_EQ(missingItem.riskLevel, StartupItemRisk::Medium);
+    EXPECT_TRUE(missingItem.isSuspicious);
+    EXPECT_EQ(missingItem.suspicionReason, L"Target file not found");
+
+    StartupItem unsupportedItem;
+    unsupportedItem.name = L"unsupported";
+    unsupportedItem.path = missingPath.wstring();
+    unsupportedItem.type = StartupItemType::Unknown;
+    EXPECT_FALSE(analyzer.DisableStartupItem(unsupportedItem));
+    EXPECT_FALSE(analyzer.EnableStartupItem(unsupportedItem));
+}
+
 TEST_F(BootTimeAnalyzerTest, StartupFolderItemCanBeDisabledAndReenabledOnDisk) {
     auto& analyzer = BootTimeAnalyzer::Instance();
     ASSERT_TRUE(analyzer.Initialize(BootTimeAnalyzerConfig::CreateDefault()));
@@ -154,6 +191,23 @@ TEST_F(BootTimeAnalyzerTest, StartupAnalysisAndExportsProduceReadableArtifacts) 
 
     EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("BootTimeAnalyzer Report"));
     EXPECT_THAT(ReadTextFile(optimizationPath), HasSubstr("Boot Optimization Suggestions"));
+}
+
+TEST_F(BootTimeAnalyzerTest, ExportAndEnableGuardsFollowCurrentFilesystemSemantics) {
+    auto& analyzer = BootTimeAnalyzer::Instance();
+
+    const auto reportPath = MakePath(L"preinit-boot-report.txt");
+    ASSERT_TRUE(analyzer.ExportReport(reportPath.wstring()));
+    EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("BootTimeAnalyzer Report"));
+
+    const auto startupFile = WriteText(L"startup\\enabled-only.lnk", "shadowstrike");
+
+    StartupItem item;
+    item.name = startupFile.filename().wstring();
+    item.path = startupFile.wstring();
+    item.type = StartupItemType::StartupFolder;
+
+    EXPECT_FALSE(analyzer.EnableStartupItem(item));
 }
 
 TEST_F(BootTimeAnalyzerTest, SelfTestPassesAfterInitialization) {

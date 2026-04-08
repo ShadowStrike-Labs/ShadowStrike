@@ -162,15 +162,16 @@
 #ifdef NOERROR
 #undef NOERROR
 #endif
-#ifdef IN
-#undef IN
-#endif
 #ifdef ERROR
 #undef ERROR
 #endif
-#ifdef OUT
+
+// Save and undef IN/OUT to allow DNS class enum names,
+// then restore them after the enum so later Windows SDK headers still work.
+#pragma push_macro("IN")
+#pragma push_macro("OUT")
+#undef IN
 #undef OUT
-#endif
 
 namespace ShadowStrike {
 namespace Core {
@@ -476,7 +477,7 @@ struct alignas(64) DNSResourceRecord {
  * @struct DNSResponse
  * @brief DNS response information.
  */
-struct alignas(128) DNSResponse {
+struct alignas(64) DNSResponse {
     // Response identity
     uint64_t queryId{ 0 };                       ///< Matching query ID
     uint16_t transactionId{ 0 };
@@ -1456,3 +1457,7 @@ private:
 }  // namespace Network
 }  // namespace Core
 }  // namespace ShadowStrike
+
+// Restore Windows SAL macros that were temporarily suppressed for DNS enums
+#pragma pop_macro("OUT")
+#pragma pop_macro("IN")

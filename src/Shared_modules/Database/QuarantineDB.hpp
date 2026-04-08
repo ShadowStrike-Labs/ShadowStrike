@@ -186,6 +186,10 @@ namespace ShadowStrike {
          */
         class QuarantineDB {
         public:
+            // Factory for controlled construction (used by QuarantineManager via unique_ptr)
+            [[nodiscard]] static std::unique_ptr<QuarantineDB> Create() {
+                return std::unique_ptr<QuarantineDB>(new QuarantineDB());
+            }
 
             // ============================================================================
             //                          TYPES & ENUMERATIONS
@@ -1154,9 +1158,11 @@ namespace ShadowStrike {
 
             /** @brief Private constructor for singleton pattern. */
             QuarantineDB();
-            
+
+        public:
             /** @brief Destructor - calls Shutdown() if still initialized. */
             ~QuarantineDB();
+        private:
 
             /** @brief Deleted copy constructor (singleton). */
             QuarantineDB(const QuarantineDB&) = delete;

@@ -212,6 +212,25 @@ TEST_F(MemoryScannerValueTest, ContainsPEAndParsePESupportPE32AndPE32PlusBuffers
     EXPECT_EQ(pe64Info->imageSize, 0x9000u);
 }
 
+TEST_F(MemoryScannerValueTest, ContainsPEAndParsePERejectTruncatedAndCorruptImages) {
+    auto& scanner = MemoryScanner::Instance();
+
+    const std::vector<uint8_t> truncated(63, 0x00);
+    EXPECT_FALSE(scanner.ContainsPE(truncated));
+    EXPECT_FALSE(scanner.ParsePE(truncated).has_value());
+
+    auto missingDosMagic = BuildMinimalPE32();
+    missingDosMagic[0] = 'N';
+    EXPECT_FALSE(scanner.ContainsPE(missingDosMagic));
+    EXPECT_FALSE(scanner.ParsePE(missingDosMagic).has_value());
+
+    auto invalidOptionalMagic = BuildMinimalPE32();
+    const uint16_t badMagic = 0x0137;
+    std::memcpy(invalidOptionalMagic.data() + 0x80 + 24, &badMagic, sizeof(badMagic));
+    EXPECT_TRUE(scanner.ContainsPE(invalidOptionalMagic));
+    EXPECT_FALSE(scanner.ParsePE(invalidOptionalMagic).has_value());
+}
+
 TEST_F(MemoryScannerValueTest, AnalyzeForShellcodeFlagsCompoundIndicatorsAndConfidenceCap) {
     auto& scanner = MemoryScanner::Instance();
 
@@ -237,6 +256,22 @@ TEST_F(MemoryScannerValueTest, AnalyzeForShellcodeFlagsCompoundIndicatorsAndConf
     EXPECT_EQ(analysis.apiHashAlgorithm, "ROL/ROR");
     EXPECT_EQ(analysis.architecture, "x64");
     EXPECT_DOUBLE_EQ(analysis.confidence, 90.0);
+}
+
+TEST_F(MemoryScannerValueTest, AnalyzeForShellcodeKeepsExactBoundarySignalsBelowShellcodeThreshold) {
+    auto& scanner = MemoryScanner::Instance();
+    const std::vector<uint8_t> boundaryNopSled(16, 0x90);
+
+    const auto analysis = scanner.AnalyzeForShellcode(boundaryNopSled);
+
+    EXPECT_FALSE(analysis.isShellcode);
+    EXPECT_TRUE(analysis.hasNOPSled);
+    EXPECT_FALSE(analysis.hasGetPC);
+    EXPECT_FALSE(analysis.hasAPIHashing);
+    EXPECT_FALSE(analysis.hasSyscallStubs);
+    EXPECT_EQ(analysis.nopSledLength, 16u);
+    EXPECT_EQ(analysis.architecture, "x86");
+    EXPECT_DOUBLE_EQ(analysis.confidence, 0.0);
 }
 
 TEST_F(MemoryScannerValueTest, AnalyzeForShellcodeRejectsBuffersBelowMinimumSize) {

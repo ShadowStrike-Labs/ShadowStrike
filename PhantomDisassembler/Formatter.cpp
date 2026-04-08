@@ -159,7 +159,7 @@ Status Formatter::FormatInstruction(
     char*                     buffer,
     size_t                    bufferSize,
     uint64_t                  runtimeAddress,
-    void*                     /*userData*/) noexcept
+    void*                     /*userData*/) const noexcept
 {
     // ---- validation ----
     if (!m_initialized)                        return Status::InternalError;
@@ -271,7 +271,7 @@ size_t Formatter::FormatOperand(const DecodedOperand& op,
                                inst.address, inst.length,
                                buf, remaining);
 
-    case OperandType::RELATIVE:
+    case OperandType::RELATIVE_OFFSET:
         return FormatImmediate(op.imm, op.size,
                                /*isRelative=*/true,
                                runtimeAddr, inst.length,

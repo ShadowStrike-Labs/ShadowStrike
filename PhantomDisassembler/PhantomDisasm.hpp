@@ -27,9 +27,9 @@ namespace Phantom::Disasm {
 // Version information
 // ============================================================================
 
-constexpr uint32_t VERSION_MAJOR = 1;
-constexpr uint32_t VERSION_MINOR = 0;
-constexpr uint32_t VERSION_PATCH = 0;
+constexpr uint32_t PHANTOM_DISASM_VERSION_MAJOR = 1;
+constexpr uint32_t PHANTOM_DISASM_VERSION_MINOR = 0;
+constexpr uint32_t PHANTOM_DISASM_VERSION_PATCH = 0;
 
 // ============================================================================
 // Quick single-instruction disassemble helper
