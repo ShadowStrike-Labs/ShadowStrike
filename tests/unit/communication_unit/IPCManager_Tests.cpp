@@ -43,6 +43,12 @@ TEST(IPCManagerTest, IPCConfigurationEnforcesProductionSafetyBounds) {
     IPC::IPCConfiguration config{};
     EXPECT_TRUE(config.IsValid());
 
+    config.workerThreadCount = 64;
+    config.maxQueueDepth = 1'000'000;
+    config.replyTimeoutMs = 300'000;
+    EXPECT_TRUE(config.IsValid());
+
+    config = {};
     config.filterPortName.clear();
     EXPECT_FALSE(config.IsValid());
 

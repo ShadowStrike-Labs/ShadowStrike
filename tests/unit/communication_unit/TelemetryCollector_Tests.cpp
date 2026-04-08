@@ -53,6 +53,11 @@ TEST(TelemetryCollectorTest, ScrubPIIRedactsSensitiveFieldsWhilePreservingUseful
     EXPECT_NE(scrubbed.find("[SID_REDACTED]"), std::string::npos);
 }
 
+TEST(TelemetryCollectorTest, ScrubPIILeavesBenignTelemetryUntouched) {
+    const std::string input = "engine=healthy queueDepth=4 mode=active";
+    EXPECT_EQ(Telemetry::ScrubPII(input), input);
+}
+
 TEST(TelemetryCollectorTest, HashSensitiveDataIsDeterministicSha256Hex) {
     const std::string first = Telemetry::HashSensitiveData("sensitive-artifact");
     const std::string second = Telemetry::HashSensitiveData("sensitive-artifact");
@@ -155,6 +160,14 @@ TEST(TelemetryCollectorTest, TelemetryConfigurationValidatesQueueAndEndpointSafe
     Telemetry::TelemetryConfiguration config{};
     EXPECT_TRUE(config.IsValid());
 
+    config.batchSize = 1000;
+    config.maxQueueSize = 100'000;
+    config.flushIntervalHours = 168;
+    config.maxRetryAttempts = 20;
+    config.endpoint = "https://telemetry.shadowstrike.io/collect";
+    EXPECT_TRUE(config.IsValid());
+
+    config = {};
     config.batchSize = 0;
     EXPECT_FALSE(config.IsValid());
 

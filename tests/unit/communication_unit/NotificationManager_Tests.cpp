@@ -86,6 +86,13 @@ TEST(NotificationManagerTest, NotificationPreferencesValidateVolumeAndConcurrenc
     Notify::NotificationPreferences preferences{};
     EXPECT_TRUE(preferences.IsValid());
 
+    preferences.soundVolume = 0;
+    preferences.maxConcurrent = 20;
+    EXPECT_TRUE(preferences.IsValid());
+
+    preferences.soundVolume = 100;
+    EXPECT_TRUE(preferences.IsValid());
+
     preferences.soundVolume = -1;
     EXPECT_FALSE(preferences.IsValid());
 
@@ -110,12 +117,30 @@ TEST(NotificationManagerTest, QuietHoursScheduleReturnsFalseForDisabledOrImpossi
     quietHours.enabled = true;
     quietHours.daysOfWeek = 0;
     EXPECT_FALSE(quietHours.IsActive());
+
+    quietHours.daysOfWeek = 0x7F;
+    quietHours.startHour = 9;
+    quietHours.startMinute = 30;
+    quietHours.endHour = 9;
+    quietHours.endMinute = 30;
+    EXPECT_FALSE(quietHours.IsActive());
 }
 
 TEST(NotificationManagerTest, NotificationConfigurationRejectsUnsafeRateLimitsAndTraversal) {
     Notify::NotificationConfiguration config{};
     EXPECT_TRUE(config.IsValid());
 
+    config.rateLimitPerMinute = 1000;
+    config.dedupWindowSeconds = 3600;
+    config.quietHours.enabled = true;
+    config.quietHours.startHour = 23;
+    config.quietHours.startMinute = 59;
+    config.quietHours.endHour = 0;
+    config.quietHours.endMinute = 0;
+    config.customSoundsFolder = LR"(C:\Sounds)";
+    EXPECT_TRUE(config.IsValid());
+
+    config = {};
     config.rateLimitPerMinute = 0;
     EXPECT_FALSE(config.IsValid());
 
@@ -130,6 +155,11 @@ TEST(NotificationManagerTest, NotificationConfigurationRejectsUnsafeRateLimitsAn
     config = {};
     config.quietHours.enabled = true;
     config.quietHours.startHour = 24;
+    EXPECT_FALSE(config.IsValid());
+
+    config = {};
+    config.quietHours.enabled = true;
+    config.quietHours.endMinute = 60;
     EXPECT_FALSE(config.IsValid());
 
     config = {};

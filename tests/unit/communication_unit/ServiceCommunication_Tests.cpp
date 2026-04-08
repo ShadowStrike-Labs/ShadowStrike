@@ -81,9 +81,15 @@ TEST(ServiceCommunicationTest, ServiceMessagePayloadHelpersRoundTripBinarySafeSt
     ServiceComm::ServiceMessage message{};
     EXPECT_TRUE(message.GetPayloadString().empty());
 
-    message.SetPayloadString(R"({"command":"scan","path":"C:\\Temp\\sample.exe"})");
-    EXPECT_EQ(message.GetPayloadString(), R"({"command":"scan","path":"C:\\Temp\\sample.exe"})");
-    EXPECT_EQ(message.payload.size(), message.GetPayloadString().size());
+    const std::string binaryPayload{"abc\0def", 7};
+    message.SetPayloadString(binaryPayload);
+    EXPECT_EQ(message.GetPayloadString(), binaryPayload);
+    ASSERT_EQ(message.payload.size(), binaryPayload.size());
+    EXPECT_EQ(message.payload[3], 0u);
+
+    message.SetPayloadString({});
+    EXPECT_TRUE(message.GetPayloadString().empty());
+    EXPECT_TRUE(message.payload.empty());
 }
 
 TEST(ServiceCommunicationTest, ServiceCommunicationConfigurationRejectsUnsafeValues) {
@@ -96,6 +102,10 @@ TEST(ServiceCommunicationTest, ServiceCommunicationConfigurationRejectsUnsafeVal
     config = {};
     config.maxClients = 0;
     EXPECT_FALSE(config.IsValid());
+
+    config = {};
+    config.maxClients = 256;
+    EXPECT_TRUE(config.IsValid());
 
     config = {};
     config.maxClients = 257;

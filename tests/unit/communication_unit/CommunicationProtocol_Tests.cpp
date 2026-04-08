@@ -41,6 +41,25 @@ SystemClock::time_point FixedTime() {
     return SystemClock::from_time_t(1'700'000'000);
 }
 
+std::vector<uint8_t> BuildMessageBuffer(
+    Comm::MessageType type,
+    std::span<const uint8_t> payload = {},
+    uint64_t messageId = 0x1234ULL) {
+
+    Comm::MessageHeader header{};
+    header.magic = Comm::MESSAGE_MAGIC;
+    header.version = Comm::PROTOCOL_VERSION;
+    header.messageType = static_cast<uint16_t>(type);
+    header.messageId = messageId;
+    header.totalSize = static_cast<uint32_t>(sizeof(Comm::MessageHeader) + payload.size());
+    header.dataSize = static_cast<uint32_t>(payload.size());
+
+    std::vector<uint8_t> buffer;
+    AppendPod(buffer, header);
+    buffer.insert(buffer.end(), payload.begin(), payload.end());
+    return buffer;
+}
+
 } // namespace
 
 /*
@@ -82,6 +101,10 @@ TEST(CommunicationProtocolTest, MessageHeaderValidationAcceptsOnlyWireCompatible
 
     header.totalSize = Comm::MAX_MESSAGE_SIZE + 1;
     EXPECT_FALSE(header.IsValid());
+
+    header.totalSize = sizeof(Comm::MessageHeader);
+    header.version = Comm::PROTOCOL_VERSION - 1;
+    EXPECT_TRUE(header.IsValid());
 }
 
 TEST(CommunicationProtocolTest, ParseFileScanRequestParsesFixedAndVariableFields) {
@@ -146,6 +169,26 @@ TEST(CommunicationProtocolTest, ParseFileScanRequestRejectsTruncatedVariableData
     EXPECT_FALSE(Comm::MessageDispatcher::ParseFileScanRequest(buffer).has_value());
 }
 
+TEST(CommunicationProtocolTest, ParseFileScanRequestAcceptsHeaderOnlyBuffersWhenStringsAreEmpty) {
+    Comm::FileScanRequestData raw{};
+    raw.messageId = 15;
+    raw.accessType = static_cast<uint8_t>(Comm::FileAccessType::Read);
+    raw.priority = static_cast<uint8_t>(Comm::ScanPriority::Low);
+    raw.processId = 91;
+    raw.requiresReply = 0;
+
+    std::vector<uint8_t> buffer(sizeof(raw));
+    std::memcpy(buffer.data(), &raw, sizeof(raw));
+
+    const auto request = Comm::MessageDispatcher::ParseFileScanRequest(buffer);
+    ASSERT_TRUE(request.has_value());
+    EXPECT_TRUE(request->filePath.empty());
+    EXPECT_TRUE(request->processName.empty());
+    EXPECT_EQ(request->processId, 91u);
+    EXPECT_FALSE(request->requiresReply);
+    EXPECT_EQ(request->priority, Comm::ScanPriority::Low);
+}
+
 TEST(CommunicationProtocolTest, ParseProcessNotificationParsesImagePathAndCommandLine) {
     const std::wstring imagePath = LR"(C:\Windows\System32\cmd.exe)";
     const std::wstring commandLine = LR"("C:\Windows\System32\cmd.exe" /c whoami)";
@@ -189,6 +232,27 @@ TEST(CommunicationProtocolTest, ParseProcessNotificationParsesImagePathAndComman
 TEST(CommunicationProtocolTest, ParseProcessNotificationRejectsShortBuffer) {
     std::vector<uint8_t> buffer(sizeof(Comm::ProcessNotificationData) - 1, 0xAB);
     EXPECT_FALSE(Comm::MessageDispatcher::ParseProcessNotification(buffer).has_value());
+}
+
+TEST(CommunicationProtocolTest, ParseProcessNotificationAcceptsHeaderOnlyBuffersWhenStringsAreEmpty) {
+    Comm::ProcessNotificationData raw{};
+    raw.messageId = 17;
+    raw.processId = 500;
+    raw.parentProcessId = 400;
+    raw.requiresReply = 0;
+    raw.flags = 0x99;
+
+    std::vector<uint8_t> buffer(sizeof(raw));
+    std::memcpy(buffer.data(), &raw, sizeof(raw));
+
+    const auto notification = Comm::MessageDispatcher::ParseProcessNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_TRUE(notification->imagePath.empty());
+    EXPECT_TRUE(notification->commandLine.empty());
+    EXPECT_EQ(notification->processId, 500u);
+    EXPECT_EQ(notification->parentProcessId, 400u);
+    EXPECT_EQ(notification->flags, 0x99u);
+    EXPECT_FALSE(notification->requiresReply);
 }
 
 TEST(CommunicationProtocolTest, ParseRegistryNotificationParsesKeyNameAndValueBytes) {
@@ -241,6 +305,27 @@ TEST(CommunicationProtocolTest, ParseRegistryNotificationRejectsTruncatedValueDa
     EXPECT_FALSE(Comm::MessageDispatcher::ParseRegistryNotification(buffer).has_value());
 }
 
+TEST(CommunicationProtocolTest, ParseRegistryNotificationAcceptsHeaderOnlyBuffersWhenPayloadIsEmpty) {
+    Comm::RegistryNotificationData raw{};
+    raw.messageId = 21;
+    raw.processId = 701;
+    raw.threadId = 702;
+    raw.operationType = 5;
+    raw.valueType = 1;
+    raw.requiresReply = 0;
+
+    std::vector<uint8_t> buffer(sizeof(raw));
+    std::memcpy(buffer.data(), &raw, sizeof(raw));
+
+    const auto notification = Comm::MessageDispatcher::ParseRegistryNotification(buffer);
+    ASSERT_TRUE(notification.has_value());
+    EXPECT_TRUE(notification->keyPath.empty());
+    EXPECT_TRUE(notification->valueName.empty());
+    EXPECT_TRUE(notification->valueData.empty());
+    EXPECT_EQ(notification->operationType, 5u);
+    EXPECT_FALSE(notification->requiresReply);
+}
+
 TEST(CommunicationProtocolTest, SerializeVerdictReplyProducesWireCompatibleLayout) {
     Comm::ScanVerdictReply reply{};
     reply.messageId = 0xCAFEBABEULL;
@@ -270,6 +355,22 @@ TEST(CommunicationProtocolTest, SerializeVerdictReplyProducesWireCompatibleLayou
         buffer.data() + sizeof(Comm::ScanVerdictReplyData));
     const std::wstring decoded(threatNamePtr, raw->threatNameLength);
     EXPECT_EQ(decoded, reply.threatName);
+}
+
+TEST(CommunicationProtocolTest, SerializeVerdictReplyOmitsVariablePayloadForEmptyThreatName) {
+    Comm::ScanVerdictReply reply{};
+    reply.messageId = 0xAA55;
+    reply.verdict = Comm::ScanVerdict::Clean;
+    reply.resultCode = 0;
+    reply.threatDetected = false;
+
+    const std::vector<uint8_t> buffer = Comm::MessageDispatcher::SerializeVerdictReply(reply);
+    ASSERT_EQ(buffer.size(), sizeof(Comm::ScanVerdictReplyData));
+
+    const auto* raw = reinterpret_cast<const Comm::ScanVerdictReplyData*>(buffer.data());
+    EXPECT_EQ(raw->threatNameLength, 0u);
+    EXPECT_EQ(raw->cacheResult, 0u);
+    EXPECT_EQ(raw->threatDetected, 0u);
 }
 
 TEST(CommunicationProtocolTest, UserModeStructuresSerializeToJsonWithEscapedContent) {
@@ -353,6 +454,78 @@ TEST(CommunicationProtocolTest, CommunicationConfigSerializesAndEmptyJsonFallsBa
     EXPECT_EQ(parsed.replyTimeoutMs, Comm::DEFAULT_REPLY_TIMEOUT_MS);
     EXPECT_TRUE(parsed.autoReconnect);
     EXPECT_TRUE(parsed.enableStatistics);
+
+    const Comm::CommunicationConfig malformed =
+        Comm::CommunicationConfig::FromJson("{\"portName\":\"\\\\ignored\",\"replyTimeoutMs\":1}");
+    EXPECT_EQ(malformed.portName, Comm::SS_COMM_PORT_NAME);
+    EXPECT_EQ(malformed.replyTimeoutMs, Comm::DEFAULT_REPLY_TIMEOUT_MS);
+    EXPECT_EQ(malformed.workerThreadCount, 4u);
+}
+
+TEST(CommunicationProtocolTest, MovedFromFilterConnectionRemainsSafelyInert) {
+    Comm::FilterConnection source(L"\\ShadowStrikeUnitTestPort");
+    Comm::FilterConnection moved(std::move(source));
+
+    EXPECT_FALSE(source.Connect());
+    EXPECT_FALSE(source.IsConnected());
+    EXPECT_EQ(source.ToJson(), "{}");
+
+    Comm::FilterConnection assigned(L"\\ShadowStrikeUnitTestPort2");
+    assigned = std::move(moved);
+    EXPECT_FALSE(moved.Connect());
+    EXPECT_FALSE(moved.IsConnected());
+    EXPECT_EQ(moved.ToJson(), "{}");
+    EXPECT_FALSE(assigned.IsConnected());
+}
+
+TEST(CommunicationProtocolTest, DispatchMessageRejectsEmptyAndTruncatedBuffersBeforeRouting) {
+    Comm::FilterConnection connection(L"\\ShadowStrikeDispatchTestPort");
+    Comm::MessageDispatcher dispatcher(connection);
+
+    EXPECT_FALSE(dispatcher.DispatchMessage({}));
+    EXPECT_EQ(dispatcher.GetStatistics().TakeSnapshot().parseErrors, 1u);
+
+    std::vector<uint8_t> truncated = BuildMessageBuffer(Comm::MessageType::Heartbeat);
+    auto* header = reinterpret_cast<Comm::MessageHeader*>(truncated.data());
+    header->totalSize += 4;
+
+    EXPECT_FALSE(dispatcher.DispatchMessage(truncated));
+
+    const Comm::DispatchStatisticsSnapshot snapshot = dispatcher.GetStatistics().TakeSnapshot();
+    EXPECT_EQ(snapshot.messagesDispatched, 0u);
+    EXPECT_EQ(snapshot.parseErrors, 2u);
+}
+
+TEST(CommunicationProtocolTest, DispatchMessageTracksUnknownAndNotificationOnlyMessageTypes) {
+    Comm::FilterConnection connection(L"\\ShadowStrikeDispatchTestPort");
+    Comm::MessageDispatcher dispatcher(connection);
+
+    std::vector<uint8_t> unknown = BuildMessageBuffer(Comm::MessageType::None);
+    reinterpret_cast<Comm::MessageHeader*>(unknown.data())->messageType = 0xFFFF;
+    EXPECT_FALSE(dispatcher.DispatchMessage(unknown));
+
+    const std::vector<uint8_t> alert = BuildMessageBuffer(Comm::MessageType::BehavioralAlert);
+    EXPECT_TRUE(dispatcher.DispatchMessage(alert));
+
+    const Comm::DispatchStatisticsSnapshot snapshot = dispatcher.GetStatistics().TakeSnapshot();
+    EXPECT_EQ(snapshot.messagesDispatched, 2u);
+    EXPECT_EQ(snapshot.unknownMessages, 1u);
+    EXPECT_EQ(snapshot.fileNotifications, 1u);
+    EXPECT_EQ(snapshot.parseErrors, 0u);
+}
+
+TEST(CommunicationProtocolTest, DispatchHeartbeatOnDisconnectedConnectionRecordsReplyFailure) {
+    Comm::FilterConnection connection(L"\\ShadowStrikeDispatchTestPort");
+    Comm::MessageDispatcher dispatcher(connection);
+
+    const std::vector<uint8_t> heartbeat = BuildMessageBuffer(Comm::MessageType::Heartbeat, {}, 0x99ULL);
+    EXPECT_TRUE(dispatcher.DispatchMessage(heartbeat));
+
+    const Comm::DispatchStatisticsSnapshot snapshot = dispatcher.GetStatistics().TakeSnapshot();
+    EXPECT_EQ(snapshot.messagesDispatched, 1u);
+    EXPECT_EQ(snapshot.repliesSent, 0u);
+    EXPECT_EQ(snapshot.replyErrors, 1u);
+    EXPECT_EQ(snapshot.parseErrors, 0u);
 }
 
 TEST(CommunicationProtocolTest, CommunicationStatisticsResetProducesCleanSnapshotAndJson) {
