@@ -1059,6 +1059,9 @@
     <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\integration\realtime_protection_pipeline\RTPPipeline_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
