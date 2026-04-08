@@ -109,4 +109,27 @@ TEST(SandboxEvasionDetector_Config, FactoryMethodsEncodeExpectedTradeoffs) {
     EXPECT_TRUE(fastConfig.checkArtifacts);
 }
 
+TEST(SandboxEvasionDetector_Statistics, ResetClearsCountersAndProductDistribution) {
+    SandboxDetectorStats stats;
+    stats.totalScans = 12;
+    stats.sandboxesDetected = 5;
+    stats.definitiveDetections = 2;
+    stats.humanInteractionChecks = 7;
+    stats.cacheHits = 3;
+    stats.cacheMisses = 4;
+    stats.avgAnalysisDurationUs = 2500;
+    stats.detectionsByProduct[static_cast<size_t>(SandboxProduct::Cuckoo)] = 2;
+
+    stats.Reset();
+
+    EXPECT_EQ(0u, stats.totalScans.load());
+    EXPECT_EQ(0u, stats.sandboxesDetected.load());
+    EXPECT_EQ(0u, stats.definitiveDetections.load());
+    EXPECT_EQ(0u, stats.humanInteractionChecks.load());
+    EXPECT_EQ(0u, stats.cacheHits.load());
+    EXPECT_EQ(0u, stats.cacheMisses.load());
+    EXPECT_EQ(0u, stats.avgAnalysisDurationUs.load());
+    EXPECT_EQ(0u, stats.detectionsByProduct[static_cast<size_t>(SandboxProduct::Cuckoo)].load());
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

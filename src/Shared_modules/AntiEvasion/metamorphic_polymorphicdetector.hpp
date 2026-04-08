@@ -1700,6 +1700,10 @@ namespace ShadowStrike {
                 errors.clear();
                 analysisComplete = false;
                 fromCache = false;
+                fuzzyHash.clear();
+                tlshHash.clear();
+                ngramProfile.clear();
+                similarityAnalysisComplete = false;
             }
         };
 
@@ -2113,6 +2117,7 @@ namespace ShadowStrike {
 
                 void Reset() noexcept {
                     totalAnalyses = 0;
+                    detections = 0;
                     metamorphicDetections = 0;
                     polymorphicDetections = 0;
                     packerDetections = 0;

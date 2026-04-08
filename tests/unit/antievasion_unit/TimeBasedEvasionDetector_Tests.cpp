@@ -35,9 +35,16 @@ TEST(TimeBasedEvasionDetector_ResultHelpers, RiskDurationAndClearBehavePredictab
     result.analysisEndTime = result.analysisStartTime + std::chrono::milliseconds(1500);
     result.processId = 1337;
     result.processName = L"sample.exe";
+    result.processPath = L"C:\\Temp\\sample.exe";
+    result.commandLine = L"sample.exe /quiet";
+    result.parentProcessId = 4;
     result.mitreIds = { "T1497.003" };
     result.details = { L"High-frequency RDTSC pattern" };
     result.findings = { TimingEvasionFinding{ .type = TimingEvasionType::RDTSCHighFrequency } };
+    result.qpcCallCount = 3;
+    result.eventsAnalyzed = 8;
+    result.errorMessage = L"stale";
+    result.analysisComplete = true;
 
     EXPECT_TRUE(result.HasEvasionType(TimingEvasionType::RDTSCHighFrequency));
     EXPECT_TRUE(result.HasEvasionType(TimingEvasionType::SleepBombing));
@@ -57,6 +64,23 @@ TEST(TimeBasedEvasionDetector_ResultHelpers, RiskDurationAndClearBehavePredictab
     EXPECT_TRUE(result.mitreIds.empty());
     EXPECT_EQ("TA0005", result.mitreTactic);
     EXPECT_TRUE(result.processName.empty());
+    EXPECT_TRUE(result.processPath.empty());
+    EXPECT_TRUE(result.commandLine.empty());
+    EXPECT_EQ(0u, result.parentProcessId);
+    EXPECT_EQ(0u, result.qpcCallCount);
+    EXPECT_EQ(0u, result.eventsAnalyzed);
+    EXPECT_TRUE(result.errorMessage.empty());
+    EXPECT_FALSE(result.analysisComplete);
+}
+
+TEST(TimeBasedEvasionDetector_ResultHelpers, HighThreatScoreTriggersHighRiskEvenAtInfoSeverity) {
+    TimingEvasionResult result;
+    result.severity = TimingEvasionSeverity::Info;
+    result.threatScore = 70.0f;
+    EXPECT_TRUE(result.IsHighRisk());
+
+    result.threatScore = 69.9f;
+    EXPECT_FALSE(result.IsHighRisk());
 }
 
 TEST(TimeBasedEvasionDetector_ConfigAndStats, FactoryMethodsAndStatisticsRemainStable) {

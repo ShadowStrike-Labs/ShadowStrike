@@ -89,4 +89,92 @@ TEST(MetamorphicDetector_Builder, DetectionBuilderPopulatesDerivedMetadataAndPay
     EXPECT_GT(detection.detectionTime, std::chrono::system_clock::time_point{});
 }
 
+TEST(MetamorphicDetector_ResultHelpers, CategoryFilteringAndClearResetSimilarityState) {
+    MetamorphicResult result;
+    result.filePath = L"C:\\Temp\\sample.bin";
+    result.processId = 1001;
+    result.sha256Hash = "deadbeef";
+    result.fileSize = 4096;
+    result.isMetamorphic = true;
+    result.mutationScore = 84.5;
+    result.maxSeverity = MetamorphicSeverity::Critical;
+    result.totalDetections = 2;
+    result.detectedCategories =
+        (1u << static_cast<uint32_t>(MetamorphicCategory::Metamorphic)) |
+        (1u << static_cast<uint32_t>(MetamorphicCategory::Obfuscation));
+    result.detectedTechniques = {
+        MetamorphicDetectionBuilder{}
+            .Technique(MetamorphicTechnique::META_InstructionSubstitution)
+            .Confidence(0.92)
+            .Build(),
+        MetamorphicDetectionBuilder{}
+            .Technique(MetamorphicTechnique::OBF_ControlFlowFlattening)
+            .Confidence(0.73)
+            .Build()
+    };
+    result.fuzzyHash = "3:abcdef:abcdef";
+    result.tlshHash = "T1ABCDEF123456789";
+    result.ngramProfile = { 1, 2, 3, 5, 8 };
+    result.similarityAnalysisComplete = true;
+    result.analysisComplete = true;
+    result.fromCache = true;
+
+    EXPECT_TRUE(result.HasCategory(MetamorphicCategory::Metamorphic));
+    EXPECT_TRUE(result.HasTechnique(MetamorphicTechnique::OBF_ControlFlowFlattening));
+    EXPECT_FALSE(result.HasCategory(MetamorphicCategory::CodeGeneration));
+    EXPECT_FALSE(result.HasTechnique(MetamorphicTechnique::PACK_UPX));
+    EXPECT_EQ(1u, result.GetCategoryCount(MetamorphicCategory::Obfuscation));
+    EXPECT_EQ(0u, result.GetCategoryCount(MetamorphicCategory::CodeGeneration));
+
+    result.Clear();
+
+    EXPECT_TRUE(result.filePath.empty());
+    EXPECT_EQ(0u, result.processId);
+    EXPECT_TRUE(result.sha256Hash.empty());
+    EXPECT_EQ(0u, result.fileSize);
+    EXPECT_FALSE(result.isMetamorphic);
+    EXPECT_DOUBLE_EQ(0.0, result.mutationScore);
+    EXPECT_EQ(MetamorphicSeverity::Low, result.maxSeverity);
+    EXPECT_EQ(0u, result.totalDetections);
+    EXPECT_EQ(0u, result.detectedCategories);
+    EXPECT_TRUE(result.detectedTechniques.empty());
+    EXPECT_TRUE(result.fuzzyHash.empty());
+    EXPECT_TRUE(result.tlshHash.empty());
+    EXPECT_TRUE(result.ngramProfile.empty());
+    EXPECT_FALSE(result.similarityAnalysisComplete);
+    EXPECT_FALSE(result.analysisComplete);
+    EXPECT_FALSE(result.fromCache);
+}
+
+TEST(MetamorphicDetector_Statistics, ResetClearsDetectionAndCategoryCounters) {
+    MetamorphicDetector::Statistics stats;
+    stats.totalAnalyses = 6;
+    stats.detections = 5;
+    stats.metamorphicDetections = 4;
+    stats.polymorphicDetections = 3;
+    stats.packerDetections = 2;
+    stats.familyMatches = 1;
+    stats.cacheHits = 7;
+    stats.cacheMisses = 8;
+    stats.analysisErrors = 2;
+    stats.totalAnalysisTimeUs = 12000;
+    stats.bytesAnalyzed = 8192;
+    stats.categoryDetections[static_cast<size_t>(MetamorphicCategory::Obfuscation)] = 3;
+
+    stats.Reset();
+
+    EXPECT_EQ(0u, stats.totalAnalyses.load());
+    EXPECT_EQ(0u, stats.detections.load());
+    EXPECT_EQ(0u, stats.metamorphicDetections.load());
+    EXPECT_EQ(0u, stats.polymorphicDetections.load());
+    EXPECT_EQ(0u, stats.packerDetections.load());
+    EXPECT_EQ(0u, stats.familyMatches.load());
+    EXPECT_EQ(0u, stats.cacheHits.load());
+    EXPECT_EQ(0u, stats.cacheMisses.load());
+    EXPECT_EQ(0u, stats.analysisErrors.load());
+    EXPECT_EQ(0u, stats.totalAnalysisTimeUs.load());
+    EXPECT_EQ(0u, stats.bytesAnalyzed.load());
+    EXPECT_EQ(0u, stats.categoryDetections[static_cast<size_t>(MetamorphicCategory::Obfuscation)].load());
+}
+
 } // namespace ShadowStrike::AntiEvasion::Tests

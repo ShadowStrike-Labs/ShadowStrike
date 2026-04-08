@@ -62,6 +62,59 @@ TEST(NetworkBasedEvasionDetector_DGA, DomainEntropyAndWrapperRemainDeterministic
     EXPECT_EQ(suspiciousScoreWrapped >= NetworkEvasionConstants::MIN_DGA_SCORE, suspiciousFlagged);
 }
 
+TEST(NetworkBasedEvasionDetector_ResultHelpers, FilteringAndClearResetAllMutableState) {
+    NetworkEvasionResult result;
+    result.processId = 5150;
+    result.processName = L"sample.exe";
+    result.isEvasive = true;
+    result.evasionScore = 77.5;
+    result.maxSeverity = NetworkEvasionSeverity::Critical;
+    result.totalDetections = 2;
+    result.detectedCategories =
+        (1u << static_cast<uint32_t>(NetworkEvasionCategory::DNSEvasion)) |
+        (1u << static_cast<uint32_t>(NetworkEvasionCategory::TrafficPattern));
+    result.detectedTechniques = {
+        NetworkDetectedTechnique(NetworkEvasionTechnique::DNS_DomainGenerationAlgorithm),
+        NetworkDetectedTechnique(NetworkEvasionTechnique::CONN_PingKnownDomain)
+    };
+    result.suspiciousDomains = { L"xj93kq2p9zv8q1w.biz" };
+    result.suspiciousIPs = { L"203.0.113.10" };
+    result.knownC2 = { L"c2.shadow.invalid" };
+    result.totalDNSQueries = 5;
+    result.totalHTTPRequests = 2;
+    result.totalConnections = 7;
+    result.networkConfig.hasProxy = true;
+    result.networkConfig.proxyAddress = L"http://127.0.0.1:8080";
+    result.analysisComplete = true;
+    result.fromCache = true;
+
+    EXPECT_TRUE(result.HasCategory(NetworkEvasionCategory::DNSEvasion));
+    EXPECT_TRUE(result.HasTechnique(NetworkEvasionTechnique::DNS_DomainGenerationAlgorithm));
+    EXPECT_FALSE(result.HasCategory(NetworkEvasionCategory::ProxyDetection));
+    EXPECT_FALSE(result.HasTechnique(NetworkEvasionTechnique::DNS_Tunneling));
+
+    result.Clear();
+
+    EXPECT_EQ(0u, result.processId);
+    EXPECT_TRUE(result.processName.empty());
+    EXPECT_FALSE(result.isEvasive);
+    EXPECT_DOUBLE_EQ(0.0, result.evasionScore);
+    EXPECT_EQ(NetworkEvasionSeverity::Low, result.maxSeverity);
+    EXPECT_EQ(0u, result.totalDetections);
+    EXPECT_EQ(0u, result.detectedCategories);
+    EXPECT_TRUE(result.detectedTechniques.empty());
+    EXPECT_TRUE(result.suspiciousDomains.empty());
+    EXPECT_TRUE(result.suspiciousIPs.empty());
+    EXPECT_TRUE(result.knownC2.empty());
+    EXPECT_FALSE(result.networkConfig.hasProxy);
+    EXPECT_TRUE(result.networkConfig.proxyAddress.empty());
+    EXPECT_EQ(0u, result.totalDNSQueries);
+    EXPECT_EQ(0u, result.totalHTTPRequests);
+    EXPECT_EQ(0u, result.totalConnections);
+    EXPECT_FALSE(result.analysisComplete);
+    EXPECT_FALSE(result.fromCache);
+}
+
 TEST(NetworkBasedEvasionDetector_Beaconing, DetectBeaconingDistinguishesRegularAndIrregularIntervals) {
     NetworkBasedEvasionDetector detector;
 
@@ -79,6 +132,30 @@ TEST(NetworkBasedEvasionDetector_Beaconing, DetectBeaconingDistinguishesRegularA
     EXPECT_FALSE(detector.DetectBeaconing(irregularTimestamps, irregularInfo));
     EXPECT_FALSE(irregularInfo.isBeaconing);
     EXPECT_EQ(4u, irregularInfo.beaconCount);
+}
+
+TEST(NetworkBasedEvasionDetector_Beaconing, RejectsInsufficientAndNonIncreasingSeriesWithoutLeakingState) {
+    NetworkBasedEvasionDetector detector;
+
+    BeaconingInfo shortSeriesInfo;
+    shortSeriesInfo.target = L"stale.example";
+    shortSeriesInfo.beaconCount = 99;
+
+    EXPECT_FALSE(detector.DetectBeaconing(BuildSystemClockSeries({ 0, 10 }), shortSeriesInfo));
+    EXPECT_FALSE(shortSeriesInfo.isBeaconing);
+    EXPECT_EQ(0u, shortSeriesInfo.beaconCount);
+    EXPECT_TRUE(shortSeriesInfo.timestamps.empty());
+    EXPECT_TRUE(shortSeriesInfo.target.empty());
+
+    BeaconingInfo duplicateSeriesInfo;
+    duplicateSeriesInfo.isBeaconing = true;
+    duplicateSeriesInfo.beaconCount = 42;
+
+    EXPECT_FALSE(detector.DetectBeaconing(BuildSystemClockSeries({ 0, 0, 0, 0 }), duplicateSeriesInfo));
+    EXPECT_FALSE(duplicateSeriesInfo.isBeaconing);
+    EXPECT_EQ(4u, duplicateSeriesInfo.beaconCount);
+    EXPECT_DOUBLE_EQ(0.0, duplicateSeriesInfo.averageIntervalSec);
+    EXPECT_DOUBLE_EQ(0.0, duplicateSeriesInfo.intervalVariance);
 }
 
 } // namespace ShadowStrike::AntiEvasion::Tests
