@@ -162,6 +162,9 @@ TEST(ReportGeneratorTest, ReportConfigurationRejectsTraversalAndInvalidCapacityS
     Reports::ReportConfiguration config{};
     EXPECT_TRUE(config.IsValid());
 
+    config.maxReportSizeMB = 1024;
+    EXPECT_TRUE(config.IsValid());
+
     config.maxReportSizeMB = 0;
     EXPECT_FALSE(config.IsValid());
 

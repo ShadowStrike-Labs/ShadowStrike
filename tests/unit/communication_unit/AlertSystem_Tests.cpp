@@ -43,9 +43,16 @@ TEST(AlertSystemTest, DeliveryConfigurationsValidateRequiredFieldsAndReasonableL
     smtp.server.clear();
     EXPECT_FALSE(smtp.IsValid());
 
+    smtp.server = "smtp.shadowstrike.test";
+    smtp.port = 0;
+    EXPECT_FALSE(smtp.IsValid());
+
     Alerting::WebhookConfiguration webhook{};
     webhook.webhookId = "teams-prod";
     webhook.url = "https://hooks.shadowstrike.test/alerts";
+    EXPECT_TRUE(webhook.IsValid());
+
+    webhook.url.assign(2047, 'a');
     EXPECT_TRUE(webhook.IsValid());
 
     webhook.url.assign(2048, 'a');
@@ -68,6 +75,9 @@ TEST(AlertSystemTest, SuppressionRuleExpiryCoversPermanentDerivedAndExplicitEndT
     explicitEnd.startTime = SystemClock::now();
     explicitEnd.endTime = SystemClock::now() + 5min;
     EXPECT_FALSE(explicitEnd.IsExpired());
+
+    explicitEnd.endTime = SystemClock::now() - 1min;
+    EXPECT_TRUE(explicitEnd.IsExpired());
 }
 
 TEST(AlertSystemTest, AlertConfigurationRejectsUnsafeRateLimitAndRetrySettings) {
@@ -76,6 +86,10 @@ TEST(AlertSystemTest, AlertConfigurationRejectsUnsafeRateLimitAndRetrySettings) 
 
     config.rateLimitPerMinute = 0;
     EXPECT_FALSE(config.IsValid());
+
+    config = {};
+    config.maxRetryAttempts = 10;
+    EXPECT_TRUE(config.IsValid());
 
     config = {};
     config.maxRetryAttempts = 11;
