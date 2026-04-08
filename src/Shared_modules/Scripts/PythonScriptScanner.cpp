@@ -1497,19 +1497,30 @@ void PythonScriptScannerImpl::Shutdown() {
     std::string sourceStr(source);
     std::wstring wideSource = Utils::StringUtils::ToWide(sourceStr);
 
+    const auto countCallPattern = [&](std::string_view name) -> size_t {
+        size_t count = 0;
+        size_t pos = 0;
+
+        while ((pos = sourceStr.find(name, pos)) != std::string::npos) {
+            size_t cursor = pos + name.size();
+            while (cursor < sourceStr.size() &&
+                   std::isspace(static_cast<unsigned char>(sourceStr[cursor]))) {
+                ++cursor;
+            }
+
+            if (cursor < sourceStr.size() && sourceStr[cursor] == '(') {
+                ++count;
+            }
+
+            pos += name.size();
+        }
+
+        return count;
+    };
+
     // Check for exec/eval chains
-    size_t execCount = 0;
-    size_t evalCount = 0;
-    size_t pos = 0;
-    while ((pos = sourceStr.find("exec(", pos)) != std::string::npos) {
-        execCount++;
-        pos += 5;
-    }
-    pos = 0;
-    while ((pos = sourceStr.find("eval(", pos)) != std::string::npos) {
-        evalCount++;
-        pos += 5;
-    }
+    size_t execCount = countCallPattern("exec");
+    size_t evalCount = countCallPattern("eval");
 
     if (execCount + evalCount > 3) {
         return PythonObfuscationType::ExecEval;
@@ -1536,7 +1547,7 @@ void PythonScriptScannerImpl::Shutdown() {
 
     // Check for base64 encoding
     size_t b64Count = 0;
-    pos = 0;
+    size_t pos = 0;
     while ((pos = sourceStr.find("base64", pos)) != std::string::npos) {
         b64Count++;
         pos += 6;

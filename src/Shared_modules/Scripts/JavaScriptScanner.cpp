@@ -576,6 +576,12 @@ JSScanResult JavaScriptScanner::ScanFile(
 JSScanResult JavaScriptScanner::ScanMemory(
     std::span<const char> content,
     std::string_view sourceName) {
+    if (!m_impl->IsInitialized()) {
+        JSScanResult result;
+        result.status = JSScanStatus::ErrorInternal;
+        result.description = "Scanner not initialized";
+        return result;
+    }
     if (content.empty()) {
         JSScanResult result;
         result.status = JSScanStatus::Clean;
@@ -592,6 +598,12 @@ JSScanResult JavaScriptScanner::ScanMemory(
     std::span<const char> content,
     std::string_view sourceName,
     uint32_t processId) {
+    if (!m_impl->IsInitialized()) {
+        JSScanResult result;
+        result.status = JSScanStatus::ErrorInternal;
+        result.description = "Scanner not initialized";
+        return result;
+    }
     if (content.empty()) {
         JSScanResult result;
         result.status = JSScanStatus::Clean;
@@ -607,6 +619,12 @@ JSScanResult JavaScriptScanner::ScanMemory(
 JSScanResult JavaScriptScanner::ScanString(
     std::string_view content,
     std::string_view sourceName) {
+    if (!m_impl->IsInitialized()) {
+        JSScanResult result;
+        result.status = JSScanStatus::ErrorInternal;
+        result.description = "Scanner not initialized";
+        return result;
+    }
     return m_impl->ScanContent(content, sourceName, 0);
 }
 
@@ -1483,6 +1501,20 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivity(
         detectedMethod = "POST";
     }
 
+    const auto selectTarget = [](const std::vector<std::string>& extractedIocs) -> std::string {
+        for (const auto& ioc : extractedIocs) {
+            if (ioc.starts_with("http://") || ioc.starts_with("https://")) {
+                return ioc;
+            }
+        }
+
+        if (!extractedIocs.empty()) {
+            return extractedIocs.front();
+        }
+
+        return {};
+    };
+
     for (const auto& pattern : NETWORK_PATTERNS) {
         if (lower.find(pattern) != std::string::npos) {
             JSNetworkActivity activity;
@@ -1495,7 +1527,7 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivity(
                 iocsExtracted = true;
             }
             if (!iocs.empty()) {
-                activity.target = iocs[0];
+                activity.target = selectTarget(iocs);
             }
 
             activities.push_back(std::move(activity));
@@ -2184,6 +2216,20 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivityWithL
         detectedMethod = "POST";
     }
 
+    const auto selectTarget = [](const std::vector<std::string>& extractedIocs) -> std::string {
+        for (const auto& ioc : extractedIocs) {
+            if (ioc.starts_with("http://") || ioc.starts_with("https://")) {
+                return ioc;
+            }
+        }
+
+        if (!extractedIocs.empty()) {
+            return extractedIocs.front();
+        }
+
+        return {};
+    };
+
     for (const auto& pattern : NETWORK_PATTERNS) {
         if (loweredContent.find(pattern) != std::string_view::npos) {
             JSNetworkActivity activity;
@@ -2194,7 +2240,7 @@ std::vector<JSNetworkActivity> JavaScriptScannerImpl::DetectNetworkActivityWithL
                 iocsExtracted = true;
             }
             if (!iocs.empty()) {
-                activity.target = iocs[0];
+                activity.target = selectTarget(iocs);
             }
             activities.push_back(std::move(activity));
         }

@@ -1086,6 +1086,7 @@ public:
     std::vector<COMObjectUsage> AnalyzeCOMUsage(std::string_view source) {
         std::vector<COMObjectUsage> objects;
         std::string src(source);
+        std::vector<std::pair<size_t, COMObjectUsage>> detectedObjects;
 
         // Find CreateObject calls
         std::sregex_iterator it(src.begin(), src.end(), CREATEOBJECT_PATTERN);
@@ -1107,7 +1108,7 @@ public:
                 usage.capabilities = GetCapabilitiesForObject(usage.type);
             }
 
-            objects.push_back(usage);
+            detectedObjects.emplace_back(static_cast<size_t>((*it).position()), std::move(usage));
             ++it;
             ++iters;
         }
@@ -1128,14 +1129,28 @@ public:
                 usage.capabilities = VBSCapability::WMIAccess;
             }
 
-            objects.push_back(usage);
+            detectedObjects.emplace_back(static_cast<size_t>((*git).position()), std::move(usage));
             ++git;
             ++iters;
         }
 
+        std::sort(detectedObjects.begin(), detectedObjects.end(),
+            [](const auto& left, const auto& right) {
+                return left.first < right.first;
+            });
+
+        objects.reserve(detectedObjects.size());
+
         // Analyze method calls for each object
-        for (auto& obj : objects) {
-            obj.methodsCalled = FindMethodCalls(source, obj.objectName);
+        for (size_t index = 0; index < detectedObjects.size(); ++index) {
+            auto& [position, object] = detectedObjects[index];
+            const size_t nextPosition =
+                (index + 1 < detectedObjects.size()) ? detectedObjects[index + 1].first : src.size();
+            const size_t sliceLength = (nextPosition > position) ? (nextPosition - position) : 0;
+
+            object.methodsCalled = FindMethodCalls(
+                std::string_view(src.data() + position, sliceLength));
+            objects.push_back(std::move(object));
         }
 
         return objects;
@@ -1197,7 +1212,7 @@ public:
         }
     }
 
-    std::vector<std::string> FindMethodCalls(std::string_view source, const std::string& /*objectName*/) {
+    std::vector<std::string> FindMethodCalls(std::string_view source) {
         std::vector<std::string> methods;
 
         for (const auto& [method, desc] : DANGEROUS_METHODS) {
