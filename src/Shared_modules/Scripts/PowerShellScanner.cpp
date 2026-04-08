@@ -1343,6 +1343,11 @@ private:
 
             if (end > start) {
                 payload = cmdLine.substr(start, end - start);
+                if (payload.size() >= 2 &&
+                    ((payload.front() == '"' && payload.back() == '"') ||
+                     (payload.front() == '\'' && payload.back() == '\''))) {
+                    payload = payload.substr(1, payload.size() - 2);
+                }
                 return true;
             }
         }
