@@ -207,6 +207,7 @@ private:
     void RegisterUrlmon() noexcept;
     void RegisterAmsi() noexcept;
     void RegisterVss() noexcept;
+    void RegisterKernelNtoskrnl() noexcept;
 };
 
 } // namespace Phantom

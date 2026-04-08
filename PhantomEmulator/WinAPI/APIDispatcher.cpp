@@ -33,6 +33,7 @@
 #include "Amsi\AmsiAPI.hpp"
 #include "Ole32\COMAPI.hpp"
 #include "Vss\VssAPI.hpp"
+#include "Kernel\KernelAPI.hpp"
 #include "../Core/CPU/State/CPUState.hpp"
 #include "../Core/Memory/VirtualMemory.hpp"
 #include "../Core/Loader/ImportResolver.hpp"
@@ -179,6 +180,7 @@ void APIDispatcher::RegisterAll() noexcept {
     RegisterOle32();
     RegisterUrlmon();
     RegisterVss();
+    RegisterKernelNtoskrnl();
 }
 
 // DLL registration stubs — will be filled by DLL handler modules.
@@ -213,6 +215,9 @@ void APIDispatcher::RegisterAmsi() noexcept {
 }
 void APIDispatcher::RegisterVss() noexcept {
     WinAPI::Vss::RegisterVssAPI(*this);
+}
+void APIDispatcher::RegisterKernelNtoskrnl() noexcept {
+    WinAPI::Kernel::RegisterKernelAPIs(*this);
 }
 
 // ============================================================================

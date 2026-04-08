@@ -69,6 +69,8 @@
 #include "../Core/Kernel/MSREmulation.hpp"
 #include "../Core/Kernel/RingTransition.hpp"
 #include "../Core/Kernel/DriverLoader.hpp"
+#include "../Analysis/DKOMDetector.hpp"
+#include "../WinAPI/Kernel/KernelAPI.hpp"
 
 // Analysis (all 11 modules)
 #include "../Analysis/BehaviorMonitor.hpp"
@@ -2446,6 +2448,15 @@ struct EmulationSession::Impl {
         objMgr.CreateProcess(4, 0, "System");
         objMgr.CreateProcess(348, 4, "smss.exe");
 
+        // Initialize high-level DKOM detector with correlation engine
+        auto& dkom = DKOMDetector::Instance();
+        dkom.Reset();
+        dkom.Initialize();
+        dkom.SetRootkitScoreThreshold(m_config.rootkitScoreThreshold);
+
+        // Reset kernel API tracker for clean session state
+        WinAPI::Kernel::KernelAPITracker::Instance().Reset();
+
         m_kernelInitialized = true;
     }
 
@@ -2493,10 +2504,12 @@ struct EmulationSession::Impl {
             auto msrMods = msrEmu.DetectModifications();
             if (!msrMods.empty()) {
                 m_kernelMSRTampered = true;
+                auto& dkom = DKOMDetector::Instance();
                 for (const auto& mod : msrMods) {
                     m_threatScorer.AddEvasionAttempt(
                         "MSR tampering: " + mod.msrName, 0.88f);
                     m_mitreMapper.OnEvasionAttempt("msr_modification_" + mod.msrName);
+                    dkom.OnMSRWrite(mod.msrIndex, mod.currentValue);
                 }
             }
         }
@@ -2535,6 +2548,30 @@ struct EmulationSession::Impl {
             }
         }
 
+        // High-level DKOM analysis — runs the DKOMDetector correlation engine
+        // which cross-references kernel object state with behavioral signals
+        // (API calls, MSR writes, ring transitions) for severity scoring
+        {
+            auto& dkom = DKOMDetector::Instance();
+            auto report = dkom.RunFullScan();
+            m_kernelDKOMReport = std::move(report);
+
+            for (const auto& tech : m_kernelDKOMReport.mitreTechniquesUsed) {
+                m_kernelMitreTechniques.push_back(tech);
+            }
+        }
+
+        // Collect kernel API tracker telemetry
+        {
+            auto& tracker = WinAPI::Kernel::KernelAPITracker::Instance();
+            m_kernelAPIReport = tracker.GenerateReport();
+
+            for (const auto& tech : m_kernelAPIReport.mitreTechniques) {
+                m_kernelMitreTechniques.push_back(tech);
+                m_mitreMapper.OnEvasionAttempt(tech);
+            }
+        }
+
         // Compute rootkit score
         ComputeRootkitScore();
     }
@@ -2542,7 +2579,7 @@ struct EmulationSession::Impl {
     void ComputeRootkitScore() noexcept {
         float score = 0.0f;
 
-        // DKOM findings
+        // Low-level DKOM findings from KernelObjectManager
         for (const auto& det : m_kernelDKOMDetections) {
             switch (det.type) {
                 case DKOMDetection::Type::ProcessUnlinked: score += 20.0f; break;
@@ -2565,6 +2602,20 @@ struct EmulationSession::Impl {
         // Process list corruption
         if (m_kernelProcessListCorrupted) score += 20.0f;
 
+        // Incorporate DKOMDetector high-level composite score (behavioral correlation)
+        // Weight at 0.3 to blend with the raw structural findings
+        if (m_kernelDKOMReport.overallRootkitScore > 0.0f) {
+            score += m_kernelDKOMReport.overallRootkitScore * 0.3f;
+        }
+
+        // Incorporate kernel API suspicious activity score
+        if (m_kernelAPIReport.suspiciousCalls > 0) {
+            score += std::min(static_cast<float>(m_kernelAPIReport.suspiciousCalls) * 3.0f, 20.0f);
+        }
+        if (m_kernelAPIReport.usesDirectSSDTAccess) score += 10.0f;
+        if (m_kernelAPIReport.usesAPCInjection)     score += 8.0f;
+        if (m_kernelAPIReport.usesMmMapIoSpace)     score += 6.0f;
+
         // Cap at 100
         m_kernelRootkitScore = (score > 100.0f) ? 100.0f : score;
         m_kernelRootkitDetected =
@@ -2576,6 +2627,8 @@ struct EmulationSession::Impl {
     std::vector<uint32_t>      m_kernelSSDTHooks;
     std::vector<uint8_t>       m_kernelIDTHooks;
     std::vector<std::string>   m_kernelMitreTechniques;
+    DKOMAnalysisReport         m_kernelDKOMReport;
+    WinAPI::Kernel::KernelAPIReport m_kernelAPIReport;
     float                      m_kernelRootkitScore = 0.0f;
     bool                       m_kernelRootkitDetected = false;
     bool                       m_kernelProcessListCorrupted = false;
@@ -2819,11 +2872,9 @@ struct EmulationSession::Impl {
         result.msrTamperingDetected      = m_kernelMSRTampered;
         result.kernelMitreTechniques     = std::move(m_kernelMitreTechniques);
 
-        // Aggregate kernel API call counts
-        auto& objMgr = KernelObjectManager::Instance();
-        result.kernelAPICalls = objMgr.GetProcessCount() +
-                                objMgr.GetThreadCount() +
-                                objMgr.GetDriverCount();
+        // Aggregate kernel API call counts from KernelAPITracker
+        result.kernelAPICalls       = m_kernelAPIReport.totalCalls;
+        result.suspiciousKernelAPIs = m_kernelAPIReport.suspiciousCalls;
     }
 
     void DetermineSessionStatus(PhantomEmulationResult& result,
