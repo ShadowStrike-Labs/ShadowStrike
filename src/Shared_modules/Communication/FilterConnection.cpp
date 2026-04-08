@@ -55,8 +55,8 @@
 
 // Include AFTER fltuser.h so __FLT_USER_STRUCTURES_H__ is defined,
 // preventing MessageProtocol.h from redefining FILTER_MESSAGE_HEADER.
-#include "../../PhantomSensor/Shared/MessageProtocol.h"
-#include "../../PhantomSensor/Shared/MessageTypes.h"
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
+#include "../../../PhantomSensor/Shared/MessageTypes.h"
 
 namespace ShadowStrike {
 namespace Communication {

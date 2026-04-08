@@ -160,10 +160,10 @@
 #  define __FLT_USER_STRUCTURES_H__
 #endif
 
-#include "../../PhantomSensor/Shared/MessageProtocol.h"
-#include "../../PhantomSensor/Shared/MessageTypes.h"
-#include "../../PhantomSensor/Shared/VerdictTypes.h"
-#include "../../PhantomSensor/Shared/PortName.h"
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
+#include "../../../PhantomSensor/Shared/MessageTypes.h"
+#include "../../../PhantomSensor/Shared/VerdictTypes.h"
+#include "../../../PhantomSensor/Shared/PortName.h"
 
 // ============================================================================
 // FORWARD DECLARATIONS
