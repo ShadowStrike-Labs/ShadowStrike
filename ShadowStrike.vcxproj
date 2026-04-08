@@ -880,6 +880,9 @@
     <ClCompile Include="tests\unit\config_unit\PolicyManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\ProfileManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_process\ProcessChain_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\MemoryScanner_Tests.cpp" />
@@ -895,6 +898,7 @@
     <ClCompile Include="tests\unit\core_network_unit\NetworkMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\TrafficAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEValidation_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\SafeReader_Tests.cpp" />
