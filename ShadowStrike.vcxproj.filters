@@ -1002,6 +1002,36 @@
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\MemoryScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ProcessAnalyzer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ProcessHollowingDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ProcessInjectionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ProcessKiller_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ProcessMonitor_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ReflectiveDLLDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_process_unit\ThreadHijackDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\unit\core_network_unit\DNSMonitor_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1042,6 +1072,30 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\scripts_unit\VBScriptScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\DeltaUpdater_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\LocalFolderTransport_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\ProgramUpdater_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\RollbackManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\SignatureUpdater_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\UpdateManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\UpdateScheduler_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\update_unit\UpdateVerifier_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\core_registry_unit\PersistenceDetector_Tests.cpp">
@@ -1305,6 +1359,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tests\unit\core_registry_unit\CoreRegistry_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tests\unit\update_unit\Update_TestUtils.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\nlohmann\json.hpp">

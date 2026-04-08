@@ -880,6 +880,16 @@
     <ClCompile Include="tests\unit\config_unit\PolicyManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\ProfileManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\MemoryScanner_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessHollowingDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessInjectionDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessKiller_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ProcessMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ReflectiveDLLDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_process_unit\ThreadHijackDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\DNSMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\FirewallManager_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\NetworkMonitor_Tests.cpp" />
@@ -894,6 +904,14 @@
     <ClCompile Include="tests\unit\scripts_unit\PowerShellScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\PythonScriptScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\VBScriptScanner_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\DeltaUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\LocalFolderTransport_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\ProgramUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\RollbackManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\SignatureUpdater_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateScheduler_Tests.cpp" />
+    <ClCompile Include="tests\unit\update_unit\UpdateVerifier_Tests.cpp" />
     <ClCompile Include="tests\unit\core_registry_unit\PersistenceDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_registry_unit\RegistryAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_registry_unit\RegistryMonitor_Tests.cpp" />
@@ -935,6 +953,7 @@
     <ClInclude Include="tests\unit\core_network_unit\CoreNetwork_TestUtils.hpp" />
     <ClInclude Include="tests\unit\peparser_unit\PEParser_TestUtils.hpp" />
     <ClInclude Include="tests\unit\core_registry_unit\CoreRegistry_TestUtils.hpp" />
+    <ClInclude Include="tests\unit\update_unit\Update_TestUtils.hpp" />
     <ClInclude Include="tests\unit\realtime_unit\RealTime_TestUtils.hpp" />
   </ItemGroup>
   <ItemGroup>
