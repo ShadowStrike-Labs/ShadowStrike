@@ -114,6 +114,12 @@ TEST_F(PersistenceDetectorTest, EntryConversionsPreserveExpectedLocationTypeAndM
     EXPECT_EQ(driverEntry.type, PersistenceType::KernelDriver);
     EXPECT_EQ(driverEntry.status, EntryStatus::Disabled);
 
+    service.startType = SERVICE_BOOT_START;
+    service.serviceType = SERVICE_FILE_SYSTEM_DRIVER;
+    const PersistenceEntry fileSystemDriverEntry = service.asPersistenceEntry();
+    EXPECT_EQ(fileSystemDriverEntry.type, PersistenceType::KernelDriver);
+    EXPECT_EQ(fileSystemDriverEntry.status, EntryStatus::Active);
+
     ScheduledTaskEntry task;
     task.taskName = L"ShadowStrikeTask";
     task.description = L"Task description";
@@ -133,6 +139,14 @@ TEST_F(PersistenceDetectorTest, EntryConversionsPreserveExpectedLocationTypeAndM
     EXPECT_EQ(taskEntry.target.path, task.actions.front().path);
     EXPECT_EQ(taskEntry.target.arguments, task.actions.front().arguments);
     EXPECT_EQ(taskEntry.mitreTechnique, "T1053.005");
+
+    ScheduledTaskEntry actionlessTask;
+    actionlessTask.taskName = L"ActionlessTask";
+    actionlessTask.enabled = true;
+    const PersistenceEntry actionlessTaskEntry = actionlessTask.asPersistenceEntry();
+    EXPECT_TRUE(actionlessTaskEntry.rawCommand.empty());
+    EXPECT_TRUE(actionlessTaskEntry.target.path.empty());
+    EXPECT_EQ(actionlessTaskEntry.status, EntryStatus::Active);
 
     WMISubscription subscription;
     subscription.filterName = L"ShadowStrikeFilter";
@@ -175,6 +189,9 @@ TEST_F(PersistenceDetectorTest, CallbackContractsAndUninitializedGuardsRemainSaf
             L"ShadowStrike",
             L"powershell.exe"),
         PersistenceRiskLevel::Unknown);
+    EXPECT_TRUE(detector.ResolveTarget(L"\"C:\\Temp\\evil.exe\" -nop").path.empty());
+    EXPECT_FALSE(detector.ResolveTarget(L"\"C:\\Temp\\evil.exe\" -nop").exists);
+    EXPECT_TRUE(detector.ResolveComplexCommand(L"rundll32.exe C:\\Temp\\evil.dll,EntryPoint").empty());
 
     const RealTimeAnalysis analysis = detector.AnalyzeRealTimeFull(
         L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",

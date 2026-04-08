@@ -51,8 +51,12 @@ TEST_F(StartupAnalyzerTest, SingletonVersionAndEnumNamesRemainStableForConsumers
         "Investigate");
 
     EXPECT_EQ(GetStartupSourceName(static_cast<StartupSource>(0xFFFF)), "Unknown");
+    EXPECT_EQ(GetStartupStatusName(static_cast<StartupStatus>(0xFFFF)), "Unknown");
     EXPECT_EQ(GetItemCategoryName(static_cast<ItemCategory>(0xFF)), "Unknown");
     EXPECT_EQ(GetActionResultName(static_cast<ActionResult>(0xFF)), "Unknown");
+    EXPECT_EQ(
+        GetOptimizationRecommendationName(static_cast<OptimizationRecommendation>(0xFF)),
+        "Unknown");
 }
 
 TEST_F(StartupAnalyzerTest, ConfigFactoriesAndStatisticsPreserveExpectedProfiles) {
@@ -119,6 +123,17 @@ TEST_F(StartupAnalyzerTest, CallbackAndDefaultStateContractsRemainSafeAfterShutd
     EXPECT_TRUE(analyzer.GetItemsBySource(StartupSource::Service).empty());
     EXPECT_TRUE(analyzer.GetItemsByCategory(ItemCategory::Malicious).empty());
     EXPECT_EQ(analyzer.GetBootBaseline(), 0u);
+    EXPECT_TRUE(analyzer.GetDelayRecommendations().empty());
+    EXPECT_TRUE(analyzer.GetDisableRecommendations().empty());
+    EXPECT_TRUE(analyzer.GetMaliciousItems().empty());
+    EXPECT_TRUE(analyzer.GetSuspiciousItems(0).empty());
+    EXPECT_TRUE(analyzer.GetHistory(0).empty());
+    EXPECT_FALSE(analyzer.RollbackChange(0xDEADBEEFull));
+
+    const StartupItem scannedMissingItem = analyzer.ScanItem(L"MissingEntry");
+    EXPECT_EQ(scannedMissingItem.name, L"MissingEntry");
+    EXPECT_EQ(scannedMissingItem.itemId, 0u);
+    EXPECT_TRUE(scannedMissingItem.command.empty());
 
     const OptimizationPlan plan = analyzer.GetOptimizationPlan();
     EXPECT_EQ(plan.itemsToDelay, 0u);
@@ -126,6 +141,10 @@ TEST_F(StartupAnalyzerTest, CallbackAndDefaultStateContractsRemainSafeAfterShutd
     EXPECT_EQ(plan.itemsToRemove, 0u);
     EXPECT_EQ(plan.estimatedTimeSavedMs, 0u);
     EXPECT_TRUE(plan.isSafe);
+
+    EXPECT_EQ(analyzer.RegisterNewItemCallback({}), 0u);
+    EXPECT_EQ(analyzer.RegisterAlertCallback({}), 0u);
+    EXPECT_EQ(analyzer.RegisterChangeCallback({}), 0u);
 
     const uint64_t newItemCallbackId =
         analyzer.RegisterNewItemCallback([](const StartupItem&) {});

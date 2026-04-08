@@ -321,6 +321,10 @@ void SystemSettingsMonitorStatistics::Reset() noexcept {
 class CallbackManager {
 public:
     uint64_t RegisterChange(SettingChangeCallback callback) {
+        if (!callback) {
+            return 0;
+        }
+
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextId++;
         m_changeCallbacks[id] = std::move(callback);
@@ -328,6 +332,10 @@ public:
     }
 
     uint64_t RegisterAlert(SecurityAlertCallback callback) {
+        if (!callback) {
+            return 0;
+        }
+
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextId++;
         m_alertCallbacks[id] = std::move(callback);
@@ -335,6 +343,10 @@ public:
     }
 
     uint64_t RegisterCompliance(ComplianceCallback callback) {
+        if (!callback) {
+            return 0;
+        }
+
         std::unique_lock lock(m_mutex);
         const uint64_t id = m_nextId++;
         m_complianceCallbacks[id] = std::move(callback);
@@ -419,9 +431,13 @@ public:
         return std::nullopt;
     }
 
-    void SetActiveBaseline(uint64_t id) {
+    bool SetActiveBaseline(uint64_t id) {
         std::unique_lock lock(m_mutex);
+        if (m_baselines.find(id) == m_baselines.end()) {
+            return false;
+        }
         m_activeBaselineId = id;
+        return true;
     }
 
     std::optional<uint64_t> GetActiveBaselineId() const {
@@ -922,7 +938,12 @@ public:
     }
 
     bool SetActiveBaseline(uint64_t baselineId) {
-        m_baselineManager->SetActiveBaseline(baselineId);
+        if (!m_baselineManager->SetActiveBaseline(baselineId)) {
+            SS_LOG_WARN(L"SystemSettingsMonitor", L"Attempted to activate unknown baseline %llu",
+                static_cast<unsigned long long>(baselineId));
+            return false;
+        }
+
         SS_LOG_INFO(L"SystemSettingsMonitor", L"Set active baseline to %llu", static_cast<unsigned long long>(baselineId));
         return true;
     }

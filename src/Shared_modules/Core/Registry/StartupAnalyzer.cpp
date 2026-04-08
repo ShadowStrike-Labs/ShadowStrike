@@ -2430,6 +2430,10 @@ bool StartupAnalyzer::RollbackChange(uint64_t changeId) {
 // ============================================================================
 
 uint64_t StartupAnalyzer::RegisterNewItemCallback(NewItemCallback callback) {
+    if (!callback || !m_impl) {
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->m_callbacksMutex);
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_newItemCallbacks.emplace_back(id, std::move(callback));
@@ -2437,6 +2441,10 @@ uint64_t StartupAnalyzer::RegisterNewItemCallback(NewItemCallback callback) {
 }
 
 uint64_t StartupAnalyzer::RegisterAlertCallback(StartupAlertCallback callback) {
+    if (!callback || !m_impl) {
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->m_callbacksMutex);
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_alertCallbacks.emplace_back(id, std::move(callback));
@@ -2444,6 +2452,10 @@ uint64_t StartupAnalyzer::RegisterAlertCallback(StartupAlertCallback callback) {
 }
 
 uint64_t StartupAnalyzer::RegisterChangeCallback(ItemChangeCallback callback) {
+    if (!callback || !m_impl) {
+        return 0;
+    }
+
     std::lock_guard<std::mutex> lock(m_impl->m_callbacksMutex);
     uint64_t id = m_impl->m_nextCallbackId.fetch_add(1, std::memory_order_relaxed);
     m_impl->m_changeCallbacks.emplace_back(id, std::move(callback));
