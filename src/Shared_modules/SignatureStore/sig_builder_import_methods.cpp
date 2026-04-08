@@ -33,6 +33,7 @@
  */
 
 #include"pch.h"
+#ifdef SHADOWSTRIKE_HAS_YARA  // Entire TU requires libyara SDK
 #include "SignatureBuilder.hpp"
 
 #include <algorithm>
@@ -3065,3 +3066,4 @@ namespace {
 	}
 
 }
+#endif // SHADOWSTRIKE_HAS_YARA

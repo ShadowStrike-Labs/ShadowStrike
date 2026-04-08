@@ -3291,8 +3291,8 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
                     buffer.data() + offset, buffer.size() - offset,
                     instruction, operands))) {
 
-                const char* mnemonicStr = Phantom::Disasm::MnemonicToString(instruction.mnemonic);
-                if (!mnemonicStr) {
+                const std::string_view mnemonicStr = Phantom::Disasm::MnemonicToString(instruction.mnemonic);
+                if (mnemonicStr.empty()) {
                     offset += instruction.length;
                     ++instructionIndex;
                     continue;
@@ -3319,7 +3319,7 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
                 if (isAntiVM) {
                     // Format the full instruction text
                     char fmtBuffer[256] = { 0 };
-                    formatter.FormatInstruction(&instruction, operands,
+                    formatter.FormatInstruction(instruction, operands,
                         instruction.operand_count_visible, fmtBuffer, sizeof(fmtBuffer),
                         virtualAddress + offset);
 

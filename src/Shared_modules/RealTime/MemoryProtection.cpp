@@ -1575,9 +1575,13 @@ namespace RealTime {
                 hchk.HandleExceptionsPermanentlyEnabled     = 1;
                 (void)SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy, &hchk, sizeof(hchk));
 
-                PROCESS_MITIGATION_HEAP_POLICY hp{};
-                hp.TerminateOnHeapErrors = 1;
-                if (!SetProcessMitigationPolicy(ProcessHeapPolicy, &hp, sizeof(hp))) {
+                // PROCESS_MITIGATION_HEAP_POLICY requires recent Windows SDK
+                // Use runtime check via GetProcAddress to remain compatible
+                struct HeapPolicy_ { DWORD Flags; };
+                HeapPolicy_ hp{};
+                hp.Flags = 0x1;  // TerminateOnHeapErrors
+                if (!SetProcessMitigationPolicy(static_cast<PROCESS_MITIGATION_POLICY>(16 /*ProcessHeapPolicy*/),
+                        &hp, sizeof(hp))) {
                     SS_LOG_WARN(LOG_CATEGORY,
                         L"EnableExploitProtection: heap-terminate policy failed (0x%08X)",
                         GetLastError());

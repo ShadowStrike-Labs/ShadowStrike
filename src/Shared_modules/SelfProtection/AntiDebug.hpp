@@ -302,7 +302,9 @@ namespace AntiDebugConstants {
     inline constexpr size_t MAX_PARENT_CHAIN_DEPTH = 10;
     
     /// @brief Process name maximum length
+#ifndef MAX_PROCESS_NAME_LENGTH
     inline constexpr size_t MAX_PROCESS_NAME_LENGTH = 260;
+#endif
 
     // ========================================================================
     // CODE INTEGRITY

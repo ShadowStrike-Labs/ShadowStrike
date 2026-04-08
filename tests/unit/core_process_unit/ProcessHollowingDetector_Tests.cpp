@@ -137,4 +137,31 @@ TEST(ProcessHollowingValueTests, RiskScoreIncludesContextualFlagsAndCapsAtMaximu
     EXPECT_EQ(result.riskScore, 100u);
 }
 
+TEST(ProcessHollowingValueTests, ConfidenceAndRiskScoreHandleEmptyAndIntermediateSignals) {
+    {
+        HollowingDetectionResult result;
+        result.CalculateConfidence();
+        EXPECT_EQ(result.confidence, HollowingConfidence::None);
+    }
+
+    {
+        HollowingDetectionResult result;
+        result.detectionMethods = {
+            DetectionMethod::MemoryProtection,
+            DetectionMethod::EntropyAnomaly
+        };
+        result.CalculateConfidence();
+        EXPECT_EQ(result.confidence, HollowingConfidence::Medium);
+    }
+
+    {
+        HollowingDetectionResult result;
+        result.confidence = HollowingConfidence::High;
+        result.hasUnbackedExecutableMemory = true;
+        result.entryPointAnalysis.hasShellcodePattern = true;
+        result.CalculateRiskScore();
+        EXPECT_EQ(result.riskScore, 85u);
+    }
+}
+
 }  // namespace

@@ -1147,8 +1147,11 @@ void IPCManager::ResetStatistics() {
 // ============================================================================
 
 void IPCManager::WorkerRoutine() {
-    Utils::Logger::Debug("[IPCManager] Worker thread {} started",
-                         std::this_thread::get_id());
+    {
+        std::ostringstream oss;
+        oss << std::this_thread::get_id();
+        Utils::Logger::Debug("[IPCManager] Worker thread {} started", oss.str());
+    }
 
     // Allocate per-thread receive buffer.
     // Wire format: [FILTER_MESSAGE_HEADER (WDK, 12 bytes)] [SHADOWSTRIKE_MESSAGE_HEADER (40 bytes)] [payload]
@@ -1249,8 +1252,11 @@ void IPCManager::WorkerRoutine() {
         DispatchMessage(buffer.data(), pWdkHeader->MessageId);
     }
 
-    Utils::Logger::Debug("[IPCManager] Worker thread {} exiting",
-                         std::this_thread::get_id());
+    {
+        std::ostringstream oss;
+        oss << std::this_thread::get_id();
+        Utils::Logger::Debug("[IPCManager] Worker thread {} exiting", oss.str());
+    }
 }
 
 void IPCManager::DispatchMessage(uint8_t* buffer, uint64_t messageId) {

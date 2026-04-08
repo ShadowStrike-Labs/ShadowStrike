@@ -324,12 +324,12 @@ public:
 
     [[nodiscard]] bool DisassembleBuffer(const uint8_t* buffer, size_t size, uint64_t baseAddress,
                                           bool is64Bit, std::vector<DisassembledInstruction>& out,
-                                          size_t maxInstructions = 0) noexcept {
+                                          size_t maxInstructions = 0) const noexcept {
         if (!m_disasmInitialized || !buffer || size == 0) {
             return false;
         }
 
-        Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
+        const Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
         size_t offset = 0;
         size_t instrCount = 0;
         size_t limit = maxInstructions > 0 ? maxInstructions : MetamorphicConstants::MAX_INSTRUCTIONS;
@@ -3327,10 +3327,10 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
                 Phantom::Disasm::Register reg = instr.operands[i].reg.value;
                 // Map to general purpose register index (0-15 for x64)
                 if (reg >= Phantom::Disasm::Register::RAX && reg <= Phantom::Disasm::Register::R15) {
-                    ++registerUseCounts[reg - Phantom::Disasm::Register::RAX];
+                    ++registerUseCounts[static_cast<int>(reg) - static_cast<int>(Phantom::Disasm::Register::RAX)];
                     ++totalRegisterUses;
                 } else if (reg >= Phantom::Disasm::Register::EAX && reg <= Phantom::Disasm::Register::R15D) {
-                    ++registerUseCounts[reg - Phantom::Disasm::Register::EAX];
+                    ++registerUseCounts[static_cast<int>(reg) - static_cast<int>(Phantom::Disasm::Register::EAX)];
                     ++totalRegisterUses;
                 }
             }

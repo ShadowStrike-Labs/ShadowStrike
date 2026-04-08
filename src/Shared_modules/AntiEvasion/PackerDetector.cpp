@@ -3027,8 +3027,8 @@ private:
                     hasVmDetection = true;
                     break;
                     
-                case Phantom::Disasm::Mnemonic::IN:
-                case Phantom::Disasm::Mnemonic::OUT:
+                case Phantom::Disasm::Mnemonic::IN_INST:
+                case Phantom::Disasm::Mnemonic::OUT_INST:
                     // I/O instructions often used for VM detection (VMware backdoor)
                     if (operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                         uint16_t port = static_cast<uint16_t>(operands[1].imm.value.u);

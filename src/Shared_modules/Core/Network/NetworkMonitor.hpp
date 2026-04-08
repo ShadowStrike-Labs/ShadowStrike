@@ -665,7 +665,7 @@ struct alignas(64) BandwidthStats {
  * @struct ConnectionInfo
  * @brief Comprehensive information about a network connection.
  */
-struct alignas(128) ConnectionInfo {
+struct alignas(64) ConnectionInfo {
     // Connection identity
     uint64_t connectionId{ 0 };                  ///< Unique connection ID
     ConnectionTuple tuple;
@@ -1001,7 +1001,7 @@ struct alignas(64) NetworkMonitorConfig {
  * @struct NetworkMonitorStatistics
  * @brief Runtime statistics for network monitoring.
  */
-struct alignas(128) NetworkMonitorStatistics {
+struct alignas(64) NetworkMonitorStatistics {
     // Connection statistics
     std::atomic<uint64_t> totalConnections{ 0 };
     std::atomic<uint64_t> activeConnections{ 0 };

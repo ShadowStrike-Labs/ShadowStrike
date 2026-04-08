@@ -16,6 +16,7 @@
  * along with this program. If not, see <https://www.gnu.org/licenses/>.
  */
 #include"pch.h"
+#ifdef SHADOWSTRIKE_HAS_YARA  // Entire TU requires libyara SDK
 /*
  * ============================================================================
  * ShadowStrike YaraRuleStore - IMPLEMENTATION
@@ -4619,3 +4620,4 @@ const SignatureDatabaseHeader* YaraRuleStore::GetHeader() const noexcept {
 
 } // namespace SignatureStore
 } // namespace ShadowStrike
+#endif // SHADOWSTRIKE_HAS_YARA

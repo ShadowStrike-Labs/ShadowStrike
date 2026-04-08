@@ -41,7 +41,7 @@ public:
         char* buffer,
         size_t bufferSize,
         uint64_t runtimeAddress = 0,
-        void* userData = nullptr) noexcept;
+        void* userData = nullptr) const noexcept;
 
     [[nodiscard]] bool IsInitialized() const noexcept { return m_initialized; }
     [[nodiscard]] FormatterStyle GetStyle() const noexcept { return m_style; }

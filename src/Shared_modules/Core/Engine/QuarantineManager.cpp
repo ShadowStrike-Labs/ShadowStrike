@@ -489,7 +489,7 @@ public:
             }
 
             // Initialize database
-            m_database = std::make_unique<Database::QuarantineDB>();
+            m_database = Database::QuarantineDB::Create();
             Database::QuarantineDB::Config dbConfig{};
             dbConfig.dbPath = (fs::path(m_config.vaultPath) / L"quarantine.db").wstring();
             dbConfig.quarantineBasePath = m_config.vaultPath;

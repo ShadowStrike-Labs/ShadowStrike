@@ -52,7 +52,18 @@
  */
 
 #pragma once
+
+#ifdef SHADOWSTRIKE_HAS_YARA
 #include <yara.h>
+#else
+// Forward-declare opaque YARA types when the SDK is not available.
+// The YaraRuleStore implementation requires libyara at link time;
+// consuming modules that only reference the header will compile cleanly.
+typedef struct YR_RULES     YR_RULES;
+typedef struct YR_COMPILER  YR_COMPILER;
+typedef struct YR_SCANNER   YR_SCANNER;
+typedef struct YR_RULE      YR_RULE;
+#endif
 
 #include "SignatureFormat.hpp"
 #include <memory>

@@ -22,7 +22,7 @@
  * Coverage focus:
  * - statistics reset, enum-name helpers, and versioning contracts
  * - singleton lifecycle, diagnostics, and built-in self-test behavior
- * - export path validation and readable snapshot generation
+ * - export path validation, statistics accounting, and readable snapshot generation
  */
 
 #include "pch.h"
@@ -76,6 +76,7 @@ TEST(SystemInfoValueTests, StatisticsUtilitiesAndVersionRemainStable) {
 TEST_F(SystemInfoTest, InitializeDiagnosticsAndSelfTestExposeStableContracts) {
     auto& info = SystemInfo::Instance();
     ASSERT_TRUE(info.Initialize());
+    EXPECT_TRUE(info.Initialize());
 
     EXPECT_TRUE(SystemInfo::HasInstance());
     EXPECT_TRUE(info.IsInitialized());
@@ -87,12 +88,38 @@ TEST_F(SystemInfoTest, InitializeDiagnosticsAndSelfTestExposeStableContracts) {
     EXPECT_TRUE(info.SelfTest());
 }
 
+TEST_F(SystemInfoTest, RefreshAndDiagnosticsOnlyAdvanceQueryCountersWhenInitialized) {
+    auto& info = SystemInfo::Instance();
+
+    info.Refresh();
+    EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), 0u);
+
+    ASSERT_TRUE(info.Initialize());
+    info.Refresh();
+    EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), 1u);
+
+    const auto diagnostics = info.RunDiagnostics();
+    ASSERT_FALSE(diagnostics.empty());
+    EXPECT_THAT(diagnostics[2], HasSubstr(L"Initialized: Yes"));
+    EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), 4u);
+}
+
 TEST_F(SystemInfoTest, ExportSnapshotRejectsTraversalAndWritesReadableReport) {
     auto& info = SystemInfo::Instance();
     ASSERT_TRUE(info.Initialize());
 
+    EXPECT_FALSE(info.ExportSnapshot(L""));
+
     const auto blockedPath = MakePath(L"..\\blocked-snapshot.txt");
     EXPECT_FALSE(info.ExportSnapshot(blockedPath.wstring()));
+
+    const auto dottedNamePath = MakePath(L"snapshot..txt");
+    EXPECT_FALSE(info.ExportSnapshot(dottedNamePath.wstring()));
+
+    EXPECT_FALSE(info.ExportSnapshot(std::wstring(MAX_PATH + 1, L'a')));
+
+    const auto missingParentPath = testRoot_ / L"missing-parent" / L"snapshot.txt";
+    EXPECT_FALSE(info.ExportSnapshot(missingParentPath.wstring()));
 
     const auto outputPath = MakePath(L"system-snapshot.txt");
     ASSERT_TRUE(info.ExportSnapshot(outputPath.wstring()));
