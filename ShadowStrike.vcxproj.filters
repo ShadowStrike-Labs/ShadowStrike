@@ -1059,6 +1059,36 @@
     <ClCompile Include="tests\unit\core_registry_unit\SystemSettingsMonitor_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\AccessControlManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\BehaviorBlocker_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\ExploitPrevention_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\FileIntegrityMonitor_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\FileSystemFilter_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\MemoryProtection_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\NetworkTrafficFilter_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\ProcessCreationMonitor_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\RealTimeProtection_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\realtime_unit\ZeroHourProtection_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\unit\communication_unit\AlertSystem_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2214,6 +2244,9 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\antievasion_unit\AntiEvasion_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tests\unit\realtime_unit\RealTime_TestUtils.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
