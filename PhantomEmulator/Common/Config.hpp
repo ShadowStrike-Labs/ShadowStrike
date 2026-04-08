@@ -49,6 +49,7 @@ struct EmulationConfig {
     bool      enableAMSI         = true;            // AMSI bypass detection
     bool      enableVSS          = true;            // VSS deletion detection (ransomware)
     bool      enableWMI          = true;            // WMI query tracking (recon/persistence)
+    bool      enableDotNetAnalysis = true;          // .NET/CLR metadata, MSIL, obfuscation analysis
     bool      blockExternalCalls = true;            // Block unrecognized API calls
 
     // === Anti-evasion ===
@@ -124,6 +125,7 @@ struct EmulationConfig {
     cfg.enableAMSI = false;
     cfg.enableVSS = false;
     cfg.enableWMI = false;
+    cfg.enableDotNetAnalysis = false;
     cfg.yaraScansPerSession = 1;
     return cfg;
 }
@@ -142,6 +144,7 @@ struct EmulationConfig {
     cfg.enableAMSI = true;
     cfg.enableVSS = true;
     cfg.enableWMI = true;
+    cfg.enableDotNetAnalysis = true;
     cfg.yaraScansPerSession = 8;
     return cfg;
 }

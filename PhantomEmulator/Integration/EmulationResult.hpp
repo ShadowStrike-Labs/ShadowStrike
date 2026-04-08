@@ -31,6 +31,7 @@
 #include "../Analysis/CryptoDetector.hpp"
 #include "../Analysis/NetworkBehaviorAnalyzer.hpp"
 #include "../Analysis/EvasionDetector.hpp"
+#include "../Core/CLR/CLRTypes.hpp"
 
 #include <cstdint>
 #include <string>
@@ -146,6 +147,10 @@ struct PhantomEmulationResult {
 
     std::vector<CryptoFinding> cryptoFindings;
     CryptoStats                cryptoStats;
+
+    // === .NET/CLR Analysis ====================================================
+
+    CLR::DotNetAnalysisResult  dotNetAnalysis;
 
     // === Session Status =======================================================
 

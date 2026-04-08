@@ -62,12 +62,12 @@ public:
 
     /// Main entry point: run the full .NET analysis pipeline on a loaded PE.
     [[nodiscard]] DotNetAnalysisResult Analyze(
-        const VirtualMemory& memory,
+        VirtualMemory& memory,
         GuestAddress imageBase) noexcept;
 
     /// Quick predicate: does this PE contain a CLR runtime header?
     [[nodiscard]] static bool IsDotNetAssembly(
-        const VirtualMemory& memory,
+        VirtualMemory& memory,
         GuestAddress imageBase) noexcept;
 
     // ---- Result accessors ----
@@ -89,13 +89,13 @@ private:
     // Analysis pipeline stages
     void AnalyzeMetadata(const MetadataParser& parser) noexcept;
     void AnalyzeMethods(const MetadataParser& parser,
-                        const VirtualMemory& memory,
+                        VirtualMemory& memory,
                         GuestAddress imageBase) noexcept;
     void DetectObfuscation(const MetadataParser& parser) noexcept;
     void ExtractPInvokes(const MetadataParser& parser) noexcept;
     void ClassifyAPICalls() noexcept;
     void DetectPayloadEmbedding(const MetadataParser& parser,
-                                const VirtualMemory& memory,
+                                VirtualMemory& memory,
                                 GuestAddress imageBase) noexcept;
     void ComputeThreatScore() noexcept;
 

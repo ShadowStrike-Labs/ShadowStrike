@@ -44,7 +44,7 @@ namespace {
 // Const-safe guest memory reader via GetHostReadPtr (page-granular)
 // ----------------------------------------------------------------------------
 
-[[nodiscard]] bool ReadGuestMemory(const VirtualMemory& mem,
+[[nodiscard]] bool ReadGuestMemory(VirtualMemory& mem,
                                    GuestAddress addr,
                                    void* dst,
                                    uint32_t size) noexcept
@@ -148,7 +148,7 @@ struct PEInfo {
     uint32_t clrSize              = 0;
 };
 
-[[nodiscard]] PEInfo ParsePEHeaders(const VirtualMemory& mem,
+[[nodiscard]] PEInfo ParsePEHeaders(VirtualMemory& mem,
                                     GuestAddress imageBase) noexcept
 {
     PEInfo info;
@@ -612,7 +612,7 @@ void DotNetAnalyzer::Reset() noexcept {
 // ============================================================================
 
 bool DotNetAnalyzer::IsDotNetAssembly(
-    const VirtualMemory& memory,
+    VirtualMemory& memory,
     GuestAddress imageBase) noexcept
 {
     const auto pe = ParsePEHeaders(memory, imageBase);
@@ -626,7 +626,7 @@ bool DotNetAnalyzer::IsDotNetAssembly(
 // ============================================================================
 
 DotNetAnalysisResult DotNetAnalyzer::Analyze(
-    const VirtualMemory& memory,
+    VirtualMemory& memory,
     GuestAddress imageBase) noexcept
 {
     m_impl->ResetWorking();
@@ -734,12 +734,12 @@ void DotNetAnalyzer::AnalyzeMetadata(const MetadataParser& parser) noexcept {
         }
 
         // Entry point method
-        const auto entryTok = parser.GetEntryPointToken();
-        if (!entryTok.IsNull() &&
+        MetadataToken entryTok{ cor20.entryPointToken };
+        if (entryTok.Row() != 0 &&
             entryTok.Table() == MetadataTableId::MethodDef)
         {
             const uint32_t row = entryTok.Row();
-            if (row > 0 && row <= methodDefs.size())
+            if (row > 0 && row <= static_cast<uint32_t>(methodDefs.size()))
                 result.entryPointMethod = methodDefs[row - 1].name;
         }
 
@@ -786,7 +786,7 @@ void DotNetAnalyzer::AnalyzeMetadata(const MetadataParser& parser) noexcept {
 
 void DotNetAnalyzer::AnalyzeMethods(
     const MetadataParser& parser,
-    const VirtualMemory& memory,
+    VirtualMemory& memory,
     GuestAddress imageBase) noexcept
 {
     try {
@@ -1419,7 +1419,7 @@ void DotNetAnalyzer::ClassifyAPICalls() noexcept {
 
 void DotNetAnalyzer::DetectPayloadEmbedding(
     const MetadataParser& parser,
-    const VirtualMemory& memory,
+    VirtualMemory& memory,
     GuestAddress imageBase) noexcept
 {
     try {

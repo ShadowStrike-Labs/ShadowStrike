@@ -18,6 +18,7 @@
  */
 
 #include "MSILInterpreter.hpp"
+#include "MetadataParser.hpp"
 #include "CLRTypes.hpp"
 
 #include <algorithm>
@@ -383,16 +384,47 @@ struct MSILInterpreter::Impl {
 
             if (table == MetadataTableId::MethodDef) {
                 rm.isLocal = true;
-                // Attempt to resolve from MetadataParser.
-                // The parser exposes GetMethodDefRows() and GetTypeDefRows().
-                // We search TypeDef rows to find which type owns this MethodDef row.
-                // This is best-effort: failures leave rm with empty strings.
+                const auto& methodDefs = metadata.GetMethodDefs();
+                if (row <= static_cast<uint32_t>(methodDefs.size())) {
+                    rm.methodName = methodDefs[row - 1].name;
+                    // Find owning type by scanning TypeDefs
+                    const auto& typeDefs = metadata.GetTypeDefs();
+                    for (uint32_t t = 0; t < static_cast<uint32_t>(typeDefs.size()); ++t) {
+                        uint32_t mStart = typeDefs[t].methodList;
+                        uint32_t mEnd   = (t + 1 < static_cast<uint32_t>(typeDefs.size()))
+                                              ? typeDefs[t + 1].methodList
+                                              : static_cast<uint32_t>(methodDefs.size()) + 1;
+                        if (row >= mStart && row < mEnd) {
+                            rm.nameSpace = typeDefs[t].typeNamespace;
+                            rm.className = typeDefs[t].typeName;
+                            break;
+                        }
+                    }
+                }
+            } else if (table == MetadataTableId::MemberRef) {
+                const auto& memberRefs = metadata.GetMemberRefs();
+                if (row <= static_cast<uint32_t>(memberRefs.size())) {
+                    const auto& ref = memberRefs[row - 1];
+                    rm.methodName = ref.name;
+                    // Resolve the class via the coded index token
+                    MetadataToken parentTok{ ref.classCodedIndex };
+                    std::string resolved = metadata.ResolveToken(parentTok);
+                    // Split "Namespace.ClassName" into parts
+                    auto lastDot = resolved.rfind('.');
+                    if (lastDot != std::string::npos) {
+                        rm.nameSpace = resolved.substr(0, lastDot);
+                        rm.className = resolved.substr(lastDot + 1);
+                    } else {
+                        rm.className = resolved;
+                    }
+                }
+            } else {
+                // For other table types, use generic token resolution
+                std::string resolved = metadata.ResolveToken(tok);
+                if (!resolved.empty()) {
+                    rm.methodName = resolved;
+                }
             }
-            // For MemberRef and MethodDef, we would call into MetadataParser.
-            // Since the parser is built in parallel we keep this thin:
-            // the actual resolution happens below via a compile-time check
-            // (see the #if 0 block) — but in the shipping build the caller
-            // populates the ResolvedMethod fields through ResolveMethodToken().
 
         } catch (...) {
             // Never propagate — hostile IL is expected.
@@ -1480,14 +1512,8 @@ struct MSILInterpreter::Impl {
     uint32_t HandleCall(const MSILInstruction& instr, uint32_t pc) noexcept {
         MetadataToken tok{ instr.operand.token };
 
-        // Resolve the method target
-        ResolvedMethod rm;
-        try {
-            rm = metadata.ResolveMethodToken(tok);
-        } catch (...) {
-            // Resolution failed — record as unknown, push Null, continue
-            rm.methodName = "?";
-        }
+        // Resolve the method target using our local ResolveToken bridge
+        ResolvedMethod rm = ResolveToken(tok);
 
         // Record API call
         RecordAPICall(rm, tok, instr.offset);
@@ -1683,8 +1709,8 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
     // fetch their IL bytes via the body provider, and execute them.
     //
     // MetadataParser exposes:
-    //   const std::vector<TypeDefRow>&   GetTypeDefRows() const;
-    //   const std::vector<MethodDefRow>& GetMethodDefRows() const;
+    //   const std::vector<TypeDefRow>&   GetTypeDefs() const;
+    //   const std::vector<MethodDefRow>& GetMethodDefs() const;
     //
     // For each TypeDef, MethodDef rows from [methodList, next.methodList) belong
     // to that type.  We look for methods named ".cctor".
@@ -1692,8 +1718,8 @@ InterpretationResult MSILInterpreter::ExecuteStaticConstructors(
     InterpretationResult aggregated;
 
     try {
-        const auto& typeDefs   = m_impl->metadata.GetTypeDefRows();
-        const auto& methodDefs = m_impl->metadata.GetMethodDefRows();
+        const auto& typeDefs   = m_impl->metadata.GetTypeDefs();
+        const auto& methodDefs = m_impl->metadata.GetMethodDefs();
 
         for (uint32_t tIdx = 0; tIdx < static_cast<uint32_t>(typeDefs.size()); ++tIdx) {
             uint32_t mStart = typeDefs[tIdx].methodList;
