@@ -21,8 +21,8 @@
  *
  * Coverage focus:
  * - configuration presets and statistics reset behavior
- * - initialization, callback registration, and safe fresh-state throttling logic
- * - kernel-metric ingestion and round-tripping through the public API
+ * - initialization, callback registration quirks, and safe fresh-state throttling logic
+ * - kernel-metric ingestion, forced metadata updates, and persistence through shutdown
  */
 
 #include "pch.h"
@@ -141,6 +141,61 @@ TEST_F(PerformanceMonitorTest, KernelMetricsRoundTripPreservesReportedValues) {
     EXPECT_EQ(observed.dpcQueueDepth, 3u);
     EXPECT_EQ(observed.kernelHandleCount, 9876u);
     EXPECT_GT(observed.sampleTime.time_since_epoch().count(), 0);
+}
+
+TEST_F(PerformanceMonitorTest, EmptyCallbacksStillRegisterAndUnregisterCleanly) {
+    auto& monitor = PerformanceMonitor::Instance();
+
+    const auto resourceId = monitor.RegisterResourceUsageCallback(ResourceUsageCallback{});
+    const auto anomalyId = monitor.RegisterAnomalyCallback(AnomalyCallback{});
+    const auto throttleId = monitor.RegisterThrottleCallback(ThrottleCallback{});
+
+    EXPECT_NE(resourceId, 0u);
+    EXPECT_NE(anomalyId, 0u);
+    EXPECT_NE(throttleId, 0u);
+    EXPECT_NE(resourceId, anomalyId);
+    EXPECT_NE(anomalyId, throttleId);
+
+    monitor.UnregisterResourceUsageCallback(resourceId);
+    monitor.UnregisterResourceUsageCallback(resourceId);
+    monitor.UnregisterAnomalyCallback(anomalyId);
+    monitor.UnregisterAnomalyCallback(anomalyId);
+    monitor.UnregisterThrottleCallback(throttleId);
+    monitor.UnregisterThrottleCallback(throttleId);
+}
+
+TEST_F(PerformanceMonitorTest, KernelMetricsAreForcedPresentAndPersistAcrossShutdown) {
+    auto& monitor = PerformanceMonitor::Instance();
+    ASSERT_TRUE(monitor.Initialize(PerformanceMonitorConfig::CreateDefault()));
+
+    KernelResourceMetrics metrics;
+    metrics.nonPagedPoolUsageBytes = 16384;
+    metrics.interruptRate = 77;
+    metrics.kernelHandleCount = 321;
+    metrics.hasKernelData = false;
+    metrics.sampleTime = std::chrono::steady_clock::time_point{};
+
+    monitor.UpdateKernelMetrics(metrics);
+    const auto observed = monitor.GetKernelMetrics();
+    EXPECT_TRUE(observed.hasKernelData);
+    EXPECT_EQ(observed.nonPagedPoolUsageBytes, 16384u);
+    EXPECT_EQ(observed.interruptRate, 77u);
+    EXPECT_EQ(observed.kernelHandleCount, 321u);
+    EXPECT_NE(observed.sampleTime, metrics.sampleTime);
+
+    monitor.Shutdown();
+    const auto afterShutdown = monitor.GetKernelMetrics();
+    EXPECT_TRUE(afterShutdown.hasKernelData);
+    EXPECT_EQ(afterShutdown.nonPagedPoolUsageBytes, 16384u);
+    EXPECT_EQ(afterShutdown.interruptRate, 77u);
+    EXPECT_EQ(afterShutdown.kernelHandleCount, 321u);
+
+    ASSERT_TRUE(monitor.Initialize(PerformanceMonitorConfig::CreateDefault()));
+    const auto afterReinitialize = monitor.GetKernelMetrics();
+    EXPECT_TRUE(afterReinitialize.hasKernelData);
+    EXPECT_EQ(afterReinitialize.nonPagedPoolUsageBytes, 16384u);
+    EXPECT_EQ(afterReinitialize.interruptRate, 77u);
+    EXPECT_EQ(afterReinitialize.kernelHandleCount, 321u);
 }
 
 }  // namespace
