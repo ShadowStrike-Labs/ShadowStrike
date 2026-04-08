@@ -43,26 +43,51 @@ TEST_F(CPUMonitorTest, ConfigValidationRejectsOutOfRangeValues) {
     SSP::CPUMonitorConfig config;
     EXPECT_TRUE(config.IsValid());
 
+    config.samplingIntervalMs = 100;
+    EXPECT_TRUE(config.IsValid());
+    config.samplingIntervalMs = 60000;
+    EXPECT_TRUE(config.IsValid());
     config.samplingIntervalMs = 99;
     EXPECT_FALSE(config.IsValid());
     config.samplingIntervalMs = 1000;
 
+    config.highUsageThreshold = 1.0;
+    EXPECT_TRUE(config.IsValid());
+    config.highUsageThreshold = 100.0;
+    EXPECT_TRUE(config.IsValid());
     config.highUsageThreshold = 0.5;
     EXPECT_FALSE(config.IsValid());
     config.highUsageThreshold = 75.0;
 
+    config.cryptoMinerThresholdPercent = 1.0;
+    EXPECT_TRUE(config.IsValid());
+    config.cryptoMinerThresholdPercent = 100.0;
+    EXPECT_TRUE(config.IsValid());
     config.cryptoMinerThresholdPercent = 101.0;
     EXPECT_FALSE(config.IsValid());
     config.cryptoMinerThresholdPercent = 80.0;
 
+    config.selfUsageAlertThreshold = 0.1;
+    EXPECT_TRUE(config.IsValid());
+    config.selfUsageAlertThreshold = 100.0;
+    EXPECT_TRUE(config.IsValid());
     config.selfUsageAlertThreshold = 0.0;
     EXPECT_FALSE(config.IsValid());
     config.selfUsageAlertThreshold = 5.0;
 
+    config.maxTrackedProcesses = 65536;
+    EXPECT_TRUE(config.IsValid());
     config.maxTrackedProcesses = 0;
     EXPECT_FALSE(config.IsValid());
     config.maxTrackedProcesses = 512;
+    config.maxTrackedProcesses = 65537;
+    EXPECT_FALSE(config.IsValid());
+    config.maxTrackedProcesses = 512;
 
+    config.historySize = 1;
+    EXPECT_TRUE(config.IsValid());
+    config.historySize = 3600;
+    EXPECT_TRUE(config.IsValid());
     config.historySize = 3601;
     EXPECT_FALSE(config.IsValid());
 }
@@ -154,18 +179,25 @@ TEST_F(CPUMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishedSamples) {
     EXPECT_FALSE(monitor.GetProcessUsage(0xFFFFFFFFu).has_value());
     EXPECT_FALSE(monitor.GetProcessInfo(0xFFFFFFFFu).has_value());
     EXPECT_TRUE(monitor.GetTopConsumers(0).empty());
+    EXPECT_TRUE(monitor.GetTopConsumers(32).empty());
     EXPECT_GE(monitor.GetSelfUsage(), 0.0);
     EXPECT_FALSE(monitor.IsSelfUsageExcessive());
+    EXPECT_TRUE(monitor.IsSystemUnderLoad(0.0));
     EXPECT_FALSE(monitor.IsSystemUnderLoad(101.0));
 }
 
 TEST_F(CPUMonitorTest, CallbackRegistrationUsesStableNonZeroIdsAndRejectsNullHandlers) {
     const uint32_t callbackId = monitor.RegisterHighCpuCallback(
         [](uint32_t, const std::wstring&, double) {});
+    const uint32_t secondCallbackId = monitor.RegisterHighCpuCallback(
+        [](uint32_t, const std::wstring&, double) {});
     EXPECT_NE(callbackId, 0u);
+    EXPECT_NE(secondCallbackId, 0u);
+    EXPECT_NE(secondCallbackId, callbackId);
     EXPECT_EQ(monitor.RegisterHighCpuCallback({}), 0u);
 
     monitor.UnregisterHighCpuCallback(callbackId);
+    monitor.UnregisterHighCpuCallback(secondCallbackId);
     monitor.UnregisterHighCpuCallback(callbackId);
     monitor.UnregisterHighCpuCallback(0);
 }

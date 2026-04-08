@@ -14,7 +14,9 @@
 #include "pch.h"
 
 #include <gtest/gtest.h>
+#include <nlohmann/json.hpp>
 
+#include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
@@ -27,6 +29,12 @@ namespace SSP = ShadowStrike::Performance;
 
 namespace ShadowStrike::Performance::Test {
 namespace {
+
+using nlohmann::json;
+
+json ParseJson(const std::string& text) {
+    return json::parse(text);
+}
 
 class PerformanceProfilerTest : public ::testing::Test {
 protected:
@@ -58,6 +66,21 @@ TEST_F(PerformanceProfilerTest, SystemResourceUsageSerializationContainsExpected
     EXPECT_NE(json.find("\"cpuUsagePercent\":12.5"), std::string::npos);
     EXPECT_NE(json.find("\"workingSetBytes\":4096"), std::string::npos);
     EXPECT_NE(json.find("\"pageFaultCount\":7"), std::string::npos);
+}
+
+TEST_F(PerformanceProfilerTest, EmptyReportAndResourceUsageExposeStableDefaultShape) {
+    const json report = ParseJson(profiler.GenerateReport());
+    EXPECT_EQ(report["session"], "");
+    EXPECT_EQ(report["total_samples"], 0);
+    EXPECT_TRUE(report["statistics"].is_object());
+    EXPECT_TRUE(report["statistics"].empty());
+    EXPECT_TRUE(report["events"].is_array());
+    EXPECT_TRUE(report["events"].empty());
+
+    const SSP::SystemResourceUsage usage = profiler.GetResourceUsage();
+    EXPECT_TRUE(std::isfinite(usage.processCpuUsagePercent));
+    EXPECT_GE(usage.processCpuUsagePercent, 0.0);
+    EXPECT_LE(usage.processCpuUsagePercent, 100.0);
 }
 
 TEST_F(PerformanceProfilerTest, SessionLifecycleAndDisabledModeBehaveSafely) {
@@ -106,9 +129,47 @@ TEST_F(PerformanceProfilerTest, ScopedProfileRecordsEventsAndClearHistoryResetsA
     EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
 }
 
+TEST_F(PerformanceProfilerTest, SessionReplacementAndNameLengthLimitsResetStateDeterministically) {
+    profiler.StartSession("first-session");
+    {
+        SSP::ScopedProfile scoped("first-metric");
+        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    }
+    EXPECT_GT(profiler.GetAverageExecutionTimeMs("first-metric"), 0.0);
+
+    profiler.StartSession("second-session");
+    const json secondSessionReport = ParseJson(profiler.GenerateReport());
+    EXPECT_EQ(secondSessionReport["session"], "second-session");
+    EXPECT_TRUE(secondSessionReport["statistics"].empty());
+    EXPECT_TRUE(secondSessionReport["events"].empty());
+    EXPECT_EQ(profiler.GetAverageExecutionTimeMs("first-metric"), 0.0);
+
+    const std::string maxLengthSessionName(300, 's');
+    profiler.StartSession(maxLengthSessionName);
+    const json truncatedReport = ParseJson(profiler.GenerateReport());
+    ASSERT_TRUE(truncatedReport["session"].is_string());
+    EXPECT_EQ(truncatedReport["session"].get<std::string>(),
+              maxLengthSessionName.substr(0, 256));
+
+    const std::string acceptedProfileName(256, 'p');
+    profiler.StartProfile(acceptedProfileName);
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 1u);
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    profiler.StopProfile(acceptedProfileName);
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
+    EXPECT_GT(profiler.GetAverageExecutionTimeMs(acceptedProfileName), 0.0);
+
+    const std::string rejectedProfileName(257, 'q');
+    profiler.StartProfile(rejectedProfileName);
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
+    profiler.StopProfile(rejectedProfileName);
+    EXPECT_EQ(profiler.GetAverageExecutionTimeMs(rejectedProfileName), 0.0);
+}
+
 TEST_F(PerformanceProfilerTest, SaveReportRejectsUnsafePathsAndWritesTempReport) {
     EXPECT_FALSE(profiler.SaveReport({}));
     EXPECT_FALSE(profiler.SaveReport(std::filesystem::path(L"\\\\?\\C:\\unsafe-report.json")));
+    EXPECT_FALSE(profiler.SaveReport(std::filesystem::path(L"\\\\.\\C:\\device-report.json")));
 
     profiler.StartSession("save-report");
     {
@@ -133,6 +194,35 @@ TEST_F(PerformanceProfilerTest, SaveReportRejectsUnsafePathsAndWritesTempReport)
 
     input.close();
     std::filesystem::remove(reportPath, ec);
+
+    const std::filesystem::path nestedDir =
+        std::filesystem::temp_directory_path() / "shadowstrike-profiler-nested";
+    const std::filesystem::path nestedReportPath = nestedDir / "report.txt";
+    std::filesystem::remove(nestedReportPath, ec);
+    std::filesystem::remove_all(nestedDir, ec);
+
+    ASSERT_TRUE(profiler.SaveReport(nestedReportPath));
+    EXPECT_TRUE(std::filesystem::exists(nestedReportPath));
+    std::ifstream nestedInput(nestedReportPath, std::ios::binary);
+    ASSERT_TRUE(nestedInput.is_open());
+    const std::string nestedContent((std::istreambuf_iterator<char>(nestedInput)),
+                                    std::istreambuf_iterator<char>());
+    EXPECT_NE(nestedContent.find("save-report"), std::string::npos);
+    nestedInput.close();
+
+    std::filesystem::remove(nestedReportPath, ec);
+    std::filesystem::remove_all(nestedDir, ec);
+}
+
+TEST_F(PerformanceProfilerTest, ClearHistoryRemovesInflightProfilesAndLateStopsRemainNoOp) {
+    profiler.StartSession("clear-history");
+    profiler.StartProfile("inflight");
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 1u);
+
+    profiler.ClearHistory();
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
+    profiler.StopProfile("inflight");
+    EXPECT_EQ(profiler.GetAverageExecutionTimeMs("inflight"), 0.0);
 }
 
 TEST_F(PerformanceProfilerTest, SelfTestPassesAndRestoresEnabledState) {
