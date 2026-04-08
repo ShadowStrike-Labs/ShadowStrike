@@ -252,42 +252,126 @@ enum class Mnemonic : uint16_t {
     // AVX / AVX2
     // =========================================================================
 
+    // --- Arithmetic ---
     VADDPS, VADDPD, VADDSS, VADDSD, VSUBPS, VSUBPD, VSUBSS, VSUBSD,
     VMULPS, VMULPD, VMULSS, VMULSD, VDIVPS, VDIVPD, VDIVSS, VDIVSD,
+    VSQRTPS, VSQRTPD, VSQRTSS, VSQRTSD,
+    VRSQRTPS, VRSQRTSS, VRCPPS, VRCPSS,
+    VMINPS, VMINPD, VMINSS, VMINSD, VMAXPS, VMAXPD, VMAXSS, VMAXSD,
 
+    // --- Logic ---
+    VANDPS, VANDPD, VANDNPS, VANDNPD,
+    VORPS, VORPD, VXORPS, VXORPD,
+
+    // --- Compare ---
+    VCMPPS, VCMPPD, VCMPSS, VCMPSD_CMP,
+    VUCOMISS, VUCOMISD, VCOMISS, VCOMISD,
+
+    // --- Move ---
     VMOVAPS, VMOVUPS, VMOVAPD, VMOVUPD, VMOVDQA, VMOVDQU,
     VMOVSS, VMOVSD_AVX, VMOVD, VMOVQ,
+    VMOVLPS, VMOVLPD, VMOVHPS, VMOVHPD,
+    VMOVHLPS, VMOVLHPS,
+    VMOVSLDUP, VMOVSHDUP, VMOVDDUP,
+    VMOVNTPS, VMOVNTPD, VMOVNTDQ,
+    VMOVMSKPS, VMOVMSKPD,
 
-    VBROADCASTSS, VBROADCASTSD, VBROADCASTF128,
+    // --- Unpack/Shuffle ---
+    VUNPCKLPS, VUNPCKHPS, VUNPCKLPD, VUNPCKHPD,
+    VSHUFPS, VSHUFPD,
+    VPSHUFHW, VPSHUFLW,
 
+    // --- Convert ---
+    VCVTSI2SS, VCVTSI2SD,
+    VCVTSS2SI, VCVTSD2SI, VCVTTSS2SI, VCVTTSD2SI,
+    VCVTPS2PD, VCVTPD2PS, VCVTSS2SD, VCVTSD2SS,
+    VCVTDQ2PS, VCVTPS2DQ, VCVTDQ2PD, VCVTPD2DQ,
+    VCVTTPS2DQ, VCVTTPD2DQ,
+
+    // --- Broadcast ---
+    VBROADCASTSS, VBROADCASTSD, VBROADCASTF128, VBROADCASTI128,
+
+    // --- Permute ---
     VPERM2F128, VPERM2I128, VPERMD, VPERMQ, VPERMPS, VPERMPD,
+    VPERMILPS, VPERMILPD,
 
+    // --- Integer packed logic ---
     VPAND, VPANDN, VPOR, VPXOR, VPTEST,
 
-    VPADDB, VPADDW, VPADDD, VPADDQ, VPSUBB, VPSUBW, VPSUBD, VPSUBQ,
+    // --- Integer packed arithmetic ---
+    VPADDB, VPADDW, VPADDD, VPADDQ,
+    VPSUBB, VPSUBW, VPSUBD, VPSUBQ,
+    VPADDUSB, VPADDUSW, VPADDSB, VPADDSW,
+    VPSUBUSB, VPSUBUSW, VPSUBSB, VPSUBSW,
     VPMULLW, VPMULLD, VPMULUDQ, VPMULDQ,
+    VPMULHW, VPMULHUW, VPMULHRSW,
+    VPMADDWD, VPMADDUBSW,
+    VPSADBW,
+    VPAVGB, VPAVGW,
 
+    // --- Integer packed compare ---
     VPCMPEQB, VPCMPEQW, VPCMPEQD, VPCMPEQQ,
     VPCMPGTB, VPCMPGTW, VPCMPGTD, VPCMPGTQ,
 
+    // --- Integer packed min/max ---
     VPMINUB, VPMINUW, VPMINUD, VPMINSB, VPMINSW, VPMINSD,
     VPMAXUB, VPMAXUW, VPMAXUD, VPMAXSB, VPMAXSW, VPMAXSD,
 
+    // --- Integer packed shift ---
     VPSLLW, VPSLLD, VPSLLQ, VPSLLDQ, VPSRLW, VPSRLD, VPSRLQ, VPSRLDQ, VPSRAW, VPSRAD,
     VPSLLVD, VPSLLVQ, VPSRLVD, VPSRLVQ, VPSRAVD,
 
-    VPSHUFD, VPSHUFB, VSHUFPS, VSHUFPD,
-
+    // --- Integer shuffle / unpack ---
+    VPSHUFD, VPSHUFB,
     VPUNPCKLBW, VPUNPCKLWD, VPUNPCKLDQ, VPUNPCKLQDQ,
     VPUNPCKHBW, VPUNPCKHWD, VPUNPCKHDQ, VPUNPCKHQDQ,
+    VPACKSSWB, VPACKUSWB, VPACKSSDW, VPACKUSDW,
+    VPALIGNR,
 
+    // --- Integer blend / insert / extract ---
     VPBLENDW, VPBLENDVB, VPBLENDD, VBLENDPS, VBLENDPD,
+    VBLENDVPS, VBLENDVPD,
+    VPINSRB, VPINSRW, VPINSRD, VPINSRQ,
+    VPEXTRB, VPEXTRW, VPEXTRD, VPEXTRQ,
+    VINSERTPS, VEXTRACTPS,
 
+    // --- Integer abs / sign / hadd ---
+    VPABSB, VPABSW, VPABSD,
+    VPHADDW, VPHADDD, VPHADDSW,
+    VPHSUBW, VPHSUBD, VPHSUBSW,
+    VPSIGNB, VPSIGNW, VPSIGND,
+    VPHMINPOSUW,
+    VPMOVMSKB,
+
+    // --- Integer sign/zero extend ---
+    VPMOVSXBW, VPMOVSXBD, VPMOVSXBQ, VPMOVSXWD, VPMOVSXWQ, VPMOVSXDQ,
+    VPMOVZXBW, VPMOVZXBD, VPMOVZXBQ, VPMOVZXWD, VPMOVZXWQ, VPMOVZXDQ,
+
+    // --- SSE3 horizontal ---
+    VHADDPS, VHADDPD, VHSUBPS, VHSUBPD,
+    VADDSUBPS, VADDSUBPD,
+    VLDDQU,
+
+    // --- SSE4 round / dot product ---
+    VROUNDPS, VROUNDPD, VROUNDSS, VROUNDSD,
+    VDPPS, VDPPD, VMPSADBW,
+
+    // --- SSE4.2 string ---
+    VPCMPESTRM, VPCMPESTRI, VPCMPISTRM, VPCMPISTRI,
+
+    // --- AVX2 insert/extract 128/256 ---
     VINSERTF128, VINSERTF32X4, VINSERTI128, VINSERTI32X4,
     VEXTRACTF128, VEXTRACTF32X4, VEXTRACTI128, VEXTRACTI32X4,
 
+    // --- AVX2 gather ---
     VPGATHERDD, VPGATHERDQ, VPGATHERQD, VPGATHERQQ,
     VGATHERDPS, VGATHERDPD, VGATHERQPS, VGATHERQPD,
+
+    // --- AVX2 mask move ---
+    VMASKMOVPS, VMASKMOVPD, VPMASKMOVD, VPMASKMOVQ,
+
+    // --- AVX2 LDMXCSR/STMXCSR ---
+    VLDMXCSR, VSTMXCSR,
 
     // --- FMA ---
     VFMADD132PS, VFMADD213PS, VFMADD231PS,
@@ -296,8 +380,16 @@ enum class Mnemonic : uint16_t {
     VFMADD132SD, VFMADD213SD, VFMADD231SD,
     VFMSUB132PS, VFMSUB213PS, VFMSUB231PS,
     VFMSUB132PD, VFMSUB213PD, VFMSUB231PD,
+    VFMSUB132SS, VFMSUB213SS, VFMSUB231SS,
+    VFMSUB132SD, VFMSUB213SD, VFMSUB231SD,
     VFNMADD132PS, VFNMADD213PS, VFNMADD231PS,
     VFNMADD132PD, VFNMADD213PD, VFNMADD231PD,
+    VFNMADD132SS, VFNMADD213SS, VFNMADD231SS,
+    VFNMADD132SD, VFNMADD213SD, VFNMADD231SD,
+    VFNMSUB132PS, VFNMSUB213PS, VFNMSUB231PS,
+    VFNMSUB132PD, VFNMSUB213PD, VFNMSUB231PD,
+    VFNMSUB132SS, VFNMSUB213SS, VFNMSUB231SS,
+    VFNMSUB132SD, VFNMSUB213SD, VFNMSUB231SD,
 
     VZEROALL, VZEROUPPER,
 
@@ -372,9 +464,6 @@ enum class Mnemonic : uint16_t {
     VPTESTMD, VPTESTMQ, VPTESTNMD, VPTESTNMQ,
     VPTERNLOGD, VPTERNLOGQ,
 
-    VPMOVZXBD, VPMOVZXBW, VPMOVZXBQ, VPMOVZXWD, VPMOVZXWQ, VPMOVZXDQ,
-    VPMOVSXBD, VPMOVSXBW, VPMOVSXBQ, VPMOVSXWD, VPMOVSXWQ, VPMOVSXDQ,
-
     VCVTPS2PH, VCVTPH2PS,
 
     VPCONFLICTD, VPCONFLICTQ, VPLZCNTD, VPLZCNTQ,
@@ -386,6 +475,58 @@ enum class Mnemonic : uint16_t {
     VFIXUPIMMPS, VFIXUPIMMPD, VFIXUPIMMSS, VFIXUPIMMSD,
     VGETEXPPS, VGETEXPPD, VGETEXPSS, VGETEXPSD,
     VGETMANTPS, VGETMANTPD, VGETMANTSS, VGETMANTSD,
+
+    // =========================================================================
+    // VMX / SVM Virtualization
+    // =========================================================================
+
+    VMCALL, VMLAUNCH, VMRESUME, VMXOFF,
+    VMREAD, VMWRITE, VMPTRLD, VMPTRST, VMCLEAR, VMXON,
+    INVEPT, INVVPID,
+
+    // =========================================================================
+    // MONITOR / MWAIT
+    // =========================================================================
+
+    MONITOR_INST, MWAIT_INST,
+
+    // =========================================================================
+    // AVX-512 additional
+    // =========================================================================
+
+    VADDPD_Z, VSUBPD_Z, VMULPD_Z, VDIVPD_Z,
+    VANDPS_Z, VANDPD_Z, VORPS_Z, VORPD_Z, VXORPS_Z, VXORPD_Z,
+
+    VPCMPB, VPCMPW, VPCMPD, VPCMPQ,
+    VPCMPUB, VPCMPUW, VPCMPUD, VPCMPUQ,
+
+    VPBROADCASTB, VPBROADCASTW, VPBROADCASTD, VPBROADCASTQ,
+
+    VSCATTERDPS, VSCATTERDPD, VSCATTERQPS, VSCATTERQPD,
+    VPSCATTERDD, VPSCATTERDQ, VPSCATTERQD, VPSCATTERQQ,
+
+    VPROLD, VPROLQ, VPRORD, VPRORQ,
+    VPROLVD, VPROLVQ, VPRORVD, VPRORVQ,
+
+    VPANDD, VPANDQ, VPANDND, VPANDNQ,
+    VPORD, VPORQ, VPXORD, VPXORQ,
+
+    VCVTUDQ2PS, VCVTUDQ2PD, VCVTPS2UDQ, VCVTPD2UDQ,
+    VCVTTPS2UDQ, VCVTTPD2UDQ,
+    VCVTUSI2SS, VCVTUSI2SD, VCVTSS2USI, VCVTSD2USI,
+    VCVTTSS2USI, VCVTTSD2USI,
+
+    VPMOVB2M, VPMOVW2M, VPMOVD2M, VPMOVQ2M,
+    VPMOVM2B, VPMOVM2W, VPMOVM2D, VPMOVM2Q,
+
+    VPMOVDB, VPMOVDW, VPMOVQB, VPMOVQD, VPMOVQW, VPMOVWB,
+    VPMOVSDB, VPMOVSDW, VPMOVSQB, VPMOVSQD, VPMOVSQW, VPMOVSWB,
+    VPMOVUSDB, VPMOVSUDW, VPMOVUSQB, VPMOVUSQD, VPMOVUSQW, VPMOVSUWB,
+
+    VRANGEPS, VRANGEPD, VRANGESS, VRANGESD,
+    VREDUCEPS, VREDUCEPD, VREDUCESS, VREDUCESD,
+
+    VDBPSADBW,
 
     // --- Sentinel ---
     UNKNOWN,
@@ -1269,6 +1410,315 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::PMOVZXWD:      return "pmovzxwd";
     case Mnemonic::PMOVZXWQ:      return "pmovzxwq";
     case Mnemonic::PMOVZXDQ:      return "pmovzxdq";
+
+    // --- New AVX/AVX2 arithmetic ---
+    case Mnemonic::VSQRTPS:       return "vsqrtps";
+    case Mnemonic::VSQRTPD:       return "vsqrtpd";
+    case Mnemonic::VSQRTSS:       return "vsqrtss";
+    case Mnemonic::VSQRTSD:       return "vsqrtsd";
+    case Mnemonic::VRSQRTPS:      return "vrsqrtps";
+    case Mnemonic::VRSQRTSS:      return "vrsqrtss";
+    case Mnemonic::VRCPPS:        return "vrcpps";
+    case Mnemonic::VRCPSS:        return "vrcpss";
+    case Mnemonic::VMINPS:        return "vminps";
+    case Mnemonic::VMINPD:        return "vminpd";
+    case Mnemonic::VMINSS:        return "vminss";
+    case Mnemonic::VMINSD:        return "vminsd";
+    case Mnemonic::VMAXPS:        return "vmaxps";
+    case Mnemonic::VMAXPD:        return "vmaxpd";
+    case Mnemonic::VMAXSS:        return "vmaxss";
+    case Mnemonic::VMAXSD:        return "vmaxsd";
+
+    // --- New AVX logic ---
+    case Mnemonic::VANDPS:        return "vandps";
+    case Mnemonic::VANDPD:        return "vandpd";
+    case Mnemonic::VANDNPS:       return "vandnps";
+    case Mnemonic::VANDNPD:       return "vandnpd";
+    case Mnemonic::VORPS:         return "vorps";
+    case Mnemonic::VORPD:         return "vorpd";
+    case Mnemonic::VXORPS:        return "vxorps";
+    case Mnemonic::VXORPD:        return "vxorpd";
+
+    // --- New AVX compare ---
+    case Mnemonic::VCMPPS:        return "vcmpps";
+    case Mnemonic::VCMPPD:        return "vcmppd";
+    case Mnemonic::VCMPSS:        return "vcmpss";
+    case Mnemonic::VCMPSD_CMP:    return "vcmpsd";
+    case Mnemonic::VUCOMISS:      return "vucomiss";
+    case Mnemonic::VUCOMISD:      return "vucomisd";
+    case Mnemonic::VCOMISS:       return "vcomiss";
+    case Mnemonic::VCOMISD:       return "vcomisd";
+
+    // --- New AVX move ---
+    case Mnemonic::VMOVLPS:       return "vmovlps";
+    case Mnemonic::VMOVLPD:       return "vmovlpd";
+    case Mnemonic::VMOVHPS:       return "vmovhps";
+    case Mnemonic::VMOVHPD:       return "vmovhpd";
+    case Mnemonic::VMOVHLPS:      return "vmovhlps";
+    case Mnemonic::VMOVLHPS:      return "vmovlhps";
+    case Mnemonic::VMOVSLDUP:     return "vmovsldup";
+    case Mnemonic::VMOVSHDUP:     return "vmovshdup";
+    case Mnemonic::VMOVDDUP:      return "vmovddup";
+    case Mnemonic::VMOVNTPS:      return "vmovntps";
+    case Mnemonic::VMOVNTPD:      return "vmovntpd";
+    case Mnemonic::VMOVNTDQ:      return "vmovntdq";
+    case Mnemonic::VMOVMSKPS:     return "vmovmskps";
+    case Mnemonic::VMOVMSKPD:     return "vmovmskpd";
+
+    // --- New AVX unpack ---
+    case Mnemonic::VUNPCKLPS:     return "vunpcklps";
+    case Mnemonic::VUNPCKHPS:     return "vunpckhps";
+    case Mnemonic::VUNPCKLPD:     return "vunpcklpd";
+    case Mnemonic::VUNPCKHPD:     return "vunpckhpd";
+    case Mnemonic::VPSHUFHW:      return "vpshufhw";
+    case Mnemonic::VPSHUFLW:      return "vpshuflw";
+
+    // --- New AVX convert ---
+    case Mnemonic::VCVTSI2SS:     return "vcvtsi2ss";
+    case Mnemonic::VCVTSI2SD:     return "vcvtsi2sd";
+    case Mnemonic::VCVTSS2SI:     return "vcvtss2si";
+    case Mnemonic::VCVTSD2SI:     return "vcvtsd2si";
+    case Mnemonic::VCVTTSS2SI:    return "vcvttss2si";
+    case Mnemonic::VCVTTSD2SI:    return "vcvttsd2si";
+    case Mnemonic::VCVTPS2PD:     return "vcvtps2pd";
+    case Mnemonic::VCVTPD2PS:     return "vcvtpd2ps";
+    case Mnemonic::VCVTSS2SD:     return "vcvtss2sd";
+    case Mnemonic::VCVTSD2SS:     return "vcvtsd2ss";
+    case Mnemonic::VCVTDQ2PS:     return "vcvtdq2ps";
+    case Mnemonic::VCVTPS2DQ:     return "vcvtps2dq";
+    case Mnemonic::VCVTDQ2PD:     return "vcvtdq2pd";
+    case Mnemonic::VCVTPD2DQ:     return "vcvtpd2dq";
+    case Mnemonic::VCVTTPS2DQ:    return "vcvttps2dq";
+    case Mnemonic::VCVTTPD2DQ:    return "vcvttpd2dq";
+
+    // --- New broadcast/permute ---
+    case Mnemonic::VBROADCASTI128:return "vbroadcasti128";
+    case Mnemonic::VPERMILPS:     return "vpermilps";
+    case Mnemonic::VPERMILPD:     return "vpermilpd";
+
+    // --- New integer arithmetic ---
+    case Mnemonic::VPADDUSB:      return "vpaddusb";
+    case Mnemonic::VPADDUSW:      return "vpaddusw";
+    case Mnemonic::VPADDSB:       return "vpaddsb";
+    case Mnemonic::VPADDSW:       return "vpaddsw";
+    case Mnemonic::VPSUBUSB:      return "vpsubusb";
+    case Mnemonic::VPSUBUSW:      return "vpsubusw";
+    case Mnemonic::VPSUBSB:       return "vpsubsb";
+    case Mnemonic::VPSUBSW:       return "vpsubsw";
+    case Mnemonic::VPMULHW:       return "vpmulhw";
+    case Mnemonic::VPMULHUW:      return "vpmulhuw";
+    case Mnemonic::VPMULHRSW:     return "vpmulhrsw";
+    case Mnemonic::VPMADDWD:      return "vpmaddwd";
+    case Mnemonic::VPMADDUBSW:    return "vpmaddubsw";
+    case Mnemonic::VPSADBW:       return "vpsadbw";
+    case Mnemonic::VPAVGB:        return "vpavgb";
+    case Mnemonic::VPAVGW:        return "vpavgw";
+
+    // --- New integer pack/align ---
+    case Mnemonic::VPACKSSWB:     return "vpacksswb";
+    case Mnemonic::VPACKUSWB:     return "vpackuswb";
+    case Mnemonic::VPACKSSDW:     return "vpackssdw";
+    case Mnemonic::VPACKUSDW:     return "vpackusdw";
+    case Mnemonic::VPALIGNR:      return "vpalignr";
+
+    // --- New blend ---
+    case Mnemonic::VBLENDVPS:     return "vblendvps";
+    case Mnemonic::VBLENDVPD:     return "vblendvpd";
+    case Mnemonic::VPINSRB:       return "vpinsrb";
+    case Mnemonic::VPINSRD:       return "vpinsrd";
+    case Mnemonic::VPINSRQ:       return "vpinsrq";
+    case Mnemonic::VPEXTRB:       return "vpextrb";
+    case Mnemonic::VPEXTRD:       return "vpextrd";
+    case Mnemonic::VPEXTRQ:       return "vpextrq";
+    case Mnemonic::VINSERTPS:     return "vinsertps";
+    case Mnemonic::VEXTRACTPS:    return "vextractps";
+
+    // --- New abs/sign/hadd ---
+    case Mnemonic::VPABSB:        return "vpabsb";
+    case Mnemonic::VPABSW:        return "vpabsw";
+    case Mnemonic::VPABSD:        return "vpabsd";
+    case Mnemonic::VPHADDW:       return "vphaddw";
+    case Mnemonic::VPHADDD:       return "vphaddd";
+    case Mnemonic::VPHADDSW:      return "vphaddsw";
+    case Mnemonic::VPHSUBW:       return "vphsubw";
+    case Mnemonic::VPHSUBD:       return "vphsubd";
+    case Mnemonic::VPHSUBSW:      return "vphsubsw";
+    case Mnemonic::VPSIGNB:       return "vpsignb";
+    case Mnemonic::VPSIGNW:       return "vpsignw";
+    case Mnemonic::VPSIGND:       return "vpsignd";
+    case Mnemonic::VPHMINPOSUW:   return "vphminposuw";
+    case Mnemonic::VPMOVMSKB:     return "vpmovmskb";
+
+    // --- New SSE3 horizontal ---
+    case Mnemonic::VHADDPS:       return "vhaddps";
+    case Mnemonic::VHADDPD:       return "vhaddpd";
+    case Mnemonic::VHSUBPS:       return "vhsubps";
+    case Mnemonic::VHSUBPD:       return "vhsubpd";
+    case Mnemonic::VADDSUBPS:     return "vaddsubps";
+    case Mnemonic::VADDSUBPD:     return "vaddsubpd";
+    case Mnemonic::VLDDQU:        return "vlddqu";
+
+    // --- New SSE4 round/dp ---
+    case Mnemonic::VROUNDPS:      return "vroundps";
+    case Mnemonic::VROUNDPD:      return "vroundpd";
+    case Mnemonic::VROUNDSS:      return "vroundss";
+    case Mnemonic::VROUNDSD:      return "vroundsd";
+    case Mnemonic::VDPPS:         return "vdpps";
+    case Mnemonic::VDPPD:         return "vdppd";
+    case Mnemonic::VMPSADBW:      return "vmpsadbw";
+
+    // --- New SSE4.2 string ---
+    case Mnemonic::VPCMPESTRM:    return "vpcmpestrm";
+    case Mnemonic::VPCMPESTRI:    return "vpcmpestri";
+    case Mnemonic::VPCMPISTRM:    return "vpcmpistrm";
+    case Mnemonic::VPCMPISTRI:    return "vpcmpistri";
+
+    // --- New mask move ---
+    case Mnemonic::VMASKMOVPS:    return "vmaskmovps";
+    case Mnemonic::VMASKMOVPD:    return "vmaskmovpd";
+    case Mnemonic::VPMASKMOVD:    return "vpmaskmovd";
+    case Mnemonic::VPMASKMOVQ:    return "vpmaskmovq";
+    case Mnemonic::VLDMXCSR:      return "vldmxcsr";
+    case Mnemonic::VSTMXCSR:      return "vstmxcsr";
+
+    // --- FMA missing SS/SD variants ---
+    case Mnemonic::VFMSUB132SS:   return "vfmsub132ss";
+    case Mnemonic::VFMSUB213SS:   return "vfmsub213ss";
+    case Mnemonic::VFMSUB231SS:   return "vfmsub231ss";
+    case Mnemonic::VFMSUB132SD:   return "vfmsub132sd";
+    case Mnemonic::VFMSUB213SD:   return "vfmsub213sd";
+    case Mnemonic::VFMSUB231SD:   return "vfmsub231sd";
+    case Mnemonic::VFNMADD132SS:  return "vfnmadd132ss";
+    case Mnemonic::VFNMADD213SS:  return "vfnmadd213ss";
+    case Mnemonic::VFNMADD231SS:  return "vfnmadd231ss";
+    case Mnemonic::VFNMADD132SD:  return "vfnmadd132sd";
+    case Mnemonic::VFNMADD213SD:  return "vfnmadd213sd";
+    case Mnemonic::VFNMADD231SD:  return "vfnmadd231sd";
+    case Mnemonic::VFNMSUB132PS:  return "vfnmsub132ps";
+    case Mnemonic::VFNMSUB213PS:  return "vfnmsub213ps";
+    case Mnemonic::VFNMSUB231PS:  return "vfnmsub231ps";
+    case Mnemonic::VFNMSUB132PD:  return "vfnmsub132pd";
+    case Mnemonic::VFNMSUB213PD:  return "vfnmsub213pd";
+    case Mnemonic::VFNMSUB231PD:  return "vfnmsub231pd";
+    case Mnemonic::VFNMSUB132SS:  return "vfnmsub132ss";
+    case Mnemonic::VFNMSUB213SS:  return "vfnmsub213ss";
+    case Mnemonic::VFNMSUB231SS:  return "vfnmsub231ss";
+    case Mnemonic::VFNMSUB132SD:  return "vfnmsub132sd";
+    case Mnemonic::VFNMSUB213SD:  return "vfnmsub213sd";
+    case Mnemonic::VFNMSUB231SD:  return "vfnmsub231sd";
+
+    // --- VMX / SVM virtualization ---
+    case Mnemonic::VMCALL:        return "vmcall";
+    case Mnemonic::VMLAUNCH:      return "vmlaunch";
+    case Mnemonic::VMRESUME:      return "vmresume";
+    case Mnemonic::VMXOFF:        return "vmxoff";
+    case Mnemonic::VMREAD:        return "vmread";
+    case Mnemonic::VMWRITE:       return "vmwrite";
+    case Mnemonic::VMPTRLD:       return "vmptrld";
+    case Mnemonic::VMPTRST:       return "vmptrst";
+    case Mnemonic::VMCLEAR:       return "vmclear";
+    case Mnemonic::VMXON:         return "vmxon";
+    case Mnemonic::INVEPT:        return "invept";
+    case Mnemonic::INVVPID:       return "invvpid";
+
+    // --- MONITOR / MWAIT ---
+    case Mnemonic::MONITOR_INST:  return "monitor";
+    case Mnemonic::MWAIT_INST:    return "mwait";
+
+    // --- AVX-512 additional ---
+    case Mnemonic::VADDPD_Z:      return "vaddpd";
+    case Mnemonic::VSUBPD_Z:      return "vsubpd";
+    case Mnemonic::VMULPD_Z:      return "vmulpd";
+    case Mnemonic::VDIVPD_Z:      return "vdivpd";
+    case Mnemonic::VANDPS_Z:      return "vandps";
+    case Mnemonic::VANDPD_Z:      return "vandpd";
+    case Mnemonic::VORPS_Z:       return "vorps";
+    case Mnemonic::VORPD_Z:       return "vorpd";
+    case Mnemonic::VXORPS_Z:      return "vxorps";
+    case Mnemonic::VXORPD_Z:      return "vxorpd";
+    case Mnemonic::VPCMPB:        return "vpcmpb";
+    case Mnemonic::VPCMPW:        return "vpcmpw";
+    case Mnemonic::VPCMPD:        return "vpcmpd";
+    case Mnemonic::VPCMPQ:        return "vpcmpq";
+    case Mnemonic::VPCMPUB:       return "vpcmpub";
+    case Mnemonic::VPCMPUW:       return "vpcmpuw";
+    case Mnemonic::VPCMPUD:       return "vpcmpud";
+    case Mnemonic::VPCMPUQ:       return "vpcmpuq";
+    case Mnemonic::VPBROADCASTB:  return "vpbroadcastb";
+    case Mnemonic::VPBROADCASTW:  return "vpbroadcastw";
+    case Mnemonic::VPBROADCASTD:  return "vpbroadcastd";
+    case Mnemonic::VPBROADCASTQ:  return "vpbroadcastq";
+    case Mnemonic::VSCATTERDPS:   return "vscatterdps";
+    case Mnemonic::VSCATTERDPD:   return "vscatterdpd";
+    case Mnemonic::VSCATTERQPS:   return "vscatterqps";
+    case Mnemonic::VSCATTERQPD:   return "vscatterqpd";
+    case Mnemonic::VPSCATTERDD:   return "vpscatterdd";
+    case Mnemonic::VPSCATTERDQ:   return "vpscatterdq";
+    case Mnemonic::VPSCATTERQD:   return "vpscatterqd";
+    case Mnemonic::VPSCATTERQQ:   return "vpscatterqq";
+    case Mnemonic::VPROLD:        return "vprold";
+    case Mnemonic::VPROLQ:        return "vprolq";
+    case Mnemonic::VPRORD:        return "vprord";
+    case Mnemonic::VPRORQ:        return "vprorq";
+    case Mnemonic::VPROLVD:       return "vprolvd";
+    case Mnemonic::VPROLVQ:       return "vprolvq";
+    case Mnemonic::VPRORVD:       return "vprorvd";
+    case Mnemonic::VPRORVQ:       return "vprorvq";
+    case Mnemonic::VPANDD:        return "vpandd";
+    case Mnemonic::VPANDQ:        return "vpandq";
+    case Mnemonic::VPANDND:       return "vpandnd";
+    case Mnemonic::VPANDNQ:       return "vpandnq";
+    case Mnemonic::VPORD:         return "vpord";
+    case Mnemonic::VPORQ:         return "vporq";
+    case Mnemonic::VPXORD:        return "vpxord";
+    case Mnemonic::VPXORQ:        return "vpxorq";
+    case Mnemonic::VCVTUDQ2PS:    return "vcvtudq2ps";
+    case Mnemonic::VCVTUDQ2PD:    return "vcvtudq2pd";
+    case Mnemonic::VCVTPS2UDQ:    return "vcvtps2udq";
+    case Mnemonic::VCVTPD2UDQ:    return "vcvtpd2udq";
+    case Mnemonic::VCVTTPS2UDQ:   return "vcvttps2udq";
+    case Mnemonic::VCVTTPD2UDQ:   return "vcvttpd2udq";
+    case Mnemonic::VCVTUSI2SS:    return "vcvtusi2ss";
+    case Mnemonic::VCVTUSI2SD:    return "vcvtusi2sd";
+    case Mnemonic::VCVTSS2USI:    return "vcvtss2usi";
+    case Mnemonic::VCVTSD2USI:    return "vcvtsd2usi";
+    case Mnemonic::VCVTTSS2USI:   return "vcvttss2usi";
+    case Mnemonic::VCVTTSD2USI:   return "vcvttsd2usi";
+    case Mnemonic::VPMOVB2M:      return "vpmovb2m";
+    case Mnemonic::VPMOVW2M:      return "vpmovw2m";
+    case Mnemonic::VPMOVD2M:      return "vpmovd2m";
+    case Mnemonic::VPMOVQ2M:      return "vpmovq2m";
+    case Mnemonic::VPMOVM2B:      return "vpmovm2b";
+    case Mnemonic::VPMOVM2W:      return "vpmovm2w";
+    case Mnemonic::VPMOVM2D:      return "vpmovm2d";
+    case Mnemonic::VPMOVM2Q:      return "vpmovm2q";
+    case Mnemonic::VPMOVDB:       return "vpmovdb";
+    case Mnemonic::VPMOVDW:       return "vpmovdw";
+    case Mnemonic::VPMOVQB:       return "vpmovqb";
+    case Mnemonic::VPMOVQD:       return "vpmovqd";
+    case Mnemonic::VPMOVQW:       return "vpmovqw";
+    case Mnemonic::VPMOVWB:       return "vpmovwb";
+    case Mnemonic::VPMOVSDB:      return "vpmovsdb";
+    case Mnemonic::VPMOVSDW:      return "vpmovsdw";
+    case Mnemonic::VPMOVSQB:      return "vpmovsqb";
+    case Mnemonic::VPMOVSQD:      return "vpmovsqd";
+    case Mnemonic::VPMOVSQW:      return "vpmovsqw";
+    case Mnemonic::VPMOVSWB:      return "vpmovswb";
+    case Mnemonic::VPMOVUSDB:     return "vpmovusdb";
+    case Mnemonic::VPMOVSUDW:     return "vpmovsudw";
+    case Mnemonic::VPMOVUSQB:     return "vpmovusqb";
+    case Mnemonic::VPMOVUSQD:     return "vpmovusqd";
+    case Mnemonic::VPMOVUSQW:     return "vpmovusqw";
+    case Mnemonic::VPMOVSUWB:     return "vpmovsuwb";
+    case Mnemonic::VRANGEPS:      return "vrangeps";
+    case Mnemonic::VRANGEPD:      return "vrangepd";
+    case Mnemonic::VRANGESS:      return "vrangess";
+    case Mnemonic::VRANGESD:      return "vrangesd";
+    case Mnemonic::VREDUCEPS:     return "vreduceps";
+    case Mnemonic::VREDUCEPD:     return "vreducepd";
+    case Mnemonic::VREDUCESS:     return "vreducess";
+    case Mnemonic::VREDUCESD:     return "vreducesd";
+    case Mnemonic::VDBPSADBW:     return "vdbpsadbw";
 
     case Mnemonic::UNKNOWN:       return "unknown";
     case Mnemonic::MAX_MNEMONIC:  return "<max_mnemonic>";
