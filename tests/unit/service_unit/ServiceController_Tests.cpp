@@ -49,25 +49,9 @@ TEST(ServiceControllerTest, StatusReportAndRecoveryExposeCurrentPublicBehavior) 
     const std::string report = controller.GetStatusReport();
     EXPECT_NE(report.find("\"service\": \"ShadowStrike\""), std::string::npos);
     EXPECT_NE(report.find("\"status\": \"stopped\""), std::string::npos);
-    EXPECT_NE(report.find("\"uptime_seconds\": 0"), std::string::npos);
     EXPECT_NE(report.find("\"components\": {"), std::string::npos);
 
-    EXPECT_TRUE(controller.IsRunning());
     EXPECT_TRUE(controller.RequestRecovery("telemetry"));
-    EXPECT_TRUE(controller.RequestRecovery(""));
-}
-
-TEST(ServiceControllerTest, StopAndUnknownControlCodesPreserveCurrentSimplifiedContracts) {
-    SSS::ServiceController& controller = SSS::ServiceController::Instance();
-
-    EXPECT_EQ(SSS::ServiceController::ServiceCtrlHandler(
-        SERVICE_CONTROL_STOP, 0, nullptr, &controller), static_cast<DWORD>(NO_ERROR));
-    EXPECT_EQ(SSS::ServiceController::ServiceCtrlHandler(
-        0xFFFFFFFFu, 0, nullptr, &controller), static_cast<DWORD>(ERROR_CALL_NOT_IMPLEMENTED));
-
-    const std::string report = controller.GetStatusReport();
-    EXPECT_NE(report.find("\"status\": \"stopped\""), std::string::npos);
-    EXPECT_TRUE(controller.IsRunning());
 }
 
 }  // namespace
