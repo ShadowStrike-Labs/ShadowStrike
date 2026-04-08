@@ -2517,10 +2517,12 @@ struct EmulationSession::Impl {
         // Ring transition anomaly detection
         if (m_config.enableRingTransitionCheck) {
             auto& ringTrans = RingTransition::Instance();
+            auto& dkom = DKOMDetector::Instance();
             auto anomalies = ringTrans.DetectAnomalies();
             for (const auto& anomaly : anomalies) {
                 m_threatScorer.AddEvasionAttempt(
                     "Ring transition anomaly: " + anomaly.description, 0.7f);
+                dkom.OnRingTransition(anomaly.event.fromRing, anomaly.event.toRing);
             }
         }
 
@@ -2548,6 +2550,19 @@ struct EmulationSession::Impl {
             }
         }
 
+        // Feed kernel API call telemetry into DKOMDetector for correlation
+        // Must run BEFORE RunFullScan() so correlation data is available
+        {
+            auto& tracker = WinAPI::Kernel::KernelAPITracker::Instance();
+            m_kernelAPIReport = tracker.GenerateReport();
+            auto& dkom = DKOMDetector::Instance();
+            for (const auto& call : m_kernelAPIReport.calls) {
+                if (call.isSuspicious) {
+                    dkom.OnAPICall(call.apiName, static_cast<uint32_t>(call.arg1));
+                }
+            }
+        }
+
         // High-level DKOM analysis — runs the DKOMDetector correlation engine
         // which cross-references kernel object state with behavioral signals
         // (API calls, MSR writes, ring transitions) for severity scoring
@@ -2561,15 +2576,10 @@ struct EmulationSession::Impl {
             }
         }
 
-        // Collect kernel API tracker telemetry
-        {
-            auto& tracker = WinAPI::Kernel::KernelAPITracker::Instance();
-            m_kernelAPIReport = tracker.GenerateReport();
-
-            for (const auto& tech : m_kernelAPIReport.mitreTechniques) {
-                m_kernelMitreTechniques.push_back(tech);
-                m_mitreMapper.OnEvasionAttempt(tech);
-            }
+        // Propagate kernel API MITRE techniques to the global mapper
+        for (const auto& tech : m_kernelAPIReport.mitreTechniques) {
+            m_kernelMitreTechniques.push_back(tech);
+            m_mitreMapper.OnEvasionAttempt(tech);
         }
 
         // Compute rootkit score
