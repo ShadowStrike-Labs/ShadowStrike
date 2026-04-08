@@ -43,22 +43,41 @@ TEST_F(DiskMonitorTest, ConfigValidationRejectsOutOfRangeValues) {
     SSP::DiskMonitorConfig config;
     EXPECT_TRUE(config.IsValid());
 
+    config.pollingIntervalMs = SSP::DiskConstants::MIN_POLLING_INTERVAL_MS;
+    EXPECT_TRUE(config.IsValid());
+    config.pollingIntervalMs = SSP::DiskConstants::MAX_POLLING_INTERVAL_MS;
+    EXPECT_TRUE(config.IsValid());
     config.pollingIntervalMs = 99;
     EXPECT_FALSE(config.IsValid());
     config.pollingIntervalMs = SSP::DiskConstants::DEFAULT_POLLING_INTERVAL_MS;
 
+    config.ransomwareSustainedWindowSec = SSP::DiskConstants::MIN_SUSTAINED_WINDOW_SEC;
+    EXPECT_TRUE(config.IsValid());
+    config.ransomwareSustainedWindowSec = SSP::DiskConstants::MAX_SUSTAINED_WINDOW_SEC;
+    EXPECT_TRUE(config.IsValid());
     config.ransomwareSustainedWindowSec = 1;
     EXPECT_FALSE(config.IsValid());
     config.ransomwareSustainedWindowSec = SSP::DiskConstants::DEFAULT_SUSTAINED_WINDOW_SEC;
 
+    config.ransomwareWriteThresholdBps = 1;
+    EXPECT_TRUE(config.IsValid());
     config.ransomwareWriteThresholdBps = 0;
     EXPECT_FALSE(config.IsValid());
     config.ransomwareWriteThresholdBps = 32ULL * 1024ULL * 1024ULL;
 
+    config.maxTrackedProcesses = 100000;
+    EXPECT_TRUE(config.IsValid());
     config.maxTrackedProcesses = 0;
     EXPECT_FALSE(config.IsValid());
     config.maxTrackedProcesses = 4096;
+    config.maxTrackedProcesses = 100001;
+    EXPECT_FALSE(config.IsValid());
+    config.maxTrackedProcesses = 4096;
 
+    config.lowSpaceThresholdPercent = 0.0;
+    EXPECT_TRUE(config.IsValid());
+    config.lowSpaceThresholdPercent = 100.0;
+    EXPECT_TRUE(config.IsValid());
     config.lowSpaceThresholdPercent = 101.0;
     EXPECT_FALSE(config.IsValid());
 }
@@ -173,6 +192,7 @@ TEST_F(DiskMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishedSamples) {
     ASSERT_TRUE(monitor.Initialize(config));
 
     EXPECT_FALSE(monitor.GetProcessUsage(0xFFFFFFFFu).has_value());
+    EXPECT_TRUE(monitor.GetTopConsumers(0).empty());
     EXPECT_TRUE(monitor.GetTopConsumers(5).empty());
     EXPECT_TRUE(monitor.GetDriveInfo().empty());
     EXPECT_FALSE(monitor.GetSelfIoUsage().has_value());
@@ -187,6 +207,26 @@ TEST_F(DiskMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishedSamples) {
     EXPECT_EQ(moduleStats.alertsTriggered, 0u);
     EXPECT_GE(moduleStats.uptimeSeconds, 0.0);
     EXPECT_EQ(DiskMonitor::GetVersionString(), "4.0.0");
+}
+
+TEST_F(DiskMonitorTest, ShutdownIsIdempotentAndRestoresEmptySnapshots) {
+    SSP::DiskMonitorConfig config;
+    config.enabled = false;
+    ASSERT_TRUE(monitor.Initialize(config));
+    EXPECT_TRUE(monitor.IsInitialized());
+
+    monitor.Shutdown();
+    EXPECT_FALSE(monitor.IsInitialized());
+    monitor.Shutdown();
+
+    EXPECT_TRUE(monitor.GetTopConsumers(1).empty());
+    EXPECT_TRUE(monitor.GetDriveInfo().empty());
+    EXPECT_FALSE(monitor.GetProcessUsage(::GetCurrentProcessId()).has_value());
+
+    const SSP::DiskGlobalStats stats = monitor.GetGlobalStats();
+    EXPECT_DOUBLE_EQ(stats.totalReadBytesPerSec, 0.0);
+    EXPECT_DOUBLE_EQ(stats.totalWriteBytesPerSec, 0.0);
+    EXPECT_EQ(stats.activeProcesses, 0u);
 }
 
 TEST_F(DiskMonitorTest, CallbackRegistrationAndResetAreSafeForNullAndLiveHandlers) {

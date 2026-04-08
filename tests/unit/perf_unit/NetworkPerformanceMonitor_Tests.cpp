@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <limits>
 #include <string>
 
 #include "../../../src/Shared_modules/Performance/NetworkPerformanceMonitor.hpp"
@@ -43,10 +44,17 @@ TEST_F(NetworkPerformanceMonitorTest, ConfigValidationAndHelperTotalsRejectInval
     SSP::NetworkMonitorConfig config;
     EXPECT_TRUE(config.IsValid());
 
+    config.pollingIntervalMs = SSP::NetworkConstants::MIN_POLLING_INTERVAL_MS;
+    EXPECT_TRUE(config.IsValid());
+    config.pollingIntervalMs = SSP::NetworkConstants::MAX_POLLING_INTERVAL_MS;
+    EXPECT_TRUE(config.IsValid());
     config.pollingIntervalMs = 99;
     EXPECT_FALSE(config.IsValid());
     config.pollingIntervalMs = SSP::NetworkConstants::DEFAULT_POLLING_INTERVAL_MS;
 
+    config.highBandwidthThresholdMbps = std::numeric_limits<double>::quiet_NaN();
+    EXPECT_FALSE(config.IsValid());
+    config.highBandwidthThresholdMbps = 25.0;
     config.highBandwidthThresholdMbps = 0.0;
     EXPECT_FALSE(config.IsValid());
     config.highBandwidthThresholdMbps = 25.0;
@@ -55,8 +63,11 @@ TEST_F(NetworkPerformanceMonitorTest, ConfigValidationAndHelperTotalsRejectInval
     EXPECT_FALSE(config.IsValid());
     config.connectionFloodThreshold = 100;
 
+    config.exfiltrationThresholdBytes = 1;
+    EXPECT_TRUE(config.IsValid());
     config.exfiltrationThresholdBytes = 0;
     EXPECT_FALSE(config.IsValid());
+    config.exfiltrationThresholdBytes = 1024;
 
     const SSP::ProcessNetworkUsage usage{
         15,
@@ -219,8 +230,10 @@ TEST_F(NetworkPerformanceMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishe
     EXPECT_EQ(stats.activeInterfaces, 0u);
 
     EXPECT_TRUE(monitor.GetInterfaceStats().empty());
+    EXPECT_TRUE(monitor.GetTopProcesses(0).empty());
     EXPECT_TRUE(monitor.GetTopProcesses(5).empty());
     EXPECT_FALSE(monitor.GetProcessUsage(0xFFFFFFFFu).has_value());
+    EXPECT_TRUE(monitor.GetRecentAlerts(0).empty());
     EXPECT_TRUE(monitor.GetRecentAlerts(10).empty());
 
     const SSP::NetworkMonitorModuleStats moduleStats = monitor.GetModuleStats();
@@ -228,6 +241,42 @@ TEST_F(NetworkPerformanceMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishe
     EXPECT_EQ(moduleStats.alertsTriggered, 0u);
     EXPECT_EQ(moduleStats.totalConnectionsTracked, 0u);
     EXPECT_EQ(NetworkPerformanceMonitor::GetVersionString(), "4.0.0");
+}
+
+TEST_F(NetworkPerformanceMonitorTest, PreInitReinitAndShutdownTransitionsStaySafe) {
+    EXPECT_FALSE(monitor.IsInitialized());
+    EXPECT_FALSE(monitor.SelfTest());
+
+    SSP::NetworkMonitorConfig firstConfig;
+    firstConfig.enabled = false;
+    firstConfig.pollingIntervalMs = 750;
+    firstConfig.trackPerProcess = false;
+    firstConfig.trackInterfaces = false;
+    ASSERT_TRUE(monitor.Initialize(firstConfig));
+    EXPECT_TRUE(monitor.IsInitialized());
+
+    SSP::NetworkMonitorConfig secondConfig = firstConfig;
+    secondConfig.pollingIntervalMs = 1800;
+    secondConfig.trackInterfaces = true;
+    ASSERT_TRUE(monitor.Initialize(secondConfig));
+
+    const SSP::NetworkMonitorConfig persisted = monitor.GetConfig();
+    EXPECT_EQ(persisted.pollingIntervalMs, firstConfig.pollingIntervalMs);
+    EXPECT_FALSE(persisted.trackInterfaces);
+    EXPECT_FALSE(persisted.trackPerProcess);
+
+    monitor.Shutdown();
+    EXPECT_FALSE(monitor.IsInitialized());
+    monitor.Shutdown();
+
+    const SSP::NetworkGlobalStats stats = monitor.GetGlobalStats();
+    EXPECT_DOUBLE_EQ(stats.totalInboundBitsPerSec, 0.0);
+    EXPECT_DOUBLE_EQ(stats.totalOutboundBitsPerSec, 0.0);
+    EXPECT_EQ(stats.activeInterfaces, 0u);
+    EXPECT_TRUE(monitor.GetInterfaceStats().empty());
+    EXPECT_TRUE(monitor.GetTopProcesses(1).empty());
+    EXPECT_TRUE(monitor.GetRecentAlerts(1).empty());
+    EXPECT_FALSE(monitor.GetProcessUsage(::GetCurrentProcessId()).has_value());
 }
 
 TEST_F(NetworkPerformanceMonitorTest, AlertCallbackRegistrationAndResetAreSafeWithoutLiveAlerts) {

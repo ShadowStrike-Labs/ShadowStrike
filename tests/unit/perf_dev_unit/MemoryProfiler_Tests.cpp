@@ -45,14 +45,24 @@ TEST_F(MemoryProfilerTest, ConfigValidationRejectsOutOfRangeValues) {
     SSP::MemoryProfilerConfig config;
     EXPECT_TRUE(config.IsValid());
 
+    config.samplingIntervalMs = 100;
+    EXPECT_TRUE(config.IsValid());
+    config.samplingIntervalMs = 3600000;
+    EXPECT_TRUE(config.IsValid());
     config.samplingIntervalMs = 99;
     EXPECT_FALSE(config.IsValid());
     config.samplingIntervalMs = 2000;
 
+    config.historySize = 3;
+    EXPECT_TRUE(config.IsValid());
+    config.historySize = 10000;
+    EXPECT_TRUE(config.IsValid());
     config.historySize = 2;
     EXPECT_FALSE(config.IsValid());
     config.historySize = 30;
 
+    config.highLoadThreshold = 100;
+    EXPECT_TRUE(config.IsValid());
     config.highLoadThreshold = 0;
     EXPECT_FALSE(config.IsValid());
     config.highLoadThreshold = 90;
@@ -61,10 +71,17 @@ TEST_F(MemoryProfilerTest, ConfigValidationRejectsOutOfRangeValues) {
     EXPECT_FALSE(config.IsValid());
     config.leakThresholdBytes = 1024 * 1024;
 
+    config.maxTrackedProcesses = 100000;
+    EXPECT_TRUE(config.IsValid());
     config.maxTrackedProcesses = 0;
     EXPECT_FALSE(config.IsValid());
     config.maxTrackedProcesses = 2048;
+    config.maxTrackedProcesses = 100001;
+    EXPECT_FALSE(config.IsValid());
+    config.maxTrackedProcesses = 2048;
 
+    config.minSamplesForLeakDetection = config.historySize;
+    EXPECT_TRUE(config.IsValid());
     config.minSamplesForLeakDetection = 31;
     EXPECT_FALSE(config.IsValid());
 }
@@ -148,6 +165,7 @@ TEST_F(MemoryProfilerTest, AccessorsAndRefreshReturnSafeAndPlausibleData) {
     EXPECT_LE(stats.availablePhysical, stats.totalPhysical);
 
     EXPECT_FALSE(profiler.GetProcessInfo(0xFFFFFFFFu).has_value());
+    EXPECT_TRUE(profiler.GetTopConsumers(0).empty());
     EXPECT_TRUE(profiler.GetTopConsumers(10).empty());
 
     const SSP::ProcessMemoryInfo self = profiler.GetSelfMemoryUsage();
