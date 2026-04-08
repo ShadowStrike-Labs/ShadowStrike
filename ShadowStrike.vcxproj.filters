@@ -1041,6 +1041,30 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\gmock\gmock-more-actions.h">
+    <ClCompile Include="tests\unit\core_engine_unit\BehaviorAnalyzer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\PackerUnpacker_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\PolymorphicDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\gmock\gmock-more-matchers.h">

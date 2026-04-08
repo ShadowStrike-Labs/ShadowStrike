@@ -893,6 +893,14 @@
     <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
     <ClInclude Include="tests\unit\config_unit\Config_TestUtils.hpp" />
   </ItemGroup>
+    <ClCompile Include="tests\unit\core_engine_unit\BehaviorAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\PackerUnpacker_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\PolymorphicDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp" />
   <ItemGroup>
     <ClCompile Include="tests\unit\antievasion_unit\DebuggerEvasionDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\antievasion_unit\EnvironmentEvasionDetector_Tests.cpp" />
