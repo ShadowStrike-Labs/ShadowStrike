@@ -41,8 +41,7 @@
 #include <optional>
 #include <algorithm>
 
-// Fix include path - use proper relative path
-#include "../../include/nlohmann/json.hpp"
+#include <nlohmann/json.hpp>
 
 namespace ShadowStrike {
 	namespace Utils {
