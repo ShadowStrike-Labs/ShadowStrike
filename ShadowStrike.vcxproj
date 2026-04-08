@@ -899,6 +899,7 @@
     <ClCompile Include="tests\unit\core_network_unit\TrafficAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\realtime_protection_pipeline\RTPPipeline_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEValidation_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\SafeReader_Tests.cpp" />
