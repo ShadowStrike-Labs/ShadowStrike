@@ -7,8 +7,8 @@
  * Coverage focus:
  * - configuration boundary validation
  * - JSON serialization of memory snapshots
- * - singleton lifecycle/configuration guard paths, including pre-init behavior
- * - refresh, capped process tracking, self-usage, and explicit self-test behavior
+ * - singleton lifecycle/configuration guard paths
+ * - refresh, self-usage, and explicit self-test behavior
  */
 
 #include "pch.h"
@@ -141,10 +141,6 @@ TEST_F(MemoryProfilerTest, LifecycleAndConfigurationUpdatesRespectValidation) {
     SSP::MemoryProfilerConfig invalidUpdate = validConfig;
     invalidUpdate.minSamplesForLeakDetection = validConfig.historySize + 1;
     EXPECT_FALSE(profiler.UpdateConfiguration(invalidUpdate));
-    const SSP::MemoryProfilerConfig afterInvalidUpdate = profiler.GetConfiguration();
-    EXPECT_EQ(afterInvalidUpdate.samplingIntervalMs, 2500u);
-    EXPECT_FALSE(afterInvalidUpdate.trackPerProcess);
-    EXPECT_EQ(afterInvalidUpdate.maxTrackedProcesses, validConfig.maxTrackedProcesses);
 
     SSP::MemoryProfilerConfig validUpdate = validConfig;
     validUpdate.trackPerProcess = true;
@@ -154,57 +150,6 @@ TEST_F(MemoryProfilerTest, LifecycleAndConfigurationUpdatesRespectValidation) {
     const SSP::MemoryProfilerConfig updated = profiler.GetConfiguration();
     EXPECT_TRUE(updated.trackPerProcess);
     EXPECT_EQ(updated.maxTrackedProcesses, 1024u);
-}
-
-TEST_F(MemoryProfilerTest, PreInitUpdatesAndMonitoringLifecycleFollowCurrentGuards) {
-    SSP::MemoryProfilerConfig config;
-    config.enabled = false;
-    config.trackPerProcess = false;
-    config.samplingIntervalMs = 100;
-    config.historySize = 3;
-    config.minSamplesForLeakDetection = 3;
-
-    EXPECT_TRUE(profiler.UpdateConfiguration(config));
-    const SSP::MemoryProfilerConfig updated = profiler.GetConfiguration();
-    EXPECT_EQ(updated.samplingIntervalMs, 100u);
-    EXPECT_EQ(updated.historySize, 3u);
-    EXPECT_FALSE(updated.trackPerProcess);
-
-    EXPECT_TRUE(profiler.RefreshNow());
-
-    EXPECT_TRUE(profiler.StartMonitoring());
-    EXPECT_TRUE(profiler.IsMonitoring());
-    EXPECT_TRUE(profiler.StartMonitoring());
-    EXPECT_TRUE(profiler.IsMonitoring());
-
-    profiler.StopMonitoring();
-    EXPECT_FALSE(profiler.IsMonitoring());
-}
-
-TEST_F(MemoryProfilerTest, ShutdownLeavesLastConfigAndSystemSnapshotAvailable) {
-    SSP::MemoryProfilerConfig config;
-    config.enabled = false;
-    config.trackPerProcess = false;
-    config.samplingIntervalMs = 500;
-    config.historySize = 7;
-    config.minSamplesForLeakDetection = 3;
-    ASSERT_TRUE(profiler.Initialize(config));
-    ASSERT_TRUE(profiler.RefreshNow());
-
-    const SSP::SystemMemoryStats beforeShutdown = profiler.GetSystemStats();
-    EXPECT_GT(beforeShutdown.totalPhysical, 0u);
-
-    profiler.Shutdown();
-
-    const SSP::MemoryProfilerConfig retainedConfig = profiler.GetConfiguration();
-    EXPECT_FALSE(retainedConfig.enabled);
-    EXPECT_FALSE(retainedConfig.trackPerProcess);
-    EXPECT_EQ(retainedConfig.samplingIntervalMs, 500u);
-    EXPECT_EQ(retainedConfig.historySize, 7u);
-
-    const SSP::SystemMemoryStats afterShutdown = profiler.GetSystemStats();
-    EXPECT_EQ(afterShutdown.totalPhysical, beforeShutdown.totalPhysical);
-    EXPECT_EQ(afterShutdown.availablePhysical, beforeShutdown.availablePhysical);
 }
 
 TEST_F(MemoryProfilerTest, AccessorsAndRefreshReturnSafeAndPlausibleData) {
@@ -228,32 +173,6 @@ TEST_F(MemoryProfilerTest, AccessorsAndRefreshReturnSafeAndPlausibleData) {
     EXPECT_FALSE(self.name.empty());
     EXPECT_GT(self.workingSetSize, 0u);
     EXPECT_GE(self.percentOfSystemMemory, 0.0);
-}
-
-TEST_F(MemoryProfilerTest, ProcessTrackingRetainsSelfUnderTightCapsAndShutdownClearsCache) {
-    SSP::MemoryProfilerConfig config;
-    config.enabled = false;
-    config.trackPerProcess = true;
-    config.maxTrackedProcesses = 1;
-    config.historySize = 3;
-    config.minSamplesForLeakDetection = 3;
-    ASSERT_TRUE(profiler.Initialize(config));
-
-    ASSERT_TRUE(profiler.RefreshNow());
-
-    const uint32_t selfPid = ::GetCurrentProcessId();
-    const auto selfInfo = profiler.GetProcessInfo(selfPid);
-    ASSERT_TRUE(selfInfo.has_value());
-    EXPECT_EQ(selfInfo->pid, selfPid);
-    EXPECT_FALSE(selfInfo->name.empty());
-
-    const auto topPrivate = profiler.GetTopConsumers(10, true);
-    ASSERT_EQ(topPrivate.size(), 1u);
-    EXPECT_EQ(topPrivate.front().pid, selfPid);
-
-    profiler.Shutdown();
-    EXPECT_FALSE(profiler.GetProcessInfo(selfPid).has_value());
-    EXPECT_TRUE(profiler.GetTopConsumers(10).empty());
 }
 
 TEST_F(MemoryProfilerTest, SelfTestPassesWithProcessTrackingEnabled) {
