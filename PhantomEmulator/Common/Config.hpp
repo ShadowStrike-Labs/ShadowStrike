@@ -80,6 +80,26 @@ struct EmulationConfig {
     uint32_t    jitCodeCacheSize   = 4 * 1024 * 1024;   // 4 MB
     uint32_t    jitHotThreshold    = 64;                 // Interpret N times before compiling
 
+    // === Hardware acceleration (Phase 6) ===
+    bool      enableHardwareAccel       = true;   // Master switch for all acceleration
+    bool      enableSIMDScanning        = true;   // SIMD-accelerated entropy/pattern ops
+    bool      enableCryptoAcceleration  = true;   // AES-NI/SHA-NI crypto detection & hashing
+    bool      enableMemoryScanAccel     = true;   // SIMD shellcode/ROP/packer scanning
+    bool      enableJITOptimizer        = false;  // Trace compilation + IR optimization (opt-in)
+
+    // === Kernel-mode emulation (Phase 7) ===
+    bool      enableKernelEmulation     = true;   // Master switch for kernel-mode analysis
+    bool      enableDKOMDetection       = true;   // DKOM rootkit detection scanning
+    bool      enableSSDTIntegrity       = true;   // SSDT hook detection
+    bool      enableIDTIntegrity        = true;   // IDT hook detection
+    bool      enableMSRMonitoring       = true;   // MSR read/write tracking
+    bool      enableRingTransitionCheck = true;   // CPL transition anomaly detection
+    bool      enableDriverLoading       = true;   // PE/COFF driver loading into kernel space
+    bool      enableKernelAPITracking   = true;   // Behavioral tracking of kernel API calls
+    uint32_t  maxKernelDrivers          = 128;    // Max drivers per session
+    uint32_t  dkomScanIntervalMs        = 5000;   // DKOM scan interval during emulation
+    float     rootkitScoreThreshold     = 60.0f;  // Score above which rootkit verdict fires
+
     // === Multi-process emulation ===
     bool      enableMultiProcess        = true;
     uint32_t  maxChildProcesses         = 8;           // Max child processes per session
@@ -126,6 +146,10 @@ struct EmulationConfig {
     cfg.enableVSS = false;
     cfg.enableWMI = false;
     cfg.enableDotNetAnalysis = false;
+    cfg.enableMemoryScanAccel = false;
+    cfg.enableCryptoAcceleration = false;
+    cfg.enableKernelEmulation = false;
+    cfg.enableDKOMDetection = false;
     cfg.yaraScansPerSession = 1;
     return cfg;
 }
@@ -145,6 +169,11 @@ struct EmulationConfig {
     cfg.enableVSS = true;
     cfg.enableWMI = true;
     cfg.enableDotNetAnalysis = true;
+    cfg.enableKernelEmulation = true;
+    cfg.enableDKOMDetection = true;
+    cfg.enableDriverLoading = true;
+    cfg.enableKernelAPITracking = true;
+    cfg.enableJITOptimizer = true;
     cfg.yaraScansPerSession = 8;
     return cfg;
 }

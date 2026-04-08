@@ -606,15 +606,15 @@ uint32_t RingTransition::GetTransitionCount() const {
 // Anomaly Detection
 // ============================================================================
 
-std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
+std::vector<RingTransitionAnomaly> RingTransition::DetectAnomalies() const {
     std::shared_lock lock(m_impl->mutex);
-    std::vector<TransitionAnomaly> anomalies;
+    std::vector<RingTransitionAnomaly> anomalies;
 
     for (const auto& event : m_impl->history) {
         // Check: User-space RIP executing at Ring 0
         if (event.toRing == 0 && KernelAddressSpace::IsUserAddress(event.toRIP)) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::UserCodeAtRing0;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::UserCodeAtRing0;
             anomaly.description = "User-space RIP 0x" + std::to_string(event.toRIP) +
                                   " executing at CPL=0 — possible exploitation";
             anomaly.event       = event;
@@ -623,8 +623,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
 
         // Check: Kernel RIP at Ring 3
         if (event.toRing == 3 && KernelAddressSpace::IsKernelAddress(event.toRIP)) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::KernelCodeAtRing3;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::KernelCodeAtRing3;
             anomaly.description = "Kernel-space RIP 0x" + std::to_string(event.toRIP) +
                                   " at CPL=3 — possible SYSRET exploit";
             anomaly.event       = event;
@@ -633,8 +633,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
 
         // Check: SYSCALL when already in Ring 0
         if (event.type == TransitionType::Syscall && event.fromRing == 0) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::SyscallFromKernel;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::SyscallFromKernel;
             anomaly.description = "SYSCALL executed from Ring 0 — abnormal kernel behavior";
             anomaly.event       = event;
             anomalies.push_back(std::move(anomaly));
@@ -643,8 +643,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
         // Check: SYSRET to kernel address
         if (event.type == TransitionType::Sysret &&
             KernelAddressSpace::IsKernelAddress(event.toRIP)) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::SysretToKernel;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::SysretToKernel;
             anomaly.description = "SYSRET targeting kernel address 0x" +
                                   std::to_string(event.toRIP);
             anomaly.event       = event;
@@ -656,8 +656,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
              event.type == TransitionType::Sysenter ||
              event.type == TransitionType::Int2E) &&
             event.syscallNumber > kMaxSyscallNumber) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::InvalidSyscallNumber;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::InvalidSyscallNumber;
             anomaly.description = "Syscall number " + std::to_string(event.syscallNumber) +
                                   " exceeds maximum " + std::to_string(kMaxSyscallNumber);
             anomaly.event       = event;
@@ -667,8 +667,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
         // Check: Non-canonical return address on SYSRET/IRET
         if ((event.type == TransitionType::Sysret || event.type == TransitionType::Iret) &&
             !IsCanonicalAddress(event.toRIP)) {
-            TransitionAnomaly anomaly;
-            anomaly.type        = TransitionAnomaly::Type::NonCanonicalReturn;
+            RingTransitionAnomaly anomaly;
+            anomaly.type        = RingTransitionAnomaly::Type::NonCanonicalReturn;
             anomaly.description = "Return to non-canonical address 0x" +
                                   std::to_string(event.toRIP);
             anomaly.event       = event;
@@ -687,8 +687,8 @@ std::vector<TransitionAnomaly> RingTransition::DetectAnomalies() const {
                                    ? (curr.rsp - prev.rsp)
                                    : (prev.rsp - curr.rsp);
             if (rspDiff > kStackPivotThreshold) {
-                TransitionAnomaly anomaly;
-                anomaly.type        = TransitionAnomaly::Type::StackPivot;
+                RingTransitionAnomaly anomaly;
+                anomaly.type        = RingTransitionAnomaly::Type::StackPivot;
                 anomaly.description = "RSP shifted by 0x" + std::to_string(rspDiff) +
                                       " bytes between transitions — possible stack pivot";
                 anomaly.event       = curr;

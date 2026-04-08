@@ -32,6 +32,11 @@
 #include "../Analysis/NetworkBehaviorAnalyzer.hpp"
 #include "../Analysis/EvasionDetector.hpp"
 #include "../Core/CLR/CLRTypes.hpp"
+#include "../Core/Accel/MemoryScanAccel.hpp"
+#include "../Core/Accel/CryptoAccelerator.hpp"
+#include "../Core/JIT/JITOptimizer.hpp"
+#include "../Core/Kernel/KernelStructures.hpp"
+#include "../Core/Kernel/DriverLoader.hpp"
 
 #include <cstdint>
 #include <string>
@@ -151,6 +156,31 @@ struct PhantomEmulationResult {
     // === .NET/CLR Analysis ====================================================
 
     CLR::DotNetAnalysisResult  dotNetAnalysis;
+
+    // === Hardware Acceleration (Phase 6) =====================================
+
+    MemoryScanResult           accelMemoryScan;
+    std::vector<AESDetectionResult> accelAESDetections;
+    EncryptionAnalysis         accelEncryptionAnalysis;
+    OptimizationStats          jitOptimizerStats;
+    bool                       simdAvailable   = false;
+    bool                       aesniAvailable  = false;
+    bool                       shaniAvailable  = false;
+
+    // === Kernel-Mode Emulation (Phase 7) =====================================
+
+    std::vector<DKOMDetection>       dkomDetections;
+    std::vector<uint32_t>            ssdtHookedEntries;
+    std::vector<uint8_t>             idtHookedVectors;
+    std::vector<LoadedDriver>        loadedDrivers;
+    uint32_t                         kernelAPICalls       = 0;
+    uint32_t                         suspiciousKernelAPIs = 0;
+    float                            rootkitScore         = 0.0f;
+    bool                             rootkitDetected      = false;
+    bool                             processListCorrupted = false;
+    bool                             ssdtIntegrityFailed  = false;
+    bool                             msrTamperingDetected = false;
+    std::vector<std::string>         kernelMitreTechniques;
 
     // === Session Status =======================================================
 
