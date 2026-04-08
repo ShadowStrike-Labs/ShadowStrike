@@ -76,6 +76,10 @@ TEST_F(SandboxAnalyzerTest, ErrorAndVmConfigurationHelpersEnforceOperationalSafe
     EXPECT_FALSE(vm.IsValid());
 
     vm = MakeValidVmConfiguration();
+    vm.snapshotName.clear();
+    EXPECT_TRUE(vm.IsValid());
+
+    vm = MakeValidVmConfiguration();
     vm.memoryMb = 256;
     EXPECT_FALSE(vm.IsValid());
 
@@ -167,6 +171,10 @@ TEST_F(SandboxAnalyzerTest, OptionAndConfigurationValidationProtectRuntimeBounds
     EXPECT_FALSE(config.IsValid());
 
     config = {};
+    config.vms.clear();
+    EXPECT_TRUE(config.IsValid());
+
+    config = {};
     config.defaultTimeoutSeconds = 0;
     EXPECT_FALSE(config.IsValid());
 
@@ -178,13 +186,19 @@ TEST_F(SandboxAnalyzerTest, OptionAndConfigurationValidationProtectRuntimeBounds
 TEST_F(SandboxAnalyzerTest, StatisticsResetClearsRuntimeCounters) {
     Engine::SandboxAnalyzer::Statistics stats;
     stats.totalAnalyses.store(3, std::memory_order_relaxed);
+    stats.vmsStarted.store(1, std::memory_order_relaxed);
+    stats.timeouts.store(4, std::memory_order_relaxed);
     stats.failures.store(2, std::memory_order_relaxed);
     stats.artifactsExtracted.store(5, std::memory_order_relaxed);
+    const auto startTime = stats.startTime;
 
     stats.Reset();
     EXPECT_EQ(stats.totalAnalyses.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.vmsStarted.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.timeouts.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.failures.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.artifactsExtracted.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.startTime, startTime);
 }
 
 TEST_F(SandboxAnalyzerTest, GuardPathsStayNonOperationalBeforeInitialization) {
@@ -217,6 +231,11 @@ TEST_F(SandboxAnalyzerTest, GuardPathsStayNonOperationalBeforeInitialization) {
     EXPECT_FALSE(analyzer.DownloadArtifact("missing", "artifact", L"C:\\artifact.bin"));
     EXPECT_FALSE(analyzer.GetMemoryDump("missing").has_value());
     EXPECT_FALSE(analyzer.GetNetworkCapture("missing").has_value());
+    analyzer.RegisterProgressCallback([](const std::string&, uint32_t, const std::string&) {});
+    analyzer.RegisterCompleteCallback([](const std::string&, const Engine::SandboxVerdict&) {});
+    analyzer.RegisterErrorCallback([](const std::string&, int) {});
+    analyzer.UnregisterCallbacks();
+    EXPECT_TRUE(Contains(Engine::SandboxAnalyzer::GetVersionString(), "3.0."));
     EXPECT_FALSE(analyzer.SelfTest());
 }
 

@@ -122,17 +122,27 @@ TEST_F(ZeroDayDetectorTest, ValidationAndSerializationHelpersRemainStable) {
     EXPECT_TRUE(Contains(resultJson, "\"analysisTimeUs\":123"));
     EXPECT_TRUE(Contains(resultJson, "\"shellcode\":"));
 
+    Engine::ZeroDayResult minimalResult;
+    minimalResult.detected = false;
+    const std::string minimalJson = minimalResult.ToJson();
+    EXPECT_FALSE(Contains(minimalJson, "\"shellcode\":"));
+    EXPECT_FALSE(Contains(minimalJson, "\"ropChain\":"));
+    EXPECT_FALSE(Contains(minimalJson, "\"heapSpray\":"));
+
     Engine::ZeroDayStatistics stats;
     stats.totalAnalyses.store(8, std::memory_order_relaxed);
     stats.exploitsDetected.store(2, std::memory_order_relaxed);
     stats.shellcodeDetected.store(1, std::memory_order_relaxed);
-    EXPECT_TRUE(Contains(stats.ToJson(), "\"totalAnalyses\":8"));
+    const std::string statsJson = stats.ToJson();
+    EXPECT_TRUE(Contains(statsJson, "\"totalAnalyses\":8"));
+    EXPECT_TRUE(Contains(statsJson, "\"shellcode\":1"));
     stats.Reset();
     EXPECT_EQ(stats.totalAnalyses.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.exploitsDetected.load(std::memory_order_relaxed), 0u);
 
     EXPECT_EQ(Engine::GetExploitTypeName(Engine::ExploitType::ROPChain), "ROPChain");
     EXPECT_EQ(Engine::GetShellcodeTypeName(Engine::ShellcodeType::ConnectBack), "ConnectBack");
+    EXPECT_EQ(Engine::GetShellcodeTypeName(Engine::ShellcodeType::Egg_Hunter), "EggHunter");
     EXPECT_EQ(Engine::GetGadgetTypeName(Engine::GadgetType::PopRet), "PopRet");
     EXPECT_EQ(Engine::GetExploitSeverityName(Engine::ExploitSeverity::Critical), "Critical");
     EXPECT_EQ(Engine::GetDetectionConfidenceName(Engine::DetectionConfidence::High), "High");
@@ -171,6 +181,8 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
     EXPECT_TRUE(detector.IsNopSled(shellcodeBuffer));
     EXPECT_TRUE(detector.HasGetPC(std::span<const uint8_t>(shellcodeBuffer).subspan(
         Engine::ZeroDayConstants::MIN_NOP_SLED_LENGTH)));
+    EXPECT_TRUE(detector.IsNopSled(std::vector<uint8_t>(Engine::ZeroDayConstants::MIN_NOP_SLED_LENGTH, 0x97)));
+    EXPECT_TRUE(detector.HasGetPC(std::vector<uint8_t>{0xD9, 0x74, 0x24, 0xF4}));
 
     const std::vector<uint8_t> decoderStub = {
         0x31, 0xC0, 0x40, 0xE2, 0xFE, 0x41,
@@ -189,6 +201,12 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
 
     const std::vector<uint8_t> heapPattern(128, 0x0C);
     EXPECT_TRUE(detector.IsHeapSprayPattern(heapPattern));
+    EXPECT_FALSE(detector.IsHeapSprayPattern(std::vector<uint8_t>(63, 0x0C)));
+    std::vector<uint8_t> almostUniform(64, 0x41);
+    for (size_t i = 0; i < 7; ++i) {
+        almostUniform[i] = static_cast<uint8_t>(0x50 + i);
+    }
+    EXPECT_FALSE(detector.IsHeapSprayPattern(almostUniform));
 
     const std::vector<std::pair<uintptr_t, size_t>> allocations = {
         {0x0C0C0C0C, 0x100000}, {0x0C1C0C0C, 0x100000}, {0x0C2C0C0C, 0x100000},
@@ -200,6 +218,14 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
     ASSERT_TRUE(heapSpray.has_value());
     EXPECT_EQ(heapSpray->allocationCount, allocations.size());
     EXPECT_EQ(heapSpray->sprayValue, 0x0C0C0C0C);
+
+    const std::vector<std::pair<uintptr_t, size_t>> insufficientSpray = {
+        {0x0C0C0C0C, 0x20000}, {0x0C1C0C0C, 0x20000}, {0x0C2C0C0C, 0x20000},
+        {0x0C3C0C0C, 0x20000}, {0x0C4C0C0C, 0x20000}, {0x0C5C0C0C, 0x20000},
+        {0x0C6C0C0C, 0x20000}, {0x0C7C0C0C, 0x20000}, {0x0C8C0C0C, 0x20000},
+        {0x0C9C0C0C, 0x20000}
+    };
+    EXPECT_FALSE(detector.DetectHeapSpray(insufficientSpray).has_value());
 
     const std::vector<uint8_t> gadgetBytes = {0x58, 0xC3, 0x90, 0x5A, 0xC3};
     const auto gadgets = detector.FindGadgets(gadgetBytes, 0x1000);

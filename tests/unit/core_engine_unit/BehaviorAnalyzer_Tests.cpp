@@ -53,6 +53,7 @@ TEST(BehaviorAnalyzerTest, ClearResetsAccumulatedProcessState) {
     state.currentVerdict = Engine::BehaviorVerdictType::Malicious;
     state.recommendedAction = Engine::RecommendedAction::Terminate;
     state.hasBeenReported = true;
+    state.exfilThresholdTriggered = true;
 
     state.Clear();
 
@@ -67,6 +68,7 @@ TEST(BehaviorAnalyzerTest, ClearResetsAccumulatedProcessState) {
     EXPECT_EQ(state.currentVerdict, Engine::BehaviorVerdictType::Clean);
     EXPECT_EQ(state.recommendedAction, Engine::RecommendedAction::None);
     EXPECT_FALSE(state.hasBeenReported);
+    EXPECT_TRUE(state.exfilThresholdTriggered);
 }
 
 TEST(BehaviorAnalyzerTest, VerdictAndAttackChainHelpersEncodeImmediateResponseSemantics) {
@@ -84,6 +86,93 @@ TEST(BehaviorAnalyzerTest, VerdictAndAttackChainHelpersEncodeImmediateResponseSe
     secondEvent.systemTime += 9s;
     chain.events = {firstEvent, secondEvent};
     EXPECT_EQ(chain.GetDuration(), 9s);
+}
+
+TEST(BehaviorAnalyzerTest, ThresholdsAndHelperFactoriesMatchCurrentDetectionSemantics) {
+    Engine::ProcessBehaviorState state;
+    state.maliceScore = Engine::BehaviorConstants::WARNING_THRESHOLD - 0.01;
+    EXPECT_EQ(state.GetSeverity(), Engine::BehaviorSeverity::Info);
+
+    state.maliceScore = Engine::BehaviorConstants::WARNING_THRESHOLD;
+    EXPECT_EQ(state.GetSeverity(), Engine::BehaviorSeverity::Low);
+
+    state.maliceScore = Engine::BehaviorConstants::ALERT_THRESHOLD;
+    EXPECT_EQ(state.GetSeverity(), Engine::BehaviorSeverity::Medium);
+
+    state.maliceScore = Engine::BehaviorConstants::BLOCK_THRESHOLD;
+    EXPECT_EQ(state.GetSeverity(), Engine::BehaviorSeverity::High);
+
+    state.maliceScore = Engine::BehaviorConstants::CRITICAL_THRESHOLD;
+    EXPECT_EQ(state.GetSeverity(), Engine::BehaviorSeverity::Critical);
+
+    state = {};
+    state.shadowCopyOperations = 1;
+    EXPECT_TRUE(state.HasRansomwareBehavior());
+    state = {};
+    state.canaryFilesTouched = 1;
+    EXPECT_TRUE(state.HasRansomwareBehavior());
+    state = {};
+    state.ransomNoteIndicators = 1;
+    EXPECT_TRUE(state.HasRansomwareBehavior());
+
+    state = {};
+    state.crossProcessWrites = 1;
+    EXPECT_TRUE(state.HasInjectionBehavior());
+    state = {};
+    state.targetedProcessIds.insert(404);
+    EXPECT_TRUE(state.HasInjectionBehavior());
+
+    Engine::BehaviorVerdict verdict;
+    verdict.action = Engine::RecommendedAction::Suspend;
+    EXPECT_FALSE(verdict.RequiresImmediateAction());
+    verdict.action = Engine::RecommendedAction::BlockAndQuarantine;
+    EXPECT_TRUE(verdict.RequiresImmediateAction());
+
+    Engine::BehaviorAttackChain emptyChain;
+    EXPECT_EQ(emptyChain.GetDuration(), 0s);
+
+    const Engine::BehaviorEvent fileEvent =
+        Engine::CreateFileEvent(Engine::BehaviorEventType::FileWrite, 77, L"C:\\Temp\\note.txt", false);
+    EXPECT_EQ(fileEvent.category, Engine::BehaviorEventCategory::FileSystem);
+    EXPECT_EQ(fileEvent.processId, 77u);
+    EXPECT_EQ(fileEvent.targetPath, L"C:\\Temp\\note.txt");
+    EXPECT_EQ(fileEvent.fileExtension, L".txt");
+    EXPECT_FALSE(fileEvent.success);
+
+    const Engine::BehaviorEvent registryEvent = Engine::CreateRegistryEvent(
+        Engine::BehaviorEventType::RegistrySetValue,
+        91,
+        L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run",
+        L"ShadowStrike",
+        true);
+    EXPECT_EQ(registryEvent.category, Engine::BehaviorEventCategory::Registry);
+    EXPECT_EQ(registryEvent.valueName, L"ShadowStrike");
+    EXPECT_TRUE(registryEvent.success);
+
+    const Engine::BehaviorEvent networkEvent =
+        Engine::CreateNetworkEvent(Engine::BehaviorEventType::NetworkConnect, 13, "198.51.100.7", 443, "TLS");
+    EXPECT_EQ(networkEvent.category, Engine::BehaviorEventCategory::Network);
+    EXPECT_EQ(networkEvent.remoteHostname, "198.51.100.7");
+    EXPECT_EQ(networkEvent.remoteIP, "198.51.100.7");
+    EXPECT_EQ(networkEvent.remotePort, 443);
+    EXPECT_EQ(networkEvent.protocol, "TLS");
+
+    const Engine::BehaviorEvent processEvent =
+        Engine::CreateProcessEvent(Engine::BehaviorEventType::ProcessInject, 100, 200);
+    EXPECT_EQ(processEvent.category, Engine::BehaviorEventCategory::Process);
+    EXPECT_EQ(processEvent.processId, 100u);
+    EXPECT_EQ(processEvent.targetProcessId, 200u);
+
+    EXPECT_TRUE(Engine::IsRansomNotePattern(L"C:\\Users\\Public\\README_FOR_DECRYPT.txt"));
+    EXPECT_FALSE(Engine::IsRansomNotePattern(L"C:\\Users\\Public\\notes.txt"));
+    EXPECT_TRUE(Engine::IsPersistenceRegistryPath(
+        L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\ShadowStrike"));
+    EXPECT_FALSE(Engine::IsPersistenceRegistryPath(L"HKCU\\Software\\ShadowStrike"));
+    EXPECT_TRUE(Engine::IsLSASSProcess(L"LSASS.EXE"));
+    EXPECT_TRUE(Engine::IsDocumentApplication(L"WINWORD.EXE"));
+    EXPECT_FALSE(Engine::IsDocumentApplication(L"powershell.exe"));
+    EXPECT_TRUE(Engine::IsScriptInterpreter(L"PowerShell.EXE"));
+    EXPECT_FALSE(Engine::IsScriptInterpreter(L"explorer.exe"));
 }
 
 TEST(BehaviorAnalyzerTest, ConfigurationFactoriesShiftSensitivityAndStatsResetCleanly) {

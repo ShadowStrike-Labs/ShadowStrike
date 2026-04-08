@@ -61,6 +61,15 @@ TEST_F(MachineLearningDetectorTest, ModelConfigEnforcesProductionValidationBound
     Engine::ModelConfig config = MakeValidModelConfig();
     EXPECT_TRUE(config.IsValid());
 
+    config.threshold = 0.0f;
+    EXPECT_TRUE(config.IsValid());
+    config.threshold = 1.0f;
+    EXPECT_TRUE(config.IsValid());
+    config.ensembleWeight = 0.0f;
+    EXPECT_TRUE(config.IsValid());
+    config.ensembleWeight = 1.0f;
+    EXPECT_TRUE(config.IsValid());
+
     config.modelPath.clear();
     EXPECT_FALSE(config.IsValid());
 
@@ -142,6 +151,8 @@ TEST_F(MachineLearningDetectorTest, SerializationHelpersExposeStableDiagnosticFi
     EXPECT_TRUE(Contains(predictionJson, "\"isMalicious\":true"));
     EXPECT_TRUE(Contains(predictionJson, "\"classification\":4"));
     EXPECT_TRUE(Contains(predictionJson, "\"modelName\":\"primary\""));
+    EXPECT_TRUE(Contains(predictionJson, "\"threshold\":0.9"));
+    EXPECT_FALSE(Contains(predictionJson, "thresholdUsed"));
 
     Engine::EnsemblePrediction ensemble;
     ensemble.finalResult = prediction;
@@ -193,6 +204,13 @@ TEST_F(MachineLearningDetectorTest, ConfigurationValidationTracksPrimaryAndEnsem
     config.ensembleModels = {MakeValidModelConfig()};
     EXPECT_TRUE(config.IsValid());
 
+    config.ensembleModels = {Engine::ModelConfig{}};
+    EXPECT_TRUE(config.IsValid());
+
+    config = {};
+    config.enabled = false;
+    EXPECT_TRUE(config.IsValid());
+
     config.batchSize = 0;
     EXPECT_FALSE(config.IsValid());
 
@@ -208,17 +226,26 @@ TEST_F(MachineLearningDetectorTest, GuardPathsRemainBenignBeforeInitialization) 
     EXPECT_EQ(detector.GetStatus(), Engine::MLDetectorStatus::Uninitialized);
 
     EXPECT_FALSE(detector.Initialize(Engine::MachineLearningConfiguration{}));
+    EXPECT_FALSE(detector.GetModelInfo("primary").has_value());
+    EXPECT_TRUE(detector.GetLoadedModels().empty());
 
     Engine::ExtractedFeatures features;
     features.features = {0.25f, 0.75f};
     const Engine::PredictionResult prediction = detector.Analyze(features);
     EXPECT_FALSE(prediction.isMalicious);
-    EXPECT_EQ(prediction.classification, Engine::Classification::Unknown);
-    EXPECT_TRUE(prediction.modelName.empty());
+    EXPECT_EQ(prediction.classification, Engine::Classification::PotentiallyUnwanted);
+    EXPECT_EQ(prediction.modelName, "PhantomCortex-Fallback");
+    EXPECT_FLOAT_EQ(prediction.probability, 0.5f);
+    EXPECT_FLOAT_EQ(prediction.thresholdUsed, 0.85f);
 
     const auto stats = detector.GetStatistics();
-    EXPECT_EQ(stats.totalPredictions, 1u);
-    EXPECT_EQ(stats.modelInferences, 0u);
+    EXPECT_EQ(stats.totalPredictions, 0u);
+    EXPECT_EQ(stats.modelInferences, 1u);
+
+    const auto devices = Engine::GetAvailableDevices();
+    EXPECT_FALSE(devices.empty());
+    EXPECT_EQ(devices.front(), Engine::InferenceDevice::CPU);
+    EXPECT_TRUE(Contains(Engine::MachineLearningDetector::GetVersionString(), "3.0."));
 }
 
 TEST_F(MachineLearningDetectorTest, EnumNameHelpersStayStableForOperationalTelemetry) {

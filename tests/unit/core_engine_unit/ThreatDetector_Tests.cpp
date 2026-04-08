@@ -31,6 +31,17 @@ bool Contains(std::string_view haystack, std::string_view needle) {
 
 }  // namespace
 
+class ThreatDetectorFixture : public ::testing::Test {
+protected:
+    void SetUp() override {
+        Engine::ThreatDetector::Instance().Shutdown();
+    }
+
+    void TearDown() override {
+        Engine::ThreatDetector::Instance().Shutdown();
+    }
+};
+
 TEST(ThreatDetectorTest, SystemEventHelpersReflectAgeAndCrossProcessBehavior) {
     Engine::SystemEvent event;
     event.timestamp = std::chrono::steady_clock::now() - 20ms;
@@ -41,6 +52,9 @@ TEST(ThreatDetectorTest, SystemEventHelpersReflectAgeAndCrossProcessBehavior) {
     EXPECT_TRUE(event.IsCrossProcess());
 
     event.targetProcessId = 100;
+    EXPECT_FALSE(event.IsCrossProcess());
+
+    event.targetProcessId = 0;
     EXPECT_FALSE(event.IsCrossProcess());
 }
 
@@ -61,6 +75,14 @@ TEST(ThreatDetectorTest, VerdictAndAttackChainJsonSurfacesExposeStableCounts) {
     EXPECT_TRUE(Contains(verdictJson, "\"mitreCount\":1"));
     EXPECT_TRUE(verdict.RequiresImmediateAction());
     EXPECT_EQ(verdict.GetSeverityString(), "Critical");
+
+    verdict.severity = Engine::ThreatSeverity::High;
+    verdict.recommendedAction = Engine::ResponseAction::None;
+    EXPECT_TRUE(verdict.RequiresImmediateAction());
+
+    verdict.severity = Engine::ThreatSeverity::Medium;
+    verdict.recommendedAction = Engine::ResponseAction::Block;
+    EXPECT_FALSE(verdict.RequiresImmediateAction());
 
     Engine::AttackChain chain;
     chain.chainId = 77;
@@ -95,15 +117,52 @@ TEST(ThreatDetectorTest, ConfigurationFactoriesEncodeOperationalResponseProfiles
 TEST(ThreatDetectorTest, StatisticsResetClearsAllRuntimeCounters) {
     Engine::ThreatDetectorStats stats;
     stats.totalEventsProcessed.store(20, std::memory_order_relaxed);
+    stats.eventsByCategory[3].store(2, std::memory_order_relaxed);
     stats.totalThreatsDetected.store(4, std::memory_order_relaxed);
+    stats.threatsBySeverity[2].store(5, std::memory_order_relaxed);
+    stats.threatsByCategory[1].store(6, std::memory_order_relaxed);
+    stats.detectionsBySource[4].store(7, std::memory_order_relaxed);
+    stats.actionsTaken[2].store(8, std::memory_order_relaxed);
+    stats.eventsPerSecond.store(9, std::memory_order_relaxed);
+    stats.peakEventsPerSecond.store(10, std::memory_order_relaxed);
     stats.eventsDropped.store(1, std::memory_order_relaxed);
+    stats.falsePositives.store(2, std::memory_order_relaxed);
     stats.avgProcessingTimeUs.store(120, std::memory_order_relaxed);
 
     stats.Reset();
     EXPECT_EQ(stats.totalEventsProcessed.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.eventsByCategory[3].load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.totalThreatsDetected.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.threatsBySeverity[2].load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.threatsByCategory[1].load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.detectionsBySource[4].load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.actionsTaken[2].load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.eventsPerSecond.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.peakEventsPerSecond.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.eventsDropped.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.falsePositives.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.avgProcessingTimeUs.load(std::memory_order_relaxed), 0u);
+}
+
+TEST_F(ThreatDetectorFixture, CallbackAndIdleQueueSurfacesRemainStableWithoutEvents) {
+    auto& detector = Engine::ThreatDetector::Instance();
+    EXPECT_FALSE(detector.IsInitialized());
+    EXPECT_EQ(detector.GetQueueDepth(), 0u);
+
+    const uint64_t verdictCallbackId =
+        detector.RegisterVerdictCallback([](const Engine::ThreatVerdict&) {});
+    const uint64_t chainCallbackId =
+        detector.RegisterAttackChainCallback([](const Engine::AttackChain&) {});
+    EXPECT_NE(verdictCallbackId, 0u);
+    EXPECT_NE(chainCallbackId, 0u);
+    EXPECT_TRUE(detector.UnregisterVerdictCallback(verdictCallbackId));
+    EXPECT_TRUE(detector.UnregisterAttackChainCallback(chainCallbackId));
+    EXPECT_FALSE(detector.UnregisterVerdictCallback(verdictCallbackId));
+    EXPECT_FALSE(detector.UnregisterAttackChainCallback(chainCallbackId));
+
+    const Engine::ThreatDetectorStats stats = detector.GetStats();
+    EXPECT_EQ(stats.totalEventsProcessed.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(stats.falsePositives.load(std::memory_order_relaxed), 0u);
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test
