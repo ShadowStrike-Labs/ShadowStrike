@@ -909,6 +909,11 @@
     <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestComparer_Tests.cpp" />
     <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestGenerator_Tests.cpp" />
     <ClCompile Include="tests\unit\FuzzyHasher_Unit\FuzzyHasher_Tests.cpp" />
+    <ClCompile Include="tests\unit\perf_dev_unit\MemoryProfiler_Tests.cpp" />
+    <ClCompile Include="tests\unit\perf_dev_unit\PerformanceProfiler_Tests.cpp" />
+    <ClCompile Include="tests\unit\perf_unit\CPUMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\perf_unit\DiskMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\perf_unit\NetworkPerformanceMonitor_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
