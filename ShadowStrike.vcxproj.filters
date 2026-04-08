@@ -975,6 +975,57 @@
     <ClCompile Include="src\Shared_modules\Update\LocalFolderTransport.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\ai_unit\CortexConfig_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ai_unit\FeatureExtractor_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ai_unit\ModelCache_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ai_unit\ModelInference_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ai_unit\PhantomCortex_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\config_unit\ConfigManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\config_unit\PolicyManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\config_unit\ProfileManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\AlertSystem_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\CommunicationProtocol_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\IPCManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\NotificationManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\ReportGenerator_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\ServiceCommunication_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\TelemetryCollector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\communication_unit\ThreatIntelPusher_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="include\gmock\gmock-actions.h">
@@ -1089,6 +1140,12 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\gtest\internal\custom\gtest.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tests\unit\config_unit\Config_TestUtils.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="include\nlohmann\json.hpp">
@@ -1996,6 +2053,59 @@
     <MASM Include="src\Shared_modules\AntiEvasion\DebuggerEvasionDetector_x64.asm">
       <Filter>Source Files</Filter>
     </MASM>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="tests\unit\antievasion_unit\DebuggerEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\EnvironmentEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\MetamorphicDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\NetworkBasedEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\PackerDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\ProcessEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\SandboxEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\TimeBasedEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\antievasion_unit\VMEvasionDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="tests\unit\antievasion_unit\AntiEvasion_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="tests\unit\core_filesys_unit\DirectoryMonitor_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_filesys_unit\FileHasher_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_filesys_unit\FileReputation_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\core_filesys_unit\FileTypeAnalyzer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="tests\unit\core_filesys_unit\CoreFileSystem_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
   </ItemGroup>
   <ItemGroup>
     <None Include="src\Shared_modules\Core\Engine\HeuristicAnalyzer.cpp.bak" />
