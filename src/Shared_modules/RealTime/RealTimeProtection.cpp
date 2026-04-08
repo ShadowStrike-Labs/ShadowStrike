@@ -66,6 +66,7 @@
 
 // Kernel network event structures (for FilterMessageType_NetworkAlert parsing)
 #include "../../PhantomSensor/Shared/NetworkTypes.h"
+#include "../../PhantomSensor/Shared/MessageTypes.h"
 
 // ============================================================================
 // EXPLOIT DETECTOR INCLUDES
@@ -100,6 +101,7 @@
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
 #include "../Communication/IPCManager.hpp"
+#include "../Communication/Communication.hpp"
 #include "../Communication/TelemetryCollector.hpp"
 #include "../Communication/AlertSystem.hpp"
 #include "../Communication/ThreatIntelPusher.hpp"
@@ -188,6 +190,24 @@ namespace {
         }
 
         return lowerPath == lowerPattern;
+    }
+
+    // =========================================================================
+    // KERNEL VERDICT CONVERSION
+    // =========================================================================
+
+    SHADOWSTRIKE_SCAN_VERDICT MapKernelVerdictToScanVerdict(
+        Communication::KernelVerdict kv) noexcept
+    {
+        switch (kv) {
+            case Communication::KernelVerdict::Allow:      return Verdict_Clean;
+            case Communication::KernelVerdict::Block:       return Verdict_Malicious;
+            case Communication::KernelVerdict::Quarantine:  return Verdict_Malicious;
+            case Communication::KernelVerdict::Log:         return Verdict_Suspicious;
+            case Communication::KernelVerdict::Delay:       return Verdict_Timeout;
+            case Communication::KernelVerdict::Error:       return Verdict_Error;
+            default:                                        return Verdict_Unknown;
+        }
     }
 
     // =========================================================================
@@ -439,8 +459,10 @@ public:
         try {
             // 1. Initialize ThreadPool if not provided
             if (!m_threadPool) {
-                m_threadPool = std::make_shared<Utils::ThreadPool>(
-                    std::min(std::thread::hardware_concurrency(), 8u));
+                Utils::ThreadPoolConfig tpConfig;
+                tpConfig.minThreads = std::min(std::thread::hardware_concurrency(), 8u);
+                tpConfig.maxThreads = std::min(std::thread::hardware_concurrency() * 2u, 16u);
+                m_threadPool = std::make_shared<Utils::ThreadPool>(std::move(tpConfig));
             }
 
             // 1.5. Initialize CacheManager for shared verdict/result caching
@@ -653,7 +675,7 @@ public:
 
         // Set up auto-resume if duration specified
         if (durationMs > 0) {
-            m_threadPool->Submit([this, durationMs]() {
+            m_threadPool->Submit([this, durationMs](const Utils::TaskContext&) {
                 std::this_thread::sleep_for(std::chrono::milliseconds(durationMs));
                 if (m_state == ProtectionState::PAUSED) {
                     Resume();
@@ -718,23 +740,23 @@ public:
             }
 
             // Register kernel event handlers
-            ipc.RegisterFileScanHandler([this](const Communication::FileScanRequest& req) {
-                return OnKernelFileScan(req);
+            ipc.RegisterFileScanHandler([this](const FILE_SCAN_REQUEST& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                return MapKernelVerdictToScanVerdict(OnKernelFileScan(req));
             });
 
-            ipc.RegisterProcessHandler([this](const Communication::ProcessNotifyRequest& req) {
-                return OnKernelProcessNotify(req);
+            ipc.RegisterProcessHandler([this](const Communication::ProcessNotifyRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                return MapKernelVerdictToScanVerdict(OnKernelProcessNotify(req));
             });
 
-            ipc.RegisterImageLoadHandler([this](const Communication::ImageLoadRequest& req) {
-                return OnKernelImageLoad(req);
+            ipc.RegisterImageLoadHandler([this](const Communication::ImageLoadRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                return MapKernelVerdictToScanVerdict(OnKernelImageLoad(req));
             });
 
-            ipc.RegisterRegistryHandler([this](const Communication::RegistryOpRequest& req) {
-                return OnKernelRegistryOp(req);
+            ipc.RegisterRegistryHandler([this](const Communication::RegistryOpRequest& req) -> SHADOWSTRIKE_SCAN_VERDICT {
+                return MapKernelVerdictToScanVerdict(OnKernelRegistryOp(req));
             });
 
-            ipc.RegisterGenericHandler([this](Communication::SHADOWSTRIKE_MESSAGE_TYPE type,
+            ipc.RegisterGenericHandler([this](SHADOWSTRIKE_MESSAGE_TYPE type,
                                               const void* data, size_t size) {
                 OnKernelGenericEvent(type, data, size);
             });
@@ -930,7 +952,8 @@ public:
                         if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                             Utils::Logger::Warn(
                                 "[PD-CB] file={} packer={} confidence={:.2f} severity={} method={} mitre={}",
-                                Utils::StringUtils::ToNarrow(file.substr(0, 120)), match.packerName,
+                                Utils::StringUtils::ToNarrow(file.substr(0, 120)),
+                                Utils::StringUtils::ToNarrow(match.packerName),
                                 match.confidence,
                                 static_cast<int>(match.severity),
                                 static_cast<int>(match.method),
@@ -1117,7 +1140,7 @@ public:
         if (m_config.monitorMemoryAllocation) {
             try {
                 auto& mp = MemoryProtection::Instance();
-                MemoryProtection::MemoryProtectionConfig mpConfig;
+                MemoryProtectionConfig mpConfig;
                 mpConfig.enableKernelIntegration = true;
                 mpConfig.enableContinuousMonitoring = m_config.monitorMemoryAllocation;
                 mpConfig.enableAPTHunting = m_config.enableExploitPrevention;
@@ -1529,8 +1552,8 @@ public:
                 } else {
                     // Register verdict callback for SOC/SIEM integration
                     zhp.RegisterVerdictCallback(
-                        [](const std::wstring& filePath, const ZeroHourProtection::FileAnalysisResult& result) {
-                            if (result.verdict != ZeroHourProtection::CloudVerdict::CLEAN) {
+                        [](const std::wstring& filePath, const FileAnalysisResult& result) {
+                            if (result.verdict != CloudVerdict::CLEAN) {
                                 Utils::Logger::Warn(
                                     "RealTimeProtection: [ZHP] Verdict for {}: threat={} (source={})",
                                     Utils::StringUtils::ToNarrow(filePath),
@@ -1540,7 +1563,7 @@ public:
                         });
                     // Register outbreak callback for rapid response
                     zhp.RegisterOutbreakCallback(
-                        [](const ZeroHourProtection::OutbreakInfo& outbreak, bool isNew) {
+                        [](const OutbreakInfo& outbreak, bool isNew) {
                             Utils::Logger::Error(
                                 "RealTimeProtection: [ZHP] OUTBREAK {}: {} "
                                 "(severity={} globalVictims={} localVictims={})",
@@ -1552,7 +1575,7 @@ public:
                         });
                     // Register signature update callback
                     zhp.RegisterSignatureUpdateCallback(
-                        [](const ZeroHourProtection::MicroSigUpdatePackage& package, bool success) {
+                        [](const MicroSigUpdatePackage& package, bool success) {
                             Utils::Logger::Info(
                                 "RealTimeProtection: [ZHP] Signature update {}: "
                                 "v{} -> v{} (additions={} removals={} emergency={})",
@@ -1674,7 +1697,7 @@ public:
                                 Utils::Logger::Error(
                                     "[KED-CB] Vulnerable driver: {} (SHA256: {}, "
                                     "LOLDriver={}, MSBlocked={}, Action={})",
-                                    info.fileName,
+                                    Utils::StringUtils::ToNarrow(info.fileName),
                                     info.sha256.substr(0, 16),
                                     info.isLOLDriver ? "YES" : "NO",
                                     info.isMicrosoftBlocked ? "YES" : "NO",
@@ -1820,7 +1843,7 @@ public:
     // KERNEL EVENT HANDLERS
     // =========================================================================
 
-    Communication::KernelVerdict OnKernelFileScan(const Communication::FileScanRequest& req) {
+    Communication::KernelVerdict OnKernelFileScan(const FILE_SCAN_REQUEST& req) {
         auto startTime = std::chrono::high_resolution_clock::now();
 
         m_stats.totalEvents++;
@@ -1832,37 +1855,25 @@ public:
             return Communication::KernelVerdict::Allow;
         }
 
-        std::wstring filePath(req.fileName);
+        // Extract file path from variable-length data after the struct
+        std::wstring filePath(
+            reinterpret_cast<const wchar_t*>(
+                reinterpret_cast<const uint8_t*>(&req) + sizeof(FILE_SCAN_REQUEST)),
+            req.PathLength / sizeof(wchar_t));
 
         // 1. Check Exclusions
-        if (IsExcluded(filePath, req.header.processId)) {
+        if (IsExcluded(filePath, req.ProcessId)) {
             m_stats.excludedByPath++;
             return Communication::KernelVerdict::Allow;
         }
 
         // 2. Check Verdict Cache
         std::string hashKey;
-        if (req.hashValid) {
-            // Convert hash to hex string for cache lookup
-            std::ostringstream oss;
-            for (size_t i = 0; i < 32 && i < sizeof(req.hash); ++i) {
-                oss << std::hex << std::setfill('0') << std::setw(2)
-                    << static_cast<int>(req.hash[i]);
-            }
-            hashKey = oss.str();
-
-            auto cached = CheckVerdictCache(hashKey);
-            if (cached.has_value()) {
-                m_performanceMetrics.cacheHits++;
-                return MapScanVerdictToKernel(cached->verdict);
-            }
-            m_performanceMetrics.cacheMisses++;
-        }
 
         // Anti-Evasion: Metamorphic Analysis
         if (m_metamorphicDetector) {
             ShadowStrike::AntiEvasion::MetamorphicAnalysisConfig metaCfg;
-            metaCfg.processId = req.header.processId;
+            metaCfg.processId = req.ProcessId;
             auto metaResult = m_metamorphicDetector->AnalyzeFile(filePath, metaCfg);
             if (metaResult.isMetamorphic) {
                 Utils::Logger::Warn(
@@ -1872,7 +1883,7 @@ public:
                     metaResult.mutationScore,
                     static_cast<int>(metaResult.maxSeverity),
                     metaResult.totalDetections,
-                    metaResult.familyName.empty() ? "unknown" : metaResult.familyName);
+                    metaResult.familyName.empty() ? std::string("unknown") : Utils::StringUtils::ToNarrow(metaResult.familyName));
                 m_stats.threatsDetected++;
                 return Communication::KernelVerdict::Block;
             }
@@ -1885,7 +1896,7 @@ public:
             ShadowStrike::AntiEvasion::PackerAnalysisConfig pdConfig;
             pdConfig.depth = ShadowStrike::AntiEvasion::PackerAnalysisDepth::Deep;
             pdConfig.flags = ShadowStrike::AntiEvasion::PackerAnalysisFlags::DeepScan;
-            pdConfig.processId = req.header.processId;
+            pdConfig.processId = req.ProcessId;
 
             ShadowStrike::AntiEvasion::PackerError pdErr{};
             auto packResult = m_packerDetector->AnalyzeFile(filePath, pdConfig, &pdErr);
@@ -1901,7 +1912,8 @@ public:
                 Utils::Logger::Info(
                     "RealTimeProtection: Packed file: {} [packer={} confidence={:.1f}% "
                     "severity={} category={} layers={} entropy={:.2f}]",
-                    Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
+                    Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName),
+                    packResult.packingConfidence * 100.0,
                     static_cast<int>(packResult.severity),
                     static_cast<int>(packResult.packerCategory),
                     packResult.layerCount,
@@ -1910,7 +1922,8 @@ public:
                 // Critical/High severity packer = malware-specific packer → block immediately
                 if (packResult.severity >= ShadowStrike::AntiEvasion::PackerSeverity::Critical) {
                     Utils::Logger::Warn(
-                        "RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",\n                        Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName), packResult.packerMatches.size());
+                        "RealTimeProtection: Blocked malware-specific packer: {} [packer={} matches={}]",
+                        Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(packResult.packerName), packResult.packerMatches.size());
                     m_stats.threatsDetected++;
                     return Communication::KernelVerdict::Block;
                 }
@@ -1918,7 +1931,8 @@ public:
                 for (const auto& match : packResult.packerMatches) {
                     if (match.severity >= ShadowStrike::AntiEvasion::PackerSeverity::High) {
                         Utils::Logger::Warn(
-                            "RealTimeProtection: High-severity packer match in {}: {} (confidence={:.2f}, method={})",\n                            Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(match.packerName), match.confidence,
+                            "RealTimeProtection: High-severity packer match in {}: {} (confidence={:.2f}, method={})",
+                            Utils::StringUtils::ToNarrow(filePath), Utils::StringUtils::ToNarrow(match.packerName), match.confidence,
                             static_cast<int>(match.method));
                     }
                 }
@@ -1932,8 +1946,8 @@ public:
             auto& execAnalyzer = Core::FileSystem::ExecutableAnalyzer::Instance();
             auto quickInfo = execAnalyzer.AnalyzeForKernel(
                 filePath,
-                req.header.processId,
-                req.fileSize
+                req.ProcessId,
+                req.FileSize
             );
 
             // If risk score is extremely high, block immediately without full scan
@@ -1942,9 +1956,9 @@ public:
                     L"ExecutableAnalyzer rapid block: risk=%u, anomalies=%zu, PID=%u",
                     static_cast<unsigned>(quickInfo.riskScore),
                     quickInfo.anomalies.size(),
-                    req.header.processId);
+                    req.ProcessId);
 
-                m_stats.blockedThreats++;
+                m_stats.threatsDetected++;
                 return Communication::KernelVerdict::Block;
             }
         }
@@ -1953,7 +1967,7 @@ public:
         Core::Engine::ScanContext context;
         context.type = Core::Engine::ScanType::RealTime;
         context.priority = Core::Engine::ScanPriority::Critical;
-        context.processId = req.header.processId;
+        context.processId = req.ProcessId;
         context.filePath = filePath;
         context.timeout = std::chrono::milliseconds(
             RTPConstants::KERNEL_REPLY_TIMEOUT_MS - 100);
@@ -1982,7 +1996,7 @@ public:
             std::shared_lock lock(m_callbackMutex);
             RTPFileScanRequest rtpReq;
             rtpReq.filePath = filePath;
-            rtpReq.pid = req.header.processId;
+            rtpReq.pid = req.ProcessId;
 
             for (const auto& [id, callback] : m_fileScanCallbacks) {
                 try {
@@ -2011,7 +2025,7 @@ public:
 
         // 9. Handle Threat
         if (scanResult.isThreat) {
-            HandleThreatDetection(scanResult, filePath, req.header.processId);
+            HandleThreatDetection(scanResult, filePath, req.ProcessId);
         }
 
         // 10. Map to kernel verdict
@@ -2151,7 +2165,7 @@ public:
 
             // 1. Debugger Evasion — pass kernel context for APT-grade detection
             if (m_debuggerDetector) {
-                ShadowStrike::AntiEvasion::DebuggerEvasionDetector::AnalysisConfig dedConfig;
+                ShadowStrike::AntiEvasion::AnalysisConfig dedConfig;
                 dedConfig.depth = ShadowStrike::AntiEvasion::AnalysisDepth::Standard;
 
                 // Populate kernel-enriched context — kernel sensor provides tamper-proof data
@@ -2246,7 +2260,7 @@ public:
 
             // 3. Process Evasion — kernel-enriched injection/hollowing/masquerading detection
             if (m_processDetector) {
-                ShadowStrike::AntiEvasion::ProcessAnalysisConfig pedConfig;
+                ShadowStrike::AntiEvasion::ProcessEvasionAnalysisConfig pedConfig;
                 pedConfig.flags = ShadowStrike::AntiEvasion::ProcessAnalysisFlags::Default
                                 | ShadowStrike::AntiEvasion::ProcessAnalysisFlags::DeepAnalysis;
                 pedConfig.enableDeepScan = true;
@@ -2451,7 +2465,7 @@ public:
                     req.parentProcessId,
                     imagePath,
                     commandLine,
-                    req.isElevated);
+                    false);
             } catch (...) {}
         }
 
@@ -2587,8 +2601,8 @@ public:
                     detection.threatType = "APT";
                     detection.detectionMethod = "DigitalSignatureValidator";
                     detection.actionTaken = "Blocked";
-                    detection.filePath = Utils::StringUtils::ToNarrow(imagePath);
-                    Communication::TelemetryCollector::Instance().ReportDetection(detection);
+                    detection.fileHash = Utils::StringUtils::ToNarrow(imagePath);
+                    Communication::TelemetryCollector::Instance().RecordDetection(detection);
                 }
 
                 return Communication::KernelVerdict::Block;
@@ -2655,7 +2669,8 @@ public:
                         Utils::Logger::Warn(
                             "RealTimeProtection: Packed module loaded in PID {}: {} "
                             "[packer={} confidence={:.1f}% severity={} category={} entropy={:.2f}]",
-                            req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(packResult.packerName),\n                    packResult.packingConfidence * 100.0,
+                            req.processId, Utils::StringUtils::ToNarrow(imagePath), Utils::StringUtils::ToNarrow(packResult.packerName),
+                            packResult.packingConfidence * 100.0,
                             static_cast<int>(packResult.severity),
                             static_cast<int>(packResult.packerCategory),
                             packResult.fileEntropy);
@@ -2701,8 +2716,8 @@ public:
                             // Emit telemetry for SOC
                             if (Communication::TelemetryCollector::HasInstance()) {
                                 Communication::DetectionEventData detection;
-                                detection.threatName = "KernelExploit." + GetKernelThreatTypeName(driverInfo.isLOLDriver ?
-                                    KernelThreatType::VulnerableDriverLoad : KernelThreatType::DriverBlocklistViolation);
+                                detection.threatName = std::string("KernelExploit.") + std::string(Exploits::GetKernelThreatTypeName(driverInfo.isLOLDriver ?
+                                    Exploits::KernelThreatType::VulnerableDriverLoad : Exploits::KernelThreatType::DriverBlocklistViolation));
                                 detection.threatType = "KernelExploit";
                                 detection.detectionMethod = "KernelExploitDetector";
                                 detection.actionTaken = "Blocked";
@@ -2846,8 +2861,8 @@ public:
         try {
             auto& ped = Exploits::PrivilegeEscalationDetector::Instance();
             auto valueData = std::vector<uint8_t>(
-                req.valueDataBegin(),
-                req.valueDataEnd());
+                req.registryData(),
+                req.registryData() + req.dataSize);
             ped.OnKernelRegistryModified(
                 req.processId,
                 keyPath,
@@ -2862,7 +2877,7 @@ public:
     // GENERIC EVENT HANDLER — thread/handle/network/memory/ALPC alerts
     // =========================================================================
 
-    void OnKernelGenericEvent(Communication::SHADOWSTRIKE_MESSAGE_TYPE type,
+    void OnKernelGenericEvent(SHADOWSTRIKE_MESSAGE_TYPE type,
                               const void* data, size_t size) {
         m_stats.totalEvents++;
 
@@ -3485,8 +3500,8 @@ public:
         // Get process info
         try {
             auto procPath = Utils::ProcessUtils::GetProcessPath(pid);
-            event.processPath = procPath.wstring();
-            event.processName = procPath.filename().wstring();
+            event.processPath = procPath.value();
+            event.processName = fs::path(procPath.value()).filename().wstring();
         } catch (...) {}
 
         // Record action
@@ -3619,7 +3634,7 @@ public:
     ScanResult ScanProcess(uint32_t pid) {
         try {
             auto path = Utils::ProcessUtils::GetProcessPath(pid);
-            return ScanFile(path.wstring(), ScanPriority::HIGH);
+            return ScanFile(path.value(), ScanPriority::HIGH);
         } catch (const std::exception& e) {
             ScanResult result;
             result.verdict = KernelVerdict::ERROR;
@@ -3641,8 +3656,8 @@ public:
 
     bool QuarantineFile(const std::wstring& filePath, std::wstring_view threatName) {
         try {
-            auto result = Core::Engine::QuarantineManager::Instance().Quarantine(filePath, threatName);
-            if (result) {
+            auto result = Core::Engine::QuarantineManager::Instance().QuarantineFile(filePath, std::wstring(threatName));
+            if (result.IsSuccess()) {
                 m_stats.filesQuarantined++;
                 Utils::Logger::Info("RealTimeProtection: Quarantined file: {}",
                     Utils::StringUtils::ToNarrow(filePath));
@@ -3650,7 +3665,7 @@ public:
                 Utils::Logger::Error("RealTimeProtection: QuarantineManager failed to quarantine: {}",
                     Utils::StringUtils::ToNarrow(filePath));
             }
-            return result;
+            return result.IsSuccess();
         } catch (const std::exception& ex) {
             Utils::Logger::Error("RealTimeProtection: Quarantine exception for {}: {}",
                 Utils::StringUtils::ToNarrow(filePath), ex.what());
@@ -3817,7 +3832,7 @@ public:
                        er.verdict == Core::Engine::ScanVerdict::Suspicious);
         sr.threatName = Utils::StringUtils::ToWide(er.threatName);
         sr.confidence = er.confidence;
-        sr.severity = er.severity;
+        sr.severity = static_cast<uint8_t>(er.severity);
 
         switch (er.verdict) {
             case Core::Engine::ScanVerdict::Clean:
@@ -3843,10 +3858,11 @@ public:
                 sr.verdict = KernelVerdict::ALLOW;
         }
 
-        sr.detectedBySignature = er.detectedBySignature;
-        sr.detectedByHeuristic = er.detectedByHeuristic;
-        sr.detectedByBehavior = er.detectedByBehavior;
-        sr.detectedByML = er.detectedByML;
+        const auto& methods = er.detectionMethods;
+        sr.detectedBySignature = std::find(methods.begin(), methods.end(), "Signature") != methods.end();
+        sr.detectedByHeuristic = std::find(methods.begin(), methods.end(), "Heuristic") != methods.end();
+        sr.detectedByBehavior = std::find(methods.begin(), methods.end(), "Behavior") != methods.end();
+        sr.detectedByML = std::find(methods.begin(), methods.end(), "ML") != methods.end();
 
         return sr;
     }
