@@ -1002,6 +1002,15 @@
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\integration\core_process\ProcessChain_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1045,6 +1054,9 @@
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp">
