@@ -44,6 +44,9 @@
 #include "../WinAPI/Vss/VssAPI.hpp"
 #include "../WinAPI/Ole32/WmiEmulation.hpp"
 
+// CLR/.NET Analysis
+#include "../Analysis/DotNetAnalyzer.hpp"
+
 // VirtualOS
 #include "../VirtualOS/EnvironmentBuilder.hpp"
 
@@ -318,6 +321,9 @@ struct EmulationSession::Impl {
     ProcessManager          m_processManager;
     WoW64Layer              m_wow64Layer;
 
+    // Phase 5 .NET/CLR analysis result (populated by CollectDotNetForensics)
+    CLR::DotNetAnalysisResult m_dotNetResult;
+
     // Session state
     std::atomic<bool> m_abortRequested{false};
     bool              m_executed = false;
@@ -548,6 +554,7 @@ struct EmulationSession::Impl {
         WinAPI::Ntdll::EtwState::Instance().Reset();
         WinAPI::Vss::VssDetector::Instance().Reset();
         WinAPI::Ole32::WmiState::Instance().Reset();
+        CLR::DotNetAnalyzer::Instance().Reset();
 
         // Build the full virtual environment: filesystem, registry, process
         // table, network, timing, anti-evasion subsystems
@@ -1481,6 +1488,12 @@ struct EmulationSession::Impl {
         //     anti-VM checks, shadow copy deletion via WMI, and WMI event
         //     subscriptions used for fileless persistence (T1546.003).
         CollectWmiForensics();
+
+        // 5s: .NET/CLR analysis — parse ECMA-335 metadata, disassemble MSIL,
+        //     execute static constructors for string decryption, detect obfuscation
+        //     (ConfuserEx, .NET Reactor, etc.), classify P/Invoke imports, and
+        //     extract embedded payloads from managed assemblies (T1027, T1620).
+        CollectDotNetForensics(target);
     }
 
     // ========================================================================
@@ -2139,6 +2152,71 @@ struct EmulationSession::Impl {
     }
 
     // ========================================================================
+    // 5s: .NET/CLR Analysis
+    // ========================================================================
+
+    void CollectDotNetForensics(const LoadedTarget& target) noexcept {
+        if (!m_config.enableDotNetAnalysis) return;
+
+        // Check if the loaded PE is a .NET assembly before running full analysis
+        if (!CLR::DotNetAnalyzer::IsDotNetAssembly(m_memory, target.imageBase)) return;
+
+        auto& analyzer = CLR::DotNetAnalyzer::Instance();
+        auto dotNetResult = analyzer.Analyze(m_memory, target.imageBase);
+
+        if (!dotNetResult.isDotNet) return;
+
+        // Feed threat score to the global scorer
+        if (dotNetResult.threatScore > 0.1f) {
+            ScoringFactor dotnetFactor;
+            dotnetFactor.source = "DotNetAnalyzer";
+            dotnetFactor.description = "Managed assembly threat analysis";
+            dotnetFactor.weight = dotNetResult.threatScore;
+            dotnetFactor.score = dotNetResult.threatScore;
+            dotnetFactor.confidence = 0.8f;
+            m_threatScorer.AddCustomFactor(dotnetFactor);
+        }
+
+        // Feed obfuscation detections to evasion detector
+        for (const auto& obf : dotNetResult.obfuscationDetected) {
+            std::string obfName;
+            switch (obf) {
+                case CLR::DotNetObfuscation::ConfuserEx:      obfName = "confuserex"; break;
+                case CLR::DotNetObfuscation::Dotfuscator:     obfName = "dotfuscator"; break;
+                case CLR::DotNetObfuscation::SmartAssembly:   obfName = "smartassembly"; break;
+                case CLR::DotNetObfuscation::Eazfuscator:     obfName = "eazfuscator"; break;
+                case CLR::DotNetObfuscation::Babel:           obfName = "babel"; break;
+                case CLR::DotNetObfuscation::DNGuard:         obfName = "dnguard"; break;
+                case CLR::DotNetObfuscation::NetReactor:      obfName = "netreactor"; break;
+                case CLR::DotNetObfuscation::NameMangling:    obfName = "name_mangling"; break;
+                case CLR::DotNetObfuscation::ControlFlow:     obfName = "control_flow"; break;
+                case CLR::DotNetObfuscation::StringEncryption:obfName = "string_encryption"; break;
+                default: obfName = "unknown_obfuscation"; break;
+            }
+            m_evasionDetector.OnEnvironmentQuery("dotnet-obfuscation", obfName);
+        }
+
+        // Feed MITRE ATT&CK technique IDs
+        if (m_config.enableMITREMapping) {
+            for (const auto& mitreId : dotNetResult.mitreAttackIDs) {
+                m_mitreMapper.OnEvasionAttempt("dotnet_" + mitreId);
+            }
+        }
+
+        // Feed suspicious P/Invoke declarations to evasion detector
+        for (const auto& pinvoke : dotNetResult.pinvokes) {
+            if (!pinvoke.dllName.empty() && !pinvoke.functionName.empty()) {
+                m_evasionDetector.OnEnvironmentQuery(
+                    "dotnet-pinvoke",
+                    pinvoke.dllName + "!" + pinvoke.functionName);
+            }
+        }
+
+        // Store the result for later collection in Phase 6
+        m_dotNetResult = std::move(dotNetResult);
+    }
+
+    // ========================================================================
     // Phase 6: Collect Results
     // ========================================================================
 
@@ -2183,6 +2261,9 @@ struct EmulationSession::Impl {
 
         // === Crypto ===
         CollectCryptoResults(result);
+
+        // === .NET/CLR Analysis ===
+        result.dotNetAnalysis = std::move(m_dotNetResult);
 
         // === Session Status ===
         DetermineSessionStatus(result, cpuResult);
