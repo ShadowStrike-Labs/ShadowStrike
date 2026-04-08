@@ -182,6 +182,24 @@ TEST(FuzzyHasherTest, HashBufferNormalizedTrimsTrailingZerosAndFallsBackForMalfo
     EXPECT_EQ(*malformedPe.normalizedDigest, *malformedPe.fullFileDigest);
     EXPECT_TRUE(IsLowerHex64(*malformedPe.sha256Hex));
 
+    const FH::NormalizedHashResult autoDetectedPe = FH::HashBufferNormalized(peLike, false);
+    ASSERT_TRUE(autoDetectedPe.normalizedDigest.has_value());
+    ASSERT_TRUE(autoDetectedPe.fullFileDigest.has_value());
+    ASSERT_TRUE(autoDetectedPe.sha256Hex.has_value());
+    EXPECT_FALSE(autoDetectedPe.wasNormalized);
+    EXPECT_EQ(*autoDetectedPe.normalizedDigest, *autoDetectedPe.fullFileDigest);
+
+    const std::vector<uint8_t> allZeros(700, 0);
+    const FH::NormalizedHashResult zeroStripped = FH::HashBufferNormalized(allZeros, false);
+    const std::vector<uint8_t> singleZero = {0};
+    const auto singleZeroDigest = FH::HashBuffer(singleZero);
+    ASSERT_TRUE(zeroStripped.normalizedDigest.has_value());
+    ASSERT_TRUE(zeroStripped.sha256Hex.has_value());
+    ASSERT_TRUE(singleZeroDigest.has_value());
+    EXPECT_TRUE(zeroStripped.wasNormalized);
+    EXPECT_FALSE(zeroStripped.fullFileDigest.has_value());
+    EXPECT_EQ(*zeroStripped.normalizedDigest, *singleZeroDigest);
+
     const FH::NormalizedHashResult invalid = FH::HashBufferNormalized(OversizedSpan(), false);
     EXPECT_FALSE(invalid.normalizedDigest.has_value());
     EXPECT_FALSE(invalid.fullFileDigest.has_value());
@@ -206,9 +224,12 @@ TEST(FuzzyHasherTest, HashWithSaltSupportsFixedAndSessionScopedDeterminism) {
 
     const auto sessionSaltA = FH::HashWithSalt(sample);
     const auto sessionSaltB = FH::HashWithSalt(sample);
+    const auto explicitZeroSalt = FH::HashWithSalt(sample, 0);
     ASSERT_TRUE(sessionSaltA.has_value());
     ASSERT_TRUE(sessionSaltB.has_value());
+    ASSERT_TRUE(explicitZeroSalt.has_value());
     EXPECT_EQ(*sessionSaltA, *sessionSaltB);
+    EXPECT_EQ(*sessionSaltA, *explicitZeroSalt);
 }
 
 TEST(FuzzyHasherTest, SuspiciousDigestScreenRejectsCraftedInputsAndAllowsLegitimateDigests) {
@@ -273,6 +294,11 @@ TEST(FuzzyHasherTest, CompareWithCryptoConfirmationDistinguishesExactSkippedAndV
     EXPECT_FALSE(skipped.hash1Hex.has_value());
     EXPECT_FALSE(skipped.hash2Hex.has_value());
 
+    const FH::CryptoConfirmResult boundary = FH::CompareWithCryptoConfirmation(sample, sample, 100);
+    EXPECT_EQ(boundary.fuzzyScore, 100);
+    EXPECT_TRUE(boundary.cryptoRan);
+    EXPECT_TRUE(boundary.exactMatch);
+
     std::vector<uint8_t> variant = sample;
     std::reverse(variant.begin(), variant.end());
     const FH::CryptoConfirmResult different = FH::CompareWithCryptoConfirmation(sample, variant, 0);
@@ -289,6 +315,19 @@ TEST(FuzzyHasherTest, CompareWithCryptoConfirmationDistinguishesExactSkippedAndV
     EXPECT_EQ(normalized.fuzzyScore, 100);
     EXPECT_TRUE(normalized.cryptoRan);
     EXPECT_TRUE(normalized.exactMatch);
+
+    const FH::CryptoConfirmResult emptyRejected = FH::CompareWithCryptoConfirmation({}, sample, 0);
+    EXPECT_EQ(emptyRejected.fuzzyScore, -1);
+    EXPECT_FALSE(emptyRejected.cryptoRan);
+    EXPECT_FALSE(emptyRejected.hash1Hex.has_value());
+    EXPECT_FALSE(emptyRejected.hash2Hex.has_value());
+
+    const FH::CryptoConfirmResult oversizedRejected =
+        FH::CompareWithCryptoConfirmation(OversizedSpan(), sample, 0);
+    EXPECT_EQ(oversizedRejected.fuzzyScore, -1);
+    EXPECT_FALSE(oversizedRejected.cryptoRan);
+    EXPECT_FALSE(oversizedRejected.hash1Hex.has_value());
+    EXPECT_FALSE(oversizedRejected.hash2Hex.has_value());
 }
 
 }  // namespace ShadowStrike::FuzzyHasher::Test

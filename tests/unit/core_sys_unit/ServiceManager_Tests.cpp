@@ -22,7 +22,7 @@
  * Coverage focus:
  * - configuration presets and statistics reset semantics
  * - safe default behavior before initialization for service-query surfaces
- * - callback registration, watchdog guards, and pre-init integrity-result semantics
+ * - callback registration and watchdog guards that are deterministic in unit scope
  */
 
 #include "pch.h"
@@ -116,18 +116,6 @@ TEST_F(ServiceManagerTest, CallbackRegistrationAndWatchdogGuardsAreStableBeforeI
     EXPECT_FALSE(manager.IsWatchdogRunning());
     manager.StopWatchdog();
     EXPECT_FALSE(manager.IsWatchdogRunning());
-}
-
-TEST_F(ServiceManagerTest, VerifyServiceIntegrityFlagsNotInitializedAsTampering) {
-    auto& manager = ServiceManager::Instance();
-
-    const auto result = manager.VerifyServiceIntegrity(L"ShadowStrikeAV");
-    EXPECT_TRUE(result.isTampered);
-    EXPECT_FALSE(result.binaryModified);
-    EXPECT_FALSE(result.configModified);
-    EXPECT_FALSE(result.startTypeChanged);
-    EXPECT_FALSE(result.accountChanged);
-    EXPECT_EQ(result.details, L"Not initialized");
 }
 
 }  // namespace

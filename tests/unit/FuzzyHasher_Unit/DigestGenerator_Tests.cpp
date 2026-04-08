@@ -69,6 +69,15 @@ bool IsValidBlockSize(uint32_t blockSize) {
 TEST(DigestGeneratorTest, GenerateDigestRejectsEmptyInputAndProducesStableWellFormedDigests) {
     EXPECT_FALSE(FH::GenerateDigest({}).has_value());
 
+    const std::vector<uint8_t> singleByte = {0x41};
+    const auto singleDigest = FH::GenerateDigest(singleByte);
+    ASSERT_TRUE(singleDigest.has_value());
+    const auto singleParts = ParseDigest(*singleDigest);
+    ASSERT_TRUE(singleParts.has_value());
+    EXPECT_EQ(singleParts->blockSize, FH::kMinBlockSize);
+    EXPECT_EQ(singleParts->sig1.size(), 1u);
+    EXPECT_EQ(singleParts->sig2.size(), 1u);
+
     const std::vector<uint8_t> sample = MakePatternData(8192);
     const auto digestA = FH::GenerateDigest(sample);
     const auto digestB = FH::GenerateDigest(sample);
@@ -105,13 +114,18 @@ TEST(DigestGeneratorTest, GenerateDigestWithSaltIsDeterministicPerSaltAndVariesA
 
     EXPECT_FALSE(FH::GenerateDigestWithSalt({}, 0x1111ULL).has_value());
 
+    const auto unsalted = FH::GenerateDigest(sample);
+    const auto zeroSalt = FH::GenerateDigestWithSalt(sample, 0);
     const auto saltA1 = FH::GenerateDigestWithSalt(sample, 0x0123456789ABCDEFULL);
     const auto saltA2 = FH::GenerateDigestWithSalt(sample, 0x0123456789ABCDEFULL);
     const auto saltB = FH::GenerateDigestWithSalt(sample, 0x0FEDCBA987654321ULL);
+    ASSERT_TRUE(unsalted.has_value());
+    ASSERT_TRUE(zeroSalt.has_value());
     ASSERT_TRUE(saltA1.has_value());
     ASSERT_TRUE(saltA2.has_value());
     ASSERT_TRUE(saltB.has_value());
 
+    EXPECT_EQ(*zeroSalt, *unsalted);
     EXPECT_EQ(*saltA1, *saltA2);
     EXPECT_NE(*saltA1, *saltB);
     EXPECT_EQ(FH::Compare(*saltA1, *saltA2), 100);
