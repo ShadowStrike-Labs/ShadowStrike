@@ -65,7 +65,7 @@ struct RingTransitionEvent {
 // Transition Anomaly
 // ============================================================================
 
-struct TransitionAnomaly {
+struct RingTransitionAnomaly {
     enum class Type : uint8_t {
         UserCodeAtRing0,          // User-space RIP executing at CPL=0
         KernelCodeAtRing3,        // Kernel RIP at CPL=3
@@ -113,7 +113,7 @@ public:
     [[nodiscard]] uint32_t GetTransitionCount() const;
 
     // Anomaly detection
-    [[nodiscard]] std::vector<TransitionAnomaly> DetectAnomalies() const;
+    [[nodiscard]] std::vector<RingTransitionAnomaly> DetectAnomalies() const;
 
     // Most called syscalls (for behavioral analysis)
     [[nodiscard]] std::vector<std::pair<uint32_t, uint32_t>> GetSyscallHistogram() const;
