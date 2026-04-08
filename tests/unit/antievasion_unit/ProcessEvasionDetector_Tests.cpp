@@ -12,7 +12,7 @@
 namespace ShadowStrike::AntiEvasion {
 const wchar_t* ProcessEvasionTechniqueToString(ProcessEvasionTechnique technique) noexcept;
 const wchar_t* InjectionMethodToString(InjectionMethod method) noexcept;
-const char* ProcessEvasionTechniqueToMitreId(ProcessEvasionTechnique technique) noexcept;
+const char* ProcessEvasionTechniqueToMitre(ProcessEvasionTechnique technique) noexcept;
 }
 
 namespace ShadowStrike::AntiEvasion::Tests {
@@ -39,6 +39,14 @@ TEST(ProcessEvasionDetector_Flags, OperatorsAndKernelContextBehaveAsDesigned) {
     ProcessKernelContext parentOnlyContext;
     parentOnlyContext.parentProcessId = 4;
     EXPECT_TRUE(parentOnlyContext.hasKernelData());
+
+    ProcessKernelContext commandLineOnlyContext;
+    commandLineOnlyContext.commandLine = L"sample.exe /quiet";
+    EXPECT_FALSE(commandLineOnlyContext.hasKernelData());
+
+    ProcessKernelContext imagePathContext;
+    imagePathContext.imagePath = L"C:\\Temp\\sample.exe";
+    EXPECT_TRUE(imagePathContext.hasKernelData());
 }
 
 TEST(ProcessEvasionDetector_Helpers, StringAndMitreMappingsRemainStable) {
@@ -57,10 +65,31 @@ TEST(ProcessEvasionDetector_Helpers, StringAndMitreMappingsRemainStable) {
     EXPECT_STREQ(L"Process Herpaderping", InjectionMethodToString(InjectionMethod::Herpaderping));
     EXPECT_STREQ(L"Unknown", InjectionMethodToString(static_cast<InjectionMethod>(0xFF)));
 
-    EXPECT_STREQ("T1055", ProcessEvasionTechniqueToMitreId(ProcessEvasionTechnique::INJ_ClassicDLLInjection));
-    EXPECT_STREQ("T1036.005", ProcessEvasionTechniqueToMitreId(ProcessEvasionTechnique::MASK_PathAnomaly));
-    EXPECT_STREQ("T1622", ProcessEvasionTechniqueToMitreId(ProcessEvasionTechnique::ANTI_IsDebuggerPresent));
-    EXPECT_STREQ("T1055", ProcessEvasionTechniqueToMitreId(static_cast<ProcessEvasionTechnique>(0xFFFF)));
+    EXPECT_STREQ("T1055.001", ProcessEvasionTechniqueToMitre(ProcessEvasionTechnique::INJ_ClassicDLLInjection));
+    EXPECT_STREQ("T1036.005", ProcessEvasionTechniqueToMitre(ProcessEvasionTechnique::MASK_PathAnomaly));
+    EXPECT_STREQ("T1622", ProcessEvasionTechniqueToMitre(ProcessEvasionTechnique::ANTI_IsDebuggerPresent));
+    EXPECT_STREQ("T1055", ProcessEvasionTechniqueToMitre(static_cast<ProcessEvasionTechnique>(0xFFFF)));
+}
+
+TEST(ProcessEvasionDetector_ErrorHelpers, ResetClearsBothWin32AndMessageOnlyFailures) {
+    ProcessEvasionError error;
+    EXPECT_FALSE(error.IsError());
+
+    error.message = L"Access denied";
+    EXPECT_TRUE(error.IsError());
+
+    error.Reset();
+    EXPECT_FALSE(error.IsError());
+
+    error.win32Code = ERROR_ACCESS_DENIED;
+    error.context = L"AnalyzeProcess";
+    EXPECT_TRUE(error.IsError());
+
+    error.Reset();
+
+    EXPECT_EQ(static_cast<DWORD>(0), error.win32Code);
+    EXPECT_TRUE(error.message.empty());
+    EXPECT_TRUE(error.context.empty());
 }
 
 TEST(ProcessEvasionDetector_ResultHelpers, GetHighestConfidenceReturnsMostConfidentTechnique) {

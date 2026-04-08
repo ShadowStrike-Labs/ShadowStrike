@@ -1048,6 +1048,12 @@ void VMEvasionResult::Clear() noexcept {
     completed = false;
     timedOut = false;
     errorMessage.clear();
+    isLegitimateCloudEnvironment = false;
+    isEnterpriseVirtualization = false;
+    isSuspiciousEvasion = false;
+    cloudProvider.clear();
+    cloudInstanceId.clear();
+    cloudRegion.clear();
 }
 
 // ============================================================================

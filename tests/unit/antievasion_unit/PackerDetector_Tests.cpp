@@ -66,6 +66,66 @@ TEST(PackerDetector_Builder, MatchBuilderPopulatesDerivedMetadata) {
     EXPECT_EQ(L"Commercial virtualization protector stub detected", match.details);
 }
 
+TEST(PackerDetector_ResultHelpers, MatchQueriesAndClearResetAllEntropyMetrics) {
+    PackingInfo info;
+    info.filePath = L"C:\\Temp\\packed.exe";
+    info.fileSize = 8192;
+    info.sha256Hash = "abc123";
+    info.isPacked = true;
+    info.packingConfidence = 0.97;
+    info.primaryPacker = PackerType::VMProtect;
+    info.packerName = L"VMProtect";
+    info.packerVersion = L"3.x";
+    info.packerCategory = PackerCategory::VMProtection;
+    info.severity = PackerSeverity::Critical;
+    info.packerMatches = {
+        PackerMatchBuilder{}.Type(PackerType::UPX).Confidence(0.66).Build(),
+        PackerMatchBuilder{}.Type(PackerType::VMProtect).Confidence(0.98).Build()
+    };
+    info.fileEntropy = 7.9;
+    info.chiSquared = 3.14;
+    info.monteCarloPiError = 0.42;
+    info.codeSectionEntropy = 7.1;
+    info.dataSectionEntropy = 7.8;
+    info.maxSectionEntropy = 8.0;
+    info.maxEntropySectionName = ".vmp0";
+    info.averageSectionEntropy = 7.45;
+    info.entropyIndicatesCompression = true;
+    info.entropyIndicatesEncryption = true;
+    info.analysisComplete = true;
+    info.fromCache = true;
+
+    EXPECT_TRUE(info.HasMatch(PackerType::UPX));
+    EXPECT_TRUE(info.HasCategory(PackerCategory::VMProtection));
+    EXPECT_FALSE(info.HasMatch(PackerType::Themida));
+    EXPECT_FALSE(info.HasCategory(PackerCategory::Crypter));
+    ASSERT_NE(nullptr, info.GetBestMatch());
+    EXPECT_EQ(PackerType::VMProtect, info.GetBestMatch()->packerType);
+
+    info.Clear();
+
+    EXPECT_TRUE(info.filePath.empty());
+    EXPECT_EQ(0u, info.fileSize);
+    EXPECT_TRUE(info.sha256Hash.empty());
+    EXPECT_FALSE(info.isPacked);
+    EXPECT_DOUBLE_EQ(0.0, info.packingConfidence);
+    EXPECT_EQ(PackerType::Unknown, info.primaryPacker);
+    EXPECT_TRUE(info.packerMatches.empty());
+    EXPECT_DOUBLE_EQ(0.0, info.fileEntropy);
+    EXPECT_DOUBLE_EQ(0.0, info.chiSquared);
+    EXPECT_DOUBLE_EQ(0.0, info.monteCarloPiError);
+    EXPECT_DOUBLE_EQ(0.0, info.codeSectionEntropy);
+    EXPECT_DOUBLE_EQ(0.0, info.dataSectionEntropy);
+    EXPECT_DOUBLE_EQ(0.0, info.maxSectionEntropy);
+    EXPECT_TRUE(info.maxEntropySectionName.empty());
+    EXPECT_DOUBLE_EQ(0.0, info.averageSectionEntropy);
+    EXPECT_FALSE(info.entropyIndicatesCompression);
+    EXPECT_FALSE(info.entropyIndicatesEncryption);
+    EXPECT_FALSE(info.analysisComplete);
+    EXPECT_FALSE(info.fromCache);
+    EXPECT_EQ(nullptr, info.GetBestMatch());
+}
+
 TEST(PackerDetector_Statistics, ResetClearsCounters) {
     PackerDetector::Statistics stats;
     stats.totalAnalyses = 8;

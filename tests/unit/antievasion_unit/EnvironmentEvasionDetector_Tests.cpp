@@ -58,6 +58,102 @@ TEST(EnvironmentEvasionDetector_Builder, DetectionBuilderPopulatesDerivedMetadat
     EXPECT_GT(detection.detectionTime, std::chrono::system_clock::time_point{});
 }
 
+TEST(EnvironmentEvasionDetector_ErrorHelpers, FactoryMethodsAndClearPreserveFailureState) {
+    const EnvironmentError win32Error = EnvironmentError::FromWin32(ERROR_FILE_NOT_FOUND, L"CheckFileSystemArtifacts");
+    EXPECT_TRUE(win32Error.HasError());
+    EXPECT_EQ(static_cast<DWORD>(ERROR_FILE_NOT_FOUND), win32Error.win32Code);
+    EXPECT_EQ(0, win32Error.ntStatus);
+    EXPECT_EQ(L"CheckFileSystemArtifacts", win32Error.context);
+
+    EnvironmentError error;
+    error.win32Code = ERROR_ACCESS_DENIED;
+    error.ntStatus = static_cast<LONG>(0xC0000022L);
+    error.message = L"Access denied";
+    error.context = L"AnalyzeProcess";
+    EXPECT_TRUE(error.HasError());
+
+    error.Clear();
+
+    EXPECT_FALSE(error.HasError());
+    EXPECT_EQ(static_cast<DWORD>(ERROR_SUCCESS), error.win32Code);
+    EXPECT_EQ(0, error.ntStatus);
+    EXPECT_TRUE(error.message.empty());
+    EXPECT_TRUE(error.context.empty());
+}
+
+TEST(EnvironmentEvasionDetector_ResultHelpers, FilteringAndClearResetAllMutableState) {
+    EnvironmentEvasionResult result;
+    result.targetPid = 31337;
+    result.processName = L"sample.exe";
+    result.processPath = L"C:\\Temp\\sample.exe";
+    result.isEvasive = true;
+    result.evasionScore = 91.0;
+    result.maxSeverity = EnvironmentEvasionSeverity::Critical;
+    result.totalDetections = 3;
+    result.detectedCategories =
+        (1u << static_cast<uint32_t>(EnvironmentEvasionCategory::NameChecks)) |
+        (1u << static_cast<uint32_t>(EnvironmentEvasionCategory::DisplayConfiguration)) |
+        (1u << static_cast<uint32_t>(EnvironmentEvasionCategory::TimingChecks));
+    result.detectedTechniques = {
+        EnvironmentDetectionBuilder{}
+            .Technique(EnvironmentEvasionTechnique::NAME_BlacklistedUsername)
+            .Confidence(0.95)
+            .Build(),
+        EnvironmentDetectionBuilder{}
+            .Technique(EnvironmentEvasionTechnique::DISPLAY_SingleMonitor)
+            .Confidence(0.37)
+            .Build(),
+        EnvironmentDetectionBuilder{}
+            .Technique(EnvironmentEvasionTechnique::TIMING_ShortUptime)
+            .Confidence(0.81)
+            .Severity(EnvironmentEvasionSeverity::High)
+            .Build()
+    };
+    result.categoriesChecked = 6;
+    result.techniquesChecked = 9;
+    result.registryKeysChecked = 2;
+    result.filesChecked = 4;
+    result.processesChecked = 3;
+    result.analysisComplete = true;
+    result.fromCache = true;
+    result.errors.push_back(EnvironmentError::FromWin32(ERROR_ACCESS_DENIED, L"UnitTest"));
+
+    EXPECT_TRUE(result.HasCategory(EnvironmentEvasionCategory::NameChecks));
+    EXPECT_TRUE(result.HasTechnique(EnvironmentEvasionTechnique::TIMING_ShortUptime));
+    EXPECT_FALSE(result.HasCategory(EnvironmentEvasionCategory::BrowserArtifacts));
+    EXPECT_FALSE(result.HasTechnique(EnvironmentEvasionTechnique::BROWSER_NoHistory));
+    EXPECT_EQ(1u, result.GetCategoryCount(EnvironmentEvasionCategory::DisplayConfiguration));
+    EXPECT_EQ(0u, result.GetCategoryCount(EnvironmentEvasionCategory::BrowserArtifacts));
+
+    const auto highSeverity = result.GetBySeverity(EnvironmentEvasionSeverity::High);
+    ASSERT_EQ(2u, highSeverity.size());
+    EXPECT_EQ(EnvironmentEvasionTechnique::NAME_BlacklistedUsername, highSeverity[0]->technique);
+    EXPECT_EQ(EnvironmentEvasionTechnique::TIMING_ShortUptime, highSeverity[1]->technique);
+
+    result.Clear();
+
+    EXPECT_EQ(0u, result.targetPid);
+    EXPECT_TRUE(result.processName.empty());
+    EXPECT_TRUE(result.processPath.empty());
+    EXPECT_FALSE(result.isEvasive);
+    EXPECT_DOUBLE_EQ(0.0, result.evasionScore);
+    EXPECT_EQ(EnvironmentEvasionSeverity::Low, result.maxSeverity);
+    EXPECT_EQ(0u, result.totalDetections);
+    EXPECT_EQ(0u, result.detectedCategories);
+    EXPECT_TRUE(result.detectedTechniques.empty());
+    EXPECT_TRUE(result.vmIndicators.empty());
+    EXPECT_TRUE(result.sandboxIndicators.empty());
+    EXPECT_TRUE(result.analysisToolIndicators.empty());
+    EXPECT_TRUE(result.errors.empty());
+    EXPECT_EQ(0u, result.categoriesChecked);
+    EXPECT_EQ(0u, result.techniquesChecked);
+    EXPECT_EQ(0u, result.registryKeysChecked);
+    EXPECT_EQ(0u, result.filesChecked);
+    EXPECT_EQ(0u, result.processesChecked);
+    EXPECT_FALSE(result.analysisComplete);
+    EXPECT_FALSE(result.fromCache);
+}
+
 TEST(EnvironmentEvasionDetector_Statistics, ResetClearsCounters) {
     EnvironmentEvasionDetector::Statistics stats;
     stats.totalAnalyses = 11;

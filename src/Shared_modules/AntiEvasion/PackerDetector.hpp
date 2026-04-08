@@ -1778,6 +1778,8 @@ namespace ShadowStrike {
                 resourceInfo = {};
                 unpackingHints = {};
                 fileEntropy = 0.0;
+                chiSquared = 0.0;
+                monteCarloPiError = 0.0;
                 codeSectionEntropy = 0.0;
                 dataSectionEntropy = 0.0;
                 maxSectionEntropy = 0.0;
