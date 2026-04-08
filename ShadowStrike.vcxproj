@@ -880,6 +880,16 @@
     <ClCompile Include="tests\unit\config_unit\PolicyManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\ProfileManager_Tests.cpp" />
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_network_unit\DNSMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_network_unit\FirewallManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_network_unit\NetworkMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_network_unit\TrafficAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_registry_unit\PersistenceDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_registry_unit\RegistryAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_registry_unit\RegistryMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_registry_unit\StartupAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_registry_unit\SystemSettingsMonitor_Tests.cpp" />
     <ClCompile Include="tests\unit\communication_unit\AlertSystem_Tests.cpp" />
     <ClCompile Include="tests\unit\communication_unit\CommunicationProtocol_Tests.cpp" />
     <ClCompile Include="tests\unit\communication_unit\IPCManager_Tests.cpp" />
@@ -888,11 +898,6 @@
     <ClCompile Include="tests\unit\communication_unit\ServiceCommunication_Tests.cpp" />
     <ClCompile Include="tests\unit\communication_unit\TelemetryCollector_Tests.cpp" />
     <ClCompile Include="tests\unit\communication_unit\ThreatIntelPusher_Tests.cpp" />
-  </ItemGroup>
-  <ItemGroup>
-    <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
-    <ClInclude Include="tests\unit\config_unit\Config_TestUtils.hpp" />
-  </ItemGroup>
     <ClCompile Include="tests\unit\core_engine_unit\BehaviorAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\EmulationEngine_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\MachineLearningDetector_Tests.cpp" />
@@ -901,6 +906,13 @@
     <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
+    <ClInclude Include="tests\unit\config_unit\Config_TestUtils.hpp" />
+    <ClInclude Include="tests\unit\core_network_unit\CoreNetwork_TestUtils.hpp" />
+    <ClInclude Include="tests\unit\core_registry_unit\CoreRegistry_TestUtils.hpp" />
+  </ItemGroup>
   <ItemGroup>
     <ClCompile Include="tests\unit\antievasion_unit\DebuggerEvasionDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\antievasion_unit\EnvironmentEvasionDetector_Tests.cpp" />
@@ -923,6 +935,18 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\core_filesys_unit\CoreFileSystem_TestUtils.hpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="tests\unit\core_sys_unit\BootTimeAnalyzer_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\CoreSystem_ValueContracts_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\EventLogger_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\HardwareMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\PerformanceMonitor_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\ServiceManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\core_sys_unit\SystemInfo_Tests.cpp" />
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="tests\unit\core_sys_unit\CoreSystem_TestUtils.hpp" />
   </ItemGroup>
   <ItemGroup>
     <None Include="src\Shared_modules\Core\Engine\HeuristicAnalyzer.cpp.bak" />
