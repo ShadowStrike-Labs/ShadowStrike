@@ -906,6 +906,9 @@
     <ClCompile Include="tests\unit\core_engine_unit\SandboxAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\ThreatDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_engine_unit\ZeroDayDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestComparer_Tests.cpp" />
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\DigestGenerator_Tests.cpp" />
+    <ClCompile Include="tests\unit\FuzzyHasher_Unit\FuzzyHasher_Tests.cpp" />
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\ai_unit\AI_TestUtils.hpp" />
