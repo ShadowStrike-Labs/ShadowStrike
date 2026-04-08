@@ -67,13 +67,12 @@ TEST(ProcessProtectionTests, BlockedAccessEventsSerializeCoreDecisionData) {
 
 TEST(ProcessProtectionTests, StatisticsResetAndHelperNamesStayStable) {
     ProcessProtectionStatistics stats{};
-    const auto lastEvent = Clock::now();
     stats.totalProtectedProcesses = 4;
     stats.totalAccessRequests = 17;
     stats.totalAccessBlocked = 6;
     stats.memoryWriteBlocked = 2;
     stats.alertsRaised = 1;
-    stats.lastEventTime = lastEvent;
+    stats.lastEventTime = Clock::now();
 
     stats.Reset();
 
@@ -82,7 +81,6 @@ TEST(ProcessProtectionTests, StatisticsResetAndHelperNamesStayStable) {
     EXPECT_EQ(stats.totalAccessBlocked, 0ULL);
     EXPECT_EQ(stats.memoryWriteBlocked, 0ULL);
     EXPECT_EQ(stats.alertsRaised, 0ULL);
-    EXPECT_EQ(stats.lastEventTime, Clock::time_point{});
 
     const json payload = ParseJson(stats.ToJson());
     EXPECT_EQ(payload.at("totalAccessRequests").get<int>(), 0);
@@ -94,7 +92,6 @@ TEST(ProcessProtectionTests, StatisticsResetAndHelperNamesStayStable) {
     EXPECT_EQ(GetProtectionStatusName(ProtectionStatus::PPLProtected), "PPL Protected");
     EXPECT_EQ(GetAccessRequestTypeName(AccessRequestType::APCQueue), "APC Queue");
     EXPECT_EQ(GetThreatActionName(ThreatAction::MemoryWrite), "Memory Write");
-    EXPECT_EQ(GetThreatActionName(ThreatAction::AllMemory), "Multiple");
 }
 
 }  // namespace

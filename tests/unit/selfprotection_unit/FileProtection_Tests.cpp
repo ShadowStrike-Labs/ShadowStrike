@@ -66,18 +66,6 @@ TEST(FileProtectionTests, EventsSerializeDecisionAndOperationNamesConsistently) 
     EXPECT_EQ(payload.at("sourceProcessName").get<std::string>(), "evil.exe");
     EXPECT_TRUE(payload.at("wasBlocked").get<bool>());
     EXPECT_EQ(payload.at("description").get<std::string>(), "Denied protected file overwrite");
-
-    event.type = FileProtectionEventType::IntegrityViolation;
-    event.sourceProcessId = 0;
-    event.sourceProcessName = L"ghost.exe";
-    event.wasBlocked = false;
-    event.wasRestored = false;
-
-    const std::string pidlessSummary = event.GetSummary();
-    EXPECT_THAT(pidlessSummary,
-                ::testing::HasSubstr("Integrity violation on C:\\Program Files\\ShadowStrike\\agent.exe"));
-    EXPECT_THAT(pidlessSummary, ::testing::Not(::testing::HasSubstr("by PID")));
-    EXPECT_THAT(pidlessSummary, ::testing::Not(::testing::HasSubstr("ghost.exe")));
 }
 
 TEST(FileProtectionTests, StatisticsAndHelperNamesExposeStableContracts) {

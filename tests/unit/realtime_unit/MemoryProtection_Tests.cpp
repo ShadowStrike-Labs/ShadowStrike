@@ -105,11 +105,14 @@ TEST_F(MemoryProtectionTest, MonitoringAndCallbackContractsRemainSafe) {
     EXPECT_NE(0u, callbackId);
 
     EXPECT_TRUE(protection.MonitorProcess(4242));
+    EXPECT_TRUE(protection.MonitorProcess(4242));
     EXPECT_TRUE(protection.EnableExploitProtection(4242, EXPLOIT_PROTECT_MONITOR_ONLY));
+    EXPECT_FALSE(protection.EnableExploitProtection(0, EXPLOIT_PROTECT_MONITOR_ONLY));
     EXPECT_TRUE(ContainsSubstring(protection.GetStatistics(), "\"monitoredProcesses\":1"));
     EXPECT_TRUE(ContainsSubstring(protection.GetStatistics(), "\"registeredCallbacks\":1"));
 
     EXPECT_TRUE(protection.UnmonitorProcess(4242));
+    EXPECT_FALSE(protection.UnmonitorProcess(4242));
     EXPECT_TRUE(protection.UnregisterThreatCallback(callbackId));
     EXPECT_FALSE(protection.UnregisterThreatCallback(callbackId));
 }
@@ -125,6 +128,13 @@ TEST_F(MemoryProtectionTest, DefaultScanBehaviorAndDiagnosticsRemainDeterministi
     EXPECT_EQ(0u, invalidRegionScan.pid);
     EXPECT_FALSE(invalidRegionScan.compromised);
     EXPECT_TRUE(invalidRegionScan.violations.empty());
+
+    const auto oversizedRegionScan = protection.ScanRegion(0xDEADu, 0x1000, (256ULL * 1024ULL * 1024ULL) + 1ULL);
+    EXPECT_EQ(0u, oversizedRegionScan.pid);
+    EXPECT_FALSE(oversizedRegionScan.compromised);
+    EXPECT_TRUE(oversizedRegionScan.violations.empty());
+    EXPECT_FALSE(protection.IsProcessCompromised(0xDEADu));
+    EXPECT_TRUE(protection.HuntAPT(0xDEADu).violations.empty());
 
     EXPECT_TRUE(protection.SelfTest());
     EXPECT_TRUE(ContainsSubstring(protection.GetStatistics(), "\"scansPerformed\":0"));

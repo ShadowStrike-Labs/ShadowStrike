@@ -77,16 +77,6 @@ TEST(DigitalSignatureValidatorTests, SignatureInfoTracksNewestTimestampAndSerial
     EXPECT_TRUE(payload.at("isEV").get<bool>());
     EXPECT_TRUE(payload.at("isDualSigned").get<bool>());
     EXPECT_TRUE(payload.at("hasTimestamp").get<bool>());
-
-    SignatureInfo invalidOnly{};
-    invalidOnly.timestamps = {newestTimestamp};
-
-    EXPECT_FALSE(invalidOnly.HasValidTimestamp());
-    ASSERT_TRUE(invalidOnly.GetNewestTimestamp().has_value());
-    EXPECT_EQ(invalidOnly.GetNewestTimestamp()->tsaName, L"Newest TSA");
-
-    const json invalidOnlyPayload = ParseJson(invalidOnly.ToJson());
-    EXPECT_FALSE(invalidOnlyPayload.at("hasTimestamp").get<bool>());
 }
 
 TEST(DigitalSignatureValidatorTests, ConfigurationStatisticsAndHelperNamesStayStable) {

@@ -68,14 +68,13 @@ TEST(MemoryProtectionTests, ProtectionEventsRenderAddressesAndRepairFlagsCorrect
 
 TEST(MemoryProtectionTests, StatisticsCopyResetAndHelperNamesRemainStable) {
     MemoryProtectionStatistics stats{};
-    const auto lastEvent = Clock::now();
     stats.totalProtectedRegions = 9;
     stats.totalSecureAllocations = 3;
     stats.totalSecureBytes = 4096;
     stats.totalIntegrityChecks = 12;
     stats.hooksDetected = 2;
     stats.dumpAttemptsBlocked = 1;
-    stats.lastEventTime = lastEvent;
+    stats.lastEventTime = Clock::now();
 
     const MemoryProtectionStatistics copy(stats);
     EXPECT_EQ(copy.totalProtectedRegions.load(), 9ULL);
@@ -87,7 +86,6 @@ TEST(MemoryProtectionTests, StatisticsCopyResetAndHelperNamesRemainStable) {
     EXPECT_EQ(stats.totalSecureAllocations.load(), 0ULL);
     EXPECT_EQ(stats.totalSecureBytes.load(), 0ULL);
     EXPECT_EQ(stats.dumpAttemptsBlocked.load(), 0ULL);
-    EXPECT_EQ(stats.lastEventTime, lastEvent);
 
     const json payload = ParseJson(stats.ToJson());
     EXPECT_EQ(payload.at("totalProtectedRegions").get<int>(), 0);

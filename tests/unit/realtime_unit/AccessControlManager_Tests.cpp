@@ -208,6 +208,16 @@ TEST_F(AccessControlManagerTest, CallbackRegistrationAndDefaultStateRemainSafe) 
     EXPECT_TRUE(manager.UnregisterCallback(auditId));
     EXPECT_TRUE(manager.UnregisterCallback(privilegeId));
     EXPECT_FALSE(manager.UnregisterCallback(privilegeId));
+    EXPECT_FALSE(manager.UnregisterCallback(0));
+}
+
+TEST_F(AccessControlManagerTest, UnknownHelperMappingsFallBackToExplicitSentinels) {
+    EXPECT_EQ(std::wstring_view(L"UNKNOWN"),
+        AccessControlManager::GetPermissionName(Permission::INVALID_PERMISSION));
+    EXPECT_EQ(std::wstring_view(L"CUSTOM"),
+        AccessControlManager::GetRoleName(RoleType::INVALID));
+    EXPECT_EQ(std::wstring_view(L"Unknown"),
+        AccessControlManager::GetPrivilegeName(WindowsPrivilege::INVALID_PRIVILEGE));
 }
 
 }  // namespace ShadowStrike::RealTime::Tests

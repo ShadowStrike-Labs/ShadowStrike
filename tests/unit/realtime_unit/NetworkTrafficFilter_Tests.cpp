@@ -34,13 +34,27 @@ protected:
 };
 
 TEST_F(NetworkTrafficFilterTest, HelperTypesAndConfigFactoriesRemainStable) {
+    const IPAddress invalidIp = IPAddress::FromString("");
     const IPAddress privateV4 = IPAddress::FromString("192.168.1.10");
+    const IPAddress boundaryPrivate = IPAddress::FromString("172.16.0.1");
+    const IPAddress boundaryPublic = IPAddress::FromString("172.32.0.1");
+    const IPAddress loopbackV4 = IPAddress::FromString("127.0.0.1");
     const IPAddress loopbackV6 = IPAddress::FromString("::1");
+
+    EXPECT_EQ(IPVersion::Unknown, invalidIp.version);
+    EXPECT_TRUE(invalidIp.ToString().empty());
+    EXPECT_FALSE(invalidIp.IsPrivate());
+    EXPECT_FALSE(invalidIp.IsLoopback());
 
     EXPECT_EQ(IPVersion::IPv4, privateV4.version);
     EXPECT_EQ(std::string("192.168.1.10"), privateV4.ToString());
     EXPECT_TRUE(privateV4.IsPrivate());
     EXPECT_FALSE(privateV4.IsLoopback());
+
+    EXPECT_TRUE(boundaryPrivate.IsPrivate());
+    EXPECT_FALSE(boundaryPublic.IsPrivate());
+    EXPECT_TRUE(loopbackV4.IsPrivate());
+    EXPECT_TRUE(loopbackV4.IsLoopback());
 
     EXPECT_EQ(IPVersion::IPv6, loopbackV6.version);
     EXPECT_EQ(std::string("::1"), loopbackV6.ToString());
@@ -91,13 +105,27 @@ TEST_F(NetworkTrafficFilterTest, BlocklistsNormalizeInputsAndCallbacksRemainSafe
     filter.UnblockIP(blockedIp);
     EXPECT_FALSE(filter.IsIPBlocked(blockedIp));
 
+    filter.BlockIP("198.51.100.42");
+    EXPECT_TRUE(filter.IsIPBlocked(IPAddress::FromString("198.51.100.42")));
+    filter.UnblockIP(IPAddress::FromString("198.51.100.42"));
+    EXPECT_FALSE(filter.IsIPBlocked(IPAddress::FromString("198.51.100.42")));
+
     filter.BlockDomain("MiXeD.Example.COM");
     EXPECT_TRUE(filter.IsDomainBlocked("mixed.example.com"));
     EXPECT_TRUE(ContainsString(filter.GetBlockedDomains(), "mixed.example.com"));
 
     filter.UnblockDomain("MIXED.EXAMPLE.COM");
     EXPECT_FALSE(filter.IsDomainBlocked("mixed.example.com"));
+    filter.BlockDomain("");
+    EXPECT_TRUE(filter.IsDomainBlocked(""));
+    filter.UnblockDomain("");
+    EXPECT_FALSE(filter.IsDomainBlocked(""));
 
+    const uint64_t nullConnectionId = filter.RegisterConnectionCallback({});
+    const uint64_t nullEventId = filter.RegisterEventCallback({});
+    const uint64_t nullDnsId = filter.RegisterDNSCallback({});
+    const uint64_t nullC2Id = filter.RegisterC2Callback({});
+    const uint64_t nullExfilId = filter.RegisterExfiltrationCallback({});
     const uint64_t connectionId = filter.RegisterConnectionCallback(
         [](const NetworkConnection&) { return FilterAction::Allow; });
     const uint64_t eventId = filter.RegisterEventCallback([](const NetworkEvent&) {});
@@ -107,12 +135,22 @@ TEST_F(NetworkTrafficFilterTest, BlocklistsNormalizeInputsAndCallbacksRemainSafe
     const uint64_t exfilId = filter.RegisterExfiltrationCallback(
         [](uint32_t, const NetworkEndpoint&, size_t) { return FilterAction::Block; });
 
+    EXPECT_NE(0u, nullConnectionId);
+    EXPECT_NE(0u, nullEventId);
+    EXPECT_NE(0u, nullDnsId);
+    EXPECT_NE(0u, nullC2Id);
+    EXPECT_NE(0u, nullExfilId);
     EXPECT_NE(0u, connectionId);
     EXPECT_NE(0u, eventId);
     EXPECT_NE(0u, dnsId);
     EXPECT_NE(0u, c2Id);
     EXPECT_NE(0u, exfilId);
 
+    EXPECT_TRUE(filter.UnregisterConnectionCallback(nullConnectionId));
+    EXPECT_TRUE(filter.UnregisterEventCallback(nullEventId));
+    EXPECT_TRUE(filter.UnregisterDNSCallback(nullDnsId));
+    EXPECT_TRUE(filter.UnregisterC2Callback(nullC2Id));
+    EXPECT_TRUE(filter.UnregisterExfiltrationCallback(nullExfilId));
     EXPECT_TRUE(filter.UnregisterConnectionCallback(connectionId));
     EXPECT_TRUE(filter.UnregisterEventCallback(eventId));
     EXPECT_TRUE(filter.UnregisterDNSCallback(dnsId));
