@@ -41,7 +41,9 @@ TEST_F(FileSystemFilterTest, StringHelpersAndPresetFactoriesRemainStable) {
     EXPECT_STREQ("NotifyFileRename", FilterMessageTypeToString(FilterMessageType::NotifyFileRename));
     EXPECT_STREQ("Execute", FileAccessTypeToString(FileAccessType::Execute));
     EXPECT_EQ(std::wstring(L".txt"), GetFileExtension(L"C:\\Temp\\sample.txt"));
+    EXPECT_EQ(std::wstring(L".gitignore"), GetFileExtension(L"C:\\Repo\\.gitignore"));
     EXPECT_TRUE(GetFileExtension(L"C:\\Temp\\sample").empty());
+    EXPECT_TRUE(GetFileExtension(L"C:\\Temp\\trailing.").empty());
 
     const auto defaults = FileSystemFilterConfig::CreateDefault();
     const auto performance = FileSystemFilterConfig::CreateHighPerformance();
@@ -68,6 +70,9 @@ TEST_F(FileSystemFilterTest, ExclusionMatchingAndCallbacksRemainDeterministic) {
     processExclusion.type = FilterExclusion::Type::Process;
     processExclusion.pattern = L"POWERSHELL.EXE";
     processExclusion.comment = L"Trusted automation";
+    processExclusion.caseInsensitive = false;
+
+    FilterExclusion duplicateProcessExclusion = processExclusion;
 
     FilterExclusion processPathExclusion;
     processPathExclusion.type = FilterExclusion::Type::ProcessPath;
@@ -75,15 +80,20 @@ TEST_F(FileSystemFilterTest, ExclusionMatchingAndCallbacksRemainDeterministic) {
     processPathExclusion.comment = L"Signed Windows binaries";
 
     EXPECT_TRUE(filter.AddExclusion(processExclusion));
+    EXPECT_TRUE(filter.AddExclusion(duplicateProcessExclusion));
     EXPECT_TRUE(filter.AddExclusion(processPathExclusion));
-    EXPECT_EQ(2u, filter.GetExclusions().size());
+    EXPECT_EQ(3u, filter.GetExclusions().size());
 
-    EXPECT_TRUE(filter.IsProcessExcluded(L"powershell.exe"));
+    EXPECT_FALSE(filter.IsProcessExcluded(L"powershell.exe"));
+    EXPECT_TRUE(filter.IsProcessExcluded(L"POWERSHELL.EXE"));
     EXPECT_TRUE(filter.IsProcessExcluded(L"cmd.exe", L"c:\\windows\\system32\\cmd.exe"));
     EXPECT_FALSE(filter.IsProcessExcluded(L"notepad.exe", L"c:\\apps\\notepad.exe"));
 
     filter.RegisterScanCallback([](const FileAccessEvent&) { return ScanVerdict::Allow; });
 
+    const uint64_t nullNotificationId = filter.RegisterNotificationCallback({});
+    const uint64_t nullStatusId = filter.RegisterStatusCallback({});
+    const uint64_t nullThreatId = filter.RegisterThreatCallback({});
     const uint64_t notificationId = filter.RegisterNotificationCallback(
         [](const FileAccessEvent&) {});
     const uint64_t statusId = filter.RegisterStatusCallback(
@@ -91,17 +101,28 @@ TEST_F(FileSystemFilterTest, ExclusionMatchingAndCallbacksRemainDeterministic) {
     const uint64_t threatId = filter.RegisterThreatCallback(
         [](const FileAccessEvent&, const std::wstring&, double) {});
 
+    EXPECT_NE(0u, nullNotificationId);
+    EXPECT_NE(0u, nullStatusId);
+    EXPECT_NE(0u, nullThreatId);
     EXPECT_NE(0u, notificationId);
     EXPECT_NE(0u, statusId);
     EXPECT_NE(0u, threatId);
 
+    EXPECT_TRUE(filter.UnregisterNotificationCallback(nullNotificationId));
+    EXPECT_TRUE(filter.UnregisterStatusCallback(nullStatusId));
+    EXPECT_TRUE(filter.UnregisterThreatCallback(nullThreatId));
     EXPECT_TRUE(filter.UnregisterNotificationCallback(notificationId));
     EXPECT_TRUE(filter.UnregisterStatusCallback(statusId));
     EXPECT_TRUE(filter.UnregisterThreatCallback(threatId));
     EXPECT_FALSE(filter.UnregisterThreatCallback(threatId));
 
     EXPECT_TRUE(filter.RemoveExclusion(processExclusion.pattern));
+    ASSERT_EQ(1u, filter.GetExclusions().size());
+    EXPECT_EQ(processPathExclusion.pattern, filter.GetExclusions().front().pattern);
     EXPECT_TRUE(filter.RemoveExclusion(processPathExclusion.pattern));
+    EXPECT_FALSE(filter.RemoveExclusion(processPathExclusion.pattern));
+    EXPECT_TRUE(filter.GetExclusions().empty());
+    filter.ClearExclusions();
     EXPECT_TRUE(filter.GetExclusions().empty());
 }
 

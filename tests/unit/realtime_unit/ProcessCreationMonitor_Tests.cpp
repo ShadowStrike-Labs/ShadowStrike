@@ -83,6 +83,7 @@ TEST_F(ProcessCreationMonitorTest, StatisticsResetAndDecodeHelpersRemainDetermin
     EXPECT_EQ(0u, stats.avgDecisionTimeUs);
 
     EXPECT_EQ(std::wstring(L"ABC"), monitor.DecodeEncodedContent(L"QQBCAEMA"));
+    EXPECT_EQ(std::wstring(L"ABC"), monitor.DecodeEncodedContent(L" QQBCAEMA== \r\n"));
     EXPECT_EQ(std::wstring(L"Hello"), monitor.DecodeEncodedContent(L"SGVsbG8="));
     EXPECT_EQ(std::wstring(L"powershell.exe"),
         GetProcessImageName(L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe"));
@@ -110,13 +111,26 @@ TEST_F(ProcessCreationMonitorTest, RuleOrderingAndCallbacksRemainSafe) {
     highRule.commandLinePattern = L".*-enc.*";
 
     EXPECT_TRUE(monitor.AddRule(lowRule));
+    EXPECT_TRUE(monitor.AddRule(lowRule));
     EXPECT_TRUE(monitor.AddRule(highRule));
+    EXPECT_FALSE(monitor.RemoveRule("missing"));
 
     const auto rules = monitor.GetRules();
-    ASSERT_EQ(2u, rules.size());
+    ASSERT_EQ(3u, rules.size());
     EXPECT_EQ(std::string("high-priority"), rules.front().ruleId);
     EXPECT_EQ(std::string("low-priority"), rules.back().ruleId);
 
+    const auto analysis = monitor.AnalyzeCommandLine(
+        L"powershell.exe -enc SQBFAFgA https://example.invalid");
+    EXPECT_EQ(std::wstring(L"powershell.exe"), analysis.executablePath);
+    EXPECT_TRUE(analysis.hasEncodedContent);
+    EXPECT_TRUE(analysis.hasURLs);
+    EXPECT_TRUE(monitor.IsCommandLineSuspicious(
+        L"powershell.exe -enc SQBFAFgA https://example.invalid"));
+
+    const uint64_t nullCreateId = monitor.RegisterCreateCallback({});
+    const uint64_t nullTerminateId = monitor.RegisterTerminateCallback({});
+    const uint64_t nullSuspiciousId = monitor.RegisterSuspiciousCallback({});
     const uint64_t createId = monitor.RegisterCreateCallback(
         [](const ProcessCreateEvent&) { return ProcessVerdict::Allow; });
     const uint64_t terminateId = monitor.RegisterTerminateCallback(
@@ -124,10 +138,16 @@ TEST_F(ProcessCreationMonitorTest, RuleOrderingAndCallbacksRemainSafe) {
     const uint64_t suspiciousId = monitor.RegisterSuspiciousCallback(
         [](const ProcessInfo&, const std::vector<SuspiciousPattern>&) {});
 
+    EXPECT_NE(0u, nullCreateId);
+    EXPECT_NE(0u, nullTerminateId);
+    EXPECT_NE(0u, nullSuspiciousId);
     EXPECT_NE(0u, createId);
     EXPECT_NE(0u, terminateId);
     EXPECT_NE(0u, suspiciousId);
 
+    EXPECT_TRUE(monitor.UnregisterCreateCallback(nullCreateId));
+    EXPECT_TRUE(monitor.UnregisterTerminateCallback(nullTerminateId));
+    EXPECT_TRUE(monitor.UnregisterSuspiciousCallback(nullSuspiciousId));
     EXPECT_TRUE(monitor.UnregisterCreateCallback(createId));
     EXPECT_TRUE(monitor.UnregisterTerminateCallback(terminateId));
     EXPECT_TRUE(monitor.UnregisterSuspiciousCallback(suspiciousId));

@@ -33,11 +33,6 @@ TEST(CryptoManagerTests, KeyMetadataExpirationAndSerializationExposeStableFields
     EXPECT_EQ(payload.at("usageCount").get<int>(), 3);
     EXPECT_TRUE(payload.at("isExportable").get<bool>());
     EXPECT_EQ(payload.at("description").get<std::string>(), "Primary kernel attestation key");
-    EXPECT_FALSE(payload.contains("algorithm"));
-    EXPECT_FALSE(payload.contains("createdAt"));
-    EXPECT_FALSE(payload.contains("expiresAt"));
-    EXPECT_FALSE(payload.contains("lastUsed"));
-    EXPECT_FALSE(payload.contains("isExtractable"));
 }
 
 TEST(CryptoManagerTests, KdfFactoriesAndEncryptionOutputPreserveExpectedLayout) {

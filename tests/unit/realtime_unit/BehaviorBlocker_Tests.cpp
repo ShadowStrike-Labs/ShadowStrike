@@ -159,4 +159,43 @@ TEST_F(BehaviorBlockerTest, DefaultStateAndCallbackContractsRemainSafe) {
     blocker.UnregisterBlockCallback(callbackId);
 }
 
+TEST_F(BehaviorBlockerTest, LifecycleAndAnalysisGatesPreserveAllowByDefaultBehavior) {
+    ASSERT_TRUE(blocker.Initialize(BehaviorBlockerConfig::CreateDefault()));
+    EXPECT_EQ(ComponentState::Stopped, blocker.GetState());
+
+    ProcessBehavior behavior;
+    behavior.processId = 2048;
+    behavior.parentPid = 4;
+    behavior.processPath = L"C:\\Tools\\powershell.exe";
+    behavior.commandLine = L"powershell.exe -enc SGVsbG8=";
+    behavior.type = BehaviorType::ScriptExecution;
+
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(behavior));
+    EXPECT_FALSE(blocker.DisableRule("missing"));
+    EXPECT_FALSE(blocker.EnableRule("missing"));
+    EXPECT_FALSE(blocker.RemoveRule("missing"));
+    EXPECT_FALSE(blocker.RemoveExclusion("missing"));
+
+    ASSERT_TRUE(blocker.Start());
+    EXPECT_TRUE(blocker.IsRunning());
+
+    blocker.Pause();
+    EXPECT_TRUE(blocker.IsPaused());
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(behavior));
+
+    blocker.Resume();
+    EXPECT_TRUE(blocker.IsRunning());
+
+    ProcessBehavior emptyPathBehavior = behavior;
+    emptyPathBehavior.processPath.clear();
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(emptyPathBehavior));
+
+    ProcessBehavior systemBehavior = behavior;
+    systemBehavior.processId = 4;
+    EXPECT_EQ(BlockAction::Allow, blocker.AnalyzeBehavior(systemBehavior));
+
+    blocker.Stop();
+    EXPECT_EQ(ComponentState::Stopped, blocker.GetState());
+}
+
 }  // namespace ShadowStrike::RealTime::Tests

@@ -106,18 +106,25 @@ TEST_F(RealTimeProtectionTest, StatusExclusionAndCacheAccessorsRemainSafe) {
     EXPECT_EQ(ProtectionComponentState::UNINITIALIZED, invalidComponent.state);
 
     EXPECT_TRUE(rtp.AddPathExclusion(L"C:\\Trusted"));
+    EXPECT_TRUE(rtp.AddPathExclusion(L"C:\\Trusted"));
     EXPECT_TRUE(rtp.AddProcessExclusion(L"trusted.exe"));
+    EXPECT_TRUE(rtp.AddProcessExclusion(L"trusted.exe"));
+    EXPECT_TRUE(rtp.AddHashExclusion(L"deadbeef"));
     EXPECT_TRUE(rtp.AddHashExclusion(L"deadbeef"));
 
     const auto exclusions = rtp.GetExclusions();
-    EXPECT_TRUE(ContainsWideString(exclusions.at(L"paths"), L"C:\\Trusted"));
-    EXPECT_TRUE(ContainsWideString(exclusions.at(L"processes"), L"trusted.exe"));
-    EXPECT_TRUE(ContainsWideString(exclusions.at(L"hashes"), L"deadbeef"));
+    EXPECT_EQ(2u, exclusions.at(L"paths").size());
+    EXPECT_EQ(2u, exclusions.at(L"processes").size());
+    EXPECT_EQ(2u, exclusions.at(L"hashes").size());
     EXPECT_TRUE(exclusions.contains(L"extensions"));
 
     std::array<uint8_t, 32> zeroHash{};
     EXPECT_FALSE(rtp.QueryVerdictCache(zeroHash).has_value());
     EXPECT_EQ(0u, rtp.GetCacheSize());
+
+    EXPECT_FALSE(rtp.RemovePathExclusion(L"C:\\Missing"));
+    EXPECT_FALSE(rtp.RemoveProcessExclusion(L"missing.exe"));
+    EXPECT_FALSE(rtp.RemoveHashExclusion(L"missing"));
 
     rtp.ClearAllExclusions();
     EXPECT_TRUE(rtp.GetExclusions().at(L"paths").empty());
@@ -126,6 +133,25 @@ TEST_F(RealTimeProtectionTest, StatusExclusionAndCacheAccessorsRemainSafe) {
 }
 
 TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterministic) {
+    RTPConfig updated = RTPConfig::CreateHighSecurity();
+    updated.scanOnOpen = false;
+    updated.mode = ProtectionMode::BLOCK_SUSPICIOUS;
+    ASSERT_TRUE(rtp.UpdateConfig(updated));
+    EXPECT_FALSE(rtp.GetConfig().scanOnOpen);
+    EXPECT_EQ(ProtectionMode::BLOCK_SUSPICIOUS, rtp.GetProtectionMode());
+
+    rtp.SetProtectionMode(ProtectionMode::MONITOR_ONLY);
+    EXPECT_EQ(ProtectionMode::MONITOR_ONLY, rtp.GetProtectionMode());
+    EXPECT_EQ(ProtectionMode::MONITOR_ONLY, rtp.GetConfig().mode);
+    EXPECT_FALSE(rtp.Pause(0, L"not-started"));
+    EXPECT_FALSE(rtp.Resume());
+
+    const uint64_t nullFileScanId = rtp.RegisterFileScanCallback({});
+    const uint64_t nullProcessId = rtp.RegisterProcessCreateCallback({});
+    const uint64_t nullThreatId = rtp.RegisterThreatDetectionCallback({});
+    const uint64_t nullStateId = rtp.RegisterStateChangeCallback({});
+    const uint64_t nullComponentId = rtp.RegisterComponentStatusCallback({});
+    const uint64_t nullNotificationId = rtp.RegisterNotificationCallback({});
     const uint64_t fileScanId = rtp.RegisterFileScanCallback(
         [](const RTPFileScanRequest&, ScanResult&) { return false; });
     const uint64_t processId = rtp.RegisterProcessCreateCallback(
@@ -140,6 +166,12 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
         [](NotificationSeverity, std::wstring_view, std::wstring_view,
             const std::optional<ThreatEvent>&) {});
 
+    EXPECT_NE(0u, nullFileScanId);
+    EXPECT_NE(0u, nullProcessId);
+    EXPECT_NE(0u, nullThreatId);
+    EXPECT_NE(0u, nullStateId);
+    EXPECT_NE(0u, nullComponentId);
+    EXPECT_NE(0u, nullNotificationId);
     EXPECT_NE(0u, fileScanId);
     EXPECT_NE(0u, processId);
     EXPECT_NE(0u, threatId);
@@ -147,6 +179,12 @@ TEST_F(RealTimeProtectionTest, CallbackRegistrationAndUnregistrationRemainDeterm
     EXPECT_NE(0u, componentId);
     EXPECT_NE(0u, notificationId);
 
+    EXPECT_TRUE(rtp.UnregisterCallback(nullFileScanId));
+    EXPECT_TRUE(rtp.UnregisterCallback(nullProcessId));
+    EXPECT_TRUE(rtp.UnregisterCallback(nullThreatId));
+    EXPECT_TRUE(rtp.UnregisterCallback(nullStateId));
+    EXPECT_TRUE(rtp.UnregisterCallback(nullComponentId));
+    EXPECT_TRUE(rtp.UnregisterCallback(nullNotificationId));
     EXPECT_TRUE(rtp.UnregisterCallback(fileScanId));
     EXPECT_TRUE(rtp.UnregisterCallback(processId));
     EXPECT_TRUE(rtp.UnregisterCallback(threatId));

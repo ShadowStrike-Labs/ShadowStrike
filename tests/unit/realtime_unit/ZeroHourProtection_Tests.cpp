@@ -117,6 +117,10 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     EXPECT_EQ(0u, protection.RegisterSignatureUpdateCallback({}));
     EXPECT_EQ(0u, protection.RegisterCloudStatusCallback({}));
 
+    const uint64_t nullVerdictId = protection.RegisterVerdictCallback({});
+    const uint64_t nullHoldId = protection.RegisterFileHoldCallback({});
+    const uint64_t nullOutbreakId = protection.RegisterOutbreakCallback({});
+    const uint64_t nullThreatLevelId = protection.RegisterThreatLevelCallback({});
     const uint64_t verdictId = protection.RegisterVerdictCallback(
         [](const std::wstring&, const FileAnalysisResult&) {});
     const uint64_t holdId = protection.RegisterFileHoldCallback([](const HeldFile&) {});
@@ -129,6 +133,10 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     const uint64_t cloudId = protection.RegisterCloudStatusCallback(
         [](CloudServiceStatus, CloudServiceStatus) {});
 
+    EXPECT_NE(0u, nullVerdictId);
+    EXPECT_NE(0u, nullHoldId);
+    EXPECT_NE(0u, nullOutbreakId);
+    EXPECT_NE(0u, nullThreatLevelId);
     EXPECT_NE(0u, verdictId);
     EXPECT_NE(0u, holdId);
     EXPECT_NE(0u, outbreakId);
@@ -136,6 +144,10 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     EXPECT_NE(0u, signatureId);
     EXPECT_NE(0u, cloudId);
 
+    EXPECT_TRUE(protection.UnregisterCallback(nullVerdictId));
+    EXPECT_TRUE(protection.UnregisterCallback(nullHoldId));
+    EXPECT_TRUE(protection.UnregisterCallback(nullOutbreakId));
+    EXPECT_TRUE(protection.UnregisterCallback(nullThreatLevelId));
     EXPECT_TRUE(protection.UnregisterCallback(verdictId));
     EXPECT_TRUE(protection.UnregisterCallback(holdId));
     EXPECT_TRUE(protection.UnregisterCallback(outbreakId));
@@ -143,6 +155,36 @@ TEST_F(ZeroHourProtectionTest, CallbackGuardsAndIdentifiersRemainStable) {
     EXPECT_TRUE(protection.UnregisterCallback(signatureId));
     EXPECT_TRUE(protection.UnregisterCallback(cloudId));
     EXPECT_FALSE(protection.UnregisterCallback(cloudId));
+    EXPECT_FALSE(protection.UnregisterCallback(0));
+}
+
+TEST_F(ZeroHourProtectionTest, ThreatLevelAndHoldPolicyEdgesRemainDeterministic) {
+    ZeroHourProtectionConfig config = ZeroHourProtectionConfig::CreateEnterprise();
+    config.excludedExtensions = { L".txt" };
+    ASSERT_TRUE(protection.UpdateConfig(config));
+
+    EXPECT_FALSE(protection.ShouldHoldFile(L"C:\\Temp\\note.txt"));
+    EXPECT_TRUE(protection.ShouldHoldFile(L"C:\\Temp\\NOTE.TXT"));
+    EXPECT_TRUE(protection.ShouldHoldFile(L"C:\\Temp\\payload.bin"));
+
+    EXPECT_EQ(ThreatLevel::NORMAL, protection.GetThreatLevel());
+    protection.SetThreatLevel(ThreatLevel::NORMAL, L"no-op");
+    EXPECT_EQ(ThreatLevel::NORMAL, protection.GetThreatLevel());
+
+    protection.SetThreatLevel(ThreatLevel::HIGH, L"escalate");
+    EXPECT_EQ(ThreatLevel::HIGH, protection.GetThreatLevel());
+    protection.SetThreatLevel(ThreatLevel::HIGH, L"repeat");
+    EXPECT_EQ(ThreatLevel::HIGH, protection.GetThreatLevel());
+
+    protection.SetOutbreakMode(true, L"outbreak");
+    EXPECT_TRUE(protection.IsOutbreakModeActive());
+    EXPECT_EQ(ThreatLevel::CRITICAL, protection.GetThreatLevel());
+    protection.SetOutbreakMode(true, L"repeat");
+    EXPECT_EQ(ThreatLevel::CRITICAL, protection.GetThreatLevel());
+
+    protection.SetOutbreakMode(false, L"clear");
+    EXPECT_FALSE(protection.IsOutbreakModeActive());
+    EXPECT_EQ(ThreatLevel::NORMAL, protection.GetThreatLevel());
 }
 
 }  // namespace ShadowStrike::RealTime::Tests

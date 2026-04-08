@@ -74,11 +74,24 @@ TEST_F(FileIntegrityMonitorTest, RuleCallbacksAndLookupsRemainSafeWithoutLiveMon
     rule.violationAction = FIMAction::Restore;
 
     EXPECT_TRUE(fim.AddRule(rule));
+    EXPECT_FALSE(fim.AddRule(rule));
+    EXPECT_FALSE(fim.AddRule(MonitoringRule{}));
     EXPECT_FALSE(fim.GetRules().empty());
+    ASSERT_TRUE(fim.GetRule(rule.ruleId).has_value());
+    EXPECT_TRUE(fim.GetRule(rule.ruleId)->enabled);
+    fim.SetRuleEnabled(rule.ruleId, false);
+    ASSERT_TRUE(fim.GetRule(rule.ruleId).has_value());
+    EXPECT_FALSE(fim.GetRule(rule.ruleId)->enabled);
+    fim.SetRuleEnabled("missing-rule", false);
+    EXPECT_FALSE(fim.GetRule("missing-rule").has_value());
     EXPECT_TRUE(fim.RemoveRule(rule.ruleId));
+    EXPECT_FALSE(fim.RemoveRule(rule.ruleId));
     EXPECT_TRUE(fim.GetRules().empty());
 
     EXPECT_EQ(0u, fim.RegisterChangeCallback({}));
+    EXPECT_EQ(0u, fim.RegisterViolationCallback({}));
+    EXPECT_EQ(0u, fim.RegisterVerificationCallback({}));
+    EXPECT_EQ(0u, fim.RegisterRestoreCallback({}));
 
     const uint64_t changeId = fim.RegisterChangeCallback(
         [](const FileChangeEvent&) { return FIMAction::LogOnly; });
@@ -102,9 +115,16 @@ TEST_F(FileIntegrityMonitorTest, RuleCallbacksAndLookupsRemainSafeWithoutLiveMon
     EXPECT_FALSE(fim.GetBaseline(L"C:\\does-not-exist.bin").has_value());
     EXPECT_FALSE(fim.QueryFileAttributes(L"C:\\does-not-exist.bin").has_value());
     EXPECT_FALSE(fim.GetFileSignature(L"C:\\does-not-exist.bin").has_value());
+    EXPECT_FALSE(fim.DeleteBaseline(L"C:\\does-not-exist.bin"));
 }
 
 TEST_F(FileIntegrityMonitorTest, StatisticsExposureStaysDeterministicAfterReset) {
+    FIMConfig updated = FIMConfig::CreateStrict();
+    updated.realTimeMonitoring = false;
+    fim.UpdateConfig(updated);
+    EXPECT_FALSE(fim.GetConfig().realTimeMonitoring);
+    EXPECT_EQ(FIMAction::Restore, fim.GetConfig().defaultAction);
+
     fim.ResetStats();
 
     const auto stats = fim.GetStats();
