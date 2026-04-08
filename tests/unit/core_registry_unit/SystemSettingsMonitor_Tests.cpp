@@ -15,12 +15,14 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/Shared_modules/Core/Registry/SystemSettingsMonitor.hpp"
+#include "CoreRegistry_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Registry::Test {
 
 class SystemSettingsMonitorTest : public ::testing::Test {
 protected:
     SystemSettingsMonitor& monitor = SystemSettingsMonitor::Instance();
+    TempDirectoryGuard temp{ L"ShadowStrike_SystemSettingsMonitor_UT" };
 
     void SetUp() override {
         monitor.Shutdown();
@@ -134,18 +136,44 @@ TEST_F(SystemSettingsMonitorTest, DefaultStateAndBaselineContractsRemainDetermin
 
     const uint64_t baselineId = monitor.CreateBaseline("Core registry unit baseline");
     EXPECT_NE(baselineId, 0u);
+    EXPECT_FALSE(monitor.GetBaseline(0xDEADBEEFull).has_value());
 
     const auto baseline = monitor.GetBaseline(baselineId);
     ASSERT_TRUE(baseline.has_value());
     EXPECT_EQ(baseline->snapshotId, baselineId);
     EXPECT_EQ(baseline->description, "Core registry unit baseline");
 
+    EXPECT_FALSE(monitor.SetActiveBaseline(0xDEADBEEFull));
+    EXPECT_FALSE(monitor.GetActiveBaseline().has_value());
     EXPECT_TRUE(monitor.SetActiveBaseline(baselineId));
 
     const auto activeBaseline = monitor.GetActiveBaseline();
     ASSERT_TRUE(activeBaseline.has_value());
     EXPECT_EQ(activeBaseline->snapshotId, baselineId);
     EXPECT_TRUE(monitor.CompareToBaseline(baselineId).empty());
+
+    const ComplianceStatus compliance = monitor.CheckCompliance();
+    EXPECT_TRUE(compliance.isCompliant);
+    EXPECT_EQ(compliance.totalChecks, 7u);
+    EXPECT_EQ(compliance.passedChecks, 7u);
+    EXPECT_EQ(compliance.failedChecks, 0u);
+    EXPECT_EQ(compliance.warnings, 0u);
+    EXPECT_TRUE(compliance.failures.empty());
+    EXPECT_TRUE(compliance.warningList.empty());
+
+    const auto missingPolicyPath = temp.Path(L"missing-policy.json");
+    const ComplianceStatus missingPolicy = monitor.CheckPolicyCompliance(missingPolicyPath.wstring());
+    EXPECT_FALSE(missingPolicy.isCompliant);
+    EXPECT_EQ(missingPolicy.totalChecks, 1u);
+    EXPECT_EQ(missingPolicy.failedChecks, 1u);
+    ASSERT_EQ(missingPolicy.failures.size(), 1u);
+    EXPECT_NE(missingPolicy.failures.front().find("Policy file not found:"), std::string::npos);
+
+    const auto policyPath = temp.WriteText(L"policy.json", "{}");
+    const ComplianceStatus fileBackedCompliance = monitor.CheckPolicyCompliance(policyPath.wstring());
+    EXPECT_TRUE(fileBackedCompliance.isCompliant);
+    EXPECT_EQ(fileBackedCompliance.totalChecks, compliance.totalChecks);
+    EXPECT_EQ(fileBackedCompliance.passedChecks, compliance.passedChecks);
 }
 
 TEST_F(SystemSettingsMonitorTest, AutoRemediationAndCallbackContractsRemainInProcess) {
@@ -154,6 +182,17 @@ TEST_F(SystemSettingsMonitorTest, AutoRemediationAndCallbackContractsRemainInPro
     EXPECT_TRUE(monitor.IsAutoRemediationEnabled());
     monitor.SetAutoRemediation(false);
     EXPECT_FALSE(monitor.IsAutoRemediationEnabled());
+    EXPECT_TRUE(monitor.GetHistory().empty());
+    EXPECT_TRUE(monitor.GetHistory(0).empty());
+    EXPECT_TRUE(monitor.GetHistoryByCategory(SettingCategory::Security).empty());
+    EXPECT_TRUE(monitor.GetActiveAlerts().empty());
+    EXPECT_FALSE(monitor.AcknowledgeAlert(0xDEADBEEFull));
+    monitor.ClearAlerts();
+    EXPECT_FALSE(monitor.Remediate(0xDEADBEEFull));
+
+    EXPECT_EQ(monitor.RegisterChangeCallback({}), 0u);
+    EXPECT_EQ(monitor.RegisterAlertCallback({}), 0u);
+    EXPECT_EQ(monitor.RegisterComplianceCallback({}), 0u);
 
     const uint64_t changeCallbackId =
         monitor.RegisterChangeCallback([](const SettingChange&) {});

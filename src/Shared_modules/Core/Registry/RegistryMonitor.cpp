@@ -379,20 +379,27 @@ KeyCategory RegistryEvent::GetCategory() const {
 }
 
 std::wstring RegistryEvent::GetHive() const {
-    if (keyPath.starts_with(L"\\Registry\\Machine") ||
-        keyPath.starts_with(L"HKLM\\") ||
-        keyPath.starts_with(L"HKEY_LOCAL_MACHINE\\")) {
+    const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
+
+    if (lowerPath.starts_with(L"\\registry\\machine") ||
+        lowerPath.starts_with(L"hklm\\") ||
+        lowerPath.starts_with(L"hkey_local_machine\\")) {
         return L"HKLM";
     }
 
-    if (keyPath.starts_with(L"\\Registry\\User") ||
-        keyPath.starts_with(L"HKCU\\") ||
-        keyPath.starts_with(L"HKEY_CURRENT_USER\\")) {
+    if (lowerPath.starts_with(L"\\registry\\user") ||
+        lowerPath.starts_with(L"hkcu\\") ||
+        lowerPath.starts_with(L"hkey_current_user\\")) {
         return L"HKCU";
     }
 
-    if (keyPath.starts_with(L"HKCR\\") ||
-        keyPath.starts_with(L"HKEY_CLASSES_ROOT\\")) {
+    if (lowerPath.starts_with(L"hku\\") ||
+        lowerPath.starts_with(L"hkey_users\\")) {
+        return L"HKU";
+    }
+
+    if (lowerPath.starts_with(L"hkcr\\") ||
+        lowerPath.starts_with(L"hkey_classes_root\\")) {
         return L"HKCR";
     }
 
@@ -858,7 +865,10 @@ public:
                 return true;
             }
 
-            if (pk.includeSubkeys && lowerPath.starts_with(lowerProtected)) {
+            if (pk.includeSubkeys &&
+                lowerPath.size() > lowerProtected.size() &&
+                lowerPath.starts_with(lowerProtected) &&
+                (lowerProtected.back() == L'\\' || lowerPath[lowerProtected.size()] == L'\\')) {
                 return true;
             }
         }

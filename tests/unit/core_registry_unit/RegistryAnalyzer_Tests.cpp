@@ -22,6 +22,7 @@ namespace ShadowStrike::Core::Registry::Test {
 class RegistryAnalyzerTest : public ::testing::Test {
 protected:
     RegistryAnalyzer& analyzer = RegistryAnalyzer::Instance();
+    TempDirectoryGuard temp{ L"ShadowStrike_RegistryAnalyzer_UT" };
 
     void SetUp() override {
         analyzer.Shutdown();
@@ -120,6 +121,51 @@ TEST_F(RegistryAnalyzerTest, StatisticsResetAndEntropyStayDeterministic) {
     EXPECT_NEAR(analyzer.CalculateEntropy(varied), 8.0, 0.01);
 }
 
+TEST_F(RegistryAnalyzerTest, OfflineHiveAndIndicatorHelpersHandleMalformedInputsDeterministically) {
+    ASSERT_TRUE(analyzer.Initialize(RegistryAnalyzerConfig::CreateDefault()));
+
+    const auto missingHive = temp.Path(L"missing.hiv");
+    const HiveHeader missingHeader = analyzer.ParseHiveHeader(missingHive.wstring());
+    EXPECT_FALSE(missingHeader.isValid);
+    EXPECT_FALSE(missingHeader.isCorrupted);
+    EXPECT_FALSE(analyzer.ValidateHiveStructure(missingHive.wstring()));
+    EXPECT_FALSE(analyzer.GetKeyCell(missingHive.wstring(), 0).has_value());
+    EXPECT_FALSE(analyzer.GetKeyCell(missingHive.wstring(), 0xFFFFFFFFu).has_value());
+
+    std::vector<uint8_t> malformedHive(0x100, 0x41);
+    malformedHive[0] = 'B';
+    malformedHive[1] = 'A';
+    malformedHive[2] = 'D';
+    malformedHive[3] = '!';
+    const auto malformedHivePath = temp.WriteBytes(L"malformed.hiv", malformedHive);
+
+    const HiveHeader malformedHeader = analyzer.ParseHiveHeader(malformedHivePath.wstring());
+    EXPECT_FALSE(malformedHeader.isValid);
+    EXPECT_TRUE(malformedHeader.isCorrupted);
+    EXPECT_FALSE(analyzer.ValidateHiveStructure(malformedHivePath.wstring()));
+
+    const AnalysisResult hiveResult = analyzer.AnalyzeHiveFile(malformedHivePath.wstring());
+    EXPECT_TRUE(hiveResult.hadErrors);
+    EXPECT_FALSE(hiveResult.completed);
+    EXPECT_TRUE(ContainsString(hiveResult.errors, "Invalid hive file"));
+
+    EXPECT_EQ(analyzer.LoadThreatIndicators(missingHive.wstring()), 0u);
+
+    const auto indicatorsPath = temp.WriteText(
+        L"indicators.txt",
+        "# comment\n"
+        "HKLM\\\\Software\\\\Bad|Run|ThreatOne|FamilyOne|T1112\n"
+        "HKCU\\\\Software\\\\Bad|Value|ThreatTwo|FamilyTwo|\n");
+    EXPECT_EQ(analyzer.LoadThreatIndicators(indicatorsPath.wstring()), 2u);
+    EXPECT_TRUE(analyzer.SearchIOCs({ L"shadowstrike" }).empty());
+
+    const auto timelinePath = temp.Path(L"timeline.csv");
+    EXPECT_TRUE(analyzer.ExportTimeline(timelinePath.wstring()));
+    EXPECT_EQ(
+        temp.ReadText(timelinePath),
+        "Timestamp,Action,Hive,KeyPath,ValueName,Description,IsAnomaly\n");
+}
+
 TEST_F(RegistryAnalyzerTest, CallbackAndUninitializedAccessContractsRemainSafe) {
     EXPECT_FALSE(analyzer.IsAnalysisRunning());
     EXPECT_TRUE(analyzer.GetHiddenKeys().empty());
@@ -129,6 +175,9 @@ TEST_F(RegistryAnalyzerTest, CallbackAndUninitializedAccessContractsRemainSafe) 
     EXPECT_TRUE(analyzer.GetAnomaliesBySeverity(AnomalySeverity::Low).empty());
     EXPECT_FALSE(analyzer.GetAnomalyById(0xDEADBEEFull).has_value());
     EXPECT_TRUE(analyzer.GetHighEntropyValues().empty());
+    EXPECT_EQ(analyzer.RegisterAnomalyCallback({}), 0u);
+    EXPECT_EQ(analyzer.RegisterProgressCallback({}), 0u);
+    EXPECT_EQ(analyzer.RegisterHiddenEntryCallback({}), 0u);
 
     const uint64_t anomalyCallbackId =
         analyzer.RegisterAnomalyCallback([](const RegistryAnomaly&) {});
@@ -147,6 +196,7 @@ TEST_F(RegistryAnalyzerTest, CallbackAndUninitializedAccessContractsRemainSafe) 
     EXPECT_TRUE(analyzer.UnregisterCallback(progressCallbackId));
     EXPECT_TRUE(analyzer.UnregisterCallback(hiddenCallbackId));
     EXPECT_FALSE(analyzer.UnregisterCallback(hiddenCallbackId));
+    EXPECT_FALSE(analyzer.UnregisterCallback(0xFFFFFFFFull));
 }
 
 }  // namespace ShadowStrike::Core::Registry::Test
