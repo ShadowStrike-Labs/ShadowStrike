@@ -1302,8 +1302,9 @@ public:
 
             // Extract credentials (user:pass@)
             size_t atPos = remaining.find('@');
-            size_t slashPos = remaining.find('/');
-            if (atPos != std::string::npos && (slashPos == std::string::npos || atPos < slashPos)) {
+            size_t authorityTerminatorPos = remaining.find_first_of("/?#");
+            if (atPos != std::string::npos &&
+                (authorityTerminatorPos == std::string::npos || atPos < authorityTerminatorPos)) {
                 std::string creds = remaining.substr(0, atPos);
                 remaining = remaining.substr(atPos + 1);
                 parsed.hasCredentials = true;
@@ -1317,10 +1318,26 @@ public:
                 }
             }
 
-            // Extract host and port — handle IPv6 bracket notation
-            size_t pathStart = remaining.find('/');
-            std::string hostPort = (pathStart != std::string::npos) ?
-                remaining.substr(0, pathStart) : remaining;
+            // Extract authority, path, query, and fragment. Host-only URLs may
+            // legally start the query/fragment directly without a '/'.
+            const size_t slashPos = remaining.find('/');
+            const size_t queryPos = remaining.find('?');
+            const size_t fragmentPos = remaining.find('#');
+
+            size_t authorityEnd = remaining.size();
+            if (slashPos != std::string::npos) {
+                authorityEnd = std::min(authorityEnd, slashPos);
+            }
+            if (queryPos != std::string::npos) {
+                authorityEnd = std::min(authorityEnd, queryPos);
+            }
+            if (fragmentPos != std::string::npos) {
+                authorityEnd = std::min(authorityEnd, fragmentPos);
+            }
+
+            const bool hasAuthoritySuffix = authorityEnd < remaining.size();
+            std::string hostPort = hasAuthoritySuffix ?
+                remaining.substr(0, authorityEnd) : remaining;
 
             if (!hostPort.empty() && hostPort.front() == '[') {
                 // IPv6 bracket notation: [::1]:port
@@ -1377,13 +1394,17 @@ public:
             parsed.isPrivateIP = IsPrivateIPv4(parsed.hostNormalized);
 
             // Extract path, query, fragment
-            if (pathStart != std::string::npos) {
-                remaining = remaining.substr(pathStart);
+            if (hasAuthoritySuffix) {
+                remaining = remaining.substr(authorityEnd);
 
                 size_t queryStart = remaining.find('?');
                 size_t fragmentStart = remaining.find('#');
 
-                if (queryStart != std::string::npos) {
+                if (!remaining.empty() && remaining.front() == '?') {
+                    parsed.path = "/";
+                } else if (!remaining.empty() && remaining.front() == '#') {
+                    parsed.path = "/";
+                } else if (queryStart != std::string::npos) {
                     parsed.path = remaining.substr(0, queryStart);
 
                     size_t queryEnd = (fragmentStart != std::string::npos) ? fragmentStart : remaining.length();
@@ -1394,8 +1415,17 @@ public:
                     parsed.path = remaining;
                 }
 
+                if (queryStart != std::string::npos) {
+                    size_t queryEnd = (fragmentStart != std::string::npos) ? fragmentStart : remaining.length();
+                    parsed.query = remaining.substr(queryStart + 1, queryEnd - queryStart - 1);
+                }
+
                 if (fragmentStart != std::string::npos) {
                     parsed.fragment = remaining.substr(fragmentStart + 1);
+                }
+
+                if (parsed.path.empty()) {
+                    parsed.path = "/";
                 }
             } else {
                 parsed.path = "/";
