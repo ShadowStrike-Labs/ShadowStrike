@@ -70,6 +70,9 @@ constexpr uint8_t kSIB_NoIndex    = 4;
 constexpr uint8_t kSIB_Disp32Base = 5;
 constexpr uint8_t kScaleFactors[4] = { 1, 2, 4, 8 };
 
+// Forward declaration — defined below after ResolveMnemonic
+Mnemonic ResolveFPUMnemonicImpl(uint8_t primaryOp, uint8_t modrm) noexcept;
+
 } // anonymous namespace
 
 // ============================================================================
@@ -1828,7 +1831,6 @@ namespace {
 Mnemonic ResolveFPUMnemonicImpl(uint8_t primaryOp, uint8_t modrm) noexcept {
     uint8_t mod = ModRM_Mod(modrm);
     uint8_t ext = ModRM_Reg(modrm);
-    uint8_t rm  = ModRM_RM(modrm);
     bool isReg  = (mod == kMod_Register);
 
     switch (primaryOp) {
@@ -2570,21 +2572,8 @@ void Decoder::DecodeModRMOperands(DecodeContext& ctx,
         }
 
         if (dispSz > 0) {
-            uint32_t dOff = ctx.offset;
-            // We need to read the displacement from the buffer at the right offset
-            // The displacement comes right after ModRM (+ SIB if present)
-            // But ctx.offset has already advanced past it
-            // Calculate back from current offset
-            uint32_t immSz = 0;
-            if (ctx.opcodeMap == 0) {
-                immSz = 0; // Will be calculated after this, not yet consumed
-            }
-            // The displacement bytes are at (ctx.offset - immSize - dispSize) offset in original
-            // Actually, the displacement was already consumed. Let's re-read it.
-            uint32_t dispStart = ctx.offset;
-            // Walk back to find displacement position
-            // After modrm + sib, before immediate
-            // Actually, we need a different approach: read from raw bytes
+            // Re-read displacement from buffer using computed position
+            // Compute displacement position: after prefix + opcode + modrm + optional SIB
             if (ctx.hasSIB) {
                 // prefix + opcode + modrm(1) + sib(1) + disp
                 dispOff = ctx.offset;

@@ -136,9 +136,10 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/MemoryUtils.hpp"
 
-// Forward declaration for Zydis decoder
-struct ZydisDecoder_;
-typedef struct ZydisDecoder_ ZydisDecoder;
+// Forward declaration for PhantomDisassembler decoder
+namespace Phantom::Disasm {
+    class Decoder;
+}
 
 // Forward declarations to avoid circular dependencies
 namespace ShadowStrike::SignatureStore {
@@ -2040,7 +2041,7 @@ namespace ShadowStrike {
              * @brief Scan code buffer for timing-related CPU instructions
              */
             void ScanCodeForTimingInstructions(
-                const ZydisDecoder* decoder,
+                const Phantom::Disasm::Decoder* decoder,
                 const uint8_t* code,
                 size_t size,
                 uintptr_t baseAddress,
@@ -2051,7 +2052,7 @@ namespace ShadowStrike {
              * @brief Scan executable section for timing patterns with context analysis
              */
             void ScanCodeForTimingPatterns(
-                const ZydisDecoder* decoder,
+                const Phantom::Disasm::Decoder* decoder,
                 const uint8_t* code,
                 size_t size,
                 uintptr_t baseAddress,

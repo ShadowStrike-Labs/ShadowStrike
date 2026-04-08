@@ -47,7 +47,7 @@
  *    - YARA rule integration via SignatureStore
  *
  * 4. HEURISTIC ANALYSIS
- *    - Unpacking stub detection via Zydis disassembly
+ *    - Unpacking stub detection via PhantomDisassembler disassembly
  *    - API resolution pattern recognition
  *    - Self-modifying code indicators
  *
@@ -99,7 +99,7 @@
 #include "../HashStore/HashStore.hpp"
 #include "../PEParser/PEParser.hpp"
 
-#include <Zydis/Zydis.h>
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 
 namespace ShadowStrike {
 namespace AntiEvasion {
@@ -1064,10 +1064,10 @@ public:
 
         SS_LOG_INFO(L"PackerDetector", L"Initializing packer detector...");
 
-        if (!InitializeZydis()) {
+        if (!InitializeDisassembler()) {
             if (err) {
                 err->win32Code = ERROR_INVALID_FUNCTION;
-                err->message = L"Failed to initialize Zydis disassembler";
+                err->message = L"Failed to initialize PhantomDisassembler";
             }
             return false;
         }
@@ -2254,10 +2254,10 @@ private:
     // INTERNAL METHODS
     // ========================================================================
 
-    [[nodiscard]] bool InitializeZydis() noexcept {
-        ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
-        ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-        ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+    [[nodiscard]] bool InitializeDisassembler() noexcept {
+        m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
+        m_decoder64.Init(Phantom::Disasm::MachineMode::Long64);
+        m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
         return true;
     }
 
@@ -2775,7 +2775,7 @@ private:
         PackingInfo& result) noexcept
     {
         // ============================================================================
-        // Enterprise-grade packer stub analysis using Zydis disassembly
+        // Enterprise-grade packer stub analysis using PhantomDisassembler
         // Detects:
         //   - Register preservation patterns (PUSHAD/PUSHA sequences)
         //   - Unpacking loops (LOOP, DEC+JNZ, SUB+JNZ patterns)
@@ -2787,11 +2787,11 @@ private:
         //   - Polymorphic NOP sequences (multi-byte NOPs, XCHG patterns)
         // ============================================================================
         
-        ZydisDecoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
+        Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
 
-        ZydisDecodedInstruction instruction;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        ZyanUSize offset = 0;
+        Phantom::Disasm::DecodedInstruction instruction{};
+        Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS]{};
+        size_t offset = 0;
 
         // Counters and state tracking
         size_t pushCount = 0;
@@ -2822,9 +2822,9 @@ private:
         
         // Track instruction history for pattern matching
         struct InstrRecord {
-            ZydisMnemonic mnemonic;
-            ZydisOperandType op0Type;
-            ZydisRegister op0Reg;
+            Phantom::Disasm::Mnemonic mnemonic;
+            Phantom::Disasm::OperandType op0Type;
+            Phantom::Disasm::Register op0Reg;
             bool op0IsMem;
             bool op1IsMem;
         };
@@ -2836,8 +2836,8 @@ private:
         size_t regXorCount = 0;
 
         while (offset < codeSize && instructionCount < MAX_STUB_INSTRUCTIONS) {
-            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset,
-                codeSize - offset, &instruction, operands))) {
+            if (!Phantom::Disasm::IsSuccess(decoder->DecodeFull(code + offset,
+                codeSize - offset, instruction, operands))) {
                 break;
             }
 
@@ -2846,13 +2846,13 @@ private:
             rec.mnemonic = instruction.mnemonic;
             if (instruction.operand_count > 0) {
                 rec.op0Type = operands[0].type;
-                if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                if (operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
                     rec.op0Reg = operands[0].reg.value;
                 }
-                rec.op0IsMem = (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY);
+                rec.op0IsMem = (operands[0].type == Phantom::Disasm::OperandType::MEMORY);
             }
             if (instruction.operand_count > 1) {
-                rec.op1IsMem = (operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY);
+                rec.op1IsMem = (operands[1].type == Phantom::Disasm::OperandType::MEMORY);
             }
             history.push_back(rec);
 
@@ -2860,81 +2860,81 @@ private:
                 // ================================================================
                 // Register preservation detection
                 // ================================================================
-                case ZYDIS_MNEMONIC_PUSH:
-                case ZYDIS_MNEMONIC_PUSHFQ:
-                case ZYDIS_MNEMONIC_PUSHF:
+                case Phantom::Disasm::Mnemonic::PUSH:
+                case Phantom::Disasm::Mnemonic::PUSHFQ:
+                case Phantom::Disasm::Mnemonic::PUSHF:
                     ++pushCount;
                     break;
                     
-                case ZYDIS_MNEMONIC_PUSHA:
-                case ZYDIS_MNEMONIC_PUSHAD:
+                case Phantom::Disasm::Mnemonic::PUSHA:
+                case Phantom::Disasm::Mnemonic::PUSHAD:
                     pushCount += 8; // PUSHAD pushes 8 registers
                     break;
                     
-                case ZYDIS_MNEMONIC_POP:
-                case ZYDIS_MNEMONIC_POPFQ:
-                case ZYDIS_MNEMONIC_POPF:
+                case Phantom::Disasm::Mnemonic::POP:
+                case Phantom::Disasm::Mnemonic::POPFQ:
+                case Phantom::Disasm::Mnemonic::POPF:
                     ++popCount;
                     break;
                     
-                case ZYDIS_MNEMONIC_POPA:
-                case ZYDIS_MNEMONIC_POPAD:
+                case Phantom::Disasm::Mnemonic::POPA:
+                case Phantom::Disasm::Mnemonic::POPAD:
                     popCount += 8;
                     break;
 
                 // ================================================================
                 // Loop detection (traditional LOOP instruction)
                 // ================================================================
-                case ZYDIS_MNEMONIC_LOOP:
-                case ZYDIS_MNEMONIC_LOOPE:
-                case ZYDIS_MNEMONIC_LOOPNE:
+                case Phantom::Disasm::Mnemonic::LOOP:
+                case Phantom::Disasm::Mnemonic::LOOPE:
+                case Phantom::Disasm::Mnemonic::LOOPNE:
                     hasUnpackLoop = true;
                     break;
 
                 // ================================================================
                 // Decryption pattern detection (XOR, ROL, ROR, ADD, SUB)
                 // ================================================================
-                case ZYDIS_MNEMONIC_XOR:
+                case Phantom::Disasm::Mnemonic::XOR:
                     ++xorCount;
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY ||
-                        operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    if (operands[0].type == Phantom::Disasm::OperandType::MEMORY ||
+                        operands[1].type == Phantom::Disasm::OperandType::MEMORY) {
                         ++memXorCount;
                     } else {
                         ++regXorCount;
                         // Check for XOR reg, reg (zero idiom) vs actual XOR
-                        if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                            operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                        if (operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                            operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                             operands[0].reg.value != operands[1].reg.value) {
                             // XOR with different registers - potential decryption
                         }
                     }
                     break;
                     
-                case ZYDIS_MNEMONIC_ROL:
-                case ZYDIS_MNEMONIC_ROR:
+                case Phantom::Disasm::Mnemonic::ROL:
+                case Phantom::Disasm::Mnemonic::ROR:
                     ++rolRorCount;
                     // Check for API hashing pattern: ROL followed by XOR
                     if (history.size() >= 2) {
                         const auto& prev = history[history.size() - 2];
-                        if (prev.mnemonic == ZYDIS_MNEMONIC_XOR ||
-                            prev.mnemonic == ZYDIS_MNEMONIC_ADD) {
+                        if (prev.mnemonic == Phantom::Disasm::Mnemonic::XOR ||
+                            prev.mnemonic == Phantom::Disasm::Mnemonic::ADD) {
                             hasApiHashing = true;
                         }
                     }
                     break;
                     
-                case ZYDIS_MNEMONIC_ADD:
-                case ZYDIS_MNEMONIC_SUB:
+                case Phantom::Disasm::Mnemonic::ADD:
+                case Phantom::Disasm::Mnemonic::SUB:
                     ++addSubCount;
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    if (operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                         // ADD/SUB to memory - potential decryption
                     }
                     // Check for stack pivot (large immediate to ESP/RSP)
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                        ZydisRegister reg = operands[0].reg.value;
-                        if (reg == ZYDIS_REGISTER_RSP || reg == ZYDIS_REGISTER_ESP ||
-                            reg == ZYDIS_REGISTER_SP) {
-                            if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    if (operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
+                        Phantom::Disasm::Register reg = operands[0].reg.value;
+                        if (reg == Phantom::Disasm::Register::RSP || reg == Phantom::Disasm::Register::ESP ||
+                            reg == Phantom::Disasm::Register::SP) {
+                            if (operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                                 int64_t imm = operands[1].imm.value.s;
                                 // Large stack adjustment (> 4KB) is suspicious
                                 if (std::abs(imm) > 4096) {
@@ -2948,48 +2948,48 @@ private:
                 // ================================================================
                 // Counter manipulation (DEC/INC for loop detection)
                 // ================================================================
-                case ZYDIS_MNEMONIC_DEC:
+                case Phantom::Disasm::Mnemonic::DEC:
                     ++decCount;
                     break;
                     
-                case ZYDIS_MNEMONIC_INC:
+                case Phantom::Disasm::Mnemonic::INC:
                     ++incCount;
                     break;
 
                 // ================================================================
                 // Conditional jumps - check for DEC+JNZ or SUB+JNZ loops
-                // Zydis: JNE is JNZ (same opcode 0x75)
+                // PhantomDisassembler: JNE is JNZ (same opcode 0x75)
                 // ================================================================
-                case ZYDIS_MNEMONIC_JNZ:
+                case Phantom::Disasm::Mnemonic::JNZ:
                     if (history.size() >= 2) {
                         const auto& prev = history[history.size() - 2];
-                        if (prev.mnemonic == ZYDIS_MNEMONIC_DEC) {
+                        if (prev.mnemonic == Phantom::Disasm::Mnemonic::DEC) {
                             hasDecJnzLoop = true;
-                        } else if (prev.mnemonic == ZYDIS_MNEMONIC_SUB) {
+                        } else if (prev.mnemonic == Phantom::Disasm::Mnemonic::SUB) {
                             hasSubJnzLoop = true;
                         }
                     }
                     ++jmpCount;
                     break;
                     
-                case ZYDIS_MNEMONIC_JMP:
-                case ZYDIS_MNEMONIC_JZ:      // JE is JZ (same opcode 0x74)
-                case ZYDIS_MNEMONIC_JB:
-                case ZYDIS_MNEMONIC_JNBE:    // JA is JNBE (same opcode 0x77)
-                case ZYDIS_MNEMONIC_JL:
-                case ZYDIS_MNEMONIC_JNLE:    // JG is JNLE (same opcode 0x7F)
-                case ZYDIS_MNEMONIC_JLE:
-                case ZYDIS_MNEMONIC_JNL:     // JGE is JNL (same opcode 0x7D)
+                case Phantom::Disasm::Mnemonic::JMP:
+                case Phantom::Disasm::Mnemonic::JZ:      // JE is JZ (same opcode 0x74)
+                case Phantom::Disasm::Mnemonic::JB:
+                case Phantom::Disasm::Mnemonic::JNBE:    // JA is JNBE (same opcode 0x77)
+                case Phantom::Disasm::Mnemonic::JL:
+                case Phantom::Disasm::Mnemonic::JNLE:    // JG is JNLE (same opcode 0x7F)
+                case Phantom::Disasm::Mnemonic::JLE:
+                case Phantom::Disasm::Mnemonic::JNL:     // JGE is JNL (same opcode 0x7D)
                     ++jmpCount;
                     break;
 
                 // ================================================================
                 // Call detection
                 // ================================================================
-                case ZYDIS_MNEMONIC_CALL:
+                case Phantom::Disasm::Mnemonic::CALL:
                     ++callCount;
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER ||
-                        operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                    if (operands[0].type == Phantom::Disasm::OperandType::REGISTER ||
+                        operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                         hasIndirectCall = true;
                     }
                     break;
@@ -2997,13 +2997,13 @@ private:
                 // ================================================================
                 // Anti-debugging detection
                 // ================================================================
-                case ZYDIS_MNEMONIC_RDTSC:
-                case ZYDIS_MNEMONIC_RDTSCP:
+                case Phantom::Disasm::Mnemonic::RDTSC:
+                case Phantom::Disasm::Mnemonic::RDTSCP:
                     hasRdtsc = true;
                     break;
                     
-                case ZYDIS_MNEMONIC_INT:
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                case Phantom::Disasm::Mnemonic::INT:
+                    if (operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                         uint8_t intNum = static_cast<uint8_t>(operands[0].imm.value.u);
                         if (intNum == 0x2D) {
                             hasInt2d = true; // Anti-debugging
@@ -3013,24 +3013,24 @@ private:
                     }
                     break;
                     
-                case ZYDIS_MNEMONIC_CPUID:
+                case Phantom::Disasm::Mnemonic::CPUID:
                     hasCpuid = true;
                     break;
                     
                 // ================================================================
                 // VM detection instructions
                 // ================================================================
-                case ZYDIS_MNEMONIC_SIDT:
-                case ZYDIS_MNEMONIC_SGDT:
-                case ZYDIS_MNEMONIC_SLDT:
-                case ZYDIS_MNEMONIC_STR:
+                case Phantom::Disasm::Mnemonic::SIDT:
+                case Phantom::Disasm::Mnemonic::SGDT:
+                case Phantom::Disasm::Mnemonic::SLDT:
+                case Phantom::Disasm::Mnemonic::STR:
                     hasVmDetection = true;
                     break;
                     
-                case ZYDIS_MNEMONIC_IN:
-                case ZYDIS_MNEMONIC_OUT:
+                case Phantom::Disasm::Mnemonic::IN:
+                case Phantom::Disasm::Mnemonic::OUT:
                     // I/O instructions often used for VM detection (VMware backdoor)
-                    if (operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    if (operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                         uint16_t port = static_cast<uint16_t>(operands[1].imm.value.u);
                         if (port == 0x5658 || port == 0x5659) { // VMware ports
                             hasVmDetection = true;
@@ -3041,44 +3041,44 @@ private:
                 // ================================================================
                 // NOP detection (polymorphic NOPs)
                 // ================================================================
-                case ZYDIS_MNEMONIC_NOP:
+                case Phantom::Disasm::Mnemonic::NOP:
                     ++nopCount;
                     break;
                     
-                case ZYDIS_MNEMONIC_XCHG:
+                case Phantom::Disasm::Mnemonic::XCHG:
                     // XCHG reg, reg is often used as a NOP (e.g., XCHG EAX, EAX)
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+                    if (operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                        operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                         operands[0].reg.value == operands[1].reg.value) {
                         ++nopCount;
                     }
                     break;
                     
-                case ZYDIS_MNEMONIC_LEA:
+                case Phantom::Disasm::Mnemonic::LEA:
                     // LEA reg, [reg] is a NOP-equivalent
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                        operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                    if (operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                        operands[1].type == Phantom::Disasm::OperandType::MEMORY &&
                         operands[1].mem.base == operands[0].reg.value &&
                         operands[1].mem.disp.value == 0 &&
-                        operands[1].mem.index == ZYDIS_REGISTER_NONE) {
+                        operands[1].mem.index == Phantom::Disasm::Register::NONE) {
                         ++nopCount;
                     }
                     break;
 
                 // ================================================================
                 // Memory write detection (self-modifying code indicator)
-                // Zydis uses size-suffixed mnemonics: MOVSB/MOVSW/MOVSD/MOVSQ
+                // PhantomDisassembler uses size-suffixed mnemonics: MOVSB/MOVSW/MOVSD/MOVSQ
                 // ================================================================
-                case ZYDIS_MNEMONIC_MOV:
-                case ZYDIS_MNEMONIC_MOVSB:
-                case ZYDIS_MNEMONIC_MOVSW:
-                case ZYDIS_MNEMONIC_MOVSD:
-                case ZYDIS_MNEMONIC_MOVSQ:
-                case ZYDIS_MNEMONIC_STOSB:
-                case ZYDIS_MNEMONIC_STOSW:
-                case ZYDIS_MNEMONIC_STOSD:
-                case ZYDIS_MNEMONIC_STOSQ:
-                    if (operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                case Phantom::Disasm::Mnemonic::MOV:
+                case Phantom::Disasm::Mnemonic::MOVSB:
+                case Phantom::Disasm::Mnemonic::MOVSW:
+                case Phantom::Disasm::Mnemonic::MOVSD_STR:
+                case Phantom::Disasm::Mnemonic::MOVSQ:
+                case Phantom::Disasm::Mnemonic::STOSB:
+                case Phantom::Disasm::Mnemonic::STOSW:
+                case Phantom::Disasm::Mnemonic::STOSD:
+                case Phantom::Disasm::Mnemonic::STOSQ:
+                    if (operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                         // Could be writing to code section (self-modifying)
                         hasWriteToCode = true;
                     }
@@ -3380,9 +3380,9 @@ private:
 
     Utils::pe_sig_utils::PEFileSignatureVerifier m_sigVerifier;
 
-    ZydisDecoder m_decoder32{};
-    ZydisDecoder m_decoder64{};
-    ZydisFormatter m_formatter{};
+    Phantom::Disasm::Decoder m_decoder32{};
+    Phantom::Disasm::Decoder m_decoder64{};
+    Phantom::Disasm::Formatter m_formatter{};
 
     std::unordered_map<PackerType, EPSignatures::EPSignature> m_epSignatureMap;
 

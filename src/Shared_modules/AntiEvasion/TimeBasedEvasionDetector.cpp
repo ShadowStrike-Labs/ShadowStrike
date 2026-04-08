@@ -29,7 +29,7 @@
  * This module implements comprehensive detection of timing attacks:
  *
  * 1. RDTSC/RDTSCP ANALYSIS
- *    - Instruction pattern scanning via Zydis disassembler
+ *    - Instruction pattern scanning via PhantomDisassembler
  *    - High-frequency RDTSC detection
  *    - RDTSC delta checks for VM detection
  *    - RDTSC+CPUID serialization patterns
@@ -101,7 +101,7 @@
 #include "../Utils/MemoryUtils.hpp"
 #include "../PEParser/PEParser.hpp"
 
-#include <Zydis/Zydis.h>
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 
 // =============================================================================
 // ASSEMBLY FUNCTION FALLBACKS
@@ -718,10 +718,10 @@ struct TimeBasedEvasionDetector::Impl {
 
     std::shared_ptr<Utils::ThreadPool> m_threadPool;
 
-    // Zydis disassembler contexts
-    ZydisDecoder m_decoder32{};
-    ZydisDecoder m_decoder64{};
-    ZydisFormatter m_formatter{};
+    // PhantomDisassembler contexts
+    Phantom::Disasm::Decoder m_decoder32{};
+    Phantom::Disasm::Decoder m_decoder64{};
+    Phantom::Disasm::Formatter m_formatter{};
 
     // Process monitoring contexts
     std::unordered_map<uint32_t, std::unique_ptr<ProcessMonitoringContext>> m_monitoredProcesses;
@@ -749,10 +749,10 @@ struct TimeBasedEvasionDetector::Impl {
     // ========================================================================
 
     Impl() {
-        // Initialize Zydis decoders
-        ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LEGACY_32, ZYDIS_STACK_WIDTH_32);
-        ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64);
-        ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL);
+        // Initialize PhantomDisassembler decoders
+        m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32);
+        m_decoder64.Init(Phantom::Disasm::MachineMode::Long64);
+        m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
     }
 
     ~Impl() {
@@ -1070,7 +1070,7 @@ struct TimeBasedEvasionDetector::Impl {
         bool is64Bit = false;
 
         // FIX (Issue #1): Capture the return value - previous code ignored it!
-        // This caused all 64-bit malware to be analyzed with wrong Zydis decoder
+        // This caused all 64-bit malware to be analyzed with wrong PhantomDisassembler decoder
         is64Bit = Utils::ProcessUtils::IsProcess64Bit(processId);
 
         // Read code section and scan for RDTSC patterns
@@ -1094,8 +1094,8 @@ struct TimeBasedEvasionDetector::Impl {
                 analysis.rdtscCpuidComboCount = CountRDTSCCPUIDCombos(
                     codeBuffer.data(), bytesRead);
 
-                // Analyze using Zydis for more accurate detection
-                AnalyzeCodeWithZydis(codeBuffer.data(), bytesRead, is64Bit, analysis);
+                // Analyze using PhantomDisassembler for more accurate detection
+                AnalyzeCodeWithPhantomDisasm(codeBuffer.data(), bytesRead, is64Bit, analysis);
             }
         }
 
@@ -2234,17 +2234,17 @@ public:
         return count;
     }
 
-    void AnalyzeCodeWithZydis(
+    void AnalyzeCodeWithPhantomDisasm(
         const uint8_t* code,
         size_t codeSize,
         bool is64Bit,
         RDTSCAnalysis& analysis)
     {
-        ZydisDecoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
+        Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
 
-        ZydisDecodedInstruction instruction;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
-        ZyanUSize offset = 0;
+        Phantom::Disasm::DecodedInstruction instruction;
+        Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
+        size_t offset = 0;
         size_t instructionCount = 0;
 
         uint64_t rdtscCount = 0;
@@ -2252,14 +2252,14 @@ public:
         bool seenCpuid = false;
 
         while (offset < codeSize && instructionCount < MAX_INSTRUCTIONS_PER_SCAN) {
-            if (!ZYAN_SUCCESS(ZydisDecoderDecodeFull(decoder, code + offset,
-                codeSize - offset, &instruction, operands))) {
+            if (!Phantom::Disasm::IsSuccess(decoder->DecodeFull(code + offset,
+                codeSize - offset, instruction, operands))) {
                 ++offset;
                 continue;
             }
 
             switch (instruction.mnemonic) {
-                case ZYDIS_MNEMONIC_RDTSC:
+                case Phantom::Disasm::Mnemonic::RDTSC:
                     ++rdtscCount;
                     if (seenCpuid) {
                         // CPUID+RDTSC combo for serialization
@@ -2268,19 +2268,19 @@ public:
                     seenCpuid = false;
                     break;
 
-                case ZYDIS_MNEMONIC_RDTSCP:
+                case Phantom::Disasm::Mnemonic::RDTSCP:
                     ++rdtscpCount;
                     break;
 
-                case ZYDIS_MNEMONIC_CPUID:
+                case Phantom::Disasm::Mnemonic::CPUID:
                     seenCpuid = true;
                     break;
 
                 default:
                     // Reset CPUID tracking after non-RDTSC instruction
-                    if (instruction.mnemonic != ZYDIS_MNEMONIC_MOV &&
-                        instruction.mnemonic != ZYDIS_MNEMONIC_PUSH &&
-                        instruction.mnemonic != ZYDIS_MNEMONIC_XOR) {
+                    if (instruction.mnemonic != Phantom::Disasm::Mnemonic::MOV &&
+                        instruction.mnemonic != Phantom::Disasm::Mnemonic::PUSH &&
+                        instruction.mnemonic != Phantom::Disasm::Mnemonic::XOR) {
                         seenCpuid = false;
                     }
                     break;
