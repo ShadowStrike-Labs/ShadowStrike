@@ -639,7 +639,7 @@ namespace ShadowStrike {
             }};
 
             // -------------------------------------------------------------------------
-            // Instruction Patterns for Zydis-based Analysis
+            // Instruction Patterns for PhantomDisassembler-based Analysis
             // -------------------------------------------------------------------------
 
             /// @brief x86/x64 mnemonics indicative of anti-VM behavior
@@ -1010,7 +1010,7 @@ namespace ShadowStrike {
         };
 
         // ============================================================================
-        // ZYDIS DISASSEMBLY STRUCTURES (Enterprise Enhancement)
+        // PHANTOM DISASSEMBLY STRUCTURES (Enterprise Enhancement)
         // ============================================================================
 
         /**
@@ -1028,7 +1028,7 @@ namespace ShadowStrike {
         };
 
         /**
-         * @brief Result of Zydis-based code analysis
+         * @brief Result of PhantomDisassembler-based code analysis
          */
         struct CodeAnalysisResult {
             std::vector<DisassembledInstruction> antiVMInstructions;  ///< Anti-VM instructions found
@@ -1103,14 +1103,14 @@ namespace ShadowStrike {
         };
 
         /**
-         * @brief Extended process analysis result with Zydis and PE integration
+         * @brief Extended process analysis result with PhantomDisassembler and PE integration
          */
         struct ExtendedProcessAnalysis {
             Utils::ProcessUtils::ProcessId processId = 0;
             std::wstring processName;
             std::wstring executablePath;
 
-            // Code analysis (Zydis)
+            // Code analysis (PhantomDisassembler)
             CodeAnalysisResult codeAnalysis;
 
             // PE analysis
@@ -1131,10 +1131,10 @@ namespace ShadowStrike {
         };
 
         /**
-         * @brief Configuration for extended analysis with Zydis/PE
+         * @brief Configuration for extended analysis with PhantomDisassembler/PE
          */
         struct ExtendedAnalysisConfig {
-            // Zydis options
+            // PhantomDisassembler options
             bool enableDisassembly = true;             ///< Enable instruction-level analysis
             bool analyzeAllExecutableRegions = true;   ///< Scan all executable memory
             bool detectCpuidLoops = true;              ///< Detect CPUID timing loops
@@ -1694,14 +1694,14 @@ namespace ShadowStrike {
             );
 
             // ========================================================================
-            // Extended Analysis API (Zydis + PEParser Integration)
+            // Extended Analysis API (PhantomDisassembler + PEParser Integration)
             // ========================================================================
 
             /**
-             * @brief Performs extended process analysis with Zydis disassembly and PE parsing
+             * @brief Performs extended process analysis with PhantomDisassembler disassembly and PE parsing
              *
              * This is the enterprise-grade analysis method that combines:
-             * - Zydis-based instruction-level anti-VM detection
+             * - PhantomDisassembler-based instruction-level anti-VM detection
              * - PEParser-based import and section analysis
              * - Entropy calculation for packed code detection
              * - TLS callback analysis
@@ -1738,7 +1738,7 @@ namespace ShadowStrike {
             );
 
             /**
-             * @brief Analyzes a memory buffer for anti-VM code patterns using Zydis
+             * @brief Analyzes a memory buffer for anti-VM code patterns using PhantomDisassembler
              *
              * Disassembles the provided buffer and identifies anti-VM instructions:
              * - CPUID, RDTSC, SIDT, SGDT, SLDT, STR

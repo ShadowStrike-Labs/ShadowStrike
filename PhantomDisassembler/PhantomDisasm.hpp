@@ -12,10 +12,7 @@
  *
  * Include this single header to pull in the complete PhantomDisassembler API:
  * type definitions, decoded instruction/operand structures, the decoder, and
- * the text formatter.
- *
- * For Zydis API compatibility (drop-in replacement), include ZydisCompat.hpp
- * instead — it includes this header and provides all necessary aliases.
+ * the text formatter. Built entirely from scratch for the ShadowStrike platform.
  */
 #pragma once
 

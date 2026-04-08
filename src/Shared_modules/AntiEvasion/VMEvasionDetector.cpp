@@ -53,8 +53,8 @@
 #include "../Utils/RegistryUtils.hpp"
 #include "../PEParser/PEParser.hpp"
 
-// Zydis Disassembler Integration
-#include <Zydis/Zydis.h>
+// PhantomDisassembler Integration
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 
 #include <algorithm>
 #include <numeric>
@@ -71,7 +71,6 @@
 #pragma comment(lib, "wbemuuid.lib")
 #pragma comment(lib, "SetupAPI.lib")
 #pragma comment(lib, "cfgmgr32.lib")
-#pragma comment(lib, "Zydis.lib")
 
 // External assembly functions (implemented in VMEvasionDetector_x64.asm)
 extern "C" {
@@ -3249,21 +3248,19 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
     }
 
     try {
-        // Initialize Zydis decoder
-        ZydisDecoder decoder;
-        ZyanStatus status = ZydisDecoderInit(&decoder,
-            is64Bit ? ZYDIS_MACHINE_MODE_LONG_64 : ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
-            is64Bit ? ZYDIS_STACK_WIDTH_64 : ZYDIS_STACK_WIDTH_32);
-        if (!ZYAN_SUCCESS(status)) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: ZydisDecoderInit failed (0x%08X)",
+        // Initialize PhantomDisassembler decoder
+        Phantom::Disasm::Decoder decoder;
+        auto status = decoder.Init(is64Bit ? Phantom::Disasm::MachineMode::Long64 : Phantom::Disasm::MachineMode::LongCompat32);
+        if (!Phantom::Disasm::IsSuccess(status)) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: Decoder::Init failed (0x%08X)",
                          static_cast<uint32_t>(status));
             return false;
         }
 
-        ZydisFormatter formatter;
-        status = ZydisFormatterInit(&formatter, ZYDIS_FORMATTER_STYLE_INTEL);
-        if (!ZYAN_SUCCESS(status)) {
-            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: ZydisFormatterInit failed (0x%08X)",
+        Phantom::Disasm::Formatter formatter;
+        status = formatter.Init(Phantom::Disasm::FormatterStyle::Intel);
+        if (!Phantom::Disasm::IsSuccess(status)) {
+            SS_LOG_ERROR(L"AntiEvasion", L"AnalyzeCodeBuffer: Formatter::Init failed (0x%08X)",
                          static_cast<uint32_t>(status));
             return false;
         }
@@ -3273,8 +3270,8 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
         std::vector<size_t> rdtscPositions;
         size_t instructionIndex = 0;
 
-        ZydisDecodedInstruction instruction;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        Phantom::Disasm::DecodedInstruction instruction;
+        Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
         size_t offset = 0;
 
         while (offset < buffer.size()) {
@@ -3290,11 +3287,11 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
                 }
             }
 
-            if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder,
+            if (Phantom::Disasm::IsSuccess(decoder.DecodeFull(
                     buffer.data() + offset, buffer.size() - offset,
-                    &instruction, operands))) {
+                    instruction, operands))) {
 
-                const char* mnemonicStr = ZydisMnemonicGetString(instruction.mnemonic);
+                const char* mnemonicStr = Phantom::Disasm::MnemonicToString(instruction.mnemonic);
                 if (!mnemonicStr) {
                     offset += instruction.length;
                     ++instructionIndex;
@@ -3322,9 +3319,9 @@ bool VMEvasionDetector::AnalyzeCodeBuffer(
                 if (isAntiVM) {
                     // Format the full instruction text
                     char fmtBuffer[256] = { 0 };
-                    ZydisFormatterFormatInstruction(&formatter, &instruction, operands,
+                    formatter.FormatInstruction(&instruction, operands,
                         instruction.operand_count_visible, fmtBuffer, sizeof(fmtBuffer),
-                        virtualAddress + offset, ZYAN_NULL);
+                        virtualAddress + offset);
 
                     // Extract operand portion (after mnemonic)
                     std::string fullText(fmtBuffer);
@@ -3684,7 +3681,7 @@ bool VMEvasionDetector::AnalyzeProcessExtended(
             (void)AnalyzePEFile(result.executablePath, result.peAnalysis, config);
         }
 
-        // 3. Code analysis (memory-level via Zydis)
+        // 3. Code analysis (memory-level via PhantomDisassembler)
         if (config.enableDisassembly) {
             HANDLE rawHandle = OpenProcess(PROCESS_VM_READ | PROCESS_QUERY_INFORMATION, FALSE, processId);
             if (!rawHandle) {

@@ -1542,7 +1542,7 @@ namespace ShadowStrike {
         /**
          * @brief Specific anti-debugging technique identifiers for code analysis
          *
-         * These are used by the Zydis integration to identify anti-debug patterns
+         * These are used by the PhantomDisassembler integration to identify anti-debug patterns
          * in process code. Categorized by detection method.
          */
         enum class AntiDebugTechnique : uint32_t {
@@ -1752,7 +1752,7 @@ namespace ShadowStrike {
         }
 
         // ============================================================================
-        // ZYDIS INTEGRATION STRUCTURES (Enterprise Enhancement)
+        // PHANTOM DISASSEMBLER INTEGRATION STRUCTURES (Enterprise Enhancement)
         // ============================================================================
 
         /**
@@ -1794,7 +1794,7 @@ namespace ShadowStrike {
         };
 
         /**
-         * @brief Result of Zydis-based code pattern analysis
+         * @brief Result of PhantomDisassembler-based code pattern analysis
          */
         struct EnvironmentCodeAnalysisResult {
             /// @brief Instructions identified as anti-debug
@@ -1990,11 +1990,11 @@ namespace ShadowStrike {
         // ============================================================================
 
         /**
-         * @brief Extended configuration for Zydis/PEParser analysis
+         * @brief Extended configuration for PhantomDisassembler/PEParser analysis
          */
         struct ExtendedEnvironmentAnalysisConfig {
-            /// @brief Enable Zydis disassembly analysis
-            bool enableZydisAnalysis = true;
+            /// @brief Enable PhantomDisassembler disassembly analysis
+            bool enablePhantomDisasmAnalysis = true;
 
             /// @brief Enable PE import/section analysis
             bool enablePEAnalysis = true;
@@ -2046,7 +2046,7 @@ namespace ShadowStrike {
          * @brief Combined extended analysis result
          */
         struct ExtendedEnvironmentAnalysisResult {
-            /// @brief Code analysis result (Zydis)
+            /// @brief Code analysis result (PhantomDisassembler)
             EnvironmentCodeAnalysisResult codeAnalysis;
 
             /// @brief PE analysis result (PEParser)

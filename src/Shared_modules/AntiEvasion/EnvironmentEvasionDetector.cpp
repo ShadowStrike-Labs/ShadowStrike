@@ -99,12 +99,12 @@
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 
 // ============================================================================
-// PEPARSER AND ZYDIS INTEGRATION
+// PEPARSER AND DISASSEMBLER INTEGRATION
 // Enterprise-grade PE analysis and disassembly for hook detection
 // ============================================================================
 
 #include "../PEParser/PEParser.hpp"
-#include <Zydis/Zydis.h>
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 
 // ============================================================================
 // EXTERNAL ASSEMBLY FUNCTIONS
@@ -5513,7 +5513,7 @@ namespace ShadowStrike::AntiEvasion {
     }
 
     // ========================================================================
-    // ADVANCED HOOK DETECTION USING ZYDIS DISASSEMBLER
+    // ADVANCED HOOK DETECTION USING PHANTOMDISASSEMBLER
     // Detects API hooking commonly used by sandboxes and analysis tools
     // ========================================================================
 
@@ -5524,9 +5524,9 @@ namespace ShadowStrike::AntiEvasion {
         try {
             bool found = false;
 
-            // Initialize Zydis decoder for x64
-            ZydisDecoder decoder;
-            if (ZYAN_FAILED(ZydisDecoderInit(&decoder, ZYDIS_MACHINE_MODE_LONG_64, ZYDIS_STACK_WIDTH_64))) {
+            // Initialize PhantomDisassembler decoder for x64
+            Phantom::Disasm::Decoder decoder;
+            if (Phantom::Disasm::IsFailed(decoder.Init(Phantom::Disasm::MachineMode::Long64))) {
                 return false;
             }
 
@@ -5571,18 +5571,18 @@ namespace ShadowStrike::AntiEvasion {
                 }
 
                 // Decode first instruction
-                ZydisDecodedInstruction instruction;
-                ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+                Phantom::Disasm::DecodedInstruction instruction;
+                Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
 
-                if (ZYAN_SUCCESS(ZydisDecoderDecodeFull(&decoder, funcBytes, sizeof(funcBytes),
-                    &instruction, operands))) {
+                if (Phantom::Disasm::IsSuccess(decoder.DecodeFull(funcBytes, sizeof(funcBytes),
+                    instruction, operands))) {
 
                     bool isHooked = false;
                     std::wstring hookType;
 
                     // Check for common hook patterns:
                     // 1. JMP rel32 (E9 xx xx xx xx)
-                    if (instruction.mnemonic == ZYDIS_MNEMONIC_JMP) {
+                    if (instruction.mnemonic == Phantom::Disasm::Mnemonic::JMP) {
                         isHooked = true;
                         hookType = L"JMP hook";
                     }
@@ -5634,7 +5634,7 @@ namespace ShadowStrike::AntiEvasion {
                 detection.detectedValue = std::to_wstring(hookedAPIs.size()) + L" hooked APIs";
                 detection.technicalDetails = hookList;
                 detection.description = L"API hooks detected (sandbox/analysis tool indicator)";
-                detection.source = L"Zydis Disassembly Analysis";
+                detection.source = L"PhantomDisassembler Analysis";
                 detection.severity = EnvironmentEvasionSeverity::Critical;
                 outDetections.push_back(detection);
                 found = true;

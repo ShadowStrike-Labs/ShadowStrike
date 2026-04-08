@@ -30,7 +30,7 @@
  * - VM-based protection
  * - Packing indicators
  *
- * Uses Zydis disassembler for instruction-level analysis and integrates
+ * Uses PhantomDisassembler for instruction-level analysis and integrates
  * with ShadowStrike's PEParser for safe PE file handling.
  */
 
@@ -51,7 +51,7 @@
 #include "../FuzzyHasher/FuzzyHasher.hpp"
 #include "tlsh/tlsh.h"
 
-#include <Zydis/Zydis.h>
+#include <PhantomDisassembler/PhantomDisasm.hpp>
 #include <Psapi.h>
 
 #include <algorithm>
@@ -100,11 +100,11 @@ public:
     std::shared_ptr<PatternStore::PatternStore> m_patternStore;
     std::shared_ptr<ThreatIntel::ThreatIntelStore> m_threatIntel;
 
-    // Zydis decoder
-    ZydisDecoder m_decoder32;
-    ZydisDecoder m_decoder64;
-    ZydisFormatter m_formatter;
-    bool m_zydisInitialized = false;
+    // PhantomDisassembler decoder
+    Phantom::Disasm::Decoder m_decoder32;
+    Phantom::Disasm::Decoder m_decoder64;
+    Phantom::Disasm::Formatter m_formatter;
+    bool m_disasmInitialized = false;
 
     // Cache
     mutable std::shared_mutex m_cacheMutex;
@@ -137,37 +137,35 @@ public:
             return true;
         }
 
-        // Initialize Zydis decoders
-        if (ZYAN_FAILED(ZydisDecoderInit(&m_decoder32, ZYDIS_MACHINE_MODE_LONG_COMPAT_32,
-                                          ZYDIS_STACK_WIDTH_32))) {
+        // Initialize PhantomDisassembler decoders
+        if (Phantom::Disasm::IsFailed(m_decoder32.Init(Phantom::Disasm::MachineMode::Legacy32))) {
             if (err) {
                 err->win32Code = ERROR_INVALID_FUNCTION;
-                err->message = L"Failed to initialize Zydis 32-bit decoder";
+                err->message = L"Failed to initialize PhantomDisassembler 32-bit decoder";
             }
-            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize Zydis 32-bit decoder");
+            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize PhantomDisassembler 32-bit decoder");
             return false;
         }
 
-        if (ZYAN_FAILED(ZydisDecoderInit(&m_decoder64, ZYDIS_MACHINE_MODE_LONG_64,
-                                          ZYDIS_STACK_WIDTH_64))) {
+        if (Phantom::Disasm::IsFailed(m_decoder64.Init(Phantom::Disasm::MachineMode::Long64))) {
             if (err) {
                 err->win32Code = ERROR_INVALID_FUNCTION;
-                err->message = L"Failed to initialize Zydis 64-bit decoder";
+                err->message = L"Failed to initialize PhantomDisassembler 64-bit decoder";
             }
-            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize Zydis 64-bit decoder");
+            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize PhantomDisassembler 64-bit decoder");
             return false;
         }
 
-        if (ZYAN_FAILED(ZydisFormatterInit(&m_formatter, ZYDIS_FORMATTER_STYLE_INTEL))) {
+        if (Phantom::Disasm::IsFailed(m_formatter.Init(Phantom::Disasm::FormatterStyle::Intel))) {
             if (err) {
                 err->win32Code = ERROR_INVALID_FUNCTION;
-                err->message = L"Failed to initialize Zydis formatter";
+                err->message = L"Failed to initialize PhantomDisassembler formatter";
             }
-            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize Zydis formatter");
+            SS_LOG_ERROR(L"MetamorphicDetector", L"Failed to initialize PhantomDisassembler formatter");
             return false;
         }
 
-        m_zydisInitialized = true;
+        m_disasmInitialized = true;
         m_initialized = true;
 
         SS_LOG_INFO(L"MetamorphicDetector", L"Initialized successfully");
@@ -179,7 +177,7 @@ public:
 
         ClearCacheInternal();
         m_customPatterns.clear();
-        m_zydisInitialized = false;
+        m_disasmInitialized = false;
         m_initialized = false;
 
         SS_LOG_INFO(L"MetamorphicDetector", L"Shutdown complete");
@@ -318,20 +316,20 @@ public:
     struct DisassembledInstruction {
         uint64_t address;
         size_t length;
-        ZydisMnemonic mnemonic;
-        ZydisDecodedInstruction instruction;
-        ZydisDecodedOperand operands[ZYDIS_MAX_OPERAND_COUNT];
+        Phantom::Disasm::Mnemonic mnemonic;
+        Phantom::Disasm::DecodedInstruction instruction;
+        Phantom::Disasm::DecodedOperand operands[Phantom::Disasm::MAX_OPERANDS];
         char text[256];
     };
 
     [[nodiscard]] bool DisassembleBuffer(const uint8_t* buffer, size_t size, uint64_t baseAddress,
                                           bool is64Bit, std::vector<DisassembledInstruction>& out,
-                                          size_t maxInstructions = 0) const noexcept {
-        if (!m_zydisInitialized || !buffer || size == 0) {
+                                          size_t maxInstructions = 0) noexcept {
+        if (!m_disasmInitialized || !buffer || size == 0) {
             return false;
         }
 
-        const ZydisDecoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
+        Phantom::Disasm::Decoder* decoder = is64Bit ? &m_decoder64 : &m_decoder32;
         size_t offset = 0;
         size_t instrCount = 0;
         size_t limit = maxInstructions > 0 ? maxInstructions : MetamorphicConstants::MAX_INSTRUCTIONS;
@@ -342,15 +340,14 @@ public:
             DisassembledInstruction instr = {};
             instr.address = baseAddress + offset;
 
-            ZyanStatus status = ZydisDecoderDecodeFull(
-                decoder,
+            Phantom::Disasm::Status status = decoder->DecodeFull(
                 buffer + offset,
                 size - offset,
-                &instr.instruction,
+                instr.instruction,
                 instr.operands
             );
 
-            if (ZYAN_FAILED(status)) {
+            if (Phantom::Disasm::IsFailed(status)) {
                 ++offset;
                 continue;
             }
@@ -358,9 +355,8 @@ public:
             instr.length = instr.instruction.length;
             instr.mnemonic = instr.instruction.mnemonic;
 
-            ZydisFormatterFormatInstruction(
-                &m_formatter,
-                &instr.instruction,
+            m_formatter.FormatInstruction(
+                instr.instruction,
                 instr.operands,
                 instr.instruction.operand_count,
                 instr.text,
@@ -497,7 +493,7 @@ public:
     [[nodiscard]] bool DetectDecryptionLoops(const uint8_t* buffer, size_t size,
                                               std::vector<DecryptionLoopInfo>& out,
                                               bool is64Bit) const noexcept {
-        if (!m_zydisInitialized || !buffer || size < 16) {
+        if (!m_disasmInitialized || !buffer || size < 16) {
             return false;
         }
 
@@ -514,15 +510,15 @@ public:
             bool isBackwardJump = false;
             int64_t jumpOffset = 0;
 
-            if (instr.mnemonic == ZYDIS_MNEMONIC_LOOP ||
-                instr.mnemonic == ZYDIS_MNEMONIC_LOOPE ||
-                instr.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::LOOP ||
+                instr.mnemonic == Phantom::Disasm::Mnemonic::LOOPE ||
+                instr.mnemonic == Phantom::Disasm::Mnemonic::LOOPNE) {
                 isBackwardJump = true;
-                if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                if (instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                     jumpOffset = instr.operands[0].imm.value.s;
                 }
-            } else if (instr.mnemonic >= ZYDIS_MNEMONIC_JB && instr.mnemonic <= ZYDIS_MNEMONIC_JS) {
-                if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            } else if (instr.mnemonic >= Phantom::Disasm::Mnemonic::JB && instr.mnemonic <= Phantom::Disasm::Mnemonic::JS) {
+                if (instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                     jumpOffset = instr.operands[0].imm.value.s;
                     isBackwardJump = jumpOffset < 0;
                 }
@@ -569,17 +565,17 @@ public:
 
             for (size_t j = loopStartIdx; j <= i; ++j) {
                 switch (instructions[j].mnemonic) {
-                case ZYDIS_MNEMONIC_XOR:
+                case Phantom::Disasm::Mnemonic::XOR:
                     hasXor = true;
                     ++cryptoOps;
                     break;
-                case ZYDIS_MNEMONIC_ADD:
-                case ZYDIS_MNEMONIC_SUB:
+                case Phantom::Disasm::Mnemonic::ADD:
+                case Phantom::Disasm::Mnemonic::SUB:
                     hasAddSub = true;
                     ++cryptoOps;
                     break;
-                case ZYDIS_MNEMONIC_ROL:
-                case ZYDIS_MNEMONIC_ROR:
+                case Phantom::Disasm::Mnemonic::ROL:
+                case Phantom::Disasm::Mnemonic::ROR:
                     hasRotate = true;
                     ++cryptoOps;
                     break;
@@ -651,50 +647,50 @@ public:
             const auto& i1 = instructions[i + 1];
 
             // Pattern: PUSH reg; POP reg (equivalent to NOP)
-            if (i0.mnemonic == ZYDIS_MNEMONIC_PUSH && i1.mnemonic == ZYDIS_MNEMONIC_POP) {
-                if (i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                    i1.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (i0.mnemonic == Phantom::Disasm::Mnemonic::PUSH && i1.mnemonic == Phantom::Disasm::Mnemonic::POP) {
+                if (i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                    i1.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
                     i0.operands[0].reg.value == i1.operands[0].reg.value) {
                     ++substitutionPatterns;
                 }
             }
 
             // Pattern: SUB reg, 0 or ADD reg, 0 (NOP equivalents)
-            if ((i0.mnemonic == ZYDIS_MNEMONIC_SUB || i0.mnemonic == ZYDIS_MNEMONIC_ADD) &&
-                i0.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+            if ((i0.mnemonic == Phantom::Disasm::Mnemonic::SUB || i0.mnemonic == Phantom::Disasm::Mnemonic::ADD) &&
+                i0.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                 i0.operands[1].imm.value.u == 0) {
                 ++substitutionPatterns;
             }
 
             // Pattern: XOR reg, 0 (NOP equivalent)
-            if (i0.mnemonic == ZYDIS_MNEMONIC_XOR &&
-                i0.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+            if (i0.mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+                i0.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                 i0.operands[1].imm.value.u == 0) {
                 ++substitutionPatterns;
             }
 
             // Pattern: MOV reg, reg (same register)
-            if (i0.mnemonic == ZYDIS_MNEMONIC_MOV &&
-                i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                i0.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (i0.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+                i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                i0.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                 i0.operands[0].reg.value == i0.operands[1].reg.value) {
                 ++substitutionPatterns;
             }
 
             // Pattern: LEA reg, [reg] (equivalent to MOV reg, reg or NOP)
-            if (i0.mnemonic == ZYDIS_MNEMONIC_LEA &&
-                i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                i0.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            if (i0.mnemonic == Phantom::Disasm::Mnemonic::LEA &&
+                i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                i0.operands[1].type == Phantom::Disasm::OperandType::MEMORY &&
                 i0.operands[1].mem.base == i0.operands[0].reg.value &&
-                i0.operands[1].mem.index == ZYDIS_REGISTER_NONE &&
+                i0.operands[1].mem.index == Phantom::Disasm::Register::NONE &&
                 i0.operands[1].mem.disp.value == 0) {
                 ++substitutionPatterns;
             }
 
             // Pattern: INC followed by DEC on same register
-            if (i0.mnemonic == ZYDIS_MNEMONIC_INC && i1.mnemonic == ZYDIS_MNEMONIC_DEC &&
-                i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                i1.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (i0.mnemonic == Phantom::Disasm::Mnemonic::INC && i1.mnemonic == Phantom::Disasm::Mnemonic::DEC &&
+                i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                i1.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
                 i0.operands[0].reg.value == i1.operands[0].reg.value) {
                 ++substitutionPatterns;
             }
@@ -766,40 +762,40 @@ public:
             // Determine if this is a control transfer instruction
             switch (instr.mnemonic) {
             // Unconditional jumps
-            case ZYDIS_MNEMONIC_JMP:
+            case Phantom::Disasm::Mnemonic::JMP:
                 hasTarget = true;
                 isConditional = false;
                 break;
                 
             // Conditional jumps (fallthrough also reachable)
-            case ZYDIS_MNEMONIC_JZ:
-            case ZYDIS_MNEMONIC_JNZ:
-            case ZYDIS_MNEMONIC_JB:
-            case ZYDIS_MNEMONIC_JNB:
-            case ZYDIS_MNEMONIC_JBE:
-            case ZYDIS_MNEMONIC_JNBE:
-            case ZYDIS_MNEMONIC_JL:
-            case ZYDIS_MNEMONIC_JNL:
-            case ZYDIS_MNEMONIC_JLE:
-            case ZYDIS_MNEMONIC_JNLE:
-            case ZYDIS_MNEMONIC_JS:
-            case ZYDIS_MNEMONIC_JNS:
-            case ZYDIS_MNEMONIC_JP:
-            case ZYDIS_MNEMONIC_JNP:
-            case ZYDIS_MNEMONIC_JO:
-            case ZYDIS_MNEMONIC_JNO:
-            case ZYDIS_MNEMONIC_JCXZ:
-            case ZYDIS_MNEMONIC_JECXZ:
-            case ZYDIS_MNEMONIC_JRCXZ:
-            case ZYDIS_MNEMONIC_LOOP:
-            case ZYDIS_MNEMONIC_LOOPE:
-            case ZYDIS_MNEMONIC_LOOPNE:
+            case Phantom::Disasm::Mnemonic::JZ:
+            case Phantom::Disasm::Mnemonic::JNZ:
+            case Phantom::Disasm::Mnemonic::JB:
+            case Phantom::Disasm::Mnemonic::JNB:
+            case Phantom::Disasm::Mnemonic::JBE:
+            case Phantom::Disasm::Mnemonic::JNBE:
+            case Phantom::Disasm::Mnemonic::JL:
+            case Phantom::Disasm::Mnemonic::JNL:
+            case Phantom::Disasm::Mnemonic::JLE:
+            case Phantom::Disasm::Mnemonic::JNLE:
+            case Phantom::Disasm::Mnemonic::JS:
+            case Phantom::Disasm::Mnemonic::JNS:
+            case Phantom::Disasm::Mnemonic::JP:
+            case Phantom::Disasm::Mnemonic::JNP:
+            case Phantom::Disasm::Mnemonic::JO:
+            case Phantom::Disasm::Mnemonic::JNO:
+            case Phantom::Disasm::Mnemonic::JCXZ:
+            case Phantom::Disasm::Mnemonic::JECXZ:
+            case Phantom::Disasm::Mnemonic::JRCXZ:
+            case Phantom::Disasm::Mnemonic::LOOP:
+            case Phantom::Disasm::Mnemonic::LOOPE:
+            case Phantom::Disasm::Mnemonic::LOOPNE:
                 hasTarget = true;
                 isConditional = true;
                 break;
                 
             // Calls - mark target as reachable (it's a function entry)
-            case ZYDIS_MNEMONIC_CALL:
+            case Phantom::Disasm::Mnemonic::CALL:
                 hasTarget = true;
                 isConditional = true; // Fallthrough after call is reachable
                 break;
@@ -812,9 +808,9 @@ public:
                 const auto& op = instr.operands[0];
                 
                 // Handle relative immediate targets
-                if (op.type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                if (op.type == Phantom::Disasm::OperandType::IMMEDIATE) {
                     // For relative jumps: target = instruction_address + instruction_length + signed_offset
-                    // Zydis provides the absolute target in op.imm.value for us
+                    // Decoder provides the absolute target in op.imm.value for us
                     if (op.imm.is_signed) {
                         target = static_cast<uint64_t>(
                             static_cast<int64_t>(instr.address) + 
@@ -827,7 +823,7 @@ public:
                     reachableAddresses.insert(target);
                 }
                 // Handle memory-indirect targets (jump tables, vtables)
-                else if (op.type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                else if (op.type == Phantom::Disasm::OperandType::MEMORY) {
                     // Can't know exact target statically, but mark next instruction
                     // as potentially reachable (conservative approach)
                     // In production, we'd parse jump tables from .rdata
@@ -850,17 +846,17 @@ public:
             const auto& instr = instructions[i];
             
             // Pattern: push rbp/ebp; mov rbp/ebp, rsp/esp
-            if (instr.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::PUSH) {
                 // Check if pushing base pointer register
                 if (instr.instruction.operand_count > 0 &&
-                    instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
                     
-                    ZydisRegister reg = instr.operands[0].reg.value;
-                    if (reg == ZYDIS_REGISTER_RBP || reg == ZYDIS_REGISTER_EBP) {
+                    Phantom::Disasm::Register reg = instr.operands[0].reg.value;
+                    if (reg == Phantom::Disasm::Register::RBP || reg == Phantom::Disasm::Register::EBP) {
                         // Check next instruction for mov rbp, rsp
                         if (i + 1 < instructions.size()) {
                             const auto& next = instructions[i + 1];
-                            if (next.mnemonic == ZYDIS_MNEMONIC_MOV) {
+                            if (next.mnemonic == Phantom::Disasm::Mnemonic::MOV) {
                                 // This looks like a function prologue - mark as reachable
                                 reachableAddresses.insert(instr.address);
                             }
@@ -870,17 +866,17 @@ public:
             }
             
             // Pattern: sub rsp, imm (stack frame allocation - often at function start)
-            if (instr.mnemonic == ZYDIS_MNEMONIC_SUB &&
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::SUB &&
                 instr.instruction.operand_count >= 2 &&
-                instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
                 
-                ZydisRegister reg = instr.operands[0].reg.value;
-                if (reg == ZYDIS_REGISTER_RSP || reg == ZYDIS_REGISTER_ESP) {
+                Phantom::Disasm::Register reg = instr.operands[0].reg.value;
+                if (reg == Phantom::Disasm::Register::RSP || reg == Phantom::Disasm::Register::ESP) {
                     // Stack allocation - likely function body, check if previous was prologue
                     if (i > 0) {
                         const auto& prev = instructions[i - 1];
-                        if (prev.mnemonic == ZYDIS_MNEMONIC_MOV ||
-                            prev.mnemonic == ZYDIS_MNEMONIC_PUSH) {
+                        if (prev.mnemonic == Phantom::Disasm::Mnemonic::MOV ||
+                            prev.mnemonic == Phantom::Disasm::Mnemonic::PUSH) {
                             reachableAddresses.insert(instructions[i > 1 ? i - 2 : 0].address);
                         }
                     }
@@ -918,13 +914,13 @@ public:
             bool fallsThrough = true;
             
             switch (instr.mnemonic) {
-            case ZYDIS_MNEMONIC_JMP:
-            case ZYDIS_MNEMONIC_RET:
-            case ZYDIS_MNEMONIC_INT3:
-            case ZYDIS_MNEMONIC_HLT:
-            case ZYDIS_MNEMONIC_UD0:
-            case ZYDIS_MNEMONIC_UD1:
-            case ZYDIS_MNEMONIC_UD2:
+            case Phantom::Disasm::Mnemonic::JMP:
+            case Phantom::Disasm::Mnemonic::RET:
+            case Phantom::Disasm::Mnemonic::INT3:
+            case Phantom::Disasm::Mnemonic::HLT:
+            case Phantom::Disasm::Mnemonic::UD0:
+            case Phantom::Disasm::Mnemonic::UD1:
+            case Phantom::Disasm::Mnemonic::UD2:
                 fallsThrough = false;
                 break;
             default:
@@ -956,9 +952,9 @@ public:
             
             // Skip alignment padding - not malicious dead code
             bool isPadding = 
-                instr.mnemonic == ZYDIS_MNEMONIC_NOP ||
-                instr.mnemonic == ZYDIS_MNEMONIC_INT3 ||
-                (instr.mnemonic == ZYDIS_MNEMONIC_LEA && 
+                instr.mnemonic == Phantom::Disasm::Mnemonic::NOP ||
+                instr.mnemonic == Phantom::Disasm::Mnemonic::INT3 ||
+                (instr.mnemonic == Phantom::Disasm::Mnemonic::LEA && 
                  instr.instruction.operand_count >= 2 &&
                  instr.operands[0].reg.value == instr.operands[1].mem.base); // lea reg, [reg+0] = NOP
             
@@ -1086,35 +1082,35 @@ public:
             int64_t target = 0;
 
             switch (instr.mnemonic) {
-            case ZYDIS_MNEMONIC_JMP:
-            case ZYDIS_MNEMONIC_JB:
-            case ZYDIS_MNEMONIC_JBE:
-            case ZYDIS_MNEMONIC_JCXZ:
-            case ZYDIS_MNEMONIC_JECXZ:
-            case ZYDIS_MNEMONIC_JL:
-            case ZYDIS_MNEMONIC_JLE:
-            case ZYDIS_MNEMONIC_JNB:
-            case ZYDIS_MNEMONIC_JNBE:
-            case ZYDIS_MNEMONIC_JNL:
-            case ZYDIS_MNEMONIC_JNLE:
-            case ZYDIS_MNEMONIC_JNO:
-            case ZYDIS_MNEMONIC_JNP:
-            case ZYDIS_MNEMONIC_JNS:
-            case ZYDIS_MNEMONIC_JNZ:
-            case ZYDIS_MNEMONIC_JO:
-            case ZYDIS_MNEMONIC_JP:
-            case ZYDIS_MNEMONIC_JRCXZ:
-            case ZYDIS_MNEMONIC_JS:
-            case ZYDIS_MNEMONIC_JZ:
-            case ZYDIS_MNEMONIC_LOOP:
-            case ZYDIS_MNEMONIC_LOOPE:
-            case ZYDIS_MNEMONIC_LOOPNE:
+            case Phantom::Disasm::Mnemonic::JMP:
+            case Phantom::Disasm::Mnemonic::JB:
+            case Phantom::Disasm::Mnemonic::JBE:
+            case Phantom::Disasm::Mnemonic::JCXZ:
+            case Phantom::Disasm::Mnemonic::JECXZ:
+            case Phantom::Disasm::Mnemonic::JL:
+            case Phantom::Disasm::Mnemonic::JLE:
+            case Phantom::Disasm::Mnemonic::JNB:
+            case Phantom::Disasm::Mnemonic::JNBE:
+            case Phantom::Disasm::Mnemonic::JNL:
+            case Phantom::Disasm::Mnemonic::JNLE:
+            case Phantom::Disasm::Mnemonic::JNO:
+            case Phantom::Disasm::Mnemonic::JNP:
+            case Phantom::Disasm::Mnemonic::JNS:
+            case Phantom::Disasm::Mnemonic::JNZ:
+            case Phantom::Disasm::Mnemonic::JO:
+            case Phantom::Disasm::Mnemonic::JP:
+            case Phantom::Disasm::Mnemonic::JRCXZ:
+            case Phantom::Disasm::Mnemonic::JS:
+            case Phantom::Disasm::Mnemonic::JZ:
+            case Phantom::Disasm::Mnemonic::LOOP:
+            case Phantom::Disasm::Mnemonic::LOOPE:
+            case Phantom::Disasm::Mnemonic::LOOPNE:
                 isControl = true;
-                if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                if (instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                     target = instr.address + instr.length + instr.operands[0].imm.value.s;
                 }
                 break;
-            case ZYDIS_MNEMONIC_CALL:
+            case Phantom::Disasm::Mnemonic::CALL:
                 ++out.totalEdges;
                 break;
             default:
@@ -1138,8 +1134,8 @@ public:
         // Count indirect branches
         size_t indirectBranches = 0;
         for (const auto& instr : instructions) {
-            if ((instr.mnemonic == ZYDIS_MNEMONIC_JMP || instr.mnemonic == ZYDIS_MNEMONIC_CALL) &&
-                instr.operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if ((instr.mnemonic == Phantom::Disasm::Mnemonic::JMP || instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) &&
+                instr.operands[0].type != Phantom::Disasm::OperandType::IMMEDIATE) {
                 ++indirectBranches;
             }
         }
@@ -1230,13 +1226,13 @@ public:
             const auto& instr = instructions[i];
 
             // Look for ROR/ROL with constants (common in hash algorithms)
-            if ((instr.mnemonic == ZYDIS_MNEMONIC_ROR || instr.mnemonic == ZYDIS_MNEMONIC_ROL) &&
-                instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if ((instr.mnemonic == Phantom::Disasm::Mnemonic::ROR || instr.mnemonic == Phantom::Disasm::Mnemonic::ROL) &&
+                instr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
 
                 // Check for nearby CMP with large immediate (hash comparison)
                 for (size_t j = i; j < std::min(i + 20, instructions.size()); ++j) {
-                    if (instructions[j].mnemonic == ZYDIS_MNEMONIC_CMP &&
-                        instructions[j].operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                    if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::CMP &&
+                        instructions[j].operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                         instructions[j].operands[1].imm.value.u > 0x10000) {
                         ++hashingPatterns;
                         break;
@@ -1275,18 +1271,18 @@ public:
         size_t pushCount = 0, popCount = 0;
 
         for (const auto& instr : instructions) {
-            if (instr.mnemonic == ZYDIS_MNEMONIC_PUSH) ++pushCount;
-            if (instr.mnemonic == ZYDIS_MNEMONIC_POP) ++popCount;
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::PUSH) ++pushCount;
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::POP) ++popCount;
 
             // Computed jump (JMP reg or JMP [reg+...])
-            if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-                instr.operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+                instr.operands[0].type != Phantom::Disasm::OperandType::IMMEDIATE) {
                 ++computedJumps;
             }
 
             // Switch-like dispatcher (JMP [reg*4+base])
-            if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-                instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+                instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY &&
                 instr.operands[0].mem.scale == 4) {
                 ++switchDispatcher;
             }
@@ -2024,7 +2020,7 @@ void MetamorphicDetector::AnalyzeFileInternal(
         }
     }
 
-    if (HasFlag(config.flags, MetamorphicAnalysisFlags::EnableDisassembly) && m_impl->m_zydisInitialized) {
+    if (HasFlag(config.flags, MetamorphicAnalysisFlags::EnableDisassembly) && m_impl->m_disasmInitialized) {
         const uint8_t* codeBuffer = buffer;
         size_t codeSize = size;
         uint64_t baseAddress = 0;
@@ -3301,7 +3297,7 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
     size_t size,
     MetamorphicResult& result) noexcept
 {
-    if (!buffer || size < 16 || !m_impl->m_zydisInitialized) {
+    if (!buffer || size < 16 || !m_impl->m_disasmInitialized) {
         return;
     }
 
@@ -3327,14 +3323,14 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
 
     for (const auto& instr : instructions) {
         for (size_t i = 0; i < instr.instruction.operand_count; ++i) {
-            if (instr.operands[i].type == ZYDIS_OPERAND_TYPE_REGISTER) {
-                ZydisRegister reg = instr.operands[i].reg.value;
+            if (instr.operands[i].type == Phantom::Disasm::OperandType::REGISTER) {
+                Phantom::Disasm::Register reg = instr.operands[i].reg.value;
                 // Map to general purpose register index (0-15 for x64)
-                if (reg >= ZYDIS_REGISTER_RAX && reg <= ZYDIS_REGISTER_R15) {
-                    ++registerUseCounts[reg - ZYDIS_REGISTER_RAX];
+                if (reg >= Phantom::Disasm::Register::RAX && reg <= Phantom::Disasm::Register::R15) {
+                    ++registerUseCounts[reg - Phantom::Disasm::Register::RAX];
                     ++totalRegisterUses;
-                } else if (reg >= ZYDIS_REGISTER_EAX && reg <= ZYDIS_REGISTER_R15D) {
-                    ++registerUseCounts[reg - ZYDIS_REGISTER_EAX];
+                } else if (reg >= Phantom::Disasm::Register::EAX && reg <= Phantom::Disasm::Register::R15D) {
+                    ++registerUseCounts[reg - Phantom::Disasm::Register::EAX];
                     ++totalRegisterUses;
                 }
             }
@@ -3375,8 +3371,8 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
     for (size_t i = 0; i < instructions.size(); ++i) {
         const auto& instr = instructions[i];
 
-        if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
 
             int64_t target = instr.address + instr.length + instr.operands[0].imm.value.s;
 
@@ -3388,8 +3384,8 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
                 for (size_t j = i + 1; j < instructions.size() &&
                      instructions[j].address < static_cast<uint64_t>(target); ++j) {
 
-                    if (instructions[j].mnemonic == ZYDIS_MNEMONIC_JMP &&
-                        instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+                    if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+                        instructions[j].operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
 
                         int64_t backTarget = instructions[j].address + instructions[j].length +
                                             instructions[j].operands[0].imm.value.s;
@@ -3426,18 +3422,18 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
     size_t consecutiveGarbage = 0;
     size_t maxConsecutiveGarbage = 0;
 
-    const ZydisDecoder* decoder = result.peAnalysis.is64Bit ?
+    Phantom::Disasm::Decoder* decoder = result.peAnalysis.is64Bit ?
         &m_impl->m_decoder64 : &m_impl->m_decoder32;
 
     size_t offset = 0;
     while (offset < size) {
-        ZydisDecodedInstruction tempInstr;
-        ZydisDecodedOperand tempOps[ZYDIS_MAX_OPERAND_COUNT];
+        Phantom::Disasm::DecodedInstruction tempInstr;
+        Phantom::Disasm::DecodedOperand tempOps[Phantom::Disasm::MAX_OPERANDS];
 
-        ZyanStatus status = ZydisDecoderDecodeFull(
-            decoder, buffer + offset, size - offset, &tempInstr, tempOps);
+        Phantom::Disasm::Status status = decoder->DecodeFull(
+            buffer + offset, size - offset, tempInstr, tempOps);
 
-        if (ZYAN_FAILED(status)) {
+        if (Phantom::Disasm::IsFailed(status)) {
             ++garbageByteCount;
             ++consecutiveGarbage;
             maxConsecutiveGarbage = std::max(maxConsecutiveGarbage, consecutiveGarbage);
@@ -3472,55 +3468,55 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
         const auto& instr = instructions[i];
 
         // Pattern 1: XOR reg, reg followed by JZ (always taken)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_XOR &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
             instr.operands[0].reg.value == instr.operands[1].reg.value) {
 
             // Check if followed by JZ/JE
-            if (instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_JZ) {
+            if (instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::JZ) {
                 ++opaquePredicates;
             }
         }
 
         // Pattern 2: CMP reg, reg followed by JE (always taken)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CMP &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CMP &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
             instr.operands[0].reg.value == instr.operands[1].reg.value) {
 
-            if (instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_JZ) {
+            if (instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::JZ) {
                 ++opaquePredicates;
             }
         }
 
         // Pattern 3: TEST reg, reg followed by JS (never taken for positive values)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_TEST &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::TEST &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
             instr.operands[0].reg.value == instr.operands[1].reg.value) {
 
             // If preceded by AND with positive mask, JS is opaque
-            if (i > 0 && instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_AND &&
-                instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_JS) {
+            if (i > 0 && instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::AND &&
+                instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::JS) {
                 ++opaquePredicates;
             }
         }
 
         // Pattern 4: MOV reg, const; CMP reg, const+1; JA (never taken)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
             i + 2 < instructions.size()) {
 
             const auto& cmpInstr = instructions[i + 1];
-            if (cmpInstr.mnemonic == ZYDIS_MNEMONIC_CMP &&
-                cmpInstr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (cmpInstr.mnemonic == Phantom::Disasm::Mnemonic::CMP &&
+                cmpInstr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
                 cmpInstr.operands[0].reg.value == instr.operands[0].reg.value &&
-                cmpInstr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                cmpInstr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                 cmpInstr.operands[1].imm.value.u > instr.operands[1].imm.value.u) {
 
-                if (instructions[i + 2].mnemonic == ZYDIS_MNEMONIC_JNBE) {
+                if (instructions[i + 2].mnemonic == Phantom::Disasm::Mnemonic::JNBE) {
                     ++opaquePredicates;
                 }
             }
@@ -3550,30 +3546,30 @@ void MetamorphicDetector::AnalyzeMetamorphicTechniques(
         const auto& i1 = instructions[i + 1];
 
         // Pattern: ADD reg, X; ADD reg, Y instead of ADD reg, X+Y
-        if (i0.mnemonic == ZYDIS_MNEMONIC_ADD && i1.mnemonic == ZYDIS_MNEMONIC_ADD &&
-            i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            i1.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (i0.mnemonic == Phantom::Disasm::Mnemonic::ADD && i1.mnemonic == Phantom::Disasm::Mnemonic::ADD &&
+            i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            i1.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
             i0.operands[0].reg.value == i1.operands[0].reg.value &&
-            i0.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-            i1.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            i0.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
+            i1.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
             ++splittingPatterns;
         }
 
         // Pattern: SHL reg, X; SHL reg, Y instead of SHL reg, X+Y
-        if (i0.mnemonic == ZYDIS_MNEMONIC_SHL && i1.mnemonic == ZYDIS_MNEMONIC_SHL &&
-            i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            i1.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (i0.mnemonic == Phantom::Disasm::Mnemonic::SHL && i1.mnemonic == Phantom::Disasm::Mnemonic::SHL &&
+            i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            i1.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
             i0.operands[0].reg.value == i1.operands[0].reg.value) {
             ++splittingPatterns;
         }
 
         // Pattern: XOR reg, X; XOR reg, Y (partial key XOR)
-        if (i0.mnemonic == ZYDIS_MNEMONIC_XOR && i1.mnemonic == ZYDIS_MNEMONIC_XOR &&
-            i0.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            i1.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+        if (i0.mnemonic == Phantom::Disasm::Mnemonic::XOR && i1.mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+            i0.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            i1.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
             i0.operands[0].reg.value == i1.operands[0].reg.value &&
-            i0.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
-            i1.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            i0.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
+            i1.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
             ++splittingPatterns;
         }
     }
@@ -3622,7 +3618,7 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
     size_t size,
     MetamorphicResult& result) noexcept
 {
-    if (!buffer || size < 32 || !m_impl->m_zydisInitialized) {
+    if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
         return;
     }
 
@@ -3654,19 +3650,19 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
         bool isBackwardBranch = false;
         int64_t branchOffset = 0;
 
-        if (instr.mnemonic == ZYDIS_MNEMONIC_LOOP ||
-            instr.mnemonic == ZYDIS_MNEMONIC_LOOPE ||
-            instr.mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::LOOP ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::LOOPE ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::LOOPNE) {
 
-            if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+            if (instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                 instr.operands[0].imm.value.s < 0) {
                 isBackwardBranch = true;
                 branchOffset = instr.operands[0].imm.value.s;
             }
         }
 
-        if (instr.mnemonic >= ZYDIS_MNEMONIC_JB && instr.mnemonic <= ZYDIS_MNEMONIC_JS) {
-            if (instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if (instr.mnemonic >= Phantom::Disasm::Mnemonic::JB && instr.mnemonic <= Phantom::Disasm::Mnemonic::JS) {
+            if (instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                 instr.operands[0].imm.value.s < 0) {
                 isBackwardBranch = true;
                 branchOffset = instr.operands[0].imm.value.s;
@@ -3725,29 +3721,29 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
         const auto& instr = instructions[i];
 
         // RDTSC - timing-based key
-        if (instr.mnemonic == ZYDIS_MNEMONIC_RDTSC) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::RDTSC) {
             hasTimingKey = true;
         }
 
         // CPUID - can be used for key derivation
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CPUID) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CPUID) {
             hasEnvironmentKey = true;
         }
 
         // Self-referencing key (reading from code section)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::MEMORY) {
 
             // Check if reading from code-relative address
-            if (instr.operands[1].mem.base == ZYDIS_REGISTER_RIP ||
-                instr.operands[1].mem.base == ZYDIS_REGISTER_EIP) {
+            if (instr.operands[1].mem.base == Phantom::Disasm::Register::RIP ||
+                instr.operands[1].mem.base == Phantom::Disasm::Register::RIP) {
 
                 // Look for subsequent XOR/crypto operation
                 if (i + 1 < instructions.size()) {
                     auto nextMnemonic = instructions[i + 1].mnemonic;
-                    if (nextMnemonic == ZYDIS_MNEMONIC_XOR ||
-                        nextMnemonic == ZYDIS_MNEMONIC_ADD ||
-                        nextMnemonic == ZYDIS_MNEMONIC_SUB) {
+                    if (nextMnemonic == Phantom::Disasm::Mnemonic::XOR ||
+                        nextMnemonic == Phantom::Disasm::Mnemonic::ADD ||
+                        nextMnemonic == Phantom::Disasm::Mnemonic::SUB) {
                         hasSelfReferencingKey = true;
                     }
                 }
@@ -3796,13 +3792,13 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
         const auto& instr = instructions[i];
 
         // Pattern: RDTSC ... RDTSC ... SUB (timing check)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_RDTSC) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::RDTSC) {
             for (size_t j = i + 1; j < std::min(i + 50, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_RDTSC) {
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::RDTSC) {
                     // Look for comparison
                     for (size_t k = j + 1; k < std::min(j + 10, instructions.size()); ++k) {
-                        if (instructions[k].mnemonic == ZYDIS_MNEMONIC_SUB ||
-                            instructions[k].mnemonic == ZYDIS_MNEMONIC_CMP) {
+                        if (instructions[k].mnemonic == Phantom::Disasm::Mnemonic::SUB ||
+                            instructions[k].mnemonic == Phantom::Disasm::Mnemonic::CMP) {
                             ++antiEmulationIndicators;
                             break;
                         }
@@ -3813,19 +3809,19 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
         }
 
         // INT 2D - debugger detection
-        if (instr.mnemonic == ZYDIS_MNEMONIC_INT &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::INT &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
             instr.operands[0].imm.value.u == 0x2D) {
             ++antiEmulationIndicators;
         }
 
         // PUSHF/POPF with trap flag manipulation
-        if (instr.mnemonic == ZYDIS_MNEMONIC_PUSHFQ ||
-            instr.mnemonic == ZYDIS_MNEMONIC_PUSHFD) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::PUSHFQ ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::PUSHFD) {
             for (size_t j = i + 1; j < std::min(i + 10, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_OR ||
-                    instructions[j].mnemonic == ZYDIS_MNEMONIC_AND) {
-                    if (instructions[j].operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::OR ||
+                    instructions[j].mnemonic == Phantom::Disasm::Mnemonic::AND) {
+                    if (instructions[j].operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                         (instructions[j].operands[1].imm.value.u & 0x100)) {
                         ++antiEmulationIndicators;
                         break;
@@ -3858,23 +3854,23 @@ void MetamorphicDetector::AnalyzePolymorphicTechniques(
         const auto& instr = instructions[i];
 
         // Look for crypto operation followed by backward jump
-        if (instr.mnemonic == ZYDIS_MNEMONIC_XOR ||
-            instr.mnemonic == ZYDIS_MNEMONIC_ADD ||
-            instr.mnemonic == ZYDIS_MNEMONIC_SUB) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::XOR ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::ADD ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::SUB) {
 
             // Check for nearby backward jump
             for (size_t j = i + 1; j < std::min(i + 10, instructions.size()); ++j) {
                 bool isLoopEnd = false;
 
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_LOOP ||
-                    instructions[j].mnemonic == ZYDIS_MNEMONIC_LOOPE ||
-                    instructions[j].mnemonic == ZYDIS_MNEMONIC_LOOPNE) {
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::LOOP ||
+                    instructions[j].mnemonic == Phantom::Disasm::Mnemonic::LOOPE ||
+                    instructions[j].mnemonic == Phantom::Disasm::Mnemonic::LOOPNE) {
                     isLoopEnd = true;
                 }
 
-                if ((instructions[j].mnemonic >= ZYDIS_MNEMONIC_JB &&
-                     instructions[j].mnemonic <= ZYDIS_MNEMONIC_JS) &&
-                    instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                if ((instructions[j].mnemonic >= Phantom::Disasm::Mnemonic::JB &&
+                     instructions[j].mnemonic <= Phantom::Disasm::Mnemonic::JS) &&
+                    instructions[j].operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                     instructions[j].operands[0].imm.value.s < 0) {
                     isLoopEnd = true;
                 }
@@ -3934,7 +3930,7 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
     size_t size,
     MetamorphicResult& result) noexcept
 {
-    if (!buffer || size < 32 || !m_impl->m_zydisInitialized) {
+    if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
         return;
     }
 
@@ -3955,7 +3951,7 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
         const auto& instr = instructions[i];
 
         // Look for CALL instruction (potential API call)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
             // Track if followed by memory write and another call pattern
             bool hasMemoryWrite = false;
             bool hasSecondCall = false;
@@ -3965,27 +3961,27 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
                 const auto& nextInstr = instructions[j];
 
                 // Memory write (MOV [mem], reg or STOSB/STOSW/STOSD)
-                if (nextInstr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-                    nextInstr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                if (nextInstr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+                    nextInstr.operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                     hasMemoryWrite = true;
                 }
 
-                if (nextInstr.mnemonic == ZYDIS_MNEMONIC_STOSB ||
-                    nextInstr.mnemonic == ZYDIS_MNEMONIC_STOSW ||
-                    nextInstr.mnemonic == ZYDIS_MNEMONIC_STOSD ||
-                    nextInstr.mnemonic == ZYDIS_MNEMONIC_STOSQ) {
+                if (nextInstr.mnemonic == Phantom::Disasm::Mnemonic::STOSB ||
+                    nextInstr.mnemonic == Phantom::Disasm::Mnemonic::STOSW ||
+                    nextInstr.mnemonic == Phantom::Disasm::Mnemonic::STOSD ||
+                    nextInstr.mnemonic == Phantom::Disasm::Mnemonic::STOSQ) {
                     hasMemoryWrite = true;
                 }
 
-                if (hasMemoryWrite && nextInstr.mnemonic == ZYDIS_MNEMONIC_CALL) {
+                if (hasMemoryWrite && nextInstr.mnemonic == Phantom::Disasm::Mnemonic::CALL) {
                     hasSecondCall = true;
                 }
 
                 // Indirect jump/call to dynamically written code
                 if (hasSecondCall &&
-                    (nextInstr.mnemonic == ZYDIS_MNEMONIC_JMP ||
-                     nextInstr.mnemonic == ZYDIS_MNEMONIC_CALL) &&
-                    nextInstr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                    (nextInstr.mnemonic == Phantom::Disasm::Mnemonic::JMP ||
+                     nextInstr.mnemonic == Phantom::Disasm::Mnemonic::CALL) &&
+                    nextInstr.operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
                     hasIndirectJump = true;
                     break;
                 }
@@ -4023,16 +4019,16 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
             const auto& instr = instructions[j];
 
             // Store immediate to memory (code emission)
-            if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-                instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-                instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+                instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY &&
+                instr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                 ++consecutiveStores;
             }
 
             // REP STOSB/MOVSB for bulk code copy
-            if (instr.instruction.attributes & ZYDIS_ATTRIB_HAS_REP) {
-                if (instr.mnemonic == ZYDIS_MNEMONIC_STOSB ||
-                    instr.mnemonic == ZYDIS_MNEMONIC_MOVSB) {
+            if (instr.instruction.attributes & Phantom::Disasm::ATTRIB_HAS_REP) {
+                if (instr.mnemonic == Phantom::Disasm::Mnemonic::STOSB ||
+                    instr.mnemonic == Phantom::Disasm::Mnemonic::MOVSB) {
                     consecutiveStores += 5; // Weight higher
                 }
             }
@@ -4097,9 +4093,9 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
         const auto& instr = instructions[i];
 
         // MOV BYTE PTR [mem], imm8 - single byte patch
-        if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
             instr.instruction.operand_width == 8) {
 
             // Check for common patch values (NOP, JMP short, etc.)
@@ -4111,14 +4107,14 @@ void MetamorphicDetector::AnalyzeSelfModifyingTechniques(
         }
 
         // XCHG [mem], reg - atomic swap for thread-safe patching
-        if (instr.mnemonic == ZYDIS_MNEMONIC_XCHG &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::XCHG &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
             ++patchingIndicators;
         }
 
         // LOCK CMPXCHG - atomic compare-exchange for patching
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CMPXCHG &&
-            (instr.instruction.attributes & ZYDIS_ATTRIB_HAS_LOCK)) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CMPXCHG &&
+            (instr.instruction.attributes & Phantom::Disasm::ATTRIB_HAS_LOCK)) {
             ++patchingIndicators;
         }
     }
@@ -4166,7 +4162,7 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
     size_t size,
     MetamorphicResult& result) noexcept
 {
-    if (!buffer || size < 32 || !m_impl->m_zydisInitialized) {
+    if (!buffer || size < 32 || !m_impl->m_disasmInitialized) {
         return;
     }
 
@@ -4189,39 +4185,39 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
 
     for (size_t i = 0; i + 4 < instructions.size(); ++i) {
         // Pattern: XOR followed by AND followed by arithmetic
-        if (instructions[i].mnemonic == ZYDIS_MNEMONIC_XOR &&
-            instructions[i].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if (instructions[i].mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+            instructions[i].operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
 
-            ZydisRegister xorReg = instructions[i].operands[0].reg.value;
-            ZydisRegister xorSrc = (instructions[i].operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+            Phantom::Disasm::Register xorReg = instructions[i].operands[0].reg.value;
+            Phantom::Disasm::Register xorSrc = (instructions[i].operands[1].type == Phantom::Disasm::OperandType::REGISTER)
                                      ? instructions[i].operands[1].reg.value
-                                     : ZYDIS_REGISTER_NONE;
+                                     : Phantom::Disasm::Register::NONE;
 
             // Look for AND involving the same source operands
             for (size_t j = i + 1; j < std::min(i + 5, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_AND &&
-                    instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::AND &&
+                    instructions[j].operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
                     // Verify AND uses at least one real register operand from the XOR
                     // MBA identity: (x ^ y) + 2*(x & y)  — AND must share operands with XOR
-                    ZydisRegister andDst = instructions[j].operands[0].reg.value;
-                    ZydisRegister andSrc = (instructions[j].operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER)
+                    Phantom::Disasm::Register andDst = instructions[j].operands[0].reg.value;
+                    Phantom::Disasm::Register andSrc = (instructions[j].operands[1].type == Phantom::Disasm::OperandType::REGISTER)
                                              ? instructions[j].operands[1].reg.value
-                                             : ZYDIS_REGISTER_NONE;
-                    // Exclude ZYDIS_REGISTER_NONE from comparisons to prevent
+                                             : Phantom::Disasm::Register::NONE;
+                    // Exclude Phantom::Disasm::Register::NONE from comparisons to prevent
                     // false matches when both operands are immediates
                     bool sharesOperand =
                         (andDst == xorReg) ||
-                        (xorSrc != ZYDIS_REGISTER_NONE && (andDst == xorSrc || andSrc == xorSrc)) ||
-                        (andSrc != ZYDIS_REGISTER_NONE && andSrc == xorReg);
+                        (xorSrc != Phantom::Disasm::Register::NONE && (andDst == xorSrc || andSrc == xorSrc)) ||
+                        (andSrc != Phantom::Disasm::Register::NONE && andSrc == xorReg);
                     if (!sharesOperand) break;
                     // Then look for SHL by 1 (multiply by 2)
                     for (size_t k = j + 1; k < std::min(j + 3, instructions.size()); ++k) {
-                        if (instructions[k].mnemonic == ZYDIS_MNEMONIC_SHL &&
-                            instructions[k].operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                        if (instructions[k].mnemonic == Phantom::Disasm::Mnemonic::SHL &&
+                            instructions[k].operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                             instructions[k].operands[1].imm.value.u == 1) {
                             // Finally look for ADD
                             for (size_t l = k + 1; l < std::min(k + 3, instructions.size()); ++l) {
-                                if (instructions[l].mnemonic == ZYDIS_MNEMONIC_ADD) {
+                                if (instructions[l].mnemonic == Phantom::Disasm::Mnemonic::ADD) {
                                     ++mbaPatterns;
                                     break;
                                 }
@@ -4235,14 +4231,14 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         }
 
         // Alternative MBA pattern: NOT + AND + ADD combinations
-        if (instructions[i].mnemonic == ZYDIS_MNEMONIC_NOT) {
+        if (instructions[i].mnemonic == Phantom::Disasm::Mnemonic::NOT) {
             size_t andCount = 0;
             size_t addCount = 0;
 
             for (size_t j = i + 1; j < std::min(i + 8, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_AND) ++andCount;
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_ADD) ++addCount;
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_OR) ++addCount;
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::AND) ++andCount;
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::ADD) ++addCount;
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::OR) ++addCount;
             }
 
             if (andCount >= 2 && addCount >= 1) {
@@ -4271,29 +4267,29 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
 
     for (size_t i = 0; i + 3 < instructions.size(); ++i) {
         // Pattern: LEA/MOV to set up pointer, then XOR in loop
-        if ((instructions[i].mnemonic == ZYDIS_MNEMONIC_LEA ||
-             instructions[i].mnemonic == ZYDIS_MNEMONIC_MOV) &&
-            instructions[i].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER) {
+        if ((instructions[i].mnemonic == Phantom::Disasm::Mnemonic::LEA ||
+             instructions[i].mnemonic == Phantom::Disasm::Mnemonic::MOV) &&
+            instructions[i].operands[0].type == Phantom::Disasm::OperandType::REGISTER) {
 
-            ZydisRegister ptrReg = instructions[i].operands[0].reg.value;
+            Phantom::Disasm::Register ptrReg = instructions[i].operands[0].reg.value;
 
             // Look for XOR byte loop
             for (size_t j = i + 1; j < std::min(i + 15, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_XOR &&
-                    instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+                    instructions[j].operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
 
                     // Check for loop structure
                     for (size_t k = j + 1; k < std::min(j + 8, instructions.size()); ++k) {
-                        if (instructions[k].mnemonic == ZYDIS_MNEMONIC_INC ||
-                            instructions[k].mnemonic == ZYDIS_MNEMONIC_ADD) {
+                        if (instructions[k].mnemonic == Phantom::Disasm::Mnemonic::INC ||
+                            instructions[k].mnemonic == Phantom::Disasm::Mnemonic::ADD) {
 
                             // And backward jump
                             for (size_t l = k + 1; l < std::min(k + 5, instructions.size()); ++l) {
-                                if ((instructions[l].mnemonic >= ZYDIS_MNEMONIC_JB &&
-                                     instructions[l].mnemonic <= ZYDIS_MNEMONIC_JS) ||
-                                    instructions[l].mnemonic == ZYDIS_MNEMONIC_LOOP) {
+                                if ((instructions[l].mnemonic >= Phantom::Disasm::Mnemonic::JB &&
+                                     instructions[l].mnemonic <= Phantom::Disasm::Mnemonic::JS) ||
+                                    instructions[l].mnemonic == Phantom::Disasm::Mnemonic::LOOP) {
 
-                                    if (instructions[l].operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+                                    if (instructions[l].operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
                                         instructions[l].operands[0].imm.value.s < 0) {
                                         ++stringDecryptPatterns;
                                     }
@@ -4329,8 +4325,8 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         const auto& instr = instructions[i];
 
         // Jump into middle of instruction (overlapping)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE) {
 
             int64_t target = instr.address + instr.length + instr.operands[0].imm.value.s;
 
@@ -4345,13 +4341,13 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         }
 
         // CALL $+5 / ADD [ESP], offset pattern (fake call)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CALL &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CALL &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
             instr.operands[0].imm.value.s == 0) {
 
             if (i + 1 < instructions.size() &&
-                instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_ADD &&
-                instructions[i + 1].operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::ADD &&
+                instructions[i + 1].operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                 ++antiDisasmTricks;
             }
         }
@@ -4359,29 +4355,29 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         // JZ/JNZ $+2 after deterministic flag-setting (XOR reg,reg / CMP reg,reg / OR reg,reg)
         // indicates always-taken conditional over garbage bytes.
         // Plain JZ/JNZ $+2 is too common in compiler output to flag alone.
-        if ((instr.mnemonic == ZYDIS_MNEMONIC_JZ || instr.mnemonic == ZYDIS_MNEMONIC_JNZ) &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_IMMEDIATE &&
+        if ((instr.mnemonic == Phantom::Disasm::Mnemonic::JZ || instr.mnemonic == Phantom::Disasm::Mnemonic::JNZ) &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::IMMEDIATE &&
             std::abs(instr.operands[0].imm.value.s) <= 2 && i > 0) {
             const auto& prev = instructions[i - 1];
             bool deterministicFlags = false;
             // XOR reg, reg  → ZF=1 always
-            if (prev.mnemonic == ZYDIS_MNEMONIC_XOR &&
-                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (prev.mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+                prev.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                prev.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                 prev.operands[0].reg.value == prev.operands[1].reg.value) {
                 deterministicFlags = true;
             }
             // CMP reg, reg  → ZF=1 always
-            if (prev.mnemonic == ZYDIS_MNEMONIC_CMP &&
-                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (prev.mnemonic == Phantom::Disasm::Mnemonic::CMP &&
+                prev.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                prev.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                 prev.operands[0].reg.value == prev.operands[1].reg.value) {
                 deterministicFlags = true;
             }
             // OR reg, reg  → ZF depends on value, but often used as anti-disasm setup
-            if (prev.mnemonic == ZYDIS_MNEMONIC_OR &&
-                prev.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                prev.operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (prev.mnemonic == Phantom::Disasm::Mnemonic::OR &&
+                prev.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                prev.operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                 prev.operands[0].reg.value == prev.operands[1].reg.value) {
                 deterministicFlags = true;
             }
@@ -4413,31 +4409,31 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         const auto& instr = instructions[i];
 
         // INT 3 not at function boundary (used for SEH-based flow)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_INT3) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::INT3) {
             // Check if preceded by meaningful code (not padding)
-            if (i > 0 && instructions[i - 1].mnemonic != ZYDIS_MNEMONIC_RET &&
-                instructions[i - 1].mnemonic != ZYDIS_MNEMONIC_JMP) {
+            if (i > 0 && instructions[i - 1].mnemonic != Phantom::Disasm::Mnemonic::RET &&
+                instructions[i - 1].mnemonic != Phantom::Disasm::Mnemonic::JMP) {
                 ++exceptionCFPatterns;
             }
         }
 
         // Intentional divide by zero
-        if (instr.mnemonic == ZYDIS_MNEMONIC_DIV ||
-            instr.mnemonic == ZYDIS_MNEMONIC_IDIV) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::DIV ||
+            instr.mnemonic == Phantom::Disasm::Mnemonic::IDIV) {
             // Check if divisor was just set to zero
-            if (i > 0 && instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_XOR &&
-                instructions[i - 1].operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-                instructions[i - 1].operands[1].type == ZYDIS_OPERAND_TYPE_REGISTER &&
+            if (i > 0 && instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::XOR &&
+                instructions[i - 1].operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+                instructions[i - 1].operands[1].type == Phantom::Disasm::OperandType::REGISTER &&
                 instructions[i - 1].operands[0].reg.value == instructions[i - 1].operands[1].reg.value) {
                 ++exceptionCFPatterns;
             }
         }
 
         // Access to invalid memory (null pointer dereference for SEH)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
-            instr.operands[1].mem.base == ZYDIS_REGISTER_NONE &&
-            instr.operands[1].mem.index == ZYDIS_REGISTER_NONE &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::MEMORY &&
+            instr.operands[1].mem.base == Phantom::Disasm::Register::NONE &&
+            instr.operands[1].mem.index == Phantom::Disasm::Register::NONE &&
             instr.operands[1].mem.disp.value < 0x1000) {
             ++exceptionCFPatterns;
         }
@@ -4466,20 +4462,20 @@ void MetamorphicDetector::AnalyzeObfuscationTechniques(
         const auto& instr = instructions[i];
 
         // Count PUSH followed by RET (simulated call)
-        if (instr.mnemonic == ZYDIS_MNEMONIC_PUSH &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::PUSH &&
             i + 1 < instructions.size() &&
-            instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_RET) {
+            instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::RET) {
             ++retChainPatterns;
         }
 
         // Track consecutive short code sequences ending in RET
-        if (instr.mnemonic == ZYDIS_MNEMONIC_RET) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::RET) {
             ++consecutiveRets;
         } else if (consecutiveRets > 0) {
-            if (instr.mnemonic != ZYDIS_MNEMONIC_POP &&
-                instr.mnemonic != ZYDIS_MNEMONIC_MOV &&
-                instr.mnemonic != ZYDIS_MNEMONIC_ADD &&
-                instr.mnemonic != ZYDIS_MNEMONIC_XOR) {
+            if (instr.mnemonic != Phantom::Disasm::Mnemonic::POP &&
+                instr.mnemonic != Phantom::Disasm::Mnemonic::MOV &&
+                instr.mnemonic != Phantom::Disasm::Mnemonic::ADD &&
+                instr.mnemonic != Phantom::Disasm::Mnemonic::XOR) {
                 consecutiveRets = 0;
             }
         }
@@ -4530,7 +4526,7 @@ void MetamorphicDetector::AnalyzeVMProtection(
     size_t size,
     MetamorphicResult& result) noexcept
 {
-    if (!buffer || size < 64 || !m_impl->m_zydisInitialized) {
+    if (!buffer || size < 64 || !m_impl->m_disasmInitialized) {
         return;
     }
 
@@ -4556,20 +4552,20 @@ void MetamorphicDetector::AnalyzeVMProtection(
         const auto& instr = instructions[i];
 
         // JMP [reg*4 + base] or JMP [reg*8 + base] - table dispatch
-        if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
 
             if (instr.operands[0].mem.scale == 4 || instr.operands[0].mem.scale == 8) {
                 ++tableJumps;
 
                 // Check if preceded by bounds check (valid opcode range)
                 if (i >= 2) {
-                    if (instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JNBE ||
-                        instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JNB ||
-                        instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JB ||
-                        instructions[i - 1].mnemonic == ZYDIS_MNEMONIC_JBE) {
+                    if (instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::JNBE ||
+                        instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::JNB ||
+                        instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::JB ||
+                        instructions[i - 1].mnemonic == Phantom::Disasm::Mnemonic::JBE) {
 
-                        if (instructions[i - 2].mnemonic == ZYDIS_MNEMONIC_CMP) {
+                        if (instructions[i - 2].mnemonic == Phantom::Disasm::Mnemonic::CMP) {
                             hasHandlerTable = true;
                         }
                     }
@@ -4578,8 +4574,8 @@ void MetamorphicDetector::AnalyzeVMProtection(
         }
 
         // CALL [reg*4 + base] - alternative handler dispatch
-        if (instr.mnemonic == ZYDIS_MNEMONIC_CALL &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::CALL &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::MEMORY &&
             (instr.operands[0].mem.scale == 4 || instr.operands[0].mem.scale == 8)) {
             ++tableJumps;
         }
@@ -4605,16 +4601,16 @@ void MetamorphicDetector::AnalyzeVMProtection(
     size_t stackRelativeOps = 0;
 
     for (const auto& instr : instructions) {
-        if (instr.mnemonic == ZYDIS_MNEMONIC_PUSH) ++pushCount;
-        if (instr.mnemonic == ZYDIS_MNEMONIC_POP) ++popCount;
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::PUSH) ++pushCount;
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::POP) ++popCount;
 
         // Stack-relative memory operations
         for (size_t j = 0; j < instr.instruction.operand_count; ++j) {
-            if (instr.operands[j].type == ZYDIS_OPERAND_TYPE_MEMORY) {
-                if (instr.operands[j].mem.base == ZYDIS_REGISTER_RSP ||
-                    instr.operands[j].mem.base == ZYDIS_REGISTER_ESP ||
-                    instr.operands[j].mem.base == ZYDIS_REGISTER_RBP ||
-                    instr.operands[j].mem.base == ZYDIS_REGISTER_EBP) {
+            if (instr.operands[j].type == Phantom::Disasm::OperandType::MEMORY) {
+                if (instr.operands[j].mem.base == Phantom::Disasm::Register::RSP ||
+                    instr.operands[j].mem.base == Phantom::Disasm::Register::ESP ||
+                    instr.operands[j].mem.base == Phantom::Disasm::Register::RBP ||
+                    instr.operands[j].mem.base == Phantom::Disasm::Register::EBP) {
                     ++stackRelativeOps;
                 }
             }
@@ -4649,19 +4645,19 @@ void MetamorphicDetector::AnalyzeVMProtection(
 
         // MOV reg, [base + small_offset] followed by operation
         // This pattern is typical of VM context field access
-        if (instr.mnemonic == ZYDIS_MNEMONIC_MOV &&
-            instr.operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER &&
-            instr.operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+        if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+            instr.operands[0].type == Phantom::Disasm::OperandType::REGISTER &&
+            instr.operands[1].type == Phantom::Disasm::OperandType::MEMORY &&
             instr.operands[1].mem.disp.has_displacement &&
             std::abs(instr.operands[1].mem.disp.value) < 256) {
 
             // Check for similar access patterns nearby (context fields)
             size_t similarAccesses = 0;
-            ZydisRegister baseReg = instr.operands[1].mem.base;
+            Phantom::Disasm::Register baseReg = instr.operands[1].mem.base;
 
             for (size_t j = i + 1; j < std::min(i + 10, instructions.size()); ++j) {
-                if (instructions[j].mnemonic == ZYDIS_MNEMONIC_MOV &&
-                    instructions[j].operands[1].type == ZYDIS_OPERAND_TYPE_MEMORY &&
+                if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+                    instructions[j].operands[1].type == Phantom::Disasm::OperandType::MEMORY &&
                     instructions[j].operands[1].mem.base == baseReg) {
                     ++similarAccesses;
                 }
@@ -4701,22 +4697,22 @@ void MetamorphicDetector::AnalyzeVMProtection(
             const auto& instr = instructions[j];
 
             // Fetch: MOVZX or LODSB/LODSW
-            if (instr.mnemonic == ZYDIS_MNEMONIC_MOVZX ||
-                instr.mnemonic == ZYDIS_MNEMONIC_LODSB ||
-                instr.mnemonic == ZYDIS_MNEMONIC_LODSW) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::MOVZX ||
+                instr.mnemonic == Phantom::Disasm::Mnemonic::LODSB ||
+                instr.mnemonic == Phantom::Disasm::Mnemonic::LODSW) {
                 hasFetch = true;
             }
 
             // Decode: AND with mask or SHR
-            if ((instr.mnemonic == ZYDIS_MNEMONIC_AND ||
-                 instr.mnemonic == ZYDIS_MNEMONIC_SHR) &&
-                instr.operands[1].type == ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if ((instr.mnemonic == Phantom::Disasm::Mnemonic::AND ||
+                 instr.mnemonic == Phantom::Disasm::Mnemonic::SHR) &&
+                instr.operands[1].type == Phantom::Disasm::OperandType::IMMEDIATE) {
                 hasDecode = true;
             }
 
             // Dispatch: Indirect JMP
-            if (instr.mnemonic == ZYDIS_MNEMONIC_JMP &&
-                instr.operands[0].type != ZYDIS_OPERAND_TYPE_IMMEDIATE) {
+            if (instr.mnemonic == Phantom::Disasm::Mnemonic::JMP &&
+                instr.operands[0].type != Phantom::Disasm::OperandType::IMMEDIATE) {
                 hasDispatch = true;
             }
         }
@@ -4810,7 +4806,7 @@ void MetamorphicDetector::AnalyzePacking(
     // ========================================================================
     // Crypters use XOR/encryption, packers use compression
 
-    if (m_impl->m_zydisInitialized && !result.decryptionLoops.empty()) {
+    if (m_impl->m_disasmInitialized && !result.decryptionLoops.empty()) {
         // Has decryption loops - likely a crypter
         size_t xorLoops = 0;
         size_t complexCrypto = 0;
@@ -4846,7 +4842,7 @@ void MetamorphicDetector::AnalyzePacking(
 
         // Look for GetProcAddress call patterns
         std::vector<Impl::DisassembledInstruction> instructions;
-        if (m_impl->m_zydisInitialized &&
+        if (m_impl->m_disasmInitialized &&
             m_impl->DisassembleBuffer(buffer, std::min(size, static_cast<size_t>(4096)),
                                        0, result.peAnalysis.is64Bit, instructions, 1000)) {
 
@@ -4854,14 +4850,14 @@ void MetamorphicDetector::AnalyzePacking(
 
             for (size_t i = 0; i + 3 < instructions.size(); ++i) {
                 // Pattern: PUSH string_addr, PUSH module_handle, CALL GetProcAddress, MOV [iat], eax
-                if (instructions[i].mnemonic == ZYDIS_MNEMONIC_PUSH &&
-                    instructions[i + 1].mnemonic == ZYDIS_MNEMONIC_PUSH &&
-                    instructions[i + 2].mnemonic == ZYDIS_MNEMONIC_CALL) {
+                if (instructions[i].mnemonic == Phantom::Disasm::Mnemonic::PUSH &&
+                    instructions[i + 1].mnemonic == Phantom::Disasm::Mnemonic::PUSH &&
+                    instructions[i + 2].mnemonic == Phantom::Disasm::Mnemonic::CALL) {
 
                     // Check for store after call
                     for (size_t j = i + 3; j < std::min(i + 6, instructions.size()); ++j) {
-                        if (instructions[j].mnemonic == ZYDIS_MNEMONIC_MOV &&
-                            instructions[j].operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        if (instructions[j].mnemonic == Phantom::Disasm::Mnemonic::MOV &&
+                            instructions[j].operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                             ++importResolutionPatterns;
                             break;
                         }
@@ -4887,7 +4883,7 @@ void MetamorphicDetector::AnalyzePacking(
     // ========================================================================
     // Packers typically end with a jump to the Original Entry Point
 
-    if (m_impl->m_zydisInitialized) {
+    if (m_impl->m_disasmInitialized) {
         // Analyze the end of the unpacker stub (typically first executable section)
         for (const auto& section : result.peAnalysis.sections) {
             if (!section.isExecutable || section.rawSize == 0) continue;
@@ -4910,15 +4906,15 @@ void MetamorphicDetector::AnalyzePacking(
 
                 // Look for unconditional JMP as last meaningful instruction
                 for (auto it = tailInstructions.rbegin(); it != tailInstructions.rend(); ++it) {
-                    if (it->mnemonic == ZYDIS_MNEMONIC_NOP ||
-                        it->mnemonic == ZYDIS_MNEMONIC_INT3) {
+                    if (it->mnemonic == Phantom::Disasm::Mnemonic::NOP ||
+                        it->mnemonic == Phantom::Disasm::Mnemonic::INT3) {
                         continue;
                     }
 
-                    if (it->mnemonic == ZYDIS_MNEMONIC_JMP) {
+                    if (it->mnemonic == Phantom::Disasm::Mnemonic::JMP) {
                         // This could be the OEP jump
-                        if (it->operands[0].type == ZYDIS_OPERAND_TYPE_REGISTER ||
-                            it->operands[0].type == ZYDIS_OPERAND_TYPE_MEMORY) {
+                        if (it->operands[0].type == Phantom::Disasm::OperandType::REGISTER ||
+                            it->operands[0].type == Phantom::Disasm::OperandType::MEMORY) {
                             // Indirect jump - very suspicious (computed OEP)
                             auto detection = MetamorphicDetectionBuilder()
                                 .Technique(MetamorphicTechnique::PACK_Custom)
@@ -5083,7 +5079,7 @@ void MetamorphicDetector::PerformSimilarityAnalysis(
     // ========================================================================
     // Build n-gram profile of instruction sequences for similarity
 
-    if (!result.peAnalysis.sections.empty() && m_impl->m_zydisInitialized) {
+    if (!result.peAnalysis.sections.empty() && m_impl->m_disasmInitialized) {
         // Get first executable section for n-gram analysis
         const uint8_t* codeBuffer = nullptr;
         size_t codeSize = 0;
