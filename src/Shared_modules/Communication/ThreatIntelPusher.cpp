@@ -28,8 +28,8 @@
 #include <cstring>
 
 // Shared protocol definitions (kernel/user-mode compatible)
-#include "../../PhantomSensor/Shared/MessageProtocol.h"
-#include "../../PhantomSensor/Shared/MessageTypes.h"
+#include "../../../PhantomSensor/Shared/MessageProtocol.h"
+#include "../../../PhantomSensor/Shared/MessageTypes.h"
 #include "../../PhantomSensor/PhantomSensor/Behavioral/RuleEngine.h"
 
 namespace ShadowStrike {
