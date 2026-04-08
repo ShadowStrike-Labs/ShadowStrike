@@ -1017,6 +1017,33 @@
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\peparser_unit\PEValidation_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\peparser_unit\SafeReader_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\AMSIIntegration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\JavaScriptScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\MacroDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\PowerShellScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\PythonScriptScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\scripts_unit\VBScriptScanner_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\unit\core_registry_unit\PersistenceDetector_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -1227,6 +1254,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tests\unit\core_network_unit\CoreNetwork_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="tests\unit\peparser_unit\PEParser_TestUtils.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="tests\unit\core_registry_unit\CoreRegistry_TestUtils.hpp">
@@ -2216,6 +2246,40 @@
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="tests\unit\core_sys_unit\CoreSystem_TestUtils.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+  </ItemGroup>
+  <ItemGroup>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\BackupProtector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\FileBackupManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\HoneypotManager_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\LockyDetector_ValueContracts_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\RansomwareDecryptor_ValueContracts_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\RansomwareDetector_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\ShadowCopyProtector_ValueContracts_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\VolumeSnapshotService_ValueContracts_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\unit\ransomware_protection_unit\WannaCryDetector_ValueContracts_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+  </ItemGroup>
+  <ItemGroup>
+    <ClInclude Include="tests\unit\ransomware_protection_unit\RansomwareProtection_TestUtils.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
   </ItemGroup>
