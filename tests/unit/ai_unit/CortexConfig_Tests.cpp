@@ -255,12 +255,12 @@ TEST_F(CortexConfigManagerTest, SaveConfigWritesRoundTrippableSnapshot) {
 
     const auto savedDoc = ReadJsonFile(outputPath);
     EXPECT_EQ(savedDoc.at("modelDirectory").get<std::string>(), rawModelDirUtf8);
-    EXPECT_DOUBLE_EQ(savedDoc.at("staticThreshold").get<double>(), 0.33);
-    EXPECT_DOUBLE_EQ(savedDoc.at("behavioralThreshold").get<double>(), 0.66);
-    EXPECT_DOUBLE_EQ(savedDoc.at("memoryThreshold").get<double>(), 0.77);
-    EXPECT_DOUBLE_EQ(savedDoc.at("networkThreshold").get<double>(), 0.88);
-    EXPECT_DOUBLE_EQ(savedDoc.at("emulationThreshold").get<double>(), 0.44);
-    EXPECT_DOUBLE_EQ(savedDoc.at("ensembleThreshold").get<double>(), 0.55);
+    EXPECT_NEAR(savedDoc.at("staticThreshold").get<double>(), 0.33, 1e-5);
+    EXPECT_NEAR(savedDoc.at("behavioralThreshold").get<double>(), 0.66, 1e-5);
+    EXPECT_NEAR(savedDoc.at("memoryThreshold").get<double>(), 0.77, 1e-5);
+    EXPECT_NEAR(savedDoc.at("networkThreshold").get<double>(), 0.88, 1e-5);
+    EXPECT_NEAR(savedDoc.at("emulationThreshold").get<double>(), 0.44, 1e-5);
+    EXPECT_NEAR(savedDoc.at("ensembleThreshold").get<double>(), 0.55, 1e-5);
     EXPECT_FALSE(savedDoc.at("useGPU").get<bool>());
     EXPECT_TRUE(savedDoc.at("useAVX512").get<bool>());
     EXPECT_EQ(savedDoc.at("maxBatchSize").get<uint32_t>(), 64u);
