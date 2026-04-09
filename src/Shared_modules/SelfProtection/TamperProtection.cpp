@@ -2810,6 +2810,45 @@ TamperProtection::~TamperProtection() {
     return m_impl->Initialize(config);
 }
 
+[[nodiscard]] bool TamperProtection::Initialize(TamperProtectionMode mode) {
+    // Guard against hostile or corrupted enum values arriving from external surfaces.
+    const auto modeRaw = static_cast<uint32_t>(mode);
+    if (modeRaw > static_cast<uint32_t>(TamperProtectionMode::Lockdown)) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+                     L"Initialize(mode) rejected: mode value %u is out of the valid range [0, %u]",
+                     modeRaw,
+                     static_cast<uint32_t>(TamperProtectionMode::Lockdown));
+        return false;
+    }
+
+    const TamperProtectionConfiguration config = TamperProtectionConfiguration::FromMode(mode);
+
+    // Pre-flight validation with a mode-qualified error message so that log
+    // triage can immediately identify which preset produced an invalid config —
+    // the impl's own validation check is a second line of defence.
+    if (!config.IsValid()) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+                     L"Configuration derived from mode preset '%hs' failed validation — "
+                     L"check TamperProtectionConstants bounds",
+                     std::string(GetModeName(mode)).c_str());
+        return false;
+    }
+
+    SS_LOG_INFO(LOG_CATEGORY,
+                L"Initializing TamperProtection via mode preset '%hs'",
+                std::string(GetModeName(mode)).c_str());
+
+    const bool result = Initialize(config);
+
+    if (!result) {
+        SS_LOG_ERROR(LOG_CATEGORY,
+                     L"TamperProtection initialization failed for mode preset '%hs'",
+                     std::string(GetModeName(mode)).c_str());
+    }
+
+    return result;
+}
+
 void TamperProtection::Shutdown(std::string_view authToken) {
     m_impl->Shutdown(authToken);
 }
