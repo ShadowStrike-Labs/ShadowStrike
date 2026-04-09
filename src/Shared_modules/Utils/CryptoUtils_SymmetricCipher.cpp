@@ -120,26 +120,26 @@ namespace ShadowStrike {
 
 				// Secure wipe key object buffer
 				if (!m_keyObject.empty()) {
-					SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+					SecureWipeMemory(m_keyObject.data(), m_keyObject.size());
 					m_keyObject.clear();
 				}
 #endif
 
 				// Secure wipe key material
 				if (!m_key.empty()) {
-					SecureZeroMemory(m_key.data(), m_key.size());
+					SecureWipeMemory(m_key.data(), m_key.size());
 					m_key.clear();
 				}
 
 				// Secure wipe IV
 				if (!m_iv.empty()) {
-					SecureZeroMemory(m_iv.data(), m_iv.size());
+					SecureWipeMemory(m_iv.data(), m_iv.size());
 					m_iv.clear();
 				}
 
 				// Secure wipe stream buffer
 				if (!m_streamBuffer.empty()) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 				}
 
@@ -331,7 +331,7 @@ namespace ShadowStrike {
 							L"BCryptGetProperty OBJECT_LENGTH failed",
 							L"SetKey");
 					}
-					SecureZeroMemory(m_key.data(), m_key.size());
+					SecureWipeMemory(m_key.data(), m_key.size());
 					m_key.clear();
 					return false;
 				}
@@ -346,7 +346,7 @@ namespace ShadowStrike {
 							L"Failed to allocate key object buffer",
 							L"SetKey");
 					}
-					SecureZeroMemory(m_key.data(), m_key.size());
+					SecureWipeMemory(m_key.data(), m_key.size());
 					m_key.clear();
 					return false;
 				}
@@ -376,9 +376,9 @@ namespace ShadowStrike {
 					SafeLogError(debugMsg);
 
 					// Cleanup on failure
-					SecureZeroMemory(m_key.data(), m_key.size());
+					SecureWipeMemory(m_key.data(), m_key.size());
 					m_key.clear();
-					SecureZeroMemory(m_keyObject.data(), m_keyObject.size());
+					SecureWipeMemory(m_keyObject.data(), m_keyObject.size());
 					m_keyObject.clear();
 					m_keyHandle = nullptr;
 					return false;
@@ -427,7 +427,7 @@ namespace ShadowStrike {
 
 				// Set the generated key
 				if (!SetKey(outKey, err)) {
-					SecureZeroMemory(outKey.data(), outKey.size());
+					SecureWipeMemory(outKey.data(), outKey.size());
 					outKey.clear();
 					return false;
 				}
@@ -522,7 +522,7 @@ namespace ShadowStrike {
 
 				// Set the generated IV
 				if (!SetIV(outIV, err)) {
-					SecureZeroMemory(outIV.data(), outIV.size());
+					SecureWipeMemory(outIV.data(), outIV.size());
 					outIV.clear();
 					return false;
 				}
@@ -678,7 +678,7 @@ namespace ShadowStrike {
 								L"PKCS7 padding failed",
 								L"Encrypt");
 						}
-						SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+						SecureWipeMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 						return false;
 					}
 
@@ -705,7 +705,7 @@ namespace ShadowStrike {
 					ivLocal = m_iv;
 				}
 				catch (const std::exception&) {
-					SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+					SecureWipeMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 					if (err != nullptr) {
 						err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
 							L"Failed to allocate IV buffer",
@@ -743,7 +743,7 @@ namespace ShadowStrike {
 							L"BCryptEncrypt size query failed",
 							L"Encrypt");
 					}
-					SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+					SecureWipeMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 					return false;
 				}
 
@@ -752,7 +752,7 @@ namespace ShadowStrike {
 					ciphertext.resize(cbResult);
 				}
 				catch (const std::exception&) {
-					SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+					SecureWipeMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 					if (err != nullptr) {
 						err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
 							L"Failed to allocate ciphertext buffer",
@@ -776,7 +776,7 @@ namespace ShadowStrike {
 				);
 
 				// Secure cleanup of padded plaintext
-				SecureZeroMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
+				SecureWipeMemory(plaintextWithPadding.data(), plaintextWithPadding.size());
 
 				if (!BCRYPT_SUCCESS(st)) {
 					if (err != nullptr) {
@@ -784,14 +784,14 @@ namespace ShadowStrike {
 							L"BCryptEncrypt failed",
 							L"Encrypt");
 					}
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					SecureWipeMemory(ciphertext.data(), ciphertext.size());
 					ciphertext.clear();
 					return false;
 				}
 
 				try { ciphertext.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					SecureWipeMemory(ciphertext.data(), ciphertext.size());
 					ciphertext.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"Encrypt"); }
 					return false;
@@ -921,14 +921,14 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					if (err) { err->SetNtStatus(st, L"BCryptDecrypt failed", L"Decrypt"); }
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					plaintext.clear();
 					return false;
 				}
 
 				try { plaintext.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					plaintext.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"Decrypt"); }
 					return false;
@@ -942,7 +942,7 @@ namespace ShadowStrike {
 
 					if (!removePadding(plaintext, blockSize)) {
 						//  SECURITY: Zero memory before reporting error
-						SecureZeroMemory(plaintext.data(), originalSize);
+						SecureWipeMemory(plaintext.data(), originalSize);
 						plaintext.clear();
 
 						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Invalid PKCS7 padding", L"Decrypt"); }
@@ -1040,7 +1040,7 @@ namespace ShadowStrike {
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear tag on failure
-					SecureZeroMemory(tag.data(), tag.size());
+					SecureWipeMemory(tag.data(), tag.size());
 					tag.clear();
 					if (err) { err->SetNtStatus(st, L"BCryptEncrypt AEAD size query failed", L"EncryptAEAD"); }
 					return false;
@@ -1050,7 +1050,7 @@ namespace ShadowStrike {
 					ciphertext.resize(cbResult);
 				}
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(tag.data(), tag.size());
+					SecureWipeMemory(tag.data(), tag.size());
 					tag.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Ciphertext allocation failed", L"EncryptAEAD"); }
 					return false;
@@ -1063,8 +1063,8 @@ namespace ShadowStrike {
 					ciphertext.data(), static_cast<ULONG>(ciphertext.size()), &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear both ciphertext and tag on failure
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
-					SecureZeroMemory(tag.data(), tag.size());
+					SecureWipeMemory(ciphertext.data(), ciphertext.size());
+					SecureWipeMemory(tag.data(), tag.size());
 					ciphertext.clear();
 					tag.clear();
 					if (err) { err->SetNtStatus(st, L"BCryptEncrypt AEAD failed", L"EncryptAEAD"); }
@@ -1073,8 +1073,8 @@ namespace ShadowStrike {
 
 				try { ciphertext.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
-					SecureZeroMemory(tag.data(), tag.size());
+					SecureWipeMemory(ciphertext.data(), ciphertext.size());
+					SecureWipeMemory(tag.data(), tag.size());
 					ciphertext.clear();
 					tag.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptAEAD"); }
@@ -1170,7 +1170,7 @@ namespace ShadowStrike {
 					nullptr, 0,
 					plaintext.data(), static_cast<ULONG>(plaintext.size()), &cbResult, 0);
 				if (st < 0) {
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					plaintext.clear();
 					if (err) { err->SetNtStatus(st, L"BCryptDecrypt AEAD failed or authentication failed", L"DecryptAEAD"); }
 					return false;
@@ -1178,7 +1178,7 @@ namespace ShadowStrike {
 
 				try { plaintext.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					plaintext.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptAEAD"); }
 					return false;
@@ -1265,7 +1265,7 @@ namespace ShadowStrike {
 
 				// Validate sizes for ULONG conversion
 				if (toEncrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
 					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"EncryptUpdate"); }
 					return false;
 				}
@@ -1278,7 +1278,7 @@ namespace ShadowStrike {
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear temporary buffer on failure
-					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
 					if (err) { err->SetNtStatus(st, L"BCryptEncrypt size query failed", L"EncryptUpdate"); }
 					return false;
 				}
@@ -1287,7 +1287,7 @@ namespace ShadowStrike {
 					out.resize(cbResult);
 				}
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"EncryptUpdate"); }
 					return false;
 				}
@@ -1299,8 +1299,8 @@ namespace ShadowStrike {
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear both buffers on failure
-					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
-					SecureZeroMemory(out.data(), out.size());
+					SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
+					SecureWipeMemory(out.data(), out.size());
 					out.clear();
 					if (err) { err->SetNtStatus(st, L"BCryptEncrypt failed", L"EncryptUpdate"); }
 					return false;
@@ -1308,7 +1308,7 @@ namespace ShadowStrike {
 
 				try { out.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+					SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptUpdate"); }
 					return false;
 				}
@@ -1319,7 +1319,7 @@ namespace ShadowStrike {
 				}
 
 				// SECURITY: Securely clear temporary buffer after use
-				SecureZeroMemory(toEncrypt.data(), toEncrypt.size());
+				SecureWipeMemory(toEncrypt.data(), toEncrypt.size());
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + alignedSize);
 				return true;
 #else
@@ -1358,7 +1358,7 @@ namespace ShadowStrike {
 				if (m_paddingMode == PaddingMode::PKCS7) {
 					if (!applyPadding(m_streamBuffer, GetBlockSize())) {
 						// SECURITY: Clear stream buffer on failure
-						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+						SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 						m_streamBuffer.clear();
 						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Padding failed", L"EncryptFinal"); }
 						return false;
@@ -1367,7 +1367,7 @@ namespace ShadowStrike {
 
 				// Validate size for ULONG conversion
 				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"EncryptFinal"); }
 					return false;
@@ -1386,7 +1386,7 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					// SECURITY: Clear stream buffer on failure
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetNtStatus(st, L"EncryptFinal size query failed", L"EncryptFinal"); }
 					return false;
@@ -1396,7 +1396,7 @@ namespace ShadowStrike {
 					out.resize(cbResult);
 				}
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"EncryptFinal"); }
 					return false;
@@ -1411,8 +1411,8 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					// SECURITY: Clear both buffers on failure
-					SecureZeroMemory(out.data(), out.size());
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(out.data(), out.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					out.clear();
 					m_streamBuffer.clear();
 					if (err) { err->SetNtStatus(st, L"EncryptFinal failed", L"EncryptFinal"); }
@@ -1421,14 +1421,14 @@ namespace ShadowStrike {
 
 				try { out.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"EncryptFinal"); }
 					return false;
 				}
 
 				// SECURITY: Securely clear stream buffer before clearing
-				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+				SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 				m_streamBuffer.clear();
 				m_streamFinalized = true;
 				return true;
@@ -1534,13 +1534,13 @@ namespace ShadowStrike {
 
 				// Validate sizes for ULONG conversion
 				if (toDecrypt.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"toDecrypt size too large for ULONG", L"DecryptUpdate"); }
 					return false;
 				}
 
 				if (m_iv.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"IV size too large for ULONG", L"DecryptUpdate"); }
 					return false;
 				}
@@ -1556,7 +1556,7 @@ namespace ShadowStrike {
 					nullptr, 0, &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear ciphertext copy on failure
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->SetNtStatus(st, L"BCryptDecrypt size query failed", L"DecryptUpdate"); }
 					return false;
 				}
@@ -1565,7 +1565,7 @@ namespace ShadowStrike {
 					out.resize(cbResult);
 				}
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"DecryptUpdate"); }
 					return false;
 				}
@@ -1577,8 +1577,8 @@ namespace ShadowStrike {
 					out.data(), static_cast<ULONG>(out.size()), &cbResult, 0);
 				if (st < 0) {
 					// SECURITY: Clear both buffers on failure
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
-					SecureZeroMemory(out.data(), out.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(out.data(), out.size());
 					out.clear();
 					if (err) { err->SetNtStatus(st, L"BCryptDecrypt failed", L"DecryptUpdate"); }
 					return false;
@@ -1586,7 +1586,7 @@ namespace ShadowStrike {
 
 				try { out.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+					SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptUpdate"); }
 					return false;
 				}
@@ -1597,7 +1597,7 @@ namespace ShadowStrike {
 				}
 
 				// SECURITY: Securely clear ciphertext copy
-				SecureZeroMemory(toDecrypt.data(), toDecrypt.size());
+				SecureWipeMemory(toDecrypt.data(), toDecrypt.size());
 				m_streamBuffer.erase(m_streamBuffer.begin(), m_streamBuffer.begin() + processSize);
 
 				return true;
@@ -1633,7 +1633,7 @@ namespace ShadowStrike {
 
 				// Validate size for ULONG conversion
 				if (m_streamBuffer.size() > static_cast<size_t>(std::numeric_limits<ULONG>::max())) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_ARITHMETIC_OVERFLOW, L"Data too large for ULONG", L"DecryptFinal"); }
 					return false;
@@ -1652,7 +1652,7 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					// SECURITY: Clear stream buffer on failure
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetNtStatus(st, L"DecryptFinal size query failed", L"DecryptFinal"); }
 					return false;
@@ -1662,7 +1662,7 @@ namespace ShadowStrike {
 					out.resize(cbResult);
 				}
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output allocation failed", L"DecryptFinal"); }
 					return false;
@@ -1677,8 +1677,8 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					// SECURITY: Clear both buffers on failure
-					SecureZeroMemory(out.data(), out.size());
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(out.data(), out.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					out.clear();
 					m_streamBuffer.clear();
 					if (err) { err->SetNtStatus(st, L"DecryptFinal failed", L"DecryptFinal"); }
@@ -1687,7 +1687,7 @@ namespace ShadowStrike {
 
 				try { out.resize(cbResult); }
 				catch (const std::bad_alloc&) {
-					SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+					SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 					m_streamBuffer.clear();
 					if (err) { err->SetWin32Error(ERROR_OUTOFMEMORY, L"Output trim allocation failed", L"DecryptFinal"); }
 					return false;
@@ -1700,8 +1700,8 @@ namespace ShadowStrike {
 					const size_t originalSize = out.size();
 					if (!removePadding(out, GetBlockSize())) {
 						// SECURITY: Clear sensitive data on padding failure
-						SecureZeroMemory(out.data(), originalSize);
-						SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+						SecureWipeMemory(out.data(), originalSize);
+						SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 						out.clear();
 						m_streamBuffer.clear();
 						if (err) { err->SetWin32Error(ERROR_INVALID_DATA, L"Invalid padding", L"DecryptFinal"); }
@@ -1710,7 +1710,7 @@ namespace ShadowStrike {
 				}
 
 				// SECURITY: Securely clear stream buffer
-				SecureZeroMemory(m_streamBuffer.data(), m_streamBuffer.size());
+				SecureWipeMemory(m_streamBuffer.data(), m_streamBuffer.size());
 				m_streamBuffer.clear();
 				m_streamFinalized = true;
 				return true;

@@ -256,25 +256,8 @@ uint64_t Fallback_MeasureTimingPrecision(void) {
 #endif
 }
 
-/// Fallback: DetectSingleStepTiming
-uint32_t Fallback_DetectSingleStepTiming(void) {
-#ifdef _WIN32
-    uint64_t start = __rdtsc();
-    
-    // Execute known number of simple operations
-    volatile int x = 0;
-    for (int i = 0; i < 20; ++i) {
-        x++;
-    }
-    
-    uint64_t end = __rdtsc();
-    
-    // If > 1000 cycles for 20 simple increments, likely single-stepping
-    return (end - start > 1000) ? 1 : 0;
-#else
-    return 0;
-#endif
-}
+// NOTE: Fallback_DetectSingleStepTiming is provided by DebuggerEvasionDetector.cpp
+// to avoid duplicate symbol errors when both TUs are linked together.
 
 /// Fallback: MeasureVMExitOverhead
 uint64_t Fallback_MeasureVMExitOverhead(void) {

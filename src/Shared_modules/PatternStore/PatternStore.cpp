@@ -2377,6 +2377,17 @@ void PatternStore::UpdateHitCount(uint64_t patternId) const noexcept {
     counter.fetch_add(1, std::memory_order_relaxed);
 }
 
+bool PatternStore::IsDeadlineExceeded(const LARGE_INTEGER& deadline) const noexcept {
+    if (deadline.QuadPart == 0) {
+        return false;
+    }
+    LARGE_INTEGER now{};
+    if (!QueryPerformanceCounter(&now)) {
+        return false;
+    }
+    return now.QuadPart >= deadline.QuadPart;
+}
+
 std::wstring PatternStore::GetDatabasePath() const noexcept {
     std::shared_lock<std::shared_mutex> lock(m_globalLock);
     return m_databasePath;

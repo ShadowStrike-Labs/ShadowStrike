@@ -220,7 +220,7 @@ Status Formatter::FormatInstruction(
 // ============================================================================
 
 size_t Formatter::FormatMnemonic(const DecodedInstruction& inst,
-                                 char* buf, size_t remaining) noexcept
+                                 char* buf, size_t remaining) const noexcept
 {
     size_t pos = 0;
 
@@ -255,7 +255,7 @@ size_t Formatter::FormatMnemonic(const DecodedInstruction& inst,
 size_t Formatter::FormatOperand(const DecodedOperand& op,
                                 const DecodedInstruction& inst,
                                 char* buf, size_t remaining,
-                                uint64_t runtimeAddr) noexcept
+                                uint64_t runtimeAddr) const noexcept
 {
     switch (op.type) {
 
@@ -299,7 +299,7 @@ size_t Formatter::FormatOperand(const DecodedOperand& op,
 // ============================================================================
 
 size_t Formatter::FormatRegister(Register reg, char* buf,
-                                 size_t remaining) noexcept
+                                 size_t remaining) const noexcept
 {
     if (reg == Register::NONE) return 0;
 
@@ -316,7 +316,7 @@ size_t Formatter::FormatRegister(Register reg, char* buf,
 // ============================================================================
 
 size_t Formatter::FormatSizePrefix(uint16_t sizeBits, char* buf,
-                                   size_t remaining) noexcept
+                                   size_t remaining) const noexcept
 {
     const char* prefix = nullptr;
 
@@ -354,7 +354,7 @@ size_t Formatter::FormatSizePrefix(uint16_t sizeBits, char* buf,
 size_t Formatter::FormatMemory(const DecodedOperandMem& mem,
                                const DecodedInstruction& /*inst*/,
                                uint16_t opSize,
-                               char* buf, size_t remaining) noexcept
+                               char* buf, size_t remaining) const noexcept
 {
     size_t pos = 0;
 
@@ -447,7 +447,7 @@ size_t Formatter::FormatImmediate(const DecodedOperandImm& imm,
                                   bool                     isRelative,
                                   uint64_t                 instrAddr,
                                   uint8_t                  instrLen,
-                                  char* buf, size_t remaining) noexcept
+                                  char* buf, size_t remaining) const noexcept
 {
     // ---- branch / call target: resolve to absolute address ----
     if (isRelative) {
