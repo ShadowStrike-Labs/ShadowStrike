@@ -265,7 +265,7 @@ TEST_F(FeatureExtractorTest, ExtractMemoryFeaturesEncodesHeuristicsAndProtection
     EXPECT_NEAR((*features)[kNopSledIndex], 0.25f, 1e-6f);
     EXPECT_NEAR((*features)[kNullRatioIndex], 0.25f, 1e-6f);
     EXPECT_NEAR((*features)[kPrintableRatioIndex], 0.25f, 1e-6f);
-    EXPECT_FLOAT_EQ((*features)[kAlignmentIndex], 0.5f);
+    EXPECT_FLOAT_EQ((*features)[kAlignmentIndex], 0.75f);
     EXPECT_NEAR((*features)[kRopDensityIndex], 0.25f, 1e-6f);
     EXPECT_FLOAT_EQ((*features)[kReadFlagIndex], 1.0f);
     EXPECT_FLOAT_EQ((*features)[kWriteFlagIndex], 1.0f);
