@@ -2,7 +2,7 @@
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
- * Integration Tests – Tier 4: RansomwareProtection ↔ Store Dependencies
+ * Integration Tests – RansomwareProtection ↔ Store Dependencies
  *
  * ============================================================================
  * PURPOSE

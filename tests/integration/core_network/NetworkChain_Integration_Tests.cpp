@@ -1,6 +1,6 @@
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
- * Integration Tests - Tier 5: Network Chain
+ * Integration Tests - Network Chain
  *
  * ============================================================================
  * PURPOSE

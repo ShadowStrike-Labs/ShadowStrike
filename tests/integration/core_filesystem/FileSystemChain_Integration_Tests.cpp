@@ -1,6 +1,6 @@
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
- * Integration Tests - Tier 5: FileSystem Chain
+ * Integration Tests - FileSystem Chain
  *
  * ============================================================================
  * PURPOSE
@@ -25,7 +25,12 @@
  *   GROUP 7  FileSystemChain_Concurrency    - parallel hash and analyze
  */
 
-#include "pch.h"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <format>
+#include <gtest/gtest.h>
 
 #include "../../../src/Shared_modules/Core/FileSystem/FileHasher.hpp"
 #include "../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp"

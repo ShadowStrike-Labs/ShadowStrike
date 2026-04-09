@@ -1,6 +1,6 @@
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
- * Integration Tests - Tier 5: Registry Chain
+ * Integration Tests - Registry Chain
  *
  * ============================================================================
  * PURPOSE
