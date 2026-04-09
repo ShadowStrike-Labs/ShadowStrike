@@ -1,6 +1,6 @@
 /*
  * ShadowStrike - Enterprise NGAV/EDR Platform
- * Integration Tests - Tier 5: Process Chain
+ * Integration Tests - Process Chain
  *
  * ============================================================================
  * PURPOSE
@@ -36,7 +36,12 @@
  *   5. Initialize ReflectiveDLLDetector with default config
  */
 
-#include "../../../src/pch.h"
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+
+#include <format>
+#include <gtest/gtest.h>
 
 #include "../../../src/Shared_modules/Core/Process/ProcessMonitor.hpp"
 #include "../../../src/Shared_modules/Core/Process/ProcessAnalyzer.hpp"

@@ -2,7 +2,7 @@
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
- * Integration Tests - Tier 3: RealTime Protection Pipeline
+ * Integration Tests - RealTime Protection Pipeline
  *
  * ==========================================================================
  * PURPOSE

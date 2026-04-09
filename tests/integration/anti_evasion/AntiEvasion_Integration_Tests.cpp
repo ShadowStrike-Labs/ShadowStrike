@@ -2,7 +2,7 @@
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
- * Integration Tests – Tier 4: AntiEvasion ↔ Store Dependencies
+ * Integration Tests – AntiEvasion ↔ Store Dependencies
  *
  * ============================================================================
  * PURPOSE
@@ -93,7 +93,7 @@ public:
         wchar_t tmp[MAX_PATH];
         GetTempPathW(MAX_PATH, tmp);
         m_path = std::wstring(tmp) +
-                 L"SS_IntTier4_AE_" +
+                 L"SS_Int_AE_" +
                  std::to_wstring(GetCurrentProcessId()) + L"_" +
                  std::to_wstring(s_counter.fetch_add(1, std::memory_order_relaxed));
         std::filesystem::create_directories(m_path);

@@ -2,7 +2,7 @@
  * ShadowStrike - Enterprise NGAV/EDR Platform
  * Copyright (C) 2026 ShadowStrike Security
  *
- * Integration Tests – Tier 6: Update Lifecycle
+ * Integration Tests – Update Lifecycle
  * ============================================================================
  *
  * @file UpdateLifecycle_Integration_Tests.cpp
