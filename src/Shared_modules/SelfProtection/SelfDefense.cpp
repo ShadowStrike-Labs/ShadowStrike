@@ -475,7 +475,7 @@ bool SelfDefense::IsWhitelisted(std::wstring_view processName) const { return m_
 bool SelfDefense::IsWhitelisted(uint32_t processId) const { return m_impl->IsWhitelisted(processId); }
 std::vector<std::wstring> SelfDefense::GetWhitelistedProcesses() const { return m_impl->GetWhitelistedProcesses(); }
 
-uint64_t SelfDefense::RegisterThreatCallback(ThreatCallback callback) { return m_impl->RegisterThreatCallback(std::move(callback)); }
+uint64_t SelfDefense::RegisterThreatCallback(SelfDefenseThreatCallback callback) { return m_impl->RegisterThreatCallback(std::move(callback)); }
 void SelfDefense::UnregisterThreatCallback(uint64_t callbackId) { m_impl->UnregisterThreatCallback(callbackId); }
 uint64_t SelfDefense::RegisterAccessCallback(AccessCallback callback) { return m_impl->RegisterAccessCallback(std::move(callback)); }
 void SelfDefense::UnregisterAccessCallback(uint64_t callbackId) { m_impl->UnregisterAccessCallback(callbackId); }
@@ -909,8 +909,24 @@ bool SelfDefenseImpl::IsComponentEnabled(ProtectionComponent component) const no
 }
 
 void SelfDefenseImpl::SetThreatResponse(ThreatType threatType, ThreatResponse response) {
-    std::unique_lock lock(m_mutex);
-    m_threatResponsePolicy[threatType] = response;
+    if (threatType == ThreatType::None) {
+        SS_LOG_WARN(LOG_CATEGORY, L"SetThreatResponse: ignoring ThreatType::None — policy update rejected");
+        return;
+    }
+
+    ThreatResponse previous = ThreatResponse::None;
+    {
+        std::unique_lock lock(m_mutex);
+        auto it = m_threatResponsePolicy.find(threatType);
+        if (it != m_threatResponsePolicy.end()) previous = it->second;
+        m_threatResponsePolicy[threatType] = response;
+    }
+
+    SS_LOG_INFO(LOG_CATEGORY,
+        L"Threat response policy updated: type=0x%08X previous=0x%08X new=0x%08X",
+        static_cast<uint32_t>(threatType),
+        static_cast<uint32_t>(previous),
+        static_cast<uint32_t>(response));
 }
 
 ThreatResponse SelfDefenseImpl::GetThreatResponse(ThreatType threatType) const {
@@ -1110,22 +1126,523 @@ AccessDecisionResult SelfDefenseImpl::FilterAccessRequest(const AccessRequest& r
     result.decision = AccessDecision::Allow;
     result.grantedAccess = request.desiredAccess;
 
-    if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) return result;
+    const auto hasResponseFlag = [](ThreatResponse value, ThreatResponse flag) noexcept {
+        return (static_cast<uint32_t>(value) & static_cast<uint32_t>(flag)) != 0;
+    };
 
-    bool allowed = IsAccessAllowed(request.callerProcessId, request.targetProcessId, request.desiredAccess);
-    if (!allowed) {
-        uint32_t dangerous = SelfDefenseConstants::BLOCKED_PROCESS_ACCESS;
-        uint32_t stripped = request.desiredAccess & ~dangerous;
-        if (stripped != 0) {
+    const auto shouldBlockDecision = [](AccessDecision decision) noexcept {
+        return decision == AccessDecision::Deny || decision == AccessDecision::StripRights;
+    };
+
+    auto applyStrippedDecision = [&](uint32_t blockedMask, std::string_view stripReason, std::string_view denyReason) {
+        const uint32_t strippedAccess = request.desiredAccess & ~blockedMask;
+        if (strippedAccess != 0) {
             result.decision = AccessDecision::StripRights;
-            result.grantedAccess = stripped;
-            result.reason = "Dangerous access rights stripped from handle to protected process";
+            result.grantedAccess = strippedAccess;
+            result.reason.assign(stripReason);
         } else {
             result.decision = AccessDecision::Deny;
             result.grantedAccess = 0;
-            result.reason = "All requested access rights are dangerous to protected process";
+            result.reason.assign(denyReason);
         }
         result.shouldLog = true;
+    };
+
+    auto evaluateProtectedPath = [&](std::wstring_view rawPath,
+                                     std::wstring& normalizedPath,
+                                     std::wstring& matchedRulePath,
+                                     bool& allowWrite,
+                                     bool& allowDelete) {
+        normalizedPath = NormalizePath(rawPath);
+        std::shared_lock lock(m_mutex);
+
+        auto exactIt = m_protectedPaths.find(normalizedPath);
+        if (exactIt != m_protectedPaths.end()) {
+            matchedRulePath = exactIt->first;
+            allowWrite = exactIt->second->allowWrite;
+            allowDelete = exactIt->second->allowDelete;
+            return true;
+        }
+
+        for (const auto& [protectedPath, entry] : m_protectedPaths) {
+            if (entry->includeSubdirectories && normalizedPath.starts_with(protectedPath + L"\\")) {
+                matchedRulePath = protectedPath;
+                allowWrite = entry->allowWrite;
+                allowDelete = entry->allowDelete;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    auto evaluateProtectedRegistryKey = [&](std::wstring_view rawKeyPath,
+                                            std::wstring& normalizedKeyPath,
+                                            std::wstring& matchedRuleKey,
+                                            bool& allowWrite,
+                                            bool& allowDelete) {
+        normalizedKeyPath = NormalizeKeyPath(rawKeyPath);
+        std::shared_lock lock(m_mutex);
+
+        auto exactIt = m_protectedRegKeys.find(normalizedKeyPath);
+        if (exactIt != m_protectedRegKeys.end()) {
+            matchedRuleKey = exactIt->first;
+            allowWrite = exactIt->second->allowWrite;
+            allowDelete = exactIt->second->allowDelete;
+            return true;
+        }
+
+        for (const auto& [protectedKey, entry] : m_protectedRegKeys) {
+            if (entry->includeSubkeys && normalizedKeyPath.starts_with(protectedKey + L"\\")) {
+                matchedRuleKey = protectedKey;
+                allowWrite = entry->allowWrite;
+                allowDelete = entry->allowDelete;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    if (m_status.load(std::memory_order_acquire) != ModuleStatus::Running) {
+        result.decision = AccessDecision::Defer;
+        result.reason = "Self-defense engine is not running";
+        return result;
+    }
+
+    if (!IsComponentEnabled(ProtectionComponent::AccessControl)) {
+        result.decision = AccessDecision::Defer;
+        result.reason = "Self-defense access-control filtering is disabled";
+        return result;
+    }
+
+    if (request.isSystemCaller || request.isWhitelistedCaller) return result;
+    if (request.callerProcessId != 0 && request.callerProcessId == request.targetProcessId) return result;
+    if (request.callerProcessId != 0 && IsCallerWhitelisted(request.callerProcessId)) return result;
+
+    bool callerProtected = false;
+    bool callerIsShadowStrikeComponent = false;
+    bool targetProcessProtected = false;
+    {
+        std::shared_lock lock(m_mutex);
+        auto callerIt = m_protectedProcesses.find(request.callerProcessId);
+        if (callerIt != m_protectedProcesses.end()) {
+            callerProtected = true;
+            callerIsShadowStrikeComponent = callerIt->second->isShadowStrikeComponent;
+        }
+
+        if (request.targetProcessId != 0) {
+            targetProcessProtected = m_protectedProcesses.contains(request.targetProcessId);
+        }
+    }
+
+    if (callerIsShadowStrikeComponent) return result;
+
+    ThreatType detectedThreatType = ThreatType::None;
+    ThreatResponse actionTaken = ThreatResponse::None;
+    ProtectedEntityType targetType = ProtectedEntityType::Process;
+    std::wstring targetIdentifier;
+    uint32_t blockedAccess = 0;
+
+    bool updateProtectedProcessAttempt = false;
+    bool incrementProcessTermination = false;
+    bool incrementThreadTermination = false;
+    bool incrementMemoryModification = false;
+    bool incrementFileModification = false;
+    bool incrementRegistryModification = false;
+    bool incrementServiceControl = false;
+
+    std::wstring normalizedTargetPath;
+    std::wstring matchedProtectedPath;
+    bool matchedPathAllowWrite = false;
+    bool matchedPathAllowDelete = false;
+
+    std::wstring normalizedTargetRegistryKey;
+    std::wstring matchedProtectedRegistryKey;
+    bool matchedRegistryAllowWrite = false;
+    bool matchedRegistryAllowDelete = false;
+
+    switch (request.type) {
+        case AccessRequestType::ProcessOpen:
+        case AccessRequestType::HandleDuplicate: {
+            if (request.targetProcessId == 0) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Malformed process access request: missing target process ID");
+                result.decision = AccessDecision::Defer;
+                result.reason = "Malformed process access request";
+                result.shouldLog = true;
+                break;
+            }
+
+            if (!targetProcessProtected) break;
+            if (callerProtected && request.type == AccessRequestType::ProcessOpen) break;
+
+            blockedAccess = request.desiredAccess & SelfDefenseConstants::BLOCKED_PROCESS_ACCESS;
+            if (blockedAccess == 0) break;
+
+            targetType = ProtectedEntityType::Process;
+            targetIdentifier = std::to_wstring(request.targetProcessId);
+            updateProtectedProcessAttempt = true;
+
+            if (request.type == AccessRequestType::HandleDuplicate) {
+                detectedThreatType = ThreatType::HandleDuplication;
+                applyStrippedDecision(
+                    blockedAccess,
+                    "Dangerous duplicated process access rights stripped from protected target",
+                    "All duplicated process access rights are dangerous to the protected target");
+            } else {
+                if ((blockedAccess & PROCESS_CREATE_THREAD) != 0) {
+                    detectedThreatType = ThreatType::CodeInjection;
+                } else if ((blockedAccess & (PROCESS_VM_WRITE | PROCESS_VM_OPERATION)) != 0) {
+                    detectedThreatType = ThreatType::MemoryModification;
+                } else if ((blockedAccess & PROCESS_TERMINATE) != 0) {
+                    detectedThreatType = ThreatType::ProcessTermination;
+                } else {
+                    detectedThreatType = ThreatType::ProcessSuspension;
+                }
+
+                incrementProcessTermination = (blockedAccess & PROCESS_TERMINATE) != 0;
+                incrementMemoryModification = (blockedAccess & (PROCESS_VM_WRITE | PROCESS_VM_OPERATION)) != 0;
+
+                applyStrippedDecision(
+                    blockedAccess,
+                    "Dangerous process access rights stripped from handle to protected process",
+                    "All requested process access rights are dangerous to the protected process");
+            }
+            break;
+        }
+
+        case AccessRequestType::ThreadOpen: {
+            if (request.targetProcessId == 0 || request.targetThreadId == 0) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Malformed thread access request: missing target process or thread ID");
+                result.decision = AccessDecision::Defer;
+                result.reason = "Malformed thread access request";
+                result.shouldLog = true;
+                break;
+            }
+
+            if (!targetProcessProtected) break;
+
+            blockedAccess = request.desiredAccess & SelfDefenseConstants::BLOCKED_THREAD_ACCESS;
+            if (blockedAccess == 0) break;
+
+            targetType = ProtectedEntityType::Thread;
+            targetIdentifier = std::to_wstring(request.targetProcessId) + L":" + std::to_wstring(request.targetThreadId);
+            updateProtectedProcessAttempt = true;
+
+            if ((blockedAccess & THREAD_SET_CONTEXT) != 0) {
+                detectedThreatType = ThreatType::CodeInjection;
+            } else if ((blockedAccess & THREAD_SET_THREAD_TOKEN) != 0) {
+                detectedThreatType = ThreatType::TokenManipulation;
+            } else if ((blockedAccess & THREAD_TERMINATE) != 0) {
+                detectedThreatType = ThreatType::ThreadTermination;
+            } else {
+                detectedThreatType = ThreatType::ProcessSuspension;
+            }
+
+            incrementThreadTermination = (blockedAccess & THREAD_TERMINATE) != 0;
+
+            applyStrippedDecision(
+                blockedAccess,
+                "Dangerous thread access rights stripped from handle to protected thread",
+                "All requested thread access rights are dangerous to the protected thread");
+            break;
+        }
+
+        case AccessRequestType::FileAccess: {
+            if (request.targetPath.empty()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Malformed file access request: missing target path");
+                result.decision = AccessDecision::Defer;
+                result.reason = "Malformed file access request";
+                result.shouldLog = true;
+                break;
+            }
+
+            if (!evaluateProtectedPath(request.targetPath, normalizedTargetPath, matchedProtectedPath,
+                                       matchedPathAllowWrite, matchedPathAllowDelete)) {
+                break;
+            }
+
+            constexpr uint32_t kFileWriteMask =
+                FILE_WRITE_DATA | FILE_APPEND_DATA | FILE_WRITE_ATTRIBUTES | FILE_WRITE_EA |
+                WRITE_DAC | WRITE_OWNER;
+            constexpr uint32_t kFileDeleteMask = FILE_DELETE_CHILD | DELETE;
+
+            uint32_t effectiveBlockedMask = 0;
+            if (!matchedPathAllowWrite) effectiveBlockedMask |= kFileWriteMask;
+            if (!matchedPathAllowDelete) effectiveBlockedMask |= kFileDeleteMask;
+
+            blockedAccess = request.desiredAccess & effectiveBlockedMask;
+            if (blockedAccess == 0) break;
+
+            targetType = ProtectedEntityType::File;
+            targetIdentifier = normalizedTargetPath;
+            detectedThreatType = ((blockedAccess & kFileDeleteMask) != 0) ? ThreatType::FileDeletion
+                                                                           : ThreatType::FileModification;
+            incrementFileModification = true;
+
+            applyStrippedDecision(
+                blockedAccess,
+                "Dangerous write or delete rights stripped from protected path access",
+                "All requested write or delete rights are blocked for the protected path");
+            break;
+        }
+
+        case AccessRequestType::RegistryAccess: {
+            if (request.targetPath.empty()) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Malformed registry access request: missing target key path");
+                result.decision = AccessDecision::Defer;
+                result.reason = "Malformed registry access request";
+                result.shouldLog = true;
+                break;
+            }
+
+            if (!evaluateProtectedRegistryKey(request.targetPath, normalizedTargetRegistryKey,
+                                              matchedProtectedRegistryKey, matchedRegistryAllowWrite,
+                                              matchedRegistryAllowDelete)) {
+                break;
+            }
+
+            constexpr uint32_t kRegistryWriteMask =
+                KEY_SET_VALUE | KEY_CREATE_SUB_KEY | KEY_CREATE_LINK | WRITE_DAC | WRITE_OWNER;
+            constexpr uint32_t kRegistryDeleteMask = DELETE;
+
+            uint32_t effectiveBlockedMask = 0;
+            if (!matchedRegistryAllowWrite) effectiveBlockedMask |= kRegistryWriteMask;
+            if (!matchedRegistryAllowDelete) effectiveBlockedMask |= kRegistryDeleteMask;
+
+            blockedAccess = request.desiredAccess & effectiveBlockedMask;
+            if (blockedAccess == 0) break;
+
+            targetType = ProtectedEntityType::RegistryKey;
+            targetIdentifier = normalizedTargetRegistryKey;
+            detectedThreatType = ((blockedAccess & kRegistryDeleteMask) != 0) ? ThreatType::RegistryDeletion
+                                                                               : ThreatType::RegistryModification;
+            incrementRegistryModification = true;
+
+            applyStrippedDecision(
+                blockedAccess,
+                "Dangerous registry rights stripped from protected registry access",
+                "All requested registry rights are blocked for the protected registry key");
+            break;
+        }
+
+        case AccessRequestType::ServiceControl: {
+            if (!m_serviceProtected.load(std::memory_order_acquire)) break;
+
+            constexpr uint32_t kServiceDangerousMask =
+                SERVICE_STOP | SERVICE_PAUSE_CONTINUE | SERVICE_CHANGE_CONFIG | DELETE;
+
+            blockedAccess = request.desiredAccess & kServiceDangerousMask;
+            if (blockedAccess == 0) break;
+
+            targetType = ProtectedEntityType::Service;
+            targetIdentifier = request.targetPath.empty()
+                ? std::wstring(SelfDefenseConstants::SERVICE_NAME)
+                : request.targetPath;
+            detectedThreatType = ThreatType::ServiceControl;
+            incrementServiceControl = true;
+
+            applyStrippedDecision(
+                blockedAccess,
+                "Dangerous service-control rights stripped from protected service request",
+                "All requested service-control rights are blocked for the protected service");
+            break;
+        }
+
+        case AccessRequestType::ProcessCreate:
+            result.decision = AccessDecision::Defer;
+            result.reason = "Process creation requests are deferred to specialized policy handlers";
+            break;
+
+        case AccessRequestType::ImageLoad:
+            result.decision = AccessDecision::Defer;
+            result.reason = "Image load requests are deferred to specialized policy handlers";
+            break;
+    }
+
+    std::optional<ThreatEvent> detectedThreat;
+    if (detectedThreatType != ThreatType::None) {
+        actionTaken = GetThreatResponse(detectedThreatType);
+        if (hasResponseFlag(actionTaken, ThreatResponse::Block)) {
+            if (result.reason.empty()) {
+                applyStrippedDecision(blockedAccess,
+                                      "Dangerous access rights stripped by self-defense policy",
+                                      "Requested access rights are blocked by self-defense policy");
+            }
+        } else {
+            result.decision = AccessDecision::Allow;
+            result.grantedAccess = request.desiredAccess;
+            result.reason = "Threat detected but current response policy is non-blocking";
+            result.shouldLog = actionTaken != ThreatResponse::None;
+        }
+
+        ThreatEvent event;
+        event.type = detectedThreatType;
+        event.timestamp = request.timestamp;
+        event.attackerProcessId = request.callerProcessId;
+        event.attackerThreadId = request.callerThreadId;
+        event.attackerProcessName = GetProcessName(request.callerProcessId);
+        event.attackerProcessPath = request.callerImagePath.empty()
+            ? GetProcessImagePath(request.callerProcessId)
+            : request.callerImagePath;
+        event.targetType = targetType;
+        event.targetIdentifier = targetIdentifier;
+        event.requestedAccess = request.desiredAccess;
+        event.blockedAccess = blockedAccess;
+        event.actionTaken = actionTaken;
+        event.wasBlocked = shouldBlockDecision(result.decision);
+        if (!result.reason.empty()) {
+            event.details["reason"] = result.reason;
+        }
+        detectedThreat = std::move(event);
+    }
+
+    std::vector<AccessCallback> accessCallbacks;
+    {
+        std::shared_lock lock(m_callbackMutex);
+        accessCallbacks.reserve(m_accessCallbacks.size());
+        for (const auto& [id, callback] : m_accessCallbacks) {
+            accessCallbacks.push_back(callback);
+        }
+    }
+
+    for (const auto& callback : accessCallbacks) {
+        try {
+            AccessDecisionResult callbackResult = callback(request);
+            result.shouldLog = result.shouldLog || callbackResult.shouldLog;
+
+            switch (result.decision) {
+                case AccessDecision::Allow:
+                    if (callbackResult.decision == AccessDecision::Deny) {
+                        result.decision = AccessDecision::Deny;
+                        result.grantedAccess = 0;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    } else if (callbackResult.decision == AccessDecision::StripRights) {
+                        result.decision = AccessDecision::StripRights;
+                        result.grantedAccess = request.desiredAccess & callbackResult.grantedAccess;
+                        if (result.grantedAccess == 0) result.decision = AccessDecision::Deny;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    } else if (callbackResult.decision == AccessDecision::Defer) {
+                        result.decision = AccessDecision::Defer;
+                        result.grantedAccess = request.desiredAccess;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    }
+                    break;
+
+                case AccessDecision::Defer:
+                    if (callbackResult.decision == AccessDecision::Deny) {
+                        result.decision = AccessDecision::Deny;
+                        result.grantedAccess = 0;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    } else if (callbackResult.decision == AccessDecision::StripRights) {
+                        result.decision = AccessDecision::StripRights;
+                        result.grantedAccess = request.desiredAccess & callbackResult.grantedAccess;
+                        if (result.grantedAccess == 0) result.decision = AccessDecision::Deny;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    }
+                    break;
+
+                case AccessDecision::StripRights:
+                    if (callbackResult.decision == AccessDecision::Deny) {
+                        result.decision = AccessDecision::Deny;
+                        result.grantedAccess = 0;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    } else if (callbackResult.decision == AccessDecision::StripRights) {
+                        result.grantedAccess &= callbackResult.grantedAccess;
+                        if (result.grantedAccess == 0) result.decision = AccessDecision::Deny;
+                        if (!callbackResult.reason.empty()) result.reason = callbackResult.reason;
+                    }
+                    break;
+
+                case AccessDecision::Deny:
+                    break;
+            }
+
+            if (!detectedThreat.has_value() && callbackResult.threatEvent.has_value()) {
+                detectedThreat = std::move(callbackResult.threatEvent);
+            }
+        } catch (const std::exception& ex) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Access callback threw: %S", ex.what());
+        } catch (...) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Access callback threw a non-standard exception");
+        }
+    }
+
+    const bool finalBlocked = shouldBlockDecision(result.decision);
+    if (finalBlocked) {
+        result.shouldLog = true;
+
+        if (incrementProcessTermination) {
+            m_stats.processTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (incrementThreadTermination) {
+            m_stats.threadTerminationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (incrementMemoryModification) {
+            m_stats.memoryModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (incrementFileModification) {
+            m_stats.fileModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (incrementRegistryModification) {
+            m_stats.registryModificationBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+        if (incrementServiceControl) {
+            m_stats.serviceControlBlocked.fetch_add(1, std::memory_order_relaxed);
+        }
+
+        if (updateProtectedProcessAttempt && request.targetProcessId != 0) {
+            std::unique_lock lock(m_mutex);
+            auto it = m_protectedProcesses.find(request.targetProcessId);
+            if (it != m_protectedProcesses.end()) {
+                it->second->blockedAttempts.fetch_add(1, std::memory_order_relaxed);
+                it->second->lastBlockedAttempt = Clock::now();
+            }
+        }
+
+        if (!matchedProtectedPath.empty()) {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedPaths.find(matchedProtectedPath);
+            if (it != m_protectedPaths.end()) {
+                it->second->blockedOperations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+
+        if (!matchedProtectedRegistryKey.empty()) {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedRegKeys.find(matchedProtectedRegistryKey);
+            if (it != m_protectedRegKeys.end()) {
+                it->second->blockedOperations.fetch_add(1, std::memory_order_relaxed);
+            }
+        }
+    }
+
+    if (detectedThreat.has_value()) {
+        detectedThreat->wasBlocked = finalBlocked;
+        if (finalBlocked) {
+            detectedThreat->blockedAccess = request.desiredAccess & ~result.grantedAccess;
+            if (!hasResponseFlag(detectedThreat->actionTaken, ThreatResponse::Block)) {
+                detectedThreat->actionTaken = detectedThreat->actionTaken | ThreatResponse::Block;
+            }
+        }
+        if (!result.reason.empty()) {
+            detectedThreat->details["reason"] = result.reason;
+        }
+
+        ThreatEvent recordedThreat = *detectedThreat;
+        RecordThreatEvent(std::move(recordedThreat));
+        result.threatEvent = std::move(detectedThreat);
+    }
+
+    if (result.shouldLog) {
+        SS_LOG_WARN(LOG_CATEGORY,
+                    L"Access request filtered: type=%u callerPid=%u targetPid=%u targetTid=%u desired=0x%08X granted=0x%08X path=%s reason=%S",
+                    static_cast<unsigned>(request.type),
+                    request.callerProcessId,
+                    request.targetProcessId,
+                    request.targetThreadId,
+                    request.desiredAccess,
+                    result.grantedAccess,
+                    request.targetPath.empty() ? L"<none>" : request.targetPath.c_str(),
+                    result.reason.c_str());
     }
     return result;
 }
