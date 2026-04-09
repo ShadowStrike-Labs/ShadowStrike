@@ -96,7 +96,8 @@ TEST(PackerDetector_ResultHelpers, MatchQueriesAndClearResetAllEntropyMetrics) {
     info.fromCache = true;
 
     EXPECT_TRUE(info.HasMatch(PackerType::UPX));
-    EXPECT_TRUE(info.HasCategory(PackerCategory::VMProtection));
+    // VMProtect (110) falls in 101-200 range → PackerCategory::Protector
+    EXPECT_TRUE(info.HasCategory(PackerCategory::Protector));
     EXPECT_FALSE(info.HasMatch(PackerType::Themida));
     EXPECT_FALSE(info.HasCategory(PackerCategory::Crypter));
     ASSERT_NE(nullptr, info.GetBestMatch());

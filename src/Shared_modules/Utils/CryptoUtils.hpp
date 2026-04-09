@@ -1558,8 +1558,9 @@ namespace ShadowStrike {
              * @param ptr Memory to wipe
              * @param size Number of bytes to wipe
              * @note Safe to call with nullptr (no-op)
+             * @note Named SecureWipeMemory to avoid Windows SecureZeroMemory macro collision
              */
-            void SecureZeroMemory(void* ptr, size_t size) noexcept;
+            void SecureWipeMemory(void* ptr, size_t size) noexcept;
 
         } // namespace CryptoUtils
     } // namespace Utils

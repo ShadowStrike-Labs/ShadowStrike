@@ -105,7 +105,7 @@ namespace ShadowStrike {
 
                 if (!BCRYPT_SUCCESS(st)) {
                     // Secure wipe the buffer on failure
-                    SecureZeroMemory(buffer, size);
+                    SecureWipeMemory(buffer, size);
 
                     if (err != nullptr) {
                         err->SetNtStatus(st, L"BCryptGenRandom failed");
@@ -116,7 +116,7 @@ namespace ShadowStrike {
                 return true;
 #else
                 // Non-Windows platforms not supported
-                SecureZeroMemory(buffer, size);
+                SecureWipeMemory(buffer, size);
                 if (err != nullptr) {
                     err->SetWin32Error(ERROR_NOT_SUPPORTED, L"Platform not supported");
                 }
@@ -156,7 +156,7 @@ namespace ShadowStrike {
                 }
 
                 if (!Generate(out.data(), size, err)) {
-                    SecureZeroMemory(out.data(), out.size());
+                    SecureWipeMemory(out.data(), out.size());
                     out.clear();
                     return false;
                 }
@@ -281,7 +281,7 @@ namespace ShadowStrike {
                         // on failure, producing predictable 'alphanum[0]' characters.
                         if (err != nullptr && err->HasError()) {
                             if (out.capacity() > 0) {
-                                SecureZeroMemory(out.data(), out.capacity());
+                                SecureWipeMemory(out.data(), out.capacity());
                             }
                             return std::string();
                         }
@@ -293,7 +293,7 @@ namespace ShadowStrike {
                 catch (const std::exception&) {
                     // Wipe partial random characters before releasing memory
                     if (out.capacity() > 0) {
-                        SecureZeroMemory(out.data(), out.capacity());
+                        SecureWipeMemory(out.data(), out.capacity());
                     }
                     if (err != nullptr) {
                         err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
@@ -316,11 +316,11 @@ namespace ShadowStrike {
                 try {
                     std::string hex = HashUtils::ToHexLower(bytes.data(), bytes.size());
                     // Wipe raw random bytes — hex string is the intended output
-                    SecureZeroMemory(bytes.data(), bytes.size());
+                    SecureWipeMemory(bytes.data(), bytes.size());
                     return hex;
                 }
                 catch (const std::exception&) {
-                    SecureZeroMemory(bytes.data(), bytes.size());
+                    SecureWipeMemory(bytes.data(), bytes.size());
                     if (err != nullptr) {
                         err->SetWin32Error(ERROR_NOT_ENOUGH_MEMORY,
                             L"Failed to encode random bytes as hex string");
@@ -342,7 +342,7 @@ namespace ShadowStrike {
                 std::string result = Base64::Encode(bytes);
 
                 // Securely wipe the raw bytes
-                SecureZeroMemory(bytes.data(), bytes.size());
+                SecureWipeMemory(bytes.data(), bytes.size());
 
                 return result;
             }

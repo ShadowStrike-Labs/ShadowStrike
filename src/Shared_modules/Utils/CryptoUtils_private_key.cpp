@@ -38,7 +38,7 @@ namespace ShadowStrike {
 
 			void PrivateKey::SecureErase() noexcept {
 				if (!keyBlob.empty()) {
-					SecureZeroMemory(keyBlob.data(), keyBlob.size());
+					SecureWipeMemory(keyBlob.data(), keyBlob.size());
 					keyBlob.clear();
 				}
 			}
@@ -54,7 +54,7 @@ namespace ShadowStrike {
 					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Failed to copy key blob"; }
 					return false;
 				}
-				// SECURITY WARNING: Caller MUST call SecureZeroMemory(out.data(), out.size())
+				// SECURITY WARNING: Caller MUST call SecureWipeMemory(out.data(), out.size())
 				// when finished with the exported key material.
 				return true;
 			}
@@ -90,35 +90,35 @@ namespace ShadowStrike {
 
 						std::vector<uint8_t> key;
 						if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) {
-							SecureZeroMemory(salt.data(), salt.size());
+							SecureWipeMemory(salt.data(), salt.size());
 							return false;
 						}
 
 						SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
 						if (!cipher.SetKey(key, err)) {
-							SecureZeroMemory(key.data(), key.size());
-							SecureZeroMemory(salt.data(), salt.size());
+							SecureWipeMemory(key.data(), key.size());
+							SecureWipeMemory(salt.data(), salt.size());
 							return false;
 						}
 
-						SecureZeroMemory(key.data(), key.size());
+						SecureWipeMemory(key.data(), key.size());
 						key.clear();
 
 						std::vector<uint8_t> iv;
 						if (!cipher.GenerateIV(iv, err)) {
-							SecureZeroMemory(salt.data(), salt.size());
+							SecureWipeMemory(salt.data(), salt.size());
 							return false;
 						}
 
 						if (iv.size() != 16) {
-							SecureZeroMemory(salt.data(), salt.size());
+							SecureWipeMemory(salt.data(), salt.size());
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid IV size"; }
 							return false;
 						}
 
 						std::vector<uint8_t> encrypted;
 						if (!cipher.Encrypt(keyBlob.data(), keyBlob.size(), encrypted, err)) {
-							SecureZeroMemory(salt.data(), salt.size());
+							SecureWipeMemory(salt.data(), salt.size());
 							return false;
 						}
 
@@ -132,8 +132,8 @@ namespace ShadowStrike {
 						dataToEncode.insert(dataToEncode.end(), iv.begin(), iv.end());
 						dataToEncode.insert(dataToEncode.end(), encrypted.begin(), encrypted.end());
 
-						SecureZeroMemory(salt.data(), salt.size());
-						SecureZeroMemory(encrypted.data(), encrypted.size());
+						SecureWipeMemory(salt.data(), salt.size());
+						SecureWipeMemory(encrypted.data(), encrypted.size());
 					}
 					else {
 						dataToEncode.assign(keyBlob.begin(), keyBlob.end());
@@ -143,7 +143,7 @@ namespace ShadowStrike {
 					base64 = Base64::Encode(dataToEncode);
 
 					// PK5/PK9: Securely erase plaintext/intermediate data
-					SecureZeroMemory(dataToEncode.data(), dataToEncode.capacity());
+					SecureWipeMemory(dataToEncode.data(), dataToEncode.capacity());
 					dataToEncode.clear();
 
 					if (base64.empty()) {
@@ -169,7 +169,7 @@ namespace ShadowStrike {
 					pem.append(endMarker);
 
 					// PK6: Securely wipe base64-encoded key material
-					SecureZeroMemory(base64.data(), base64.capacity());
+					SecureWipeMemory(base64.data(), base64.capacity());
 					base64.clear();
 
 					out = std::move(pem);
@@ -177,8 +177,8 @@ namespace ShadowStrike {
 				}
 				catch (const std::exception&) {
 					// Wipe sensitive locals that survived stack unwinding (declared before try)
-					if (!dataToEncode.empty()) SecureZeroMemory(dataToEncode.data(), dataToEncode.capacity());
-					if (!base64.empty()) SecureZeroMemory(base64.data(), base64.capacity());
+					if (!dataToEncode.empty()) SecureWipeMemory(dataToEncode.data(), dataToEncode.capacity());
+					if (!base64.empty()) SecureWipeMemory(base64.data(), base64.capacity());
 					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Allocation failure in ExportPEM"; }
 					return false;
 				}
@@ -232,19 +232,19 @@ namespace ShadowStrike {
 
 					std::vector<uint8_t> decoded;
 					if (!Base64::Decode(cleanBase64, decoded)) {
-						SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
+						SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 decoding failed"; }
 						return false;
 					}
 
-					SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
+					SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
 					cleanBase64.clear();
 
 					out.keyBlob = std::move(decoded);
 					return true;
 				}
 				catch (const std::exception&) {
-					if (!cleanBase64.empty()) SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
+					if (!cleanBase64.empty()) SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
 					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Allocation failure in ImportPEM_RSAFormat"; }
 					return false;
 				}
@@ -362,7 +362,7 @@ namespace ShadowStrike {
 							if (!ImportPEM_RSAFormat(pem, out, std::string_view{}, err)) return false;
 							if (!ValidatePKCS1RSAPrivateKey(out.keyBlob)) {
 								if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid PKCS#1 RSA private key"; }
-								SecureZeroMemory(out.keyBlob.data(), out.keyBlob.size());
+								SecureWipeMemory(out.keyBlob.data(), out.keyBlob.size());
 								out.keyBlob.clear();
 								return false;
 							}
@@ -399,13 +399,13 @@ namespace ShadowStrike {
 
 					// Base64 decode
 					if (!Base64::Decode(cleanBase64, decoded)) {
-						SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
+						SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Base64 decoding failed"; }
 						return false;
 					}
 
 					// Wipe base64 material
-					SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
+					SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
 					cleanBase64.clear();
 
 					if (decoded.empty()) {
@@ -416,7 +416,7 @@ namespace ShadowStrike {
 					if (isEncrypted) {
 						if (password.empty()) {
 							if (err) { err->win32 = ERROR_INVALID_PASSWORD; err->message = L"Password required for encrypted key"; }
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
@@ -425,7 +425,7 @@ namespace ShadowStrike {
 						constexpr size_t kMinHeaderSize = 4 + 4 + 32 + 16;
 						if (decoded.size() < kMinHeaderSize) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted data too short"; }
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
@@ -436,13 +436,13 @@ namespace ShadowStrike {
 						// PK8: Reject unknown format versions instead of silent fallback
 						if (version != 1) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Unsupported encrypted key format version"; }
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
 						if (decoded.size() < offset + 32 + 16) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted data format mismatch"; }
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
@@ -458,9 +458,9 @@ namespace ShadowStrike {
 						constexpr size_t kMaxEncryptedKeySize = 64 * 1024;
 						if (encryptedSize > kMaxEncryptedKeySize || encryptedSize == 0) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Encrypted key data size out of range"; }
-							SecureZeroMemory(salt.data(), salt.size());
-							SecureZeroMemory(iv.data(), iv.size());
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(salt.data(), salt.size());
+							SecureWipeMemory(iv.data(), iv.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
@@ -474,40 +474,40 @@ namespace ShadowStrike {
 						kdfParams.salt = salt;
 
 						if (!KeyDerivation::DeriveKey(password, kdfParams, key, err)) {
-							SecureZeroMemory(salt.data(), salt.size());
-							SecureZeroMemory(iv.data(), iv.size());
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(salt.data(), salt.size());
+							SecureWipeMemory(iv.data(), iv.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
 						SymmetricCipher cipher(SymmetricAlgorithm::AES_256_CBC);
 						if (!cipher.SetKey(key, err)) {
-							SecureZeroMemory(key.data(), key.size());
-							SecureZeroMemory(salt.data(), salt.size());
-							SecureZeroMemory(iv.data(), iv.size());
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(key.data(), key.size());
+							SecureWipeMemory(salt.data(), salt.size());
+							SecureWipeMemory(iv.data(), iv.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 						if (!cipher.SetIV(iv, err)) {
-							SecureZeroMemory(key.data(), key.size());
-							SecureZeroMemory(salt.data(), salt.size());
-							SecureZeroMemory(iv.data(), iv.size());
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(key.data(), key.size());
+							SecureWipeMemory(salt.data(), salt.size());
+							SecureWipeMemory(iv.data(), iv.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 
 						const bool decOk = cipher.Decrypt(encryptedData, encryptedSize, decrypted, err);
 
 						// Zero sensitive buffers regardless of success
-						SecureZeroMemory(key.data(), key.size());
-						SecureZeroMemory(salt.data(), salt.size());
-						SecureZeroMemory(iv.data(), iv.size());
-						SecureZeroMemory(decoded.data(), decoded.size());
+						SecureWipeMemory(key.data(), key.size());
+						SecureWipeMemory(salt.data(), salt.size());
+						SecureWipeMemory(iv.data(), iv.size());
+						SecureWipeMemory(decoded.data(), decoded.size());
 
 						if (!decOk) {
 							// PK11: Wipe decrypted buffer on failure (may contain partial plaintext)
 							if (!decrypted.empty()) {
-								SecureZeroMemory(decrypted.data(), decrypted.size());
+								SecureWipeMemory(decrypted.data(), decrypted.size());
 							}
 							return false;
 						}
@@ -515,7 +515,7 @@ namespace ShadowStrike {
 						// ASN.1 validation
 						if (!ValidatePKCS1RSAPrivateKey(decrypted) && !ValidatePKCS8PrivateKeyInfo(decrypted)) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Decrypted data is not a valid private key"; }
-							SecureZeroMemory(decrypted.data(), decrypted.size());
+							SecureWipeMemory(decrypted.data(), decrypted.size());
 							return false;
 						}
 
@@ -526,7 +526,7 @@ namespace ShadowStrike {
 						// Unencrypted PKCS#8
 						if (!ValidatePKCS8PrivateKeyInfo(decoded)) {
 							if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"Invalid PKCS#8 PrivateKeyInfo"; }
-							SecureZeroMemory(decoded.data(), decoded.size());
+							SecureWipeMemory(decoded.data(), decoded.size());
 							return false;
 						}
 						out.keyBlob = std::move(decoded);
@@ -535,12 +535,12 @@ namespace ShadowStrike {
 				}
 				catch (const std::exception&) {
 					// Wipe all sensitive locals that survived stack unwinding
-					if (!cleanBase64.empty()) SecureZeroMemory(cleanBase64.data(), cleanBase64.capacity());
-					if (!decoded.empty()) SecureZeroMemory(decoded.data(), decoded.capacity());
-					if (!salt.empty()) SecureZeroMemory(salt.data(), salt.capacity());
-					if (!iv.empty()) SecureZeroMemory(iv.data(), iv.capacity());
-					if (!key.empty()) SecureZeroMemory(key.data(), key.capacity());
-					if (!decrypted.empty()) SecureZeroMemory(decrypted.data(), decrypted.capacity());
+					if (!cleanBase64.empty()) SecureWipeMemory(cleanBase64.data(), cleanBase64.capacity());
+					if (!decoded.empty()) SecureWipeMemory(decoded.data(), decoded.capacity());
+					if (!salt.empty()) SecureWipeMemory(salt.data(), salt.capacity());
+					if (!iv.empty()) SecureWipeMemory(iv.data(), iv.capacity());
+					if (!key.empty()) SecureWipeMemory(key.data(), key.capacity());
+					if (!decrypted.empty()) SecureWipeMemory(decrypted.data(), decrypted.capacity());
 					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Allocation failure in ImportPEM"; }
 					return false;
 				}

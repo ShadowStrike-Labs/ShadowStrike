@@ -121,7 +121,7 @@ namespace ShadowStrike {
 			template<typename T>
 			void SecureBuffer<T>::deallocate() {
 				if (m_data) {
-					SecureZeroMemory(m_data, m_size * sizeof(T));
+					SecureWipeMemory(m_data, m_size * sizeof(T));
 #ifdef _WIN32
 					if (m_locked) {
 						VirtualUnlock(m_data, m_size * sizeof(T));
@@ -213,7 +213,7 @@ namespace ShadowStrike {
 				Assign(narrow);
 
 				// SECURITY: Securely clear the temporary string
-				SecureZeroMemory(narrow.data(), narrow.size());
+				SecureWipeMemory(narrow.data(), narrow.size());
 			}
 
 			void SecureString::Clear() {

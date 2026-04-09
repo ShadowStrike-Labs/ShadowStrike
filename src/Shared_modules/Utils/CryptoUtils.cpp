@@ -113,7 +113,7 @@ namespace ShadowStrike {
 				}
 
 				if (plaintext.size() > MAX_PLAINTEXT_SIZE) {
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					if (err) { err->win32 = ERROR_BUFFER_OVERFLOW; err->message = L"Input file exceeds MAX_PLAINTEXT_SIZE (256 MiB)"; }
 					return false;
 				}
@@ -123,12 +123,12 @@ namespace ShadowStrike {
 					nullptr, 0, ciphertext, tag, err))
 				{
 					// SECURITY: Clear plaintext before returning on error
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
 
 				// SECURITY: Clear plaintext immediately after encryption
-				SecureZeroMemory(plaintext.data(), plaintext.size());
+				SecureWipeMemory(plaintext.data(), plaintext.size());
 				plaintext.clear();
 
 				// Format: [IV_SIZE][IV][TAG_SIZE][TAG][CIPHERTEXT]
@@ -228,18 +228,18 @@ namespace ShadowStrike {
 				);
 
 				// SECURITY: Clear plaintext after conversion
-				SecureZeroMemory(plaintext.data(), plaintext.size());
+				SecureWipeMemory(plaintext.data(), plaintext.size());
 				plaintext.clear();
 
 				if (!FileUtils::WriteAllBytesAtomic(outputPath, output, &fileErr)) {
 					// SECURITY: Clear output buffer on write failure
-					SecureZeroMemory(output.data(), output.size());
+					SecureWipeMemory(output.data(), output.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to write output file"; }
 					return false;
 				}
 
 				// SECURITY: Clear output buffer after successful write
-				SecureZeroMemory(output.data(), output.size());
+				SecureWipeMemory(output.data(), output.size());
 				return true;
 			}
 
@@ -272,7 +272,7 @@ namespace ShadowStrike {
 				FileUtils::Error fileErr{};
 				if (!FileUtils::ReadAllBytes(inputPath, plaintext, &fileErr)) {
 					// SECURITY: Clear key on failure
-					SecureZeroMemory(key.data(), key.size());
+					SecureWipeMemory(key.data(), key.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to read input file"; }
 					return false;
 				}
@@ -280,18 +280,18 @@ namespace ShadowStrike {
 				// Encrypt with AES-256-GCM
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
 				if (!cipher.SetKey(key, err)) {
-					SecureZeroMemory(key.data(), key.size());
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(key.data(), key.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
 
 				// SECURITY: Clear key immediately after setting in cipher
-				SecureZeroMemory(key.data(), key.size());
+				SecureWipeMemory(key.data(), key.size());
 				key.clear();
 
 				std::vector<uint8_t> iv;
 				if (!cipher.GenerateIV(iv, err)) {
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
 
@@ -300,12 +300,12 @@ namespace ShadowStrike {
 					nullptr, 0, ciphertext, tag, err))
 				{
 					// SECURITY: Clear plaintext on encryption failure
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
 
 				// SECURITY: Clear plaintext immediately after encryption
-				SecureZeroMemory(plaintext.data(), plaintext.size());
+				SecureWipeMemory(plaintext.data(), plaintext.size());
 				plaintext.clear();
 
 				// Format: [SALT_SIZE(4)][SALT][ITERATIONS(4)][IV_SIZE(4)][IV][TAG_SIZE(4)][TAG][CIPHERTEXT]
@@ -335,7 +335,7 @@ namespace ShadowStrike {
 				}
 
 				// SECURITY: Clear salt after use (key already cleared earlier)
-				SecureZeroMemory(salt.data(), salt.size());
+				SecureWipeMemory(salt.data(), salt.size());
 				return true;
 			}
 
@@ -434,12 +434,12 @@ namespace ShadowStrike {
 				// Decrypt
 				SymmetricCipher cipher(SymmetricAlgorithm::AES_256_GCM);
 				if (!cipher.SetKey(key, err)) {
-					SecureZeroMemory(key.data(), key.size());
+					SecureWipeMemory(key.data(), key.size());
 					return false;
 				}
 
 				// SECURITY: Clear key immediately after setting in cipher
-				SecureZeroMemory(key.data(), key.size());
+				SecureWipeMemory(key.data(), key.size());
 				key.clear();
 
 				if (!cipher.SetIV(iv, err)) return false;
@@ -457,18 +457,18 @@ namespace ShadowStrike {
 				);
 
 				// SECURITY: Clear plaintext after conversion
-				SecureZeroMemory(plaintext.data(), plaintext.size());
+				SecureWipeMemory(plaintext.data(), plaintext.size());
 				plaintext.clear();
 
 				if (!FileUtils::WriteAllBytesAtomic(outputPath, output, &fileErr)) {
 					// SECURITY: Clear output on write failure
-					SecureZeroMemory(output.data(), output.size());
+					SecureWipeMemory(output.data(), output.size());
 					if (err) { err->win32 = fileErr.win32; err->message = L"Failed to write output file"; }
 					return false;
 				}
 
 				// SECURITY: Clear output buffer after successful write
-				SecureZeroMemory(output.data(), output.size());
+				SecureWipeMemory(output.data(), output.size());
 				return true;
 			}
 
@@ -586,7 +586,7 @@ namespace ShadowStrike {
 				outPlaintext.assign(reinterpret_cast<const char*>(plaintext.data()), plaintext.size());
 
 				// SECURITY: Clear plaintext vector after assignment
-				SecureZeroMemory(plaintext.data(), plaintext.size());
+				SecureWipeMemory(plaintext.data(), plaintext.size());
 				return true;
 			}
 

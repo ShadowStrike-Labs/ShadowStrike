@@ -51,18 +51,18 @@ private:
     bool m_initialized = false;
 
     // Internal formatting helpers
-    size_t FormatMnemonic(const DecodedInstruction& inst, char* buf, size_t remaining) noexcept;
+    size_t FormatMnemonic(const DecodedInstruction& inst, char* buf, size_t remaining) const noexcept;
     size_t FormatOperand(const DecodedOperand& op, const DecodedInstruction& inst,
-                         char* buf, size_t remaining, uint64_t runtimeAddr) noexcept;
-    size_t FormatRegister(Register reg, char* buf, size_t remaining) noexcept;
+                         char* buf, size_t remaining, uint64_t runtimeAddr) const noexcept;
+    size_t FormatRegister(Register reg, char* buf, size_t remaining) const noexcept;
     size_t FormatMemory(const DecodedOperandMem& mem, const DecodedInstruction& inst,
-                        uint16_t opSize, char* buf, size_t remaining) noexcept;
+                        uint16_t opSize, char* buf, size_t remaining) const noexcept;
     size_t FormatImmediate(const DecodedOperandImm& imm, uint16_t opSize,
                            bool isRelative, uint64_t instrAddr, uint8_t instrLen,
-                           char* buf, size_t remaining) noexcept;
+                           char* buf, size_t remaining) const noexcept;
 
     // Size prefix helper (byte ptr, word ptr, dword ptr, qword ptr, etc.)
-    size_t FormatSizePrefix(uint16_t sizeBits, char* buf, size_t remaining) noexcept;
+    size_t FormatSizePrefix(uint16_t sizeBits, char* buf, size_t remaining) const noexcept;
 
     // Safe string append
     static size_t SafeAppend(char* dst, size_t dstRemaining, const char* src) noexcept;

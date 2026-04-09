@@ -269,7 +269,7 @@ namespace ShadowStrike {
 					// SECURITY: Clear both key blobs on failure
 					outKeyPair.publicKey.keyBlob.clear();
 					if (!outKeyPair.privateKey.keyBlob.empty()) {
-						SecureZeroMemory(outKeyPair.privateKey.keyBlob.data(), outKeyPair.privateKey.keyBlob.size());
+						SecureWipeMemory(outKeyPair.privateKey.keyBlob.data(), outKeyPair.privateKey.keyBlob.size());
 						outKeyPair.privateKey.keyBlob.clear();
 					}
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptExportKey (private) failed"; }
@@ -372,7 +372,7 @@ namespace ShadowStrike {
 					static_cast<ULONG>(blobCopy.size()), 0);
 
 				// Securely wipe the local copy regardless of success/failure
-				SecureZeroMemory(blobCopy.data(), blobCopy.size());
+				SecureWipeMemory(blobCopy.data(), blobCopy.size());
 				blobCopy.clear();
 
 				if (st < 0) {
@@ -500,7 +500,7 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptEncrypt failed"; }
-					SecureZeroMemory(ciphertext.data(), ciphertext.size());
+					SecureWipeMemory(ciphertext.data(), ciphertext.size());
 					return false;
 				}
 
@@ -615,7 +615,7 @@ namespace ShadowStrike {
 
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDecrypt failed"; }
-					SecureZeroMemory(plaintext.data(), plaintext.size());
+					SecureWipeMemory(plaintext.data(), plaintext.size());
 					return false;
 				}
 
@@ -1000,7 +1000,7 @@ namespace ShadowStrike {
 				if (st < 0) {
 					if (err) { err->ntstatus = st; err->win32 = RtlNtStatusToDosError(st); err->message = L"BCryptDeriveKey failed"; }
 					SS_LOG_ERROR(L"CryptoUtils", L"BCryptDeriveKey failed: 0x%08X", st);
-					SecureZeroMemory(sharedSecret.data(), sharedSecret.size());
+					SecureWipeMemory(sharedSecret.data(), sharedSecret.size());
 					sharedSecret.clear();
 					return false;
 				}
@@ -1242,18 +1242,18 @@ namespace ShadowStrike {
 				if (!HashUtils::ComputeHmac(hashAlg, hmacKey.data(), hmacKey.size(),
 					inputKeyMaterial, ikmLen, prk, nullptr)) {
 					// SECURITY: Clear hmacKey on failure
-					SecureZeroMemory(hmacKey.data(), hmacKey.size());
+					SecureWipeMemory(hmacKey.data(), hmacKey.size());
 					if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Extract failed"; }
 					return false;
 				}
 
 				// SECURITY: Clear hmacKey after use (it may contain salt or zeros)
-				SecureZeroMemory(hmacKey.data(), hmacKey.size());
+				SecureWipeMemory(hmacKey.data(), hmacKey.size());
 				hmacKey.clear();
 
 				if (keyLen > 255 * hashLen) {
 					// SECURITY: Clear prk before returning
-					SecureZeroMemory(prk.data(), prk.size());
+					SecureWipeMemory(prk.data(), prk.size());
 					if (err) {
 						err->win32 = ERROR_INVALID_PARAMETER;
 						err->message = L"HKDF keyLen too large";
@@ -1279,16 +1279,16 @@ namespace ShadowStrike {
 					if (!HashUtils::ComputeHmac(hashAlg, prk.data(), prk.size(),
 						msg.data(), msg.size(), t, nullptr)) {
 						// SECURITY: Clear all intermediate key material on failure
-						SecureZeroMemory(msg.data(), msg.size());
-						SecureZeroMemory(prk.data(), prk.size());
-						SecureZeroMemory(t.data(), t.size());
-						SecureZeroMemory(okm.data(), okm.size());
+						SecureWipeMemory(msg.data(), msg.size());
+						SecureWipeMemory(prk.data(), prk.size());
+						SecureWipeMemory(t.data(), t.size());
+						SecureWipeMemory(okm.data(), okm.size());
 						if (err) { err->win32 = ERROR_INVALID_DATA; err->message = L"HKDF Expand failed"; }
 						return false;
 					}
 
 					// SECURITY: Wipe msg containing T(i-1) concatenation before it goes out of scope
-					SecureZeroMemory(msg.data(), msg.size());
+					SecureWipeMemory(msg.data(), msg.size());
 
 					okm.insert(okm.end(), t.begin(), t.end());
 				}
@@ -1296,9 +1296,9 @@ namespace ShadowStrike {
 				std::memcpy(outKey, okm.data(), keyLen);
 
 				// SECURITY: Clear all intermediate key material
-				SecureZeroMemory(prk.data(), prk.size());
-				SecureZeroMemory(t.data(), t.size());
-				SecureZeroMemory(okm.data(), okm.size());
+				SecureWipeMemory(prk.data(), prk.size());
+				SecureWipeMemory(t.data(), t.size());
+				SecureWipeMemory(okm.data(), okm.size());
 
 				return true;
 			}

@@ -419,8 +419,8 @@ SelfDefenseLevel SelfDefense::GetProtectionLevel() const noexcept { return m_imp
 bool SelfDefense::EnableComponent(ProtectionComponent component) { return m_impl->EnableComponent(component); }
 bool SelfDefense::DisableComponent(ProtectionComponent component, std::string_view authorizationToken) { return m_impl->DisableComponent(component, authorizationToken); }
 bool SelfDefense::IsComponentEnabled(ProtectionComponent component) const noexcept { return m_impl->IsComponentEnabled(component); }
-void SelfDefense::SetThreatResponse(ThreatType threatType, ThreatResponse response) { m_impl->SetThreatResponse(threatType, response); }
-ThreatResponse SelfDefense::GetThreatResponse(ThreatType threatType) const { return m_impl->GetThreatResponse(threatType); }
+void SelfDefense::SetThreatResponse(ThreatType threatType, SelfDefenseThreatResponse response) { m_impl->SetThreatResponse(threatType, response); }
+SelfDefenseThreatResponse SelfDefense::GetThreatResponse(ThreatType threatType) const { return m_impl->GetThreatResponse(threatType); }
 
 bool SelfDefense::ProtectProcess(uint32_t processId) { return m_impl->ProtectProcess(processId); }
 bool SelfDefense::UnprotectProcess(uint32_t processId, std::string_view authorizationToken) { return m_impl->UnprotectProcess(processId, authorizationToken); }
@@ -428,7 +428,7 @@ bool SelfDefense::IsProcessProtected(uint32_t processId) const { return m_impl->
 std::optional<ProtectedProcess> SelfDefense::GetProtectedProcess(uint32_t processId) const { return m_impl->GetProtectedProcess(processId); }
 std::vector<ProtectedProcess> SelfDefense::GetAllProtectedProcesses() const { return m_impl->GetAllProtectedProcesses(); }
 bool SelfDefense::IsAccessAllowed(uint32_t callerPid, uint32_t targetPid, uint32_t desiredAccess) { return m_impl->IsAccessAllowed(callerPid, targetPid, desiredAccess); }
-AccessDecisionResult SelfDefense::FilterAccessRequest(const AccessRequest& request) { return m_impl->FilterAccessRequest(request); }
+SelfDefenseAccessDecisionResult SelfDefense::FilterAccessRequest(const SelfDefenseAccessRequest& request) { return m_impl->FilterAccessRequest(request); }
 bool SelfDefense::RegisterShadowStrikeComponent(uint32_t processId, std::string_view componentName) { return m_impl->RegisterShadowStrikeComponent(processId, componentName); }
 
 bool SelfDefense::ProtectService() { return m_impl->ProtectService(); }
