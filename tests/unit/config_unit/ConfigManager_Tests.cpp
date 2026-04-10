@@ -37,6 +37,9 @@ protected:
 
     void SetUp() override {
         manager.Shutdown();
+        // Re-initialize ConfigManager (was missing, caused PolicyManager crashes)
+        ConfigManagerConfiguration config;
+        (void)manager.Initialize(config);
         ResetAllLayers();
         DeleteAllSnapshots();
         manager.ResetStatistics();
@@ -364,6 +367,12 @@ TEST_F(ConfigManagerTest, MetadataValidationAndLayerResolutionHonorContracts) {
 
     const auto limitKeys = manager.GetKeysByCategory("limits");
     EXPECT_NE(std::find(limitKeys.begin(), limitKeys.end(), intKey), limitKeys.end());
+
+    // Set valid values for keys that would otherwise fail validation
+    // modeKey requires one of {"balanced", "strict"}
+    ASSERT_TRUE(manager.SetRawValue(modeKey, ConfigValue{std::string("balanced")}, ConfigLayer::Session));
+    // customValidatorKey requires "allow:" prefix
+    ASSERT_TRUE(manager.SetRawValue(customValidatorKey, ConfigValue{std::string("allow:test")}, ConfigLayer::Session));
 
     const auto validationErrors = manager.ValidateAll();
     EXPECT_TRUE(validationErrors.empty());
