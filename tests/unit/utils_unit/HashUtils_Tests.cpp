@@ -34,9 +34,9 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Utils/HashUtils.hpp"
-#include "../../../src/Utils/FileUtils.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/HashUtils.hpp"
+#include "../../../src/Shared_modules/Utils/FileUtils.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 #include <Objbase.h>
 #include <filesystem>
 #include <fstream>
