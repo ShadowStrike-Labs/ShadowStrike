@@ -173,6 +173,7 @@ TEST_F(MachineLearningDetectorTest, StatisticsResetAndAverageInferenceStayDeterm
     stats.errors.store(2, std::memory_order_relaxed);
     stats.byClassification[static_cast<size_t>(Engine::Classification::Malicious)]
         .store(3, std::memory_order_relaxed);
+    const auto beforeResetStartTime = stats.startTime;
 
     EXPECT_DOUBLE_EQ(stats.GetAverageInferenceTimeMs(), 1.5);
     const std::string beforeResetJson = stats.ToJson();
@@ -183,7 +184,11 @@ TEST_F(MachineLearningDetectorTest, StatisticsResetAndAverageInferenceStayDeterm
     EXPECT_EQ(stats.totalPredictions.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.modelInferences.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.errors.load(std::memory_order_relaxed), 0u);
+    EXPECT_EQ(
+        stats.byClassification[static_cast<size_t>(Engine::Classification::Malicious)].load(std::memory_order_relaxed),
+        0u);
     EXPECT_DOUBLE_EQ(stats.GetAverageInferenceTimeMs(), 0.0);
+    EXPECT_GE(stats.startTime, beforeResetStartTime);
 }
 
 TEST_F(MachineLearningDetectorTest, ConfigurationValidationTracksPrimaryAndEnsembleModes) {
@@ -254,6 +259,11 @@ TEST_F(MachineLearningDetectorTest, EnumNameHelpersStayStableForOperationalTelem
     EXPECT_EQ(Engine::GetFeatureCategoryName(Engine::FeatureCategory::Entropy), "Entropy");
     EXPECT_EQ(Engine::GetClassificationName(Engine::Classification::Ransomware), "Ransomware");
     EXPECT_EQ(Engine::GetModelStatusName(Engine::ModelStatus::Disabled), "Disabled");
+    EXPECT_EQ(Engine::GetModelArchitectureName(static_cast<Engine::ModelArchitecture>(255)), "Unknown");
+    EXPECT_EQ(Engine::GetInferenceDeviceName(static_cast<Engine::InferenceDevice>(255)), "Unknown");
+    EXPECT_EQ(Engine::GetFeatureCategoryName(static_cast<Engine::FeatureCategory>(255)), "Unknown");
+    EXPECT_EQ(Engine::GetClassificationName(static_cast<Engine::Classification>(255)), "Unknown");
+    EXPECT_EQ(Engine::GetModelStatusName(static_cast<Engine::ModelStatus>(255)), "Unknown");
 }
 
 }  // namespace ShadowStrike::Core::Engine::Test

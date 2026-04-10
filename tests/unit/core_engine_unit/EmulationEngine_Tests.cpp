@@ -140,8 +140,24 @@ TEST_F(EmulationEngineTest, FreeHelpersPreservePackedPeOepAndApiClassificationCo
     upxMarkedPe[sizeof(IMAGE_DOS_HEADER) + 7] = '!';
     EXPECT_TRUE(Engine::IsPELikelyPacked(upxMarkedPe));
 
-    const std::vector<uint8_t> memoryDump = {0x90, 0x90, 0x55, 0x8B, 0xEC, 0x90};
+    std::vector<uint8_t> mpressMarkedPe(sizeof(IMAGE_DOS_HEADER) + 32, 0x00);
+    auto* mpressDos = reinterpret_cast<IMAGE_DOS_HEADER*>(mpressMarkedPe.data());
+    mpressDos->e_magic = IMAGE_DOS_SIGNATURE;
+    mpressDos->e_lfanew = static_cast<LONG>(sizeof(IMAGE_DOS_HEADER));
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 4] = 'M';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 5] = 'P';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 6] = 'R';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 7] = 'E';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 8] = 'S';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 9] = 'S';
+    mpressMarkedPe[sizeof(IMAGE_DOS_HEADER) + 10] = '1';
+    EXPECT_TRUE(Engine::IsPELikelyPacked(mpressMarkedPe));
+
+    const std::vector<uint8_t> memoryDump = {0x90, 0x90, 0x55, 0x8B, 0xEC, 0x90, 0x90, 0x90};
     EXPECT_EQ(Engine::DetectOEP(memoryDump, 0x140000000ULL), 0x140000002ULL);
+
+    const std::vector<uint8_t> x64MemoryDump = {0x90, 0x48, 0x89, 0xE5, 0x90, 0x90, 0x90, 0x90};
+    EXPECT_EQ(Engine::DetectOEP(x64MemoryDump, 0x180000000ULL), 0x180000001ULL);
 
     std::vector<uint8_t> oversizedDump(1024 * 1024 + 8, 0x90);
     oversizedDump[1024 * 1024 + 1] = 0x55;
@@ -158,6 +174,9 @@ TEST_F(EmulationEngineTest, FreeHelpersPreservePackedPeOepAndApiClassificationCo
     EXPECT_EQ(
         Engine::CategorizeAPI("kernel32.dll", "LoadLibraryA"),
         Engine::APICategory::DynamicCode);
+    EXPECT_EQ(
+        Engine::CategorizeAPI("advapi32.dll", "RegSetValueExW"),
+        Engine::APICategory::Registry);
 
     EXPECT_EQ(
         Engine::AssessAPISeverity("kernel32.dll", "WriteProcessMemory", {}),
@@ -171,6 +190,9 @@ TEST_F(EmulationEngineTest, FreeHelpersPreservePackedPeOepAndApiClassificationCo
     EXPECT_EQ(
         Engine::AssessAPISeverity("kernel32.dll", "CreateFileW", {}),
         Engine::APISeverity::Low);
+    EXPECT_EQ(
+        Engine::AssessAPISeverity("winhttp.dll", "WinHttpOpen", {}),
+        Engine::APISeverity::Medium);
     EXPECT_EQ(
         Engine::AssessAPISeverity("kernel32.dll", "GetTickCount", {}),
         Engine::APISeverity::Benign);
