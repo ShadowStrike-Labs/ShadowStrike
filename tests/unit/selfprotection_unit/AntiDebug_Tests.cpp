@@ -19,6 +19,13 @@ TEST(AntiDebugTests, ProtectionPresetsAndValidationStayConsistent) {
     EXPECT_EQ(disabled.monitoringMode, MonitoringMode::Disabled);
     EXPECT_FALSE(disabled.enableCodeIntegrity);
     EXPECT_FALSE(disabled.enableHookDetection);
+    EXPECT_FALSE(disabled.enableTimingDetection);
+    EXPECT_FALSE(disabled.enableExceptionDetection);
+    EXPECT_FALSE(disabled.enableProcessDetection);
+    EXPECT_FALSE(disabled.enableHardwareDetection);
+    EXPECT_FALSE(disabled.autoHideThreads);
+    EXPECT_FALSE(disabled.autoClearDebugRegisters);
+    EXPECT_FALSE(disabled.sendTelemetry);
 
     const AntiDebugConfiguration paranoid =
         AntiDebugConfiguration::FromProtectionLevel(AntiDebugProtectionLevel::Paranoid);
@@ -95,7 +102,12 @@ TEST(AntiDebugTests, DetectionResultJsonAndDebugRegistersCaptureCoreSignals) {
     registers.dr7 = 0xFF;
 
     EXPECT_TRUE(registers.HasBreakpoints());
-    EXPECT_EQ(registers.GetActiveBreakpointCount(), 2U);
+    EXPECT_EQ(registers.GetActiveBreakpointCount(), 4U);
+
+    registers.Clear();
+    registers.dr7 = 0x1;
+    EXPECT_TRUE(registers.HasBreakpoints());
+    EXPECT_EQ(registers.GetActiveBreakpointCount(), 1U);
 
     registers.Clear();
     EXPECT_FALSE(registers.HasBreakpoints());
@@ -129,10 +141,10 @@ TEST(AntiDebugTests, StatisticsResetAndHelperNamesRemainStable) {
     EXPECT_EQ(stats.actionsExecuted, 0ULL);
     EXPECT_EQ(stats.threadsHidden, 0ULL);
     EXPECT_EQ(stats.maxCheckDurationUs, 0ULL);
-    EXPECT_EQ(stats.detectionsByTechnique.at(DetectionTechnique::Timing_RDTSC), 2ULL);
-    EXPECT_EQ(stats.detectionsByType.at(DebuggerType::KernelMode), 1ULL);
-    EXPECT_EQ(stats.lastDetectionTime, lastDetection);
-    EXPECT_EQ(stats.lastCheckTime, lastCheck);
+    EXPECT_TRUE(stats.detectionsByTechnique.empty());
+    EXPECT_TRUE(stats.detectionsByType.empty());
+    EXPECT_EQ(stats.lastDetectionTime, Clock::time_point{});
+    EXPECT_EQ(stats.lastCheckTime, Clock::time_point{});
 
     const json payload = ParseJson(stats.ToJson());
     EXPECT_EQ(payload.at("threadsHidden").get<int>(), 0);
