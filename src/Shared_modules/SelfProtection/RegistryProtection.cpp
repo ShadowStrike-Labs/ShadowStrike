@@ -2915,7 +2915,7 @@ std::string RegistryProtectionEvent::ToJson() const {
     json << "\"keyPath\":\"" << EscapeJsonString(WideToNarrow(keyPath)) << "\",";
     json << "\"valueName\":\"" << EscapeJsonString(WideToNarrow(valueName)) << "\",";
     json << "\"operation\":" << static_cast<uint32_t>(operation) << ",";
-    json << "\"decision\":" << static_cast<uint8_t>(decision) << ",";
+    json << "\"decision\":" << static_cast<uint32_t>(decision) << ",";
     json << "\"sourceProcessId\":" << sourceProcessId << ",";
     json << "\"sourceProcessName\":\"" << EscapeJsonString(WideToNarrow(sourceProcessName)) << "\",";
     json << "\"wasBlocked\":" << (wasBlocked ? "true" : "false") << ",";

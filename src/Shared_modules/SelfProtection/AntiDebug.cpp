@@ -4911,6 +4911,15 @@ AntiDebugConfiguration AntiDebugConfiguration::FromProtectionLevel(AntiDebugProt
             config.enabledTechniques = DetectionTechnique::None;
             config.responseActions = ResponseAction::None;
             config.monitoringMode = MonitoringMode::Disabled;
+            config.enableCodeIntegrity = false;
+            config.enableHookDetection = false;
+            config.enableTimingDetection = false;
+            config.enableExceptionDetection = false;
+            config.enableProcessDetection = false;
+            config.enableHardwareDetection = false;
+            config.autoHideThreads = false;
+            config.autoClearDebugRegisters = false;
+            config.sendTelemetry = false;
             break;
 
         case AntiDebugProtectionLevel::Minimal:
@@ -5026,11 +5035,14 @@ std::string DetectionResult::ToJson() const {
 
 uint32_t DebugRegisterState::GetActiveBreakpointCount() const noexcept {
     uint32_t count = 0;
+    const uintptr_t addresses[4] = {dr0, dr1, dr2, dr3};
 
-    if (dr0 != 0) count++;
-    if (dr1 != 0) count++;
-    if (dr2 != 0) count++;
-    if (dr3 != 0) count++;
+    for (uint32_t slot = 0; slot < 4; ++slot) {
+        const uintptr_t enableMask = static_cast<uintptr_t>(0x3u) << (slot * 2u);
+        if (addresses[slot] != 0 || (dr7 & enableMask) != 0) {
+            ++count;
+        }
+    }
 
     return count;
 }
@@ -5046,7 +5058,11 @@ void AntiDebugStatistics::Reset() noexcept {
     integrityViolations = 0;
     avgCheckDurationUs = 0;
     maxCheckDurationUs = 0;
+    detectionsByTechnique.clear();
+    detectionsByType.clear();
     startTime = Clock::now();
+    lastDetectionTime = TimePoint{};
+    lastCheckTime = TimePoint{};
 }
 
 std::string AntiDebugStatistics::ToJson() const {
