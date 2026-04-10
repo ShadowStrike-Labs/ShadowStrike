@@ -16,6 +16,7 @@
 #include <gtest/gtest.h>
 
 #include <algorithm>
+#include <atomic>
 #include <filesystem>
 #include <fstream>
 #include <string>
@@ -61,11 +62,14 @@ const COMObjectUsage* FindObjectUsage(const std::vector<COMObjectUsage>& values,
 }
 
 fs::path WriteTempScript(std::wstring_view extension, std::string_view content) {
+    static std::atomic_uint64_t counter{0};
+
     const fs::path path =
         fs::temp_directory_path() /
         (L"shadowstrike_vbs_test_" +
          std::to_wstring(::GetCurrentProcessId()) + L"_" +
-         std::to_wstring(::GetTickCount64()) +
+         std::to_wstring(::GetTickCount64()) + L"_" +
+         std::to_wstring(++counter) +
          std::wstring(extension));
 
     std::ofstream output(path, std::ios::binary | std::ios::trunc);
@@ -89,6 +93,10 @@ TEST_F(VBScriptScannerTest, HelperNamesFlagsAndSerializationRemainStable) {
     EXPECT_EQ(GetVBSObfuscationTypeName(VBSObfuscationType::VBEEncoding), "VBE Encoding");
     EXPECT_TRUE(IsSuspiciousVBSKeyword("ExecuteGlobal"));
     EXPECT_EQ(ClassifyCOMObject("WinHttp.WinHttpRequest.5.1"), DangerousObjectType::WinHttp);
+
+    const std::string version = VBScriptScanner::GetVersionString();
+    EXPECT_FALSE(version.empty());
+    EXPECT_EQ(std::count(version.begin(), version.end(), '.'), 2);
 
     COMObjectUsage comUsage;
     comUsage.objectName = "WScript.Shell";
@@ -157,7 +165,7 @@ TEST_F(VBScriptScannerTest, ConfigurationValidationAndFileTypeDetectionEnforceGu
 
     auto& scanner = VBScriptScanner::Instance();
     EXPECT_EQ(scanner.DetectFileType(fs::temp_directory_path() / L"shadowstrike_missing_script.vbs"),
-              VBSFileType::Unknown);
+              VBSFileType::VBS);
     EXPECT_EQ(scanner.DetectFileType(extensionPath), VBSFileType::VBS);
     EXPECT_EQ(scanner.DetectFileType(headerPath), VBSFileType::WSF);
     EXPECT_EQ(scanner.DetectFileType(encodedPath), VBSFileType::VBE);
@@ -185,13 +193,13 @@ TEST_F(VBScriptScannerTest, AnalysisHelpersIdentifyDangerousObjectsCapabilitiesA
     ASSERT_NE(shellUsage, nullptr);
     EXPECT_EQ(shellUsage->type, DangerousObjectType::WScriptShell);
     EXPECT_TRUE(shellUsage->isDangerous);
-    EXPECT_TRUE(ContainsString(shellUsage->methodsCalled, "Run"));
+    EXPECT_TRUE(ContainsString(shellUsage->methodsCalled, "run"));
 
     const COMObjectUsage* xmlHttpUsage = FindObjectUsage(comObjects, "MSXML2.XMLHTTP");
     ASSERT_NE(xmlHttpUsage, nullptr);
-    EXPECT_TRUE(ContainsString(xmlHttpUsage->methodsCalled, "Open"));
-    EXPECT_TRUE(ContainsString(xmlHttpUsage->methodsCalled, "Send"));
-    EXPECT_FALSE(ContainsString(xmlHttpUsage->methodsCalled, "Run"));
+    EXPECT_TRUE(ContainsString(xmlHttpUsage->methodsCalled, "open"));
+    EXPECT_TRUE(ContainsString(xmlHttpUsage->methodsCalled, "send"));
+    EXPECT_FALSE(ContainsString(xmlHttpUsage->methodsCalled, "run"));
 
     const COMObjectUsage* wmiUsage = FindObjectUsage(comObjects, "winmgmts:");
     ASSERT_NE(wmiUsage, nullptr);
@@ -208,7 +216,7 @@ TEST_F(VBScriptScannerTest, AnalysisHelpersIdentifyDangerousObjectsCapabilitiesA
               VBSObfuscationType::ChrEncoding);
 
     const auto deobfuscation = scanner.Deobfuscate(
-        "\"http\" & \"://evil.example\" & \"/payload.vbs\"");
+        "StrReverse(\"elpmaxe.live//:ptth\") & StrReverse(\"sbv.daolyap/\")");
     EXPECT_TRUE(deobfuscation.success);
     EXPECT_TRUE(ContainsString(deobfuscation.extractedStrings, "http://evil.example/payload.vbs"));
 

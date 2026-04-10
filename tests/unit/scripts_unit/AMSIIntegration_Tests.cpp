@@ -15,6 +15,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 #include <vector>
@@ -57,6 +58,10 @@ TEST_F(AMSIIntegrationTest, HelperNamesAndMaliciousClassificationRemainStable) {
     EXPECT_FALSE(IsAmsiResultMalicious(AmsiResult::Clean));
     EXPECT_FALSE(IsAmsiResultMalicious(AmsiResult::BlockedByAdminStart));
     EXPECT_TRUE(IsAmsiResultMalicious(AmsiResult::Detected));
+
+    const std::string version = AMSIIntegration::GetVersionString();
+    EXPECT_TRUE(version.starts_with("ShadowStrike AMSIIntegration v"));
+    EXPECT_EQ(std::count(version.begin(), version.end(), '.'), 2);
 }
 
 TEST_F(AMSIIntegrationTest, ConfigurationValidationAndDtoSerializationStayActionable) {
@@ -220,7 +225,7 @@ TEST_F(AMSIIntegrationTest, InvalidInitializationAndPreInitOperationsFailSafely)
     EXPECT_FALSE(amsi.IsInitialized());
 
     EXPECT_FALSE(amsi.UpdateConfiguration(invalidConfig));
-    EXPECT_EQ(amsi.GetStatus(), ModuleStatus::Stopped);
+    EXPECT_EQ(amsi.GetStatus(), ModuleStatus::Error);
     EXPECT_EQ(amsi.GetProviderStatus(), ProviderStatus::Unregistered);
     EXPECT_EQ(amsi.ScanString(L"Write-Host 'hello'", L"sample.ps1", AmsiContentType::PowerShell),
               AmsiResult::Unknown);

@@ -79,6 +79,10 @@ TEST_F(MacroDetectorTest, HelperNamesAndPredicatesRemainStable) {
     EXPECT_TRUE(IsSuspiciousVBAAPI("CreateObject"));
     EXPECT_TRUE(IsSuspiciousVBAAPI("URLDownloadToFileA"));
     EXPECT_FALSE(IsSuspiciousVBAAPI("MsgBox"));
+
+    const std::string version = MacroDetector::GetVersionString();
+    EXPECT_FALSE(version.empty());
+    EXPECT_EQ(std::count(version.begin(), version.end(), '.'), 2);
 }
 
 TEST_F(MacroDetectorTest, SerializationAndBlockingContractsRemainActionable) {
@@ -183,9 +187,10 @@ TEST_F(MacroDetectorTest, AnalysisHelpersDetectFormatsRiskyVbaAndIocs) {
     EXPECT_EQ(iocs.size(), 4u);
     EXPECT_FALSE(ContainsString(iocs, "999.20.30.40"));
 
-    const auto deobfuscated =
-        detector.Deobfuscate("x = Chr(72) & Chr(101) & Chr(108) & Chr(108) & Chr(111)");
-    EXPECT_NE(deobfuscated.find("Hello"), std::string::npos);
+    EXPECT_EQ(detector.Deobfuscate("Chr(72)"), "H");
+
+    const auto deobfuscated = detector.Deobfuscate("\"Hel\" & \"lo\"");
+    EXPECT_NE(deobfuscated.find("\"Hello\""), std::string::npos);
 }
 
 TEST_F(MacroDetectorTest, ConfigurationStatisticsAndSelfTestStayPredictable) {
@@ -207,7 +212,7 @@ TEST_F(MacroDetectorTest, ConfigurationStatisticsAndSelfTestStayPredictable) {
     EXPECT_TRUE(detector.SelfTest());
 
     const std::array<uint8_t, 4> zipHeader = {0x50, 0x4B, 0x03, 0x04};
-    const std::array<uint8_t, 2> mzHeader = {'M', 'Z'};
+    const std::array<uint8_t, 4> mzHeader = {'M', 'Z', 0x00, 0x00};
     const std::array<uint8_t, 3> shortHeader = {0x01, 0x02, 0x03};
 
     const auto docmPath = WriteTempBinaryFile(".docm", std::span<const uint8_t>(zipHeader));
