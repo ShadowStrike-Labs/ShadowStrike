@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -30,6 +31,10 @@ TEST(UpdateManagerTest, HelperNamesVersionParsingAndFormattingRemainStable) {
     EXPECT_EQ(GetChannelName(UpdateChannel::Enterprise), "Enterprise");
     EXPECT_EQ(GetDownloadStateName(DownloadState::Cancelled), "Cancelled");
     EXPECT_EQ(GetStatusName(static_cast<UpdateStatus>(0xFF)), "Unknown");
+
+    const std::string versionString = UpdateManager::GetVersionString();
+    EXPECT_FALSE(versionString.empty());
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     const auto parsed = ParseVersionString("3.14.159.26");
     ASSERT_TRUE(parsed.has_value());

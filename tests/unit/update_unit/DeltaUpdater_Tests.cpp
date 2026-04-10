@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <array>
 #include <string>
 #include <vector>
@@ -61,6 +62,10 @@ TEST(DeltaUpdaterTest, HelperNamesDetectionAndSizingRemainStable) {
     EXPECT_EQ(GetPatchStateName(PatchState::Completed), "Completed");
     EXPECT_EQ(GetAlgorithmName(static_cast<PatchAlgorithm>(0xFF)), "Unknown");
     EXPECT_EQ(GetPatchStateName(static_cast<PatchState>(0xFF)), "Unknown");
+
+    const std::string versionString = DeltaUpdater::GetVersionString();
+    EXPECT_FALSE(versionString.empty());
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     PatchHeader header;
     header.algorithm = PatchAlgorithm::XDelta3;
