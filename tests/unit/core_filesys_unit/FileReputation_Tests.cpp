@@ -222,6 +222,51 @@ TEST_F(FileReputationTest, CheckFileUsesHasherBackedWhitelistForRealOnDiskArtifa
     EXPECT_FALSE(result.md5.empty());
 }
 
+TEST_F(FileReputationTest, UnknownHashesPopulateCacheAndMarkSubsequentQueriesAsCached) {
+    auto& reputation = FileReputation::Instance();
+    ASSERT_TRUE(reputation.Initialize(FileReputationConfig::CreateOffline()));
+
+    const auto hash = MakeHexHash('7');
+
+    const auto first = reputation.CheckHash(hash, QueryMode::LocalOnly);
+    EXPECT_EQ(first.level, ReputationLevel::Unknown);
+    EXPECT_FALSE(first.fromCache);
+    EXPECT_EQ(reputation.GetCacheSize(), 1u);
+
+    const auto second = reputation.CheckHash(hash, QueryMode::LocalOnly);
+    EXPECT_EQ(second.level, ReputationLevel::Unknown);
+    EXPECT_TRUE(second.fromCache);
+    EXPECT_EQ(second.sha256, hash);
+    EXPECT_EQ(reputation.GetCacheSize(), 1u);
+}
+
+TEST_F(FileReputationTest, AsyncChecksWorkAfterShutdownAndReinitialize) {
+    auto& hasher = FileHasher::Instance();
+    auto hasherConfig = FileHasherConfig::CreateMinimal();
+    hasherConfig.enableCache = false;
+    ASSERT_TRUE(hasher.Initialize(hasherConfig));
+
+    auto& reputation = FileReputation::Instance();
+    ASSERT_TRUE(reputation.Initialize(FileReputationConfig::CreateOffline()));
+    reputation.Shutdown();
+    ASSERT_TRUE(reputation.Initialize(FileReputationConfig::CreateOffline()));
+
+    const auto filePath = WriteText(L"async-reputation.bin", "async reputation payload");
+    std::promise<ReputationResult> callbackPromise;
+
+    reputation.CheckFileAsync(filePath.wstring(), [&](const ReputationResult& result) {
+        callbackPromise.set_value(result);
+    });
+
+    auto future = callbackPromise.get_future();
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+
+    const auto result = future.get();
+    EXPECT_FALSE(result.sha256.empty());
+    EXPECT_EQ(result.level, ReputationLevel::Suspicious);
+    EXPECT_EQ(result.recommendation, "Investigate");
+}
+
 TEST_F(FileReputationTest, UnknownHashTriggersRegisteredCallback) {
     auto& reputation = FileReputation::Instance();
     ASSERT_TRUE(reputation.Initialize(FileReputationConfig::CreateOffline()));
@@ -269,6 +314,8 @@ TEST_F(FileReputationTest, CacheFacadeAndStatisticsResetExposeStableBehavior) {
     EXPECT_EQ(statsAfterReset.totalQueries.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(statsAfterReset.localHits.load(std::memory_order_relaxed), 0u);
 
+    EXPECT_EQ(reputation.GetCacheSize(), 1u);
+    reputation.ClearCache();
     EXPECT_EQ(reputation.GetCacheSize(), 0u);
     EXPECT_EQ(reputation.PreloadCache(WriteText(L"cache.rep", "cache").wstring()), 0u);
     EXPECT_TRUE(reputation.SaveCache(MakePath(L"cache-save.rep").wstring()));

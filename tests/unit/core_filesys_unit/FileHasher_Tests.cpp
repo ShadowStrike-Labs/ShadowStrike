@@ -34,6 +34,7 @@
 
 #include <chrono>
 #include <future>
+#include <thread>
 
 namespace {
 
@@ -172,6 +173,25 @@ TEST_F(FileHasherTest, ComputeFileHashesPopulateCacheAndStatisticsForOnDiskFile)
     EXPECT_GE(stats.cacheMisses, 1u);
 }
 
+TEST_F(FileHasherTest, CachedEntriesAreInvalidatedWhenFileContentsChange) {
+    auto& hasher = FileHasher::Instance();
+    const auto filePath = WriteText(L"mutable.bin", "original payload");
+
+    const auto firstHashes = hasher.ComputeAll(filePath.wstring(), HashAlgorithm::SHA256);
+    ASSERT_TRUE(firstHashes.hasSHA256);
+    ASSERT_TRUE(hasher.GetCached(filePath.wstring()).has_value());
+
+    std::this_thread::sleep_for(20ms);
+    const auto rewrittenPath = WriteText(L"mutable.bin", "updated payload");
+    EXPECT_EQ(rewrittenPath, filePath);
+
+    const auto secondHashes = hasher.ComputeAll(filePath.wstring(), HashAlgorithm::SHA256);
+    ASSERT_TRUE(secondHashes.hasSHA256);
+    EXPECT_NE(firstHashes.sha256Hex, secondHashes.sha256Hex);
+    ASSERT_TRUE(hasher.GetCached(filePath.wstring()).has_value());
+    EXPECT_EQ(hasher.GetCached(filePath.wstring())->sha256Hex, secondHashes.sha256Hex);
+}
+
 TEST_F(FileHasherTest, HeaderHashUsesRequestedPrefixOnly) {
     auto& hasher = FileHasher::Instance();
     const auto filePath = WriteText(L"prefix.bin", "abcdef");
@@ -250,6 +270,42 @@ TEST_F(FileHasherTest, AsyncComputeInvokesDirectAndRegisteredCallbacks) {
     EXPECT_EQ(directPromise.get_future().wait_for(5s), std::future_status::ready);
     EXPECT_EQ(registeredPromise.get_future().wait_for(5s), std::future_status::ready);
     EXPECT_TRUE(hasher.UnregisterHashCallback(callbackId));
+}
+
+TEST_F(FileHasherTest, FutureAsyncAndComparisonHelpersStayDeterministic) {
+    auto& hasher = FileHasher::Instance();
+
+    const auto leftPath = WriteText(L"compare-left.bin", "same payload");
+    const auto rightPath = WriteText(L"compare-right.bin", "same payload");
+    const auto differentPath = WriteText(L"compare-different.bin", "different payload");
+
+    auto future = hasher.ComputeAllAsync(leftPath.wstring(), HashAlgorithm::SHA256);
+    ASSERT_EQ(future.wait_for(5s), std::future_status::ready);
+    const auto leftHashes = future.get();
+    const auto rightHashes = hasher.ComputeAll(rightPath.wstring(), HashAlgorithm::SHA256);
+    const auto differentHashes = hasher.ComputeAll(differentPath.wstring(), HashAlgorithm::SHA256);
+
+    ASSERT_TRUE(leftHashes.hasSHA256);
+    ASSERT_TRUE(rightHashes.hasSHA256);
+    ASSERT_TRUE(differentHashes.hasSHA256);
+
+    const auto exactComparison = hasher.Compare(leftHashes, rightHashes);
+    EXPECT_TRUE(exactComparison.sha256Match);
+    EXPECT_TRUE(exactComparison.IsMatch());
+    EXPECT_TRUE(hasher.MatchesAny(leftHashes, { differentHashes, rightHashes }));
+    EXPECT_FALSE(hasher.MatchesAny(leftHashes, { differentHashes }));
+
+    EXPECT_DOUBLE_EQ(hasher.CompareFuzzyHash("", ""), 0.0);
+    EXPECT_EQ(hasher.ComputeTLSHDistance("", ""), UINT32_MAX);
+
+    auto updatedConfig = hasher.GetConfig();
+    updatedConfig.enableCache = false;
+    updatedConfig.workerThreads = 1;
+    hasher.UpdateConfig(updatedConfig);
+
+    const auto reloadedConfig = hasher.GetConfig();
+    EXPECT_FALSE(reloadedConfig.enableCache);
+    EXPECT_EQ(reloadedConfig.workerThreads, 1u);
 }
 
 TEST_F(FileHasherTest, SelfTestPassesAndStatisticsResetClearsObservedWork) {
