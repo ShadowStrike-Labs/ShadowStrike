@@ -40,8 +40,8 @@
 // ============================================================================
 
 #include <gtest/gtest.h>
-#include "../../../../src/ThreatIntel/ReputationCache.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
+#include "Shared_modules/ThreatIntel/ReputationCache.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
 #include <vector>
 #include <cstdint>
 #include <random>
@@ -80,9 +80,12 @@ protected:
 
     // Helper: Create CacheKey from specific value
     CacheKey CreateKeyFromValue(uint32_t value) {
-        IPv4Address addr;
-        addr.address = value;
-        return CacheKey(addr);
+        return CacheKey(IPv4Address::Create(
+            static_cast<uint8_t>((value >> 24) & 0xFF),
+            static_cast<uint8_t>((value >> 16) & 0xFF),
+            static_cast<uint8_t>((value >> 8) & 0xFF),
+            static_cast<uint8_t>(value & 0xFF),
+            32));
     }
 
     // Helper: Create hash array for testing

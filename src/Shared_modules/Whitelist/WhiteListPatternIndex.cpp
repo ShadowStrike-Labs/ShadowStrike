@@ -1485,9 +1485,13 @@ std::vector<uint64_t> PathIndex::Lookup(
                     // Check if queryPath (normalizedPath) ENDS WITH storedPattern
                     if (normalizedPath.length() >= storedPattern.length() &&
                         normalizedPath.substr(normalizedPath.length() - storedPattern.length()) == storedPattern) {
-                        // PI-7 fix: verify match at segment boundary to prevent partial matches
-                        size_t matchStart = normalizedPath.length() - storedPattern.length();
-                        if (matchStart == 0 || normalizedPath[matchStart - 1] == '/') {
+                        const size_t matchStart = normalizedPath.length() - storedPattern.length();
+                        const bool segmentScopedPattern = storedPattern.find('/') != std::string::npos;
+
+                        // Extension-style suffix rules such as ".dll" intentionally match in
+                        // the middle of the final path segment. Require a segment boundary only
+                        // for multi-segment suffix patterns like "system32/kernel32.dll".
+                        if (!segmentScopedPattern || matchStart == 0 || normalizedPath[matchStart - 1] == '/') {
                             results.push_back(node->entryOffset);
                         }
                     }

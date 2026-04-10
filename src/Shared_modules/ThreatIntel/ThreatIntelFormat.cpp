@@ -781,12 +781,8 @@ std::optional<IPv6Address> ParseIPv6(std::string_view str) noexcept {
         return std::nullopt;
     }
     
-    // Create IPv6Address from parsed bytes
-    IPv6Address ipv6;
-    std::memcpy(ipv6.address.data(), addr6.s6_addr, 16);
-    ipv6.prefixLength = prefixLength;
-    
-    return ipv6;
+    // Create IPv6Address from parsed bytes with deterministic reserved bytes.
+    return IPv6Address::Create(addr6.s6_addr, prefixLength);
 }
 
 // ----------------------------------------------------------------------------
@@ -864,9 +860,11 @@ std::optional<HashValue> ParseHashString(
             return std::nullopt;
         }
         
-        HashValue hash;
+        HashValue hash{};
         hash.algorithm = algo;
         hash.length = static_cast<uint8_t>(hashStr.length());
+        hash.reserved[0] = 0;
+        hash.reserved[1] = 0;
         
         // Clear buffer first for safety
         hash.data.fill(0);
@@ -896,9 +894,12 @@ std::optional<HashValue> ParseHashString(
     }
     
     // Parse hex string
-    HashValue hash;
+    HashValue hash{};
     hash.algorithm = algo;
     hash.length = expectedLength;
+    hash.reserved[0] = 0;
+    hash.reserved[1] = 0;
+    hash.data.fill(0);
     
     size_t parsed = ParseHexString(hashStr, hash.data.data(), hash.data.size());
     if (parsed != expectedLength) {

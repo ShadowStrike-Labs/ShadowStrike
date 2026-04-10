@@ -1295,23 +1295,9 @@ LookupResult WhitelistStore::IsPathWhitelisted(
         return result;
     }
     
-    // Bloom filter check for paths
-    if (options.useBloomFilter && m_bloomFilterEnabled.load(std::memory_order_acquire) && m_pathBloomFilter) {
-        // Compute FNV-1a hash of normalized path
-        uint64_t pathHash = 14695981039346656037ULL; // FNV offset basis
-        for (wchar_t c : normalizedPath) {
-            pathHash ^= static_cast<uint64_t>(c);
-            pathHash *= 1099511628211ULL; // FNV prime
-        }
-        
-        if (!m_pathBloomFilter->MightContain(pathHash)) {
-            m_bloomRejects.fetch_add(1, std::memory_order_relaxed);
-            m_totalMisses.fetch_add(1, std::memory_order_relaxed);
-            
-            result.lookupTimeNs = calculateElapsedNs();
-            return result;
-        }
-    }
+    // Path bloom pre-rejection is unsafe for prefix/suffix/glob/regex rules because the
+    // queried path hash intentionally differs from the stored pattern hash. Preserve
+    // correctness by letting the path index evaluate the full match semantics.
     
     // Path index lookup
     if (!m_pathIndex) {

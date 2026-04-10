@@ -44,13 +44,14 @@
 
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/SignatureBuilder.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/SignatureStore/SignatureBuilder.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <vector>
 #include <thread>
 #include <chrono>
+#include <iomanip>
 #include <sstream>
 #include <random>
 
@@ -241,7 +242,9 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromFileLongLine) {
     auto filePath = CreateTempFile(content, L"hashes_longline.txt");
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    // Should handle gracefully
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 0u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromFileLargeFile) {
@@ -330,7 +333,9 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromCsvMissingFields) {
     auto filePath = CreateTempFile(content, L"incomplete.csv");
     
     StoreError err = m_builder->ImportHashesFromCsv(filePath, ',');
-    // Should handle gracefully
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 0u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromCsvWithHeader) {
@@ -341,7 +346,11 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromCsvWithHeader) {
     auto filePath = CreateTempFile(content, L"hashes_with_header.csv");
     
     StoreError err = m_builder->ImportHashesFromCsv(filePath, ',');
-    // Should process, header might be treated as invalid entry
+    EXPECT_FALSE(err.IsSuccess())
+        << "A CSV header row should be reported as a partial-format failure.";
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 2u)
+        << "Valid rows after the header must still be imported.";
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromCsvLargeFile) {
@@ -359,7 +368,8 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromCsvWithWhitespace) {
     auto filePath = CreateTempFile(content, L"hashes_whitespace.csv");
     
     StoreError err = m_builder->ImportHashesFromCsv(filePath, ',');
-    // Should handle gracefully
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 2u);
 }
 
 // ============================================================================
@@ -370,7 +380,9 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonEmpty) {
     std::string content = "{}";
     
     StoreError err = m_builder->ImportHashesFromJson(content);
-    // Empty JSON should be handled
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 0u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonValidFormat) {
@@ -399,7 +411,9 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonInvalidJSON) {
     std::string content = "{ invalid json }";
     
     StoreError err = m_builder->ImportHashesFromJson(content);
-    // Should handle gracefully
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 0u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonMissingFields) {
@@ -410,26 +424,29 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonMissingFields) {
             "value": "5d41402abc4b2a76b9719d911017c592"
         }
     ]
-})";
+    })";
     
     StoreError err = m_builder->ImportHashesFromJson(content);
-    // Should handle missing fields
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 0u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonLargeArray) {
     std::stringstream ss;
     ss << "{ \"hashes\": [";
     
-    // Test with 1,000 entries - reasonable for unit test performance.
-    // Note: Using correct field names as expected by ImportHashesFromJson:
-    // - "hash" (not "value")
-    // - "threat_level" (not "level") - optional, defaults to 50
+    // Exercise large-array parsing with unique hashes. Duplicate handling is covered by
+    // dedicated tests elsewhere; this case should validate scale without conflating it
+    // with deduplication behavior.
     constexpr int ENTRY_COUNT = 1000;
     for (int i = 0; i < ENTRY_COUNT; ++i) {
         if (i > 0) ss << ",";
+        std::ostringstream hashStream;
+        hashStream << std::hex << std::setw(32) << std::setfill('0') << i;
         ss << R"({
             "type": "MD5",
-            "hash": "5d41402abc4b2a76b9719d911017c592",
+            "hash": ")" << hashStream.str() << R"(",
             "name": "hash)" << i << R"(",
             "threat_level": 50
         })";
@@ -438,8 +455,9 @@ TEST_F(SignatureBuilderImportTest, ImportHashesFromJsonLargeArray) {
     ss << "]}";
     
     StoreError err = m_builder->ImportHashesFromJson(ss.str());
-    // Should handle arrays - expect success or partial success
-    // since all entries have the same hash value (duplicates after first)
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingHashCount(), static_cast<size_t>(ENTRY_COUNT));
+    EXPECT_EQ(m_builder->GetStatistics().duplicatesRemoved, 0u);
 }
 
 // ============================================================================
@@ -468,42 +486,48 @@ TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileInvalidPath) {
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileValidPatterns) {
-    std::string content = "48:8B:05:??:??:??:??:pattern1:50\n";
-    content += "55:48:89:E5:pattern2:75\n";
-    content += "48:83:EC:??:pattern3:100\n";
+    std::string content = "48 8B 05 ?? ?? ?? ??:pattern1:50\n";
+    content += "55 48 89 E5:pattern2:75\n";
+    content += "48 83 EC ??:pattern3:100\n";
     
     auto filePath = CreateTempFile(content, L"patterns.txt");
     
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
-    // Should process patterns
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 3u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileWithComments) {
     std::string content = "# Patterns with comments\n";
-    content += "48:8B:05:pattern1:50\n";
+    content += "48 8B 05:pattern1:50\n";
     content += "; Another comment\n";
-    content += "55:48:89:E5:pattern2:75\n";
+    content += "55 48 89 E5:pattern2:75\n";
     
     auto filePath = CreateTempFile(content, L"patterns_comments.txt");
     
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 2u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileWithWildcards) {
-    std::string content = "48:??:05:pattern1:50\n";
-    content += "??:??:??:??:pattern2:75\n";
-    content += "48:[40 50 60]:05:pattern3:100\n";
+    std::string content = "48 ?? 05:pattern1:50\n";
+    content += "?? ?? ?? ??:pattern2:75\n";
+    content += "48 [40-60] 05:pattern3:100\n";
     
     auto filePath = CreateTempFile(content, L"patterns_wildcards.txt");
     
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 3u);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileLargeFile) {
     auto filePath = CreateLargeFile(550 * 1024 * 1024, L"huge_patterns.txt");
     
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
-    // Should reject or handle gracefully
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileInvalidFormat) {
@@ -513,7 +537,9 @@ TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileInvalidFormat) {
     auto filePath = CreateTempFile(content, L"invalid_patterns.txt");
     
     StoreError err = m_builder->ImportPatternsFromFile(filePath);
-    // Should handle gracefully
+    EXPECT_FALSE(err.IsSuccess());
+    EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 0u);
 }
 
 // ============================================================================
@@ -537,13 +563,14 @@ TEST_F(SignatureBuilderImportTest, ImportPatternsFromClamAVEmpty) {
 }
 
 TEST_F(SignatureBuilderImportTest, ImportPatternsFromClamAVValidFormat) {
-    // ClamAV format: Name:Hash:Offset:SizeOrWildcard:PatternData
-    std::string content = "Trojan.Win32.Test:5d41402abc4b2a76b9719d911017c592:0:*:48 8B 05\n";
+    // ClamAV format: Name:TargetType:Offset:Signature
+    std::string content = "Trojan.Win32.Test:0:*:48 8B 05\n";
     
     auto filePath = CreateTempFile(content, L"clamav.txt");
     
     StoreError err = m_builder->ImportPatternsFromClamAV(filePath);
-    // Should process ClamAV format
+    EXPECT_TRUE(err.IsSuccess());
+    EXPECT_EQ(m_builder->GetPendingPatternCount(), 1u);
 }
 
 // ============================================================================
@@ -817,8 +844,8 @@ TEST_F(SignatureBuilderImportTest, ConcurrentHashImports) {
 }
 
 TEST_F(SignatureBuilderImportTest, ConcurrentPatternImports) {
-    std::string content = "48:8B:05:pattern1:50\n";
-    content += "55:48:89:E5:pattern2:75\n";
+    std::string content = "48 8B 05:pattern1:50\n";
+    content += "55 48 89 E5:pattern2:75\n";
     
     auto filePath = CreateTempFile(content, L"concurrent_patterns.txt");
     
@@ -840,7 +867,7 @@ TEST_F(SignatureBuilderImportTest, MixedConcurrentImports) {
     std::string hashContent = "MD5:5d41402abc4b2a76b9719d911017c592:hash1:50\n";
     auto hashFile = CreateTempFile(hashContent, L"concurrent_mixed_hashes.txt");
     
-    std::string patternContent = "48:8B:05:pattern1:50\n";
+    std::string patternContent = "48 8B 05:pattern1:50\n";
     auto patternFile = CreateTempFile(patternContent, L"concurrent_mixed_patterns.txt");
     
     std::array<std::thread,2> threads;
@@ -871,9 +898,17 @@ TEST_F(SignatureBuilderImportTest, ImportHashesPreservesData) {
     auto filePath = CreateTempFile(content, L"integrity_test.txt");
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    
-    // Verify data is preserved (would need access to internal state)
-    // This is a placeholder for actual data verification
+
+    auto expectedHash = Format::ParseHashString("5d41402abc4b2a76b9719d911017c592",
+                                                HashType::MD5);
+    ASSERT_TRUE(expectedHash.has_value());
+    EXPECT_TRUE(err.IsSuccess()) << "Hash import should succeed for a valid MD5 entry.";
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 1u)
+        << "Exactly one valid hash should be queued after import.";
+    EXPECT_TRUE(m_builder->HasHash(*expectedHash))
+        << "Imported hash must remain queryable through the builder's deduplication index.";
+    EXPECT_EQ(m_builder->GetStatistics().duplicatesRemoved, 0u)
+        << "A single-entry import must not report duplicate removals.";
 }
 
 TEST_F(SignatureBuilderImportTest, ImportDuplicateHandling) {
@@ -883,7 +918,16 @@ TEST_F(SignatureBuilderImportTest, ImportDuplicateHandling) {
     auto filePath = CreateTempFile(content, L"duplicates.txt");
     
     StoreError err = m_builder->ImportHashesFromFile(filePath);
-    // Should handle duplicates according to deduplication policy
+
+    auto duplicateHash = Format::ParseHashString("5d41402abc4b2a76b9719d911017c592",
+                                                 HashType::MD5);
+    ASSERT_TRUE(duplicateHash.has_value());
+    EXPECT_TRUE(err.IsSuccess()) << "Duplicate rows should be handled gracefully, not fail the import.";
+    EXPECT_EQ(m_builder->GetPendingHashCount(), 1u)
+        << "Deduplication must retain a single pending hash for duplicate input rows.";
+    EXPECT_TRUE(m_builder->HasHash(*duplicateHash));
+    EXPECT_GE(m_builder->GetStatistics().duplicatesRemoved, 1u)
+        << "Duplicate imports must increment duplicate-removal statistics.";
 }
 
 // ============================================================================
@@ -927,7 +971,7 @@ TEST_F(SignatureBuilderImportTest, DISABLED_BenchmarkHashImport) {
 TEST_F(SignatureBuilderImportTest, DISABLED_BenchmarkPatternImport) {
     std::stringstream ss;
     for (int i = 0; i < 50000; ++i) {
-        ss << "48:8B:05:??:??:??:??:pattern_" << i << ":50\n";
+        ss << "48 8B 05 ?? ?? ?? ??:pattern_" << i << ":50\n";
     }
     
     auto filePath = CreateTempFile(ss.str(), L"benchmark_patterns.txt");

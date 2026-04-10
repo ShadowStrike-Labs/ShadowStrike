@@ -489,10 +489,9 @@ bool IPv6PatriciaTrie::Insert(const IPv6Address& addr, const IndexValue& value) 
         // Move to context
         curr = childRef.get();
 
-        // If we found an existing terminal node with the same key, update it
+        // If we found an existing terminal node with the same canonical key, update it
         if (curr->isTerminal) {
-            // Safely compare the 16-byte address array
-            if (std::memcmp(curr->key.address.data(), addr.address.data(), 16) == 0) {
+            if (curr->key == addr) {
                 curr->value = value; // Update performance statistics or entry ID
                 return true;
             }
@@ -510,7 +509,7 @@ bool IPv6PatriciaTrie::Lookup(const IPv6Address& addr, IndexValue& outValue) con
         const bool bitValue = GetBit(addr, bit);
         node = bitValue ? node->right.get() : node->left.get();
         
-        if (node && node->isTerminal && std::memcmp(&node->key, &addr, sizeof(addr)) == 0) {
+        if (node && node->isTerminal && node->key == addr) {
             outValue = node->value;
             return true;
         }
@@ -533,7 +532,7 @@ bool IPv6PatriciaTrie::Remove(const IPv6Address& addr) {
         const bool bitValue = GetBit(addr, bit);
         node = bitValue ? node->right.get() : node->left.get();
         
-        if (node && node->isTerminal && std::memcmp(&node->key, &addr, sizeof(addr)) == 0) {
+        if (node && node->isTerminal && node->key == addr) {
             node->isTerminal = false;
             node->value = {};
             if (m_entryCount > 0) --m_entryCount;  // Track actual entries
