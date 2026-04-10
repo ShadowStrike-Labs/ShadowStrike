@@ -101,7 +101,7 @@ TEST(LockyDetectorValueContractTests, ConfigStatisticsHelpersAndVersionRemainSta
     EXPECT_EQ(GetLockyVariantName(LockyVariant::Original), "Original (.locky)");
     EXPECT_EQ(GetLockyVariantName(LockyVariant::Lukitus), "Lukitus");
     EXPECT_EQ(GetDetectionConfidenceName(DetectionConfidence::Confirmed), "Confirmed");
-    EXPECT_EQ(GetDetectionConfidenceName(static_cast<DetectionConfidence>(0xFF)), "None");
+    EXPECT_EQ(GetDetectionConfidenceName(static_cast<DetectionConfidence>(0xFF)), "Unknown");
     EXPECT_EQ(GetLockyExtension(LockyVariant::Thor), L".thor");
     EXPECT_EQ(GetLockyExtension(LockyVariant::Ykcol), L".ykcol");
     EXPECT_EQ(GetLockyVariantName(static_cast<LockyVariant>(0xFF)), "Unknown");

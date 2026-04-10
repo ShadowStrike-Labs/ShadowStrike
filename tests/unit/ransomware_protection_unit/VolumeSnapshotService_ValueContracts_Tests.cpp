@@ -142,7 +142,7 @@ TEST(VolumeSnapshotServiceValueContractTests, ConfigStatisticsHelpersAndVersionR
     EXPECT_EQ(GetSnapshotTypeName(SnapshotType::Transportable), "Transportable");
     EXPECT_EQ(GetSnapshotStateName(SnapshotState::Committed), "Committed");
     EXPECT_EQ(GetWriterStateName(WriterState::Failed), "Failed");
-    EXPECT_EQ(GetVSSResultName(static_cast<VSSResult>(0xFF)), "Unknown");
+    EXPECT_EQ(GetVSSResultName(static_cast<VSSResult>(0xFF)), "UnknownError");
     EXPECT_EQ(VolumeSnapshotService::GetVersionString(), "3.1.0");
 }
 

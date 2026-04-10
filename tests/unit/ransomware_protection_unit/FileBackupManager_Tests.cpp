@@ -95,6 +95,19 @@ TEST(FileBackupManagerValueTests, ConfigurationPoliciesStatisticsUtilitiesAndVer
     policy.enabled = false;
     EXPECT_FALSE(policy.ShouldBackup(L"C:\\Data\\report.docx", 128));
 
+    BackupPolicy filteredPolicy;
+    filteredPolicy.includeExtensions = { L".docx" };
+    EXPECT_TRUE(filteredPolicy.ShouldBackup(L"C:\\Data\\report.docx", 128));
+    EXPECT_FALSE(filteredPolicy.ShouldBackup(L"C:\\Data\\report.txt", 128));
+
+    filteredPolicy.includeDirectories = { LR"(C:\Data\Protected)" };
+    EXPECT_TRUE(filteredPolicy.ShouldBackup(L"C:\\Data\\Protected\\report.docx", 128));
+    EXPECT_FALSE(filteredPolicy.ShouldBackup(L"C:\\Data\\ProtectedOld\\report.docx", 128));
+
+    filteredPolicy.excludeDirectories = { LR"(C:\Data\Protected\Blocked)" };
+    EXPECT_FALSE(filteredPolicy.ShouldBackup(L"C:\\Data\\Protected\\Blocked\\report.docx", 128));
+    EXPECT_TRUE(filteredPolicy.ShouldBackup(L"C:\\Data\\Protected\\Blocked-Archive\\report.docx", 128));
+
     BackupStatistics stats;
     stats.filesBackedUp.store(4, std::memory_order_relaxed);
     stats.filesRestored.store(3, std::memory_order_relaxed);
@@ -265,10 +278,58 @@ TEST_F(FileBackupManagerTest, DiskBackupsRollbackModifiedFilesAndCommitRemovesCa
     EXPECT_EQ(stats.filesCommitted, 1u);
 }
 
+TEST_F(FileBackupManagerTest, DiskRestoresRejectTamperedAndMissingBackupArtifacts) {
+    auto& manager = FileBackupManager::Instance();
+
+    const auto tamperedSource = WriteText(L"docs\\tampered.txt", "original-bytes");
+    const auto tamperedId = manager.BackupFileTo(tamperedSource.wstring(), 4303, BackupStorageType::Disk);
+    ASSERT_TRUE(tamperedId.has_value());
+
+    const auto tamperedBackup = manager.GetBackup(tamperedSource.wstring(), 4303);
+    ASSERT_TRUE(tamperedBackup.has_value());
+    ASSERT_NE(::SetFileAttributesW(tamperedBackup->backupPath.c_str(), FILE_ATTRIBUTE_NORMAL), 0);
+    {
+        std::ofstream stream(fs::path(tamperedBackup->backupPath), std::ios::binary | std::ios::trunc);
+        ASSERT_TRUE(stream.is_open());
+        stream << "tampered-backup";
+        ASSERT_TRUE(stream.good());
+    }
+
+    const auto tamperedRestore = manager.RestoreFile(*tamperedId);
+    EXPECT_EQ(tamperedRestore.status, RestoreStatus::Corrupted);
+    EXPECT_THAT(tamperedRestore.errorMessage, HasSubstr("hash mismatch"));
+    EXPECT_FALSE(tamperedRestore.integrityVerified);
+
+    const auto missingSource = WriteText(L"docs\\missing.txt", "recover-me");
+    const auto missingId = manager.BackupFileTo(missingSource.wstring(), 4304, BackupStorageType::Disk);
+    ASSERT_TRUE(missingId.has_value());
+
+    const auto missingBackup = manager.GetBackup(missingSource.wstring(), 4304);
+    ASSERT_TRUE(missingBackup.has_value());
+    ASSERT_NE(::SetFileAttributesW(missingBackup->backupPath.c_str(), FILE_ATTRIBUTE_NORMAL), 0);
+    std::error_code removeError;
+    EXPECT_TRUE(fs::remove(fs::path(missingBackup->backupPath), removeError));
+    EXPECT_FALSE(removeError);
+
+    const auto missingRestore = manager.RestoreFile(*missingId);
+    EXPECT_EQ(missingRestore.status, RestoreStatus::Failed);
+    EXPECT_THAT(missingRestore.errorMessage, HasSubstr("missing from disk"));
+    EXPECT_FALSE(missingRestore.integrityVerified);
+
+    const auto stats = manager.GetStatistics();
+    EXPECT_EQ(stats.filesBackedUp, 2u);
+    EXPECT_EQ(stats.filesRestored, 0u);
+    EXPECT_EQ(stats.restoreFailures, 2u);
+}
+
 TEST_F(FileBackupManagerTest, CacheInternalPathsExcludedPoliciesAndMissingRestoresReturnSafeDefaults) {
     auto& manager = FileBackupManager::Instance();
     const auto protectedInternal = WriteText(L"cache\\internal.txt", "internal-cache-file");
     const auto external = WriteText(L"docs\\external.txt", "candidate");
+    const auto included = WriteText(L"docs\\scope\\kept.bin", "kept");
+    const auto includeSibling = WriteText(L"docs\\scope-archive\\skipped.bin", "skipped");
+    const auto excluded = WriteText(L"docs\\temp\\blocked.bin", "blocked");
+    const auto excludeSibling = WriteText(L"docs\\temp-archive\\allowed.bin", "allowed");
 
     EXPECT_FALSE(manager.BackupFile(protectedInternal.wstring(), 5001));
 
@@ -276,9 +337,22 @@ TEST_F(FileBackupManagerTest, CacheInternalPathsExcludedPoliciesAndMissingRestor
     excludedPolicy.excludeExtensions = { L".txt" };
     EXPECT_FALSE(manager.BackupFileEx(external.wstring(), 5001, excludedPolicy).has_value());
 
+    BackupPolicy includeDirectoryPolicy;
+    includeDirectoryPolicy.includeDirectories = { MakePath(L"docs\\scope").wstring() };
+    EXPECT_TRUE(manager.BackupFileEx(included.wstring(), 5002, includeDirectoryPolicy).has_value());
+    EXPECT_FALSE(manager.BackupFileEx(includeSibling.wstring(), 5002, includeDirectoryPolicy).has_value());
+
+    BackupPolicy excludeDirectoryPolicy;
+    excludeDirectoryPolicy.excludeDirectories = { MakePath(L"docs\\temp").wstring() };
+    EXPECT_FALSE(manager.BackupFileEx(excluded.wstring(), 5003, excludeDirectoryPolicy).has_value());
+    EXPECT_TRUE(manager.BackupFileEx(excludeSibling.wstring(), 5003, excludeDirectoryPolicy).has_value());
+
     const auto missing = manager.RestoreFile("missing-backup-id");
     EXPECT_EQ(missing.status, RestoreStatus::NotFound);
     EXPECT_THAT(missing.errorMessage, HasSubstr("not found"));
+
+    manager.CommitChanges(5002);
+    manager.CommitChanges(5003);
 
     const auto statsBeforeCommit = manager.GetStatistics();
     manager.CommitBackup("missing-backup-id");

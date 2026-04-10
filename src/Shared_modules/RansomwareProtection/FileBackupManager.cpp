@@ -126,6 +126,97 @@ namespace {
         return ShadowStrike::Utils::HashUtils::Equal(a.data(), b.data(), 32);
     }
 
+    [[nodiscard]] std::wstring NormalizePolicyPath(std::wstring_view path) {
+        if (path.empty()) {
+            return {};
+        }
+
+        std::wstring normalized(path);
+        std::replace(normalized.begin(), normalized.end(), L'/', L'\\');
+        std::transform(normalized.begin(), normalized.end(), normalized.begin(),
+                       [](wchar_t ch) { return static_cast<wchar_t>(::towlower(ch)); });
+
+        while (normalized.size() > 3 && !normalized.empty() && normalized.back() == L'\\') {
+            normalized.pop_back();
+        }
+
+        return normalized;
+    }
+
+    [[nodiscard]] std::wstring NormalizeDirectoryPrefix(std::wstring_view directory) {
+        std::wstring normalized = NormalizePolicyPath(directory);
+        if (!normalized.empty() && normalized.back() != L'\\') {
+            normalized.push_back(L'\\');
+        }
+        return normalized;
+    }
+
+    [[nodiscard]] bool HasDirectoryPrefix(std::wstring_view normalizedPath,
+                                          std::wstring_view normalizedDirectory) {
+        if (normalizedPath.empty() || normalizedDirectory.empty() ||
+            normalizedPath.size() < normalizedDirectory.size()) {
+            return false;
+        }
+
+        return normalizedPath.compare(0, normalizedDirectory.size(), normalizedDirectory) == 0;
+    }
+
+    [[nodiscard]] bool MatchesExtensionList(std::wstring_view extension,
+                                            const std::vector<std::wstring>& filterList) {
+        for (const auto& filter : filterList) {
+            if (extension == NormalizePolicyPath(filter)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    [[nodiscard]] bool IsPathAllowedByPolicy(
+        std::wstring_view normalizedPath,
+        const ShadowStrike::Ransomware::BackupPolicy& policy)
+    {
+        auto dotPos = normalizedPath.find_last_of(L'.');
+        if (dotPos != std::wstring::npos) {
+            const std::wstring extension(normalizedPath.substr(dotPos));
+            if (MatchesExtensionList(extension, policy.excludeExtensions)) {
+                return false;
+            }
+
+            if (!policy.includeExtensions.empty() &&
+                !MatchesExtensionList(extension, policy.includeExtensions)) {
+                return false;
+            }
+        } else if (!policy.includeExtensions.empty()) {
+            return false;
+        }
+
+        if (!policy.includeDirectories.empty()) {
+            bool matchedIncludeDirectory = false;
+            for (const auto& directory : policy.includeDirectories) {
+                const auto normalizedDirectory = NormalizeDirectoryPrefix(directory);
+                if (!normalizedDirectory.empty() &&
+                    HasDirectoryPrefix(normalizedPath, normalizedDirectory)) {
+                    matchedIncludeDirectory = true;
+                    break;
+                }
+            }
+
+            if (!matchedIncludeDirectory) {
+                return false;
+            }
+        }
+
+        for (const auto& directory : policy.excludeDirectories) {
+            const auto normalizedDirectory = NormalizeDirectoryPrefix(directory);
+            if (!normalizedDirectory.empty() &&
+                HasDirectoryPrefix(normalizedPath, normalizedDirectory)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
     [[nodiscard]] uint64_t FileTimeToUint64(const FILETIME& ft) noexcept {
         return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
     }
@@ -245,27 +336,12 @@ public:
     }
 
     [[nodiscard]] bool IsPathExcluded(const std::wstring& path, const BackupPolicy& policy) const {
-        auto dotPos = path.find_last_of(L'.');
-        if (dotPos != std::wstring::npos) {
-            std::wstring ext = Utils::StringUtils::ToLowerCopy(path.substr(dotPos));
-            for (const auto& excl : policy.excludeExtensions) {
-                if (ext == Utils::StringUtils::ToLowerCopy(excl)) return true;
-            }
-            if (!policy.includeExtensions.empty()) {
-                bool found = false;
-                for (const auto& incl : policy.includeExtensions) {
-                    if (ext == Utils::StringUtils::ToLowerCopy(incl)) { found = true; break; }
-                }
-                if (!found) return true;
-            }
+        const std::wstring normalizedPath = NormalizePolicyPath(path);
+        if (normalizedPath.empty()) {
+            return true;
         }
-        std::wstring lowerPath = Utils::StringUtils::ToLowerCopy(path);
-        for (const auto& dir : policy.excludeDirectories) {
-            if (Utils::StringUtils::StartsWith(lowerPath, Utils::StringUtils::ToLowerCopy(dir))) {
-                return true;
-            }
-        }
-        return false;
+
+        return !IsPathAllowedByPolicy(normalizedPath, policy);
     }
 
     // ========================================================================
@@ -1338,7 +1414,11 @@ void BackupStatistics::Reset() noexcept {
     if (!enabled) return false;
     if (fileSize > maxFileSize) return false;
     if (fileSize == 0) return false;
-    return true;
+
+    const std::wstring normalizedPath = NormalizePolicyPath(filePath);
+    if (normalizedPath.empty()) return false;
+
+    return IsPathAllowedByPolicy(normalizedPath, *this);
 }
 
 // ============================================================================
