@@ -179,6 +179,29 @@ TEST_F(PerformanceProfilerTest, SessionReplacementAndNameLengthLimitsResetStateD
     EXPECT_EQ(profiler.GetAverageExecutionTimeMs(rejectedProfileName), 0.0);
 }
 
+TEST_F(PerformanceProfilerTest, SessionReplacementClearsInflightProfilesBeforeNewSessionStarts) {
+    profiler.StartSession("first-session");
+    profiler.StartProfile("carryover-profile");
+    ASSERT_EQ(profiler.GetActiveProfileCount(), 1u);
+
+    profiler.StartSession("second-session");
+    EXPECT_TRUE(profiler.IsSessionActive());
+    EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
+
+    const json report = ParseJson(profiler.GenerateReport());
+    EXPECT_EQ(report["session"], "second-session");
+    EXPECT_TRUE(report["statistics"].empty());
+    EXPECT_TRUE(report["events"].empty());
+
+    profiler.StopProfile("carryover-profile");
+    EXPECT_EQ(profiler.GetAverageExecutionTimeMs("carryover-profile"), 0.0);
+
+    profiler.StartProfile("second-session-profile");
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+    profiler.StopProfile("second-session-profile");
+    EXPECT_GT(profiler.GetAverageExecutionTimeMs("second-session-profile"), 0.0);
+}
+
 TEST_F(PerformanceProfilerTest, SaveReportRejectsUnsafePathsAndWritesTempReport) {
     EXPECT_FALSE(profiler.SaveReport({}));
     EXPECT_FALSE(profiler.SaveReport(std::filesystem::path(L"\\\\?\\C:\\unsafe-report.json")));
@@ -244,17 +267,12 @@ TEST_F(PerformanceProfilerTest, ClearHistoryRemovesInflightProfilesAndLateStopsR
     EXPECT_EQ(profiler.GetAverageExecutionTimeMs("inflight"), 0.0);
 }
 
-TEST_F(PerformanceProfilerTest, DisablingBeforeStopLeavesInflightProfileUntilReenabled) {
+TEST_F(PerformanceProfilerTest, DisablingBeforeStopStillDrainsInflightProfilesSafely) {
     profiler.StartSession("disable-inflight");
     profiler.StartProfile("stuck-profile");
     ASSERT_EQ(profiler.GetActiveProfileCount(), 1u);
 
     profiler.SetEnabled(false);
-    profiler.StopProfile("stuck-profile");
-    EXPECT_EQ(profiler.GetActiveProfileCount(), 1u);
-
-    profiler.SetEnabled(true);
-    std::this_thread::sleep_for(std::chrono::milliseconds(2));
     profiler.StopProfile("stuck-profile");
     EXPECT_EQ(profiler.GetActiveProfileCount(), 0u);
     EXPECT_GT(profiler.GetAverageExecutionTimeMs("stuck-profile"), 0.0);

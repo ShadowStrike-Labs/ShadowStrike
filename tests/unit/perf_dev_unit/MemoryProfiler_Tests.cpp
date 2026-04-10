@@ -54,6 +54,8 @@ TEST_F(MemoryProfilerTest, ConfigValidationRejectsOutOfRangeValues) {
     config.samplingIntervalMs = 2000;
 
     config.historySize = 3;
+    EXPECT_FALSE(config.IsValid());
+    config.minSamplesForLeakDetection = 3;
     EXPECT_TRUE(config.IsValid());
     config.historySize = 10000;
     EXPECT_TRUE(config.IsValid());
@@ -254,6 +256,32 @@ TEST_F(MemoryProfilerTest, ProcessTrackingRetainsSelfUnderTightCapsAndShutdownCl
     profiler.Shutdown();
     EXPECT_FALSE(profiler.GetProcessInfo(selfPid).has_value());
     EXPECT_TRUE(profiler.GetTopConsumers(10).empty());
+}
+
+TEST_F(MemoryProfilerTest, DisablingProcessTrackingPurgesCachedProcessSnapshotsOnRefresh) {
+    SSP::MemoryProfilerConfig config;
+    config.enabled = false;
+    config.trackPerProcess = true;
+    config.maxTrackedProcesses = 8;
+    config.historySize = 5;
+    config.minSamplesForLeakDetection = 3;
+    ASSERT_TRUE(profiler.Initialize(config));
+    ASSERT_TRUE(profiler.RefreshNow());
+
+    const uint32_t selfPid = ::GetCurrentProcessId();
+    ASSERT_TRUE(profiler.GetProcessInfo(selfPid).has_value());
+    EXPECT_FALSE(profiler.GetTopConsumers(4).empty());
+
+    config.trackPerProcess = false;
+    ASSERT_TRUE(profiler.UpdateConfiguration(config));
+    ASSERT_TRUE(profiler.RefreshNow());
+
+    EXPECT_FALSE(profiler.GetProcessInfo(selfPid).has_value());
+    EXPECT_TRUE(profiler.GetTopConsumers(4).empty());
+
+    const SSP::ProcessMemoryInfo self = profiler.GetSelfMemoryUsage();
+    EXPECT_EQ(self.pid, selfPid);
+    EXPECT_FALSE(self.name.empty());
 }
 
 TEST_F(MemoryProfilerTest, SelfTestPassesWithProcessTrackingEnabled) {
