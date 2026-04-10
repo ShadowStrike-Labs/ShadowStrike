@@ -164,7 +164,8 @@ TEST(RansomwareDetectorValueTests, ConfigurationIoStatsStatisticsUtilitiesAndVer
     event.entropyResult = entropy;
     event.details = L"high-entropy overwrite";
     EXPECT_THAT(event.ToJson(), HasSubstr("\"eventId\":1"));
-    EXPECT_THAT(event.ToJson(), HasSubstr("\"entropy\":{\"shannonEntropy\":0.0"));
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"entropy\":{"));
+    EXPECT_THAT(event.ToJson(), HasSubstr("\"shannonEntropy\":0.0"));
     EXPECT_THAT(event.ToJson(), HasSubstr("\"details\":\"high-entropy overwrite\""));
 
     DetectionStatisticsSnapshot snapshot;

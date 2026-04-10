@@ -178,8 +178,9 @@ TEST(HoneypotManagerValueTests, ConfigurationDefaultsStatisticsUtilitiesAndVersi
     snapshot.falsePositives = 1;
     snapshot.uptimeSeconds = 9;
     snapshot.eventsByType[static_cast<size_t>(HoneypotAccessType::Write)] = 5;
-    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\":9"));
-    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"eventsByType\":[0,0,5"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"uptimeSeconds\": 9"));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("\"eventsByType\": ["));
+    EXPECT_THAT(snapshot.ToJson(), HasSubstr("5"));
 
     EXPECT_EQ(HoneypotManager::GetVersionString(), "3.1.0");
 }

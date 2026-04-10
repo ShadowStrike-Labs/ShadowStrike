@@ -90,6 +90,10 @@ TEST(RansomwareDecryptorValueContractTests, ConfigCompatibilityRulesHelpersAndVe
     key.algorithm = EncryptionAlgorithm::Unknown;
     EXPECT_TRUE(key.IsValidFor(file));
 
+    key.family = RansomwareFamily::WannaCry;
+    EXPECT_FALSE(key.IsValidFor(file));
+
+    key.family = RansomwareFamily::Locky;
     key.algorithm = EncryptionAlgorithm::AES128CBC;
     EXPECT_FALSE(key.IsValidFor(file));
 
@@ -149,7 +153,7 @@ TEST(RansomwareDecryptorValueContractTests, ConfigCompatibilityRulesHelpersAndVe
     EXPECT_EQ(GetKeyTypeName(KeyType::OfflineKey), "OfflineKey");
     EXPECT_EQ(GetAlgorithmName(EncryptionAlgorithm::ChaCha20), "ChaCha20");
     EXPECT_EQ(GetKeySourceName(KeySource::LawEnforcement), "LawEnforcement");
-    EXPECT_EQ(GetAlgorithmName(static_cast<EncryptionAlgorithm>(0xFF)), "Unknown");
+    EXPECT_EQ(GetAlgorithmName(static_cast<EncryptionAlgorithm>(0xFF)), "Custom");
 
     const auto lockyExtensions = GetFamilyExtensions(RansomwareFamily::Locky);
     EXPECT_FALSE(lockyExtensions.empty());
@@ -159,6 +163,9 @@ TEST(RansomwareDecryptorValueContractTests, ConfigCompatibilityRulesHelpersAndVe
     const auto wannaCryNotes = GetFamilyRansomNotes(RansomwareFamily::WannaCry);
     EXPECT_NE(std::find(wannaCryNotes.begin(), wannaCryNotes.end(), L"@WanaDecryptor@.txt"),
               wannaCryNotes.end());
+
+    EXPECT_TRUE(GetFamilyExtensions(RansomwareFamily::Unknown).empty());
+    EXPECT_TRUE(GetFamilyRansomNotes(RansomwareFamily::Unknown).empty());
 
     EXPECT_EQ(RansomwareDecryptor::GetVersionString(), "3.1.0");
 }

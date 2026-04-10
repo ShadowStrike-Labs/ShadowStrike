@@ -141,7 +141,7 @@ TEST_F(BackupProtectorTest, DestructiveToolClassificationHonorsWhitelistState) {
     auto& protector = BackupProtector::Instance();
 
     const std::wstring imagePath = L"C:\\Windows\\System32\\vssadmin.exe";
-    const std::wstring commandLine = L"vssadmin delete shadows /all /quiet";
+    const std::wstring commandLine = L"vssadmin.exe delete shadows /all /quiet";
 
     EXPECT_TRUE(protector.IsDestructiveCommand(commandLine));
     EXPECT_FALSE(protector.IsDestructiveCommand(L"vssadmin list shadows"));
@@ -192,6 +192,10 @@ TEST_F(BackupProtectorTest, FileServiceAndRegistryProtectionHelpersRejectDestruc
 
 TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInvokesCallback) {
     auto& protector = BackupProtector::Instance();
+    auto updated = protector.GetConfiguration();
+    updated.killOnDetection = false;
+    updated.defaultAction = ProtectionAction::Block;
+    ASSERT_TRUE(protector.UpdateConfiguration(updated));
 
     std::promise<BlockedAttempt> callbackPromise;
     auto callbackFuture = callbackPromise.get_future();
@@ -204,12 +208,14 @@ TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInv
             }
         });
 
+    constexpr uint32_t kAnalyzedPid = 0x4141;
     const auto result = protector.AnalyzeProcess(
-        ::GetCurrentProcessId(),
+        kAnalyzedPid,
         L"C:\\Windows\\System32\\vssadmin.exe",
-        L"vssadmin delete shadows /all /quiet");
+        L"vssadmin.exe delete shadows /all /quiet");
 
     ASSERT_TRUE(result.has_value());
+    EXPECT_EQ(result->pid, kAnalyzedPid);
     EXPECT_EQ(result->toolType, DangerousToolType::VSSAdmin);
     EXPECT_EQ(result->threatType, BackupThreatType::VSSDelete);
     EXPECT_EQ(result->action, ProtectionAction::Block);
@@ -230,9 +236,9 @@ TEST_F(BackupProtectorTest, AnalyzeProcessBuildsBlockedAttemptUpdatesStatsAndInv
     EXPECT_EQ(recent.front().attemptId, result->attemptId);
 
     const auto secondResult = protector.AnalyzeProcess(
-        ::GetCurrentProcessId(),
+        kAnalyzedPid + 1,
         L"C:\\Windows\\System32\\wmic.exe",
-        L"wmic shadowcopy delete");
+        L"wmic.exe shadowcopy delete /nointeractive");
     ASSERT_TRUE(secondResult.has_value());
 
     const auto newestOnly = protector.GetRecentBlocks(1);
