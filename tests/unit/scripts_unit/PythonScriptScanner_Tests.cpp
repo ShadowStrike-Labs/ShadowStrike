@@ -68,6 +68,10 @@ TEST_F(PythonScriptScannerTest, HelperNamesAndMagicVersionDetectionRemainStable)
     EXPECT_EQ(DetectPythonVersionFromMagic(py35Magic), PythonVersion::Python35);
     EXPECT_EQ(DetectPythonVersionFromMagic(py311Magic), PythonVersion::Python311);
     EXPECT_EQ(DetectPythonVersionFromMagic(invalidMagic), PythonVersion::Unknown);
+
+    const std::string version = PythonScriptScanner::GetVersionString();
+    EXPECT_FALSE(version.empty());
+    EXPECT_EQ(std::count(version.begin(), version.end(), '.'), 2);
 }
 
 TEST_F(PythonScriptScannerTest, SerializationAndBlockingContractsRemainActionable) {
@@ -176,14 +180,16 @@ TEST_F(PythonScriptScannerTest, AnalysisHelpersIdentifyImportsCapabilitiesAndObf
                   "import base64\npayload = base64.b64decode(data).decode()\n"),
               PythonObfuscationType::Base64Encoding);
 
-    const auto iocs = scanner.ExtractIOCs(
+    const auto iocResult = scanner.ScanSource(
         "url = 'https://evil.example/dropper.py'\n"
         "url2 = 'https://evil.example/dropper.py'\n"
         "public_ip = '8.8.8.8'\n"
         "private_ip = '10.20.30.40'\n"
         "invalid_ip = '256.1.1.1'\n"
         "domain = 'evil.example'\n"
-        "safe_domain = 'github.com'\n");
+        "safe_domain = 'github.com'\n",
+        "ioc_sample.py");
+    const auto& iocs = iocResult.extractedIOCs;
     EXPECT_TRUE(ContainsString(iocs, "https://evil.example/dropper.py"));
     EXPECT_TRUE(ContainsString(iocs, "8.8.8.8"));
     EXPECT_TRUE(ContainsString(iocs, "evil.example"));
@@ -225,6 +231,27 @@ TEST_F(PythonScriptScannerTest, LifecycleAndStatisticsResetBehavePredictably) {
     const json snapshotJson = json::parse(snapshot.ToJson());
     EXPECT_EQ(snapshotJson.at("totalScans"), 3);
     EXPECT_EQ(snapshotJson.at("uptimeMs"), 42);
+}
+
+TEST_F(PythonScriptScannerTest, RepeatedInitializePreservesExistingConfiguration) {
+    auto& scanner = PythonScriptScanner::Instance();
+
+    PythonScannerConfiguration initialConfig;
+    initialConfig.maxFileSize = 4096;
+    initialConfig.blockObfuscatedScripts = true;
+
+    ASSERT_TRUE(scanner.Initialize(initialConfig));
+    ASSERT_TRUE(scanner.IsInitialized());
+
+    PythonScannerConfiguration replacementConfig = initialConfig;
+    replacementConfig.maxFileSize = 8192;
+    replacementConfig.blockObfuscatedScripts = false;
+
+    ASSERT_TRUE(scanner.Initialize(replacementConfig));
+
+    const auto effectiveConfig = scanner.GetConfiguration();
+    EXPECT_EQ(effectiveConfig.maxFileSize, initialConfig.maxFileSize);
+    EXPECT_TRUE(effectiveConfig.blockObfuscatedScripts);
 }
 
 }  // namespace ShadowStrike::Scripts::Test

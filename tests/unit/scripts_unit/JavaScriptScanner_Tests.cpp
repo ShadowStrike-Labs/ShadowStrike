@@ -75,6 +75,10 @@ TEST_F(JavaScriptScannerTest, ConfigurationAndHelperNamesRejectInvalidInputs) {
     EXPECT_EQ(GetJSScanStatusName(static_cast<JSScanStatus>(0x12345678)), "Unknown");
     EXPECT_TRUE(IsSuspiciousActiveXObject("WScript.Shell"));
     EXPECT_FALSE(IsSuspiciousActiveXObject("Safe.Custom.Object"));
+
+    const std::string version = JavaScriptScanner::GetVersionString();
+    EXPECT_FALSE(version.empty());
+    EXPECT_EQ(std::count(version.begin(), version.end(), '.'), 2);
 }
 
 TEST_F(JavaScriptScannerTest, ResultAndObfuscationSerializationPreserveBlockingSemantics) {
@@ -220,6 +224,31 @@ TEST_F(JavaScriptScannerTest, StatisticsResetAndMemoryScanningRemainPredictable)
     const json statsJson = json::parse(snapshot.ToJson());
     EXPECT_EQ(statsJson.at("totalScans"), 4);
     EXPECT_EQ(statsJson.at("downloadersDetected"), 2);
+}
+
+TEST_F(JavaScriptScannerTest, RepeatedInitializePreservesExistingConfiguration) {
+    auto& scanner = JavaScriptScanner::Instance();
+
+    JSScanConfig initialConfig;
+    initialConfig.maxScriptSize = 4096;
+    initialConfig.blockObfuscatedScripts = true;
+    initialConfig.allowedActiveX = {"Safe.Control"};
+
+    ASSERT_TRUE(scanner.Initialize(initialConfig));
+    ASSERT_TRUE(scanner.IsInitialized());
+
+    JSScanConfig replacementConfig = initialConfig;
+    replacementConfig.maxScriptSize = 8192;
+    replacementConfig.blockObfuscatedScripts = false;
+    replacementConfig.allowedActiveX = {"Replacement.Control"};
+
+    ASSERT_TRUE(scanner.Initialize(replacementConfig));
+
+    const auto effectiveConfig = scanner.GetConfig();
+    EXPECT_EQ(effectiveConfig.maxScriptSize, initialConfig.maxScriptSize);
+    EXPECT_TRUE(effectiveConfig.blockObfuscatedScripts);
+    ASSERT_EQ(effectiveConfig.allowedActiveX.size(), 1u);
+    EXPECT_EQ(effectiveConfig.allowedActiveX.front(), "Safe.Control");
 }
 
 }  // namespace ShadowStrike::Scripts::Test
