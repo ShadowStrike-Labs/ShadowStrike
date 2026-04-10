@@ -20,9 +20,7 @@
 #include <string>
 #include <vector>
 
-#define private public
 #include "../../../src/Shared_modules/Service/ServiceInstaller.hpp"
-#undef private
 
 namespace SSS = ShadowStrike::Service;
 
@@ -30,12 +28,12 @@ namespace ShadowStrike::Service::Test {
 namespace {
 
 TEST(ServiceInstallerTest, FormatDependenciesReturnsEmptyStringForNoDependencies) {
-    EXPECT_TRUE(SSS::ServiceInstaller::FormatDependencies({}).empty());
+    EXPECT_TRUE(SSS::ServiceInstaller::TestOnly_FormatDependencies({}).empty());
 }
 
 TEST(ServiceInstallerTest, FormatDependenciesBuildsDoubleNullTerminatedMultiString) {
     const std::vector<std::wstring> dependencies = {L"RpcSs", L"Winmgmt", L"W32Time"};
-    const std::wstring formatted = SSS::ServiceInstaller::FormatDependencies(dependencies);
+    const std::wstring formatted = SSS::ServiceInstaller::TestOnly_FormatDependencies(dependencies);
 
     std::wstring expected = L"RpcSs";
     expected.push_back(L'\0');
@@ -51,11 +49,25 @@ TEST(ServiceInstallerTest, FormatDependenciesBuildsDoubleNullTerminatedMultiStri
 }
 
 TEST(ServiceInstallerTest, FormatDependenciesPreservesEmptyEntriesAsExplicitSeparators) {
-    const std::wstring formatted = SSS::ServiceInstaller::FormatDependencies({L""});
+    const std::wstring formatted = SSS::ServiceInstaller::TestOnly_FormatDependencies({L""});
 
     ASSERT_EQ(formatted.size(), 2U);
     EXPECT_EQ(formatted[0], L'\0');
     EXPECT_EQ(formatted[1], L'\0');
+}
+
+TEST(ServiceInstallerTest, FormatDependenciesPreservesInteriorEmptyDependenciesWithoutCollapsingOrder) {
+    const std::wstring formatted =
+        SSS::ServiceInstaller::TestOnly_FormatDependencies({L"RpcSs", L"", L"Winmgmt"});
+
+    std::wstring expected = L"RpcSs";
+    expected.push_back(L'\0');
+    expected.push_back(L'\0');
+    expected += L"Winmgmt";
+    expected.push_back(L'\0');
+    expected.push_back(L'\0');
+
+    EXPECT_EQ(formatted, expected);
 }
 
 }  // namespace

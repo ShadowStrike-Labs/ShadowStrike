@@ -188,12 +188,16 @@ namespace ShadowStrike::Service {
             ss << "{";
             ss << "\"service\": \"ShadowStrike\",";
             ss << "\"status\": \"" << (m_running ? "running" : "stopped") << "\",";
-            ss << "\"uptime_seconds\": " << GetUptime(),
+            ss << "\"uptime_seconds\": " << GetUptime() << ",";
             ss << "\"components\": {";
             // Iterate components
             ss << "}";
             ss << "}";
             return ss.str();
+        }
+
+        [[nodiscard]] bool IsRunning() const noexcept {
+            return m_running.load();
         }
 
         bool RecoverComponent(const std::string& id) {
@@ -290,8 +294,7 @@ namespace ShadowStrike::Service {
     }
 
     bool ServiceController::IsRunning() const {
-        // Implementation check
-        return true; // Simplified for now
+        return m_impl->IsRunning();
     }
 
     std::string ServiceController::GetStatusReport() const {

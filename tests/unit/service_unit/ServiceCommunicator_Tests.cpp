@@ -91,6 +91,24 @@ TEST_F(ServiceCommunicatorTest, IpcMessageJsonIncludesTypeSizeAndTimestamp) {
     EXPECT_EQ(json.find("\"payload\""), std::string::npos);
 }
 
+TEST_F(ServiceCommunicatorTest, DefaultMessageAndInitializationSurfacesRemainStable) {
+    const SSS::IpcMessage message;
+    EXPECT_EQ(message.magic, SSS::CommunicationConstants::PROTOCOL_MAGIC);
+    EXPECT_EQ(message.type, SSS::CommandType::Unknown);
+    EXPECT_EQ(message.payloadSize, 0u);
+    EXPECT_TRUE(message.payload.empty());
+
+    const std::string json = message.ToJson();
+    EXPECT_NE(json.find("\"type\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"size\":0"), std::string::npos);
+    EXPECT_NE(json.find("\"timestamp\":0"), std::string::npos);
+
+    ASSERT_TRUE(communicator.Initialize());
+    EXPECT_TRUE(communicator.Initialize());
+    EXPECT_FALSE(communicator.IsRunning());
+    EXPECT_TRUE(communicator.SelfTest());
+}
+
 TEST_F(ServiceCommunicatorTest, DefaultsAndStatsAccessorsAreSafeWithoutClients) {
     EXPECT_FALSE(communicator.IsRunning());
     EXPECT_EQ(SSS::ServiceCommunicator::GetVersionString(), "3.0.0");
@@ -125,6 +143,8 @@ TEST_F(ServiceCommunicatorTest, ResetStatsDoesNotAffectRunningStateOrClientlessB
     ASSERT_TRUE(communicator.Start());
     EXPECT_TRUE(communicator.IsRunning());
 
+    EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::string{}), 0u);
+    EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::vector<uint8_t>{}), 0u);
     EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::string("status")), 0u);
     EXPECT_EQ(communicator.Broadcast(SSS::CommandType::ThreatAlert, std::vector<uint8_t>{9, 8, 7}), 0u);
 

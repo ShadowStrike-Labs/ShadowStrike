@@ -45,6 +45,16 @@ TEST(AntivirusServiceTest, StatusReportExposesUninitializedServiceShape) {
     EXPECT_FALSE(SSS::AntivirusService::Instance().IsHealthy());
 }
 
+TEST(AntivirusServiceTest, ServiceConstantsPreserveScmIdentityAndDependencyFormatting) {
+    EXPECT_STREQ(SSS::ServiceConstants::SERVICE_NAME, L"ShadowStrikeService");
+    EXPECT_STREQ(SSS::ServiceConstants::DISPLAY_NAME, L"ShadowStrike Enterprise AV Service");
+    EXPECT_GT(SSS::ServiceConstants::SHUTDOWN_TIMEOUT_MS, 0u);
+
+    const std::wstring dependencies(SSS::ServiceConstants::DEPENDENCIES,
+                                    SSS::ServiceConstants::DEPENDENCIES + 15);
+    EXPECT_EQ(dependencies, std::wstring(L"RpcSs\0Winmgmt\0\0", 15));
+}
+
 TEST(AntivirusServiceTest, ControlHandlerReturnsExpectedCodesForSafeCommands) {
     EXPECT_EQ(SSS::AntivirusService::ServiceCtrlHandler(
         SERVICE_CONTROL_INTERROGATE, 0, nullptr, nullptr), static_cast<DWORD>(NO_ERROR));
