@@ -171,6 +171,26 @@ TEST_F(CPUMonitorTest, LifecycleAndConfigurationUpdatesRespectValidation) {
     EXPECT_EQ(unchanged.historySize, update.historySize);
 }
 
+TEST_F(CPUMonitorTest, StartMonitoringRequiresInitializationAndStopIsIdempotent) {
+    EXPECT_FALSE(monitor.StartMonitoring());
+    EXPECT_FALSE(monitor.IsMonitoring());
+
+    SSP::CPUMonitorConfig config;
+    config.enabled = false;
+    config.samplingIntervalMs = 250;
+    ASSERT_TRUE(monitor.Initialize(config));
+
+    EXPECT_TRUE(monitor.StartMonitoring());
+    EXPECT_TRUE(monitor.IsMonitoring());
+    EXPECT_TRUE(monitor.StartMonitoring());
+    EXPECT_TRUE(monitor.IsMonitoring());
+
+    monitor.StopMonitoring();
+    EXPECT_FALSE(monitor.IsMonitoring());
+    monitor.StopMonitoring();
+    EXPECT_FALSE(monitor.IsMonitoring());
+}
+
 TEST_F(CPUMonitorTest, AccessorsReturnSafeDefaultsWithoutPublishedSamples) {
     EXPECT_TRUE(SSP::CPUMonitor::HasInstance());
     EXPECT_GT(SSP::CPUMonitor::GetProcessorCount(), 0u);
