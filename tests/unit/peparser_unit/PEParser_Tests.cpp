@@ -221,9 +221,10 @@ TEST_F(PEParserApiTest, DotNetSignatureOverlayAndChecksumSignalsSurfaceThroughPu
     options.includeOverlay = true;
     options.useInvalidChecksum = true;
 
+    const auto image = BuildMinimalPE32(options);
     PEInfo info;
     PEError error;
-    ASSERT_TRUE(parser.ParseBuffer(BuildMinimalPE32(options), info, &error));
+    ASSERT_TRUE(parser.ParseBuffer(image, info, &error));
     EXPECT_TRUE(info.isDotNet);
     EXPECT_TRUE(info.isSigned);
     EXPECT_GT(info.overlayOffset, 0u);
@@ -240,9 +241,10 @@ TEST_F(PEParserApiTest, DriverAndHighEntropyHeuristicsAreDetectedOnPe64Images) {
     options.driver = true;
     options.highEntropyText = true;
 
+    const auto image = BuildMinimalPE64(options);
     PEInfo info;
     PEError error;
-    ASSERT_TRUE(parser.ParseBuffer(BuildMinimalPE64(options), info, &error));
+    ASSERT_TRUE(parser.ParseBuffer(image, info, &error));
     EXPECT_TRUE(info.valid);
     EXPECT_TRUE(info.is64Bit);
     EXPECT_TRUE(info.isDriver);
@@ -255,6 +257,47 @@ TEST_F(PEParserApiTest, DriverAndHighEntropyHeuristicsAreDetectedOnPe64Images) {
     std::vector<ExceptionEntry> exceptions;
     EXPECT_TRUE(parser.ParseExceptionDirectory(exceptions, &error));
     EXPECT_TRUE(exceptions.empty());
+}
+
+TEST_F(PEParserApiTest, SignedImagesExposeSecurityFileOffsetWithoutOverlayFalsePositive) {
+    ::ShadowStrike::PEParser::PEParser parser;
+    SyntheticPEOptions options;
+    options.includeSecurityDirectory = true;
+
+    const auto image = BuildMinimalPE32(options);
+    PEInfo info;
+    PEError error;
+    ASSERT_TRUE(parser.ParseBuffer(image, info, &error));
+
+    const auto& securityDir = info.dataDirectories[DataDirectory::SECURITY];
+    EXPECT_TRUE(info.isSigned);
+    EXPECT_TRUE(securityDir.present);
+    ASSERT_TRUE(securityDir.fileOffset.has_value());
+    EXPECT_EQ(*securityDir.fileOffset, static_cast<size_t>(securityDir.rva));
+    EXPECT_EQ(info.overlayOffset, 0u);
+    EXPECT_EQ(info.overlaySize, 0u);
+    EXPECT_FALSE(parser.HasAnomaly(AnomalyType::OverlayPresent));
+}
+
+TEST_F(PEParserApiTest, WritableExecutableSectionsRemainVisibleAsSectionLevelAnomalies) {
+    ::ShadowStrike::PEParser::PEParser parser;
+    SyntheticPEOptions options;
+    options.writableExecutableText = true;
+
+    const auto image = BuildMinimalPE32(options);
+    PEInfo info;
+    PEError error;
+    ASSERT_TRUE(parser.ParseBuffer(image, info, &error));
+    ASSERT_EQ(info.sections.size(), 1u);
+    EXPECT_TRUE(info.sections[0].isExecutable);
+    EXPECT_TRUE(info.sections[0].isWritable);
+    EXPECT_NE(std::find_if(
+                  info.sections[0].anomalies.begin(),
+                  info.sections[0].anomalies.end(),
+                  [](const Anomaly& anomaly) {
+                      return anomaly.type == AnomalyType::SectionWritableExecutable;
+                  }),
+              info.sections[0].anomalies.end());
 }
 
 TEST_F(PEParserApiTest, ResetReparseAndDeepValidationRemainUsableAfterMalformedSections) {
@@ -277,10 +320,9 @@ TEST_F(PEParserApiTest, ResetReparseAndDeepValidationRemainUsableAfterMalformedS
     header.SizeOfRawData = 0x500;
     WriteObject(invalidImage, sectionHeaderOffset, header);
 
-    ASSERT_TRUE(parser.ParseBuffer(invalidImage, info, &error));
-    std::vector<ValidationResult> issues;
-    EXPECT_FALSE(parser.ValidatePE(issues));
-    EXPECT_NE(std::find(issues.begin(), issues.end(), ValidationResult::SectionBeyondFile), issues.end());
+    EXPECT_FALSE(parser.ParseBuffer(invalidImage, info, &error));
+    EXPECT_EQ(error.code, ValidationResult::SectionBeyondFile);
+    EXPECT_FALSE(parser.IsParsed());
 
     SyntheticPEOptions secure64;
     secure64.pe64 = true;

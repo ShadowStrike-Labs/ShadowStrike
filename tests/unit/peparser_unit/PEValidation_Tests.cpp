@@ -149,29 +149,37 @@ TEST(PEValidationTest, OptionalHeaderValidationRejectsAlignmentSizingAndSubsyste
     EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
               ValidationResult::Valid);
     EXPECT_EQ(parsed32.ImageBase, 0x400000u);
+    const auto valid32 = parsed32;
 
+    opt32 = valid32;
     opt32.FileAlignment = 300;
     WriteObject(buffer, 0, opt32);
     EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
               ValidationResult::InvalidFileAlignment);
 
-    opt32 = parsed32;
+    opt32 = valid32;
     opt32.SizeOfStackCommit = opt32.SizeOfStackReserve + 1;
     WriteObject(buffer, 0, opt32);
     EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
               ValidationResult::SizeOfStackCommitExceedsReserve);
 
-    opt32 = parsed32;
+    opt32 = valid32;
     opt32.Subsystem = 99;
     WriteObject(buffer, 0, opt32);
     EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
               ValidationResult::InvalidSubsystem);
 
-    opt32 = parsed32;
+    opt32 = valid32;
     opt32.SizeOfImage = 0x2101;
     WriteObject(buffer, 0, opt32);
     EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
               ValidationResult::SizeOfImageNotAligned);
+
+    opt32 = valid32;
+    opt32.SizeOfHeaders = 0x180;
+    WriteObject(buffer, 0, opt32);
+    EXPECT_EQ(ValidateOptionalHeader32(reader, 0, sizeof(OptionalHeader32), parsed32, &error),
+              ValidationResult::SizeOfHeadersNotAligned);
 
     OptionalHeader64 opt64{};
     opt64.Magic = PE64_MAGIC;
@@ -250,6 +258,10 @@ TEST(PEValidationTest, SectionOverlapAndDirectoryChecksPreserveSecurityInvariant
     EXPECT_EQ(ValidateDataDirectory(DataDirectory::IMPORT, 0, 16, 0x3000, 0x1000, &error),
               ValidationResult::DataDirectoryRvaInvalid);
     EXPECT_EQ(ValidateDataDirectory(DataDirectory::SECURITY, 0x900, 0x200, 0x3000, 0x1000, &error),
+              ValidationResult::Valid);
+    EXPECT_EQ(ValidateDataDirectory(DataDirectory::SECURITY, 0x900, 4, 0x3000, 0x1000, &error),
+              ValidationResult::SecurityDirectoryInvalid);
+    EXPECT_EQ(ValidateDataDirectory(DataDirectory::SECURITY, 0xF80, 0x100, 0x3000, 0x1000, &error),
               ValidationResult::SecurityDirectoryInvalid);
     EXPECT_EQ(ValidateDataDirectory(DataDirectory::IMPORT, 0x1000, 8, 0x3000, 0x1000, &error),
               ValidationResult::ImportDirectoryInvalid);

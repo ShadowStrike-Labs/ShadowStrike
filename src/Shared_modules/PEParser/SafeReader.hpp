@@ -110,25 +110,26 @@ public:
      */
     template<typename To, typename From>
     [[nodiscard]] static constexpr std::optional<To> SafeCast(From value) noexcept {
-        // Handle signed to unsigned conversion
-        if constexpr (std::is_signed_v<From> && std::is_unsigned_v<To>) {
+        if constexpr (std::is_signed_v<From> && std::is_signed_v<To>) {
+            if (value < static_cast<From>(std::numeric_limits<To>::min()) ||
+                value > static_cast<From>(std::numeric_limits<To>::max())) {
+                return std::nullopt;
+            }
+        } else if constexpr (std::is_signed_v<From> && std::is_unsigned_v<To>) {
             if (value < 0) {
                 return std::nullopt;
             }
-        }
-
-        // Check upper bound
-        if constexpr (sizeof(From) > sizeof(To) ||
-                      (sizeof(From) == sizeof(To) && std::is_unsigned_v<From> && std::is_signed_v<To>)) {
             if (static_cast<std::make_unsigned_t<From>>(value) >
+                std::numeric_limits<To>::max()) {
+                return std::nullopt;
+            }
+        } else if constexpr (std::is_unsigned_v<From> && std::is_signed_v<To>) {
+            if (value >
                 static_cast<std::make_unsigned_t<To>>(std::numeric_limits<To>::max())) {
                 return std::nullopt;
             }
-        }
-
-        // Check lower bound for signed target
-        if constexpr (std::is_signed_v<To> && std::is_signed_v<From>) {
-            if (value < std::numeric_limits<To>::min()) {
+        } else {
+            if (value > std::numeric_limits<To>::max()) {
                 return std::nullopt;
             }
         }
