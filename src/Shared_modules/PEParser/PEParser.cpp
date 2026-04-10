@@ -172,6 +172,9 @@ public:
             return false;
         }
 
+        // Section-backed directory RVAs can only be translated after the section table exists.
+        FinalizeDataDirectoryFileOffsets();
+
         // Step 5: Analyze entry point
         AnalyzeEntryPoint();
 
@@ -255,13 +258,6 @@ public:
             }
         }
 
-        // Compute file offsets for present directories
-        for (size_t i = 0; i < DataDirectory::MAX_ENTRIES; ++i) {
-            if (m_info.dataDirectories[i].present && m_info.dataDirectories[i].rva != 0) {
-                m_info.dataDirectories[i].fileOffset = RvaToOffsetInternal(
-                    m_info.dataDirectories[i].rva);
-            }
-        }
     }
 
     void ParseDataDirectories64(const OptionalHeader64& opt, uint16_t headerSize) noexcept {
@@ -290,11 +286,28 @@ public:
             }
         }
 
+    }
+
+    void FinalizeDataDirectoryFileOffsets() noexcept {
         for (size_t i = 0; i < DataDirectory::MAX_ENTRIES; ++i) {
-            if (m_info.dataDirectories[i].present && m_info.dataDirectories[i].rva != 0) {
-                m_info.dataDirectories[i].fileOffset = RvaToOffsetInternal(
-                    m_info.dataDirectories[i].rva);
+            auto& dir = m_info.dataDirectories[i];
+            dir.fileOffset.reset();
+
+            if (!dir.present || dir.rva == 0) {
+                continue;
             }
+
+            if (i == DataDirectory::SECURITY) {
+                size_t certEnd = 0;
+                const size_t certStart = static_cast<size_t>(dir.rva);
+                if (SafeMath::SafeAdd(certStart, static_cast<size_t>(dir.size), certEnd) &&
+                    certEnd <= m_reader.Size()) {
+                    dir.fileOffset = certStart;
+                }
+                continue;
+            }
+
+            dir.fileOffset = RvaToOffsetInternal(dir.rva);
         }
     }
 
@@ -353,7 +366,9 @@ public:
                                                     m_info.sizeOfImage,
                                                     m_info.fileAlignment, i, err,
                                                     &info.anomalies);
-            // Don't fail on section validation errors; anomalies are recorded above
+            if (valResult != ValidationResult::Valid) {
+                return false;
+            }
 
             // Extract name (handle non-null-terminated 8-char names)
             std::string name;
@@ -491,10 +506,25 @@ public:
             }
         }
 
-        // Check if there's data after the last section
-        if (lastSectionEnd < m_info.fileSize) {
-            m_info.overlayOffset = lastSectionEnd;
-            m_info.overlaySize = m_info.fileSize - lastSectionEnd;
+        size_t overlayStart = lastSectionEnd;
+
+        // Authenticode certificates live after the image by design and must not
+        // be misclassified as overlay when they immediately follow the last section.
+        const auto& secDir = m_info.dataDirectories[DataDirectory::SECURITY];
+        if (secDir.present && secDir.rva != 0 && secDir.size >= Limits::MIN_WIN_CERTIFICATE) {
+            size_t certEnd = 0;
+            const size_t certStart = static_cast<size_t>(secDir.rva);
+            if (certStart == overlayStart &&
+                SafeMath::SafeAdd(certStart, static_cast<size_t>(secDir.size), certEnd) &&
+                certEnd <= m_info.fileSize) {
+                overlayStart = certEnd;
+            }
+        }
+
+        // Check if there's data after the last section/certificate tail
+        if (overlayStart < m_info.fileSize) {
+            m_info.overlayOffset = overlayStart;
+            m_info.overlaySize = m_info.fileSize - overlayStart;
 
             if (m_info.overlaySize > 0) {
                 m_info.anomalies.emplace_back(AnomalyType::OverlayPresent,
@@ -1239,7 +1269,9 @@ public:
             // Read GUID
             if (m_reader.ReadBytes(offset + 4, info.pdbGuid.data(), 16)) {
                 // Read age
-                m_reader.Read(offset + 20, info.pdbAge);
+                if (!m_reader.Read(offset + 20, info.pdbAge)) {
+                    return;
+                }
 
                 // Read PDB path and sanitize before storing.
                 // Paths from hostile PEs can be UNC paths (\\server\share) that
@@ -1782,7 +1814,9 @@ public:
                             } else if ((thunk & 0xFFFFFFFF00000000ULL) == 0) {
                                 auto hintOff = RvaToOffsetInternal(static_cast<uint32_t>(thunk));
                                 if (hintOff) {
-                                    m_reader.Read(*hintOff, func.hint);
+                                    if (!m_reader.Read(*hintOff, func.hint)) {
+                                        break;
+                                    }
                                     std::string_view funcName;
                                     if (m_reader.ReadString(*hintOff + 2,
                                             Limits::MAX_FUNCTION_NAME, funcName)) {
@@ -1801,7 +1835,9 @@ public:
                             } else {
                                 auto hintOff = RvaToOffsetInternal(thunk);
                                 if (hintOff) {
-                                    m_reader.Read(*hintOff, func.hint);
+                                    if (!m_reader.Read(*hintOff, func.hint)) {
+                                        break;
+                                    }
                                     std::string_view funcName;
                                     if (m_reader.ReadString(*hintOff + 2,
                                             Limits::MAX_FUNCTION_NAME, funcName)) {
@@ -1867,7 +1903,9 @@ public:
                                              sizeof(LoadConfigDirectory64));
             if (!m_reader.ValidateRange(*lcOffset, readSize)) return false;
             std::memset(&lc64, 0, sizeof(lc64));
-            m_reader.ReadBytes(*lcOffset, &lc64, readSize);
+            if (!m_reader.ReadBytes(*lcOffset, &lc64, readSize)) {
+                return false;
+            }
 
             out.timeDateStamp = lc64.TimeDateStamp;
             out.majorVersion = lc64.MajorVersion;
@@ -1885,7 +1923,9 @@ public:
                                              sizeof(LoadConfigDirectory32));
             if (!m_reader.ValidateRange(*lcOffset, readSize)) return false;
             std::memset(&lc32, 0, sizeof(lc32));
-            m_reader.ReadBytes(*lcOffset, &lc32, readSize);
+            if (!m_reader.ReadBytes(*lcOffset, &lc32, readSize)) {
+                return false;
+            }
 
             out.timeDateStamp = lc32.TimeDateStamp;
             out.majorVersion = lc32.MajorVersion;

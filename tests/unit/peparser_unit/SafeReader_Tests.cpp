@@ -48,7 +48,9 @@ TEST(SafeMathTest, ArithmeticAndCastGuardsRejectOverflowAndUnderflow) {
     const auto signedCast = SafeMath::SafeCast<int16_t>(-123);
     ASSERT_TRUE(signedCast.has_value());
     EXPECT_EQ(*signedCast, -123);
+    EXPECT_FALSE(SafeMath::SafeCast<int16_t>(-32769).has_value());
     EXPECT_FALSE(SafeMath::SafeCast<int8_t>(200).has_value());
+    EXPECT_FALSE(SafeMath::SafeCast<int8_t>(256u).has_value());
 }
 
 TEST(SafeReaderTest, ConstructorsRangeChecksAndPrimitiveReadsStayBounded) {
