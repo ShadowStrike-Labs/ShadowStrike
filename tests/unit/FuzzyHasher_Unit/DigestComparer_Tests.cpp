@@ -78,6 +78,7 @@ TEST(DigestComparerTest, CompareDigestsRejectsMalformedAndOverlongInputs) {
     EXPECT_EQ(FH::CompareDigests("", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("bad-digest", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("0:ABCDEFG:HIJKLMN", "3:ABCDEFG:HIJKLMN"), -1);
+    EXPECT_EQ(FH::CompareDigests("4294967296:ABCDEFG:HIJKLMN", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("3::HIJKLMN", "3:ABCDEFG:HIJKLMN"), -1);
     EXPECT_EQ(FH::CompareDigests("3:ABCDEFG:", "3:ABCDEFG:HIJKLMN"), -1);
 
@@ -103,10 +104,11 @@ TEST(DigestComparerTest, CompareDigestsHandlesExactNearAndIncompatibleComparison
 
     EXPECT_EQ(FH::CompareDigests("3:ABCDEFG:HIJKLMN", "5:ABCDEFG:HIJKLMN"), 0);
 
-    ASSERT_GE(parts->sig2.size(), 7u);
-    const std::string doubledBlockCompatible =
-        std::to_string(parts->blockSize * 2u) + ":" + parts->sig2 + ":" + parts->sig2;
-    EXPECT_EQ(FH::CompareDigests(digest->c_str(), doubledBlockCompatible.c_str()), 100);
+    ASSERT_GT(parts->blockSize, 3u);
+    ASSERT_EQ(parts->blockSize % 2u, 0u);
+    const std::string halvedBlockCompatible =
+        std::to_string(parts->blockSize / 2u) + ":" + parts->sig1 + ":" + parts->sig1;
+    EXPECT_EQ(FH::CompareDigests(digest->c_str(), halvedBlockCompatible.c_str()), 100);
 }
 
 TEST(DigestComparerTest, PublicCompareOverloadsMirrorComparerSemanticsAndValidateBoundaries) {
@@ -115,8 +117,10 @@ TEST(DigestComparerTest, PublicCompareOverloadsMirrorComparerSemanticsAndValidat
 
     EXPECT_EQ(FH::Compare(*digest, *digest), 100);
     EXPECT_EQ(FH::Compare(digest->c_str(), digest->c_str()), 100);
+    EXPECT_EQ(FH::Compare("3:ABCDEFG:HIJKLMN", "12:ABCDEFG:HIJKLMN"), 0);
     EXPECT_EQ(FH::Compare(nullptr, digest->c_str()), -1);
     EXPECT_EQ(FH::Compare(std::string{}, *digest), -1);
+    EXPECT_EQ(FH::Compare(std::string("4294967296:ABCDEFG:HIJKLMN"), *digest), -1);
 
     const std::string oversized(FH::kMaxDigestStringLength + 1, 'A');
     EXPECT_EQ(FH::Compare(oversized, *digest), -1);

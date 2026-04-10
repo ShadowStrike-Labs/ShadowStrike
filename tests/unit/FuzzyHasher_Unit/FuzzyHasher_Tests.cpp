@@ -159,6 +159,21 @@ TEST(FuzzyHasherTest, CompareOverloadsValidateInputsAndReportExpectedScores) {
 
 TEST(FuzzyHasherTest, HashBufferNormalizedTrimsTrailingZerosAndFallsBackForMalformedPe) {
     const std::vector<uint8_t> base = MakePatternData(1536);
+    const auto baseDigest = FH::HashBuffer(base);
+    ASSERT_TRUE(baseDigest.has_value());
+
+    std::vector<uint8_t> belowThresholdPad = base;
+    belowThresholdPad.resize(base.size() + 511, 0);
+    const auto belowThresholdDigest = FH::HashBuffer(belowThresholdPad);
+    const FH::NormalizedHashResult belowThresholdNormalized =
+        FH::HashBufferNormalized(belowThresholdPad, false);
+    ASSERT_TRUE(belowThresholdDigest.has_value());
+    ASSERT_TRUE(belowThresholdNormalized.normalizedDigest.has_value());
+    ASSERT_TRUE(belowThresholdNormalized.sha256Hex.has_value());
+    EXPECT_FALSE(belowThresholdNormalized.wasNormalized);
+    EXPECT_FALSE(belowThresholdNormalized.fullFileDigest.has_value());
+    EXPECT_EQ(*belowThresholdNormalized.normalizedDigest, *belowThresholdDigest);
+
     std::vector<uint8_t> padded = base;
     padded.resize(base.size() + 700, 0);
 
@@ -168,9 +183,6 @@ TEST(FuzzyHasherTest, HashBufferNormalizedTrimsTrailingZerosAndFallsBackForMalfo
     EXPECT_TRUE(trimmed.wasNormalized);
     EXPECT_FALSE(trimmed.fullFileDigest.has_value());
     EXPECT_TRUE(IsLowerHex64(*trimmed.sha256Hex));
-
-    const auto baseDigest = FH::HashBuffer(base);
-    ASSERT_TRUE(baseDigest.has_value());
     EXPECT_EQ(*trimmed.normalizedDigest, *baseDigest);
 
     const std::vector<uint8_t> peLike = {'M', 'Z', 0x90, 0x00, 0x03, 0x00, 0x00, 0x00};
@@ -188,6 +200,14 @@ TEST(FuzzyHasherTest, HashBufferNormalizedTrimsTrailingZerosAndFallsBackForMalfo
     ASSERT_TRUE(autoDetectedPe.sha256Hex.has_value());
     EXPECT_FALSE(autoDetectedPe.wasNormalized);
     EXPECT_EQ(*autoDetectedPe.normalizedDigest, *autoDetectedPe.fullFileDigest);
+
+    const FH::NormalizedHashResult forcedPeFallback = FH::HashBufferNormalized(base, true);
+    ASSERT_TRUE(forcedPeFallback.normalizedDigest.has_value());
+    ASSERT_TRUE(forcedPeFallback.fullFileDigest.has_value());
+    ASSERT_TRUE(forcedPeFallback.sha256Hex.has_value());
+    EXPECT_FALSE(forcedPeFallback.wasNormalized);
+    EXPECT_EQ(*forcedPeFallback.normalizedDigest, *forcedPeFallback.fullFileDigest);
+    EXPECT_EQ(*forcedPeFallback.normalizedDigest, *baseDigest);
 
     const std::vector<uint8_t> allZeros(700, 0);
     const FH::NormalizedHashResult zeroStripped = FH::HashBufferNormalized(allZeros, false);
@@ -215,7 +235,7 @@ TEST(FuzzyHasherTest, HashWithSaltSupportsFixedAndSessionScopedDeterminism) {
 
     const auto saltedA = FH::HashWithSalt(sample, 0x0123456789ABCDEFULL);
     const auto saltedB = FH::HashWithSalt(sample, 0x0123456789ABCDEFULL);
-    const auto saltedC = FH::HashWithSalt(sample, 0x0FEDCBA987654321ULL);
+    const auto saltedC = FH::HashWithSalt(sample, 0x13579BDF2468ACE0ULL);
     ASSERT_TRUE(saltedA.has_value());
     ASSERT_TRUE(saltedB.has_value());
     ASSERT_TRUE(saltedC.has_value());
@@ -240,6 +260,7 @@ TEST(FuzzyHasherTest, SuspiciousDigestScreenRejectsCraftedInputsAndAllowsLegitim
     EXPECT_TRUE(FH::IsSuspiciousDigest("9:ABCDEFG:HIJKLMN"));
     EXPECT_TRUE(FH::IsSuspiciousDigest("3:ABCDEF:HIJKLMN"));
     EXPECT_TRUE(FH::IsSuspiciousDigest("3:AAAAAAA:HIJKLMN"));
+    EXPECT_FALSE(FH::IsSuspiciousDigest("3:ABCDEFG:HIJKLMN"));
 
     const auto digest = FH::HashBuffer(MakePatternData(4096));
     ASSERT_TRUE(digest.has_value());

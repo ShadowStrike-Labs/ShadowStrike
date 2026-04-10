@@ -109,6 +109,23 @@ TEST(DigestGeneratorTest, GenerateDigestAdjustsBlockSizeAcrossSmallAndLargeInput
     EXPECT_GT(largeParts->blockSize, FH::kMinBlockSize);
 }
 
+TEST(DigestGeneratorTest, GenerateDigestRespectsMinimumBlockSizeBoundaryTransitions) {
+    const auto boundaryDigest =
+        FH::GenerateDigest(MakePatternData(FH::kMinBlockSize * FH::kDigestComponentLength));
+    const auto boundaryPlusOneDigest =
+        FH::GenerateDigest(MakePatternData(FH::kMinBlockSize * FH::kDigestComponentLength + 1u));
+    ASSERT_TRUE(boundaryDigest.has_value());
+    ASSERT_TRUE(boundaryPlusOneDigest.has_value());
+
+    const auto boundaryParts = ParseDigest(*boundaryDigest);
+    const auto boundaryPlusOneParts = ParseDigest(*boundaryPlusOneDigest);
+    ASSERT_TRUE(boundaryParts.has_value());
+    ASSERT_TRUE(boundaryPlusOneParts.has_value());
+
+    EXPECT_EQ(boundaryParts->blockSize, FH::kMinBlockSize);
+    EXPECT_EQ(boundaryPlusOneParts->blockSize, FH::kMinBlockSize * 2u);
+}
+
 TEST(DigestGeneratorTest, GenerateDigestWithSaltIsDeterministicPerSaltAndVariesAcrossSalts) {
     const std::vector<uint8_t> sample = MakePatternData(4096);
 
@@ -118,7 +135,7 @@ TEST(DigestGeneratorTest, GenerateDigestWithSaltIsDeterministicPerSaltAndVariesA
     const auto zeroSalt = FH::GenerateDigestWithSalt(sample, 0);
     const auto saltA1 = FH::GenerateDigestWithSalt(sample, 0x0123456789ABCDEFULL);
     const auto saltA2 = FH::GenerateDigestWithSalt(sample, 0x0123456789ABCDEFULL);
-    const auto saltB = FH::GenerateDigestWithSalt(sample, 0x0FEDCBA987654321ULL);
+    const auto saltB = FH::GenerateDigestWithSalt(sample, 0x13579BDF2468ACE0ULL);
     ASSERT_TRUE(unsalted.has_value());
     ASSERT_TRUE(zeroSalt.has_value());
     ASSERT_TRUE(saltA1.has_value());
