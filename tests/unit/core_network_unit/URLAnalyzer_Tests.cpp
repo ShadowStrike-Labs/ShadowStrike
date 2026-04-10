@@ -83,6 +83,13 @@ TEST_F(URLAnalyzerTest, ParseUrlRejectsUnsafeInputAndHandlesSpecialSchemes) {
     EXPECT_EQ(dataUrl.scheme, URLScheme::DATA);
     EXPECT_TRUE(dataUrl.hasDataUri);
 
+    const ParsedURL mailtoUrl = URLAnalyzer::ParseURL("mailto:alerts@shadowstrike.dev");
+    EXPECT_TRUE(mailtoUrl.isValid);
+    EXPECT_EQ(mailtoUrl.scheme, URLScheme::MAILTO);
+    EXPECT_EQ(mailtoUrl.schemeString, "mailto");
+    EXPECT_TRUE(mailtoUrl.host.empty());
+    EXPECT_EQ(mailtoUrl.path, "alerts@shadowstrike.dev");
+
     std::string embeddedNull("https://exa");
     embeddedNull.push_back('\0');
     embeddedNull += "mple.com";

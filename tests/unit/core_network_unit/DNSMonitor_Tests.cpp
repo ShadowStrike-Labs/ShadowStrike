@@ -104,6 +104,11 @@ TEST_F(DNSMonitorTest, ConfigFactoriesStatisticsAndRuleHelpersPreserveExpectedDe
     regexRule.domainPattern = R"(.*\.corp\.local)";
     EXPECT_TRUE(regexRule.Matches("dc01.corp.local"));
     EXPECT_FALSE(regexRule.Matches("corp.local"));
+
+    DNSFilterRule invalidRegexRule;
+    invalidRegexRule.isRegex = true;
+    invalidRegexRule.domainPattern = "(";
+    EXPECT_FALSE(invalidRegexRule.Matches("corp.local"));
 }
 
 TEST_F(DNSMonitorTest, UtilityHelpersAndEnumNamesStayStableForPolicyConsumers) {
@@ -118,6 +123,7 @@ TEST_F(DNSMonitorTest, UtilityHelpersAndEnumNamesStayStableForPolicyConsumers) {
     EXPECT_FALSE(DNSMonitor::IsValidDomain(".leading-dot.example"));
     EXPECT_FALSE(DNSMonitor::IsValidDomain("trailing-dot.example."));
     EXPECT_FALSE(DNSMonitor::IsValidDomain("bad domain.example"));
+    EXPECT_FALSE(DNSMonitor::IsValidDomain(std::string(DNSConstants::MAX_DOMAIN_LENGTH + 1, 'a')));
 
     EXPECT_EQ(DNSMonitor::GetRecordTypeName(DNSRecordType::AAAA), "AAAA");
     EXPECT_EQ(GetResponseCodeName(DNSResponseCode::NXDOMAIN), "NXDOMAIN");
@@ -131,9 +137,9 @@ TEST_F(DNSMonitorTest, UtilityHelpersAndEnumNamesStayStableForPolicyConsumers) {
 }
 
 TEST_F(DNSMonitorTest, DgaFilteringCallbackAndCacheContractsRemainDeterministic) {
-    const DGAAnalysis suspicious = monitor.AnalyzeDGA("xvkdf8s9df.com");
+    const DGAAnalysis suspicious = monitor.AnalyzeDGA("qzxjv9kptd8r.com");
     EXPECT_TRUE(suspicious.isDGA);
-    EXPECT_TRUE(monitor.IsDGA("xvkdf8s9df.com"));
+    EXPECT_TRUE(monitor.IsDGA("qzxjv9kptd8r.com"));
     EXPECT_FALSE(monitor.IsDGA("microsoft.com"));
 
     const uint64_t queryCallbackId = monitor.RegisterQueryCallback([](const DNSQuery&) {});

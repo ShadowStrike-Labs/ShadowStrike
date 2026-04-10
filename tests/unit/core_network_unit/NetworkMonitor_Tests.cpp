@@ -67,6 +67,10 @@ TEST_F(NetworkMonitorTest, IPv4AddressContractsClassifyFormatAndCompareCorrectly
 }
 
 TEST_F(NetworkMonitorTest, IPv6AndRangeContractsPreserveClassificationContainmentAndCounts) {
+    std::array<uint8_t, 16> loopbackBytes{};
+    loopbackBytes[15] = 0x01;
+    std::array<uint8_t, 16> unspecifiedBytes{};
+
     std::array<uint8_t, 16> linkLocalBytes{};
     linkLocalBytes[0] = 0xFE;
     linkLocalBytes[1] = 0x80;
@@ -77,8 +81,14 @@ TEST_F(NetworkMonitorTest, IPv6AndRangeContractsPreserveClassificationContainmen
     multicastBytes[1] = 0x02;
     multicastBytes[15] = 0x01;
 
+    const IPAddress loopback(loopbackBytes);
+    const IPAddress unspecified(unspecifiedBytes);
     const IPAddress linkLocal(linkLocalBytes);
     const IPAddress multicast(multicastBytes);
+
+    EXPECT_EQ(loopback.classification, IPClassification::LOOPBACK);
+    EXPECT_TRUE(loopback.IsLoopback());
+    EXPECT_FALSE(unspecified.IsLoopback());
 
     EXPECT_EQ(linkLocal.type, IPAddressType::IPV6);
     EXPECT_EQ(linkLocal.classification, IPClassification::LINK_LOCAL);

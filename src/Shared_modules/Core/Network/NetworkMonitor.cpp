@@ -117,7 +117,8 @@ IPAddress::IPAddress(const std::array<uint8_t, 16>& v6) noexcept
         classification = IPClassification::LINK_LOCAL;
     } else if (v6[0] == 0xFF) {
         classification = IPClassification::MULTICAST;
-    } else if (std::all_of(v6.begin(), v6.end(), [](uint8_t b) { return b == 0; })) {
+    } else if (std::all_of(v6.begin(), v6.end() - 1, [](uint8_t b) { return b == 0; }) &&
+               v6[15] == 0x01) {
         classification = IPClassification::LOOPBACK;  // ::1
     } else {
         classification = IPClassification::PUBLIC;
