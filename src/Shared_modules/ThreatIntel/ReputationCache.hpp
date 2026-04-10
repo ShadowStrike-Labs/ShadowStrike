@@ -157,15 +157,17 @@ struct alignas(8) CacheKey {
     
     /// @brief Construct from IPv4 address
     explicit CacheKey(const IPv4Address& addr) noexcept
-        : type(IOCType::IPv4), length(sizeof(IPv4Address)) {
-        std::memcpy(data.data(), &addr, sizeof(IPv4Address));
+        : type(IOCType::IPv4), length(5) {
+        std::memcpy(data.data(), addr.octets.data(), 4);
+        data[4] = addr.prefixLength;
         ComputeHash();
     }
     
     /// @brief Construct from IPv6 address
     explicit CacheKey(const IPv6Address& addr) noexcept
-        : type(IOCType::IPv6), length(sizeof(IPv6Address)) {
-        std::memcpy(data.data(), &addr, sizeof(IPv6Address));
+        : type(IOCType::IPv6), length(17) {
+        std::memcpy(data.data(), addr.address.data(), 16);
+        data[16] = addr.prefixLength;
         ComputeHash();
     }
     

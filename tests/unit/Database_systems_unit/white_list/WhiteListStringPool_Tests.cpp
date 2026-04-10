@@ -39,8 +39,8 @@
 
 #include <gtest/gtest.h>
 #include"Utils/Logger.hpp"
-#include "../../../../src/Whitelist/WhiteListStore.hpp"
-#include "../../../../src/Whitelist/WhiteListFormat.hpp"
+#include "Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
 
 #include <vector>
 #include <string>
@@ -830,16 +830,13 @@ TEST_F(StringPoolTest, AddString_SpecialCharacters_Success) {
 TEST_F(StringPoolTest, AddString_NullBytesInMiddle_HandledCorrectly) {
     InitializeWritable();
     
-    // String with embedded null - string_view handles this
+    // Embedded NULs are rejected to prevent path truncation and parser confusion.
     std::string strWithNull = "Before";
     strWithNull.push_back('\0');
     strWithNull += "After";
     
     auto offset = pool->AddString(strWithNull);
-    ASSERT_TRUE(offset.has_value());
-    
-    auto retrieved = pool->GetString(offset.value(), static_cast<uint16_t>(strWithNull.length()));
-    EXPECT_EQ(retrieved.length(), strWithNull.length());
+    EXPECT_FALSE(offset.has_value());
 }
 
 // ============================================================================

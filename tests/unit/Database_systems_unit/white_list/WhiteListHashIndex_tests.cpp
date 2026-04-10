@@ -49,8 +49,8 @@
 #include <gtest/gtest.h>
 #include <gmock/gmock.h>
 
-#include "../../src/Whitelist/WhiteListStore.hpp"
-#include "../../src/Whitelist/WhiteListFormat.hpp"
+#include "Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
 
 #include <vector>
 #include <array>
@@ -426,11 +426,12 @@ TEST_F(HashIndexTest, UpdateExistingHash) {
     EXPECT_TRUE(index.Insert(hash, 100).IsSuccess());
     EXPECT_EQ(index.Lookup(hash).value(), 100u);
     
-    // Update with second offset (upsert semantics)
+    // Re-inserting the same hash must be idempotent. The index is keyed by FastHash, so
+    // blindly overwriting on duplicate insert would allow collisions to corrupt lookups.
     EXPECT_TRUE(index.Insert(hash, 200).IsSuccess());
-    EXPECT_EQ(index.Lookup(hash).value(), 200u);
+    EXPECT_EQ(index.Lookup(hash).value(), 100u);
     
-    // Entry count should remain 1 (update, not new insert)
+    // Entry count should remain 1 (duplicate no-op, not a second insert)
     EXPECT_EQ(index.GetEntryCount(), 1u);
 }
 
@@ -1199,9 +1200,9 @@ TEST_F(HashIndexTest, RegressionDuplicateKeyHandling) {
     EXPECT_TRUE(index.Insert(hash, 200).IsSuccess());
     EXPECT_TRUE(index.Insert(hash, 300).IsSuccess());
     
-    // Should only have one entry (last wins)
+    // Duplicate inserts must not create extra entries or replace the original offset.
     EXPECT_EQ(index.GetEntryCount(), 1u);
-    EXPECT_EQ(index.Lookup(hash).value(), 300u);
+    EXPECT_EQ(index.Lookup(hash).value(), 100u);
 }
 
 TEST_F(HashIndexTest, RegressionRemoveFromSingleEntryIndex) {

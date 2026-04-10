@@ -64,8 +64,7 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
-
-                        // Bloom rejection is an optimization, not a lookup failure
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
                         m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
@@ -149,6 +148,8 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
@@ -222,6 +223,8 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
@@ -286,6 +289,8 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
@@ -357,6 +362,8 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
@@ -421,6 +428,8 @@ namespace ThreatIntel {
                     if (!bloomIt->second->MightContain(key)) {
                         result.bloomRejected = true;
                         m_impl->stats.bloomFilterRejects.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.failedLookups.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->stats.totalLookups.fetch_add(1, std::memory_order_relaxed);
 
                         if (options.collectStatistics) {
                             result.latencyNs = GetNanoseconds() - startTime;
