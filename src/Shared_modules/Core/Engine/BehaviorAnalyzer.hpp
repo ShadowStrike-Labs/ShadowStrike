@@ -946,7 +946,7 @@ enum class RecommendedAction : uint8_t {
 /**
  * @brief Get string representation of behavior pattern.
  */
-[[nodiscard]] constexpr const char* BehaviorPatternTypeToString(BehaviorPatternType pattern) noexcept;
+[[nodiscard]] const char* BehaviorPatternTypeToString(BehaviorPatternType pattern) noexcept;
 
 // ============================================================================
 // DATA STRUCTURES

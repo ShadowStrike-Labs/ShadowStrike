@@ -1800,16 +1800,6 @@ std::string_view GetLockyVariantName(LockyVariant variant) noexcept {
     }
 }
 
-std::string_view GetDetectionConfidenceName(DetectionConfidence conf) noexcept {
-    switch (conf) {
-        case DetectionConfidence::Low:       return "Low";
-        case DetectionConfidence::Medium:    return "Medium";
-        case DetectionConfidence::High:      return "High";
-        case DetectionConfidence::Confirmed: return "Confirmed";
-        default:                             return "None";
-    }
-}
-
 std::wstring_view GetLockyExtension(LockyVariant variant) noexcept {
     switch (variant) {
         case LockyVariant::Original: return L".locky";
