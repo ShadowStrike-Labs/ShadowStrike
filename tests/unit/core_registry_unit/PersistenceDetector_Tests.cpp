@@ -15,12 +15,49 @@
 #include <gtest/gtest.h>
 
 #include "../../../src/Shared_modules/Core/Registry/PersistenceDetector.hpp"
+#include "CoreRegistry_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Registry::Test {
+
+namespace {
+
+class ScopedEnvironmentVariable {
+public:
+    ScopedEnvironmentVariable(std::wstring_view name, const std::wstring& value)
+        : name_(name) {
+        DWORD required = ::GetEnvironmentVariableW(name_.c_str(), nullptr, 0);
+        if (required > 0) {
+            hadOriginalValue_ = true;
+            originalValue_.resize(required - 1);
+            (void)::GetEnvironmentVariableW(
+                name_.c_str(),
+                originalValue_.data(),
+                static_cast<DWORD>(originalValue_.size() + 1));
+        }
+
+        (void)::SetEnvironmentVariableW(name_.c_str(), value.c_str());
+    }
+
+    ~ScopedEnvironmentVariable() {
+        if (hadOriginalValue_) {
+            (void)::SetEnvironmentVariableW(name_.c_str(), originalValue_.c_str());
+        } else {
+            (void)::SetEnvironmentVariableW(name_.c_str(), nullptr);
+        }
+    }
+
+private:
+    std::wstring name_;
+    std::wstring originalValue_;
+    bool hadOriginalValue_{ false };
+};
+
+}  // namespace
 
 class PersistenceDetectorTest : public ::testing::Test {
 protected:
     PersistenceDetector& detector = PersistenceDetector::Instance();
+    TempDirectoryGuard temp{ L"ShadowStrike_PersistenceDetector_UT" };
 
     void SetUp() override {
         detector.Shutdown();
@@ -200,6 +237,69 @@ TEST_F(PersistenceDetectorTest, CallbackContractsAndUninitializedGuardsRemainSaf
     EXPECT_EQ(analysis.risk, PersistenceRiskLevel::Unknown);
     EXPECT_FALSE(analysis.isPersistenceAttempt);
     EXPECT_FALSE(analysis.isKnownBad);
+}
+
+TEST_F(PersistenceDetectorTest, InitializedParsingAndLocationNormalizationHandleRegistryEdgeCases) {
+    ASSERT_TRUE(detector.Initialize(PersistenceDetectorConfig::CreateDefault()));
+
+    const std::array<uint8_t, 2> minimalExecutable{ 'M', 'Z' };
+    const auto envTargetPath = temp.WriteBytes(
+        L"payload folder\\shadow payload.exe",
+        minimalExecutable);
+    const auto dllPath = temp.WriteBytes(L"plugin.dll", minimalExecutable);
+    const auto htaPath = temp.WriteText(
+        L"launcher.hta",
+        "<html><script>close()</script></html>");
+
+    const ScopedEnvironmentVariable envOverride(
+        L"SHADOWSTRIKE_PERSISTENCE_UT_BIN",
+        envTargetPath.wstring());
+
+    const TargetBinary envResolved = detector.ResolveTarget(
+        L"\"%SHADOWSTRIKE_PERSISTENCE_UT_BIN%\" --scan --quiet");
+    EXPECT_EQ(envResolved.path, envTargetPath.wstring());
+    EXPECT_EQ(envResolved.arguments, L"--scan --quiet");
+    EXPECT_TRUE(envResolved.exists);
+    EXPECT_TRUE(envResolved.isExecutable);
+
+    EXPECT_EQ(
+        detector.IsPersistenceLocation(
+            L"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\Run"),
+        PersistenceType::RunKey);
+    EXPECT_EQ(
+        detector.IsPersistenceLocation(
+            L"\\Registry\\Machine\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Image File Execution Options\\notepad.exe"),
+        PersistenceType::IFEO_Debugger);
+    EXPECT_EQ(
+        detector.IsPersistenceLocation(
+            L"\\Registry\\User\\S-1-5-21-1000\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce"),
+        PersistenceType::RunKeyOnce);
+
+    const auto rundllTargets = detector.ResolveComplexCommand(
+        L"rundll32.exe " + dllPath.wstring() + L",EntryPoint");
+    ASSERT_GE(rundllTargets.size(), 2u);
+    EXPECT_EQ(rundllTargets[1].path, dllPath.wstring());
+    EXPECT_EQ(rundllTargets[1].description, L"Target DLL loaded via rundll32");
+
+    const auto regsvrTargets = detector.ResolveComplexCommand(
+        L"regsvr32.exe /s " + dllPath.wstring());
+    ASSERT_GE(regsvrTargets.size(), 2u);
+    EXPECT_EQ(regsvrTargets[1].path, dllPath.wstring());
+    EXPECT_EQ(regsvrTargets[1].description, L"Target DLL registered via regsvr32");
+
+    const auto mshtaTargets = detector.ResolveComplexCommand(
+        L"mshta.exe " + htaPath.wstring());
+    ASSERT_GE(mshtaTargets.size(), 2u);
+    EXPECT_EQ(mshtaTargets[1].path, htaPath.wstring());
+    EXPECT_EQ(mshtaTargets[1].description, L"HTA/Script target executed via mshta");
+
+    const auto powershellTargets = detector.ResolveComplexCommand(
+        L"powershell.exe -enc "
+        L"VwByAGkAdABlAC0ASABvAHMAdAAgAHMAaABhAGQAbwB3AHMAdAByAGkAawBlAA==");
+    ASSERT_GE(powershellTargets.size(), 2u);
+    EXPECT_EQ(powershellTargets.back().path, L"DECODED_SCRIPT");
+    EXPECT_TRUE(powershellTargets.back().isScript);
+    EXPECT_EQ(powershellTargets.back().arguments, L"Write-Host shadowstrike");
 }
 
 }  // namespace ShadowStrike::Core::Registry::Test

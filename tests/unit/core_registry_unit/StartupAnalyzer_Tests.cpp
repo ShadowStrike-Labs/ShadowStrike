@@ -129,6 +129,11 @@ TEST_F(StartupAnalyzerTest, CallbackAndDefaultStateContractsRemainSafeAfterShutd
     EXPECT_TRUE(analyzer.GetSuspiciousItems(0).empty());
     EXPECT_TRUE(analyzer.GetHistory(0).empty());
     EXPECT_FALSE(analyzer.RollbackChange(0xDEADBEEFull));
+    EXPECT_EQ(analyzer.DisableItem(L"MissingEntry"), ActionResult::NotFound);
+    EXPECT_EQ(analyzer.EnableItem(L"MissingEntry"), ActionResult::NotFound);
+    EXPECT_EQ(analyzer.RemoveItem(L"MissingEntry", true), ActionResult::NotFound);
+    EXPECT_EQ(analyzer.DelayItem(L"MissingEntry", 30), ActionResult::NotFound);
+    EXPECT_EQ(analyzer.RestoreItem(L"MissingEntry"), ActionResult::NotFound);
 
     const StartupItem scannedMissingItem = analyzer.ScanItem(L"MissingEntry");
     EXPECT_EQ(scannedMissingItem.name, L"MissingEntry");

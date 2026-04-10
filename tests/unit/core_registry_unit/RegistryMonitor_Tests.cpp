@@ -62,7 +62,7 @@ TEST_F(RegistryMonitorTest, RegistryEventClassificationAndStaticKeyHelpersRemain
     RegistryEvent serviceEvent;
     serviceEvent.keyPath = L"\\Registry\\Machine\\SYSTEM\\CurrentControlSet\\Services\\ShadowStrike";
     EXPECT_TRUE(serviceEvent.IsServiceKey());
-    EXPECT_EQ(serviceEvent.GetCategory(), KeyCategory::System);
+    EXPECT_EQ(serviceEvent.GetCategory(), KeyCategory::Persistence);
     EXPECT_EQ(serviceEvent.GetHive(), L"HKLM");
 
     RegistryEvent securityEvent;
@@ -323,6 +323,79 @@ TEST_F(RegistryMonitorTest, AnalyzeValueAndProcessEventBoundariesStayDeterminist
     ASSERT_EQ(recentEvents.size(), 2u);
     EXPECT_EQ(recentEvents.front().keyPath, secondAllowed.keyPath);
     EXPECT_EQ(recentEvents.back().keyPath, firstAllowed.keyPath);
+}
+
+TEST_F(RegistryMonitorTest, RulePriorityAndProtectedKeyBoundariesRemainDeterministic) {
+    ProtectedKey exactOnly;
+    exactOnly.keyPath = L"HKLM\\Software\\ShadowStrike\\ExactOnly";
+    exactOnly.includeSubkeys = false;
+    monitor.AddProtectedKey(exactOnly);
+
+    EXPECT_TRUE(monitor.IsProtectedKey(exactOnly.keyPath));
+    EXPECT_FALSE(monitor.IsProtectedKey(exactOnly.keyPath + L"\\Child"));
+
+    RegistryRule silentDropRule;
+    silentDropRule.name = "Silent drop fallback";
+    silentDropRule.keyPathPattern = L"HKLM\\Software\\ShadowStrike\\Policies\\*";
+    silentDropRule.action = RuleAction::Block;
+    silentDropRule.verdict = RegistryVerdict::SilentDrop;
+    silentDropRule.priority = 10;
+
+    RegistryRule highPriorityBlockRule;
+    highPriorityBlockRule.name = "High priority block";
+    highPriorityBlockRule.keyPathPattern = L"HKLM\\Software\\ShadowStrike\\Policies\\*";
+    highPriorityBlockRule.action = RuleAction::Block;
+    highPriorityBlockRule.verdict = RegistryVerdict::Block;
+    highPriorityBlockRule.priority = 100;
+
+    RegistryRule expiredRule;
+    expiredRule.name = "Expired rule";
+    expiredRule.keyPathPattern = L"HKLM\\Software\\ShadowStrike\\Expired\\*";
+    expiredRule.action = RuleAction::Block;
+    expiredRule.verdict = RegistryVerdict::Block;
+    expiredRule.priority = 500;
+    expiredRule.isPermanent = false;
+    expiredRule.expiresAt = std::chrono::system_clock::now() - std::chrono::seconds(1);
+
+    RegistryRule expiredFallbackRule;
+    expiredFallbackRule.name = "Expired fallback";
+    expiredFallbackRule.keyPathPattern = L"HKLM\\Software\\ShadowStrike\\Expired\\*";
+    expiredFallbackRule.action = RuleAction::Block;
+    expiredFallbackRule.verdict = RegistryVerdict::SilentDrop;
+    expiredFallbackRule.priority = 50;
+
+    const uint64_t silentDropRuleId = monitor.AddRule(silentDropRule);
+    const uint64_t highPriorityBlockRuleId = monitor.AddRule(highPriorityBlockRule);
+    EXPECT_NE(silentDropRuleId, 0u);
+    EXPECT_NE(highPriorityBlockRuleId, 0u);
+    EXPECT_NE(silentDropRuleId, highPriorityBlockRuleId);
+    EXPECT_NE(monitor.AddRule(expiredRule), 0u);
+    EXPECT_NE(monitor.AddRule(expiredFallbackRule), 0u);
+
+    RegistryEvent policyEvent;
+    policyEvent.processId = 42;
+    policyEvent.keyPath = L"HKLM\\Software\\ShadowStrike\\Policies\\DeviceControl";
+    policyEvent.operation = RegistryOp::SetValue;
+    EXPECT_EQ(monitor.ProcessEvent(policyEvent), RegistryVerdict::Block);
+
+    EXPECT_TRUE(monitor.SetRuleEnabled(highPriorityBlockRuleId, false));
+    EXPECT_EQ(monitor.ProcessEvent(policyEvent), RegistryVerdict::SilentDrop);
+
+    RegistryEvent expiredEvent;
+    expiredEvent.processId = 43;
+    expiredEvent.keyPath = L"HKLM\\Software\\ShadowStrike\\Expired\\Test";
+    expiredEvent.operation = RegistryOp::SetValue;
+    EXPECT_EQ(monitor.ProcessEvent(expiredEvent), RegistryVerdict::SilentDrop);
+
+    RegistryEvent overlongEvent;
+    overlongEvent.processId = 44;
+    overlongEvent.operation = RegistryOp::SetValue;
+    overlongEvent.keyPath =
+        L"HKLM\\Software\\ShadowStrike\\" +
+        std::wstring(RegistryMonitorConstants::MAX_KEY_PATH_LENGTH, L'A');
+    const auto recentCountBefore = monitor.GetRecentEvents(32).size();
+    EXPECT_EQ(monitor.ProcessEvent(overlongEvent), RegistryVerdict::Block);
+    EXPECT_EQ(monitor.GetRecentEvents(32).size(), recentCountBefore);
 }
 
 }  // namespace ShadowStrike::Core::Registry::Test

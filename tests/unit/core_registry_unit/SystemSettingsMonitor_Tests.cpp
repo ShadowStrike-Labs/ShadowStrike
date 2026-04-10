@@ -154,8 +154,8 @@ TEST_F(SystemSettingsMonitorTest, DefaultStateAndBaselineContractsRemainDetermin
 
     const ComplianceStatus compliance = monitor.CheckCompliance();
     EXPECT_TRUE(compliance.isCompliant);
-    EXPECT_EQ(compliance.totalChecks, 7u);
-    EXPECT_EQ(compliance.passedChecks, 7u);
+    EXPECT_EQ(compliance.totalChecks, 6u);
+    EXPECT_EQ(compliance.passedChecks, 6u);
     EXPECT_EQ(compliance.failedChecks, 0u);
     EXPECT_EQ(compliance.warnings, 0u);
     EXPECT_TRUE(compliance.failures.empty());

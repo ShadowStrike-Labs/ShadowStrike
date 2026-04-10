@@ -296,6 +296,25 @@ namespace {
     return false;
 }
 
+[[nodiscard]] static bool MatchesRegistryKeyPattern(const std::wstring& lowerPath,
+                                                    const std::wstring& pattern) {
+    const std::wstring lowerPattern = StringUtils::ToLowerCopy(pattern);
+    const size_t wildcardPos = lowerPattern.find(L'*');
+    if (wildcardPos == std::wstring::npos) {
+        return lowerPath.find(lowerPattern) != std::wstring::npos;
+    }
+
+    const std::wstring prefix = lowerPattern.substr(0, wildcardPos);
+    const std::wstring suffix = lowerPattern.substr(wildcardPos + 1);
+    const size_t prefixPos = lowerPath.find(prefix);
+    if (prefixPos == std::wstring::npos) {
+        return false;
+    }
+
+    return suffix.empty() ||
+           lowerPath.find(suffix, prefixPos + prefix.size()) != std::wstring::npos;
+}
+
 // ============================================================================
 // REGISTRY EVENT METHODS
 // ============================================================================
@@ -304,8 +323,7 @@ bool RegistryEvent::IsPersistenceKey() const {
     const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
 
     for (const auto& key : PERSISTENCE_KEYS) {
-        const std::wstring lowerKey = StringUtils::ToLowerCopy(key);
-        if (lowerPath.find(lowerKey) != std::wstring::npos) {
+        if (MatchesRegistryKeyPattern(lowerPath, key)) {
             return true;
         }
     }
@@ -323,8 +341,7 @@ bool RegistryEvent::IsSecurityKey() const {
     const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
 
     for (const auto& key : SECURITY_KEYS) {
-        const std::wstring lowerKey = StringUtils::ToLowerCopy(key);
-        if (lowerPath.find(lowerKey) != std::wstring::npos) {
+        if (MatchesRegistryKeyPattern(lowerPath, key)) {
             return true;
         }
     }
@@ -336,8 +353,7 @@ bool RegistryEvent::IsCOMKey() const {
     const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
 
     for (const auto& key : COM_KEYS) {
-        const std::wstring lowerKey = StringUtils::ToLowerCopy(key);
-        if (lowerPath.find(lowerKey) != std::wstring::npos) {
+        if (MatchesRegistryKeyPattern(lowerPath, key)) {
             return true;
         }
     }
@@ -349,8 +365,7 @@ bool RegistryEvent::IsNetworkKey() const {
     const std::wstring lowerPath = StringUtils::ToLowerCopy(keyPath);
 
     for (const auto& key : NETWORK_KEYS) {
-        const std::wstring lowerKey = StringUtils::ToLowerCopy(key);
-        if (lowerPath.find(lowerKey) != std::wstring::npos) {
+        if (MatchesRegistryKeyPattern(lowerPath, key)) {
             return true;
         }
     }
@@ -913,6 +928,14 @@ public:
         ValueAnalysis analysis;
         analysis.dataSize = data.size();
         analysis.type = type;
+        const auto addExtractedPath = [&analysis](const std::wstring& candidate) {
+            analysis.containsPath = true;
+            if (std::find(analysis.extractedPaths.begin(),
+                          analysis.extractedPaths.end(),
+                          candidate) == analysis.extractedPaths.end()) {
+                analysis.extractedPaths.push_back(candidate);
+            }
+        };
 
         try {
             // Size check
@@ -977,16 +1000,14 @@ public:
                             }
                             // Use expanded value for path detection
                             if (IsPathLike(expanded)) {
-                                analysis.containsPath = true;
-                                analysis.extractedPaths.push_back(expanded);
+                                addExtractedPath(expanded);
                             }
                         }
                     }
 
                     // Path detection on raw value
                     if (IsPathLike(value)) {
-                        analysis.containsPath = true;
-                        analysis.extractedPaths.push_back(value);
+                        addExtractedPath(value);
                     }
 
                     // URL detection (lightweight, no regex on hot path)

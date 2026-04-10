@@ -1830,6 +1830,16 @@ public:
 
     [[nodiscard]] PersistenceType IsPersistenceLocationImpl(const std::wstring& keyPath) const noexcept {
         std::wstring upperPath = StringUtils::ToUpperCopy(keyPath);
+        const auto matchesLocation = [](const std::wstring& path,
+                                        const std::wstring& location) noexcept {
+            const size_t matchPos = path.find(location);
+            if (matchPos == std::wstring::npos) {
+                return false;
+            }
+
+            const size_t matchEnd = matchPos + location.size();
+            return matchEnd == path.size() || path[matchEnd] == L'\\';
+        };
 
         // Normalize kernel-format paths to usermode format
         // Kernel sends: \REGISTRY\MACHINE\..., usermode uses: HKEY_LOCAL_MACHINE\...
@@ -1854,7 +1864,7 @@ public:
 
             std::wstring upperCheckPath = StringUtils::ToUpperCopy(checkPath);
 
-            if (normalizedPath.find(upperCheckPath) != std::wstring::npos) {
+            if (matchesLocation(normalizedPath, upperCheckPath)) {
                 return loc.type;
             }
         }
@@ -1877,7 +1887,7 @@ public:
                     loc.subkey);
 
                 std::wstring upperCheckPath = StringUtils::ToUpperCopy(checkPath);
-                if (shortFormPath.find(upperCheckPath) != std::wstring::npos) {
+                if (matchesLocation(shortFormPath, upperCheckPath)) {
                     return loc.type;
                 }
             }
