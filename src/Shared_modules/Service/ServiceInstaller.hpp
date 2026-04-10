@@ -161,6 +161,13 @@ private:
     [[nodiscard]] static bool ConfigureDescription(SC_HANDLE hService, const std::wstring& description);
     [[nodiscard]] static bool ConfigureDelayedAutoStart(SC_HANDLE hService, bool delayed);
     [[nodiscard]] static std::wstring FormatDependencies(const std::vector<std::wstring>& deps);
+
+#ifdef SHADOWSTRIKE_TESTING
+public:
+    [[nodiscard]] static std::wstring TestOnly_FormatDependencies(const std::vector<std::wstring>& deps) {
+        return FormatDependencies(deps);
+    }
+#endif
 };
 
 } // namespace Service

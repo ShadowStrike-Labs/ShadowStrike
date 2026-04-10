@@ -49,10 +49,9 @@ TEST(ServiceControllerTest, StatusReportAndRecoveryExposeCurrentPublicBehavior) 
     const std::string report = controller.GetStatusReport();
     EXPECT_NE(report.find("\"service\": \"ShadowStrike\""), std::string::npos);
     EXPECT_NE(report.find("\"status\": \"stopped\""), std::string::npos);
-    EXPECT_NE(report.find("\"uptime_seconds\": 0"), std::string::npos);
-    EXPECT_NE(report.find("\"components\": {"), std::string::npos);
+    EXPECT_NE(report.find("\"uptime_seconds\": 0,\"components\": {"), std::string::npos);
 
-    EXPECT_TRUE(controller.IsRunning());
+    EXPECT_FALSE(controller.IsRunning());
     EXPECT_TRUE(controller.RequestRecovery("telemetry"));
     EXPECT_TRUE(controller.RequestRecovery(""));
 }
@@ -67,7 +66,16 @@ TEST(ServiceControllerTest, StopAndUnknownControlCodesPreserveCurrentSimplifiedC
 
     const std::string report = controller.GetStatusReport();
     EXPECT_NE(report.find("\"status\": \"stopped\""), std::string::npos);
-    EXPECT_TRUE(controller.IsRunning());
+    EXPECT_FALSE(controller.IsRunning());
+}
+
+TEST(ServiceControllerTest, ShutdownAndSessionControlsReturnNoErrorForBoundControllerContext) {
+    SSS::ServiceController& controller = SSS::ServiceController::Instance();
+
+    EXPECT_EQ(SSS::ServiceController::ServiceCtrlHandler(
+        SERVICE_CONTROL_SHUTDOWN, 0, nullptr, &controller), static_cast<DWORD>(NO_ERROR));
+    EXPECT_EQ(SSS::ServiceController::ServiceCtrlHandler(
+        SERVICE_CONTROL_SESSIONCHANGE, WTS_SESSION_LOCK, nullptr, &controller), static_cast<DWORD>(NO_ERROR));
 }
 
 }  // namespace

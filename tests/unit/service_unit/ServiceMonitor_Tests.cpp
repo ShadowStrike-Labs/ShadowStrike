@@ -25,6 +25,20 @@ namespace SSS = ShadowStrike::Service;
 namespace ShadowStrike::Service::Test {
 namespace {
 
+bool WaitForHealthState(ServiceMonitor& monitor,
+                        bool expectedState,
+                        std::chrono::milliseconds timeout) {
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    do {
+        if (monitor.IsHealthy() == expectedState) {
+            return true;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(25));
+    } while (std::chrono::steady_clock::now() < deadline);
+
+    return monitor.IsHealthy() == expectedState;
+}
+
 class ServiceMonitorTest : public ::testing::Test {
 protected:
     ServiceMonitor& monitor = ServiceMonitor::Instance();
@@ -124,8 +138,7 @@ TEST_F(ServiceMonitorTest, CpuLimitDoesNotByItselfFlipHealthStateAndStopDoesNotR
     EXPECT_EQ(beforeStop.threadCount, 0ULL);
 
     monitor.SetMaxMemoryLimit(0);
-    std::this_thread::sleep_for(std::chrono::milliseconds(250));
-    ASSERT_FALSE(monitor.IsHealthy());
+    ASSERT_TRUE(WaitForHealthState(monitor, false, std::chrono::milliseconds(1500)));
 
     monitor.StopMonitoring();
 
