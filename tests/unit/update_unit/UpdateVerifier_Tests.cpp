@@ -34,6 +34,10 @@ TEST(UpdateVerifierTest, HelperNamesVersionFormattingAndHashingRemainStable) {
     EXPECT_EQ(GetRevocationMethodName(RevocationCheckMethod::Both), "Both");
     EXPECT_EQ(GetVerificationStatusName(static_cast<VerificationStatus>(0xFF)), "Unknown");
 
+    const std::string versionString = UpdateVerifier::GetVersionString();
+    EXPECT_FALSE(versionString.empty());
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 3);
+
     const auto components = ParseVersion("3.14.159");
     EXPECT_EQ(components[0], 3u);
     EXPECT_EQ(components[1], 14u);
@@ -222,6 +226,41 @@ TEST(UpdateVerifierTest, PinnedCertificateAndMinimumVersionPoliciesRemainMonoton
     EXPECT_EQ(verifier.GetMinimumVersion(), "2.0.0");
     EXPECT_FALSE(verifier.ValidateVersionSequence("1.9.9"));
     EXPECT_TRUE(verifier.ValidateVersionSequence("2.0.0"));
+
+    verifier.Shutdown();
+}
+
+TEST(UpdateVerifierTest, RepeatedInitializePreservesPinnedCertificatesAndMinimumVersion) {
+    auto& verifier = UpdateVerifier::Instance();
+    verifier.Shutdown();
+
+    PinnedCertificate initialPinned;
+    initialPinned.subjectName = "CN=Initial";
+    initialPinned.thumbprint = "ABC123";
+    initialPinned.publicKeyHash = "feedface";
+
+    UpdateVerifierConfiguration initialConfig;
+    initialConfig.enableCertificatePinning = true;
+    initialConfig.pinnedCertificates = {initialPinned};
+    initialConfig.minimumVersion = "2.0.0";
+    ASSERT_TRUE(initialConfig.IsValid());
+    ASSERT_TRUE(verifier.Initialize(initialConfig));
+
+    PinnedCertificate replacementPinned;
+    replacementPinned.subjectName = "CN=Replacement";
+    replacementPinned.thumbprint = "DEF456";
+    replacementPinned.publicKeyHash = "deadbeef";
+
+    UpdateVerifierConfiguration replacementConfig = initialConfig;
+    replacementConfig.pinnedCertificates = {replacementPinned};
+    replacementConfig.minimumVersion = "9.0.0";
+
+    ASSERT_TRUE(verifier.Initialize(replacementConfig));
+
+    EXPECT_EQ(verifier.GetMinimumVersion(), "2.0.0");
+    const auto pinnedCertificates = verifier.GetPinnedCertificates();
+    ASSERT_EQ(pinnedCertificates.size(), 1u);
+    EXPECT_EQ(pinnedCertificates.front().thumbprint, "ABC123");
 
     verifier.Shutdown();
 }

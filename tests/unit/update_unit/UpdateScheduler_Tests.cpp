@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -29,6 +30,10 @@ TEST(UpdateSchedulerTest, HelperNamesAndTimeWindowPredicatesRemainStable) {
     EXPECT_EQ(GetDeferralReasonName(DeferralReason::MaintenanceWindow), "MaintenanceWindow");
     EXPECT_EQ(GetNetworkTypeName(NetworkType::VPN), "VPN");
     EXPECT_EQ(GetNetworkTypeName(static_cast<NetworkType>(0xFF)), "Unknown");
+
+    const std::string versionString = UpdateScheduler::GetVersionString();
+    EXPECT_TRUE(versionString.starts_with("UpdateScheduler "));
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     ScheduleRule rule;
     rule.enabled = true;
@@ -266,6 +271,38 @@ TEST(UpdateSchedulerTest, RuleWindowAndLifecycleTransitionsRemainDeterministic) 
     EXPECT_FALSE(scheduler.GetNextCheckTime().has_value());
 
     scheduler.Stop();
+    scheduler.Shutdown();
+}
+
+TEST(UpdateSchedulerTest, RepeatedInitializePreservesExistingIntervalAndQuietHours) {
+    auto& scheduler = UpdateScheduler::Instance();
+    scheduler.Shutdown();
+
+    UpdateSchedulerConfiguration initialConfig;
+    initialConfig.enabled = false;
+    initialConfig.checkOnStartup = false;
+    initialConfig.defaultIntervalHours = 12;
+    initialConfig.quietHours.enabled = true;
+    initialConfig.quietHours.daysOfWeek = 0x7F;
+    initialConfig.quietHours.startMinutes = 90;
+    initialConfig.quietHours.endMinutes = 180;
+    ASSERT_TRUE(initialConfig.IsValid());
+    ASSERT_TRUE(scheduler.Initialize(initialConfig));
+
+    UpdateSchedulerConfiguration replacementConfig = initialConfig;
+    replacementConfig.defaultIntervalHours = 48;
+    replacementConfig.quietHours.enabled = false;
+    replacementConfig.quietHours.startMinutes = 0;
+    replacementConfig.quietHours.endMinutes = 0;
+
+    ASSERT_TRUE(scheduler.Initialize(replacementConfig));
+
+    EXPECT_EQ(scheduler.GetInterval(), std::chrono::hours(12));
+    const auto effectiveQuietHours = scheduler.GetQuietHours();
+    EXPECT_TRUE(effectiveQuietHours.enabled);
+    EXPECT_EQ(effectiveQuietHours.startMinutes, 90u);
+    EXPECT_EQ(effectiveQuietHours.endMinutes, 180u);
+
     scheduler.Shutdown();
 }
 

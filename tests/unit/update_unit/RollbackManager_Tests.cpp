@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
@@ -30,6 +31,10 @@ TEST(RollbackManagerTest, HelperNamesSnapshotIdsAndSizeAccountingRemainStable) {
     EXPECT_EQ(GetHealthStatusName(HealthStatus::Critical), "Critical");
     EXPECT_EQ(GetComponentHealthName(ComponentHealth::Corrupted), "Corrupted");
     EXPECT_EQ(GetSnapshotTypeName(static_cast<SnapshotType>(0xFF)), "Unknown");
+
+    const std::string versionString = RollbackManager::GetVersionString();
+    EXPECT_FALSE(versionString.empty());
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     const std::string firstId = GenerateSnapshotId();
     const std::string secondId = GenerateSnapshotId();

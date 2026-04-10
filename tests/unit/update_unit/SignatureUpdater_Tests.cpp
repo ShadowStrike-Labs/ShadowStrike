@@ -9,6 +9,7 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <string>
@@ -33,6 +34,10 @@ TEST(SignatureUpdaterTest, HelperNamesExtensionsAndDeltaPathRemainStable) {
     EXPECT_EQ(GetDatabaseExtension(SignatureDatabaseType::Emergency), ".edb");
     EXPECT_EQ(GetDatabaseTypeName(static_cast<SignatureDatabaseType>(0xFF)), "Unknown");
     EXPECT_EQ(GetDatabaseExtension(static_cast<SignatureDatabaseType>(0xFF)), ".dat");
+
+    const std::string versionString = SignatureUpdater::GetVersionString();
+    EXPECT_FALSE(versionString.empty());
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     const std::vector<DeltaPatchInfo> patches = {
         DeltaPatchInfo{"p12", 1, 2, 10, "12", "a", {}},
@@ -237,6 +242,40 @@ TEST(SignatureUpdaterTest, RuntimeDefaultsAndInitializedNoWorkPathsRemainSafe) {
     SignatureUpdaterConfiguration invalidConfig = config;
     invalidConfig.maxDeltaChain = 0;
     EXPECT_FALSE(updater.UpdateConfiguration(invalidConfig));
+
+    updater.Shutdown();
+}
+
+TEST(SignatureUpdaterTest, RepeatedInitializePreservesExistingConfiguration) {
+    auto& updater = SignatureUpdater::Instance();
+    updater.Shutdown();
+
+    ScopedTempDir tempDir(L"signature_reinit_");
+
+    SignatureUpdaterConfiguration initialConfig;
+    initialConfig.databaseDirectory = tempDir.Path() / L"db_a";
+    initialConfig.stagingDirectory = tempDir.Path() / L"stage_a";
+    initialConfig.enabledTypes = {SignatureDatabaseType::Main};
+    initialConfig.enableHotReload = true;
+    initialConfig.preferDeltaUpdates = false;
+    ASSERT_TRUE(initialConfig.IsValid());
+    ASSERT_TRUE(updater.Initialize(initialConfig));
+
+    SignatureUpdaterConfiguration replacementConfig = initialConfig;
+    replacementConfig.databaseDirectory = tempDir.Path() / L"db_b";
+    replacementConfig.stagingDirectory = tempDir.Path() / L"stage_b";
+    replacementConfig.enabledTypes = {SignatureDatabaseType::YARA};
+    replacementConfig.enableHotReload = false;
+    replacementConfig.preferDeltaUpdates = true;
+
+    ASSERT_TRUE(updater.Initialize(replacementConfig));
+
+    const auto effectiveConfig = updater.GetConfiguration();
+    EXPECT_EQ(effectiveConfig.databaseDirectory, initialConfig.databaseDirectory);
+    EXPECT_EQ(effectiveConfig.stagingDirectory, initialConfig.stagingDirectory);
+    EXPECT_EQ(effectiveConfig.enabledTypes, initialConfig.enabledTypes);
+    EXPECT_TRUE(effectiveConfig.enableHotReload);
+    EXPECT_FALSE(effectiveConfig.preferDeltaUpdates);
 
     updater.Shutdown();
 }

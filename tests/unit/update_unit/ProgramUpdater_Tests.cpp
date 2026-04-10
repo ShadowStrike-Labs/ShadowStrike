@@ -9,12 +9,14 @@
 
 #include <gtest/gtest.h>
 
+#include <algorithm>
 #include <chrono>
 #include <string>
 
 #include <nlohmann/json.hpp>
 
 #include "../../../src/Shared_modules/Update/ProgramUpdater.hpp"
+#include "Update_TestUtils.hpp"
 
 namespace ShadowStrike::Update::Test {
 namespace {
@@ -29,6 +31,10 @@ TEST(ProgramUpdaterTest, HelperNamesAndVersionComparisonRemainStable) {
     EXPECT_EQ(GetInstallMethodName(InstallMethod::MoveFileEx), "MoveFileEx");
     EXPECT_EQ(GetRebootRequirementName(RebootRequirement::Immediate), "Immediate");
     EXPECT_EQ(GetComponentTypeName(static_cast<ComponentType>(0xFF)), "Unknown");
+
+    const std::string versionString = ProgramUpdater::GetVersionString();
+    EXPECT_TRUE(versionString.starts_with("ProgramUpdater v"));
+    EXPECT_EQ(std::count(versionString.begin(), versionString.end(), '.'), 2);
 
     const ProgramVersion v1{1, 2, 3, 4, "", "", "", ""};
     const ProgramVersion v2{1, 2, 3, 5, "", "", "", ""};
@@ -210,6 +216,37 @@ TEST(ProgramUpdaterTest, DefaultRuntimeStateAndUninitializedMutatorsFailClosed) 
     ProgramUpdaterConfiguration invalidConfig;
     invalidConfig.bootLoopThreshold = 0;
     EXPECT_FALSE(updater.UpdateConfiguration(invalidConfig));
+}
+
+TEST(ProgramUpdaterTest, RepeatedInitializePreservesExistingConfiguration) {
+    auto& updater = ProgramUpdater::Instance();
+    updater.Shutdown();
+
+    ScopedTempDir tempDir(L"program_reinit_");
+
+    ProgramUpdaterConfiguration initialConfig;
+    initialConfig.autoUpdate = true;
+    initialConfig.allowDriverUpdates = false;
+    initialConfig.stagingDirectory = tempDir.Path() / L"stage_a";
+    initialConfig.backupDirectory = tempDir.Path() / L"backup_a";
+    ASSERT_TRUE(initialConfig.IsValid());
+    ASSERT_TRUE(updater.Initialize(initialConfig));
+
+    ProgramUpdaterConfiguration replacementConfig = initialConfig;
+    replacementConfig.autoUpdate = false;
+    replacementConfig.allowDriverUpdates = true;
+    replacementConfig.stagingDirectory = tempDir.Path() / L"stage_b";
+    replacementConfig.backupDirectory = tempDir.Path() / L"backup_b";
+
+    ASSERT_TRUE(updater.Initialize(replacementConfig));
+
+    const auto effectiveConfig = updater.GetConfiguration();
+    EXPECT_TRUE(effectiveConfig.autoUpdate);
+    EXPECT_FALSE(effectiveConfig.allowDriverUpdates);
+    EXPECT_EQ(effectiveConfig.stagingDirectory, initialConfig.stagingDirectory);
+    EXPECT_EQ(effectiveConfig.backupDirectory, initialConfig.backupDirectory);
+
+    updater.Shutdown();
 }
 
 }  // namespace ShadowStrike::Update::Test
