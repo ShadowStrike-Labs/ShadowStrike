@@ -2101,6 +2101,7 @@ void ProcessBehaviorState::Clear() noexcept {
     crossProcessWrites = 0;
     credentialAccessAttempts = 0;
     evasionAttempts = 0;
+    exfilThresholdTriggered = false;
 
     highEntropyWrites = 0;
     fileRenames = 0;

@@ -53,6 +53,7 @@ TEST(BehaviorAnalyzerTest, ClearResetsAccumulatedProcessState) {
     state.currentVerdict = Engine::BehaviorVerdictType::Malicious;
     state.recommendedAction = Engine::RecommendedAction::Terminate;
     state.hasBeenReported = true;
+    state.hasBeenTerminated = true;
     state.exfilThresholdTriggered = true;
 
     state.Clear();
@@ -68,7 +69,8 @@ TEST(BehaviorAnalyzerTest, ClearResetsAccumulatedProcessState) {
     EXPECT_EQ(state.currentVerdict, Engine::BehaviorVerdictType::Clean);
     EXPECT_EQ(state.recommendedAction, Engine::RecommendedAction::None);
     EXPECT_FALSE(state.hasBeenReported);
-    EXPECT_TRUE(state.exfilThresholdTriggered);
+    EXPECT_FALSE(state.hasBeenTerminated);
+    EXPECT_FALSE(state.exfilThresholdTriggered);
 }
 
 TEST(BehaviorAnalyzerTest, VerdictAndAttackChainHelpersEncodeImmediateResponseSemantics) {
@@ -139,6 +141,10 @@ TEST(BehaviorAnalyzerTest, ThresholdsAndHelperFactoriesMatchCurrentDetectionSema
     EXPECT_EQ(fileEvent.fileExtension, L".txt");
     EXPECT_FALSE(fileEvent.success);
 
+    const Engine::BehaviorEvent extensionlessFileEvent =
+        Engine::CreateFileEvent(Engine::BehaviorEventType::FileRead, 78, L"C:\\Temp\\README", true);
+    EXPECT_TRUE(extensionlessFileEvent.fileExtension.empty());
+
     const Engine::BehaviorEvent registryEvent = Engine::CreateRegistryEvent(
         Engine::BehaviorEventType::RegistrySetValue,
         91,
@@ -164,14 +170,23 @@ TEST(BehaviorAnalyzerTest, ThresholdsAndHelperFactoriesMatchCurrentDetectionSema
     EXPECT_EQ(processEvent.targetProcessId, 200u);
 
     EXPECT_TRUE(Engine::IsRansomNotePattern(L"C:\\Users\\Public\\README_FOR_DECRYPT.txt"));
+    EXPECT_TRUE(Engine::IsRansomNotePattern(L"C:\\Users\\Public\\IMPORTANT_READ_ME.HTA"));
     EXPECT_FALSE(Engine::IsRansomNotePattern(L"C:\\Users\\Public\\notes.txt"));
     EXPECT_TRUE(Engine::IsPersistenceRegistryPath(
         L"HKCU\\Software\\Microsoft\\Windows\\CurrentVersion\\Run\\ShadowStrike"));
+    EXPECT_TRUE(Engine::IsPersistenceRegistryPath(
+        L"HKLM\\Software\\Microsoft\\Windows\\CurrentVersion\\RunOnce\\ShadowStrike"));
     EXPECT_FALSE(Engine::IsPersistenceRegistryPath(L"HKCU\\Software\\ShadowStrike"));
     EXPECT_TRUE(Engine::IsLSASSProcess(L"LSASS.EXE"));
+    EXPECT_TRUE(Engine::IsLSASSProcess(L"LSAISO.EXE"));
+    EXPECT_FALSE(Engine::IsLSASSProcess(L"lsass.exe.bak"));
     EXPECT_TRUE(Engine::IsDocumentApplication(L"WINWORD.EXE"));
+    EXPECT_TRUE(Engine::IsDocumentApplication(L"AcroRd32.exe"));
+    EXPECT_FALSE(Engine::IsDocumentApplication(L""));
     EXPECT_FALSE(Engine::IsDocumentApplication(L"powershell.exe"));
     EXPECT_TRUE(Engine::IsScriptInterpreter(L"PowerShell.EXE"));
+    EXPECT_TRUE(Engine::IsScriptInterpreter(L"pwsh.exe"));
+    EXPECT_FALSE(Engine::IsScriptInterpreter(L""));
     EXPECT_FALSE(Engine::IsScriptInterpreter(L"explorer.exe"));
 }
 

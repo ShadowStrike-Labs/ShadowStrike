@@ -182,7 +182,7 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
     EXPECT_TRUE(detector.HasGetPC(std::span<const uint8_t>(shellcodeBuffer).subspan(
         Engine::ZeroDayConstants::MIN_NOP_SLED_LENGTH)));
     EXPECT_TRUE(detector.IsNopSled(std::vector<uint8_t>(Engine::ZeroDayConstants::MIN_NOP_SLED_LENGTH, 0x97)));
-    EXPECT_TRUE(detector.HasGetPC(std::vector<uint8_t>{0xD9, 0x74, 0x24, 0xF4}));
+    EXPECT_TRUE(detector.HasGetPC(std::vector<uint8_t>{0xD9, 0x74, 0x24, 0xF4, 0x90, 0x90}));
 
     const std::vector<uint8_t> decoderStub = {
         0x31, 0xC0, 0x40, 0xE2, 0xFE, 0x41,
@@ -203,7 +203,7 @@ TEST_F(ZeroDayDetectorTest, InitializedHeuristicsDetectShellcodeHeapAndRopSignal
     EXPECT_TRUE(detector.IsHeapSprayPattern(heapPattern));
     EXPECT_FALSE(detector.IsHeapSprayPattern(std::vector<uint8_t>(63, 0x0C)));
     std::vector<uint8_t> almostUniform(64, 0x41);
-    for (size_t i = 0; i < 7; ++i) {
+    for (size_t i = 0; i < 8; ++i) {
         almostUniform[i] = static_cast<uint8_t>(0x50 + i);
     }
     EXPECT_FALSE(detector.IsHeapSprayPattern(almostUniform));
