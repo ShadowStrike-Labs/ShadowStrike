@@ -102,6 +102,22 @@ TEST_F(FirewallManagerTest, ApplicationAndGeoMatchersRespectExplicitCriteria) {
     pathApp.path = L"C:\\Apps\\good.exe";
     EXPECT_TRUE(pathApp.Matches(L"C:\\Apps\\GOOD.exe", L"good.exe", L"", {}));
 
+    ApplicationMatch wildcardPathApp;
+    wildcardPathApp.type = ApplicationMatch::Type::PATH_WILDCARD;
+    wildcardPathApp.path = L"C:\\Program Files\\ShadowStrike\\*.exe";
+    EXPECT_TRUE(wildcardPathApp.Matches(
+        L"C:\\Program Files\\ShadowStrike\\agent.exe", L"agent.exe", L"", {}));
+    EXPECT_FALSE(wildcardPathApp.Matches(
+        L"C:\\Program Files\\ShadowStrike\\agent.dll", L"agent.dll", L"", {}));
+
+    ApplicationMatch singleCharWildcardApp;
+    singleCharWildcardApp.type = ApplicationMatch::Type::PATH_WILDCARD;
+    singleCharWildcardApp.path = L"C:\\Apps\\scanner?.exe";
+    EXPECT_TRUE(singleCharWildcardApp.Matches(
+        L"C:\\Apps\\scanner1.exe", L"scanner1.exe", L"", {}));
+    EXPECT_FALSE(singleCharWildcardApp.Matches(
+        L"C:\\Apps\\scanner12.exe", L"scanner12.exe", L"", {}));
+
     ApplicationMatch nameApp;
     nameApp.type = ApplicationMatch::Type::NAME;
     nameApp.processName = L"scanner.exe";

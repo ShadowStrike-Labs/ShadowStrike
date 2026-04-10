@@ -116,7 +116,7 @@ TEST_F(TrafficAnalyzerTest, ProtocolIdentificationAndNameHelpersRemainStable) {
 
 TEST_F(TrafficAnalyzerTest, PayloadAnalysisDifferentiatesTextBase64AndHighEntropyContent) {
     const auto textPayload = Bytes("Hello ShadowStrike\n");
-    const auto base64Payload = Bytes("QUJDREVGRw==");
+    const auto base64Payload = Bytes("QUJDREVGR0hJSktMTQ==");
     const auto entropyPayload = ByteRamp();
     const auto binaryPayload = std::vector<uint8_t>{0x4D, 0x01, 0x5A, 0x02, 0x03};
 

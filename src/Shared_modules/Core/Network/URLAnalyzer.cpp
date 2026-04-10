@@ -214,12 +214,14 @@ namespace {
     return lower == "localhost" || lower == "127.0.0.1" || lower == "::1" || lower == "[::1]";
 }
 
-// Detect double-percent-encoding (e.g., %2525 → %25 → %).
+// Detect double-percent-encoding (e.g., %2525 → %25 → % or %252e → %2e → '.').
 [[nodiscard]] static bool HasDoublePercentEncoding(std::string_view str) noexcept {
-    // We check for the 4-byte pattern "%25%" which needs indices i..i+3.
-    // The condition i + 3 < str.size() ensures all four accesses are valid.
-    for (size_t i = 0; i + 3 < str.size(); ++i) {
-        if (str[i] == '%' && str[i + 1] == '2' && str[i + 2] == '5' && str[i + 3] == '%') {
+    // A second-encoded escape sequence is represented as "%25" followed by the
+    // hex digits of another percent-encoded byte, such as "%252e" for "%2e".
+    for (size_t i = 0; i + 4 < str.size(); ++i) {
+        if (str[i] == '%' && str[i + 1] == '2' && str[i + 2] == '5' &&
+            std::isxdigit(static_cast<unsigned char>(str[i + 3])) &&
+            std::isxdigit(static_cast<unsigned char>(str[i + 4]))) {
             return true;
         }
     }
@@ -1272,6 +1274,14 @@ public:
                     parsed.scheme = URLScheme::DATA;
                     parsed.schemeString = "data";
                     parsed.hasDataUri = true;
+                    parsed.isValid = true;
+                    parsed.host = "";
+                    parsed.path = url.substr(url.find(':') + 1);
+                    return parsed;
+                }
+                if (lowerUrl.starts_with("mailto:")) {
+                    parsed.scheme = URLScheme::MAILTO;
+                    parsed.schemeString = "mailto";
                     parsed.isValid = true;
                     parsed.host = "";
                     parsed.path = url.substr(url.find(':') + 1);

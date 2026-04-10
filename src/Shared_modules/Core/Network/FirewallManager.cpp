@@ -129,6 +129,53 @@ namespace {
 }
 
 /**
+ * @brief Performs case-insensitive wildcard matching for application paths.
+ *
+ * Supports the documented firewall semantics:
+ *   *  -> zero or more characters
+ *   ?  -> exactly one character
+ */
+[[nodiscard]] bool WildcardMatchInsensitive(std::wstring_view pattern,
+                                            std::wstring_view text) noexcept {
+    if (pattern.empty()) {
+        return text.empty();
+    }
+
+    try {
+        const std::wstring p = StringUtils::ToLowerCopy(pattern);
+        const std::wstring t = StringUtils::ToLowerCopy(text);
+
+        size_t pi = 0;
+        size_t ti = 0;
+        size_t star = std::wstring::npos;
+        size_t mark = 0;
+
+        while (ti < t.size()) {
+            if (pi < p.size() && (p[pi] == L'?' || p[pi] == t[ti])) {
+                ++pi;
+                ++ti;
+            } else if (pi < p.size() && p[pi] == L'*') {
+                star = pi++;
+                mark = ti;
+            } else if (star != std::wstring::npos) {
+                pi = star + 1;
+                ti = ++mark;
+            } else {
+                return false;
+            }
+        }
+
+        while (pi < p.size() && p[pi] == L'*') {
+            ++pi;
+        }
+
+        return pi == p.size();
+    } catch (...) {
+        return false;
+    }
+}
+
+/**
  * @brief Checks if two IPs match with subnet mask.
  */
 [[nodiscard]] bool IPMatchesWithMask(
@@ -257,13 +304,8 @@ namespace {
         case Type::PATH:
             return StringUtils::IEquals(path, processPath);
 
-        case Type::PATH_WILDCARD: {
-            // Simple wildcard matching
-            std::wstring pattern = path;
-            std::replace(pattern.begin(), pattern.end(), L'*', L'.');
-            // Would use regex, but simplified for now
-            return processPath.find(pattern) != std::wstring::npos;
-        }
+        case Type::PATH_WILDCARD:
+            return WildcardMatchInsensitive(path, processPath);
 
         case Type::NAME:
             return StringUtils::IEquals(processName, procName);

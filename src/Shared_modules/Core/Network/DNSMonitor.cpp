@@ -1710,7 +1710,7 @@ bool DNSMonitor::SelfTest() {
         SS_LOG_INFO(L"Network", L"DNSMonitor: Starting self-test");
 
         // Test DGA detection
-        auto dgaAnalysis = AnalyzeDGA("xvkdf8s9df.com");
+        auto dgaAnalysis = AnalyzeDGA("qzxjv9kptd8r.com");
         if (!dgaAnalysis.isDGA) {
             SS_LOG_ERROR(L"Network", L"DNSMonitor: DGA detection test failed");
             return false;
