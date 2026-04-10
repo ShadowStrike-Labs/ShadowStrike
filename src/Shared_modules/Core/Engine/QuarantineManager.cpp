@@ -1311,7 +1311,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
 
         } catch (const std::exception& e) {
             // SECURITY: Clear any potentially sensitive data that was read
-            CryptoUtils::SecureZeroMemory(fileContent.data(), fileContent.size());
+            CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
             
             SS_LOG_ERROR(L"QuarantineManager", L"File read failed: %ls", 
                 StringUtils::ToWide(e.what()).c_str());
@@ -1334,7 +1334,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
                 contentFlags = contentFlags | QuarantineFlags::Encrypted;
             } catch (const std::exception& e) {
                 // SECURITY: Clear sensitive plaintext data before returning
-                CryptoUtils::SecureZeroMemory(fileContent.data(), fileContent.size());
+                CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
                 
                 SS_LOG_ERROR(L"QuarantineManager", L"Encryption failed: %ls", 
                     StringUtils::ToWide(e.what()).c_str());
@@ -1381,7 +1381,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
             outFile.close();
 
             // Securely wipe plaintext from memory after successful vault write
-            CryptoUtils::SecureZeroMemory(fileContent.data(), fileContent.size());
+            CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
             fileContent.clear();
 
             SS_LOG_INFO(L"QuarantineManager", L"File written to vault: %ls",
@@ -1389,7 +1389,7 @@ QuarantineResult QuarantineManager::QuarantineFile(const QuarantineRequest& requ
 
         } catch (const std::exception& e) {
             // SECURITY: Clear sensitive data on vault write failure
-            CryptoUtils::SecureZeroMemory(fileContent.data(), fileContent.size());
+            CryptoUtils::SecureWipeMemory(fileContent.data(), fileContent.size());
             
             SS_LOG_ERROR(L"QuarantineManager", L"Vault write failed: %ls", 
                 StringUtils::ToWide(e.what()).c_str());

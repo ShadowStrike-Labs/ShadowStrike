@@ -103,7 +103,8 @@ struct HandleGuard {
  * Only reads the first 64 KB via direct handle I/O to avoid allocating
  * the entire file into memory (potential DoS with large DLLs).
  */
-double CalculateFileEntropy(const std::wstring& filePath) {
+namespace {
+static double CalculateFileEntropy(const std::wstring& filePath) {
     try {
         constexpr DWORD SAMPLE_SIZE = 65536; // 64 KB sample
 
@@ -140,6 +141,7 @@ double CalculateFileEntropy(const std::wstring& filePath) {
         return 0.0;
     }
 }
+} // anonymous namespace
 
 /**
  * @brief Normalize path for comparison.

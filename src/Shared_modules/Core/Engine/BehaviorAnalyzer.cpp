@@ -2326,7 +2326,7 @@ constexpr const char* BehaviorPatternToMitre(BehaviorPatternType pattern) noexce
     }
 }
 
-constexpr const char* BehaviorPatternTypeToString(BehaviorPatternType pattern) noexcept {
+const char* BehaviorPatternTypeToString(BehaviorPatternType pattern) noexcept {
     switch (pattern) {
         case BehaviorPatternType::Unknown: return "Unknown";
         case BehaviorPatternType::RansomwareEncryption: return "RansomwareEncryption";
@@ -2481,44 +2481,6 @@ BehaviorEvent CreateProcessEvent(
 // ============================================================================
 // Free Functions: Analysis Helpers
 // ============================================================================
-
-double CalculateFileEntropy(const std::wstring& filePath) noexcept {
-    try {
-        HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
-                                    nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-        if (hFile == INVALID_HANDLE_VALUE) return 0.0;
-
-        // Read first 64KB for entropy calculation
-        constexpr size_t SAMPLE_SIZE = 65536;
-        std::vector<uint8_t> buffer(SAMPLE_SIZE);
-        DWORD bytesRead = 0;
-        BOOL ok = ReadFile(hFile, buffer.data(), static_cast<DWORD>(SAMPLE_SIZE),
-                           &bytesRead, nullptr);
-        CloseHandle(hFile);
-
-        if (!ok || bytesRead == 0) return 0.0;
-
-        // Shannon entropy calculation
-        std::array<uint64_t, 256> freq{};
-        for (DWORD i = 0; i < bytesRead; ++i) {
-            freq[buffer[i]]++;
-        }
-
-        double entropy = 0.0;
-        double total = static_cast<double>(bytesRead);
-        for (auto count : freq) {
-            if (count > 0) {
-                double p = static_cast<double>(count) / total;
-                entropy -= p * std::log2(p);
-            }
-        }
-
-        return entropy;
-    }
-    catch (...) {
-        return 0.0;
-    }
-}
 
 bool IsRansomNotePattern(const std::wstring& path) noexcept {
     if (path.empty()) return false;

@@ -317,25 +317,6 @@ namespace {
     return modules;
 }
 
-[[nodiscard]] bool IsAddressInModule(uint32_t pid, uintptr_t address) noexcept {
-    try {
-        std::vector<Utils::ProcessUtils::ProcessModuleInfo> modules;
-        if (!Utils::ProcessUtils::EnumerateProcessModules(pid, modules)) {
-            return false;
-        }
-
-        for (const auto& mod : modules) {
-            auto modBase = reinterpret_cast<uintptr_t>(mod.baseAddress);
-            if (address >= modBase && address < modBase + mod.size) {
-                return true;
-            }
-        }
-    } catch (...) {
-        // Suppress exceptions
-    }
-    return false;
-}
-
 // ============================================================================
 // HELPER FUNCTIONS
 // ============================================================================
