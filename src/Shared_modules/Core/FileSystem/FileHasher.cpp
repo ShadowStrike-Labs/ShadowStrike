@@ -379,12 +379,13 @@ public:
     InternalStats m_stats{};
 
     // Hash cache (LRU with TTL)
-    struct CachedHash {
-        FileHashes hashes;
-        steady_clock::time_point timestamp;
-        system_clock::time_point fileModTime;
-        mutable std::atomic<uint32_t> hitCount{0};
-    };
+     struct CachedHash {
+         FileHashes hashes;
+         steady_clock::time_point timestamp;
+         fs::file_time_type fileModTime{};
+         bool hasFileModTime{ false };
+         mutable std::atomic<uint32_t> hitCount{0};
+     };
     std::unordered_map<std::wstring, CachedHash> m_hashCache;
 
     // Callbacks
@@ -428,18 +429,23 @@ public:
             DetectHardwareCapabilities();
 
             // Create thread pool if needed
-            if (!m_threadPool && m_config.workerThreads > 0) {
-                ThreadPoolConfig tpConfig;
-                tpConfig.minThreads = std::max(
-                    ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
-                    static_cast<size_t>(m_config.workerThreads));
-                tpConfig.maxThreads = std::max(
-                    ThreadPoolConfig::MIN_THREAD_LIMIT,
-                    static_cast<size_t>(m_config.workerThreads));
-                m_threadPool = std::make_shared<ThreadPool>(tpConfig);
-                SS_LOG_INFO(L"FileHasher", L"FileHasher: Thread pool created with %u workers",
-                            m_config.workerThreads);
-            }
+             if (!m_threadPool && m_config.workerThreads > 0) {
+                 ThreadPoolConfig tpConfig;
+                 tpConfig.minThreads = std::max(
+                     ThreadPoolConfig::ABSOLUTE_MIN_THREADS,
+                     static_cast<size_t>(m_config.workerThreads));
+                 tpConfig.maxThreads = std::max(
+                     ThreadPoolConfig::MIN_THREAD_LIMIT,
+                     static_cast<size_t>(m_config.workerThreads));
+                 m_threadPool = std::make_shared<ThreadPool>(tpConfig);
+                 if (!m_threadPool->Initialize()) {
+                     SS_LOG_ERROR(L"FileHasher", L"FileHasher: Thread pool initialization failed");
+                     m_threadPool.reset();
+                     return false;
+                 }
+                 SS_LOG_INFO(L"FileHasher", L"FileHasher: Thread pool created with %u workers",
+                             m_config.workerThreads);
+             }
 
             // Reset statistics
             m_stats.Reset();
@@ -531,28 +537,24 @@ public:
         auto& cached = it->second;
 
         // Check TTL
-        auto age = steady_clock::now() - cached.timestamp;
-        auto ttl = std::chrono::hours(m_config.cacheTTLHours);
-        if (age > ttl) {
-            return std::nullopt;
-        }
+            auto age = steady_clock::now() - cached.timestamp;
+            auto ttl = std::chrono::hours(m_config.cacheTTLHours);
+            if (age > ttl) {
+                return std::nullopt;
+            }
 
-        // Check file modification time
-        try {
-            std::error_code ec;
-            auto lastWrite = fs::last_write_time(filePath, ec);
-            if (!ec) {
-                auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    lastWrite - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-                );
-
-                if (sctp != cached.fileModTime) {
-                    return std::nullopt; // File modified
+            // Check file modification time
+            if (cached.hasFileModTime) {
+                try {
+                    std::error_code ec;
+                    auto lastWrite = fs::last_write_time(filePath, ec);
+                    if (ec || lastWrite != cached.fileModTime) {
+                        return std::nullopt; // File modified or no longer queryable
+                    }
+                } catch (...) {
+                    return std::nullopt;
                 }
             }
-        } catch (...) {
-            return std::nullopt;
-        }
 
         // Update hit count atomically — safe under shared_lock
         cached.hitCount.fetch_add(1, std::memory_order_relaxed);
@@ -584,18 +586,17 @@ public:
             }
         }
 
-        // Get file modification time
-        system_clock::time_point modTime = system_clock::now();
+        fs::file_time_type modTime{};
+        bool hasModTime = false;
         try {
             std::error_code ec;
             auto lastWrite = fs::last_write_time(filePath, ec);
             if (!ec) {
-                modTime = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
-                    lastWrite - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
-                );
+                modTime = lastWrite;
+                hasModTime = true;
             }
         } catch (...) {
-            // Use current time if we can't get modification time
+            // Cache the hashes without modification-time binding if metadata lookup fails.
         }
 
         // Erase existing entry (if any) to make room for the new one
@@ -607,6 +608,7 @@ public:
         entry.hashes = hashes;
         entry.timestamp = steady_clock::now();
         entry.fileModTime = modTime;
+        entry.hasFileModTime = hasModTime;
         entry.hitCount.store(0, std::memory_order_relaxed);
 
         SS_LOG_DEBUG(L"FileHasher", L"FileHasher: Added to cache: %hs (size: %zu)", StringUtils::ToNarrow(filePath).c_str(), m_hashCache.size());

@@ -115,11 +115,45 @@ bool IsTextContent(std::span<const uint8_t> buffer, size_t sampleSize = 512) {
             printableCount++;
         } else if (byte >= 0x20 && byte <= 0x7E) {
             printableCount++;
-        } else if (byte >= 0x80) {
-            // Could be UTF-8
-            printableCount++;
         } else {
-            controlCount++;
+            size_t sequenceLength = 0;
+            uint32_t codePoint = 0;
+
+            if (byte >= 0xC2 && byte <= 0xDF) {
+                sequenceLength = 2;
+                codePoint = byte & 0x1F;
+            } else if (byte >= 0xE0 && byte <= 0xEF) {
+                sequenceLength = 3;
+                codePoint = byte & 0x0F;
+            } else if (byte >= 0xF0 && byte <= 0xF4) {
+                sequenceLength = 4;
+                codePoint = byte & 0x07;
+            } else {
+                return false;
+            }
+
+            if (i + sequenceLength > checkSize) {
+                return false;
+            }
+
+            for (size_t j = 1; j < sequenceLength; ++j) {
+                const uint8_t continuation = buffer[i + j];
+                if ((continuation & 0xC0) != 0x80) {
+                    return false;
+                }
+                codePoint = (codePoint << 6) | (continuation & 0x3F);
+            }
+
+            if ((sequenceLength == 2 && codePoint < 0x80) ||
+                (sequenceLength == 3 && codePoint < 0x800) ||
+                (sequenceLength == 4 && codePoint < 0x10000) ||
+                (codePoint >= 0xD800 && codePoint <= 0xDFFF) ||
+                codePoint > 0x10FFFF) {
+                return false;
+            }
+
+            printableCount += sequenceLength;
+            i += sequenceLength - 1;
         }
     }
 
@@ -1707,6 +1741,24 @@ public:
     }
 
     std::string GetExtensionForFormat(FileFormat format) const {
+        switch (format) {
+            case FileFormat::PE32:
+            case FileFormat::PE64:
+                return ".exe";
+            case FileFormat::DLL32:
+            case FileFormat::DLL64:
+                return ".dll";
+            case FileFormat::SYS32:
+            case FileFormat::SYS64:
+                return ".sys";
+            case FileFormat::DotNetAssembly:
+                return ".exe";
+            case FileFormat::JavaJAR:
+                return ".jar";
+            default:
+                break;
+        }
+
         for (const auto& [ext, fmt] : MagicDB::g_extensionMap) {
             if (fmt == format) {
                 return ext;

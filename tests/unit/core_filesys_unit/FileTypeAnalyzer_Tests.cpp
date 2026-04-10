@@ -100,6 +100,20 @@ TEST_F(FileTypeAnalyzerTest, ExtensionFallbackHelpersAndUnsupportedSignatureLoad
     EXPECT_EQ(analyzer.LoadSignatures(MakePath(L"unsupported.sig").wstring()), 0u);
 }
 
+TEST_F(FileTypeAnalyzerTest, AnalyzeRejectsEmbeddedNullBytePathsAsUnicodeAbuse) {
+    auto& analyzer = FileTypeAnalyzer::Instance();
+
+    std::wstring craftedPath = MakePath(L"normal.txt").wstring();
+    craftedPath.push_back(L'\0');
+    craftedPath += L".exe";
+
+    const auto info = analyzer.Analyze(craftedPath);
+
+    EXPECT_FALSE(info.detected);
+    EXPECT_TRUE(info.isSpoofed);
+    EXPECT_EQ(info.spoofingType, SpoofingType::UnicodeAbuse);
+}
+
 TEST_F(FileTypeAnalyzerTest, AnalyzeBufferClassifiesMinimalPe64Executable) {
     auto& analyzer = FileTypeAnalyzer::Instance();
     const auto buffer = BuildMinimalPe64Image();
@@ -181,11 +195,52 @@ TEST_F(FileTypeAnalyzerTest, AnalyzeFileDetectsContentExtensionMismatch) {
     const auto info = analyzer.Analyze(filePath.wstring());
 
     EXPECT_TRUE(info.detected);
-    EXPECT_EQ(info.format, FileFormat::ZIP);
-    EXPECT_EQ(info.category, FileCategory::Archive);
+    EXPECT_EQ(info.format, FileFormat::DOCX);
+    EXPECT_EQ(info.category, FileCategory::Document);
     EXPECT_TRUE(info.isSpoofed);
     EXPECT_EQ(info.spoofingType, SpoofingType::ExtensionMismatch);
-    EXPECT_EQ(info.suggestedExtension, L".zip");
+    EXPECT_EQ(info.suggestedExtension, L".docx");
+}
+
+TEST_F(FileTypeAnalyzerTest, DetectionHelpersStayAlignedAcrossExecutableAndArchiveInputs) {
+    auto& analyzer = FileTypeAnalyzer::Instance();
+
+    const auto peBuffer = BuildMinimalPe64Image();
+    const std::array<uint8_t, 8> zipBuffer{ 'P', 'K', 0x03, 0x04, 0x14, 0x00, 0x00, 0x00 };
+    const auto zipPath = WriteBytes(L"archive.zip", zipBuffer);
+    const auto exePath = WriteBytes(L"helper.exe", peBuffer);
+
+    EXPECT_EQ(analyzer.DetectFormat(peBuffer), FileFormat::PE64);
+    EXPECT_TRUE(analyzer.IsExecutable(peBuffer));
+
+    EXPECT_EQ(analyzer.DetectFormat(exePath.wstring()), FileFormat::PE64);
+    EXPECT_EQ(analyzer.GetCategory(exePath.wstring()), FileCategory::Executable);
+    EXPECT_TRUE(analyzer.IsExecutable(exePath.wstring()));
+
+    EXPECT_EQ(analyzer.DetectFormat(zipPath.wstring()), FileFormat::ZIP);
+    EXPECT_EQ(analyzer.GetCategory(zipPath.wstring()), FileCategory::Archive);
+    EXPECT_TRUE(analyzer.IsArchive(zipPath.wstring()));
+    EXPECT_FALSE(analyzer.IsScript(zipPath.wstring()));
+    EXPECT_THAT(analyzer.GetMimeType(zipPath.wstring()), HasSubstr("zip"));
+    EXPECT_EQ(analyzer.DetectSpoofing(zipPath.wstring()), SpoofingType::None);
+}
+
+TEST_F(FileTypeAnalyzerTest, ValidAlternateExtensionsDoNotTriggerSpoofing) {
+    auto& analyzer = FileTypeAnalyzer::Instance();
+
+    const auto screenSaverPath = WriteBytes(L"payload.scr", BuildMinimalPe64Image());
+    const auto officeZipPath = WriteBytes(L"report.docx", BuildZipOfficeBuffer("word"));
+
+    const auto screenSaverInfo = analyzer.Analyze(screenSaverPath.wstring());
+    EXPECT_TRUE(screenSaverInfo.detected);
+    EXPECT_EQ(screenSaverInfo.format, FileFormat::PE64);
+    EXPECT_FALSE(screenSaverInfo.isSpoofed);
+    EXPECT_EQ(analyzer.DetectSpoofing(screenSaverPath.wstring()), SpoofingType::None);
+
+    const auto officeZipInfo = analyzer.Analyze(officeZipPath.wstring());
+    EXPECT_TRUE(officeZipInfo.detected);
+    EXPECT_FALSE(officeZipInfo.isSpoofed);
+    EXPECT_EQ(analyzer.DetectSpoofing(officeZipPath.wstring()), SpoofingType::None);
 }
 
 TEST_F(FileTypeAnalyzerTest, AnalyzeEmptyFileReturnsDedicatedEmptyClassification) {

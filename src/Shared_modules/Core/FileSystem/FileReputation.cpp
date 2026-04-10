@@ -201,6 +201,7 @@ public:
 
         try {
             m_config = config;
+            m_shuttingDown.store(false, std::memory_order_release);
             m_initialized = true;
 
             // Initialize cloud connectivity check

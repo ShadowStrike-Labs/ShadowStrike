@@ -216,6 +216,27 @@ TEST_F(DirectoryMonitorTest, AddMonitorRejectsEmptyMissingAndExcludedPaths) {
     EXPECT_EQ(monitor.GetActiveMonitorCount(), 0u);
 }
 
+TEST_F(DirectoryMonitorTest, AddMonitorCanonicalizesEquivalentPathsAndHonorsMaxMonitorLimit) {
+    auto& monitor = DirectoryMonitor::Instance();
+
+    auto config = DirectoryMonitorConfig::CreateDefault();
+    config.maxConcurrentMonitors = 1;
+    ASSERT_TRUE(monitor.Initialize(config));
+
+    const auto firstPath = CreateDirectory(L"watched-one");
+    const auto secondPath = CreateDirectory(L"watched-two");
+    const auto canonicalVariant = (firstPath / L"." / L"..") / firstPath.filename();
+
+    const auto firstId = monitor.AddMonitor(firstPath.wstring(), PathCategory::Custom, false);
+    ASSERT_NE(firstId, 0u);
+
+    const auto duplicateId = monitor.AddMonitor(canonicalVariant.wstring(), PathCategory::Custom, false);
+    EXPECT_EQ(duplicateId, firstId);
+
+    EXPECT_EQ(monitor.AddMonitor(secondPath.wstring(), PathCategory::Custom, false), 0u);
+    EXPECT_EQ(monitor.GetActiveMonitorCount(), 1u);
+}
+
 TEST_F(DirectoryMonitorTest, PauseResumeAndStatusCallbacksTrackMonitorLifecycle) {
     auto& monitor = DirectoryMonitor::Instance();
     ASSERT_TRUE(monitor.Initialize(DirectoryMonitorConfig::CreateDefault()));

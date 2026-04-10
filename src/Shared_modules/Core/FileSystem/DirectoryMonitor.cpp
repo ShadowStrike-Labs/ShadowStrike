@@ -256,6 +256,7 @@ struct DirectoryMonitor::Impl {
             StopMonitor(monitor);
         }
         m_monitors.clear();
+        m_statistics.activeMonitors.store(0, std::memory_order_relaxed);
     }
 
     void StopMonitor(MonitorInfo& monitor) {
@@ -996,7 +997,6 @@ void DirectoryMonitor::RemoveMonitor(uint32_t monitorId) {
 }
 
 void DirectoryMonitor::RemoveAllMonitors() {
-    std::unique_lock<std::shared_mutex> lock(m_impl->m_monitorsMutex);
     m_impl->StopAllMonitors();
     SS_LOG_INFO(L"DirectoryMonitor", L"All monitors removed");
 }
