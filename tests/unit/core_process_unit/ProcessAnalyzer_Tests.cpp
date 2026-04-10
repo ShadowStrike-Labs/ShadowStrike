@@ -121,6 +121,16 @@ TEST(ProcessAnalyzerValueTests, RiskScoringHonorsMaliciousAndTrustPrecedence) {
     EXPECT_EQ(trusted.riskLevel, ProcessRiskLevel::Trusted);
 }
 
+TEST(ProcessAnalyzerValueTests, RiskScoringTreatsRevokedCertificatesAsMediumRiskWithoutOtherSignals) {
+    auto result = MakeSignedBaselineResult();
+    result.signatureInfo.status = SignatureStatus::Revoked;
+
+    result.CalculateOverallRisk();
+
+    EXPECT_EQ(result.overallRiskScore, 50u);
+    EXPECT_EQ(result.riskLevel, ProcessRiskLevel::MediumRisk);
+}
+
 TEST(ProcessAnalyzerValueTests, RiskScoringMapsAccumulatedIndicatorsIntoPublishedBands) {
     {
         auto result = MakeSignedBaselineResult();
@@ -174,6 +184,17 @@ TEST(ProcessAnalyzerValueTests, RiskScoringMapsAccumulatedIndicatorsIntoPublishe
         EXPECT_EQ(result.overallRiskScore, 90u);
         EXPECT_EQ(result.riskLevel, ProcessRiskLevel::Critical);
     }
+}
+
+TEST(ProcessAnalyzerValueTests, RiskScoringAccumulatesBehavioralIndicatorsWithoutSignaturePenalty) {
+    auto result = MakeSignedBaselineResult();
+    result.behavioralIndicators.hasDirectSyscalls = true;
+    result.behavioralIndicators.hasRemoteThreads = true;
+
+    result.CalculateOverallRisk();
+
+    EXPECT_EQ(result.overallRiskScore, 55u);
+    EXPECT_EQ(result.riskLevel, ProcessRiskLevel::MediumRisk);
 }
 
 TEST(ProcessAnalyzerValueTests, RiskScoringCapsExploitHeavyProcessesAtMaximumRisk) {

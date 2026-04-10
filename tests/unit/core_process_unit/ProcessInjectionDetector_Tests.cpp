@@ -202,6 +202,28 @@ TEST_F(ProcessInjectionValueTest, ClassificationFallsBackToSectionMappingRemoteT
     EXPECT_EQ(shellcodeType, InjectionType::ShellcodeInjection);
 }
 
+TEST_F(ProcessInjectionValueTest, ClassificationTreatsUnknownRemoteStartModulesAsReflectiveDll) {
+    auto& detector = ProcessInjectionDetector::Instance();
+
+    const auto reflectiveType = detector.ClassifyInjection(
+        {},
+        { MakeMemoryEvent(MemoryOperationEvent::OpType::Write) },
+        { MakeThreadEvent(ThreadOperationEvent::OpType::Create, true, false, L"<unknown>") });
+
+    EXPECT_EQ(reflectiveType, InjectionType::ReflectiveDLL);
+}
+
+TEST_F(ProcessInjectionValueTest, ClassificationRequiresRemoteThreadForClassicDllInjection) {
+    auto& detector = ProcessInjectionDetector::Instance();
+
+    const auto type = detector.ClassifyInjection(
+        {},
+        { MakeMemoryEvent(MemoryOperationEvent::OpType::Write) },
+        { MakeThreadEvent(ThreadOperationEvent::OpType::Create, false, false, L"kernel32.dll") });
+
+    EXPECT_EQ(type, InjectionType::ShellcodeInjection);
+}
+
 TEST_F(ProcessInjectionValueTest, ConfidenceCalculationAppliesBoostsWhitelistReductionsAndClamping) {
     auto& detector = ProcessInjectionDetector::Instance();
 

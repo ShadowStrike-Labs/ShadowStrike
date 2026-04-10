@@ -165,6 +165,15 @@ TEST_F(MemoryScannerValueTest, CalculateEntropyDistinguishesConstantAndUniformBu
     EXPECT_NEAR(scanner.CalculateEntropy(uniform), 8.0, 0.001);
 }
 
+TEST_F(MemoryScannerValueTest, CalculateEntropyAndExtractStringsHandleEmptyBuffers) {
+    auto& scanner = MemoryScanner::Instance();
+    const std::vector<uint8_t> empty;
+
+    EXPECT_DOUBLE_EQ(scanner.CalculateEntropy(empty), 0.0);
+    EXPECT_TRUE(scanner.ExtractStrings(empty).empty());
+    EXPECT_FALSE(scanner.CheckAPIHashing(empty));
+}
+
 TEST_F(MemoryScannerValueTest, ExtractStringsKeepsPrintableRunsAboveRequestedThreshold) {
     auto& scanner = MemoryScanner::Instance();
     const std::vector<uint8_t> buffer{
@@ -219,16 +228,38 @@ TEST_F(MemoryScannerValueTest, ContainsPEAndParsePERejectTruncatedAndCorruptImag
     EXPECT_FALSE(scanner.ContainsPE(truncated));
     EXPECT_FALSE(scanner.ParsePE(truncated).has_value());
 
-    auto missingDosMagic = BuildMinimalPE32();
-    missingDosMagic[0] = 'N';
-    EXPECT_FALSE(scanner.ContainsPE(missingDosMagic));
-    EXPECT_FALSE(scanner.ParsePE(missingDosMagic).has_value());
+    auto invalidNtSignature = BuildMinimalPE32();
+    invalidNtSignature[0x80 + 0] = 'P';
+    invalidNtSignature[0x80 + 1] = 'X';
+    EXPECT_FALSE(scanner.ContainsPE(invalidNtSignature));
+    EXPECT_FALSE(scanner.ParsePE(invalidNtSignature).has_value());
 
     auto invalidOptionalMagic = BuildMinimalPE32();
     const uint16_t badMagic = 0x0137;
     std::memcpy(invalidOptionalMagic.data() + 0x80 + 24, &badMagic, sizeof(badMagic));
     EXPECT_TRUE(scanner.ContainsPE(invalidOptionalMagic));
     EXPECT_FALSE(scanner.ParsePE(invalidOptionalMagic).has_value());
+}
+
+TEST_F(MemoryScannerValueTest, ContainsPEAndParsePERejectInvalidOffsetsAndTruncatedPE64Headers) {
+    auto& scanner = MemoryScanner::Instance();
+
+    std::vector<uint8_t> invalidOffset(0x80, 0x00);
+    invalidOffset[0] = 'M';
+    invalidOffset[1] = 'Z';
+    const uint32_t badOffset = 0x20;
+    std::memcpy(invalidOffset.data() + 0x3C, &badOffset, sizeof(badOffset));
+    invalidOffset[badOffset + 0] = 'P';
+    invalidOffset[badOffset + 1] = 'E';
+
+    EXPECT_FALSE(scanner.ContainsPE(invalidOffset));
+    EXPECT_FALSE(scanner.ParsePE(invalidOffset).has_value());
+
+    auto truncatedPe64 = BuildMinimalPE64();
+    truncatedPe64.resize(0x90 + 24 + 111);
+
+    EXPECT_TRUE(scanner.ContainsPE(truncatedPe64));
+    EXPECT_FALSE(scanner.ParsePE(truncatedPe64).has_value());
 }
 
 TEST_F(MemoryScannerValueTest, AnalyzeForShellcodeFlagsCompoundIndicatorsAndConfidenceCap) {
