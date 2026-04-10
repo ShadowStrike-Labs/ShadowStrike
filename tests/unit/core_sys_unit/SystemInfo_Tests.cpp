@@ -69,7 +69,7 @@ TEST(SystemInfoValueTests, StatisticsUtilitiesAndVersionRemainStable) {
     EXPECT_EQ(GetBootModeName(BootMode::SafeModeWithNetworking), "Safe Mode with Networking");
     EXPECT_EQ(GetProcessorArchitectureName(ProcessorArchitecture::X64), "x64 (64-bit)");
     EXPECT_EQ(GetPowerStateName(PowerState::BatteryLow), "Battery Low");
-    EXPECT_EQ(GetSandboxTypeName(static_cast<SandboxType>(0xFF)), "Unknown");
+    EXPECT_EQ(GetSandboxTypeName(static_cast<SandboxType>(0xFE)), "Unknown");
     EXPECT_EQ(SystemInfo::GetVersionString(), "3.1.0");
 }
 
@@ -102,6 +102,38 @@ TEST_F(SystemInfoTest, RefreshAndDiagnosticsOnlyAdvanceQueryCountersWhenInitiali
     ASSERT_FALSE(diagnostics.empty());
     EXPECT_THAT(diagnostics[2], HasSubstr(L"Initialized: Yes"));
     EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), 4u);
+}
+
+TEST_F(SystemInfoTest, PreInitCachedQueriesStayStableWhileLiveQueriesRemainUsable) {
+    auto& info = SystemInfo::Instance();
+
+    const auto startingQueries = info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed);
+    const auto os = info.GetOSVersion();
+    const auto cpu = info.GetCPUInfo();
+    const auto fingerprint = info.GetMachineFingerprint();
+    const auto osAgain = info.GetOSVersion();
+    const auto cpuAgain = info.GetCPUInfo();
+    const auto fingerprintAgain = info.GetMachineFingerprint();
+
+    EXPECT_EQ(os.majorVersion, osAgain.majorVersion);
+    EXPECT_EQ(os.minorVersion, osAgain.minorVersion);
+    EXPECT_EQ(os.buildNumber, osAgain.buildNumber);
+    EXPECT_EQ(cpu.brand, cpuAgain.brand);
+    EXPECT_EQ(cpu.vendor, cpuAgain.vendor);
+    EXPECT_EQ(fingerprint.machineId, fingerprintAgain.machineId);
+    EXPECT_EQ(fingerprint.hardwareFingerprint, fingerprintAgain.hardwareFingerprint);
+    EXPECT_EQ(info.GetMachineId(), fingerprint.machineId);
+    EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), startingQueries);
+
+    (void)info.GetMemoryInfo();
+    EXPECT_EQ(info.GetStatistics().queriesExecuted.load(std::memory_order_relaxed), startingQueries + 1);
+
+    const auto uptime = info.GetUptime();
+    const auto bootTime = info.GetBootTime();
+    const auto now = std::chrono::system_clock::now();
+    const auto reconstructedNow = bootTime + uptime;
+    const auto skew = (reconstructedNow > now) ? (reconstructedNow - now) : (now - reconstructedNow);
+    EXPECT_LE(skew, std::chrono::seconds(5));
 }
 
 TEST_F(SystemInfoTest, ExportSnapshotRejectsTraversalAndWritesReadableReport) {

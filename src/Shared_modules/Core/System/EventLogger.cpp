@@ -873,6 +873,8 @@ public:
                 }
             }
 
+            m_shutdown.store(false, std::memory_order_release);
+
             // Start worker threads (single writer thread for file to avoid contention)
             StartWorkerThreads();
 

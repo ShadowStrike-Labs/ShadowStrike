@@ -200,6 +200,11 @@ TEST_F(BootTimeAnalyzerTest, ExportAndEnableGuardsFollowCurrentFilesystemSemanti
     ASSERT_TRUE(analyzer.ExportReport(reportPath.wstring()));
     EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("BootTimeAnalyzer Report"));
 
+    const auto missingParentReport = testRoot_ / L"missing-parent" / L"boot-report.txt";
+    const auto missingParentOptimizations = testRoot_ / L"missing-parent" / L"boot-optimizations.txt";
+    EXPECT_FALSE(analyzer.ExportReport(missingParentReport.wstring()));
+    EXPECT_FALSE(analyzer.ExportOptimizations(missingParentOptimizations.wstring()));
+
     const auto startupFile = WriteText(L"startup\\enabled-only.lnk", "shadowstrike");
 
     StartupItem item;
@@ -208,6 +213,14 @@ TEST_F(BootTimeAnalyzerTest, ExportAndEnableGuardsFollowCurrentFilesystemSemanti
     item.type = StartupItemType::StartupFolder;
 
     EXPECT_FALSE(analyzer.EnableStartupItem(item));
+}
+
+TEST_F(BootTimeAnalyzerTest, ZeroCountSlowListsReturnEmptyVectors) {
+    auto& analyzer = BootTimeAnalyzer::Instance();
+    ASSERT_TRUE(analyzer.Initialize(BootTimeAnalyzerConfig::CreateDefault()));
+
+    EXPECT_TRUE(analyzer.GetSlowestDrivers(0).empty());
+    EXPECT_TRUE(analyzer.GetSlowestServices(0).empty());
 }
 
 TEST_F(BootTimeAnalyzerTest, SelfTestPassesAfterInitialization) {
