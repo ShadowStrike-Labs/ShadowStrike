@@ -123,6 +123,37 @@ TEST(ProcessHollowingValueTests, DetectionConfidenceEscalatesWithIndicatorStreng
     }
 }
 
+TEST(ProcessHollowingValueTests, DetectionConfidenceUsesExactThresholdBoundariesAndBaselineRisk) {
+    {
+        HollowingDetectionResult result;
+        result.detectionMethods = {
+            DetectionMethod::EntryPointAnomaly,
+            DetectionMethod::MemoryProtection,
+            DetectionMethod::EntropyAnomaly
+        };
+        result.CalculateConfidence();
+        EXPECT_EQ(result.confidence, HollowingConfidence::High);
+    }
+
+    {
+        HollowingDetectionResult result;
+        result.detectionMethods = {
+            DetectionMethod::PEHeaderMismatch,
+            DetectionMethod::SizeOfImageMismatch,
+            DetectionMethod::ChecksumMismatch
+        };
+        result.CalculateConfidence();
+        EXPECT_EQ(result.confidence, HollowingConfidence::Confirmed);
+    }
+
+    {
+        HollowingDetectionResult result;
+        result.confidence = HollowingConfidence::Low;
+        result.CalculateRiskScore();
+        EXPECT_EQ(result.riskScore, 30u);
+    }
+}
+
 TEST(ProcessHollowingValueTests, RiskScoreIncludesContextualFlagsAndCapsAtMaximum) {
     HollowingDetectionResult result;
     result.confidence = HollowingConfidence::Confirmed;

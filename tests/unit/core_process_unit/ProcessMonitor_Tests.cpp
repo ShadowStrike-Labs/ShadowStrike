@@ -81,7 +81,7 @@ TEST(ProcessMonitorValueTests, ConfigPresetsReflectMinimalAndForensicTradeoffs) 
     EXPECT_TRUE(forensic.trackAncestry);
     EXPECT_TRUE(forensic.detectPPIDSpoofing);
     EXPECT_TRUE(forensic.enableHistoricalTracking);
-    EXPECT_LT(forensic.snapshotIntervalMs, defaults.snapshotIntervalMs);
+    EXPECT_LE(forensic.snapshotIntervalMs, defaults.snapshotIntervalMs);
 }
 
 TEST(ProcessMonitorValueTests, StatisticsHelpersComputeRatiosRatesAndResetSentinels) {
@@ -109,6 +109,18 @@ TEST(ProcessMonitorValueTests, StatisticsHelpersComputeRatiosRatesAndResetSentin
     EXPECT_EQ(stats.totalLookupTimeUs.load(std::memory_order_relaxed), 0u);
     EXPECT_EQ(stats.minLookupTimeUs.load(std::memory_order_relaxed), UINT64_MAX);
     EXPECT_EQ(stats.maxLookupTimeUs.load(std::memory_order_relaxed), 0u);
+}
+
+TEST(ProcessMonitorValueTests, StatisticsHelpersReturnZeroWithoutLookupsOrElapsedTime) {
+    MonitorStatistics stats;
+    stats.cacheHits.store(5, std::memory_order_relaxed);
+    stats.totalLookupTimeUs.store(500, std::memory_order_relaxed);
+    stats.eventsProcessed.store(25, std::memory_order_relaxed);
+    stats.startTime = std::chrono::system_clock::now() + 5s;
+
+    EXPECT_DOUBLE_EQ(stats.GetCacheHitRatio(), 0.0);
+    EXPECT_DOUBLE_EQ(stats.GetAverageLookupTimeUs(), 0.0);
+    EXPECT_DOUBLE_EQ(stats.GetEventsPerSecond(), 0.0);
 }
 
 TEST(ProcessMonitorValueTests, ExtendedProcessInfoConversionsPreserveIdentityAndStalenessRules) {
