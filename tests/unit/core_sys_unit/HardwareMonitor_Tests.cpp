@@ -181,4 +181,25 @@ TEST_F(HardwareMonitorTest, ExportReportStillSucceedsWithoutInitialization) {
     EXPECT_THAT(ReadTextFile(reportPath), HasSubstr("HardwareMonitor Report"));
 }
 
+TEST_F(HardwareMonitorTest, PreInitQueriesAndInvalidCallbackIdsRemainSafe) {
+    auto& monitor = HardwareMonitor::Instance();
+
+    EXPECT_FALSE(monitor.HasDiskHealthIssues());
+    EXPECT_FALSE(monitor.IsThrottling());
+    EXPECT_FALSE(monitor.GetDiskHealth(L"\\\\.\\PHYSICALDRIVE999").has_value());
+    EXPECT_TRUE(monitor.GetRecentChanges(0).empty());
+
+    const auto powerInfo = monitor.GetPowerInfo();
+    EXPECT_EQ(powerInfo.activePowerPlan, L"");
+    EXPECT_FALSE(powerInfo.battery.hasBattery);
+
+    EXPECT_NO_THROW({
+        monitor.ClearChangeHistory();
+        monitor.UnregisterDiskHealthCallback(9999);
+        monitor.UnregisterThermalAlertCallback(9999);
+        monitor.UnregisterPowerChangeCallback(9999);
+        monitor.UnregisterHardwareChangeCallback(9999);
+    });
+}
+
 }  // namespace

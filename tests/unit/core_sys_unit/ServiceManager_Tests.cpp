@@ -130,4 +130,26 @@ TEST_F(ServiceManagerTest, VerifyServiceIntegrityFlagsNotInitializedAsTampering)
     EXPECT_EQ(result.details, L"Not initialized");
 }
 
+TEST_F(ServiceManagerTest, PreInitLifecycleCallsAndInvalidCallbackIdsRemainSafe) {
+    auto& manager = ServiceManager::Instance();
+
+    EXPECT_FALSE(manager.StartService(L"ShadowStrikeAV", {}, 1000));
+    EXPECT_FALSE(manager.StopService(L"ShadowStrikeAV", false, 1000));
+    EXPECT_FALSE(manager.RestartService(L"ShadowStrikeAV", 1000));
+    EXPECT_FALSE(manager.ConfigureRecovery(
+        L"ShadowStrikeAV",
+        FailureAction::Restart,
+        FailureAction::None,
+        FailureAction::None,
+        0,
+        0));
+
+    EXPECT_NO_THROW({
+        manager.UnregisterServiceChangeCallback(9999);
+        manager.UnregisterTamperAlertCallback(9999);
+        manager.StopWatchdog();
+    });
+    EXPECT_FALSE(manager.IsWatchdogRunning());
+}
+
 }  // namespace

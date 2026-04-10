@@ -198,4 +198,25 @@ TEST_F(PerformanceMonitorTest, KernelMetricsAreForcedPresentAndPersistAcrossShut
     EXPECT_EQ(afterReinitialize.kernelHandleCount, 321u);
 }
 
+TEST_F(PerformanceMonitorTest, MonitoringBoundariesAndZeroCountQueriesRemainStable) {
+    auto& monitor = PerformanceMonitor::Instance();
+    ASSERT_TRUE(monitor.Initialize(PerformanceMonitorConfig::CreateDefault()));
+
+    EXPECT_TRUE(monitor.GetTopCPUProcesses(0).empty());
+    EXPECT_TRUE(monitor.GetTopMemoryProcesses(0).empty());
+    EXPECT_TRUE(monitor.GetTopIOProcesses(0).empty());
+    EXPECT_TRUE(monitor.GetUsageHistory(0s).empty());
+
+    ASSERT_NO_THROW({
+        (void)monitor.GetProcessUsage(0);
+        monitor.StartMonitoring();
+        monitor.StartMonitoring();
+        monitor.StopMonitoring();
+        monitor.StopMonitoring();
+        monitor.UnregisterResourceUsageCallback(9999);
+        monitor.UnregisterAnomalyCallback(9999);
+        monitor.UnregisterThrottleCallback(9999);
+    });
+}
+
 }  // namespace

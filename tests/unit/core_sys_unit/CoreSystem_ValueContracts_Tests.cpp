@@ -157,4 +157,16 @@ TEST(CoreSystemValueContractTests, DriverAnalyzerLookupNormalizesKnownVulnerable
     EXPECT_FALSE(analyzer.GetVulnerableDriverInfo(L"deadbeef").has_value());
 }
 
+TEST(CoreSystemValueContractTests, DriverAnalyzerLookupIsCaseInsensitiveForKnownHashes) {
+    auto& analyzer = DriverAnalyzer::Instance();
+
+    const std::wstring lowerHash = L"c1d5cf8c43e7679b782630e93f5e6420ca1749a7663159a581b87a8fa3a429c0";
+    EXPECT_TRUE(analyzer.IsVulnerableDriver(lowerHash));
+
+    const auto lowerEntry = analyzer.GetVulnerableDriverInfo(lowerHash);
+    ASSERT_TRUE(lowerEntry.has_value());
+    EXPECT_EQ(lowerEntry->driverName, L"Capcom.sys");
+    EXPECT_EQ(lowerEntry->vendor, L"Capcom");
+}
+
 }  // namespace

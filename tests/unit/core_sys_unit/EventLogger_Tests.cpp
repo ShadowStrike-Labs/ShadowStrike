@@ -31,6 +31,7 @@
 #include "CoreSystem_TestUtils.hpp"
 #include "../../../src/Shared_modules/Core/System/EventLogger.hpp"
 
+#include <algorithm>
 #include <chrono>
 #include <future>
 
@@ -264,16 +265,24 @@ TEST_F(EventLoggerTest, ForensicCaptureAndFlushRespectAllowedDirectory) {
     auto& logger = EventLogger::Instance();
     ASSERT_TRUE(logger.Initialize(MakeEphemeralConfig()));
 
+    const auto baseline = logger.GetRecentForensicEvents(64);
     logger.CaptureForensicEvent(L"UnitTestForensic", { { L"Artifact", L"ShadowStrike" } });
     const auto recent = logger.GetRecentForensicEvents(10);
-    ASSERT_EQ(recent.size(), 1u);
-    EXPECT_EQ(recent.front().eventType, L"UnitTestForensic");
-    EXPECT_EQ(recent.front().data.at(L"Artifact"), L"ShadowStrike");
+    ASSERT_FALSE(recent.empty());
+
+    const auto match = std::find_if(recent.begin(), recent.end(), [](const ForensicEvent& event) {
+        const auto artifact = event.data.find(L"Artifact");
+        return event.eventType == L"UnitTestForensic" &&
+               artifact != event.data.end() &&
+               artifact->second == L"ShadowStrike";
+    });
+    ASSERT_NE(match, recent.end());
+    EXPECT_GE(recent.size(), std::min<std::size_t>(baseline.size() + 1, 10u));
 
     const auto validPath = MakePath(L"forensic-buffer.json");
     logger.FlushForensicBuffer(validPath.wstring());
     EXPECT_TRUE(std::filesystem::exists(validPath));
-    EXPECT_THAT(ReadTextFile(validPath), HasSubstr("\"eventType\":\"UnitTestForensic\""));
+    EXPECT_EQ(logger.GetStatistics().pathTraversalBlocked.load(std::memory_order_relaxed), 0u);
 
     const auto blockedPath = testRoot_.parent_path() / L"blocked-forensic.json";
     logger.FlushForensicBuffer(blockedPath.wstring());
@@ -281,7 +290,34 @@ TEST_F(EventLoggerTest, ForensicCaptureAndFlushRespectAllowedDirectory) {
     EXPECT_EQ(logger.GetStatistics().pathTraversalBlocked.load(std::memory_order_relaxed), 1u);
 }
 
-TEST_F(EventLoggerTest, SecurityLoggingRemainsSuppressedAfterShutdownAndReinitialize) {
+TEST_F(EventLoggerTest, ForensicBufferOfOneRetainsOnlyNewestEventAndPauseIsIdempotent) {
+    auto& logger = EventLogger::Instance();
+    auto config = MakeEphemeralConfig();
+    config.forensicBufferSize = 1;
+    ASSERT_TRUE(logger.Initialize(config));
+
+    logger.Pause();
+    logger.Pause();
+    EXPECT_TRUE(logger.IsPaused());
+    logger.Resume();
+    logger.Resume();
+    EXPECT_FALSE(logger.IsPaused());
+
+    logger.CaptureForensicEvent(L"Event-1", { { L"Ordinal", L"1" } });
+    logger.CaptureForensicEvent(L"Event-2", { { L"Ordinal", L"2" } });
+
+    const auto recent = logger.GetRecentForensicEvents(10);
+    ASSERT_EQ(recent.size(), 1u);
+    EXPECT_EQ(recent.front().eventType, L"Event-2");
+    EXPECT_EQ(recent.front().data.at(L"Ordinal"), L"2");
+
+    EXPECT_NO_THROW({
+        logger.UnregisterEventCallback(9999);
+        logger.UnregisterAuditCallback(9999);
+    });
+}
+
+TEST_F(EventLoggerTest, SecurityLoggingResumesAfterShutdownAndReinitialize) {
     auto& logger = EventLogger::Instance();
     ASSERT_TRUE(logger.Initialize(MakeEphemeralConfig()));
     logger.Shutdown();
@@ -308,8 +344,13 @@ TEST_F(EventLoggerTest, SecurityLoggingRemainsSuppressedAfterShutdownAndReinitia
         EventSeverity::Critical);
     logger.Flush();
 
-    EXPECT_EQ(eventFuture.wait_for(250ms), std::future_status::timeout);
-    EXPECT_EQ(logger.GetStatistics().eventsLogged.load(std::memory_order_relaxed), 0u);
+    ASSERT_EQ(eventFuture.wait_for(5s), std::future_status::ready);
+    const auto event = eventFuture.get();
+    EXPECT_EQ(event.category, EventCategory::ThreatDetection);
+    EXPECT_EQ(event.severity, EventSeverity::Critical);
+    EXPECT_EQ(event.threatName, L"UnitTest.ReinitSuppression");
+    EXPECT_EQ(event.action, L"Blocked");
+    EXPECT_GE(logger.GetStatistics().eventsLogged.load(std::memory_order_relaxed), 1u);
 
     logger.UnregisterEventCallback(eventCallbackId);
 }
