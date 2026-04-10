@@ -129,6 +129,10 @@ namespace Performance {
             m_sessionName = name.substr(0, kMaxProfileNameLength);
             m_snapshots.clear();
             m_stats.clear();
+            {
+                std::lock_guard activeLock(m_activeProfilesMutex);
+                m_activeProfiles.clear();
+            }
             m_startTime = std::chrono::steady_clock::now();
             m_sessionActive.store(true, std::memory_order_release);
 
@@ -182,7 +186,6 @@ namespace Performance {
         }
 
         void StopProfile(const std::string& name) {
-            if (!m_enabled.load(std::memory_order_acquire)) return;
             if (name.empty() || name.size() > kMaxProfileNameLength) return;
 
             // Capture timing BEFORE acquiring lock for accuracy

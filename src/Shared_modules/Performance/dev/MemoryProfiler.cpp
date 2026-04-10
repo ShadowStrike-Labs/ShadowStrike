@@ -364,6 +364,10 @@ public:
         bool processOk = true;
         if (trackProcs) {
             processOk = RefreshProcessStats();
+        } else {
+            std::unique_lock lock(m_dataMutex);
+            m_processHistory.clear();
+            m_processCache.clear();
         }
 
         return systemOk && processOk;
