@@ -556,6 +556,12 @@ namespace ShadowStrike {
                 // If decompression succeeded into scratch buffer, use it
                 if (ok != FALSE) {
                     if (required <= sizeof(scratch)) {
+                        if (expectedSize > 0 && static_cast<size_t>(required) != expectedSize) {
+                            SS_LOG_WARN(L"CompressionUtils",
+                                L"DecompressCore: size mismatch (expected %zu, got %zu)",
+                                expectedSize, static_cast<size_t>(required));
+                            return false;
+                        }
                         try {
                             dst.assign(scratch, scratch + required);
                             return true;
@@ -600,14 +606,6 @@ namespace ShadowStrike {
                     // and 'required' (capped at MAX_DECOMPRESSED_SIZE=512MB) can't exceed it.
                 }
 
-                // Validate against expected size if provided
-                if (expectedSize > 0 && static_cast<size_t>(required) != expectedSize) {
-                    SS_LOG_WARN(L"CompressionUtils",
-                        L"DecompressCore: size mismatch (expected %zu, got %zu)",
-                        expectedSize, static_cast<size_t>(required));
-                    return false;
-                }
-
                 // Allocate output buffer
                 try {
                     dst.resize(static_cast<size_t>(required));
@@ -628,6 +626,14 @@ namespace ShadowStrike {
 #endif
 
                 if (ok == FALSE) {
+                    dst.clear();
+                    return false;
+                }
+
+                if (expectedSize > 0 && static_cast<size_t>(outSize) != expectedSize) {
+                    SS_LOG_WARN(L"CompressionUtils",
+                        L"DecompressCore: size mismatch (expected %zu, got %zu)",
+                        expectedSize, static_cast<size_t>(outSize));
                     dst.clear();
                     return false;
                 }
@@ -984,6 +990,15 @@ namespace ShadowStrike {
                 SIZE_T actualOut = 0;
                 if (!SafeDecompress(api, static_cast<DECOMPRESSOR_HANDLE>(m_handle),
                     src, srcSizeT, dst.data(), required, &actualOut, lastErr)) {
+                    dst.clear();
+                    return false;
+                }
+
+                if (expectedUncompressedSize > 0 &&
+                    static_cast<size_t>(actualOut) != expectedUncompressedSize) {
+                    SS_LOG_WARN(L"CompressionUtils",
+                        L"Decompressor::decompress size mismatch (expected %zu, got %zu)",
+                        expectedUncompressedSize, static_cast<size_t>(actualOut));
                     dst.clear();
                     return false;
                 }

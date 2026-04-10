@@ -17,8 +17,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Utils/ThreadPool.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/ThreadPool.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 #include <thread>
 #include <chrono>
 #include <atomic>

@@ -35,8 +35,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Utils/ProcessUtils.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/ProcessUtils.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>

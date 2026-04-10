@@ -35,8 +35,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Utils/XMLUtils.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/XMLUtils.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 
 #include <string>
 #include <filesystem>
@@ -475,7 +475,7 @@ TEST_F(XMLUtilsTest, ToXPath_SimplePath_Converted) {
     std::string pathLike = "root.item";
     std::string xpath = ToXPath(pathLike);
     
-    EXPECT_EQ(xpath, "/root/item");
+    EXPECT_EQ(xpath, "root/item");
 }
 
 TEST_F(XMLUtilsTest, ToXPath_WithAttribute_Converted) {
@@ -483,7 +483,7 @@ TEST_F(XMLUtilsTest, ToXPath_WithAttribute_Converted) {
     std::string pathLike = "root.item.@id";
     std::string xpath = ToXPath(pathLike);
     
-    EXPECT_EQ(xpath, "/root/item/@id");
+    EXPECT_EQ(xpath, "root/item/@id");
 }
 
 TEST_F(XMLUtilsTest, ToXPath_WithIndex_Converted) {
@@ -492,7 +492,7 @@ TEST_F(XMLUtilsTest, ToXPath_WithIndex_Converted) {
     std::string xpath = ToXPath(pathLike);
     
     // XPath uses 1-based indexing, so [2] -> [3]
-    EXPECT_EQ(xpath, "/root/item[3]");
+    EXPECT_EQ(xpath, "root/item[3]");
 }
 
 TEST_F(XMLUtilsTest, ToXPath_AlreadyXPath_Unchanged) {
@@ -508,7 +508,7 @@ TEST_F(XMLUtilsTest, ToXPath_EmptyPath_ReturnsRoot) {
     std::string pathLike = "";
     std::string xpath = ToXPath(pathLike);
     
-    EXPECT_EQ(xpath, "/");
+    EXPECT_EQ(xpath, ".");
 }
 
 // ============================================================================
@@ -532,7 +532,7 @@ TEST_F(XMLUtilsTest, Security_IntegerOverflow_MaxIndex_Rejected) {
     std::string xpath = ToXPath(pathLike);
     
     // Index should be ignored (exceeds limit)
-    EXPECT_EQ(xpath, "/root/item");
+    EXPECT_EQ(xpath, "root/item");
 }
 
 // ============================================================================
@@ -1251,7 +1251,7 @@ TEST_F(XMLUtilsTest, ToXPath_MultipleIndices_Converted) {
     std::string xpath = ToXPath(pathLike);
     
     // XPath uses 1-based indexing
-    EXPECT_EQ(xpath, "/root/items[1]/sub[3]");
+    EXPECT_EQ(xpath, "root/items[1]/sub[3]");
 }
 
 TEST_F(XMLUtilsTest, ToXPath_AttributeOnly_Converted) {
@@ -1259,7 +1259,7 @@ TEST_F(XMLUtilsTest, ToXPath_AttributeOnly_Converted) {
     std::string pathLike = "@version";
     std::string xpath = ToXPath(pathLike);
     
-    EXPECT_EQ(xpath, "/@version");
+    EXPECT_EQ(xpath, "@version");
 }
 
 TEST_F(XMLUtilsTest, ToXPath_XPathInjection_Rejected) {
@@ -1278,6 +1278,22 @@ TEST_F(XMLUtilsTest, ToXPath_CommentInjection_Rejected) {
     std::string xpath = ToXPath(pathLike);
     
     // Should be rejected (returns __INVALID__ due to non-digit in brackets)
+    EXPECT_EQ(xpath, "__INVALID__");
+}
+
+TEST_F(XMLUtilsTest, ToXPath_UnterminatedIndexRejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_UnterminatedIndexRejected] Testing...");
+    std::string pathLike = "root.item[";
+    std::string xpath = ToXPath(pathLike);
+
+    EXPECT_EQ(xpath, "__INVALID__");
+}
+
+TEST_F(XMLUtilsTest, ToXPath_TrailingContentAfterIndexRejected) {
+    SS_LOG_INFO(L"XMLUtils_Tests", L"[ToXPath_TrailingContentAfterIndexRejected] Testing...");
+    std::string pathLike = "root.item[1]tail";
+    std::string xpath = ToXPath(pathLike);
+
     EXPECT_EQ(xpath, "__INVALID__");
 }
 

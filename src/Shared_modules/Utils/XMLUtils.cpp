@@ -354,13 +354,24 @@ static void parsePathLike(std::string_view sv, std::vector<Step>& out) noexcept 
         }
         
         const auto lb = s.name.find('[');
-        if (lb == std::string::npos || lb + 1 >= s.name.size()) {
+        const auto strayRb = s.name.find(']');
+        if (lb == std::string::npos) {
+            if (strayRb != std::string::npos) {
+                out.clear();
+                return;
+            }
             continue;
+        }
+
+        if (lb + 1 >= s.name.size()) {
+            out.clear();
+            return;
         }
         
         const auto rb = s.name.find(']', lb + 1);
-        if (rb == std::string::npos) {
-            continue;
+        if (rb == std::string::npos || rb != s.name.size() - 1) {
+            out.clear();
+            return;
         }
         
         // Extract index string

@@ -36,8 +36,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../src/Utils/SystemUtils.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/SystemUtils.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>

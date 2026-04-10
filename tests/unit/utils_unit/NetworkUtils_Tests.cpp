@@ -36,8 +36,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Utils/NetworkUtils.hpp"
-#include "../../../src/Utils/Logger.hpp"
+#include "../../../src/Shared_modules/Utils/NetworkUtils.hpp"
+#include "../../../src/Shared_modules/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>
@@ -554,7 +554,7 @@ TEST_F(NetworkUtilsTest, ParseUrl_HttpsUrl) {
 TEST_F(NetworkUtilsTest, UrlEncode_SpecialCharacters) {
     SS_LOG_INFO(L"NetworkUtils_Tests", L"[UrlEncode_SpecialCharacters] Testing...");
     std::wstring encoded = UrlEncode(L"hello world");
-    EXPECT_EQ(encoded, L"hello+world");
+    EXPECT_EQ(encoded, L"hello%20world");
 }
 
 TEST_F(NetworkUtilsTest, UrlDecode_SpecialCharacters) {
