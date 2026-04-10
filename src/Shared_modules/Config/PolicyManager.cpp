@@ -181,6 +181,13 @@ void PolicyManager::Shutdown() {
     {
         std::unique_lock lock(m_mutex);
         m_activePolicies.clear();
+        
+        // Clear all callbacks to prevent dangling references after shutdown
+        m_impl->m_policyCallbacks.clear();
+        m_impl->m_violationCallbacks.clear();
+        m_impl->m_syncCallbacks.clear();
+        m_impl->m_violations.clear();
+        
         m_impl->m_status = PolicyStatus::Stopped;
     }
     SS_LOG_INFO(L"Policy", L"PolicyManager shutdown complete");
@@ -906,19 +913,31 @@ bool PolicyManager::ValidateSetting(const std::string& key, const PolicyValue& v
         std::unique_lock lock(m_mutex);
         m_impl->m_stats.enforcementChecks.fetch_add(1, std::memory_order_relaxed);
 
+        // Find the HIGHEST PRIORITY mandatory policy that governs this key
+        const Policy* winningPolicy = nullptr;
+        const PolicySetting* winningSetting = nullptr;
+        
         for (const auto& [id, p] : m_activePolicies) {
             if (p.state != PolicyState::Active || !p.isMandatory) continue;
             auto sit = p.settings.find(key);
             if (sit == p.settings.end()) continue;
             if (sit->second.enforcement != EnforcementLevel::Mandatory) continue;
-
-            // Proposed value differs from mandatory policy value → violation
-            if (PolicyValueToString(sit->second.value) != PolicyValueToString(value)) {
+            
+            // Higher priority wins (or first if same priority)
+            if (!winningPolicy || p.priority > winningPolicy->priority) {
+                winningPolicy = &p;
+                winningSetting = &sit->second;
+            }
+        }
+        
+        // If there's a winning policy, compare against IT only
+        if (winningPolicy && winningSetting) {
+            if (PolicyValueToString(winningSetting->value) != PolicyValueToString(value)) {
                 PolicyViolation violation;
                 violation.violationId  = m_impl->m_nextViolationId++;
-                violation.policyId     = p.id;
+                violation.policyId     = winningPolicy->id;
                 violation.settingKey   = key;
-                violation.expectedValue = sit->second.value;
+                violation.expectedValue = winningSetting->value;
                 violation.actualValue  = value;
                 violation.timestamp    = std::chrono::system_clock::now();
                 violation.action       = ViolationAction::Block;
@@ -944,7 +963,6 @@ bool PolicyManager::ValidateSetting(const std::string& key, const PolicyValue& v
                 }
 
                 detectedViolation = std::move(violation);
-                break;
             }
         }
     }
@@ -1065,6 +1083,11 @@ bool PolicyManager::RemediateViolation(uint64_t violationId) {
     std::unique_lock lock(m_mutex);
     for (auto& v : m_impl->m_violations) {
         if (v.violationId == violationId) {
+            if (v.remediated) {
+                SS_LOG_WARN(L"Policy", L"Violation id=%llu already remediated",
+                            static_cast<unsigned long long>(violationId));
+                return false;
+            }
             v.remediated = true;
             m_impl->m_stats.violationsRemediated.fetch_add(1, std::memory_order_relaxed);
             SS_LOG_INFO(L"Policy", L"Violation id=%llu remediated", static_cast<unsigned long long>(violationId));

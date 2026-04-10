@@ -427,9 +427,9 @@ static void parsePathLike(std::string_view sv, std::vector<Step>& out) noexcept 
 
 std::string ToXPath(std::string_view pathLike) noexcept {
     try {
-        // Empty path returns root selector
+        // Empty path returns current node selector (for relative queries)
         if (pathLike.empty()) {
-            return std::string("/");
+            return std::string(".");
         }
         
         // Already XPath - pass through unchanged
@@ -447,10 +447,10 @@ std::string ToXPath(std::string_view pathLike) noexcept {
             return std::string("__INVALID__");
         }
 
-        // Build XPath string
+        // Build RELATIVE XPath string (no leading slash)
+        // This allows queries to work correctly when called on sub-nodes
         std::string xp;
         xp.reserve(pathLike.size() * 2);  // Reserve for efficiency
-        xp.push_back('/');
         
         for (size_t i = 0; i < steps.size(); ++i) {
             const auto& s = steps[i];

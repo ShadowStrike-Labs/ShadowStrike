@@ -22,6 +22,7 @@
 #include <vector>
 
 #include "../../../src/Shared_modules/Config/PolicyManager.hpp"
+#include "../../../src/Shared_modules/Config/ConfigManager.hpp"
 #include "Config_TestUtils.hpp"
 
 namespace ShadowStrike::Config::Test {
@@ -65,8 +66,15 @@ class PolicyManagerTest : public ::testing::Test {
 protected:
     ScopedTempDir tempDir{L"ShadowStrike_PolicyTests_"};
     PolicyManager& manager = PolicyManager::Instance();
+    ConfigManager& configMgr = ConfigManager::Instance();
 
     void SetUp() override {
+        // Initialize ConfigManager first (PolicyManager depends on it for compliance checks)
+        configMgr.Shutdown();
+        ConfigManagerConfiguration cfgConfig;
+        // Use empty databasePath for in-memory operation
+        (void)configMgr.Initialize(cfgConfig);
+
         manager.Shutdown();
 
         PolicyManagerConfiguration config;
@@ -79,7 +87,9 @@ protected:
     }
 
     void TearDown() override {
+        // Shutdown clears all state including callbacks
         manager.Shutdown();
+        configMgr.Shutdown();
     }
 };
 
@@ -242,32 +252,31 @@ TEST_F(PolicyManagerTest, ParsePolicyFromJsonAndXmlRestoresExpectedFields) {
                                        static_cast<uint8_t>(0xFF)));
     EXPECT_TRUE(parsedJsonPolicy->targetGroups.contains("servers"));
 
-    const std::string xml = R"(
-        <policy>
-          <id>xml-policy</id>
-          <name>Imported XML Policy</name>
-          <description>xml import</description>
-          <createdBy>console</createdBy>
-          <type>13</type>
-          <state>1</state>
-          <enforcement>0</enforcement>
-          <priority>7</priority>
-          <version>2</version>
-          <isMandatory>true</isMandatory>
-          <effectiveFrom>2026-01-03T00:00:00Z</effectiveFrom>
-          <createdAt>2026-01-03T00:00:00Z</createdAt>
-          <modifiedAt>2026-01-03T01:00:00Z</modifiedAt>
-          <settings>
-            <item>
-              <key>network.mode</key>
-              <displayName>Network Mode</displayName>
-              <value>locked</value>
-              <enforcement>0</enforcement>
-              <description>managed</description>
-            </item>
-          </settings>
-          <targetMachines><item>host01</item></targetMachines>
-        </policy>)";
+    const std::string xml = R"(<policy>
+  <id>xml-policy</id>
+  <name>Imported XML Policy</name>
+  <description>xml import</description>
+  <createdBy>console</createdBy>
+  <type>13</type>
+  <state>1</state>
+  <enforcement>0</enforcement>
+  <priority>7</priority>
+  <version>2</version>
+  <isMandatory>true</isMandatory>
+  <effectiveFrom>2026-01-03T00:00:00Z</effectiveFrom>
+  <createdAt>2026-01-03T00:00:00Z</createdAt>
+  <modifiedAt>2026-01-03T01:00:00Z</modifiedAt>
+  <settings>
+    <item>
+      <key>network.mode</key>
+      <displayName>Network Mode</displayName>
+      <value>locked</value>
+      <enforcement>0</enforcement>
+      <description>managed</description>
+    </item>
+  </settings>
+  <targetMachines><item>host01</item></targetMachines>
+</policy>)";
 
     const auto parsedXmlPolicy = ParsePolicyFromXml(xml);
     ASSERT_TRUE(parsedXmlPolicy.has_value());
@@ -327,10 +336,11 @@ TEST_F(PolicyManagerTest, ApplyQueryEnforcementAndViolationLifecycleRemainConsis
 
     const auto violations = manager.GetPendingViolations();
     ASSERT_EQ(violations.size(), 1u);
-    EXPECT_EQ(violations.front().policyId, "policy-primary");
+    // Violation comes from highest priority policy (policy-stronger, priority 80)
+    EXPECT_EQ(violations.front().policyId, "policy-stronger");
     EXPECT_EQ(violations.front().settingKey, "scan.mode");
     ASSERT_EQ(violationEvents.size(), 1u);
-    EXPECT_EQ(violationEvents.front().policyId, "policy-primary");
+    EXPECT_EQ(violationEvents.front().policyId, "policy-stronger");
 
     EXPECT_TRUE(manager.RemediateViolation(violations.front().violationId));
     EXPECT_TRUE(manager.GetPendingViolations().empty());

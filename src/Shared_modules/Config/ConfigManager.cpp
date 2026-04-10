@@ -1158,7 +1158,11 @@ std::vector<ConfigValidationError> ConfigManager::ValidateAll() const {
     // Validate each key outside the lock (ValidateValue acquires its own lock)
     for (const auto& [key, val] : keysToValidate) {
         auto result = ValidateValue(key, val);
-        if (result != ValidationResult::Valid) {
+        // ReadOnly and Deprecated are not errors when validating existing state -
+        // they indicate the key cannot be CHANGED, not that the value is invalid.
+        if (result != ValidationResult::Valid &&
+            result != ValidationResult::ReadOnly &&
+            result != ValidationResult::Deprecated) {
             ConfigValidationError err;
             err.key = key;
             err.result = result;
