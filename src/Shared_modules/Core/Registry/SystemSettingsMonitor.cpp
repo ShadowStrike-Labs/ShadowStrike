@@ -597,7 +597,11 @@ private:
 
 class SystemSettingsMonitorImpl {
 public:
-    SystemSettingsMonitorImpl() = default;
+    SystemSettingsMonitorImpl()
+        : m_callbackManager(std::make_unique<CallbackManager>()),
+          m_baselineManager(std::make_unique<BaselineManager>()),
+          m_changeTracker(std::make_unique<ChangeTracker>()),
+          m_alertManager(std::make_unique<AlertManager>()) {}
     ~SystemSettingsMonitorImpl() {
         Stop();
     }

@@ -163,7 +163,7 @@ TEST_F(RegistryAnalyzerTest, OfflineHiveAndIndicatorHelpersHandleMalformedInputs
     EXPECT_TRUE(analyzer.ExportTimeline(timelinePath.wstring()));
     EXPECT_EQ(
         temp.ReadText(timelinePath),
-        "Timestamp,Action,Hive,KeyPath,ValueName,Description,IsAnomaly\n");
+        "Timestamp,Action,Hive,KeyPath,ValueName,Description,IsAnomaly\r\n");
 }
 
 TEST_F(RegistryAnalyzerTest, CallbackAndUninitializedAccessContractsRemainSafe) {
@@ -197,6 +197,87 @@ TEST_F(RegistryAnalyzerTest, CallbackAndUninitializedAccessContractsRemainSafe) 
     EXPECT_TRUE(analyzer.UnregisterCallback(hiddenCallbackId));
     EXPECT_FALSE(analyzer.UnregisterCallback(hiddenCallbackId));
     EXPECT_FALSE(analyzer.UnregisterCallback(0xFFFFFFFFull));
+}
+
+TEST_F(RegistryAnalyzerTest, HiveHeaderAndKeyCellBoundariesRemainDeterministic) {
+    ASSERT_TRUE(analyzer.Initialize(RegistryAnalyzerConfig::CreateDefault()));
+
+    std::vector<uint8_t> hiveBytes(0x3000, 0);
+
+    const auto writeUInt16 = [&hiveBytes](size_t offset, uint16_t value) {
+        std::memcpy(hiveBytes.data() + offset, &value, sizeof(value));
+    };
+    const auto writeUInt32 = [&hiveBytes](size_t offset, uint32_t value) {
+        std::memcpy(hiveBytes.data() + offset, &value, sizeof(value));
+    };
+    const auto writeInt32 = [&hiveBytes](size_t offset, int32_t value) {
+        std::memcpy(hiveBytes.data() + offset, &value, sizeof(value));
+    };
+    const auto writeUInt64 = [&hiveBytes](size_t offset, uint64_t value) {
+        std::memcpy(hiveBytes.data() + offset, &value, sizeof(value));
+    };
+
+    hiveBytes[0] = 'r';
+    hiveBytes[1] = 'e';
+    hiveBytes[2] = 'g';
+    hiveBytes[3] = 'f';
+    writeUInt32(0x04, 1u);
+    writeUInt32(0x08, 2u);
+    writeUInt64(0x0C, 0u);
+    writeUInt32(0x14, 1u);
+    writeUInt32(0x18, 3u);
+    writeUInt32(0x1C, 0u);
+    writeUInt32(0x24, 0x40u);
+    writeUInt32(0x28, 0x2000u);
+
+    writeInt32(0x1000, 5);
+
+    const size_t wrongSignatureCell = 0x1000 + 0x20;
+    writeInt32(wrongSignatureCell, -0x60);
+    writeUInt16(wrongSignatureCell + 4, 0x6B76);
+
+    const size_t validCell = 0x1000 + 0x40;
+    writeInt32(validCell, -0x600);
+    writeUInt16(validCell + 4, 0x6B6E);
+    writeUInt32(validCell + 4 + 0x10, 0x20u);
+    writeUInt32(validCell + 4 + 0x14, 2u);
+    writeUInt32(validCell + 4 + 0x24, 3u);
+    writeUInt32(validCell + 4 + 0x2C, 0x88u);
+    writeUInt32(validCell + 4 + 0x30, 0x99u);
+    writeUInt16(validCell + 4 + 0x48, 1500u);
+
+    for (size_t i = 0; i < 1500; ++i) {
+        hiveBytes[validCell + 4 + 0x4C + i] = 'A';
+    }
+    hiveBytes[validCell + 4 + 0x4C + 12] = '\0';
+
+    const auto hivePath = temp.WriteBytes(L"dirty-with-cells.hiv", hiveBytes);
+
+    const HiveHeader header = analyzer.ParseHiveHeader(hivePath.wstring());
+    EXPECT_TRUE(header.isValid);
+    EXPECT_FALSE(header.isCorrupted);
+    EXPECT_TRUE(header.isDirty);
+    EXPECT_EQ(header.sequence1, 1u);
+    EXPECT_EQ(header.sequence2, 2u);
+    EXPECT_EQ(header.rootCellOffset, 0x40u);
+    EXPECT_TRUE(analyzer.ValidateHiveStructure(hivePath.wstring()));
+
+    EXPECT_FALSE(analyzer.GetKeyCell(hivePath.wstring(), 0u).has_value());
+    EXPECT_FALSE(analyzer.GetKeyCell(hivePath.wstring(), 0x20u).has_value());
+
+    const auto keyCell = analyzer.GetKeyCell(hivePath.wstring(), 0x40u);
+    ASSERT_TRUE(keyCell.has_value());
+    EXPECT_EQ(keyCell->offset, 0x40u);
+    EXPECT_TRUE(keyCell->isAllocated);
+    EXPECT_FALSE(keyCell->isDeleted);
+    EXPECT_EQ(keyCell->parentOffset, 0x20u);
+    EXPECT_EQ(keyCell->subKeyCount, 2u);
+    EXPECT_EQ(keyCell->valueCount, 3u);
+    EXPECT_EQ(keyCell->securityOffset, 0x88u);
+    EXPECT_EQ(keyCell->classNameOffset, 0x99u);
+    EXPECT_TRUE(keyCell->hasNullByte);
+    EXPECT_LE(keyCell->keyName.size(), 1024u);
+    EXPECT_LE(keyCell->keyNameRaw.size(), 1024u);
 }
 
 }  // namespace ShadowStrike::Core::Registry::Test
