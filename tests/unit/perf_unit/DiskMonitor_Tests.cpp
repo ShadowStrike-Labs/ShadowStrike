@@ -229,6 +229,26 @@ TEST_F(DiskMonitorTest, ShutdownIsIdempotentAndRestoresEmptySnapshots) {
     EXPECT_EQ(stats.activeProcesses, 0u);
 }
 
+TEST_F(DiskMonitorTest, ReinitializeKeepsExistingConfigurationUntilShutdown) {
+    SSP::DiskMonitorConfig firstConfig;
+    firstConfig.enabled = false;
+    firstConfig.pollingIntervalMs = 900;
+    firstConfig.enableProcessMonitoring = false;
+    firstConfig.enableDriveSpaceMonitoring = false;
+    ASSERT_TRUE(monitor.Initialize(firstConfig));
+
+    SSP::DiskMonitorConfig secondConfig = firstConfig;
+    secondConfig.pollingIntervalMs = 1600;
+    secondConfig.enableProcessMonitoring = true;
+    secondConfig.enableDriveSpaceMonitoring = true;
+    ASSERT_TRUE(monitor.Initialize(secondConfig));
+
+    const SSP::DiskMonitorConfig persisted = monitor.GetConfig();
+    EXPECT_EQ(persisted.pollingIntervalMs, firstConfig.pollingIntervalMs);
+    EXPECT_FALSE(persisted.enableProcessMonitoring);
+    EXPECT_FALSE(persisted.enableDriveSpaceMonitoring);
+}
+
 TEST_F(DiskMonitorTest, CallbackRegistrationAndResetAreSafeForNullAndLiveHandlers) {
     monitor.RegisterHighIoCallback({});
     monitor.RegisterLowSpaceCallback({});
