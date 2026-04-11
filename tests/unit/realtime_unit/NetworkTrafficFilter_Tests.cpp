@@ -117,7 +117,8 @@ TEST_F(NetworkTrafficFilterTest, BlocklistsNormalizeInputsAndCallbacksRemainSafe
     filter.UnblockDomain("MIXED.EXAMPLE.COM");
     EXPECT_FALSE(filter.IsDomainBlocked("mixed.example.com"));
     filter.BlockDomain("");
-    EXPECT_TRUE(filter.IsDomainBlocked(""));
+    EXPECT_FALSE(filter.IsDomainBlocked(""));
+    EXPECT_TRUE(filter.GetBlockedDomains().empty());
     filter.UnblockDomain("");
     EXPECT_FALSE(filter.IsDomainBlocked(""));
 
