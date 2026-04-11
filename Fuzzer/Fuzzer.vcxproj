@@ -90,14 +90,22 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\AttackSurface.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Core\EngineArchitecture.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Core\OperationsPipeline.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Targets\KernelTargetCatalog.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Targets\UserModeTargetCatalog.hpp" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="src\AttackSurface.cpp" />
+    <ClCompile Include="src\EngineArchitecture.cpp" />
     <ClCompile Include="src\KernelMessageFactory.cpp" />
     <ClCompile Include="src\KernelMessageSchema.cpp" />
+    <ClCompile Include="src\KernelTargetCatalog.cpp" />
     <ClCompile Include="src\main.cpp" />
+    <ClCompile Include="src\OperationsPipeline.cpp" />
+    <ClCompile Include="src\UserModeTargetCatalog.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
