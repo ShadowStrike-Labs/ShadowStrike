@@ -221,6 +221,80 @@ namespace {
     // Entropy threshold for suspicious files
     constexpr double HIGH_ENTROPY_THRESHOLD = 7.5;
 
+    // ────────────────────────────────────────────────────────────────────
+    // TAR format constants (POSIX.1-2001 / pax)
+    // ────────────────────────────────────────────────────────────────────
+    constexpr size_t  TAR_BLOCK_SIZE        = 512;
+    constexpr size_t  TAR_NAME_OFFSET       = 0;
+    constexpr size_t  TAR_NAME_LEN          = 100;
+    constexpr size_t  TAR_MODE_OFFSET       = 100;
+    constexpr size_t  TAR_SIZE_OFFSET       = 124;
+    constexpr size_t  TAR_SIZE_LEN          = 12;
+    constexpr size_t  TAR_MTIME_OFFSET      = 136;
+    constexpr size_t  TAR_MTIME_LEN         = 12;
+    constexpr size_t  TAR_CHKSUM_OFFSET     = 148;
+    constexpr size_t  TAR_CHKSUM_LEN        = 8;
+    constexpr size_t  TAR_TYPEFLAG_OFFSET   = 156;
+    constexpr size_t  TAR_LINKNAME_OFFSET   = 157;
+    constexpr size_t  TAR_LINKNAME_LEN      = 100;
+    constexpr size_t  TAR_MAGIC_OFFSET      = 257;
+    constexpr size_t  TAR_MAGIC_LEN         = 6;
+    constexpr size_t  TAR_PREFIX_OFFSET     = 345;
+    constexpr size_t  TAR_PREFIX_LEN        = 155;
+    constexpr uint32_t TAR_MAX_ENTRIES      = 500000;
+    constexpr uint64_t TAR_MAX_ENTRY_SIZE   = 4ULL * 1024 * 1024 * 1024; // 4 GiB per entry
+
+    // TAR type flags
+    constexpr char TAR_TYPE_REGULAR     = '0';
+    constexpr char TAR_TYPE_REGULAR_ALT = '\0';  // Pre-POSIX compatibility
+    constexpr char TAR_TYPE_LINK        = '1';
+    constexpr char TAR_TYPE_SYMLINK     = '2';
+    constexpr char TAR_TYPE_CHARDEV     = '3';
+    constexpr char TAR_TYPE_BLOCKDEV    = '4';
+    constexpr char TAR_TYPE_DIRECTORY   = '5';
+    constexpr char TAR_TYPE_FIFO        = '6';
+    constexpr char TAR_TYPE_LONGNAME    = 'L';   // GNU long filename
+    constexpr char TAR_TYPE_LONGLINK    = 'K';   // GNU long linkname
+    constexpr char TAR_TYPE_PAX_GLOBAL  = 'g';   // pax global extended header
+    constexpr char TAR_TYPE_PAX_NEXT    = 'x';   // pax per-entry extended header
+
+    // ────────────────────────────────────────────────────────────────────
+    // GZIP format constants (RFC 1952)
+    // ────────────────────────────────────────────────────────────────────
+    constexpr size_t  GZIP_HEADER_MIN_SIZE  = 10;
+    constexpr uint8_t GZIP_FLAG_FTEXT       = 0x01;
+    constexpr uint8_t GZIP_FLAG_FHCRC       = 0x02;
+    constexpr uint8_t GZIP_FLAG_FEXTRA      = 0x04;
+    constexpr uint8_t GZIP_FLAG_FNAME       = 0x08;
+    constexpr uint8_t GZIP_FLAG_FCOMMENT    = 0x10;
+    constexpr size_t  GZIP_TRAILER_SIZE     = 8; // CRC32 + ISIZE
+
+    // ────────────────────────────────────────────────────────────────────
+    // RAR format constants
+    // ────────────────────────────────────────────────────────────────────
+    constexpr uint8_t RAR4_MARKER_SIZE      = 7;
+    constexpr uint8_t RAR4_ARCHIVE_HEADER   = 0x73;
+    constexpr uint8_t RAR4_FILE_HEADER      = 0x74;
+    constexpr uint8_t RAR4_END_HEADER       = 0x7B;
+    constexpr uint16_t RAR4_FLAG_LARGE      = 0x8000; // Large file (>2 GiB)
+    constexpr uint16_t RAR4_FLAG_UNICODE    = 0x0200; // Unicode filename
+    constexpr uint16_t RAR4_FLAG_ENCRYPTED  = 0x0004; // Encrypted file
+    constexpr uint16_t RAR4_FLAG_DIRECTORY  = 0x00E0; // Directory entry (bits 5-7)
+    constexpr uint32_t RAR4_MAX_ENTRIES     = 500000;
+
+    // RAR5 header types
+    constexpr uint32_t RAR5_HEADER_MAIN       = 1;
+    constexpr uint32_t RAR5_HEADER_FILE       = 2;
+    constexpr uint32_t RAR5_HEADER_SERVICE    = 3;
+    constexpr uint32_t RAR5_HEADER_ENCRYPTION = 4;
+    constexpr uint32_t RAR5_HEADER_END        = 5;
+
+    // RAR5 file flags
+    constexpr uint32_t RAR5_FILE_FLAG_DIRECTORY   = 0x0001;
+    constexpr uint32_t RAR5_FILE_FLAG_UNIX_MTIME  = 0x0002;
+    constexpr uint32_t RAR5_FILE_FLAG_CRC32       = 0x0004;
+    constexpr uint32_t RAR5_FILE_FLAG_UNPACKED_KNOWN = 0x0008;
+
     // Windows reserved device names
     constexpr std::wstring_view RESERVED_NAMES[] = {
         L"CON", L"PRN", L"AUX", L"NUL",
@@ -243,6 +317,114 @@ namespace {
         return table;
     }
     static constexpr auto CRC32_TABLE = BuildCrc32Table();
+
+    // ────────────────────────────────────────────────────────────────────
+    // TAR helper: parse octal ASCII field into uint64_t
+    // Handles both POSIX octal strings and GNU base-256 encoding.
+    // ────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static uint64_t ParseTarOctal(
+        const uint8_t* field, size_t length) noexcept {
+
+        if (length == 0) return 0;
+
+        // GNU base-256 encoding: high bit of first byte set
+        if ((field[0] & 0x80) != 0) {
+            // Positive value: strip the marker bit, read big-endian
+            uint64_t value = field[0] & 0x7F;
+            for (size_t i = 1; i < length; ++i) {
+                value = (value << 8) | field[i];
+            }
+            return value;
+        }
+
+        // Standard POSIX: octal ASCII, skip leading spaces/zeros
+        uint64_t value = 0;
+        for (size_t i = 0; i < length; ++i) {
+            if (field[i] == ' ' || field[i] == '\0') continue;
+            if (field[i] < '0' || field[i] > '7') break;
+            // Overflow guard: if value would exceed 2^60, cap
+            if (value > (UINT64_MAX >> 3)) return UINT64_MAX;
+            value = (value << 3) | static_cast<uint64_t>(field[i] - '0');
+        }
+        return value;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // TAR helper: verify header checksum
+    // ────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static bool VerifyTarChecksum(const uint8_t* block) noexcept {
+        // Compute unsigned checksum treating checksum field as spaces
+        uint32_t computed = 0;
+        for (size_t i = 0; i < TAR_BLOCK_SIZE; ++i) {
+            if (i >= TAR_CHKSUM_OFFSET && i < TAR_CHKSUM_OFFSET + TAR_CHKSUM_LEN) {
+                computed += ' ';
+            } else {
+                computed += block[i];
+            }
+        }
+
+        uint32_t stored = static_cast<uint32_t>(
+            ParseTarOctal(block + TAR_CHKSUM_OFFSET, TAR_CHKSUM_LEN));
+
+        // Also check signed checksum for compatibility with some archivers
+        int32_t signedComputed = 0;
+        for (size_t i = 0; i < TAR_BLOCK_SIZE; ++i) {
+            if (i >= TAR_CHKSUM_OFFSET && i < TAR_CHKSUM_OFFSET + TAR_CHKSUM_LEN) {
+                signedComputed += ' ';
+            } else {
+                signedComputed += static_cast<int8_t>(block[i]);
+            }
+        }
+
+        return (computed == stored) ||
+               (static_cast<uint32_t>(signedComputed) == stored);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // TAR helper: check if block is all zeros (end-of-archive)
+    // ────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static bool IsZeroBlock(const uint8_t* block) noexcept {
+        // Use 8-byte comparisons for performance on 64-bit
+        const uint64_t* qwords = reinterpret_cast<const uint64_t*>(block);
+        for (size_t i = 0; i < TAR_BLOCK_SIZE / sizeof(uint64_t); ++i) {
+            if (qwords[i] != 0) return false;
+        }
+        return true;
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // TAR helper: extract null-terminated string from fixed-width field
+    // ────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static std::string ExtractTarString(
+        const uint8_t* field, size_t maxLen) noexcept {
+
+        size_t len = 0;
+        while (len < maxLen && field[len] != '\0') {
+            ++len;
+        }
+        return std::string(reinterpret_cast<const char*>(field), len);
+    }
+
+    // ────────────────────────────────────────────────────────────────────
+    // RAR5 helper: read variable-length integer (vint) from buffer
+    // Returns bytes consumed, 0 on error.
+    // ────────────────────────────────────────────────────────────────────
+    [[nodiscard]] static size_t ReadRar5Vint(
+        const uint8_t* data, size_t available, uint64_t& outValue) noexcept {
+
+        outValue = 0;
+        size_t bytesRead = 0;
+        unsigned shift = 0;
+
+        while (bytesRead < available && bytesRead < 10) {
+            uint8_t b = data[bytesRead++];
+            outValue |= static_cast<uint64_t>(b & 0x7F) << shift;
+            if ((b & 0x80) == 0) return bytesRead;
+            shift += 7;
+        }
+
+        return 0; // Unterminated vint
+    }
 
 } // anonymous namespace
 
@@ -1010,6 +1192,999 @@ public:
     }
 
     // ========================================================================
+    // TAR CONTENT PARSING
+    // ========================================================================
+
+    [[nodiscard]] std::vector<ArchiveEntry> ParseTarContents(
+        HANDLE hFile, uint64_t fileSize, const ExtractionOptions& options) const {
+
+        std::vector<ArchiveEntry> entries;
+        entries.reserve(256);
+
+        uint64_t offset = 0;
+        uint64_t entryId = 0;
+        uint32_t consecutiveZeroBlocks = 0;
+        std::string gnuLongName;  // Accumulated GNU @LongLink filename
+
+        while (offset + TAR_BLOCK_SIZE <= fileSize) {
+            if (IsCancelled()) break;
+            if (entries.size() >= TAR_MAX_ENTRIES) {
+                SS_LOG_WARN(L"ArchiveExtractor",
+                    L"TAR entry limit (%u) reached — truncating", TAR_MAX_ENTRIES);
+                break;
+            }
+
+            // Seek and read one 512-byte header block
+            LARGE_INTEGER seekPos{};
+            seekPos.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) break;
+
+            uint8_t block[TAR_BLOCK_SIZE]{};
+            DWORD bytesRead = 0;
+            if (!ReadFile(hFile, block, TAR_BLOCK_SIZE, &bytesRead, nullptr) ||
+                bytesRead < TAR_BLOCK_SIZE) {
+                break;
+            }
+
+            // End-of-archive: two consecutive zero blocks
+            if (IsZeroBlock(block)) {
+                consecutiveZeroBlocks++;
+                if (consecutiveZeroBlocks >= 2) break;
+                offset += TAR_BLOCK_SIZE;
+                continue;
+            }
+            consecutiveZeroBlocks = 0;
+
+            // Verify header checksum
+            if (!VerifyTarChecksum(block)) {
+                SS_LOG_WARN(L"ArchiveExtractor",
+                    L"TAR: invalid checksum at offset %llu — stopping parse", offset);
+                break;
+            }
+
+            // Parse header fields
+            char typeFlag = static_cast<char>(block[TAR_TYPEFLAG_OFFSET]);
+            uint64_t entrySize = ParseTarOctal(
+                block + TAR_SIZE_OFFSET, TAR_SIZE_LEN);
+            uint64_t mtime = ParseTarOctal(
+                block + TAR_MTIME_OFFSET, TAR_MTIME_LEN);
+
+            // Extract name: prefix + '/' + name (POSIX) or just name
+            std::string prefix = ExtractTarString(
+                block + TAR_PREFIX_OFFSET, TAR_PREFIX_LEN);
+            std::string name = ExtractTarString(
+                block + TAR_NAME_OFFSET, TAR_NAME_LEN);
+
+            if (!prefix.empty()) {
+                name = prefix + "/" + name;
+            }
+
+            // GNU long filename extension: type 'L' means the data block
+            // contains the real filename for the NEXT entry.
+            if (typeFlag == TAR_TYPE_LONGNAME) {
+                // Read the long name data blocks
+                uint64_t nameDataBlocks = (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+                uint64_t nameDataSize = nameDataBlocks * TAR_BLOCK_SIZE;
+                if (nameDataSize > 65536) {
+                    // Sanity: reject absurdly long filenames
+                    SS_LOG_WARN(L"ArchiveExtractor",
+                        L"TAR: GNU long name too large (%llu) at offset %llu",
+                        entrySize, offset);
+                    offset += TAR_BLOCK_SIZE + nameDataSize;
+                    continue;
+                }
+                std::vector<uint8_t> nameBuf(static_cast<size_t>(nameDataSize));
+                if (!ReadFile(hFile, nameBuf.data(),
+                    static_cast<DWORD>(nameDataSize), &bytesRead, nullptr)) {
+                    break;
+                }
+                // Extract null-terminated string from the data
+                gnuLongName = std::string(
+                    reinterpret_cast<const char*>(nameBuf.data()),
+                    strnlen(reinterpret_cast<const char*>(nameBuf.data()),
+                            static_cast<size_t>(entrySize)));
+                offset += TAR_BLOCK_SIZE + nameDataSize;
+                continue;
+            }
+
+            // pax extended header: type 'x' or 'g' — skip data blocks
+            if (typeFlag == TAR_TYPE_PAX_NEXT || typeFlag == TAR_TYPE_PAX_GLOBAL) {
+                uint64_t dataBlocks = (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+                offset += TAR_BLOCK_SIZE + dataBlocks * TAR_BLOCK_SIZE;
+                continue;
+            }
+
+            // Apply GNU long name if pending
+            if (!gnuLongName.empty()) {
+                name = std::move(gnuLongName);
+                gnuLongName.clear();
+            }
+
+            // Validate entry size
+            if (entrySize > TAR_MAX_ENTRY_SIZE) {
+                SS_LOG_WARN(L"ArchiveExtractor",
+                    L"TAR: entry size %llu exceeds limit at offset %llu",
+                    entrySize, offset);
+                break;
+            }
+
+            // Build ArchiveEntry
+            ArchiveEntry entry;
+            entry.entryId = entryId++;
+
+            // Convert filename to wide string
+            std::wstring wideName;
+            wideName.reserve(name.size());
+            for (char ch : name) {
+                wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+            }
+            entry.path = wideName;
+
+            // Extract just the filename component
+            auto lastSep = wideName.find_last_of(L"/\\");
+            entry.filename = (lastSep != std::wstring::npos)
+                ? wideName.substr(lastSep + 1) : wideName;
+
+            entry.uncompressedSize = entrySize;
+            entry.compressedSize = entrySize;  // TAR is uncompressed
+            entry.compressionRatio = 1.0;
+            entry.compressionMethod = "stored";
+
+            entry.isDirectory = (typeFlag == TAR_TYPE_DIRECTORY);
+            entry.isEncrypted = false;
+
+            // Set modification time
+            if (mtime > 0 && mtime < 0x7FFFFFFF) {
+                entry.modifiedTime = std::chrono::system_clock::from_time_t(
+                    static_cast<time_t>(mtime));
+            }
+
+            // Detect symlinks
+            if (typeFlag == TAR_TYPE_SYMLINK || typeFlag == TAR_TYPE_LINK) {
+                std::string linkTarget = ExtractTarString(
+                    block + TAR_LINKNAME_OFFSET, TAR_LINKNAME_LEN);
+                std::wstring wideLinkTarget;
+                wideLinkTarget.reserve(linkTarget.size());
+                for (char ch : linkTarget) {
+                    wideLinkTarget += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+                }
+                entry.linkTarget = std::move(wideLinkTarget);
+            }
+
+            // Path safety check
+            if (!IsPathSafe(entry.path)) {
+                entry.securityFlags |= SecurityFlag::PathTraversalAttempt;
+                entry.isSuspicious = true;
+            }
+
+            // Determine entry type from filename
+            auto lowerPath = ToLowerCopy(entry.path);
+            if (!entry.isDirectory) {
+                // Check for nested archives
+                if (lowerPath.ends_with(L".zip") || lowerPath.ends_with(L".rar") ||
+                    lowerPath.ends_with(L".7z") || lowerPath.ends_with(L".tar") ||
+                    lowerPath.ends_with(L".gz") || lowerPath.ends_with(L".bz2") ||
+                    lowerPath.ends_with(L".xz") || lowerPath.ends_with(L".cab")) {
+                    entry.isNestedArchive = true;
+                    entry.type = EntryType::Archive;
+                } else if (lowerPath.ends_with(L".exe") || lowerPath.ends_with(L".dll") ||
+                           lowerPath.ends_with(L".sys") || lowerPath.ends_with(L".scr") ||
+                           lowerPath.ends_with(L".ocx")) {
+                    entry.type = EntryType::File;
+                    entry.isPE = true;
+                } else if (lowerPath.ends_with(L".doc") || lowerPath.ends_with(L".docx") ||
+                           lowerPath.ends_with(L".xls") || lowerPath.ends_with(L".xlsx") ||
+                           lowerPath.ends_with(L".pdf")) {
+                    entry.type = EntryType::File;
+                } else {
+                    entry.type = EntryType::Unknown;
+                }
+            }
+
+            entries.push_back(std::move(entry));
+
+            // Skip data blocks: TAR pads to 512-byte boundaries
+            uint64_t dataBlocks = (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            offset += TAR_BLOCK_SIZE + dataBlocks * TAR_BLOCK_SIZE;
+        }
+
+        return entries;
+    }
+
+    // ========================================================================
+    // TAR ARCHIVE SCANNING (Full Data Extraction)
+    // ========================================================================
+
+    void ScanTarArchive(
+        const std::wstring& filePath,
+        const EntryCallback& callback,
+        const ExtractionOptions& options,
+        ExtractionSummary& summary,
+        uint32_t nestingLevel) {
+
+        if (nestingLevel >= options.maxNestingDepth) {
+            summary.warnings.push_back("Max nesting depth reached: " +
+                std::to_string(nestingLevel));
+            return;
+        }
+
+        std::error_code ec;
+        uint64_t fileSize = fs::file_size(filePath, ec);
+        if (ec || fileSize < TAR_BLOCK_SIZE) return;
+
+        ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+            FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+        if (!hFile) {
+            summary.result = ExtractionResult::AccessDenied;
+            return;
+        }
+
+        auto entries = ParseTarContents(hFile.get(), fileSize, options);
+        uint64_t totalExtracted = 0;
+
+        // Rewind and iterate entries, extracting data for each
+        uint64_t offset = 0;
+        uint32_t entryIndex = 0;
+        uint32_t consecutiveZeroBlocks = 0;
+        std::string gnuLongName;
+
+        while (offset + TAR_BLOCK_SIZE <= fileSize && entryIndex < entries.size()) {
+            if (IsCancelled()) {
+                summary.result = ExtractionResult::Cancelled;
+                break;
+            }
+
+            LARGE_INTEGER seekPos{};
+            seekPos.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(hFile.get(), seekPos, nullptr, FILE_BEGIN)) break;
+
+            uint8_t block[TAR_BLOCK_SIZE]{};
+            DWORD bytesRead = 0;
+            if (!ReadFile(hFile.get(), block, TAR_BLOCK_SIZE, &bytesRead, nullptr) ||
+                bytesRead < TAR_BLOCK_SIZE) {
+                break;
+            }
+
+            if (IsZeroBlock(block)) {
+                consecutiveZeroBlocks++;
+                if (consecutiveZeroBlocks >= 2) break;
+                offset += TAR_BLOCK_SIZE;
+                continue;
+            }
+            consecutiveZeroBlocks = 0;
+
+            if (!VerifyTarChecksum(block)) break;
+
+            char typeFlag = static_cast<char>(block[TAR_TYPEFLAG_OFFSET]);
+            uint64_t entrySize = ParseTarOctal(
+                block + TAR_SIZE_OFFSET, TAR_SIZE_LEN);
+            uint64_t dataBlocks = (entrySize + TAR_BLOCK_SIZE - 1) / TAR_BLOCK_SIZE;
+            uint64_t paddedSize = dataBlocks * TAR_BLOCK_SIZE;
+
+            // Skip metadata-only header types
+            if (typeFlag == TAR_TYPE_LONGNAME || typeFlag == TAR_TYPE_LONGLINK) {
+                offset += TAR_BLOCK_SIZE + paddedSize;
+                continue;
+            }
+            if (typeFlag == TAR_TYPE_PAX_NEXT || typeFlag == TAR_TYPE_PAX_GLOBAL) {
+                offset += TAR_BLOCK_SIZE + paddedSize;
+                continue;
+            }
+
+            // Match to our parsed entry
+            if (entryIndex >= entries.size()) break;
+            const auto& entry = entries[entryIndex];
+            summary.entriesProcessed++;
+
+            // Skip directories and symlinks (no data to extract)
+            if (entry.isDirectory || typeFlag == TAR_TYPE_SYMLINK ||
+                typeFlag == TAR_TYPE_LINK) {
+                if (callback) {
+                    try {
+                        std::vector<uint8_t> emptyData;
+                        callback(entry, emptyData);
+                    } catch (...) {}
+                }
+                offset += TAR_BLOCK_SIZE + paddedSize;
+                entryIndex++;
+                continue;
+            }
+
+            // Check total extraction limit
+            if (totalExtracted > options.maxTotalSize - entrySize ||
+                totalExtracted + entrySize > options.maxTotalSize) {
+                summary.warnings.push_back("Total extraction size limit reached");
+                break;
+            }
+
+            // Read entry data (TAR is uncompressed — data follows header directly)
+            std::vector<uint8_t> data;
+            if (options.mode != ExtractionMode::MetadataOnly && entrySize > 0) {
+                uint64_t readSize = std::min(entrySize,
+                    static_cast<uint64_t>(options.maxEntrySize));
+
+                // Guard against oversized allocations
+                if (readSize > 512ULL * 1024 * 1024) {
+                    SS_LOG_WARN(L"ArchiveExtractor",
+                        L"TAR: skipping oversized entry '%ls' (%llu bytes)",
+                        entry.path.c_str(), entrySize);
+                    summary.entriesSkipped++;
+                    offset += TAR_BLOCK_SIZE + paddedSize;
+                    entryIndex++;
+                    continue;
+                }
+
+                data.resize(static_cast<size_t>(readSize));
+                if (!ReadFile(hFile.get(), data.data(),
+                    static_cast<DWORD>(readSize), &bytesRead, nullptr)) {
+                    summary.entriesFailed++;
+                    offset += TAR_BLOCK_SIZE + paddedSize;
+                    entryIndex++;
+                    continue;
+                }
+                data.resize(bytesRead);
+
+                if (!data.empty()) {
+                    totalExtracted += data.size();
+                    m_stats.bytesExtracted.fetch_add(data.size(), std::memory_order_relaxed);
+                    m_stats.entriesExtracted.fetch_add(1, std::memory_order_relaxed);
+                    summary.bytesExtracted += data.size();
+                    summary.entriesExtracted++;
+                }
+            }
+
+            // Enrich entry with content analysis and fire callback
+            if (callback) {
+                try {
+                    ArchiveEntry enrichedEntry = entry;
+                    if (!data.empty()) {
+                        enrichedEntry.entropy = CalculateEntropy(
+                            std::span<const uint8_t>(data.data(), data.size()));
+
+                        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+                        if (hasher.Update(data.data(), data.size())) {
+                            std::string hexHash;
+                            if (hasher.FinalHex(hexHash, false)) {
+                                enrichedEntry.sha256Hex = std::move(hexHash);
+                            }
+                        }
+
+                        if (data.size() >= 2 && data[0] == 'M' && data[1] == 'Z') {
+                            enrichedEntry.isPE = true;
+                        }
+
+                        if (data.size() >= 10) {
+                            std::string_view header(
+                                reinterpret_cast<const char*>(data.data()),
+                                std::min(data.size(), static_cast<size_t>(256)));
+                            if (header.find("#!/") != std::string_view::npos ||
+                                header.find("powershell") != std::string_view::npos ||
+                                header.find("wscript") != std::string_view::npos ||
+                                header.find("<script") != std::string_view::npos) {
+                                enrichedEntry.isScript = true;
+                            }
+                        }
+
+                        // Detect nested archive by magic bytes
+                        if (data.size() >= 8) {
+                            auto nestedFmt = DetectFormat(
+                                std::span<const uint8_t>(data.data(),
+                                    std::min(data.size(), MAGIC_HEADER_READ_SIZE)));
+                            if (nestedFmt != ArchiveFormat::Unknown) {
+                                enrichedEntry.isNestedArchive = true;
+                                enrichedEntry.nestedFormat = nestedFmt;
+                            }
+                        }
+                    }
+
+                    callback(enrichedEntry, data);
+
+                } catch (const std::exception& e) {
+                    SS_LOG_ERROR(L"ArchiveExtractor",
+                        L"TAR entry callback exception: %hs", e.what());
+                    summary.entriesFailed++;
+                }
+            }
+
+            // Handle nested archives
+            if (entry.isNestedArchive && options.extractNestedArchives && !data.empty()) {
+                m_stats.nestedArchives.fetch_add(1, std::memory_order_relaxed);
+                summary.nestedArchives++;
+
+                LARGE_INTEGER perfCounter{};
+                QueryPerformanceCounter(&perfCounter);
+                fs::path tempPath = fs::path(m_config.tempDirectory) /
+                    (L"ae_tar_" + std::to_wstring(GetCurrentProcessId()) + L"_" +
+                     std::to_wstring(perfCounter.QuadPart) + L"_" +
+                     std::to_wstring(entryIndex));
+
+                std::ofstream tempFile(tempPath, std::ios::binary);
+                if (tempFile) {
+                    tempFile.write(
+                        reinterpret_cast<const char*>(data.data()),
+                        static_cast<std::streamsize>(data.size()));
+                    tempFile.close();
+
+                    // Detect nested format and dispatch to appropriate scanner
+                    auto nestedFmt = DetectFormat(tempPath.wstring());
+                    if (nestedFmt == ArchiveFormat::ZIP) {
+                        ScanZipArchive(tempPath.wstring(), callback, options,
+                                       summary, nestingLevel + 1);
+                    } else if (nestedFmt == ArchiveFormat::TAR) {
+                        ScanTarArchive(tempPath.wstring(), callback, options,
+                                       summary, nestingLevel + 1);
+                    }
+                    // Other nested formats: metadata-only callback already fired above
+
+                    std::error_code removeEc;
+                    if (!fs::remove(tempPath, removeEc) || removeEc) {
+                        SS_LOG_WARN(L"ArchiveExtractor",
+                            L"Failed to remove temp file '%ls'", tempPath.c_str());
+                    }
+                }
+            }
+
+            // Report progress
+            {
+                std::shared_lock lock(m_dataMutex);
+                if (m_progressCallback) {
+                    ExtractionProgress progress;
+                    progress.currentEntry = entryIndex;
+                    progress.totalEntries = static_cast<uint32_t>(entries.size());
+                    progress.bytesExtracted = summary.bytesExtracted;
+                    progress.currentFile = entry.path;
+                    progress.nestingLevel = nestingLevel;
+                    progress.percentComplete = entries.empty() ? 100.0 :
+                        (static_cast<double>(entryIndex + 1) /
+                         static_cast<double>(entries.size())) * 100.0;
+                    try { m_progressCallback(progress); }
+                    catch (...) {}
+                }
+            }
+
+            offset += TAR_BLOCK_SIZE + paddedSize;
+            entryIndex++;
+        }
+
+        if (summary.result == ExtractionResult::Success && summary.entriesFailed > 0) {
+            summary.result = ExtractionResult::PartialSuccess;
+        }
+    }
+
+    // ========================================================================
+    // GZIP HEADER PARSING (Metadata Extraction — RFC 1952)
+    // ========================================================================
+
+    [[nodiscard]] std::vector<ArchiveEntry> ParseGzipContents(
+        HANDLE hFile, uint64_t fileSize, const ExtractionOptions& /*options*/) const {
+
+        std::vector<ArchiveEntry> entries;
+
+        if (fileSize < GZIP_HEADER_MIN_SIZE + GZIP_TRAILER_SIZE) return entries;
+
+        // Read header
+        LARGE_INTEGER seekPos{};
+        seekPos.QuadPart = 0;
+        SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+
+        // Read enough for header + possible FNAME (cap at 4 KiB)
+        constexpr size_t MAX_HEADER_READ = 4096;
+        size_t headerReadSize = static_cast<size_t>(
+            std::min(fileSize, static_cast<uint64_t>(MAX_HEADER_READ)));
+        std::vector<uint8_t> headerBuf(headerReadSize);
+        DWORD bytesRead = 0;
+        if (!ReadFile(hFile, headerBuf.data(),
+            static_cast<DWORD>(headerReadSize), &bytesRead, nullptr) ||
+            bytesRead < GZIP_HEADER_MIN_SIZE) {
+            return entries;
+        }
+
+        // Validate magic and compression method
+        if (headerBuf[0] != 0x1F || headerBuf[1] != 0x8B) return entries;
+        if (headerBuf[2] != 8) {
+            // Compression method must be 8 (deflate)
+            SS_LOG_DEBUG(L"ArchiveExtractor",
+                L"GZIP: unsupported compression method %u", headerBuf[2]);
+            return entries;
+        }
+
+        uint8_t flags = headerBuf[3];
+
+        // Parse modification time
+        uint32_t mtime = 0;
+        std::memcpy(&mtime, headerBuf.data() + 4, 4);
+
+        // Skip header fields to find FNAME
+        size_t pos = 10;
+        std::string originalName;
+
+        // FEXTRA
+        if ((flags & GZIP_FLAG_FEXTRA) != 0) {
+            if (pos + 2 > bytesRead) return entries;
+            uint16_t extraLen = 0;
+            std::memcpy(&extraLen, headerBuf.data() + pos, 2);
+            pos += 2 + extraLen;
+        }
+
+        // FNAME — original filename
+        if ((flags & GZIP_FLAG_FNAME) != 0) {
+            size_t nameStart = pos;
+            while (pos < bytesRead && headerBuf[pos] != '\0') {
+                ++pos;
+            }
+            if (pos < bytesRead) {
+                originalName = std::string(
+                    reinterpret_cast<const char*>(headerBuf.data() + nameStart),
+                    pos - nameStart);
+                ++pos; // skip null terminator
+            }
+        }
+
+        // FCOMMENT — skip
+        if ((flags & GZIP_FLAG_FCOMMENT) != 0) {
+            while (pos < bytesRead && headerBuf[pos] != '\0') {
+                ++pos;
+            }
+            if (pos < bytesRead) ++pos;
+        }
+
+        // FHCRC
+        if ((flags & GZIP_FLAG_FHCRC) != 0) {
+            pos += 2;
+        }
+
+        // Read trailer to get ISIZE (original file size mod 2^32)
+        seekPos.QuadPart = static_cast<LONGLONG>(fileSize - GZIP_TRAILER_SIZE);
+        if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) return entries;
+
+        uint8_t trailer[GZIP_TRAILER_SIZE]{};
+        if (!ReadFile(hFile, trailer, GZIP_TRAILER_SIZE, &bytesRead, nullptr) ||
+            bytesRead < GZIP_TRAILER_SIZE) {
+            return entries;
+        }
+
+        uint32_t crc32Val = 0;
+        uint32_t isize = 0;
+        std::memcpy(&crc32Val, trailer, 4);
+        std::memcpy(&isize, trailer + 4, 4);
+
+        // Build a single entry representing the inner content
+        ArchiveEntry entry;
+        entry.entryId = 0;
+
+        // Use original filename if available, otherwise derive from archive name
+        if (!originalName.empty()) {
+            std::wstring wideName;
+            wideName.reserve(originalName.size());
+            for (char ch : originalName) {
+                wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+            }
+            entry.path = wideName;
+            entry.filename = wideName;
+        } else {
+            entry.path = L"[content]";
+            entry.filename = L"[content]";
+        }
+
+        entry.uncompressedSize = isize;
+        entry.compressedSize = fileSize - pos - GZIP_TRAILER_SIZE;
+        entry.compressionMethod = "deflate";
+        entry.crc32 = crc32Val;
+        entry.isDirectory = false;
+        entry.isEncrypted = false;
+
+        if (isize > 0 && entry.compressedSize > 0) {
+            entry.compressionRatio = static_cast<double>(isize) /
+                static_cast<double>(entry.compressedSize);
+
+            // Suspicious compression ratio check
+            if (entry.compressionRatio > m_config.defaultMaxRatio) {
+                entry.securityFlags |= SecurityFlag::HighCompressionRatio;
+                entry.isSuspicious = true;
+            }
+        }
+
+        if (mtime > 0 && mtime < 0x7FFFFFFF) {
+            entry.modifiedTime = std::chrono::system_clock::from_time_t(
+                static_cast<time_t>(mtime));
+        }
+
+        // Detect if inner content is a TAR (for .tar.gz)
+        auto lowerName = ToLowerCopy(entry.path);
+        if (lowerName.ends_with(L".tar")) {
+            entry.isNestedArchive = true;
+            entry.nestedFormat = ArchiveFormat::TAR;
+            entry.type = EntryType::Archive;
+        }
+
+        entries.push_back(std::move(entry));
+        return entries;
+    }
+
+    // ========================================================================
+    // RAR4 CONTENT PARSING (Header-Level Entry Enumeration)
+    // ========================================================================
+
+    [[nodiscard]] std::vector<ArchiveEntry> ParseRar4Contents(
+        HANDLE hFile, uint64_t fileSize, const ExtractionOptions& options) const {
+
+        std::vector<ArchiveEntry> entries;
+
+        // RAR4 starts with 7-byte marker: 52 61 72 21 1A 07 00
+        // Followed by archive header (type 0x73), then file headers (type 0x74)
+        constexpr size_t RAR4_MARKER_LEN = 7;
+
+        if (fileSize < RAR4_MARKER_LEN + 7) return entries; // marker + minimal header
+
+        LARGE_INTEGER seekPos{};
+        seekPos.QuadPart = RAR4_MARKER_LEN; // Skip marker
+        if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) return entries;
+
+        uint64_t offset = RAR4_MARKER_LEN;
+        uint64_t entryId = 0;
+
+        // Read archive header first
+#pragma pack(push, 1)
+        struct Rar4Header {
+            uint16_t headCRC;
+            uint8_t  headType;
+            uint16_t flags;
+            uint16_t headSize;
+        };
+#pragma pack(pop)
+
+        while (offset + sizeof(Rar4Header) < fileSize) {
+            if (IsCancelled()) break;
+            if (entries.size() >= RAR4_MAX_ENTRIES) break;
+
+            seekPos.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) break;
+
+            Rar4Header hdr{};
+            DWORD bytesRead = 0;
+            if (!ReadFile(hFile, &hdr, sizeof(hdr), &bytesRead, nullptr) ||
+                bytesRead < sizeof(hdr)) {
+                break;
+            }
+
+            if (hdr.headSize < sizeof(Rar4Header)) break;
+            if (hdr.headSize > 65535) break; // Sanity
+
+            // End of archive
+            if (hdr.headType == RAR4_END_HEADER) break;
+
+            // File header
+            if (hdr.headType == RAR4_FILE_HEADER && hdr.headSize >= 32) {
+                // Read extended file header data
+                constexpr size_t MAX_FILE_HDR = 4096;
+                size_t readLen = std::min(static_cast<size_t>(hdr.headSize), MAX_FILE_HDR);
+                std::vector<uint8_t> hdrBuf(readLen);
+
+                // Re-read from header start
+                seekPos.QuadPart = static_cast<LONGLONG>(offset);
+                SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+                if (!ReadFile(hFile, hdrBuf.data(),
+                    static_cast<DWORD>(readLen), &bytesRead, nullptr) ||
+                    bytesRead < 32) {
+                    break;
+                }
+
+                // RAR4 file header layout after the 7-byte base header:
+                // Offset 7:  uint32_t packSize (low)
+                // Offset 11: uint32_t unpSize (low)
+                // Offset 15: uint8_t  hostOS
+                // Offset 16: uint32_t fileCRC
+                // Offset 20: uint32_t fileTime (DOS format)
+                // Offset 24: uint8_t  unpackVersion
+                // Offset 25: uint8_t  method
+                // Offset 26: uint16_t nameSize
+                // Offset 28: uint32_t attributes
+                uint32_t packSizeLow = 0, unpSizeLow = 0;
+                uint32_t fileCrc = 0;
+                uint16_t nameSize = 0;
+                uint32_t fileAttr = 0;
+
+                if (bytesRead >= 32) {
+                    std::memcpy(&packSizeLow, hdrBuf.data() + 7, 4);
+                    std::memcpy(&unpSizeLow, hdrBuf.data() + 11, 4);
+                    std::memcpy(&fileCrc, hdrBuf.data() + 16, 4);
+                    std::memcpy(&nameSize, hdrBuf.data() + 26, 2);
+                    std::memcpy(&fileAttr, hdrBuf.data() + 28, 4);
+                }
+
+                uint64_t packSize = packSizeLow;
+                uint64_t unpSize = unpSizeLow;
+
+                // Large file flag: additional 4 bytes each for high 32 bits
+                if ((hdr.flags & RAR4_FLAG_LARGE) != 0 && bytesRead >= 40) {
+                    uint32_t packHigh = 0, unpHigh = 0;
+                    std::memcpy(&packHigh, hdrBuf.data() + 32, 4);
+                    std::memcpy(&unpHigh, hdrBuf.data() + 36, 4);
+                    packSize |= (static_cast<uint64_t>(packHigh) << 32);
+                    unpSize |= (static_cast<uint64_t>(unpHigh) << 32);
+                }
+
+                // Extract filename
+                size_t nameOffset = 32;
+                if ((hdr.flags & RAR4_FLAG_LARGE) != 0) nameOffset = 40;
+
+                std::string fileName;
+                if (nameSize > 0 && nameSize < 4096 &&
+                    nameOffset + nameSize <= bytesRead) {
+                    fileName = std::string(
+                        reinterpret_cast<const char*>(hdrBuf.data() + nameOffset),
+                        nameSize);
+                }
+
+                // Build entry
+                ArchiveEntry entry;
+                entry.entryId = entryId++;
+                entry.compressedSize = packSize;
+                entry.uncompressedSize = unpSize;
+                entry.crc32 = fileCrc;
+                entry.isEncrypted = (hdr.flags & RAR4_FLAG_ENCRYPTED) != 0;
+                entry.isDirectory = ((fileAttr & 0x10) != 0) ||
+                    ((hdr.flags & 0x00E0) == 0x00E0);
+                entry.compressionMethod = "rar4";
+
+                if (unpSize > 0 && packSize > 0) {
+                    entry.compressionRatio = static_cast<double>(unpSize) /
+                        static_cast<double>(packSize);
+                }
+
+                std::wstring wideName;
+                wideName.reserve(fileName.size());
+                for (char ch : fileName) {
+                    wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+                }
+                entry.path = wideName;
+                auto lastSep = wideName.find_last_of(L"/\\");
+                entry.filename = (lastSep != std::wstring::npos)
+                    ? wideName.substr(lastSep + 1) : wideName;
+
+                if (!IsPathSafe(entry.path)) {
+                    entry.securityFlags |= SecurityFlag::PathTraversalAttempt;
+                    entry.isSuspicious = true;
+                }
+
+                // Detect entry type
+                auto lowerPath = ToLowerCopy(entry.path);
+                if (!entry.isDirectory) {
+                    if (lowerPath.ends_with(L".exe") || lowerPath.ends_with(L".dll") ||
+                        lowerPath.ends_with(L".sys") || lowerPath.ends_with(L".scr")) {
+                        entry.type = EntryType::File;
+                        entry.isPE = true;
+                    } else if (lowerPath.ends_with(L".zip") || lowerPath.ends_with(L".rar") ||
+                               lowerPath.ends_with(L".7z") || lowerPath.ends_with(L".tar")) {
+                        entry.isNestedArchive = true;
+                        entry.type = EntryType::Archive;
+                    } else {
+                        entry.type = EntryType::Unknown;
+                    }
+                }
+
+                entries.push_back(std::move(entry));
+
+                // Skip past data
+                offset += hdr.headSize + packSize;
+            } else {
+                // Non-file header: skip using header size
+                uint64_t dataSize = 0;
+                // If ADD_SIZE flag is set (0x8000), there's additional data
+                if ((hdr.flags & 0x8000) != 0 && hdr.headSize >= 11) {
+                    seekPos.QuadPart = static_cast<LONGLONG>(offset + 7);
+                    SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN);
+                    uint32_t addSize = 0;
+                    DWORD addRead = 0;
+                    ReadFile(hFile, &addSize, 4, &addRead, nullptr);
+                    dataSize = addSize;
+                }
+                offset += hdr.headSize + dataSize;
+            }
+        }
+
+        return entries;
+    }
+
+    // ========================================================================
+    // RAR5 CONTENT PARSING (Header-Level Entry Enumeration)
+    // ========================================================================
+
+    [[nodiscard]] std::vector<ArchiveEntry> ParseRar5Contents(
+        HANDLE hFile, uint64_t fileSize, const ExtractionOptions& options) const {
+
+        std::vector<ArchiveEntry> entries;
+
+        // RAR5 starts with 8-byte marker: 52 61 72 21 1A 07 01 00
+        constexpr size_t RAR5_MARKER_LEN = 8;
+        if (fileSize < RAR5_MARKER_LEN + 12) return entries;
+
+        uint64_t offset = RAR5_MARKER_LEN;
+        uint64_t entryId = 0;
+
+        // Read in large chunks for sequential scanning
+        constexpr size_t READ_BUF_SIZE = 64 * 1024;
+        std::vector<uint8_t> readBuf(READ_BUF_SIZE);
+
+        while (offset + 6 < fileSize) {
+            if (IsCancelled()) break;
+            if (entries.size() >= RAR4_MAX_ENTRIES) break;
+
+            LARGE_INTEGER seekPos{};
+            seekPos.QuadPart = static_cast<LONGLONG>(offset);
+            if (!SetFilePointerEx(hFile, seekPos, nullptr, FILE_BEGIN)) break;
+
+            DWORD bytesRead = 0;
+            DWORD toRead = static_cast<DWORD>(
+                std::min(static_cast<uint64_t>(READ_BUF_SIZE), fileSize - offset));
+            if (!ReadFile(hFile, readBuf.data(), toRead, &bytesRead, nullptr) ||
+                bytesRead < 6) {
+                break;
+            }
+
+            size_t pos = 0;
+
+            // Header CRC32 (4 bytes)
+            pos += 4;
+
+            // Header size (vint)
+            uint64_t headerSize = 0;
+            size_t vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, headerSize);
+            if (vintBytes == 0 || headerSize < 1) break;
+            pos += vintBytes;
+
+            // Header type (vint)
+            uint64_t headerType = 0;
+            vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, headerType);
+            if (vintBytes == 0) break;
+            pos += vintBytes;
+
+            // Header flags (vint)
+            uint64_t headerFlags = 0;
+            vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, headerFlags);
+            if (vintBytes == 0) break;
+            pos += vintBytes;
+
+            // Extra data size (if flag bit 0 set)
+            uint64_t extraSize = 0;
+            if ((headerFlags & 0x0001) != 0) {
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, extraSize);
+                if (vintBytes == 0) break;
+                pos += vintBytes;
+            }
+
+            // Data area size (if flag bit 1 set)
+            uint64_t dataAreaSize = 0;
+            if ((headerFlags & 0x0002) != 0) {
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, dataAreaSize);
+                if (vintBytes == 0) break;
+                pos += vintBytes;
+            }
+
+            // End archive
+            if (headerType == RAR5_HEADER_END) break;
+
+            // File header
+            if (headerType == RAR5_HEADER_FILE && pos + 4 < bytesRead) {
+                // File flags (vint)
+                uint64_t fileFlags = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, fileFlags);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // Unpacked size (vint)
+                uint64_t unpSize = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, unpSize);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // Attributes (vint)
+                uint64_t attributes = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, attributes);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // mtime (uint32 if flag bit 1 set)
+                uint32_t mtime = 0;
+                if ((fileFlags & RAR5_FILE_FLAG_UNIX_MTIME) != 0 && pos + 4 <= bytesRead) {
+                    std::memcpy(&mtime, readBuf.data() + pos, 4);
+                    pos += 4;
+                }
+
+                // Data CRC32 (uint32 if flag bit 2 set)
+                uint32_t dataCrc = 0;
+                if ((fileFlags & RAR5_FILE_FLAG_CRC32) != 0 && pos + 4 <= bytesRead) {
+                    std::memcpy(&dataCrc, readBuf.data() + pos, 4);
+                    pos += 4;
+                }
+
+                // Compression info (vint)
+                uint64_t compInfo = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, compInfo);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // Host OS (vint)
+                uint64_t hostOS = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, hostOS);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // Name length (vint)
+                uint64_t nameLen = 0;
+                vintBytes = ReadRar5Vint(readBuf.data() + pos, bytesRead - pos, nameLen);
+                if (vintBytes == 0) { offset += 4 + headerSize + dataAreaSize; continue; }
+                pos += vintBytes;
+
+                // Name (UTF-8)
+                std::string fileName;
+                if (nameLen > 0 && nameLen < 4096 && pos + nameLen <= bytesRead) {
+                    fileName = std::string(
+                        reinterpret_cast<const char*>(readBuf.data() + pos), 
+                        static_cast<size_t>(nameLen));
+                }
+
+                // Build entry
+                ArchiveEntry entry;
+                entry.entryId = entryId++;
+                entry.compressedSize = dataAreaSize;
+                entry.uncompressedSize = unpSize;
+                entry.crc32 = dataCrc;
+                entry.isDirectory = (fileFlags & RAR5_FILE_FLAG_DIRECTORY) != 0;
+                entry.compressionMethod = "rar5";
+
+                if (unpSize > 0 && dataAreaSize > 0) {
+                    entry.compressionRatio = static_cast<double>(unpSize) /
+                        static_cast<double>(dataAreaSize);
+                }
+
+                if (mtime > 0) {
+                    entry.modifiedTime = std::chrono::system_clock::from_time_t(
+                        static_cast<time_t>(mtime));
+                }
+
+                std::wstring wideName;
+                wideName.reserve(fileName.size());
+                for (char ch : fileName) {
+                    wideName += static_cast<wchar_t>(static_cast<uint8_t>(ch));
+                }
+                entry.path = wideName;
+                auto lastSep = wideName.find_last_of(L"/\\");
+                entry.filename = (lastSep != std::wstring::npos)
+                    ? wideName.substr(lastSep + 1) : wideName;
+
+                if (!IsPathSafe(entry.path)) {
+                    entry.securityFlags |= SecurityFlag::PathTraversalAttempt;
+                    entry.isSuspicious = true;
+                }
+
+                auto lowerPath = ToLowerCopy(entry.path);
+                if (!entry.isDirectory) {
+                    if (lowerPath.ends_with(L".exe") || lowerPath.ends_with(L".dll") ||
+                        lowerPath.ends_with(L".sys") || lowerPath.ends_with(L".scr")) {
+                        entry.type = EntryType::File;
+                        entry.isPE = true;
+                    } else if (lowerPath.ends_with(L".zip") || lowerPath.ends_with(L".rar") ||
+                               lowerPath.ends_with(L".7z")) {
+                        entry.isNestedArchive = true;
+                        entry.type = EntryType::Archive;
+                    } else {
+                        entry.type = EntryType::Unknown;
+                    }
+                }
+
+                entries.push_back(std::move(entry));
+            }
+
+            // Advance: CRC32(4) + headerSize + dataAreaSize
+            offset += 4 + headerSize + dataAreaSize;
+        }
+
+        return entries;
+    }
+
+    // ========================================================================
     // ARCHIVE INFORMATION
     // ========================================================================
 
@@ -1153,12 +2328,60 @@ public:
                 }
 
                 entries = ParseZipCentralDirectory(hFile.get(), fileSize, options);
+
+            } else if (format == ArchiveFormat::TAR) {
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+                if (!hFile) {
+                    SS_LOG_ERROR(L"ArchiveExtractor",
+                        L"Cannot open TAR archive '%ls': 0x%08X",
+                        filePath.c_str(), GetLastError());
+                    return entries;
+                }
+                entries = ParseTarContents(hFile.get(), fileSize, options);
+
+            } else if (format == ArchiveFormat::GZIP || format == ArchiveFormat::TarGz) {
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+                if (!hFile) {
+                    SS_LOG_ERROR(L"ArchiveExtractor",
+                        L"Cannot open GZIP archive '%ls': 0x%08X",
+                        filePath.c_str(), GetLastError());
+                    return entries;
+                }
+                entries = ParseGzipContents(hFile.get(), fileSize, options);
+
+            } else if (format == ArchiveFormat::RAR) {
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+                if (!hFile) {
+                    SS_LOG_ERROR(L"ArchiveExtractor",
+                        L"Cannot open RAR archive '%ls': 0x%08X",
+                        filePath.c_str(), GetLastError());
+                    return entries;
+                }
+                entries = ParseRar4Contents(hFile.get(), fileSize, options);
+
+            } else if (format == ArchiveFormat::RAR5) {
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+                if (!hFile) {
+                    SS_LOG_ERROR(L"ArchiveExtractor",
+                        L"Cannot open RAR5 archive '%ls': 0x%08X",
+                        filePath.c_str(), GetLastError());
+                    return entries;
+                }
+                entries = ParseRar5Contents(hFile.get(), fileSize, options);
+
             } else {
-                // Non-ZIP formats: content listing not yet implemented.
-                // Format was detected — log explicitly so callers know why
-                // the entry list is empty.
+                // Remaining formats (7z, BZ2, XZ, LZMA, etc.) — format detected
+                // but no header parser available. Log and return empty.
                 SS_LOG_INFO(L"ArchiveExtractor",
-                    L"Content listing not yet implemented for %hs format: '%ls'",
+                    L"Content listing requires external codec for %hs: '%ls'",
                     GetFormatName(format).c_str(), filePath.c_str());
             }
 
@@ -1176,9 +2399,22 @@ public:
     [[nodiscard]] bool VerifyIntegrity(const std::wstring& filePath) const {
         try {
             auto format = DetectFormat(filePath);
+            if (format == ArchiveFormat::TAR) {
+                // TAR integrity: verify all header checksums parse correctly
+                std::error_code ec;
+                uint64_t fileSize = fs::file_size(filePath, ec);
+                if (ec || fileSize < TAR_BLOCK_SIZE) return false;
+                ScopedHandle hFile(CreateFileW(filePath.c_str(), GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                    FILE_ATTRIBUTE_NORMAL | FILE_FLAG_SEQUENTIAL_SCAN, nullptr));
+                if (!hFile) return false;
+                auto entries = ParseTarContents(hFile.get(), fileSize,
+                    ExtractionOptions::CreateDefault());
+                return !entries.empty();
+            }
             if (format != ArchiveFormat::ZIP) {
                 SS_LOG_INFO(L"ArchiveExtractor",
-                    L"Integrity verification only supported for ZIP: '%ls'",
+                    L"Integrity verification supported for ZIP and TAR: '%ls'",
                     filePath.c_str());
                 return fs::exists(filePath);
             }
@@ -1507,15 +2743,25 @@ public:
 
             if (format == ArchiveFormat::ZIP) {
                 ScanZipArchive(filePath, callback, options, summary, 0);
+            } else if (format == ArchiveFormat::TAR) {
+                ScanTarArchive(filePath, callback, options, summary, 0);
             } else {
-                // Non-ZIP formats: extraction not yet implemented.
-                // Provide metadata-only pass and report as such.
-                SS_LOG_INFO(L"ArchiveExtractor",
-                    L"Extraction not yet implemented for %hs — metadata-only pass: '%ls'",
-                    GetFormatName(format).c_str(), filePath.c_str());
-
+                // Formats without native data extraction (RAR, 7z, GZIP, BZ2, XZ, etc.)
+                // Provide metadata-only pass via header parsing.
                 auto entries = ListContents(filePath, options);
                 summary.entriesProcessed = static_cast<uint32_t>(entries.size());
+
+                if (entries.empty()) {
+                    SS_LOG_INFO(L"ArchiveExtractor",
+                        L"No entries enumerable for %hs: '%ls'",
+                        GetFormatName(format).c_str(), filePath.c_str());
+                } else {
+                    SS_LOG_INFO(L"ArchiveExtractor",
+                        L"Metadata-only pass for %hs (%u entries): '%ls'",
+                        GetFormatName(format).c_str(),
+                        static_cast<uint32_t>(entries.size()), filePath.c_str());
+                }
+
                 for (const auto& entry : entries) {
                     if (IsCancelled()) {
                         summary.result = ExtractionResult::Cancelled;
@@ -1532,12 +2778,9 @@ public:
                         }
                     }
                 }
-                // Do NOT report entriesExtracted — no data was actually extracted.
-                // Callers must check entriesProcessed vs entriesExtracted to see
-                // that this was a metadata-only pass.
                 if (entries.empty() && summary.result == ExtractionResult::Success) {
                     summary.warnings.push_back(
-                        "No entries enumerated — extraction not supported for " +
+                        "Metadata-only — data extraction requires external codec for " +
                         GetFormatName(format));
                 }
             }
@@ -1587,10 +2830,11 @@ public:
             }
 
             auto format = DetectFormat(filePath);
-            if (format != ArchiveFormat::ZIP) {
+            if (format != ArchiveFormat::ZIP && format != ArchiveFormat::TAR) {
                 summary.result = ExtractionResult::UnsupportedFormat;
                 summary.errors.push_back(
-                    "Full extraction currently supports ZIP format");
+                    "Full extraction supports ZIP and TAR formats; detected " +
+                    GetFormatName(format));
                 return summary;
             }
 
@@ -1641,9 +2885,10 @@ public:
 
         try {
             auto format = DetectFormat(filePath);
-            if (format != ArchiveFormat::ZIP) {
+            if (format != ArchiveFormat::ZIP && format != ArchiveFormat::TAR) {
                 result.result = ExtractionResult::UnsupportedFormat;
-                result.errorMessage = "Single entry extraction requires ZIP";
+                result.errorMessage = "Single entry extraction supports ZIP and TAR; detected " +
+                    GetFormatName(format);
                 return result;
             }
 
@@ -2311,8 +3556,15 @@ private:
                         static_cast<std::streamsize>(data.size()));
                     tempFile.close();
 
-                    ScanZipArchive(tempPath.wstring(), callback, options,
-                                  summary, nestingLevel + 1);
+                    // Dispatch nested scan by detected format
+                    auto nestedFmt = DetectFormat(tempPath.wstring());
+                    if (nestedFmt == ArchiveFormat::TAR) {
+                        ScanTarArchive(tempPath.wstring(), callback, options,
+                                       summary, nestingLevel + 1);
+                    } else {
+                        ScanZipArchive(tempPath.wstring(), callback, options,
+                                       summary, nestingLevel + 1);
+                    }
 
                     // Clean up temp file — log failure
                     std::error_code removeEc;
