@@ -844,6 +844,8 @@ std::vector<Policy> PolicyManager::GetMandatoryPolicies() const {
 // ============================================================================
 
 bool PolicyManager::IsEnforced(const std::string& settingName) const {
+    if (settingName.empty()) return false;
+
     std::shared_lock lock(m_mutex);
     m_impl->m_stats.enforcementChecks.fetch_add(1, std::memory_order_relaxed);
 
