@@ -73,7 +73,7 @@ void RenderStringArray(std::ostringstream& stream,
                 "pipeline\\queue",
                 "state\\runs",
                 "telemetry\\health",
-                "vm\\snapshot-profiles",
+                "vm\\profiles",
                 "vm\\crash-collection",
                 "corpora\\kernel\\baseline",
                 "corpora\\kernel\\variants"
