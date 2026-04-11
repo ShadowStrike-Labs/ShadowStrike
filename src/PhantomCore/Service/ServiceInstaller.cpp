@@ -114,10 +114,40 @@ bool ServiceInstaller::Install(const ServiceConfig& config) {
     if (!hService) {
         DWORD err = GetLastError();
         if (err == ERROR_SERVICE_EXISTS) {
-            SS_LOG_WARN(L"Installer", L"Service already exists.");
-            // We might want to update config here, but for now just return success?
-            // Or fail? Generally Install should fail if already installed unless Reinstall is called.
-            // Let's return false to indicate it wasn't created.
+            SS_LOG_INFO(L"Installer", L"Service already exists, attempting in-place configuration update");
+
+            // Open existing service for reconfiguration
+            SC_HANDLE hExisting = OpenServiceW(hSCManager, config.name.c_str(),
+                                               SERVICE_CHANGE_CONFIG | SERVICE_QUERY_CONFIG);
+            if (!hExisting) {
+                SS_LOG_ERROR(L"Installer", L"Cannot open existing service for update. Error: %lu",
+                             GetLastError());
+                return false;
+            }
+            std::shared_ptr<void> existGuard(hExisting, [](void* h) { CloseServiceHandle((SC_HANDLE)h); });
+
+            // Update binary path and start type in-place
+            if (!ChangeServiceConfigW(hExisting,
+                    SERVICE_WIN32_OWN_PROCESS,
+                    config.startType,
+                    config.errorControl,
+                    config.binaryPath.c_str(),
+                    nullptr, nullptr,
+                    dependencies.empty() ? nullptr : dependencies.c_str(),
+                    config.account.empty() ? nullptr : config.account.c_str(),
+                    config.password.empty() ? nullptr : config.password.c_str(),
+                    config.displayName.c_str())) {
+                SS_LOG_ERROR(L"Installer", L"ChangeServiceConfig failed. Error: %lu", GetLastError());
+                return false;
+            }
+
+            // Update description on existing service
+            if (!config.description.empty()) {
+                ConfigureDescription(hExisting, config.description);
+            }
+
+            SS_LOG_INFO(L"Installer", L"Existing service configuration updated successfully");
+            return true;
         } else {
             SS_LOG_ERROR(L"Installer", L"CreateService failed. Error: %lu", err);
         }

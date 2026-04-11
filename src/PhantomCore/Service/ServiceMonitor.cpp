@@ -22,6 +22,7 @@
 
 #include <windows.h>
 #include <psapi.h>
+#include <TlHelp32.h>
 #include <thread>
 #include <mutex>
 #include <shared_mutex>
@@ -252,8 +253,8 @@ namespace ShadowStrike {
                     if (sysDiff > 0) {
                         // Needs to be divided by number of processors usually, but for process specific usage:
                         // Total system time difference vs process time difference
-                        // Note: This is a simplified calculation.
-                        // A more accurate one requires getting SystemTimes for all processors.
+                        // CPU percent: (process time delta) / (wall clock delta × num processors)
+                        // This normalizes per-process usage against total available CPU capacity
 
                         // Let's use a simpler approach relative to wall clock
                         // Percent = (Process Time Delta) / (Wall Clock Delta * NumProcessors)
@@ -293,15 +294,29 @@ namespace ShadowStrike {
             // 2. CPU
             newStats.cpuUsagePercent = CalculateCpuUsage();
 
-            // 3. Threads (using ToolHelp32 or just tracking uptime)
-            // Simplified: just uptime
+            // 3. Uptime
             auto now = std::chrono::steady_clock::now();
             newStats.uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(now - m_startTime).count();
 
-            // 4. Thread count approximation or specific call
-            // Using Performance Counters is heavy, let's skip thread count unless essential or use native API
-            // NtQueryInformationProcess could get thread count but it's internal.
-            // We'll leave thread count as 0 for now or implement if strictly needed by requirements.
+            // 4. Thread count via ToolHelp32 snapshot
+            {
+                DWORD pid = GetCurrentProcessId();
+                HANDLE hSnap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+                if (hSnap != INVALID_HANDLE_VALUE) {
+                    uint64_t count = 0;
+                    THREADENTRY32 te = {};
+                    te.dwSize = sizeof(THREADENTRY32);
+                    if (Thread32First(hSnap, &te)) {
+                        do {
+                            if (te.th32OwnerProcessID == pid) {
+                                ++count;
+                            }
+                        } while (Thread32Next(hSnap, &te));
+                    }
+                    CloseHandle(hSnap);
+                    newStats.threadCount = count;
+                }
+            }
 
             // 5. Health Check
             bool healthy = true;
@@ -317,11 +332,10 @@ namespace ShadowStrike {
                     static_cast<unsigned long long>(newStats.memoryUsageBytes));
             }
 
-            if (newStats.cpuUsagePercent > m_maxCpuPercent) {
-                // Don't flag healthy=false immediately on CPU spike, maybe if sustained.
-                // For now, just log warning.
-                // status.str("");
-                // status << "High CPU Usage: " << newStats.cpuUsagePercent << "%";
+            if (newStats.cpuUsagePercent > m_maxCpuPercent.load()) {
+                // CPU spikes are normal during scans; only flag sustained overuse
+                SS_LOG_WARN(kServiceMonitorLogCategory, L"CPU usage %.1f%% exceeds threshold %.1f%%",
+                    newStats.cpuUsagePercent, m_maxCpuPercent.load());
             }
 
             // Check Hang (Heartbeat)
