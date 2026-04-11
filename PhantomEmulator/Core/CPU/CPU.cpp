@@ -333,7 +333,7 @@ ExecutionResult CPU::Execute(
         if (m_jitEnabled) {
             auto profIt = m_blockProfile.find(result.lastRIP);
             if (profIt != m_blockProfile.end() && profIt->second == m_jitHotThreshold) {
-                m_jit.CompileBlock(result.lastRIP, &inst, 1);
+                (void)m_jit.CompileBlock(result.lastRIP, &inst, 1);
             }
         }
     }
@@ -631,7 +631,7 @@ ErrorCode CPU::DispatchInstruction(
         uint8_t op = inst.opcode;
 
         if (isEVEX) {
-            auto err = ExecuteSSE2(inst, memory);
+            auto err = ExecuteAVX512(inst, memory);
             if (err == ErrorCode::Success) {
                 m_state.AdvanceRIP(inst.length);
             }
@@ -701,6 +701,24 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
+        // === RDRAND/RDSEED (0xC7 /6, /7 mod=3) ===
+        if (op == 0xC7) {
+            uint8_t ext = inst.opcodeExt;
+            uint8_t mod = (inst.modrm >> 6) & 3;
+            if ((ext == 6 || ext == 7) && mod == 3) {
+                auto err = ExecuteRdRandSeed(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+            // /1 = CMPXCHG8B/16B — route to ALU
+            if (ext == 1) {
+                auto err = ExecuteALU(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+            return ErrorCode::UnsupportedOpcode;
+        }
+
         // === BSWAP (0xC8-0xCF) ===
         if (op >= 0xC8 && op <= 0xCF) {
             auto err = ExecuteDataTransfer(inst, memory);
@@ -756,6 +774,13 @@ ErrorCode CPU::DispatchInstruction(
             return ErrorCode::Success;
         }
 
+        // === CET: ENDBR32/ENDBR64, RDSSPD/Q (F3 0F 1E) ===
+        if (op == 0x1E) {
+            auto err = ExecuteCET(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
         // === CMPXCHG (0xB0, 0xB1) ===
         if (op == 0xB0 || op == 0xB1) {
             auto err = ExecuteALU(inst, memory);
@@ -777,6 +802,35 @@ ErrorCode CPU::DispatchInstruction(
                 return ErrorCode::Success;
             }
             return ErrorCode::InvalidSystemCall;
+        }
+
+        // === FENCE / CLFLUSH / XSAVE / XRSTOR (0F AE) ===
+        // CET: INCSSPD/Q (F3 0F AE /5 mod=3), CLRSSBSY (F3 0F AE /6 mod!=3)
+        if (op == 0xAE) {
+            if (inst.prefixes.hasRep &&
+                (inst.opcodeExt == 5 || inst.opcodeExt == 6)) {
+                auto err = ExecuteCET(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+            auto err = ExecuteSystem(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // === System instructions: RDTSCP/XGETBV (0F 01), WRMSR (0F 30),
+        //     RDMSR (0F 32), PREFETCH (0F 18) ===
+        // CET: RSTORSSP (F3 0F 01 /5 mem), SETSSBSY (F3 0F 01 E8),
+        //      SAVEPREVSSP (F3 0F 01 EA)
+        if (op == 0x01 || op == 0x30 || op == 0x32 || op == 0x18) {
+            if (op == 0x01 && inst.prefixes.hasRep) {
+                auto err = ExecuteCET(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+            auto err = ExecuteSystem(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
         }
 
         // === SSE/SSE2 (TwoByte map fallthrough) ===
@@ -804,15 +858,44 @@ ErrorCode CPU::DispatchInstruction(
         uint8_t op = inst.opcode;
 
         if (isEVEX) {
-            auto err = ExecuteSSE4(inst, memory);
+            auto err = ExecuteAVX512(inst, memory);
             if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
             return err;
         }
 
-        // === VEX-encoded AVX2 instructions in 0F 38 map ===
-        // Covers VPSHUFB, VPMOVSXBW/WD/DQ, VPMOVZXBW/WD/DQ, VPMASKMOVD,
-        // VPGATHERDD, VPERMD, VPBROADCAST*, and other AVX2 ops.
+        // === VEX-encoded instructions in 0F 38 map ===
         if (inst.prefixes.hasVEX) {
+            // AMX tile instructions (VEX.0F38 49/4B/5C/5E)
+            if (op == 0x49 || op == 0x4B ||
+                ((op == 0x5C || op == 0x5E) && !inst.prefixes.vexW)) {
+                auto err = ExecuteAMX(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+
+            // FMA3 (VEX.66.0F38 W0/W1, opcodes 96-9F, A6-AF, B6-BF)
+            if (inst.prefixes.vexPP == 1 && op >= 0x96 && op <= 0xBF
+                && (op & 0x0F) >= 6) {
+                auto err = ExecuteFMA(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+
+            // BMI1/BMI2 (VEX.0F38 F2-F7, various pp values)
+            if (op >= 0xF2 && op <= 0xF7) {
+                auto err = ExecuteBitManip(inst, memory);
+                if (err == ErrorCode::Success) {
+                    m_state.AdvanceRIP(inst.length);
+                    return ErrorCode::Success;
+                }
+                if (err != ErrorCode::UnimplementedOpcode &&
+                    err != ErrorCode::UnsupportedOpcode) {
+                    return err;
+                }
+                // Fall through to AVX2 if BitManip doesn't handle it
+            }
+
+            // General AVX2 handler (VPSHUFB, VPMOVSXBW, VPERMD, etc.)
             auto err = ExecuteAVX2(inst, memory);
             if (err == ErrorCode::Success) {
                 m_state.AdvanceRIP(inst.length);
@@ -824,6 +907,36 @@ ErrorCode CPU::DispatchInstruction(
             }
         }
 
+        // === Non-VEX: MOVBE (0F 38 F0/F1) ===
+        if (op == 0xF0 || op == 0xF1) {
+            auto err = ExecuteDataTransfer(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // === Non-VEX: SHA-NI (0F 38 C8-CD) ===
+        if (op >= 0xC8 && op <= 0xCD && !inst.prefixes.hasOpSizeOverride) {
+            auto err = ExecuteSHA(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // === Non-VEX: ADX — ADCX (66 0F38 F6) / ADOX (F3 0F38 F6) ===
+        if (op == 0xF6 && (inst.prefixes.hasOpSizeOverride || inst.prefixes.hasRep)) {
+            auto err = ExecuteALU(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // === CET: WRSSD/Q (NP 0F 38 F6), WRUSSD/Q (66 0F 38 F5) ===
+        if ((op == 0xF6 && !inst.prefixes.hasOpSizeOverride && !inst.prefixes.hasRep &&
+             !inst.prefixes.hasVEX) ||
+            (op == 0xF5 && inst.prefixes.hasOpSizeOverride && !inst.prefixes.hasVEX)) {
+            auto err = ExecuteCET(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
         // AES-NI instructions: 0xDB-0xDF with 66 prefix
         if (op >= 0xDB && op <= 0xDF && inst.prefixes.hasOpSizeOverride) {
             auto err = ExecuteAESNI(inst, memory);
@@ -831,8 +944,7 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
-        // SSE4 handles everything else in this map, including EVEX forms
-        // that share the 0F 38 opcode map with VEX encodings.
+        // SSE4 handles everything else in this map
         auto err = ExecuteSSE4(inst, memory);
         if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
         return err;
@@ -846,14 +958,34 @@ ErrorCode CPU::DispatchInstruction(
         uint8_t op = inst.opcode;
 
         if (isEVEX) {
-            auto err = ExecuteSSE4(inst, memory);
+            auto err = ExecuteAVX512(inst, memory);
             if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
             return err;
         }
 
-        // === VEX-encoded AVX2 instructions in 0F 3A map ===
-        // Covers VPERM2I128, VINSERTI128, VEXTRACTI128, VPBLENDD, etc.
+        // === VEX-encoded instructions in 0F 3A map ===
         if (inst.prefixes.hasVEX) {
+            // RORX (VEX.LZ.F2.0F3A F0, pp=3) — BMI2
+            if (op == 0xF0 && inst.prefixes.vexPP == 3) {
+                auto err = ExecuteBitManip(inst, memory);
+                if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+                return err;
+            }
+
+            // F16C: VCVTPS2PH (VEX.66.0F3A.W0 1D) — Float16 conversion
+            if (op == 0x1D && inst.prefixes.vexPP == 1) {
+                auto err = ExecuteAVX2(inst, memory);
+                if (err == ErrorCode::Success) {
+                    m_state.AdvanceRIP(inst.length);
+                    return ErrorCode::Success;
+                }
+                if (err != ErrorCode::UnimplementedOpcode &&
+                    err != ErrorCode::UnsupportedOpcode) {
+                    return err;
+                }
+            }
+
+            // General AVX2 handler (VPERM2I128, VINSERTI128, etc.)
             auto err = ExecuteAVX2(inst, memory);
             if (err == ErrorCode::Success) {
                 m_state.AdvanceRIP(inst.length);
@@ -872,8 +1004,14 @@ ErrorCode CPU::DispatchInstruction(
             return err;
         }
 
-        // SSE4 handles everything else in this map, including EVEX forms
-        // that share the 0F 3A opcode map with VEX encodings.
+        // SHA1RNDS4 (NP 0F 3A CC) — non-VEX, no 66 prefix
+        if (op == 0xCC && !inst.prefixes.hasOpSizeOverride && !inst.prefixes.hasVEX) {
+            auto err = ExecuteSHA(inst, memory);
+            if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
+            return err;
+        }
+
+        // SSE4 handles everything else in this map
         auto err = ExecuteSSE4(inst, memory);
         if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
         return err;

@@ -98,6 +98,15 @@ enum class Mnemonic : uint16_t {
 
     // --- Undefined / NOP / CET ---
     UD0, UD1, UD2, NOP, PAUSE, ENDBR32, ENDBR64,
+    INCSSPD, INCSSPQ, RDSSPD, RDSSPQ,
+    SAVEPREVSSP, RSTORSSP, SETSSBSY, CLRSSBSY,
+    WRSSD, WRSSQ, WRUSSD, WRUSSQ,
+
+    // --- AMX (Advanced Matrix Extensions) ---
+    LDTILECFG, STTILECFG, TILELOADD, TILESTORED,
+    TILEZERO, TILERELEASE,
+    TDPBSSD, TDPBSUD, TDPBUSD, TDPBUUD,
+    TDPBF16PS, TDPFP16PS,
 
     // --- Conversion ---
     CBW, CWDE, CDQE, CWD, CDQ, CQO,
@@ -521,12 +530,62 @@ enum class Mnemonic : uint16_t {
 
     VPMOVDB, VPMOVDW, VPMOVQB, VPMOVQD, VPMOVQW, VPMOVWB,
     VPMOVSDB, VPMOVSDW, VPMOVSQB, VPMOVSQD, VPMOVSQW, VPMOVSWB,
-    VPMOVUSDB, VPMOVSUDW, VPMOVUSQB, VPMOVUSQD, VPMOVUSQW, VPMOVSUWB,
+    VPMOVUSDB, VPMOVUSDW, VPMOVUSQB, VPMOVUSQD, VPMOVUSQW, VPMOVUSWB,
 
     VRANGEPS, VRANGEPD, VRANGESS, VRANGESD,
     VREDUCEPS, VREDUCEPD, VREDUCESS, VREDUCESD,
 
     VDBPSADBW,
+
+    // AVX-512 VNNI (Vector Neural Network Instructions)
+    VPDPBUSD, VPDPBUSDS, VPDPWSSD, VPDPWSSDS,
+
+    // AVX-512 VBMI (Vector Byte Manipulation Instructions)
+    VPERMB, VPERMI2B, VPERMI2W, VPERMI2D, VPERMI2Q,
+    VPERMT2B, VPERMT2W, VPERMT2D, VPERMT2Q,
+
+    // AVX-512 IFMA (Integer Fused Multiply-Add)
+    VPMADD52LUQ, VPMADD52HUQ,
+
+    // AVX-512 BITALG
+    VPSHUFBITQMB, VPOPCNTB, VPOPCNTW,
+
+    // AVX-512DQ additional
+    VFPCLASSPS, VFPCLASSPD, VFPCLASSSS, VFPCLASSSD,
+    VCVTQQ2PS, VCVTQQ2PD, VCVTTPD2QQ, VCVTTPD2UQQ,
+    VCVTPD2QQ, VCVTPD2UQQ,
+    VCVTUQQ2PS, VCVTUQQ2PD,
+    VPMULLQ, VEXTRACTF64X2, VEXTRACTI64X2,
+    VINSERTF64X2, VINSERTI64X2,
+
+    // SHA-512 (Intel Golden Cove+)
+    SHA512RNDS2, SHA512MSG1, SHA512MSG2,
+
+    // GFNI (Galois Field New Instructions)
+    GF2P8AFFINEINVQB, GF2P8AFFINEQB, GF2P8MULB,
+    VGF2P8AFFINEINVQB, VGF2P8AFFINEQB, VGF2P8MULB,
+
+    // CMPCCXADD (atomic conditional add, Sierra Forest+)
+    CMPccXADD,
+
+    // SM3 (Chinese cryptographic hash)
+    VSM3MSG1, VSM3MSG2, VSM3RNDS2,
+
+    // SM4 (Chinese block cipher)
+    VSM4KEY4, VSM4RNDS4,
+
+    // Miscellaneous modern instructions
+    SERIALIZE,      // 0F 01 E8 — memory ordering fence
+    PREFETCHIT0,    // 0F 18 /7 — instruction prefetch L1
+    PREFETCHIT1,    // 0F 18 /6 — instruction prefetch L2
+    CLDEMOTE,       // 0F 1C /0 — cache line demote
+    UMONITOR,       // F3 0F AE /6 — user-level monitor
+    UMWAIT,         // F2 0F AE /6 — user-level wait
+    TPAUSE,         // 66 0F AE /6 — timed pause
+    ENQCMD,         // F3 0F 38 F8 — enqueue command
+    ENQCMDS,        // F2 0F 38 F8 — enqueue command supervisor
+    MOVDIRI,        // 0F 38 F9 — direct store integer
+    MOVDIR64B,      // 66 0F 38 F8 — direct store 64 bytes
 
     // --- Sentinel ---
     UNKNOWN,
@@ -678,6 +737,30 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::PAUSE:         return "pause";
     case Mnemonic::ENDBR32:       return "endbr32";
     case Mnemonic::ENDBR64:       return "endbr64";
+    case Mnemonic::INCSSPD:       return "incsspd";
+    case Mnemonic::INCSSPQ:       return "incsspq";
+    case Mnemonic::RDSSPD:        return "rdsspd";
+    case Mnemonic::RDSSPQ:        return "rdsspq";
+    case Mnemonic::SAVEPREVSSP:   return "saveprevssp";
+    case Mnemonic::RSTORSSP:      return "rstorssp";
+    case Mnemonic::SETSSBSY:      return "setssbsy";
+    case Mnemonic::CLRSSBSY:      return "clrssbsy";
+    case Mnemonic::WRSSD:         return "wrssd";
+    case Mnemonic::WRSSQ:         return "wrssq";
+    case Mnemonic::WRUSSD:        return "wrussd";
+    case Mnemonic::WRUSSQ:        return "wrussq";
+    case Mnemonic::LDTILECFG:     return "ldtilecfg";
+    case Mnemonic::STTILECFG:     return "sttilecfg";
+    case Mnemonic::TILELOADD:     return "tileloadd";
+    case Mnemonic::TILESTORED:    return "tilestored";
+    case Mnemonic::TILEZERO:      return "tilezero";
+    case Mnemonic::TILERELEASE:   return "tilerelease";
+    case Mnemonic::TDPBSSD:       return "tdpbssd";
+    case Mnemonic::TDPBSUD:       return "tdpbsud";
+    case Mnemonic::TDPBUSD:       return "tdpbusd";
+    case Mnemonic::TDPBUUD:       return "tdpbuud";
+    case Mnemonic::TDPBF16PS:     return "tdpbf16ps";
+    case Mnemonic::TDPFP16PS:     return "tdpfp16ps";
     case Mnemonic::CBW:           return "cbw";
     case Mnemonic::CWDE:          return "cwde";
     case Mnemonic::CDQE:          return "cdqe";
@@ -1705,11 +1788,11 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::VPMOVSQW:      return "vpmovsqw";
     case Mnemonic::VPMOVSWB:      return "vpmovswb";
     case Mnemonic::VPMOVUSDB:     return "vpmovusdb";
-    case Mnemonic::VPMOVSUDW:     return "vpmovsudw";
+    case Mnemonic::VPMOVUSDW:    return "vpmovusdw";
     case Mnemonic::VPMOVUSQB:     return "vpmovusqb";
     case Mnemonic::VPMOVUSQD:     return "vpmovusqd";
     case Mnemonic::VPMOVUSQW:     return "vpmovusqw";
-    case Mnemonic::VPMOVSUWB:     return "vpmovsuwb";
+    case Mnemonic::VPMOVUSWB:    return "vpmovuswb";
     case Mnemonic::VRANGEPS:      return "vrangeps";
     case Mnemonic::VRANGEPD:      return "vrangepd";
     case Mnemonic::VRANGESS:      return "vrangess";
@@ -1719,6 +1802,89 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::VREDUCESS:     return "vreducess";
     case Mnemonic::VREDUCESD:     return "vreducesd";
     case Mnemonic::VDBPSADBW:     return "vdbpsadbw";
+
+    // AVX-512 VNNI
+    case Mnemonic::VPDPBUSD:      return "vpdpbusd";
+    case Mnemonic::VPDPBUSDS:     return "vpdpbusds";
+    case Mnemonic::VPDPWSSD:      return "vpdpwssd";
+    case Mnemonic::VPDPWSSDS:     return "vpdpwssds";
+
+    // AVX-512 VBMI
+    case Mnemonic::VPERMB:        return "vpermb";
+    case Mnemonic::VPERMI2B:      return "vpermi2b";
+    case Mnemonic::VPERMI2W:      return "vpermi2w";
+    case Mnemonic::VPERMI2D:      return "vpermi2d";
+    case Mnemonic::VPERMI2Q:      return "vpermi2q";
+    case Mnemonic::VPERMT2B:      return "vpermt2b";
+    case Mnemonic::VPERMT2W:      return "vpermt2w";
+    case Mnemonic::VPERMT2D:      return "vpermt2d";
+    case Mnemonic::VPERMT2Q:      return "vpermt2q";
+
+    // AVX-512 IFMA
+    case Mnemonic::VPMADD52LUQ:   return "vpmadd52luq";
+    case Mnemonic::VPMADD52HUQ:   return "vpmadd52huq";
+
+    // AVX-512 BITALG
+    case Mnemonic::VPSHUFBITQMB:  return "vpshufbitqmb";
+    case Mnemonic::VPOPCNTB:      return "vpopcntb";
+    case Mnemonic::VPOPCNTW:      return "vpopcntw";
+
+    // AVX-512DQ additional
+    case Mnemonic::VFPCLASSPS:    return "vfpclassps";
+    case Mnemonic::VFPCLASSPD:    return "vfpclasspd";
+    case Mnemonic::VFPCLASSSS:    return "vfpclassss";
+    case Mnemonic::VFPCLASSSD:    return "vfpclasssd";
+    case Mnemonic::VCVTQQ2PS:     return "vcvtqq2ps";
+    case Mnemonic::VCVTQQ2PD:     return "vcvtqq2pd";
+    case Mnemonic::VCVTTPD2QQ:    return "vcvttpd2qq";
+    case Mnemonic::VCVTTPD2UQQ:   return "vcvttpd2uqq";
+    case Mnemonic::VCVTPD2QQ:     return "vcvtpd2qq";
+    case Mnemonic::VCVTPD2UQQ:    return "vcvtpd2uqq";
+    case Mnemonic::VCVTUQQ2PS:    return "vcvtuqq2ps";
+    case Mnemonic::VCVTUQQ2PD:    return "vcvtuqq2pd";
+    case Mnemonic::VPMULLQ:       return "vpmullq";
+    case Mnemonic::VEXTRACTF64X2: return "vextractf64x2";
+    case Mnemonic::VEXTRACTI64X2: return "vextracti64x2";
+    case Mnemonic::VINSERTF64X2:  return "vinsertf64x2";
+    case Mnemonic::VINSERTI64X2:  return "vinserti64x2";
+
+    // SHA-512
+    case Mnemonic::SHA512RNDS2:   return "sha512rnds2";
+    case Mnemonic::SHA512MSG1:    return "sha512msg1";
+    case Mnemonic::SHA512MSG2:    return "sha512msg2";
+
+    // GFNI
+    case Mnemonic::GF2P8AFFINEINVQB:  return "gf2p8affineinvqb";
+    case Mnemonic::GF2P8AFFINEQB:     return "gf2p8affineqb";
+    case Mnemonic::GF2P8MULB:         return "gf2p8mulb";
+    case Mnemonic::VGF2P8AFFINEINVQB: return "vgf2p8affineinvqb";
+    case Mnemonic::VGF2P8AFFINEQB:    return "vgf2p8affineqb";
+    case Mnemonic::VGF2P8MULB:        return "vgf2p8mulb";
+
+    // CMPCCXADD
+    case Mnemonic::CMPccXADD:     return "cmpccxadd";
+
+    // SM3
+    case Mnemonic::VSM3MSG1:      return "vsm3msg1";
+    case Mnemonic::VSM3MSG2:      return "vsm3msg2";
+    case Mnemonic::VSM3RNDS2:     return "vsm3rnds2";
+
+    // SM4
+    case Mnemonic::VSM4KEY4:      return "vsm4key4";
+    case Mnemonic::VSM4RNDS4:     return "vsm4rnds4";
+
+    // Misc modern
+    case Mnemonic::SERIALIZE:     return "serialize";
+    case Mnemonic::PREFETCHIT0:   return "prefetchit0";
+    case Mnemonic::PREFETCHIT1:   return "prefetchit1";
+    case Mnemonic::CLDEMOTE:      return "cldemote";
+    case Mnemonic::UMONITOR:      return "umonitor";
+    case Mnemonic::UMWAIT:        return "umwait";
+    case Mnemonic::TPAUSE:        return "tpause";
+    case Mnemonic::ENQCMD:        return "enqcmd";
+    case Mnemonic::ENQCMDS:       return "enqcmds";
+    case Mnemonic::MOVDIRI:       return "movdiri";
+    case Mnemonic::MOVDIR64B:     return "movdir64b";
 
     case Mnemonic::UNKNOWN:       return "unknown";
     case Mnemonic::MAX_MNEMONIC:  return "<max_mnemonic>";
@@ -2089,6 +2255,7 @@ inline namespace InstructionAttribs {
     constexpr uint64_t ATTRIB_HAS_BRANCH_TAKEN      = 1ull << 14;
     constexpr uint64_t ATTRIB_HAS_BRANCH_NOT_TAKEN  = 1ull << 15;
     constexpr uint64_t ATTRIB_IS_FAR_BRANCH         = 1ull << 16;
+    constexpr uint64_t ATTRIB_HAS_REX2              = 1ull << 17;
 } // namespace InstructionAttribs
 
 // ============================================================================
@@ -2190,6 +2357,23 @@ enum class ISAExtension : uint8_t {
     MPX,
     CET,
     AMX,
+    VAES,
+    GFNI,
+    SHA512,
+    SM3,
+    SM4,
+    AVX512IFMA,
+    AVX512BITALG,
+    CMPCCXADD,
+    APX,
+    SERIALIZE_EXT,
+    CLDEMOTE_EXT,
+    WAITPKG,
+    CLWB_EXT,
+    ENQCMD_EXT,
+    MOVDIRI_EXT,
+    MOVDIR64B_EXT,
+    PREFETCHI,
 };
 
 // ============================================================================

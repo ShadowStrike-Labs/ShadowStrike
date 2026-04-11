@@ -65,4 +65,24 @@ struct alignas(32) YMMValue {
 
 static_assert(sizeof(YMMValue) == 32, "YMMValue must be 32 bytes");
 
+// ZMM register represented as a 64-byte aligned buffer for AVX-512 executor.
+struct alignas(64) ZMMValue {
+    union {
+        uint8_t  u8[64];
+        uint16_t u16[32];
+        uint32_t u32[16];
+        uint64_t u64[8];
+        int8_t   i8[64];
+        int16_t  i16[32];
+        int32_t  i32[16];
+        int64_t  i64[8];
+        float    f32[16];
+        double   f64[8];
+    };
+
+    void Clear() noexcept { std::memset(this, 0, sizeof(*this)); }
+};
+
+static_assert(sizeof(ZMMValue) == 64, "ZMMValue must be 64 bytes");
+
 } // namespace Phantom

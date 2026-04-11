@@ -213,8 +213,10 @@ public:
     uint64_t cr3 = 0;             // Page directory base
     uint64_t cr4 = 0x000406F8;   // PAE, PGE, OSFXSR, OSXMMEXCPT, OSXSAVE
 
-    // Extended Control Register (for XGETBV support — bits: x87=1, SSE=2, AVX=4)
-    uint64_t xcr0 = 0x7;
+    // Extended Control Register (XGETBV support)
+    // Bits: x87=0, SSE=1, AVX=2, BNDREGS=3, BNDCSR=4,
+    //       OPMASK=5, ZMM_Hi256=6, Hi16_ZMM=7
+    uint64_t xcr0 = 0xE7;  // x87+SSE+AVX+OPMASK+ZMM_Hi256+Hi16_ZMM
 
     // ========================================================================
     // Debug Registers (for anti-evasion: malware checks DR0-DR3)
@@ -290,6 +292,51 @@ public:
     // The low 128 bits are stored in xmm[], the high 128 bits here.
     std::array<XMMReg, 16> ymmHigh{};  // Upper halves of YMM0-YMM15
 
+    // ========================================================================
+    // AVX-512 State (ZMM registers — upper 256 bits beyond YMM)
+    // ========================================================================
+    // ZMM[i] layout: { XMM[i] (0-127) | ymmHigh[i] (128-255) | zmmHigh[i] (256-511) }
+    // We store the upper 256 bits separately to avoid disrupting existing XMM/YMM code.
+    struct alignas(32) ZMMHighReg {
+        uint8_t u8[32]{};
+        void Clear() noexcept { std::memset(u8, 0, sizeof(u8)); }
+    };
+    std::array<ZMMHighReg, 32> zmmHigh{};    // Upper 256 bits of ZMM0-ZMM31
+
+    // Opmask registers k0-k7 (64-bit each, width depends on element size)
+    std::array<uint64_t, 8> opmask{};
+
+    // Get full 512-bit ZMM value (caller provides 64-byte aligned buffer)
+    void GetZMM(uint8_t index, void* dst64) const noexcept {
+        if (index < 16) {
+            // ZMM0-15: composed from xmm + ymmHigh + zmmHigh
+            auto* d = static_cast<uint8_t*>(dst64);
+            std::memcpy(d, xmm[index].u8, 16);
+            std::memcpy(d + 16, ymmHigh[index].u8, 16);
+            std::memcpy(d + 32, zmmHigh[index].u8, 32);
+        } else if (index < 32) {
+            // ZMM16-31: stored entirely in zmmHigh (no XMM/YMM alias)
+            // Use first 32 bytes from a dedicated slot + zmmHigh upper
+            // For simplicity we store ZMM16-31 entirely in zmmHigh pairs
+            auto* d = static_cast<uint8_t*>(dst64);
+            std::memcpy(d, zmmHigh[index].u8, 32);
+            // Upper 256 bits are always zero for ZMM16-31 in this model
+            // (Real APX would extend further — adequate for AVX-512 emulation)
+            std::memset(d + 32, 0, 32);
+        }
+    }
+
+    void SetZMM(uint8_t index, const void* src64) noexcept {
+        const auto* s = static_cast<const uint8_t*>(src64);
+        if (index < 16) {
+            std::memcpy(xmm[index].u8, s, 16);
+            std::memcpy(ymmHigh[index].u8, s + 16, 16);
+            std::memcpy(zmmHigh[index].u8, s + 32, 32);
+        } else if (index < 32) {
+            std::memcpy(zmmHigh[index].u8, s, 32);
+        }
+    }
+
     // Get pointer to full 256-bit YMM value (caller provides 32-byte aligned buffer)
     void GetYMM(uint8_t index, void* dst32) const noexcept {
         auto idx = index & 0x0F;
@@ -300,6 +347,8 @@ public:
         auto idx = index & 0x0F;
         std::memcpy(xmm[idx].u8, src32, 16);
         std::memcpy(ymmHigh[idx].u8, static_cast<const uint8_t*>(src32) + 16, 16);
+        // AVX (VEX) zeroes upper ZMM bits
+        zmmHigh[idx].Clear();
     }
 
     // Clear upper halves (VEX-encoded 128-bit ops zero the upper YMM bits)
@@ -333,6 +382,94 @@ public:
         }
         return AddressSize::Addr64;
     }
+
+    // ========================================================================
+    // AMX (Advanced Matrix Extensions) Tile State
+    // ========================================================================
+    // 8 tiles (tmm0-tmm7), each up to 1024 bytes (16 rows × 64 bytes).
+    // Tile configuration register (TILECFG) controls active tile dimensions.
+    static constexpr uint32_t kMaxTileRows = 16;
+    static constexpr uint32_t kMaxTileCols = 64;
+    static constexpr uint32_t kTileBytes   = kMaxTileRows * kMaxTileCols; // 1024
+
+    struct TileConfig {
+        uint8_t paletteId = 0;            // Palette (must be 1 for AMX-INT8/BF16)
+        uint8_t startRow  = 0;            // Start row for tileload/store restart
+        struct TileDim {
+            uint16_t colsb = 0;           // Columns in bytes (max 64)
+            uint8_t  rows  = 0;           // Rows (max 16)
+        } tiles[8]{};
+        bool configured = false;
+
+        void Reset() noexcept {
+            paletteId = 0;
+            startRow = 0;
+            configured = false;
+            for (auto& t : tiles) { t.colsb = 0; t.rows = 0; }
+        }
+    } tileConfig;
+
+    struct alignas(64) TileData {
+        uint8_t data[kTileBytes]{};
+
+        void Clear() noexcept { std::memset(data, 0, kTileBytes); }
+
+        [[nodiscard]] int32_t GetI32(uint32_t row, uint32_t col) const noexcept {
+            uint32_t off = row * kMaxTileCols + col * sizeof(int32_t);
+            int32_t v = 0;
+            std::memcpy(&v, data + off, sizeof(int32_t));
+            return v;
+        }
+        void SetI32(uint32_t row, uint32_t col, int32_t v) noexcept {
+            uint32_t off = row * kMaxTileCols + col * sizeof(int32_t);
+            std::memcpy(data + off, &v, sizeof(int32_t));
+        }
+    };
+
+    std::array<TileData, 8> tiles{};
+
+    // ========================================================================
+    // CET Shadow Stack State
+    // ========================================================================
+    // Hardware-enforced return address protection. Maintains a parallel stack
+    // of return addresses to detect ROP/JOP exploitation.
+    static constexpr uint32_t kShadowStackMaxDepth = 4096;
+
+    struct ShadowStackState {
+        std::array<uint64_t, kShadowStackMaxDepth> entries{};
+        uint32_t pointer = 0;          // Current shadow stack index (grows upward)
+        bool     enabled = false;       // CET-SS active
+        bool     ibtEnabled = false;    // Indirect Branch Tracking active
+        bool     waitForEndBranch = false;  // Expecting ENDBR after indirect JMP/CALL
+        bool     busy = false;          // SSP busy flag (SETSSBSY/CLRSSBSY)
+        uint32_t violations = 0;        // Count of detected violations (for analysis)
+
+        void Reset() noexcept {
+            pointer = 0;
+            enabled = false;
+            ibtEnabled = false;
+            waitForEndBranch = false;
+            busy = false;
+            violations = 0;
+        }
+
+        [[nodiscard]] bool Push(uint64_t returnAddr) noexcept {
+            if (pointer >= kShadowStackMaxDepth) return false;
+            entries[pointer++] = returnAddr;
+            return true;
+        }
+
+        [[nodiscard]] bool Pop(uint64_t& returnAddr) noexcept {
+            if (pointer == 0) return false;
+            returnAddr = entries[--pointer];
+            return true;
+        }
+
+        [[nodiscard]] uint64_t Peek() const noexcept {
+            if (pointer == 0) return 0;
+            return entries[pointer - 1];
+        }
+    } shadowStack;
 
     // ========================================================================
     // Instruction Counter (for analysis + limits)

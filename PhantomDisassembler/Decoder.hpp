@@ -225,6 +225,12 @@ private:
         bool rexX   = false;    ///< SIB index extension
         bool rexB   = false;    ///< ModRM r/m or SIB base extension
 
+        // --- REX2 prefix (D5h, APX future extension) ---
+        bool hasREX2 = false;
+        bool rex2R4  = false;   ///< 5th bit for ModRM reg (r16-r31)
+        bool rex2X4  = false;   ///< 5th bit for SIB index (r16-r31)
+        bool rex2B4  = false;   ///< 5th bit for ModRM r/m / SIB base (r16-r31)
+
         // --- VEX prefix (C4h 3-byte / C5h 2-byte) ---
         bool    hasVEX   = false;
         uint8_t vexL     = 0;       ///< Vector length (0=128, 1=256)

@@ -4,6 +4,10 @@
  *
  * ControlFlow.cpp — JMP, Jcc, CALL, RET, LOOP, SETcc
  *
+ * CET shadow stack integration: CALL pushes return addresses to the shadow
+ * stack, RET validates against it, and indirect JMP/CALL set the
+ * waitForEndBranch flag for IBT enforcement.
+ *
  * Copyright (C) 2025-2026 ShadowStrike Labs
  * AGPL-3.0 License
  */
@@ -11,6 +15,44 @@
 #include "../CPU.hpp"
 
 namespace Phantom {
+
+// ============================================================================
+// Shadow Stack Helpers (inlined for hot-path performance)
+// ============================================================================
+
+static inline void ShadowStackPush(CPUState& state, uint64_t returnAddr) noexcept {
+    auto& ss = state.shadowStack;
+    if (!ss.enabled) return;
+    // Silently wrap on overflow — real hardware would #CP, but for
+    // emulation analysis we keep running to observe full behavior.
+    [[maybe_unused]] bool ok = ss.Push(returnAddr);
+}
+
+static inline ErrorCode ShadowStackValidateReturn(CPUState& state, uint64_t retAddr) noexcept {
+    auto& ss = state.shadowStack;
+    if (!ss.enabled) return ErrorCode::Success;
+
+    uint64_t expectedAddr = 0;
+    if (!ss.Pop(expectedAddr)) {
+        // Shadow stack underflow — suspicious but not necessarily malicious
+        // (could be entry-point return). Record the violation for analysis.
+        ++ss.violations;
+        return ErrorCode::Success;
+    }
+
+    if (expectedAddr != retAddr) {
+        // Shadow stack mismatch — potential ROP detected
+        ++ss.violations;
+        return ErrorCode::ControlProtectionFault;
+    }
+    return ErrorCode::Success;
+}
+
+static inline void SetWaitForEndBranch(CPUState& state) noexcept {
+    if (state.shadowStack.ibtEnabled) {
+        state.shadowStack.waitForEndBranch = true;
+    }
+}
 
 ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory& mem) noexcept {
     uint8_t op = inst.opcode;
@@ -47,6 +89,7 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
             GuestAddress returnAddr = inst.NextRIP();
             auto err = StackPush(mem, returnAddr, pushSize);
             if (err != ErrorCode::Success) return err;
+            ShadowStackPush(m_state, returnAddr);
             m_state.SetRIP(inst.NextRIP() + inst.Op(0).rel.offset);
             return ErrorCode::Success;
         }
@@ -56,6 +99,8 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
             uint64_t retAddr = 0;
             auto err = StackPop(mem, retAddr, pushSize);
             if (err != ErrorCode::Success) return err;
+            err = ShadowStackValidateReturn(m_state, retAddr);
+            if (err != ErrorCode::Success) return err;
             m_state.SetRIP(retAddr);
             return ErrorCode::Success;
         }
@@ -64,6 +109,8 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
         if (op == 0xC2) {
             uint64_t retAddr = 0;
             auto err = StackPop(mem, retAddr, pushSize);
+            if (err != ErrorCode::Success) return err;
+            err = ShadowStackValidateReturn(m_state, retAddr);
             if (err != ErrorCode::Success) return err;
             uint16_t stackAdj = static_cast<uint16_t>(inst.immediate & 0xFFFF);
             m_state.SetReg64(GPR::RSP, m_state.RSP() + stackAdj);
@@ -123,6 +170,7 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
                 uint64_t target = 0;
                 auto err = ReadOperand(inst.Op(0), inst, mem, target);
                 if (err != ErrorCode::Success) return err;
+                SetWaitForEndBranch(m_state);
                 m_state.SetRIP(target);
                 return ErrorCode::Success;
             }
@@ -135,6 +183,8 @@ ErrorCode CPU::ExecuteControlFlow(const DecodedInstruction& inst, VirtualMemory&
                 GuestAddress returnAddr = inst.NextRIP();
                 err = StackPush(mem, returnAddr, pushSize);
                 if (err != ErrorCode::Success) return err;
+                ShadowStackPush(m_state, returnAddr);
+                SetWaitForEndBranch(m_state);
                 m_state.SetRIP(target);
                 return ErrorCode::Success;
             }

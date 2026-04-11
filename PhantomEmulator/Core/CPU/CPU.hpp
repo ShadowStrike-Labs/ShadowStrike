@@ -210,6 +210,13 @@ private:
     ErrorCode ExecuteAESNI(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
     ErrorCode ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
     ErrorCode ExecuteFPU(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteRdRandSeed(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteFMA(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteBMI(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteSHA(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteAVX512(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteCET(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
+    ErrorCode ExecuteAMX(const DecodedInstruction& inst, VirtualMemory& mem) noexcept;
 
     // === Operand read/write helpers ===
 
