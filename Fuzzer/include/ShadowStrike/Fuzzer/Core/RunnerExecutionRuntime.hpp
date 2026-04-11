@@ -52,6 +52,10 @@ struct RunnerExecutionRecord {
     std::string telemetryArtifactRelativePath;
     std::string replayArtifactRelativePath;
     std::string crashBucketRelativePath;
+    std::string workerResultRelativePath;
+    std::string workerLogRelativePath;
+    std::string workerFailureSignal;
+    std::uint32_t workerExitCode{ 0 };
     bool requiresFreshSession{ false };
     std::uint32_t maxIterationsPerCycle{ 0 };
     std::uint32_t maxArtifactsPerIteration{ 0 };
