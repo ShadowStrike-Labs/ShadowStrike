@@ -16,7 +16,7 @@
 
 #include <chrono>
 
-#include "../../../src/Shared_modules/Core/Engine/BehaviorAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Engine/BehaviorAnalyzer.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 using namespace std::chrono_literals;

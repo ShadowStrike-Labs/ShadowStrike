@@ -18,8 +18,8 @@
 #include <array>
 #include <string_view>
 
-#include "../../../src/Shared_modules/Core/Engine/EmulationEngine.hpp"
-#include "../../../src/Shared_modules/Core/Engine/PackerUnpacker.hpp"
+#include "../../../src/PhantomCore/Core/Engine/EmulationEngine.hpp"
+#include "../../../src/PhantomCore/Core/Engine/PackerUnpacker.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 

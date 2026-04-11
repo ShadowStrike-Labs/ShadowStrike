@@ -1,151 +1,151 @@
 test_main.cpp
 FileSystemChain_Integration_Tests.cpp
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 FileHasher.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 FileTypeAnalyzer.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PatternStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.cpp(2096): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PatternStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.cpp(2096): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 FileReputation.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Core\FileSystem\FileReputation.cpp(1470): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Core\FileSystem\FileReputation.cpp(1471): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\FileSystem\FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Core\FileSystem\FileReputation.cpp(1470): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Core\FileSystem\FileReputation.cpp(1471): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 FuzzyHasher.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
 DigestGenerator.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 DigestComparer.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 HashStore.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\HashStore\HashStore.cpp(1265): warning C4127: koşullu ifade sabit
-src\Shared_modules\HashStore\HashStore.cpp(1265): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\HashStore\HashStore.cpp(1265): warning C4127: koşullu ifade sabit
+src\PhantomCore\HashStore\HashStore.cpp(1265): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
 HashStore_mgnmnt.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 HashStore_query_operations.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 HashStore_import_export.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 BloomFilter_impl.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 HashBucket_impl.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 WhiteListStore.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Whitelist\WhiteListStore.cpp(339): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(391): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(403): warning C4459: 'MAX_DATABASE_SIZE' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(124): note: 'ShadowStrike::Whitelist::MAX_DATABASE_SIZE' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(1277): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(1436): warning C4459: 'MAX_PUBLISHER_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(120): note: 'ShadowStrike::Whitelist::MAX_PUBLISHER_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(1608): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(1921): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(2833): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListStore.cpp(3544): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Whitelist\WhiteListStore.cpp(339): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(391): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(403): warning C4459: 'MAX_DATABASE_SIZE' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(124): note: 'ShadowStrike::Whitelist::MAX_DATABASE_SIZE' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(1277): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(1436): warning C4459: 'MAX_PUBLISHER_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(120): note: 'ShadowStrike::Whitelist::MAX_PUBLISHER_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(1608): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(1921): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(2833): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListStore.cpp(3544): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
 WhiteListFormat.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Whitelist\WhiteListFormat.cpp(2024): warning C4127: koşullu ifade sabit
-src\Shared_modules\Whitelist\WhiteListFormat.cpp(2024): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
-src\Shared_modules\Whitelist\WhiteListFormat.cpp(2048): warning C4127: koşullu ifade sabit
-src\Shared_modules\Whitelist\WhiteListFormat.cpp(2048): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Whitelist\WhiteListFormat.cpp(2024): warning C4127: koşullu ifade sabit
+src\PhantomCore\Whitelist\WhiteListFormat.cpp(2024): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+src\PhantomCore\Whitelist\WhiteListFormat.cpp(2048): warning C4127: koşullu ifade sabit
+src\PhantomCore\Whitelist\WhiteListFormat.cpp(2048): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
 WhiteListHashIndex.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3745): warning C4456: 'nodeAddr' bildirimi önceki yerel bildirimi gizliyor
-src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3597): note: 'nodeAddr' bildirimine bakın
-src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3746): warning C4456: 'baseAddr' bildirimi önceki yerel bildirimi gizliyor
-src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3598): note: 'baseAddr' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Whitelist\WhiteListHashIndex.cpp(3745): warning C4456: 'nodeAddr' bildirimi önceki yerel bildirimi gizliyor
+src\PhantomCore\Whitelist\WhiteListHashIndex.cpp(3597): note: 'nodeAddr' bildirimine bakın
+src\PhantomCore\Whitelist\WhiteListHashIndex.cpp(3746): warning C4456: 'baseAddr' bildirimi önceki yerel bildirimi gizliyor
+src\PhantomCore\Whitelist\WhiteListHashIndex.cpp(3598): note: 'baseAddr' bildirimine bakın
 WhiteListPatternIndex.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\Whitelist\WhiteListPatternIndex.cpp(1843): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\Whitelist\WhiteListPatternIndex.cpp(1843): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
 WhiteListBloomFilter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 WhiteListStringPool.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 Kod Üretiliyor...
 Derleniyor...
 SignatureFormat.cpp
@@ -154,288 +154,288 @@ SignatureBuilder.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 batch_sig_builder.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureIndex.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): warning C4477: 'snprintf' : '%X' biçim dizesi 'unsigned int' türü bir bağımsız değişken gerektirir, ancak 1 değişen sayıda bağımsız değişkenin türü 'unsigned __int64'
-src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%llX' kullanmayı düşünün
-src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%IX' kullanmayı düşünün
-src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%I64X' kullanmayı düşünün
-src\Shared_modules\SignatureStore\SignatureIndex.cpp(68): warning C4505: 'ShadowStrike::SignatureStore::GetCurrentTimeNs': iç bağlantıya sahip başvurulmayan işlev kaldırıldı
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\SignatureStore\SignatureIndex.cpp(866): warning C4477: 'snprintf' : '%X' biçim dizesi 'unsigned int' türü bir bağımsız değişken gerektirir, ancak 1 değişen sayıda bağımsız değişkenin türü 'unsigned __int64'
+src\PhantomCore\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%llX' kullanmayı düşünün
+src\PhantomCore\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%IX' kullanmayı düşünün
+src\PhantomCore\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%I64X' kullanmayı düşünün
+src\PhantomCore\SignatureStore\SignatureIndex.cpp(68): warning C4505: 'ShadowStrike::SignatureStore::GetCurrentTimeNs': iç bağlantıya sahip başvurulmayan işlev kaldırıldı
 SignatureIndex_COW.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureIndex_Cache_mngmnt.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureIndex_modification.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureIndex_Query.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureIndex_stat_maintenance.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureStore.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureStore_mngmnt.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\SignatureStore\SignatureStore_mngmnt.cpp(141): warning C4459: 'MAX_PATTERN_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureFormat.hpp(91): note: 'ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\SignatureStore\SignatureStore_mngmnt.cpp(141): warning C4459: 'MAX_PATTERN_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureFormat.hpp(91): note: 'ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH' bildirimine bakın
 SignatureStore_Query.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 SignatureStore_scan.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 sig_builder_import_methods.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 sig_builder_input_methods.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 sig_builder_serialization.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 sig_builder_utils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 sig_indx_internal_node_mng.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 YaraRuleStore.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 ThreatIntelStore.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelStore.cpp(1794): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelStore.cpp(1794): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
 Kod Üretiliyor...
 Derleniyor...
 ThreatIntelLookup.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelLookup.cpp(1155): warning C4324: 'ShadowStrike::ThreatIntel::ThreadLocalCache': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelLookup.cpp(1155): warning C4324: 'ShadowStrike::ThreatIntel::ThreadLocalCache': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIOCManager.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_URLMatcher.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp(93): warning C4324: 'ShadowStrike::ThreatIntel::AhoCorasickAutomaton::State': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp(93): warning C4324: 'ShadowStrike::ThreatIntel::AhoCorasickAutomaton::State': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_Trees.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.cpp(129): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.cpp(178): warning C4324: 'ShadowStrike::ThreatIntel::GenericBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelIndex_Trees.cpp(129): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelIndex_Trees.cpp(178): warning C4324: 'ShadowStrike::ThreatIntel::GenericBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_Modifications.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_Lookups.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_DataStructures.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelIndex_Core.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelImporter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelImporter.cpp(4605): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelImporter.cpp(4605): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 ThreatIntelFormat.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelFeedManager_parsers.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ThreatIntelFeedManager.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(362): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(419): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3079): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3553): warning C4456: 'headersStr' bildirimi önceki yerel bildirimi gizliyor
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3380): note: 'headersStr' bildirimine bakın
-src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(4233): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(362): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(419): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(3079): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(3553): warning C4456: 'headersStr' bildirimi önceki yerel bildirimi gizliyor
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(3380): note: 'headersStr' bildirimine bakın
+src\PhantomCore\ThreatIntel\ThreatIntelFeedManager.cpp(4233): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
 ThreatIntelExporter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelExporter.cpp(860): warning C4127: koşullu ifade sabit
-src\Shared_modules\ThreatIntel\ThreatIntelExporter.cpp(860): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelExporter.cpp(860): warning C4127: koşullu ifade sabit
+src\PhantomCore\ThreatIntel\ThreatIntelExporter.cpp(860): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
 ThreatIntelDatabase.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-src\Shared_modules\ThreatIntel\ThreatIntelDatabase.cpp(172): warning C4127: koşullu ifade sabit
-src\Shared_modules\ThreatIntel\ThreatIntelDatabase.cpp(172): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\PhantomCore\ThreatIntel\ThreatIntelDatabase.cpp(172): warning C4127: koşullu ifade sabit
+src\PhantomCore\ThreatIntel\ThreatIntelDatabase.cpp(172): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
 ThreatIntelBloomFilter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 ReputationCache.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
 PEParser.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
 PEValidation.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
 Logger.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 StringUtils.cpp
@@ -454,15 +454,15 @@ MemoryUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 ProcessUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\ProcessUtils.cpp(1344): warning C4456: 'read' bildirimi önceki yerel bildirimi gizliyor
-src\Shared_modules\Utils\ProcessUtils.cpp(1287): note: 'read' bildirimine bakın
-src\Shared_modules\Utils\ProcessUtils.cpp(1906): warning C4459: 'kMaxModuleCount' bildirimi genel bildirimi gizliyor
-src\Shared_modules\Utils\ProcessUtils.cpp(95): note: 'ShadowStrike::Utils::ProcessUtils::`anonymous-namespace'::kMaxModuleCount' bildirimine bakın
-src\Shared_modules\Utils\ProcessUtils.cpp(2909): warning C4459: 'PUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
+src\PhantomCore\Utils\ProcessUtils.cpp(1344): warning C4456: 'read' bildirimi önceki yerel bildirimi gizliyor
+src\PhantomCore\Utils\ProcessUtils.cpp(1287): note: 'read' bildirimine bakın
+src\PhantomCore\Utils\ProcessUtils.cpp(1906): warning C4459: 'kMaxModuleCount' bildirimi genel bildirimi gizliyor
+src\PhantomCore\Utils\ProcessUtils.cpp(95): note: 'ShadowStrike::Utils::ProcessUtils::`anonymous-namespace'::kMaxModuleCount' bildirimine bakın
+src\PhantomCore\Utils\ProcessUtils.cpp(2909): warning C4459: 'PUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
 C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(436): note: 'PUBLIC_OBJECT_TYPE_INFORMATION' bildirimine bakın
-src\Shared_modules\Utils\ProcessUtils.cpp(2909): warning C4459: 'PPUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
+src\PhantomCore\Utils\ProcessUtils.cpp(2909): warning C4459: 'PPUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
 C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(436): note: 'PPUBLIC_OBJECT_TYPE_INFORMATION' bildirimine bakın
-src\Shared_modules\Utils\ProcessUtils.cpp(2914): warning C4459: 'OBJECT_INFORMATION_CLASS' bildirimi genel bildirimi gizliyor
+src\PhantomCore\Utils\ProcessUtils.cpp(2914): warning C4459: 'OBJECT_INFORMATION_CLASS' bildirimi genel bildirimi gizliyor
 C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(414): note: 'OBJECT_INFORMATION_CLASS' bildirimine bakın
 SystemUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
@@ -472,8 +472,8 @@ ThreadPool.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 CacheManager.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\CacheManager.cpp(1187): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
-src\Shared_modules\Utils\CacheManager.cpp(1250): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\CacheManager.cpp(1187): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\CacheManager.cpp(1250): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
 CryptoUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(66): warning C4005: 'STATUS_WAIT_0': makro yeniden tanımlama
@@ -754,15 +754,15 @@ Kod Üretiliyor...
 Derleniyor...
 NetworkUtils_http_https.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_http_https.cpp(468): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_http_https.cpp(468): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtils_DNS.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_DNS.cpp(472): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_DNS.cpp(472): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtils_Adapter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(947): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1070): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1183): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(947): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(1070): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(1183): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtilsIpAddress.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 NetworkUtilsMacAdress.cpp

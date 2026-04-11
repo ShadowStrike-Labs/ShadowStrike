@@ -1,10 +1,10 @@
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Communication/AlertSystem.hpp"
-#include "../../../src/Shared_modules/Communication/TelemetryCollector.hpp"
-#include "../../../src/Shared_modules/Communication/IPCManager.hpp"
-#include "../../../src/Shared_modules/Core/Process/ProcessKiller.hpp"
-#include "../../../src/Shared_modules/Utils/ProcessUtils.hpp"
+#include "../../../src/PhantomCore/Communication/AlertSystem.hpp"
+#include "../../../src/PhantomCore/Communication/TelemetryCollector.hpp"
+#include "../../../src/PhantomCore/Communication/IPCManager.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessKiller.hpp"
+#include "../../../src/PhantomCore/Utils/ProcessUtils.hpp"
 
 namespace ShadowStrike::Communication {
 

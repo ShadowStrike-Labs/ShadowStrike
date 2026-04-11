@@ -227,7 +227,7 @@ Five purpose-built neural network models running inference **locally on each end
 - **Feature extraction pipeline** with PE, behavioral, emulation, memory, and network feature modules
 - **Model evaluation** with precision/recall/F1 tracking, A/B deployment support
 
-### C++ Inference Bridge (`src/Shared_modules/AI/`)
+### C++ Inference Bridge (`src/PhantomCore/AI/`)
 - `PhantomCortex.cpp` — Singleton orchestrator coordinating all 5 models
 - `ModelInference.cpp` — ONNX Runtime integration with thread-safe batch inference
 - `ModelCache.cpp` — LRU model cache with secure hash verification
@@ -474,7 +474,7 @@ ShadowStrike/
 │       └── export/             # ONNX export · Quantization
 │
 ├── src/
-│   └── Shared_modules/         # User-mode detection infrastructure (461 source files)
+│   └── PhantomCore/         # User-mode detection infrastructure (461 source files)
 │       ├── AI/                 # C++ inference bridge → PhantomCortex models
 │       ├── Core/               # Engine · FileSystem · Network · Process · Registry · System
 │       ├── RealTime/           # RTP · Exploit prevention · Behavior blocking

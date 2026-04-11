@@ -26,7 +26,7 @@
 
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Core/Process/AtomBombingDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/AtomBombingDetector.hpp"
 
 namespace {
 

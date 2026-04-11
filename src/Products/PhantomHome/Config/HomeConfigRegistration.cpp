@@ -4,9 +4,9 @@
 // ===========================================================================
 #include "pch.h"
 #include "HomeConfigRegistration.hpp"
-#include "../../Shared_modules/Config/ConfigManager.hpp"
-#include "../../Shared_modules/Config/ProfileManager.hpp"
-#include "../../Shared_modules/Config/SettingsManager.hpp"
+#include "../../PhantomCore/Config/ConfigManager.hpp"
+#include "../../PhantomCore/Config/ProfileManager.hpp"
+#include "../../PhantomCore/Config/SettingsManager.hpp"
 
 namespace ShadowStrike::Products::PhantomHome::Config {
 

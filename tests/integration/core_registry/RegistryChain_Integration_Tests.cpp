@@ -38,11 +38,11 @@
 #include <utility>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Registry/RegistryMonitor.hpp"
-#include "../../../src/Shared_modules/Core/Registry/RegistryAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Registry/RegistryMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Registry/RegistryAnalyzer.hpp"
 // PersistenceDetector and RegistryAnalyzer both define ScanProgressCallback; alias for this TU.
 #define ScanProgressCallback PersistenceDetectorScanProgressCallback
-#include "../../../src/Shared_modules/Core/Registry/PersistenceDetector.hpp"
+#include "../../../src/PhantomCore/Core/Registry/PersistenceDetector.hpp"
 #undef ScanProgressCallback
 
 namespace {

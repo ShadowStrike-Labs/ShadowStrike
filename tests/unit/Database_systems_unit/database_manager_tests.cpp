@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "Shared_modules/Database/DatabaseManager.hpp"
+#include "PhantomCore/Database/DatabaseManager.hpp"
 #include <filesystem>
 #include <thread>
 #include <chrono>

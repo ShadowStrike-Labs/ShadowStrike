@@ -16,7 +16,7 @@
 #include <filesystem>
 #include <vector>
 
-#include "../../../src/Shared_modules/AI/ModelInference.hpp"
+#include "../../../src/PhantomCore/AI/ModelInference.hpp"
 #include "AI_TestUtils.hpp"
 
 namespace fs = std::filesystem;

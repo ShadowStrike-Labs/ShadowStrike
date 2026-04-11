@@ -19,7 +19,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/PEParser/PEValidation.hpp"
+#include "../../../src/PhantomCore/PEParser/PEValidation.hpp"
 #include "PEParser_TestUtils.hpp"
 
 namespace ShadowStrike::PEParser::Test {

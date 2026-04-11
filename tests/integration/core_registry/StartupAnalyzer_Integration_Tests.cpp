@@ -29,10 +29,10 @@
 
 // PersistenceDetector and RegistryAnalyzer both define ScanProgressCallback.
 #define ScanProgressCallback PersistenceDetectorScanProgressCallback
-#include "../../../src/Shared_modules/Core/Registry/PersistenceDetector.hpp"
+#include "../../../src/PhantomCore/Core/Registry/PersistenceDetector.hpp"
 #undef ScanProgressCallback
-#include "../../../src/Shared_modules/Core/Registry/RegistryMonitor.hpp"
-#include "../../../src/Shared_modules/Core/Registry/StartupAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Registry/RegistryMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Registry/StartupAnalyzer.hpp"
 
 // =============================================================================
 // Test fixture

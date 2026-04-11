@@ -29,7 +29,7 @@
 #include "pch.h"
 
 #include "CoreFileSystem_TestUtils.hpp"
-#include "../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp"
 
 #include <algorithm>
 

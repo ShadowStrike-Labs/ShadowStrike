@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Engine/PolymorphicDetector.hpp"
+#include "../../../src/PhantomCore/Core/Engine/PolymorphicDetector.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 

@@ -10,7 +10,7 @@ set CL_FLAGS=/std:c++20 /EHsc /W3 /MDd /Gy /FI"%SRC%\pch.h" /I"%SRC%" /I"%INC%" 
 if not exist "%OUTDIR%" mkdir "%OUTDIR%"
 
 echo Compiling ZeroHourProtection.cpp...
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\ZeroHourProtection.obj" "%SRC%\Shared_modules\RealTime\ZeroHourProtection.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\ZeroHourProtection.obj" "%SRC%\PhantomCore\RealTime\ZeroHourProtection.cpp"
 echo ZHP_EXIT=%ERRORLEVEL%
 
 echo Compiling stubs...
@@ -18,11 +18,11 @@ cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\ZeroHour_stubs.obj" "%TESTS%\ZeroHour_stubs.cp
 echo STUBS_EXIT=%ERRORLEVEL%
 
 echo Compiling utils...
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\Logger.obj" "%SRC%\Shared_modules\Utils\Logger.cpp"
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\StringUtils.obj" "%SRC%\Shared_modules\Utils\StringUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\FileUtils.obj" "%SRC%\Shared_modules\Utils\FileUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\SystemUtils.obj" "%SRC%\Shared_modules\Utils\SystemUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\HashUtils.obj" "%SRC%\Shared_modules\Utils\HashUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\Logger.obj" "%SRC%\PhantomCore\Utils\Logger.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\StringUtils.obj" "%SRC%\PhantomCore\Utils\StringUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\FileUtils.obj" "%SRC%\PhantomCore\Utils\FileUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\SystemUtils.obj" "%SRC%\PhantomCore\Utils\SystemUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\HashUtils.obj" "%SRC%\PhantomCore\Utils\HashUtils.cpp"
 
 echo Compiling test files...
 cl.exe %CL_FLAGS% /c /Fo"%OUTDIR%\test_main.obj" "C:\ShadowStrike\ShadowStrike\tests\test_main.cpp"

@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/AI/PhantomCortex.hpp"
+#include "../../../src/PhantomCore/AI/PhantomCortex.hpp"
 #include "AI_TestUtils.hpp"
 
 namespace fs = std::filesystem;

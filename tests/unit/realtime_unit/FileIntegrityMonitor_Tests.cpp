@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/FileIntegrityMonitor.hpp"
+#include "../../../src/PhantomCore/RealTime/FileIntegrityMonitor.hpp"
 
 namespace ShadowStrike::RealTime::Tests {
 

@@ -16,7 +16,7 @@
 
 #include <string_view>
 
-#include "../../../src/Shared_modules/Core/Engine/SandboxAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Engine/SandboxAnalyzer.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 

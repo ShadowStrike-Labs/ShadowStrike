@@ -22,7 +22,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/RansomwareProtection/VolumeSnapshotService.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/VolumeSnapshotService.hpp"
 
 namespace {
 

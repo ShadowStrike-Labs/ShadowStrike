@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/SandboxEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/SandboxEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

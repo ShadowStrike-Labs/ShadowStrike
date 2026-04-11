@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/ServiceCommunication.hpp"
+#include "../../../src/PhantomCore/Communication/ServiceCommunication.hpp"
 
 #include <chrono>
 #include <string>

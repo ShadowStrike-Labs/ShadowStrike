@@ -75,7 +75,7 @@
 // ============================================================================
 // SHADOWSTRIKE MODULE HEADERS
 // ============================================================================
-#include "../../../src/Shared_modules/RansomwareProtection/RansomwareDetector.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/RansomwareDetector.hpp"
 
 // ============================================================================
 // CONVENIENCE ALIASES

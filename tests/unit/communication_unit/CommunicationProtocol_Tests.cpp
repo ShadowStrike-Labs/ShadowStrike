@@ -2,9 +2,9 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/Communication.hpp"
-#include "../../../src/Shared_modules/Communication/FilterConnection.hpp"
-#include "../../../src/Shared_modules/Communication/MessageDispatcher.hpp"
+#include "../../../src/PhantomCore/Communication/Communication.hpp"
+#include "../../../src/PhantomCore/Communication/FilterConnection.hpp"
+#include "../../../src/PhantomCore/Communication/MessageDispatcher.hpp"
 
 #include <array>
 #include <chrono>

@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/ReportGenerator.hpp"
+#include "../../../src/PhantomCore/Communication/ReportGenerator.hpp"
 
 #include <chrono>
 #include <string>

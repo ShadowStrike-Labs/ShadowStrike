@@ -17,8 +17,8 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "Shared_modules/Database/ConfigurationDB.hpp"
-#include "Shared_modules/Utils/StringUtils.hpp"
+#include "PhantomCore/Database/ConfigurationDB.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 #include <filesystem>
 #include <thread>
 #include <chrono>

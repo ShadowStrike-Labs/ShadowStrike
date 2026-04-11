@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/TelemetryCollector.hpp"
+#include "../../../src/PhantomCore/Communication/TelemetryCollector.hpp"
 
 #include <algorithm>
 #include <chrono>

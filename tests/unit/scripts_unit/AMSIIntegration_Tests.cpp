@@ -22,7 +22,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/AMSIIntegration.hpp"
+#include "../../../src/PhantomCore/Scripts/AMSIIntegration.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

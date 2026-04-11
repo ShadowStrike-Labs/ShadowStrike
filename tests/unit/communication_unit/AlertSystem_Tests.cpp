@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/AlertSystem.hpp"
+#include "../../../src/PhantomCore/Communication/AlertSystem.hpp"
 
 #include <chrono>
 #include <string>

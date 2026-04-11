@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/PackerDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/PackerDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

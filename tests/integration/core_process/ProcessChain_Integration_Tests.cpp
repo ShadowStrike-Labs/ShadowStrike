@@ -43,12 +43,12 @@
 #include <format>
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Core/Process/ProcessMonitor.hpp"
-#include "../../../src/Shared_modules/Core/Process/ProcessAnalyzer.hpp"
-#include "../../../src/Shared_modules/Core/Process/ProcessHollowingDetector.hpp"
-#include "../../../src/Shared_modules/Core/Process/ProcessInjectionDetector.hpp"
-#include "../../../src/Shared_modules/Core/Process/ReflectiveDLLDetector.hpp"
-#include "../../../src/Shared_modules/Core/Process/ProcessTypes.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessHollowingDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessInjectionDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/ReflectiveDLLDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessTypes.hpp"
 
 #include <algorithm>
 #include <atomic>

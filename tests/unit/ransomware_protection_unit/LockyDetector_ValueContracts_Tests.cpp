@@ -22,7 +22,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/RansomwareProtection/LockyDetector.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/LockyDetector.hpp"
 
 namespace {
 

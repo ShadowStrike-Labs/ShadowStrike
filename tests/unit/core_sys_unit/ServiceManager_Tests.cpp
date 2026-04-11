@@ -27,7 +27,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/Core/System/ServiceManager.hpp"
+#include "../../../src/PhantomCore/Core/System/ServiceManager.hpp"
 
 namespace {
 

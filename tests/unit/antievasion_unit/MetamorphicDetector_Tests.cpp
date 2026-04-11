@@ -8,7 +8,7 @@
 #include <climits>
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/metamorphic_polymorphicdetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

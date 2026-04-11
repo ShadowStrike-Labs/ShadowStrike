@@ -48,9 +48,9 @@
 #include <utility>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Network/NetworkMonitor.hpp"
-#include "../../../src/Shared_modules/Core/Network/DNSMonitor.hpp"
-#include "../../../src/Shared_modules/Core/Network/FirewallManager.hpp"
+#include "../../../src/PhantomCore/Core/Network/NetworkMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Network/DNSMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Network/FirewallManager.hpp"
 
 namespace SSN = ShadowStrike::Core::Network;
 

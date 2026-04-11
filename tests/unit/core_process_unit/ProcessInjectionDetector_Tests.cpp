@@ -27,7 +27,7 @@
 
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Core/Process/ProcessInjectionDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessInjectionDetector.hpp"
 
 namespace {
 

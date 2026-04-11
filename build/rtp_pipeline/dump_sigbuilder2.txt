@@ -19685,7 +19685,7 @@ FFE 00000000 SECT6B9 notype       Static      | .text$mn
 4CDB 00000000 SECT16E0 notype       External   | ??_C@_0FM@KDCANNLJ@ShadowStrike?3?3SignatureStore?3?3S@ (`string')
 4CDC 00000000 SECT16E1 notype       Static     | .rdata
     Section length   37, #relocs    0, #linenums    0, checksum 5BD5274C, selection    2 (pick any)
-4CDE 00000000 SECT16E1 notype       External   | ??_C@_0DH@LFBBBKPC@src?2Shared_modules?2SignatureSto@ (`string')
+4CDE 00000000 SECT16E1 notype       External   | ??_C@_0DH@LFBBBKPC@src?2PhantomCore?2SignatureSto@ (`string')
 4CDF 00000000 SECT16E2 notype       Static     | .rdata
     Section length   22, #relocs    0, #linenums    0, checksum 2C620689, selection    2 (pick any)
 4CE1 00000000 SECT16E2 notype       External   | ??_C@_1CC@JCOMJFFM@?$AAS?$AAi?$AAg?$AAn?$AAa?$AAt?$AAu?$AAr?$AAe?$AAB?$AAu?$AAi?$AAl?$AAd?$AAe@ (`string')

@@ -25,8 +25,8 @@
 #include <type_traits>
 #include <vector>
 
-#include "../../../src/Shared_modules/PEParser/PEConstants.hpp"
-#include "../../../src/Shared_modules/PEParser/PETypes.hpp"
+#include "../../../src/PhantomCore/PEParser/PEConstants.hpp"
+#include "../../../src/PhantomCore/PEParser/PETypes.hpp"
 
 namespace ShadowStrike::PEParser::Test {
 

@@ -30,7 +30,7 @@
 #include <cstdint>
 #include <string>
 
-#include "../../../src/Shared_modules/Core/Registry/SystemSettingsMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Registry/SystemSettingsMonitor.hpp"
 
 // =============================================================================
 // Fixture

@@ -4,9 +4,9 @@
 // ===========================================================================
 #include "pch.h"
 #include "XDRConfigRegistration.hpp"
-#include "../../Shared_modules/Config/ConfigManager.hpp"
-#include "../../Shared_modules/Config/PolicyManager.hpp"
-#include "../../Shared_modules/Config/ProfileManager.hpp"
+#include "../../PhantomCore/Config/ConfigManager.hpp"
+#include "../../PhantomCore/Config/PolicyManager.hpp"
+#include "../../PhantomCore/Config/ProfileManager.hpp"
 
 // XDR inherits EDR defaults — register EDR keys first
 #include "../PhantomEDR/Config/EDRConfigRegistration.hpp"

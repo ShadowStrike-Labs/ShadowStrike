@@ -35,8 +35,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "Shared_modules/ThreatIntel/ThreatIntelFeedManager.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelFeedManager.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelFormat.hpp"
 #include <memory>
 #include <vector>
 #include <string>

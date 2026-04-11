@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/ZeroHourProtection.hpp"
+#include "../../../src/PhantomCore/RealTime/ZeroHourProtection.hpp"
 
 namespace ShadowStrike::RealTime::Tests {
 

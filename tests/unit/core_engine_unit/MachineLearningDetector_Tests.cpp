@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Engine/MachineLearningDetector.hpp"
+#include "../../../src/PhantomCore/Core/Engine/MachineLearningDetector.hpp"
 
 namespace fs = std::filesystem;
 namespace Engine = ShadowStrike::Core::Engine;

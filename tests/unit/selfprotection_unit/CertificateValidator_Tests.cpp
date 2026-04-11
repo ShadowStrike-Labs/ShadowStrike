@@ -1,6 +1,6 @@
 #include "../../../src/pch.h"
 #include <nlohmann/json.hpp>
-#include "../../../src/Shared_modules/SelfProtection/CertificateValidator.hpp"
+#include "../../../src/PhantomCore/SelfProtection/CertificateValidator.hpp"
 
 namespace {
 

@@ -36,8 +36,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Shared_modules/Utils/NetworkUtils.hpp"
-#include "../../../src/Shared_modules/Utils/Logger.hpp"
+#include "../../../src/PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../src/PhantomCore/Utils/Logger.hpp"
 
 #include <string>
 #include <vector>

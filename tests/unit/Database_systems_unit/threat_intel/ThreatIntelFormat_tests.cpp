@@ -29,7 +29,7 @@
 
 #include <gtest/gtest.h>
 
-#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelFormat.hpp"
 
 #include<unordered_set>
 #include <array>

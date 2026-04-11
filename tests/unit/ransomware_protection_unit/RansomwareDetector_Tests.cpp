@@ -29,7 +29,7 @@
 #include "pch.h"
 
 #include "RansomwareProtection_TestUtils.hpp"
-#include "../../../src/Shared_modules/RansomwareProtection/RansomwareDetector.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/RansomwareDetector.hpp"
 
 #include <future>
 #include <random>

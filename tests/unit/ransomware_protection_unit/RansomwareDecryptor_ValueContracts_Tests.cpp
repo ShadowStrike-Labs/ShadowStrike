@@ -22,7 +22,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/RansomwareProtection/RansomwareDecryptor.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/RansomwareDecryptor.hpp"
 
 #include <algorithm>
 

@@ -86,16 +86,16 @@
 // ============================================================================
 // SHADOWSTRIKE SHARED-MODULE HEADERS (relative to repo root)
 // ============================================================================
-#include "../../../src/Shared_modules/SignatureStore/SignatureFormat.hpp"
-#include "../../../src/Shared_modules/SignatureStore/SignatureStore.hpp"
-#include "../../../src/Shared_modules/SignatureStore/YaraRuleStore.hpp"
-#include "../../../src/Shared_modules/HashStore/HashStore.hpp"
-#include "../../../src/Shared_modules/PatternStore/PatternStore.hpp"
-#include "../../../src/Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
-#include "../../../src/Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
-#include "../../../src/Shared_modules/Whitelist/WhiteListFormat.hpp"
-#include "../../../src/Shared_modules/Whitelist/WhiteListStore.hpp"
-#include "../../../src/Shared_modules/Utils/HashUtils.hpp"
+#include "../../../src/PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "../../../src/PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "../../../src/PhantomCore/SignatureStore/YaraRuleStore.hpp"
+#include "../../../src/PhantomCore/HashStore/HashStore.hpp"
+#include "../../../src/PhantomCore/PatternStore/PatternStore.hpp"
+#include "../../../src/PhantomCore/ThreatIntel/ThreatIntelFormat.hpp"
+#include "../../../src/PhantomCore/ThreatIntel/ThreatIntelStore.hpp"
+#include "../../../src/PhantomCore/Whitelist/WhiteListFormat.hpp"
+#include "../../../src/PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "../../../src/PhantomCore/Utils/HashUtils.hpp"
 
 // ============================================================================
 // CONVENIENCE NAMESPACE ALIASES

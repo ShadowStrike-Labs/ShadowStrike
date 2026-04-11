@@ -111,10 +111,10 @@
 // SHADOWSTRIKE MODULE HEADERS
 // ============================================================================
 
-#include "src/Shared_modules/Update/SignatureUpdater.hpp"
-#include "src/Shared_modules/Update/UpdateVerifier.hpp"
-#include "src/Shared_modules/Update/RollbackManager.hpp"
-#include "src/Shared_modules/SignatureStore/SignatureStore.hpp"
+#include "src/PhantomCore/Update/SignatureUpdater.hpp"
+#include "src/PhantomCore/Update/UpdateVerifier.hpp"
+#include "src/PhantomCore/Update/RollbackManager.hpp"
+#include "src/PhantomCore/SignatureStore/SignatureStore.hpp"
 
 // ============================================================================
 // NAMESPACE ALIASES

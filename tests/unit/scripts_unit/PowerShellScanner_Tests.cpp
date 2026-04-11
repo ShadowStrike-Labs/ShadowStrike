@@ -20,7 +20,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/PowerShellScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/PowerShellScanner.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

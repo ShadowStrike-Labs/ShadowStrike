@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/MemoryProtection.hpp"
+#include "../../../src/PhantomCore/RealTime/MemoryProtection.hpp"
 #include "RealTime_TestUtils.hpp"
 
 namespace ShadowStrike::RealTime::Tests {

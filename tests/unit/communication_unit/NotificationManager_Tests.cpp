@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/NotificationManager.hpp"
+#include "../../../src/PhantomCore/Communication/NotificationManager.hpp"
 
 #include <chrono>
 #include <string>

@@ -32537,7 +32537,7 @@ FFE 00000000 SECT4BC notype       Static      | .text$mn
 7F0F 00000000 SECT24CB notype       External   | ??_C@_0FC@PNAIGLDN@ShadowStrike?3?3SignatureStore?3?3Y@ (`string')
 7F10 00000000 SECT24CC notype       Static     | .rdata
     Section length   34, #relocs    0, #linenums    0, checksum 9506E952, selection    2 (pick any)
-7F12 00000000 SECT24CC notype       External   | ??_C@_0DE@KGNCBJBN@src?2Shared_modules?2SignatureSto@ (`string')
+7F12 00000000 SECT24CC notype       External   | ??_C@_0DE@KGNCBJBN@src?2PhantomCore?2SignatureSto@ (`string')
 7F13 00000000 SECT24CD notype       Static     | .rdata
     Section length   1C, #relocs    0, #linenums    0, checksum AE6A13B0, selection    2 (pick any)
 7F15 00000000 SECT24CD notype       External   | ??_C@_1BM@NBOFJLKG@?$AAY?$AAa?$AAr?$AAa?$AAR?$AAu?$AAl?$AAe?$AAS?$AAt?$AAo?$AAr?$AAe@ (`string')

@@ -18,7 +18,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Network/TrafficAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Network/TrafficAnalyzer.hpp"
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {

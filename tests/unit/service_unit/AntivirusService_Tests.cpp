@@ -16,7 +16,7 @@
 
 #include <string>
 
-#include "../../../src/Shared_modules/Service/AntivirusService.hpp"
+#include "../../../src/PhantomCore/Service/AntivirusService.hpp"
 
 namespace SSS = ShadowStrike::Service;
 

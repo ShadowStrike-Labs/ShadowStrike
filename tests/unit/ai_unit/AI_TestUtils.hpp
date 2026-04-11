@@ -26,8 +26,8 @@
 #include <system_error>
 #include <vector>
 
-#include "../../../src/Shared_modules/PEParser/PEConstants.hpp"
-#include "../../../src/Shared_modules/PEParser/PETypes.hpp"
+#include "../../../src/PhantomCore/PEParser/PEConstants.hpp"
+#include "../../../src/PhantomCore/PEParser/PETypes.hpp"
 
 namespace ShadowStrike::AI::Test {
 

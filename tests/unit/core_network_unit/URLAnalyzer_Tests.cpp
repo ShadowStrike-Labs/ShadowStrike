@@ -18,7 +18,7 @@
 #include <regex>
 #include <string>
 
-#include "../../../src/Shared_modules/Core/Network/URLAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Network/URLAnalyzer.hpp"
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {

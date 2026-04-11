@@ -35,108 +35,108 @@
 // ---------------------------------------------------------------------------
 // Store / shared infrastructure
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
-#include "src/Shared_modules/HashStore/HashStore.hpp"
-#include "src/Shared_modules/PatternStore/PatternStore.hpp"
-#include "src/Shared_modules/SignatureStore/SignatureStore.hpp"
+#include "src/PhantomCore/ThreatIntel/ThreatIntelStore.hpp"
+#include "src/PhantomCore/HashStore/HashStore.hpp"
+#include "src/PhantomCore/PatternStore/PatternStore.hpp"
+#include "src/PhantomCore/SignatureStore/SignatureStore.hpp"
 
 // ---------------------------------------------------------------------------
 // Utils
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Utils/ProcessUtils.hpp"
+#include "src/PhantomCore/Utils/ProcessUtils.hpp"
 
 // ---------------------------------------------------------------------------
 // RealTime subsystems
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/RealTime/FileSystemFilter.hpp"
-#include "src/Shared_modules/RealTime/NetworkTrafficFilter.hpp"
-#include "src/Shared_modules/RealTime/AccessControlManager.hpp"
-#include "src/Shared_modules/RealTime/BehaviorBlocker.hpp"
-#include "src/Shared_modules/RealTime/ExploitPrevention.hpp"
-#include "src/Shared_modules/RealTime/FileIntegrityMonitor.hpp"
-#include "src/Shared_modules/RealTime/MemoryProtection.hpp"
-#include "src/Shared_modules/RealTime/ZeroHourProtection.hpp"
-#include "src/Shared_modules/RealTime/ProcessCreationMonitor.hpp"
+#include "src/PhantomCore/RealTime/FileSystemFilter.hpp"
+#include "src/PhantomCore/RealTime/NetworkTrafficFilter.hpp"
+#include "src/PhantomCore/RealTime/AccessControlManager.hpp"
+#include "src/PhantomCore/RealTime/BehaviorBlocker.hpp"
+#include "src/PhantomCore/RealTime/ExploitPrevention.hpp"
+#include "src/PhantomCore/RealTime/FileIntegrityMonitor.hpp"
+#include "src/PhantomCore/RealTime/MemoryProtection.hpp"
+#include "src/PhantomCore/RealTime/ZeroHourProtection.hpp"
+#include "src/PhantomCore/RealTime/ProcessCreationMonitor.hpp"
 
 // ---------------------------------------------------------------------------
 // AntiEvasion
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/AntiEvasion/DebuggerEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/VMEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/SandboxEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/ProcessEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/metamorphic_polymorphicdetector.hpp"
-#include "src/Shared_modules/AntiEvasion/TimeBasedEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/NetworkBasedEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/EnvironmentEvasionDetector.hpp"
-#include "src/Shared_modules/AntiEvasion/PackerDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/DebuggerEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/VMEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/SandboxEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/ProcessEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/metamorphic_polymorphicdetector.hpp"
+#include "src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/EnvironmentEvasionDetector.hpp"
+#include "src/PhantomCore/AntiEvasion/PackerDetector.hpp"
 
 // ---------------------------------------------------------------------------
 // AI
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/AI/PhantomCortex.hpp"
-#include "src/Shared_modules/AI/CortexConfig.hpp"
+#include "src/PhantomCore/AI/PhantomCortex.hpp"
+#include "src/PhantomCore/AI/CortexConfig.hpp"
 
 // ---------------------------------------------------------------------------
 // Communication
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Communication/IPCManager.hpp"
-#include "src/Shared_modules/Communication/TelemetryCollector.hpp"
-#include "src/Shared_modules/Communication/AlertSystem.hpp"
+#include "src/PhantomCore/Communication/IPCManager.hpp"
+#include "src/PhantomCore/Communication/TelemetryCollector.hpp"
+#include "src/PhantomCore/Communication/AlertSystem.hpp"
 
 // ---------------------------------------------------------------------------
 // Core :: Engine
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Core/Engine/ScanEngine.hpp"
-#include "src/Shared_modules/Core/Engine/BehaviorAnalyzer.hpp"
-#include "src/Shared_modules/Core/Engine/ThreatDetector.hpp"
-#include "src/Shared_modules/Core/Engine/QuarantineManager.hpp"
+#include "src/PhantomCore/Core/Engine/ScanEngine.hpp"
+#include "src/PhantomCore/Core/Engine/BehaviorAnalyzer.hpp"
+#include "src/PhantomCore/Core/Engine/ThreatDetector.hpp"
+#include "src/PhantomCore/Core/Engine/QuarantineManager.hpp"
 
 // ---------------------------------------------------------------------------
 // Core :: FileSystem
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Core/FileSystem/ExecutableAnalyzer.hpp"
+#include "src/PhantomCore/Core/FileSystem/ExecutableAnalyzer.hpp"
 
 // ---------------------------------------------------------------------------
 // Core :: Network
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Core/Network/NetworkMonitor.hpp"
-#include "src/Shared_modules/Core/Network/TrafficAnalyzer.hpp"
-#include "src/Shared_modules/Core/Network/DNSMonitor.hpp"
-#include "src/Shared_modules/Core/Network/URLAnalyzer.hpp"
-#include "src/Shared_modules/Core/Network/BotnetDetector.hpp"
-#include "src/Shared_modules/Core/Network/WebProtection.hpp"
-#include "src/Shared_modules/Core/Network/TorDetector.hpp"
-#include "src/Shared_modules/Core/Network/VPNDetector.hpp"
-#include "src/Shared_modules/Core/Network/P2PMonitor.hpp"
+#include "src/PhantomCore/Core/Network/NetworkMonitor.hpp"
+#include "src/PhantomCore/Core/Network/TrafficAnalyzer.hpp"
+#include "src/PhantomCore/Core/Network/DNSMonitor.hpp"
+#include "src/PhantomCore/Core/Network/URLAnalyzer.hpp"
+#include "src/PhantomCore/Core/Network/BotnetDetector.hpp"
+#include "src/PhantomCore/Core/Network/WebProtection.hpp"
+#include "src/PhantomCore/Core/Network/TorDetector.hpp"
+#include "src/PhantomCore/Core/Network/VPNDetector.hpp"
+#include "src/PhantomCore/Core/Network/P2PMonitor.hpp"
 
 // ---------------------------------------------------------------------------
 // Core :: Process
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Core/Process/ProcessInjectionDetector.hpp"
-#include "src/Shared_modules/Core/Process/ProcessMonitor.hpp"
-#include "src/Shared_modules/Core/Process/AtomBombingDetector.hpp"
-#include "src/Shared_modules/Core/Process/DLLInjectionDetector.hpp"
+#include "src/PhantomCore/Core/Process/ProcessInjectionDetector.hpp"
+#include "src/PhantomCore/Core/Process/ProcessMonitor.hpp"
+#include "src/PhantomCore/Core/Process/AtomBombingDetector.hpp"
+#include "src/PhantomCore/Core/Process/DLLInjectionDetector.hpp"
 
 // ---------------------------------------------------------------------------
 // Exploits
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/Exploits/HeapSprayDetector.hpp"
-#include "src/Shared_modules/Exploits/JITSprayDetector.hpp"
-#include "src/Shared_modules/Exploits/BufferOverflowProtection.hpp"
-#include "src/Shared_modules/Exploits/StackPivotDetector.hpp"
-#include "src/Shared_modules/Exploits/KernelExploitDetector.hpp"
-#include "src/Shared_modules/Exploits/PrivilegeEscalationDetector.hpp"
+#include "src/PhantomCore/Exploits/HeapSprayDetector.hpp"
+#include "src/PhantomCore/Exploits/JITSprayDetector.hpp"
+#include "src/PhantomCore/Exploits/BufferOverflowProtection.hpp"
+#include "src/PhantomCore/Exploits/StackPivotDetector.hpp"
+#include "src/PhantomCore/Exploits/KernelExploitDetector.hpp"
+#include "src/PhantomCore/Exploits/PrivilegeEscalationDetector.hpp"
 
 // ---------------------------------------------------------------------------
 // SelfProtection  (namespace ShadowStrike::Security)
 // ---------------------------------------------------------------------------
-#include "src/Shared_modules/SelfProtection/DigitalSignatureValidator.hpp"
-#include "src/Shared_modules/SelfProtection/ProcessProtection.hpp"
-#include "src/Shared_modules/SelfProtection/TamperProtection.hpp"
-#include "src/Shared_modules/SelfProtection/SelfDefense.hpp"
-#include "src/Shared_modules/SelfProtection/AntiDebug.hpp"
-#include "src/Shared_modules/SelfProtection/CertificateValidator.hpp"
+#include "src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+#include "src/PhantomCore/SelfProtection/ProcessProtection.hpp"
+#include "src/PhantomCore/SelfProtection/TamperProtection.hpp"
+#include "src/PhantomCore/SelfProtection/SelfDefense.hpp"
+#include "src/PhantomCore/SelfProtection/AntiDebug.hpp"
+#include "src/PhantomCore/SelfProtection/CertificateValidator.hpp"
 
 // ---------------------------------------------------------------------------
 // Placement-storage Meyers'-safe singleton helpers.

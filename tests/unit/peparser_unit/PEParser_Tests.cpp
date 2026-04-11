@@ -17,7 +17,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/PEParser/PEParser.hpp"
+#include "../../../src/PhantomCore/PEParser/PEParser.hpp"
 #include "PEParser_TestUtils.hpp"
 
 namespace ShadowStrike::PEParser::Test {

@@ -35,7 +35,7 @@
 
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Shared_modules/Utils/CertUtils.hpp"
+#include "../../../src/PhantomCore/Utils/CertUtils.hpp"
 #include <vector>
 #include <string>
 #include <filesystem>

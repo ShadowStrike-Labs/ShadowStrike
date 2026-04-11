@@ -2,12 +2,12 @@
 
 #include <new>
 
-#include "../../../src/Shared_modules/AI/PhantomCortex.hpp"
-#include "../../../src/Shared_modules/Core/Engine/BehaviorAnalyzer.hpp"
-#include "../../../src/Shared_modules/Core/Engine/ScanEngine.hpp"
-#include "../../../src/Shared_modules/HashStore/HashStore.hpp"
-#include "../../../src/Shared_modules/SelfProtection/DigitalSignatureValidator.hpp"
-#include "../../../src/Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "../../../src/PhantomCore/AI/PhantomCortex.hpp"
+#include "../../../src/PhantomCore/Core/Engine/BehaviorAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Engine/ScanEngine.hpp"
+#include "../../../src/PhantomCore/HashStore/HashStore.hpp"
+#include "../../../src/PhantomCore/SelfProtection/DigitalSignatureValidator.hpp"
+#include "../../../src/PhantomCore/Whitelist/WhiteListStore.hpp"
 
 namespace ShadowStrike::HashStore {
 

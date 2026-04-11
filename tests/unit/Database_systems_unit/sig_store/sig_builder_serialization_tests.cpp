@@ -42,10 +42,10 @@
 
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "Shared_modules/SignatureStore/SignatureBuilder.hpp"
-#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
-#include "Shared_modules/HashStore/HashStore.hpp"
-#include "Shared_modules/PatternStore/PatternStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureBuilder.hpp"
+#include "PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>

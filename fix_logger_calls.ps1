@@ -1,5 +1,5 @@
 param(
-    [string]$FilePath = "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\Engine\QuarantineManager.cpp"
+    [string]$FilePath = "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Core\Engine\QuarantineManager.cpp"
 )
 
 # Read file content

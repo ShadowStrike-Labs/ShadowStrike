@@ -16,7 +16,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Update/DeltaUpdater.hpp"
+#include "../../../src/PhantomCore/Update/DeltaUpdater.hpp"
 
 namespace ShadowStrike::Update::Test {
 namespace {

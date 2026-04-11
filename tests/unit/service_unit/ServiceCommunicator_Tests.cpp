@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Service/ServiceCommunicator.hpp"
+#include "../../../src/PhantomCore/Service/ServiceCommunicator.hpp"
 
 namespace SSS = ShadowStrike::Service;
 

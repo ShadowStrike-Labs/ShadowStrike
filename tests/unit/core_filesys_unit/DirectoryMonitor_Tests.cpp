@@ -30,7 +30,7 @@
 #include "pch.h"
 
 #include "CoreFileSystem_TestUtils.hpp"
-#include "../../../src/Shared_modules/Core/FileSystem/DirectoryMonitor.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/DirectoryMonitor.hpp"
 
 namespace {
 

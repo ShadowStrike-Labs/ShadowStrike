@@ -66,13 +66,13 @@
 // ============================================================================
 // SHADOWSTRIKE MODULE HEADERS
 // ============================================================================
-#include "../../../src/Shared_modules/AntiEvasion/DebuggerEvasionDetector.hpp"
-#include "../../../src/Shared_modules/AntiEvasion/VMEvasionDetector.hpp"
-#include "../../../src/Shared_modules/HashStore/HashStore.hpp"
-#include "../../../src/Shared_modules/PatternStore/PatternStore.hpp"
-#include "../../../src/Shared_modules/SignatureStore/YaraRuleStore.hpp"
-#include "../../../src/Shared_modules/SignatureStore/SignatureStore.hpp"
-#include "../../../src/Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/DebuggerEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/VMEvasionDetector.hpp"
+#include "../../../src/PhantomCore/HashStore/HashStore.hpp"
+#include "../../../src/PhantomCore/PatternStore/PatternStore.hpp"
+#include "../../../src/PhantomCore/SignatureStore/YaraRuleStore.hpp"
+#include "../../../src/PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "../../../src/PhantomCore/ThreatIntel/ThreatIntelStore.hpp"
 
 // ============================================================================
 // CONVENIENCE ALIASES

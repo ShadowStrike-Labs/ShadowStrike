@@ -22,7 +22,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/RansomwareProtection/ShadowCopyProtector.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/ShadowCopyProtector.hpp"
 
 namespace {
 

@@ -26,7 +26,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/MacroDetector.hpp"
+#include "../../../src/PhantomCore/Scripts/MacroDetector.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

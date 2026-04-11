@@ -26,7 +26,7 @@
 
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Core/Process/ThreadHijackDetector.hpp"
+#include "../../../src/PhantomCore/Core/Process/ThreadHijackDetector.hpp"
 
 namespace {
 

@@ -33,8 +33,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Shared_modules/Utils/FileUtils.hpp"
-#include "../../../src/Shared_modules/Utils/Logger.hpp"
+#include "../../../src/PhantomCore/Utils/FileUtils.hpp"
+#include "../../../src/PhantomCore/Utils/Logger.hpp"
 
 #include <Objbase.h>
 #include <vector>

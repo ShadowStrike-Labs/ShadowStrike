@@ -22,7 +22,7 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/RansomwareProtection/WannaCryDetector.hpp"
+#include "../../../src/PhantomCore/RansomwareProtection/WannaCryDetector.hpp"
 
 namespace {
 
