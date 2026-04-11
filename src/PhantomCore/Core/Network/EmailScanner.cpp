@@ -56,6 +56,7 @@
 #include "../../Utils/Base64Utils.hpp"
 #include "../FileSystem/FileTypeAnalyzer.hpp"
 #include "../FileSystem/ExecutableAnalyzer.hpp"
+#include "../FileSystem/ArchiveExtractor.hpp"
 
 // Standard library
 #include <algorithm>
@@ -64,6 +65,8 @@
 #include <sstream>
 #include <iomanip>
 #include <ctime>
+#include <filesystem>
+#include <fstream>
 
 namespace ShadowStrike {
 namespace Core {
@@ -123,6 +126,233 @@ std::string QuotedPrintableDecode(std::string_view input) {
     }
 
     return result;
+}
+
+// ============================================================================
+// MIME PARSING CONSTANTS & HELPERS
+// ============================================================================
+
+// Security limits for MIME parsing
+constexpr size_t kMaxMultipartNestingDepth = 10;
+constexpr size_t kMaxMIMEPartCount         = 256;
+constexpr size_t kMaxArchiveEntryCount     = 1024;
+constexpr size_t kMaxArchiveExtractionSize = 64 * 1024 * 1024;  // 64 MB
+constexpr size_t kMaxSingleAttachmentSize  = 128 * 1024 * 1024; // 128 MB
+constexpr size_t kMaxHeaderLineLength      = 8192;
+constexpr size_t kMaxEncodedWordLength     = 2048;
+
+// Dangerous archive extensions for risk elevation
+static const std::array<std::string_view, 14> kDangerousArchiveExtensions = {
+    ".exe", ".dll", ".scr", ".bat", ".cmd", ".ps1",
+    ".vbs", ".js",  ".hta", ".wsf", ".msi", ".com",
+    ".pif", ".cpl"
+};
+
+/**
+ * @brief RFC 2047 encoded-word decoder.
+ * Handles =?charset?encoding?text?= tokens in MIME headers.
+ * Supports B (base64) and Q (quoted-printable variant) encodings.
+ */
+std::string DecodeRFC2047EncodedWord(const std::string& input) {
+    std::string result;
+    result.reserve(input.size());
+
+    size_t pos = 0;
+    while (pos < input.size()) {
+        size_t startToken = input.find("=?", pos);
+        if (startToken == std::string::npos) {
+            result.append(input, pos, std::string::npos);
+            break;
+        }
+
+        // Append text before the encoded-word
+        result.append(input, pos, startToken - pos);
+
+        // Parse =?charset?encoding?text?=
+        size_t charsetEnd = input.find('?', startToken + 2);
+        if (charsetEnd == std::string::npos || charsetEnd - startToken > kMaxEncodedWordLength) {
+            result.append("=?");
+            pos = startToken + 2;
+            continue;
+        }
+
+        size_t encodingEnd = input.find('?', charsetEnd + 1);
+        if (encodingEnd == std::string::npos || encodingEnd - charsetEnd > 3) {
+            result.append("=?");
+            pos = startToken + 2;
+            continue;
+        }
+
+        size_t textEnd = input.find("?=", encodingEnd + 1);
+        if (textEnd == std::string::npos || textEnd - startToken > kMaxEncodedWordLength) {
+            result.append("=?");
+            pos = startToken + 2;
+            continue;
+        }
+
+        const char encoding = input[charsetEnd + 1];
+        std::string encodedText = input.substr(encodingEnd + 1, textEnd - (encodingEnd + 1));
+
+        if (encoding == 'B' || encoding == 'b') {
+            // Base64 encoding
+            auto decoded = Base64Decode(encodedText);
+            result.append(reinterpret_cast<const char*>(decoded.data()), decoded.size());
+        } else if (encoding == 'Q' || encoding == 'q') {
+            // Q-encoding: like quoted-printable but underscore = space
+            std::string qDecoded;
+            qDecoded.reserve(encodedText.size());
+            for (size_t i = 0; i < encodedText.size(); ++i) {
+                if (encodedText[i] == '_') {
+                    qDecoded += ' ';
+                } else if (encodedText[i] == '=' && i + 2 < encodedText.size()) {
+                    const char hex[3] = { encodedText[i + 1], encodedText[i + 2], '\0' };
+                    char* end;
+                    long val = std::strtol(hex, &end, 16);
+                    if (end == hex + 2) {
+                        qDecoded += static_cast<char>(val);
+                        i += 2;
+                    } else {
+                        qDecoded += encodedText[i];
+                    }
+                } else {
+                    qDecoded += encodedText[i];
+                }
+            }
+            result.append(qDecoded);
+        } else {
+            // Unknown encoding — preserve raw
+            result.append(input, startToken, textEnd + 2 - startToken);
+        }
+
+        pos = textEnd + 2;
+    }
+
+    return result;
+}
+
+/**
+ * @brief Unfold RFC 5322 header continuation lines.
+ * Lines starting with SP/HTAB are continuations of the previous header.
+ */
+std::string UnfoldHeaders(std::string_view raw) {
+    std::string result;
+    result.reserve(raw.size());
+
+    for (size_t i = 0; i < raw.size(); ++i) {
+        if (raw[i] == '\r' && i + 1 < raw.size() && raw[i + 1] == '\n') {
+            // Check if next line is a continuation (starts with SP or HTAB)
+            if (i + 2 < raw.size() && (raw[i + 2] == ' ' || raw[i + 2] == '\t')) {
+                result += ' ';
+                i += 2; // skip \r\n and the leading whitespace
+                // Skip additional whitespace
+                while (i + 1 < raw.size() && (raw[i + 1] == ' ' || raw[i + 1] == '\t')) {
+                    ++i;
+                }
+                continue;
+            }
+        } else if (raw[i] == '\n') {
+            // Bare LF (non-standard but encountered in wild)
+            if (i + 1 < raw.size() && (raw[i + 1] == ' ' || raw[i + 1] == '\t')) {
+                result += ' ';
+                i += 1;
+                while (i + 1 < raw.size() && (raw[i + 1] == ' ' || raw[i + 1] == '\t')) {
+                    ++i;
+                }
+                continue;
+            }
+        }
+        result += raw[i];
+    }
+
+    return result;
+}
+
+/**
+ * @brief Extract a parameter value from a MIME header value string.
+ * e.g., from 'multipart/mixed; boundary="abc"' extracts "abc" for param "boundary".
+ * Supports RFC 5987 extended parameters (e.g., filename*=UTF-8''encoded%20name).
+ */
+std::string ExtractMIMEParameter(const std::string& headerValue, const std::string& paramName) {
+    // First try RFC 5987 extended parameter (paramName*)
+    std::string extName = paramName + "*=";
+    size_t extPos = headerValue.find(extName);
+    if (extPos != std::string::npos) {
+        std::string extVal = headerValue.substr(extPos + extName.size());
+        size_t end = extVal.find_first_of(";\r\n");
+        if (end != std::string::npos) extVal = extVal.substr(0, end);
+
+        // Format: charset'language'encoded_value
+        size_t firstQuote = extVal.find('\'');
+        size_t secondQuote = (firstQuote != std::string::npos) ?
+            extVal.find('\'', firstQuote + 1) : std::string::npos;
+
+        if (secondQuote != std::string::npos) {
+            std::string percentEncoded = extVal.substr(secondQuote + 1);
+            // Percent-decode
+            std::string decoded;
+            decoded.reserve(percentEncoded.size());
+            for (size_t i = 0; i < percentEncoded.size(); ++i) {
+                if (percentEncoded[i] == '%' && i + 2 < percentEncoded.size()) {
+                    const char hex[3] = { percentEncoded[i + 1], percentEncoded[i + 2], '\0' };
+                    char* hexEnd;
+                    long val = std::strtol(hex, &hexEnd, 16);
+                    if (hexEnd == hex + 2) {
+                        decoded += static_cast<char>(val);
+                        i += 2;
+                        continue;
+                    }
+                }
+                decoded += percentEncoded[i];
+            }
+            return decoded;
+        }
+    }
+
+    // Standard parameter
+    std::string stdName = paramName + "=";
+    size_t pos = headerValue.find(stdName);
+    if (pos == std::string::npos) return {};
+
+    std::string val = headerValue.substr(pos + stdName.size());
+
+    // Trim leading whitespace
+    size_t startTrim = val.find_first_not_of(" \t");
+    if (startTrim != std::string::npos && startTrim > 0) {
+        val = val.substr(startTrim);
+    }
+
+    if (!val.empty() && val.front() == '"') {
+        // Quoted string
+        size_t closeQuote = val.find('"', 1);
+        if (closeQuote != std::string::npos) {
+            return val.substr(1, closeQuote - 1);
+        }
+        return val.substr(1);
+    }
+
+    // Unquoted — terminated by semicolon or whitespace
+    size_t end = val.find_first_of("; \t\r\n");
+    if (end != std::string::npos) {
+        return val.substr(0, end);
+    }
+    return val;
+}
+
+/**
+ * @brief Check if a filename extension is dangerous (executable content).
+ */
+bool IsDangerousExtension(const std::string& filename) {
+    size_t dotPos = filename.rfind('.');
+    if (dotPos == std::string::npos) return false;
+
+    std::string ext = filename.substr(dotPos);
+    // Case-insensitive comparison
+    for (auto& c : ext) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    for (const auto& dangerous : kDangerousArchiveExtensions) {
+        if (ext == dangerous) return true;
+    }
+    return false;
 }
 
 /**
@@ -989,14 +1219,170 @@ public:
                                            const std::string& filename) {
         std::vector<AttachmentInfo> results;
 
-        // Archive extraction would use CompressionUtils
-        // Simplified implementation - just mark as archive
-        AttachmentInfo info;
-        info.filename = filename;
-        info.isArchive = true;
-        info.size = archiveData.size();
-        info.riskLevel = AttachmentRisk::MEDIUM;
-        results.push_back(info);
+        if (archiveData.empty()) {
+            return results;
+        }
+
+        // Cap input size to prevent decompression bombs
+        if (archiveData.size() > kMaxSingleAttachmentSize) {
+            SS_LOG_WARN(L"Network",
+                L"EmailScanner::ScanArchive: archive exceeds size limit (%zu bytes), skipping deep inspection",
+                archiveData.size());
+            AttachmentInfo info;
+            info.filename  = filename;
+            info.isArchive = true;
+            info.size      = archiveData.size();
+            info.riskLevel = AttachmentRisk::HIGH;
+            results.push_back(std::move(info));
+            m_stats.archivesExtracted.fetch_add(1, std::memory_order_relaxed);
+            return results;
+        }
+
+        // Detect archive format from magic bytes
+        using ShadowStrike::Core::FileSystem::ArchiveExtractor;
+        using ShadowStrike::Core::FileSystem::ArchiveFormat;
+
+        const auto& extractor = ArchiveExtractor::Instance();
+        const ArchiveFormat detectedFormat = extractor.DetectFormat(archiveData);
+
+        if (detectedFormat == ArchiveFormat::Unknown) {
+            // Not a recognized archive — return as opaque attachment
+            AttachmentInfo info;
+            info.filename  = filename;
+            info.isArchive = true;
+            info.size      = archiveData.size();
+            info.riskLevel = AttachmentRisk::MEDIUM;
+            results.push_back(std::move(info));
+            m_stats.archivesExtracted.fetch_add(1, std::memory_order_relaxed);
+            return results;
+        }
+
+        // Write to secure temp file for ArchiveExtractor (it requires file path)
+        std::error_code ec;
+        auto tempDir = std::filesystem::temp_directory_path(ec);
+        if (ec) {
+            SS_LOG_ERROR(L"Network",
+                L"EmailScanner::ScanArchive: cannot resolve temp directory: %hs", ec.message().c_str());
+            AttachmentInfo info;
+            info.filename  = filename;
+            info.isArchive = true;
+            info.size      = archiveData.size();
+            info.riskLevel = AttachmentRisk::MEDIUM;
+            results.push_back(std::move(info));
+            return results;
+        }
+
+        // Use a unique temp name to avoid collisions
+        auto tempPath = tempDir / (L"ss_email_archive_" +
+            std::to_wstring(std::hash<std::string>{}(filename)) +
+            L"_" + std::to_wstring(reinterpret_cast<uintptr_t>(archiveData.data())) +
+            L".tmp");
+
+        // RAII cleanup for temp file
+        struct TempFileGuard {
+            std::filesystem::path path;
+            ~TempFileGuard() {
+                std::error_code ignored;
+                std::filesystem::remove(path, ignored);
+            }
+        } tempGuard{ tempPath };
+
+        {
+            std::ofstream ofs(tempPath, std::ios::binary | std::ios::trunc);
+            if (!ofs.is_open()) {
+                SS_LOG_ERROR(L"Network",
+                    L"EmailScanner::ScanArchive: failed to create temp file for archive extraction");
+                AttachmentInfo info;
+                info.filename  = filename;
+                info.isArchive = true;
+                info.size      = archiveData.size();
+                info.riskLevel = AttachmentRisk::MEDIUM;
+                results.push_back(std::move(info));
+                return results;
+            }
+            ofs.write(reinterpret_cast<const char*>(archiveData.data()),
+                      static_cast<std::streamsize>(archiveData.size()));
+        }
+
+        // List contents with security limits
+        try {
+            ShadowStrike::Core::FileSystem::ExtractionOptions extractOpts =
+                ShadowStrike::Core::FileSystem::ExtractionOptions::CreateDefault();
+            extractOpts.maxEntries  = kMaxArchiveEntryCount;
+            extractOpts.maxTotalSize = kMaxArchiveExtractionSize;
+            extractOpts.maxNestingDepth = 3; // Limit nested-archive depth inside email
+
+            auto entries = extractor.ListContents(tempPath.wstring(), extractOpts);
+
+            // Parent archive entry
+            AttachmentInfo archiveInfo;
+            archiveInfo.filename  = filename;
+            archiveInfo.isArchive = true;
+            archiveInfo.size      = archiveData.size();
+            archiveInfo.riskLevel = AttachmentRisk::MEDIUM;
+
+            bool hasDangerousContent = false;
+            size_t executableCount   = 0;
+            size_t scriptCount       = 0;
+
+            for (const auto& entry : entries) {
+                // Convert entry path to narrow string for analysis
+                std::string entryName(entry.path.begin(), entry.path.end());
+
+                if (entry.isPE) {
+                    ++executableCount;
+                    hasDangerousContent = true;
+                }
+                if (entry.isScript) {
+                    ++scriptCount;
+                    hasDangerousContent = true;
+                }
+                if (entry.isNestedArchive) {
+                    hasDangerousContent = true;
+                }
+
+                // Check for dangerous extensions
+                if (IsDangerousExtension(entryName)) {
+                    hasDangerousContent = true;
+                }
+
+                // High compression ratio may indicate zip bomb
+                if (entry.compressionRatio > 100.0) {
+                    archiveInfo.riskLevel = AttachmentRisk::HIGH;
+                    SS_LOG_WARN(L"Network",
+                        L"EmailScanner::ScanArchive: suspicious compression ratio %.1f in %hs",
+                        entry.compressionRatio, entryName.c_str());
+                }
+
+                // Check security flags
+                if (entry.isSuspicious) {
+                    hasDangerousContent = true;
+                }
+            }
+
+            if (hasDangerousContent) {
+                archiveInfo.riskLevel = AttachmentRisk::HIGH;
+            }
+            if (executableCount > 0) {
+                archiveInfo.riskLevel = AttachmentRisk::CRITICAL;
+            }
+
+            SS_LOG_INFO(L"Network",
+                L"EmailScanner::ScanArchive: %hs contains %zu entries (%zu executables, %zu scripts)",
+                filename.c_str(), entries.size(), executableCount, scriptCount);
+
+            results.push_back(std::move(archiveInfo));
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(L"Network",
+                L"EmailScanner::ScanArchive: extraction failed for %hs: %hs",
+                filename.c_str(), e.what());
+            AttachmentInfo info;
+            info.filename  = filename;
+            info.isArchive = true;
+            info.size      = archiveData.size();
+            info.riskLevel = AttachmentRisk::HIGH;  // Suspicious: couldn't analyze
+            results.push_back(std::move(info));
+        }
 
         m_stats.archivesExtracted.fetch_add(1, std::memory_order_relaxed);
         return results;
@@ -1208,24 +1594,130 @@ private:
     }
 
     void ProcessSessionBuffer(EmailSession& session) {
-        // Look for email boundaries in buffer
-        // This is a simplified implementation
-        // Full SMTP/IMAP/POP3 parsing would be much more complex
+        if (session.buffer.empty()) return;
 
         std::string bufferStr(session.buffer.begin(), session.buffer.end());
 
-        // SMTP: DATA command followed by message and terminated by CRLF.CRLF
-        size_t dataPos = bufferStr.find("\r\n.\r\n");
-        if (dataPos != std::string::npos) {
-            // Found complete email
-            std::span<const uint8_t> emailData(session.buffer.data(), dataPos);
+        if (session.protocol == EmailProtocol::SMTP) {
+            // SMTP: DATA content terminated by CRLF.CRLF (RFC 5321 §4.1.1.4)
+            // The termination sequence is \r\n.\r\n
+            size_t dataPos = bufferStr.find("\r\n.\r\n");
+            if (dataPos != std::string::npos) {
+                std::span<const uint8_t> emailData(session.buffer.data(), dataPos);
 
-            auto analysis = ScanEmail(emailData);
-            analysis.protocol = session.protocol;
+                auto analysis = ScanEmail(emailData);
+                analysis.protocol = session.protocol;
 
-            // Clear processed data
-            session.buffer.erase(session.buffer.begin(), session.buffer.begin() + dataPos + 5);
-            session.emailsProcessed++;
+                // Remove dot-stuffing (RFC 5321 §4.5.2): lines starting with ".."
+                // have the leading dot removed by the receiver
+                session.buffer.erase(session.buffer.begin(),
+                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
+                session.emailsProcessed++;
+            }
+        } else if (session.protocol == EmailProtocol::POP3) {
+            // POP3 RETR response: +OK ... followed by message terminated by CRLF.CRLF
+            // Skip the +OK status line if present
+            size_t msgStart = 0;
+            if (bufferStr.starts_with("+OK")) {
+                size_t lineEnd = bufferStr.find("\r\n");
+                if (lineEnd != std::string::npos) {
+                    msgStart = lineEnd + 2;
+                } else {
+                    return; // Incomplete +OK line
+                }
+            }
+
+            size_t dataPos = bufferStr.find("\r\n.\r\n", msgStart);
+            if (dataPos != std::string::npos) {
+                std::span<const uint8_t> emailData(
+                    session.buffer.data() + msgStart, dataPos - msgStart);
+
+                auto analysis = ScanEmail(emailData);
+                analysis.protocol = session.protocol;
+
+                session.buffer.erase(session.buffer.begin(),
+                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
+                session.emailsProcessed++;
+            }
+        } else if (session.protocol == EmailProtocol::IMAP) {
+            // IMAP FETCH response: look for BODY[] or RFC822 literal {size}\r\n
+            // Literal format: {<size>}\r\n followed by exactly <size> bytes
+            size_t literalPos = bufferStr.find('{');
+            while (literalPos != std::string::npos) {
+                size_t closePos = bufferStr.find('}', literalPos);
+                if (closePos == std::string::npos) break;
+
+                std::string sizeStr = bufferStr.substr(literalPos + 1, closePos - literalPos - 1);
+                // Validate numeric
+                bool isNumeric = !sizeStr.empty();
+                for (char c : sizeStr) {
+                    if (!std::isdigit(static_cast<unsigned char>(c))) {
+                        isNumeric = false;
+                        break;
+                    }
+                }
+
+                if (!isNumeric) {
+                    literalPos = bufferStr.find('{', closePos);
+                    continue;
+                }
+
+                size_t literalSize = 0;
+                try {
+                    literalSize = std::stoull(sizeStr);
+                } catch (...) {
+                    literalPos = bufferStr.find('{', closePos);
+                    continue;
+                }
+
+                // Cap literal size
+                if (literalSize > kMaxSingleAttachmentSize) {
+                    SS_LOG_WARN(L"Network",
+                        L"EmailScanner::ProcessSessionBuffer: IMAP literal too large (%zu), skipping",
+                        literalSize);
+                    literalPos = bufferStr.find('{', closePos);
+                    continue;
+                }
+
+                // Look for CRLF after }
+                size_t dataStart = closePos + 1;
+                if (dataStart + 1 < bufferStr.size() &&
+                    bufferStr[dataStart] == '\r' && bufferStr[dataStart + 1] == '\n') {
+                    dataStart += 2;
+                } else {
+                    break; // Incomplete
+                }
+
+                // Check if we have enough data
+                if (dataStart + literalSize <= bufferStr.size()) {
+                    std::span<const uint8_t> emailData(
+                        session.buffer.data() + dataStart, literalSize);
+
+                    auto analysis = ScanEmail(emailData);
+                    analysis.protocol = session.protocol;
+
+                    size_t consumed = dataStart + literalSize;
+                    session.buffer.erase(session.buffer.begin(),
+                                         session.buffer.begin() + static_cast<ptrdiff_t>(consumed));
+                    session.emailsProcessed++;
+                    break; // Process one email per call
+                } else {
+                    break; // Not enough data yet
+                }
+            }
+        } else {
+            // Unknown protocol — fallback to SMTP-style termination
+            size_t dataPos = bufferStr.find("\r\n.\r\n");
+            if (dataPos != std::string::npos) {
+                std::span<const uint8_t> emailData(session.buffer.data(), dataPos);
+
+                auto analysis = ScanEmail(emailData);
+                analysis.protocol = session.protocol;
+
+                session.buffer.erase(session.buffer.begin(),
+                                     session.buffer.begin() + static_cast<ptrdiff_t>(dataPos + 5));
+                session.emailsProcessed++;
+            }
         }
     }
 
@@ -1335,9 +1827,8 @@ private:
         try {
             const std::string contentType = analysis.header.contentType;
 
-            // Simplified MIME parsing
             if (contentType.find("multipart") != std::string::npos) {
-                ParseMultipartBody(bodyData, contentType, analysis);
+                ParseMultipartBody(bodyData, contentType, analysis, 0);
             } else if (contentType.find("text/plain") != std::string::npos) {
                 analysis.bodyText = std::string(
                     reinterpret_cast<const char*>(bodyData.data()),
@@ -1348,11 +1839,19 @@ private:
                     reinterpret_cast<const char*>(bodyData.data()),
                     bodyData.size()
                 );
-                // HTML exploit detection on non-multipart HTML body
                 auto htmlThreats = DetectHTMLExploits(analysis.bodyHtml);
                 for (auto& threat : htmlThreats) {
                     analysis.header.anomalies.push_back(std::move(threat));
                 }
+            } else if (contentType.find("application/") != std::string::npos ||
+                       contentType.find("image/") != std::string::npos) {
+                // Non-text single-part body — treat as implicit attachment
+                AttachmentInfo attachment;
+                attachment.contentType = contentType;
+                attachment.size        = bodyData.size();
+                attachment.data.assign(bodyData.begin(), bodyData.end());
+                attachment.disposition = ContentDisposition::ATTACHMENT;
+                analysis.attachments.push_back(std::move(attachment));
             }
 
         } catch (const std::exception& e) {
@@ -1362,42 +1861,70 @@ private:
 
     void ParseMultipartBody(std::span<const uint8_t> bodyData,
                            const std::string& contentType,
-                           EmailAnalysis& analysis) {
-        // Extract boundary
-        size_t boundaryPos = contentType.find("boundary=");
-        if (boundaryPos == std::string::npos) return;
+                           EmailAnalysis& analysis,
+                           size_t recursionDepth) {
+        if (recursionDepth >= kMaxMultipartNestingDepth) {
+            SS_LOG_WARN(L"Network",
+                L"EmailScanner::ParseMultipartBody: max nesting depth %zu reached, aborting",
+                kMaxMultipartNestingDepth);
+            analysis.header.anomalies.push_back(
+                "Excessive MIME nesting depth (possible evasion)");
+            return;
+        }
 
-        std::string boundary = contentType.substr(boundaryPos + 9);
-        // Remove quotes if present
-        if (!boundary.empty() && boundary.front() == '"') {
-            boundary = boundary.substr(1, boundary.find('"', 1) - 1);
+        // Extract boundary using robust parameter extraction
+        std::string boundary = ExtractMIMEParameter(contentType, "boundary");
+        if (boundary.empty()) {
+            SS_LOG_WARN(L"Network",
+                L"EmailScanner::ParseMultipartBody: missing boundary parameter");
+            return;
+        }
+
+        // Sanitize boundary — RFC 2046 says max 70 chars, no trailing spaces
+        if (boundary.size() > 70) {
+            boundary.resize(70);
         }
 
         const std::string boundaryDelim = "--" + boundary;
         std::string bodyStr(reinterpret_cast<const char*>(bodyData.data()), bodyData.size());
 
+        size_t partCount = 0;
         size_t pos = 0;
         while ((pos = bodyStr.find(boundaryDelim, pos)) != std::string::npos) {
             pos += boundaryDelim.length();
 
-            // Check for end boundary
-            if (pos + 2 < bodyStr.length() && bodyStr.substr(pos, 2) == "--") {
+            // Check for end boundary (--boundary--)
+            if (pos + 2 <= bodyStr.length() && bodyStr[pos] == '-' && bodyStr[pos + 1] == '-') {
                 break;
             }
+
+            // Skip past CRLF after boundary
+            if (pos < bodyStr.length() && bodyStr[pos] == '\r') ++pos;
+            if (pos < bodyStr.length() && bodyStr[pos] == '\n') ++pos;
 
             // Find next boundary
             size_t nextBoundary = bodyStr.find(boundaryDelim, pos);
             if (nextBoundary == std::string::npos) break;
 
-            // Extract part
+            // Guard against excessive part count
+            if (++partCount > kMaxMIMEPartCount) {
+                SS_LOG_WARN(L"Network",
+                    L"EmailScanner::ParseMultipartBody: exceeded max part count %zu",
+                    kMaxMIMEPartCount);
+                analysis.header.anomalies.push_back(
+                    "Excessive MIME part count (possible evasion or abuse)");
+                break;
+            }
+
             std::string part = bodyStr.substr(pos, nextBoundary - pos);
-            ParseMIMEPart(part, analysis);
+            ParseMIMEPart(part, analysis, recursionDepth);
 
             pos = nextBoundary;
         }
     }
 
-    void ParseMIMEPart(const std::string& part, EmailAnalysis& analysis) {
+    void ParseMIMEPart(const std::string& part, EmailAnalysis& analysis,
+                       size_t recursionDepth) {
         // Find headers/body separator
         size_t bodyPos = part.find("\r\n\r\n");
         if (bodyPos == std::string::npos) {
@@ -1408,75 +1935,178 @@ private:
             bodyPos += 4;
         }
 
-        std::string headers = part.substr(0, bodyPos);
+        std::string rawHeaders = part.substr(0, bodyPos);
         std::string body = part.substr(bodyPos);
 
-        // Parse Content-Type and Content-Disposition
+        // Unfold continuation lines (RFC 5322 §2.2.3)
+        std::string headers = UnfoldHeaders(rawHeaders);
+
+        // Parse headers with proper field extraction
         std::string contentType;
         std::string contentDisposition;
         std::string contentEncoding;
+        std::string contentId;
         std::string filename;
 
         std::istringstream stream(headers);
         std::string line;
         while (std::getline(stream, line)) {
-            if (line.find("Content-Type:") == 0) {
-                contentType = line.substr(13);
-            } else if (line.find("Content-Disposition:") == 0) {
-                contentDisposition = line.substr(20);
+            // Strip trailing CR
+            if (!line.empty() && line.back() == '\r') {
+                line.pop_back();
+            }
 
-                // Extract filename
-                size_t fnPos = contentDisposition.find("filename=");
-                if (fnPos != std::string::npos) {
-                    filename = contentDisposition.substr(fnPos + 9);
-                    size_t endPos = filename.find_first_of(";\r\n");
-                    if (endPos != std::string::npos) {
-                        filename = filename.substr(0, endPos);
-                    }
-                    // Remove quotes
-                    if (!filename.empty() && filename.front() == '"') {
-                        filename = filename.substr(1, filename.length() - 2);
-                    }
+            if (line.empty()) continue;
+
+            // Case-insensitive header name matching
+            std::string lowerLine = line;
+            for (auto& c : lowerLine) {
+                c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+            }
+
+            if (lowerLine.starts_with("content-type:")) {
+                contentType = line.substr(13);
+                // Trim leading whitespace
+                size_t start = contentType.find_first_not_of(" \t");
+                if (start != std::string::npos && start > 0) {
+                    contentType = contentType.substr(start);
                 }
-            } else if (line.find("Content-Transfer-Encoding:") == 0) {
+            } else if (lowerLine.starts_with("content-disposition:")) {
+                contentDisposition = line.substr(20);
+                size_t start = contentDisposition.find_first_not_of(" \t");
+                if (start != std::string::npos && start > 0) {
+                    contentDisposition = contentDisposition.substr(start);
+                }
+            } else if (lowerLine.starts_with("content-transfer-encoding:")) {
                 contentEncoding = line.substr(26);
                 contentEncoding.erase(0, contentEncoding.find_first_not_of(" \t"));
+                // Strip trailing whitespace/semicolons
+                while (!contentEncoding.empty() &&
+                       (contentEncoding.back() == ' ' || contentEncoding.back() == '\t' ||
+                        contentEncoding.back() == ';' || contentEncoding.back() == '\r')) {
+                    contentEncoding.pop_back();
+                }
+            } else if (lowerLine.starts_with("content-id:")) {
+                contentId = line.substr(11);
+                size_t start = contentId.find_first_not_of(" \t");
+                if (start != std::string::npos && start > 0) {
+                    contentId = contentId.substr(start);
+                }
+                // Strip angle brackets: <id> -> id
+                if (!contentId.empty() && contentId.front() == '<') {
+                    contentId = contentId.substr(1);
+                    size_t close = contentId.find('>');
+                    if (close != std::string::npos) {
+                        contentId = contentId.substr(0, close);
+                    }
+                }
             }
+        }
+
+        // Extract filename from Content-Disposition and Content-Type
+        // Priority: Content-Disposition filename* > filename > Content-Type name* > name
+        filename = ExtractMIMEParameter(contentDisposition, "filename");
+        if (filename.empty()) {
+            filename = ExtractMIMEParameter(contentType, "name");
+        }
+
+        // Decode RFC 2047 encoded-words in filename
+        if (filename.find("=?") != std::string::npos) {
+            filename = DecodeRFC2047EncodedWord(filename);
+        }
+
+        // Detect nested multipart — recurse
+        std::string lowerCT = contentType;
+        for (auto& c : lowerCT) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+
+        if (lowerCT.find("multipart/") != std::string::npos) {
+            auto bodySpan = std::span<const uint8_t>(
+                reinterpret_cast<const uint8_t*>(body.data()), body.size());
+            ParseMultipartBody(bodySpan, contentType, analysis, recursionDepth + 1);
+            return;
         }
 
         // Decode body based on encoding
         std::vector<uint8_t> decodedBody;
-        if (contentEncoding.find("base64") != std::string::npos) {
+        std::string lowerEncoding = contentEncoding;
+        for (auto& c : lowerEncoding) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+
+        if (lowerEncoding.find("base64") != std::string::npos) {
             decodedBody = Base64Decode(body);
-        } else if (contentEncoding.find("quoted-printable") != std::string::npos) {
+        } else if (lowerEncoding.find("quoted-printable") != std::string::npos) {
             std::string decoded = QuotedPrintableDecode(body);
             decodedBody.assign(decoded.begin(), decoded.end());
         } else {
+            // 7bit, 8bit, or binary — pass through
             decodedBody.assign(body.begin(), body.end());
         }
 
-        // Determine if attachment
-        if (!filename.empty() || contentDisposition.find("attachment") != std::string::npos) {
-            // This is an attachment
-            AttachmentInfo attachment;
-            attachment.filename = filename;
-            attachment.contentType = contentType;
-            attachment.size = decodedBody.size();
-            attachment.data = std::move(decodedBody);
+        // Cap decoded size to prevent memory exhaustion
+        if (decodedBody.size() > kMaxSingleAttachmentSize) {
+            SS_LOG_WARN(L"Network",
+                L"EmailScanner::ParseMIMEPart: decoded body exceeds %zu bytes, truncating",
+                kMaxSingleAttachmentSize);
+            decodedBody.resize(kMaxSingleAttachmentSize);
+        }
 
-            if (contentDisposition.find("inline") != std::string::npos) {
+        // Determine disposition: attachment, inline, or body text
+        bool isAttachment = !filename.empty() ||
+                            contentDisposition.find("attachment") != std::string::npos;
+        bool isInline = contentDisposition.find("inline") != std::string::npos;
+
+        // Content-Type mismatch detection: filename says .exe but Content-Type says image/jpeg
+        if (!filename.empty() && IsDangerousExtension(filename)) {
+            if (lowerCT.find("image/") != std::string::npos ||
+                lowerCT.find("text/") != std::string::npos ||
+                lowerCT.find("audio/") != std::string::npos) {
+                analysis.header.anomalies.push_back(
+                    "Content-Type/extension mismatch: " + filename +
+                    " declared as " + contentType);
+            }
+        }
+
+        if (isAttachment || (!contentId.empty() && isInline)) {
+            AttachmentInfo attachment;
+            attachment.filename    = filename;
+            attachment.contentType = contentType;
+            attachment.size        = decodedBody.size();
+            attachment.data        = std::move(decodedBody);
+
+            if (isInline) {
                 attachment.disposition = ContentDisposition::INLINE;
             } else {
                 attachment.disposition = ContentDisposition::ATTACHMENT;
             }
 
+            // Store Content-ID for inline reference tracking
+            if (!contentId.empty()) {
+                attachment.contentId = contentId;
+            }
+
             analysis.attachments.push_back(std::move(attachment));
         } else {
-            // This is body content
-            if (contentType.find("text/plain") != std::string::npos) {
+            // Body content
+            if (lowerCT.find("text/plain") != std::string::npos) {
                 analysis.bodyText = std::string(decodedBody.begin(), decodedBody.end());
-            } else if (contentType.find("text/html") != std::string::npos) {
+            } else if (lowerCT.find("text/html") != std::string::npos) {
                 analysis.bodyHtml = std::string(decodedBody.begin(), decodedBody.end());
+                auto htmlThreats = DetectHTMLExploits(analysis.bodyHtml);
+                for (auto& threat : htmlThreats) {
+                    analysis.header.anomalies.push_back(std::move(threat));
+                }
+            } else if (!lowerCT.empty() && lowerCT.find("text/") == std::string::npos) {
+                // Non-text part without disposition — treat as inline attachment
+                AttachmentInfo attachment;
+                attachment.filename    = filename;
+                attachment.contentType = contentType;
+                attachment.size        = decodedBody.size();
+                attachment.data        = std::move(decodedBody);
+                attachment.disposition = ContentDisposition::INLINE;
+                analysis.attachments.push_back(std::move(attachment));
             }
         }
     }
