@@ -24,6 +24,11 @@
 #include "../Utils/HashUtils.hpp"
 #include "../Utils/Logger.hpp"
 
+// Performance monitors for telemetry collection
+#include "../Performance/CPUMonitor.hpp"
+#include "../Performance/DiskMonitor.hpp"
+#include "../Performance/NetworkPerformanceMonitor.hpp"
+
 #include <algorithm>
 #include <deque>
 #include <thread>
@@ -530,29 +535,35 @@ void TelemetryCollectorImpl::HealthCollectorLoop() {
         // Collect health metrics
         HealthEventData health;
 
-        // CPU usage via performance counter
-        FILETIME idleTime{}, kernelTime{}, userTime{};
-        if (GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
-            static FILETIME prevIdle{}, prevKernel{}, prevUser{};
-            static bool s_hasPrev = false;
-            const auto toULL = [](FILETIME ft) -> uint64_t {
-                return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
-            };
-            if (s_hasPrev) {
-                const uint64_t idle = toULL(idleTime) - toULL(prevIdle);
-                const uint64_t kernel = toULL(kernelTime) - toULL(prevKernel);
-                const uint64_t user = toULL(userTime) - toULL(prevUser);
-                const uint64_t total = kernel + user;
-                if (total > 0) {
-                    health.cpuUsage = 100.0 * (1.0 - static_cast<double>(idle) / static_cast<double>(total));
-                    if (health.cpuUsage < 0.0) health.cpuUsage = 0.0;
-                    if (health.cpuUsage > 100.0) health.cpuUsage = 100.0;
+        // CPU usage — prefer CPUMonitor singleton, fallback to direct query
+        if (Performance::CPUMonitor::HasInstance() &&
+            Performance::CPUMonitor::Instance().IsMonitoring()) {
+            auto cpuStats = Performance::CPUMonitor::Instance().GetSystemStats();
+            health.cpuUsage = std::clamp(cpuStats.totalUsagePercent, 0.0, 100.0);
+        } else {
+            // Fallback: direct GetSystemTimes when CPUMonitor is not available
+            FILETIME idleTime{}, kernelTime{}, userTime{};
+            if (GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
+                static FILETIME prevIdle{}, prevKernel{}, prevUser{};
+                static bool s_hasPrev = false;
+                const auto toULL = [](FILETIME ft) -> uint64_t {
+                    return (static_cast<uint64_t>(ft.dwHighDateTime) << 32) | ft.dwLowDateTime;
+                };
+                if (s_hasPrev) {
+                    const uint64_t idle = toULL(idleTime) - toULL(prevIdle);
+                    const uint64_t kernel = toULL(kernelTime) - toULL(prevKernel);
+                    const uint64_t user = toULL(userTime) - toULL(prevUser);
+                    const uint64_t total = kernel + user;
+                    if (total > 0) {
+                        health.cpuUsage = 100.0 * (1.0 - static_cast<double>(idle) / static_cast<double>(total));
+                        health.cpuUsage = std::clamp(health.cpuUsage, 0.0, 100.0);
+                    }
                 }
+                prevIdle = idleTime;
+                prevKernel = kernelTime;
+                prevUser = userTime;
+                s_hasPrev = true;
             }
-            prevIdle = idleTime;
-            prevKernel = kernelTime;
-            prevUser = userTime;
-            s_hasPrev = true;
         }
 
         // Memory usage
@@ -562,6 +573,15 @@ void TelemetryCollectorImpl::HealthCollectorLoop() {
                                   reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc),
                                   sizeof(pmc))) {
             health.memoryUsageMB = pmc.WorkingSetSize / (1024 * 1024);
+        }
+
+        // Disk I/O throughput from DiskMonitor
+        if (Performance::DiskMonitor::Instance().IsInitialized()) {
+            auto diskStats = Performance::DiskMonitor::Instance().GetGlobalStats();
+            // Report combined write throughput in MB (write-heavy = ransomware indicator)
+            health.diskUsageMB = static_cast<uint64_t>(
+                (diskStats.totalWriteBytesPerSec + diskStats.totalReadBytesPerSec)
+                / (1024.0 * 1024.0));
         }
 
         // Uptime

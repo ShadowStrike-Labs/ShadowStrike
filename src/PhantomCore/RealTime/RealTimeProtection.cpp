@@ -71,6 +71,11 @@
 // ============================================================================
 // EXPLOIT DETECTOR INCLUDES
 // ============================================================================
+// Performance monitors — CPU/Disk/Network telemetry
+#include "../Performance/CPUMonitor.hpp"
+#include "../Performance/DiskMonitor.hpp"
+#include "../Performance/NetworkPerformanceMonitor.hpp"
+
 #include "../Exploits/HeapSprayDetector.hpp"
 #include "../Exploits/JITSprayDetector.hpp"
 #include "../Exploits/BufferOverflowProtection.hpp"
@@ -672,6 +677,51 @@ public:
                     L"PhantomCortex init unknown exception — ML detection disabled");
             }
 
+            // 10. Initialize Performance Monitors for telemetry and scan throttling
+            try {
+                Performance::CPUMonitorConfig cpuCfg;
+                cpuCfg.samplingIntervalMs = 1000;
+                cpuCfg.highUsageThreshold = 90.0;
+                cpuCfg.selfUsageAlertThreshold = 10.0;
+                if (Performance::CPUMonitor::Instance().Initialize(cpuCfg)) {
+                    Performance::CPUMonitor::Instance().StartMonitoring();
+                    SS_LOG_INFO(L"RealTimeProtection", L"CPUMonitor initialized and monitoring");
+                } else {
+                    SS_LOG_WARN(L"RealTimeProtection", L"CPUMonitor initialization failed");
+                }
+            } catch (...) {
+                SS_LOG_WARN(L"RealTimeProtection", L"CPUMonitor init exception");
+            }
+
+            try {
+                Performance::DiskMonitorConfig diskCfg;
+                diskCfg.pollingIntervalMs = 1000;
+                diskCfg.enableProcessMonitoring = true;
+                diskCfg.enableSelfMonitoring = true;
+                if (Performance::DiskMonitor::Instance().Initialize(diskCfg)) {
+                    SS_LOG_INFO(L"RealTimeProtection", L"DiskMonitor initialized");
+                } else {
+                    SS_LOG_WARN(L"RealTimeProtection", L"DiskMonitor initialization failed");
+                }
+            } catch (...) {
+                SS_LOG_WARN(L"RealTimeProtection", L"DiskMonitor init exception");
+            }
+
+            try {
+                Performance::NetworkMonitorConfig netCfg;
+                netCfg.pollingIntervalMs = 1000;
+                netCfg.detectBeaconing = true;
+                netCfg.detectExfiltration = true;
+                netCfg.detectConnectionFlood = true;
+                if (Performance::NetworkPerformanceMonitor::Instance().Initialize(netCfg)) {
+                    SS_LOG_INFO(L"RealTimeProtection", L"NetworkPerformanceMonitor initialized");
+                } else {
+                    SS_LOG_WARN(L"RealTimeProtection", L"NetworkPerformanceMonitor initialization failed");
+                }
+            } catch (...) {
+                SS_LOG_WARN(L"RealTimeProtection", L"NetworkPerformanceMonitor init exception");
+            }
+
             SetState(ProtectionState::ACTIVE);
             Utils::Logger::Info("RealTimeProtection: Started successfully");
             return true;
@@ -775,7 +825,13 @@ public:
         m_protectionStatus.isProtected = false;
         m_protectionStatus.lastUpdate = Now();
 
-        // 6. Shutdown Anti-Evasion Detectors
+        // 6. Shutdown Performance Monitors
+        try { Performance::CPUMonitor::Instance().StopMonitoring(); } catch (...) {}
+        try { Performance::CPUMonitor::Instance().Shutdown(); } catch (...) {}
+        try { Performance::DiskMonitor::Instance().Shutdown(); } catch (...) {}
+        try { Performance::NetworkPerformanceMonitor::Instance().Shutdown(); } catch (...) {}
+
+        // 7. Shutdown Anti-Evasion Detectors
         ShutdownAntiEvasionDetectors();
 
         SetState(ProtectionState::UNINITIALIZED);
@@ -2005,6 +2061,18 @@ public:
         if (IsExcluded(filePath, req.ProcessId)) {
             m_stats.excludedByPath++;
             return Communication::KernelVerdict::Allow;
+        }
+
+        // 1.5. CPU-based scan throttling — defer low-priority scans under heavy load
+        if (m_config.throttleOnHighCPU && Performance::CPUMonitor::HasInstance()) {
+            if (Performance::CPUMonitor::Instance().IsSystemUnderLoad(90.0)) {
+                // Under extreme load, only allow high-priority scans (Priority > 0).
+                // Low-priority background I/O scans are deferred to reduce system impact.
+                if (req.Priority == 0) {
+                    m_stats.excludedByPath++;
+                    return Communication::KernelVerdict::Allow;
+                }
+            }
         }
 
         // 2. Check Verdict Cache
@@ -3909,8 +3977,13 @@ public:
     }
 
     void UpdatePerformanceMetrics() {
-        // Measure system-wide CPU usage via GetSystemTimes delta
-        {
+        // Delegate CPU measurement to CPUMonitor singleton (avoids duplicate GetSystemTimes)
+        if (Performance::CPUMonitor::HasInstance()) {
+            auto cpuStats = Performance::CPUMonitor::Instance().GetSystemStats();
+            m_performanceMetrics.cpuUsagePercent =
+                static_cast<uint32_t>(std::clamp(cpuStats.totalUsagePercent, 0.0, 100.0));
+        } else {
+            // Fallback: direct GetSystemTimes when CPUMonitor is not yet initialized
             FILETIME idleTimeFt{}, kernelTimeFt{}, userTimeFt{};
             if (::GetSystemTimes(&idleTimeFt, &kernelTimeFt, &userTimeFt)) {
                 ULARGE_INTEGER idle, kernel, user;
@@ -3925,23 +3998,32 @@ public:
                     uint64_t idleDelta   = idle.QuadPart   - m_prevIdleTime.QuadPart;
                     uint64_t kernelDelta = kernel.QuadPart - m_prevKernelTime.QuadPart;
                     uint64_t userDelta   = user.QuadPart   - m_prevUserTime.QuadPart;
-
-                    // kernel time includes idle time on Windows
-                    uint64_t totalDelta = kernelDelta + userDelta;
+                    uint64_t totalDelta  = kernelDelta + userDelta;
                     if (totalDelta > 0) {
                         uint64_t busyDelta = totalDelta - idleDelta;
                         uint32_t cpuPercent = static_cast<uint32_t>(
                             (busyDelta * 100) / totalDelta);
-                        // Clamp to 0-100 (should not exceed but safety)
                         m_performanceMetrics.cpuUsagePercent =
                             static_cast<uint32_t>(std::min(cpuPercent, 100u));
                     }
                 }
-
                 m_prevIdleTime   = idle;
                 m_prevKernelTime = kernel;
                 m_prevUserTime   = user;
                 m_cpuTimesInitialized = true;
+            }
+        }
+
+        // Collect disk I/O metrics from DiskMonitor
+        if (Performance::DiskMonitor::Instance().IsInitialized()) {
+            auto diskStats = Performance::DiskMonitor::Instance().GetGlobalStats();
+            // EDR self-monitoring: track our own I/O footprint
+            auto selfIo = Performance::DiskMonitor::Instance().GetSelfIoUsage();
+            if (selfIo.has_value()) {
+                SS_LOG_DEBUG(L"RealTimeProtection",
+                    L"Self I/O: read=%.1f KB/s write=%.1f KB/s",
+                    selfIo->readBytesPerSec / 1024.0,
+                    selfIo->writeBytesPerSec / 1024.0);
             }
         }
 
