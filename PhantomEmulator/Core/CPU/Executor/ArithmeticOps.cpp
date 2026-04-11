@@ -785,6 +785,65 @@ ErrorCode CPU::ExecuteALU(const DecodedInstruction& inst, VirtualMemory& mem) no
         return WriteOperand(inst.Op(0), inst, mem, sum);
     }
 
+    // ========================================================================
+    // ThreeByte38 map (0F 38 xx) — ADX Extension
+    // ========================================================================
+    // ADCX and ADOX perform multi-precision addition using separate carry chains.
+    // This is critical for cryptographic malware that uses multi-precision
+    // arithmetic (e.g., RSA, ECC implementations).
+    //
+    // ADCX: 66 0F 38 F6 /r — Add with CF (uses CF for carry in/out)
+    // ADOX: F3 0F 38 F6 /r — Add with OF (uses OF for carry in/out)
+    //
+    // Both only affect their respective flag (CF or OF), leaving all other
+    // flags unchanged. This is their key feature: two independent carry chains.
+
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38 && op == 0xF6) {
+        bool isADCX = inst.prefixes.hasOpSizeOverride && !inst.prefixes.hasRep;
+        bool isADOX = inst.prefixes.hasRep && !inst.prefixes.hasOpSizeOverride;
+
+        if (isADCX || isADOX) {
+            uint64_t dst = 0, src = 0;
+            auto err = ReadOperand(inst.Op(0), inst, mem, dst);
+            if (err != ErrorCode::Success) return err;
+            err = ReadOperand(inst.Op(1), inst, mem, src);
+            if (err != ErrorCode::Success) return err;
+
+            uint8_t carryIn = isADCX ? (m_state.eflags.CF() ? 1 : 0)
+                                     : (m_state.eflags.OF() ? 1 : 0);
+
+            bool is64 = (size == OperandSize::Size64);
+            uint64_t result = 0;
+            uint8_t carryOut = 0;
+
+            if (is64) {
+                // 64-bit addition with carry
+                unsigned __int64 lo = static_cast<unsigned __int64>(dst)
+                                    + static_cast<unsigned __int64>(src);
+                carryOut = (lo < dst) ? 1 : 0;
+                result = lo + carryIn;
+                if (result < lo) carryOut = 1;
+            } else {
+                // 32-bit addition with carry (zero-extends result to 64 bits)
+                uint64_t sum = static_cast<uint64_t>(static_cast<uint32_t>(dst))
+                             + static_cast<uint64_t>(static_cast<uint32_t>(src))
+                             + static_cast<uint64_t>(carryIn);
+                carryOut = (sum > 0xFFFFFFFFULL) ? 1 : 0;
+                result = sum & 0xFFFFFFFF;
+            }
+
+            // ADCX: only CF is updated. ADOX: only OF is updated.
+            // All other flags are preserved — this is the key ADX feature.
+            if (isADCX) {
+                m_state.eflags.SetCF(carryOut != 0);
+            } else {
+                m_state.eflags.SetOF(carryOut != 0);
+            }
+
+            return WriteOperand(inst.Op(0), inst, mem, result);
+        }
+    }
+
     return ErrorCode::UnimplementedOpcode;
 }
 

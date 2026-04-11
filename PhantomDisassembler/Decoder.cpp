@@ -85,6 +85,7 @@ void Decoder::DecodeContext::Reset() noexcept {
     hasSegOverride = false;  segOverride = Register::NONE;
     hasOpSizeOverride = false;  hasAddrSizeOverride = false;
     hasREX = false;  rexW = rexR = rexX = rexB = false;
+    hasREX2 = false;  rex2R4 = rex2X4 = rex2B4 = false;
     hasVEX = false;  vexL = 0;  vexPP = 0;  vexMMMMM = 1;  vexVVVV = 0;  vexW = false;
     hasEVEX = false;  evexZ = 0;  evexLL = 0;  evexB = 0;
     evexAAA = 0;  evexV2 = 0;  evexR2 = 0;
@@ -195,6 +196,27 @@ Status Decoder::DecodeFull(
     // Phase 1: Legacy prefixes + REX
     Status st = DecodePrefixes(ctx);
     if (st != Status::Success) return st;
+
+    // Phase 1a: REX2 (APX, 0xD5 prefix — future CPUs)
+    if (ctx.offset < ctx.bufferLength && ctx.buffer[ctx.offset] == 0xD5) {
+        if (ctx.offset + 1 >= ctx.bufferLength) return Status::TruncatedInput;
+        ctx.hasREX2 = true;
+        ctx.hasREX  = true;    // REX2 implies REX behavior
+        uint8_t payload = ctx.buffer[ctx.offset + 1];
+        ctx.rexW   = (payload >> 7) & 1;
+        ctx.rexR   = (payload >> 6) & 1;  // R3 (inverted in REX2)
+        ctx.rexX   = (payload >> 5) & 1;  // X3
+        ctx.rexB   = (payload >> 4) & 1;  // B3
+        ctx.rex2R4 = (payload >> 3) & 1;  // R4 (high-16 reg extension)
+        ctx.rex2X4 = (payload >> 2) & 1;  // X4
+        ctx.rex2B4 = (payload >> 1) & 1;  // B4
+        // M0 bit (bit 0): 0 = legacy map, 1 = 0F map
+        if (payload & 1) ctx.opcodeMap = 1;
+        ctx.offset += 2;
+        if (ctx.offset >= ctx.bufferLength) return Status::TruncatedInput;
+        ctx.opcode = ctx.buffer[ctx.offset++];
+        goto vex_done;
+    }
 
     // Phase 1b: VEX
     if (ctx.offset < ctx.bufferLength) {
@@ -326,6 +348,7 @@ vex_done:
     if (ctx.hasOpSizeOverride)   instruction.attributes |= ATTRIB_HAS_OPERAND_SIZE;
     if (ctx.hasAddrSizeOverride) instruction.attributes |= ATTRIB_HAS_ADDRESS_SIZE;
     if (ctx.hasREX)              instruction.attributes |= ATTRIB_HAS_REX;
+    if (ctx.hasREX2)             instruction.attributes |= ATTRIB_HAS_REX2;
     if (ctx.hasVEX)              instruction.attributes |= ATTRIB_HAS_VEX;
     if (ctx.hasEVEX)             instruction.attributes |= ATTRIB_HAS_EVEX;
     if (ctx.hasModRM)            instruction.attributes |= ATTRIB_HAS_MODRM;
@@ -1291,6 +1314,8 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0x01: {
             uint8_t mod = ModRM_Mod(ctx.modrm);
             if (mod != kMod_Register) {
+                // CET: RSTORSSP — F3 0F 01 /5 (memory form)
+                if (ctx.hasRep && ext == 5) return Mnemonic::RSTORSSP;
                 static constexpr Mnemonic grp7mem[8] = {
                     Mnemonic::SGDT, Mnemonic::SIDT, Mnemonic::LGDT, Mnemonic::LIDT,
                     Mnemonic::SMSW, Mnemonic::UNKNOWN, Mnemonic::LMSW, Mnemonic::INVLPG,
@@ -1314,6 +1339,14 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
                 if (rm == 1) return Mnemonic::XSETBV;
             }
             if (ext == 4) return Mnemonic::SMSW;
+            if (ext == 5) {
+                // CET: F3 0F 01 E8 → SETSSBSY (ext=5, rm=0)
+                // CET: F3 0F 01 EA → SAVEPREVSSP (ext=5, rm=2)
+                if (ctx.hasRep && rm == 0) return Mnemonic::SETSSBSY;
+                if (ctx.hasRep && rm == 2) return Mnemonic::SAVEPREVSSP;
+                // SERIALIZE: NP 0F 01 E8 (ext=5, rm=0) — no F3 prefix
+                if (!ctx.hasRep && rm == 0) return Mnemonic::SERIALIZE;
+            }
             if (ext == 6) return Mnemonic::LMSW;
             if (ext == 7) {
                 if (rm == 0) return Mnemonic::SWAPGS;
@@ -1377,13 +1410,29 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
             case 1: return Mnemonic::PREFETCHT0;
             case 2: return Mnemonic::PREFETCHT1;
             case 3: return Mnemonic::PREFETCHT2;
+            case 6: return Mnemonic::PREFETCHIT1;
+            case 7: return Mnemonic::PREFETCHIT0;
             default: return Mnemonic::NOP;
             }
         }
-        if (op >= 0x19 && op <= 0x1E) return Mnemonic::NOP;
+        if (op >= 0x19 && op <= 0x1D) {
+            // CLDEMOTE: NP 0F 1C /0
+            if (op == 0x1C && ext == 0) return Mnemonic::CLDEMOTE;
+            return Mnemonic::NOP;
+        }
+        // CET instructions on 0F 1E
+        if (op == 0x1E) {
+            if (ctx.hasRep) {
+                // F3 0F 1E — CET shadow stack / IBT
+                if (ctx.modrm == 0xFA) return Mnemonic::ENDBR64;
+                if (ctx.modrm == 0xFB) return Mnemonic::ENDBR32;
+                if (ext == 1 && (ctx.modrm >> 6) == 3) {
+                    return ctx.rexW ? Mnemonic::RDSSPQ : Mnemonic::RDSSPD;
+                }
+            }
+            return Mnemonic::NOP;
+        }
         if (op == 0x1F) {
-            if (ext == 0 && ctx.modrm == 0xFA) return Mnemonic::ENDBR64;
-            if (ext == 0 && ctx.modrm == 0xFB) return Mnemonic::ENDBR32;
             return Mnemonic::NOP;
         }
 
@@ -1585,15 +1634,30 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0xAD: return Mnemonic::SHRD;
         case 0xAE: {
             // Group 15: FXSAVE/FXRSTOR/LDMXCSR/STMXCSR/XSAVE/XRSTOR/CLFLUSH/LFENCE/MFENCE/SFENCE
+            // + CET: INCSSPD/Q (F3 0F AE /5, mod=3), CLRSSBSY (F3 0F AE /6, mod!=3)
             uint8_t mod = ModRM_Mod(ctx.modrm);
             if (mod == kMod_Register) {
+                // CET: INCSSPD/Q — F3 0F AE /5 (mod=3, register form)
+                if (ext == 5 && ctx.hasRep) {
+                    return ctx.rexW ? Mnemonic::INCSSPQ : Mnemonic::INCSSPD;
+                }
+                // Prefix-differentiated register forms
+                if (ext == 6) {
+                    if (ctx.hasRep) return Mnemonic::UMONITOR;      // F3 0F AE /6
+                    if (ctx.hasRepNE) return Mnemonic::UMWAIT;      // F2 0F AE /6
+                    if (ctx.hasOpSizeOverride) return Mnemonic::TPAUSE; // 66 0F AE /6
+                    return Mnemonic::MFENCE;
+                }
                 switch (ext) {
                 case 5: return Mnemonic::LFENCE;
-                case 6: return Mnemonic::MFENCE;
                 case 7: return Mnemonic::SFENCE;
                 default: return Mnemonic::UNKNOWN;
                 }
             }
+            // Memory forms
+            // CET: CLRSSBSY — F3 0F AE /6 (mod!=3, memory form)
+            if (ext == 6 && ctx.hasRep) return Mnemonic::CLRSSBSY;
+            if (ext == 6 && ctx.hasOpSizeOverride) return Mnemonic::CLWB; // 66 0F AE /6
             switch (ext) {
             case 0: return Mnemonic::FXSAVE;
             case 1: return Mnemonic::FXRSTOR;
@@ -1783,9 +1847,33 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0xF1:
             if (ctx.hasRepNE) return Mnemonic::CRC32_INST;
             return Mnemonic::MOVBE;
+        case 0xF5:
+            // CET: WRUSSD (66 0F 38 F5) / WRUSSQ (66 REX.W 0F 38 F5)
+            if (ctx.hasOpSizeOverride) return ctx.rexW ? Mnemonic::WRUSSQ : Mnemonic::WRUSSD;
+            return Mnemonic::UNKNOWN;
         case 0xF6:
             if (ctx.hasOpSizeOverride) return Mnemonic::ADCX;
             if (ctx.hasRep) return Mnemonic::ADOX;
+            // CET: WRSSD (NP 0F 38 F6) / WRSSQ (NP REX.W 0F 38 F6)
+            return ctx.rexW ? Mnemonic::WRSSQ : Mnemonic::WRSSD;
+        // SHA-NI (no prefix required for legacy encode)
+        case 0xC8: return Mnemonic::SHA1NEXTE;
+        case 0xC9: return Mnemonic::SHA1MSG1;
+        case 0xCA: return Mnemonic::SHA1MSG2;
+        case 0xCB: return Mnemonic::SHA256RNDS2;
+        case 0xCC: return Mnemonic::SHA256MSG1;
+        case 0xCD: return Mnemonic::SHA256MSG2;
+        // GFNI legacy (66 prefix, map 2)
+        case 0xCF:
+            if (ctx.hasOpSizeOverride) return Mnemonic::GF2P8MULB;
+            return Mnemonic::UNKNOWN;
+        // MOVDIRI: NP 0F 38 F9
+        case 0xF9: return Mnemonic::MOVDIRI;
+        // ENQCMD/ENQCMDS/MOVDIR64B: 0F 38 F8 with prefix
+        case 0xF8:
+            if (ctx.hasRep) return Mnemonic::ENQCMD;              // F3 0F 38 F8
+            if (ctx.hasRepNE) return Mnemonic::ENQCMDS;           // F2 0F 38 F8
+            if (ctx.hasOpSizeOverride) return Mnemonic::MOVDIR64B; // 66 0F 38 F8
             return Mnemonic::UNKNOWN;
         default: return Mnemonic::UNKNOWN;
         }
@@ -1819,6 +1907,15 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0x61: return Mnemonic::PCMPESTRI;
         case 0x62: return Mnemonic::PCMPISTRM;
         case 0x63: return Mnemonic::PCMPISTRI;
+        // SHA-NI (map 3, NP)
+        case 0xCC: return Mnemonic::SHA1RNDS4;
+        // GFNI affine legacy (66 prefix, map 3, with imm8)
+        case 0xCE:
+            if (ctx.hasOpSizeOverride) return Mnemonic::GF2P8AFFINEQB;
+            return Mnemonic::UNKNOWN;
+        case 0xCF:
+            if (ctx.hasOpSizeOverride) return Mnemonic::GF2P8AFFINEINVQB;
+            return Mnemonic::UNKNOWN;
         default: return Mnemonic::UNKNOWN;
         }
     }
@@ -2211,6 +2308,30 @@ Mnemonic Decoder::ResolveVEXMnemonic(const DecodeContext& ctx) const noexcept {
 
     // ---- VEX Map 2 (0F38) ----
     if (map == 2) {
+
+        // AMX tile instructions (VEX.0F38, various pp)
+        // These must be checked before BMI since they share the map.
+        if (op == 0x49) {
+            if (pp == 0 && ctx.modrm == 0xC0) return Mnemonic::TILERELEASE;
+            if (pp == 0 && (ctx.modrm >> 6) != 3) return Mnemonic::LDTILECFG;
+            if (pp == 1 && (ctx.modrm >> 6) != 3) return Mnemonic::STTILECFG;
+            if (pp == 3 && (ctx.modrm >> 6) == 3) return Mnemonic::TILEZERO;
+        }
+        if (op == 0x4B) {
+            if (pp == 3) return Mnemonic::TILELOADD;
+            if (pp == 2) return Mnemonic::TILESTORED;
+        }
+        if (op == 0x5E && !ctx.vexW) {
+            if (pp == 3) return Mnemonic::TDPBSSD;
+            if (pp == 2) return Mnemonic::TDPBSUD;
+            if (pp == 1) return Mnemonic::TDPBUSD;
+            if (pp == 0) return Mnemonic::TDPBUUD;
+        }
+        if (op == 0x5C && !ctx.vexW) {
+            if (pp == 2) return Mnemonic::TDPBF16PS;
+            if (pp == 3) return Mnemonic::TDPFP16PS;
+        }
+
         // BMI1/BMI2 — VEX-only, distinguished by pp and vexW
         if (pp == 0) { // NP
             switch (op) {
@@ -2348,6 +2469,47 @@ Mnemonic Decoder::ResolveVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0xDE: return Mnemonic::VAESDEC;
             case 0xDF: return Mnemonic::VAESDECLAST;
             case 0xDB: return Mnemonic::VAESIMC;
+            // GFNI (66 prefix, VEX map 2)
+            case 0xCF: return Mnemonic::VGF2P8MULB;
+            // CMPCCXADD (66 prefix, VEX map 2, opcodes E0-EF)
+            case 0xE0: case 0xE1: case 0xE2: case 0xE3:
+            case 0xE4: case 0xE5: case 0xE6: case 0xE7:
+            case 0xE8: case 0xE9: case 0xEA: case 0xEB:
+            case 0xEC: case 0xED: case 0xEE: case 0xEF:
+                return Mnemonic::CMPccXADD;
+            // SM3MSG2: VEX.128.66.0F38.W0 DA
+            case 0xDA: return Mnemonic::VSM3MSG2;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // F2 prefix (pp=3) VEX map 2 instructions
+        if (pp == 3) {
+            switch (op) {
+            // SHA-512 (VEX.256.F2.0F38.W0)
+            case 0xCB: return Mnemonic::SHA512RNDS2;
+            case 0xCC: return Mnemonic::SHA512MSG1;
+            case 0xCD: return Mnemonic::SHA512MSG2;
+            // SM4RNDS4: VEX.128.F2.0F38.W0 DA
+            case 0xDA: return Mnemonic::VSM4RNDS4;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // F3 prefix (pp=2) VEX map 2 instructions
+        if (pp == 2) {
+            switch (op) {
+            // SM4KEY4: VEX.128.F3.0F38.W0 DA
+            case 0xDA: return Mnemonic::VSM4KEY4;
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // No prefix (pp=0) VEX map 2 instructions
+        if (pp == 0) {
+            switch (op) {
+            // SM3MSG1: VEX.128.NP.0F38.W0 DA
+            case 0xDA: return Mnemonic::VSM3MSG1;
             default: return Mnemonic::UNKNOWN;
             }
         }
@@ -2401,6 +2563,11 @@ Mnemonic Decoder::ResolveVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0x62: return Mnemonic::VPCMPISTRM;
             case 0x63: return Mnemonic::VPCMPISTRI;
             case 0xDF: return Mnemonic::VAESKEYGENASSIST;
+            // GFNI affine (66 prefix, VEX map 3, with imm8)
+            case 0xCE: return Mnemonic::VGF2P8AFFINEQB;
+            case 0xCF: return Mnemonic::VGF2P8AFFINEINVQB;
+            // SM3RNDS2: VEX.128.66.0F3A.W0 DE
+            case 0xDE: return Mnemonic::VSM3RNDS2;
             default: return Mnemonic::UNKNOWN;
             }
         }
@@ -2586,6 +2753,29 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
             return ctx.vexW ? Mnemonic::VMOVDQU16 : Mnemonic::VMOVDQU8;
         }
 
+        // AVX-512DQ: qword integer ↔ FP conversions (EVEX map 1, pp=1 66-prefix, W=1)
+        if (pp == 1) {
+            switch (op) {
+            case 0x7A: return ctx.vexW ? Mnemonic::VCVTTPD2QQ : Mnemonic::UNKNOWN;
+            case 0x79: return ctx.vexW ? Mnemonic::VCVTPD2QQ : Mnemonic::UNKNOWN;
+            case 0x78: return ctx.vexW ? Mnemonic::VCVTTPD2UQQ : Mnemonic::UNKNOWN;
+            case 0x7B: return ctx.vexW ? Mnemonic::VCVTPD2UQQ : Mnemonic::UNKNOWN;
+            default: break;
+            }
+        }
+        // AVX-512DQ: unsigned qword to FP (no prefix, W=1)
+        if (pp == 0) {
+            switch (op) {
+            case 0x7A: return ctx.vexW ? Mnemonic::VCVTUQQ2PD : Mnemonic::UNKNOWN;
+            case 0x78: return ctx.vexW ? Mnemonic::VCVTUQQ2PS : Mnemonic::UNKNOWN;
+            default: break;
+            }
+        }
+        // AVX-512DQ: qword to packed single (no prefix, W=1)
+        if (pp == 0 && op == 0x5B && ctx.vexW) {
+            return Mnemonic::VCVTQQ2PS;
+        }
+
         return Mnemonic::UNKNOWN;
     } // end EVEX map 1
 
@@ -2616,7 +2806,7 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0x3D: return Mnemonic::VPMAXSD;
             case 0x3E: return Mnemonic::VPMAXUW;
             case 0x3F: return Mnemonic::VPMAXUD;
-            case 0x40: return Mnemonic::VPMULLD;
+            case 0x40: return ctx.vexW ? Mnemonic::VPMULLQ : Mnemonic::VPMULLD;
             case 0x42: return Mnemonic::VGETEXPPS;
             case 0x43: return Mnemonic::VGETEXPSD;
             case 0x44: return Mnemonic::VPLZCNTD;
@@ -2627,16 +2817,37 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0x4D: return Mnemonic::VRCP14SD;
             case 0x4E: return Mnemonic::VRSQRT14PS;
             case 0x4F: return Mnemonic::VRSQRT14SD;
+
+            // AVX-512 VNNI (dot-product instructions)
+            case 0x50: return Mnemonic::VPDPBUSD;
+            case 0x51: return Mnemonic::VPDPBUSDS;
+            case 0x52: return Mnemonic::VPDPWSSD;
+            case 0x53: return Mnemonic::VPDPWSSDS;
+
             case 0x58: return Mnemonic::VPBROADCASTD;
             case 0x59: return Mnemonic::VPBROADCASTQ;
             case 0x5A: return Mnemonic::VBROADCASTI128;
             case 0x63: return ctx.vexW ? Mnemonic::VPCOMPRESSQ : Mnemonic::VPCOMPRESSD;
             case 0x64: return Mnemonic::VPCONFLICTD;
+
+            // AVX-512 VBMI (byte permutation)
+            case 0x75: return ctx.vexW ? Mnemonic::VPERMI2W : Mnemonic::VPERMI2B;
+            case 0x76: return ctx.vexW ? Mnemonic::VPERMI2D : Mnemonic::UNKNOWN;
+            case 0x77: return ctx.vexW ? Mnemonic::VPERMI2Q : Mnemonic::UNKNOWN;
+            case 0x7D: return ctx.vexW ? Mnemonic::VPERMT2W : Mnemonic::VPERMT2B;
+            case 0x7E: return ctx.vexW ? Mnemonic::VPERMT2D : Mnemonic::UNKNOWN;
+            case 0x7F: return ctx.vexW ? Mnemonic::VPERMT2Q : Mnemonic::UNKNOWN;
+
             case 0x78: return Mnemonic::VPBROADCASTB;
             case 0x79: return Mnemonic::VPBROADCASTW;
             case 0x88: return ctx.vexW ? Mnemonic::VPEXPANDQ : Mnemonic::VPEXPANDD;
             case 0x89: return ctx.vexW ? Mnemonic::VPCOMPRESSQ : Mnemonic::VPCOMPRESSD;
-            case 0x8D: return ctx.vexW ? Mnemonic::VPERMQ : Mnemonic::UNKNOWN;
+            case 0x8D: return ctx.vexW ? Mnemonic::VPERMQ : Mnemonic::VPERMB;
+
+            // AVX-512 IFMA (integer fused multiply-add)
+            case 0xB4: return Mnemonic::VPMADD52LUQ;
+            case 0xB5: return Mnemonic::VPMADD52HUQ;
+
             case 0x90: return ctx.vexW ? Mnemonic::VPGATHERDQ : Mnemonic::VPGATHERDD;
             case 0x91: return ctx.vexW ? Mnemonic::VPGATHERQQ : Mnemonic::VPGATHERQD;
             case 0x92: return ctx.vexW ? Mnemonic::VGATHERDPD : Mnemonic::VGATHERDPS;
@@ -2671,6 +2882,51 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0xBE: return ctx.vexW ? Mnemonic::VFNMSUB231PD : Mnemonic::VFNMSUB231PS;
             case 0xBF: return ctx.vexW ? Mnemonic::VFNMSUB231SD : Mnemonic::VFNMSUB231SS;
             case 0xC4: return Mnemonic::VPCONFLICTD; // vpconflictd/q by W
+
+            // AVX-512 BITALG (66 prefix)
+            case 0x54: return ctx.vexW ? Mnemonic::VPOPCNTW : Mnemonic::VPOPCNTB;
+            case 0x8F: return Mnemonic::VPSHUFBITQMB;
+
+            // VAES (EVEX 256/512-bit AES, 66 prefix)
+            case 0xDC: return Mnemonic::VAESENC;
+            case 0xDD: return Mnemonic::VAESENCLAST;
+            case 0xDE: return Mnemonic::VAESDEC;
+            case 0xDF: return Mnemonic::VAESDECLAST;
+
+            // GFNI (66 prefix, map 2)
+            case 0xCF: return Mnemonic::VGF2P8MULB;
+
+            default: return Mnemonic::UNKNOWN;
+            }
+        }
+
+        // F3 prefix instructions in EVEX map 2 (all narrowing down-converts)
+        if (pp == 2) {
+            switch (op) {
+            // AVX-512BW unsigned narrowing moves with saturation (0x1x)
+            case 0x10: return Mnemonic::VPMOVUSWB;
+            case 0x11: return Mnemonic::VPMOVUSDB;
+            case 0x12: return Mnemonic::VPMOVUSQB;
+            case 0x13: return Mnemonic::VPMOVUSDW;
+            case 0x14: return Mnemonic::VPMOVUSQW;
+            case 0x15: return Mnemonic::VPMOVUSQD;
+            // AVX-512BW signed narrowing moves with saturation (0x2x)
+            case 0x20: return Mnemonic::VPMOVSWB;
+            case 0x21: return Mnemonic::VPMOVSDB;
+            case 0x22: return Mnemonic::VPMOVSQB;
+            case 0x23: return Mnemonic::VPMOVSDW;
+            case 0x24: return Mnemonic::VPMOVSQW;
+            case 0x25: return Mnemonic::VPMOVSQD;
+            // Mask-to-vector conversions
+            case 0x28: return ctx.vexW ? Mnemonic::VPMOVM2Q : Mnemonic::VPMOVM2D;
+            case 0x38: return ctx.vexW ? Mnemonic::VPMOVM2W : Mnemonic::VPMOVM2B;
+            // AVX-512BW truncating narrowing moves (0x3x)
+            case 0x30: return Mnemonic::VPMOVWB;
+            case 0x31: return Mnemonic::VPMOVDB;
+            case 0x32: return Mnemonic::VPMOVQB;
+            case 0x33: return Mnemonic::VPMOVDW;
+            case 0x34: return Mnemonic::VPMOVQW;
+            case 0x35: return Mnemonic::VPMOVQD;
             default: return Mnemonic::UNKNOWN;
             }
         }
@@ -2689,22 +2945,27 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
             case 0x09: return Mnemonic::VROUNDPD;
             case 0x0A: return Mnemonic::VROUNDSS;
             case 0x0B: return Mnemonic::VROUNDSD;
-            case 0x18: return Mnemonic::VINSERTF32X4;
-            case 0x19: return Mnemonic::VEXTRACTF32X4;
+            case 0x18: return ctx.vexW ? Mnemonic::VINSERTF64X2 : Mnemonic::VINSERTF32X4;
+            case 0x19: return ctx.vexW ? Mnemonic::VEXTRACTF64X2 : Mnemonic::VEXTRACTF32X4;
             case 0x1D: return Mnemonic::VCVTPS2PH;
-            case 0x25: return Mnemonic::VPTERNLOGD; // vpternlogd/q by W
-            case 0x38: return Mnemonic::VINSERTI32X4;
-            case 0x39: return Mnemonic::VEXTRACTI32X4;
+            case 0x25: return ctx.vexW ? Mnemonic::VPTERNLOGQ : Mnemonic::VPTERNLOGD;
+            case 0x38: return ctx.vexW ? Mnemonic::VINSERTI64X2 : Mnemonic::VINSERTI32X4;
+            case 0x39: return ctx.vexW ? Mnemonic::VEXTRACTI64X2 : Mnemonic::VEXTRACTI32X4;
             case 0x42: return Mnemonic::VDBPSADBW;
             case 0x43: return Mnemonic::UNKNOWN; // vshufi32x4/i64x2
-            case 0x50: return Mnemonic::VRANGEPS;
-            case 0x51: return Mnemonic::VRANGESD;
-            case 0x54: return Mnemonic::VFIXUPIMMPS;
-            case 0x55: return Mnemonic::VFIXUPIMMSD;
-            case 0x56: return Mnemonic::VREDUCEPS;
-            case 0x57: return Mnemonic::VREDUCESD;
-            case 0x66: return Mnemonic::UNKNOWN; // vfpclassps (not yet defined)
-            case 0x67: return Mnemonic::UNKNOWN;     // vfpclasssd
+            case 0x50: return ctx.vexW ? Mnemonic::VRANGEPD : Mnemonic::VRANGEPS;
+            case 0x51: return ctx.vexW ? Mnemonic::VRANGESD : Mnemonic::VRANGESS;
+            case 0x54: return ctx.vexW ? Mnemonic::VFIXUPIMMPD : Mnemonic::VFIXUPIMMPS;
+            case 0x55: return ctx.vexW ? Mnemonic::VFIXUPIMMSD : Mnemonic::VFIXUPIMMSS;
+            case 0x56: return ctx.vexW ? Mnemonic::VREDUCEPD : Mnemonic::VREDUCEPS;
+            case 0x57: return ctx.vexW ? Mnemonic::VREDUCESD : Mnemonic::VREDUCESS;
+            // AVX-512DQ: VFPCLASS
+            case 0x66: return ctx.vexW ? Mnemonic::VFPCLASSPD : Mnemonic::VFPCLASSPS;
+            case 0x67: return ctx.vexW ? Mnemonic::VFPCLASSSD : Mnemonic::VFPCLASSSS;
+
+            // GFNI affine (map 3, 66 prefix, with imm8)
+            case 0xCE: return Mnemonic::VGF2P8AFFINEQB;
+            case 0xCF: return Mnemonic::VGF2P8AFFINEINVQB;
             default: return Mnemonic::UNKNOWN;
             }
         }
@@ -3148,9 +3409,95 @@ InstructionCategory Decoder::ResolveCategory(Mnemonic mnemonic) const noexcept {
 // ============================================================================
 
 ISAExtension Decoder::ResolveISAExtension(const DecodeContext& ctx) const noexcept {
-    if (ctx.hasEVEX) return ISAExtension::AVX512F;
-    if (ctx.hasVEX)  return ISAExtension::AVX;
-    if (ctx.opcodeMap == 3) return ISAExtension::SSE4_1;
+    // REX2 / APX instructions
+    if (ctx.hasREX2) return ISAExtension::APX;
+
+    // EVEX-encoded: refine beyond blanket AVX512F
+    if (ctx.hasEVEX) {
+        uint8_t op = ctx.opcode;
+        uint8_t pp = ctx.vexPP;
+        // VNNI: map2 50-53
+        if (ctx.vexMMMMM == 2 && pp == 1 && op >= 0x50 && op <= 0x53)
+            return ISAExtension::AVX512VNNI;
+        // VBMI: map2 75/76/77/7D/7E/7F (w=0 variants), 8D (w=0)
+        if (ctx.vexMMMMM == 2 && pp == 1 &&
+            ((op == 0x75 || op == 0x7D || op == 0x8D) && !ctx.vexW))
+            return ISAExtension::AVX512VBMI;
+        // IFMA: map2 B4/B5
+        if (ctx.vexMMMMM == 2 && pp == 1 && (op == 0xB4 || op == 0xB5))
+            return ISAExtension::AVX512IFMA;
+        // BITALG: map2 54/8F (pp=1)
+        if (ctx.vexMMMMM == 2 && pp == 1 && (op == 0x54 || op == 0x8F))
+            return ISAExtension::AVX512BITALG;
+        // VAES: map2 DC-DF
+        if (ctx.vexMMMMM == 2 && pp == 1 && op >= 0xDC && op <= 0xDF)
+            return ISAExtension::VAES;
+        // GFNI: map2 CF, map3 CE/CF
+        if ((ctx.vexMMMMM == 2 && op == 0xCF) ||
+            (ctx.vexMMMMM == 3 && (op == 0xCE || op == 0xCF)))
+            return ISAExtension::GFNI;
+        // DQ: map3 66/67 (VFPCLASS), map1 conversions, map2 40 (VPMULLQ)
+        if (ctx.vexMMMMM == 3 && pp == 1 && (op == 0x66 || op == 0x67))
+            return ISAExtension::AVX512DQ;
+        if (ctx.vexMMMMM == 2 && pp == 1 && op == 0x40 && ctx.vexW)
+            return ISAExtension::AVX512DQ;
+        // BW: F3-prefix narrowing converts (map2, pp=2)
+        if (ctx.vexMMMMM == 2 && pp == 2)
+            return ISAExtension::AVX512BW;
+        // CD: VPCONFLICT/VPLZCNT
+        if (ctx.vexMMMMM == 2 && pp == 1 && (op == 0xC4 || op == 0x44))
+            return ISAExtension::AVX512CD;
+        return ISAExtension::AVX512F;
+    }
+
+    // VEX-encoded: refine beyond blanket AVX
+    if (ctx.hasVEX) {
+        uint8_t op = ctx.opcode;
+        uint8_t pp = ctx.vexPP;
+        uint8_t map = ctx.vexMMMMM;
+        // SHA-512: F2 map2 CB-CD
+        if (map == 2 && pp == 3 && op >= 0xCB && op <= 0xCD)
+            return ISAExtension::SHA512;
+        // SM3: map2 DA (NP/66), map3 DE
+        if ((map == 2 && pp == 0 && op == 0xDA) ||
+            (map == 2 && pp == 1 && op == 0xDA) ||
+            (map == 3 && pp == 1 && op == 0xDE))
+            return ISAExtension::SM3;
+        // SM4: map2 DA (F2/F3)
+        if (map == 2 && (pp == 2 || pp == 3) && op == 0xDA)
+            return ISAExtension::SM4;
+        // GFNI: map2 CF, map3 CE/CF
+        if ((map == 2 && pp == 1 && op == 0xCF) ||
+            (map == 3 && pp == 1 && (op == 0xCE || op == 0xCF)))
+            return ISAExtension::GFNI;
+        // CMPCCXADD: map2 E0-EF
+        if (map == 2 && pp == 1 && op >= 0xE0 && op <= 0xEF)
+            return ISAExtension::CMPCCXADD;
+        // AMX: map2 49/4B/5C/5E (tile instructions)
+        if (map == 2 && (op == 0x49 || op == 0x4B ||
+            ((op == 0x5C || op == 0x5E) && !ctx.vexW)))
+            return ISAExtension::AMX;
+        // FMA3: map2 96-BF
+        if (map == 2 && pp == 1 && op >= 0x96 && op <= 0xBF)
+            return ISAExtension::FMA;
+        // AES-NI: map2 DC-DF/DB
+        if (map == 2 && pp == 1 && (op >= 0xDC && op <= 0xDF || op == 0xDB))
+            return ISAExtension::AES_NI;
+        // BMI2: map3 F0 (RORX)
+        if (map == 3 && pp == 3 && op == 0xF0)
+            return ISAExtension::BMI2;
+        return ISAExtension::AVX;
+    }
+
+    // Legacy map 3 (0F 3A)
+    if (ctx.opcodeMap == 3) {
+        uint8_t op = ctx.opcode;
+        if (op == 0xCC) return ISAExtension::SHA_EXT;
+        if (op == 0xCE || op == 0xCF) return ISAExtension::GFNI;
+        return ISAExtension::SSE4_1;
+    }
+
+    // Legacy map 2 (0F 38)
     if (ctx.opcodeMap == 2) {
         uint8_t op = ctx.opcode;
         if (op <= 0x0B) return ISAExtension::SSSE3;
@@ -3160,21 +3507,66 @@ ISAExtension Decoder::ResolveISAExtension(const DecodeContext& ctx) const noexce
         if (op >= 0x28 && op <= 0x41) return ISAExtension::SSE4_1;
         if (op == 0xF0 || op == 0xF1) {
             if (ctx.hasRepNE) return ISAExtension::SSE4_2;
-            return ISAExtension::BASE;
+            return ISAExtension::MOVBE_EXT;
         }
+        if (op == 0xF6) {
+            if (ctx.hasOpSizeOverride || ctx.hasRep) return ISAExtension::ADX;
+            // CET: WRSSD/WRSSQ (NP 0F 38 F6)
+            return ISAExtension::CET;
+        }
+        // CET: WRUSSD/WRUSSQ (66 0F 38 F5)
+        if (op == 0xF5 && ctx.hasOpSizeOverride) return ISAExtension::CET;
+        if (op >= 0xC8 && op <= 0xCD) return ISAExtension::SHA_EXT;
+        if (op == 0xCF) return ISAExtension::GFNI;
+        if (op == 0xF8) {
+            if (ctx.hasRep) return ISAExtension::ENQCMD_EXT;
+            if (ctx.hasRepNE) return ISAExtension::ENQCMD_EXT;
+            if (ctx.hasOpSizeOverride) return ISAExtension::MOVDIR64B_EXT;
+            return ISAExtension::SSE4_1;
+        }
+        if (op == 0xF9) return ISAExtension::MOVDIRI_EXT;
         return ISAExtension::SSE4_1;
     }
+
+    // Legacy map 1 (0F)
     if (ctx.opcodeMap == 1) {
         uint8_t op = ctx.opcode;
         if (op >= 0xD8 && op <= 0xDF) return ISAExtension::FPU;
         if (op >= 0x10 && op <= 0x17) return ISAExtension::SSE;
+        if (op == 0x18) {
+            uint8_t ext = ctx.opcodeExt;
+            if (ext == 6 || ext == 7) return ISAExtension::PREFETCHI;
+            return ISAExtension::SSE;
+        }
+        if (op == 0x1C && ctx.opcodeExt == 0) return ISAExtension::CLDEMOTE_EXT;
+        // CET: ENDBR32/ENDBR64 (F3 0F 1E FA/FB), RDSSPD/Q (F3 0F 1E /1 mod=3)
+        if (op == 0x1E && ctx.hasRep) return ISAExtension::CET;
+        if (op == 0x01) {
+            // CET: SETSSBSY/SAVEPREVSSP (F3 0F 01 E8/EA), RSTORSSP (F3 0F 01 /5 mem)
+            if (ctx.hasRep && ctx.opcodeExt == 5) return ISAExtension::CET;
+            return ISAExtension::BASE;
+        }
         if (op >= 0x28 && op <= 0x2F) return ISAExtension::SSE;
         if (op >= 0x50 && op <= 0x5F) return ISAExtension::SSE;
         if (op >= 0x60 && op <= 0x7F) return ISAExtension::SSE2;
+        if (op == 0xAE) {
+            uint8_t ext = ctx.opcodeExt;
+            if (ext == 6) {
+                if (ctx.hasRep) return ISAExtension::WAITPKG;
+                if (ctx.hasRepNE) return ISAExtension::WAITPKG;
+                if (ctx.hasOpSizeOverride) return ISAExtension::CLWB_EXT;
+            }
+            // CET: INCSSPD/Q (F3 0F AE /5 mod=3), CLRSSBSY (F3 0F AE /6 mem)
+            if (ext == 5 && ctx.hasRep) return ISAExtension::CET;
+            if (ext == 6 && ctx.hasRep) return ISAExtension::CET;
+            return ISAExtension::SSE;
+        }
         if (op >= 0xC2 && op <= 0xC6) return ISAExtension::SSE;
         if (op >= 0xD0 && op <= 0xFF) return ISAExtension::SSE2;
         return ISAExtension::BASE;
     }
+
+    // 1-byte opcode map
     if (ctx.opcodeMap == 0 && ctx.opcode >= 0xD8 && ctx.opcode <= 0xDF) {
         return ISAExtension::FPU;
     }

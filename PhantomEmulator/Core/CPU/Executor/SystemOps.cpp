@@ -204,6 +204,7 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
 
         // === MFENCE (0F AE /6), LFENCE (0F AE /5), SFENCE (0F AE /7) ===
         // === CLFLUSH (0F AE /7 with memory operand) ===
+        // === XSAVE/XRSTOR/XSAVEOPT (0F AE /4,/5,/6 with memory operand) ===
         if (inst.opcode == 0xAE) {
             uint8_t ext = inst.opcodeExt;
             uint8_t mod = (inst.modrm >> 6) & 3;
@@ -219,6 +220,165 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
 
             // CLFLUSH (ext=7, memory operand) — no-op in emulator
             if (ext == 7 && mod != 3) return ErrorCode::Success;
+
+            // XSAVE (0F AE /4, memory operand)
+            // XSAVEOPT (0F AE /6, memory operand) — same format, hint optimization only
+            if ((ext == 4 || ext == 6) && mod != 3) {
+                GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+
+                // EDX:EAX = requested-feature bitmap (RFBM)
+                uint64_t rfbm = (static_cast<uint64_t>(m_state.GetReg32(GPR::RDX)) << 32)
+                              | m_state.GetReg32(GPR::RAX);
+
+                // Component 0: x87 FPU state (bytes 0-159 of legacy region)
+                if (rfbm & 1) {
+                    // FXSAVE-format legacy area: FCW(2) + FSW(2) + FTW(1) + reserved(1)
+                    // + FOP(2) + FIP(8) + FDP(8) + MXCSR(4) + MXCSR_MASK(4) = 32 bytes header
+                    // Then 8 × 16-byte FPU registers = 128 bytes → total 160 bytes at offset 0
+                    uint8_t legacyHdr[32]{};
+                    // FCW at [0..1]
+                    std::memcpy(legacyHdr, &m_state.fpuControl, 2);
+                    // FSW at [2..3]
+                    std::memcpy(legacyHdr + 2, &m_state.fpuStatus, 2);
+                    // Abridged FTW at [4] — convert full tag word to abridged form
+                    uint8_t abridgedTag = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        if (((m_state.fpuTag >> (i * 2)) & 3) != 3)
+                            abridgedTag |= (1 << i);
+                    }
+                    legacyHdr[4] = abridgedTag;
+                    // FOP at [6..7]
+                    std::memcpy(legacyHdr + 6, &m_state.fpuOpcode, 2);
+                    // FIP at [8..15]
+                    std::memcpy(legacyHdr + 8, &m_state.fpuIP, 8);
+                    // FDP at [16..23]
+                    std::memcpy(legacyHdr + 16, &m_state.fpuDP, 8);
+                    // MXCSR at [24..27]
+                    std::memcpy(legacyHdr + 24, &m_state.mxcsr, 4);
+                    // MXCSR_MASK at [28..31]
+                    uint32_t mxcsrMask = 0x0000FFBF;
+                    std::memcpy(legacyHdr + 28, &mxcsrMask, 4);
+
+                    auto err = mem.Write(addr, legacyHdr, 32);
+                    if (err != ErrorCode::Success) return err;
+
+                    // x87 data registers: 8 × 16 bytes at offset 32 (within legacy 160-byte area)
+                    for (int i = 0; i < 8; ++i) {
+                        uint8_t fpuBuf[16]{};
+                        auto ld = m_state.fpuStack[i].value;
+                        std::memcpy(fpuBuf, &ld, sizeof(ld) <= 16 ? sizeof(ld) : 16);
+                        err = mem.Write(addr + 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
+                        if (err != ErrorCode::Success) return err;
+                    }
+                }
+
+                // Component 1: SSE state (XMM registers at bytes 160-415 of legacy region)
+                if (rfbm & 2) {
+                    for (uint8_t i = 0; i < 16; ++i) {
+                        auto err = mem.Write(addr + 160 + static_cast<uint32_t>(i) * 16,
+                                             m_state.xmm[i].u8, 16);
+                        if (err != ErrorCode::Success) return err;
+                    }
+                }
+
+                // XSAVE header (bytes 512-575)
+                uint8_t header[64]{};
+                // XSTATE_BV at [512..519] = which components are saved
+                uint64_t xstateBv = rfbm & 0x07; // x87 + SSE + AVX
+                std::memcpy(header, &xstateBv, 8);
+                auto err = mem.Write(addr + 512, header, 64);
+                if (err != ErrorCode::Success) return err;
+
+                // Component 2: AVX upper YMM (bytes 576-831, 16 × 16 bytes)
+                if (rfbm & 4) {
+                    for (uint8_t i = 0; i < 16; ++i) {
+                        err = mem.Write(addr + 576 + static_cast<uint32_t>(i) * 16,
+                                        m_state.ymmHigh[i].u8, 16);
+                        if (err != ErrorCode::Success) return err;
+                    }
+                }
+
+                return ErrorCode::Success;
+            }
+
+            // XRSTOR (0F AE /5, memory operand)
+            if (ext == 5 && mod != 3) {
+                GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+
+                // EDX:EAX = requested-feature bitmap (RFBM)
+                uint64_t rfbm = (static_cast<uint64_t>(m_state.GetReg32(GPR::RDX)) << 32)
+                              | m_state.GetReg32(GPR::RAX);
+
+                // Read XSAVE header to determine which components are present
+                uint8_t header[64]{};
+                auto err = mem.Read(addr + 512, header, 64);
+                if (err != ErrorCode::Success) return err;
+                uint64_t xstateBv = 0;
+                std::memcpy(&xstateBv, header, 8);
+
+                // Only restore components in both RFBM and XSTATE_BV
+                uint64_t restoreMask = rfbm & xstateBv;
+
+                // Component 0: x87 FPU state
+                if (restoreMask & 1) {
+                    uint8_t legacyHdr[32]{};
+                    err = mem.Read(addr, legacyHdr, 32);
+                    if (err != ErrorCode::Success) return err;
+
+                    std::memcpy(&m_state.fpuControl, legacyHdr, 2);
+                    std::memcpy(&m_state.fpuStatus, legacyHdr + 2, 2);
+                    uint8_t abridgedTag = legacyHdr[4];
+                    m_state.fpuTag = 0;
+                    for (int i = 0; i < 8; ++i) {
+                        if (!(abridgedTag & (1 << i)))
+                            m_state.fpuTag |= (3 << (i * 2)); // empty
+                    }
+                    std::memcpy(&m_state.fpuOpcode, legacyHdr + 6, 2);
+                    std::memcpy(&m_state.fpuIP, legacyHdr + 8, 8);
+                    std::memcpy(&m_state.fpuDP, legacyHdr + 16, 8);
+                    std::memcpy(&m_state.mxcsr, legacyHdr + 24, 4);
+
+                    for (int i = 0; i < 8; ++i) {
+                        uint8_t fpuBuf[16]{};
+                        err = mem.Read(addr + 32 + static_cast<uint32_t>(i) * 16, fpuBuf, 16);
+                        if (err != ErrorCode::Success) return err;
+                        std::memcpy(&m_state.fpuStack[i].value, fpuBuf,
+                                    sizeof(m_state.fpuStack[i].value) <= 16
+                                        ? sizeof(m_state.fpuStack[i].value) : 16);
+                    }
+                } else if (rfbm & 1) {
+                    // Component in RFBM but not in XSTATE_BV: restore to init state
+                    m_state.fpuControl = 0x037F;
+                    m_state.fpuStatus = 0;
+                    m_state.fpuTag = 0xFFFF;
+                    for (int i = 0; i < 8; ++i) m_state.fpuStack[i].value = 0.0L;
+                }
+
+                // Component 1: SSE state
+                if (restoreMask & 2) {
+                    for (uint8_t i = 0; i < 16; ++i) {
+                        err = mem.Read(addr + 160 + static_cast<uint32_t>(i) * 16,
+                                       m_state.xmm[i].u8, 16);
+                        if (err != ErrorCode::Success) return err;
+                    }
+                } else if (rfbm & 2) {
+                    for (uint8_t i = 0; i < 16; ++i) m_state.xmm[i].Clear();
+                    m_state.mxcsr = 0x1F80;
+                }
+
+                // Component 2: AVX upper YMM
+                if (restoreMask & 4) {
+                    for (uint8_t i = 0; i < 16; ++i) {
+                        err = mem.Read(addr + 576 + static_cast<uint32_t>(i) * 16,
+                                       m_state.ymmHigh[i].u8, 16);
+                        if (err != ErrorCode::Success) return err;
+                    }
+                } else if (rfbm & 4) {
+                    for (uint8_t i = 0; i < 16; ++i) m_state.ymmHigh[i].Clear();
+                }
+
+                return ErrorCode::Success;
+            }
 
             return ErrorCode::UnimplementedOpcode;
         }
@@ -274,6 +434,69 @@ ErrorCode CPU::ExecuteSystem(const DecodedInstruction& inst, VirtualMemory& mem)
     }
 
     return ErrorCode::UnimplementedOpcode;
+}
+
+// ============================================================================
+// RDRAND / RDSEED  (0F C7 /6 and /7 with mod=3)
+// ============================================================================
+// Returns a pseudorandom value in the destination register and sets CF=1
+// to indicate success. We use a 64-bit xorshift PRNG seeded from the
+// emulated TSC to avoid pulling in <random> and to remain deterministic
+// within a single emulation session (important for reproducible analysis).
+
+ErrorCode CPU::ExecuteRdRandSeed(const DecodedInstruction& inst, VirtualMemory& /*mem*/) noexcept {
+    // Validate opcode
+    if (inst.opcodeMap != OpcodeMap::TwoByte || inst.opcode != 0xC7)
+        return ErrorCode::UnimplementedOpcode;
+
+    uint8_t ext = inst.opcodeExt;
+    uint8_t mod = (inst.modrm >> 6) & 3;
+
+    // RDRAND = /6 mod=3, RDSEED = /7 mod=3
+    if ((ext != 6 && ext != 7) || mod != 3)
+        return ErrorCode::UnimplementedOpcode;
+
+    // Xorshift64* PRNG — fast, non-cryptographic, sufficient for emulation.
+    // Seed from TSC on first call; subsequent calls advance the state.
+    static thread_local uint64_t s_prngState = 0;
+    if (s_prngState == 0) {
+        s_prngState = m_state.tsc ^ 0x5DEECE66DULL;
+        if (s_prngState == 0) s_prngState = 1; // Avoid zero state
+    }
+
+    // Xorshift64* step
+    s_prngState ^= s_prngState >> 12;
+    s_prngState ^= s_prngState << 25;
+    s_prngState ^= s_prngState >> 27;
+    uint64_t value = s_prngState * 0x2545F4914F6CDD1DULL;
+
+    // Destination is the register encoded in ModRM.rm (bits 2:0 + REX.B)
+    uint8_t regIdx = (inst.modrm & 7) | (inst.prefixes.rexB ? 8 : 0);
+    auto reg = static_cast<GPR>(regIdx);
+
+    switch (inst.operandSize) {
+        case OperandSize::Size16:
+            m_state.SetReg16(reg, static_cast<uint16_t>(value));
+            break;
+        case OperandSize::Size32:
+            m_state.SetReg32(reg, static_cast<uint32_t>(value));
+            break;
+        case OperandSize::Size64:
+            m_state.SetReg64(reg, value);
+            break;
+        default:
+            return ErrorCode::InvalidOperandSize;
+    }
+
+    // CF=1 indicates success (hardware had enough entropy).
+    // In emulation we always succeed. OF=SF=ZF=AF=PF=0 per spec.
+    m_state.eflags.SetCF(true);
+    m_state.eflags.SetOF(false);
+    m_state.eflags.SetSF(false);
+    m_state.eflags.SetZF(false);
+    m_state.eflags.SetPF(false);
+
+    return ErrorCode::Success;
 }
 
 } // namespace Phantom

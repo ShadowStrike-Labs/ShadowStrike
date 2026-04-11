@@ -966,6 +966,61 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
         }
 
         // ================================================================
+        // VCVTPH2PS (0F38 13) — F16C: Convert packed half-float to float
+        // VEX.128.66.0F38.W0 13 /r → 4 FP16 → 4 FP32 (XMM)
+        // VEX.256.66.0F38.W0 13 /r → 8 FP16 → 8 FP32 (YMM)
+        // Source is XMM register or 64/128-bit memory
+        // ================================================================
+        if (op == 0x13) {
+            uint32_t halfCount = is256 ? 8u : 4u;
+            uint16_t halfVals[8] = {};
+
+            if (inst.Op(1).IsRegister()) {
+                std::memcpy(halfVals, m_state.XMM(inst.Op(1).reg.regIndex).u8,
+                           halfCount * 2);
+            } else if (inst.Op(1).IsMemory()) {
+                GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
+                auto err = mem.Read(addr, reinterpret_cast<uint8_t*>(halfVals),
+                                   halfCount * 2);
+                if (err != ErrorCode::Success) return err;
+            } else {
+                return ErrorCode::InvalidOperandSize;
+            }
+
+            YMMValue dst{};
+            for (uint32_t i = 0; i < halfCount; ++i) {
+                uint16_t h = halfVals[i];
+                uint32_t sign = (h >> 15) & 1;
+                uint32_t exp  = (h >> 10) & 0x1F;
+                uint32_t mant = h & 0x3FF;
+
+                uint32_t f;
+                if (exp == 0) {
+                    if (mant == 0) {
+                        f = sign << 31; // ±0
+                    } else {
+                        // Denormalized: normalize it
+                        exp = 1;
+                        while (!(mant & 0x400)) { mant <<= 1; exp--; }
+                        mant &= 0x3FF;
+                        f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                    }
+                } else if (exp == 0x1F) {
+                    // Inf or NaN
+                    f = (sign << 31) | 0x7F800000u | (mant << 13);
+                } else {
+                    // Normalized
+                    f = (sign << 31) | ((exp + 127 - 15) << 23) | (mant << 13);
+                }
+
+                std::memcpy(&dst.f32[i], &f, 4);
+            }
+
+            WriteDst(dst);
+            return ErrorCode::Success;
+        }
+
+        // ================================================================
         // VPMADDUBSW (0F38 04) — Multiply unsigned/signed bytes, add to words
         // ================================================================
         if (op == 0x04) {
@@ -1597,6 +1652,88 @@ ErrorCode CPU::ExecuteAVX2(const DecodedInstruction& inst, VirtualMemory& mem) n
             dst.u64[2] = src.u64[(imm >> 4) & 3];
             dst.u64[3] = src.u64[(imm >> 6) & 3];
             WriteDst(dst);
+            return ErrorCode::Success;
+        }
+
+        // ================================================================
+        // VCVTPS2PH (0F3A 1D) — F16C: Convert packed float to half-float
+        // VEX.128.66.0F3A.W0 1D /r ib → 4 FP32 → 4 FP16 (XMM/m64)
+        // VEX.256.66.0F3A.W0 1D /r ib → 8 FP32 → 8 FP16 (XMM/m128)
+        // imm8[1:0] selects rounding mode (ignored — we use round-to-nearest)
+        // ================================================================
+        if (op == 0x1D) {
+            uint32_t count = is256 ? 8u : 4u;
+            YMMValue src{};
+            uint8_t srcIdx = inst.Op(1).reg.regIndex;
+            if (is256) {
+                m_state.GetYMM(srcIdx, src.u8);
+            } else {
+                std::memcpy(src.u8, m_state.XMM(srcIdx).u8, 16);
+            }
+
+            uint16_t halfVals[8] = {};
+            for (uint32_t i = 0; i < count; ++i) {
+                uint32_t f;
+                std::memcpy(&f, &src.f32[i], 4);
+
+                uint32_t sign = (f >> 31) & 1;
+                int32_t  exp  = static_cast<int32_t>((f >> 23) & 0xFF) - 127;
+                uint32_t mant = f & 0x7FFFFF;
+
+                uint16_t h;
+                if ((f & 0x7FFFFFFF) == 0) {
+                    h = static_cast<uint16_t>(sign << 15); // ±0
+                } else if (exp > 15) {
+                    // Overflow → ±infinity (or NaN passthrough)
+                    if ((f & 0x7F800000) == 0x7F800000 && mant != 0) {
+                        // NaN: preserve sign, set exp=31, keep some mantissa
+                        h = static_cast<uint16_t>((sign << 15) | 0x7C00 | (mant >> 13));
+                        if ((h & 0x03FF) == 0) h |= 1; // Ensure NaN stays NaN
+                    } else {
+                        h = static_cast<uint16_t>((sign << 15) | 0x7C00); // ±Inf
+                    }
+                } else if (exp < -24) {
+                    h = static_cast<uint16_t>(sign << 15); // Underflow to ±0
+                } else if (exp < -14) {
+                    // Denormalized half-float
+                    uint32_t m = mant | 0x800000; // Restore implicit 1
+                    uint8_t shift = static_cast<uint8_t>(-exp - 14 + 13);
+                    if (shift > 31) shift = 31;
+                    uint32_t hmant = m >> shift;
+                    // Round to nearest even
+                    uint32_t roundBit = (m >> (shift - 1)) & 1;
+                    uint32_t stickyBits = (m & ((1u << (shift - 1)) - 1)) ? 1 : 0;
+                    hmant += (roundBit & (stickyBits | (hmant & 1)));
+                    h = static_cast<uint16_t>((sign << 15) | (hmant & 0x3FF));
+                } else {
+                    // Normalized
+                    uint16_t hexp = static_cast<uint16_t>(exp + 15);
+                    uint16_t hmant = static_cast<uint16_t>(mant >> 13);
+                    // Round to nearest even
+                    uint32_t roundBit = (mant >> 12) & 1;
+                    uint32_t stickyBits = (mant & 0xFFF) ? 1 : 0;
+                    hmant = static_cast<uint16_t>(hmant + (roundBit & (stickyBits | (hmant & 1))));
+                    if (hmant > 0x3FF) { hmant = 0; hexp++; }
+                    if (hexp > 30) { hexp = 31; hmant = 0; } // Overflow to Inf
+                    h = static_cast<uint16_t>((sign << 15) | (hexp << 10) | hmant);
+                }
+                halfVals[i] = h;
+            }
+
+            // Write to destination: XMM register or memory
+            if (inst.Op(0).IsRegister()) {
+                uint8_t dstIdx = inst.Op(0).reg.regIndex;
+                std::memset(m_state.XMM(dstIdx).u8, 0, 16);
+                std::memcpy(m_state.XMM(dstIdx).u8, halfVals, count * 2);
+                m_state.ClearYMMHigh(dstIdx);
+            } else if (inst.Op(0).IsMemory()) {
+                GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+                auto err = mem.Write(addr, reinterpret_cast<const uint8_t*>(halfVals),
+                                    count * 2);
+                if (err != ErrorCode::Success) return err;
+            } else {
+                return ErrorCode::InvalidOperandSize;
+            }
             return ErrorCode::Success;
         }
 

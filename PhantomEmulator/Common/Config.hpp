@@ -90,6 +90,11 @@ struct EmulationConfig {
     bool      enableMemoryScanAccel     = true;   // SIMD shellcode/ROP/packer scanning
     bool      enableJITOptimizer        = false;  // Trace compilation + IR optimization (opt-in)
 
+    // === CET (Control-flow Enforcement Technology) ===
+    bool      enableCET                 = true;   // Shadow stack + IBT emulation
+    bool      cetEnforceShadowStack     = true;   // Detect ROP via shadow stack mismatch
+    bool      cetEnforceIBT             = true;   // Detect JOP via missing ENDBR
+
     // === Kernel-mode emulation (Phase 7) ===
     bool      enableKernelEmulation     = true;   // Master switch for kernel-mode analysis
     bool      enableDKOMDetection       = true;   // DKOM rootkit detection scanning

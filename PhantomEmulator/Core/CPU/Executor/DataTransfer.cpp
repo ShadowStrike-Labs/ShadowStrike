@@ -163,14 +163,81 @@ ErrorCode CPU::ExecuteDataTransfer(const DecodedInstruction& inst, VirtualMemory
 
             if (size == OperandSize::Size64 || inst.prefixes.rexW) {
                 uint64_t val = m_state.GetReg64(reg);
-                val = Platform::ByteSwap64(val);
+                val = PHANTOM_BSWAP64(val);
                 m_state.SetReg64(reg, val);
             } else {
                 uint32_t val = m_state.GetReg32(reg);
-                val = Platform::ByteSwap32(val);
+                val = PHANTOM_BSWAP32(val);
                 m_state.SetReg32(reg, val);
             }
             return ErrorCode::Success;
+        }
+    }
+
+    // ========================================================================
+    // ThreeByte38 map (0F 38 xx) — MOVBE
+    // ========================================================================
+    // MOVBE performs a byte-swap load or store. Intel CPUID leaf 1 ECX bit 22.
+    // Encoding: NP 0F 38 F0 /r (load), NP 0F 38 F1 /r (store).
+    // Operand-size override (66h) selects 16-bit form.
+    // REX.W selects 64-bit form.
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38) {
+        // === MOVBE r, m (0F 38 F0) — Load with byte swap ===
+        if (op == 0xF0) {
+            if (!inst.Op(1).IsMemory()) return ErrorCode::InvalidOperandSize;
+            GuestAddress addr = CalculateEffectiveAddress(inst.Op(1), inst);
+            uint64_t val = 0;
+            uint32_t bytes = 0;
+            switch (size) {
+                case OperandSize::Size16: bytes = 2; break;
+                case OperandSize::Size32: bytes = 4; break;
+                case OperandSize::Size64: bytes = 8; break;
+                default: return ErrorCode::InvalidOperandSize;
+            }
+            auto err = mem.Read(addr, reinterpret_cast<uint8_t*>(&val), bytes);
+            if (err != ErrorCode::Success) return err;
+            switch (size) {
+                case OperandSize::Size16:
+                    val = PHANTOM_BSWAP16(static_cast<uint16_t>(val));
+                    break;
+                case OperandSize::Size32:
+                    val = PHANTOM_BSWAP32(static_cast<uint32_t>(val));
+                    break;
+                case OperandSize::Size64:
+                    val = PHANTOM_BSWAP64(val);
+                    break;
+                default: break;
+            }
+            return WriteOperand(inst.Op(0), inst, mem, val);
+        }
+
+        // === MOVBE m, r (0F 38 F1) — Store with byte swap ===
+        if (op == 0xF1) {
+            if (!inst.Op(0).IsMemory()) return ErrorCode::InvalidOperandSize;
+            uint64_t val = 0;
+            auto err = ReadOperand(inst.Op(1), inst, mem, val);
+            if (err != ErrorCode::Success) return err;
+            switch (size) {
+                case OperandSize::Size16:
+                    val = PHANTOM_BSWAP16(static_cast<uint16_t>(val));
+                    break;
+                case OperandSize::Size32:
+                    val = PHANTOM_BSWAP32(static_cast<uint32_t>(val));
+                    break;
+                case OperandSize::Size64:
+                    val = PHANTOM_BSWAP64(val);
+                    break;
+                default: return ErrorCode::InvalidOperandSize;
+            }
+            GuestAddress addr = CalculateEffectiveAddress(inst.Op(0), inst);
+            uint32_t bytes = 0;
+            switch (size) {
+                case OperandSize::Size16: bytes = 2; break;
+                case OperandSize::Size32: bytes = 4; break;
+                case OperandSize::Size64: bytes = 8; break;
+                default: break;
+            }
+            return mem.Write(addr, reinterpret_cast<const uint8_t*>(&val), bytes);
         }
     }
 

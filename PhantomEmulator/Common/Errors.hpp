@@ -41,6 +41,7 @@ enum class ErrorCode : uint32_t {
     StackUnderflow        = 205,
     InvalidSystemCall     = 206,
     PrivilegedInstruction = 207,
+    ControlProtectionFault = 208,  // CET: shadow stack / IBT violation
 
     // Memory errors (3xx)
     AccessViolationRead   = 300,
