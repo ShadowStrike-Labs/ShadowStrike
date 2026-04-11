@@ -385,3 +385,7 @@ SHADOWSTRIKE_3_YEAR_ROADMAP.md
 # Backup files (use git history instead)
 *.bak
 
+
+# Documentation book (draft - not yet published)
+docs/book/
+
