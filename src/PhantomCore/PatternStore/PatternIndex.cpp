@@ -1068,7 +1068,7 @@ namespace ShadowStrike {
              * - Traverse trie, creating nodes as needed
              * - Add pattern ID to output list at terminal node
              * - Update depth information
-             * - Maintain Aho-Corasick failure links (simplified)
+             * - Maintain Aho-Corasick failure links (rebuilt on Compile)
              *
              * Thread Safety:
              * - Exclusive write lock required

@@ -1667,67 +1667,416 @@ StoreError PatternStore::ImportFromYaraFile(
         return StoreError{ SignatureStoreError::FileNotFound, fileErr.win32, "Cannot read file" };
     }
 
-    // Convert to string
+    // Cap file size to prevent abuse (64 MB max for rule files)
+    constexpr size_t MAX_YARA_FILE_SIZE = 64 * 1024 * 1024;
+    if (fileContent.size() > MAX_YARA_FILE_SIZE) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"ImportFromYaraFile: File exceeds 64 MB limit: %zu bytes", fileContent.size());
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "YARA file exceeds 64 MB limit" };
+    }
+
     std::string yaraContent(reinterpret_cast<const char*>(fileContent.data()), fileContent.size());
 
-    // Parse YARA rules (simplified - production would use full YARA parser)
+    // Collected patterns from all rules
     std::vector<std::string> patterns;
     std::vector<std::string> names;
     std::vector<ThreatLevel> levels;
 
-    // Use string stream for line-by-line parsing
+    // ---- Full YARA Rule Parser ----
+    // Parses: rule RuleName [: tag1 tag2] { meta: ... strings: ... condition: ... }
+    // Extracts hex patterns ($var = { hex }) and string patterns ($var = "text")
+    // Reads meta: threat_level/severity for severity classification
+
     size_t pos = 0;
-    size_t lineCount = 0;
+    size_t ruleCount = 0;
     size_t importedCount = 0;
+    constexpr size_t MAX_RULES_PER_FILE = 100000;
 
-    while (pos < yaraContent.size()) {
-        // Find next newline
-        size_t nextNewline = yaraContent.find('\n', pos);
-        if (nextNewline == std::string::npos) {
-            nextNewline = yaraContent.size();
+    // Helper: skip whitespace and comments
+    auto skipWS = [&]() {
+        while (pos < yaraContent.size()) {
+            if (std::isspace(static_cast<unsigned char>(yaraContent[pos]))) {
+                ++pos;
+                continue;
+            }
+            // Single-line comment: //
+            if (pos + 1 < yaraContent.size() &&
+                yaraContent[pos] == '/' && yaraContent[pos + 1] == '/') {
+                pos = yaraContent.find('\n', pos);
+                if (pos == std::string::npos) pos = yaraContent.size();
+                else ++pos;
+                continue;
+            }
+            // Multi-line comment: /* ... */
+            if (pos + 1 < yaraContent.size() &&
+                yaraContent[pos] == '/' && yaraContent[pos + 1] == '*') {
+                size_t endComment = yaraContent.find("*/", pos + 2);
+                pos = (endComment == std::string::npos) ? yaraContent.size() : endComment + 2;
+                continue;
+            }
+            break;
         }
+    };
 
-        // Extract line
-        std::string line = yaraContent.substr(pos, nextNewline - pos);
-        pos = nextNewline + 1;
-        lineCount++;
-
-        // Remove trailing \r if present
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
+    // Helper: read identifier (alphanumeric + underscore)
+    auto readIdent = [&]() -> std::string {
+        size_t start = pos;
+        while (pos < yaraContent.size() &&
+               (std::isalnum(static_cast<unsigned char>(yaraContent[pos])) ||
+                yaraContent[pos] == '_')) {
+            ++pos;
         }
+        return yaraContent.substr(start, pos - start);
+    };
 
-        // Look for hex pattern strings (simplified parser)
-        size_t hexPos = line.find("{ ");
-        if (hexPos != std::string::npos) {
-            size_t endPos = line.find(" }", hexPos);
-            if (endPos != std::string::npos) {
-                std::string hexPattern = line.substr(hexPos + 2, endPos - hexPos - 2);
+    // Helper: find matching closing brace, respecting nesting/strings/comments
+    auto findClosingBrace = [&](size_t startPos) -> size_t {
+        int depth = 0;
+        size_t i = startPos;
+        bool inStr = false;
+        bool inLineComment = false;
+        bool inBlockComment = false;
 
-                // Extract rule name
-                std::string ruleName = "imported_pattern_" + std::to_string(importedCount);
+        while (i < yaraContent.size()) {
+            char c = yaraContent[i];
 
-                patterns.push_back(hexPattern);
-                names.push_back(ruleName);
-                levels.push_back(ThreatLevel::Medium);
-
-                importedCount++;
-
-                if (progressCallback) {
-                    progressCallback(importedCount, 0); // Total unknown
+            if (inLineComment) {
+                if (c == '\n') inLineComment = false;
+                ++i; continue;
+            }
+            if (inBlockComment) {
+                if (c == '*' && i + 1 < yaraContent.size() && yaraContent[i + 1] == '/') {
+                    inBlockComment = false; i += 2; continue;
                 }
+                ++i; continue;
+            }
+            if (c == '/' && i + 1 < yaraContent.size()) {
+                if (yaraContent[i + 1] == '/') { inLineComment = true; i += 2; continue; }
+                if (yaraContent[i + 1] == '*') { inBlockComment = true; i += 2; continue; }
+            }
+            if (c == '"' && !inStr) { inStr = true; ++i; continue; }
+            if (inStr) {
+                if (c == '\\' && i + 1 < yaraContent.size()) { i += 2; continue; }
+                if (c == '"') inStr = false;
+                ++i; continue;
+            }
+            if (c == '{') ++depth;
+            if (c == '}') { --depth; if (depth == 0) return i; }
+            ++i;
+        }
+        return std::string::npos;
+    };
+
+    // Helper: extract hex pattern from raw content between { and }
+    auto extractHex = [](const std::string& raw) -> std::string {
+        std::string result;
+        result.reserve(raw.size());
+        for (char c : raw) {
+            if (std::isxdigit(static_cast<unsigned char>(c)) ||
+                c == '?' || c == '[' || c == ']' || c == '-' ||
+                c == '(' || c == ')' || c == '|') {
+                result += c;
+            } else if (c == ' ' || c == '\t' || c == '\n' || c == '\r') {
+                if (!result.empty() && result.back() != ' ') result += ' ';
             }
         }
+        while (!result.empty() && result.back() == ' ') result.pop_back();
+        return result;
+    };
+
+    // Helper: convert quoted string literal to hex pattern
+    auto strToHex = [](const std::string& str) -> std::string {
+        std::ostringstream hex;
+        hex << std::uppercase << std::hex << std::setfill('0');
+        for (size_t i = 0; i < str.size(); ++i) {
+            if (str[i] == '\\' && i + 1 < str.size()) {
+                ++i;
+                switch (str[i]) {
+                    case 'n': hex << "0A "; break;
+                    case 'r': hex << "0D "; break;
+                    case 't': hex << "09 "; break;
+                    case '\\': hex << "5C "; break;
+                    case '"': hex << "22 "; break;
+                    case '0': hex << "00 "; break;
+                    case 'x':
+                        if (i + 2 < str.size()) {
+                            hex << str[i + 1] << str[i + 2] << ' ';
+                            i += 2;
+                        }
+                        break;
+                    default:
+                        hex << std::setw(2) << static_cast<int>(
+                            static_cast<unsigned char>(str[i])) << ' ';
+                        break;
+                }
+            } else {
+                hex << std::setw(2) << static_cast<int>(
+                    static_cast<unsigned char>(str[i])) << ' ';
+            }
+        }
+        std::string result = hex.str();
+        while (!result.empty() && result.back() == ' ') result.pop_back();
+        return result;
+    };
+
+    while (pos < yaraContent.size() && ruleCount < MAX_RULES_PER_FILE) {
+        skipWS();
+        if (pos >= yaraContent.size()) break;
+
+        // Skip 'import' and 'include' directives
+        if (yaraContent.compare(pos, 7, "import ") == 0 ||
+            yaraContent.compare(pos, 8, "include ") == 0) {
+            pos = yaraContent.find('\n', pos);
+            if (pos == std::string::npos) pos = yaraContent.size();
+            else ++pos;
+            continue;
+        }
+
+        // Handle 'private' and 'global' modifiers before 'rule'
+        if (yaraContent.compare(pos, 8, "private ") == 0) {
+            pos += 8; skipWS();
+        }
+        if (yaraContent.compare(pos, 7, "global ") == 0) {
+            pos += 7; skipWS();
+        }
+
+        if (yaraContent.compare(pos, 5, "rule ") != 0) {
+            pos = yaraContent.find('\n', pos);
+            if (pos == std::string::npos) pos = yaraContent.size();
+            else ++pos;
+            continue;
+        }
+        pos += 5;
+        skipWS();
+
+        std::string ruleName = readIdent();
+        if (ruleName.empty()) {
+            SS_LOG_WARN(L"PatternStore",
+                L"ImportFromYaraFile: Empty rule name at offset %zu", pos);
+            pos = yaraContent.find('\n', pos);
+            if (pos == std::string::npos) pos = yaraContent.size();
+            else ++pos;
+            continue;
+        }
+        if (ruleName.size() > 256) ruleName = ruleName.substr(0, 256);
+
+        skipWS();
+
+        // Optional tags: rule Name : tag1 tag2 {
+        if (pos < yaraContent.size() && yaraContent[pos] == ':') {
+            ++pos; skipWS();
+            while (pos < yaraContent.size() && yaraContent[pos] != '{') {
+                readIdent(); // consume tag, not stored
+                skipWS();
+            }
+        }
+
+        skipWS();
+
+        // Expect opening brace
+        if (pos >= yaraContent.size() || yaraContent[pos] != '{') {
+            SS_LOG_WARN(L"PatternStore",
+                L"ImportFromYaraFile: Expected '{' for rule '%hs' at offset %zu",
+                ruleName.c_str(), pos);
+            continue;
+        }
+
+        size_t closingBrace = findClosingBrace(pos);
+        if (closingBrace == std::string::npos) {
+            SS_LOG_WARN(L"PatternStore",
+                L"ImportFromYaraFile: Unmatched brace for rule '%hs'", ruleName.c_str());
+            break;
+        }
+
+        std::string ruleBody = yaraContent.substr(pos + 1, closingBrace - pos - 1);
+        pos = closingBrace + 1;
+        ruleCount++;
+
+        // --- Parse meta: section for threat level ---
+        ThreatLevel ruleThreatLevel = ThreatLevel::Medium;
+
+        size_t metaPos = ruleBody.find("meta:");
+        size_t stringsPos = ruleBody.find("strings:");
+        size_t conditionPos = ruleBody.find("condition:");
+
+        if (metaPos != std::string::npos) {
+            size_t metaEnd = std::string::npos;
+            if (stringsPos != std::string::npos && stringsPos > metaPos)
+                metaEnd = stringsPos;
+            else if (conditionPos != std::string::npos && conditionPos > metaPos)
+                metaEnd = conditionPos;
+
+            std::string metaSection = (metaEnd != std::string::npos)
+                ? ruleBody.substr(metaPos + 5, metaEnd - metaPos - 5)
+                : ruleBody.substr(metaPos + 5);
+
+            // Extract a meta key's value
+            auto getMetaVal = [&](const std::string& key) -> std::string {
+                size_t kpos = metaSection.find(key);
+                if (kpos == std::string::npos) return {};
+                kpos += key.size();
+                while (kpos < metaSection.size() && metaSection[kpos] != '=') ++kpos;
+                if (kpos >= metaSection.size()) return {};
+                ++kpos;
+                while (kpos < metaSection.size() &&
+                       std::isspace(static_cast<unsigned char>(metaSection[kpos]))) ++kpos;
+
+                if (kpos < metaSection.size() && metaSection[kpos] == '"') {
+                    ++kpos;
+                    size_t eq = metaSection.find('"', kpos);
+                    if (eq != std::string::npos)
+                        return metaSection.substr(kpos, eq - kpos);
+                }
+                size_t vs = kpos;
+                while (kpos < metaSection.size() &&
+                       !std::isspace(static_cast<unsigned char>(metaSection[kpos])) &&
+                       metaSection[kpos] != '\n') ++kpos;
+                return metaSection.substr(vs, kpos - vs);
+            };
+
+            std::string sev = getMetaVal("threat_level");
+            if (sev.empty()) sev = getMetaVal("severity");
+            if (sev.empty()) sev = getMetaVal("level");
+
+            if (!sev.empty()) {
+                std::string ls;
+                ls.reserve(sev.size());
+                for (char c : sev)
+                    ls += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                if (ls == "critical" || ls == "100")
+                    ruleThreatLevel = ThreatLevel::Critical;
+                else if (ls == "high" || ls == "75")
+                    ruleThreatLevel = ThreatLevel::High;
+                else if (ls == "medium" || ls == "50")
+                    ruleThreatLevel = ThreatLevel::Medium;
+                else if (ls == "low" || ls == "25")
+                    ruleThreatLevel = ThreatLevel::Low;
+                else if (ls == "info" || ls == "0" || ls == "informational")
+                    ruleThreatLevel = ThreatLevel::Info;
+            }
+        }
+
+        // --- Parse strings: section ---
+        if (stringsPos == std::string::npos) {
+            // No strings section (condition-only rule like filesize checks)
+            SS_LOG_DEBUG(L"PatternStore",
+                L"ImportFromYaraFile: Rule '%hs' has no strings section, skipping",
+                ruleName.c_str());
+            continue;
+        }
+
+        size_t strEnd = (conditionPos != std::string::npos && conditionPos > stringsPos)
+            ? conditionPos : ruleBody.size();
+        std::string strSection = ruleBody.substr(stringsPos + 8, strEnd - stringsPos - 8);
+
+        size_t sp = 0;
+        size_t pIdx = 0;
+        constexpr size_t MAX_PATTERNS_PER_RULE = 1000;
+
+        while (sp < strSection.size() && pIdx < MAX_PATTERNS_PER_RULE) {
+            size_t dollarPos = strSection.find('$', sp);
+            if (dollarPos == std::string::npos) break;
+            sp = dollarPos + 1;
+
+            // Read variable name
+            size_t vs = sp;
+            while (sp < strSection.size() &&
+                   (std::isalnum(static_cast<unsigned char>(strSection[sp])) ||
+                    strSection[sp] == '_')) ++sp;
+            std::string varName = strSection.substr(vs, sp - vs);
+
+            // Skip to '='
+            while (sp < strSection.size() &&
+                   std::isspace(static_cast<unsigned char>(strSection[sp]))) ++sp;
+            if (sp >= strSection.size() || strSection[sp] != '=') continue;
+            ++sp;
+            while (sp < strSection.size() &&
+                   std::isspace(static_cast<unsigned char>(strSection[sp]))) ++sp;
+            if (sp >= strSection.size()) break;
+
+            std::string patHex;
+
+            if (strSection[sp] == '{') {
+                // Hex pattern: $var = { AB CD ?? EF }
+                size_t hexEnd = strSection.find('}', sp);
+                if (hexEnd == std::string::npos) break;
+                patHex = extractHex(strSection.substr(sp + 1, hexEnd - sp - 1));
+                sp = hexEnd + 1;
+            } else if (strSection[sp] == '"') {
+                // String pattern: $var = "text"
+                ++sp;
+                std::string literal;
+                while (sp < strSection.size() && strSection[sp] != '"') {
+                    if (strSection[sp] == '\\' && sp + 1 < strSection.size()) {
+                        literal += strSection[sp];
+                        literal += strSection[sp + 1];
+                        sp += 2;
+                    } else {
+                        literal += strSection[sp];
+                        ++sp;
+                    }
+                }
+                if (sp < strSection.size()) ++sp;
+                patHex = strToHex(literal);
+            } else if (strSection[sp] == '/') {
+                // Regex: not importable as byte pattern
+                size_t regEnd = strSection.find('/', sp + 1);
+                if (regEnd != std::string::npos) {
+                    sp = regEnd + 1;
+                    while (sp < strSection.size() &&
+                           std::isalpha(static_cast<unsigned char>(strSection[sp]))) ++sp;
+                }
+                SS_LOG_DEBUG(L"PatternStore",
+                    L"ImportFromYaraFile: Skipping regex pattern $%hs in rule '%hs'",
+                    varName.c_str(), ruleName.c_str());
+                continue;
+            } else {
+                continue;
+            }
+
+            // Validate minimum pattern length (at least 2 hex bytes)
+            if (patHex.size() < 4) continue;
+
+            // Cap individual pattern size (16 KB hex = ~8 KB binary)
+            if (patHex.size() > 16384) {
+                SS_LOG_WARN(L"PatternStore",
+                    L"ImportFromYaraFile: Pattern $%hs exceeds 16 KB in rule '%hs', truncating",
+                    varName.c_str(), ruleName.c_str());
+                patHex = patHex.substr(0, 16384);
+            }
+
+            // Build signature name: ruleName.$varName
+            std::string sigName = ruleName;
+            if (!varName.empty()) sigName += ".$" + varName;
+
+            patterns.push_back(std::move(patHex));
+            names.push_back(std::move(sigName));
+            levels.push_back(ruleThreatLevel);
+            importedCount++;
+            pIdx++;
+
+            if (progressCallback) progressCallback(importedCount, 0);
+        }
+    }
+
+    if (ruleCount == 0) {
+        SS_LOG_WARN(L"PatternStore", L"ImportFromYaraFile: No YARA rules found in '%ls'",
+            filePath.c_str());
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No YARA rules found" };
     }
 
     if (patterns.empty()) {
-        SS_LOG_WARN(L"PatternStore", L"ImportFromYaraFile: No patterns found");
-        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No patterns found" };
+        SS_LOG_WARN(L"PatternStore",
+            L"ImportFromYaraFile: Parsed %zu rules, 0 patterns from '%ls'",
+            ruleCount, filePath.c_str());
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No scannable patterns in rules" };
     }
 
-    SS_LOG_INFO(L"PatternStore", L"ImportFromYaraFile: Importing %zu patterns", patterns.size());
+    SS_LOG_INFO(L"PatternStore",
+        L"ImportFromYaraFile: Parsed %zu rules, importing %zu patterns",
+        ruleCount, patterns.size());
 
-    // Batch import
     return AddPatternBatch(patterns, names, levels);
 }
 
@@ -1751,67 +2100,106 @@ StoreError PatternStore::ImportFromClamAV(const std::wstring& filePath) noexcept
         return StoreError{ SignatureStoreError::FileNotFound, fileErr.win32, "Cannot read file" };
     }
 
+    // Cap file size (128 MB max for ClamAV .ndb files)
+    constexpr size_t MAX_CLAMAV_FILE_SIZE = 128 * 1024 * 1024;
+    if (fileContent.size() > MAX_CLAMAV_FILE_SIZE) {
+        SS_LOG_ERROR(L"PatternStore",
+            L"ImportFromClamAV: File exceeds 128 MB limit: %zu bytes", fileContent.size());
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "ClamAV file exceeds 128 MB" };
+    }
+
     std::string content(reinterpret_cast<const char*>(fileContent.data()), fileContent.size());
 
-    // Parse ClamAV format (simplified)
-    // Format: SignatureName:TargetType:Offset:HexSignature
+    // ClamAV .ndb format: SignatureName:TargetType:Offset:HexSignature[:MinFL[:MaxFL]]
+    // TargetType: 0=any, 1=PE, 2=OLE2, 3=HTML, 4=Mail, 5=Graphics, 6=ELF, 7=ASCII
     std::vector<std::string> patterns;
     std::vector<std::string> names;
     std::vector<ThreatLevel> levels;
 
     size_t pos = 0;
     size_t importedCount = 0;
+    size_t skippedCount = 0;
+    constexpr size_t MAX_SIGNATURES = 500000;
 
-    while (pos < content.size()) {
-        // Find next newline
+    while (pos < content.size() && importedCount < MAX_SIGNATURES) {
         size_t nextNewline = content.find('\n', pos);
-        if (nextNewline == std::string::npos) {
-            nextNewline = content.size();
-        }
+        if (nextNewline == std::string::npos) nextNewline = content.size();
 
-        // Extract line
         std::string line = content.substr(pos, nextNewline - pos);
         pos = nextNewline + 1;
 
-        // Remove trailing \r
-        if (!line.empty() && line.back() == '\r') {
-            line.pop_back();
-        }
+        if (!line.empty() && line.back() == '\r') line.pop_back();
+        if (line.empty() || line[0] == '#') continue;
 
-        // Skip empty lines and comments
-        if (line.empty() || line[0] == '#') {
-            continue;
-        }
-
-        // Parse ClamAV signature line: Name:Type:Offset:Signature
+        // Tokenize by ':'
         std::vector<std::string> tokens;
         size_t tokenStart = 0;
 
         for (size_t i = 0; i <= line.size(); ++i) {
             if (i == line.size() || line[i] == ':') {
-                if (i > tokenStart) {
-                    tokens.push_back(line.substr(tokenStart, i - tokenStart));
-                }
+                tokens.push_back(line.substr(tokenStart, i - tokenStart));
                 tokenStart = i + 1;
+                if (tokens.size() >= 6) break; // Only need up to MaxFL
             }
         }
 
-        // Need at least 4 tokens
-        if (tokens.size() >= 4) {
-            std::string sigName = tokens[0];
-            std::string hexSig = tokens[3];
-
-            patterns.push_back(hexSig);
-            names.push_back(sigName);
-            levels.push_back(ThreatLevel::High);
-
-            importedCount++;
+        // Require at least 4 fields: Name:TargetType:Offset:HexSignature
+        if (tokens.size() < 4 || tokens[0].empty() || tokens[3].empty()) {
+            ++skippedCount;
+            continue;
         }
+
+        std::string& sigName = tokens[0];
+        std::string& hexSig = tokens[3];
+
+        // Cap signature name length
+        if (sigName.size() > 256) sigName = sigName.substr(0, 256);
+
+        // Validate hex signature contains only valid hex chars and wildcards
+        bool validHex = true;
+        for (char c : hexSig) {
+            if (!std::isxdigit(static_cast<unsigned char>(c)) &&
+                c != '?' && c != '*' && c != '{' && c != '}' &&
+                c != '-' && c != '(' && c != ')' && c != '|' &&
+                c != '[' && c != ']' && c != '!' && c != 'n') {
+                validHex = false;
+                break;
+            }
+        }
+        if (!validHex || hexSig.size() < 4) {
+            ++skippedCount;
+            continue;
+        }
+
+        // Cap individual signature size
+        if (hexSig.size() > 32768) {
+            hexSig = hexSig.substr(0, 32768);
+        }
+
+        // Classify threat level from signature name prefix conventions
+        ThreatLevel level = ThreatLevel::High;
+        if (sigName.find("PUA.") == 0 || sigName.find("Adware.") == 0)
+            level = ThreatLevel::Low;
+        else if (sigName.find("Trojan.") == 0 || sigName.find("Exploit.") == 0 ||
+                 sigName.find("Ransomware.") == 0)
+            level = ThreatLevel::Critical;
+        else if (sigName.find("Worm.") == 0 || sigName.find("Backdoor.") == 0)
+            level = ThreatLevel::High;
+
+        patterns.push_back(std::move(hexSig));
+        names.push_back(std::move(sigName));
+        levels.push_back(level);
+        importedCount++;
+    }
+
+    if (skippedCount > 0) {
+        SS_LOG_INFO(L"PatternStore",
+            L"ImportFromClamAV: Skipped %zu malformed lines", skippedCount);
     }
 
     if (patterns.empty()) {
-        SS_LOG_WARN(L"PatternStore", L"ImportFromClamAV: No patterns found");
-        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No patterns found" };
+        SS_LOG_WARN(L"PatternStore", L"ImportFromClamAV: No valid patterns found");
+        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No valid patterns found" };
     }
 
     SS_LOG_INFO(L"PatternStore", L"ImportFromClamAV: Importing %zu patterns", patterns.size());
