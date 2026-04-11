@@ -68,6 +68,9 @@
 // ============================================================================
 #include "../../../src/Shared_modules/AntiEvasion/DebuggerEvasionDetector.hpp"
 #include "../../../src/Shared_modules/AntiEvasion/VMEvasionDetector.hpp"
+#include "../../../src/Shared_modules/HashStore/HashStore.hpp"
+#include "../../../src/Shared_modules/PatternStore/PatternStore.hpp"
+#include "../../../src/Shared_modules/SignatureStore/YaraRuleStore.hpp"
 #include "../../../src/Shared_modules/SignatureStore/SignatureStore.hpp"
 #include "../../../src/Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
 
@@ -76,6 +79,8 @@
 // ============================================================================
 namespace AE  = ShadowStrike::AntiEvasion;
 namespace SS  = ShadowStrike::SignatureStore;
+namespace HS  = ShadowStrike::HashStore;
+namespace PS  = ShadowStrike::PatternStore;
 namespace TI  = ShadowStrike::ThreatIntel;
 using DED     = AE::DebuggerEvasionDetector;
 using VMED    = AE::VMEvasionDetector;
@@ -862,10 +867,47 @@ public:
 
         s_tempDir = new ScopedTempDir;
 
-        // Initialize SignatureStore (write-mode, new empty database)
+        const std::wstring hashPath    = s_tempDir->File(L"ae_hash.hdb");
+        const std::wstring patternPath = s_tempDir->File(L"ae_pattern.pdb");
+        const std::wstring yaraPath    = s_tempDir->File(L"ae_yara.ydb");
+
+        // YARA global state must be initialized before any YaraRuleStore::CreateNew.
+        if (!SS::YaraRuleStore::InitializeYara().IsSuccess()) {
+            ADD_FAILURE() << "YaraRuleStore::InitializeYara() failed.";
+            return;
+        }
+
+        // Create empty sub-store databases on disk.
+        {
+            HS::HashStore hs;
+            if (!hs.CreateNew(hashPath).IsSuccess()) {
+                ADD_FAILURE() << "HashStore::CreateNew() failed.";
+                return;
+            }
+        }
+        {
+            PS::PatternStore ps;
+            if (!ps.CreateNew(patternPath).IsSuccess()) {
+                ADD_FAILURE() << "PatternStore::CreateNew() failed.";
+                return;
+            }
+        }
+        {
+            SS::YaraRuleStore yr;
+            if (!yr.CreateNew(yaraPath).IsSuccess()) {
+                ADD_FAILURE() << "YaraRuleStore::CreateNew() failed.";
+                return;
+            }
+        }
+
+        // Open SignatureStore facade over the three sub-stores.
         s_sigStore = std::make_shared<SS::SignatureStore>();
-        if (!s_sigStore->Initialize(s_tempDir->File(L"ae_sigs.sdb"), /*readOnly=*/false)) {
-            ADD_FAILURE() << "SignatureStore::Initialize() failed.";
+        const SS::StoreError ssErr = s_sigStore->InitializeMulti(
+            hashPath, patternPath, yaraPath, /*readOnly=*/false);
+        if (!ssErr.IsSuccess()) {
+            ADD_FAILURE() << "SignatureStore::InitializeMulti() failed: "
+                          << ssErr.message;
+            s_sigStore.reset();
             return;
         }
 

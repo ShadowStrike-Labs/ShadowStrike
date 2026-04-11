@@ -834,7 +834,7 @@ DetectGDTRelocation ENDP
 DetectLDTPresence PROC
     sub     rsp, 8
     
-    sldt    [rsp]               ; Store LDT selector
+    sldt    WORD PTR [rsp]      ; Store LDT selector (16-bit)
     
     movzx   rax, WORD PTR [rsp]
     

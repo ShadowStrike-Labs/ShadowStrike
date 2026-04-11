@@ -577,7 +577,7 @@ namespace ShadowStrike {
             // -------------------------------------------------------------------------
 
             /// @brief APIs commonly used for VM detection by malware
-            inline constexpr std::array<std::string_view, 32> ANTI_VM_IMPORT_APIS = {{
+            inline constexpr std::array<std::string_view, 31> ANTI_VM_IMPORT_APIS = {{
                 // Debugger detection (often paired with VM detection)
                 "IsDebuggerPresent",
                 "CheckRemoteDebuggerPresent",
