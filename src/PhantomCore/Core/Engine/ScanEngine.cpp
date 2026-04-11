@@ -36,6 +36,7 @@
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../../ThreatIntel/ThreatIntelDatabase.hpp"
+#include "../../Database/LogDB.hpp"
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
@@ -2260,6 +2261,64 @@ EngineResult ScanEngine::ScanFile(
 
         // Update cache
         m_impl->UpdateCache(fileHash, result);
+
+        // Record scan result to persistent LogDB
+        try {
+            auto& logDb = ShadowStrike::Database::LogDB::Instance();
+            if (logDb.IsInitialized()) {
+                Database::LogDB::LogEntry logEntry{};
+                logEntry.category = Database::LogDB::LogCategory::Scanner;
+                logEntry.source = L"ScanEngine";
+                logEntry.processId = GetCurrentProcessId();
+                logEntry.threadId = GetCurrentThreadId();
+                logEntry.durationMs = static_cast<int64_t>(result.scanDurationUs / 1000);
+
+                if (result.verdict == ScanVerdict::Clean) {
+                    logEntry.level = Database::LogDB::LogLevel::Trace;
+                    logEntry.message = L"Scan clean: " + filePath;
+                } else if (result.verdict == ScanVerdict::Suspicious) {
+                    logEntry.level = Database::LogDB::LogLevel::Warn;
+                    logEntry.message = L"Suspicious: " +
+                        StringUtils::ToWide(result.threatName) + L" — " + filePath;
+                } else if (result.verdict == ScanVerdict::Infected) {
+                    logEntry.level = Database::LogDB::LogLevel::Error;
+                    logEntry.message = L"INFECTED: " +
+                        StringUtils::ToWide(result.threatName) + L" — " + filePath;
+                } else {
+                    logEntry.level = Database::LogDB::LogLevel::Debug;
+                    logEntry.message = L"Scan completed (verdict=" +
+                        std::to_wstring(static_cast<int>(result.verdict)) + L"): " + filePath;
+                }
+
+                // Build structured metadata JSON
+                std::wstring metaJson = L"{";
+                metaJson += L"\"verdict\":" + std::to_wstring(static_cast<int>(result.verdict));
+                if (!result.sha256.empty()) {
+                    metaJson += L",\"sha256\":\"" + StringUtils::ToWide(result.sha256.substr(0, 16)) + L"...\"";
+                }
+                metaJson += L",\"score\":" + std::to_wstring(static_cast<int>(result.threatScore));
+                metaJson += L",\"duration_us\":" + std::to_wstring(result.scanDurationUs);
+                if (!result.detectionSource.empty()) {
+                    metaJson += L",\"source\":\"" + StringUtils::ToWide(result.detectionSource) + L"\"";
+                }
+                if (!result.detectionMethods.empty()) {
+                    metaJson += L",\"methods\":[";
+                    for (size_t i = 0; i < result.detectionMethods.size(); ++i) {
+                        if (i > 0) metaJson += L",";
+                        metaJson += L"\"" + StringUtils::ToWide(result.detectionMethods[i]) + L"\"";
+                    }
+                    metaJson += L"]";
+                }
+                metaJson += L"}";
+                logEntry.metadata = metaJson;
+                logEntry.filePath = filePath;
+
+                logDb.LogDetailed(logEntry);
+            }
+        } catch (...) {
+            // LogDB failure must never block scan results
+            SS_LOG_DEBUG(L"ScanEngine", L"LogDB recording failed (non-fatal)");
+        }
 
         SS_LOG_INFO(L"ScanEngine", L"Scan complete - Verdict: %d, Duration: %llu us",
             static_cast<int>(result.verdict),
