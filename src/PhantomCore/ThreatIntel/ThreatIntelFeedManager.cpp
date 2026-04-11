@@ -3082,11 +3082,18 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
         return response;
     }
     
-    // Validate URL scheme for security
+    // Validate URL scheme — HTTPS required for threat intel integrity
     const bool isHttps = url.starts_with("https://");
     const bool isHttp = url.starts_with("http://");
     if (!isHttps && !isHttp) {
-        response.error = "Invalid URL scheme (only http/https supported)";
+        response.error = "Invalid URL scheme (only https supported for threat intelligence feeds)";
+        return response;
+    }
+    if (isHttp && !isHttps) {
+        // Plain HTTP feeds are a MITM vector — attacker can inject false IOCs
+        EmitEvent(FeedEventType::HealthWarning, context.config.feedId,
+                 "SECURITY: Feed URL uses plain HTTP - rejecting to prevent IOC injection attacks");
+        response.error = "Plain HTTP feed URLs rejected (HTTPS required for threat intelligence)";
         return response;
     }
     
@@ -3354,8 +3361,9 @@ HttpResponse ThreatIntelFeedManager::FetchFeedData(
                      "SSL certificate verification disabled for feed - SECURITY RISK");
         }
     } else {
+        // Non-HTTPS path should not be reached for feed data — reject as defense-in-depth
         EmitEvent(FeedEventType::HealthWarning, context.config.feedId,
-                 "Feed using non-HTTPS connection - data may be intercepted");
+                 "SECURITY: Non-HTTPS connection detected in HTTP request path");
     }
     
     // Open HTTP request with proper method
