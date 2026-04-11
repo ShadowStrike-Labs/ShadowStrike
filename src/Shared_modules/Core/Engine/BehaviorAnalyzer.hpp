@@ -247,6 +247,17 @@ namespace ShadowStrike {
     namespace Whitelist {
         class WhitelistStore;
     }
+    namespace Ransomware {
+        class RansomwareDetector;
+    }
+    namespace Core {
+        namespace Process {
+            class ProcessInjectionDetector;
+        }
+        namespace Registry {
+            class PersistenceDetector;
+        }
+    }
 }
 
 namespace ShadowStrike {
@@ -2154,6 +2165,32 @@ public:
      * @brief Set SignatureStore for pattern matching.
      */
     void SetSignatureStore(SignatureStore::SignatureStore* store);
+
+    // =========================================================================
+    // Specialized Detector Integration (Enrichment Delegation)
+    // =========================================================================
+
+    /**
+     * @brief Connect the specialized RansomwareDetector for enrichment.
+     * When set, UpdateRansomwareScore queries this detector for deeper
+     * analysis (entropy validation, family identification). Nullable —
+     * if nullptr, inline detection logic is the sole authority.
+     */
+    void SetRansomwareDetector(Ransomware::RansomwareDetector* detector);
+
+    /**
+     * @brief Connect the specialized ProcessInjectionDetector for enrichment.
+     * When set, UpdateInjectionScore cross-references the detector's
+     * compound-pattern analysis for target processes. Nullable.
+     */
+    void SetInjectionDetector(Core::Process::ProcessInjectionDetector* detector);
+
+    /**
+     * @brief Connect the specialized PersistenceDetector for enrichment.
+     * When set, UpdatePersistenceScore queries the detector for type
+     * classification and risk scoring. Nullable.
+     */
+    void SetPersistenceDetector(Core::Registry::PersistenceDetector* detector);
 
 private:
     // =========================================================================

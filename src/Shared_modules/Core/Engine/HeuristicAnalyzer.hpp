@@ -214,6 +214,7 @@
 #include "../../PatternStore/PatternStore.hpp" // String/shellcode patterns
 #include "../../SignatureStore/SignatureStore.hpp" // YARA rules
 #include "../../ThreatIntel/ThreatIntelLookup.hpp"  // Cert reputation
+#include "../../PEParser/PEParser.hpp"        // Delegated PE structure parsing
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -2469,17 +2470,17 @@ private:
     // =========================================================================
 
     /**
-     * @brief Parse DOS header.
+     * @brief Parse DOS header (legacy — PEParser handles this in AnalyzePE).
      */
     bool ParseDOSHeader(std::span<const uint8_t> data, PEAnalysis& pe);
 
     /**
-     * @brief Parse PE headers.
+     * @brief Parse PE headers (legacy — PEParser handles this in AnalyzePE).
      */
     bool ParsePEHeaders(std::span<const uint8_t> data, PEAnalysis& pe);
 
     /**
-     * @brief Parse sections.
+     * @brief Parse sections (legacy — PEParser handles this in AnalyzePE).
      */
     void ParseSections(std::span<const uint8_t> data, PEAnalysis& pe);
 
@@ -2489,7 +2490,7 @@ private:
     void ParseImports(std::span<const uint8_t> data, PEAnalysis& pe);
 
     /**
-     * @brief Parse exports.
+     * @brief Parse exports (legacy — PEParser handles this in AnalyzePE).
      */
     void ParseExports(std::span<const uint8_t> data, PEAnalysis& pe);
 
@@ -2499,14 +2500,48 @@ private:
     void ParseResources(std::span<const uint8_t> data, PEAnalysis& pe);
 
     /**
-     * @brief Analyze rich header.
+     * @brief Analyze rich header (legacy — PopulateRichHeader handles this).
      */
     void AnalyzeRichHeader(std::span<const uint8_t> data, PEAnalysis& pe);
 
     /**
-     * @brief Detect PE anomalies.
+     * @brief Detect PE anomalies (legacy — DetectHeuristicAnomalies handles this).
      */
     void DetectPEAnomalies(std::span<const uint8_t> data, PEAnalysis& pe);
+
+    // =========================================================================
+    // PEParser Delegation Methods (new — replace manual PE walking)
+    // =========================================================================
+
+    /**
+     * @brief Populate PEAnalysis header fields from PEParser::PEInfo.
+     * Maps PEParser's parsed output to our internal PEAnalysis model.
+     */
+    void PopulateFromPEInfo(const ShadowStrike::PEParser::PEParser& parser,
+                            const ShadowStrike::PEParser::PEInfo& peInfo,
+                            PEAnalysis& pe);
+
+    /**
+     * @brief Populate PEAnalysis sections from PEParser::PEInfo.
+     * Also computes HA-specific section hashes and entropy.
+     */
+    void PopulateSections(const ShadowStrike::PEParser::PEParser& parser,
+                          const ShadowStrike::PEParser::PEInfo& peInfo,
+                          std::span<const uint8_t> data,
+                          PEAnalysis& pe);
+
+    /**
+     * @brief Populate Rich header info from PEParser.
+     */
+    void PopulateRichHeader(ShadowStrike::PEParser::PEParser& parser,
+                            PEAnalysis& pe);
+
+    /**
+     * @brief Run heuristic-specific anomaly checks (scoring, alignment, EP).
+     * PEParser catches structural anomalies; this adds scoring logic.
+     */
+    void DetectHeuristicAnomalies(const ShadowStrike::PEParser::PEInfo& peInfo,
+                                  PEAnalysis& pe);
 
     /**
      * @brief Analyze code section.

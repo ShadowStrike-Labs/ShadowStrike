@@ -12,6 +12,7 @@
 #include "../../SignatureStore/SignatureFormat.hpp"
 #include "../../ThreatIntel/ThreatIntelIndex.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
+#include "../../PEParser/PEParser.hpp"
 
 #include <algorithm>
 #include <numeric>
@@ -53,6 +54,59 @@ namespace {
         if (offset > dataSize) return false;
         if (size > dataSize - offset) return false;  // Prevents overflow
         return true;
+    }
+
+    // ========================================================================
+    // PEParser → HeuristicAnalyzer Anomaly Mapping
+    // ========================================================================
+
+    /// @brief Map PEParser::AnomalyType to HeuristicAnalyzer::PEAnomaly.
+    /// Returns PEAnomaly::None for anomaly types that have no direct equivalent.
+    [[nodiscard]] PEAnomaly MapPEParserAnomaly(
+        ShadowStrike::PEParser::AnomalyType type) noexcept
+    {
+        using AT = ShadowStrike::PEParser::AnomalyType;
+        switch (type) {
+            case AT::TimestampInFuture:           return PEAnomaly::FutureTimestamp;
+            case AT::TimestampZero:               return PEAnomaly::ZeroedTimestamp;
+            case AT::ChecksumMismatch:            return PEAnomaly::ChecksumMismatch;
+            case AT::SectionNameEmpty:             return PEAnomaly::EmptySectionName;
+            case AT::SectionNameNonPrintable:      return PEAnomaly::NonASCIISectionName;
+            case AT::SectionNameSuspicious:        return PEAnomaly::SuspiciousSectionName;
+            case AT::SectionWritableExecutable:    return PEAnomaly::RWXSection;
+            case AT::SectionZeroRawSize:           return PEAnomaly::ZeroRawSize;
+            case AT::SectionHighEntropy:           return PEAnomaly::HighEntropyResource;
+            case AT::TooManySections:              return PEAnomaly::TooManySections;
+            case AT::EntryPointInHeader:           return PEAnomaly::EntryPointInHeader;
+            case AT::EntryPointZero:               return PEAnomaly::InvalidEntryPoint;
+            case AT::EntryPointOutsideFile:        return PEAnomaly::EntryPointOutsideSections;
+            case AT::NoImports:                    return PEAnomaly::NoImports;
+            case AT::OverlayPresent:               return PEAnomaly::HasOverlay;
+            case AT::OverlayHighEntropy:           return PEAnomaly::LargeOverlay;
+            case AT::NoASLR:                       return PEAnomaly::None; // scored separately
+            case AT::NoDEP:                        return PEAnomaly::None;
+            case AT::NoSEH:                        return PEAnomaly::None;
+            case AT::NoCFG:                        return PEAnomaly::None;
+            case AT::ResourcesContainPE:           return PEAnomaly::PEInResources;
+            case AT::ResourcesHighEntropy:         return PEAnomaly::HighEntropyResource;
+            default:                               return PEAnomaly::None;
+        }
+    }
+
+    /// @brief Transfer relevant PEParser anomalies into PEAnalysis, deduplicating.
+    void TransferPEParserAnomalies(
+        const std::vector<ShadowStrike::PEParser::Anomaly>& ppAnomalies,
+        PEAnalysis& pe)
+    {
+        for (const auto& a : ppAnomalies) {
+            auto mapped = MapPEParserAnomaly(a.type);
+            if (mapped == PEAnomaly::None) continue;
+            // Avoid duplicates
+            if (std::find(pe.anomalies.begin(), pe.anomalies.end(), mapped)
+                == pe.anomalies.end()) {
+                pe.anomalies.push_back(mapped);
+            }
+        }
     }
 }
 
@@ -630,28 +684,57 @@ HeuristicResult HeuristicAnalyzer::QuickScan(const std::wstring& filePath) {
 PEAnalysis HeuristicAnalyzer::AnalyzePE(std::span<const uint8_t> data) {
     PEAnalysis pe;
 
-    if (!ParseDOSHeader(data, pe)) {
-        return pe;
-    }
-    if (!ParsePEHeaders(data, pe)) {
+    // =========================================================================
+    // DELEGATE PE PARSING TO PEParser MODULE
+    // =========================================================================
+    // PEParser provides enterprise-grade bounds checking, overflow protection,
+    // and comprehensive PE structure parsing. We delegate raw header parsing
+    // to it and adapt the output to our internal PEAnalysis model.
+    PEParser::PEParser parser;
+    PEParser::PEInfo peInfo;
+    PEParser::PEError parseErr;
+
+    if (!parser.ParseBuffer(data, peInfo, &parseErr)) {
+        // PEParser failed basic parsing — transfer any anomalies it caught
+        TransferPEParserAnomalies(peInfo.anomalies, pe);
+        SS_LOG_DEBUG(L"HeuristicAnalyzer", L"PEParser rejected buffer: %s",
+                     parseErr.message.c_str());
         return pe;
     }
 
     pe.isValidPE = true;
 
-    ParseSections(data, pe);
+    // --- Map core header fields from PEInfo ---
+    PopulateFromPEInfo(parser, peInfo, pe);
+
+    // --- Map sections from PEParser (plus HA-specific entropy/hash analysis) ---
+    PopulateSections(parser, peInfo, data, pe);
+
+    // --- Suspicious import scanning (raw-byte API name search) ---
+    // This is NOT the same as PEParser's IAT walk; HeuristicAnalyzer scans for
+    // suspicious API name strings in the raw binary to detect API usage even
+    // in packed/obfuscated files where the import table may be destroyed.
     ParseImports(data, pe);
-    ParseExports(data, pe);
+
+    // --- Export anomaly detection ---
+    if (pe.isDLL && !peInfo.dataDirectories[PEParser::DataDirectory::EXPORT].present) {
+        pe.anomalies.push_back(PEAnomaly::NoExportsForDLL);
+    }
 
     if (m_impl->m_config.enableResourceAnalysis) {
         ParseResources(data, pe);
     }
 
-    AnalyzeRichHeader(data, pe);
-    DetectPEAnomalies(data, pe);
+    // --- Rich header via PEParser ---
+    PopulateRichHeader(parser, pe);
+
+    // --- Heuristic-specific PE anomaly detection ---
+    DetectHeuristicAnomalies(peInfo, pe);
+
+    // --- Transfer any remaining PEParser anomalies ---
+    TransferPEParserAnomalies(peInfo.anomalies, pe);
 
     if (m_impl->m_config.enableCodeAnalysis) {
-        // Analyze code sections
         for (const auto& sec : pe.sections) {
             if (sec.isCode && sec.rawSize > 0 &&
                 sec.rawOffset + sec.rawSize <= data.size())
@@ -702,193 +785,118 @@ PEAnalysis HeuristicAnalyzer::AnalyzePE(std::span<const uint8_t> data) {
     return pe;
 }
 
-bool HeuristicAnalyzer::ParseDOSHeader(std::span<const uint8_t> data, PEAnalysis& pe) {
-    if (data.size() < sizeof(IMAGE_DOS_HEADER)) {
-        return false;
-    }
+// ============================================================================
+// PEParser Delegation: Header Fields Adapter
+// ============================================================================
 
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
-        pe.anomalies.push_back(PEAnomaly::InvalidDOSSignature);
-        return false;
-    }
+void HeuristicAnalyzer::PopulateFromPEInfo(
+    const PEParser::PEParser& /*parser*/,
+    const PEParser::PEInfo& peInfo,
+    PEAnalysis& pe)
+{
+    pe.is64Bit           = peInfo.is64Bit;
+    pe.isDLL             = peInfo.isDLL;
+    pe.isDriver          = peInfo.isDriver;
+    pe.isDotNet          = peInfo.isDotNet;
+    pe.machine           = peInfo.machine;
+    pe.subsystem         = static_cast<PESubsystem>(peInfo.subsystem);
+    pe.numberOfSections  = static_cast<uint16_t>(peInfo.sections.size());
+    pe.timestamp         = peInfo.timeDateStamp;
+    pe.entryPoint        = peInfo.entryPointRva;
+    pe.imageBase         = peInfo.imageBase;
+    pe.sectionAlignment  = peInfo.sectionAlignment;
+    pe.fileAlignment     = peInfo.fileAlignment;
+    pe.sizeOfImage       = peInfo.sizeOfImage;
+    pe.sizeOfHeaders     = peInfo.sizeOfHeaders;
+    pe.checksum          = peInfo.checksum;
+    pe.dllCharacteristics = peInfo.dllCharacteristics;
 
-    // Validate e_lfanew is reasonable with overflow check
-    auto peOffsetOpt = SafeToSizeT(dos->e_lfanew);
-    if (!peOffsetOpt || *peOffsetOpt > data.size() || 
-        *peOffsetOpt + sizeof(IMAGE_NT_HEADERS32) > data.size()) {
-        pe.anomalies.push_back(PEAnomaly::InvalidPEOffset);
-        return false;
-    }
-
-    return true;
-}
-
-bool HeuristicAnalyzer::ParsePEHeaders(std::span<const uint8_t> data, PEAnalysis& pe) {
-    if (data.size() < sizeof(IMAGE_DOS_HEADER)) {
-        return false;
-    }
-
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    auto peOffsetOpt = SafeToSizeT(dos->e_lfanew);
-    if (!peOffsetOpt) {
-        return false;
-    }
-    
-    const size_t peOffset = *peOffsetOpt;
-    if (!IsValidRange(data.size(), peOffset, sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER))) {
-        return false;
-    }
-
-    auto sig = *reinterpret_cast<const DWORD*>(data.data() + peOffset);
-    if (sig != IMAGE_NT_SIGNATURE) {
-        pe.anomalies.push_back(PEAnomaly::InvalidPESignature);
-        return false;
-    }
-
-    auto fileHdr = reinterpret_cast<const IMAGE_FILE_HEADER*>(
-        data.data() + peOffset + sizeof(DWORD));
-
-    pe.machine = fileHdr->Machine;
-    pe.numberOfSections = fileHdr->NumberOfSections;
-    pe.timestamp = fileHdr->TimeDateStamp;
-    pe.characteristics = fileHdr->Characteristics;
-
-    // Determine 32/64
-    const size_t optStart = peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
-    if (!IsValidRange(data.size(), optStart, sizeof(WORD))) {
-        return false;
-    }
-
-    auto optMagic = *reinterpret_cast<const WORD*>(data.data() + optStart);
-
-    if (optMagic == IMAGE_NT_OPTIONAL_HDR64_MAGIC) {
-        if (!IsValidRange(data.size(), optStart, sizeof(IMAGE_OPTIONAL_HEADER64))) {
-            return false;
-        }
-        auto opt64 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(data.data() + optStart);
-
-        pe.is64Bit = true;
-        pe.entryPoint = opt64->AddressOfEntryPoint;
-        pe.imageBase = opt64->ImageBase;
-        pe.sectionAlignment = opt64->SectionAlignment;
-        pe.fileAlignment = opt64->FileAlignment;
-        pe.sizeOfImage = opt64->SizeOfImage;
-        pe.sizeOfHeaders = opt64->SizeOfHeaders;
-        pe.checksum = opt64->CheckSum;
-        pe.dllCharacteristics = opt64->DllCharacteristics;
-        pe.subsystem = static_cast<PESubsystem>(opt64->Subsystem);
-    }
-    else if (optMagic == IMAGE_NT_OPTIONAL_HDR32_MAGIC) {
-        if (!IsValidRange(data.size(), optStart, sizeof(IMAGE_OPTIONAL_HEADER32))) {
-            return false;
-        }
-        auto opt32 = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(data.data() + optStart);
-
-        pe.is64Bit = false;
-        pe.entryPoint = opt32->AddressOfEntryPoint;
-        pe.imageBase = opt32->ImageBase;
-        pe.sectionAlignment = opt32->SectionAlignment;
-        pe.fileAlignment = opt32->FileAlignment;
-        pe.sizeOfImage = opt32->SizeOfImage;
-        pe.sizeOfHeaders = opt32->SizeOfHeaders;
-        pe.checksum = opt32->CheckSum;
-        pe.dllCharacteristics = opt32->DllCharacteristics;
-        pe.subsystem = static_cast<PESubsystem>(opt32->Subsystem);
-    }
-    else {
-        pe.anomalies.push_back(PEAnomaly::InvalidOptionalMagic);
-        return false;
-    }
-
-    pe.isDLL = (pe.characteristics & IMAGE_FILE_DLL) != 0;
-    pe.isDriver = (pe.subsystem == PESubsystem::Native);
-
-    // Security mitigations
-    pe.hasASLR = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0;
-    pe.hasDEP  = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0;
-    pe.hasCFG  = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) != 0;
+    // Security mitigation flags derived from DLL characteristics
+    pe.hasASLR          = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_DYNAMIC_BASE) != 0;
+    pe.hasDEP           = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NX_COMPAT) != 0;
+    pe.hasCFG           = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_GUARD_CF) != 0;
     pe.hasHighEntropyVA = (pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_HIGH_ENTROPY_VA) != 0;
-    pe.hasSEH = !(pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH);
+    pe.hasSEH           = !(pe.dllCharacteristics & IMAGE_DLLCHARACTERISTICS_NO_SEH);
 
-    // Timestamp analysis
-    if (pe.timestamp == 0) {
-        pe.anomalies.push_back(PEAnomaly::ZeroedTimestamp);
-    } else {
+    // Timestamp analysis (kept from original — heuristic-specific checks)
+    if (pe.timestamp != 0) {
+        pe.timestampDate = std::chrono::system_clock::from_time_t(
+            static_cast<time_t>(pe.timestamp));
         auto now = static_cast<uint32_t>(std::time(nullptr));
         if (pe.timestamp > now) {
             pe.anomalies.push_back(PEAnomaly::FutureTimestamp);
         }
+    } else {
+        pe.anomalies.push_back(PEAnomaly::ZeroedTimestamp);
     }
 
-    // Section count checks
+    // Section count heuristic checks
     if (pe.numberOfSections == 0) {
         pe.anomalies.push_back(PEAnomaly::ZeroSections);
     } else if (pe.numberOfSections > HeuristicConstants::MAX_NORMAL_SECTIONS) {
         pe.anomalies.push_back(PEAnomaly::TooManySections);
     }
 
-    return true;
-}
-// ============================================================================
-// Section / Import / Export / Resource Parsing
-// ============================================================================
-
-void HeuristicAnalyzer::ParseSections(std::span<const uint8_t> data, PEAnalysis& pe) {
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    const auto peOffset = static_cast<size_t>(dos->e_lfanew);
-
-    // Compute section header offset
-    size_t sectionStart = peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER)
-        + (pe.is64Bit ? sizeof(IMAGE_OPTIONAL_HEADER64) : sizeof(IMAGE_OPTIONAL_HEADER32));
-
-    const size_t sectionEnd = sectionStart + pe.numberOfSections * sizeof(IMAGE_SECTION_HEADER);
-    if (sectionEnd > data.size()) {
-        pe.anomalies.push_back(PEAnomaly::TooManySections);
-        return;
+    // Overlay detection from PEParser
+    if (peInfo.overlayOffset > 0 && peInfo.overlaySize > 0) {
+        pe.hasOverlay    = true;
+        pe.overlayOffset = peInfo.overlayOffset;
+        pe.overlaySize   = peInfo.overlaySize;
     }
 
-    auto sections = reinterpret_cast<const IMAGE_SECTION_HEADER*>(data.data() + sectionStart);
+    // Entry point section from PEParser
+    if (peInfo.entryPointSectionIndex.has_value()) {
+        auto idx = *peInfo.entryPointSectionIndex;
+        if (idx < peInfo.sections.size()) {
+            pe.entryPointSection = peInfo.sections[idx].name;
+        }
+    }
+}
 
-    for (uint16_t i = 0; i < pe.numberOfSections; ++i) {
+// ============================================================================
+// PEParser Delegation: Section Adapter
+// ============================================================================
+
+void HeuristicAnalyzer::PopulateSections(
+    const PEParser::PEParser& /*parser*/,
+    const PEParser::PEInfo& peInfo,
+    std::span<const uint8_t> data,
+    PEAnalysis& pe)
+{
+    pe.sections.reserve(peInfo.sections.size());
+
+    for (uint16_t i = 0; i < peInfo.sections.size(); ++i) {
+        const auto& ppSec = peInfo.sections[i];
         SectionAnalysis sec;
-        sec.index = i;
+        sec.index              = i;
+        sec.name               = ppSec.name;
+        sec.virtualAddress     = ppSec.virtualAddress;
+        sec.virtualSize        = ppSec.virtualSize;
+        sec.rawOffset          = ppSec.rawAddress;
+        sec.rawSize            = ppSec.rawSize;
+        sec.characteristics    = ppSec.characteristics;
 
-        // Safe section name extraction (up to 8 bytes, may not be null-terminated)
-        sec.name.assign(reinterpret_cast<const char*>(sections[i].Name),
-                        strnlen(reinterpret_cast<const char*>(sections[i].Name), IMAGE_SIZEOF_SHORT_NAME));
-
-        sec.virtualAddress = sections[i].VirtualAddress;
-        sec.virtualSize = sections[i].Misc.VirtualSize;
-        sec.rawOffset = sections[i].PointerToRawData;
-        sec.rawSize = sections[i].SizeOfRawData;
-        sec.characteristics = sections[i].Characteristics;
-
-        sec.isReadable   = (sec.characteristics & IMAGE_SCN_MEM_READ) != 0;
-        sec.isWritable   = (sec.characteristics & IMAGE_SCN_MEM_WRITE) != 0;
-        sec.isExecutable = (sec.characteristics & IMAGE_SCN_MEM_EXECUTE) != 0;
-        sec.isCode       = (sec.characteristics & IMAGE_SCN_CNT_CODE) != 0;
-        sec.isInitializedData   = (sec.characteristics & IMAGE_SCN_CNT_INITIALIZED_DATA) != 0;
-        sec.isUninitializedData = (sec.characteristics & IMAGE_SCN_CNT_UNINITIALIZED_DATA) != 0;
-        sec.isEmpty = (sec.rawSize == 0 && sec.virtualSize == 0);
+        sec.isReadable         = ppSec.isReadable;
+        sec.isWritable         = ppSec.isWritable;
+        sec.isExecutable       = ppSec.isExecutable;
+        sec.isCode             = ppSec.hasCode;
+        sec.isInitializedData  = ppSec.hasInitializedData;
+        sec.isUninitializedData = ppSec.hasUninitializedData;
+        sec.isEmpty            = (sec.rawSize == 0 && sec.virtualSize == 0);
 
         // Entry point check
         if (pe.entryPoint >= sec.virtualAddress &&
             pe.entryPoint < sec.virtualAddress + sec.virtualSize) {
             sec.containsEntryPoint = true;
-            pe.entryPointSection = sec.name;
         }
 
-        // Check section name for non-ASCII
-        bool hasNonAscii = false;
+        // Non-ASCII section name check
         for (char c : sec.name) {
-            if (c != 0 && (static_cast<unsigned char>(c) < 0x20 || static_cast<unsigned char>(c) > 0x7E)) {
-                hasNonAscii = true;
+            if (c != 0 && (static_cast<unsigned char>(c) < 0x20 ||
+                           static_cast<unsigned char>(c) > 0x7E)) {
+                pe.anomalies.push_back(PEAnomaly::NonASCIISectionName);
                 break;
             }
-        }
-        if (hasNonAscii) {
-            pe.anomalies.push_back(PEAnomaly::NonASCIISectionName);
         }
 
         // Empty section name
@@ -896,40 +904,139 @@ void HeuristicAnalyzer::ParseSections(std::span<const uint8_t> data, PEAnalysis&
             pe.anomalies.push_back(PEAnomaly::EmptySectionName);
         }
 
-        // Compute section hashes
+        // Section hashes (HA-specific: PEParser does not compute per-section hashes)
         if (sec.rawSize > 0 && sec.rawOffset + sec.rawSize <= data.size()) {
             CalculateSectionHashes(
-                data.subspan(static_cast<size_t>(sec.rawOffset), static_cast<size_t>(sec.rawSize)),
+                data.subspan(static_cast<size_t>(sec.rawOffset),
+                             static_cast<size_t>(sec.rawSize)),
                 sec);
         }
 
         pe.sections.push_back(std::move(sec));
     }
 
-    // Check if last section is executable (suspicious)
+    // Last section executable check
     if (!pe.sections.empty() && pe.sections.back().isExecutable) {
         pe.anomalies.push_back(PEAnomaly::LastSectionExecutable);
     }
 
-    // Detect overlay
-    if (!pe.sections.empty()) {
-        const auto& lastSec = pe.sections.back();
-        uint64_t endOfSections = lastSec.rawOffset + lastSec.rawSize;
-        if (endOfSections < data.size()) {
-            pe.hasOverlay = true;
-            pe.overlayOffset = endOfSections;
-            pe.overlaySize = data.size() - endOfSections;
-            if (pe.overlaySize > 0) {
-                auto overlaySpan = data.subspan(
-                    static_cast<size_t>(endOfSections),
-                    static_cast<size_t>(pe.overlaySize));
-                pe.overlayEntropy = CalculateEntropy(overlaySpan);
-                pe.anomalies.push_back(PEAnomaly::HasOverlay);
-                if (pe.overlaySize > pe.sizeOfImage) {
-                    pe.anomalies.push_back(PEAnomaly::LargeOverlay);
-                }
-            }
+    // Overlay entropy computation (HA-specific: PEParser detects overlay but
+    // doesn't return the entropy value)
+    if (pe.hasOverlay && pe.overlaySize > 0 &&
+        pe.overlayOffset + pe.overlaySize <= data.size())
+    {
+        auto overlaySpan = data.subspan(
+            static_cast<size_t>(pe.overlayOffset),
+            static_cast<size_t>(pe.overlaySize));
+        pe.overlayEntropy = CalculateEntropy(overlaySpan);
+        pe.anomalies.push_back(PEAnomaly::HasOverlay);
+        if (pe.overlaySize > pe.sizeOfImage) {
+            pe.anomalies.push_back(PEAnomaly::LargeOverlay);
         }
+    }
+}
+
+// ============================================================================
+// PEParser Delegation: Rich Header Adapter
+// ============================================================================
+
+void HeuristicAnalyzer::PopulateRichHeader(
+    PEParser::PEParser& parser,
+    PEAnalysis& pe)
+{
+    PEParser::RichHeaderInfo richInfo;
+    if (parser.ParseRichHeader(richInfo)) {
+        pe.hasRichHeader = richInfo.present;
+        pe.richEntries.reserve(richInfo.entries.size());
+        for (const auto& entry : richInfo.entries) {
+            pe.richEntries.emplace_back(
+                static_cast<uint32_t>(entry.productId),
+                entry.useCount);
+        }
+    } else {
+        pe.anomalies.push_back(PEAnomaly::RichHeaderStripped);
+    }
+}
+
+// ============================================================================
+// PEParser Delegation: Heuristic Anomaly Detection
+// ============================================================================
+
+void HeuristicAnalyzer::DetectHeuristicAnomalies(
+    const PEParser::PEInfo& peInfo,
+    PEAnalysis& pe)
+{
+    // Alignment checks (heuristic-specific scoring)
+    if (pe.sectionAlignment == 0 ||
+        (pe.sectionAlignment & (pe.sectionAlignment - 1)) != 0) {
+        pe.anomalies.push_back(PEAnomaly::InvalidSectionAlignment);
+        pe.riskScore += 5.0;
+    }
+    if (pe.fileAlignment == 0 ||
+        (pe.fileAlignment & (pe.fileAlignment - 1)) != 0) {
+        pe.anomalies.push_back(PEAnomaly::InvalidFileAlignment);
+        pe.riskScore += 5.0;
+    }
+
+    // Zero image base
+    if (pe.imageBase == 0) {
+        pe.anomalies.push_back(PEAnomaly::ZeroImageBase);
+        pe.riskScore += 5.0;
+    }
+
+    // Entry point outside all sections
+    if (pe.entryPointSection.empty() && pe.entryPoint != 0) {
+        pe.anomalies.push_back(PEAnomaly::EntryPointOutsideSections);
+        pe.riskScore += 10.0;
+    }
+
+    // .NET detection already handled by PEParser (peInfo.isDotNet)
+    // No need to re-read CLR data directory
+}
+
+// ============================================================================
+// LEGACY METHODS — Retained for backward compatibility, now delegate
+// ============================================================================
+
+bool HeuristicAnalyzer::ParseDOSHeader(std::span<const uint8_t> data, PEAnalysis& pe) {
+    // DOS header validation is now handled by PEParser::ParseBuffer().
+    // This method is retained for backward compatibility with any callers
+    // outside of AnalyzePE(). It performs the minimum check.
+    if (data.size() < sizeof(IMAGE_DOS_HEADER)) {
+        return false;
+    }
+    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE) {
+        pe.anomalies.push_back(PEAnomaly::InvalidDOSSignature);
+        return false;
+    }
+    return true;
+}
+
+bool HeuristicAnalyzer::ParsePEHeaders(std::span<const uint8_t> data, PEAnalysis& pe) {
+    // Full PE header parsing is now delegated to PEParser in AnalyzePE().
+    // This legacy method delegates to PEParser for any external callers.
+    PEParser::PEParser parser;
+    PEParser::PEInfo peInfo;
+    if (!parser.ParseBuffer(data, peInfo)) {
+        TransferPEParserAnomalies(peInfo.anomalies, pe);
+        return false;
+    }
+    PopulateFromPEInfo(parser, peInfo, pe);
+    return true;
+}
+
+// ============================================================================
+// Section / Import / Export / Resource Parsing
+// ============================================================================
+
+void HeuristicAnalyzer::ParseSections(std::span<const uint8_t> data, PEAnalysis& pe) {
+    // Section parsing is now handled by PopulateSections() via PEParser.
+    // This legacy method is retained for backward compatibility.
+    PEParser::PEParser parser;
+    PEParser::PEInfo peInfo;
+    if (parser.ParseBuffer(data, peInfo)) {
+        PopulateSections(parser, peInfo, data, pe);
     }
 }
 
@@ -940,27 +1047,16 @@ void HeuristicAnalyzer::ParseImports(std::span<const uint8_t> data, PEAnalysis& 
 }
 
 void HeuristicAnalyzer::ParseExports(std::span<const uint8_t> data, PEAnalysis& pe) {
-    // Minimal export parsing: check if DLL has exports
+    // Export anomaly detection is now handled in AnalyzePE() by checking
+    // PEInfo.dataDirectories[EXPORT].present directly.
+    // This legacy method retained for backward compatibility only.
     if (pe.isDLL) {
-        auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-        const auto peOffset = static_cast<size_t>(dos->e_lfanew);
-        const size_t optStart = peOffset + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
-
-        DWORD exportRVA = 0;
-        if (pe.is64Bit) {
-            auto opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(data.data() + optStart);
-            if (IMAGE_DIRECTORY_ENTRY_EXPORT < opt->NumberOfRvaAndSizes) {
-                exportRVA = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
+        PEParser::PEParser parser;
+        PEParser::PEInfo peInfo;
+        if (parser.ParseBuffer(data, peInfo)) {
+            if (!peInfo.dataDirectories[PEParser::DataDirectory::EXPORT].present) {
+                pe.anomalies.push_back(PEAnomaly::NoExportsForDLL);
             }
-        } else {
-            auto opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(data.data() + optStart);
-            if (IMAGE_DIRECTORY_ENTRY_EXPORT < opt->NumberOfRvaAndSizes) {
-                exportRVA = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_EXPORT].VirtualAddress;
-            }
-        }
-
-        if (exportRVA == 0) {
-            pe.anomalies.push_back(PEAnomaly::NoExportsForDLL);
         }
     }
 }
@@ -974,65 +1070,21 @@ void HeuristicAnalyzer::ParseResources(std::span<const uint8_t> /*data*/, PEAnal
 }
 
 void HeuristicAnalyzer::AnalyzeRichHeader(std::span<const uint8_t> data, PEAnalysis& pe) {
-    // Rich header sits between DOS stub and PE signature
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    const auto peOffset = static_cast<size_t>(dos->e_lfanew);
-
-    // Scan for "Rich" marker
-    constexpr uint32_t kRichMagic = 0x68636952; // "Rich"
-    bool found = false;
-    for (size_t off = sizeof(IMAGE_DOS_HEADER); off + 8 <= peOffset && off + 8 <= data.size(); off += 4) {
-        auto val = *reinterpret_cast<const uint32_t*>(data.data() + off);
-        if (val == kRichMagic) {
-            pe.hasRichHeader = true;
-            found = true;
-            break;
-        }
-    }
-    if (!found) {
-        pe.anomalies.push_back(PEAnomaly::RichHeaderStripped);
+    // Rich header is now analyzed via PEParser in PopulateRichHeader().
+    // This legacy method retained for backward compatibility only.
+    PEParser::PEParser parser;
+    PEParser::PEInfo peInfo;
+    if (parser.ParseBuffer(data, peInfo)) {
+        PopulateRichHeader(parser, pe);
     }
 }
 
-void HeuristicAnalyzer::DetectPEAnomalies(std::span<const uint8_t> data, PEAnalysis& pe) {
-    // Alignment checks
-    if (pe.sectionAlignment == 0 || (pe.sectionAlignment & (pe.sectionAlignment - 1)) != 0) {
-        pe.anomalies.push_back(PEAnomaly::InvalidSectionAlignment);
-        pe.riskScore += 5.0;
-    }
-    if (pe.fileAlignment == 0 || (pe.fileAlignment & (pe.fileAlignment - 1)) != 0) {
-        pe.anomalies.push_back(PEAnomaly::InvalidFileAlignment);
-        pe.riskScore += 5.0;
-    }
-
-    // Image base of zero
-    if (pe.imageBase == 0) {
-        pe.anomalies.push_back(PEAnomaly::ZeroImageBase);
-        pe.riskScore += 5.0;
-    }
-
-    // Entry point outside all sections
-    if (pe.entryPointSection.empty() && pe.entryPoint != 0) {
-        pe.anomalies.push_back(PEAnomaly::EntryPointOutsideSections);
-        pe.riskScore += 10.0;
-    }
-
-    // .NET detection
-    auto dos = reinterpret_cast<const IMAGE_DOS_HEADER*>(data.data());
-    const size_t optStart = static_cast<size_t>(dos->e_lfanew) + sizeof(DWORD) + sizeof(IMAGE_FILE_HEADER);
-    DWORD clrRVA = 0;
-    if (pe.is64Bit && optStart + sizeof(IMAGE_OPTIONAL_HEADER64) <= data.size()) {
-        auto opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER64*>(data.data() + optStart);
-        if (IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR < opt->NumberOfRvaAndSizes) {
-            clrRVA = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
-        }
-    } else if (!pe.is64Bit && optStart + sizeof(IMAGE_OPTIONAL_HEADER32) <= data.size()) {
-        auto opt = reinterpret_cast<const IMAGE_OPTIONAL_HEADER32*>(data.data() + optStart);
-        if (IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR < opt->NumberOfRvaAndSizes) {
-            clrRVA = opt->DataDirectory[IMAGE_DIRECTORY_ENTRY_COM_DESCRIPTOR].VirtualAddress;
-        }
-    }
-    pe.isDotNet = (clrRVA != 0);
+void HeuristicAnalyzer::DetectPEAnomalies(std::span<const uint8_t> /*data*/, PEAnalysis& pe) {
+    // Heuristic anomaly detection is now handled by DetectHeuristicAnomalies()
+    // using PEInfo. This legacy method applies the same checks without needing
+    // the raw buffer (anomaly data comes from pre-populated pe fields).
+    PEParser::PEInfo dummyInfo;
+    DetectHeuristicAnomalies(dummyInfo, pe);
 }
 // ============================================================================
 // Import Analysis (Public)
