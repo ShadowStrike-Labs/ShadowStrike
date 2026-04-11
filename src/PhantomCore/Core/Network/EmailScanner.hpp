@@ -446,6 +446,7 @@ struct alignas(128) AttachmentInfo {
     uint64_t attachmentId{ 0 };
     std::string filename;
     std::string contentType;
+    std::string contentId;             // Content-ID for inline reference tracking
     ContentDisposition disposition{ ContentDisposition::ATTACHMENT };
 
     // File info
