@@ -78,11 +78,14 @@
 #include <atomic>
 #include <chrono>
 #include <cstring>
+#include <filesystem>
 #include <functional>
+#include <map>
 #include <memory>
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -174,6 +177,23 @@ namespace {
     return as.Initialize(cfg);
 }
 
+// Polls GetAlert() until the alert appears in m_history (i.e. the async worker
+// has processed it) or the timeout elapses. Tests must call this after
+// RaiseAlert() and before any operation that requires the alert in history
+// (GetAlert, AcknowledgeAlert, ResolveAlert, EscalateAlert, GetAlertsByStatus).
+[[nodiscard]] bool WaitForAlertInHistory(
+    const std::string& alertId,
+    std::chrono::milliseconds timeout = std::chrono::milliseconds(3000)) noexcept
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (std::chrono::steady_clock::now() < deadline) {
+        if (AlertSystem::Instance().GetAlert(alertId).has_value())
+            return true;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return false;
+}
+
 [[nodiscard]] bool EnsureTelemetryCollectorInit() noexcept {
     auto& tc = TelemetryCollector::Instance();
     if (tc.IsInitialized()) return true;
@@ -229,7 +249,8 @@ namespace {
     uint16_t        pathLen,
     const wchar_t*  procName,
     uint16_t        procLen,
-    uint32_t        pid = 4)
+    uint32_t        pid         = 4,
+    uint8_t         requiresReply = 0)
 {
     FileScanRequestData fsr{};
     fsr.messageId         = messageId;
@@ -237,7 +258,7 @@ namespace {
     fsr.priority          = static_cast<uint8_t>(Comm::ScanPriority::Normal);
     fsr.processId         = pid;
     fsr.fileSize          = 0x10000;
-    fsr.requiresReply     = 0;  // notification-style; no kernel reply expected in tests
+    fsr.requiresReply     = requiresReply;
     fsr.pathLength        = pathLen;
     fsr.processNameLength = procLen;
 
@@ -600,6 +621,27 @@ TEST_F(MessageDispatcher_Parse, SerializeVerdictReply_VerdictFieldCorrect) {
     EXPECT_GT(data->threatNameLength, 0u);
 }
 
+// 2.14 ParseProcessNotification with imagePathLength exceeding the buffer must return nullopt.
+// Ensures no out-of-bounds read when a kernel-crafted packet is malformed.
+TEST_F(MessageDispatcher_Parse, ProcessNotify_PathExceedsBuffer_ReturnsNullopt) {
+    auto payload = BuildProcessNotifyPayload(0xFE00ULL, nullptr, 0, nullptr, 0);
+    auto* pnd = reinterpret_cast<ProcessNotificationData*>(payload.data());
+    pnd->imagePathLength = 32767;  // inflated length far exceeds buffer capacity
+    EXPECT_FALSE(MessageDispatcher::ParseProcessNotification(
+        std::span<const uint8_t>(payload)).has_value())
+        << "An imagePathLength that overflows the buffer must yield nullopt (no over-read).";
+}
+
+// 2.15 ParseRegistryNotification with valueNameLength exceeding the buffer must return nullopt.
+TEST_F(MessageDispatcher_Parse, RegistryNotify_ValueNameExceedsBuffer_ReturnsNullopt) {
+    auto payload = BuildRegistryNotifyPayload(0xFE01ULL, nullptr, 0, nullptr, 0);
+    auto* rnd = reinterpret_cast<RegistryNotificationData*>(payload.data());
+    rnd->valueNameLength = 32767;  // inflated length far exceeds buffer capacity
+    EXPECT_FALSE(MessageDispatcher::ParseRegistryNotification(
+        std::span<const uint8_t>(payload)).has_value())
+        << "A valueNameLength that overflows the buffer must yield nullopt (no over-read).";
+}
+
 // ============================================================================
 // GROUP 3 — MessageDispatcher_Dispatch
 // ============================================================================
@@ -789,6 +831,14 @@ TEST_F(MessageDispatcher_Dispatch, HandlerException_BlockOnError_False_CleanVerd
         << "A handler exception must be counted in handlerErrors.";
 }
 
+// 3.15 SetBlockOnTimeout(true) must not throw and must be observable without crashing.
+TEST_F(MessageDispatcher_Dispatch, SetBlockOnTimeout_DoesNotThrow) {
+    EXPECT_NO_FATAL_FAILURE({
+        f.dispatcher.SetBlockOnTimeout(true);
+        f.dispatcher.SetBlockOnTimeout(false);
+    }) << "SetBlockOnTimeout() must not throw or crash on any bool value.";
+}
+
 // ============================================================================
 // GROUP 4 — MessageDispatcher_Statistics
 // ============================================================================
@@ -891,6 +941,59 @@ TEST_F(MessageDispatcher_Statistics, ToJson_NonEmpty) {
     EXPECT_FALSE(f.dispatcher.ToJson().empty());
 }
 
+// 4.8 fileScanRequests counter increments once per ScanRequest dispatch.
+TEST_F(MessageDispatcher_Statistics, FileScanRequests_IncrementOnDispatch) {
+    f.dispatcher.ResetStatistics();
+
+    f.dispatcher.RegisterFileScanHandler(
+        [](const FileScanRequest& req) -> ScanVerdictReply {
+            ScanVerdictReply reply;
+            reply.messageId = req.messageId;
+            reply.verdict   = ScanVerdict::Clean;
+            return reply;
+        });
+
+    for (int i = 0; i < 4; ++i) {
+        const auto payload = BuildFileScanPayload(
+            static_cast<uint64_t>(0xC00 + i), nullptr, 0, nullptr, 0, 4);
+        const auto msg = BuildMessage(MessageType::ScanRequest,
+                                       static_cast<uint64_t>(0xC00 + i),
+                                       payload.data(), payload.size());
+        (void)f.dispatcher.DispatchMessage(std::span<const uint8_t>(msg));
+    }
+
+    EXPECT_EQ(f.dispatcher.GetStatistics().TakeSnapshot().fileScanRequests, 4u)
+        << "fileScanRequests must increment exactly once per ScanRequest dispatch.";
+}
+
+// 4.9 replyErrors increments when a ScanRequest with requiresReply=1 is dispatched
+//     on a disconnected port (reply serialization succeeds; FilterConnection send fails).
+TEST_F(MessageDispatcher_Statistics, ReplyErrors_IncrementOnDisconnectedReply) {
+    f.dispatcher.ResetStatistics();
+
+    f.dispatcher.RegisterFileScanHandler(
+        [](const FileScanRequest& req) -> ScanVerdictReply {
+            ScanVerdictReply reply;
+            reply.messageId = req.messageId;
+            reply.verdict   = ScanVerdict::Clean;
+            return reply;
+        });
+
+    const wchar_t path[] = L"C:\\Temp\\test_reply.exe";
+    const uint16_t pLen  = static_cast<uint16_t>(wcslen(path));
+    // requiresReply=1: dispatcher must attempt to send the verdict reply.
+    const auto payload   = BuildFileScanPayload(0xC10ULL, path, pLen, nullptr, 0, 4, 1);
+    const auto msg       = BuildMessage(MessageType::ScanRequest, 0xC10ULL,
+                                         payload.data(), payload.size());
+    (void)f.dispatcher.DispatchMessage(std::span<const uint8_t>(msg));
+
+    const auto snap = f.dispatcher.GetStatistics().TakeSnapshot();
+    EXPECT_GE(snap.fileScanRequests, 1u)
+        << "fileScanRequests must increment even when the reply send fails.";
+    EXPECT_GE(snap.replyErrors, 1u)
+        << "replyErrors must increment when ReplyMessage() fails on a disconnected port.";
+}
+
 // ============================================================================
 // GROUP 5 — AlertSystem_CoreOperations
 // ============================================================================
@@ -933,6 +1036,8 @@ TEST_F(AlertSystem_CoreOperations, GetAlert_ByKnownId_Found) {
 
     ASSERT_FALSE(id.empty());
 
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must appear in history within timeout after RaiseAlert().";
     const auto found = AlertSystem::Instance().GetAlert(id);
     ASSERT_TRUE(found.has_value())
         << "GetAlert() must find an alert by the ID returned from RaiseAlert().";
@@ -949,6 +1054,9 @@ TEST_F(AlertSystem_CoreOperations, RaisedAlert_SeverityPreserved) {
         "Severity preservation check.",
         "CommunicationPipeline_Tests");
 
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must appear in history within timeout after RaiseAlert().";
     const auto found = AlertSystem::Instance().GetAlert(id);
     ASSERT_TRUE(found.has_value());
     EXPECT_EQ(found->severity, AlertSeverity::Critical);
@@ -973,6 +1081,8 @@ TEST_F(AlertSystem_CoreOperations, AcknowledgeAlert_TransitionsStatus) {
         "CommunicationPipeline_Tests");
 
     ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must reach history before AcknowledgeAlert() can act on it.";
     const bool acked = AlertSystem::Instance().AcknowledgeAlert(id, "soc-analyst-01");
     EXPECT_TRUE(acked) << "AcknowledgeAlert() must return true for a known alert.";
 
@@ -1000,6 +1110,8 @@ TEST_F(AlertSystem_CoreOperations, ResolveAlert_TransitionsStatus) {
         "CommunicationPipeline_Tests");
 
     ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must reach history before lifecycle transitions.";
     (void)AlertSystem::Instance().AcknowledgeAlert(id, "analyst");
     const bool resolved = AlertSystem::Instance().ResolveAlert(
         id, "analyst", "False positive — whitelisted binary");
@@ -1021,6 +1133,8 @@ TEST_F(AlertSystem_CoreOperations, EscalateAlert_TransitionsStatus) {
         "CommunicationPipeline_Tests");
 
     ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must reach history before EscalateAlert() can act on it.";
     const bool escalated = AlertSystem::Instance().EscalateAlert(
         id, "Auto-escalated: no acknowledgment within SLA.");
 
@@ -1070,6 +1184,9 @@ TEST_F(AlertSystem_CoreOperations, GetAlertsByStatus_ReturnsMatchingAlerts) {
         "Alert for status filter.",
         "CommunicationPipeline_Tests");
 
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must reach history before AcknowledgeAlert() can act on it.";
     (void)AlertSystem::Instance().AcknowledgeAlert(id, "filter-tester");
 
     const auto acked = AlertSystem::Instance().GetAlertsByStatus(AlertStatus::Acknowledged);
@@ -1121,6 +1238,8 @@ TEST_F(AlertSystem_RecipientWebhook, AddRecipient_Valid_Stored) {
             return rec.recipientId == "tier8-test-recipient-1";
         });
     EXPECT_TRUE(found) << "AddRecipient() must persist the recipient in GetRecipients().";
+    EXPECT_TRUE(AlertSystem::Instance().RemoveRecipient("tier8-test-recipient-1"))
+        << "Recipient-creation tests must clean up singleton state for later suites.";
 }
 
 // 6.2 RemoveRecipient() by ID removes the previously-added recipient.
@@ -1168,6 +1287,8 @@ TEST_F(AlertSystem_RecipientWebhook, AddWebhook_Valid_Stored) {
             return w.webhookId == "tier8-test-webhook-1";
         });
     EXPECT_TRUE(found);
+    EXPECT_TRUE(AlertSystem::Instance().RemoveWebhook("tier8-test-webhook-1"))
+        << "Webhook-creation tests must clean up singleton state for later suites.";
 }
 
 // 6.5 RemoveWebhook() by ID removes the webhook.
@@ -1229,9 +1350,11 @@ TEST_F(AlertSystem_Suppression, AddRule_Stored_InGetRules) {
     const bool found = std::any_of(rules.begin(), rules.end(),
         [](const SuppressionRule& r) { return r.ruleId == "tier8-suppress-1"; });
     EXPECT_TRUE(found);
-}
 
-// 7.2 RemoveSuppressionRule() by known ID removes the rule.
+    // Remove immediately: source="CommunicationPipeline_Tests" would suppress
+    // every subsequent test alert, breaking callbacks and lifecycle tests.
+    (void)AlertSystem::Instance().RemoveSuppressionRule("tier8-suppress-1");
+}
 TEST_F(AlertSystem_Suppression, RemoveRule_ByKnownId_Removed) {
     SKIP_AS();
     SuppressionRule rule;
@@ -1395,7 +1518,15 @@ TEST_F(AlertSystem_Callbacks, UnregisterCallbacks_PreventsSubsequentFiring) {
         AlertSeverity::Low, AlertType::Operational,
         "Pre-Unregister Test", "Before unregister.", "CommunicationPipeline_Tests");
 
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
+    // Spin-wait until at least one callback fires to avoid a race between the
+    // async delivery thread and UnregisterCallbacks().
+    {
+        const auto spinDeadline = std::chrono::steady_clock::now() + std::chrono::seconds(2);
+        while (fireCount.load(std::memory_order_acquire) == 0 &&
+               std::chrono::steady_clock::now() < spinDeadline) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
     AlertSystem::Instance().UnregisterCallbacks();
 
     const uint32_t countAfterUnregister = fireCount.load();
@@ -1447,6 +1578,9 @@ TEST_F(AlertSystem_Statistics, AlertsAcknowledged_IncrementOnAck) {
         AlertSeverity::High, AlertType::Security,
         "Stats Ack Test", "Ack counter test.", "CommunicationPipeline_Tests");
 
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must be in history before AcknowledgeAlert() can increment the counter.";
     const uint64_t before = AlertSystem::Instance().GetStatistics().alertsAcknowledged;
     (void)AlertSystem::Instance().AcknowledgeAlert(id, "stats-tester");
     const uint64_t after = AlertSystem::Instance().GetStatistics().alertsAcknowledged;
@@ -1485,6 +1619,29 @@ TEST_F(AlertSystem_Statistics, SelfTest_Completes) {
     EXPECT_NO_FATAL_FAILURE({
         (void)AlertSystem::Instance().SelfTest();
     });
+}
+
+// 9.6 alertsEscalated increments after a successful EscalateAlert() call.
+TEST_F(AlertSystem_Statistics, AlertsEscalated_IncrementOnEscalate) {
+    SKIP_AS();
+    AlertSystem::Instance().ResetStatistics();
+
+    const std::string id = AlertSystem::Instance().RaiseAlert(
+        AlertSeverity::High, AlertType::ThreatDetection,
+        "Escalation Stats Test",
+        "Verifying that alertsEscalated increments on escalation.",
+        "CommunicationPipeline_Tests");
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must be in history before EscalateAlert() can act on it.";
+
+    const uint64_t before = AlertSystem::Instance().GetStatistics().alertsEscalated;
+    const bool escalated  = AlertSystem::Instance().EscalateAlert(
+        id, "SLA breach — no analyst response within threshold.");
+
+    EXPECT_TRUE(escalated);
+    EXPECT_GT(AlertSystem::Instance().GetStatistics().alertsEscalated, before)
+        << "alertsEscalated must increment after a successful EscalateAlert() call.";
 }
 
 // ============================================================================
@@ -1747,6 +1904,34 @@ TEST_F(TelemetryCollector_Consent, UpdateConfiguration_ValidConfig_Succeeds) {
     restore.enabled         = true;
     restore.consentLevel    = ConsentLevel::Full;
     (void)TelemetryCollector::Instance().UpdateConfiguration(restore);
+}
+
+// 11.11 Anonymize() with AnonymizationLevel::Strict returns a non-empty string.
+//       Strict mode must apply the strongest available anonymization without discarding the payload.
+TEST_F(TelemetryCollector_Consent, Anonymize_Strict_NonEmpty) {
+    SKIP_TC();
+    const std::string raw  = R"({"user":"john.doe@corp.com","host":"DESKTOP-ABC123","ip":"192.168.1.100"})";
+    const std::string anon = TelemetryCollector::Instance().Anonymize(
+        raw, AnonymizationLevel::Strict);
+    EXPECT_FALSE(anon.empty())
+        << "Anonymize() with Strict level must return a non-empty result — "
+           "the payload may not be silently discarded.";
+}
+
+// 11.12 RecordEvent() with ConsentLevel::None must not enqueue the event.
+//       Privacy contract: zero telemetry when the user has revoked consent.
+TEST_F(TelemetryCollector_Consent, ConsentNone_EventDropped_QueueUnchanged) {
+    SKIP_TC();
+    TelemetryCollector::Instance().SetConsentLevel(ConsentLevel::None);
+    TelemetryCollector::Instance().ClearQueue();
+    TelemetryCollector::Instance().ResetStatistics();
+
+    TelemetryCollector::Instance().RecordEvent("Detection", R"({"threat":"TestDropEvent"})");
+
+    EXPECT_EQ(TelemetryCollector::Instance().GetQueueSize(), 0u)
+        << "Events must be silently dropped when ConsentLevel is None — "
+           "no telemetry may leave the endpoint without user consent.";
+    // TearDown() restores ConsentLevel::Full.
 }
 
 // ============================================================================
@@ -2250,6 +2435,8 @@ TEST_F(TypeContracts, TelemetryEventType_Ordinals) {
     EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Health),        5u);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Performance),   6u);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Configuration), 7u);
+    EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::License),       8u);
+    EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Feedback),      9u);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Sample),        10u);
     EXPECT_EQ(static_cast<uint8_t>(TelemetryEventType::Custom),        11u);
 }
@@ -2324,6 +2511,7 @@ TEST_F(TypeContracts, GetEventTypeName_AllValues_NonEmpty) {
         TelemetryEventType::Update,    TelemetryEventType::Crash,
         TelemetryEventType::Error,     TelemetryEventType::Health,
         TelemetryEventType::Performance, TelemetryEventType::Configuration,
+        TelemetryEventType::License,   TelemetryEventType::Feedback,
         TelemetryEventType::Sample,    TelemetryEventType::Custom
     };
     for (auto v : values) {
@@ -2362,4 +2550,364 @@ TEST_F(TypeContracts, EscalationLevel_Ordinals) {
     EXPECT_EQ(static_cast<uint8_t>(EscalationLevel::Level3), 2u);
     EXPECT_EQ(static_cast<uint8_t>(EscalationLevel::Level4), 3u);
     EXPECT_EQ(static_cast<uint8_t>(EscalationLevel::Level5), 4u);
+}
+
+// 15.15 GetDeliveryChannelName() returns a non-empty string for all named channels.
+TEST_F(TypeContracts, GetDeliveryChannelName_AllValues_NonEmpty) {
+    const DeliveryChannel channels[] = {
+        DeliveryChannel::Email,   DeliveryChannel::Slack,
+        DeliveryChannel::Teams,   DeliveryChannel::SMS,
+        DeliveryChannel::SIEM,    DeliveryChannel::Webhook,
+        DeliveryChannel::Syslog
+    };
+    for (auto ch : channels) {
+        EXPECT_FALSE(Comm::GetDeliveryChannelName(ch).empty())
+            << "GetDeliveryChannelName() must return non-empty for every named channel.";
+    }
+}
+
+// 15.16 GetAlertStatusName() returns a non-empty string for all AlertStatus values.
+TEST_F(TypeContracts, GetAlertStatusName_AllValues_NonEmpty) {
+    const AlertStatus statuses[] = {
+        AlertStatus::New,          AlertStatus::Pending,
+        AlertStatus::Sent,         AlertStatus::Acknowledged,
+        AlertStatus::Escalated,    AlertStatus::Resolved,
+        AlertStatus::Suppressed,   AlertStatus::Failed
+    };
+    for (auto s : statuses) {
+        EXPECT_FALSE(Comm::GetAlertStatusName(s).empty())
+            << "GetAlertStatusName() must return non-empty for every AlertStatus value.";
+    }
+}
+
+// 15.17 GetEscalationLevelName() returns a non-empty string for all levels.
+TEST_F(TypeContracts, GetEscalationLevelName_AllValues_NonEmpty) {
+    const EscalationLevel levels[] = {
+        EscalationLevel::Level1, EscalationLevel::Level2,
+        EscalationLevel::Level3, EscalationLevel::Level4,
+        EscalationLevel::Level5
+    };
+    for (auto l : levels) {
+        EXPECT_FALSE(Comm::GetEscalationLevelName(l).empty())
+            << "GetEscalationLevelName() must return non-empty for every EscalationLevel.";
+    }
+}
+
+// ============================================================================
+// GROUP 1 ADDITIONS — extended lifecycle contracts
+// ============================================================================
+
+// 1.11 AlertSystem version string must contain at least one dot (semantic version format).
+TEST_F(Pipeline_Lifecycle, AlertSystem_VersionString_HasDotSeparator) {
+    const std::string ver = AlertSystem::GetVersionString();
+    EXPECT_NE(ver.find('.'), std::string::npos)
+        << "AlertSystem::GetVersionString() must embed a semantic version (x.y.z) "
+           "with at least one dot separator.";
+}
+
+// 1.12 TelemetryCollector version string must contain at least one dot separator.
+TEST_F(Pipeline_Lifecycle, TelemetryCollector_VersionString_HasDotSeparator) {
+    const std::string ver = TelemetryCollector::GetVersionString();
+    EXPECT_NE(ver.find('.'), std::string::npos)
+        << "TelemetryCollector::GetVersionString() must embed a semantic version (x.y.z).";
+}
+
+// 1.13 A second AlertSystem::Initialize() call must not overwrite the first configuration.
+//      Meyers' singleton contract: whichever caller wins the first init owns the config.
+TEST_F(Pipeline_Lifecycle, AlertSystem_RepeatedInitialize_PreservesFirstConfig) {
+    SKIP_AS();
+    AlertConfiguration intruderCfg;
+    intruderCfg.enabled           = false;   // deliberately contrary to first init
+    intruderCfg.rateLimitPerMinute = 1;
+
+    (void)AlertSystem::Instance().Initialize(intruderCfg);
+
+    // The original enabled=true must be intact.
+    const auto cfg = AlertSystem::Instance().GetConfiguration();
+    EXPECT_TRUE(cfg.enabled)
+        << "A second Initialize() call must not overwrite the configuration "
+           "established by the first caller.";
+}
+
+// 1.14 A second TelemetryCollector::Initialize() call must not overwrite the first config.
+TEST_F(Pipeline_Lifecycle, TelemetryCollector_RepeatedInitialize_PreservesFirstConfig) {
+    SKIP_TC();
+    TelemetryConfiguration intruderCfg;
+    intruderCfg.enabled      = false;
+    intruderCfg.consentLevel = ConsentLevel::None;
+
+    (void)TelemetryCollector::Instance().Initialize(intruderCfg);
+
+    const auto cfg = TelemetryCollector::Instance().GetConfiguration();
+    EXPECT_TRUE(cfg.enabled)
+        << "A second Initialize() must not change enabled=true set at first init.";
+    EXPECT_NE(cfg.consentLevel, ConsentLevel::None)
+        << "A second Initialize() must not change the consent level set at first init.";
+}
+
+// ============================================================================
+// GROUP 2 ADDITIONS — additional parse adversarial edge cases
+// ============================================================================
+
+// 2.16 ParseFileScanRequest: processNameLength alone overflowing the buffer yields nullopt.
+//      Validates that bounds checking covers both variable-length fields independently.
+TEST_F(MessageDispatcher_Parse, FileScan_ProcNameExceedsBuffer_ReturnsNullopt) {
+    auto payload = BuildFileScanPayload(0xFE02ULL, nullptr, 0, nullptr, 0);
+    auto* fsr    = reinterpret_cast<FileScanRequestData*>(payload.data());
+    fsr->pathLength        = 0;
+    fsr->processNameLength = 32767;  // inflated — no actual data appended
+    EXPECT_FALSE(MessageDispatcher::ParseFileScanRequest(
+        std::span<const uint8_t>(payload)).has_value())
+        << "A processNameLength that overflows the buffer must yield nullopt.";
+}
+
+// 2.17 ParseProcessNotification: commandLineLength overflow must return nullopt.
+//      Tests that both variable-length fields in the packed struct are bounds-checked.
+TEST_F(MessageDispatcher_Parse, ProcessNotify_CmdLineExceedsBuffer_ReturnsNullopt) {
+    auto payload = BuildProcessNotifyPayload(0xFE03ULL, nullptr, 0, nullptr, 0);
+    auto* pnd    = reinterpret_cast<ProcessNotificationData*>(payload.data());
+    pnd->imagePathLength   = 0;
+    pnd->commandLineLength = 32767;  // inflated — no actual data appended
+    EXPECT_FALSE(MessageDispatcher::ParseProcessNotification(
+        std::span<const uint8_t>(payload)).has_value())
+        << "A commandLineLength overflowing the buffer must yield nullopt (no over-read).";
+}
+
+// ============================================================================
+// GROUP 5 ADDITIONS — additional AlertSystem core-operation edge cases
+// ============================================================================
+
+// 5.13 After raising an alert the singleton history must contain at least one
+//      entry with the returned ID — GetRecentAlerts() is used here because the
+//      test environment uses DeliveryChannel::None which causes the worker to
+//      mark alerts as Failed (not Pending/Sent). GetPendingAlerts() semantics
+//      are separately verified in the unit-level AlertSystem tests.
+TEST_F(AlertSystem_CoreOperations, GetRecentAlerts_AfterRaise_ContainsNewAlert) {
+    SKIP_AS();
+    const std::string id = AlertSystem::Instance().RaiseAlert(
+        AlertSeverity::High,
+        AlertType::ThreatDetection,
+        "Recent Alerts Contract Test",
+        "Verifying that GetRecentAlerts() reflects a just-raised alert.",
+        "CommunicationPipeline_Tests");
+
+    ASSERT_FALSE(id.empty());
+    ASSERT_TRUE(WaitForAlertInHistory(id))
+        << "Alert must appear in history within timeout after RaiseAlert().";
+
+    const auto recent = AlertSystem::Instance().GetRecentAlerts(10);
+    EXPECT_FALSE(recent.empty())
+        << "GetRecentAlerts() must return at least the newly raised alert.";
+    const bool found = std::any_of(recent.begin(), recent.end(),
+        [&id](const Alert& a) { return a.alertId == id; });
+    EXPECT_TRUE(found) << "GetRecentAlerts() must include the just-raised alert ID.";
+}
+
+// 5.14 Alert::ToJson() on a fully populated alert must return a non-empty JSON payload.
+TEST_F(AlertSystem_CoreOperations, Alert_ToJson_ReturnsNonEmpty) {
+    Alert a;
+    a.alertId  = "toJson-test-id";
+    a.severity = AlertSeverity::Critical;
+    a.type     = AlertType::Security;
+    a.subject  = "JSON Serialization Contract Test";
+    a.details  = "Alert::ToJson() must produce a valid, non-empty JSON string.";
+    a.source   = "CommunicationPipeline_Tests";
+    a.status   = AlertStatus::New;
+
+    const std::string json = a.ToJson();
+    EXPECT_FALSE(json.empty())
+        << "Alert::ToJson() must return a non-empty JSON payload for any populated alert.";
+}
+
+// 5.15 RaiseAlert() with an empty subject must not crash (adversarial robustness).
+//      The system must handle empty/degenerate inputs without undefined behaviour.
+TEST_F(AlertSystem_CoreOperations, RaiseAlert_EmptySubject_DoesNotCrash) {
+    SKIP_AS();
+    EXPECT_NO_FATAL_FAILURE({
+        (void)AlertSystem::Instance().RaiseAlert(
+            AlertSeverity::Low,
+            AlertType::Operational,
+            "",  // empty subject — adversarial input
+            "Empty-subject adversarial robustness test.",
+            "CommunicationPipeline_Tests");
+    }) << "RaiseAlert() must not crash or assert on an empty subject string.";
+}
+
+// ============================================================================
+// GROUP 6 ADDITIONS — WebhookConfiguration IsValid positive case
+// ============================================================================
+
+// 6.7 WebhookConfiguration::IsValid() returns true for a fully-populated config.
+TEST_F(AlertSystem_RecipientWebhook, WebhookIsValid_FullyPopulated_ReturnsTrue) {
+    WebhookConfiguration wh;
+    wh.webhookId   = "valid-webhook-positive-test";
+    wh.name        = "Valid Webhook";
+    wh.url         = "https://hooks.example.com/valid";
+    wh.channelType = DeliveryChannel::Webhook;
+    wh.enabled     = true;
+    EXPECT_TRUE(wh.IsValid())
+        << "WebhookConfiguration::IsValid() must return true for a fully-populated, "
+           "enabled webhook with a non-empty URL.";
+}
+
+// ============================================================================
+// GROUP 11 ADDITION — eventsDropped privacy counter
+// ============================================================================
+
+// 11.13 eventsDropped increments when an event is attempted with ConsentLevel::None.
+//       Privacy accounting contract: dropped events must be explicitly counted,
+//       not silently discarded with no observable side-effect.
+TEST_F(TelemetryCollector_Consent, ConsentNone_EventDropped_IncrementsDroppedCounter) {
+    SKIP_TC();
+    TelemetryCollector::Instance().SetConsentLevel(ConsentLevel::None);
+    TelemetryCollector::Instance().ResetStatistics();
+    TelemetryCollector::Instance().ClearQueue();
+
+    TelemetryCollector::Instance().RecordEvent("Detection", R"({"threat":"DropCounterTest"})");
+
+    const auto snap = TelemetryCollector::Instance().GetStatistics();
+    EXPECT_GE(snap.eventsDropped, 1u)
+        << "eventsDropped must increment when an event is rejected due to ConsentLevel::None. "
+           "Silent discard without counter update violates the privacy accounting contract.";
+    // TearDown() restores ConsentLevel::Full.
+}
+
+// ============================================================================
+// GROUP 16 — Hardening: EscalationRule CRUD / FilterConnection / DispatchAsync
+// ============================================================================
+/**
+ * Supplementary hardening tests covering API surfaces not exercised in
+ * Groups 1–15: escalation rule management, FilterConnection state contracts,
+ * and async dispatch lifecycle.
+ */
+
+class Hardening_EscalationRules : public ::testing::Test {
+public:
+    static void SetUpTestSuite() { s_asInit = EnsureAlertSystemInit(); }
+    static bool s_asInit;
+};
+bool Hardening_EscalationRules::s_asInit = false;
+
+// 16.1 AddEscalationRule() persists a rule retrievable via GetEscalationRules().
+TEST_F(Hardening_EscalationRules, AddEscalationRule_Persists) {
+    SKIP_AS();
+    EscalationRule rule;
+    rule.ruleId         = "hardening-escalation-persist";
+    rule.name           = "Hardening Escalation Persist Test";
+    rule.minSeverity    = AlertSeverity::High;
+    rule.alertTypes     = { AlertType::ThreatDetection, AlertType::Security };
+    rule.timeoutMinutes = 15;
+    rule.enabled        = true;
+
+    EXPECT_TRUE(AlertSystem::Instance().AddEscalationRule(rule))
+        << "AddEscalationRule() must return true for a valid, uniquely-IDed rule.";
+
+    const auto rules = AlertSystem::Instance().GetEscalationRules();
+    const bool found = std::any_of(rules.begin(), rules.end(),
+        [](const EscalationRule& r) {
+            return r.ruleId == "hardening-escalation-persist";
+        });
+    EXPECT_TRUE(found)
+        << "AddEscalationRule() must make the rule visible via GetEscalationRules().";
+}
+
+// 16.2 RemoveEscalationRule() by known ID removes the previously-added rule.
+TEST_F(Hardening_EscalationRules, RemoveEscalationRule_ByKnownId_Removed) {
+    SKIP_AS();
+    EscalationRule rule;
+    rule.ruleId  = "hardening-escalation-remove";
+    rule.name    = "Temp Escalation Rule for Removal Test";
+    rule.enabled = true;
+    (void)AlertSystem::Instance().AddEscalationRule(rule);
+
+    EXPECT_TRUE(AlertSystem::Instance().RemoveEscalationRule("hardening-escalation-remove"))
+        << "RemoveEscalationRule() must return true for a known rule ID.";
+
+    const auto rules = AlertSystem::Instance().GetEscalationRules();
+    const bool stillPresent = std::any_of(rules.begin(), rules.end(),
+        [](const EscalationRule& r) {
+            return r.ruleId == "hardening-escalation-remove";
+        });
+    EXPECT_FALSE(stillPresent)
+        << "RemoveEscalationRule() must remove the rule from GetEscalationRules().";
+}
+
+// 16.3 RemoveEscalationRule() with an unknown ID must return false without crashing.
+TEST_F(Hardening_EscalationRules, RemoveEscalationRule_UnknownId_ReturnsFalse) {
+    SKIP_AS();
+    EXPECT_FALSE(
+        AlertSystem::Instance().RemoveEscalationRule("no-such-escalation-rule-xyz-9999"))
+        << "RemoveEscalationRule() must return false for an unknown rule ID.";
+}
+
+// ============================================================================
+
+class Hardening_FilterConnection : public ::testing::Test {};
+
+// 16.4 FilterConnection constructed with a non-existent port must report IsConnected()==false.
+//      This is the fundamental state contract used throughout the test suite.
+TEST_F(Hardening_FilterConnection, DisconnectedPort_IsConnected_False) {
+    FilterConnection fc{ L"\\PhantomSensorHardeningTestPort_NeverExists" };
+    EXPECT_FALSE(fc.IsConnected())
+        << "A FilterConnection to a non-existent port must report IsConnected()==false.";
+}
+
+// 16.5 GetHandle() on a disconnected FilterConnection must return nullptr.
+TEST_F(Hardening_FilterConnection, DisconnectedPort_GetHandle_Nullptr) {
+    FilterConnection fc{ L"\\PhantomSensorHardeningTestPort_NeverExists2" };
+    EXPECT_EQ(fc.GetHandle(), nullptr)
+        << "GetHandle() must return nullptr for a FilterConnection that is not connected.";
+}
+
+// 16.6 GetLastErrorMessage() on a disconnected port must return a non-empty string.
+//      The error must be surfaced as an actionable message, not silently eaten.
+TEST_F(Hardening_FilterConnection, DisconnectedPort_GetLastErrorMessage_NonEmpty) {
+    FilterConnection fc{ L"\\PhantomSensorHardeningTestPort_NeverExists3" };
+    // Attempt a connect — will fail; error state must be populated.
+    (void)fc.Connect();
+    EXPECT_FALSE(fc.GetLastErrorMessage().empty())
+        << "GetLastErrorMessage() must be non-empty after a failed Connect() attempt.";
+}
+
+// ============================================================================
+
+class Hardening_AsyncDispatch : public ::testing::Test {
+protected:
+    DispatcherFixture f;
+};
+
+// 16.7 DispatchMessageAsync returns a valid future; bad magic resolves to false.
+TEST_F(Hardening_AsyncDispatch, BadMagic_AsyncDispatch_FutureResolvesToFalse) {
+    auto buf   = BuildMessage(MessageType::ProcessNotify, 0xA010ULL, nullptr, 0);
+    auto* hdr  = reinterpret_cast<MessageHeader*>(buf.data());
+    hdr->magic = 0xDEADC0DEu;   // corrupt magic
+
+    auto fut = f.dispatcher.DispatchMessageAsync(std::span<const uint8_t>(buf));
+    ASSERT_TRUE(fut.valid())
+        << "DispatchMessageAsync must always return a valid std::future.";
+    EXPECT_FALSE(fut.get())
+        << "A message with a corrupt magic must resolve the async future to false.";
+}
+
+// 16.8 DispatchMessageAsync with a valid ProcessNotify fires the handler asynchronously
+//      and resolves the future to true.
+TEST_F(Hardening_AsyncDispatch, ValidProcessNotify_AsyncDispatch_FutureResolvesToTrue) {
+    std::atomic<bool> handlerFired{ false };
+    f.dispatcher.RegisterProcessNotifyHandler(
+        [&handlerFired](const ProcessNotification&) {
+            handlerFired.store(true, std::memory_order_release);
+        });
+
+    const auto payload = BuildProcessNotifyPayload(0xA011ULL, nullptr, 0, nullptr, 0, 9901);
+    const auto msg     = BuildMessage(MessageType::ProcessNotify, 0xA011ULL,
+                                      payload.data(), payload.size());
+
+    auto fut = f.dispatcher.DispatchMessageAsync(std::span<const uint8_t>(msg));
+    ASSERT_TRUE(fut.valid());
+    const bool result = fut.get();
+    EXPECT_TRUE(result)
+        << "DispatchMessageAsync must resolve to true for a valid, handleable message.";
+    EXPECT_TRUE(handlerFired.load(std::memory_order_acquire))
+        << "DispatchMessageAsync must invoke the registered ProcessNotify handler "
+           "before the future resolves.";
 }

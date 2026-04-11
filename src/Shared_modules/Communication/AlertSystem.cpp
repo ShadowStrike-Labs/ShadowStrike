@@ -343,6 +343,14 @@ std::string AlertSystemImpl::RaiseAlert(Alert alert) {
         return {};
     }
 
+    // Assign ID and timestamp before any early-exit path so callers always
+    // receive a non-empty, retrievable ID even when an alert is suppressed or
+    // deduplicated, and suppressed alerts are identifiable in history.
+    if (alert.alertId.empty())
+        alert.alertId = GenerateAlertId();
+    if (alert.createdTime == SystemTimePoint{})
+        alert.createdTime = std::chrono::system_clock::now();
+
     m_stats.totalAlerts.fetch_add(1, std::memory_order_relaxed);
 
     const auto sevIdx = static_cast<size_t>(alert.severity);
@@ -373,7 +381,7 @@ std::string AlertSystemImpl::RaiseAlert(Alert alert) {
             m_stats.alertsSuppressed.fetch_add(1, std::memory_order_relaxed);
             Utils::Logger::Debug("[AlertSystem] Duplicate alert suppressed: correlationId={}",
                                 alert.correlationId);
-            return {};
+            return alert.alertId;
         }
     }
 
@@ -384,11 +392,6 @@ std::string AlertSystemImpl::RaiseAlert(Alert alert) {
                             alert.subject);
     }
 
-    // Assign ID and timestamp
-    if (alert.alertId.empty())
-        alert.alertId = GenerateAlertId();
-    if (alert.createdTime == SystemTimePoint{})
-        alert.createdTime = std::chrono::system_clock::now();
     alert.status = AlertStatus::Pending;
 
     // Assign default channels
