@@ -65,6 +65,7 @@
 #include <algorithm>
 #include <unordered_set>
 #include <cmath>
+#include <cstring>
 
 namespace fs = std::filesystem;
 
@@ -126,6 +127,62 @@ namespace {
         {"objdata 0105000", "CVE-2012-0158"}, // MSCOMCTL
         {"\\\\objhtml", "CVE-2017-8570"}, // Composite Moniker
     };
+
+    // ========================================================================
+    // KNOWN DANGEROUS OLE CLSIDs (raw on-disk byte order: mixed-endian)
+    // ========================================================================
+    // GUID layout on disk: Data1 (4B LE) | Data2 (2B LE) | Data3 (2B LE) | Data4 (8B as-is)
+    struct KnownOLECLSID {
+        uint8_t bytes[16];
+        const char* name;
+        const char* progId;
+        bool isExecutable;
+        bool isPackage;
+        bool hasAutoStart;
+    };
+
+    constexpr KnownOLECLSID DANGEROUS_OLE_CLSIDS[] = {
+        // Package: {0003000A-0000-0000-C000-000000000046} — arbitrary file embedding
+        {{0x0A,0x00,0x03,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "Package", "Package", true, true, false},
+        // Equation.3: {0002CE02-0000-0000-C000-000000000046} — CVE-2017-11882 / CVE-2018-0802
+        {{0x02,0xCE,0x02,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "Equation.3", "Equation.3", true, false, true},
+        // Equation.2: {0002CE01-0000-0000-C000-000000000046}
+        {{0x01,0xCE,0x02,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "Equation.2", "Equation.2", true, false, true},
+        // ShellLink: {00021401-0000-0000-C000-000000000046} — embedded LNK execution
+        {{0x01,0x14,0x02,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "ShellLink", ".lnk", true, false, true},
+        // Script Moniker: {06290BD0-48AA-11CF-A8D7-00AA006C3706} — script execution
+        {{0xD0,0x0B,0x29,0x06, 0xAA,0x48, 0xCF,0x11, 0xA8,0xD7,0x00,0xAA,0x00,0x6C,0x37,0x06},
+         "ScriptMoniker", "script:", true, false, true},
+        // OLE2Link / StdOleLink: {00000300-0000-0000-C000-000000000046} — DDEAUTO
+        {{0x00,0x03,0x00,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "OLE2Link", "OLE2Link", true, false, true},
+        // MSComctlLib.TreeCtrl (CVE-2012-0158): {BDD1F04B-858B-11D1-B16A-00C0F0283628}
+        {{0x4B,0xF0,0xD1,0xBD, 0x8B,0x85, 0xD1,0x11, 0xB1,0x6A,0x00,0xC0,0xF0,0x28,0x36,0x28},
+         "MSComctlLib.TreeCtrl", "MSComctlLib.TreeCtrl.2", true, false, false},
+        // htmlfile (CVE-2017-8570): {25336920-03F9-11CF-8FD0-00AA00686F13}
+        {{0x20,0x69,0x33,0x25, 0xF9,0x03, 0xCF,0x11, 0x8F,0xD0,0x00,0xAA,0x00,0x68,0x6F,0x13},
+         "htmlfile", "htmlfile", true, false, true},
+        // Composite Moniker: {00000309-0000-0000-C000-000000000046} — chain execution
+        {{0x09,0x03,0x00,0x00, 0x00,0x00, 0x00,0x00, 0xC0,0x00,0x00,0x00,0x00,0x00,0x00,0x46},
+         "CompositeMoniker", "CompositeMoniker", false, false, true},
+    };
+    constexpr size_t NUM_DANGEROUS_OLE_CLSIDS = sizeof(DANGEROUS_OLE_CLSIDS) / sizeof(DANGEROUS_OLE_CLSIDS[0]);
+
+    // OLE object extraction limits
+    constexpr size_t MAX_OLE_OBJECT_DATA = 64 * 1024 * 1024; // 64 MB per extracted object
+    constexpr size_t MAX_OLE_FAT_CHAIN_STEPS = 200000;       // FAT chain cycle guard
+    constexpr size_t MINI_STREAM_CUTOFF_SIZE = 4096;          // CFB spec: streams < 4096 use mini-FAT
+
+    // Executable content signatures for deep inspection
+    constexpr uint8_t PE_MAGIC[] = { 0x4D, 0x5A };           // MZ
+    constexpr uint8_t ELF_MAGIC[] = { 0x7F, 0x45, 0x4C, 0x46 }; // .ELF
+    constexpr uint8_t ZIP_INNER_MAGIC[] = { 0x50, 0x4B, 0x03, 0x04 }; // PK
+    constexpr uint8_t CAB_MAGIC[] = { 0x4D, 0x53, 0x43, 0x46 }; // MSCF
+    constexpr uint8_t RAR_MAGIC[] = { 0x52, 0x61, 0x72, 0x21 }; // Rar!
 
 } // anonymous namespace
 
@@ -567,23 +624,417 @@ public:
         std::shared_lock lock(m_mutex);
         std::vector<OLEObjectInfo> objects;
 
+        constexpr size_t MAX_DIR_ENTRIES = 10000;
+
         try {
-            auto streams = ListOLEStreamsInternal(filePath);
+            std::ifstream file(filePath, std::ios::binary);
+            if (!file) return objects;
 
-            for (const auto& stream : streams) {
-                // Look for embedded objects
-                if (stream.find("ObjectPool") != std::string::npos ||
-                    stream.find("\\x01Ole") != std::string::npos) {
+            // Determine file size for bounds checking
+            file.seekg(0, std::ios::end);
+            const auto rawSize = file.tellg();
+            if (rawSize < 512) return objects;
+            const size_t fileSize = static_cast<size_t>(rawSize);
+            file.seekg(0);
 
-                    OLEObjectInfo objInfo;
-                    objInfo.displayName = StringUtils::ToWide(stream);
+            // ================================================================
+            // PHASE 1: Parse CFB Header (512 bytes)
+            // ================================================================
+            std::vector<uint8_t> header(512);
+            file.read(reinterpret_cast<char*>(header.data()), 512);
+            if (!file || file.gcount() < 512) return objects;
 
-                    // Extract object data (simplified - full implementation would parse OLE structure)
-                    // This would use a proper OLE parser library in production
+            if (!std::equal(std::begin(OLE_SIGNATURE), std::end(OLE_SIGNATURE), header.begin()))
+                return objects;
 
-                    objects.push_back(objInfo);
+            const uint16_t majorVersion = *reinterpret_cast<const uint16_t*>(&header[0x1A]);
+            const uint16_t sectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x1E]);
+            if (sectorSizePow < 7 || sectorSizePow > 16) return objects;
+            const uint32_t sectorSize = 1u << sectorSizePow;
+
+            const uint16_t miniSectorSizePow = *reinterpret_cast<const uint16_t*>(&header[0x20]);
+            if (miniSectorSizePow > 16) return objects;
+            const uint32_t miniSectorSize = 1u << miniSectorSizePow;
+
+            const uint32_t fatSectorsCount = *reinterpret_cast<const uint32_t*>(&header[0x2C]);
+            const uint32_t firstDirSect = *reinterpret_cast<const uint32_t*>(&header[0x30]);
+            const uint32_t firstMiniFATSect = *reinterpret_cast<const uint32_t*>(&header[0x3C]);
+            const uint32_t numMiniFATSects = *reinterpret_cast<const uint32_t*>(&header[0x40]);
+            const uint32_t firstDIFATSect = *reinterpret_cast<const uint32_t*>(&header[0x44]);
+            const uint32_t numDIFATSects = *reinterpret_cast<const uint32_t*>(&header[0x48]);
+
+            if (firstDirSect == 0xFFFFFFFE) return objects;
+            if (fatSectorsCount > 10000) return objects;
+
+            // ================================================================
+            // PHASE 2: Build FAT Table
+            // ================================================================
+            // Collect FAT sector IDs from DIFAT array in header (109 entries)
+            std::vector<uint32_t> fatSectorIds;
+            fatSectorIds.reserve(std::min(fatSectorsCount, 109u));
+            for (uint32_t fi = 0; fi < std::min(fatSectorsCount, 109u); ++fi) {
+                const uint32_t id = *reinterpret_cast<const uint32_t*>(&header[0x4C + fi * 4]);
+                if (id == 0xFFFFFFFE || id == 0xFFFFFFFF) break;
+                fatSectorIds.push_back(id);
+            }
+
+            // Follow DIFAT chain for files with >109 FAT sectors
+            if (fatSectorsCount > 109 && firstDIFATSect != 0xFFFFFFFE && firstDIFATSect != 0xFFFFFFFF) {
+                uint32_t difatSect = firstDIFATSect;
+                uint32_t difatCount = 0;
+                while (difatSect != 0xFFFFFFFE && difatSect != 0xFFFFFFFF &&
+                       difatCount < numDIFATSects && difatCount < 1000) {
+                    const auto pos = 512 + static_cast<std::streamoff>(difatSect) * sectorSize;
+                    if (static_cast<size_t>(pos + sectorSize) > fileSize) break;
+
+                    std::vector<uint8_t> difatData(sectorSize);
+                    file.seekg(pos);
+                    file.read(reinterpret_cast<char*>(difatData.data()), sectorSize);
+                    if (!file) break;
+
+                    const uint32_t entriesInSect = sectorSize / 4 - 1;
+                    for (uint32_t j = 0; j < entriesInSect && fatSectorIds.size() < fatSectorsCount; ++j) {
+                        const uint32_t id = *reinterpret_cast<const uint32_t*>(&difatData[j * 4]);
+                        if (id == 0xFFFFFFFE || id == 0xFFFFFFFF) break;
+                        fatSectorIds.push_back(id);
+                    }
+
+                    difatSect = *reinterpret_cast<const uint32_t*>(&difatData[entriesInSect * 4]);
+                    ++difatCount;
                 }
             }
+
+            // Read FAT entries from collected sector IDs
+            std::vector<uint32_t> fat;
+            const uint32_t entriesPerSector = sectorSize / 4;
+            fat.reserve(fatSectorIds.size() * entriesPerSector);
+
+            for (const auto& fatSectId : fatSectorIds) {
+                const auto pos = 512 + static_cast<std::streamoff>(fatSectId) * sectorSize;
+                if (static_cast<size_t>(pos + sectorSize) > fileSize) break;
+
+                std::vector<uint8_t> fatSectData(sectorSize);
+                file.seekg(pos);
+                file.read(reinterpret_cast<char*>(fatSectData.data()), sectorSize);
+                if (!file) break;
+
+                for (uint32_t j = 0; j < entriesPerSector; ++j) {
+                    fat.push_back(*reinterpret_cast<const uint32_t*>(&fatSectData[j * 4]));
+                }
+            }
+
+            if (fat.empty()) return objects;
+
+            // ================================================================
+            // PHASE 3: Build Mini-FAT Table
+            // ================================================================
+            std::vector<uint32_t> miniFat;
+            if (firstMiniFATSect != 0xFFFFFFFE && firstMiniFATSect != 0xFFFFFFFF && numMiniFATSects > 0) {
+                uint32_t mfSect = firstMiniFATSect;
+                uint32_t mfCount = 0;
+                while (mfSect != 0xFFFFFFFE && mfSect != 0xFFFFFFFF &&
+                       mfCount < numMiniFATSects && mfCount < 1000) {
+                    if (mfSect >= fat.size()) break;
+                    const auto pos = 512 + static_cast<std::streamoff>(mfSect) * sectorSize;
+                    if (static_cast<size_t>(pos + sectorSize) > fileSize) break;
+
+                    std::vector<uint8_t> mfData(sectorSize);
+                    file.seekg(pos);
+                    file.read(reinterpret_cast<char*>(mfData.data()), sectorSize);
+                    if (!file) break;
+
+                    for (uint32_t j = 0; j < entriesPerSector; ++j) {
+                        miniFat.push_back(*reinterpret_cast<const uint32_t*>(&mfData[j * 4]));
+                    }
+
+                    mfSect = fat[mfSect];
+                    ++mfCount;
+                }
+            }
+
+            // ================================================================
+            // PHASE 4: Parse Directory Entries
+            // ================================================================
+            struct CFBDirEntry {
+                std::string name;
+                std::wstring wname;
+                uint8_t objectType;   // 0=empty, 1=storage, 2=stream, 5=root
+                uint8_t clsid[16];
+                uint32_t startSector;
+                uint64_t streamSize;
+                uint32_t childId;     // first child directory entry index
+            };
+
+            std::vector<CFBDirEntry> dirEntries;
+            uint32_t rootStartSector = 0xFFFFFFFE;
+            uint64_t rootStreamSize = 0;
+
+            uint32_t dirSect = firstDirSect;
+            size_t dirEntriesRead = 0;
+            constexpr uint32_t DIR_ENTRY_SIZE = 128;
+            const uint32_t entriesPerDirSector = sectorSize / DIR_ENTRY_SIZE;
+            uint32_t dirChainLen = 0;
+
+            while (dirSect != 0xFFFFFFFE && dirSect != 0xFFFFFFFF && dirEntriesRead < MAX_DIR_ENTRIES) {
+                if (dirSect >= fat.size()) break;
+                if (++dirChainLen > MAX_OLE_FAT_CHAIN_STEPS) break;
+
+                const auto pos = 512 + static_cast<std::streamoff>(dirSect) * sectorSize;
+                if (static_cast<size_t>(pos + sectorSize) > fileSize) break;
+
+                std::vector<uint8_t> dirData(sectorSize);
+                file.seekg(pos);
+                file.read(reinterpret_cast<char*>(dirData.data()), sectorSize);
+                if (!file) break;
+
+                for (uint32_t e = 0; e < entriesPerDirSector && dirEntriesRead < MAX_DIR_ENTRIES; ++e) {
+                    const uint8_t* entry = &dirData[e * DIR_ENTRY_SIZE];
+                    const uint8_t objectType = entry[0x42];
+
+                    if (objectType == 0) { dirEntriesRead++; continue; }
+
+                    const uint16_t nameSize = *reinterpret_cast<const uint16_t*>(&entry[0x40]);
+                    if (nameSize == 0 || nameSize > 64) { dirEntriesRead++; continue; }
+
+                    CFBDirEntry de{};
+                    de.objectType = objectType;
+                    std::memcpy(de.clsid, &entry[0x50], 16);
+                    de.startSector = *reinterpret_cast<const uint32_t*>(&entry[0x74]);
+                    de.streamSize = *reinterpret_cast<const uint32_t*>(&entry[0x78]);
+                    if (majorVersion >= 4) {
+                        de.streamSize |= static_cast<uint64_t>(
+                            *reinterpret_cast<const uint32_t*>(&entry[0x7C])) << 32;
+                    }
+                    de.childId = *reinterpret_cast<const uint32_t*>(&entry[0x4C]);
+
+                    de.wname = std::wstring(reinterpret_cast<const wchar_t*>(entry), nameSize / 2);
+                    while (!de.wname.empty() && de.wname.back() == L'\0') de.wname.pop_back();
+                    de.name = StringUtils::ToNarrow(de.wname);
+
+                    // Capture root entry for mini-stream container access
+                    if (objectType == 5 && dirEntries.empty()) {
+                        rootStartSector = de.startSector;
+                        rootStreamSize = de.streamSize;
+                    }
+
+                    dirEntries.push_back(std::move(de));
+                    dirEntriesRead++;
+                }
+
+                dirSect = fat[dirSect];
+            }
+
+            if (dirEntries.empty()) return objects;
+
+            // ================================================================
+            // PHASE 5: Read Mini-Stream Container (root entry's stream)
+            // ================================================================
+            std::vector<uint8_t> miniStreamContainer;
+            if (rootStartSector != 0xFFFFFFFE && rootStreamSize > 0 && !miniFat.empty()) {
+                miniStreamContainer = ReadStreamFromFATChain(
+                    file, fat, rootStartSector, rootStreamSize, sectorSize, fileSize);
+            }
+
+            // Lambda: read stream data using FAT or mini-FAT depending on size
+            auto readStream = [&](uint32_t startSect, uint64_t size) -> std::vector<uint8_t> {
+                if (size == 0 || startSect == 0xFFFFFFFE || startSect == 0xFFFFFFFF)
+                    return {};
+                if (size > MAX_OLE_OBJECT_DATA)
+                    return {};
+
+                if (size < MINI_STREAM_CUTOFF_SIZE && !miniStreamContainer.empty() && !miniFat.empty()) {
+                    return ReadMiniStreamData(miniStreamContainer, miniFat, startSect,
+                                               size, miniSectorSize);
+                }
+                return ReadStreamFromFATChain(file, fat, startSect, size, sectorSize, fileSize);
+            };
+
+            // ================================================================
+            // PHASE 6: Identify and Analyze Embedded OLE Objects
+            // ================================================================
+            // Build a name→entry-index map for fast sibling lookups
+            std::unordered_map<std::string, size_t> nameToIndex;
+            for (size_t i = 0; i < dirEntries.size(); ++i) {
+                nameToIndex[dirEntries[i].name] = i;
+            }
+
+            // Track CompObj ProgIDs discovered (keyed by storage index)
+            std::unordered_map<size_t, std::string> storageProgIds;
+
+            // First pass: extract ProgIDs from CompObj streams
+            for (size_t i = 0; i < dirEntries.size(); ++i) {
+                const auto& de = dirEntries[i];
+                if (de.objectType != 2) continue;
+
+                // \x01CompObj streams (byte 0x01 followed by "CompObj")
+                if (de.name.size() >= 8 &&
+                    static_cast<uint8_t>(de.name[0]) == 0x01 &&
+                    de.name.substr(1) == "CompObj") {
+
+                    auto compObjData = readStream(de.startSector, de.streamSize);
+                    if (!compObjData.empty()) {
+                        std::string progId = ParseProgIDFromCompObj(compObjData);
+                        if (!progId.empty()) {
+                            storageProgIds[i] = progId;
+                        }
+                    }
+                }
+            }
+
+            // Second pass: identify OLE objects and populate OLEObjectInfo
+            for (size_t i = 0; i < dirEntries.size(); ++i) {
+                const auto& de = dirEntries[i];
+                if (de.objectType == 0 || de.objectType == 5) continue; // skip empty and root
+
+                // Check CLSID against known dangerous types
+                const auto* clsidMatch = MatchDangerousCLSID(de.clsid);
+                const bool hasCLSID = !IsCLSIDEmpty(de.clsid);
+                const bool isNamedPackage = (de.name == "Package");
+                const bool isObjectPool = (de.name.find("ObjectPool") != std::string::npos);
+                const bool isOleMarker = (de.name.size() >= 4 &&
+                    static_cast<uint8_t>(de.name[0]) == 0x01 &&
+                    de.name.substr(1, 3) == "Ole");
+
+                // Determine if this entry represents an embedded OLE object
+                const bool isOLEObject =
+                    clsidMatch != nullptr ||                           // Known dangerous CLSID
+                    (de.objectType == 1 && hasCLSID) ||               // Storage with any CLSID
+                    isNamedPackage ||                                  // Package stream
+                    isObjectPool;                                      // ObjectPool storage
+
+                if (!isOLEObject && !isOleMarker) continue;
+
+                // Skip pure marker streams that carry no actionable data
+                if (isOleMarker && !isOLEObject) continue;
+
+                OLEObjectInfo objInfo;
+                objInfo.displayName = de.wname;
+                objInfo.size = de.streamSize;
+                objInfo.clsid = FormatCLSIDString(de.clsid);
+
+                // Apply CLSID-based classification
+                if (clsidMatch) {
+                    objInfo.progId = clsidMatch->progId;
+                    objInfo.isExecutable = clsidMatch->isExecutable;
+                    objInfo.isPackage = clsidMatch->isPackage;
+                    objInfo.hasAutoStart = clsidMatch->hasAutoStart;
+                } else if (hasCLSID) {
+                    // Unknown CLSID — check if ProgID was found via CompObj
+                    auto progIt = storageProgIds.find(i);
+                    if (progIt != storageProgIds.end()) {
+                        objInfo.progId = progIt->second;
+                    }
+                }
+
+                if (isNamedPackage) {
+                    objInfo.isPackage = true;
+                    objInfo.isExecutable = true; // Package can embed any executable
+                }
+
+                // ============================================================
+                // PHASE 6a: Stream Data Extraction and Deep Inspection
+                // ============================================================
+                if (de.objectType == 2 && de.streamSize > 0 && de.streamSize <= MAX_OLE_OBJECT_DATA) {
+                    auto streamData = readStream(de.startSector, de.streamSize);
+
+                    if (!streamData.empty()) {
+                        // Package stream: parse embedded file path and payload
+                        if (isNamedPackage && streamData.size() >= 6) {
+                            auto [embPath, payload] = ParsePackageStream(streamData);
+                            if (!embPath.empty()) {
+                                objInfo.embeddedPath = embPath;
+
+                                // Check embedded path extension for executable types
+                                const std::wstring lower = StringUtils::ToLowerCopy(embPath);
+                                if (lower.ends_with(L".exe") || lower.ends_with(L".dll") ||
+                                    lower.ends_with(L".scr") || lower.ends_with(L".bat") ||
+                                    lower.ends_with(L".cmd") || lower.ends_with(L".ps1") ||
+                                    lower.ends_with(L".vbs") || lower.ends_with(L".js")  ||
+                                    lower.ends_with(L".hta") || lower.ends_with(L".wsf") ||
+                                    lower.ends_with(L".com") || lower.ends_with(L".pif") ||
+                                    lower.ends_with(L".msi") || lower.ends_with(L".lnk")) {
+                                    objInfo.isExecutable = true;
+                                    objInfo.hasAutoStart = true;
+                                }
+                            }
+
+                            if (!payload.empty()) {
+                                // Deep-inspect the actual embedded payload
+                                if (ContainsExecutableContent(payload)) {
+                                    objInfo.isExecutable = true;
+                                }
+
+                                // Hash the payload
+                                auto& hasher = FileHasher::Instance();
+                                objInfo.sha256 = hasher.ComputeSHA256(
+                                    std::span<const uint8_t>(payload));
+                                objInfo.data = std::move(payload);
+                                objInfo.size = objInfo.data.size();
+                            }
+                        } else {
+                            // Non-Package stream: check raw content
+                            if (ContainsExecutableContent(streamData)) {
+                                objInfo.isExecutable = true;
+                            }
+
+                            auto& hasher = FileHasher::Instance();
+                            objInfo.sha256 = hasher.ComputeSHA256(
+                                std::span<const uint8_t>(streamData));
+                            objInfo.data = std::move(streamData);
+                        }
+                    }
+                }
+
+                // For storage entries, scan child streams for embedded executables
+                if (de.objectType == 1 && de.childId != 0xFFFFFFFF && de.childId < dirEntries.size()) {
+                    // Search all entries for streams that may be children of this storage
+                    // (heuristic: look for Package/Contents streams near this storage)
+                    for (size_t ci = 0; ci < dirEntries.size(); ++ci) {
+                        const auto& child = dirEntries[ci];
+                        if (child.objectType != 2) continue;
+                        if (child.streamSize == 0 || child.streamSize > MAX_OLE_OBJECT_DATA) continue;
+
+                        const bool isContents = (child.name == "Contents" || child.name == "CONTENTS");
+                        const bool isChildPackage = (child.name == "Package");
+                        const bool isEmbedding = (child.name == "\x01Ole10Native" ||
+                            (child.name.size() >= 12 &&
+                             static_cast<uint8_t>(child.name[0]) == 0x01 &&
+                             child.name.substr(1, 10) == "Ole10Nativ"));
+
+                        if (!isContents && !isChildPackage && !isEmbedding) continue;
+
+                        auto childData = readStream(child.startSector, child.streamSize);
+                        if (childData.empty()) continue;
+
+                        if (ContainsExecutableContent(childData)) {
+                            objInfo.isExecutable = true;
+                        }
+
+                        // If we don't have data yet, use this child's data
+                        if (objInfo.data.empty()) {
+                            auto& hasher = FileHasher::Instance();
+                            objInfo.sha256 = hasher.ComputeSHA256(
+                                std::span<const uint8_t>(childData));
+                            objInfo.data = std::move(childData);
+                            objInfo.size = objInfo.data.size();
+                        }
+                        break; // Use first matching child stream
+                    }
+                }
+
+                // CVE correlation for known CLSID-based exploits
+                if (objInfo.progId == "Equation.3" || objInfo.progId == "Equation.2") {
+                    auto cveIt = CVE_PATTERNS.find("Equation.3");
+                    if (cveIt != CVE_PATTERNS.end()) {
+                        objInfo.progId += " [" + cveIt->second + "]";
+                    }
+                }
+
+                objects.push_back(std::move(objInfo));
+            }
+
+            SS_LOG_DEBUG(L"DocumentScanner", L"OLE objects extracted: %zu from %ls",
+                         objects.size(), filePath.c_str());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"DocumentScanner::ExtractOLEObjects - Exception: %hs", e.what());
@@ -1495,6 +1946,312 @@ private:
         } catch (const std::exception& e) {
             SS_LOG_ERROR(L"DocumentScanner", L"AnalyzeMacroCode - Exception: %hs", e.what());
         }
+    }
+
+    // ========================================================================
+    // OLE/CFB INTERNAL HELPERS
+    // ========================================================================
+
+    /**
+     * @brief Formats a raw 16-byte CLSID as a standard GUID string.
+     * Handles the mixed-endian CFB on-disk format.
+     */
+    [[nodiscard]] static std::string FormatCLSIDString(const uint8_t clsid[16]) noexcept {
+        // Data1 (LE DWORD), Data2 (LE WORD), Data3 (LE WORD), Data4 (8 bytes as-is)
+        const uint32_t d1 = static_cast<uint32_t>(clsid[0])
+                          | (static_cast<uint32_t>(clsid[1]) << 8)
+                          | (static_cast<uint32_t>(clsid[2]) << 16)
+                          | (static_cast<uint32_t>(clsid[3]) << 24);
+        const uint16_t d2 = static_cast<uint16_t>(clsid[4])
+                          | (static_cast<uint16_t>(clsid[5]) << 8);
+        const uint16_t d3 = static_cast<uint16_t>(clsid[6])
+                          | (static_cast<uint16_t>(clsid[7]) << 8);
+
+        char buf[40];
+        std::snprintf(buf, sizeof(buf),
+            "{%08X-%04X-%04X-%02X%02X-%02X%02X%02X%02X%02X%02X}",
+            d1, d2, d3,
+            clsid[8], clsid[9], clsid[10], clsid[11],
+            clsid[12], clsid[13], clsid[14], clsid[15]);
+        return std::string(buf);
+    }
+
+    /**
+     * @brief Checks if a CLSID is all zeros (no CLSID assigned).
+     */
+    [[nodiscard]] static bool IsCLSIDEmpty(const uint8_t clsid[16]) noexcept {
+        for (int i = 0; i < 16; ++i) {
+            if (clsid[i] != 0) return false;
+        }
+        return true;
+    }
+
+    /**
+     * @brief Matches a raw CLSID against the known-dangerous table.
+     * @return Pointer to matching entry, or nullptr if no match.
+     */
+    [[nodiscard]] static const KnownOLECLSID* MatchDangerousCLSID(const uint8_t clsid[16]) noexcept {
+        if (IsCLSIDEmpty(clsid)) return nullptr;
+        for (size_t i = 0; i < NUM_DANGEROUS_OLE_CLSIDS; ++i) {
+            if (std::memcmp(clsid, DANGEROUS_OLE_CLSIDS[i].bytes, 16) == 0) {
+                return &DANGEROUS_OLE_CLSIDS[i];
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Reads stream data by following a FAT sector chain.
+     * @param file Open file stream (seekable).
+     * @param fat The FAT table (sector → next sector mapping).
+     * @param startSector Starting sector of the stream.
+     * @param streamSize Size of the stream in bytes.
+     * @param sectorSize Size of each sector.
+     * @param fileSize Total file size for bounds checking.
+     * @return Extracted data, or empty vector on error/bounds violation.
+     */
+    [[nodiscard]] static std::vector<uint8_t> ReadStreamFromFATChain(
+        std::ifstream& file,
+        const std::vector<uint32_t>& fat,
+        uint32_t startSector,
+        uint64_t streamSize,
+        uint32_t sectorSize,
+        size_t fileSize) noexcept
+    {
+        std::vector<uint8_t> result;
+        if (streamSize == 0 || startSector == 0xFFFFFFFE || startSector == 0xFFFFFFFF)
+            return result;
+        if (streamSize > MAX_OLE_OBJECT_DATA)
+            return result;
+
+        try {
+            result.reserve(static_cast<size_t>(streamSize));
+        } catch (...) {
+            return result;
+        }
+
+        uint32_t currentSector = startSector;
+        uint64_t bytesRemaining = streamSize;
+        size_t chainSteps = 0;
+
+        while (bytesRemaining > 0 &&
+               currentSector != 0xFFFFFFFE && currentSector != 0xFFFFFFFF &&
+               chainSteps < MAX_OLE_FAT_CHAIN_STEPS) {
+
+            if (currentSector >= fat.size()) break;
+
+            const auto sectorOffset = 512 + static_cast<std::streamoff>(currentSector) * sectorSize;
+            if (static_cast<size_t>(sectorOffset + sectorSize) > fileSize) break;
+
+            const auto toRead = static_cast<size_t>(std::min(
+                static_cast<uint64_t>(sectorSize), bytesRemaining));
+
+            const size_t prevSize = result.size();
+            result.resize(prevSize + toRead);
+
+            file.seekg(sectorOffset);
+            file.read(reinterpret_cast<char*>(result.data() + prevSize),
+                       static_cast<std::streamsize>(toRead));
+            if (!file) {
+                result.resize(prevSize);
+                break;
+            }
+
+            bytesRemaining -= toRead;
+            currentSector = fat[currentSector];
+            ++chainSteps;
+        }
+
+        return result;
+    }
+
+    /**
+     * @brief Reads stream data from the mini-stream container using mini-FAT.
+     * @param miniStreamContainer The root entry's stream data (mini-stream container).
+     * @param miniFat The mini-FAT table.
+     * @param startSector Starting mini-sector of the stream.
+     * @param streamSize Size of the stream in bytes.
+     * @param miniSectorSize Size of each mini-sector (typically 64 bytes).
+     * @return Extracted data, or empty vector on error.
+     */
+    [[nodiscard]] static std::vector<uint8_t> ReadMiniStreamData(
+        const std::vector<uint8_t>& miniStreamContainer,
+        const std::vector<uint32_t>& miniFat,
+        uint32_t startSector,
+        uint64_t streamSize,
+        uint32_t miniSectorSize) noexcept
+    {
+        std::vector<uint8_t> result;
+        if (streamSize == 0 || startSector == 0xFFFFFFFE || startSector == 0xFFFFFFFF)
+            return result;
+        if (streamSize > MAX_OLE_OBJECT_DATA)
+            return result;
+
+        try {
+            result.reserve(static_cast<size_t>(streamSize));
+        } catch (...) {
+            return result;
+        }
+
+        uint32_t currentSector = startSector;
+        uint64_t bytesRemaining = streamSize;
+        size_t chainSteps = 0;
+
+        while (bytesRemaining > 0 &&
+               currentSector != 0xFFFFFFFE && currentSector != 0xFFFFFFFF &&
+               chainSteps < MAX_OLE_FAT_CHAIN_STEPS) {
+
+            if (currentSector >= miniFat.size()) break;
+
+            const size_t offset = static_cast<size_t>(currentSector) * miniSectorSize;
+            if (offset >= miniStreamContainer.size()) break;
+
+            const auto available = miniStreamContainer.size() - offset;
+            const auto toRead = static_cast<size_t>(std::min({
+                static_cast<uint64_t>(miniSectorSize),
+                bytesRemaining,
+                static_cast<uint64_t>(available)
+            }));
+
+            result.insert(result.end(),
+                          miniStreamContainer.begin() + offset,
+                          miniStreamContainer.begin() + offset + toRead);
+
+            bytesRemaining -= toRead;
+            currentSector = miniFat[currentSector];
+            ++chainSteps;
+        }
+
+        return result;
+    }
+
+    /**
+     * @brief Checks extracted data for executable or dangerous content signatures.
+     * @return true if the data contains known executable content markers.
+     */
+    [[nodiscard]] static bool ContainsExecutableContent(const std::vector<uint8_t>& data) noexcept {
+        if (data.size() < 2) return false;
+
+        // PE (MZ header)
+        if (data[0] == PE_MAGIC[0] && data[1] == PE_MAGIC[1]) return true;
+
+        if (data.size() >= 4) {
+            // ELF
+            if (std::memcmp(data.data(), ELF_MAGIC, 4) == 0) return true;
+            // ZIP (may contain executables)
+            if (std::memcmp(data.data(), ZIP_INNER_MAGIC, 4) == 0) return true;
+            // CAB (Windows installer archive)
+            if (std::memcmp(data.data(), CAB_MAGIC, 4) == 0) return true;
+            // RAR
+            if (std::memcmp(data.data(), RAR_MAGIC, 4) == 0) return true;
+        }
+
+        // Script content markers (check first 512 bytes)
+        if (data.size() >= 8) {
+            const std::string_view head(reinterpret_cast<const char*>(data.data()),
+                                         std::min(data.size(), size_t{512}));
+            if (head.find("#!/") != std::string_view::npos) return true;
+            if (head.find("powershell") != std::string_view::npos) return true;
+            if (head.find("cmd.exe") != std::string_view::npos) return true;
+            if (head.find("<script") != std::string_view::npos) return true;
+            if (head.find("WScript.Shell") != std::string_view::npos) return true;
+        }
+
+        return false;
+    }
+
+    /**
+     * @brief Parses a \x01CompObj stream to extract the ProgID.
+     * CompObj format: 4-byte reserved, 4-byte version, 16-byte CLSID,
+     * then length-prefixed ANSI strings: UserType, ClipboardFormat, ProgID.
+     */
+    [[nodiscard]] static std::string ParseProgIDFromCompObj(const std::vector<uint8_t>& data) noexcept {
+        // Minimum: 4(reserved) + 4(version) + 16(clsid) + 4(usertype len) = 28 bytes
+        if (data.size() < 28) return "";
+
+        size_t offset = 4 + 4 + 16; // Skip reserved, version, CLSID
+
+        // Read UserType (length-prefixed ANSI string) — skip it
+        if (offset + 4 > data.size()) return "";
+        const uint32_t userTypeLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        offset += 4;
+        if (userTypeLen > 0x10000 || offset + userTypeLen > data.size()) return "";
+        offset += userTypeLen;
+
+        // Read ClipboardFormat (length-prefixed ANSI string) — skip it
+        if (offset + 4 > data.size()) return "";
+        const uint32_t clipFmtLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        offset += 4;
+        if (clipFmtLen > 0x10000 || offset + clipFmtLen > data.size()) return "";
+        offset += clipFmtLen;
+
+        // Read ProgID (length-prefixed ANSI string)
+        if (offset + 4 > data.size()) return "";
+        const uint32_t progIdLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        offset += 4;
+        if (progIdLen == 0 || progIdLen > 256 || offset + progIdLen > data.size()) return "";
+
+        std::string progId(reinterpret_cast<const char*>(&data[offset]), progIdLen);
+        // Trim null terminator if present
+        while (!progId.empty() && progId.back() == '\0') progId.pop_back();
+        return progId;
+    }
+
+    /**
+     * @brief Parses OLE Package stream to extract embedded file path and data.
+     * Package format: 2-byte type | display-name (null-term) | icon-file (null-term) |
+     *                 2-byte index | 2-byte type2 | embedded-path (null-term) |
+     *                 4-byte data-len | raw-data
+     */
+    [[nodiscard]] static std::pair<std::wstring, std::vector<uint8_t>>
+    ParsePackageStream(const std::vector<uint8_t>& data) noexcept {
+        std::wstring path;
+        std::vector<uint8_t> payload;
+
+        if (data.size() < 6) return {path, payload};
+
+        size_t offset = 2; // Skip stream type header
+
+        // Skip display name (null-terminated ANSI)
+        while (offset < data.size() && data[offset] != 0) ++offset;
+        if (offset >= data.size()) return {path, payload};
+        ++offset; // skip null
+
+        // Skip icon filename (null-terminated ANSI)
+        while (offset < data.size() && data[offset] != 0) ++offset;
+        if (offset >= data.size()) return {path, payload};
+        ++offset; // skip null
+
+        // Skip index (2 bytes) + type2 (2 bytes)
+        offset += 4;
+        if (offset >= data.size()) return {path, payload};
+
+        // Read command/file path (null-terminated ANSI)
+        const size_t pathStart = offset;
+        while (offset < data.size() && data[offset] != 0) ++offset;
+        if (offset > pathStart) {
+            std::string narrowPath(reinterpret_cast<const char*>(&data[pathStart]),
+                                    offset - pathStart);
+            path = StringUtils::ToWide(narrowPath);
+        }
+        if (offset >= data.size()) return {path, payload};
+        ++offset; // skip null
+
+        // Read embedded data length (4 bytes LE)
+        if (offset + 4 > data.size()) return {path, payload};
+        const uint32_t dataLen = *reinterpret_cast<const uint32_t*>(&data[offset]);
+        offset += 4;
+
+        if (dataLen == 0 || dataLen > MAX_OLE_OBJECT_DATA) return {path, payload};
+        if (offset + dataLen > data.size()) return {path, payload};
+
+        try {
+            payload.assign(data.begin() + offset, data.begin() + offset + dataLen);
+        } catch (...) {
+            // allocation failure
+        }
+
+        return {path, payload};
     }
 
     [[nodiscard]] std::vector<std::string> ListOLEStreamsInternal(const std::wstring& filePath) const {
