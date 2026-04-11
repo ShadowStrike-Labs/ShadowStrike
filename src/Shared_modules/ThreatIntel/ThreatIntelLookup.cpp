@@ -2532,8 +2532,12 @@ private:
             
             // If caller wants metadata or we need reputation data, fetch from IOCManager
             if (m_iocManager != nullptr && indexResult.entryId != 0) {
+                IOCQueryOptions queryOpts{};
+                queryOpts.minReputation = ReputationLevel::Safe;
+                queryOpts.includeFullEntry = options.includeMetadata;
+
                 // Query IOCManager directly for the entry data by ID
-                auto entryOpt = m_iocManager->GetIOC(indexResult.entryId);
+                auto entryOpt = m_iocManager->GetIOC(indexResult.entryId, queryOpts);
                 
                 if (entryOpt.has_value()) {
                     const auto& entry = entryOpt.value();
@@ -2596,7 +2600,11 @@ private:
         }
         
         // Query IOCManager directly for the IOC by type and value
-        auto entryOpt = m_iocManager->FindIOC(type, value);
+        IOCQueryOptions queryOpts{};
+        queryOpts.minReputation = ReputationLevel::Safe;
+        queryOpts.includeFullEntry = options.includeMetadata;
+
+        auto entryOpt = m_iocManager->FindIOC(type, value, queryOpts);
         
         if (!entryOpt.has_value()) {
             return result;

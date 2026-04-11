@@ -1,0 +1,186 @@
+[==========] Running 63 tests from 7 test suites.
+[----------] Global test environment set-up.
+[----------] 19 tests from FeatureExtractor_VectorSizes
+[ RUN      ] FeatureExtractor_VectorSizes.Init_Succeeds
+[       OK ] FeatureExtractor_VectorSizes.Init_Succeeds (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.PE_EmptyBuffer_ReturnsNullopt
+[       OK ] FeatureExtractor_VectorSizes.PE_EmptyBuffer_ReturnsNullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.PE_ELFMagic_ReturnsNullopt
+[       OK ] FeatureExtractor_VectorSizes.PE_ELFMagic_ReturnsNullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.PE_RealWindowsPE_CorrectVectorSize
+[       OK ] FeatureExtractor_VectorSizes.PE_RealWindowsPE_CorrectVectorSize (28 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Behavioral_EmptySequence_ReturnsNullopt
+[       OK ] FeatureExtractor_VectorSizes.Behavioral_EmptySequence_ReturnsNullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Behavioral_ValidSequence_CorrectVectorSize
+[       OK ] FeatureExtractor_VectorSizes.Behavioral_ValidSequence_CorrectVectorSize (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Behavioral_LongSequence_TruncatedAndSucceeds
+[       OK ] FeatureExtractor_VectorSizes.Behavioral_LongSequence_TruncatedAndSucceeds (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Memory_ValidRegion_CorrectVectorSize
+[       OK ] FeatureExtractor_VectorSizes.Memory_ValidRegion_CorrectVectorSize (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Memory_ExceedsMaxSize_ReturnsNullopt
+[       OK ] FeatureExtractor_VectorSizes.Memory_ExceedsMaxSize_ReturnsNullopt (11 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Network_ZeroFlow_CorrectVectorSize
+[       OK ] FeatureExtractor_VectorSizes.Network_ZeroFlow_CorrectVectorSize (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Emulation_EmptyTrace_ReturnsNullopt
+[       OK ] FeatureExtractor_VectorSizes.Emulation_EmptyTrace_ReturnsNullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Emulation_ValidTrace_CorrectVectorSize
+[       OK ] FeatureExtractor_VectorSizes.Emulation_ValidTrace_CorrectVectorSize (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Concurrent_ExtractionNoRace
+[       OK ] FeatureExtractor_VectorSizes.Concurrent_ExtractionNoRace (2 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_PE_TwoByteStub_Nullopt
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_PE_TwoByteStub_Nullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_PE_BadE_lfanew_Nullopt
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_PE_BadE_lfanew_Nullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_PE_MissingPESig_Nullopt
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_PE_MissingPESig_Nullopt (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_Memory_HighEntropy_NoNaN
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_Memory_HighEntropy_NoNaN (4 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_Behavioral_AtExactMaxLength
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_Behavioral_AtExactMaxLength (0 ms)
+[ RUN      ] FeatureExtractor_VectorSizes.Adversarial_Network_SaturatedFields_NoNaN
+[       OK ] FeatureExtractor_VectorSizes.Adversarial_Network_SaturatedFields_NoNaN (0 ms)
+[----------] 19 tests from FeatureExtractor_VectorSizes (48 ms total)
+
+[----------] 6 tests from CortexConfigManager_Integration
+[ RUN      ] CortexConfigManager_Integration.DefaultConfig_ThresholdsInValidRange
+[       OK ] CortexConfigManager_Integration.DefaultConfig_ThresholdsInValidRange (0 ms)
+[ RUN      ] CortexConfigManager_Integration.DefaultConfig_MaxBatchSizeLeqLimit
+[       OK ] CortexConfigManager_Integration.DefaultConfig_MaxBatchSizeLeqLimit (0 ms)
+[ RUN      ] CortexConfigManager_Integration.DefaultConfig_TimeoutInValidRange
+[       OK ] CortexConfigManager_Integration.DefaultConfig_TimeoutInValidRange (0 ms)
+[ RUN      ] CortexConfigManager_Integration.LoadConfig_NonExistentFile_ReturnsFalse
+[       OK ] CortexConfigManager_Integration.LoadConfig_NonExistentFile_ReturnsFalse (0 ms)
+[ RUN      ] CortexConfigManager_Integration.SaveConfig_CreatesNonEmptyFile
+[       OK ] CortexConfigManager_Integration.SaveConfig_CreatesNonEmptyFile (2 ms)
+[ RUN      ] CortexConfigManager_Integration.SaveAndLoad_Roundtrip_PreservesThresholds
+[       OK ] CortexConfigManager_Integration.SaveAndLoad_Roundtrip_PreservesThresholds (2 ms)
+[----------] 6 tests from CortexConfigManager_Integration (8 ms total)
+
+[----------] 9 tests from ModelCache_Integration
+[ RUN      ] ModelCache_Integration.Init_Succeeds
+[       OK ] ModelCache_Integration.Init_Succeeds (0 ms)
+[ RUN      ] ModelCache_Integration.Init_CreatesDirStructure
+[       OK ] ModelCache_Integration.Init_CreatesDirStructure (0 ms)
+[ RUN      ] ModelCache_Integration.GetModelPath_EmptySlot_Consistent
+[       OK ] ModelCache_Integration.GetModelPath_EmptySlot_Consistent (3 ms)
+[ RUN      ] ModelCache_Integration.VerifyIntegrity_EmptySlot_ReturnsFalse
+[       OK ] ModelCache_Integration.VerifyIntegrity_EmptySlot_ReturnsFalse (0 ms)
+[ RUN      ] ModelCache_Integration.Rollback_EmptySlot_ReturnsFalse
+[       OK ] ModelCache_Integration.Rollback_EmptySlot_ReturnsFalse (0 ms)
+[ RUN      ] ModelCache_Integration.SwapModel_InvalidPath_ReturnsFalse
+[       OK ] ModelCache_Integration.SwapModel_InvalidPath_ReturnsFalse (0 ms)
+[ RUN      ] ModelCache_Integration.SwapModel_ValidFile_ReturnsTrue
+[       OK ] ModelCache_Integration.SwapModel_ValidFile_ReturnsTrue (5 ms)
+[ RUN      ] ModelCache_Integration.GetModelPath_AfterSwap_ReturnsExistingPath
+[       OK ] ModelCache_Integration.GetModelPath_AfterSwap_ReturnsExistingPath (5 ms)
+[ RUN      ] ModelCache_Integration.Rollback_AfterDoubleSwap_Succeeds
+[       OK ] ModelCache_Integration.Rollback_AfterDoubleSwap_Succeeds (11 ms)
+[----------] 9 tests from ModelCache_Integration (26 ms total)
+
+[----------] 8 tests from ModelInference_Lifecycle
+[ RUN      ] ModelInference_Lifecycle.BeforeInit_IsInitialized_False
+[       OK ] ModelInference_Lifecycle.BeforeInit_IsInitialized_False (0 ms)
+[ RUN      ] ModelInference_Lifecycle.Initialize_DefaultConfig_ReturnsTrue
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(825): error: Value of: AI::ModelInference::Instance().Initialize(cfg)
+  Actual: false
+Expected: true
+ModelInference::Initialize() must succeed on Windows x86-64 with ORT.
+
+[  FAILED  ] ModelInference_Lifecycle.Initialize_DefaultConfig_ReturnsTrue (0 ms)
+[ RUN      ] ModelInference_Lifecycle.AfterInit_IsInitialized_True
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(837): Skipped
+ORT unavailable ÔÇö skipping post-init state check.
+
+[  SKIPPED ] ModelInference_Lifecycle.AfterInit_IsInitialized_True (0 ms)
+[ RUN      ] ModelInference_Lifecycle.LoadModel_NonExistentPath_ReturnsFalse
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(850): Skipped
+ORT unavailable ÔÇö skipping LoadModel test.
+
+[  SKIPPED ] ModelInference_Lifecycle.LoadModel_NonExistentPath_ReturnsFalse (0 ms)
+[ RUN      ] ModelInference_Lifecycle.IsModelLoaded_NoModel_ReturnsFalse
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(865): Skipped
+ORT unavailable ÔÇö skipping IsModelLoaded test.
+
+[  SKIPPED ] ModelInference_Lifecycle.IsModelLoaded_NoModel_ReturnsFalse (0 ms)
+[ RUN      ] ModelInference_Lifecycle.Infer_WithoutModel_ReturnsNullopt
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(879): Skipped
+ORT unavailable ÔÇö skipping Infer nullopt test.
+
+[  SKIPPED ] ModelInference_Lifecycle.Infer_WithoutModel_ReturnsNullopt (0 ms)
+[ RUN      ] ModelInference_Lifecycle.InferBatch_WithoutModel_ReturnsNullopt
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(900): Skipped
+ORT unavailable ÔÇö skipping InferBatch nullopt test.
+
+[  SKIPPED ] ModelInference_Lifecycle.InferBatch_WithoutModel_ReturnsNullopt (0 ms)
+[ RUN      ] ModelInference_Lifecycle.HardwareCapabilities_QueryDoesNotCrash
+tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp(924): Skipped
+ORT unavailable ÔÇö skipping hardware query test.
+
+[  SKIPPED ] ModelInference_Lifecycle.HardwareCapabilities_QueryDoesNotCrash (0 ms)
+[----------] 8 tests from ModelInference_Lifecycle (0 ms total)
+
+[----------] 6 tests from PhantomCortex_Lifecycle
+[ RUN      ] PhantomCortex_Lifecycle.Singleton_SameInstanceAddress
+[       OK ] PhantomCortex_Lifecycle.Singleton_SameInstanceAddress (0 ms)
+[ RUN      ] PhantomCortex_Lifecycle.BeforeInit_IsOperational_False
+[       OK ] PhantomCortex_Lifecycle.BeforeInit_IsOperational_False (0 ms)
+[ RUN      ] PhantomCortex_Lifecycle.BeforeInit_AnalyzeFile_ReturnsBenignDefault
+[       OK ] PhantomCortex_Lifecycle.BeforeInit_AnalyzeFile_ReturnsBenignDefault (0 ms)
+[ RUN      ] PhantomCortex_Lifecycle.BeforeInit_GetStats_ReturnsZeroStats
+[       OK ] PhantomCortex_Lifecycle.BeforeInit_GetStats_ReturnsZeroStats (0 ms)
+[ RUN      ] PhantomCortex_Lifecycle.Initialize_EmptyModelDir_IsOperationalMatchesResult
+[       OK ] PhantomCortex_Lifecycle.Initialize_EmptyModelDir_IsOperationalMatchesResult (0 ms)
+[ RUN      ] PhantomCortex_Lifecycle.Shutdown_Reinitialize_StatisticsReset
+[       OK ] PhantomCortex_Lifecycle.Shutdown_Reinitialize_StatisticsReset (0 ms)
+[----------] 6 tests from PhantomCortex_Lifecycle (4 ms total)
+
+[----------] 10 tests from EnsembleVerdict_Logic
+[ RUN      ] EnsembleVerdict_Logic.AllMalicious_FullConfidence_FinalIsMalicious
+[       OK ] EnsembleVerdict_Logic.AllMalicious_FullConfidence_FinalIsMalicious (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.AllBenign_ZeroConfidence_FinalIsBenign
+[       OK ] EnsembleVerdict_Logic.AllBenign_ZeroConfidence_FinalIsBenign (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.SingleStaticModel_Malicious_DrivesMalicious
+[       OK ] EnsembleVerdict_Logic.SingleStaticModel_Malicious_DrivesMalicious (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.SingleMemoryModel_Benign_DrivesBenign
+[       OK ] EnsembleVerdict_Logic.SingleMemoryModel_Benign_DrivesBenign (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.EnsembleConfidence_AlwaysInUnitInterval
+[       OK ] EnsembleVerdict_Logic.EnsembleConfidence_AlwaysInUnitInterval (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.ModelVerdicts_StaticSlot_ReflectsInput
+[       OK ] EnsembleVerdict_Logic.ModelVerdicts_StaticSlot_ReflectsInput (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.TotalInferenceTime_NonNegative
+[       OK ] EnsembleVerdict_Logic.TotalInferenceTime_NonNegative (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.DefaultVerdict_IsBenignWithZeroConf
+[       OK ] EnsembleVerdict_Logic.DefaultVerdict_IsBenignWithZeroConf (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.MixedVerdicts_ResultIsValidThreatVerdict
+[       OK ] EnsembleVerdict_Logic.MixedVerdicts_ResultIsValidThreatVerdict (0 ms)
+[ RUN      ] EnsembleVerdict_Logic.Concurrent_EnsembleNoRace
+[       OK ] EnsembleVerdict_Logic.Concurrent_EnsembleNoRace (4 ms)
+[----------] 10 tests from EnsembleVerdict_Logic (11 ms total)
+
+[----------] 5 tests from TypeContracts
+[ RUN      ] TypeContracts.MODEL_COUNT_Is5
+[       OK ] TypeContracts.MODEL_COUNT_Is5 (0 ms)
+[ RUN      ] TypeContracts.CortexModelType_OrdinalValues
+[       OK ] TypeContracts.CortexModelType_OrdinalValues (0 ms)
+[ RUN      ] TypeContracts.ThreatVerdict_OrdinalValues
+[       OK ] TypeContracts.ThreatVerdict_OrdinalValues (0 ms)
+[ RUN      ] TypeContracts.EnsembleVerdict_ModelArraySize_MatchesModelCount
+[       OK ] TypeContracts.EnsembleVerdict_ModelArraySize_MatchesModelCount (0 ms)
+[ RUN      ] TypeContracts.FeatureVectorSizes_MatchDocumentedValues
+[       OK ] TypeContracts.FeatureVectorSizes_MatchDocumentedValues (0 ms)
+[----------] 5 tests from TypeContracts (0 ms total)
+
+[----------] Global test environment tear-down
+[==========] 63 tests from 7 test suites ran. (107 ms total)
+[  PASSED  ] 56 tests.
+[  SKIPPED ] 6 tests, listed below:
+[  SKIPPED ] ModelInference_Lifecycle.AfterInit_IsInitialized_True
+[  SKIPPED ] ModelInference_Lifecycle.LoadModel_NonExistentPath_ReturnsFalse
+[  SKIPPED ] ModelInference_Lifecycle.IsModelLoaded_NoModel_ReturnsFalse
+[  SKIPPED ] ModelInference_Lifecycle.Infer_WithoutModel_ReturnsNullopt
+[  SKIPPED ] ModelInference_Lifecycle.InferBatch_WithoutModel_ReturnsNullopt
+[  SKIPPED ] ModelInference_Lifecycle.HardwareCapabilities_QueryDoesNotCrash
+[  FAILED  ] 1 test, listed below:
+[  FAILED  ] ModelInference_Lifecycle.Initialize_DefaultConfig_ReturnsTrue
+
+ 1 FAILED TEST

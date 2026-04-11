@@ -73,6 +73,12 @@ namespace RealTime {
 // ============================================================================
 namespace {
 
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    constexpr bool kFocusedUserModeBuild = true;
+#else
+    constexpr bool kFocusedUserModeBuild = false;
+#endif
+
     // Generate unique message ID
     uint64_t GenerateMessageId() {
         static std::atomic<uint64_t> s_counter{ 1000000 };
@@ -672,6 +678,7 @@ struct FileSystemFilter::Impl {
         }
 
         // 2. Use integrated scan engine if available (snapshot pointer)
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (snap.scanEngine) {
             try {
                 Core::Engine::ScanContext context;
@@ -754,8 +761,10 @@ struct FileSystemFilter::Impl {
                 if (snap.blockOnError) return ScanVerdict::Block;
             }
         }
+#endif
 
         // 3. Check hash store if available (snapshot pointer)
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (snap.hashStore) {
             try {
                 std::vector<uint8_t> hashBytes;
@@ -787,8 +796,10 @@ struct FileSystemFilter::Impl {
                     e.what());
             }
         }
+#endif
 
         // 4. PhantomCortex AI/ML pre-screening for high-risk file types
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (ShadowStrike::AI::PhantomCortex::Instance().IsOperational()) {
             try {
                 const std::wstring ext = GetFileExtension(event.filePath);
@@ -835,6 +846,7 @@ struct FileSystemFilter::Impl {
                 Utils::Logger::Error("FileSystemFilter: PhantomCortex ML unknown exception");
             }
         }
+#endif
 
         // 5. Default: Allow (fail-open by default)
         return ScanVerdict::Allow;
@@ -979,8 +991,12 @@ struct FileSystemFilter::Impl {
 
         // Also check whitelist store (snapshot pointer — no config lock needed)
         if (snap.whitelistStore) {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+            (void)snap;
+#else
             auto result = snap.whitelistStore->IsPathWhitelisted(event.filePath);
             if (result.found) return true;
+#endif
         }
 
         return false;
@@ -1473,10 +1489,12 @@ bool FileSystemFilter::IsProcessExcluded(const std::wstring& processName,
     for (const auto& excl : m_impl->m_exclusions) {
         if (excl.type == FilterExclusion::Type::Process) {
             std::wstring pattern = excl.caseInsensitive ? ToLowerW(excl.pattern) : excl.pattern;
-            if (lowerName == pattern) return true;
+            const std::wstring& candidateName = excl.caseInsensitive ? lowerName : processName;
+            if (candidateName == pattern) return true;
         } else if (excl.type == FilterExclusion::Type::ProcessPath && !processPath.empty()) {
             std::wstring pattern = excl.caseInsensitive ? ToLowerW(excl.pattern) : excl.pattern;
-            if (lowerPath.find(pattern) == 0) return true;
+            const std::wstring& candidatePath = excl.caseInsensitive ? lowerPath : processPath;
+            if (candidatePath.find(pattern) == 0) return true;
         }
     }
     return false;
@@ -1709,7 +1727,7 @@ void FileSystemFilter::SetCacheManager(Utils::CacheManager* cache) {
 // UTILITY FUNCTIONS
 // ============================================================================
 
-constexpr const char* FilterStatusToString(FilterStatus status) noexcept {
+const char* FilterStatusToString(FilterStatus status) noexcept {
     switch (status) {
         case FilterStatus::NotInitialized: return "NotInitialized";
         case FilterStatus::Initializing: return "Initializing";
@@ -1724,7 +1742,7 @@ constexpr const char* FilterStatusToString(FilterStatus status) noexcept {
     }
 }
 
-constexpr const char* ScanVerdictToString(ScanVerdict verdict) noexcept {
+const char* ScanVerdictToString(ScanVerdict verdict) noexcept {
     switch (verdict) {
         case ScanVerdict::Allow: return "Allow";
         case ScanVerdict::Block: return "Block";

@@ -499,7 +499,10 @@ namespace RealTime {
     }
 
     bool MemoryProtection::MemoryProtectionImpl::DetectSyscallStub(const uint8_t* data, size_t size) {
-        for (size_t i = 0; i + 10 < size; ++i) {
+        constexpr size_t kMinSyscallStubBytes =
+            sizeof(SYSCALL_STUB_X64) + sizeof(uint16_t) + sizeof(SYSCALL_INST);
+
+        for (size_t i = 0; i + kMinSyscallStubBytes <= size; ++i) {
             if (memcmp(data + i, SYSCALL_STUB_X64, sizeof(SYSCALL_STUB_X64)) == 0) {
                 uint16_t ssn = *reinterpret_cast<const uint16_t*>(data + i + 4);
                 if (ssn < 0x2000) {
@@ -511,7 +514,7 @@ namespace RealTime {
             }
         }
         // Heaven's Gate: far call to 0x33 segment
-        for (size_t i = 0; i + 7 < size; ++i) {
+        for (size_t i = 0; i + 7 <= size; ++i) {
             if (data[i] == 0x9A && data[i + 5] == 0x33 && data[i + 6] == 0x00) return true;
         }
         return false;
@@ -519,7 +522,7 @@ namespace RealTime {
 
     bool MemoryProtection::MemoryProtectionImpl::DetectEncoderStub(const uint8_t* data, size_t size) {
         if (MemContains(data, size, SHIKATA_MARKER, sizeof(SHIKATA_MARKER))) return true;
-        for (size_t i = 0; i + 8 < size; ++i) {
+        for (size_t i = 0; i + 8 <= size; ++i) {
             uint8_t op = data[i];
             if ((op >= 0x30 && op <= 0x33) || op == 0x80) {
                 for (size_t j = i + 2; j + 1 < size && j < i + 20; ++j) {
@@ -534,7 +537,7 @@ namespace RealTime {
     }
 
     bool MemoryProtection::MemoryProtectionImpl::DetectPIC(const uint8_t* data, size_t size) {
-        for (size_t i = 0; i + 6 < size; ++i) {
+        for (size_t i = 0; i + sizeof(PIC_CALL5) < size; ++i) {
             if (memcmp(data + i, PIC_CALL5, sizeof(PIC_CALL5)) == 0) {
                 uint8_t next = data[i + 5];
                 if (next >= 0x58 && next <= 0x5F) return true;

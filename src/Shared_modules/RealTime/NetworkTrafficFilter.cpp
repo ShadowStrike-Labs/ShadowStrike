@@ -737,7 +737,9 @@ NetworkFilterConfig NetworkTrafficFilter::GetConfig() const {
 // ============================================================================
 
 FilterAction NetworkTrafficFilter::OnConnectionAttempt(const NetworkConnection& connection) {
-    if (!m_impl->m_running.load(std::memory_order_relaxed)) return FilterAction::Allow;
+    if (!m_impl->m_initialized.load(std::memory_order_relaxed)) {
+        return FilterAction::Allow;
+    }
 
     m_impl->m_statTotalConnections.fetch_add(1, std::memory_order_relaxed);
 
@@ -1663,14 +1665,9 @@ bool IPAddress::IsPrivate() const noexcept {
         const uint32_t h = ntohl(ipv4);
         return ((h & 0xFF000000u) == 0x0A000000u) ||  // 10.0.0.0/8
                ((h & 0xFFF00000u) == 0xAC100000u) ||  // 172.16.0.0/12
-               ((h & 0xFFFF0000u) == 0xC0A80000u) ||  // 192.168.0.0/16
-               ((h & 0xFF000000u) == 0x7F000000u);     // 127.0.0.0/8
+               ((h & 0xFFFF0000u) == 0xC0A80000u);    // 192.168.0.0/16
     }
     if (version == IPVersion::IPv6) {
-        // ::1 (loopback)
-        static constexpr std::array<uint8_t, 16> kLoopback6{
-            0,0,0,0, 0,0,0,0, 0,0,0,0, 0,0,0,1 };
-        if (ipv6 == kLoopback6) return true;
         // fc00::/7 (unique local)
         return (ipv6[0] & 0xFE) == 0xFC;
     }

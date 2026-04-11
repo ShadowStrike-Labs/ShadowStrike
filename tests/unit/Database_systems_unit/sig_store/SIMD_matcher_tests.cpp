@@ -35,7 +35,7 @@
 // 7. Security & Safety Tests
 // ============================================================================
 #include <gtest/gtest.h>
-#include "../../../../src/PatternStore/PatternStore.hpp"
+#include "Shared_modules/PatternStore/PatternStore.hpp"
 #include <vector>
 #include <cstdint>
 #include <span>
@@ -44,7 +44,7 @@
 #include <string>
 #include <cstring>
 
-using namespace ShadowStrike::SignatureStore;
+using ShadowStrike::PatternStore::SIMDMatcher;
 
 // ============================================================================
 // TEST FIXTURE - SIMD MATCHER BASE

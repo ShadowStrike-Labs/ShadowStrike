@@ -58,7 +58,6 @@
  * @copyright 2026 ShadowStrike Security Suite
  *
  * @see DirectoryMonitor.hpp for path monitoring
- * @see FileWatcher.hpp for file change detection
  */
 
 #pragma once

@@ -68,6 +68,12 @@ namespace RealTime {
 
 namespace {
 
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    constexpr bool kFocusedUserModeBuild = true;
+#else
+    constexpr bool kFocusedUserModeBuild = false;
+#endif
+
     // -------------------------------------------------------------------------
     // INTERNAL ATOMIC STATS (bridges atomic writes → public copyable snapshot)
     // -------------------------------------------------------------------------
@@ -308,7 +314,10 @@ struct ProcessCreationMonitor::Impl {
     }
 
     bool Initialize(std::shared_ptr<Utils::ThreadPool> tp, const ProcessMonitorConfig& cfg) {
-        if (isInitialized.load(std::memory_order_acquire)) return false;
+        if (isInitialized.load(std::memory_order_acquire)) {
+            Utils::Logger::Warn("ProcessCreationMonitor already initialized");
+            return true;
+        }
 
         threadPool = tp;
         {
@@ -394,6 +403,7 @@ struct ProcessCreationMonitor::Impl {
         }
 
         // 2. Check Whitelist
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (cfg.trustWhitelisted && localWhitelistStore) {
             auto wlResult = localWhitelistStore->IsWhitelisted(event.imagePath);
             if (wlResult.found) {
@@ -402,8 +412,10 @@ struct ProcessCreationMonitor::Impl {
                 return ProcessVerdict::Allow;
             }
         }
+#endif
 
         // 3. Hash Check
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (cfg.blockKnownMalicious && localHashStore && !event.imageHash.empty()) {
             auto detection = localHashStore->LookupHashString(
                 event.imageHash, HashStore::HashType::SHA256);
@@ -417,6 +429,7 @@ struct ProcessCreationMonitor::Impl {
                 return ProcessVerdict::Block;
             }
         }
+#endif
 
         // 4. Command Line Analysis
         CommandLineAnalysis cmdAnalysis;
@@ -441,6 +454,7 @@ struct ProcessCreationMonitor::Impl {
 
         // 6. Pre-Execution Scan (if enabled and not trusted)
         ProcessVerdict scanVerdict = ProcessVerdict::Allow;
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (cfg.preExecutionScan && localScanEngine) {
             // Check if we should scan (e.g. not Microsoft signed if trusted)
             bool shouldScan = true;
@@ -457,6 +471,7 @@ struct ProcessCreationMonitor::Impl {
                 }
             }
         }
+#endif
 
         // 7. Behavioral/Heuristic Checks (Parent-Child, LOLBAS, Masquerading)
         std::vector<SuspiciousPattern> patterns;
@@ -483,6 +498,7 @@ struct ProcessCreationMonitor::Impl {
         }
 
         // 8. Forward to BehaviorAnalyzer for cross-process correlation and APT hunting
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         if (localBehaviorAnalyzer && localBehaviorAnalyzer->IsInitialized()) {
             try {
                 auto baEvent = Core::Engine::CreateProcessEvent(
@@ -512,6 +528,7 @@ struct ProcessCreationMonitor::Impl {
                     event.processId, ex.what());
             }
         }
+#endif
 
         // 9. Update State (Process Tree)
         if (finalVerdict != ProcessVerdict::Block) {
@@ -539,7 +556,7 @@ struct ProcessCreationMonitor::Impl {
 
     void UpdateProcessState(const ProcessCreateEvent& event, ProcessVerdict verdict,
                             const ProcessMonitorConfig& cfg) {
-        if (!cfg.trackParentChild) return;
+        if (!cfg.trackParentChild || event.processId == 0) return;
 
         std::unique_lock lock(processMutex);
 
@@ -577,6 +594,7 @@ struct ProcessCreationMonitor::Impl {
         stats.processTerminations.fetch_add(1, std::memory_order_relaxed);
 
         // Forward termination to BehaviorAnalyzer for state cleanup (PID reuse protection)
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         {
             Core::Engine::BehaviorAnalyzer* localBA = nullptr;
             {
@@ -595,6 +613,7 @@ struct ProcessCreationMonitor::Impl {
                 }
             }
         }
+#endif
 
         {
             std::unique_lock lock(processMutex);
@@ -666,6 +685,15 @@ struct ProcessCreationMonitor::Impl {
                 result.suspiciousKeywords.push_back(Utils::StringUtils::ToNarrow(keyword));
                 result.riskScore += 10.0;
 
+                if (keyword == L"-enc" || keyword == L"-encodedcommand") {
+                    if (!result.hasEncodedContent) {
+                        result.hasEncodedContent = true;
+                        result.encodingType = "Base64";
+                        result.patterns.push_back(SuspiciousPattern::EncodedPowerShell);
+                        result.riskScore += ProcessMonitorConstants::ENCODED_COMMAND_SCORE;
+                        stats.encodedCommandDetections.fetch_add(1, std::memory_order_relaxed);
+                    }
+                }
                 if (keyword == L"bypass") result.patterns.push_back(SuspiciousPattern::BypassExecutionPolicy);
                 if (keyword == L"hidden") result.patterns.push_back(SuspiciousPattern::HiddenWindowExecution);
                 if (keyword == L"downloadstring" || keyword == L"urldownloadtofile" ||
@@ -685,6 +713,11 @@ struct ProcessCreationMonitor::Impl {
 
     ProcessVerdict PerformScan(const ProcessCreateEvent& event,
                               Core::Engine::ScanEngine* localScanEngine) {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        (void)event;
+        (void)localScanEngine;
+        return ProcessVerdict::Allow;
+#else
         stats.scansPerformed.fetch_add(1, std::memory_order_relaxed);
 
         // ================================================================
@@ -821,6 +854,7 @@ struct ProcessCreationMonitor::Impl {
         }
 
         return ProcessVerdict::Allow;
+#endif
     }
 
     std::optional<ProcessVerdict> EvaluateRules(const ProcessCreateEvent& event, const CommandLineAnalysis& cmdAnalysis) {
@@ -962,6 +996,15 @@ struct ProcessCreationMonitor::Impl {
             }
         }
 
+        // 4. WMI provider -> shell / scripting host
+        if (Utils::StringUtils::IEquals(parent.imageName, L"wmiprvse.exe")) {
+            if (ClassifyLOLBAS(child.imageFileName) == LOLBASType::Cmd ||
+                ClassifyLOLBAS(child.imageFileName) == LOLBASType::PowerShell ||
+                IsScriptInterpreter(child.imageFileName)) {
+                patterns.push_back(SuspiciousPattern::WmiSpawnsProcess);
+            }
+        }
+
         return patterns;
     }
 
@@ -999,31 +1042,36 @@ struct ProcessCreationMonitor::Impl {
     }
 
     LOLBASType ClassifyLOLBAS(const std::wstring& imageName) const {
-        if (Utils::StringUtils::IEquals(imageName, L"cmd.exe"))        return LOLBASType::Cmd;
-        if (Utils::StringUtils::IEquals(imageName, L"powershell.exe")) return LOLBASType::PowerShell;
-        if (Utils::StringUtils::IEquals(imageName, L"pwsh.exe"))       return LOLBASType::PowerShell;
-        if (Utils::StringUtils::IEquals(imageName, L"wscript.exe"))    return LOLBASType::WSH;
-        if (Utils::StringUtils::IEquals(imageName, L"cscript.exe"))    return LOLBASType::WSH;
-        if (Utils::StringUtils::IEquals(imageName, L"mshta.exe"))      return LOLBASType::Mshta;
-        if (Utils::StringUtils::IEquals(imageName, L"regsvr32.exe"))   return LOLBASType::Regsvr32;
-        if (Utils::StringUtils::IEquals(imageName, L"rundll32.exe"))   return LOLBASType::Rundll32;
-        if (Utils::StringUtils::IEquals(imageName, L"certutil.exe"))   return LOLBASType::Certutil;
-        if (Utils::StringUtils::IEquals(imageName, L"bitsadmin.exe"))  return LOLBASType::Bitsadmin;
-        if (Utils::StringUtils::IEquals(imageName, L"wmic.exe"))       return LOLBASType::Wmic;
-        if (Utils::StringUtils::IEquals(imageName, L"msiexec.exe"))    return LOLBASType::Msiexec;
-        if (Utils::StringUtils::IEquals(imageName, L"expand.exe"))     return LOLBASType::Expand;
-        if (Utils::StringUtils::IEquals(imageName, L"esentutl.exe"))   return LOLBASType::Esentutl;
-        if (Utils::StringUtils::IEquals(imageName, L"installutil.exe")) return LOLBASType::InstallUtil;
-        if (Utils::StringUtils::IEquals(imageName, L"msbuild.exe"))    return LOLBASType::MSBuild;
-        if (Utils::StringUtils::IEquals(imageName, L"odbcconf.exe"))   return LOLBASType::ODBCConf;
-        if (Utils::StringUtils::IEquals(imageName, L"regasm.exe"))     return LOLBASType::RegAsm;
-        if (Utils::StringUtils::IEquals(imageName, L"regsvcs.exe"))    return LOLBASType::RegSvcs;
-        if (Utils::StringUtils::IEquals(imageName, L"xwizard.exe"))    return LOLBASType::XWizard;
-        if (Utils::StringUtils::IEquals(imageName, L"forfiles.exe"))   return LOLBASType::ForFiles;
-        if (Utils::StringUtils::IEquals(imageName, L"pcalua.exe"))     return LOLBASType::PcaLua;
-        if (Utils::StringUtils::IEquals(imageName, L"cmstp.exe"))      return LOLBASType::Cmstp;
-        if (Utils::StringUtils::IEquals(imageName, L"bash.exe"))       return LOLBASType::WSL;
-        if (Utils::StringUtils::IEquals(imageName, L"wsl.exe"))        return LOLBASType::WSL;
+        const std::wstring leafName =
+            std::filesystem::path(imageName).filename().wstring().empty()
+                ? imageName
+                : std::filesystem::path(imageName).filename().wstring();
+
+        if (Utils::StringUtils::IEquals(leafName, L"cmd.exe"))         return LOLBASType::Cmd;
+        if (Utils::StringUtils::IEquals(leafName, L"powershell.exe"))  return LOLBASType::PowerShell;
+        if (Utils::StringUtils::IEquals(leafName, L"pwsh.exe"))        return LOLBASType::PowerShell;
+        if (Utils::StringUtils::IEquals(leafName, L"wscript.exe"))     return LOLBASType::WSH;
+        if (Utils::StringUtils::IEquals(leafName, L"cscript.exe"))     return LOLBASType::WSH;
+        if (Utils::StringUtils::IEquals(leafName, L"mshta.exe"))       return LOLBASType::Mshta;
+        if (Utils::StringUtils::IEquals(leafName, L"regsvr32.exe"))    return LOLBASType::Regsvr32;
+        if (Utils::StringUtils::IEquals(leafName, L"rundll32.exe"))    return LOLBASType::Rundll32;
+        if (Utils::StringUtils::IEquals(leafName, L"certutil.exe"))    return LOLBASType::Certutil;
+        if (Utils::StringUtils::IEquals(leafName, L"bitsadmin.exe"))   return LOLBASType::Bitsadmin;
+        if (Utils::StringUtils::IEquals(leafName, L"wmic.exe"))        return LOLBASType::Wmic;
+        if (Utils::StringUtils::IEquals(leafName, L"msiexec.exe"))     return LOLBASType::Msiexec;
+        if (Utils::StringUtils::IEquals(leafName, L"expand.exe"))      return LOLBASType::Expand;
+        if (Utils::StringUtils::IEquals(leafName, L"esentutl.exe"))    return LOLBASType::Esentutl;
+        if (Utils::StringUtils::IEquals(leafName, L"installutil.exe")) return LOLBASType::InstallUtil;
+        if (Utils::StringUtils::IEquals(leafName, L"msbuild.exe"))     return LOLBASType::MSBuild;
+        if (Utils::StringUtils::IEquals(leafName, L"odbcconf.exe"))    return LOLBASType::ODBCConf;
+        if (Utils::StringUtils::IEquals(leafName, L"regasm.exe"))      return LOLBASType::RegAsm;
+        if (Utils::StringUtils::IEquals(leafName, L"regsvcs.exe"))     return LOLBASType::RegSvcs;
+        if (Utils::StringUtils::IEquals(leafName, L"xwizard.exe"))     return LOLBASType::XWizard;
+        if (Utils::StringUtils::IEquals(leafName, L"forfiles.exe"))    return LOLBASType::ForFiles;
+        if (Utils::StringUtils::IEquals(leafName, L"pcalua.exe"))      return LOLBASType::PcaLua;
+        if (Utils::StringUtils::IEquals(leafName, L"cmstp.exe"))       return LOLBASType::Cmstp;
+        if (Utils::StringUtils::IEquals(leafName, L"bash.exe"))        return LOLBASType::WSL;
+        if (Utils::StringUtils::IEquals(leafName, L"wsl.exe"))         return LOLBASType::WSL;
         return LOLBASType::None;
     }
 
@@ -1173,6 +1221,9 @@ void ProcessCreationMonitor::OnProcessTerminate(uint32_t pid, uint32_t exitCode)
 
 // Queries
 std::optional<ProcessInfo> ProcessCreationMonitor::GetProcessInfo(uint32_t pid) const {
+    if (pid == 0) {
+        return std::nullopt;
+    }
     std::shared_lock lock(m_impl->processMutex);
     auto it = m_impl->activeProcesses.find(pid);
     if (it != m_impl->activeProcesses.end()) return it->second;

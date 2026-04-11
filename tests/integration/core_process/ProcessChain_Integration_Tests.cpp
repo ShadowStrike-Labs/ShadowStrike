@@ -55,6 +55,7 @@
 #include <barrier>
 #include <cstddef>
 #include <cstdint>
+#include <cwctype>
 #include <optional>
 #include <string>
 #include <thread>
@@ -287,6 +288,25 @@ TEST_F(ProcessMonitorLifecycleTest, GetAllProcesses_ReturnsNonEmptyList) {
 }
 
 /**
+ * @brief Verifies the live process snapshot includes the hosting test process.
+ *
+ * A non-empty snapshot is weaker than proving the monitor can resolve the
+ * currently executing process through the bulk enumeration path it exposes.
+ */
+TEST_F(ProcessMonitorLifecycleTest, GetAllProcesses_ContainsOwnPid) {
+    const uint32_t ownPid = GetOwnPid();
+    const auto processes =
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().GetAllProcesses();
+
+    EXPECT_TRUE(std::any_of(
+        processes.begin(),
+        processes.end(),
+        [ownPid](const ShadowStrike::Core::Process::ExtendedProcessInfo& processInfo) {
+            return processInfo.uniqueId.pid == ownPid;
+        }));
+}
+
+/**
  * @brief Retrieves full metadata for the current process from the live cache.
  *
  * This validates PID lookup, metadata hydration, and unique-process identity
@@ -305,6 +325,16 @@ TEST_F(ProcessMonitorLifecycleTest, GetProcessInfo_OwnPid_ReturnsValidInfo) {
 }
 
 /**
+ * @brief Verifies impossible PID lookup fails closed rather than fabricating state.
+ */
+TEST_F(ProcessMonitorLifecycleTest, GetProcessInfo_ImpossiblePid_ReturnsNullopt) {
+    const auto processInfo =
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().GetProcessInfo(0xFFFFFFFFu);
+
+    EXPECT_FALSE(processInfo.has_value());
+}
+
+/**
  * @brief Verifies liveness checks report the test process as active.
  *
  * The current process is guaranteed to be executing, so a false result would
@@ -313,6 +343,14 @@ TEST_F(ProcessMonitorLifecycleTest, GetProcessInfo_OwnPid_ReturnsValidInfo) {
 TEST_F(ProcessMonitorLifecycleTest, IsProcessAlive_OwnPid_ReturnsTrue) {
     EXPECT_TRUE(
         ShadowStrike::Core::Process::ProcessMonitor::Instance().IsProcessAlive(GetOwnPid()));
+}
+
+/**
+ * @brief Verifies liveness checks fail closed for an impossible PID.
+ */
+TEST_F(ProcessMonitorLifecycleTest, IsProcessAlive_ImpossiblePid_ReturnsFalse) {
+    EXPECT_FALSE(
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().IsProcessAlive(0xFFFFFFFFu));
 }
 
 /**
@@ -441,6 +479,47 @@ TEST_F(ProcessMonitorAncestryTest, GetProcessesByName_Explorer_ReturnsAny) {
 }
 
 /**
+ * @brief Verifies name lookups are case-insensitive as implemented by the monitor.
+ */
+TEST_F(ProcessMonitorAncestryTest, GetProcessesByName_IsCaseInsensitive) {
+    const auto processes =
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().GetAllProcesses();
+
+    const auto processIt = std::find_if(
+        processes.begin(),
+        processes.end(),
+        [](const ShadowStrike::Core::Process::ExtendedProcessInfo& processInfo) {
+            return !processInfo.processName.empty() &&
+                std::any_of(
+                    processInfo.processName.begin(),
+                    processInfo.processName.end(),
+                    [](wchar_t ch) { return std::iswalpha(static_cast<wint_t>(ch)) != 0; });
+        });
+
+    if (processIt == processes.end()) {
+        GTEST_SKIP() << "No alphabetic process name found in the live snapshot.";
+    }
+
+    std::wstring upperName = processIt->processName;
+    std::transform(
+        upperName.begin(),
+        upperName.end(),
+        upperName.begin(),
+        [](wchar_t ch) { return static_cast<wchar_t>(std::towupper(static_cast<wint_t>(ch))); });
+
+    const auto matches =
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().GetProcessesByName(upperName);
+
+    EXPECT_TRUE(std::any_of(
+        matches.begin(),
+        matches.end(),
+        [expectedPid = processIt->uniqueId.pid](
+            const ShadowStrike::Core::Process::ExtendedProcessInfo& processInfo) {
+            return processInfo.uniqueId.pid == expectedPid;
+        }));
+}
+
+/**
  * @brief Confirms callback registration returns a usable identifier.
  *
  * Downstream telemetry and response components rely on non-zero callback IDs so
@@ -459,6 +538,16 @@ TEST_F(ProcessMonitorCallbackTest, RegisterCallback_IsAssignedNonZeroId) {
     if (callbackId != 0U) {
         ShadowStrike::Core::Process::ProcessMonitor::Instance().UnregisterCallback(callbackId);
     }
+}
+
+/**
+ * @brief Verifies the public registration API rejects an empty callback object.
+ */
+TEST_F(ProcessMonitorCallbackTest, RegisterCallback_EmptyCallback_ReturnsZero) {
+    ShadowStrike::Core::Process::ProcessCallback emptyCallback;
+    EXPECT_EQ(
+        ShadowStrike::Core::Process::ProcessMonitor::Instance().RegisterCallback(emptyCallback),
+        0U);
 }
 
 /**
@@ -513,6 +602,18 @@ TEST_F(ProcessAnalyzerChainTest, AnalyzeOwnProcess_ReturnsResult) {
 }
 
 /**
+ * @brief Verifies analyzer failure on an impossible PID is explicit and contained.
+ */
+TEST_F(ProcessAnalyzerChainTest, AnalyzeImpossiblePid_ReportsError) {
+    const ShadowStrike::Core::Process::ProcessAnalysisResult analysis =
+        ShadowStrike::Core::Process::ProcessAnalyzer::Instance().AnalyzeProcess(0xFFFFFFFFu);
+
+    EXPECT_EQ(analysis.processId, 0xFFFFFFFFu);
+    EXPECT_TRUE(analysis.processName.empty());
+    EXPECT_FALSE(analysis.analysisError.empty());
+}
+
+/**
  * @brief Ensures the quick risk surface classifies the current process sanely.
  *
  * The test process should not appear as an active exploitation case, so a
@@ -524,6 +625,15 @@ TEST_F(ProcessAnalyzerChainTest, QuickAssessRisk_OwnPid_NotCritical) {
 
     EXPECT_TRUE(IsValidRiskLevel(riskLevel));
     EXPECT_NE(riskLevel, ShadowStrike::Core::Process::ProcessRiskLevel::Critical);
+}
+
+/**
+ * @brief Verifies quick-risk assessment fails closed for an impossible PID.
+ */
+TEST_F(ProcessAnalyzerChainTest, QuickAssessRisk_ImpossiblePid_ReturnsUnknown) {
+    EXPECT_EQ(
+        ShadowStrike::Core::Process::ProcessAnalyzer::Instance().QuickAssessRisk(0xFFFFFFFFu),
+        ShadowStrike::Core::Process::ProcessRiskLevel::Unknown);
 }
 
 /**
@@ -556,6 +666,16 @@ TEST_F(ProcessAnalyzerChainTest, GetLoadedModules_OwnPid_ReturnsModules) {
         [](const ShadowStrike::Core::Process::ModuleInfo& moduleInfo) {
             return !moduleInfo.moduleName.empty() || !moduleInfo.modulePath.empty();
         }));
+}
+
+/**
+ * @brief Verifies impossible PID module enumeration returns an empty set.
+ */
+TEST_F(ProcessAnalyzerChainTest, GetLoadedModules_ImpossiblePid_ReturnsEmpty) {
+    EXPECT_TRUE(
+        ShadowStrike::Core::Process::ProcessAnalyzer::Instance()
+            .GetLoadedModules(0xFFFFFFFFu)
+            .empty());
 }
 
 /**
@@ -649,6 +769,21 @@ TEST_F(ProcessInjectionDetectorChainTest, GetInjections_OwnPid_ReturnsEmpty) {
 }
 
 /**
+ * @brief Verifies the clean test process has no recorded outbound injections either.
+ */
+TEST_F(ProcessInjectionDetectorChainTest, GetInjectionsFrom_OwnPid_ReturnsEmpty) {
+    const auto verdict =
+        ShadowStrike::Core::Process::ProcessInjectionDetector::Instance().AnalyzeProcess(
+            GetOwnPid());
+    const auto injectionsFrom =
+        ShadowStrike::Core::Process::ProcessInjectionDetector::Instance().GetInjectionsFrom(
+            GetOwnPid());
+
+    EXPECT_TRUE(IsValidInjectionVerdict(verdict));
+    EXPECT_TRUE(injectionsFrom.empty());
+}
+
+/**
  * @brief Confirms the reflective DLL detector completed suite-level startup.
  *
  * Initialization proves the detector accepted its default configuration and is
@@ -671,6 +806,23 @@ TEST_F(ReflectiveDLLDetectorChainTest, ScanOwnProcess_ReturnsResult) {
 
     EXPECT_EQ(result.processId, GetOwnPid());
     EXPECT_TRUE(result.scanComplete);
+}
+
+/**
+ * @brief Verifies reflective scan statistics advance after a real self-scan.
+ */
+TEST_F(ReflectiveDLLDetectorChainTest, GetStatistics_AfterScan_HasCount) {
+    auto& detector = ShadowStrike::Core::Process::ReflectiveDLLDetector::Instance();
+    const uint64_t scansBefore =
+        detector.GetStatistics().totalScans.load(std::memory_order_relaxed);
+
+    const auto result = detector.Scan(GetOwnPid());
+
+    const uint64_t scansAfter =
+        detector.GetStatistics().totalScans.load(std::memory_order_relaxed);
+
+    EXPECT_TRUE(result.scanComplete);
+    EXPECT_GE(scansAfter, scansBefore + 1U);
 }
 
 /**

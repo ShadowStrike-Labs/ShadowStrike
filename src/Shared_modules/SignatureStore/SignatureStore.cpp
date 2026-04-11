@@ -1873,16 +1873,17 @@ ScanResult SignatureStore::ExecuteParallelScan(
     if (options.enableHashLookup && m_hashStoreEnabled.load(std::memory_order_acquire) && m_hashStore) {
         try {
             ShadowStrike::SignatureStore::SignatureBuilder builder;
-            auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
-            if (hash.has_value()) {
-                auto detection = m_hashStore->LookupHash(*hash);
-                if (detection.has_value()) {
-                    result.hashMatches.push_back(*detection);
-                    
-                    // Check stop-on-first-match
-                    if (options.stopOnFirstMatch) {
-                        result.stoppedEarly = true;
-                        result.detections.push_back(*detection);
+                auto hash = builder.ComputeBufferHash(buffer, HashType::SHA256);
+                if (hash.has_value()) {
+                    auto detection = m_hashStore->LookupHash(*hash);
+                    if (detection.has_value()) {
+                        result.hashMatches.push_back(*detection);
+                        NotifyDetection(*detection);
+                        
+                        // Check stop-on-first-match
+                        if (options.stopOnFirstMatch) {
+                            result.stoppedEarly = true;
+                            result.detections.push_back(*detection);
                         return result;
                     }
                 }
@@ -1978,6 +1979,9 @@ ScanResult SignatureStore::ExecuteParallelScan(
             
             if (status == std::future_status::ready) {
                 auto detections = future.get();
+                for (const auto& detection : detections) {
+                    NotifyDetection(detection);
+                }
                 
                 // TITANIUM: Limit results to prevent memory exhaustion
                 const size_t maxToAdd = options.maxResults > result.detections.size() 
@@ -2045,6 +2049,7 @@ ScanResult SignatureStore::ExecuteSequentialScan(
                 if (detection.has_value()) {
                     result.hashMatches.push_back(*detection);
                     result.detections.push_back(*detection);
+                    NotifyDetection(*detection);
                     
                     if (options.stopOnFirstMatch) {
                         result.stoppedEarly = true;
@@ -2065,6 +2070,9 @@ ScanResult SignatureStore::ExecuteSequentialScan(
     if (options.enablePatternScan && m_patternStoreEnabled.load(std::memory_order_acquire) && m_patternStore) {
         try {
             result.patternMatches = m_patternStore->Scan(buffer, options.patternOptions);
+            for (const auto& detection : result.patternMatches) {
+                NotifyDetection(detection);
+            }
             
             // TITANIUM: Limit results to prevent memory exhaustion
             const size_t maxToAdd = options.maxResults > result.detections.size() 
@@ -2114,6 +2122,7 @@ ScanResult SignatureStore::ExecuteSequentialScan(
                 detection.matchTimestamp = match.matchTimeMicroseconds;
                 
                 result.detections.push_back(detection);
+                NotifyDetection(detection);
             }
             
             if (options.stopOnFirstMatch && !result.yaraMatches.empty()) {
@@ -2214,7 +2223,9 @@ std::optional<ScanResult> SignatureStore::CheckQueryCache(
     if (hashMatches && entry.timestamp != 0) {
         // Cache hit - return copy of result (avoid reference lifetime issues)
         SS_LOG_DEBUG(L"SignatureStore", L"CheckQueryCache: Cache hit at index %zu", cacheIdx);
-        return entry.result;
+        ScanResult cached = entry.result;
+        cached.cacheHit = true;
+        return cached;
     }
 
     return std::nullopt;

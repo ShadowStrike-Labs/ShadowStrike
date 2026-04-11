@@ -147,7 +147,7 @@
  * - **ProcessMonitor**: Parent-child relationships, process metadata
  * - **RegistryMonitor**: Registry event stream
  * - **NetworkMonitor**: Network connection events
- * - **FileWatcher**: File system events
+ * - **FileSystemFilter**: File system events (kernel minifilter)
  * - **ThreatIntel**: IOC correlation for network destinations
  * - **SignatureStore**: YARA/pattern matching for memory regions
  * - **Whitelist**: Legitimate software exclusions

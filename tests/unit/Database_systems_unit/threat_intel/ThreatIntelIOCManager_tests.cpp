@@ -42,10 +42,10 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../../src/ThreatIntel/ThreatIntelIOCManager.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
-#include"../../../../src/ThreatIntel/ReputationCache.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelIOCManager.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
+#include "Shared_modules/ThreatIntel/ReputationCache.hpp"
 
 #include <array>
 #include <atomic>

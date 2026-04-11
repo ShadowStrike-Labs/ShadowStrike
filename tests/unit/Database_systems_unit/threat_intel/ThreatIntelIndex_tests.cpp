@@ -43,9 +43,9 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../../src/ThreatIntel/ThreatIntelIndex.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelIndex.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
 
 #include <array>
 #include <atomic>

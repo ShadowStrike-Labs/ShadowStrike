@@ -23,7 +23,7 @@
  * @file DirectoryMonitor.hpp
  * @brief Enterprise-grade high-level directory monitoring orchestrator.
  *
- * This module provides intelligent directory monitoring that wraps FileWatcher
+ * This module provides intelligent directory monitoring backed by ReadDirectoryChangesW
  * with automatic management of critical paths, dynamic path discovery, and
  * security-focused filtering.
  *
@@ -57,7 +57,6 @@
  * @date 2026
  * @copyright 2026 ShadowStrike Security Suite
  *
- * @see FileWatcher.hpp for low-level monitoring
  * @see MountPointMonitor.hpp for drive detection
  */
 

@@ -44,9 +44,9 @@
 #include <gtest/gtest.h>
 #include<gmock/gmock.h>
 
-#include "../../../../src/ThreatIntel/ThreatIntelFeedManager.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelStore.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFeedManager.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
 
 #include <thread>
 #include <future>

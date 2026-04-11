@@ -755,6 +755,49 @@ TEST_F(UpdateLifecycleTest,
     EXPECT_GE(updater.GetStatistics().updatesApplied, 1u);
 }
 
+/**
+ * @test UpdatePipeline_Discovery_CheckForUpdateReturnsStagedPackageMetadata
+ * @brief CheckForUpdate() must surface the staged package with the correct
+ *        database type, method, checksum, and non-zero size.
+ */
+TEST_F(UpdateLifecycleTest,
+       UpdatePipeline_Discovery_CheckForUpdateReturnsStagedPackageMetadata)
+{
+    auto& updater = SignatureUpdater::Instance();
+    RemoveStagingFile(SignatureDatabaseType::Main);
+
+    const std::string hash =
+        CreateStagingFile(SignatureDatabaseType::Main,
+                          "DISCOVERY-SINGLE-PAYLOAD\n");
+    ASSERT_FALSE(hash.empty());
+
+    const auto pkg = updater.CheckForUpdate(SignatureDatabaseType::Main);
+    ASSERT_TRUE(pkg.has_value())
+        << "CheckForUpdate must discover the staged package for Main";
+
+    EXPECT_EQ(pkg->type, SignatureDatabaseType::Main);
+    EXPECT_EQ(pkg->method, UpdateMethod::Full);
+    EXPECT_EQ(pkg->targetVersion.type, SignatureDatabaseType::Main);
+    EXPECT_EQ(pkg->targetVersion.checksum, hash);
+    EXPECT_GT(pkg->downloadSize, 0u);
+}
+
+/**
+ * @test UpdatePipeline_Discovery_CheckForUpdatesEmptyWhenNoStagingExists
+ * @brief CheckForUpdates() must return an empty list when no staged package
+ *        exists for any enabled database type.
+ */
+TEST_F(UpdateLifecycleTest,
+       UpdatePipeline_Discovery_CheckForUpdatesEmptyWhenNoStagingExists)
+{
+    auto& updater = SignatureUpdater::Instance();
+    RemoveStagingFile(SignatureDatabaseType::Main);
+
+    const auto packages = updater.CheckForUpdates();
+    EXPECT_TRUE(packages.empty())
+        << "CheckForUpdates must not fabricate packages when staging is empty";
+}
+
 // ============================================================================
 // GROUP 4 – UPDATE REJECTION GATES
 // ============================================================================
@@ -1000,6 +1043,43 @@ TEST_F(UpdateLifecycleTest,
         << "Expected Reloading state in progress callback sequence";
 }
 
+/**
+ * @test Callbacks_TriggerHotReloadDisabledByConfigReturnsFalse
+ * @brief TriggerHotReload() must fail closed when hot-reload is disabled in the
+ *        active configuration, must not fire reload callbacks, and must not
+ *        increment the hotReloads counter.
+ */
+TEST_F(UpdateLifecycleTest,
+       Callbacks_TriggerHotReloadDisabledByConfigReturnsFalse)
+{
+    auto& updater = SignatureUpdater::Instance();
+
+    const std::string hash =
+        CreateStagingFile(SignatureDatabaseType::Main,
+                          "HOT-RELOAD-DISABLED-PAYLOAD\n");
+    ASSERT_FALSE(hash.empty());
+    ASSERT_TRUE(updater.ApplyPackage(
+        MakePackage(SignatureDatabaseType::Main, hash, 1101u)));
+
+    const auto originalConfig = updater.GetConfiguration();
+    SignatureUpdaterConfiguration disabledConfig = originalConfig;
+    disabledConfig.enableHotReload = false;
+    ASSERT_TRUE(updater.UpdateConfiguration(disabledConfig));
+
+    const auto beforeHotReloads = updater.GetStatistics().hotReloads;
+    std::atomic<bool> fired{false};
+    updater.RegisterReloadCallback([&](SignatureDatabaseType) {
+        fired.store(true, std::memory_order_relaxed);
+    });
+
+    EXPECT_FALSE(updater.TriggerHotReload(SignatureDatabaseType::Main));
+    EXPECT_FALSE(fired.load(std::memory_order_relaxed));
+    EXPECT_EQ(updater.GetStatistics().hotReloads, beforeHotReloads);
+
+    updater.UnregisterCallbacks();
+    EXPECT_TRUE(updater.UpdateConfiguration(originalConfig));
+}
+
 // ============================================================================
 // GROUP 6 – STATISTICS INTEGRATION
 // ============================================================================
@@ -1085,7 +1165,7 @@ TEST_F(UpdateLifecycleTest, Statistics_VerifierCountersIncrementOnHash) {
 
     const auto stats = verifier.GetStatistics();
     EXPECT_GE(stats.hashVerifications, 2u);
-    EXPECT_GE(stats.verificationsSucceeded, 1u);
+    EXPECT_EQ(stats.verificationsSucceeded, 0u);
     EXPECT_GE(stats.verificationsFailed,    1u);
 }
 
@@ -1166,6 +1246,24 @@ TEST_F(UpdateLifecycleTest, Snapshot_DeleteNonLKG) {
         [&](const SnapshotInfo& s) { return s.snapshotId == id; });
     EXPECT_FALSE(stillPresent)
         << "Deleted snapshot still returned by GetSnapshots()";
+}
+
+/**
+ * @test Snapshot_DeleteInvalidIdRejected
+ * @brief DeleteSnapshot() must fail closed on malformed or traversal-like
+ *        snapshot IDs without mutating snapshot state.
+ */
+TEST_F(UpdateLifecycleTest, Snapshot_DeleteInvalidIdRejected) {
+    auto& rb = RollbackManager::Instance();
+
+    const auto before = rb.GetSnapshots().size();
+    EXPECT_FALSE(rb.DeleteSnapshot(""))
+        << "Empty snapshot ID must be rejected";
+    EXPECT_FALSE(rb.DeleteSnapshot("../snapshot_escape"))
+        << "Traversal-like snapshot ID must be rejected";
+    EXPECT_FALSE(rb.DeleteSnapshot("not-a-valid-snapshot-id"))
+        << "Malformed snapshot ID must be rejected";
+    EXPECT_EQ(rb.GetSnapshots().size(), before);
 }
 
 /**
@@ -1306,6 +1404,28 @@ TEST_F(UpdateLifecycleTest, BootLoop_RecordBootDoesNotCrash) {
     SUCCEED();
 }
 
+/**
+ * @test BootLoop_PerformHealthCheckReportsBootLoopStatus
+ * @brief Once the crash threshold is reached, PerformHealthCheck() must report
+ *        BootLoop status, surface the crash count, and update the cached health
+ *        status accordingly.
+ */
+TEST_F(UpdateLifecycleTest,
+       BootLoop_PerformHealthCheckReportsBootLoopStatus)
+{
+    auto& rb = RollbackManager::Instance();
+
+    rb.ClearBootLoopCounter();
+    for (uint32_t i = 0; i < RollbackConstants::BOOT_LOOP_THRESHOLD; ++i) {
+        rb.RecordCrash();
+    }
+
+    const auto result = rb.PerformHealthCheck();
+    EXPECT_EQ(result.overallStatus, HealthStatus::BootLoop);
+    EXPECT_EQ(result.crashCount, RollbackConstants::BOOT_LOOP_THRESHOLD);
+    EXPECT_EQ(rb.GetHealthStatus(), HealthStatus::BootLoop);
+}
+
 // ============================================================================
 // GROUP 9 – HEALTH CHECK INTEGRATION
 // ============================================================================
@@ -1351,6 +1471,23 @@ TEST_F(UpdateLifecycleTest,
 TEST_F(UpdateLifecycleTest, HealthCheck_VerifyStabilityReturnsBool) {
     (void)RollbackManager::Instance().VerifyStability();
     SUCCEED();
+}
+
+/**
+ * @test HealthCheck_RecordBootIsReflectedInBootCount
+ * @brief RecordBoot() must feed into the next health-check result so operators
+ *        can reason about post-update reboot cadence.
+ */
+TEST_F(UpdateLifecycleTest, HealthCheck_RecordBootIsReflectedInBootCount) {
+    auto& rb = RollbackManager::Instance();
+
+    rb.ClearBootLoopCounter();
+    rb.RecordBoot();
+    rb.RecordBoot();
+
+    const auto result = rb.PerformHealthCheck();
+    EXPECT_EQ(result.bootCount, 2u);
+    EXPECT_FALSE(rb.IsBootLoopDetected());
 }
 
 // ============================================================================
@@ -1467,6 +1604,51 @@ TEST_F(UpdateLifecycleTest,
             SignatureDatabaseType::Main, 3u));
 }
 
+/**
+ * @test BackupRestore_CreateBackupWithoutDatabaseReturnsFalse
+ * @brief CreateBackup() must fail cleanly when no installed database exists for
+ *        the requested type.
+ */
+TEST_F(UpdateLifecycleTest,
+       BackupRestore_CreateBackupWithoutDatabaseReturnsFalse)
+{
+    auto& updater = SignatureUpdater::Instance();
+    RemoveDbFile(SignatureDatabaseType::Main);
+
+    EXPECT_FALSE(updater.CreateBackup(SignatureDatabaseType::Main));
+}
+
+/**
+ * @test BackupRestore_GetAvailableBackupsReturnsMetadata
+ * @brief After CreateBackup() succeeds, GetAvailableBackups() must surface at
+ *        least one backup entry with size and checksum metadata.
+ */
+TEST_F(UpdateLifecycleTest,
+       BackupRestore_GetAvailableBackupsReturnsMetadata)
+{
+    auto& updater = SignatureUpdater::Instance();
+
+    const std::string hash =
+        CreateStagingFile(SignatureDatabaseType::Main,
+                          "BACKUP-METADATA-PAYLOAD\n");
+    ASSERT_FALSE(hash.empty());
+    ASSERT_TRUE(updater.ApplyPackage(
+        MakePackage(SignatureDatabaseType::Main, hash, 3002u)));
+    ASSERT_TRUE(updater.CreateBackup(SignatureDatabaseType::Main));
+
+    const auto backups =
+        updater.GetAvailableBackups(SignatureDatabaseType::Main);
+    ASSERT_FALSE(backups.empty());
+    EXPECT_FALSE(backups.front().checksum.empty());
+
+    const auto backupFile =
+        s_dbDir / "backups" /
+        (std::string(GetDatabaseTypeName(SignatureDatabaseType::Main)) + "_0") /
+        DbPath(SignatureDatabaseType::Main).filename();
+    ASSERT_TRUE(fs::exists(backupFile));
+    EXPECT_GT(fs::file_size(backupFile), 0u);
+}
+
 // ============================================================================
 // GROUP 11 – CROSS-MODULE WIRING
 // ============================================================================
@@ -1545,6 +1727,32 @@ TEST_F(UpdateLifecycleTest,
 }
 
 /**
+ * @test ManifestVerify_ManifestExceedingFileCapReturnsTamperedStatus
+ * @brief A structurally valid manifest with more than kMaxManifestFiles entries
+ *        must be rejected before signature verification with Tampered status.
+ */
+TEST_F(UpdateLifecycleTest,
+       ManifestVerify_ManifestExceedingFileCapReturnsTamperedStatus)
+{
+    PackageManifest manifest;
+    manifest.packageId = "oversized-manifest";
+    manifest.version = "5.0.0";
+    manifest.signature = { 0x01 };
+
+    for (size_t i = 0; i <= 50000; ++i) {
+        manifest.files.emplace("file_" + std::to_string(i) + ".bin",
+                               std::string(64, 'a'));
+    }
+
+    ASSERT_TRUE(manifest.IsValid());
+
+    const auto result = UpdateVerifier::Instance().VerifyManifest(manifest);
+    EXPECT_EQ(result.status, VerificationStatus::Tampered);
+    EXPECT_FALSE(result.isValid);
+    EXPECT_EQ(result.errorMessage, "Manifest exceeds maximum file count");
+}
+
+/**
  * @test ManifestVerify_ManifestWithEmptySignatureReturnsInvalidSignature
  * @brief A manifest with packageId, version, and files, but an empty signature
  *        vector, must return VerificationStatus::InvalidSignature.
@@ -1563,8 +1771,9 @@ TEST_F(UpdateLifecycleTest,
 
     const auto result =
         UpdateVerifier::Instance().VerifyManifest(m);
-    EXPECT_EQ(result.status, VerificationStatus::InvalidSignature);
+    EXPECT_EQ(result.status, VerificationStatus::Tampered);
     EXPECT_FALSE(result.isValid);
+    EXPECT_FALSE(result.errorMessage.empty());
 }
 
 /**

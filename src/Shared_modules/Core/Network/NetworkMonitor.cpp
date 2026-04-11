@@ -112,17 +112,73 @@ IPAddress::IPAddress(const std::array<uint8_t, 16>& v6) noexcept
     : type(IPAddressType::IPV6)
     , ipv6(v6)
 {
-    // Classify IPv6
     if (v6[0] == 0xFE && (v6[1] & 0xC0) == 0x80) {
         classification = IPClassification::LINK_LOCAL;
     } else if (v6[0] == 0xFF) {
         classification = IPClassification::MULTICAST;
     } else if (std::all_of(v6.begin(), v6.end() - 1, [](uint8_t b) { return b == 0; }) &&
                v6[15] == 0x01) {
-        classification = IPClassification::LOOPBACK;  // ::1
+        classification = IPClassification::LOOPBACK;
     } else {
         classification = IPClassification::PUBLIC;
     }
+}
+
+IPAddress::IPAddress(std::string_view str)
+{
+    if (str.empty()) {
+        type = IPAddressType::UNKNOWN;
+        return;
+    }
+
+    // Try IPv4 first
+    {
+        struct in_addr v4 {};
+        std::string s(str);
+        if (inet_pton(AF_INET, s.c_str(), &v4) == 1) {
+            type = IPAddressType::IPV4;
+            ipv4 = ntohl(v4.S_un.S_addr);
+            // Classify
+            if (ipv4 == 0x7F000001) {
+                classification = IPClassification::LOOPBACK;
+            } else if ((ipv4 & 0xFF000000) == 0x0A000000 ||
+                       (ipv4 & 0xFFF00000) == 0xAC100000 ||
+                       (ipv4 & 0xFFFF0000) == 0xC0A80000) {
+                classification = IPClassification::PRIVATE;
+            } else {
+                classification = IPClassification::PUBLIC;
+            }
+            return;
+        }
+    }
+
+    // Try IPv6
+    {
+        struct in6_addr v6 {};
+        std::string s(str);
+        if (inet_pton(AF_INET6, s.c_str(), &v6) == 1) {
+            type = IPAddressType::IPV6;
+            std::memcpy(ipv6.data(), &v6, 16);
+            if (ipv6[0] == 0xFE && (ipv6[1] & 0xC0) == 0x80) {
+                classification = IPClassification::LINK_LOCAL;
+            } else if (ipv6[0] == 0xFF) {
+                classification = IPClassification::MULTICAST;
+            } else if (std::all_of(ipv6.begin(), ipv6.end() - 1, [](uint8_t b) { return b == 0; }) &&
+                       ipv6[15] == 0x01) {
+                classification = IPClassification::LOOPBACK;
+            } else {
+                classification = IPClassification::PUBLIC;
+            }
+            return;
+        }
+    }
+
+    type = IPAddressType::UNKNOWN;
+}
+
+IPAddress::IPAddress(std::wstring_view wstr)
+    : IPAddress(Utils::StringUtils::ToNarrow(std::wstring(wstr)))
+{
 }
 
 std::string IPAddress::ToString() const {

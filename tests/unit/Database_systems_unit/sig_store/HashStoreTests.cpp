@@ -55,8 +55,8 @@
 
 #include"pch.h"
 #include <gtest/gtest.h>
-#include"../../src/SignatureStore/SignatureFormat.hpp"
-#include"../../src/HashStore/HashStore.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/HashStore/HashStore.hpp"
 #include <vector>
 #include <string>
 #include <algorithm>

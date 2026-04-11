@@ -41,8 +41,8 @@
 #include <gtest/gtest.h>
 #include"Utils/Logger.hpp"
 
-#include "../../../../src/Whitelist/WhiteListStore.hpp"
-#include "../../../../src/Whitelist/WhiteListFormat.hpp"
+#include "Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
 
 #include <filesystem>
 #include <string>

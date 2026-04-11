@@ -1,0 +1,66 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<testsuites tests="18" failures="5" disabled="0" errors="0" time="0.082" timestamp="2026-04-10T17:34:38.658" name="AllTests">
+  <testsuite name="ConfigManagerTest" tests="5" failures="1" disabled="0" skipped="0" errors="0" time="0.006" timestamp="2026-04-10T17:34:38.659">
+    <testcase name="ConfigurationAndStatisticsContractsRejectUnsafeValues" file="tests\unit\config_unit\ConfigManager_Tests.cpp" line="74" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.659" classname="ConfigManagerTest" />
+    <testcase name="UtilityFunctionsAndStructSerializationCoverPublicContracts" file="tests\unit\config_unit\ConfigManager_Tests.cpp" line="131" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.659" classname="ConfigManagerTest" />
+    <testcase name="MetadataValidationAndLayerResolutionHonorContracts" file="tests\unit\config_unit\ConfigManager_Tests.cpp" line="262" status="run" result="completed" time="0.002" timestamp="2026-04-10T17:34:38.660" classname="ConfigManagerTest">
+      <failure message="tests\unit\config_unit\ConfigManager_Tests.cpp:369&#x0A;Value of: validationErrors.empty()&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[tests\unit\config_unit\ConfigManager_Tests.cpp:369
+Value of: validationErrors.empty()
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="BulkOperationsAndImportFailuresPreserveAtomicContracts" file="tests\unit\config_unit\ConfigManager_Tests.cpp" line="372" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.663" classname="ConfigManagerTest" />
+    <testcase name="CallbacksSnapshotsImportExportAndResetsPreserveObservableBehavior" file="tests\unit\config_unit\ConfigManager_Tests.cpp" line="449" status="run" result="completed" time="0.001" timestamp="2026-04-10T17:34:38.663" classname="ConfigManagerTest" />
+  </testsuite>
+  <testsuite name="PolicyManagerTest" tests="5" failures="4" disabled="0" skipped="0" errors="0" time="0.038" timestamp="2026-04-10T17:34:38.665">
+    <testcase name="ConfigurationStructsAndNameLookupsCoverPublicContracts" file="tests\unit\config_unit\PolicyManager_Tests.cpp" line="86" status="run" result="completed" time="0.009" timestamp="2026-04-10T17:34:38.665" classname="PolicyManagerTest" />
+    <testcase name="ParsePolicyFromJsonAndXmlRestoresExpectedFields" file="tests\unit\config_unit\PolicyManager_Tests.cpp" line="204" status="run" result="completed" time="0.007" timestamp="2026-04-10T17:34:38.674" classname="PolicyManagerTest">
+      <failure message="tests\unit\config_unit\PolicyManager_Tests.cpp:273&#x0A;Value of: parsedXmlPolicy.has_value()&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[tests\unit\config_unit\PolicyManager_Tests.cpp:273
+Value of: parsedXmlPolicy.has_value()
+  Actual: false
+Expected: true
+]]></failure>
+    </testcase>
+    <testcase name="ApplyQueryEnforcementAndViolationLifecycleRemainConsistent" file="tests\unit\config_unit\PolicyManager_Tests.cpp" line="285" status="run" result="completed" time="0.004" timestamp="2026-04-10T17:34:38.683" classname="PolicyManagerTest">
+      <failure message="tests\unit\config_unit\PolicyManager_Tests.cpp:325&#x0A;Value of: manager.ValidateSetting(&quot;scan.mode&quot;, PolicyValue{std::string(&quot;locked&quot;)})&#x0A;  Actual: false&#x0A;Expected: true&#x0A;" type=""><![CDATA[tests\unit\config_unit\PolicyManager_Tests.cpp:325
+Value of: manager.ValidateSetting("scan.mode", PolicyValue{std::string("locked")})
+  Actual: false
+Expected: true
+]]></failure>
+      <failure message="tests\unit\config_unit\PolicyManager_Tests.cpp:329&#x0A;Expected equality of these values:&#x0A;  violations.size()&#x0A;    Which is: 2&#x0A;  1u&#x0A;    Which is: 1&#x0A;" type=""><![CDATA[tests\unit\config_unit\PolicyManager_Tests.cpp:329
+Expected equality of these values:
+  violations.size()
+    Which is: 2
+  1u
+    Which is: 1
+]]></failure>
+    </testcase>
+    <testcase name="BatchApplyOfflineCacheSyncAndSelfTestRemainOperational" file="tests\unit\config_unit\PolicyManager_Tests.cpp" line="359" status="run" result="completed" time="0.004" timestamp="2026-04-10T17:34:38.687" classname="PolicyManagerTest">
+      <failure message="unknown file&#x0A;SEH exception with code 0xc0000005 thrown in the test body." type=""><![CDATA[unknown file
+SEH exception with code 0xc0000005 thrown in the test body.
+Stack trace:
+
+]]></failure>
+    </testcase>
+    <testcase name="ComplianceViolationHistoryAndOfflineFailuresStayDeterministic" file="tests\unit\config_unit\PolicyManager_Tests.cpp" line="408" status="run" result="completed" time="0.011" timestamp="2026-04-10T17:34:38.692" classname="PolicyManagerTest">
+      <failure message="unknown file&#x0A;SEH exception with code 0xc0000005 thrown in the test body." type=""><![CDATA[unknown file
+SEH exception with code 0xc0000005 thrown in the test body.
+Stack trace:
+
+]]></failure>
+    </testcase>
+  </testsuite>
+  <testsuite name="ProfileManagerTest" tests="4" failures="0" disabled="0" skipped="0" errors="0" time="0.003" timestamp="2026-04-10T17:34:38.704">
+    <testcase name="StructValidationSerializationAndUtilityHelpersAreStable" file="tests\unit\config_unit\ProfileManager_Tests.cpp" line="104" status="run" result="completed" time="0.001" timestamp="2026-04-10T17:34:38.704" classname="ProfileManagerTest" />
+    <testcase name="BuiltInProfilesCustomLifecycleAndEmergencyModeBehaveDeterministically" file="tests\unit\config_unit\ProfileManager_Tests.cpp" line="240" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.706" classname="ProfileManagerTest" />
+    <testcase name="SchedulesTriggersAndResourceOverridesStayLocallyConsistent" file="tests\unit\config_unit\ProfileManager_Tests.cpp" line="306" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.706" classname="ProfileManagerTest" />
+    <testcase name="CapacityFlagsAndFailurePathsRejectInvalidOperations" file="tests\unit\config_unit\ProfileManager_Tests.cpp" line="373" status="run" result="completed" time="0." timestamp="2026-04-10T17:34:38.706" classname="ProfileManagerTest" />
+  </testsuite>
+  <testsuite name="SettingsManagerTest" tests="4" failures="0" disabled="0" skipped="0" errors="0" time="0.032" timestamp="2026-04-10T17:34:38.707">
+    <testcase name="ConfigurationSerializationAndUtilityContractsRemainStable" file="tests\unit\config_unit\SettingsManager_Tests.cpp" line="50" status="run" result="completed" time="0.002" timestamp="2026-04-10T17:34:38.708" classname="SettingsManagerTest" />
+    <testcase name="LoadSaveExportImportAndResetNormalizePersistentState" file="tests\unit\config_unit\SettingsManager_Tests.cpp" line="185" status="run" result="completed" time="0.016" timestamp="2026-04-10T17:34:38.710" classname="SettingsManagerTest" />
+    <testcase name="MutationApisAndCallbacksUpdateOnlyLocalState" file="tests\unit\config_unit\SettingsManager_Tests.cpp" line="284" status="run" result="completed" time="0.005" timestamp="2026-04-10T17:34:38.728" classname="SettingsManagerTest" />
+    <testcase name="ErrorPathsSaveCurrentAndCallbackUnregistrationHonorContracts" file="tests\unit\config_unit\SettingsManager_Tests.cpp" line="388" status="run" result="completed" time="0.006" timestamp="2026-04-10T17:34:38.733" classname="SettingsManagerTest" />
+  </testsuite>
+</testsuites>

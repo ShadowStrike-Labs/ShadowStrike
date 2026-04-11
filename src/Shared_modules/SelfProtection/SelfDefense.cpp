@@ -49,6 +49,7 @@
 #include <sstream>
 #include <iomanip>
 #include <random>
+#include <array>
 #include <cstring>
 #include <cctype>
 
@@ -64,6 +65,136 @@ static constexpr wchar_t LOG_CATEGORY[] = L"SelfDefense";
 // ============================================================================
 // INTERNAL STRUCTURES
 // ============================================================================
+
+namespace {
+
+constexpr size_t AUTH_TOKEN_HMAC_SIZE = 32;
+constexpr size_t AUTH_TOKEN_HMAC_HEX_LENGTH = AUTH_TOKEN_HMAC_SIZE * 2;
+
+[[nodiscard]] uint8_t DecodeHexNibble(char ch) noexcept {
+    if (ch >= '0' && ch <= '9') return static_cast<uint8_t>(ch - '0');
+    if (ch >= 'a' && ch <= 'f') return static_cast<uint8_t>(ch - 'a' + 10);
+    if (ch >= 'A' && ch <= 'F') return static_cast<uint8_t>(ch - 'A' + 10);
+    return 0xFF;
+}
+
+[[nodiscard]] std::string HexEncode(std::string_view input) {
+    static constexpr char HEX_DIGITS[] = "0123456789abcdef";
+
+    std::string encoded;
+    encoded.reserve(input.size() * 2);
+
+    for (const unsigned char byte : input) {
+        encoded.push_back(HEX_DIGITS[(byte >> 4) & 0x0F]);
+        encoded.push_back(HEX_DIGITS[byte & 0x0F]);
+    }
+
+    return encoded;
+}
+
+[[nodiscard]] bool HexDecode(std::string_view input, std::string& output) {
+    if ((input.size() % 2) != 0) {
+        return false;
+    }
+
+    output.clear();
+    output.reserve(input.size() / 2);
+
+    for (size_t i = 0; i < input.size(); i += 2) {
+        const uint8_t high = DecodeHexNibble(input[i]);
+        const uint8_t low = DecodeHexNibble(input[i + 1]);
+        if (high == 0xFF || low == 0xFF) {
+            return false;
+        }
+
+        output.push_back(static_cast<char>((high << 4) | low));
+    }
+
+    return true;
+}
+
+[[nodiscard]] bool ComputeAuthorizationTokenHmac(
+    const std::vector<uint8_t>& secret,
+    std::string_view payload,
+    std::array<uint8_t, AUTH_TOKEN_HMAC_SIZE>& output) {
+
+    output.fill(0);
+
+    BCRYPT_ALG_HANDLE algorithm = nullptr;
+    BCRYPT_HASH_HANDLE hash = nullptr;
+
+    const NTSTATUS openStatus = BCryptOpenAlgorithmProvider(
+        &algorithm,
+        BCRYPT_SHA256_ALGORITHM,
+        nullptr,
+        BCRYPT_ALG_HANDLE_HMAC_FLAG);
+    if (!BCRYPT_SUCCESS(openStatus)) {
+        return false;
+    }
+
+    const NTSTATUS createStatus = BCryptCreateHash(
+        algorithm,
+        &hash,
+        nullptr,
+        0,
+        const_cast<PUCHAR>(secret.data()),
+        static_cast<ULONG>(secret.size()),
+        0);
+    if (!BCRYPT_SUCCESS(createStatus)) {
+        BCryptCloseAlgorithmProvider(algorithm, 0);
+        return false;
+    }
+
+    const NTSTATUS hashStatus = BCryptHashData(
+        hash,
+        reinterpret_cast<PUCHAR>(const_cast<char*>(payload.data())),
+        static_cast<ULONG>(payload.size()),
+        0);
+    const NTSTATUS finishStatus = BCRYPT_SUCCESS(hashStatus)
+        ? BCryptFinishHash(hash, output.data(), static_cast<ULONG>(output.size()), 0)
+        : hashStatus;
+
+    BCryptDestroyHash(hash);
+    BCryptCloseAlgorithmProvider(algorithm, 0);
+
+    if (!BCRYPT_SUCCESS(finishStatus)) {
+        output.fill(0);
+        return false;
+    }
+
+    return true;
+}
+
+[[nodiscard]] bool ConstantTimeHexEquals(
+    std::string_view candidateHex,
+    const std::array<uint8_t, AUTH_TOKEN_HMAC_SIZE>& expected) noexcept {
+
+    uint8_t diff = (candidateHex.size() == AUTH_TOKEN_HMAC_HEX_LENGTH) ? 0 : 0xFF;
+
+    for (size_t i = 0; i < expected.size(); ++i) {
+        const size_t hiIdx = i * 2;
+        const size_t loIdx = hiIdx + 1;
+
+        const uint8_t high = (hiIdx < candidateHex.size())
+            ? DecodeHexNibble(candidateHex[hiIdx])
+            : static_cast<uint8_t>(0xFF);
+        const uint8_t low = (loIdx < candidateHex.size())
+            ? DecodeHexNibble(candidateHex[loIdx])
+            : static_cast<uint8_t>(0xFF);
+
+        if (high == 0xFF || low == 0xFF) {
+            diff = 0xFF;
+            continue;
+        }
+
+        const uint8_t tokenByte = static_cast<uint8_t>((high << 4) | low);
+        diff |= static_cast<uint8_t>(tokenByte ^ expected[i]);
+    }
+
+    return diff == 0;
+}
+
+}  // namespace
 
 struct InternalProtectedProcess {
     uint32_t processId = 0;
@@ -940,8 +1071,13 @@ ThreatResponse SelfDefenseImpl::GetThreatResponse(ThreatType threatType) const {
 // ============================================================================
 
 bool SelfDefenseImpl::ProtectProcess(uint32_t processId) {
-    if (!m_initialized.load(std::memory_order_acquire) || processId == 0) return false;
-    if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) return false;
+    const ModuleStatus status = m_status.load(std::memory_order_acquire);
+    if (((!m_initialized.load(std::memory_order_acquire)) &&
+         status != ModuleStatus::Initializing) ||
+        processId == 0) {
+        return false;
+    }
+    if (status == ModuleStatus::Paused) return false;
 
     {
         std::shared_lock lock(m_mutex);
@@ -2458,38 +2594,23 @@ std::string SelfDefenseImpl::GenerateAuthorizationToken(std::string_view purpose
     payload += ":";
     payload += std::to_string(expiryTs);
 
-    // HMAC-SHA256(secret, payload)
-    BCRYPT_ALG_HANDLE hAlg = nullptr;
-    BCRYPT_HASH_HANDLE hHash = nullptr;
-    NTSTATUS status = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
-                                                  BCRYPT_ALG_HANDLE_HMAC_FLAG);
-    if (!BCRYPT_SUCCESS(status)) return "";
-
-    status = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
-                              const_cast<PUCHAR>(m_authSecret.data()),
-                              static_cast<ULONG>(m_authSecret.size()), 0);
-    if (!BCRYPT_SUCCESS(status)) {
-        BCryptCloseAlgorithmProvider(hAlg, 0);
+    std::array<uint8_t, AUTH_TOKEN_HMAC_SIZE> hmac{};
+    if (!ComputeAuthorizationTokenHmac(m_authSecret, payload, hmac)) {
         return "";
     }
 
-    BCryptHashData(hHash, reinterpret_cast<PUCHAR>(payload.data()),
-                   static_cast<ULONG>(payload.size()), 0);
-
-    uint8_t hmac[32]{};
-    BCryptFinishHash(hHash, hmac, 32, 0);
-    BCryptDestroyHash(hHash);
-    BCryptCloseAlgorithmProvider(hAlg, 0);
-
-    // Encode: hex(hmac) + ":" + expiryTs
+    // Encode v2 as hex(hmac) + ":" + expiryTs + ":" + hex(purpose).
+    // The embedded purpose lets verification authenticate arbitrary callers
+    // without relying on a fixed purpose allowlist. VerifyAuthorizationToken
+    // retains compatibility with legacy two-segment tokens.
     std::ostringstream oss;
-    for (int i = 0; i < 32; ++i) {
-        oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(hmac[i]);
+    for (const uint8_t byte : hmac) {
+        oss << std::hex << std::setfill('0') << std::setw(2) << static_cast<int>(byte);
     }
-    oss << ":" << std::dec << expiryTs;
+    oss << ":" << std::dec << expiryTs << ":" << HexEncode(purpose);
 
     // Zero the stack HMAC
-    ::SecureZeroMemory(hmac, sizeof(hmac));
+    ::SecureZeroMemory(hmac.data(), hmac.size());
     return oss.str();
 }
 
@@ -2499,12 +2620,22 @@ bool SelfDefenseImpl::VerifyAuthorizationToken(std::string_view token) const {
         return m_authSecret.empty();
     }
 
-    // Parse: hex(hmac):expiryTs
-    auto colonPos = token.rfind(':');
-    if (colonPos == std::string_view::npos || colonPos < 64) return false;
+    // Parse v2 token as hex(hmac):expiryTs:hex(purpose).
+    // Legacy v1 tokens use hex(hmac):expiryTs and are accepted for
+    // compatibility with already-issued in-process tokens.
+    const size_t firstColon = token.find(':');
+    if (firstColon == std::string_view::npos) return false;
 
-    std::string_view hmacHex = token.substr(0, colonPos);
-    std::string_view expiryStr = token.substr(colonPos + 1);
+    const size_t secondColon = token.find(':', firstColon + 1);
+    const std::string_view hmacHex = token.substr(0, firstColon);
+    const std::string_view expiryStr = (secondColon == std::string_view::npos)
+        ? token.substr(firstColon + 1)
+        : token.substr(firstColon + 1, secondColon - firstColon - 1);
+    const std::string_view purposeHex = (secondColon == std::string_view::npos)
+        ? std::string_view{}
+        : token.substr(secondColon + 1);
+
+    if (expiryStr.empty()) return false;
 
     // Verify expiry
     uint64_t expiryTs = 0;
@@ -2520,68 +2651,57 @@ bool SelfDefenseImpl::VerifyAuthorizationToken(std::string_view token) const {
         std::chrono::duration_cast<std::chrono::seconds>(now.time_since_epoch()).count());
     if (nowTs > expiryTs) return false; // Expired
 
-    // Recompute HMAC from the purpose (hmacHex minus the hex, plus ":" + expiryTs)
-    // Actually we need to find the purpose. Since token = HMAC(purpose:expiry):expiry,
-    // we reconstruct the payload from the portion after hmac and verify.
-    // But we dont have purpose here — so reconstruct: verify HMAC of "*:" + expiryTs
-    // Token scheme: GenerateAuthorizationToken stores purpose in the HMAC payload.
-    // For verification, we accept ANY valid purpose — the HMAC proves the token was
-    // generated by this instance with the same secret. We iterate possible purposes.
-    // Simpler: just verify the HMAC matches for the "general" purpose category.
+    std::array<uint8_t, AUTH_TOKEN_HMAC_SIZE> expected{};
 
-    // Since we cannot recover purpose from the token, verify against all known purposes.
-    // SECURITY: Always try ALL purposes to prevent timing side channel. Track match result
-    // without early-returning so that the total computation time is constant regardless
-    // of which purpose matches (or if none does).
-    static const char* purposes[] = {"shutdown", "pause", "admin", "whitelist", "general",
-                                     "unprotect", "reset", "disable", "stop_watchdog"};
+    if (secondColon != std::string_view::npos) {
+        std::string purpose;
+        if (!HexDecode(purposeHex, purpose)) {
+            return false;
+        }
+
+        std::string payload;
+        payload.reserve(purpose.size() + 1 + expiryStr.size());
+        payload.append(purpose);
+        payload.push_back(':');
+        payload.append(expiryStr);
+
+        if (!ComputeAuthorizationTokenHmac(m_authSecret, payload, expected)) {
+            return false;
+        }
+
+        const bool matched = ConstantTimeHexEquals(hmacHex, expected);
+        ::SecureZeroMemory(expected.data(), expected.size());
+        return matched;
+    }
+
+    // Legacy support for v1 tokens that omitted the purpose. We can only verify
+    // the historical built-in purpose set for those tokens.
+    static constexpr const char* LEGACY_PURPOSES[] = {
+        "shutdown",
+        "pause",
+        "admin",
+        "whitelist",
+        "general",
+        "unprotect",
+        "reset",
+        "disable",
+        "stop_watchdog"
+    };
 
     bool matched = false;
-    for (const char* purpose : purposes) {
+    for (const char* purpose : LEGACY_PURPOSES) {
         std::string payload(purpose);
-        payload += ":";
-        payload += std::string(expiryStr);
+        payload.push_back(':');
+        payload.append(expiryStr);
 
-        BCRYPT_ALG_HANDLE hAlg = nullptr;
-        BCRYPT_HASH_HANDLE hHash = nullptr;
-        NTSTATUS st = BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr,
-                                                  BCRYPT_ALG_HANDLE_HMAC_FLAG);
-        if (!BCRYPT_SUCCESS(st)) continue;
-
-        st = BCryptCreateHash(hAlg, &hHash, nullptr, 0,
-                              const_cast<PUCHAR>(m_authSecret.data()),
-                              static_cast<ULONG>(m_authSecret.size()), 0);
-        if (!BCRYPT_SUCCESS(st)) { BCryptCloseAlgorithmProvider(hAlg, 0); continue; }
-
-        BCryptHashData(hHash, reinterpret_cast<PUCHAR>(payload.data()),
-                       static_cast<ULONG>(payload.size()), 0);
-
-        uint8_t expected[32]{};
-        BCryptFinishHash(hHash, expected, 32, 0);
-        BCryptDestroyHash(hHash);
-        BCryptCloseAlgorithmProvider(hAlg, 0);
-
-        // Constant-time comparison — always compare all 32 bytes regardless of length
-        uint8_t diff = (hmacHex.size() == 64) ? 0 : 0xFF;
-        for (int i = 0; i < 32; ++i) {
-            // Safe indexing: if hmacHex is wrong size, diff is already 0xFF
-            size_t hiIdx = static_cast<size_t>(i * 2);
-            size_t loIdx = static_cast<size_t>(i * 2 + 1);
-            char hi = (hiIdx < hmacHex.size()) ? hmacHex[hiIdx] : '\0';
-            char lo = (loIdx < hmacHex.size()) ? hmacHex[loIdx] : '\0';
-            auto hexVal = [](char c) -> uint8_t {
-                if (c >= '0' && c <= '9') return static_cast<uint8_t>(c - '0');
-                if (c >= 'a' && c <= 'f') return static_cast<uint8_t>(c - 'a' + 10);
-                if (c >= 'A' && c <= 'F') return static_cast<uint8_t>(c - 'A' + 10);
-                return 0xFF;
-            };
-            uint8_t tokenByte = static_cast<uint8_t>((hexVal(hi) << 4) | hexVal(lo));
-            diff |= tokenByte ^ expected[i];
+        if (!ComputeAuthorizationTokenHmac(m_authSecret, payload, expected)) {
+            continue;
         }
-        ::SecureZeroMemory(expected, sizeof(expected));
-        // Record match but do NOT early-return — continue iterating all purposes
-        if (diff == 0) matched = true;
+
+        matched |= ConstantTimeHexEquals(hmacHex, expected);
+        ::SecureZeroMemory(expected.data(), expected.size());
     }
+
     return matched;
 }
 

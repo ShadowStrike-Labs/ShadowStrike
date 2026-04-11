@@ -17,7 +17,7 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Database/QuarantineDB.hpp"
+#include "Shared_modules/Database/QuarantineDB.hpp"
 #include <filesystem>
 #include <thread>
 #include <chrono>

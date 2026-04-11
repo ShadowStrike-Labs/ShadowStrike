@@ -99,6 +99,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <fstream>
 #include <mutex>
 #include <optional>
 #include <string>
@@ -802,6 +803,53 @@ TEST_F(FSFLifecycleFixture, IsDriverInstalled_ReturnsBool_NoCrash) {
     SUCCEED();
 }
 
+TEST_F(FSFLifecycleFixture, Start_UserModeOnly_ReturnsTrueAndSetsRunningStatus) {
+    EXPECT_TRUE(RT::FileSystemFilter::Instance().Start());
+    EXPECT_EQ(RT::FilterStatus::Running,
+              RT::FileSystemFilter::Instance().GetStatus());
+
+    RT::FileSystemFilter::Instance().Stop();
+    EXPECT_EQ(RT::FilterStatus::Stopped,
+              RT::FileSystemFilter::Instance().GetStatus());
+}
+
+TEST_F(FSFLifecycleFixture, PauseAndResume_TransitionStatusWhenStarted) {
+    ASSERT_TRUE(RT::FileSystemFilter::Instance().Start());
+    ASSERT_EQ(RT::FilterStatus::Running,
+              RT::FileSystemFilter::Instance().GetStatus());
+
+    RT::FileSystemFilter::Instance().Pause();
+    EXPECT_EQ(RT::FilterStatus::Paused,
+              RT::FileSystemFilter::Instance().GetStatus());
+
+    RT::FileSystemFilter::Instance().Resume();
+    EXPECT_EQ(RT::FilterStatus::Running,
+              RT::FileSystemFilter::Instance().GetStatus());
+
+    RT::FileSystemFilter::Instance().Stop();
+}
+
+TEST_F(FSFLifecycleFixture, GetDriverStatus_WithoutConnectedPort_ReturnsZeroedSnapshot) {
+    RT::FileSystemFilter::Instance().Stop();
+
+    const RT::DriverStatus status =
+        RT::FileSystemFilter::Instance().GetDriverStatus();
+    EXPECT_EQ(0u, status.versionMajor);
+    EXPECT_EQ(0u, status.versionMinor);
+    EXPECT_EQ(0u, status.versionBuild);
+    EXPECT_FALSE(status.filteringActive);
+    EXPECT_EQ(0u, status.totalFilesScanned);
+    EXPECT_EQ(0u, status.filesBlocked);
+    EXPECT_EQ(0u, status.pendingRequests);
+    EXPECT_EQ(0u, status.cacheHits);
+    EXPECT_EQ(0u, status.cacheMisses);
+}
+
+TEST_F(FSFLifecycleFixture, GetDriverVersion_WithoutConnectedPort_ReturnsZeroVersion) {
+    RT::FileSystemFilter::Instance().Stop();
+    EXPECT_EQ("0.0.0", RT::FileSystemFilter::Instance().GetDriverVersion());
+}
+
 TEST_F(FSFLifecycleFixture, GetCacheHitRate_ZeroBeforeScans) {
     RT::FileSystemFilter::Instance().ResetStats();
     const double rate = RT::FileSystemFilter::Instance().GetCacheHitRate();
@@ -1007,6 +1055,84 @@ TEST_F(PCMFixture, Shutdown_Idempotent_NoCrash) {
     RT::ProcessCreationMonitor::Instance().Shutdown();
     RT::ProcessCreationMonitor::Instance().Initialize();
     SUCCEED();
+}
+
+TEST_F(PCMFixture, PauseAndResume_ToggleRunningStateWhenInitialized) {
+    RT::ProcessCreationMonitor::Instance().Start();
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().IsRunning());
+
+    RT::ProcessCreationMonitor::Instance().Pause();
+    EXPECT_FALSE(RT::ProcessCreationMonitor::Instance().IsRunning());
+
+    RT::ProcessCreationMonitor::Instance().Resume();
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().IsRunning());
+
+    RT::ProcessCreationMonitor::Instance().Stop();
+    EXPECT_FALSE(RT::ProcessCreationMonitor::Instance().IsRunning());
+}
+
+TEST_F(PCMFixture, RegisterCallbacks_ReturnDistinctNonZeroIds) {
+    const uint64_t createId =
+        RT::ProcessCreationMonitor::Instance().RegisterCreateCallback(
+            [](const RT::ProcessCreateEvent&) {
+                return RT::ProcessVerdict::Allow;
+            });
+    const uint64_t terminateId =
+        RT::ProcessCreationMonitor::Instance().RegisterTerminateCallback(
+            [](uint32_t, uint32_t) {});
+    const uint64_t suspiciousId =
+        RT::ProcessCreationMonitor::Instance().RegisterSuspiciousCallback(
+            [](const RT::ProcessInfo&, const std::vector<RT::SuspiciousPattern>&) {});
+
+    EXPECT_NE(0u, createId);
+    EXPECT_NE(0u, terminateId);
+    EXPECT_NE(0u, suspiciousId);
+    EXPECT_NE(createId, terminateId);
+    EXPECT_NE(createId, suspiciousId);
+    EXPECT_NE(terminateId, suspiciousId);
+
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().UnregisterCreateCallback(createId));
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().UnregisterTerminateCallback(terminateId));
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().UnregisterSuspiciousCallback(suspiciousId));
+}
+
+TEST_F(PCMFixture, CreateAndTerminateCallbacks_FireForSyntheticEvents) {
+    constexpr uint32_t kPid = 0x510001u;
+    std::atomic<bool> createFired{ false };
+    std::atomic<bool> terminateFired{ false };
+
+    const uint64_t createId =
+        RT::ProcessCreationMonitor::Instance().RegisterCreateCallback(
+            [&](const RT::ProcessCreateEvent& event) {
+                if (event.processId == kPid &&
+                    event.imageFileName == L"cmd.exe") {
+                    createFired.store(true, std::memory_order_release);
+                }
+                return RT::ProcessVerdict::Allow;
+            });
+    const uint64_t terminateId =
+        RT::ProcessCreationMonitor::Instance().RegisterTerminateCallback(
+            [&](uint32_t pid, uint32_t exitCode) {
+                if (pid == kPid && exitCode == 23u) {
+                    terminateFired.store(true, std::memory_order_release);
+                }
+            });
+
+    RT::ProcessCreateEvent event{};
+    event.processId = kPid;
+    event.parentProcessId = 4u;
+    event.imagePath = L"C:\\Windows\\System32\\cmd.exe";
+    event.imageFileName = L"cmd.exe";
+    event.timestamp = std::chrono::system_clock::now();
+
+    RT::ProcessCreationMonitor::Instance().OnProcessCreate(event);
+    RT::ProcessCreationMonitor::Instance().OnProcessTerminate(kPid, 23u);
+
+    EXPECT_TRUE(createFired.load(std::memory_order_acquire));
+    EXPECT_TRUE(terminateFired.load(std::memory_order_acquire));
+
+    RT::ProcessCreationMonitor::Instance().UnregisterCreateCallback(createId);
+    RT::ProcessCreationMonitor::Instance().UnregisterTerminateCallback(terminateId);
 }
 
 // ============================================================================
@@ -1311,6 +1437,63 @@ TEST_F(PCMFixture, ResetStats_ZerosAfterActivity) {
     const RT::ProcessMonitorStats s =
         RT::ProcessCreationMonitor::Instance().GetStats();
     EXPECT_EQ(0u, s.totalProcessCreations);
+}
+
+TEST_F(PCMFixture, ProcessTreeQueries_ReflectTrackedParentChildRelationships) {
+    constexpr uint32_t kParentPid = 0x520001u;
+    constexpr uint32_t kChildPid = 0x520002u;
+
+    RT::ProcessCreationMonitor::Instance().OnProcessCreate(
+        kParentPid, L"C:\\Windows\\explorer.exe", 4u);
+    RT::ProcessCreationMonitor::Instance().OnProcessCreate(
+        kChildPid, L"C:\\Windows\\System32\\cmd.exe", kParentPid);
+
+    const auto tree = RT::ProcessCreationMonitor::Instance().GetProcessTree(kChildPid);
+    ASSERT_TRUE(tree.has_value());
+    EXPECT_EQ(kParentPid, tree->parentPid);
+    ASSERT_EQ(1u, tree->ancestorPath.size());
+    EXPECT_EQ(kParentPid, tree->ancestorPath.front());
+
+    const auto parent = RT::ProcessCreationMonitor::Instance().GetParentProcess(kChildPid);
+    ASSERT_TRUE(parent.has_value());
+    EXPECT_EQ(kParentPid, parent->processId);
+
+    const auto children =
+        RT::ProcessCreationMonitor::Instance().GetChildProcesses(kParentPid);
+    EXPECT_NE(children.end(),
+              std::find_if(children.begin(), children.end(),
+                           [](const RT::ProcessInfo& info) {
+                               return info.processId == kChildPid;
+                           }));
+
+    EXPECT_TRUE(RT::ProcessCreationMonitor::Instance().IsProcessRunning(kChildPid));
+    RT::ProcessCreationMonitor::Instance().OnProcessTerminate(kChildPid, 0u);
+    EXPECT_FALSE(RT::ProcessCreationMonitor::Instance().IsProcessRunning(kChildPid));
+    RT::ProcessCreationMonitor::Instance().OnProcessTerminate(kParentPid, 0u);
+}
+
+TEST_F(PCMFixture, GetProcessesByUser_ReturnsProcessesCreatedFromFullEvents) {
+    constexpr uint32_t kPid = 0x520101u;
+    RT::ProcessCreateEvent event{};
+    event.processId = kPid;
+    event.parentProcessId = 4u;
+    event.imagePath = L"C:\\Windows\\System32\\notepad.exe";
+    event.imageFileName = L"notepad.exe";
+    event.userName = L"ShadowStrikeRealtimeUser";
+    event.timestamp = std::chrono::system_clock::now();
+
+    RT::ProcessCreationMonitor::Instance().OnProcessCreate(event);
+
+    const auto matches =
+        RT::ProcessCreationMonitor::Instance().GetProcessesByUser(
+            L"ShadowStrikeRealtimeUser");
+    EXPECT_NE(matches.end(),
+              std::find_if(matches.begin(), matches.end(),
+                           [](const RT::ProcessInfo& info) {
+                               return info.processId == kPid;
+                           }));
+
+    RT::ProcessCreationMonitor::Instance().OnProcessTerminate(kPid, 0u);
 }
 
 // ============================================================================
@@ -1708,6 +1891,77 @@ TEST_F(NTFFixture, GetRecentEvents_NoCrash) {
     EXPECT_NO_THROW(RT::NetworkTrafficFilter::Instance().GetRecentEvents(100u));
 }
 
+TEST_F(NTFFixture, OnConnectionEstablished_FiresEventCallbackAndArchivesHistory) {
+    constexpr uint64_t kConnectionId = 0x6001u;
+    constexpr uint32_t kProcessId = 0x6002u;
+    std::atomic<bool> fired{ false };
+
+    const uint64_t callbackId =
+        RT::NetworkTrafficFilter::Instance().RegisterEventCallback(
+            [&](const RT::NetworkEvent& event) {
+                if (event.eventType == RT::NetworkEventType::ConnectionEstablished &&
+                    event.connectionId == kConnectionId &&
+                    event.processId == kProcessId) {
+                    fired.store(true, std::memory_order_release);
+                }
+            });
+
+    RT::NetworkConnection conn{};
+    conn.connectionId = kConnectionId;
+    conn.processId = kProcessId;
+    conn.tuple.remote.address = RT::IPAddress::FromString("203.0.113.60");
+    conn.tuple.remote.port = 443;
+
+    RT::NetworkTrafficFilter::Instance().OnConnectionEstablished(conn);
+
+    EXPECT_TRUE(fired.load(std::memory_order_acquire));
+    const auto events = RT::NetworkTrafficFilter::Instance().GetRecentEvents(8u);
+    EXPECT_NE(events.end(),
+              std::find_if(events.begin(), events.end(),
+                           [&](const RT::NetworkEvent& event) {
+                               return event.eventType ==
+                                          RT::NetworkEventType::ConnectionEstablished &&
+                                      event.connectionId == kConnectionId &&
+                                      event.processId == kProcessId;
+                           }));
+
+    RT::NetworkTrafficFilter::Instance().UnregisterEventCallback(callbackId);
+}
+
+TEST_F(NTFFixture, OnDataTransfer_HttpPayloadUpdatesTrackedConnectionAndCounters) {
+    constexpr uint64_t kConnectionId = 0x6003u;
+    constexpr uint32_t kProcessId = 0x6004u;
+    const std::vector<uint8_t> payload{
+        'G', 'E', 'T', ' ', '/', ' ', 'H', 'T', 'T', 'P', '/', '1', '.', '1'
+    };
+
+    RT::NetworkTrafficFilter::Instance().ResetStats();
+
+    RT::NetworkConnection conn{};
+    conn.connectionId = kConnectionId;
+    conn.processId = kProcessId;
+    conn.tuple.remote.address = RT::IPAddress::FromString("203.0.113.61");
+    conn.tuple.remote.port = 80;
+
+    ASSERT_NE(RT::FilterAction::Block,
+              RT::NetworkTrafficFilter::Instance().OnConnectionAttempt(conn));
+    RT::NetworkTrafficFilter::Instance().OnDataTransfer(
+        kConnectionId, true, payload.size(), payload);
+
+    const auto tracked =
+        RT::NetworkTrafficFilter::Instance().GetConnection(kConnectionId);
+    ASSERT_TRUE(tracked.has_value());
+    EXPECT_EQ(payload.size(), tracked->bytesSent);
+    EXPECT_EQ(RT::AppProtocol::HTTP, tracked->appProtocol);
+
+    const RT::NetworkFilterStats stats =
+        RT::NetworkTrafficFilter::Instance().GetStats();
+    EXPECT_EQ(payload.size(), stats.bytesOutbound);
+    EXPECT_GE(stats.deepInspections, 1u);
+
+    RT::NetworkTrafficFilter::Instance().OnConnectionClosed(kConnectionId);
+}
+
 // ============================================================================
 // GROUP 25 — NetworkTrafficFilter DNS Query Handling
 // ============================================================================
@@ -1902,6 +2156,17 @@ TEST_F(RTPFixture, GetStatus_NoCrash_FieldsCoherent) {
     EXPECT_FALSE(st.isProtected);                        // driver absent
 }
 
+TEST_F(RTPFixture, Pause_WhenNotActive_ReturnsFalse) {
+    RT::RealTimeProtection::Instance().Stop();
+    EXPECT_FALSE(RT::RealTimeProtection::Instance().Pause(
+        0u, L"Inactive state must reject pause"));
+}
+
+TEST_F(RTPFixture, Resume_WhenNotPaused_ReturnsFalse) {
+    RT::RealTimeProtection::Instance().Stop();
+    EXPECT_FALSE(RT::RealTimeProtection::Instance().Resume());
+}
+
 // ============================================================================
 // GROUP 28 — RealTimeProtection Config & Mode
 // ============================================================================
@@ -2057,6 +2322,17 @@ TEST_F(RTPFixture, GetPerformanceMetrics_NoCrash) {
     EXPECT_NO_THROW(RT::RealTimeProtection::Instance().GetPerformanceMetrics());
 }
 
+TEST_F(RTPFixture, GetPerformanceMetrics_AfterResetStatistics_ExposesZeroedCounters) {
+    RT::RealTimeProtection::Instance().ResetStatistics();
+    const RT::PerformanceMetrics& metrics =
+        RT::RealTimeProtection::Instance().GetPerformanceMetrics();
+
+    EXPECT_EQ(0u, metrics.totalScans.load(std::memory_order_relaxed));
+    EXPECT_EQ(0u, metrics.cacheHits.load(std::memory_order_relaxed));
+    EXPECT_EQ(0u, metrics.cacheMisses.load(std::memory_order_relaxed));
+    EXPECT_EQ(0u, metrics.pendingScanQueue.load(std::memory_order_relaxed));
+}
+
 TEST_F(RTPFixture, GetRecentThreats_InitiallyEmpty) {
     RT::RealTimeProtection::Instance().ResetStatistics();
     const auto threats = RT::RealTimeProtection::Instance().GetRecentThreats(100u);
@@ -2070,6 +2346,37 @@ TEST_F(RTPFixture, GetRecentThreats_ZeroMaxEvents_ReturnsEmpty) {
 
 TEST_F(RTPFixture, PerformHealthCheck_NoCrash) {
     EXPECT_NO_THROW(RT::RealTimeProtection::Instance().PerformHealthCheck());
+}
+
+TEST_F(RTPFixture, PerformDiagnostics_WhenInactive_ReturnsFalse) {
+    RT::RealTimeProtection::Instance().Stop();
+    EXPECT_FALSE(RT::RealTimeProtection::Instance().PerformDiagnostics());
+}
+
+TEST_F(RTPFixture, GetDiagnosticSummary_ContainsStateAndStatisticsSections) {
+    const std::wstring summary =
+        RT::RealTimeProtection::Instance().GetDiagnosticSummary();
+    EXPECT_NE(std::wstring::npos, summary.find(L"RealTimeProtection Diagnostic Summary"));
+    EXPECT_NE(std::wstring::npos, summary.find(L"State:"));
+    EXPECT_NE(std::wstring::npos, summary.find(L"Statistics"));
+}
+
+TEST_F(RTPFixture, ExportDiagnostics_WritesJsonPayloadToFile) {
+    wchar_t tempPath[MAX_PATH]{};
+    wchar_t tempFile[MAX_PATH]{};
+    ASSERT_NE(0u, ::GetTempPathW(MAX_PATH, tempPath));
+    ASSERT_NE(0u, ::GetTempFileNameW(tempPath, L"rtp", 0u, tempFile));
+
+    ASSERT_TRUE(RT::RealTimeProtection::Instance().ExportDiagnostics(tempFile));
+
+    std::ifstream input(tempFile, std::ios::binary);
+    ASSERT_TRUE(input.is_open());
+    const std::string contents((std::istreambuf_iterator<char>(input)),
+                               std::istreambuf_iterator<char>());
+    EXPECT_NE(std::string::npos, contents.find("\"state\""));
+    EXPECT_NE(std::string::npos, contents.find("\"statistics\""));
+
+    ::DeleteFileW(tempFile);
 }
 
 // ============================================================================
@@ -2221,6 +2528,12 @@ TEST_F(CrossComponentFixture, GetComponentHealth_ReturnsMapWithEntries) {
     const auto health =
         RT::RealTimeProtection::Instance().GetComponentHealth();
     EXPECT_FALSE(health.empty());
+    EXPECT_NE(health.end(),
+              health.find(RT::ComponentType::FILE_SYSTEM_FILTER));
+    EXPECT_NE(health.end(),
+              health.find(RT::ComponentType::PROCESS_MONITOR));
+    EXPECT_NE(health.end(),
+              health.find(RT::ComponentType::NETWORK_FILTER));
 }
 
 TEST_F(CrossComponentFixture, Concurrency_PathExclusion_8Threads_NoCrashOrDeadlock) {

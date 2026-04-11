@@ -39,8 +39,8 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../../src/ThreatIntel/ThreatIntelImporter.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelImporter.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
 
 #include <array>
 #include <chrono>

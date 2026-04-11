@@ -44,8 +44,8 @@
 // ============================================================================
 
 #include <gtest/gtest.h>
-#include "../../../../src/ThreatIntel/ThreatIntelDatabase.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <vector>

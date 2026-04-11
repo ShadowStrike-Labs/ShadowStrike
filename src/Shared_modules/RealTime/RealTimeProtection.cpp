@@ -153,6 +153,23 @@ namespace RealTime {
 // ============================================================================
 namespace {
 
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    constexpr bool kFocusedUserModeBootstrap = true;
+
+    template <typename T>
+    struct FocusedDetectorNoDelete {
+        void operator()(T*) const noexcept {}
+    };
+
+    template <typename T>
+    using FocusedDetectorPtr = std::unique_ptr<T, FocusedDetectorNoDelete<T>>;
+#else
+    constexpr bool kFocusedUserModeBootstrap = false;
+
+    template <typename T>
+    using FocusedDetectorPtr = std::unique_ptr<T>;
+#endif
+
     // Generate unique event ID
     uint64_t GenerateEventId() {
         static std::atomic<uint64_t> s_counter{ 1000000 };
@@ -356,13 +373,13 @@ public:
     static constexpr size_t MAX_RECENT_THREATS = 1000;
 
     // Anti-Evasion Detectors (non-singleton, owned by RTP)
-    std::unique_ptr<ShadowStrike::AntiEvasion::DebuggerEvasionDetector> m_debuggerDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::VMEvasionDetector> m_vmDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::ProcessEvasionDetector> m_processDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::MetamorphicDetector> m_metamorphicDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::NetworkBasedEvasionDetector> m_networkDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::EnvironmentEvasionDetector> m_environmentDetector;
-    std::unique_ptr<ShadowStrike::AntiEvasion::PackerDetector> m_packerDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::DebuggerEvasionDetector> m_debuggerDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::VMEvasionDetector> m_vmDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::ProcessEvasionDetector> m_processDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::MetamorphicDetector> m_metamorphicDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::NetworkBasedEvasionDetector> m_networkDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::EnvironmentEvasionDetector> m_environmentDetector;
+    FocusedDetectorPtr<ShadowStrike::AntiEvasion::PackerDetector> m_packerDetector;
 
     // Anti-Evasion Detectors (singletons — accessed via Instance(), not owned)
     // SandboxEvasionDetector: system-level sandbox fingerprinting (startup + periodic)
@@ -408,6 +425,7 @@ public:
         m_protectionStatus.startTime = Now();
         m_protectionStatus.lastUpdate = Now();
 
+#if !defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
         // Create shared ThreatIntel stores — injected into detectors needing IOC correlation
         try {
             m_sharedHashStore = std::make_shared<HashStore::HashStore>();
@@ -431,6 +449,7 @@ public:
         } catch (const std::exception& e) {
             Utils::Logger::Error("Failed to create Anti-Evasion detectors: {}", e.what());
         }
+#endif
 
         // Initialize component status array
         for (size_t i = 0; i < m_componentStatus.size(); ++i) {
@@ -456,6 +475,74 @@ public:
         Utils::Logger::Info("RealTimeProtection: Starting orchestrator service...");
         SetState(ProtectionState::INITIALIZING);
 
+ #if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        try {
+            if (!m_threadPool) {
+                Utils::ThreadPoolConfig tpConfig;
+                tpConfig.minThreads = std::min(std::thread::hardware_concurrency(), 8u);
+                tpConfig.maxThreads = std::min(std::thread::hardware_concurrency() * 2u, 16u);
+                m_threadPool = std::make_shared<Utils::ThreadPool>(std::move(tpConfig));
+            }
+
+            try {
+                Utils::CacheManager::Instance().Initialize(
+                    L"", 100000, 256 * 1024 * 1024, std::chrono::minutes(1));
+            } catch (...) {
+            }
+
+            auto startFocusedComponent =
+                [this](ComponentType type, auto&& initializeFn, auto&& startFn) noexcept {
+                    try {
+                        if (!initializeFn()) {
+                            SetComponentState(type, ProtectionComponentState::ERROR);
+                            return;
+                        }
+
+                        const bool started = startFn();
+                        SetComponentState(
+                            type,
+                            started ? ProtectionComponentState::RUNNING
+                                    : ProtectionComponentState::ERROR);
+                    } catch (...) {
+                        SetComponentState(type, ProtectionComponentState::ERROR);
+                    }
+                };
+
+            startFocusedComponent(
+                ComponentType::FILE_SYSTEM_FILTER,
+                []() { return FileSystemFilter::Instance().Initialize(); },
+                []() { return FileSystemFilter::Instance().Start(); });
+
+            startFocusedComponent(
+                ComponentType::PROCESS_MONITOR,
+                []() { return ProcessCreationMonitor::Instance().Initialize(); },
+                []() {
+                    ProcessCreationMonitor::Instance().Start();
+                    return true;
+                });
+
+            startFocusedComponent(
+                ComponentType::NETWORK_FILTER,
+                []() { return NetworkTrafficFilter::Instance().Initialize(); },
+                []() {
+                    NetworkTrafficFilter::Instance().Start();
+                    return true;
+                });
+
+            m_protectionStatus.driverLoaded = false;
+            m_protectionStatus.driverConnected = false;
+            m_protectionStatus.isProtected = false;
+            m_protectionStatus.lastUpdate = Now();
+
+            SetState(ProtectionState::DEGRADED);
+            Utils::Logger::Info(
+                "RealTimeProtection: Started in focused user-mode bootstrap mode");
+            return true;
+        } catch (...) {
+            SetState(ProtectionState::ERROR);
+            return false;
+        }
+ #else
         try {
             // 1. Initialize ThreadPool if not provided
             if (!m_threadPool) {
@@ -587,6 +674,7 @@ public:
             SetState(ProtectionState::ERROR);
             return false;
         }
+#endif
     }
 
     void Stop() {
@@ -611,6 +699,37 @@ public:
         }
         m_statsUpdateThread.reset();
 
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        try { NetworkTrafficFilter::Instance().Stop(); } catch (...) {}
+        try { NetworkTrafficFilter::Instance().Shutdown(); } catch (...) {}
+        SetComponentState(ComponentType::NETWORK_FILTER, ProtectionComponentState::STOPPED);
+
+        try { ProcessCreationMonitor::Instance().Stop(); } catch (...) {}
+        SetComponentState(ComponentType::PROCESS_MONITOR, ProtectionComponentState::STOPPED);
+
+        try { FileSystemFilter::Instance().Stop(); } catch (...) {}
+        try { FileSystemFilter::Instance().Shutdown(); } catch (...) {}
+        SetComponentState(ComponentType::FILE_SYSTEM_FILTER, ProtectionComponentState::STOPPED);
+
+        {
+            std::unique_lock lock(m_cacheMutex);
+            m_verdictCache.clear();
+        }
+
+        try {
+            Utils::CacheManager::Instance().Shutdown();
+        } catch (...) {
+        }
+
+        m_protectionStatus.isProtected = false;
+        m_protectionStatus.driverConnected = false;
+        m_protectionStatus.driverLoaded = false;
+        m_protectionStatus.lastUpdate = Now();
+
+        SetState(ProtectionState::UNINITIALIZED);
+        Utils::Logger::Info("RealTimeProtection: Stopped");
+        return;
+#else
         // 2. Stop components
         StopComponents();
 
@@ -653,6 +772,7 @@ public:
 
         SetState(ProtectionState::UNINITIALIZED);
         Utils::Logger::Info("RealTimeProtection: Stopped");
+#endif
     }
 
     bool Pause(uint32_t durationMs, std::wstring_view reason) {
@@ -666,10 +786,16 @@ public:
             reason.empty() ? "User request" : Utils::StringUtils::ToNarrow(reason));
 
         // Pause components
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        FileSystemFilter::Instance().Pause();
+        ProcessCreationMonitor::Instance().Pause();
+        NetworkTrafficFilter::Instance().Stop();
+#else
         FileSystemFilter::Instance().Pause();
         ProcessCreationMonitor::Instance().Pause();
         NetworkTrafficFilter::Instance().Stop(); // Network filter doesn't have Pause
         BehaviorBlocker::Instance().Pause();
+#endif
 
         m_protectionStatus.isProtected = false;
 
@@ -694,10 +820,16 @@ public:
         Utils::Logger::Info("RealTimeProtection: Resuming protection...");
 
         // Resume components
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        FileSystemFilter::Instance().Resume();
+        ProcessCreationMonitor::Instance().Resume();
+        NetworkTrafficFilter::Instance().Start();
+#else
         FileSystemFilter::Instance().Resume();
         ProcessCreationMonitor::Instance().Resume();
         NetworkTrafficFilter::Instance().Start();
         BehaviorBlocker::Instance().Resume();
+#endif
 
         m_protectionStatus.isProtected = true;
         SetState(ProtectionState::ACTIVE);
@@ -3560,6 +3692,12 @@ public:
     ScanResult ScanFile(const std::wstring& filePath, ScanPriority priority) {
         ScanResult result;
 
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        result.verdict = KernelVerdict::ERROR;
+        result.errorCode = ERROR_CALL_NOT_IMPLEMENTED;
+        result.errorMessage = L"Manual ScanFile is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD";
+        return result;
+#else
         try {
             Core::Engine::ScanContext context;
             context.type = Core::Engine::ScanType::OnDemand;
@@ -3629,6 +3767,7 @@ public:
         }
 
         return result;
+#endif
     }
 
     ScanResult ScanProcess(uint32_t pid) {
@@ -3655,6 +3794,13 @@ public:
     }
 
     bool QuarantineFile(const std::wstring& filePath, std::wstring_view threatName) {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+        (void)filePath;
+        (void)threatName;
+        Utils::Logger::Warn(
+            "RealTimeProtection: QuarantineFile unavailable in focused user-mode build");
+        return false;
+#else
         try {
             auto result = Core::Engine::QuarantineManager::Instance().QuarantineFile(filePath, std::wstring(threatName));
             if (result.IsSuccess()) {
@@ -3673,6 +3819,7 @@ public:
         } catch (...) {
             return false;
         }
+#endif
     }
 
     bool BlockNetworkAddress(const std::wstring& address, uint16_t port, uint32_t durationMs) {
@@ -4421,11 +4568,19 @@ ProcessCreationMonitor& RealTimeProtection::GetProcessCreationMonitor() {
 }
 
 MemoryProtection& RealTimeProtection::GetMemoryProtection() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("MemoryProtection is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return MemoryProtection::Instance();
+#endif
 }
 
 BehaviorBlocker& RealTimeProtection::GetBehaviorBlocker() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("BehaviorBlocker is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return BehaviorBlocker::Instance();
+#endif
 }
 
 NetworkTrafficFilter& RealTimeProtection::GetNetworkTrafficFilter() {
@@ -4433,19 +4588,35 @@ NetworkTrafficFilter& RealTimeProtection::GetNetworkTrafficFilter() {
 }
 
 ExploitPrevention& RealTimeProtection::GetExploitPrevention() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("ExploitPrevention is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return ExploitPrevention::Instance();
+#endif
 }
 
 FileIntegrityMonitor& RealTimeProtection::GetFileIntegrityMonitor() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("FileIntegrityMonitor is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return FileIntegrityMonitor::Instance();
+#endif
 }
 
 AccessControlManager& RealTimeProtection::GetAccessControlManager() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("AccessControlManager is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return AccessControlManager::Instance();
+#endif
 }
 
 ZeroHourProtection& RealTimeProtection::GetZeroHourProtection() {
+#if defined(SHADOWSTRIKE_RTP_FOCUSED_BUILD)
+    throw std::runtime_error("ZeroHourProtection is unavailable in SHADOWSTRIKE_RTP_FOCUSED_BUILD");
+#else
     return ZeroHourProtection::Instance();
+#endif
 }
 
 } // namespace RealTime

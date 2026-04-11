@@ -43,8 +43,8 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/SignatureBuilder.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/SignatureStore/SignatureBuilder.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <vector>
@@ -932,16 +932,28 @@ TEST_F(SignatureBuilderTest, NullLogCallback) {
 
 TEST_F(SignatureBuilderTest, CallbackExceptionHandling) {
     BuildConfiguration config = m_config;
+    std::atomic<size_t> progressInvocations{0};
+    std::atomic<size_t> logInvocations{0};
     
-    // Progress callback that throws
-    config.progressCallback = [](const std::string&, size_t, size_t) {
+    config.logCallback = [&](const std::string&) {
+        logInvocations.fetch_add(1, std::memory_order_relaxed);
+        throw std::runtime_error("Log callback error");
+    };
+    config.progressCallback = [&](const std::string&, size_t, size_t) {
+        progressInvocations.fetch_add(1, std::memory_order_relaxed);
         throw std::runtime_error("Callback error");
     };
     
     m_builder->SetConfiguration(config);
-    
-    // Should handle gracefully (or propagate depending on design)
-    // For now, verify no crash
+
+    EXPECT_NO_THROW(
+        m_builder->ReportProgress("Test", 1, 2)
+    ) << "A throwing progress callback must not terminate a noexcept API.";
+    EXPECT_NO_THROW(
+        m_builder->Log("Test message")
+    ) << "A throwing log callback must not terminate a noexcept API.";
+    EXPECT_EQ(progressInvocations.load(std::memory_order_relaxed), 1u);
+    EXPECT_EQ(logInvocations.load(std::memory_order_relaxed), 1u);
 }
 
 // ============================================================================

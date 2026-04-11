@@ -871,6 +871,15 @@
     </MASM>
   </ItemGroup>
   <ItemGroup>
+    <ClCompile Include="tests\integration\ai_pipeline\AIPipeline_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\anti_evasion\AntiEvasion_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\communication_pipeline\CommunicationPipeline_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\config_propagation\ConfigPropagation_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\exploit_protection\Exploits_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\ransomware_protection\RansomwareDetector_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\scan_pipeline\ScanPipeline_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\self_protection\SelfProtectionStack_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\update_lifecycle\UpdateLifecycle_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\CortexConfig_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\FeatureExtractor_Tests.cpp" />
     <ClCompile Include="tests\unit\ai_unit\ModelCache_Tests.cpp" />
@@ -902,6 +911,13 @@
     <ClCompile Include="tests\unit\core_network_unit\URLAnalyzer_Tests.cpp" />
     <ClCompile Include="tests\integration\core_network\NetworkChain_Integration_Tests.cpp" />
     <ClCompile Include="tests\integration\realtime_protection_pipeline\RTPPipeline_Integration_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\BufferOverflowProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\HeapSprayDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\JITSprayDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\KernelExploitDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\PrivilegeEscalationDetector_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\ROPProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\exploits_unit\StackPivotDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEParser_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\PEValidation_Tests.cpp" />
     <ClCompile Include="tests\unit\peparser_unit\SafeReader_Tests.cpp" />
@@ -911,6 +927,16 @@
     <ClCompile Include="tests\unit\scripts_unit\PowerShellScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\PythonScriptScanner_Tests.cpp" />
     <ClCompile Include="tests\unit\scripts_unit\VBScriptScanner_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\AntiDebug_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\CertificateValidator_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\CryptoManager_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\DigitalSignatureValidator_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\FileProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\MemoryProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\ProcessProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\RegistryProtection_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\SelfDefense_Tests.cpp" />
+    <ClCompile Include="tests\unit\selfprotection_unit\TamperProtection_Tests.cpp" />
     <ClCompile Include="tests\unit\update_unit\DeltaUpdater_Tests.cpp" />
     <ClCompile Include="tests\unit\update_unit\LocalFolderTransport_Tests.cpp" />
     <ClCompile Include="tests\unit\update_unit\ProgramUpdater_Tests.cpp" />

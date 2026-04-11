@@ -1717,6 +1717,10 @@ DecryptionResult CryptoManagerImpl::DecryptAESGCM(
             result.result = CryptoResult::InternalError;
             result.errorMessage = "Decryption failed";
         }
+        if (!result.plaintext.empty()) {
+            SecureZeroMemory(result.plaintext.data(), result.plaintext.size());
+            result.plaintext.clear();
+        }
         return result;
     }
 

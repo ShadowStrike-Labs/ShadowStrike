@@ -27,11 +27,11 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../src/SignatureStore/SignatureStore.hpp"
-#include "../../src/SignatureStore/SignatureFormat.hpp"
-#include "../../src/HashStore/HashStore.hpp"
-#include "../../src/PatternStore/PatternStore.hpp"
-#include "../../src/SignatureStore/YaraRuleStore.hpp"
+#include "Shared_modules/SignatureStore/SignatureStore.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/HashStore/HashStore.hpp"
+#include "Shared_modules/PatternStore/PatternStore.hpp"
+#include "Shared_modules/SignatureStore/YaraRuleStore.hpp"
 #include <memory>
 #include <vector>
 #include <string>
@@ -129,10 +129,20 @@ protected:
 // Initialization & Lifecycle Tests
 // ============================================================================
 
-TEST_F(SignatureStoreTest, Initialize_CreateNew) {
-    // Note: This test depends on actual database creation functionality
-    // For now, we test initialization behavior
+TEST_F(SignatureStoreTest, Initialize_MissingDatabase_FailsClosed) {
     EXPECT_FALSE(sig_store_->IsInitialized());
+
+    auto error = sig_store_->Initialize(test_db_path_);
+
+    EXPECT_FALSE(error.IsSuccess())
+        << "Initializing against a missing signature database must fail closed.";
+    EXPECT_FALSE(sig_store_->IsInitialized());
+
+    const auto status = sig_store_->GetStatus();
+    EXPECT_FALSE(status.hashStoreReady);
+    EXPECT_FALSE(status.patternStoreReady);
+    EXPECT_FALSE(status.yaraStoreReady);
+    EXPECT_FALSE(status.allReady);
 }
 
 TEST_F(SignatureStoreTest, Initialize_InvalidPath) {
