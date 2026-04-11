@@ -55,13 +55,13 @@ Code examples are drawn directly from the ShadowStrike source tree. File paths a
 | [1](vol1-foundations/ch01-introduction.md) | Introduction to ShadowStrike Phantom | ✅ |
 | [2](vol1-foundations/ch02-architecture-overview.md) | System Architecture Overview | ✅ |
 | [3](vol1-foundations/ch03-design-patterns.md) | Design Patterns & Conventions | ✅ |
-| [4](vol1-foundations/ch04-build-system.md) | The Build System | 📝 |
-| [5](vol1-foundations/ch05-threading-model.md) | Threading Model & Concurrency | 📝 |
-| [6](vol1-foundations/ch06-error-handling-logging.md) | Error Handling & Logging Infrastructure | 📝 |
-| [7](vol1-foundations/ch07-security-architecture.md) | Security Architecture & Threat Model | 📝 |
-| [8](vol1-foundations/ch08-detection-pipeline.md) | The Detection Pipeline | 📝 |
-| [9](vol1-foundations/ch09-module-dependencies.md) | Module Relationships & Dependency Graph | 📝 |
-| [10](vol1-foundations/ch10-development-workflow.md) | Development Workflow & Testing | 📝 |
+| [4](vol1-foundations/ch04-build-system.md) | The Build System | ✅ |
+| [5](vol1-foundations/ch05-threading-model.md) | Threading Model & Concurrency | ✅ |
+| [6](vol1-foundations/ch06-error-handling-logging.md) | Error Handling & Logging Infrastructure | ✅ |
+| [7](vol1-foundations/ch07-security-architecture.md) | Security Architecture & Threat Model | ✅ |
+| [8](vol1-foundations/ch08-detection-pipeline.md) | The Detection Pipeline | ✅ |
+| [9](vol1-foundations/ch09-module-relationships.md) | Module Relationships & Dependency Graph | ✅ |
+| [10](vol1-foundations/ch10-development-testing.md) | Development Workflow & Testing | ✅ |
 
 ### Volume 2: The Kernel Sentinel — PhantomSensor.sys
 
