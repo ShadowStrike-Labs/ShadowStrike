@@ -37,6 +37,7 @@
 
 #include "pch.h"
 #include "ZeroHourProtection.hpp"
+#include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
@@ -157,6 +158,7 @@ public:
 
     // Integration — raw non-owning pointers injected by RealTimeProtection
     ThreatIntel::ThreatIntelLookup* m_threatIntelLookup{ nullptr };
+    ThreatIntel::ThreatIntelStore*  m_threatIntelStore{ nullptr };
     Whitelist::WhitelistStore*      m_whitelistStore{ nullptr };
     mutable std::shared_mutex       m_integrationMutex;
 
@@ -179,6 +181,9 @@ public:
     // Last signature update check time
     std::chrono::system_clock::time_point m_lastSigCheckTime{};
     mutable std::shared_mutex             m_sigCheckMutex;
+
+    // ThreatIntelStore IOC count at last signature check (for delta detection)
+    std::atomic<size_t> m_lastKnownTIEntryCount{ 0 };
 
     // ========================================================================
     // INTERNAL LOGIC
@@ -1079,10 +1084,91 @@ bool ZeroHourProtection::CheckForSignatureUpdates(bool force) {
     SS_LOG_DEBUG(L"ZeroHourProtection",
         L"Checking for micro-signature updates (force=%d)", static_cast<int>(force));
 
-    // Actual update retrieval would go through ThreatIntelLookup or a dedicated
-    // update service.  For now, log that the check occurred and return false
-    // (no new sigs) since there is no update endpoint connected yet.
-    return false;
+    // ============================================================================
+    // PHASE 1: Query ThreatIntelStore for new IOC entries since last check
+    // ============================================================================
+    ThreatIntel::ThreatIntelStore* tiStore = nullptr;
+    {
+        std::shared_lock ilock(m_impl->m_integrationMutex);
+        tiStore = m_impl->m_threatIntelStore;
+    }
+
+    if (!tiStore) {
+        SS_LOG_WARN(L"ZeroHourProtection",
+            L"CheckForSignatureUpdates: ThreatIntelStore not wired — skipping IOC-based update");
+        return false;
+    }
+
+    bool hasNewSignatures = false;
+
+    try {
+        auto stats = tiStore->GetStatistics();
+        const size_t currentEntries = stats.totalIOCEntries;
+        const size_t previousEntries = m_impl->m_lastKnownTIEntryCount.load(
+            std::memory_order_relaxed);
+
+        if (currentEntries > previousEntries) {
+            const size_t deltaEntries = currentEntries - previousEntries;
+            SS_LOG_INFO(L"ZeroHourProtection",
+                L"ThreatIntelStore has %zu new IOC entries since last check "
+                L"(total: %zu, previous: %zu)",
+                deltaEntries, currentEntries, previousEntries);
+
+            // Update baseline so we don't re-process the same delta next time
+            m_impl->m_lastKnownTIEntryCount.store(currentEntries,
+                std::memory_order_relaxed);
+
+            // ================================================================
+            // PHASE 2: Check active feeds for pending updates and trigger sync
+            // ================================================================
+            auto feedStatuses = tiStore->GetAllFeedStatuses();
+            size_t feedsWithUpdates = 0;
+
+            for (const auto& fs : feedStatuses) {
+                if (!fs.enabled || fs.isUpdating) continue;
+
+                // If a feed has a next-update time in the past, it's overdue
+                if (fs.nextUpdateTime <= now && fs.lastSuccessTime != fs.lastUpdateTime) {
+                    if (tiStore->UpdateFeed(fs.feedId)) {
+                        ++feedsWithUpdates;
+                        SS_LOG_INFO(L"ZeroHourProtection",
+                            L"Triggered TI feed sync for feed '%hs' "
+                            L"(last imported %zu entries)",
+                            fs.feedId.c_str(), fs.lastImportCount);
+                    }
+                }
+            }
+
+            // Mark that new intelligence is available for micro-sig consumption
+            hasNewSignatures = (deltaEntries > 0);
+
+            // If in outbreak mode, escalate urgency
+            if (IsOutbreakModeActive() && hasNewSignatures) {
+                SS_LOG_WARN(L"ZeroHourProtection",
+                    L"Outbreak mode active — %zu new IOCs flagged for "
+                    L"immediate micro-signature generation", deltaEntries);
+            }
+        }
+
+        // ====================================================================
+        // PHASE 3: Check feed pending-update count for additional signals
+        // ====================================================================
+        if (stats.feedUpdatesPending > 0) {
+            SS_LOG_INFO(L"ZeroHourProtection",
+                L"ThreatIntelStore reports %zu feed updates pending",
+                stats.feedUpdatesPending);
+        }
+
+    } catch (const std::exception& ex) {
+        SS_LOG_ERROR(L"ZeroHourProtection",
+            L"CheckForSignatureUpdates: exception querying ThreatIntelStore: %hs",
+            ex.what());
+    } catch (...) {
+        SS_LOG_ERROR(L"ZeroHourProtection",
+            L"CheckForSignatureUpdates: unknown exception querying ThreatIntelStore");
+    }
+
+    return hasNewSignatures;
 }
 
 bool ZeroHourProtection::ApplySignatureUpdate(const MicroSigUpdatePackage& package) {
@@ -1604,6 +1690,17 @@ AdaptiveHeuristicConfig AdaptiveHeuristicConfig::CreateOutbreak() noexcept {
 void ZeroHourProtection::SetThreatIntelLookup(ThreatIntel::ThreatIntelLookup* lookup) noexcept {
     std::unique_lock ilock(m_impl->m_integrationMutex);
     m_impl->m_threatIntelLookup = lookup;
+}
+
+void ZeroHourProtection::SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept {
+    std::unique_lock ilock(m_impl->m_integrationMutex);
+    m_impl->m_threatIntelStore = store;
+    if (store) {
+        // Seed baseline IOC entry count so first CheckForSignatureUpdates detects delta
+        auto stats = store->GetStatistics();
+        m_impl->m_lastKnownTIEntryCount.store(
+            stats.totalIOCEntries, std::memory_order_relaxed);
+    }
 }
 
 void ZeroHourProtection::SetWhitelistStore(Whitelist::WhitelistStore* store) noexcept {
