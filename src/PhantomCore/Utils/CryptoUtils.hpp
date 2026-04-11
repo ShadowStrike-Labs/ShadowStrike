@@ -305,8 +305,8 @@ namespace ShadowStrike {
                 HKDF_SHA256 = 3,    ///< HKDF with SHA-256 (key expansion only)
                 HKDF_SHA384 = 4,    ///< HKDF with SHA-384 (key expansion only)
                 HKDF_SHA512 = 5,    ///< HKDF with SHA-512 (key expansion only)
-                Scrypt = 6,         ///< scrypt (memory-hard, requires external lib)
-                Argon2id = 7        ///< Argon2id (preferred, requires external lib)
+                Scrypt = 6,         ///< scrypt (RFC 7914, memory-hard KDF)
+                Argon2id = 7        ///< Argon2id (RFC 9106, memory-hard KDF)
             };
 
             /**
@@ -1116,11 +1116,9 @@ namespace ShadowStrike {
             /**
              * @brief Key derivation function implementations
              *
-             * Provides PBKDF2 and HKDF implementations using Windows CNG.
+             * Provides PBKDF2, HKDF, scrypt (RFC 7914), and Argon2id (RFC 9106)
+             * implementations using Windows CNG APIs with inline Blake2b.
              * All methods are static and thread-safe.
-             *
-             * @note Scrypt and Argon2id require external libraries and return
-             *       "not implemented" errors when called.
              */
             class KeyDerivation {
             public:

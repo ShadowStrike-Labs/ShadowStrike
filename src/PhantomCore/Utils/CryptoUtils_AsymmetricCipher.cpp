@@ -28,7 +28,7 @@
  * - ECC ECDH: P-256/P-384/P-521 for shared secret derivation
  * - Key Generation: Secure RSA/ECC key pair generation with proper finalization
  * - Key Import/Export: PEM and DER format support for public/private keys
- * - Key Derivation: PBKDF2, HKDF (RFC 5869) for key derivation from passwords
+ * - Key Derivation: PBKDF2, HKDF (RFC 5869), scrypt (RFC 7914), Argon2id (RFC 9106)
  *
  * Security Features:
  * - Secure key import: Private keys zeroed after BCrypt import
@@ -1303,6 +1303,593 @@ namespace ShadowStrike {
 				return true;
 			}
 
+			// =============================================================================
+			// RFC 7914 — scrypt Key Derivation (Salsa20/8 + ROMix)
+			// =============================================================================
+			namespace {
+
+				inline uint32_t ScryptRotl32(uint32_t x, int n) noexcept {
+					return (x << n) | (x >> (32 - n));
+				}
+
+				void Salsa208Core(uint32_t B[16]) noexcept {
+					uint32_t x[16];
+					std::memcpy(x, B, 64);
+
+					for (int i = 8; i > 0; i -= 2) {
+						x[ 4] ^= ScryptRotl32(x[ 0]+x[12], 7);  x[ 8] ^= ScryptRotl32(x[ 4]+x[ 0], 9);
+						x[12] ^= ScryptRotl32(x[ 8]+x[ 4],13);  x[ 0] ^= ScryptRotl32(x[12]+x[ 8],18);
+						x[ 9] ^= ScryptRotl32(x[ 5]+x[ 1], 7);  x[13] ^= ScryptRotl32(x[ 9]+x[ 5], 9);
+						x[ 1] ^= ScryptRotl32(x[13]+x[ 9],13);  x[ 5] ^= ScryptRotl32(x[ 1]+x[13],18);
+						x[14] ^= ScryptRotl32(x[10]+x[ 6], 7);  x[ 2] ^= ScryptRotl32(x[14]+x[10], 9);
+						x[ 6] ^= ScryptRotl32(x[ 2]+x[14],13);  x[10] ^= ScryptRotl32(x[ 6]+x[ 2],18);
+						x[ 3] ^= ScryptRotl32(x[15]+x[11], 7);  x[ 7] ^= ScryptRotl32(x[ 3]+x[15], 9);
+						x[11] ^= ScryptRotl32(x[ 7]+x[ 3],13);  x[15] ^= ScryptRotl32(x[11]+x[ 7],18);
+						x[ 1] ^= ScryptRotl32(x[ 0]+x[ 3], 7);  x[ 2] ^= ScryptRotl32(x[ 1]+x[ 0], 9);
+						x[ 3] ^= ScryptRotl32(x[ 2]+x[ 1],13);  x[ 0] ^= ScryptRotl32(x[ 3]+x[ 2],18);
+						x[ 6] ^= ScryptRotl32(x[ 5]+x[ 4], 7);  x[ 7] ^= ScryptRotl32(x[ 6]+x[ 5], 9);
+						x[ 4] ^= ScryptRotl32(x[ 7]+x[ 6],13);  x[ 5] ^= ScryptRotl32(x[ 4]+x[ 7],18);
+						x[11] ^= ScryptRotl32(x[10]+x[ 9], 7);  x[ 8] ^= ScryptRotl32(x[11]+x[10], 9);
+						x[ 9] ^= ScryptRotl32(x[ 8]+x[11],13);  x[10] ^= ScryptRotl32(x[ 9]+x[ 8],18);
+						x[12] ^= ScryptRotl32(x[15]+x[14], 7);  x[13] ^= ScryptRotl32(x[12]+x[15], 9);
+						x[14] ^= ScryptRotl32(x[13]+x[12],13);  x[15] ^= ScryptRotl32(x[14]+x[13],18);
+					}
+
+					for (int i = 0; i < 16; ++i) B[i] += x[i];
+					SecureWipeMemory(x, sizeof(x));
+				}
+
+				// scryptBlockMix: reads from B (2r × 16 uint32_t), writes interleaved to Bout
+				void ScryptBlockMix(const uint32_t* B, uint32_t* Bout, uint32_t r) noexcept {
+					const uint32_t numBlocks = 2 * r;
+					uint32_t X[16];
+					std::memcpy(X, &B[(numBlocks - 1) * 16], 64);
+
+					for (uint32_t i = 0; i < numBlocks; ++i) {
+						for (int j = 0; j < 16; ++j) X[j] ^= B[i * 16 + j];
+						Salsa208Core(X);
+						const uint32_t dst = (i % 2 == 0) ? (i / 2) : (r + i / 2);
+						std::memcpy(&Bout[dst * 16], X, 64);
+					}
+
+					SecureWipeMemory(X, sizeof(X));
+				}
+
+				// scryptROMix: memory-hard mixing on block B of 128*r bytes
+				bool ScryptROMix(uint32_t* B, uint32_t r, uint64_t N) noexcept {
+					const size_t blockWords = 32ULL * r;
+					const size_t blockBytes = blockWords * sizeof(uint32_t);
+
+					std::unique_ptr<uint32_t[]> V;
+					std::unique_ptr<uint32_t[]> Y;
+					try {
+						V = std::make_unique<uint32_t[]>(static_cast<size_t>(N) * blockWords);
+						Y = std::make_unique<uint32_t[]>(blockWords);
+					}
+					catch (...) { return false; }
+
+					// V[0] = B
+					std::memcpy(V.get(), B, blockBytes);
+
+					// V[i] = BlockMix(V[i-1]) for i = 1..N-1
+					for (uint64_t i = 1; i < N; ++i)
+						ScryptBlockMix(&V[(i - 1) * blockWords], &V[i * blockWords], r);
+
+					// X = BlockMix(V[N-1])
+					ScryptBlockMix(&V[(N - 1) * blockWords], B, r);
+
+					// Mixing phase: N iterations
+					for (uint64_t i = 0; i < N; ++i) {
+						uint64_t j = static_cast<uint64_t>(B[blockWords - 16]) |
+							(static_cast<uint64_t>(B[blockWords - 15]) << 32);
+						j %= N;
+
+						for (size_t k = 0; k < blockWords; ++k)
+							B[k] ^= V[j * blockWords + k];
+
+						ScryptBlockMix(B, Y.get(), r);
+						std::memcpy(B, Y.get(), blockBytes);
+					}
+
+					SecureWipeMemory(V.get(), static_cast<size_t>(N) * blockBytes);
+					SecureWipeMemory(Y.get(), blockBytes);
+					return true;
+				}
+
+			} // anonymous namespace (scrypt helpers)
+
+			static bool ScryptDeriveKey(const uint8_t* password, size_t passwordLen,
+				const uint8_t* salt, size_t saltLen,
+				const KDFParams& params,
+				uint8_t* outKey, size_t keyLen,
+				Error* err) noexcept
+			{
+				constexpr uint32_t r = 8; // Standard scrypt block size parameter
+				const uint32_t p = params.parallelism;
+
+				// Compute N: largest power of 2 that fits in the memory budget
+				// With r=8, each ROMix block = 128*r = 1024 bytes = 1 KiB, so N ≈ memoryCostKB
+				uint64_t N = 1;
+				while (N * 2 <= static_cast<uint64_t>(params.memoryCostKB) && N < (1ULL << 28))
+					N *= 2;
+				if (N < 2) N = 2;
+
+				// Memory safety: cap at 2 GiB per ROMix invocation
+				constexpr uint64_t MAX_ROMIX_BYTES = 2ULL * 1024 * 1024 * 1024;
+				if (N * 128ULL * r > MAX_ROMIX_BYTES) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Scrypt: memory cost exceeds 2 GiB ROMix limit"; }
+					return false;
+				}
+
+				// Step 1: B[0..p-1] = PBKDF2-HMAC-SHA256(password, salt, 1, p * 128 * r)
+				const size_t bLen = static_cast<size_t>(p) * 128 * r;
+				std::vector<uint8_t> B;
+				try { B.resize(bLen); }
+				catch (...) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Scrypt: B buffer allocation failed"; }
+					return false;
+				}
+
+				if (!KeyDerivation::PBKDF2(password, passwordLen, salt, saltLen, 1,
+					HashUtils::Algorithm::SHA256, B.data(), B.size(), err)) {
+					SecureWipeMemory(B.data(), B.size());
+					return false;
+				}
+
+				// Step 2: Apply ROMix to each parallel block
+				const size_t blockBytes = 128ULL * r;
+				for (uint32_t i = 0; i < p; ++i) {
+					auto* Bi = reinterpret_cast<uint32_t*>(&B[i * blockBytes]);
+					if (!ScryptROMix(Bi, r, N)) {
+						SecureWipeMemory(B.data(), B.size());
+						if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Scrypt: ROMix memory allocation failed"; }
+						return false;
+					}
+				}
+
+				// Step 3: Output = PBKDF2-HMAC-SHA256(password, B, 1, dkLen)
+				bool ok = KeyDerivation::PBKDF2(password, passwordLen, B.data(), B.size(),
+					1, HashUtils::Algorithm::SHA256, outKey, keyLen, err);
+
+				SecureWipeMemory(B.data(), B.size());
+				return ok;
+			}
+
+			// =============================================================================
+			// RFC 7693 — Blake2b Implementation (used by Argon2id)
+			// =============================================================================
+			namespace {
+
+				static constexpr uint64_t kBlake2bIV[8] = {
+					0x6A09E667F3BCC908ULL, 0xBB67AE8584CAA73BULL,
+					0x3C6EF372FE94F82BULL, 0xA54FF53A5F1D36F1ULL,
+					0x510E527FADE682D1ULL, 0x9B05688C2B3E6C1FULL,
+					0x1F83D9ABFB41BD6BULL, 0x5BE0CD19137E2179ULL
+				};
+
+				static constexpr uint8_t kBlake2bSigma[12][16] = {
+					{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+					{14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3},
+					{11, 8,12, 0, 5, 2,15,13,10,14, 3, 6, 7, 1, 9, 4},
+					{ 7, 9, 3, 1,13,12,11,14, 2, 6, 5,10, 4, 0,15, 8},
+					{ 9, 0, 5, 7, 2, 4,10,15,14, 1,11,12, 6, 8, 3,13},
+					{ 2,12, 6,10, 0,11, 8, 3, 4,13, 7, 5,15,14, 1, 9},
+					{12, 5, 1,15,14,13, 4,10, 0, 7, 6, 3, 9, 2, 8,11},
+					{13,11, 7,14,12, 1, 3, 9, 5, 0,15, 4, 8, 6, 2,10},
+					{ 6,15,14, 9,11, 3, 0, 8,12, 2,13, 7, 1, 4,10, 5},
+					{10, 2, 8, 4, 7, 6, 1, 5,15,11, 9,14, 3,12,13, 0},
+					{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,15},
+					{14,10, 4, 8, 9,15,13, 6, 1,12, 0, 2,11, 7, 5, 3}
+				};
+
+				struct Blake2bState {
+					uint64_t h[8];
+					uint64_t t[2];
+					uint64_t f[2];
+					uint8_t buf[128];
+					size_t bufLen;
+					size_t outLen;
+				};
+
+				inline uint64_t B2bRotr64(uint64_t x, int n) noexcept {
+					return (x >> n) | (x << (64 - n));
+				}
+
+				void B2bG(uint64_t v[16], int a, int b, int c, int d, uint64_t x, uint64_t y) noexcept {
+					v[a] += v[b] + x;  v[d] = B2bRotr64(v[d] ^ v[a], 32);
+					v[c] += v[d];      v[b] = B2bRotr64(v[b] ^ v[c], 24);
+					v[a] += v[b] + y;  v[d] = B2bRotr64(v[d] ^ v[a], 16);
+					v[c] += v[d];      v[b] = B2bRotr64(v[b] ^ v[c], 63);
+				}
+
+				void B2bCompress(Blake2bState& S, const uint8_t* block) noexcept {
+					uint64_t m[16], v[16];
+					for (int i = 0; i < 16; ++i)
+						std::memcpy(&m[i], &block[i * 8], 8);
+
+					for (int i = 0; i < 8; ++i) v[i] = S.h[i];
+					v[ 8] = kBlake2bIV[0];           v[ 9] = kBlake2bIV[1];
+					v[10] = kBlake2bIV[2];           v[11] = kBlake2bIV[3];
+					v[12] = kBlake2bIV[4] ^ S.t[0];  v[13] = kBlake2bIV[5] ^ S.t[1];
+					v[14] = kBlake2bIV[6] ^ S.f[0];  v[15] = kBlake2bIV[7] ^ S.f[1];
+
+					for (int r = 0; r < 12; ++r) {
+						const uint8_t* s = kBlake2bSigma[r];
+						B2bG(v,0,4, 8,12,m[s[ 0]],m[s[ 1]]); B2bG(v,1,5, 9,13,m[s[ 2]],m[s[ 3]]);
+						B2bG(v,2,6,10,14,m[s[ 4]],m[s[ 5]]); B2bG(v,3,7,11,15,m[s[ 6]],m[s[ 7]]);
+						B2bG(v,0,5,10,15,m[s[ 8]],m[s[ 9]]); B2bG(v,1,6,11,12,m[s[10]],m[s[11]]);
+						B2bG(v,2,7, 8,13,m[s[12]],m[s[13]]); B2bG(v,3,4, 9,14,m[s[14]],m[s[15]]);
+					}
+
+					for (int i = 0; i < 8; ++i) S.h[i] ^= v[i] ^ v[i + 8];
+					SecureWipeMemory(m, sizeof(m));
+					SecureWipeMemory(v, sizeof(v));
+				}
+
+				void B2bInit(Blake2bState& S, size_t outLen) noexcept {
+					std::memset(&S, 0, sizeof(S));
+					for (int i = 0; i < 8; ++i) S.h[i] = kBlake2bIV[i];
+					S.h[0] ^= 0x01010000ULL ^ static_cast<uint64_t>(outLen);
+					S.outLen = outLen;
+				}
+
+				void B2bUpdate(Blake2bState& S, const void* data, size_t len) noexcept {
+					auto p = static_cast<const uint8_t*>(data);
+					while (len > 0) {
+						if (S.bufLen == 128) {
+							S.t[0] += 128;
+							if (S.t[0] < 128) S.t[1]++;
+							B2bCompress(S, S.buf);
+							S.bufLen = 0;
+						}
+						size_t n = std::min(len, static_cast<size_t>(128) - S.bufLen);
+						std::memcpy(&S.buf[S.bufLen], p, n);
+						S.bufLen += n;
+						p += n;
+						len -= n;
+					}
+				}
+
+				void B2bFinal(Blake2bState& S, uint8_t* out) noexcept {
+					S.t[0] += static_cast<uint64_t>(S.bufLen);
+					if (S.t[0] < S.bufLen) S.t[1]++;
+					S.f[0] = ~0ULL;
+					std::memset(&S.buf[S.bufLen], 0, 128 - S.bufLen);
+					B2bCompress(S, S.buf);
+					std::memcpy(out, S.h, S.outLen);
+					SecureWipeMemory(&S, sizeof(S));
+				}
+
+				void B2bHash(const void* data, size_t dataLen, uint8_t* out, size_t outLen) noexcept {
+					Blake2bState S;
+					B2bInit(S, outLen);
+					B2bUpdate(S, data, dataLen);
+					B2bFinal(S, out);
+				}
+
+				// Argon2 variable-length hash H' (RFC 9106 Section 3.3)
+				bool B2bLongHash(const void* data, size_t dataLen, uint8_t* out, uint32_t outLen) noexcept {
+					if (outLen == 0) return false;
+					uint8_t outLenLE[4];
+					std::memcpy(outLenLE, &outLen, 4);
+
+					if (outLen <= 64) {
+						Blake2bState S;
+						B2bInit(S, outLen);
+						B2bUpdate(S, outLenLE, 4);
+						B2bUpdate(S, data, dataLen);
+						B2bFinal(S, out);
+						return true;
+					}
+
+					// r = ceil(outLen/32) - 2, intermediate digests contribute 32 bytes each
+					const uint32_t r = (outLen + 31) / 32 - 2;
+					uint8_t V[64];
+					{
+						Blake2bState S;
+						B2bInit(S, 64);
+						B2bUpdate(S, outLenLE, 4);
+						B2bUpdate(S, data, dataLen);
+						B2bFinal(S, V);
+					}
+					std::memcpy(out, V, 32);
+
+					for (uint32_t i = 2; i <= r; ++i) {
+						uint8_t prev[64];
+						std::memcpy(prev, V, 64);
+						B2bHash(prev, 64, V, 64);
+						std::memcpy(&out[(i - 1) * 32], V, 32);
+						SecureWipeMemory(prev, sizeof(prev));
+					}
+
+					// Final block: variable length
+					const uint32_t lastLen = outLen - 32 * r;
+					{
+						uint8_t prev[64];
+						std::memcpy(prev, V, 64);
+						Blake2bState S;
+						B2bInit(S, lastLen);
+						B2bUpdate(S, prev, 64);
+						B2bFinal(S, &out[r * 32]);
+						SecureWipeMemory(prev, sizeof(prev));
+					}
+
+					SecureWipeMemory(V, sizeof(V));
+					return true;
+				}
+
+			} // anonymous namespace (Blake2b)
+
+			// =============================================================================
+			// RFC 9106 — Argon2id Key Derivation
+			// =============================================================================
+			namespace {
+
+				struct Argon2Block { uint64_t v[128]; }; // 1024 bytes
+				static constexpr size_t ARGON2_QWORDS_IN_BLOCK = 128;
+
+				// Argon2 GB mixing (fBlaMka): uses multiplication for extra diffusion
+				inline void A2GB(uint64_t& a, uint64_t& b, uint64_t& c, uint64_t& d) noexcept {
+					a += b + 2 * static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+						static_cast<uint64_t>(static_cast<uint32_t>(b));
+					d = B2bRotr64(d ^ a, 32);
+					c += d + 2 * static_cast<uint64_t>(static_cast<uint32_t>(c)) *
+						static_cast<uint64_t>(static_cast<uint32_t>(d));
+					b = B2bRotr64(b ^ c, 24);
+					a += b + 2 * static_cast<uint64_t>(static_cast<uint32_t>(a)) *
+						static_cast<uint64_t>(static_cast<uint32_t>(b));
+					d = B2bRotr64(d ^ a, 16);
+					c += d + 2 * static_cast<uint64_t>(static_cast<uint32_t>(c)) *
+						static_cast<uint64_t>(static_cast<uint32_t>(d));
+					b = B2bRotr64(b ^ c, 63);
+				}
+
+				// P permutation on 16 uint64_t (128 bytes) — Blake2b-based round
+				void A2Permute(uint64_t v[16]) noexcept {
+					A2GB(v[0],v[4], v[8],v[12]); A2GB(v[1],v[5], v[9],v[13]);
+					A2GB(v[2],v[6],v[10],v[14]); A2GB(v[3],v[7],v[11],v[15]);
+					A2GB(v[0],v[5],v[10],v[15]); A2GB(v[1],v[6],v[11],v[12]);
+					A2GB(v[2],v[7], v[8],v[13]); A2GB(v[3],v[4], v[9],v[14]);
+				}
+
+				// G compression: result = (X ⊕ Y) ⊕ P_col(P_row(X ⊕ Y))
+				void A2Compress(Argon2Block& result, const Argon2Block& X, const Argon2Block& Y) noexcept {
+					Argon2Block R;
+					for (int i = 0; i < 128; ++i) R.v[i] = X.v[i] ^ Y.v[i];
+					Argon2Block Z;
+					std::memcpy(&Z, &R, sizeof(Argon2Block));
+
+					// Row-wise: 8 rows of 16 uint64_t
+					for (int i = 0; i < 8; ++i)
+						A2Permute(&Z.v[i * 16]);
+
+					// Column-wise: 8 columns, each spanning 8 rows (2 consecutive per row)
+					for (int j = 0; j < 8; ++j) {
+						uint64_t col[16];
+						for (int i = 0; i < 8; ++i) {
+							col[i * 2]     = Z.v[i * 16 + j * 2];
+							col[i * 2 + 1] = Z.v[i * 16 + j * 2 + 1];
+						}
+						A2Permute(col);
+						for (int i = 0; i < 8; ++i) {
+							Z.v[i * 16 + j * 2]     = col[i * 2];
+							Z.v[i * 16 + j * 2 + 1] = col[i * 2 + 1];
+						}
+					}
+
+					for (int i = 0; i < 128; ++i) result.v[i] = R.v[i] ^ Z.v[i];
+				}
+
+				// Compute reference block index for Argon2id segment filling
+				void A2ComputeRef(uint64_t pseudoRand, uint32_t pass, uint32_t slice,
+					uint32_t lane, uint32_t idx, uint32_t lanes,
+					uint32_t segLen, uint32_t laneLen,
+					uint32_t& refLane, uint32_t& refIdx) noexcept
+				{
+					uint32_t J1 = static_cast<uint32_t>(pseudoRand);
+					uint32_t J2 = static_cast<uint32_t>(pseudoRand >> 32);
+
+					// Reference lane
+					refLane = (pass == 0 && slice == 0) ? lane : (J2 % lanes);
+
+					// Reference area size
+					uint32_t refArea;
+					bool sameLane = (refLane == lane);
+					if (pass == 0) {
+						if (slice == 0) {
+							refArea = idx - 1;
+						}
+						else if (sameLane) {
+							refArea = slice * segLen + idx - 1;
+						}
+						else {
+							refArea = slice * segLen - ((idx == 0) ? 1 : 0);
+						}
+					}
+					else {
+						if (sameLane) {
+							refArea = laneLen - segLen + idx - 1;
+						}
+						else {
+							refArea = laneLen - segLen - ((idx == 0) ? 1 : 0);
+						}
+					}
+
+					// Map J1 → position within reference area
+					uint64_t x = (static_cast<uint64_t>(J1) * static_cast<uint64_t>(J1)) >> 32;
+					uint64_t y = (static_cast<uint64_t>(refArea) * x) >> 32;
+					uint32_t z = refArea - 1 - static_cast<uint32_t>(y);
+
+					// Starting position for the reference window
+					uint32_t startPos = (pass == 0) ? 0 : (((slice + 1) % 4) * segLen);
+					refIdx = (startPos + z) % laneLen;
+				}
+
+			} // anonymous namespace (Argon2id helpers)
+
+			static bool Argon2idDeriveKey(const uint8_t* password, size_t passwordLen,
+				const uint8_t* salt, size_t saltLen,
+				const KDFParams& params,
+				uint8_t* outKey, size_t keyLen,
+				Error* err) noexcept
+			{
+				const uint32_t lanes = params.parallelism;
+				const uint32_t hashLen = static_cast<uint32_t>(keyLen);
+				const uint32_t memKiB = params.memoryCostKB;
+
+				// Argon2 passes (t): clamp from PBKDF2 default to sensible Argon2 range
+				uint32_t passes = params.iterations;
+				if (passes > 1000) passes = 3;
+				if (passes < 1) passes = 1;
+
+				// Memory layout: at least 8*p blocks, segment = total/(4*p), rounded
+				uint32_t totalBlocks = memKiB;
+				if (totalBlocks < 8 * lanes) totalBlocks = 8 * lanes;
+				const uint32_t segLen = totalBlocks / (4 * lanes);
+				totalBlocks = segLen * 4 * lanes;
+				const uint32_t laneLen = segLen * 4;
+
+				// Cap: 2 GiB
+				if (static_cast<uint64_t>(totalBlocks) * 1024ULL > 2ULL * 1024 * 1024 * 1024) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Argon2id: memory cost exceeds 2 GiB limit"; }
+					return false;
+				}
+
+				std::unique_ptr<Argon2Block[]> mem;
+				try {
+					mem = std::make_unique<Argon2Block[]>(totalBlocks);
+				}
+				catch (...) {
+					if (err) { err->win32 = ERROR_NOT_ENOUGH_MEMORY; err->message = L"Argon2id: memory allocation failed"; }
+					return false;
+				}
+				std::memset(mem.get(), 0, static_cast<size_t>(totalBlocks) * sizeof(Argon2Block));
+
+				// Step 1: Compute H0 = Blake2b-512(p||τ||m||t||v||y||len(P)||P||len(S)||S||0||0)
+				uint8_t H0[64];
+				{
+					Blake2bState S;
+					B2bInit(S, 64);
+					auto le32 = [&S](uint32_t val) {
+						uint8_t b[4]; std::memcpy(b, &val, 4);
+						B2bUpdate(S, b, 4);
+					};
+					le32(lanes);
+					le32(hashLen);
+					le32(memKiB);
+					le32(passes);
+					le32(0x13);  // version 1.3
+					le32(2);     // Argon2id
+					le32(static_cast<uint32_t>(passwordLen));
+					B2bUpdate(S, password, passwordLen);
+					le32(static_cast<uint32_t>(saltLen));
+					B2bUpdate(S, salt, saltLen);
+					le32(0);     // |K| = 0
+					le32(0);     // |X| = 0
+					B2bFinal(S, H0);
+				}
+
+				// Step 2: Initialize first two blocks of each lane via H'
+				for (uint32_t l = 0; l < lanes; ++l) {
+					uint8_t inp[72];
+					std::memcpy(inp, H0, 64);
+					uint32_t idx0 = 0, idx1 = 1, lv = l;
+
+					std::memcpy(&inp[64], &idx0, 4); std::memcpy(&inp[68], &lv, 4);
+					B2bLongHash(inp, 72, reinterpret_cast<uint8_t*>(mem[l * laneLen].v), 1024);
+
+					std::memcpy(&inp[64], &idx1, 4);
+					B2bLongHash(inp, 72, reinterpret_cast<uint8_t*>(mem[l * laneLen + 1].v), 1024);
+
+					SecureWipeMemory(inp, sizeof(inp));
+				}
+				SecureWipeMemory(H0, sizeof(H0));
+
+				// Step 3: Fill memory
+				Argon2Block zeroBlock, inputBlock, addrBlock;
+				std::memset(&zeroBlock, 0, sizeof(Argon2Block));
+
+				for (uint32_t pass = 0; pass < passes; ++pass) {
+					for (uint32_t slice = 0; slice < 4; ++slice) {
+						for (uint32_t lane = 0; lane < lanes; ++lane) {
+							const uint32_t startIdx = (pass == 0 && slice == 0) ? 2 : 0;
+							const bool dataIndep = (pass == 0) && (slice < 2);
+
+							// Pre-generate addresses for data-independent mode
+							std::memset(&inputBlock, 0, sizeof(Argon2Block));
+							if (dataIndep) {
+								inputBlock.v[0] = pass;
+								inputBlock.v[1] = lane;
+								inputBlock.v[2] = slice;
+								inputBlock.v[3] = totalBlocks;
+								inputBlock.v[4] = passes;
+								inputBlock.v[5] = 2; // Argon2id
+							}
+							uint32_t addrCounter = 0;
+
+							for (uint32_t idx = startIdx; idx < segLen; ++idx) {
+								const uint32_t curPos = slice * segLen + idx;
+								const uint32_t prevPos = (curPos == 0) ? (laneLen - 1) : (curPos - 1);
+
+								uint64_t pseudoRand;
+								if (dataIndep) {
+									if (idx % 128 == 0) {
+										inputBlock.v[6] = ++addrCounter;
+										Argon2Block tmp;
+										A2Compress(tmp, zeroBlock, inputBlock);
+										A2Compress(addrBlock, zeroBlock, tmp);
+									}
+									pseudoRand = addrBlock.v[idx % 128];
+								}
+								else {
+									pseudoRand = mem[lane * laneLen + prevPos].v[0];
+								}
+
+								uint32_t refLane, refIdx;
+								A2ComputeRef(pseudoRand, pass, slice, lane, idx,
+									lanes, segLen, laneLen, refLane, refIdx);
+
+								Argon2Block compressed;
+								A2Compress(compressed,
+									mem[refLane * laneLen + refIdx],
+									mem[lane * laneLen + prevPos]);
+
+								if (pass == 0) {
+									mem[lane * laneLen + curPos] = compressed;
+								}
+								else {
+									for (int q = 0; q < 128; ++q)
+										mem[lane * laneLen + curPos].v[q] ^= compressed.v[q];
+								}
+							}
+						}
+					}
+				}
+
+				// Step 4: Finalize — XOR last block of each lane
+				Argon2Block finalBlock = mem[laneLen - 1];
+				for (uint32_t l = 1; l < lanes; ++l) {
+					for (int q = 0; q < 128; ++q)
+						finalBlock.v[q] ^= mem[l * laneLen + laneLen - 1].v[q];
+				}
+
+				SecureWipeMemory(mem.get(), static_cast<size_t>(totalBlocks) * sizeof(Argon2Block));
+
+				// Output = H'(finalBlock, hashLen)
+				bool ok = B2bLongHash(finalBlock.v, 1024, outKey, hashLen);
+				SecureWipeMemory(&finalBlock, sizeof(finalBlock));
+
+				if (!ok && err) {
+					err->win32 = ERROR_INVALID_DATA;
+					err->message = L"Argon2id: final hash derivation failed";
+				}
+				return ok;
+			}
+
+			// =============================================================================
+			// Key Derivation — DeriveKey dispatcher
+			// =============================================================================
+
 			bool KeyDerivation::DeriveKey(const uint8_t* password, size_t passwordLen,
 				const KDFParams& params,
 				std::vector<uint8_t>& outKey,
@@ -1380,9 +1967,12 @@ namespace ShadowStrike {
 						outKey.data(), outKey.size(), err);
 
 				case KDFAlgorithm::Scrypt:
+					return ScryptDeriveKey(password, passwordLen, salt.data(), salt.size(),
+						params, outKey.data(), outKey.size(), err);
+
 				case KDFAlgorithm::Argon2id:
-					if (err) { err->win32 = ERROR_NOT_SUPPORTED; err->message = L"Scrypt/Argon2 not implemented yet"; }
-					return false;
+					return Argon2idDeriveKey(password, passwordLen, salt.data(), salt.size(),
+						params, outKey.data(), outKey.size(), err);
 
 				default:
 					if (err) { err->win32 = ERROR_INVALID_PARAMETER; err->message = L"Unknown KDF algorithm"; }
