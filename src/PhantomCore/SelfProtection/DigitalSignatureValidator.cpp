@@ -1234,12 +1234,23 @@ public:
                 info.trustLevel = SignerTrustLevel::HighlyTrusted;
             }
 
-            // Check if EV certificate (look for policy OID)
-            // EV Code Signing OIDs
-            static const char* evOids[] = {
-                "2.23.140.1.3",      // EV Code Signing
-                "2.16.840.1.114028.10.1.2", // Entrust EV
-                "2.16.840.1.114412.2.1",    // DigiCert EV
+            // EV Code Signing OIDs (CA/Browser Forum + major CAs)
+            static constexpr const char* evOids[] = {
+                "2.23.140.1.3",                 // CA/BF EV Code Signing
+                "2.23.140.1.1",                 // CA/BF EV SSL (chain indicator)
+                "2.16.840.1.114028.10.1.2",     // Entrust EV
+                "2.16.840.1.114412.2.1",        // DigiCert EV
+                "2.16.840.1.114413.1.7.23.3",   // GoDaddy EV
+                "1.3.6.1.4.1.14370.1.6",        // GeoTrust EV
+                "1.3.6.1.4.1.6449.1.2.1.5.1",   // Comodo/Sectigo EV
+                "2.16.840.1.113733.1.7.23.6",   // Symantec/VeriSign EV
+                "2.16.840.1.113733.1.7.48.1",   // Thawte EV
+                "2.16.756.1.89.1.2.1.1",        // SwissSign EV
+                "1.3.6.1.4.1.34697.2.1",        // AffirmTrust EV
+                "1.3.6.1.4.1.8024.0.2.100.1.2", // QuoVadis EV
+                "2.16.840.1.114414.1.7.23.3",   // Starfield EV
+                "1.2.616.1.113527.2.5.1.1",     // Certum EV
+                "2.16.528.1.1003.1.2.7",        // KPN EV
             };
 
             if (certContext->pCertInfo->cExtension > 0) {
@@ -2048,16 +2059,86 @@ public:
         }
 
         // === Check 6: Test signature in production ===
-        if (sigInfo.result == SignatureValidationResult::UntrustedRoot && sigInfo.isValid) {
-            SignatureAnomaly anomaly;
-            anomaly.type = AnomalyType::TestSignatureInProd;
-            anomaly.severity = AnomalySeverity::High;
-            anomaly.filePath = std::wstring(filePath);
-            anomaly.signerName = signer.signerName;
-            anomaly.description = "Test-signed binary in production environment";
-            anomaly.mitreAttackId = "T1553.006";
-            analysis.anomalies.push_back(std::move(anomaly));
-            analysis.riskScore = std::max(analysis.riskScore, 75u);
+        // Detect test-signed binaries via multiple heuristics:
+        // (a) Untrusted root with valid signature structure
+        // (b) Known test-signing certificate CN patterns
+        // (c) Microsoft-specific test cert thumbprints
+        {
+            bool isTestSigned = false;
+            std::string testReason;
+
+            // (a) Untrusted root with structurally valid signature
+            if (sigInfo.result == SignatureValidationResult::UntrustedRoot && sigInfo.isValid) {
+                isTestSigned = true;
+                testReason = "Untrusted root certificate";
+            }
+
+            // (b) Signer CN contains test-signing indicators
+            if (!isTestSigned) {
+                std::string lowerCN;
+                lowerCN.reserve(signer.signerName.size());
+                for (char c : signer.signerName) {
+                    lowerCN += static_cast<char>(
+                        std::tolower(static_cast<unsigned char>(c)));
+                }
+                static constexpr std::array testPatterns = {
+                    "test sign", "testsign", "test cert", "testcert",
+                    "test root", "testroot", "development sign", "devsign",
+                    "do not ship", "do not trust", "internal test",
+                    "self-test", "selftest"
+                };
+                for (const char* pat : testPatterns) {
+                    if (lowerCN.find(pat) != std::string::npos) {
+                        isTestSigned = true;
+                        testReason = "Signer CN contains test indicator: '";
+                        testReason += pat;
+                        testReason += "'";
+                        break;
+                    }
+                }
+            }
+
+            // (c) Known Microsoft test cert thumbprints (SHA-1)
+            if (!isTestSigned) {
+                // Microsoft Test Root Authority (used by TESTSIGNING BCD mode)
+                static const std::array<std::array<uint8_t, 20>, 3> knownTestThumbprints = {{
+                    // Microsoft Testing Root Certificate Authority 2010
+                    {0x2B, 0xD6, 0x3D, 0x28, 0xD7, 0xBC, 0xD0, 0xE2,
+                     0x51, 0x19, 0x5A, 0xEB, 0x51, 0x9C, 0x2A, 0xE9,
+                     0x56, 0x37, 0x55, 0xC4},
+                    // Microsoft Code Verification Root (test)
+                    {0xF5, 0x3F, 0x74, 0xE1, 0xAF, 0xEC, 0xDA, 0x30,
+                     0x2E, 0x6F, 0x11, 0x7E, 0xFB, 0x0E, 0x8C, 0x56,
+                     0x2D, 0xA7, 0x49, 0x75},
+                    // WDK test-signing cert
+                    {0xD4, 0x11, 0xA8, 0x0D, 0x2E, 0x06, 0x9D, 0xB7,
+                     0x4F, 0x3F, 0x32, 0x1F, 0xF9, 0x5E, 0x53, 0xF4,
+                     0x52, 0x3B, 0x88, 0x23}
+                }};
+
+                for (const auto& cert : sigInfo.chain) {
+                    for (const auto& testThumb : knownTestThumbprints) {
+                        if (cert.thumbprint == testThumb) {
+                            isTestSigned = true;
+                            testReason = "Known Microsoft test certificate in chain";
+                            break;
+                        }
+                    }
+                    if (isTestSigned) break;
+                }
+            }
+
+            if (isTestSigned) {
+                SignatureAnomaly anomaly;
+                anomaly.type = AnomalyType::TestSignatureInProd;
+                anomaly.severity = AnomalySeverity::High;
+                anomaly.filePath = std::wstring(filePath);
+                anomaly.signerName = signer.signerName;
+                anomaly.description = "Test-signed binary in production environment: " + testReason;
+                anomaly.mitreAttackId = "T1553.006";
+                analysis.anomalies.push_back(std::move(anomaly));
+                analysis.riskScore = std::max(analysis.riskScore, 75u);
+            }
         }
 
         // === Check 7: Catalog-only signature (no embedded — evasion technique) ===
