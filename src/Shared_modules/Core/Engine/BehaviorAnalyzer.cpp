@@ -38,6 +38,11 @@
 #include "../../Utils/ThreadPool.hpp"
 #include "../../ThreatIntel/ThreatIntelIndex.hpp"
 
+// Specialized detectors for enrichment-based delegation
+#include "../../RansomwareProtection/RansomwareDetector.hpp"
+#include "../Process/ProcessInjectionDetector.hpp"
+#include "../Registry/PersistenceDetector.hpp"
+
 #include <algorithm>
 #include <numeric>
 #include <cmath>
@@ -81,6 +86,13 @@ struct BehaviorAnalyzer::Impl {
     ThreatIntel::ThreatIntelIndex* m_threatIntel{nullptr};
     Whitelist::WhitelistStore* m_whitelist{nullptr};
     SignatureStore::SignatureStore* m_signatureStore{nullptr};
+
+    // Specialized detector dependencies (non-owning, enrichment delegation)
+    // When connected, UpdateXScore methods query these for richer classification.
+    // When nullptr, existing inline detection logic is the sole authority.
+    Ransomware::RansomwareDetector* m_ransomwareDetector{nullptr};
+    Core::Process::ProcessInjectionDetector* m_injectionDetector{nullptr};
+    Core::Registry::PersistenceDetector* m_persistenceDetector{nullptr};
 
     // Process states
     mutable std::shared_mutex m_statesMutex;
@@ -767,6 +779,26 @@ void BehaviorAnalyzer::UpdateRansomwareScore(
                 }
             }
             state.lastFileModTime = now;
+
+            // ---- Enrichment: RansomwareDetector delegation ----
+            // BehaviorEvent doesn't carry the raw file buffer (it's an abstracted
+            // event), so we can't call AnalyzeWriteEx directly. Instead, if
+            // canary files are touched, we notify the detector for its own
+            // honeypot-based behavioral correlation.
+            if (m_impl->m_ransomwareDetector && !event.targetPath.empty()) {
+                try {
+                    auto lTarget = ToLowerCase(event.targetPath);
+                    std::shared_lock canaryLk(m_impl->m_canaryMutex);
+                    bool isCanary = m_impl->m_canaryFiles.count(lTarget) > 0;
+                    canaryLk.unlock();
+                    if (isCanary) {
+                        m_impl->m_ransomwareDetector->OnHoneypotTouched(
+                            event.processId, event.targetPath);
+                    }
+                } catch (...) {
+                    // Detector failure must not degrade inline detection
+                }
+            }
             break;
         }
 
@@ -778,6 +810,17 @@ void BehaviorAnalyzer::UpdateRansomwareScore(
                 scoreAdd += 8.0;
                 AddMitreMapping(state, BehaviorPatternType::RansomwareExtensionChange);
             }
+
+            // ---- Enrichment: RansomwareDetector rename analysis ----
+            if (m_impl->m_ransomwareDetector && !event.targetPath.empty()) {
+                try {
+                    auto detection = m_impl->m_ransomwareDetector->AnalyzeRenameEx(
+                        event.processId, event.previousPath, event.targetPath);
+                    if (detection.eventId != 0) {
+                        scoreAdd += 8.0;
+                    }
+                } catch (...) {}
+            }
             break;
         }
 
@@ -786,6 +829,17 @@ void BehaviorAnalyzer::UpdateRansomwareScore(
             if (state.filesDeleted > BehaviorConstants::RANSOMWARE_FILE_THRESHOLD) {
                 scoreAdd += 5.0;
                 AddMitreMapping(state, BehaviorPatternType::RansomwareMassDelete);
+            }
+
+            // ---- Enrichment: RansomwareDetector delete analysis ----
+            if (m_impl->m_ransomwareDetector && !event.targetPath.empty()) {
+                try {
+                    auto detection = m_impl->m_ransomwareDetector->AnalyzeDeleteEx(
+                        event.processId, event.targetPath);
+                    if (detection.eventId != 0) {
+                        scoreAdd += 5.0;
+                    }
+                } catch (...) {}
             }
             break;
         }
@@ -878,6 +932,30 @@ void BehaviorAnalyzer::UpdateInjectionScore(
             break;
     }
 
+    // ---- Enrichment: ProcessInjectionDetector delegation ----
+    // Cross-reference with the specialized injection detector for the TARGET
+    // process. This catches injection patterns our event-by-event scoring misses
+    // (e.g., compound patterns where alloc+write+execute span many events).
+    if (m_impl->m_injectionDetector && event.targetProcessId != 0) {
+        try {
+            auto targetState = m_impl->m_injectionDetector->GetProcessState(
+                event.targetProcessId);
+            if (targetState.has_value() && targetState->hasBeenInjected) {
+                // Detector has confirmed injection from its own analysis —
+                // boost if we haven't already scored this high
+                if (scoreAdd < 15.0) {
+                    scoreAdd += 10.0;
+                }
+                // Enrich with injection count for attack chain correlation
+                if (targetState->totalInjectionsAsTarget > 1) {
+                    AddMitreMapping(state, BehaviorPatternType::InjectionReflective);
+                }
+            }
+        } catch (...) {
+            // Detector failure must not degrade inline detection
+        }
+    }
+
     state.maliceScore += scoreAdd;  // outer clamp to MAX_MALICE_SCORE prevents overflow
 }
 
@@ -910,6 +988,47 @@ void BehaviorAnalyzer::UpdatePersistenceScore(
                 if (ContainsCaseInsensitive(event.targetPath, L"AppInit_DLLs")) {
                     scoreAdd += 10.0;
                     AddMitreMapping(state, BehaviorPatternType::PersistenceAppInit);
+                }
+            }
+
+            // ---- Enrichment: PersistenceDetector delegation ----
+            // The specialized PersistenceDetector classifies persistence type
+            // and computes a risk score considering value data, resolved targets,
+            // known-bad patterns etc. — much richer than our path-match alone.
+            if (m_impl->m_persistenceDetector && !event.targetPath.empty()) {
+                try {
+                    auto persistType = m_impl->m_persistenceDetector->IsPersistenceLocation(
+                        event.targetPath);
+                    if (static_cast<uint16_t>(persistType) != 0) {
+                        // Detector recognized this as a persistence location — get full analysis.
+                        // Convert valueData to wstring for string-typed registry values.
+                        std::wstring dataStr;
+                        if ((event.valueType == REG_SZ || event.valueType == REG_EXPAND_SZ)
+                            && event.valueData.size() >= sizeof(wchar_t)) {
+                            dataStr.assign(
+                                reinterpret_cast<const wchar_t*>(event.valueData.data()),
+                                event.valueData.size() / sizeof(wchar_t));
+                            // Strip trailing null
+                            while (!dataStr.empty() && dataStr.back() == L'\0')
+                                dataStr.pop_back();
+                        }
+                        auto analysis = m_impl->m_persistenceDetector->AnalyzeRealTimeFull(
+                            event.targetPath, event.valueName, dataStr);
+                        if (analysis.isPersistenceAttempt) {
+                            // Scale enrichment boost by detector's risk score (0-255)
+                            double enrichBoost = static_cast<double>(analysis.riskScore) / 25.5;
+                            scoreAdd += enrichBoost;
+
+                            if (analysis.isKnownBad) {
+                                scoreAdd += 15.0;
+                                SS_LOG_WARN(L"BehaviorAnalyzer",
+                                            L"PersistenceDetector: known-bad pattern at %s by PID %u",
+                                            event.targetPath.c_str(), event.processId);
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // Detector failure must not degrade inline detection
                 }
             }
             break;
@@ -2061,6 +2180,27 @@ void BehaviorAnalyzer::SetSignatureStore(SignatureStore::SignatureStore* store) 
     m_impl->m_signatureStore = store;
     SS_LOG_INFO(L"BehaviorAnalyzer", L"SignatureStore %s",
                 store ? L"connected" : L"disconnected");
+}
+
+void BehaviorAnalyzer::SetRansomwareDetector(Ransomware::RansomwareDetector* detector) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_ransomwareDetector = detector;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"RansomwareDetector %s",
+                detector ? L"connected" : L"disconnected");
+}
+
+void BehaviorAnalyzer::SetInjectionDetector(Core::Process::ProcessInjectionDetector* detector) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_injectionDetector = detector;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"ProcessInjectionDetector %s",
+                detector ? L"connected" : L"disconnected");
+}
+
+void BehaviorAnalyzer::SetPersistenceDetector(Core::Registry::PersistenceDetector* detector) {
+    std::unique_lock lock(m_impl->m_configMutex);
+    m_impl->m_persistenceDetector = detector;
+    SS_LOG_INFO(L"BehaviorAnalyzer", L"PersistenceDetector %s",
+                detector ? L"connected" : L"disconnected");
 }
 
 // ============================================================================
