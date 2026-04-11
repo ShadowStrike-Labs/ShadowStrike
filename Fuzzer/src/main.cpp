@@ -1,17 +1,22 @@
 #include "ShadowStrike/Fuzzer/Core/AttackSurface.hpp"
+#include "ShadowStrike/Fuzzer/Core/CampaignPlanner.hpp"
+#include "ShadowStrike/Fuzzer/Core/DispatchRuntime.hpp"
 #include "ShadowStrike/Fuzzer/Core/EngineArchitecture.hpp"
+#include "ShadowStrike/Fuzzer/Core/HarnessAdapterCatalog.hpp"
 #include "ShadowStrike/Fuzzer/Core/OperationsPipeline.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageSchema.hpp"
 #include "ShadowStrike/Fuzzer/Targets/KernelTargetCatalog.hpp"
 #include "ShadowStrike/Fuzzer/Targets/UserModeTargetCatalog.hpp"
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <sstream>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace SSF = ShadowStrike::Fuzzer;
 
@@ -45,11 +50,18 @@ void PrintUsage() {
         << "Usage:\n"
         << "  ShadowStrikeFuzzer --list-targets\n"
         << "  ShadowStrikeFuzzer --describe-target <id>\n"
+        << "  ShadowStrikeFuzzer --describe-campaign-plan <id>\n"
+        << "  ShadowStrikeFuzzer --describe-dispatch-runtime <workspace>\n"
         << "  ShadowStrikeFuzzer --describe-engine-architecture\n"
+        << "  ShadowStrikeFuzzer --describe-harness-adapter <id>\n"
         << "  ShadowStrikeFuzzer --describe-ops-pipeline\n"
+        << "  ShadowStrikeFuzzer --export-dispatch-runtime <workspace> <json-path>\n"
+        << "  ShadowStrikeFuzzer --export-campaign-plans <json-path>\n"
         << "  ShadowStrikeFuzzer --export-engine-architecture <json-path>\n"
+        << "  ShadowStrikeFuzzer --export-harness-adapters <json-path>\n"
         << "  ShadowStrikeFuzzer --export-ops-pipeline <json-path>\n"
         << "  ShadowStrikeFuzzer --initialize-workspace <directory>\n"
+        << "  ShadowStrikeFuzzer --list-harness-adapters\n"
         << "  ShadowStrikeFuzzer --list-kernel-targets\n"
         << "  ShadowStrikeFuzzer --describe-kernel-target <id>\n"
         << "  ShadowStrikeFuzzer --list-usermode-targets\n"
@@ -294,6 +306,189 @@ void PrintUsage() {
     return 0;
 }
 
+[[nodiscard]] int ExportCampaignPlans(const std::filesystem::path& outputPath) {
+    std::error_code ec;
+    if (outputPath.has_parent_path()) {
+        std::filesystem::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Failed to create campaign-plan directory: " << outputPath.parent_path() << '\n';
+            return 1;
+        }
+    }
+
+    const auto json = SSF::CampaignPlanner::RenderJson(SSF::CampaignPlanner::GetDefaultPlans());
+    if (!WriteTextFile(outputPath, json)) {
+        std::cerr << "Failed to write campaign plans: " << outputPath << '\n';
+        return 1;
+    }
+
+    std::cout << "Exported campaign plans to " << outputPath.string() << '\n';
+    return 0;
+}
+
+[[nodiscard]] int ExportDispatchRuntime(
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& outputPath)
+{
+    std::error_code ec;
+    if (outputPath.has_parent_path()) {
+        std::filesystem::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Failed to create dispatch-runtime directory: " << outputPath.parent_path() << '\n';
+            return 1;
+        }
+    }
+
+    const auto manifest = SSF::DispatchRuntime::BuildWorkspaceManifest(workspaceRoot);
+    if (!WriteTextFile(outputPath, SSF::DispatchRuntime::RenderJson(manifest))) {
+        std::cerr << "Failed to write dispatch runtime manifest: " << outputPath << '\n';
+        return 1;
+    }
+
+    std::cout << "Exported dispatch runtime manifest to " << outputPath.string() << '\n';
+    return 0;
+}
+
+[[nodiscard]] int ExportHarnessAdapters(const std::filesystem::path& outputPath) {
+    std::error_code ec;
+    if (outputPath.has_parent_path()) {
+        std::filesystem::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Failed to create harness-adapter directory: " << outputPath.parent_path() << '\n';
+            return 1;
+        }
+    }
+
+    const auto json = SSF::HarnessAdapterCatalog::RenderJson(SSF::HarnessAdapterCatalog::GetDefaultAdapters());
+    if (!WriteTextFile(outputPath, json)) {
+        std::cerr << "Failed to write harness adapters: " << outputPath << '\n';
+        return 1;
+    }
+
+    std::cout << "Exported harness adapters to " << outputPath.string() << '\n';
+    return 0;
+}
+
+struct LogicalCorpusManifestEntry {
+    std::string sourceKey;
+    std::string sourceId;
+    std::string description;
+    std::vector<std::string> consumerPlanIds;
+};
+
+[[nodiscard]] std::string BuildLogicalCorpusManifestJson(
+    const std::vector<SSF::CampaignExecutionPlan>& plans,
+    const std::string_view manifestRelativePath)
+{
+    std::vector<LogicalCorpusManifestEntry> entries;
+
+    for (const auto& plan : plans) {
+        for (const auto& input : plan.seedSources) {
+            if (input.kind != SSF::PlannedInputKind::LogicalCorpusManifest ||
+                input.relativePath != manifestRelativePath) {
+                continue;
+            }
+
+            auto match = std::find_if(entries.begin(), entries.end(),
+                [&](const LogicalCorpusManifestEntry& entry) { return entry.sourceKey == input.sourceKey; });
+
+            if (match == entries.end()) {
+                entries.push_back(LogicalCorpusManifestEntry{
+                    input.sourceKey,
+                    input.sourceId,
+                    input.description,
+                    { plan.id }
+                });
+                continue;
+            }
+
+            if (std::find(match->consumerPlanIds.begin(), match->consumerPlanIds.end(), plan.id) ==
+                match->consumerPlanIds.end()) {
+                match->consumerPlanIds.push_back(plan.id);
+            }
+        }
+    }
+
+    std::ostringstream stream;
+    stream << "{\n  \"logicalCorpora\": [\n";
+
+    for (std::size_t index = 0; index < entries.size(); ++index) {
+        const auto& entry = entries[index];
+        stream << "    {\n"
+               << "      \"sourceKey\": \"" << EscapeJson(entry.sourceKey) << "\",\n"
+               << "      \"sourceId\": \"" << EscapeJson(entry.sourceId) << "\",\n"
+               << "      \"description\": \"" << EscapeJson(entry.description) << "\",\n"
+               << "      \"consumerPlanIds\": [";
+
+        if (!entry.consumerPlanIds.empty()) {
+            stream << '\n';
+            for (std::size_t consumerIndex = 0; consumerIndex < entry.consumerPlanIds.size(); ++consumerIndex) {
+                stream << "        \"" << EscapeJson(entry.consumerPlanIds[consumerIndex]) << '"';
+                if (consumerIndex + 1 != entry.consumerPlanIds.size()) {
+                    stream << ',';
+                }
+                stream << '\n';
+            }
+            stream << "      ";
+        }
+
+        stream << "]\n"
+               << "    }";
+
+        if (index + 1 != entries.size()) {
+            stream << ',';
+        }
+        stream << '\n';
+    }
+
+    stream << "  ]\n}\n";
+    return stream.str();
+}
+
+[[nodiscard]] int WriteCampaignQueue(const std::filesystem::path& rootDirectory) {
+    const auto& plans = SSF::CampaignPlanner::GetDefaultPlans();
+    const auto queueDirectory = rootDirectory / "pipeline\\queue";
+
+    std::ostringstream manifest;
+    manifest << "{\n  \"plans\": [\n";
+
+    for (std::size_t index = 0; index < plans.size(); ++index) {
+        const auto& plan = plans[index];
+        const auto fileName = plan.id + ".json";
+        if (!WriteTextFile(queueDirectory / fileName, SSF::CampaignPlanner::RenderJson(plan))) {
+            std::cerr << "Failed to write queued campaign plan: " << (queueDirectory / fileName) << '\n';
+            return 1;
+        }
+
+        manifest << "    {\n"
+                 << "      \"id\": \"" << EscapeJson(plan.id) << "\",\n"
+                 << "      \"fileName\": \"" << EscapeJson(fileName) << "\",\n"
+                 << "      \"scope\": \"" << SSF::ToString(plan.scope) << "\",\n"
+                 << "      \"targetId\": \"" << EscapeJson(plan.targetId) << "\",\n"
+                 << "      \"executionLane\": \"" << EscapeJson(plan.executionLane) << "\"\n"
+                 << "    }";
+
+        if (index + 1 != plans.size()) {
+            manifest << ',';
+        }
+        manifest << '\n';
+    }
+
+    manifest << "  ]\n}\n";
+
+    if (!WriteTextFile(queueDirectory / "manifest.json", manifest.str())) {
+        std::cerr << "Failed to write queue manifest\n";
+        return 1;
+    }
+
+    if (!WriteTextFile(rootDirectory / "state\\campaign-index.json", SSF::CampaignPlanner::RenderJson(plans))) {
+        std::cerr << "Failed to write campaign index\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 [[nodiscard]] int InitializeWorkspace(const std::filesystem::path& rootDirectory) {
     std::error_code ec;
     std::filesystem::create_directories(rootDirectory, ec);
@@ -313,6 +508,45 @@ void PrintUsage() {
 
     if (!WriteTextFile(rootDirectory / "layout.json", SSF::OperationsPipelineCatalog::RenderJson(pipeline))) {
         std::cerr << "Failed to write workspace layout manifest\n";
+        return 1;
+    }
+
+    if (const int baselineStatus = ExportBinaryArtifacts(
+            rootDirectory / "corpora\\kernel\\baseline",
+            SSF::KernelMessageFactory::BuildBaselineSeedSet(),
+            "workspace kernel baseline corpus");
+        baselineStatus != 0) {
+        return baselineStatus;
+    }
+
+    if (const int variantStatus = ExportBinaryArtifacts(
+            rootDirectory / "corpora\\kernel\\variants",
+            SSF::KernelMessageFactory::BuildStructuredVariantSeedSet(),
+            "workspace kernel variant corpus");
+        variantStatus != 0) {
+        return variantStatus;
+    }
+
+    const auto& plans = SSF::CampaignPlanner::GetDefaultPlans();
+    if (!WriteTextFile(rootDirectory / "corpora\\usermode\\broker\\manifest.json",
+            BuildLogicalCorpusManifestJson(plans, "corpora\\usermode\\broker\\manifest.json"))) {
+        std::cerr << "Failed to write user-mode broker corpus manifest\n";
+        return 1;
+    }
+
+    if (!WriteTextFile(rootDirectory / "corpora\\usermode\\parser\\manifest.json",
+            BuildLogicalCorpusManifestJson(plans, "corpora\\usermode\\parser\\manifest.json"))) {
+        std::cerr << "Failed to write user-mode parser corpus manifest\n";
+        return 1;
+    }
+
+    if (const int queueStatus = WriteCampaignQueue(rootDirectory); queueStatus != 0) {
+        return queueStatus;
+    }
+
+    std::string dispatchError;
+    if (!SSF::DispatchRuntime::MaterializeWorkspaceState(rootDirectory, dispatchError)) {
+        std::cerr << dispatchError << '\n';
         return 1;
     }
 
@@ -356,6 +590,16 @@ void PrintUsage() {
     if (const int opsStatus = ExportOpsPipeline(outputDirectory / "ops-pipeline.json");
         opsStatus != 0) {
         return opsStatus;
+    }
+
+    if (const int campaignStatus = ExportCampaignPlans(outputDirectory / "campaign-plans.json");
+        campaignStatus != 0) {
+        return campaignStatus;
+    }
+
+    if (const int harnessStatus = ExportHarnessAdapters(outputDirectory / "harness-adapters.json");
+        harnessStatus != 0) {
+        return harnessStatus;
     }
 
     if (const int seedStatus = ExportKernelSeeds(outputDirectory / "kernel-seeds");
@@ -406,8 +650,71 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
+    if (command == L"--describe-campaign-plan") {
+        if (argc < 3) {
+            std::cerr << "--describe-campaign-plan requires an id\n";
+            return 1;
+        }
+
+        const std::string id = NarrowAscii(argv[2]);
+        if (id.empty()) {
+            std::cerr << "Campaign plan ids must be ASCII\n";
+            return 1;
+        }
+
+        const auto* plan = SSF::CampaignPlanner::FindById(id);
+        if (plan == nullptr) {
+            std::cerr << "Unknown campaign plan id: " << id << '\n';
+            return 1;
+        }
+
+        std::cout << SSF::CampaignPlanner::RenderJson(*plan);
+        return 0;
+    }
+
+    if (command == L"--describe-dispatch-runtime") {
+        if (argc < 3) {
+            std::cerr << "--describe-dispatch-runtime requires a workspace path\n";
+            return 1;
+        }
+
+        const auto manifest = SSF::DispatchRuntime::BuildWorkspaceManifest(argv[2]);
+        std::cout << SSF::DispatchRuntime::DescribeText(manifest);
+        return 0;
+    }
+
     if (command == L"--describe-engine-architecture") {
         std::cout << SSF::EngineArchitectureCatalog::DescribeText(SSF::EngineArchitectureCatalog::GetDefaultArchitecture());
+        return 0;
+    }
+
+    if (command == L"--list-harness-adapters") {
+        for (const auto& adapter : SSF::HarnessAdapterCatalog::GetDefaultAdapters()) {
+            std::cout << adapter.id << " | " << adapter.laneId << " | "
+                      << SSF::ToString(adapter.kind) << '\n';
+        }
+        return 0;
+    }
+
+    if (command == L"--describe-harness-adapter") {
+        if (argc < 3) {
+            std::cerr << "--describe-harness-adapter requires an id\n";
+            return 1;
+        }
+
+        const std::string id = NarrowAscii(argv[2]);
+        if (id.empty()) {
+            std::cerr << "Harness adapter ids must be ASCII\n";
+            return 1;
+        }
+
+        const auto* adapter = SSF::HarnessAdapterCatalog::FindById(id);
+        if (adapter == nullptr) {
+            std::cerr << "Unknown harness adapter id: " << id << '\n';
+            return 1;
+        }
+
+        std::cout << SSF::HarnessAdapterCatalog::DescribeText(*adapter);
         return 0;
     }
 
@@ -510,6 +817,33 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         return ExportEngineArchitecture(argv[2]);
+    }
+
+    if (command == L"--export-harness-adapters") {
+        if (argc < 3) {
+            std::cerr << "--export-harness-adapters requires an output path\n";
+            return 1;
+        }
+
+        return ExportHarnessAdapters(argv[2]);
+    }
+
+    if (command == L"--export-campaign-plans") {
+        if (argc < 3) {
+            std::cerr << "--export-campaign-plans requires an output path\n";
+            return 1;
+        }
+
+        return ExportCampaignPlans(argv[2]);
+    }
+
+    if (command == L"--export-dispatch-runtime") {
+        if (argc < 4) {
+            std::cerr << "--export-dispatch-runtime requires a workspace path and output path\n";
+            return 1;
+        }
+
+        return ExportDispatchRuntime(argv[2], argv[3]);
     }
 
     if (command == L"--export-ops-pipeline") {
