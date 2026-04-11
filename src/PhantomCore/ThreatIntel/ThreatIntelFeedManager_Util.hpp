@@ -432,11 +432,11 @@ namespace ShadowStrike {
                 // RFC 1035: domain name max 253 characters
                 if (str.empty() || str.size() > 253) return false;
 
-                // Reject potential homograph attacks (punycode starting with xn--)
+                // Reject punycode/IDN domains — homograph attacks can disguise
+                // malicious feed domains as trusted providers (e.g., xn--v1rust0tal.com)
                 if (str.size() >= 4 && (str.substr(0, 4) == "xn--" ||
                     str.find(".xn--") != std::string_view::npos)) {
-                    // Allow punycode but flag it - in security context, may want to reject
-                    // For now, we allow it but this is a security consideration
+                    return false;
                 }
 
                 // Simple domain validation with label length checks
