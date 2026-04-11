@@ -148,6 +148,7 @@
 #include "../Utils/HashUtils.hpp"             // File hashing
 #include "../Utils/CacheManager.hpp"          // Verdict caching
 #include "../ThreatIntel/ThreatIntelLookup.hpp"  // Cloud lookups
+#include "../ThreatIntel/ThreatIntelStore.hpp"   // IOC/reputation store
 #include "../SignatureStore/SignatureStore.hpp" // Rapid signature updates
 #include "../Whitelist/WhiteListStore.hpp"    // Known-good files
 
@@ -1018,6 +1019,13 @@ public:
      * @note Must be called before AnalyzeFile() for cloud verdict lookups.
      */
     void SetThreatIntelLookup(ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
+    /**
+     * @brief Injects the ThreatIntelStore for IOC-based micro-signature updates.
+     * @param store Pointer to an initialized ThreatIntelStore. Lifetime must
+     *              exceed that of ZeroHourProtection.
+     */
+    void SetThreatIntelStore(ThreatIntel::ThreatIntelStore* store) noexcept;
 
     /**
      * @brief Injects the WhitelistStore for known-good file checks.

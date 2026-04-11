@@ -47,6 +47,8 @@
 #include "../FileSystem/ExecutableAnalyzer.hpp"
 #include "BehaviorAnalyzer.hpp"
 #include "MachineLearningDetector.hpp"
+#include "../../AI/PhantomCortex.hpp"
+#include "../../AI/CortexConfig.hpp"
 #include "PackerUnpacker.hpp"
 #include "PolymorphicDetector.hpp"
 #include "SandboxAnalyzer.hpp"
@@ -205,6 +207,7 @@ public:
         std::atomic<uint64_t> heuristicTimeUs{0};
         std::atomic<uint64_t> scriptAnalysisTimeUs{0};
         std::atomic<uint64_t> scriptHits{0};
+        std::atomic<uint64_t> cortexTimeUs{0};
 
         // Archive stats
         std::atomic<uint64_t> archivesScanned{0};
@@ -419,10 +422,30 @@ public:
                 // Lazy initialization
             }
 
-            // Initialize MachineLearning (optional)
+            // Initialize MachineLearning / PhantomCortex (optional, non-fatal)
             if (m_config.enableMachineLearning) {
-                SS_LOG_INFO(L"ScanEngine", L"MachineLearning will be initialized on demand");
-                // Lazy initialization
+                try {
+                    auto& cortex = ShadowStrike::AI::PhantomCortex::Instance();
+                    if (!cortex.IsOperational()) {
+                        auto& configMgr = ShadowStrike::AI::CortexConfigManager::Instance();
+                        auto cortexCfg = configMgr.GetConfig();
+                        if (cortex.Initialize(cortexCfg)) {
+                            SS_LOG_INFO(L"ScanEngine",
+                                L"PhantomCortex ML engine initialized (Stage 10 active)");
+                        } else {
+                            SS_LOG_WARN(L"ScanEngine",
+                                L"PhantomCortex initialization failed — "
+                                L"ML classification will be skipped");
+                        }
+                    } else {
+                        SS_LOG_INFO(L"ScanEngine",
+                            L"PhantomCortex already operational");
+                    }
+                } catch (const std::exception& ex) {
+                    SS_LOG_WARN(L"ScanEngine",
+                        L"PhantomCortex initialization exception: %hs — "
+                        L"ML classification disabled", ex.what());
+                }
             }
 
             // Initialize PackerUnpacker
@@ -518,6 +541,7 @@ public:
             m_stats.heuristicTimeUs.store(0, std::memory_order_relaxed);
             m_stats.scriptAnalysisTimeUs.store(0, std::memory_order_relaxed);
             m_stats.scriptHits.store(0, std::memory_order_relaxed);
+            m_stats.cortexTimeUs.store(0, std::memory_order_relaxed);
             m_stats.archivesScanned.store(0, std::memory_order_relaxed);
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
@@ -561,6 +585,19 @@ public:
         if (m_mlDetector) {
             m_mlDetector->Shutdown();
             m_mlDetector = nullptr;
+        }
+
+        // PhantomCortex is a singleton — tell it we're shutting down.
+        // If no other consumer is active, the instance may release models.
+        if (m_config.enableMachineLearning) {
+            try {
+                auto& cortex = ShadowStrike::AI::PhantomCortex::Instance();
+                if (cortex.IsOperational()) {
+                    cortex.Shutdown();
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"PhantomCortex ML engine shut down");
+                }
+            } catch (...) { /* Singleton shutdown is best-effort */ }
         }
 
         if (m_behaviorAnalyzer) {
@@ -1910,6 +1947,119 @@ EngineResult ScanEngine::ScanFile(
             }
 
             const auto stage9End = steady_clock::now();
+        }
+
+        // ====================================================================
+        // STAGE 10: PHANTOMCORTEX ML ENSEMBLE (AI-Driven Final Classification)
+        // ====================================================================
+        // PhantomCortex combines static PE analysis, behavioral profiling,
+        // memory inspection, network flow classification, and emulation trace
+        // analysis via an ONNX Runtime-backed ensemble. This is the last-resort
+        // detection layer for zero-day threats that evade all prior stages.
+
+        if (m_impl->m_config.enableMachineLearning) {
+            const auto stage10Start = steady_clock::now();
+
+            try {
+                auto& cortex = ShadowStrike::AI::PhantomCortex::Instance();
+
+                if (cortex.IsOperational()) {
+                    // Guard: only run ML on files within the ONNX model's trained
+                    // input size (256 MiB cap prevents OOM on maliciously large files)
+                    if (fileSize > 0 &&
+                        fileSize <= ShadowStrike::AI::CortexConstants::MAX_PE_FILE_SIZE) {
+
+                        // Read file bytes for static model input
+                        std::vector<uint8_t> fileBuffer;
+                        {
+                            std::ifstream ifs(filePath, std::ios::binary | std::ios::ate);
+                            if (ifs.good()) {
+                                const auto sz = static_cast<size_t>(ifs.tellg());
+                                fileBuffer.resize(sz);
+                                ifs.seekg(0);
+                                ifs.read(reinterpret_cast<char*>(fileBuffer.data()),
+                                         static_cast<std::streamsize>(sz));
+                            }
+                        }
+
+                        if (!fileBuffer.empty()) {
+                            // Static PE analysis via PhantomCortex
+                            auto staticVerdict = cortex.AnalyzeFile(
+                                std::span<const uint8_t>(fileBuffer));
+
+                            // Ensemble — currently static-only; behavioral/memory/network
+                            // verdicts will be plumbed once hook infrastructure is wired
+                            auto ensemble = cortex.EnsembleVerdict(
+                                staticVerdict,      // static model
+                                std::nullopt,        // behavioral (future)
+                                std::nullopt,        // memory (future)
+                                std::nullopt,        // network (future)
+                                std::nullopt         // emulation (future)
+                            );
+
+                            using ThreatVerdict = ShadowStrike::AI::ThreatVerdict;
+
+                            if (ensemble.finalVerdict == ThreatVerdict::Malicious) {
+                                result.verdict        = ScanVerdict::Infected;
+                                result.threatName     = "ML/PhantomCortex.Malicious";
+                                result.detectionSource = "PhantomCortex";
+                                result.confidence     = ensemble.ensembleConfidence * 100.0f;
+                                result.threatScore    = ensemble.ensembleConfidence * 100.0f;
+                                result.detectionMethods.push_back("PhantomCortex.Ensemble");
+                                result.sha256         = fileHash;
+
+                                m_impl->m_stats.mlHits.fetch_add(1, std::memory_order_relaxed);
+                                m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_WARN(L"ScanEngine",
+                                    L"Stage 10 PhantomCortex MALICIOUS — "
+                                    L"confidence=%.2f, inferenceTime=%lldus",
+                                    ensemble.ensembleConfidence,
+                                    static_cast<long long>(
+                                        ensemble.totalInferenceTime.count()));
+
+                                m_impl->InvokeDetectionCallbacks(result);
+                                goto finalize_scan;
+
+                            } else if (ensemble.finalVerdict == ThreatVerdict::Suspicious) {
+                                result.verdict        = ScanVerdict::Suspicious;
+                                result.threatName     = "ML/PhantomCortex.Suspicious";
+                                result.detectionSource = "PhantomCortex";
+                                result.confidence     = ensemble.ensembleConfidence * 100.0f;
+                                result.threatScore    = ensemble.ensembleConfidence * 100.0f;
+                                result.detectionMethods.push_back("PhantomCortex.Ensemble");
+                                result.sha256         = fileHash;
+
+                                m_impl->m_stats.mlHits.fetch_add(1, std::memory_order_relaxed);
+                                m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Stage 10 PhantomCortex SUSPICIOUS — "
+                                    L"confidence=%.2f",
+                                    ensemble.ensembleConfidence);
+
+                                m_impl->InvokeDetectionCallbacks(result);
+                                goto finalize_scan;
+                            }
+                            // Benign verdict → fall through to "Clean"
+                        }
+                    }
+                } else {
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Stage 10 PhantomCortex skipped — not operational");
+                }
+            } catch (const std::exception& ex) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Stage 10 PhantomCortex exception: %hs", ex.what());
+            } catch (...) {
+                SS_LOG_ERROR(L"ScanEngine",
+                    L"Stage 10 PhantomCortex unknown exception");
+            }
+
+            const auto stage10End = steady_clock::now();
+            m_impl->m_stats.cortexTimeUs.fetch_add(
+                duration_cast<microseconds>(stage10End - stage10Start).count(),
+                std::memory_order_relaxed);
         }
 
         // ====================================================================
@@ -3301,6 +3451,9 @@ void ScanEngine::ResetStatistics() {
     m_impl->m_stats.threatIntelTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.signatureTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.heuristicTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.scriptAnalysisTimeUs.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.scriptHits.store(0, std::memory_order_relaxed);
+    m_impl->m_stats.cortexTimeUs.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archivesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
     m_impl->m_stats.processesScanned.store(0, std::memory_order_relaxed);
