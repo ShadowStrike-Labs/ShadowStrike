@@ -4,6 +4,7 @@
 #include "ShadowStrike/Fuzzer/Core/EngineArchitecture.hpp"
 #include "ShadowStrike/Fuzzer/Core/HarnessAdapterCatalog.hpp"
 #include "ShadowStrike/Fuzzer/Core/OperationsPipeline.hpp"
+#include "ShadowStrike/Fuzzer/Core/RunnerExecutionRuntime.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageSchema.hpp"
 #include "ShadowStrike/Fuzzer/Targets/KernelTargetCatalog.hpp"
@@ -55,11 +56,13 @@ void PrintUsage() {
         << "  ShadowStrikeFuzzer --describe-engine-architecture\n"
         << "  ShadowStrikeFuzzer --describe-harness-adapter <id>\n"
         << "  ShadowStrikeFuzzer --describe-ops-pipeline\n"
+        << "  ShadowStrikeFuzzer --describe-runner-execution <workspace>\n"
         << "  ShadowStrikeFuzzer --export-dispatch-runtime <workspace> <json-path>\n"
         << "  ShadowStrikeFuzzer --export-campaign-plans <json-path>\n"
         << "  ShadowStrikeFuzzer --export-engine-architecture <json-path>\n"
         << "  ShadowStrikeFuzzer --export-harness-adapters <json-path>\n"
         << "  ShadowStrikeFuzzer --export-ops-pipeline <json-path>\n"
+        << "  ShadowStrikeFuzzer --export-runner-execution <workspace> <json-path>\n"
         << "  ShadowStrikeFuzzer --initialize-workspace <directory>\n"
         << "  ShadowStrikeFuzzer --list-harness-adapters\n"
         << "  ShadowStrikeFuzzer --list-kernel-targets\n"
@@ -72,6 +75,7 @@ void PrintUsage() {
         << "  ShadowStrikeFuzzer --export-usermode-targets <json-path>\n"
         << "  ShadowStrikeFuzzer --export-kernel-seeds <directory>\n"
         << "  ShadowStrikeFuzzer --export-kernel-variants <directory>\n"
+        << "  ShadowStrikeFuzzer --run-workspace <directory>\n"
         << "  ShadowStrikeFuzzer --bootstrap <directory>\n";
 }
 
@@ -369,6 +373,35 @@ void PrintUsage() {
     return 0;
 }
 
+[[nodiscard]] int ExportRunnerExecution(
+    const std::filesystem::path& workspaceRoot,
+    const std::filesystem::path& outputPath)
+{
+    std::error_code ec;
+    if (outputPath.has_parent_path()) {
+        std::filesystem::create_directories(outputPath.parent_path(), ec);
+        if (ec) {
+            std::cerr << "Failed to create runner-execution directory: " << outputPath.parent_path() << '\n';
+            return 1;
+        }
+    }
+
+    std::string errorMessage;
+    const auto ledger = SSF::RunnerExecutionRuntime::ExecuteWorkspace(workspaceRoot, errorMessage);
+    if (!errorMessage.empty()) {
+        std::cerr << errorMessage << '\n';
+        return 1;
+    }
+
+    if (!WriteTextFile(outputPath, SSF::RunnerExecutionRuntime::RenderJson(ledger))) {
+        std::cerr << "Failed to write runner execution ledger: " << outputPath << '\n';
+        return 1;
+    }
+
+    std::cout << "Exported runner execution ledger to " << outputPath.string() << '\n';
+    return 0;
+}
+
 struct LogicalCorpusManifestEntry {
     std::string sourceKey;
     std::string sourceId;
@@ -489,6 +522,81 @@ struct LogicalCorpusManifestEntry {
     return 0;
 }
 
+[[nodiscard]] std::string BuildSnapshotProfileManifestJson(
+    const std::string_view snapshotProfile,
+    const std::vector<std::string>& planIds)
+{
+    std::ostringstream stream;
+    stream << "{\n"
+           << "  \"snapshotProfile\": \"" << EscapeJson(snapshotProfile) << "\",\n"
+           << "  \"plans\": [";
+    if (!planIds.empty()) {
+        stream << '\n';
+        for (std::size_t index = 0; index < planIds.size(); ++index) {
+            stream << "    \"" << EscapeJson(planIds[index]) << '"';
+            if (index + 1 != planIds.size()) {
+                stream << ',';
+            }
+            stream << '\n';
+        }
+        stream << "  ";
+    }
+    stream << "]\n}\n";
+    return stream.str();
+}
+
+[[nodiscard]] int WriteSnapshotProfileCatalog(const std::filesystem::path& rootDirectory) {
+    std::vector<std::string> snapshotProfiles;
+    const auto& plans = SSF::CampaignPlanner::GetDefaultPlans();
+
+    for (const auto& plan : plans) {
+        if (plan.snapshotProfile.empty()) {
+            continue;
+        }
+
+        if (std::find(snapshotProfiles.begin(), snapshotProfiles.end(), plan.snapshotProfile) == snapshotProfiles.end()) {
+            snapshotProfiles.push_back(plan.snapshotProfile);
+        }
+    }
+
+    for (const auto& snapshotProfile : snapshotProfiles) {
+        std::vector<std::string> boundPlanIds;
+        for (const auto& plan : plans) {
+            if (plan.snapshotProfile == snapshotProfile) {
+                boundPlanIds.push_back(plan.id);
+            }
+        }
+
+        const auto path = rootDirectory / ("vm\\profiles\\" + snapshotProfile + ".json");
+        if (!WriteTextFile(path, BuildSnapshotProfileManifestJson(snapshotProfile, boundPlanIds))) {
+            std::cerr << "Failed to write snapshot profile manifest: " << path << '\n';
+            return 1;
+        }
+    }
+
+    std::ostringstream stream;
+    stream << "{\n  \"snapshotProfiles\": [";
+    if (!snapshotProfiles.empty()) {
+        stream << '\n';
+        for (std::size_t index = 0; index < snapshotProfiles.size(); ++index) {
+            stream << "    \"" << EscapeJson(snapshotProfiles[index]) << '"';
+            if (index + 1 != snapshotProfiles.size()) {
+                stream << ',';
+            }
+            stream << '\n';
+        }
+        stream << "  ";
+    }
+    stream << "]\n}\n";
+
+    if (!WriteTextFile(rootDirectory / "vm\\profiles\\manifest.json", stream.str())) {
+        std::cerr << "Failed to write snapshot profile catalog\n";
+        return 1;
+    }
+
+    return 0;
+}
+
 [[nodiscard]] int InitializeWorkspace(const std::filesystem::path& rootDirectory) {
     std::error_code ec;
     std::filesystem::create_directories(rootDirectory, ec);
@@ -542,6 +650,10 @@ struct LogicalCorpusManifestEntry {
 
     if (const int queueStatus = WriteCampaignQueue(rootDirectory); queueStatus != 0) {
         return queueStatus;
+    }
+
+    if (const int snapshotStatus = WriteSnapshotProfileCatalog(rootDirectory); snapshotStatus != 0) {
+        return snapshotStatus;
     }
 
     std::string dispatchError;
@@ -723,6 +835,23 @@ int wmain(int argc, wchar_t* argv[]) {
         return 0;
     }
 
+    if (command == L"--describe-runner-execution") {
+        if (argc < 3) {
+            std::cerr << "--describe-runner-execution requires a workspace path\n";
+            return 1;
+        }
+
+        std::string errorMessage;
+        const auto ledger = SSF::RunnerExecutionRuntime::ExecuteWorkspace(argv[2], errorMessage);
+        if (!errorMessage.empty()) {
+            std::cerr << errorMessage << '\n';
+            return 1;
+        }
+
+        std::cout << SSF::RunnerExecutionRuntime::DescribeText(ledger);
+        return 0;
+    }
+
     if (command == L"--list-kernel-targets") {
         for (const auto& target : SSF::KernelTargetCatalog::GetDefaultTargets()) {
             std::cout << target.id << " | " << target.surfaceId << " | "
@@ -855,6 +984,15 @@ int wmain(int argc, wchar_t* argv[]) {
         return ExportOpsPipeline(argv[2]);
     }
 
+    if (command == L"--export-runner-execution") {
+        if (argc < 4) {
+            std::cerr << "--export-runner-execution requires a workspace path and output path\n";
+            return 1;
+        }
+
+        return ExportRunnerExecution(argv[2], argv[3]);
+    }
+
     if (command == L"--export-usermode-targets") {
         if (argc < 3) {
             std::cerr << "--export-usermode-targets requires an output path\n";
@@ -898,6 +1036,23 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         return Bootstrap(argv[2]);
+    }
+
+    if (command == L"--run-workspace") {
+        if (argc < 3) {
+            std::cerr << "--run-workspace requires a workspace directory\n";
+            return 1;
+        }
+
+        std::string errorMessage;
+        const auto ledger = SSF::RunnerExecutionRuntime::ExecuteWorkspace(argv[2], errorMessage);
+        if (!errorMessage.empty()) {
+            std::cerr << errorMessage << '\n';
+            return 1;
+        }
+
+        std::cout << SSF::RunnerExecutionRuntime::DescribeText(ledger);
+        return 0;
     }
 
     std::cerr << "Unknown command\n";

@@ -95,6 +95,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\EngineArchitecture.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\HarnessAdapterCatalog.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\OperationsPipeline.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Core\RunnerExecutionRuntime.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Targets\KernelTargetCatalog.hpp" />
@@ -111,6 +112,7 @@
     <ClCompile Include="src\KernelTargetCatalog.cpp" />
     <ClCompile Include="src\main.cpp" />
     <ClCompile Include="src\OperationsPipeline.cpp" />
+    <ClCompile Include="src\RunnerExecutionRuntime.cpp" />
     <ClCompile Include="src\UserModeTargetCatalog.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
