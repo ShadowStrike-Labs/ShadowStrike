@@ -69,7 +69,11 @@ void RenderStringArray(std::ostringstream& stream,
             { "pipeline\\queue", "Execution itineraries awaiting dispatch.", "Transient; clear after dispatch.", true },
             { "pipeline\\quarantine", "Artifacts or workers blocked from promotion.", "Retain until manually triaged.", true },
             { "pipeline\\promotion", "Artifacts approved for long-lived corpus promotion.", "Drain into corpora and archive metadata.", true },
-            { "state", "Run manifests, counters, and last-successful replay markers.", "Retain latest plus recent rollback points.", true }
+            { "state", "Run manifests, counters, and last-successful replay markers.", "Retain latest plus recent rollback points.", true },
+            { "state\\executions", "Execution manifests prepared for live worker consumption.", "Rotate by run window.", true },
+            { "state\\worker-results", "Per-worker completion metadata and live execution summaries.", "Rotate by run window and retain crash-linked results.", true },
+            { "state\\worker-logs", "Captured worker stdout and stderr transcripts.", "Rotate by run window and retain crash-linked logs.", true },
+            { "state\\lane-schedules", "Per-lane scheduling manifests and concurrency ledgers.", "Retain latest plus recent rollback points.", true }
         },
         {
             PipelineStageDescriptor{

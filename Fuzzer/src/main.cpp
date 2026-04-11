@@ -5,6 +5,7 @@
 #include "ShadowStrike/Fuzzer/Core/HarnessAdapterCatalog.hpp"
 #include "ShadowStrike/Fuzzer/Core/OperationsPipeline.hpp"
 #include "ShadowStrike/Fuzzer/Core/RunnerExecutionRuntime.hpp"
+#include "ShadowStrike/Fuzzer/Core/WorkerBackendRuntime.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageSchema.hpp"
 #include "ShadowStrike/Fuzzer/Targets/KernelTargetCatalog.hpp"
@@ -1053,6 +1054,26 @@ int wmain(int argc, wchar_t* argv[]) {
 
         std::cout << SSF::RunnerExecutionRuntime::DescribeText(ledger);
         return 0;
+    }
+
+    if (command == L"--worker-kernel-vm" || command == L"--worker-broker" || command == L"--worker-parser") {
+        if (argc < 4) {
+            std::cerr << "Worker command requires a workspace directory and plan id\n";
+            return 1;
+        }
+
+        const std::string planId = NarrowAscii(argv[3]);
+        if (planId.empty()) {
+            std::cerr << "Worker plan ids must be ASCII\n";
+            return 1;
+        }
+
+        const auto workerKind = command == L"--worker-kernel-vm"
+            ? SSF::WorkerCommandKind::KernelVm
+            : command == L"--worker-broker"
+                ? SSF::WorkerCommandKind::Broker
+                : SSF::WorkerCommandKind::Parser;
+        return SSF::WorkerBackendRuntime::RunWorkerCommand(workerKind, argv[2], planId);
     }
 
     std::cerr << "Unknown command\n";
