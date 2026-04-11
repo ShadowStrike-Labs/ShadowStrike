@@ -141,6 +141,8 @@
 #include <regex>
 #include <format>
 #include <nlohmann/json.hpp>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
 
 namespace fs = std::filesystem;
 using json = nlohmann::json;
@@ -403,6 +405,12 @@ public:
     // Rate calculation state (member vars instead of static locals for thread safety)
     uint64_t m_lastTotalScansForRate{ 0 };
     std::chrono::system_clock::time_point m_lastRateCalcTime{ std::chrono::system_clock::now() };
+
+    // CPU usage measurement state (GetSystemTimes delta between samples)
+    ULARGE_INTEGER m_prevIdleTime{};
+    ULARGE_INTEGER m_prevKernelTime{};
+    ULARGE_INTEGER m_prevUserTime{};
+    bool m_cpuTimesInitialized{ false };
 
     // Callbacks
     std::unordered_map<uint64_t, RTPFileScanCallback> m_fileScanCallbacks;
@@ -3901,11 +3909,51 @@ public:
     }
 
     void UpdatePerformanceMetrics() {
-        // Update CPU usage (placeholder - would use SystemUtils)
-        m_performanceMetrics.cpuUsagePercent = 5; // Placeholder
+        // Measure system-wide CPU usage via GetSystemTimes delta
+        {
+            FILETIME idleTimeFt{}, kernelTimeFt{}, userTimeFt{};
+            if (::GetSystemTimes(&idleTimeFt, &kernelTimeFt, &userTimeFt)) {
+                ULARGE_INTEGER idle, kernel, user;
+                idle.LowPart   = idleTimeFt.dwLowDateTime;
+                idle.HighPart  = idleTimeFt.dwHighDateTime;
+                kernel.LowPart = kernelTimeFt.dwLowDateTime;
+                kernel.HighPart= kernelTimeFt.dwHighDateTime;
+                user.LowPart   = userTimeFt.dwLowDateTime;
+                user.HighPart  = userTimeFt.dwHighDateTime;
 
-        // Update memory usage
-        m_performanceMetrics.memoryUsageBytes = 0; // Would query actual usage
+                if (m_cpuTimesInitialized) {
+                    uint64_t idleDelta   = idle.QuadPart   - m_prevIdleTime.QuadPart;
+                    uint64_t kernelDelta = kernel.QuadPart - m_prevKernelTime.QuadPart;
+                    uint64_t userDelta   = user.QuadPart   - m_prevUserTime.QuadPart;
+
+                    // kernel time includes idle time on Windows
+                    uint64_t totalDelta = kernelDelta + userDelta;
+                    if (totalDelta > 0) {
+                        uint64_t busyDelta = totalDelta - idleDelta;
+                        uint32_t cpuPercent = static_cast<uint32_t>(
+                            (busyDelta * 100) / totalDelta);
+                        // Clamp to 0-100 (should not exceed but safety)
+                        m_performanceMetrics.cpuUsagePercent =
+                            static_cast<uint32_t>(std::min(cpuPercent, 100u));
+                    }
+                }
+
+                m_prevIdleTime   = idle;
+                m_prevKernelTime = kernel;
+                m_prevUserTime   = user;
+                m_cpuTimesInitialized = true;
+            }
+        }
+
+        // Measure our process memory usage
+        {
+            PROCESS_MEMORY_COUNTERS_EX pmc{};
+            pmc.cb = sizeof(pmc);
+            if (::GetProcessMemoryInfo(::GetCurrentProcess(),
+                    reinterpret_cast<PROCESS_MEMORY_COUNTERS*>(&pmc), sizeof(pmc))) {
+                m_performanceMetrics.memoryUsageBytes = pmc.WorkingSetSize;
+            }
+        }
 
         // Update scans per second
         auto now = Now();
