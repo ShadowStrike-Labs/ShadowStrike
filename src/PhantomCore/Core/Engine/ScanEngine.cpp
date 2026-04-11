@@ -36,6 +36,7 @@
 #include "../../SignatureStore/SignatureStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../../ThreatIntel/ThreatIntelDatabase.hpp"
+#include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/HashUtils.hpp"
@@ -54,6 +55,11 @@
 #include "../FileSystem/ArchiveExtractor.hpp"
 #include "../FileSystem/DocumentScanner.hpp"
 #include "../FileSystem/FileTypeAnalyzer.hpp"
+#include "../../Scripts/PythonScriptScanner.hpp"
+#include "../../Scripts/JavaScriptScanner.hpp"
+#include "../../Scripts/PowerShellScanner.hpp"
+#include "../../Scripts/VBScriptScanner.hpp"
+#include "../../Scripts/MacroDetector.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -140,6 +146,7 @@ public:
     std::unique_ptr<SignatureStore::SignatureStore> m_signatureStore;
     std::unique_ptr<Whitelist::WhitelistStore> m_whitelistStore;
     std::unique_ptr<ThreatIntel::ThreatIntelDatabase> m_threatIntelDB;
+    std::unique_ptr<ThreatIntel::ThreatIntelStore> m_threatIntelStore;
     HeuristicAnalyzer* m_heuristicAnalyzer{ nullptr };
     std::unique_ptr<BehaviorAnalyzer> m_behaviorAnalyzer;
     MachineLearningDetector* m_mlDetector{ nullptr };
@@ -196,6 +203,8 @@ public:
         std::atomic<uint64_t> threatIntelTimeUs{0};
         std::atomic<uint64_t> signatureTimeUs{0};
         std::atomic<uint64_t> heuristicTimeUs{0};
+        std::atomic<uint64_t> scriptAnalysisTimeUs{0};
+        std::atomic<uint64_t> scriptHits{0};
 
         // Archive stats
         std::atomic<uint64_t> archivesScanned{0};
@@ -354,6 +363,26 @@ public:
                     m_threatIntelDB->GetEntryCount());
             }
 
+            // Initialize ThreatIntelStore (Full IOC/reputation lookup engine)
+            if (!m_config.threatIntelDbPath.empty()) {
+                SS_LOG_INFO(L"ScanEngine", L"Initializing ThreatIntelStore");
+
+                m_threatIntelStore = std::make_unique<ThreatIntel::ThreatIntelStore>();
+
+                ThreatIntel::StoreConfig tiStoreConfig{};
+                tiStoreConfig.databasePath = m_config.threatIntelDbPath;
+                tiStoreConfig.enableCache = true;
+                tiStoreConfig.enableWAL = true;
+
+                if (!m_threatIntelStore->Initialize(tiStoreConfig)) {
+                    SS_LOG_WARN(L"ScanEngine",
+                        L"ThreatIntelStore initialization failed (non-fatal, basic TI DB still active)");
+                    m_threatIntelStore.reset();
+                } else {
+                    SS_LOG_INFO(L"ScanEngine", L"ThreatIntelStore initialized for IOC/reputation lookups");
+                }
+            }
+
             // Initialize HeuristicAnalyzer (PE/ELF/Script analysis)
             if (m_config.enableHeuristics) {
                 SS_LOG_INFO(L"ScanEngine", L"Initializing HeuristicAnalyzer");
@@ -487,6 +516,8 @@ public:
             m_stats.threatIntelTimeUs.store(0, std::memory_order_relaxed);
             m_stats.signatureTimeUs.store(0, std::memory_order_relaxed);
             m_stats.heuristicTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.scriptAnalysisTimeUs.store(0, std::memory_order_relaxed);
+            m_stats.scriptHits.store(0, std::memory_order_relaxed);
             m_stats.archivesScanned.store(0, std::memory_order_relaxed);
             m_stats.archiveFilesScanned.store(0, std::memory_order_relaxed);
             m_stats.processesScanned.store(0, std::memory_order_relaxed);
@@ -568,6 +599,11 @@ public:
         if (m_threatIntelDB) {
             m_threatIntelDB->Close();
             m_threatIntelDB.reset();
+        }
+
+        if (m_threatIntelStore) {
+            m_threatIntelStore->Shutdown();
+            m_threatIntelStore.reset();
         }
 
         if (m_whitelistStore) {
@@ -1105,6 +1141,76 @@ EngineResult ScanEngine::ScanFile(
         }
 
         // ====================================================================
+        // STAGE 2.5: THREAT INTEL STORE — IOC/REPUTATION LOOKUP
+        // ====================================================================
+        // Full 5-tier lookup: TL cache → SharedCache → Index → Database → External
+        // Uses ThreatIntelStore for reputation scoring, confidence levels, and
+        // multi-source IOC correlation. Early exit on known-malicious IOCs.
+        // ====================================================================
+
+        if (m_impl->m_threatIntelStore && result.verdict == ScanVerdict::Clean) {
+            const auto stage25Start = steady_clock::now();
+
+            try {
+                auto tiLookup = m_impl->m_threatIntelStore->LookupHash(
+                    "SHA256", fileHash, ThreatIntel::StoreLookupOptions{});
+
+                if (tiLookup.found) {
+                    if (tiLookup.IsMalicious()) {
+                        // Known-malicious IOC — immediate escalation
+                        result.verdict = ScanVerdict::Infected;
+                        result.threatName = "ThreatIntel.IOC.Malicious";
+                        result.severity = (tiLookup.score >= 90)
+                            ? SignatureStore::ThreatLevel::Critical
+                            : SignatureStore::ThreatLevel::High;
+                        result.detectionSource = "ThreatIntelStore";
+                        result.sha256 = fileHash;
+                        result.confidence = static_cast<float>(tiLookup.score);
+                        result.threatScore = static_cast<float>(tiLookup.score);
+                        result.detectionMethods.push_back("ThreatIntelStore.IOC");
+
+                        m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+
+                        SS_LOG_WARN(L"ScanEngine",
+                            L"Stage 2.5 ThreatIntelStore — MALICIOUS IOC match (score=%u, rep=%u)",
+                            static_cast<unsigned>(tiLookup.score),
+                            static_cast<unsigned>(tiLookup.reputation));
+
+                        m_impl->InvokeDetectionCallbacks(result);
+                        goto finalize_scan;
+
+                    } else if (tiLookup.IsSuspicious()) {
+                        // Suspicious IOC — flag but continue deeper analysis
+                        result.verdict = ScanVerdict::Suspicious;
+                        result.threatName = "ThreatIntel.IOC.Suspicious";
+                        result.severity = SignatureStore::ThreatLevel::Medium;
+                        result.detectionSource = "ThreatIntelStore";
+                        result.sha256 = fileHash;
+                        result.confidence = static_cast<float>(tiLookup.score);
+                        result.threatScore = static_cast<float>(tiLookup.score);
+                        result.detectionMethods.push_back("ThreatIntelStore.IOC");
+
+                        SS_LOG_INFO(L"ScanEngine",
+                            L"Stage 2.5 ThreatIntelStore — Suspicious IOC (score=%u)",
+                            static_cast<unsigned>(tiLookup.score));
+
+                    } else if (tiLookup.IsKnownGood()) {
+                        // Known-good — boost confidence but don't skip further stages
+                        SS_LOG_TRACE(L"ScanEngine",
+                            L"Stage 2.5 ThreatIntelStore — Known-good IOC (rep=%u)",
+                            static_cast<unsigned>(tiLookup.reputation));
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ScanEngine", L"Stage 2.5 ThreatIntelStore exception: %hs", e.what());
+            }
+
+            const auto stage25End = steady_clock::now();
+            SS_LOG_TRACE(L"ScanEngine", L"Stage 2.5 ThreatIntelStore: %lldus",
+                static_cast<long long>(duration_cast<microseconds>(stage25End - stage25Start).count()));
+        }
+
+        // ====================================================================
         // STAGE 3: THREAT INTELLIGENCE (Cloud/Local Reputation)
         // ====================================================================
 
@@ -1297,6 +1403,248 @@ EngineResult ScanEngine::ScanFile(
             const auto stage45End = steady_clock::now();
             SS_LOG_TRACE(L"ScanEngine", L"Stage 4.5 DocumentAnalysis: %lldus",
                 static_cast<long long>(duration_cast<microseconds>(stage45End - stage45Start).count()));
+        }
+
+        // ====================================================================
+        // STAGE 4.6: SCRIPT ANALYSIS (PowerShell/Python/JS/VBS/Macro)
+        // ====================================================================
+        // Routes script files to specialized scanners based on FileTypeAnalyzer
+        // detection. Catches script-based malware (PowerShell droppers, VBA
+        // macro payloads, Python backdoors, JS downloaders) that bypass
+        // signature-only detection. All 5 scanners are Meyers Singletons.
+        // ====================================================================
+
+        if (m_impl->m_config.enableScriptAnalysis &&
+            result.verdict == ScanVerdict::Clean) {
+
+            const auto stage46Start = steady_clock::now();
+
+            try {
+                auto& fileTypeAnalyzer = FileSystem::FileTypeAnalyzer::Instance();
+                auto scriptTypeInfo = fileTypeAnalyzer.Analyze(filePath);
+
+                const bool isScript = (scriptTypeInfo.category == FileSystem::FileCategory::Script ||
+                                       scriptTypeInfo.isScript ||
+                                       scriptTypeInfo.canContainScripts);
+
+                if (isScript) {
+                    bool scriptDetected = false;
+                    std::string scriptThreatName;
+                    uint32_t scriptRiskScore = 0;
+                    std::string scriptDetectionMethod;
+
+                    const auto scriptFormat = scriptTypeInfo.format;
+
+                    // --- PowerShell Scanner ---
+                    if (scriptFormat == FileSystem::FileFormat::PowerShell) {
+                        auto& psScanner = ShadowStrike::Scripts::PowerShellScanner::getInstance();
+
+                        if (psScanner.healthCheck()) {
+                            auto psResult = psScanner.scanFile(filePath);
+
+                            if (psResult.status == ShadowStrike::Scripts::ScanStatus::MALICIOUS) {
+                                scriptDetected = true;
+                                scriptThreatName = psResult.threatName.empty()
+                                    ? "Script.PowerShell.Malicious" : psResult.threatName;
+                                scriptRiskScore = psResult.riskScore;
+                                scriptDetectionMethod = "PowerShellScanner";
+                            } else if (psResult.status == ShadowStrike::Scripts::ScanStatus::SUSPICIOUS) {
+                                if (psResult.riskScore >= 60) {
+                                    result.verdict = ScanVerdict::Suspicious;
+                                    result.threatName = psResult.threatName.empty()
+                                        ? "Script.PowerShell.Suspicious" : psResult.threatName;
+                                    result.detectionSource = "PowerShellScanner";
+                                    result.sha256 = fileHash;
+                                    result.threatScore = static_cast<float>(psResult.riskScore);
+                                    result.detectionMethods.push_back("ScriptAnalysis.PowerShell");
+                                    m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+
+                                    SS_LOG_INFO(L"ScanEngine",
+                                        L"Stage 4.6 suspicious PowerShell: %ls (risk=%u)",
+                                        filePath.c_str(), psResult.riskScore);
+                                }
+                            }
+                        }
+                    }
+                    // --- Python Scanner ---
+                    else if (scriptFormat == FileSystem::FileFormat::Python) {
+                        auto& pyScanner = ShadowStrike::Scripts::PythonScriptScanner::Instance();
+
+                        if (pyScanner.IsInitialized()) {
+                            auto pyResult = pyScanner.ScanFile(filePath);
+
+                            if (pyResult.isMalicious) {
+                                scriptDetected = true;
+                                scriptThreatName = pyResult.threatName.empty()
+                                    ? "Script.Python.Malicious" : pyResult.threatName;
+                                scriptRiskScore = pyResult.riskScore;
+                                scriptDetectionMethod = "PythonScriptScanner";
+                            } else if (pyResult.riskScore >= 60) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = pyResult.threatName.empty()
+                                    ? "Script.Python.Suspicious" : pyResult.threatName;
+                                result.detectionSource = "PythonScriptScanner";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(pyResult.riskScore);
+                                result.detectionMethods.push_back("ScriptAnalysis.Python");
+                                m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Stage 4.6 suspicious Python script: %ls (risk=%u)",
+                                    filePath.c_str(), pyResult.riskScore);
+                            }
+                        }
+                    }
+                    // --- JavaScript / JScript Scanner ---
+                    else if (scriptFormat == FileSystem::FileFormat::JavaScript ||
+                             scriptFormat == FileSystem::FileFormat::JScript) {
+                        auto& jsScanner = ShadowStrike::Scripts::JavaScriptScanner::Instance();
+
+                        if (jsScanner.IsInitialized()) {
+                            auto jsResult = jsScanner.ScanFile(filePath);
+
+                            if (jsResult.isMalicious) {
+                                scriptDetected = true;
+                                scriptThreatName = jsResult.threatName.empty()
+                                    ? "Script.JavaScript.Malicious" : jsResult.threatName;
+                                scriptRiskScore = jsResult.riskScore;
+                                scriptDetectionMethod = "JavaScriptScanner";
+                            } else if (jsResult.riskScore >= 60) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = jsResult.threatName.empty()
+                                    ? "Script.JavaScript.Suspicious" : jsResult.threatName;
+                                result.detectionSource = "JavaScriptScanner";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(jsResult.riskScore);
+                                result.detectionMethods.push_back("ScriptAnalysis.JavaScript");
+                                m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Stage 4.6 suspicious JavaScript: %ls (risk=%u)",
+                                    filePath.c_str(), jsResult.riskScore);
+                            }
+                        }
+                    }
+                    // --- VBScript / HTA Scanner ---
+                    else if (scriptFormat == FileSystem::FileFormat::VBScript ||
+                             scriptFormat == FileSystem::FileFormat::HTA) {
+                        auto& vbsScanner = ShadowStrike::Scripts::VBScriptScanner::Instance();
+
+                        if (vbsScanner.IsInitialized()) {
+                            auto vbsResult = vbsScanner.ScanFile(filePath);
+
+                            if (vbsResult.isMalicious) {
+                                scriptDetected = true;
+                                scriptThreatName = vbsResult.threatName.empty()
+                                    ? "Script.VBScript.Malicious" : vbsResult.threatName;
+                                scriptRiskScore = vbsResult.riskScore;
+                                scriptDetectionMethod = "VBScriptScanner";
+                            } else if (vbsResult.riskScore >= 60) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = vbsResult.threatName.empty()
+                                    ? "Script.VBScript.Suspicious" : vbsResult.threatName;
+                                result.detectionSource = "VBScriptScanner";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(vbsResult.riskScore);
+                                result.detectionMethods.push_back("ScriptAnalysis.VBScript");
+                                m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Stage 4.6 suspicious VBScript/HTA: %ls (risk=%u)",
+                                    filePath.c_str(), vbsResult.riskScore);
+                            }
+                        }
+                    }
+                    // --- Batch file: route through PowerShell scanner (CMD obfuscation) ---
+                    else if (scriptFormat == FileSystem::FileFormat::Batch) {
+                        auto& psScanner = ShadowStrike::Scripts::PowerShellScanner::getInstance();
+
+                        if (psScanner.healthCheck()) {
+                            auto batchResult = psScanner.scanFile(filePath);
+
+                            if (batchResult.status == ShadowStrike::Scripts::ScanStatus::MALICIOUS) {
+                                scriptDetected = true;
+                                scriptThreatName = batchResult.threatName.empty()
+                                    ? "Script.Batch.Malicious" : batchResult.threatName;
+                                scriptRiskScore = batchResult.riskScore;
+                                scriptDetectionMethod = "PowerShellScanner.Batch";
+                            } else if (batchResult.status == ShadowStrike::Scripts::ScanStatus::SUSPICIOUS &&
+                                       batchResult.riskScore >= 60) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = batchResult.threatName.empty()
+                                    ? "Script.Batch.Suspicious" : batchResult.threatName;
+                                result.detectionSource = "PowerShellScanner.Batch";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(batchResult.riskScore);
+                                result.detectionMethods.push_back("ScriptAnalysis.Batch");
+                                m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+                            }
+                        }
+                    }
+
+                    // --- Macro Detection for documents that can contain scripts ---
+                    if (!scriptDetected && scriptTypeInfo.canContainMacros) {
+                        auto& macroDetector = ShadowStrike::Scripts::MacroDetector::Instance();
+
+                        if (macroDetector.IsInitialized()) {
+                            auto macroResult = macroDetector.ScanDocument(filePath);
+
+                            if (macroResult.isMalicious) {
+                                scriptDetected = true;
+                                scriptThreatName = macroResult.threatName.empty()
+                                    ? "Macro.VBA.Malicious" : macroResult.threatName;
+                                scriptRiskScore = macroResult.riskScore;
+                                scriptDetectionMethod = "MacroDetector";
+                            } else if (macroResult.riskScore >= 60) {
+                                result.verdict = ScanVerdict::Suspicious;
+                                result.threatName = macroResult.threatName.empty()
+                                    ? "Macro.VBA.Suspicious" : macroResult.threatName;
+                                result.detectionSource = "MacroDetector";
+                                result.sha256 = fileHash;
+                                result.threatScore = static_cast<float>(macroResult.riskScore);
+                                result.detectionMethods.push_back("ScriptAnalysis.MacroDetector");
+                                m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+
+                                SS_LOG_INFO(L"ScanEngine",
+                                    L"Stage 4.6 suspicious macros: %ls (risk=%u)",
+                                    filePath.c_str(), macroResult.riskScore);
+                            }
+                        }
+                    }
+
+                    // Confirmed malicious script — escalate to Infected verdict
+                    if (scriptDetected) {
+                        result.verdict = ScanVerdict::Infected;
+                        result.threatName = std::move(scriptThreatName);
+                        result.detectionSource = std::move(scriptDetectionMethod);
+                        result.sha256 = fileHash;
+                        result.threatScore = static_cast<float>(scriptRiskScore);
+                        result.confidence = static_cast<float>(std::min(scriptRiskScore, 100u));
+                        result.severity = (scriptRiskScore >= 80)
+                            ? SignatureStore::ThreatLevel::Critical
+                            : SignatureStore::ThreatLevel::High;
+                        result.detectionMethods.push_back("ScriptAnalysis");
+                        m_impl->m_stats.scriptHits.fetch_add(1, std::memory_order_relaxed);
+                        m_impl->m_stats.infections.fetch_add(1, std::memory_order_relaxed);
+
+                        SS_LOG_WARN(L"ScanEngine",
+                            L"Stage 4.6 script malware DETECTED: %ls [%hs] (risk=%u)",
+                            filePath.c_str(), result.threatName.c_str(), scriptRiskScore);
+
+                        m_impl->InvokeDetectionCallbacks(result);
+                        goto finalize_scan;
+                    }
+                }
+            } catch (const std::exception& e) {
+                SS_LOG_ERROR(L"ScanEngine", L"Stage 4.6 ScriptAnalysis exception: %hs", e.what());
+            }
+
+            const auto stage46End = steady_clock::now();
+            m_impl->m_stats.scriptAnalysisTimeUs.fetch_add(
+                static_cast<uint64_t>(duration_cast<microseconds>(stage46End - stage46Start).count()),
+                std::memory_order_relaxed);
+            SS_LOG_TRACE(L"ScanEngine", L"Stage 4.6 ScriptAnalysis: %lldus",
+                static_cast<long long>(duration_cast<microseconds>(stage46End - stage46Start).count()));
         }
 
         // ====================================================================

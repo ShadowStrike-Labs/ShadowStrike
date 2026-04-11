@@ -516,6 +516,7 @@ struct EngineConfig {
     bool enableMachineLearning = true;
     bool enableCloudLookup = true;
     bool enableMemoryScanning = true;
+    bool enableScriptAnalysis = true;
 
     // Archive scanning
     ArchiveScanOptions archiveOptions;
