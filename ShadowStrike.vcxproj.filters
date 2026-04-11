@@ -1008,6 +1008,12 @@
     <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\StartupAnalyzer_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="tests\integration\core_registry\SystemSettingsMonitor_Integration_Tests.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>

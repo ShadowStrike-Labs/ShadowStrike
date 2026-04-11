@@ -882,6 +882,8 @@
     <ClCompile Include="tests\unit\config_unit\SettingsManager_Tests.cpp" />
     <ClCompile Include="tests\integration\core_process\ProcessChain_Integration_Tests.cpp" />
     <ClCompile Include="tests\integration\core_registry\RegistryChain_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_registry\StartupAnalyzer_Integration_Tests.cpp" />
+    <ClCompile Include="tests\integration\core_registry\SystemSettingsMonitor_Integration_Tests.cpp" />
     <ClCompile Include="tests\integration\core_filesystem\FileSystemChain_Integration_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\AtomBombingDetector_Tests.cpp" />
     <ClCompile Include="tests\unit\core_process_unit\DLLInjectionDetector_Tests.cpp" />
