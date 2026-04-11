@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/TimeBasedEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/TimeBasedEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

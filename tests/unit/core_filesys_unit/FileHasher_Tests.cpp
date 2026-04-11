@@ -30,7 +30,7 @@
 #include "pch.h"
 
 #include "CoreFileSystem_TestUtils.hpp"
-#include "../../../src/Shared_modules/Core/FileSystem/FileHasher.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/FileHasher.hpp"
 
 #include <chrono>
 #include <future>

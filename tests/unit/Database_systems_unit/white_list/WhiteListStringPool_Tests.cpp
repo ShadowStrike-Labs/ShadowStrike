@@ -39,8 +39,8 @@
 
 #include <gtest/gtest.h>
 #include"Utils/Logger.hpp"
-#include "Shared_modules/Whitelist/WhiteListStore.hpp"
-#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Whitelist/WhiteListFormat.hpp"
 
 #include <vector>
 #include <string>

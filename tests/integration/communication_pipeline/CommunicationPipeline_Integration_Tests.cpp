@@ -100,11 +100,11 @@
 // SHADOWSTRIKE MODULE HEADERS
 // ============================================================================
 
-#include "src/Shared_modules/Communication/AlertSystem.hpp"
-#include "src/Shared_modules/Communication/TelemetryCollector.hpp"
-#include "src/Shared_modules/Communication/MessageDispatcher.hpp"
-#include "src/Shared_modules/Communication/FilterConnection.hpp"
-#include "src/Shared_modules/Communication/Communication.hpp"
+#include "src/PhantomCore/Communication/AlertSystem.hpp"
+#include "src/PhantomCore/Communication/TelemetryCollector.hpp"
+#include "src/PhantomCore/Communication/MessageDispatcher.hpp"
+#include "src/PhantomCore/Communication/FilterConnection.hpp"
+#include "src/PhantomCore/Communication/Communication.hpp"
 
 // ============================================================================
 // NAMESPACE ALIASES

@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/FileSystemFilter.hpp"
+#include "../../../src/PhantomCore/RealTime/FileSystemFilter.hpp"
 #include "RealTime_TestUtils.hpp"
 
 namespace ShadowStrike::RealTime::Tests {

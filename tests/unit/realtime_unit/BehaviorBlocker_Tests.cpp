@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/BehaviorBlocker.hpp"
+#include "../../../src/PhantomCore/RealTime/BehaviorBlocker.hpp"
 #include "RealTime_TestUtils.hpp"
 
 namespace ShadowStrike::RealTime::Tests {

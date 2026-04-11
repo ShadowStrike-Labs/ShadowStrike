@@ -21,7 +21,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Config/SettingsManager.hpp"
+#include "../../../src/PhantomCore/Config/SettingsManager.hpp"
 #include "Config_TestUtils.hpp"
 
 namespace ShadowStrike::Config::Test {

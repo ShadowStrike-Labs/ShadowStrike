@@ -16,7 +16,7 @@
 
 #include <regex>
 
-#include "../../../src/Shared_modules/Core/Registry/StartupAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Registry/StartupAnalyzer.hpp"
 
 namespace ShadowStrike::Core::Registry::Test {
 

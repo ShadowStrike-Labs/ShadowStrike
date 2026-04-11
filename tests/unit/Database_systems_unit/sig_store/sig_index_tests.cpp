@@ -46,9 +46,9 @@
 #include"pch.h"
 
 #include <gtest/gtest.h>
-#include "Shared_modules/SignatureStore/SignatureIndex.hpp"
-#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
-#include "Shared_modules/Utils/Logger.hpp"
+#include "PhantomCore/SignatureStore/SignatureIndex.hpp"
+#include "PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
 #include <filesystem>
 #include <random>
 #include <thread>

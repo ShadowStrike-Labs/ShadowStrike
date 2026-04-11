@@ -1,6 +1,6 @@
 #include "../../../src/pch.h"
 #include <nlohmann/json.hpp>
-#include "../../../src/Shared_modules/SelfProtection/FileProtection.hpp"
+#include "../../../src/PhantomCore/SelfProtection/FileProtection.hpp"
 
 namespace {
 

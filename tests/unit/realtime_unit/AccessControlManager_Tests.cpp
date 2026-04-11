@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/AccessControlManager.hpp"
+#include "../../../src/PhantomCore/RealTime/AccessControlManager.hpp"
 #include "RealTime_TestUtils.hpp"
 
 namespace ShadowStrike::RealTime::Tests {

@@ -17,7 +17,7 @@
 
 #include <string>
 
-#include "../../../src/Shared_modules/Service/ServiceController.hpp"
+#include "../../../src/PhantomCore/Service/ServiceController.hpp"
 
 namespace SSS = ShadowStrike::Service;
 

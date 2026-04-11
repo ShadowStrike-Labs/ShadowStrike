@@ -48,7 +48,7 @@
  */
 #include <gtest/gtest.h>
 
-#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
+#include "PhantomCore/Whitelist/WhiteListFormat.hpp"
 
 #include <algorithm>
 #include <array>

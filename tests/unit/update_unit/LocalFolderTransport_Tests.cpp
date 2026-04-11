@@ -13,7 +13,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Update/IUpdateTransport.hpp"
+#include "../../../src/PhantomCore/Update/IUpdateTransport.hpp"
 #include "Update_TestUtils.hpp"
 
 namespace ShadowStrike::Update::Test {

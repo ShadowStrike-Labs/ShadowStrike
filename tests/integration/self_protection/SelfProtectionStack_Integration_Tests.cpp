@@ -122,10 +122,10 @@
 // ============================================================================
 // SHADOWSTRIKE MODULE HEADERS
 // ============================================================================
-#include "../../../src/Shared_modules/SelfProtection/CertificateValidator.hpp"
-#include "../../../src/Shared_modules/SelfProtection/CryptoManager.hpp"
-#include "../../../src/Shared_modules/SelfProtection/SelfDefense.hpp"
-#include "../../../src/Shared_modules/SelfProtection/TamperProtection.hpp"
+#include "../../../src/PhantomCore/SelfProtection/CertificateValidator.hpp"
+#include "../../../src/PhantomCore/SelfProtection/CryptoManager.hpp"
+#include "../../../src/PhantomCore/SelfProtection/SelfDefense.hpp"
+#include "../../../src/PhantomCore/SelfProtection/TamperProtection.hpp"
 
 // ============================================================================
 // CONVENIENCE ALIASES

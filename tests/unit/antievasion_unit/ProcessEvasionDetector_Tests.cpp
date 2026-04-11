@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/ProcessEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/ProcessEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion {
 const wchar_t* ProcessEvasionTechniqueToString(ProcessEvasionTechnique technique) noexcept;

@@ -2,53 +2,53 @@ test_main.cpp
 AIPipeline_Integration_Tests.cpp
 CortexConfig.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\AI\CortexConfig.cpp(527): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(530): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(532): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(534): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(536): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(538): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(540): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(543): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(544): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(546): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\CortexConfig.cpp(548): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(527): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(530): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(532): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(534): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(536): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(538): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(540): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(543): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(544): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(546): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\CortexConfig.cpp(548): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
 FeatureExtractor.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\AI\../PEParser/PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\AI\../PEParser/PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-src\Shared_modules\AI\FeatureExtractor.cpp(396): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\AI\../PEParser/PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\AI\../PEParser/PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+src\PhantomCore\AI\FeatureExtractor.cpp(396): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
 ModelCache.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\AI\ModelCache.cpp(467): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(468): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(469): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(496): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(503): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(505): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(508): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(515): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(645): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(671): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(851): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(948): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\ModelCache.cpp(1086): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(467): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(468): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(469): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(496): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(503): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(505): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(508): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(515): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(645): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(671): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(851): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(948): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\ModelCache.cpp(1086): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
 ModelInference.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 PhantomCortex.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\AI\PhantomCortex.cpp(1083): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\PhantomCortex.cpp(1095): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\PhantomCortex.cpp(1105): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\AI\PhantomCortex.cpp(1110): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\PhantomCortex.cpp(1083): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\PhantomCortex.cpp(1095): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\PhantomCortex.cpp(1105): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\AI\PhantomCortex.cpp(1110): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
 PEParser.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
 PEValidation.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
-C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\PhantomCore\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
 StringUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 FileUtils.cpp
@@ -61,15 +61,15 @@ NetworkUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 NetworkUtils_http_https.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_http_https.cpp(468): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_http_https.cpp(468): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtils_DNS.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_DNS.cpp(472): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_DNS.cpp(472): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtils_Adapter.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(947): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1070): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
-src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1183): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(947): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(1070): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\PhantomCore\Utils\NetworkUtils_Adapter.cpp(1183): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
 NetworkUtilsIpAddress.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 NetworkUtilsMacAdress.cpp
@@ -88,6 +88,6 @@ MemoryUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
 SystemUtils.cpp
 C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
-src\Shared_modules\Utils\SystemUtils.cpp(434): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
-src\Shared_modules\Utils\SystemUtils.cpp(477): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\Utils\SystemUtils.cpp(434): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
+src\PhantomCore\Utils\SystemUtils.cpp(477): warning C4834: [[nodiscard]] özniteliğine sahip işlevin dönüş değerinin atılması
 Kod Üretiliyor...

@@ -22,7 +22,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/PythonScriptScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/PythonScriptScanner.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

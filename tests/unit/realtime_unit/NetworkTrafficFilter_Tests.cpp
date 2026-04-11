@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/NetworkTrafficFilter.hpp"
+#include "../../../src/PhantomCore/RealTime/NetworkTrafficFilter.hpp"
 #include "RealTime_TestUtils.hpp"
 
 namespace ShadowStrike::RealTime::Tests {

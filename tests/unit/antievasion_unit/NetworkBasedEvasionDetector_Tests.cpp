@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "AntiEvasion_TestUtils.hpp"
-#include "../../../src/Shared_modules/AntiEvasion/NetworkBasedEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/NetworkBasedEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion {
 const wchar_t* NetworkEvasionTechniqueToString(NetworkEvasionTechnique technique) noexcept;

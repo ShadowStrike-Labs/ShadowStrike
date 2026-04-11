@@ -35,7 +35,7 @@
 // 7. Security & Safety Tests
 // ============================================================================
 #include <gtest/gtest.h>
-#include "Shared_modules/PatternStore/PatternStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
 #include <vector>
 #include <cstdint>
 #include <span>

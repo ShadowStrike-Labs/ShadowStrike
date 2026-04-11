@@ -2,8 +2,8 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/FilterConnection.hpp"
-#include "../../../src/Shared_modules/Communication/ThreatIntelPusher.hpp"
+#include "../../../src/PhantomCore/Communication/FilterConnection.hpp"
+#include "../../../src/PhantomCore/Communication/ThreatIntelPusher.hpp"
 
 #include <span>
 #include <string>

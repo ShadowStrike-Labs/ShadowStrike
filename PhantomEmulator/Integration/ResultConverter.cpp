@@ -25,7 +25,7 @@
 #include "../Analysis/EvasionDetector.hpp"
 
 // ShadowStrike types
-#include "../../../src/Shared_modules/Core/Engine/EmulationEngine.hpp"
+#include "../../../src/PhantomCore/Core/Engine/EmulationEngine.hpp"
 
 #include <algorithm>
 #include <chrono>

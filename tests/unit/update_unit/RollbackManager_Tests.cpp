@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Update/RollbackManager.hpp"
+#include "../../../src/PhantomCore/Update/RollbackManager.hpp"
 #include "Update_TestUtils.hpp"
 
 namespace ShadowStrike::Update::Test {

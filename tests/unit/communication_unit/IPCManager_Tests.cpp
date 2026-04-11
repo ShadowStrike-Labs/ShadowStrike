@@ -2,7 +2,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Communication/IPCManager.hpp"
+#include "../../../src/PhantomCore/Communication/IPCManager.hpp"
 
 #include <cstring>
 #include <string>

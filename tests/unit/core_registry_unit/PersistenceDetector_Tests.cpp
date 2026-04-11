@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Core/Registry/PersistenceDetector.hpp"
+#include "../../../src/PhantomCore/Core/Registry/PersistenceDetector.hpp"
 #include "CoreRegistry_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Registry::Test {

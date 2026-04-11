@@ -7,7 +7,7 @@
 #include <stdexcept>
 #include <vector>
 
-#include "../../../src/Shared_modules/Utils/NetworkUtils.hpp"
+#include "../../../src/PhantomCore/Utils/NetworkUtils.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

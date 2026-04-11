@@ -13,11 +13,11 @@
 
 #include <new>
 
-#include "../../../src/Shared_modules/Communication/AlertSystem.hpp"
-#include "../../../src/Shared_modules/Communication/TelemetryCollector.hpp"
-#include "../../../src/Shared_modules/Communication/IPCManager.hpp"
-#include "../../../src/Shared_modules/Core/Engine/BehaviorAnalyzer.hpp"
-#include "../../../src/Shared_modules/RealTime/ProcessCreationMonitor.hpp"
+#include "../../../src/PhantomCore/Communication/AlertSystem.hpp"
+#include "../../../src/PhantomCore/Communication/TelemetryCollector.hpp"
+#include "../../../src/PhantomCore/Communication/IPCManager.hpp"
+#include "../../../src/PhantomCore/Core/Engine/BehaviorAnalyzer.hpp"
+#include "../../../src/PhantomCore/RealTime/ProcessCreationMonitor.hpp"
 
 namespace ShadowStrike {
 

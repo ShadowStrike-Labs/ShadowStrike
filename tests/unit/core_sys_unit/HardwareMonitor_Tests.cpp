@@ -28,7 +28,7 @@
 #include "pch.h"
 
 #include "CoreSystem_TestUtils.hpp"
-#include "../../../src/Shared_modules/Core/System/HardwareMonitor.hpp"
+#include "../../../src/PhantomCore/Core/System/HardwareMonitor.hpp"
 
 namespace {
 

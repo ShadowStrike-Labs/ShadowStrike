@@ -17,7 +17,7 @@
 
 #include <string>
 
-#include "../../../src/Shared_modules/Performance/DiskMonitor.hpp"
+#include "../../../src/PhantomCore/Performance/DiskMonitor.hpp"
 
 namespace SSP = ShadowStrike::Performance;
 

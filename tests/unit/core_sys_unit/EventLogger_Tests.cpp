@@ -29,7 +29,7 @@
 #include "pch.h"
 
 #include "CoreSystem_TestUtils.hpp"
-#include "../../../src/Shared_modules/Core/System/EventLogger.hpp"
+#include "../../../src/PhantomCore/Core/System/EventLogger.hpp"
 
 #include <algorithm>
 #include <chrono>

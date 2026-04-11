@@ -19,7 +19,7 @@
 
 #include <string>
 
-#include "../../../src/Shared_modules/Performance/dev/MemoryProfiler.hpp"
+#include "../../../src/PhantomCore/Performance/dev/MemoryProfiler.hpp"
 
 namespace SSP = ShadowStrike::Performance;
 

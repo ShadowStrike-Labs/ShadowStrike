@@ -14,7 +14,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/RealTime/ProcessCreationMonitor.hpp"
+#include "../../../src/PhantomCore/RealTime/ProcessCreationMonitor.hpp"
 
 namespace ShadowStrike::RealTime::Tests {
 

@@ -40,8 +40,8 @@
 // ============================================================================
 
 #include <gtest/gtest.h>
-#include "Shared_modules/ThreatIntel/ReputationCache.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
+#include "PhantomCore/ThreatIntel/ReputationCache.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelFormat.hpp"
 #include <vector>
 #include <cstdint>
 #include <random>

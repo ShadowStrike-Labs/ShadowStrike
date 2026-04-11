@@ -20,8 +20,8 @@
 #include <fstream>
 #include <string>
 
-#include "../../../src/Shared_modules/AI/CortexConfig.hpp"
-#include "../../../src/Shared_modules/Utils/StringUtils.hpp"
+#include "../../../src/PhantomCore/AI/CortexConfig.hpp"
+#include "../../../src/PhantomCore/Utils/StringUtils.hpp"
 #include "../../../include/nlohmann/json.hpp"
 #include "AI_TestUtils.hpp"
 

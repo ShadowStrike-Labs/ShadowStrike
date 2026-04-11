@@ -19,9 +19,9 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/AI/ModelCache.hpp"
-#include "../../../src/Shared_modules/Utils/HashUtils.hpp"
-#include "../../../src/Shared_modules/Utils/StringUtils.hpp"
+#include "../../../src/PhantomCore/AI/ModelCache.hpp"
+#include "../../../src/PhantomCore/Utils/HashUtils.hpp"
+#include "../../../src/PhantomCore/Utils/StringUtils.hpp"
 #include "../../../include/nlohmann/json.hpp"
 #include "AI_TestUtils.hpp"
 

@@ -20,7 +20,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Service/ServiceInstaller.hpp"
+#include "../../../src/PhantomCore/Service/ServiceInstaller.hpp"
 
 namespace SSS = ShadowStrike::Service;
 

@@ -17,7 +17,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Update/SignatureUpdater.hpp"
+#include "../../../src/PhantomCore/Update/SignatureUpdater.hpp"
 #include "Update_TestUtils.hpp"
 
 namespace ShadowStrike::Update::Test {

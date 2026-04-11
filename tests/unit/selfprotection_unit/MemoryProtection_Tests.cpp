@@ -1,7 +1,7 @@
 #include "../../../src/pch.h"
 #include <limits>
 #include <nlohmann/json.hpp>
-#include "../../../src/Shared_modules/SelfProtection/MemoryProtection.hpp"
+#include "../../../src/PhantomCore/SelfProtection/MemoryProtection.hpp"
 
 namespace {
 

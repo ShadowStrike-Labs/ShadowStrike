@@ -22,7 +22,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Config/ProfileManager.hpp"
+#include "../../../src/PhantomCore/Config/ProfileManager.hpp"
 #include "Config_TestUtils.hpp"
 
 namespace ShadowStrike::Config::Test {

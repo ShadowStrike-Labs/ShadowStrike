@@ -7,7 +7,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AntiEvasion/DebuggerEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/DebuggerEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

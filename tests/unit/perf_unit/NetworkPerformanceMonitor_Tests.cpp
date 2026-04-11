@@ -18,7 +18,7 @@
 #include <limits>
 #include <string>
 
-#include "../../../src/Shared_modules/Performance/NetworkPerformanceMonitor.hpp"
+#include "../../../src/PhantomCore/Performance/NetworkPerformanceMonitor.hpp"
 
 namespace SSP = ShadowStrike::Performance;
 

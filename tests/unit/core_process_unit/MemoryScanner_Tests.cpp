@@ -28,7 +28,7 @@
 
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Core/Process/MemoryScanner.hpp"
+#include "../../../src/PhantomCore/Core/Process/MemoryScanner.hpp"
 
 #include <array>
 #include <numeric>

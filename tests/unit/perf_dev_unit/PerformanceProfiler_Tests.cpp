@@ -23,7 +23,7 @@
 #include <string>
 #include <thread>
 
-#include "../../../src/Shared_modules/Performance/dev/PerformanceProfiler.hpp"
+#include "../../../src/PhantomCore/Performance/dev/PerformanceProfiler.hpp"
 
 namespace SSP = ShadowStrike::Performance;
 

@@ -15,7 +15,7 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Core/Registry/RegistryMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Registry/RegistryMonitor.hpp"
 #include "CoreRegistry_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Registry::Test {

@@ -27,7 +27,7 @@
 
 #include "../../../src/pch.h"
 
-#include "../../../src/Shared_modules/Core/Process/ProcessAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/Process/ProcessAnalyzer.hpp"
 
 namespace {
 

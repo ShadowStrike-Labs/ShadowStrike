@@ -25,7 +25,7 @@
 #include <Windows.h>
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/VBScriptScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/VBScriptScanner.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

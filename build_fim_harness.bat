@@ -4,14 +4,14 @@ set CL_FLAGS=/std:c++20 /EHsc /W3 /MDd /Gy /FI"C:\ShadowStrike\ShadowStrike\src\
 
 if not exist "C:\ShadowStrike\ShadowStrike\bin\fim_harness" mkdir "C:\ShadowStrike\ShadowStrike\bin\fim_harness"
 
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\FileIntegrityMonitor.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\RealTime\FileIntegrityMonitor.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\Logger.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\Logger.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\StringUtils.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\StringUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\HashUtils.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\HashUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\FileUtils.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\FileUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\SystemUtils.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\SystemUtils.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\ThreadPool.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\ThreadPool.cpp"
-cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\PE_sig_verf.obj" "C:\ShadowStrike\ShadowStrike\src\Shared_modules\Utils\PE_sig_verf.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\FileIntegrityMonitor.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\RealTime\FileIntegrityMonitor.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\Logger.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\Logger.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\StringUtils.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\StringUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\HashUtils.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\HashUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\FileUtils.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\FileUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\SystemUtils.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\SystemUtils.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\ThreadPool.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\ThreadPool.cpp"
+cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\PE_sig_verf.obj" "C:\ShadowStrike\ShadowStrike\src\PhantomCore\Utils\PE_sig_verf.cpp"
 cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\test_main.obj" "C:\ShadowStrike\ShadowStrike\tests\test_main.cpp"
 cl.exe %CL_FLAGS% /c /Fo"C:\ShadowStrike\ShadowStrike\bin\fim_harness\FileIntegrityMonitor_Tests.obj" "C:\ShadowStrike\ShadowStrike\tests\unit\realtime_unit\FileIntegrityMonitor_Tests.cpp"
 

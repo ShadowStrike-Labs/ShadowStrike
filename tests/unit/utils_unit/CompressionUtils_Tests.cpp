@@ -32,8 +32,8 @@
  */
 #include "pch.h"
 #include <gtest/gtest.h>
-#include "../../../src/Shared_modules/Utils/CompressionUtils.hpp"
-#include "../../../src/Shared_modules/Utils/Logger.hpp"
+#include "../../../src/PhantomCore/Utils/CompressionUtils.hpp"
+#include "../../../src/PhantomCore/Utils/Logger.hpp"
 
 #include <vector>
 #include <string>

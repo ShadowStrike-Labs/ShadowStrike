@@ -19,7 +19,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Engine/EmulationEngine.hpp"
+#include "../../../src/PhantomCore/Core/Engine/EmulationEngine.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 

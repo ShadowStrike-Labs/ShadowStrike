@@ -20,8 +20,8 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/FuzzyHasher/DigestGenerator.hpp"
-#include "../../../src/Shared_modules/FuzzyHasher/FuzzyHasher.hpp"
+#include "../../../src/PhantomCore/FuzzyHasher/DigestGenerator.hpp"
+#include "../../../src/PhantomCore/FuzzyHasher/FuzzyHasher.hpp"
 
 namespace FH = ShadowStrike::FuzzyHasher;
 

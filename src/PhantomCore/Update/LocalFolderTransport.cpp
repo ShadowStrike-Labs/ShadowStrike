@@ -9,10 +9,10 @@
  */
 #include "pch.h"
 
-#include "Shared_modules/Update/IUpdateTransport.hpp"
-#include "Shared_modules/Utils/Logger.hpp"
-#include "Shared_modules/Utils/HashUtils.hpp"
-#include "Shared_modules/Utils/StringUtils.hpp"
+#include "PhantomCore/Update/IUpdateTransport.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
 
 #include <fstream>
 #include <atomic>

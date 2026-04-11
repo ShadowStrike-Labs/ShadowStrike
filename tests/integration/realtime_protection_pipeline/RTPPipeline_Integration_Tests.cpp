@@ -114,10 +114,10 @@
 // ==========================================================================
 // SHADOWSTRIKE REALTIME MODULE HEADERS (relative to repo root)
 // ==========================================================================
-#include "../../../src/Shared_modules/RealTime/RealTimeProtection.hpp"
-#include "../../../src/Shared_modules/RealTime/FileSystemFilter.hpp"
-#include "../../../src/Shared_modules/RealTime/ProcessCreationMonitor.hpp"
-#include "../../../src/Shared_modules/RealTime/NetworkTrafficFilter.hpp"
+#include "../../../src/PhantomCore/RealTime/RealTimeProtection.hpp"
+#include "../../../src/PhantomCore/RealTime/FileSystemFilter.hpp"
+#include "../../../src/PhantomCore/RealTime/ProcessCreationMonitor.hpp"
+#include "../../../src/PhantomCore/RealTime/NetworkTrafficFilter.hpp"
 
 // ==========================================================================
 // CONVENIENCE NAMESPACE ALIASES

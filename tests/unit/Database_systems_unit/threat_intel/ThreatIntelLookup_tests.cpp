@@ -38,10 +38,10 @@
 
 #include <gtest/gtest.h>
 
-#include "Shared_modules/ThreatIntel/ThreatIntelLookup.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelIndex.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelIndex.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelFormat.hpp"
 
 #include <atomic>
 #include <chrono>

@@ -17,7 +17,7 @@
 
 #include <string>
 
-#include "../../../src/Shared_modules/Performance/CPUMonitor.hpp"
+#include "../../../src/PhantomCore/Performance/CPUMonitor.hpp"
 
 namespace SSP = ShadowStrike::Performance;
 

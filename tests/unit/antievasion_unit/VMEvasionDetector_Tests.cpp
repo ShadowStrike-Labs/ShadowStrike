@@ -8,7 +8,7 @@
 #include <gtest/gtest.h>
 
 #include "AntiEvasion_TestUtils.hpp"
-#include "../../../src/Shared_modules/AntiEvasion/VMEvasionDetector.hpp"
+#include "../../../src/PhantomCore/AntiEvasion/VMEvasionDetector.hpp"
 
 namespace ShadowStrike::AntiEvasion::Tests {
 

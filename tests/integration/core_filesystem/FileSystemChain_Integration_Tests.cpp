@@ -32,9 +32,9 @@
 #include <format>
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/Core/FileSystem/FileHasher.hpp"
-#include "../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp"
-#include "../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/FileHasher.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/FileReputation.hpp"
+#include "../../../src/PhantomCore/Core/FileSystem/FileTypeAnalyzer.hpp"
 
 #include <algorithm>
 #include <array>

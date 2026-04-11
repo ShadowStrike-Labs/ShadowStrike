@@ -21,7 +21,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Scripts/JavaScriptScanner.hpp"
+#include "../../../src/PhantomCore/Scripts/JavaScriptScanner.hpp"
 
 namespace ShadowStrike::Scripts::Test {
 namespace {

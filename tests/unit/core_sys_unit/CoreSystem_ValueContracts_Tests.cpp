@@ -28,8 +28,8 @@
 
 #include "pch.h"
 
-#include "../../../src/Shared_modules/Core/System/CrashHandler.hpp"
-#include "../../../src/Shared_modules/Core/System/DriverAnalyzer.hpp"
+#include "../../../src/PhantomCore/Core/System/CrashHandler.hpp"
+#include "../../../src/PhantomCore/Core/System/DriverAnalyzer.hpp"
 
 namespace {
 

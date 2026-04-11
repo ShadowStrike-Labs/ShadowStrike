@@ -21,7 +21,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/PEParser/SafeReader.hpp"
+#include "../../../src/PhantomCore/PEParser/SafeReader.hpp"
 
 namespace ShadowStrike::PEParser::Test {
 

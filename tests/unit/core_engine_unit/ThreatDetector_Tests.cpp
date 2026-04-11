@@ -17,7 +17,7 @@
 #include <chrono>
 #include <string_view>
 
-#include "../../../src/Shared_modules/Core/Engine/ThreatDetector.hpp"
+#include "../../../src/PhantomCore/Core/Engine/ThreatDetector.hpp"
 
 namespace Engine = ShadowStrike::Core::Engine;
 using namespace std::chrono_literals;

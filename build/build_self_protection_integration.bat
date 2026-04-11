@@ -9,15 +9,15 @@ if exist "%OBJ_DIR%" rmdir /s /q "%OBJ_DIR%"
 mkdir "%OBJ_DIR%"
 if errorlevel 1 exit /b 1
 
-set "CL_FLAGS=/nologo /std:c++20 /EHsc /MDd /Gy /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /DGTEST_LINKED_AS_SHARED_LIBRARY=1 /I. /Isrc /Isrc\Shared_modules /Iinclude /Iinclude\YARA /Ivendor"
+set "CL_FLAGS=/nologo /std:c++20 /EHsc /MDd /Gy /DWIN32 /D_WINDOWS /DUNICODE /D_UNICODE /DGTEST_LINKED_AS_SHARED_LIBRARY=1 /I. /Isrc /Isrc\PhantomCore /Iinclude /Iinclude\YARA /Ivendor"
 
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\Logger.obj" "src\Shared_modules\Utils\Logger.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\StringUtils.obj" "src\Shared_modules\Utils\StringUtils.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\FileUtils.obj" "src\Shared_modules\Utils\FileUtils.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\CryptoManager.obj" "src\Shared_modules\SelfProtection\CryptoManager.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\CertificateValidator.obj" "src\Shared_modules\SelfProtection\CertificateValidator.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\TamperProtection.obj" "src\Shared_modules\SelfProtection\TamperProtection.cpp" || exit /b 1
-cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\SelfDefense.obj" "src\Shared_modules\SelfProtection\SelfDefense.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\Logger.obj" "src\PhantomCore\Utils\Logger.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\StringUtils.obj" "src\PhantomCore\Utils\StringUtils.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\FileUtils.obj" "src\PhantomCore\Utils\FileUtils.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\CryptoManager.obj" "src\PhantomCore\SelfProtection\CryptoManager.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\CertificateValidator.obj" "src\PhantomCore\SelfProtection\CertificateValidator.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\TamperProtection.obj" "src\PhantomCore\SelfProtection\TamperProtection.cpp" || exit /b 1
+cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\SelfDefense.obj" "src\PhantomCore\SelfProtection\SelfDefense.cpp" || exit /b 1
 cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\SelfProtection_DependencyStubs.obj" "tests\integration\self_protection\SelfProtection_DependencyStubs.cpp" || exit /b 1
 cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\test_main.obj" "tests\test_main.cpp" || exit /b 1
 cl %CL_FLAGS% /c /Fo"%OBJ_DIR%\SelfProtectionStack_Integration_Tests.obj" "tests\integration\self_protection\SelfProtectionStack_Integration_Tests.cpp" || exit /b 1

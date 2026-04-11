@@ -24,7 +24,7 @@
 #include <string_view>
 #include <vector>
 
-#include "../../../src/Shared_modules/AI/FeatureExtractor.hpp"
+#include "../../../src/PhantomCore/AI/FeatureExtractor.hpp"
 #include "AI_TestUtils.hpp"
 
 namespace ShadowStrike::AI::Test {

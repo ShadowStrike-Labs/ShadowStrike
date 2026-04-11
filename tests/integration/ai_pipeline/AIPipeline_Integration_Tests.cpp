@@ -62,12 +62,12 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../src/Shared_modules/AI/CortexTypes.hpp"
-#include "../../../src/Shared_modules/AI/PhantomCortex.hpp"
-#include "../../../src/Shared_modules/AI/FeatureExtractor.hpp"
-#include "../../../src/Shared_modules/AI/ModelCache.hpp"
-#include "../../../src/Shared_modules/AI/ModelInference.hpp"
-#include "../../../src/Shared_modules/AI/CortexConfig.hpp"
+#include "../../../src/PhantomCore/AI/CortexTypes.hpp"
+#include "../../../src/PhantomCore/AI/PhantomCortex.hpp"
+#include "../../../src/PhantomCore/AI/FeatureExtractor.hpp"
+#include "../../../src/PhantomCore/AI/ModelCache.hpp"
+#include "../../../src/PhantomCore/AI/ModelInference.hpp"
+#include "../../../src/PhantomCore/AI/CortexConfig.hpp"
 
 namespace AI = ShadowStrike::AI;
 

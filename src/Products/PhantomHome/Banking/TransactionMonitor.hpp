@@ -139,14 +139,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../../../Shared_modules/Utils/Logger.hpp"
-#include "../../../Shared_modules/Utils/NetworkUtils.hpp"
-#include "../../../Shared_modules/Utils/CryptoUtils.hpp"
-#include "../../../Shared_modules/Utils/HashUtils.hpp"
-#include "../../../Shared_modules/HashStore/HashStore.hpp"
-#include "../../../Shared_modules/PatternStore/PatternStore.hpp"
-#include "../../../Shared_modules/ThreatIntel/ThreatIntelManager.hpp"
-#include "../../../Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../PhantomCore/Utils/CryptoUtils.hpp"
+#include "../../../PhantomCore/Utils/HashUtils.hpp"
+#include "../../../PhantomCore/HashStore/HashStore.hpp"
+#include "../../../PhantomCore/PatternStore/PatternStore.hpp"
+#include "../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../PhantomCore/Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS

@@ -35,7 +35,7 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "Shared_modules/PatternStore/PatternStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
 #include <vector>
 #include <string>
 #include <algorithm>

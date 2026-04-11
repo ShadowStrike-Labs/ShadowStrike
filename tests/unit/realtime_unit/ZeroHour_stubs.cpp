@@ -11,8 +11,8 @@
  */
 
 #include "pch.h"
-#include "../../../src/Shared_modules/ThreatIntel/ThreatIntelLookup.hpp"
-#include "../../../src/Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "../../../src/PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
+#include "../../../src/PhantomCore/Whitelist/WhiteListStore.hpp"
 
 namespace ShadowStrike {
 

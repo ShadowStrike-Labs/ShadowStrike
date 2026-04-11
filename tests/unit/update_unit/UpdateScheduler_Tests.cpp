@@ -15,7 +15,7 @@
 
 #include <nlohmann/json.hpp>
 
-#include "../../../src/Shared_modules/Update/UpdateScheduler.hpp"
+#include "../../../src/PhantomCore/Update/UpdateScheduler.hpp"
 
 namespace ShadowStrike::Update::Test {
 namespace {

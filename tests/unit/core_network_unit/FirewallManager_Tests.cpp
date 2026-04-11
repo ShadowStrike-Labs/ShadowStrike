@@ -18,7 +18,7 @@
 #include <string>
 #include <vector>
 
-#include "../../../src/Shared_modules/Core/Network/FirewallManager.hpp"
+#include "../../../src/PhantomCore/Core/Network/FirewallManager.hpp"
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {

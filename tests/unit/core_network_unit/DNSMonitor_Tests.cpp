@@ -19,7 +19,7 @@
 #include <regex>
 #include <string>
 
-#include "../../../src/Shared_modules/Core/Network/DNSMonitor.hpp"
+#include "../../../src/PhantomCore/Core/Network/DNSMonitor.hpp"
 #include "CoreNetwork_TestUtils.hpp"
 
 namespace ShadowStrike::Core::Network::Test {

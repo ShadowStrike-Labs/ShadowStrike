@@ -27,11 +27,11 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "Shared_modules/SignatureStore/SignatureStore.hpp"
-#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
-#include "Shared_modules/HashStore/HashStore.hpp"
-#include "Shared_modules/PatternStore/PatternStore.hpp"
-#include "Shared_modules/SignatureStore/YaraRuleStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureFormat.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/SignatureStore/YaraRuleStore.hpp"
 #include <memory>
 #include <vector>
 #include <string>

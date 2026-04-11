@@ -81,10 +81,10 @@
 // ============================================================================
 // SHADOWSTRIKE CONFIG MODULE HEADERS
 // ============================================================================
-#include "../../../src/Shared_modules/Config/ConfigManager.hpp"
-#include "../../../src/Shared_modules/Config/PolicyManager.hpp"
-#include "../../../src/Shared_modules/Config/ProfileManager.hpp"
-#include "../../../src/Shared_modules/Config/SettingsManager.hpp"
+#include "../../../src/PhantomCore/Config/ConfigManager.hpp"
+#include "../../../src/PhantomCore/Config/PolicyManager.hpp"
+#include "../../../src/PhantomCore/Config/ProfileManager.hpp"
+#include "../../../src/PhantomCore/Config/SettingsManager.hpp"
 
 // ============================================================================
 // NAMESPACE ALIASES

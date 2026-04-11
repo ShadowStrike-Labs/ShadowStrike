@@ -18,8 +18,8 @@
 #include"pch.h"
 #include <gtest/gtest.h>
 
-#include "Shared_modules/ThreatIntel/ThreatIntelExporter.hpp"
-#include "Shared_modules/ThreatIntel/ThreatIntelDatabase.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelExporter.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelDatabase.hpp"
 
 #include <array>
 #include <atomic>
