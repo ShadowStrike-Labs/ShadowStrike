@@ -824,6 +824,24 @@ public:
      */
     [[nodiscard]] uint32_t GetCloudLatency() const noexcept;
 
+    // ========================================================================
+    // EXTERNAL MODULE WIRING
+    // ========================================================================
+
+    /**
+     * @brief Wires the HashStore for signature-based hash lookups.
+     * @param hashStore Non-owning pointer to an initialized HashStore instance.
+     * @note Must be called after Initialize() and before any reputation queries.
+     */
+    void SetHashStore(ShadowStrike::HashStore::HashStore* hashStore) noexcept;
+
+    /**
+     * @brief Wires the ThreatIntelLookup for IOC matching.
+     * @param lookup Non-owning pointer to an initialized ThreatIntelLookup instance.
+     * @note Must be called after Initialize() and before any reputation queries.
+     */
+    void SetThreatIntelLookup(ShadowStrike::ThreatIntel::ThreatIntelLookup* lookup) noexcept;
+
 private:
     FileReputation();
     ~FileReputation();
