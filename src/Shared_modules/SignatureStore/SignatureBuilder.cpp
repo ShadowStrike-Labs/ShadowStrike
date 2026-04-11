@@ -1887,13 +1887,33 @@ void SignatureBuilder::ReportProgress(
     size_t total
 ) const noexcept {
     if (m_config.progressCallback) {
-        m_config.progressCallback(stage, current, total);
+        try {
+            m_config.progressCallback(stage, current, total);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"SignatureBuilder",
+                L"Progress callback threw for stage '%S': %S",
+                stage.c_str(), ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"SignatureBuilder",
+                L"Progress callback threw a non-standard exception for stage '%S'",
+                stage.c_str());
+        }
     }
 }
 
 void SignatureBuilder::Log(const std::string& message) const noexcept {
     if (m_config.logCallback) {
-        m_config.logCallback(message);
+        try {
+            m_config.logCallback(message);
+        } catch (const std::exception& ex) {
+            SS_LOG_ERROR(L"SignatureBuilder",
+                L"Log callback threw for message '%S': %S",
+                message.c_str(), ex.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"SignatureBuilder",
+                L"Log callback threw a non-standard exception for message '%S'",
+                message.c_str());
+        }
     }
     SS_LOG_INFO(L"SignatureBuilder", L"%S", message.c_str());
 }

@@ -48,8 +48,8 @@
  */
 #include <gtest/gtest.h>
 
-#include "../../../../src/Whitelist/WhiteListStore.hpp"
-#include "../../../../src/Whitelist/WhiteListFormat.hpp"
+#include "Shared_modules/Whitelist/WhiteListStore.hpp"
+#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
 
 #include <algorithm>
 #include <atomic>

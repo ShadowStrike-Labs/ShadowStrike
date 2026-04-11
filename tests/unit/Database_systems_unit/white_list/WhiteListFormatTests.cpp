@@ -48,7 +48,7 @@
  */
 #include <gtest/gtest.h>
 
-#include "../../../../src/Whitelist/WhiteListFormat.hpp"
+#include "Shared_modules/Whitelist/WhiteListFormat.hpp"
 
 #include <algorithm>
 #include <array>

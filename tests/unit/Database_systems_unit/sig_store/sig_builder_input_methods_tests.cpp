@@ -47,8 +47,8 @@
 
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../src/SignatureStore/SignatureBuilder.hpp"
-#include "../../src/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/SignatureStore/SignatureBuilder.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
 #include <vector>
 #include <thread>
 #include <future>

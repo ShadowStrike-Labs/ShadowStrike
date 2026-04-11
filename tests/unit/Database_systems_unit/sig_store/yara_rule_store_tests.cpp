@@ -28,8 +28,8 @@
  */
 
 #include <gtest/gtest.h>
-#include "../../../../src/SignatureStore/YaraRuleStore.hpp"
-#include "../../../../src/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/SignatureStore/YaraRuleStore.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
 #include <memory>
 #include <vector>
 #include <string>

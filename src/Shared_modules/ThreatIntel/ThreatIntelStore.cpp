@@ -1464,9 +1464,11 @@ bool ThreatIntelStore::AddIOC(
         return false;
     }
 
-    // Create IOCEntry from parameters
     IOCEntry entry{};
-    entry.type = type;
+    if (!m_impl->iocManager->ParseIOC(type, value, entry)) {
+        return false;
+    }
+
     entry.reputation = reputation;
     entry.source = source;
     entry.confidence = ConfidenceLevel::Medium;
@@ -1474,38 +1476,7 @@ bool ThreatIntelStore::AddIOC(
     entry.firstSeen = GetUnixTimestamp();
     entry.lastSeen = entry.firstSeen;
     entry.expirationTime = entry.firstSeen + DEFAULT_TTL_SECONDS;
-    entry.flags = IOCFlags::HasExpiration;
-
-    // Parse value based on type
-    switch (type) {
-        case IOCType::IPv4: {
-            auto addr = ParseIPv4(value);
-            if (!addr.has_value()) return false;
-            entry.value.ipv4 = addr.value();
-            break;
-        }
-        case IOCType::IPv6: {
-            auto addr = ParseIPv6(value);
-            if (!addr.has_value()) return false;
-            entry.value.ipv6 = addr.value();
-            break;
-        }
-        case IOCType::FileHash: {
-            // Auto-detect algorithm
-            auto hash = ParseHash("", value);
-            if (!hash.has_value()) return false;
-            entry.value.hash = hash.value();
-            break;
-        }
-        case IOCType::Domain:
-        case IOCType::URL:
-        case IOCType::Email:
-        default: {
-            // String-based IOCs need string pool allocation
-            // This is handled by the IOCManager
-            break;
-        }
-    }
+    entry.flags |= IOCFlags::HasExpiration;
 
     return AddIOC(entry);
 }

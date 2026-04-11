@@ -41,8 +41,8 @@
  */
 #include"pch.h"
 #include <gtest/gtest.h>
-#include "../../src/PatternStore/PatternStore.hpp"
-#include "../../src/SignatureStore/SignatureFormat.hpp"
+#include "Shared_modules/PatternStore/PatternStore.hpp"
+#include "Shared_modules/SignatureStore/SignatureFormat.hpp"
 #include <filesystem>
 #include <fstream>
 #include <random>

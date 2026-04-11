@@ -33,7 +33,7 @@
  * =============================================================================
  *
  * 1. **Event Ingestion & Normalization**
- *    - Receives events from ProcessMonitor, FileWatcher, RegistryMonitor, NetworkMonitor
+ *    - Receives events from ProcessMonitor, FileSystemFilter, RegistryMonitor, NetworkMonitor
  *    - Normalizes events into canonical format
  *    - Enriches events with process context and threat intelligence
  *

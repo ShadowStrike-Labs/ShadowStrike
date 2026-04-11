@@ -1168,10 +1168,24 @@ LookupResult WhitelistStore::IsHashWhitelisted(
         // Validate description length is reasonable
         constexpr uint16_t MAX_DESC_LENGTH = 65535;
         if (entry->descriptionLength <= MAX_DESC_LENGTH) {
-            auto desc = m_stringPool->GetString(entry->descriptionOffset, entry->descriptionLength);
+            auto desc = m_stringPool->GetWideString(entry->descriptionOffset, entry->descriptionLength);
             if (!desc.empty()) {
                 try {
-                    result.description = std::string(desc);
+                    std::string utf8Desc;
+                    utf8Desc.resize(desc.size() * 3);
+                    const int converted = WideCharToMultiByte(
+                        CP_UTF8,
+                        0,
+                        desc.data(),
+                        static_cast<int>(desc.size()),
+                        utf8Desc.data(),
+                        static_cast<int>(utf8Desc.size()),
+                        nullptr,
+                        nullptr);
+                    if (converted > 0) {
+                        utf8Desc.resize(static_cast<size_t>(converted));
+                        result.description = std::move(utf8Desc);
+                    }
                 } catch (const std::exception&) {
                     // Description allocation failed, continue without it
                 }
@@ -1382,10 +1396,24 @@ LookupResult WhitelistStore::IsPathWhitelisted(
         if (entry->descriptionOffset > 0 && entry->descriptionLength > 0 && m_stringPool) {
             constexpr uint16_t MAX_DESC_LENGTH = 65535;
             if (entry->descriptionLength <= MAX_DESC_LENGTH) {
-                auto desc = m_stringPool->GetString(entry->descriptionOffset, entry->descriptionLength);
+                auto desc = m_stringPool->GetWideString(entry->descriptionOffset, entry->descriptionLength);
                 if (!desc.empty()) {
                     try {
-                        result.description = std::string(desc);
+                        std::string utf8Desc;
+                        utf8Desc.resize(desc.size() * 3);
+                        const int converted = WideCharToMultiByte(
+                            CP_UTF8,
+                            0,
+                            desc.data(),
+                            static_cast<int>(desc.size()),
+                            utf8Desc.data(),
+                            static_cast<int>(utf8Desc.size()),
+                            nullptr,
+                            nullptr);
+                        if (converted > 0) {
+                            utf8Desc.resize(static_cast<size_t>(converted));
+                            result.description = std::move(utf8Desc);
+                        }
                     } catch (const std::exception&) {
                         // Description allocation failed, continue without it
                     }

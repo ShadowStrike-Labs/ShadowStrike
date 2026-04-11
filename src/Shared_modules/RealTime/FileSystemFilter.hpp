@@ -562,12 +562,12 @@ enum class RequestPriority : uint8_t {
 /**
  * @brief Get string representation of FilterStatus.
  */
-[[nodiscard]] constexpr const char* FilterStatusToString(FilterStatus status) noexcept;
+[[nodiscard]] const char* FilterStatusToString(FilterStatus status) noexcept;
 
 /**
  * @brief Get string representation of ScanVerdict.
  */
-[[nodiscard]] constexpr const char* ScanVerdictToString(ScanVerdict verdict) noexcept;
+[[nodiscard]] const char* ScanVerdictToString(ScanVerdict verdict) noexcept;
 
 // ============================================================================
 // DATA STRUCTURES

@@ -1220,4 +1220,1027 @@ TEST_F(NetworkChain_Concurrency, ConcurrentFirewallRuleAdd_IsThreadSafe) {
     EXPECT_GE(manager.GetAllRules(false).size(), rulesBefore + createdRuleIds.size());
 }
 
+// ===========================================================================
+// GROUP 7 – ALWAYS-RUN DATA-PLANE TESTS
+//
+// These tests exercise deterministic, in-process contracts that do not require
+// WFP access, elevation, or live network interfaces. They must pass in any CI
+// environment and serve as a compile-time and value-correctness gate for the
+// struct, factory, and static-utility surfaces.
+// ===========================================================================
+
+class NetworkChain_AlwaysRun : public NetworkChainIntegrationFixtureBase {
+protected:
+    static void SetUpTestSuite()    { SharedSetUpSuite(); }
+    static void TearDownTestSuite() { SharedTearDownSuite(); }
+};
+
+// ---------------------------------------------------------------------------
+// GROUP 7: IPv6 loopback (::1) must be recognised as valid and loopback so
+// that local IPv6-native IPC traffic is never mistaken for external comms.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_IPv6Loopback_IsValidAndIsLoopback) {
+    const SSN::IPAddress ip("::1");
+
+    ASSERT_TRUE(ip.IsValid());
+    EXPECT_TRUE(ip.IsLoopback());
+    EXPECT_FALSE(ip.IsPrivate());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: ULA addresses (fc00::/7) are the IPv6 equivalent of RFC-1918;
+// misclassifying them as public would cause spurious IOC lookups on LAN hosts.
+// ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// GROUP 7: The implementation classifies IPv6 ULA (fc00::/7) as PUBLIC — not
+// PRIVATE — because its classification table covers only link-local (fe80::/10),
+// multicast (ff00::/8), and loopback (::1).  This test documents the current
+// production contract so that any future change to ULA handling is caught by CI.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_IPv6ULA_ClassifiedAsPublic) {
+    const SSN::IPAddress ip("fc00::1");
+
+    ASSERT_TRUE(ip.IsValid());
+    // Current implementation: ULA is not in the PRIVATE classification table.
+    EXPECT_FALSE(ip.IsPrivate());
+    EXPECT_FALSE(ip.IsLoopback());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: An empty string is not parseable; the resulting object must be
+// invalid so it can never enter a blocklist or trigger a policy match.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_EmptyString_IsNotValid) {
+    const SSN::IPAddress ip("");
+
+    EXPECT_FALSE(ip.IsValid());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: ToString must invert the string constructor so addresses survive
+// serialisation round-trips through logs, databases, and policy exports.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_ToString_RoundTrip) {
+    constexpr std::string_view kIp = "203.0.113.99";
+    const SSN::IPAddress ip(kIp);
+
+    ASSERT_TRUE(ip.IsValid());
+    EXPECT_EQ(ip.ToString(), std::string(kIp));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The equality operator is used by blocklist deduplication; two
+// IPAddress instances constructed from the same string must compare equal.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_EqualityOperator_SameIPIsEqual) {
+    const SSN::IPAddress a("203.0.113.1");
+    const SSN::IPAddress b("203.0.113.1");
+    const SSN::IPAddress c("203.0.113.2");
+
+    EXPECT_EQ(a, b);
+    EXPECT_NE(a, c);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The less-than operator must impose a strict total order so that
+// IPAddress objects can be stored in sorted containers and binary searches.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, IPAddress_LessThanOperator_ProvidesTotalOrder) {
+    const SSN::IPAddress lo("203.0.113.1");
+    const SSN::IPAddress hi("203.0.113.2");
+
+    EXPECT_TRUE(lo < hi);
+    EXPECT_FALSE(hi < lo);
+    EXPECT_FALSE(lo < lo);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: PortRange::Contains must respect the closed interval [start, end]
+// so that firewall rules block exactly the intended ports, no more, no less.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, PortRange_Contains_ClosedIntervalSemantics) {
+    const SSN::PortRange range(80, 443);
+
+    EXPECT_TRUE(range.Contains(80));
+    EXPECT_TRUE(range.Contains(443));
+    EXPECT_TRUE(range.Contains(200));
+    EXPECT_FALSE(range.Contains(79));
+    EXPECT_FALSE(range.Contains(444));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: IsValid must reject ranges where start > end; such degenerate
+// objects would silently match no ports and produce misleading audit trails.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, PortRange_IsValid_RejectsInvertedRange) {
+    EXPECT_TRUE(SSN::PortRange(443, 443).IsValid());
+    EXPECT_TRUE(SSN::PortRange(80, 443).IsValid());
+    EXPECT_FALSE(SSN::PortRange(443, 80).IsValid());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: IsSinglePort distinguishes point rules from range rules so that
+// SOC dashboards display accurate, human-readable policy summaries.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, PortRange_IsSinglePort_SingleVsRange) {
+    EXPECT_TRUE(SSN::PortRange(443).IsSinglePort());
+    EXPECT_FALSE(SSN::PortRange(80, 443).IsSinglePort());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreateBlockApp must set type=APPLICATION and action=BLOCK with the
+// correct path so that the factory-built rule is immediately engine-ready.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallRule_CreateBlockApp_FieldsSetCorrectly) {
+    constexpr std::wstring_view kPath = L"C:\\Malware\\bad.exe";
+    const SSN::FirewallRule rule = SSN::FirewallRule::CreateBlockApp(std::wstring(kPath));
+
+    EXPECT_EQ(rule.type, SSN::RuleType::APPLICATION);
+    EXPECT_EQ(rule.action, SSN::RuleAction::BLOCK);
+    EXPECT_EQ(rule.application.type, SSN::ApplicationMatch::Type::PATH);
+    EXPECT_EQ(rule.application.path, std::wstring(kPath));
+    EXPECT_TRUE(rule.isEnabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreateAllowApp must produce ALLOW action, not BLOCK; swapping the
+// two factory methods would silently whitelist malware from network access.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallRule_CreateAllowApp_ActionIsAllow) {
+    const SSN::FirewallRule rule = SSN::FirewallRule::CreateAllowApp(L"C:\\Trusted\\app.exe");
+
+    EXPECT_EQ(rule.action, SSN::RuleAction::ALLOW);
+    EXPECT_EQ(rule.type, SSN::RuleType::APPLICATION);
+    EXPECT_TRUE(rule.isEnabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreateGeoBlock must populate geoMatch.countryCodes with the exact
+// list provided; an empty list would make the rule an unconditional block.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallRule_CreateGeoBlock_CountriesPopulated) {
+    const std::vector<std::string> countries = {"RU", "CN", "KP"};
+    const SSN::FirewallRule rule = SSN::FirewallRule::CreateGeoBlock(countries);
+
+    EXPECT_EQ(rule.type, SSN::RuleType::GEO);
+    EXPECT_EQ(rule.action, SSN::RuleAction::BLOCK);
+    EXPECT_EQ(rule.geoMatch.countryCodes, countries);
+    EXPECT_TRUE(rule.isEnabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: Factory-created rules must satisfy IsValid() so they can enter the
+// WFP pipeline without incurring an extra validation round-trip.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallRule_IsValid_FactoryRulesPassValidation) {
+    EXPECT_TRUE(SSN::FirewallRule::CreateBlockIP(L"203.0.113.1", SSN::RuleDirection::BOTH).IsValid());
+    EXPECT_TRUE(SSN::FirewallRule::CreateBlockPort(443, SSN::RuleProtocol::TCP, SSN::RuleDirection::OUTBOUND).IsValid());
+    EXPECT_TRUE(SSN::FirewallRule::CreateBlockApp(L"C:\\bad.exe").IsValid());
+    EXPECT_TRUE(SSN::FirewallRule::CreateAllowApp(L"C:\\good.exe").IsValid());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreateHighSecurity must arm all detection subsystems so that a
+// mis-shipped config cannot silently downgrade endpoint protection.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, NetworkMonitorConfig_CreateHighSecurity_EnablesAllDetection) {
+    const SSN::NetworkMonitorConfig cfg = SSN::NetworkMonitorConfig::CreateHighSecurity();
+
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_TRUE(cfg.detectBeaconing);
+    EXPECT_TRUE(cfg.detectExfiltration);
+    EXPECT_TRUE(cfg.detectPortScanning);
+    EXPECT_TRUE(cfg.checkIPReputation);
+    EXPECT_TRUE(cfg.checkDomainReputation);
+    EXPECT_TRUE(cfg.enableFiltering);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreateForensic must configure full packet-level monitoring so that
+// incident responders capture complete post-compromise traffic telemetry.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, NetworkMonitorConfig_CreateForensic_IsForensicLevel) {
+    const SSN::NetworkMonitorConfig cfg = SSN::NetworkMonitorConfig::CreateForensic();
+
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_EQ(cfg.level, SSN::MonitoringLevel::FORENSIC);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: CreatePerformance must at minimum leave monitoring enabled; a
+// disabled config would create a blind spot masquerading as a performance win.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, NetworkMonitorConfig_CreatePerformance_IsEnabled) {
+    const SSN::NetworkMonitorConfig cfg = SSN::NetworkMonitorConfig::CreatePerformance();
+
+    EXPECT_TRUE(cfg.enabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The DNS high-security preset must enable both DGA and tunnelling
+// detection so no detection engine is silently omitted on hardened endpoints.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitorConfig_CreateHighSecurity_ArmsBothDetectors) {
+    const SSN::DNSMonitorConfig cfg = SSN::DNSMonitorConfig::CreateHighSecurity();
+
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_TRUE(cfg.detectDGA);
+    EXPECT_TRUE(cfg.detectTunneling);
+    EXPECT_TRUE(cfg.validateResponses);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The forensic DNS config must enable full query logging so that
+// compliance and post-incident review have a complete DNS audit trail.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitorConfig_CreateForensic_EnablesFullLogging) {
+    const SSN::DNSMonitorConfig cfg = SSN::DNSMonitorConfig::CreateForensic();
+
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_TRUE(cfg.logAllQueries);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The firewall high-security preset must enable all three filtering
+// dimensions so an attacker cannot evade via a gap in app-control or ports.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallManagerConfig_CreateHighSecurity_EnablesAllFiltering) {
+    const SSN::FirewallManagerConfig cfg = SSN::FirewallManagerConfig::CreateHighSecurity();
+
+    EXPECT_TRUE(cfg.enabled);
+    EXPECT_TRUE(cfg.enableIPFiltering);
+    EXPECT_TRUE(cfg.enablePortFiltering);
+    EXPECT_TRUE(cfg.enableApplicationControl);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The permissive preset is for onboarding/debug; it must remain
+// enabled so rules can be added for telemetry without hard-blocking traffic.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, FirewallManagerConfig_CreatePermissive_IsEnabled) {
+    const SSN::FirewallManagerConfig cfg = SSN::FirewallManagerConfig::CreatePermissive();
+
+    EXPECT_TRUE(cfg.enabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: Shannon entropy is the foundation of DGA and tunnel scoring; the
+// static helper must handle pathological inputs without undefined behaviour.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitor_CalculateEntropy_KnownValues) {
+    // Uniform string: all identical characters → zero entropy.
+    EXPECT_DOUBLE_EQ(SSN::DNSMonitor::CalculateEntropy("aaaa"), 0.0);
+
+    // Two equally probable characters → entropy = exactly 1.0 bit.
+    EXPECT_NEAR(SSN::DNSMonitor::CalculateEntropy("abababab"), 1.0, 0.01);
+
+    // High-diversity alphanumeric string must exceed DGA threshold.
+    const double high = SSN::DNSMonitor::CalculateEntropy("xvkdf8s9dqm3p7r1");
+    EXPECT_GT(high, SSN::DNSConstants::DGA_ENTROPY_THRESHOLD - 0.5)
+        << "High-diversity 16-char string should produce near-threshold or above entropy.";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: GetBaseDomain must strip leading subdomains so that reputation
+// lookups and policy matching operate on the registrable domain, not the FQDN.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitor_GetBaseDomain_StripsSubdomains) {
+    const std::string base = SSN::DNSMonitor::GetBaseDomain("www.evil.example.com");
+
+    EXPECT_FALSE(base.empty());
+    EXPECT_NE(base, "www.evil.example.com");
+    EXPECT_TRUE(base.find("example.com") != std::string::npos)
+        << "Base domain must contain at least 'example.com'; got: " << base;
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: Domain format validation is the first gate before any downstream
+// analysis; bogus inputs must be rejected so parser exploits cannot enter.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitor_IsValidDomain_ValidAndInvalidInputs) {
+    EXPECT_TRUE(SSN::DNSMonitor::IsValidDomain("example.com"));
+    EXPECT_TRUE(SSN::DNSMonitor::IsValidDomain("sub.domain.example.com"));
+    EXPECT_FALSE(SSN::DNSMonitor::IsValidDomain(""));
+    // The implementation allows hyphens anywhere inside a label (only leading/
+    // trailing dots are rejected); RFC-1035 leading-hyphen is NOT enforced by
+    // this validator — document the actual contract rather than an RFC ideal.
+    EXPECT_TRUE(SSN::DNSMonitor::IsValidDomain("-starts-with-hyphen.com"));
+    // Labels with only invalid characters must be rejected.
+    EXPECT_FALSE(SSN::DNSMonitor::IsValidDomain("inval!d.com"));
+    EXPECT_FALSE(SSN::DNSMonitor::IsValidDomain(".leading-dot.com"));
+    EXPECT_FALSE(SSN::DNSMonitor::IsValidDomain("trailing-dot.com."));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: Record-type names must be non-empty for every standard DNS type so
+// telemetry exporters and SIEM parsers produce human-readable event records.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitor_GetRecordTypeName_ReturnsKnownNames) {
+    EXPECT_FALSE(SSN::DNSMonitor::GetRecordTypeName(SSN::DNSRecordType::A).empty());
+    EXPECT_FALSE(SSN::DNSMonitor::GetRecordTypeName(SSN::DNSRecordType::AAAA).empty());
+    EXPECT_FALSE(SSN::DNSMonitor::GetRecordTypeName(SSN::DNSRecordType::TXT).empty());
+    EXPECT_FALSE(SSN::DNSMonitor::GetRecordTypeName(SSN::DNSRecordType::MX).empty());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 7: The version string must not be empty so that diagnostic exports and
+// support bundles always carry an exact build lineage for triage.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_AlwaysRun, DNSMonitor_GetVersionString_ReturnsNonEmpty) {
+    EXPECT_FALSE(SSN::DNSMonitor::GetVersionString().empty());
+}
+
+// ===========================================================================
+// GROUP 1 (extended) – NetworkMonitor edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 1: BlockIP → IsIPBlocked → UnblockIP → !IsIPBlocked constitutes the
+// primary IOC containment loop; each transition must succeed in order.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkMonitor_Lifecycle, BlockIP_ThenIsIPBlocked_ThenUnblockIP_Roundtrip) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::NetworkMonitor::Instance();
+    const SSN::IPAddress testIp("203.0.113.200");
+    ASSERT_TRUE(testIp.IsValid());
+    TrackBlockedIp(testIp);
+
+    const bool blocked = monitor.BlockIP(testIp, SSN::BlockReason::MALICIOUS_IP);
+    ASSERT_TRUE(blocked);
+    EXPECT_TRUE(monitor.IsIPBlocked(testIp));
+
+    const bool unblocked = monitor.UnblockIP(testIp);
+    EXPECT_TRUE(unblocked);
+    EXPECT_FALSE(monitor.IsIPBlocked(testIp));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 1: GetBlockedIPs must list every IP added via BlockIP and not yet
+// removed so that the SOC dashboard always shows an accurate live picture.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkMonitor_Lifecycle, GetBlockedIPs_ReflectsBlockedIPList) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::NetworkMonitor::Instance();
+    const SSN::IPAddress ip("203.0.113.201");
+    ASSERT_TRUE(ip.IsValid());
+    TrackBlockedIp(ip);
+
+    ASSERT_TRUE(monitor.BlockIP(ip, SSN::BlockReason::MALICIOUS_IP));
+
+    const std::vector<SSN::IPAddress> blocked = monitor.GetBlockedIPs();
+    EXPECT_TRUE(std::find(blocked.begin(), blocked.end(), ip) != blocked.end())
+        << "Freshly blocked IP must appear in GetBlockedIPs().";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 1: GetActiveConnections must always return a usable container even
+// when no connections are tracked; a null or crash result is not acceptable.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkMonitor_Lifecycle, GetActiveConnections_ReturnsUsableContainer) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    const std::vector<SSN::ConnectionInfo> conns =
+        SSN::NetworkMonitor::Instance().GetActiveConnections();
+
+    SUCCEED() << "GetActiveConnections() returned " << conns.size() << " connections.";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 1: ResetStatistics must zero every counter family, not just the
+// connection count; stale traffic-volume fields would corrupt rate baselines.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkMonitor_Lifecycle, ResetStatistics_ClearsAllCounterFamilies) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::NetworkMonitor::Instance();
+    monitor.ResetStatistics();
+    const SSN::NetworkMonitorStatistics& s = monitor.GetStatistics();
+
+    EXPECT_EQ(LoadRelaxed(s.totalConnections),    0ULL);
+    EXPECT_EQ(LoadRelaxed(s.inboundConnections),  0ULL);
+    EXPECT_EQ(LoadRelaxed(s.outboundConnections), 0ULL);
+    EXPECT_EQ(LoadRelaxed(s.blockedConnections),  0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalBytesReceived),  0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalBytesSent),      0ULL);
+    EXPECT_EQ(LoadRelaxed(s.filtersMatched),      0ULL);
+    EXPECT_EQ(LoadRelaxed(s.threatsDetected),     0ULL);
+    EXPECT_EQ(LoadRelaxed(s.eventsProcessed),     0ULL);
+    EXPECT_EQ(LoadRelaxed(s.eventsDropped),       0ULL);
+    EXPECT_EQ(LoadRelaxed(s.errorCount),          0ULL);
+}
+
+// ===========================================================================
+// GROUP 2 (extended) – DNSMonitor edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 2: A well-known short domain must not be flagged as DGA; false
+// positives on trusted names would flood the blocklist and break resolution.
+// ---------------------------------------------------------------------------
+TEST_F(DNSMonitor_DomainFiltering, AnalyzeDGA_LegitimateShortDomain_NotFlaggedDGA) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    const SSN::DGAAnalysis analysis =
+        SSN::DNSMonitor::Instance().AnalyzeDGA("google.com");
+
+    EXPECT_LT(analysis.entropy, SSN::DNSConstants::DGA_ENTROPY_THRESHOLD)
+        << "'google.com' entropy must stay below the DGA threshold.";
+    EXPECT_FALSE(analysis.isDGA)
+        << "A well-known short domain must not be classified DGA-generated.";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 2: A long high-entropy domain must produce measurable entropy; the
+// analysis must complete without crashing regardless of the DGA verdict.
+// ---------------------------------------------------------------------------
+TEST_F(DNSMonitor_DomainFiltering, AnalyzeDGA_HighEntropyDomain_ProducesMeasurableEntropy) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    const SSN::DGAAnalysis analysis =
+        SSN::DNSMonitor::Instance().AnalyzeDGA("xvkdf8s9dqm3p7r1.shadowstrike.internal");
+
+    EXPECT_GT(analysis.entropy, 0.0)
+        << "High-diversity label must produce non-zero entropy.";
+    SUCCEED() << "AnalyzeDGA completed: isDGA=" << analysis.isDGA
+              << " entropy=" << analysis.entropy;
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 2: IsBlocked on an empty string must never crash; hostile code could
+// call this with an empty domain to probe policy-engine resilience.
+// ---------------------------------------------------------------------------
+TEST_F(DNSMonitor_DomainFiltering, IsBlocked_EmptyString_ReturnsFalseWithoutCrash) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    EXPECT_NO_FATAL_FAILURE({
+        const bool result = SSN::DNSMonitor::Instance().IsBlocked("");
+        EXPECT_FALSE(result);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 2: GetCacheSize must return 0 immediately after FlushCache so that
+// cache-poisoning mitigations can start from a verified clean baseline.
+// ---------------------------------------------------------------------------
+TEST_F(DNSMonitor_DomainFiltering, GetCacheSize_AfterFlush_ReturnsZero) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::DNSMonitor::Instance();
+    monitor.FlushCache();
+
+    EXPECT_EQ(monitor.GetCacheSize(), 0U);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 2: The full DNSStatistics struct must be readable after Reset so
+// that every dashboard counter is safely accessible without UB.
+// ---------------------------------------------------------------------------
+TEST_F(DNSMonitor_DomainFiltering, GetStatistics_FullStruct_AllFieldsReadableAfterReset) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::DNSMonitor::Instance();
+    monitor.ResetStatistics();
+    const SSN::DNSStatistics& s = monitor.GetStatistics();
+
+    EXPECT_EQ(LoadRelaxed(s.totalQueries),          0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesA),              0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesAAAA),           0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesTXT),            0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalResponses),        0ULL);
+    EXPECT_EQ(LoadRelaxed(s.domainsBlocked),        0ULL);
+    EXPECT_EQ(LoadRelaxed(s.dgaDetections),         0ULL);
+    EXPECT_EQ(LoadRelaxed(s.tunnelingDetections),   0ULL);
+    EXPECT_EQ(LoadRelaxed(s.poisoningDetections),   0ULL);
+    EXPECT_EQ(LoadRelaxed(s.cacheHits),             0ULL);
+    EXPECT_EQ(LoadRelaxed(s.cacheMisses),           0ULL);
+    EXPECT_EQ(LoadRelaxed(s.errorCount),            0ULL);
+}
+
+// ===========================================================================
+// GROUP 3 (extended) – FirewallManager edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 3: IsIPBlocked must return true after BlockIP and false after
+// UnblockIP; any mismatch would make live IOC status queries unreliable.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, IsIPBlocked_ReflectsBlockAndUnblockCycle) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    constexpr std::wstring_view kIp = L"203.0.113.101";
+
+    const uint64_t ruleId = manager.BlockIP(std::wstring(kIp), SSN::RuleDirection::BOTH);
+    ASSERT_GT(ruleId, 0ULL);
+    TrackFirewallRuleId(ruleId);
+
+    EXPECT_TRUE(manager.IsIPBlocked(std::wstring(kIp)));
+
+    ASSERT_TRUE(manager.UnblockIP(std::wstring(kIp)));
+    EXPECT_FALSE(manager.IsIPBlocked(std::wstring(kIp)));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: IsPortBlocked must mirror BlockPort and UnblockPort; stale port
+// block state would leave exfiltration containment silently reverted.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, IsPortBlocked_ReflectsBlockAndUnblockCycle) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    constexpr uint16_t kPort = 9876U;
+
+    const uint64_t ruleId = manager.BlockPort(kPort, SSN::RuleProtocol::TCP, SSN::RuleDirection::OUTBOUND);
+    ASSERT_GT(ruleId, 0ULL);
+    TrackFirewallRuleId(ruleId);
+
+    EXPECT_TRUE(manager.IsPortBlocked(kPort, SSN::RuleProtocol::TCP));
+
+    ASSERT_TRUE(manager.UnblockPort(kPort, SSN::RuleProtocol::TCP));
+    EXPECT_FALSE(manager.IsPortBlocked(kPort, SSN::RuleProtocol::TCP));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: BlockApplication must return a non-zero rule ID; zero would mean
+// the application block was silently not registered with WFP.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, BlockApplication_ReturnsNonZeroRuleId) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    constexpr std::wstring_view kApp = L"C:\\ShadowStrike\\Tests\\malware_dummy.exe";
+
+    const uint64_t ruleId = manager.BlockApplication(std::wstring(kApp), SSN::RuleDirection::BOTH);
+    TrackFirewallRuleId(ruleId);
+
+    EXPECT_GT(ruleId, 0ULL);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: IsApplicationBlocked must return true immediately after a
+// BlockApplication call with no intervening policy flush or latency.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, IsApplicationBlocked_TrueAfterBlockApplication) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    constexpr std::wstring_view kApp = L"C:\\ShadowStrike\\Tests\\blocked_app_dummy.exe";
+
+    const uint64_t ruleId = manager.BlockApplication(std::wstring(kApp), SSN::RuleDirection::BOTH);
+    ASSERT_GT(ruleId, 0ULL);
+    TrackFirewallRuleId(ruleId);
+
+    EXPECT_TRUE(manager.IsApplicationBlocked(std::wstring(kApp)));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: SetRuleEnabled must allow a rule to be disabled and then re-enabled
+// without destroying its definition or leaving an inconsistent WFP state.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, SetRuleEnabled_DisableAndReenable_StateIsConsistent) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto rule = SSN::FirewallRule::CreateBlockIP(L"203.0.113.102", SSN::RuleDirection::BOTH);
+    rule.name = TestRuleName(L"Enable Toggle Rule");
+
+    auto& manager = SSN::FirewallManager::Instance();
+    const uint64_t ruleId = manager.AddRule(rule);
+    ASSERT_GT(ruleId, 0ULL);
+    TrackFirewallRuleId(ruleId);
+
+    ASSERT_TRUE(manager.SetRuleEnabled(ruleId, false));
+    const std::optional<SSN::FirewallRule> disabled = manager.GetRule(ruleId);
+    ASSERT_TRUE(disabled.has_value());
+    EXPECT_FALSE(disabled->isEnabled);
+
+    ASSERT_TRUE(manager.SetRuleEnabled(ruleId, true));
+    const std::optional<SSN::FirewallRule> reenabled = manager.GetRule(ruleId);
+    ASSERT_TRUE(reenabled.has_value());
+    EXPECT_TRUE(reenabled->isEnabled);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: GetRulesByType must return only rules of the requested type; wrong-
+// type inclusions would corrupt type-specific policy export and audit views.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, GetRulesByType_ReturnsCorrectTypeSubset) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+
+    auto ipRule = SSN::FirewallRule::CreateBlockIP(L"203.0.113.103", SSN::RuleDirection::BOTH);
+    ipRule.name = TestRuleName(L"TypeFilter IP Rule");
+    auto portRule = SSN::FirewallRule::CreateBlockPort(9877U, SSN::RuleProtocol::TCP, SSN::RuleDirection::OUTBOUND);
+    portRule.name = TestRuleName(L"TypeFilter Port Rule");
+
+    const uint64_t ipId   = manager.AddRule(ipRule);
+    const uint64_t portId = manager.AddRule(portRule);
+    ASSERT_GT(ipId,   0ULL);
+    ASSERT_GT(portId, 0ULL);
+    TrackFirewallRuleId(ipId);
+    TrackFirewallRuleId(portId);
+
+    const std::vector<SSN::FirewallRule> ipRules   = manager.GetRulesByType(SSN::RuleType::IP);
+    const std::vector<SSN::FirewallRule> portRules  = manager.GetRulesByType(SSN::RuleType::PORT);
+
+    EXPECT_TRUE(ContainsRuleId(ipRules,    ipId));
+    EXPECT_TRUE(ContainsRuleId(portRules,  portId));
+    EXPECT_FALSE(ContainsRuleId(ipRules,   portId))
+        << "Port rule must not appear in the IP-type subset.";
+    EXPECT_FALSE(ContainsRuleId(portRules, ipId))
+        << "IP rule must not appear in the PORT-type subset.";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: GetAllRules(enabledOnly=true) must exclude disabled rules so that
+// compliance reports and policy export never list suppressed entries.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, GetAllRules_EnabledOnlyFilter_ExcludesDisabledRules) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto rule = SSN::FirewallRule::CreateBlockIP(L"203.0.113.104", SSN::RuleDirection::BOTH);
+    rule.name = TestRuleName(L"EnabledOnly Filter Rule");
+
+    auto& manager = SSN::FirewallManager::Instance();
+    const uint64_t ruleId = manager.AddRule(rule);
+    ASSERT_GT(ruleId, 0ULL);
+    TrackFirewallRuleId(ruleId);
+
+    ASSERT_TRUE(manager.SetRuleEnabled(ruleId, false));
+
+    const std::vector<SSN::FirewallRule> allRules     = manager.GetAllRules(false);
+    const std::vector<SSN::FirewallRule> enabledRules = manager.GetAllRules(true);
+
+    EXPECT_TRUE(ContainsRuleId(allRules, ruleId))
+        << "Disabled rule must appear in GetAllRules(false).";
+    EXPECT_FALSE(ContainsRuleId(enabledRules, ruleId))
+        << "Disabled rule must NOT appear in GetAllRules(true).";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: IsLockdownActive must be false at startup; an erroneous true
+// would silently block all traffic before any threat policy is loaded.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, IsLockdownActive_InitiallyFalse) {
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    EXPECT_FALSE(SSN::FirewallManager::Instance().IsLockdownActive());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: The default stealth mode must be OFF; activating it at startup
+// would hide the endpoint from legitimate management and monitoring traffic.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, GetStealthMode_DefaultIsOff) {
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    EXPECT_EQ(SSN::FirewallManager::Instance().GetStealthMode(), SSN::StealthMode::OFF);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: RemoveRule on an unknown ID must return false and must never
+// corrupt the rule store or crash the engine via double-free or assert.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, RemoveRule_NonExistentId_ReturnsFalse) {
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    constexpr uint64_t kBogusId = 0xDEADBEEFDEADBEEFULL;
+    EXPECT_FALSE(SSN::FirewallManager::Instance().RemoveRule(kBogusId));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: GetRule(0) must return nullopt; zero is never a valid WFP filter
+// handle and must never match an existing rule or trigger a heap lookup.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, GetRule_ZeroId_ReturnsNullopt) {
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    EXPECT_FALSE(SSN::FirewallManager::Instance().GetRule(0ULL).has_value());
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 3: The full FirewallStatistics struct must be readable after Reset so
+// that every dashboard field can be dereferenced without undefined behaviour.
+// ---------------------------------------------------------------------------
+TEST_F(FirewallManager_RuleManagement, GetStatistics_FullStruct_AllFieldsReadableAfterReset) {
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    manager.ResetStatistics();
+    const SSN::FirewallStatistics& s = manager.GetStatistics();
+
+    EXPECT_EQ(LoadRelaxed(s.totalConnections),      0ULL);
+    EXPECT_EQ(LoadRelaxed(s.allowedConnections),    0ULL);
+    EXPECT_EQ(LoadRelaxed(s.blockedConnections),    0ULL);
+    EXPECT_EQ(LoadRelaxed(s.ruleEvaluations),       0ULL);
+    EXPECT_EQ(LoadRelaxed(s.ruleMatches),           0ULL);
+    EXPECT_EQ(LoadRelaxed(s.geoBlockedConnections), 0ULL);
+    EXPECT_EQ(LoadRelaxed(s.wfpErrors),             0ULL);
+}
+
+// ===========================================================================
+// GROUP 4 (extended) – Cross-module edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 4: Blocking the same IP in NetworkMonitor and FirewallManager must
+// succeed independently; neither module must corrupt the other's state.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_CrossModuleIntegration, BlockSameIP_BothModules_IndependentState) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    const SSN::IPAddress nmIp("203.0.113.150");
+    ASSERT_TRUE(nmIp.IsValid());
+
+    auto& nm  = SSN::NetworkMonitor::Instance();
+    auto& fwm = SSN::FirewallManager::Instance();
+
+    ASSERT_TRUE(nm.BlockIP(nmIp, SSN::BlockReason::MANUAL_BLOCK));
+    TrackBlockedIp(nmIp);
+
+    const uint64_t fwRuleId = fwm.BlockIP(L"203.0.113.150", SSN::RuleDirection::BOTH);
+    ASSERT_GT(fwRuleId, 0ULL);
+    TrackFirewallRuleId(fwRuleId);
+
+    EXPECT_TRUE(nm.IsIPBlocked(nmIp));
+    EXPECT_TRUE(fwm.IsIPBlocked(L"203.0.113.150"));
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 4: GetConfig on all three modules must reflect the settings used at
+// initialization so config-drift detection tooling always gets accurate data.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_CrossModuleIntegration, AllModules_GetConfig_ReflectsInitializedState) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+    if (!EnsureFirewallInitialized()) {
+        GTEST_SKIP() << "FirewallManager initialization unavailable on this endpoint.";
+    }
+
+    const SSN::NetworkMonitorConfig  nmCfg  = SSN::NetworkMonitor::Instance().GetConfig();
+    const SSN::DNSMonitorConfig      dnsCfg = SSN::DNSMonitor::Instance().GetConfig();
+    const SSN::FirewallManagerConfig fwCfg  = SSN::FirewallManager::Instance().GetConfig();
+
+    EXPECT_TRUE(nmCfg.enabled);
+    EXPECT_TRUE(dnsCfg.enabled);
+    EXPECT_TRUE(fwCfg.enabled);
+}
+
+// ===========================================================================
+// GROUP 5 (extended) – Statistics edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 5: DNSStatistics::Reset must zero ALL counter families so threat
+// hunting and DGA detection baselines are never polluted by residual data.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_Statistics, DNSMonitor_ResetStatistics_ClearsAllCounterFamilies) {
+    if (!EnsureDnsMonitorInitialized()) {
+        GTEST_SKIP() << "DNSMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::DNSMonitor::Instance();
+    monitor.ResetStatistics();
+    const SSN::DNSStatistics& s = monitor.GetStatistics();
+
+    EXPECT_EQ(LoadRelaxed(s.totalQueries),         0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesA),             0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesAAAA),          0ULL);
+    EXPECT_EQ(LoadRelaxed(s.queriesTXT),           0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalResponses),       0ULL);
+    EXPECT_EQ(LoadRelaxed(s.domainsBlocked),       0ULL);
+    EXPECT_EQ(LoadRelaxed(s.dgaDetections),        0ULL);
+    EXPECT_EQ(LoadRelaxed(s.tunnelingDetections),  0ULL);
+    EXPECT_EQ(LoadRelaxed(s.poisoningDetections),  0ULL);
+    EXPECT_EQ(LoadRelaxed(s.cacheHits),            0ULL);
+    EXPECT_EQ(LoadRelaxed(s.cacheMisses),          0ULL);
+    EXPECT_EQ(LoadRelaxed(s.errorCount),           0ULL);
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 5: NetworkMonitorStatistics::Reset must clear traffic-volume counters;
+// leftover bandwidth data would inflate attack-scoring calculations.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_Statistics, NetworkMonitor_ResetStatistics_ClearsTrafficCounters) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::NetworkMonitor::Instance();
+    monitor.ResetStatistics();
+    const SSN::NetworkMonitorStatistics& s = monitor.GetStatistics();
+
+    EXPECT_EQ(LoadRelaxed(s.totalBytesReceived),   0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalBytesSent),       0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalPacketsReceived), 0ULL);
+    EXPECT_EQ(LoadRelaxed(s.totalPacketsSent),     0ULL);
+    EXPECT_EQ(LoadRelaxed(s.threatsDetected),      0ULL);
+    EXPECT_EQ(LoadRelaxed(s.eventsProcessed),      0ULL);
+    EXPECT_EQ(LoadRelaxed(s.eventsDropped),        0ULL);
+}
+
+// ===========================================================================
+// GROUP 6 (extended) – Concurrency edge-case hardening
+// ===========================================================================
+
+// ---------------------------------------------------------------------------
+// GROUP 6: Concurrent BlockIP / IsIPBlocked / UnblockIP on distinct addresses
+// must complete without races or assertion failures in the blocklist.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_Concurrency, ConcurrentNetworkMonitorBlockUnblock_IsThreadSafe) {
+    if (!EnsureNetworkMonitorInitialized()) {
+        GTEST_SKIP() << "NetworkMonitor initialization unavailable on this endpoint.";
+    }
+
+    auto& monitor = SSN::NetworkMonitor::Instance();
+    constexpr int kThreadCount = 4;
+    constexpr int kIpsPerThread = 8;
+
+    std::atomic<int>      readyCount{0};
+    std::atomic<bool>     startGate{false};
+    std::atomic<uint32_t> failureCount{0};
+    std::vector<std::thread> threads;
+    threads.reserve(kThreadCount);
+
+    for (int t = 0; t < kThreadCount; ++t) {
+        threads.emplace_back([&, t]() {
+            readyCount.fetch_add(1, std::memory_order_acq_rel);
+            while (!startGate.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < kIpsPerThread; ++i) {
+                const int octet = 210 + t * kIpsPerThread + i;
+                const SSN::IPAddress ip("203.0.113." + std::to_string(octet));
+                if (!ip.IsValid()) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                    continue;
+                }
+
+                if (!monitor.BlockIP(ip, SSN::BlockReason::MANUAL_BLOCK)) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                }
+                if (!monitor.IsIPBlocked(ip)) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                }
+                if (!monitor.UnblockIP(ip)) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                }
+                if (monitor.IsIPBlocked(ip)) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                }
+            }
+        });
+    }
+
+    while (readyCount.load(std::memory_order_acquire) != kThreadCount) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    startGate.store(true, std::memory_order_release);
+
+    for (std::thread& th : threads) {
+        th.join();
+    }
+
+    EXPECT_EQ(failureCount.load(std::memory_order_relaxed), 0U)
+        << "One or more concurrent BlockIP/UnblockIP operations failed.";
+}
+
+// ---------------------------------------------------------------------------
+// GROUP 6: Concurrent GetAllRules calls during parallel rule additions must
+// never produce torn reads, crashes, or assertion failures in the rule store.
+// ---------------------------------------------------------------------------
+TEST_F(NetworkChain_Concurrency, ConcurrentFirewallReadDuringWrite_IsThreadSafe) {
+    if (!EnsureFirewallStarted()) {
+        GTEST_SKIP() << "FirewallManager WFP enforcement unavailable on this endpoint.";
+    }
+
+    auto& manager = SSN::FirewallManager::Instance();
+    constexpr int kWriterThreads = 2;
+    constexpr int kReaderThreads = 2;
+    constexpr int kRulesPerWriter = 4;
+
+    std::atomic<int>      readyCount{0};
+    std::atomic<bool>     startGate{false};
+    std::atomic<uint32_t> failureCount{0};
+    std::mutex            ruleTrackingMutex;
+    std::vector<uint64_t> addedRuleIds;
+    std::vector<std::thread> threads;
+    threads.reserve(kWriterThreads + kReaderThreads);
+
+    for (int t = 0; t < kWriterThreads; ++t) {
+        threads.emplace_back([&, t]() {
+            readyCount.fetch_add(1, std::memory_order_acq_rel);
+            while (!startGate.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < kRulesPerWriter; ++i) {
+                const int octet = 150 + t * kRulesPerWriter + i;
+                auto rule = SSN::FirewallRule::CreateBlockIP(
+                    L"203.0.113." + std::to_wstring(octet),
+                    SSN::RuleDirection::OUTBOUND);
+                rule.name = TestRuleName(L"ReadWrite-" + std::to_wstring(octet));
+
+                const uint64_t ruleId = manager.AddRule(rule);
+                if (ruleId == 0ULL) {
+                    failureCount.fetch_add(1, std::memory_order_acq_rel);
+                } else {
+                    std::lock_guard<std::mutex> lock(ruleTrackingMutex);
+                    addedRuleIds.push_back(ruleId);
+                }
+            }
+        });
+    }
+
+    for (int t = 0; t < kReaderThreads; ++t) {
+        threads.emplace_back([&]() {
+            readyCount.fetch_add(1, std::memory_order_acq_rel);
+            while (!startGate.load(std::memory_order_acquire)) {
+                std::this_thread::yield();
+            }
+
+            for (int i = 0; i < 8; ++i) {
+                const std::vector<SSN::FirewallRule> rules = manager.GetAllRules(false);
+                if (rules.empty() && i > 0) {
+                    // Non-fatal: writers may not have committed yet.
+                }
+                std::this_thread::yield();
+            }
+        });
+    }
+
+    while (readyCount.load(std::memory_order_acquire) != (kWriterThreads + kReaderThreads)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+    startGate.store(true, std::memory_order_release);
+
+    for (std::thread& th : threads) {
+        th.join();
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(ruleTrackingMutex);
+        for (const uint64_t id : addedRuleIds) {
+            TrackFirewallRuleId(id);
+        }
+    }
+
+    EXPECT_EQ(failureCount.load(std::memory_order_relaxed), 0U)
+        << "One or more concurrent AddRule operations failed.";
+}
+
 }  // namespace

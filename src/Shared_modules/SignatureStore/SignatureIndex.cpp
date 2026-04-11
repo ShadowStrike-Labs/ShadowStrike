@@ -178,10 +178,10 @@ StoreError SignatureIndex::Initialize(
     std::unique_lock<std::shared_mutex> lock(m_rwLock);
 
     m_view = &view;
-    m_baseAddress = view.baseAddress;
+    m_baseAddress = static_cast<uint8_t*>(view.baseAddress) + indexOffset;
     m_indexOffset = indexOffset;
     m_indexSize = indexSize;
-    m_currentOffset = 0;  // Reset offset tracker
+    m_currentOffset = Format::AlignToPage(sizeof(BPlusTreeNode));
 
     // Initialize performance counter with fallback
     if (!QueryPerformanceFrequency(&m_perfFrequency) || m_perfFrequency.QuadPart <= 0) {
@@ -189,26 +189,41 @@ StoreError SignatureIndex::Initialize(
         m_perfFrequency.QuadPart = 1000000; // Fallback to microseconds
     }
 
-    // Read root offset from first 4 bytes of index section
+    // Support both persisted-root-offset layouts and raw node-at-offset-zero
+    // layouts produced by CreateNew().
+    uint64_t resolvedRootOffset = 0;
     if (indexSize >= sizeof(uint32_t)) {
         const uint32_t* rootPtr = view.GetAt<uint32_t>(indexOffset);
         if (rootPtr) {
-            uint32_t rootVal = *rootPtr;
-            // SECURITY: Validate root offset is within bounds
-            if (rootVal < indexSize) {
-                m_rootOffset.store(rootVal, std::memory_order_release);
-                SS_LOG_DEBUG(L"SignatureIndex", L"Root offset: 0x%X", rootVal);
-            } else {
-                SS_LOG_WARN(L"SignatureIndex", 
-                    L"Root offset 0x%X out of bounds, defaulting to 0", rootVal);
-                m_rootOffset.store(0, std::memory_order_release);
+            const uint64_t rootVal = *rootPtr;
+            const bool aligned = (rootVal % alignof(BPlusTreeNode)) == 0;
+            const bool inBounds = rootVal < indexSize &&
+                                  rootVal + sizeof(BPlusTreeNode) <= indexSize;
+
+            if (aligned && inBounds) {
+                const auto* candidateRoot = reinterpret_cast<const BPlusTreeNode*>(
+                    static_cast<const uint8_t*>(m_baseAddress) + rootVal);
+
+                if (candidateRoot->keyCount <= BPlusTreeNode::MAX_KEYS) {
+                    resolvedRootOffset = rootVal;
+                    SS_LOG_DEBUG(L"SignatureIndex",
+                        L"Initialize: Using persisted root offset 0x%llX", resolvedRootOffset);
+                } else {
+                    SS_LOG_WARN(L"SignatureIndex",
+                        L"Initialize: Root candidate at 0x%llX has invalid keyCount %u; "
+                        L"falling back to offset 0",
+                        rootVal, candidateRoot->keyCount);
+                }
+            } else if (rootVal != 0) {
+                SS_LOG_WARN(L"SignatureIndex",
+                    L"Initialize: Root offset 0x%llX is invalid for section size 0x%llX; "
+                    L"falling back to offset 0",
+                    rootVal, indexSize);
             }
-        } else {
-            m_rootOffset.store(0, std::memory_order_release);
         }
-    } else {
-        m_rootOffset.store(0, std::memory_order_release);
     }
+
+    m_rootOffset.store(resolvedRootOffset, std::memory_order_release);
 
     // Reset statistics
     m_totalEntries.store(0, std::memory_order_release);

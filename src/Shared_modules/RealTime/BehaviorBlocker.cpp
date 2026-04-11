@@ -1054,9 +1054,42 @@ public:
     }
 
     [[nodiscard]] BehaviorBlockerStats GetStatistics() const {
-        uint32_t ruleCount = 0, exclCount = 0;
-        { std::shared_lock rl(m_ruleMutex); ruleCount = static_cast<uint32_t>(m_rules.size()); }
-        { std::shared_lock el(m_exclusionMutex); exclCount = static_cast<uint32_t>(m_exclusions.size()); }
+        const int64_t nowEpochMs = NowEpochMs();
+        uint32_t ruleCount = 0;
+        uint32_t exclCount = 0;
+
+        {
+            std::shared_lock rl(m_ruleMutex);
+            for (const auto& compiled : m_rules) {
+                if (!compiled.valid || !compiled.rule.enabled) {
+                    continue;
+                }
+
+                if (compiled.rule.expiryTimestamp.has_value() &&
+                    nowEpochMs > compiled.rule.expiryTimestamp.value()) {
+                    continue;
+                }
+
+                ++ruleCount;
+            }
+        }
+
+        {
+            std::shared_lock el(m_exclusionMutex);
+            for (const auto& compiled : m_exclusions) {
+                if (!compiled.valid) {
+                    continue;
+                }
+
+                if (compiled.exclusion.expiryTimestamp.has_value() &&
+                    nowEpochMs > compiled.exclusion.expiryTimestamp.value()) {
+                    continue;
+                }
+
+                ++exclCount;
+            }
+        }
+
         return m_stats.Snapshot(ruleCount, exclCount);
     }
 

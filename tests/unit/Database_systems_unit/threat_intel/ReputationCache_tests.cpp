@@ -31,7 +31,7 @@
 #include"pch.h"
 #include <gtest/gtest.h>
 
-#include "../../../../src/ThreatIntel/ReputationCache.hpp"
+#include "Shared_modules/ThreatIntel/ReputationCache.hpp"
 
 #include <array>
 #include <atomic>

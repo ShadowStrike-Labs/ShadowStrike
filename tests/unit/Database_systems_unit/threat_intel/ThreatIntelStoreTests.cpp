@@ -46,8 +46,8 @@
 
 #include <gtest/gtest.h>
 
-#include "../../../../src/ThreatIntel/ThreatIntelStore.hpp"
-#include "../../../../src/ThreatIntel/ThreatIntelFormat.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelStore.hpp"
+#include "Shared_modules/ThreatIntel/ThreatIntelFormat.hpp"
 
 #include <atomic>
 #include <chrono>

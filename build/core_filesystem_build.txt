@@ -1,0 +1,781 @@
+test_main.cpp
+FileSystemChain_Integration_Tests.cpp
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\tests\integration\core_filesystem\../../../src/Shared_modules/Core/FileSystem/FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+FileHasher.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+FileTypeAnalyzer.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PatternStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(369): warning C4324: 'ShadowStrike::Core::FileSystem::MagicSignature': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(416): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeInfo': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(464): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.hpp(479): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Core\FileSystem\FileTypeAnalyzer.cpp(2096): warning C4324: 'ShadowStrike::Core::FileSystem::FileTypeAnalyzerImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+FileReputation.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\../../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(271): warning C4324: 'ShadowStrike::Core::FileSystem::PrevalenceData': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(319): warning C4324: 'ShadowStrike::Core::FileSystem::ThreatIntelMatch': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(371): warning C4324: 'ShadowStrike::Core::FileSystem::CloudReputation': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(395): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(396): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(398): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationResult': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(442): warning C4324: 'ShadowStrike::Core::FileSystem::ReputationQuery': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(477): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationConfig': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Core\FileSystem\FileReputation.hpp(503): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationStatistics': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Core\FileSystem\FileReputation.cpp(1470): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Core\FileSystem\FileReputation.cpp(1471): warning C4324: 'ShadowStrike::Core::FileSystem::FileReputationImpl': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+FuzzyHasher.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+DigestGenerator.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+DigestComparer.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+HashStore.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\HashStore\HashStore.cpp(1265): warning C4127: koşullu ifade sabit
+src\Shared_modules\HashStore\HashStore.cpp(1265): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+HashStore_mgnmnt.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+HashStore_query_operations.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+HashStore_import_export.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+BloomFilter_impl.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+HashBucket_impl.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+WhiteListStore.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Whitelist\WhiteListStore.cpp(339): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(391): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(403): warning C4459: 'MAX_DATABASE_SIZE' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(124): note: 'ShadowStrike::Whitelist::MAX_DATABASE_SIZE' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(1277): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(1436): warning C4459: 'MAX_PUBLISHER_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(120): note: 'ShadowStrike::Whitelist::MAX_PUBLISHER_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(1608): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(1921): warning C4459: 'MAX_DESCRIPTION_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(122): note: 'ShadowStrike::Whitelist::MAX_DESCRIPTION_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(2833): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListStore.cpp(3544): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+WhiteListFormat.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Whitelist\WhiteListFormat.cpp(2024): warning C4127: koşullu ifade sabit
+src\Shared_modules\Whitelist\WhiteListFormat.cpp(2024): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+src\Shared_modules\Whitelist\WhiteListFormat.cpp(2048): warning C4127: koşullu ifade sabit
+src\Shared_modules\Whitelist\WhiteListFormat.cpp(2048): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+WhiteListHashIndex.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3745): warning C4456: 'nodeAddr' bildirimi önceki yerel bildirimi gizliyor
+src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3597): note: 'nodeAddr' bildirimine bakın
+src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3746): warning C4456: 'baseAddr' bildirimi önceki yerel bildirimi gizliyor
+src\Shared_modules\Whitelist\WhiteListHashIndex.cpp(3598): note: 'baseAddr' bildirimine bakın
+WhiteListPatternIndex.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\Whitelist\WhiteListPatternIndex.cpp(1843): warning C4459: 'MAX_PATH_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(119): note: 'ShadowStrike::Whitelist::MAX_PATH_LENGTH' bildirimine bakın
+WhiteListBloomFilter.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+WhiteListStringPool.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\Whitelist\WhiteListFormat.hpp(599): warning C4324: 'ShadowStrike::Whitelist::WhitelistEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+Kod Üretiliyor...
+Derleniyor...
+SignatureFormat.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+SignatureBuilder.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+batch_sig_builder.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureIndex.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): warning C4477: 'snprintf' : '%X' biçim dizesi 'unsigned int' türü bir bağımsız değişken gerektirir, ancak 1 değişen sayıda bağımsız değişkenin türü 'unsigned __int64'
+src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%llX' kullanmayı düşünün
+src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%IX' kullanmayı düşünün
+src\Shared_modules\SignatureStore\SignatureIndex.cpp(866): note: biçim dizesinde '%I64X' kullanmayı düşünün
+src\Shared_modules\SignatureStore\SignatureIndex.cpp(68): warning C4505: 'ShadowStrike::SignatureStore::GetCurrentTimeNs': iç bağlantıya sahip başvurulmayan işlev kaldırıldı
+SignatureIndex_COW.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureIndex_Cache_mngmnt.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureIndex_modification.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureIndex_Query.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureIndex_stat_maintenance.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureStore.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureStore_mngmnt.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\SignatureStore\SignatureStore_mngmnt.cpp(141): warning C4459: 'MAX_PATTERN_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureFormat.hpp(91): note: 'ShadowStrike::SignatureStore::MAX_PATTERN_LENGTH' bildirimine bakın
+SignatureStore_Query.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+SignatureStore_scan.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+sig_builder_import_methods.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+sig_builder_input_methods.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+sig_builder_serialization.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+sig_builder_utils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\HashStore\../SignatureStore/SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\../HashStore/HashStore.hpp(455): warning C4324: 'ShadowStrike::HashStore::HashStore::CacheEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+sig_indx_internal_node_mng.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\SignatureStore\SignatureIndex.hpp(559): warning C4324: 'ShadowStrike::SignatureStore::PatternIndex::TrieNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+YaraRuleStore.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+ThreatIntelStore.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelStore.cpp(1794): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+Kod Üretiliyor...
+Derleniyor...
+ThreatIntelLookup.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelLookup.cpp(1155): warning C4324: 'ShadowStrike::ThreatIntel::ThreadLocalCache': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIOCManager.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_URLMatcher.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelIndex_URLMatcher.cpp(93): warning C4324: 'ShadowStrike::ThreatIntel::AhoCorasickAutomaton::State': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_Trees.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.cpp(129): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelIndex_Trees.cpp(178): warning C4324: 'ShadowStrike::ThreatIntel::GenericBPlusTree::BNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_Modifications.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_Lookups.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_DataStructures.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelIndex_Core.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(577): warning C4324: 'ShadowStrike::ThreatIntel::IPv4RadixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(653): warning C4324: 'ShadowStrike::ThreatIntel::IPv6PatriciaNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(716): warning C4324: 'ShadowStrike::ThreatIntel::DomainSuffixNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(802): warning C4324: 'ShadowStrike::ThreatIntel::HashBPlusTreeNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(845): warning C4324: 'ShadowStrike::ThreatIntel::URLPatternNode': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelIndex.hpp(907): warning C4324: 'ShadowStrike::ThreatIntel::EmailHashBucket': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelImporter.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelImporter.cpp(4605): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+ThreatIntelFormat.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelFeedManager_parsers.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ThreatIntelFeedManager.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(362): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(419): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3079): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3553): warning C4456: 'headersStr' bildirimi önceki yerel bildirimi gizliyor
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(3380): note: 'headersStr' bildirimine bakın
+src\Shared_modules\ThreatIntel\ThreatIntelFeedManager.cpp(4233): warning C4459: 'MAX_URL_LENGTH' bildirimi genel bildirimi gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(233): note: 'ShadowStrike::ThreatIntel::MAX_URL_LENGTH' bildirimine bakın
+ThreatIntelExporter.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelExporter.cpp(860): warning C4127: koşullu ifade sabit
+src\Shared_modules\ThreatIntel\ThreatIntelExporter.cpp(860): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+ThreatIntelDatabase.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+src\Shared_modules\ThreatIntel\ThreatIntelDatabase.cpp(172): warning C4127: koşullu ifade sabit
+src\Shared_modules\ThreatIntel\ThreatIntelDatabase.cpp(172): note: bunun yerine 'if constexpr' deyimini kullanmanız önerilir
+ThreatIntelBloomFilter.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+ReputationCache.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1680): warning C4324: 'ShadowStrike::ThreatIntel::IOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1583): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1594): warning C4458: 'value' bildirimi işlev sınıf üyesini gizliyor
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1441): note: 'ShadowStrike::ThreatIntel::IOCEntry::value' bildirimine bakın
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\ThreatIntel\ThreatIntelFormat.hpp(1732): warning C4324: 'ShadowStrike::ThreatIntel::CompactIOCEntry': hizalama tanımlayıcısı nedeniyle yapının sonu dolduruldu
+PEParser.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+PEValidation.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(398): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+C:\ShadowStrike\ShadowStrike\src\Shared_modules\PEParser\PETypes.hpp(407): warning C4201: standart olmayan uzantı kullanıldı: adsız yapı/birleşim
+Logger.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+StringUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+Kod Üretiliyor...
+Derleniyor...
+HashUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+FileUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+JSONUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+RegistryUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+MemoryUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+ProcessUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+src\Shared_modules\Utils\ProcessUtils.cpp(1344): warning C4456: 'read' bildirimi önceki yerel bildirimi gizliyor
+src\Shared_modules\Utils\ProcessUtils.cpp(1287): note: 'read' bildirimine bakın
+src\Shared_modules\Utils\ProcessUtils.cpp(1906): warning C4459: 'kMaxModuleCount' bildirimi genel bildirimi gizliyor
+src\Shared_modules\Utils\ProcessUtils.cpp(95): note: 'ShadowStrike::Utils::ProcessUtils::`anonymous-namespace'::kMaxModuleCount' bildirimine bakın
+src\Shared_modules\Utils\ProcessUtils.cpp(2909): warning C4459: 'PUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(436): note: 'PUBLIC_OBJECT_TYPE_INFORMATION' bildirimine bakın
+src\Shared_modules\Utils\ProcessUtils.cpp(2909): warning C4459: 'PPUBLIC_OBJECT_TYPE_INFORMATION' bildirimi genel bildirimi gizliyor
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(436): note: 'PPUBLIC_OBJECT_TYPE_INFORMATION' bildirimine bakın
+src\Shared_modules\Utils\ProcessUtils.cpp(2914): warning C4459: 'OBJECT_INFORMATION_CLASS' bildirimi genel bildirimi gizliyor
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winternl.h(414): note: 'OBJECT_INFORMATION_CLASS' bildirimine bakın
+SystemUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+Timer.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+ThreadPool.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CacheManager.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+src\Shared_modules\Utils\CacheManager.cpp(1187): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+src\Shared_modules\Utils\CacheManager.cpp(1250): warning C4101: 'ex': yerel değişken başvurusu kaldırıldı
+CryptoUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(66): warning C4005: 'STATUS_WAIT_0': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2611): note: önceki 'STATUS_WAIT_0' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(227): warning C4005: 'STATUS_ABANDONED_WAIT_0': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2612): note: önceki 'STATUS_ABANDONED_WAIT_0' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(250): warning C4005: 'STATUS_USER_APC': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2613): note: önceki 'STATUS_USER_APC' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(286): warning C4005: 'STATUS_TIMEOUT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2614): note: önceki 'STATUS_TIMEOUT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(295): warning C4005: 'STATUS_PENDING': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2615): note: önceki 'STATUS_PENDING' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(751): warning C4005: 'DBG_EXCEPTION_HANDLED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2616): note: önceki 'DBG_EXCEPTION_HANDLED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(760): warning C4005: 'DBG_CONTINUE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2617): note: önceki 'DBG_CONTINUE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(835): warning C4005: 'STATUS_SEGMENT_NOTIFICATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2618): note: önceki 'STATUS_SEGMENT_NOTIFICATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(998): warning C4005: 'STATUS_FATAL_APP_EXIT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2619): note: önceki 'STATUS_FATAL_APP_EXIT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1345): warning C4005: 'DBG_REPLY_LATER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2620): note: önceki 'DBG_REPLY_LATER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1363): warning C4005: 'DBG_TERMINATE_THREAD': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2621): note: önceki 'DBG_TERMINATE_THREAD' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1372): warning C4005: 'DBG_TERMINATE_PROCESS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2622): note: önceki 'DBG_TERMINATE_PROCESS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1381): warning C4005: 'DBG_CONTROL_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2623): note: önceki 'DBG_CONTROL_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1390): warning C4005: 'DBG_PRINTEXCEPTION_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2624): note: önceki 'DBG_PRINTEXCEPTION_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1399): warning C4005: 'DBG_RIPEXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2625): note: önceki 'DBG_RIPEXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1408): warning C4005: 'DBG_CONTROL_BREAK': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2626): note: önceki 'DBG_CONTROL_BREAK' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1417): warning C4005: 'DBG_COMMAND_EXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2627): note: önceki 'DBG_COMMAND_EXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1426): warning C4005: 'DBG_PRINTEXCEPTION_WIDE_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2628): note: önceki 'DBG_PRINTEXCEPTION_WIDE_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1458): warning C4005: 'STATUS_GUARD_PAGE_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2629): note: önceki 'STATUS_GUARD_PAGE_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1469): warning C4005: 'STATUS_DATATYPE_MISALIGNMENT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2630): note: önceki 'STATUS_DATATYPE_MISALIGNMENT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1480): warning C4005: 'STATUS_BREAKPOINT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2631): note: önceki 'STATUS_BREAKPOINT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1491): warning C4005: 'STATUS_SINGLE_STEP': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2632): note: önceki 'STATUS_SINGLE_STEP' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1794): warning C4005: 'STATUS_LONGJUMP': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2633): note: önceki 'STATUS_LONGJUMP' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1821): warning C4005: 'STATUS_UNWIND_CONSOLIDATE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2634): note: önceki 'STATUS_UNWIND_CONSOLIDATE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1945): warning C4005: 'DBG_EXCEPTION_NOT_HANDLED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2635): note: önceki 'DBG_EXCEPTION_NOT_HANDLED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2112): warning C4005: 'STATUS_ACCESS_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2636): note: önceki 'STATUS_ACCESS_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2121): warning C4005: 'STATUS_IN_PAGE_ERROR': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2637): note: önceki 'STATUS_IN_PAGE_ERROR' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2139): warning C4005: 'STATUS_INVALID_HANDLE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2638): note: önceki 'STATUS_INVALID_HANDLE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2184): warning C4005: 'STATUS_INVALID_PARAMETER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2639): note: önceki 'STATUS_INVALID_PARAMETER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2284): warning C4005: 'STATUS_NO_MEMORY': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2640): note: önceki 'STATUS_NO_MEMORY' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2341): warning C4005: 'STATUS_ILLEGAL_INSTRUCTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2641): note: önceki 'STATUS_ILLEGAL_INSTRUCTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2422): warning C4005: 'STATUS_NONCONTINUABLE_EXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2642): note: önceki 'STATUS_NONCONTINUABLE_EXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2431): warning C4005: 'STATUS_INVALID_DISPOSITION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2643): note: önceki 'STATUS_INVALID_DISPOSITION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3364): warning C4005: 'STATUS_ARRAY_BOUNDS_EXCEEDED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2644): note: önceki 'STATUS_ARRAY_BOUNDS_EXCEEDED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3374): warning C4005: 'STATUS_FLOAT_DENORMAL_OPERAND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2645): note: önceki 'STATUS_FLOAT_DENORMAL_OPERAND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3384): warning C4005: 'STATUS_FLOAT_DIVIDE_BY_ZERO': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2646): note: önceki 'STATUS_FLOAT_DIVIDE_BY_ZERO' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3394): warning C4005: 'STATUS_FLOAT_INEXACT_RESULT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2647): note: önceki 'STATUS_FLOAT_INEXACT_RESULT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3404): warning C4005: 'STATUS_FLOAT_INVALID_OPERATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2648): note: önceki 'STATUS_FLOAT_INVALID_OPERATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3414): warning C4005: 'STATUS_FLOAT_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2649): note: önceki 'STATUS_FLOAT_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3424): warning C4005: 'STATUS_FLOAT_STACK_CHECK': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2650): note: önceki 'STATUS_FLOAT_STACK_CHECK' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3434): warning C4005: 'STATUS_FLOAT_UNDERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2651): note: önceki 'STATUS_FLOAT_UNDERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3444): warning C4005: 'STATUS_INTEGER_DIVIDE_BY_ZERO': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2652): note: önceki 'STATUS_INTEGER_DIVIDE_BY_ZERO' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3454): warning C4005: 'STATUS_INTEGER_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2653): note: önceki 'STATUS_INTEGER_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3464): warning C4005: 'STATUS_PRIVILEGED_INSTRUCTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2654): note: önceki 'STATUS_PRIVILEGED_INSTRUCTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4410): warning C4005: 'STATUS_STACK_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2655): note: önceki 'STATUS_STACK_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4927): warning C4005: 'STATUS_DLL_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2656): note: önceki 'STATUS_DLL_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4956): warning C4005: 'STATUS_ORDINAL_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2657): note: önceki 'STATUS_ORDINAL_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4966): warning C4005: 'STATUS_ENTRYPOINT_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2658): note: önceki 'STATUS_ENTRYPOINT_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4976): warning C4005: 'STATUS_CONTROL_C_EXIT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2659): note: önceki 'STATUS_CONTROL_C_EXIT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(5054): warning C4005: 'STATUS_DLL_INIT_FAILED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2660): note: önceki 'STATUS_DLL_INIT_FAILED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(6051): warning C4005: 'STATUS_CONTROL_STACK_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2661): note: önceki 'STATUS_CONTROL_STACK_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7645): warning C4005: 'STATUS_FLOAT_MULTIPLE_FAULTS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2662): note: önceki 'STATUS_FLOAT_MULTIPLE_FAULTS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7655): warning C4005: 'STATUS_FLOAT_MULTIPLE_TRAPS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2663): note: önceki 'STATUS_FLOAT_MULTIPLE_TRAPS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7787): warning C4005: 'STATUS_REG_NAT_CONSUMPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2664): note: önceki 'STATUS_REG_NAT_CONSUMPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(8770): warning C4005: 'STATUS_HEAP_CORRUPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2665): note: önceki 'STATUS_HEAP_CORRUPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(8998): warning C4005: 'STATUS_STACK_BUFFER_OVERRUN': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2666): note: önceki 'STATUS_STACK_BUFFER_OVERRUN' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(9125): warning C4005: 'STATUS_INVALID_CRUNTIME_PARAMETER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2667): note: önceki 'STATUS_INVALID_CRUNTIME_PARAMETER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(9188): warning C4005: 'STATUS_ASSERTION_FAILURE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2668): note: önceki 'STATUS_ASSERTION_FAILURE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10097): warning C4005: 'STATUS_ENCLAVE_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2669): note: önceki 'STATUS_ENCLAVE_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10884): warning C4005: 'STATUS_INTERRUPTED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2670): note: önceki 'STATUS_INTERRUPTED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10893): warning C4005: 'STATUS_THREAD_NOT_RUNNING': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2671): note: önceki 'STATUS_THREAD_NOT_RUNNING' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(11205): warning C4005: 'STATUS_ALREADY_REGISTERED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2672): note: önceki 'STATUS_ALREADY_REGISTERED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(15332): warning C4005: 'STATUS_SXS_EARLY_DEACTIVATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2674): note: önceki 'STATUS_SXS_EARLY_DEACTIVATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(15341): warning C4005: 'STATUS_SXS_INVALID_DEACTIVATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2675): note: önceki 'STATUS_SXS_INVALID_DEACTIVATION' tanımına bakın
+CryptoUtilsCommon.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CryptoUtils_AsymmetricCipher.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CryptoUtils_SecureBuffer.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CryptoUtils_Secure_Random.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(66): warning C4005: 'STATUS_WAIT_0': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2611): note: önceki 'STATUS_WAIT_0' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(227): warning C4005: 'STATUS_ABANDONED_WAIT_0': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2612): note: önceki 'STATUS_ABANDONED_WAIT_0' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(250): warning C4005: 'STATUS_USER_APC': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2613): note: önceki 'STATUS_USER_APC' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(286): warning C4005: 'STATUS_TIMEOUT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2614): note: önceki 'STATUS_TIMEOUT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(295): warning C4005: 'STATUS_PENDING': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2615): note: önceki 'STATUS_PENDING' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(751): warning C4005: 'DBG_EXCEPTION_HANDLED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2616): note: önceki 'DBG_EXCEPTION_HANDLED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(760): warning C4005: 'DBG_CONTINUE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2617): note: önceki 'DBG_CONTINUE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(835): warning C4005: 'STATUS_SEGMENT_NOTIFICATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2618): note: önceki 'STATUS_SEGMENT_NOTIFICATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(998): warning C4005: 'STATUS_FATAL_APP_EXIT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2619): note: önceki 'STATUS_FATAL_APP_EXIT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1345): warning C4005: 'DBG_REPLY_LATER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2620): note: önceki 'DBG_REPLY_LATER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1363): warning C4005: 'DBG_TERMINATE_THREAD': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2621): note: önceki 'DBG_TERMINATE_THREAD' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1372): warning C4005: 'DBG_TERMINATE_PROCESS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2622): note: önceki 'DBG_TERMINATE_PROCESS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1381): warning C4005: 'DBG_CONTROL_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2623): note: önceki 'DBG_CONTROL_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1390): warning C4005: 'DBG_PRINTEXCEPTION_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2624): note: önceki 'DBG_PRINTEXCEPTION_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1399): warning C4005: 'DBG_RIPEXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2625): note: önceki 'DBG_RIPEXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1408): warning C4005: 'DBG_CONTROL_BREAK': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2626): note: önceki 'DBG_CONTROL_BREAK' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1417): warning C4005: 'DBG_COMMAND_EXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2627): note: önceki 'DBG_COMMAND_EXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1426): warning C4005: 'DBG_PRINTEXCEPTION_WIDE_C': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2628): note: önceki 'DBG_PRINTEXCEPTION_WIDE_C' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1458): warning C4005: 'STATUS_GUARD_PAGE_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2629): note: önceki 'STATUS_GUARD_PAGE_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1469): warning C4005: 'STATUS_DATATYPE_MISALIGNMENT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2630): note: önceki 'STATUS_DATATYPE_MISALIGNMENT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1480): warning C4005: 'STATUS_BREAKPOINT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2631): note: önceki 'STATUS_BREAKPOINT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1491): warning C4005: 'STATUS_SINGLE_STEP': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2632): note: önceki 'STATUS_SINGLE_STEP' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1794): warning C4005: 'STATUS_LONGJUMP': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2633): note: önceki 'STATUS_LONGJUMP' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1821): warning C4005: 'STATUS_UNWIND_CONSOLIDATE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2634): note: önceki 'STATUS_UNWIND_CONSOLIDATE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(1945): warning C4005: 'DBG_EXCEPTION_NOT_HANDLED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2635): note: önceki 'DBG_EXCEPTION_NOT_HANDLED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2112): warning C4005: 'STATUS_ACCESS_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2636): note: önceki 'STATUS_ACCESS_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2121): warning C4005: 'STATUS_IN_PAGE_ERROR': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2637): note: önceki 'STATUS_IN_PAGE_ERROR' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2139): warning C4005: 'STATUS_INVALID_HANDLE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2638): note: önceki 'STATUS_INVALID_HANDLE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2184): warning C4005: 'STATUS_INVALID_PARAMETER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2639): note: önceki 'STATUS_INVALID_PARAMETER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2284): warning C4005: 'STATUS_NO_MEMORY': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2640): note: önceki 'STATUS_NO_MEMORY' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2341): warning C4005: 'STATUS_ILLEGAL_INSTRUCTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2641): note: önceki 'STATUS_ILLEGAL_INSTRUCTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2422): warning C4005: 'STATUS_NONCONTINUABLE_EXCEPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2642): note: önceki 'STATUS_NONCONTINUABLE_EXCEPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(2431): warning C4005: 'STATUS_INVALID_DISPOSITION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2643): note: önceki 'STATUS_INVALID_DISPOSITION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3364): warning C4005: 'STATUS_ARRAY_BOUNDS_EXCEEDED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2644): note: önceki 'STATUS_ARRAY_BOUNDS_EXCEEDED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3374): warning C4005: 'STATUS_FLOAT_DENORMAL_OPERAND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2645): note: önceki 'STATUS_FLOAT_DENORMAL_OPERAND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3384): warning C4005: 'STATUS_FLOAT_DIVIDE_BY_ZERO': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2646): note: önceki 'STATUS_FLOAT_DIVIDE_BY_ZERO' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3394): warning C4005: 'STATUS_FLOAT_INEXACT_RESULT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2647): note: önceki 'STATUS_FLOAT_INEXACT_RESULT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3404): warning C4005: 'STATUS_FLOAT_INVALID_OPERATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2648): note: önceki 'STATUS_FLOAT_INVALID_OPERATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3414): warning C4005: 'STATUS_FLOAT_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2649): note: önceki 'STATUS_FLOAT_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3424): warning C4005: 'STATUS_FLOAT_STACK_CHECK': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2650): note: önceki 'STATUS_FLOAT_STACK_CHECK' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3434): warning C4005: 'STATUS_FLOAT_UNDERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2651): note: önceki 'STATUS_FLOAT_UNDERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3444): warning C4005: 'STATUS_INTEGER_DIVIDE_BY_ZERO': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2652): note: önceki 'STATUS_INTEGER_DIVIDE_BY_ZERO' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3454): warning C4005: 'STATUS_INTEGER_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2653): note: önceki 'STATUS_INTEGER_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(3464): warning C4005: 'STATUS_PRIVILEGED_INSTRUCTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2654): note: önceki 'STATUS_PRIVILEGED_INSTRUCTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4410): warning C4005: 'STATUS_STACK_OVERFLOW': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2655): note: önceki 'STATUS_STACK_OVERFLOW' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4927): warning C4005: 'STATUS_DLL_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2656): note: önceki 'STATUS_DLL_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4956): warning C4005: 'STATUS_ORDINAL_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2657): note: önceki 'STATUS_ORDINAL_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4966): warning C4005: 'STATUS_ENTRYPOINT_NOT_FOUND': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2658): note: önceki 'STATUS_ENTRYPOINT_NOT_FOUND' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(4976): warning C4005: 'STATUS_CONTROL_C_EXIT': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2659): note: önceki 'STATUS_CONTROL_C_EXIT' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(5054): warning C4005: 'STATUS_DLL_INIT_FAILED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2660): note: önceki 'STATUS_DLL_INIT_FAILED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(6051): warning C4005: 'STATUS_CONTROL_STACK_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2661): note: önceki 'STATUS_CONTROL_STACK_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7645): warning C4005: 'STATUS_FLOAT_MULTIPLE_FAULTS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2662): note: önceki 'STATUS_FLOAT_MULTIPLE_FAULTS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7655): warning C4005: 'STATUS_FLOAT_MULTIPLE_TRAPS': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2663): note: önceki 'STATUS_FLOAT_MULTIPLE_TRAPS' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(7787): warning C4005: 'STATUS_REG_NAT_CONSUMPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2664): note: önceki 'STATUS_REG_NAT_CONSUMPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(8770): warning C4005: 'STATUS_HEAP_CORRUPTION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2665): note: önceki 'STATUS_HEAP_CORRUPTION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(8998): warning C4005: 'STATUS_STACK_BUFFER_OVERRUN': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2666): note: önceki 'STATUS_STACK_BUFFER_OVERRUN' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(9125): warning C4005: 'STATUS_INVALID_CRUNTIME_PARAMETER': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2667): note: önceki 'STATUS_INVALID_CRUNTIME_PARAMETER' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(9188): warning C4005: 'STATUS_ASSERTION_FAILURE': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2668): note: önceki 'STATUS_ASSERTION_FAILURE' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10097): warning C4005: 'STATUS_ENCLAVE_VIOLATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2669): note: önceki 'STATUS_ENCLAVE_VIOLATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10884): warning C4005: 'STATUS_INTERRUPTED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2670): note: önceki 'STATUS_INTERRUPTED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(10893): warning C4005: 'STATUS_THREAD_NOT_RUNNING': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2671): note: önceki 'STATUS_THREAD_NOT_RUNNING' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(11205): warning C4005: 'STATUS_ALREADY_REGISTERED': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2672): note: önceki 'STATUS_ALREADY_REGISTERED' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(15332): warning C4005: 'STATUS_SXS_EARLY_DEACTIVATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2674): note: önceki 'STATUS_SXS_EARLY_DEACTIVATION' tanımına bakın
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\shared\ntstatus.h(15341): warning C4005: 'STATUS_SXS_INVALID_DEACTIVATION': makro yeniden tanımlama
+C:\Program Files (x86)\Windows Kits\10\\include\10.0.26100.0\\um\winnt.h(2675): note: önceki 'STATUS_SXS_INVALID_DEACTIVATION' tanımına bakın
+CryptoUtils_SymmetricCipher.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CryptoUtils_private_key.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+CertUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+Base64Utils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+NetworkUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+Kod Üretiliyor...
+Derleniyor...
+NetworkUtils_http_https.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+src\Shared_modules\Utils\NetworkUtils_http_https.cpp(468): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+NetworkUtils_DNS.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+src\Shared_modules\Utils\NetworkUtils_DNS.cpp(472): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+NetworkUtils_Adapter.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(947): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1070): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+src\Shared_modules\Utils\NetworkUtils_Adapter.cpp(1183): warning C4101: 'e': yerel değişken başvurusu kaldırıldı
+NetworkUtilsIpAddress.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+NetworkUtilsMacAdress.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+NetworkUtils_URL.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+NetworkUtils_proxy.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+NetworkSecurity_SSL_TLS.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+PE_sig_verf.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+XMLUtils.cpp
+C:\Program Files\Microsoft Visual Studio\2022\Community\VC\Tools\MSVC\14.44.35207\include\expected(11): warning STL4038: The contents of <expected> are available only with C++23 or later.
+Kod Üretiliyor...
+LINK : fatal error LNK1181: 'FileSystemChain_Integration_Tests.obj' giriş dosyası açılamıyor

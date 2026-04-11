@@ -291,17 +291,96 @@ namespace ShadowStrike {
                 return StoreError{ SignatureStoreError::Unknown, err, "Failed to write header" };
             }
 
-            if (bytesWritten != sizeof(header)) {
-                SS_LOG_ERROR(L"HashStore", 
-                    L"Header write incomplete: wrote %u of %zu bytes",
-                    bytesWritten, sizeof(header));
-                return StoreError{ SignatureStoreError::Unknown, 0, "Incomplete header write" };
-            }
+             if (bytesWritten != sizeof(header)) {
+                 SS_LOG_ERROR(L"HashStore", 
+                     L"Header write incomplete: wrote %u of %zu bytes",
+                     bytesWritten, sizeof(header));
+                 return StoreError{ SignatureStoreError::Unknown, 0, "Incomplete header write" };
+             }
 
-            // Flush to ensure header is on disk before reopening
-            if (!FlushFileBuffers(hFile)) {
-                SS_LOG_WARN(L"HashStore", L"Failed to flush file buffers (non-fatal)");
-            }
+             // Seed each hash bucket with a valid empty SignatureIndex root before
+             // reopening the database through the normal Initialize() path.
+             {
+                 HANDLE hMapping = CreateFileMappingW(
+                     hFile,
+                     nullptr,
+                     PAGE_READWRITE,
+                     0,
+                     0,
+                     nullptr
+                 );
+                 if (hMapping == nullptr) {
+                     DWORD err = GetLastError();
+                     SS_LOG_LAST_ERROR(L"HashStore", L"Failed to create mapping for bucket bootstrap");
+                     return StoreError{ SignatureStoreError::MappingFailed, err,
+                         "Failed to create file mapping for bucket bootstrap" };
+                 }
+
+                 struct MappingGuard {
+                     HANDLE h;
+                     ~MappingGuard() { if (h != nullptr) CloseHandle(h); }
+                 } mappingGuard{ hMapping };
+
+                 void* mappedBase = MapViewOfFile(
+                     hMapping,
+                     FILE_MAP_WRITE,
+                     0,
+                     0,
+                     0
+                 );
+                 if (mappedBase == nullptr) {
+                     DWORD err = GetLastError();
+                     SS_LOG_LAST_ERROR(L"HashStore", L"Failed to map file for bucket bootstrap");
+                     return StoreError{ SignatureStoreError::MappingFailed, err,
+                         "Failed to map file for bucket bootstrap" };
+                 }
+
+                 struct ViewGuard {
+                     void* view;
+                     ~ViewGuard() { if (view != nullptr) UnmapViewOfFile(view); }
+                 } viewGuard{ mappedBase };
+
+                 constexpr uint8_t NUM_HASH_TYPES = static_cast<uint8_t>(HashType::TLSH) + 1;
+                 const uint64_t bucketSize = header.hashIndexSize / NUM_HASH_TYPES;
+                 if (bucketSize < sizeof(ShadowStrike::SignatureStore::BPlusTreeNode)) {
+                     SS_LOG_ERROR(L"HashStore",
+                         L"CreateNew: Bucket size 0x%llX too small for SignatureIndex root",
+                         bucketSize);
+                     return StoreError{ SignatureStoreError::TooLarge, 0,
+                         "Bucket size too small for index bootstrap" };
+                 }
+
+                 uint64_t bucketOffset = header.hashIndexOffset;
+                 for (uint8_t i = 0; i < NUM_HASH_TYPES; ++i) {
+                     HashType type = static_cast<HashType>(i);
+                     HashBucket bucket(type);
+                     uint64_t bucketUsed = 0;
+                     auto* bucketBase = static_cast<uint8_t*>(mappedBase) + bucketOffset;
+
+                     StoreError bucketErr = bucket.CreateNew(bucketBase, bucketSize, bucketUsed);
+                     if (!bucketErr.IsSuccess()) {
+                         SS_LOG_ERROR(L"HashStore",
+                             L"CreateNew: Failed to bootstrap %S bucket: %S",
+                             Format::HashTypeToString(type),
+                             bucketErr.message.c_str());
+                         return bucketErr;
+                     }
+
+                     bucketOffset += bucketSize;
+                 }
+
+                 if (!FlushViewOfFile(mappedBase, 0)) {
+                     DWORD err = GetLastError();
+                     SS_LOG_WARN(L"HashStore",
+                         L"CreateNew: FlushViewOfFile during bucket bootstrap failed, error=%lu",
+                         err);
+                 }
+             }
+
+             // Flush to ensure header is on disk before reopening
+             if (!FlushFileBuffers(hFile)) {
+                 SS_LOG_WARN(L"HashStore", L"Failed to flush file buffers (non-fatal)");
+             }
 
             SS_LOG_INFO(L"HashStore", 
                 L"Database header written successfully (magic=0x%08X, ver=%u.%u)",

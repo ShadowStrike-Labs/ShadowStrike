@@ -1,0 +1,187 @@
+Microsoft (R) COFF/PE Dumper Version 14.44.35222.0
+Copyright (C) Microsoft Corporation.  All rights reserved.
+
+
+Dump of file SignatureBuilder.obj
+
+File Type: EXTENDED COFF OBJECT
+
+COFF SYMBOL TABLE
+000 01058996 ABS    notype       Static       | @comp.id
+001 80010190 ABS    notype       Static       | @feat.00
+002 00000003 ABS    notype       Static       | @vol.md
+003 00000000 SECT1  notype       Static       | .drectve
+    Section length  219, #relocs    0, #linenums    0, checksum        0
+005 00000000 SECT2  notype       Static       | .debug$S
+    Section length   84, #relocs    0, #linenums    0, checksum        0
+007 00000000 SECT3  notype       Static       | .rdata
+    Section length  712, #relocs    0, #linenums    0, checksum D5DD999A
+009 00000000 SECT3  notype       Static       | $SG311456
+00A 00000050 SECT3  notype       Static       | $SG311457
+00B 00000074 SECT3  notype       Static       | $SG262364
+00C 00000080 SECT3  notype       Static       | $SG262367
+00D 00000090 SECT3  notype       Static       | $SG262370
+00E 000000A0 SECT3  notype       Static       | $SG262371
+00F 000000B4 SECT3  notype       Static       | $SG262381
+010 000000C0 SECT3  notype       Static       | $SG262384
+011 000000D0 SECT3  notype       Static       | $SG262387
+012 000000E0 SECT3  notype       Static       | $SG262388
+013 000000F4 SECT3  notype       Static       | $SG262398
+014 00000100 SECT3  notype       Static       | $SG262401
+015 00000110 SECT3  notype       Static       | $SG262404
+016 00000120 SECT3  notype       Static       | $SG262405
+017 00000134 SECT3  notype       Static       | $SG270669
+018 00000138 SECT3  notype       Static       | $SG270671
+019 00000140 SECT3  notype       Static       | $SG270692
+01A 00000144 SECT3  notype       Static       | $SG270698
+01B 00000148 SECT3  notype       Static       | $SG270700
+01C 00000150 SECT3  notype       Static       | $SG270861
+01D 00000154 SECT3  notype       Static       | $SG270863
+01E 0000015C SECT3  notype       Static       | $SG270884
+01F 00000160 SECT3  notype       Static       | $SG270890
+020 00000164 SECT3  notype       Static       | $SG270892
+021 0000016C SECT3  notype       Static       | $SG270989
+022 00000174 SECT3  notype       Static       | $SG271041
+023 00000180 SECT3  notype       Static       | $SG256207
+024 000001A0 SECT3  notype       Static       | $SG256208
+025 000001B0 SECT3  notype       Static       | $SG256209
+026 00000218 SECT3  notype       Static       | $SG256261
+027 00000238 SECT3  notype       Static       | $SG256262
+028 00000240 SECT3  notype       Static       | $SG256263
+029 000002A8 SECT3  notype       Static       | $SG305491
+02A 000002BC SECT3  notype       Static       | $SG305492
+02B 000002C0 SECT3  notype       Static       | $SG305493
+02C 00000324 SECT3  notype       Static       | $SG256345
+02D 00000328 SECT3  notype       Static       | $SG256348
+02E 00000334 SECT3  notype       Static       | $SG256351
+02F 00000338 SECT3  notype       Static       | $SG256352
+030 00000344 SECT3  notype       Static       | $SG256414
+031 00000348 SECT3  notype       Static       | $SG256417
+032 00000354 SECT3  notype       Static       | $SG256420
+033 00000358 SECT3  notype       Static       | $SG256421
+034 00000368 SECT3  notype       Static       | $SG256452
+035 00000388 SECT3  notype       Static       | $SG256453
+036 00000390 SECT3  notype       Static       | $SG256454
+037 000003F4 SECT3  notype       Static       | $SG256460
+038 000003F8 SECT3  notype       Static       | $SG256463
+039 00000404 SECT3  notype       Static       | $SG256466
+03A 00000408 SECT3  notype       Static       | $SG256467
+03B 00000418 SECT3  notype       Static       | $SG256499
+03C 00000438 SECT3  notype       Static       | $SG256500
+03D 00000440 SECT3  notype       Static       | $SG256501
+03E 000004A4 SECT3  notype       Static       | $SG256507
+03F 000004A8 SECT3  notype       Static       | $SG256510
+040 000004B4 SECT3  notype       Static       | $SG256513
+041 000004B8 SECT3  notype       Static       | $SG256514
+042 000004C8 SECT3  notype       Static       | $SG256572
+043 000004E8 SECT3  notype       Static       | $SG256573
+044 000004F0 SECT3  notype       Static       | $SG256574
+045 00000554 SECT3  notype       Static       | $SG256580
+046 00000558 SECT3  notype       Static       | $SG256583
+047 00000564 SECT3  notype       Static       | $SG256586
+048 00000568 SECT3  notype       Static       | $SG256587
+049 00000578 SECT3  notype       Static       | $SG256649
+04A 00000598 SECT3  notype       Static       | $SG256650
+04B 000005A0 SECT3  notype       Static       | $SG256651
+04C 00000604 SECT3  notype       Static       | $SG256657
+04D 00000608 SECT3  notype       Static       | $SG256660
+04E 00000614 SECT3  notype       Static       | $SG256663
+04F 00000618 SECT3  notype       Static       | $SG256664
+050 00000628 SECT3  notype       Static       | $SG200627
+051 0000065C SECT3  notype       Static       | $SG284332
+052 00000664 SECT3  notype       Static       | $SG284375
+053 00000000 SECT4  notype       Static       | .bss
+    Section length    4, #relocs    0, #linenums    0, checksum        0, selection    2 (pick any)
+055 00000000 SECT4  notype       External     | _Avx2WmemEnabledWeakValue
+056 00000670 SECT3  notype       Static       | $SG203908
+057 000006B0 SECT3  notype       Static       | $SG310541
+058 00000000 SECT5  notype       Static       | .text$mn
+    Section length   BD, #relocs    9, #linenums    0, checksum D2E6C36F, selection    2 (pick any)
+05A 00000000 SECT6  notype       Static       | .text$mn
+    Section length   BD, #relocs    9, #linenums    0, checksum D2E6C36F, selection    2 (pick any)
+05C 00000000 SECT7  notype       Static       | .text$mn
+    Section length   72, #relocs    5, #linenums    0, checksum EC0F3305, selection    2 (pick any)
+05E 00000000 SECT8  notype       Static       | .text$mn
+    Section length    6, #relocs    0, #linenums    0, checksum 7BCF4A59, selection    2 (pick any)
+060 00000000 SECT9  notype       Static       | .text$mn
+    Section length    B, #relocs    0, #linenums    0, checksum 38087020, selection    2 (pick any)
+062 00000000 SECTA  notype       Static       | .text$mn
+    Section length    B, #relocs    0, #linenums    0, checksum 38087020, selection    2 (pick any)
+064 00000000 SECTB  notype       Static       | .text$mn
+    Section length   10, #relocs    0, #linenums    0, checksum A867704D, selection    2 (pick any)
+066 00000000 SECTC  notype       Static       | .text$mn
+    Section length   32, #relocs    1, #linenums    0, checksum 5BA5EDC6, selection    2 (pick any)
+068 00000000 SECT8  notype ()    External     | ?__empty_global_delete@@YAXPEAX@Z (void __cdecl __empty_global_delete(void *))
+069 00000000 SECTA  notype ()    External     | ?__empty_global_delete@@YAXPEAX_K@Z (void __cdecl __empty_global_delete(void *,unsigned __int64))
+06A 00000000 SECT9  notype ()    External     | ?__empty_global_delete@@YAXPEAXW4align_val_t@std@@@Z (void __cdecl __empty_global_delete(void *,enum std::align_val_t))
+06B 00000000 SECTB  notype ()    External     | ?__empty_global_delete@@YAXPEAX_KW4align_val_t@std@@@Z (void __cdecl __empty_global_delete(void *,unsigned __int64,enum std::align_val_t))
+06C 00000000 UNDEF  notype ()    External     | memcpy
+06D 00000000 UNDEF  notype       External     | __imp_wcslen
+06E 00000000 UNDEF  notype       External     | __imp__calloc_dbg
+06F 00000000 SECTC  notype ()    External     | wmemcpy
+070 00000000 UNDEF  notype ()    External     | ?_Xbad_alloc@std@@YAXXZ (void __cdecl std::_Xbad_alloc(void))
+071 00000000 UNDEF  notype       External     | __imp_?_Getcvt@_Locinfo@std@@QEBA?AU_Cvtvec@@XZ (__declspec(dllimport) public: struct _Cvtvec __cdecl std::_Locinfo::_Getcvt(void)const )
+072 00000000 UNDEF  notype       External     | __imp_?_W_Getdays@_Locinfo@std@@QEBAPEBGXZ (__declspec(dllimport) public: unsigned short const * __cdecl std::_Locinfo::_W_Getdays(void)const )
+073 00000000 UNDEF  notype       External     | __imp_?_W_Getmonths@_Locinfo@std@@QEBAPEBGXZ (__declspec(dllimport) public: unsigned short const * __cdecl std::_Locinfo::_W_Getmonths(void)const )
+074 00000000 SECT7  notype ()    External     | ?_Maklocwcs@std@@YAPEA_WPEB_W@Z (wchar_t * __cdecl std::_Maklocwcs(wchar_t const *))
+075 00000000 SECT5  notype ()    External     | ??$_Getvals@_W@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z (protected: void __cdecl std::time_get<char,class std::istreambuf_iterator<char,struct std::char_traits<char> > >::_Getvals<wchar_t>(wchar_t,class std::_Locinfo const &))
+076 00000000 SECT6  notype ()    External     | ??$_Getvals@_W@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z (protected: void __cdecl std::time_get<wchar_t,class std::istreambuf_iterator<wchar_t,struct std::char_traits<wchar_t> > >::_Getvals<wchar_t>(wchar_t,class std::_Locinfo const &))
+077 00000000 UNDEF  notype ()    External     | __GSHandlerCheck
+078 00000000 UNDEF  notype ()    External     | __security_check_cookie
+079 00000000 SECTC  notype       Label        | $LN3
+07A 00000000 SECT7  notype       Label        | $LN4
+07B 00000000 SECT5  notype       Label        | $LN3
+07C 00000000 SECT6  notype       Label        | $LN3
+07D 00000000 SECTD  notype       Static       | .xdata
+    Section length    8, #relocs    0, #linenums    0, checksum 6072F4B7, selection    5 (pick associative Section 0xC)
+07F 00000000 SECTD  notype       Static       | $unwind$wmemcpy
+080 00000000 SECTE  notype       Static       | .pdata
+    Section length    C, #relocs    3, #linenums    0, checksum C7E85400, selection    5 (pick associative Section 0xC)
+082 00000000 SECTE  notype       Static       | $pdata$wmemcpy
+083 00000000 SECTF  notype       Static       | .xdata
+    Section length    8, #relocs    0, #linenums    0, checksum  DD7168C, selection    5 (pick associative Section 0x7)
+085 00000000 SECTF  notype       Static       | $unwind$?_Maklocwcs@std@@YAPEA_WPEB_W@Z
+086 00000000 SECT10 notype       Static       | .pdata
+    Section length    C, #relocs    3, #linenums    0, checksum EE7596ED, selection    5 (pick associative Section 0x7)
+088 00000000 SECT10 notype       Static       | $pdata$?_Maklocwcs@std@@YAPEA_WPEB_W@Z
+089 00000000 SECT11 notype       Static       | .xdata
+    Section length   14, #relocs    1, #linenums    0, checksum 5B1CEC62, selection    5 (pick associative Section 0x5)
+08B 00000000 SECT11 notype       Static       | $unwind$??$_Getvals@_W@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z
+08C 00000000 SECT12 notype       Static       | .pdata
+    Section length    C, #relocs    3, #linenums    0, checksum 4DF3C376, selection    5 (pick associative Section 0x5)
+08E 00000000 SECT12 notype       Static       | $pdata$??$_Getvals@_W@?$time_get@DV?$istreambuf_iterator@DU?$char_traits@D@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z
+08F 00000000 SECT13 notype       Static       | .voltbl
+    Section length    2, #relocs    0, #linenums    0, checksum 625015D2, selection    5 (pick associative Section 0x5)
+091 00000000 SECT13 notype       Static       | _volmd
+092 00000000 SECT14 notype       Static       | .xdata
+    Section length   14, #relocs    1, #linenums    0, checksum 5B1CEC62, selection    5 (pick associative Section 0x6)
+094 00000000 SECT14 notype       Static       | $unwind$??$_Getvals@_W@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z
+095 00000000 SECT15 notype       Static       | .pdata
+    Section length    C, #relocs    3, #linenums    0, checksum 4DF3C376, selection    5 (pick associative Section 0x6)
+097 00000000 SECT15 notype       Static       | $pdata$??$_Getvals@_W@?$time_get@_WV?$istreambuf_iterator@_WU?$char_traits@_W@std@@@std@@@std@@IEAAX_WAEBV_Locinfo@1@@Z
+098 00000000 SECT16 notype       Static       | .voltbl
+    Section length    2, #relocs    0, #linenums    0, checksum 625015D2, selection    5 (pick associative Section 0x6)
+09A 00000000 SECT16 notype       Static       | _volmd
+09B 00000000 SECT17 notype       Static       | .rdata
+    Section length   62, #relocs    0, #linenums    0, checksum 33B935FA, selection    2 (pick any)
+09D 00000000 SECT17 notype       External     | ??_C@_0GC@IAMDGGLO@C?3?2Program?5Files?2Microsoft?5Visu@ (`string')
+09E 00000000 SECT18 notype       Static       | .rdata
+    Section length   1A, #relocs    0, #linenums    0, checksum 97992F69, selection    2 (pick any)
+0A0 00000000 SECT18 notype       External     | ??_C@_1BK@MHIKGOKE@?$AA?3?$AAA?$AAM?$AA?3?$AAa?$AAm?$AA?3?$AAP?$AAM?$AA?3?$AAp?$AAm@ (`string')
+0A1 00000000 UNDEF  notype       External     | __security_cookie
+0A2 00000000 SECT19 notype       Static       | .chks64
+    Section length   C8, #relocs    0, #linenums    0, checksum        0
+
+String Table Size = 0x899 bytes
+
+  Summary
+
+           4 .bss
+          C8 .chks64
+          84 .debug$S
+         219 .drectve
+          30 .pdata
+         78E .rdata
+         24A .text$mn
+           4 .voltbl
+          38 .xdata

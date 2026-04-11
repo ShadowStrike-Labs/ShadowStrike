@@ -71,7 +71,7 @@
  *
  * INTEGRATION:
  * ============
- * - Core::FileSystem::FileWatcher for file events
+ * - Core::FileSystem::FileSystemFilter (kernel minifilter) for file events
  * - Core::Engine::BehaviorAnalyzer for central processing
  * - Ransomware::HoneypotManager for canary files
  * - Ransomware::FileBackupManager for JIT backups

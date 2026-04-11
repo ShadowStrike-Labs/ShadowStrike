@@ -76,7 +76,7 @@
  *
  * INTEGRATION:
  * ============
- * - Core::FileSystem::FileWatcher for monitoring
+ * - Core::FileSystem::FileSystemFilter (kernel minifilter) for monitoring
  * - Ransomware::RansomwareDetector for alerts
  * - Utils::FileUtils for file operations
  *

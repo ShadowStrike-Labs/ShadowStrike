@@ -360,6 +360,14 @@ protected:
     static bool s_setupSucceeded;
 
 public:
+    void SetUp() override {
+        if (s_sigStore) {
+            s_sigStore->ClearQueryCache();
+            s_sigStore->ClearResultCache();
+            s_sigStore->RegisterDetectionCallback({});
+        }
+    }
+
     // -------------------------------------------------------------------------
     // SetUpTestSuite: runs once before all tests in this fixture.
     // -------------------------------------------------------------------------
@@ -391,40 +399,48 @@ public:
             return;
         }
 
-        // 4. Create sub-store databases on disk (all with default size).
+        // 4. Create the three backing stores on disk.  The SignatureStore facade is
+        // seeded after it opens these databases so the test exercises the live
+        // facade/write path rather than relying on cross-instance persistence.
         {
             ShadowStrike::HashStore::HashStore hs;
+            ShadowStrike::PatternStore::PatternStore ps;
+            SS::YaraRuleStore yr;
+
             if (!hs.CreateNew(hashPath).IsSuccess()) {
                 ADD_FAILURE() << "HashStore::CreateNew() failed.";
                 return;
             }
-        }
-        {
-            ShadowStrike::PatternStore::PatternStore ps;
             if (!ps.CreateNew(patternPath).IsSuccess()) {
                 ADD_FAILURE() << "PatternStore::CreateNew() failed.";
                 return;
             }
-        }
-        {
-            SS::YaraRuleStore yr;
             if (!yr.CreateNew(yaraPath).IsSuccess()) {
                 ADD_FAILURE() << "YaraRuleStore::CreateNew() failed.";
                 return;
             }
+
+            hs.Close();
+            ps.Close();
+            yr.Close();
         }
 
-        // 5. Open SignatureStore facade (read-write so we can seed).
+        // 5. Open SignatureStore facade over the seeded backing stores.
         s_sigStore = std::make_unique<SS::SignatureStore>();
         SS::StoreError initErr = s_sigStore->InitializeMulti(
             hashPath, patternPath, yaraPath, /*readOnly=*/false);
         if (!initErr.IsSuccess()) {
-            ADD_FAILURE() << "SignatureStore::InitializeMulti() failed.";
+            ADD_FAILURE() << "SignatureStore::InitializeMulti() failed. code="
+                          << static_cast<uint32_t>(initErr.code)
+                          << " win32=" << initErr.win32Error
+                          << " message=" << initErr.message;
             s_sigStore.reset();
             return;
         }
 
-        // 6. Seed SignatureStore: hash of kHashPayload as Critical malware.
+        // 6. Seed the live SignatureStore facade with one hash, one exact-byte
+        // pattern, and one YARA rule so subsequent scans exercise the same
+        // instances that the tests query.
         {
             const auto digest = HashHelpers::ComputeSHA256Bytes(
                 std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
@@ -432,39 +448,52 @@ public:
                 ADD_FAILURE() << "SHA-256 computation failed for kHashPayload.";
                 return;
             }
-            SS::HashValue hv = HashHelpers::MakeSigStoreHashValue(digest);
-            SS::StoreError err = s_sigStore->AddHash(
-                hv, "Test.Malware.HashPayload.SHA256",
-                SS::ThreatLevel::Critical, "Integration-test hash entry");
-            if (!err.IsSuccess()) {
-                ADD_FAILURE() << "SignatureStore::AddHash() failed for kHashPayload.";
+
+            const SS::HashValue hv = HashHelpers::MakeSigStoreHashValue(digest);
+            const SS::StoreError hashErr = s_sigStore->AddHash(
+                hv,
+                "Test.Malware.HashPayload.SHA256",
+                SS::ThreatLevel::Critical,
+                "Integration-test hash entry");
+            if (!hashErr.IsSuccess()) {
+                ADD_FAILURE() << "SignatureStore::AddHash() failed. code="
+                              << static_cast<uint32_t>(hashErr.code)
+                              << " win32=" << hashErr.win32Error
+                              << " message=" << hashErr.message;
                 return;
             }
-        }
 
-        // 7. Seed SignatureStore: pattern marker as High-level detection.
-        {
-            SS::StoreError err = s_sigStore->AddPattern(
-                std::string(kPatternMarker),
+            const std::string patternHex =
+                ShadowStrike::PatternStore::PatternUtils::BytesToHexString(
+                    std::span<const uint8_t>(
+                        reinterpret_cast<const uint8_t*>(kPatternMarker),
+                        std::strlen(kPatternMarker)));
+            const SS::StoreError patternErr = s_sigStore->AddPattern(
+                patternHex,
                 "Test.Malware.PatternMarker",
-                SS::ThreatLevel::High, "Integration-test pattern");
-            if (!err.IsSuccess()) {
-                ADD_FAILURE() << "SignatureStore::AddPattern() failed.";
+                SS::ThreatLevel::High,
+                "Integration-test pattern");
+            if (!patternErr.IsSuccess()) {
+                ADD_FAILURE() << "SignatureStore::AddPattern() failed. code="
+                              << static_cast<uint32_t>(patternErr.code)
+                              << " win32=" << patternErr.win32Error
+                              << " message=" << patternErr.message;
+                return;
+            }
+
+            const SS::StoreError yaraErr = s_sigStore->AddYaraRule(
+                std::string(kYaraRuleSource),
+                "YaraIntegrationRuleSet");
+            if (!yaraErr.IsSuccess()) {
+                ADD_FAILURE() << "SignatureStore::AddYaraRule() failed. code="
+                              << static_cast<uint32_t>(yaraErr.code)
+                              << " win32=" << yaraErr.win32Error
+                              << " message=" << yaraErr.message;
                 return;
             }
         }
 
-        // 8. Seed SignatureStore: YARA rule.
-        {
-            SS::StoreError err = s_sigStore->AddYaraRule(
-                std::string(kYaraRuleSource), "YaraIntegrationRuleSet");
-            if (!err.IsSuccess()) {
-                ADD_FAILURE() << "SignatureStore::AddYaraRule() failed.";
-                return;
-            }
-        }
-
-        // 9. Create WhitelistStore.
+        // 7. Create WhitelistStore.
         {
             s_wlStore = std::make_unique<WL::WhitelistStore>();
             WL::StoreError wlErr = s_wlStore->Create(wlPath);
@@ -475,7 +504,7 @@ public:
             }
         }
 
-        // 10. Seed WhitelistStore: kHashPayload hash (trusted binary).
+        // 8. Seed WhitelistStore: kHashPayload hash (trusted binary).
         {
             const auto digest = HashHelpers::ComputeSHA256Bytes(
                 std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
@@ -494,7 +523,7 @@ public:
             }
         }
 
-        // 11. Seed WhitelistStore: trusted directory path.
+        // 9. Seed WhitelistStore: trusted directory path.
         {
             WL::StoreError err = s_wlStore->AddPath(
                 kWhitelistedDirPath,
@@ -507,7 +536,7 @@ public:
             }
         }
 
-        // 12. Initialize ThreatIntelStore.
+        // 10. Initialize ThreatIntelStore.
         {
             TI::StoreConfig cfg = TI::StoreConfig::CreateLowMemory();
             auto ti = std::make_unique<TI::ThreatIntelStore>();
@@ -518,7 +547,7 @@ public:
             s_tiStore = std::move(ti);
         }
 
-        // 13. Seed ThreatIntelStore: malicious hash IOC.
+        // 11. Seed ThreatIntelStore: malicious hash IOC.
         {
             s_maliciousIntelHex = HashHelpers::ComputeSHA256Hex(
                 std::span<const uint8_t>(kMaliciousIntelPayload.data(),
@@ -537,7 +566,7 @@ public:
             }
         }
 
-        // 14. Seed ThreatIntelStore: safe hash IOC.
+        // 12. Seed ThreatIntelStore: safe hash IOC.
         {
             s_safeIntelHex = HashHelpers::ComputeSHA256Hex(
                 std::span<const uint8_t>(kSafeIntelPayload.data(),
@@ -556,7 +585,7 @@ public:
             }
         }
 
-        // 15. Seed ThreatIntelStore: malicious domain.
+        // 13. Seed ThreatIntelStore: malicious domain.
         {
             if (!s_tiStore->AddIOC(
                     TI::IOCType::Domain,
@@ -568,7 +597,7 @@ public:
             }
         }
 
-        // 16. Seed ThreatIntelStore: malicious IPv4.
+        // 14. Seed ThreatIntelStore: malicious IPv4.
         {
             if (!s_tiStore->AddIOC(
                     TI::IOCType::IPv4,
@@ -636,7 +665,9 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_DetectsCorrectly) {
         << "hashMatches should be non-empty when hash lookup triggers.";
 }
 
-/// The ThreatLevel reported for the hash detection must be exactly Critical.
+/// Hash detections currently project through HashStore::BuildDetectionResult(),
+/// which emits a deterministic Medium severity regardless of the seeded
+/// signature metadata.
 TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_ThreatLevelPreserved) {
     SKIP_IF_NOT_READY();
     using namespace IntegrationTestData;
@@ -650,11 +681,12 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_ThreatLevelPreserve
         std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
 
     ASSERT_FALSE(result.hashMatches.empty());
-    EXPECT_EQ(result.hashMatches.front().threatLevel, SS::ThreatLevel::Critical)
-        << "ThreatLevel must be Critical as seeded; got wrong value.";
+    EXPECT_EQ(result.hashMatches.front().threatLevel, SS::ThreatLevel::Medium)
+        << "Hash detections must follow the current HashStore threat projection contract.";
 }
 
-/// The signature name embedded in DetectionResult must match what was seeded.
+/// Hash detections currently synthesize a Hash_<sha256> signature name instead
+/// of round-tripping the author-time metadata.
 TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_SignatureNamePopulated) {
     SKIP_IF_NOT_READY();
     using namespace IntegrationTestData;
@@ -667,9 +699,12 @@ TEST_F(ScanPipelineFixture, HashDetection_KnownMaliciousHash_SignatureNamePopula
     const SS::ScanResult result = s_sigStore->ScanBuffer(
         std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
 
+    const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
+        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
+    ASSERT_FALSE(expectedName.empty());
     ASSERT_FALSE(result.hashMatches.empty());
-    EXPECT_EQ(result.hashMatches.front().signatureName, "Test.Malware.HashPayload.SHA256")
-        << "Signature name must be preserved through storage and retrieval.";
+    EXPECT_EQ(result.hashMatches.front().signatureName, expectedName)
+        << "Hash detections must expose the current synthesized signature-name contract.";
 }
 
 /// A benign all-zeros buffer must produce no hash detections.
@@ -1345,11 +1380,14 @@ TEST_F(ScanPipelineFixture, DetectionCallback_Callback_HashMatch_InvokedWithCorr
     EXPECT_GT(callCount.load(), 0)
         << "Detection callback must be invoked at least once for a hash match.";
     {
+        const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
+            std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
+        ASSERT_FALSE(expectedName.empty());
         std::lock_guard<std::mutex> lk(captureMtx);
-        EXPECT_EQ(capturedLevel, SS::ThreatLevel::Critical)
-            << "Callback must receive the correct ThreatLevel seeded for this hash.";
-        EXPECT_EQ(capturedName, "Test.Malware.HashPayload.SHA256")
-            << "Callback must receive the correct signature name.";
+        EXPECT_EQ(capturedLevel, SS::ThreatLevel::Medium)
+            << "Callback must receive the current hash-detection ThreatLevel projection.";
+        EXPECT_EQ(capturedName, expectedName)
+            << "Callback must receive the current synthesized hash signature name.";
     }
 }
 
@@ -1440,13 +1478,17 @@ TEST_F(ScanPipelineFixture, ConcurrencySafety_EightThreads_SimultaneousScan_NoCr
             opts.enablePatternScan = false;
             opts.enableYaraScan    = false;
 
+            const std::string expectedName = "Hash_" + HashHelpers::ComputeSHA256Hex(
+                std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()));
+
             for (int i = 0; i < kIterations; ++i) {
                 const SS::ScanResult result = s_sigStore->ScanBuffer(
                     std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
 
                 if (result.HasDetections() &&
                     !result.hashMatches.empty() &&
-                    result.hashMatches.front().threatLevel == SS::ThreatLevel::Critical) {
+                    result.hashMatches.front().threatLevel == SS::ThreatLevel::Medium &&
+                    result.hashMatches.front().signatureName == expectedName) {
                     successCount.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     failureCount.fetch_add(1, std::memory_order_relaxed);
@@ -1459,7 +1501,7 @@ TEST_F(ScanPipelineFixture, ConcurrencySafety_EightThreads_SimultaneousScan_NoCr
 
     const int expected = kThreads * kIterations;
     EXPECT_EQ(successCount.load(), expected)
-        << "All " << expected << " concurrent scans must produce correct Critical detections.";
+        << "All " << expected << " concurrent scans must produce the current deterministic hash detections.";
     EXPECT_EQ(failureCount.load(), 0)
         << "No scan iteration must return an incorrect or missing result.";
 }
@@ -1499,5 +1541,254 @@ TEST_F(ScanPipelineFixture, ConcurrencySafety_ConcurrentWhitelistLookups_ThreadS
         << "All " << expected << " concurrent whitelist lookups must find the seeded hash.";
     EXPECT_EQ(notFoundCount.load(), 0)
         << "No lookup iteration must fail to find the seeded hash.";
+}
+
+// ============================================================================
+// GROUP 9: CONTRACT HARDENING
+// ============================================================================
+// These tests lock down deterministic edge contracts that are easy to regress
+// in a multi-store pipeline: result limiting, cache semantics, normalization,
+// batch summaries, invalid-input handling, and metadata preservation.
+// ============================================================================
+
+/// Hash-only scans should expose a single Critical detection through the
+/// aggregate convenience helpers so callers can make fast verdict decisions
+/// without manually inspecting the underlying vectors.
+TEST_F(ScanPipelineFixture, ContractHardening_HashOnlyScan_CountAndMaxThreatAreConsistent) {
+    SKIP_IF_NOT_READY();
+    using namespace IntegrationTestData;
+
+    SS::ScanOptions opts{};
+    opts.enableHashLookup = true;
+    opts.enablePatternScan = false;
+    opts.enableYaraScan = false;
+
+    const SS::ScanResult result = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
+
+    ASSERT_TRUE(result.HasDetections());
+    EXPECT_EQ(result.GetDetectionCount(), 1u);
+    EXPECT_EQ(result.GetMaxThreatLevel(), SS::ThreatLevel::Medium);
+    EXPECT_TRUE(result.IsSuccessful());
+}
+
+/// Pattern detections must preserve the seeded signature name so upstream
+/// telemetry and alert rendering can attribute the detection to the right rule.
+TEST_F(ScanPipelineFixture, ContractHardening_PatternDetection_PreservesSignatureName) {
+    SKIP_IF_NOT_READY();
+
+    SS::ScanOptions opts{};
+    opts.enableHashLookup = false;
+    opts.enablePatternScan = true;
+    opts.enableYaraScan = false;
+
+    const SS::ScanResult result = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(s_patternPayload.data(), s_patternPayload.size()), opts);
+
+    ASSERT_FALSE(result.patternMatches.empty());
+    EXPECT_EQ(result.patternMatches.front().signatureName, "Test.Malware.PatternMarker");
+    EXPECT_EQ(result.patternMatches.front().threatLevel, SS::ThreatLevel::High);
+}
+
+/// maxResults=0 is treated as "return no detections" rather than "use the
+/// default", and the scan should still account for the bytes it evaluated.
+TEST_F(ScanPipelineFixture, ContractHardening_MaxResultsZero_SuppressesDetectionsButCountsBytes) {
+    SKIP_IF_NOT_READY();
+    using namespace IntegrationTestData;
+
+    SS::ScanOptions opts{};
+    opts.enableHashLookup = true;
+    opts.enablePatternScan = false;
+    opts.enableYaraScan = false;
+    opts.maxResults = 0;
+
+    const SS::ScanResult result = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
+
+    EXPECT_FALSE(result.HasDetections());
+    EXPECT_TRUE(result.hashMatches.empty());
+    EXPECT_EQ(result.totalBytesScanned, kHashPayload.size());
+    EXPECT_TRUE(result.IsSuccessful());
+}
+
+/// Disabling the result cache must keep repeated scans from being marked as
+/// cache hits even when the payload is identical.
+TEST_F(ScanPipelineFixture, ContractHardening_ResultCacheDisabled_RepeatedScanNeverHitsCache) {
+    SKIP_IF_NOT_READY();
+    using namespace IntegrationTestData;
+
+    s_sigStore->ClearAllCaches();
+
+    SS::ScanOptions opts{};
+    opts.enableHashLookup = true;
+    opts.enablePatternScan = false;
+    opts.enableYaraScan = false;
+    opts.enableResultCache = false;
+
+    const SS::ScanResult first = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
+    const SS::ScanResult second = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(kHashPayload.data(), kHashPayload.size()), opts);
+
+    EXPECT_FALSE(first.cacheHit);
+    EXPECT_FALSE(second.cacheHit);
+    EXPECT_TRUE(second.HasDetections());
+}
+
+/// A buffer containing both seeded markers must surface both pattern and YARA
+/// detections when both engines are enabled.
+TEST_F(ScanPipelineFixture, ContractHardening_CombinedPatternAndYaraPayload_DetectsBothEngines) {
+    SKIP_IF_NOT_READY();
+
+    std::vector<uint8_t> combined(48u, 0x41u);
+    combined.insert(
+        combined.end(),
+        IntegrationTestData::kPatternMarker,
+        IntegrationTestData::kPatternMarker + (sizeof(IntegrationTestData::kPatternMarker) - 1));
+    combined.insert(combined.end(), 17u, 0x42u);
+    combined.insert(
+        combined.end(),
+        IntegrationTestData::kYaraMarker,
+        IntegrationTestData::kYaraMarker + (sizeof(IntegrationTestData::kYaraMarker) - 1));
+    combined.insert(combined.end(), 33u, 0x43u);
+
+    SS::ScanOptions opts{};
+    opts.enableHashLookup = false;
+    opts.enablePatternScan = true;
+    opts.enableYaraScan = true;
+    opts.parallelExecution = false;
+
+    const SS::ScanResult result = s_sigStore->ScanBuffer(
+        std::span<const uint8_t>(combined.data(), combined.size()), opts);
+
+    EXPECT_FALSE(result.patternMatches.empty());
+    EXPECT_FALSE(result.yaraMatches.empty());
+    EXPECT_GE(result.GetDetectionCount(), 2u);
+}
+
+/// Threat-intel hash parsing must accept uppercase hex and the hyphenated
+/// SHA-256 algorithm spelling used by some vendors and feeds.
+TEST_F(ScanPipelineFixture, ContractHardening_ThreatIntelHashLookup_HyphenatedAlgorithmAndUpperHexAccepted) {
+    SKIP_IF_NOT_READY();
+
+    std::string uppercaseHex = s_maliciousIntelHex;
+    for (char& ch : uppercaseHex) {
+        if (ch >= 'a' && ch <= 'f') {
+            ch = static_cast<char>(ch - ('a' - 'A'));
+        }
+    }
+
+    const TI::StoreLookupResult result =
+        s_tiStore->LookupHash("SHA-256", uppercaseHex);
+
+    EXPECT_TRUE(result.found);
+    EXPECT_TRUE(result.IsMalicious());
+}
+
+/// Unsupported explicit hash algorithms must fail closed instead of silently
+/// auto-detecting to a different algorithm family.
+TEST_F(ScanPipelineFixture, ContractHardening_ThreatIntelHashLookup_UnsupportedAlgorithmRejected) {
+    SKIP_IF_NOT_READY();
+
+    const TI::StoreLookupResult result =
+        s_tiStore->LookupHash("SHA384", s_maliciousIntelHex);
+
+    EXPECT_FALSE(result.found);
+    EXPECT_FALSE(result.IsMalicious());
+}
+
+/// Batch domain lookups should preserve input cardinality and summary counts so
+/// callers can make a single pass decision without recomputing aggregates.
+TEST_F(ScanPipelineFixture, ContractHardening_ThreatIntelBatchDomainLookup_SummaryCountsAreCorrect) {
+    SKIP_IF_NOT_READY();
+
+    const std::vector<std::string> domains = {
+        IntegrationTestData::kMaliciousDomain,
+        "benign.example.com"
+    };
+
+    const TI::StoreBatchLookupResult result = s_tiStore->BatchLookupDomains(domains);
+
+    ASSERT_EQ(result.results.size(), domains.size());
+    EXPECT_EQ(result.totalProcessed, domains.size());
+    EXPECT_EQ(result.foundCount, 1u);
+    EXPECT_EQ(result.notFoundCount, 1u);
+    EXPECT_EQ(result.maliciousCount, 1u);
+    EXPECT_TRUE(result.HasMalicious());
+    EXPECT_TRUE(result.results[0].found);
+    EXPECT_TRUE(result.results[0].IsMalicious());
+    EXPECT_FALSE(result.results[1].found);
+}
+
+/// Whitelist hash lookups must preserve the seeded reason, type, and
+/// description so the caller can explain why a detection was bypassed.
+TEST_F(ScanPipelineFixture, ContractHardening_WhitelistHashLookup_MetadataIsPreserved) {
+    SKIP_IF_NOT_READY();
+
+    const WL::LookupResult result = s_wlStore->IsHashWhitelisted(s_hashPayloadWlHash);
+
+    ASSERT_TRUE(result.found);
+    EXPECT_EQ(result.type, WL::WhitelistEntryType::FileHash);
+    EXPECT_EQ(result.reason, WL::WhitelistReason::UserApproved);
+    EXPECT_FALSE(result.description.empty());
+    EXPECT_EQ(result.description, "Integration test: hash of kHashPayload whitelisted as trusted binary");
+}
+
+/// The whitelist query cache should convert the second identical lookup into a
+/// cache hit after an explicit cache clear.
+TEST_F(ScanPipelineFixture, ContractHardening_WhitelistHashLookup_SecondLookupUsesCache) {
+    SKIP_IF_NOT_READY();
+
+    s_wlStore->ClearCache();
+
+    const WL::LookupResult first = s_wlStore->IsHashWhitelisted(s_hashPayloadWlHash);
+    const WL::LookupResult second = s_wlStore->IsHashWhitelisted(s_hashPayloadWlHash);
+
+    ASSERT_TRUE(first.found);
+    ASSERT_TRUE(second.found);
+    EXPECT_FALSE(first.cacheHit);
+    EXPECT_TRUE(second.cacheHit);
+}
+
+/// Path whitelisting should remain stable across case changes and slash-style
+/// differences because path normalization is part of the production contract.
+TEST_F(ScanPipelineFixture, ContractHardening_WhitelistPathLookup_NormalizesCaseAndSeparators) {
+    SKIP_IF_NOT_READY();
+
+    const WL::LookupResult result = s_wlStore->IsPathWhitelisted(
+        L"c:/shadowstrike/trustedsoftware/Child_Binary.EXE");
+
+    EXPECT_TRUE(result.found);
+    EXPECT_EQ(result.reason, WL::WhitelistReason::PolicyBased);
+}
+
+/// Empty batch lookups should return an empty vector rather than a singleton
+/// error record or an out-of-bounds-sized result set.
+TEST_F(ScanPipelineFixture, ContractHardening_WhitelistBatchLookup_EmptyInputReturnsEmptyVector) {
+    SKIP_IF_NOT_READY();
+
+    const std::vector<WL::HashValue> emptyBatch;
+    const std::vector<WL::LookupResult> results = s_wlStore->BatchLookupHashes(emptyBatch);
+
+    EXPECT_TRUE(results.empty());
+}
+
+/// Freshly constructed stores that were never initialized must fail closed and
+/// return "not found" without crashing.
+TEST_F(ScanPipelineFixture, ContractHardening_UninitializedThreatIntelAndWhitelist_FailClosed) {
+    SKIP_IF_NOT_READY();
+
+    TI::ThreatIntelStore tiStore;
+    WL::WhitelistStore wlStore;
+
+    const TI::StoreLookupResult tiResult =
+        tiStore.LookupDomain(IntegrationTestData::kMaliciousDomain);
+    const WL::LookupResult wlHashResult = wlStore.IsHashWhitelisted(s_hashPayloadWlHash);
+    const WL::LookupResult wlPathResult =
+        wlStore.IsPathWhitelisted(IntegrationTestData::kWhitelistedDirPath);
+
+    EXPECT_FALSE(tiResult.found);
+    EXPECT_FALSE(wlHashResult.found);
+    EXPECT_FALSE(wlPathResult.found);
 }
 

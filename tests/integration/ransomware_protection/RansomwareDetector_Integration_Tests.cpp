@@ -151,6 +151,39 @@ public:
     /// @brief true if SetUpTestSuite completed without error.
     static bool s_setupSucceeded;
 
+    void SetUp() override {
+        if (!s_setupSucceeded) {
+            return;
+        }
+
+        auto& detector = RD::Instance();
+        detector.ResetStatistics();
+        detector.ExitContainmentMode();
+        detector.SetDetectionCallback(nullptr);
+        detector.SetBlockCallback(nullptr);
+        detector.SetPreWriteCallback(nullptr);
+        detector.SetEmergencyBackupCallback(nullptr);
+        detector.SetEmergencySnapshotCallback(nullptr);
+        detector.SetLockdownCallback(nullptr);
+        detector.SetRecoveryCallback(nullptr);
+    }
+
+    void TearDown() override {
+        if (!s_setupSucceeded) {
+            return;
+        }
+
+        auto& detector = RD::Instance();
+        detector.ExitContainmentMode();
+        detector.SetDetectionCallback(nullptr);
+        detector.SetBlockCallback(nullptr);
+        detector.SetPreWriteCallback(nullptr);
+        detector.SetEmergencyBackupCallback(nullptr);
+        detector.SetEmergencySnapshotCallback(nullptr);
+        detector.SetLockdownCallback(nullptr);
+        detector.SetRecoveryCallback(nullptr);
+    }
+
     static void SetUpTestSuite() {
         s_setupSucceeded = false;
 
@@ -414,6 +447,25 @@ TEST_F(RansomwareIntegrationFixture, HoneypotManagement_Unregister_RemovesEntry)
 }
 
 /**
+ * @brief Honeypot path matching must be case-insensitive and slash-normalized.
+ *
+ * Kernel/user-mode file events can surface with different path casing and slash
+ * styles; the detector must normalize both representations to avoid bypasses.
+ */
+TEST_F(RansomwareIntegrationFixture, HoneypotManagement_PathNormalization_IsCaseInsensitive) {
+    SKIP_IF_NOT_READY();
+    const std::wstring canonical = L"C:\\ShadowStrike\\HoneyPot\\Docs\\README.txt";
+    const std::wstring variant   = L"c:/shadowstrike/honeypot/docs/readme.txt";
+
+    RD::Instance().RegisterHoneypot(canonical);
+    EXPECT_TRUE(RD::Instance().IsHoneypot(variant))
+        << "Honeypot lookup must normalize case and slash direction.";
+    RD::Instance().UnregisterHoneypot(variant);
+    EXPECT_FALSE(RD::Instance().IsHoneypot(canonical))
+        << "Unregister must remove the canonicalized honeypot path.";
+}
+
+/**
  * @brief OnHoneypotTouched must fire the registered DetectionCallback with a
  *        Honeypot verdict.
  *
@@ -605,6 +657,28 @@ TEST_F(RansomwareIntegrationFixture, ContainmentMode_InitiallyNotActive) {
     RD::Instance().ExitContainmentMode();
     EXPECT_FALSE(RD::Instance().IsInContainmentMode())
         << "Containment mode must be inactive by default.";
+}
+
+/**
+ * @brief Lockdown callback must fire only on transition into containment mode.
+ *
+ * Re-entering an already-active containment state must not duplicate one-shot
+ * lockdown actions such as emergency write suppression or driver policy flips.
+ */
+TEST_F(RansomwareIntegrationFixture, ContainmentMode_LockdownCallback_FiresOnlyOnTransition) {
+    SKIP_IF_NOT_READY();
+
+    std::atomic<int> lockdownCount{0};
+    RD::Instance().SetLockdownCallback([&]() {
+        lockdownCount.fetch_add(1, std::memory_order_relaxed);
+    });
+
+    RD::Instance().EnterContainmentMode();
+    RD::Instance().EnterContainmentMode();
+
+    EXPECT_TRUE(RD::Instance().IsInContainmentMode());
+    EXPECT_EQ(lockdownCount.load(std::memory_order_relaxed), 1)
+        << "Lockdown callback must fire exactly once per inactive->active transition.";
 }
 
 // ============================================================================
@@ -806,6 +880,73 @@ TEST_F(RansomwareIntegrationFixture, WriteAnalysis_EmptyBuffer_NoCrash) {
     });
 }
 
+/**
+ * @brief Recovery-process exemptions must bypass write analysis completely.
+ *
+ * Decryptor/recovery workflows are explicitly exempted. A high-entropy write
+ * from a registered recovery PID must return a clean default event with no
+ * entropy sub-result or detection flags.
+ */
+TEST_F(RansomwareIntegrationFixture, WriteAnalysis_RecoveryProcess_BypassesDetection) {
+    SKIP_IF_NOT_READY();
+
+    constexpr uint32_t recoveryPid = 0xC0FFEE03u;
+    const auto buf = EntropyHelpers::BuildHighEntropyBuffer(8192);
+    RD::Instance().RegisterRecoveryProcess(recoveryPid);
+
+    const auto event = RD::Instance().AnalyzeWriteEx(
+        recoveryPid,
+        std::span<const uint8_t>(buf),
+        L"C:\\ShadowStrike\\Protected\\recovery-output.lockbit");
+
+    RD::Instance().UnregisterRecoveryProcess(recoveryPid);
+
+    EXPECT_EQ(event.verdict, RW::DetectionVerdict::Clean);
+    EXPECT_EQ(event.action, RW::DetectionAction::Allow);
+    EXPECT_EQ(event.detectionFlags, 0u);
+    EXPECT_FALSE(event.entropyResult.has_value())
+        << "Recovery-process writes must bypass the detection pipeline.";
+}
+
+/**
+ * @brief Rename analysis must surface family and technique flags for known
+ *        ransomware extension changes.
+ */
+TEST_F(RansomwareIntegrationFixture, RenameAnalysis_KnownRansomExtension_SetsFamilyAndFlags) {
+    SKIP_IF_NOT_READY();
+
+    const auto event = RD::Instance().AnalyzeRenameEx(
+        0xC0FFEE04u,
+        L"C:\\Temp\\quarterly-report.docx",
+        L"C:\\Temp\\quarterly-report.lockbit");
+
+    EXPECT_EQ(event.operationType, RW::FileOperationType::Rename);
+    EXPECT_EQ(event.family, RW::RansomwareFamily::LockBit);
+    EXPECT_NE(static_cast<uint16_t>(
+                  event.detectionFlags & static_cast<uint16_t>(RW::DetectionTechnique::ExtensionChange)),
+              static_cast<uint16_t>(0));
+    EXPECT_NE(static_cast<uint16_t>(
+                  event.detectionFlags & static_cast<uint16_t>(RW::DetectionTechnique::KnownFamily)),
+              static_cast<uint16_t>(0));
+}
+
+/**
+ * @brief Delete analysis on a protected path must mark BackupDeletion.
+ */
+TEST_F(RansomwareIntegrationFixture, DeleteAnalysis_ProtectedPath_SetsBackupDeletionFlag) {
+    SKIP_IF_NOT_READY();
+
+    const auto event = RD::Instance().AnalyzeDeleteEx(
+        0xC0FFEE05u,
+        L"C:\\ShadowStrike\\Protected\\critical-backup.vhdx");
+
+    EXPECT_EQ(event.operationType, RW::FileOperationType::Delete);
+    EXPECT_NE(static_cast<uint16_t>(
+                  event.detectionFlags & static_cast<uint16_t>(RW::DetectionTechnique::BackupDeletion)),
+              static_cast<uint16_t>(0))
+        << "Protected-path deletions must surface the BackupDeletion indicator.";
+}
+
 // ============================================================================
 // GROUP 12 — ProtectedPaths
 // ============================================================================
@@ -830,6 +971,25 @@ TEST_F(RansomwareIntegrationFixture, ProtectedPaths_OutsideProtectedDir_IsNotPro
     EXPECT_FALSE(RD::Instance().IsProtectedPath(
         L"C:\\UnrelatedFolder\\file.dat"))
         << "File outside protected directories must not be recognised as protected.";
+}
+
+/**
+ * @brief Protected-path matching must be case-insensitive, slash-normalized,
+ *        and boundary-safe.
+ *
+ * Prefix-only comparisons are security-sensitive: "ProtectedSuffix" must not
+ * match the configured "Protected" directory, while canonical variants must.
+ */
+TEST_F(RansomwareIntegrationFixture, ProtectedPaths_NormalizationAndBoundaryHandling_AreCorrect) {
+    SKIP_IF_NOT_READY();
+
+    EXPECT_TRUE(RD::Instance().IsProtectedPath(
+        L"c:/shadowstrike/protected/CaseTest/FILE.DOCX"))
+        << "Protected path lookup must normalize slash direction and casing.";
+
+    EXPECT_FALSE(RD::Instance().IsProtectedPath(
+        L"C:\\ShadowStrike\\ProtectedSuffix\\escaped.docx"))
+        << "Prefix-sharing sibling directories must not be treated as protected.";
 }
 
 // ============================================================================

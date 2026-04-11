@@ -576,6 +576,7 @@ FileAnalysisResult ZeroHourProtection::AnalyzeFile(const FileAnalysisRequest& re
     if (!IsInitialized()) {
         result.errorCode = 1;
         result.errorMessage = L"Not initialized";
+        result.shouldAllow = false; // fail-closed: uninitialized engine must not allow unknown files
         return result;
     }
 

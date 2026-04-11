@@ -35,6 +35,7 @@
 
 #include "pch.h"
 #include "TamperProtection.hpp"
+#include "SelfDefense.hpp"
 
 // ============================================================================
 // WINDOWS SDK
@@ -728,7 +729,7 @@ public:
         baseline.verificationMethod = VerificationMethod::SHA256;
 
         // Compute hash
-        if (!ComputeFileHashInternal(path, baseline.contentHash)) {
+        if (!ComputeFileHashInternal(path, baseline.verificationMethod, baseline.contentHash)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to compute hash for: %ls", path.c_str());
             return false;
         }
@@ -823,7 +824,7 @@ public:
         }
 
         // Compute current hash
-        if (!ComputeFileHashInternal(path, result.computedHash)) {
+        if (!ComputeFileHashInternal(path, baseline.verificationMethod, result.computedHash)) {
             result.status = IntegrityStatus::Corrupted;
             result.errorMessage = "Failed to compute hash";
             return result;
@@ -891,7 +892,7 @@ public:
 
         // Recompute hash
         Hash256 newHash{};
-        if (!ComputeFileHashInternal(path, newHash)) {
+        if (!ComputeFileHashInternal(path, it->second.verificationMethod, newHash)) {
             return false;
         }
 
@@ -1413,7 +1414,7 @@ public:
     [[nodiscard]] Hash256 ComputeFileHash(std::wstring_view filePath, VerificationMethod method) {
         Hash256 hash{};
         std::wstring path(filePath);
-        ComputeFileHashInternal(path, hash);
+        ComputeFileHashInternal(path, method, hash);
         return hash;
     }
 
@@ -1852,7 +1853,7 @@ public:
             std::wstring testPath = L"C:\\Windows\\System32\\ntdll.dll";
             if (std::filesystem::exists(testPath)) {
                 Hash256 hash{};
-                if (!ComputeFileHashInternal(testPath, hash)) {
+                if (!ComputeFileHashInternal(testPath, VerificationMethod::SHA256, hash)) {
                     SS_LOG_WARN(LOG_CATEGORY, L"Self-test: Hash computation failed");
                 }
             }
@@ -2266,11 +2267,27 @@ private:
     // ========================================================================
 
     [[nodiscard]] bool VerifyAuthToken(std::string_view token) const {
-        // SECURITY: Only accept the exact internal token. Never accept arbitrary hex strings.
-        return !token.empty() && token == m_internalAuthToken;
+        if (token.empty()) {
+            return false;
+        }
+
+        if (token == m_internalAuthToken) {
+            return true;
+        }
+
+        if (m_config.enableSelfDefenseIntegration &&
+            SelfDefense::HasInstance() &&
+            SelfDefense::Instance().IsInitialized()) {
+            return SelfDefense::Instance().VerifyAuthorizationToken(token);
+        }
+
+        return false;
     }
 
-    [[nodiscard]] bool ComputeFileHashInternal(const std::wstring& filePath, Hash256& hashOut) {
+    [[nodiscard]] bool ComputeFileHashInternal(
+        const std::wstring& filePath,
+        VerificationMethod method,
+        Hash256& hashOut) {
         try {
             HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
                                         nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -2291,13 +2308,35 @@ private:
             bool success = false;
 
             do {
-                if (BCryptOpenAlgorithmProvider(&hAlg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) != 0) {
+                LPCWSTR algorithmId = nullptr;
+                switch (method) {
+                    case VerificationMethod::SHA256:
+                        algorithmId = BCRYPT_SHA256_ALGORITHM;
+                        break;
+                    case VerificationMethod::SHA512:
+                        algorithmId = BCRYPT_SHA512_ALGORITHM;
+                        break;
+                    default:
+                        break;
+                }
+
+                if (!algorithmId) {
+                    break;
+                }
+
+                if (BCryptOpenAlgorithmProvider(&hAlg, algorithmId, nullptr, 0) != 0) {
                     break;
                 }
 
                 DWORD hashObjSize = 0, dataSize = 0;
                 if (BCryptGetProperty(hAlg, BCRYPT_OBJECT_LENGTH, reinterpret_cast<PUCHAR>(&hashObjSize),
                                        sizeof(hashObjSize), &dataSize, 0) != 0) {
+                    break;
+                }
+
+                DWORD hashSize = 0;
+                if (BCryptGetProperty(hAlg, BCRYPT_HASH_LENGTH, reinterpret_cast<PUCHAR>(&hashSize),
+                                       sizeof(hashSize), &dataSize, 0) != 0) {
                     break;
                 }
 
@@ -2316,7 +2355,10 @@ private:
                     }
                 }
 
-                if (BCryptFinishHash(hHash, hashOut.data(), static_cast<ULONG>(hashOut.size()), 0) == 0) {
+                std::vector<uint8_t> digest(hashSize, 0);
+                if (BCryptFinishHash(hHash, digest.data(), static_cast<ULONG>(digest.size()), 0) == 0 &&
+                    digest.size() >= hashOut.size()) {
+                    std::copy_n(digest.begin(), hashOut.size(), hashOut.begin());
                     success = true;
                 }
 
