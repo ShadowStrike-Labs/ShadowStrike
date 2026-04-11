@@ -63,6 +63,7 @@
 #include "../../Scripts/PowerShellScanner.hpp"
 #include "../../Scripts/VBScriptScanner.hpp"
 #include "../../Scripts/MacroDetector.hpp"
+#include "../../Scripts/AMSIIntegration.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -1470,8 +1471,80 @@ EngineResult ScanEngine::ScanFile(
                     std::string scriptThreatName;
                     uint32_t scriptRiskScore = 0;
                     std::string scriptDetectionMethod;
-
                     const auto scriptFormat = scriptTypeInfo.format;
+
+                    // --- AMSI Pre-Scan: leverage Windows AMSI provider chain ---
+                    if (m_impl->m_config.enableAMSI &&
+                        ShadowStrike::Scripts::AMSIIntegration::HasInstance()) {
+                        try {
+                            auto& amsi = ShadowStrike::Scripts::AMSIIntegration::Instance();
+                            if (amsi.IsInitialized()) {
+                                // Map FileFormat to AmsiContentType
+                                auto amsiContentType = Scripts::AmsiContentType::Unknown;
+                                switch (scriptFormat) {
+                                    case FileSystem::FileFormat::PowerShell:
+                                        amsiContentType = Scripts::AmsiContentType::PowerShell; break;
+                                    case FileSystem::FileFormat::VBScript:
+                                    case FileSystem::FileFormat::HTA:
+                                        amsiContentType = Scripts::AmsiContentType::VBScript; break;
+                                    case FileSystem::FileFormat::JavaScript:
+                                    case FileSystem::FileFormat::JScript:
+                                        amsiContentType = Scripts::AmsiContentType::JScript; break;
+                                    default:
+                                        amsiContentType = Scripts::AmsiContentType::Custom; break;
+                                }
+
+                                // Read script content (cap at AMSI max: 64 MiB)
+                                HANDLE hScriptFile = CreateFileW(filePath.c_str(), GENERIC_READ,
+                                    FILE_SHARE_READ | FILE_SHARE_DELETE, nullptr,
+                                    OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+
+                                if (hScriptFile != INVALID_HANDLE_VALUE) {
+                                    LARGE_INTEGER scriptSize{};
+                                    if (GetFileSizeEx(hScriptFile, &scriptSize) &&
+                                        scriptSize.QuadPart > 0 &&
+                                        scriptSize.QuadPart <= static_cast<LONGLONG>(64 * 1024 * 1024)) {
+
+                                        std::vector<uint8_t> scriptBuf(static_cast<size_t>(scriptSize.QuadPart));
+                                        DWORD bytesRead = 0;
+                                        if (ReadFile(hScriptFile, scriptBuf.data(),
+                                                     static_cast<DWORD>(scriptBuf.size()), &bytesRead, nullptr) &&
+                                            bytesRead == scriptBuf.size()) {
+
+                                            auto amsiResult = amsi.ScanBuffer(
+                                                std::span<const uint8_t>(scriptBuf.data(), scriptBuf.size()),
+                                                std::filesystem::path(filePath).filename().wstring(),
+                                                0);
+
+                                            if (Scripts::IsAmsiResultMalicious(amsiResult)) {
+                                                scriptDetected = true;
+                                                scriptThreatName = "AMSI.Script.Detected";
+                                                scriptRiskScore = 90;
+                                                scriptDetectionMethod = "AMSI";
+                                                result.detectionMethods.push_back("AMSI");
+
+                                                SS_LOG_WARN(L"ScanEngine",
+                                                    L"Stage 4.6 AMSI pre-scan DETECTED malicious script: %ls (type=%u)",
+                                                    filePath.c_str(),
+                                                    static_cast<unsigned>(amsiContentType));
+                                            } else {
+                                                SS_LOG_TRACE(L"ScanEngine",
+                                                    L"Stage 4.6 AMSI pre-scan clean for: %ls",
+                                                    filePath.c_str());
+                                            }
+                                        }
+                                    }
+                                    CloseHandle(hScriptFile);
+                                }
+                            }
+                        } catch (const std::exception& amsiEx) {
+                            SS_LOG_ERROR(L"ScanEngine",
+                                L"Stage 4.6 AMSI pre-scan exception: %hs", amsiEx.what());
+                        }
+                    }
+
+                    // --- Deep script analysis (skip if AMSI already confirmed malicious) ---
+                    if (!scriptDetected) {
 
                     // --- PowerShell Scanner ---
                     if (scriptFormat == FileSystem::FileFormat::PowerShell) {
@@ -1649,6 +1722,8 @@ EngineResult ScanEngine::ScanFile(
                             }
                         }
                     }
+
+                    } // end if (!scriptDetected) — AMSI bypass for deep analysis
 
                     // Confirmed malicious script — escalate to Infected verdict
                     if (scriptDetected) {

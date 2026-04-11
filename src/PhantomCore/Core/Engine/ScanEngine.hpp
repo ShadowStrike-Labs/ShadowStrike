@@ -517,6 +517,7 @@ struct EngineConfig {
     bool enableCloudLookup = true;
     bool enableMemoryScanning = true;
     bool enableScriptAnalysis = true;
+    bool enableAMSI = true;               ///< Enable Windows AMSI pre-scan for scripts
 
     // Archive scanning
     ArchiveScanOptions archiveOptions;
