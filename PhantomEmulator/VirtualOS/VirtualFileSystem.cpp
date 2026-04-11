@@ -502,6 +502,7 @@ void VirtualFileSystem::Reset() noexcept {
     m_findHandles.clear();
     m_malwareCreatedFiles.clear();
     m_malwareDeletedFiles.clear();
+    m_adsWriteEvents.clear();
 
     m_nextFileId = 1;
     m_nextFindId = 1;
@@ -1237,8 +1238,17 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
 {
     std::unique_lock lock(m_mutex);
 
-    std::wstring normalized = NormalizePath(path);
+    // Parse ADS stream name if present (e.g., "C:\path\file.exe:Zone.Identifier")
+    auto [basePath, streamName] = ParseStreamPath(path);
+    std::wstring normalized = NormalizePath(basePath);
     if (normalized.empty()) return std::nullopt;
+
+    // Normalize stream name (case-insensitive)
+    for (auto& ch : streamName) {
+        ch = static_cast<wchar_t>(std::towlower(static_cast<std::wint_t>(ch)));
+    }
+
+    const bool isADS = !streamName.empty();
 
     auto it = m_files.find(normalized);
     bool exists = (it != m_files.end());
@@ -1330,13 +1340,54 @@ std::optional<uint32_t> VirtualFileSystem::OpenFile(
             return std::nullopt;
     }
 
+    // For ADS access: the base file must exist at this point.
+    // If the stream doesn't exist yet and we're creating, add it.
+    if (isADS) {
+        auto& entry = it->second;
+
+        // Directories cannot host alternate data streams in our VFS
+        if (entry.attributes & FileAttr::Directory) return std::nullopt;
+
+        // Cap streams per file to prevent resource exhaustion
+        if (entry.alternateStreams.size() >= kMaxStreamsPerFile &&
+            entry.alternateStreams.find(streamName) == entry.alternateStreams.end()) {
+            return std::nullopt;
+        }
+
+        // Create the stream if disposition allows creation
+        auto streamIt = entry.alternateStreams.find(streamName);
+        if (streamIt == entry.alternateStreams.end()) {
+            if (disposition == CreateDisposition::OpenExisting) {
+                return std::nullopt;
+            }
+            AlternateDataStream ads;
+            ads.name          = streamName;
+            ads.creationTime  = kSystemFileTime;
+            ads.lastWriteTime = kSystemFileTime;
+            entry.alternateStreams.emplace(streamName, std::move(ads));
+
+            // IOC: record ADS creation event
+            std::wstring adsEvent = normalized + L":" + streamName;
+            m_adsWriteEvents.push_back(adsEvent);
+            m_malwareCreatedFiles.push_back(adsEvent);
+        } else if (disposition == CreateDisposition::CreateAlways ||
+                   disposition == CreateDisposition::TruncateExisting) {
+            auto& ads = streamIt->second;
+            m_totalContentSize -= ads.content.size();
+            ads.content.clear();
+            ads.lastWriteTime = kSystemFileTime;
+        }
+    }
+
     // Create open-file state
     uint32_t fileId = m_nextFileId++;
     OpenFileState state;
     state.path        = normalized;
+    state.streamName  = streamName;
     state.access      = access;
     state.position    = 0;
     state.isDirectory = (it->second.attributes & FileAttr::Directory) != 0;
+    state.isADS       = isADS;
 
     m_openFiles.emplace(fileId, std::move(state));
     return fileId;
@@ -1401,6 +1452,27 @@ uint32_t VirtualFileSystem::ReadFile(
     auto& entry = fileIt->second;
 
     if (state.isDirectory) return 0;
+
+    // === ADS Read Path ===
+    if (state.isADS) {
+        auto streamIt = entry.alternateStreams.find(state.streamName);
+        if (streamIt == entry.alternateStreams.end()) return 0;
+
+        const auto& ads = streamIt->second;
+        uint64_t pos  = state.position;
+        uint64_t size = ads.content.size();
+        if (pos >= size) return 0;
+
+        uint64_t available = size - pos;
+        uint32_t toRead = static_cast<uint32_t>(
+            std::min<uint64_t>(bytesToRead, available));
+
+        std::memcpy(buffer, ads.content.data() + pos, toRead);
+        state.position += toRead;
+        return toRead;
+    }
+
+    // === Default stream read path ===
 
     uint64_t pos  = state.position;
     uint64_t size = entry.fileSize;
@@ -1525,6 +1597,61 @@ uint32_t VirtualFileSystem::WriteFile(
     auto& entry = fileIt->second;
 
     if (state.isDirectory) return 0;
+
+    // === ADS Write Path ===
+    if (state.isADS) {
+        auto streamIt = entry.alternateStreams.find(state.streamName);
+        if (streamIt == entry.alternateStreams.end()) return 0;
+
+        auto& ads = streamIt->second;
+
+        uint64_t endPos = state.position + bytesToWrite;
+
+        // Per-stream content cap
+        if (endPos > kMaxStreamContentSize) {
+            if (state.position >= kMaxStreamContentSize) return 0;
+            bytesToWrite = static_cast<uint32_t>(kMaxStreamContentSize - state.position);
+            endPos = kMaxStreamContentSize;
+        }
+
+        // Total VFS content cap
+        uint64_t currentSize = ads.content.size();
+        uint64_t newSize     = std::max<uint64_t>(currentSize, endPos);
+        uint64_t growth      = newSize - currentSize;
+
+        if (growth > 0 && m_totalContentSize + growth > kMaxTotalContent) {
+            uint64_t allowable = kMaxTotalContent - m_totalContentSize;
+            if (allowable == 0) return 0;
+            uint64_t maxEnd = currentSize + allowable;
+            if (endPos > maxEnd) {
+                if (state.position >= maxEnd) return 0;
+                bytesToWrite = static_cast<uint32_t>(maxEnd - state.position);
+                endPos = state.position + bytesToWrite;
+                newSize = std::max<uint64_t>(currentSize, endPos);
+                growth = newSize - currentSize;
+            }
+        }
+
+        if (newSize > currentSize) {
+            ads.content.resize(static_cast<size_t>(newSize), 0);
+            m_totalContentSize += growth;
+        }
+
+        std::memcpy(ads.content.data() + state.position, buffer, bytesToWrite);
+        state.position += bytesToWrite;
+        ads.lastWriteTime = kSystemFileTime;
+
+        // IOC: record ADS write event
+        std::wstring adsEvent = state.path + L":" + state.streamName;
+        if (std::find(m_adsWriteEvents.begin(), m_adsWriteEvents.end(), adsEvent)
+            == m_adsWriteEvents.end()) {
+            m_adsWriteEvents.push_back(adsEvent);
+        }
+
+        return bytesToWrite;
+    }
+
+    // === Default stream write path ===
 
     // Determine the required content size after this write
     uint64_t endPos = state.position + bytesToWrite;
@@ -2058,6 +2185,125 @@ std::vector<std::wstring> VirtualFileSystem::GetMalwareCreatedFiles() const noex
 std::vector<std::wstring> VirtualFileSystem::GetMalwareDeletedFiles() const noexcept {
     std::shared_lock lock(m_mutex);
     return m_malwareDeletedFiles;
+}
+
+// ============================================================================
+// ADS Path Parsing
+// ============================================================================
+//
+// NTFS ADS syntax: "C:\path\file.exe:streamName:$DATA"
+// We support:
+//   "file.exe:streamName"        → base = "file.exe", stream = "streamName"
+//   "file.exe:streamName:$DATA"  → same (strip $DATA type suffix)
+//   "file.exe"                   → base = "file.exe", stream = ""
+//   "file.exe::$DATA"            → default stream, stream = ""
+//
+// Security: reject stream names containing path separators, NUL bytes,
+// or exceeding 255 characters (NTFS limit).
+
+std::pair<std::wstring, std::wstring>
+VirtualFileSystem::ParseStreamPath(std::wstring_view fullPath) noexcept
+{
+    // Find the last path separator to avoid splitting on drive letter colons.
+    // E.g., "C:\dir\file.exe:ads" — the colon after "C" is a drive letter.
+    auto lastSep = fullPath.rfind(L'\\');
+    if (lastSep == std::wstring_view::npos) lastSep = fullPath.rfind(L'/');
+    size_t searchStart = (lastSep == std::wstring_view::npos) ? 0 : lastSep + 1;
+
+    // Find the first colon after the filename portion
+    auto colonPos = fullPath.find(L':', searchStart);
+    if (colonPos == std::wstring_view::npos || colonPos == fullPath.size() - 1) {
+        // No stream suffix or trailing colon only
+        return { std::wstring(fullPath), std::wstring() };
+    }
+
+    std::wstring basePath(fullPath.substr(0, colonPos));
+    std::wstring streamPart(fullPath.substr(colonPos + 1));
+
+    // Strip $DATA type suffix if present (e.g., "Zone.Identifier:$DATA")
+    auto dataPos = streamPart.find(L":$DATA");
+    if (dataPos != std::wstring::npos) {
+        streamPart.erase(dataPos);
+    }
+
+    // Empty stream name after stripping (e.g., "::$DATA") → default stream
+    if (streamPart.empty()) {
+        return { std::move(basePath), std::wstring() };
+    }
+
+    // Validate stream name (security)
+    static constexpr size_t kMaxStreamNameLength = 255;
+    if (streamPart.size() > kMaxStreamNameLength) {
+        return { std::wstring(fullPath), std::wstring() };
+    }
+
+    for (wchar_t ch : streamPart) {
+        // Reject path separators, NUL, and wildcard chars in stream names
+        if (ch == L'\\' || ch == L'/' || ch == L'\0' ||
+            ch == L'*'  || ch == L'?' || ch == L'<'  ||
+            ch == L'>'  || ch == L'|' || ch == L'"') {
+            return { std::wstring(fullPath), std::wstring() };
+        }
+    }
+
+    return { std::move(basePath), std::move(streamPart) };
+}
+
+// ============================================================================
+// EnumerateStreams — List all ADS names on a file
+// ============================================================================
+
+std::vector<std::wstring> VirtualFileSystem::EnumerateStreams(
+    std::wstring_view filePath) const noexcept
+{
+    std::shared_lock lock(m_mutex);
+
+    std::wstring normalized = NormalizePath(filePath);
+    auto it = m_files.find(normalized);
+    if (it == m_files.end()) return {};
+
+    std::vector<std::wstring> names;
+    names.reserve(it->second.alternateStreams.size());
+    for (const auto& [name, _] : it->second.alternateStreams) {
+        names.push_back(name);
+    }
+    return names;
+}
+
+// ============================================================================
+// DeleteStream — Remove a named ADS from a file
+// ============================================================================
+
+bool VirtualFileSystem::DeleteStream(
+    std::wstring_view filePath,
+    std::wstring_view streamName) noexcept
+{
+    std::unique_lock lock(m_mutex);
+
+    std::wstring normalized = NormalizePath(filePath);
+    auto fileIt = m_files.find(normalized);
+    if (fileIt == m_files.end()) return false;
+
+    std::wstring normalizedStream(streamName);
+    for (auto& ch : normalizedStream) {
+        ch = static_cast<wchar_t>(std::towlower(static_cast<std::wint_t>(ch)));
+    }
+
+    auto streamIt = fileIt->second.alternateStreams.find(normalizedStream);
+    if (streamIt == fileIt->second.alternateStreams.end()) return false;
+
+    m_totalContentSize -= streamIt->second.content.size();
+    fileIt->second.alternateStreams.erase(streamIt);
+    return true;
+}
+
+// ============================================================================
+// GetADSWriteEvents — IOC: all ADS write events (path:stream format)
+// ============================================================================
+
+std::vector<std::wstring> VirtualFileSystem::GetADSWriteEvents() const noexcept {
+    std::shared_lock lock(m_mutex);
+    return m_adsWriteEvents;
 }
 
 } // namespace Phantom::VirtualOS

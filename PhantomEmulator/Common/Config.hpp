@@ -42,6 +42,7 @@ struct EmulationConfig {
 
     // === API emulation behavior ===
     bool      enableFileSystem   = true;            // Virtual filesystem
+    bool      enableADSTracking  = true;            // NTFS ADS emulation & IOC tracking
     bool      enableRegistry     = true;            // Virtual registry
     bool      enableNetwork      = false;           // Virtual network (disabled: security)
     bool      enableCOM          = false;           // COM object emulation
@@ -72,7 +73,9 @@ struct EmulationConfig {
     bool      enableMemoryForensics   = true;
     bool      enableMITREMapping      = true;
     bool      enableIOCExtraction     = true;
-    uint32_t  yaraScansPerSession     = 4;          // Periodic YARA scans during emulation
+    bool      enableTaintAnalysis     = false;         // Data-flow taint tracking (expensive)
+    bool      enableMLClassifier      = true;          // PhantomCortex ML behavioral classifier
+    uint32_t  yaraScansPerSession     = 4;             // Periodic YARA scans during emulation
 
     // === JIT compilation ===
     bool        enableJIT          = false;              // Disabled by default (opt-in)
@@ -146,6 +149,7 @@ struct EmulationConfig {
     cfg.enableVSS = false;
     cfg.enableWMI = false;
     cfg.enableDotNetAnalysis = false;
+    cfg.enableADSTracking = false;
     cfg.enableMemoryScanAccel = false;
     cfg.enableCryptoAcceleration = false;
     cfg.enableKernelEmulation = false;
@@ -174,6 +178,7 @@ struct EmulationConfig {
     cfg.enableDriverLoading = true;
     cfg.enableKernelAPITracking = true;
     cfg.enableJITOptimizer = true;
+    cfg.enableTaintAnalysis = true;
     cfg.yaraScansPerSession = 8;
     return cfg;
 }
