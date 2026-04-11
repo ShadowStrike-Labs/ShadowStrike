@@ -502,7 +502,7 @@ bool IPRange::Contains(const IPAddress& ip) const noexcept {
         uint32_t mask = (prefixLength == 0) ? 0 : (~0U << (32 - prefixLength));
         return (baseAddress.ipv4 & mask) == (ip.ipv4 & mask);
     } else if (ip.type == IPAddressType::IPV6) {
-        // Simplified IPv6 range check
+        // IPv6 prefix comparison: byte-wise then partial-byte mask
         size_t fullBytes = prefixLength / 8;
         size_t remainingBits = prefixLength % 8;
 
@@ -627,8 +627,23 @@ struct NetworkMonitorImpl {
     HANDLE m_hMonitorThread = nullptr;
     HANDLE m_hStopEvent = nullptr;
 
-    // WFP engine handle (simplified - real implementation would use FWPM API)
+    // WFP engine session handle (opened via FwpmEngineOpen0)
     HANDLE m_hWfpEngine = nullptr;
+
+    // WFP filter IDs for active block rules (for cleanup/removal)
+    std::unordered_map<uint64_t, uint64_t> m_wfpFilterIds;  // internal ID → WFP filter ID
+    std::atomic<uint64_t> m_nextWfpBlockId{1};
+    mutable std::mutex m_wfpMutex;
+
+    // Blocked IP ranges (local tracking + WFP enforcement)
+    struct BlockedRange {
+        IPRange range;
+        BlockReason reason;
+        uint64_t wfpFilterIdV4{0};
+        uint64_t wfpFilterIdV6{0};
+    };
+    std::vector<BlockedRange> m_blockedRanges;
+    mutable std::mutex m_blockedRangesMutex;
 
     // Constructor
     NetworkMonitorImpl() = default;
@@ -655,7 +670,23 @@ struct NetworkMonitorImpl {
         }
 
         if (m_hWfpEngine) {
-            // Would call FwpmEngineClose0() in real implementation
+            // Remove all active WFP block filters before closing
+            {
+                std::lock_guard<std::mutex> wfpLock(m_wfpMutex);
+                for (auto& [internalId, filterId] : m_wfpFilterIds) {
+                    FwpmFilterDeleteById0(m_hWfpEngine, filterId);
+                }
+                m_wfpFilterIds.clear();
+            }
+            {
+                std::lock_guard<std::mutex> rangeLock(m_blockedRangesMutex);
+                for (auto& br : m_blockedRanges) {
+                    if (br.wfpFilterIdV4) FwpmFilterDeleteById0(m_hWfpEngine, br.wfpFilterIdV4);
+                    if (br.wfpFilterIdV6) FwpmFilterDeleteById0(m_hWfpEngine, br.wfpFilterIdV6);
+                }
+                m_blockedRanges.clear();
+            }
+            FwpmEngineClose0(m_hWfpEngine);
             m_hWfpEngine = nullptr;
         }
     }
@@ -1235,8 +1266,26 @@ bool NetworkMonitor::Initialize(const NetworkMonitorConfig& config) {
             return false;
         }
 
-        // Would initialize WFP engine here in real implementation
-        // m_impl->m_hWfpEngine = ...
+        // Initialize WFP engine session for network filtering
+        {
+            FWPM_SESSION0 session = {};
+            session.flags = FWPM_SESSION_FLAG_DYNAMIC;  // Filters auto-removed on process exit
+            session.displayData.name = const_cast<wchar_t*>(L"ShadowStrike NetworkMonitor");
+            session.displayData.description = const_cast<wchar_t*>(L"ShadowStrike EDR network filtering session");
+            // 10-second transaction timeout
+            session.txnWaitTimeoutInMSec = 10000;
+
+            DWORD wfpResult = FwpmEngineOpen0(nullptr, RPC_C_AUTHN_WINNT, nullptr, &session,
+                                              &m_impl->m_hWfpEngine);
+            if (wfpResult != ERROR_SUCCESS) {
+                SS_LOG_WARN(L"Network", L"NetworkMonitor: WFP engine open failed (0x%08X) - "
+                            L"network filtering will use software-only blocklists", wfpResult);
+                m_impl->m_hWfpEngine = nullptr;
+                // Non-fatal: software blocklists still work via IsBlocked() checks
+            } else {
+                SS_LOG_INFO(L"Network", L"NetworkMonitor: WFP engine session established");
+            }
+        }
 
         m_impl->m_initialized.store(true, std::memory_order_release);
 
@@ -1576,10 +1625,107 @@ bool NetworkMonitor::UnblockIP(const IPAddress& ip) {
 }
 
 bool NetworkMonitor::BlockIPRange(const IPRange& range, BlockReason reason) {
-    // Simplified - would implement range blocking in real implementation
-    SS_LOG_INFO(L"Network", L"NetworkMonitor: IP range %ls blocked",
-                      Utils::StringUtils::ToWide(range.ToString()).c_str());
-    return true;
+    try {
+        // Store in local blocklist (always — used by IsBlocked() software checks)
+        NetworkMonitorImpl::BlockedRange entry{range, reason, 0, 0};
+
+        // If WFP engine is available, install kernel-level block filters
+        if (m_impl->m_hWfpEngine) {
+            // Build WFP condition for the address range
+            if (range.baseAddress.type == IPAddressType::IPV4) {
+                FWP_RANGE0 addrRange = {};
+                addrRange.valueLow.type = FWP_UINT32;
+                addrRange.valueHigh.type = FWP_UINT32;
+
+                uint32_t mask = (range.prefixLength == 0) ? 0 :
+                                (~0U << (32 - range.prefixLength));
+                uint32_t networkAddr = range.baseAddress.ipv4 & mask;
+                uint32_t broadcastAddr = networkAddr | ~mask;
+
+                addrRange.valueLow.uint32 = ntohl(networkAddr);
+                addrRange.valueHigh.uint32 = ntohl(broadcastAddr);
+
+                FWPM_FILTER_CONDITION0 condition = {};
+                condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                condition.matchType = FWP_MATCH_RANGE;
+                condition.conditionValue.type = FWP_RANGE_TYPE;
+                condition.conditionValue.rangeValue = &addrRange;
+
+                FWPM_FILTER0 filter = {};
+                filter.displayData.name = const_cast<wchar_t*>(L"ShadowStrike IP Range Block");
+                filter.layerKey = FWPM_LAYER_OUTBOUND_TRANSPORT_V4;
+                filter.action.type = FWP_ACTION_BLOCK;
+                filter.weight.type = FWP_UINT8;
+                filter.weight.uint8 = 15;  // High priority
+                filter.numFilterConditions = 1;
+                filter.filterCondition = &condition;
+
+                UINT64 filterId = 0;
+                DWORD result = FwpmFilterAdd0(m_impl->m_hWfpEngine, &filter, nullptr, &filterId);
+                if (result == ERROR_SUCCESS) {
+                    entry.wfpFilterIdV4 = filterId;
+                    SS_LOG_INFO(L"Network", L"NetworkMonitor: WFP outbound v4 block filter %llu "
+                                L"installed for range %ls", filterId,
+                                Utils::StringUtils::ToWide(range.ToString()).c_str());
+                } else {
+                    SS_LOG_WARN(L"Network", L"NetworkMonitor: WFP v4 filter add failed (0x%08X) "
+                                L"for range %ls - software blocklist only", result,
+                                Utils::StringUtils::ToWide(range.ToString()).c_str());
+                }
+            } else if (range.baseAddress.type == IPAddressType::IPV6) {
+                // IPv6: use FWP_V6_ADDR_AND_MASK condition
+                FWP_V6_ADDR_AND_MASK addrMask = {};
+                memcpy(addrMask.addr, range.baseAddress.ipv6.data(), 16);
+                addrMask.prefixLength = static_cast<UINT8>(
+                    (range.prefixLength > 128) ? 128 : range.prefixLength);
+
+                FWPM_FILTER_CONDITION0 condition = {};
+                condition.fieldKey = FWPM_CONDITION_IP_REMOTE_ADDRESS;
+                condition.matchType = FWP_MATCH_EQUAL;
+                condition.conditionValue.type = FWP_V6_ADDR_MASK;
+                condition.conditionValue.v6AddrMask = &addrMask;
+
+                FWPM_FILTER0 filter = {};
+                filter.displayData.name = const_cast<wchar_t*>(L"ShadowStrike IPv6 Range Block");
+                filter.layerKey = FWPM_LAYER_OUTBOUND_TRANSPORT_V6;
+                filter.action.type = FWP_ACTION_BLOCK;
+                filter.weight.type = FWP_UINT8;
+                filter.weight.uint8 = 15;
+                filter.numFilterConditions = 1;
+                filter.filterCondition = &condition;
+
+                UINT64 filterId = 0;
+                DWORD result = FwpmFilterAdd0(m_impl->m_hWfpEngine, &filter, nullptr, &filterId);
+                if (result == ERROR_SUCCESS) {
+                    entry.wfpFilterIdV6 = filterId;
+                    SS_LOG_INFO(L"Network", L"NetworkMonitor: WFP outbound v6 block filter %llu "
+                                L"installed for range %ls", filterId,
+                                Utils::StringUtils::ToWide(range.ToString()).c_str());
+                } else {
+                    SS_LOG_WARN(L"Network", L"NetworkMonitor: WFP v6 filter add failed (0x%08X) "
+                                L"for range %ls - software blocklist only", result,
+                                Utils::StringUtils::ToWide(range.ToString()).c_str());
+                }
+            }
+        }
+
+        // Always store in local tracking regardless of WFP success
+        {
+            std::lock_guard<std::mutex> lock(m_impl->m_blockedRangesMutex);
+            m_impl->m_blockedRanges.push_back(std::move(entry));
+        }
+
+        m_impl->m_statistics.ipsBlocked.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_INFO(L"Network", L"NetworkMonitor: IP range %ls blocked - Reason: %hs",
+                          Utils::StringUtils::ToWide(range.ToString()).c_str(),
+                          GetBlockReasonName(reason).data());
+        return true;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"Network", L"NetworkMonitor: BlockIPRange failed - %ls",
+                            Utils::StringUtils::ToWide(e.what()).c_str());
+        return false;
+    }
 }
 
 bool NetworkMonitor::BlockPort(uint16_t port, ProtocolType protocol, BlockReason reason) {
