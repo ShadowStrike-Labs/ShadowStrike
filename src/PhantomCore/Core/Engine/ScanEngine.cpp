@@ -51,6 +51,7 @@
 #include "../../AI/CortexConfig.hpp"
 #include "PackerUnpacker.hpp"
 #include "PolymorphicDetector.hpp"
+#include "../../FuzzyHasher/FuzzyHasher.hpp"
 #include "SandboxAnalyzer.hpp"
 #include "EmulationEngine.hpp"
 #include "ZeroDayDetector.hpp"
@@ -1810,7 +1811,7 @@ EngineResult ScanEngine::ScanFile(
         }
 
         // ====================================================================
-        // STAGE 6: POLYMORPHIC DETECTION (Code Morphing & Encryption)
+        // STAGE 6: POLYMORPHIC DETECTION + FUZZY SIMILARITY ANALYSIS
         // ====================================================================
 
         if (m_impl->m_polymorphicDetector && m_impl->m_polymorphicDetector->IsInitialized()) {
@@ -1818,6 +1819,12 @@ EngineResult ScanEngine::ScanFile(
 
             auto polyResult = m_impl->m_polymorphicDetector->AnalyzeFile(filePath);
 
+            // Always populate the fuzzy hash in scan result for downstream consumers
+            if (!polyResult.fuzzyHash.empty()) {
+                result.fuzzyHash = polyResult.fuzzyHash;
+            }
+
+            // --- 6a: Polymorphic/metamorphic engine detection ---
             if (polyResult.isPolymorphic &&
                 static_cast<uint8_t>(polyResult.confidence) >= static_cast<uint8_t>(PolymorphicDetectionConfidence::Medium)) {
                 m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
@@ -1828,15 +1835,108 @@ EngineResult ScanEngine::ScanFile(
                 result.detectionSource = "PolymorphicDetector";
                 result.sha256 = fileHash;
 
-                SS_LOG_INFO(L"ScanEngine", L"Polymorphic detection - Confidence: %u, Family: %ls",
+                if (polyResult.isMetamorphic) {
+                    result.detectionMethods.push_back("MetamorphicEngine");
+                    result.threatScore = std::min(result.threatScore + 10.0f, 100.0f);
+                }
+                result.detectionMethods.push_back("PolymorphicDetector");
+
+                for (const auto& indicator : polyResult.indicators) {
+                    result.indicators.push_back(indicator);
+                }
+
+                SS_LOG_INFO(L"ScanEngine", L"Stage 6 polymorphic detection — Confidence: %u, Family: %ls, Metamorphic: %d",
                     static_cast<unsigned>(polyResult.confidence),
-                    StringUtils::ToWide(polyResult.threatFamily).c_str());
+                    StringUtils::ToWide(polyResult.threatFamily).c_str(),
+                    polyResult.isMetamorphic ? 1 : 0);
 
                 m_impl->InvokeDetectionCallbacks(result);
                 goto finalize_scan;
             }
 
+            // --- 6b: Fuzzy hash similarity matching against known malware families ---
+            if (!polyResult.fuzzyMatches.empty()) {
+                // Find the highest-scoring match
+                const FuzzyHashMatch* bestMatch = nullptr;
+                for (const auto& match : polyResult.fuzzyMatches) {
+                    if (!bestMatch || match.score > bestMatch->score) {
+                        bestMatch = &match;
+                    }
+                }
+
+                if (bestMatch && bestMatch->score >= 80) {
+                    // High-confidence similarity — likely a variant of known malware
+                    m_impl->m_stats.suspicious.fetch_add(1, std::memory_order_relaxed);
+
+                    result.verdict = ScanVerdict::Suspicious;
+                    result.threatFamily = bestMatch->familyName;
+                    result.threatName = bestMatch->threatName.empty()
+                        ? ("FuzzyMatch." + bestMatch->familyName + "." + bestMatch->variant)
+                        : bestMatch->threatName;
+                    result.threatScore = static_cast<float>(bestMatch->score);
+                    result.confidence = static_cast<float>(bestMatch->score);
+                    result.detectionSource = "FuzzyHasher";
+                    result.sha256 = fileHash;
+                    result.detectionMethods.push_back("FuzzyHashSimilarity");
+
+                    SS_LOG_INFO(L"ScanEngine",
+                        L"Stage 6 fuzzy match — Family: %ls, Score: %u, Variant: %ls",
+                        StringUtils::ToWide(bestMatch->familyName).c_str(),
+                        bestMatch->score,
+                        StringUtils::ToWide(bestMatch->variant).c_str());
+
+                    // Score >= 95: almost certainly a variant — early exit
+                    if (bestMatch->score >= 95) {
+                        m_impl->InvokeDetectionCallbacks(result);
+                        goto finalize_scan;
+                    }
+                    // Score 80-94: suspicious but continue deeper analysis
+                } else if (bestMatch && bestMatch->score >= 60) {
+                    // Moderate similarity — annotate but don't flag yet
+                    result.detectionMethods.push_back("FuzzyHashPartialMatch");
+                    result.indicators.push_back(
+                        "fuzzy_similarity:" + std::to_string(bestMatch->score) +
+                        ":family:" + bestMatch->familyName);
+
+                    SS_LOG_DEBUG(L"ScanEngine",
+                        L"Stage 6 partial fuzzy match — Family: %ls, Score: %u (below threshold)",
+                        StringUtils::ToWide(bestMatch->familyName).c_str(),
+                        bestMatch->score);
+                }
+            }
+
+            // --- 6c: Compute normalized fuzzy hash for PE files if not already available ---
+            if (result.fuzzyHash.empty()) {
+                try {
+                    HANDLE hFile = CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ,
+                        nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
+                    if (hFile != INVALID_HANDLE_VALUE) {
+                        LARGE_INTEGER fileSize{};
+                        if (GetFileSizeEx(hFile, &fileSize) && fileSize.QuadPart > 0 &&
+                            fileSize.QuadPart <= static_cast<LONGLONG>(200 * 1024 * 1024)) {
+
+                            std::vector<uint8_t> buf(static_cast<size_t>(fileSize.QuadPart));
+                            DWORD bytesRead = 0;
+                            if (ReadFile(hFile, buf.data(), static_cast<DWORD>(buf.size()), &bytesRead, nullptr) &&
+                                bytesRead == buf.size()) {
+                                auto fuzzyOpt = ShadowStrike::FuzzyHasher::HashBuffer(
+                                    std::span<const uint8_t>(buf.data(), buf.size()));
+                                if (fuzzyOpt.has_value()) {
+                                    result.fuzzyHash = std::move(*fuzzyOpt);
+                                }
+                            }
+                        }
+                        CloseHandle(hFile);
+                    }
+                } catch (...) {
+                    SS_LOG_DEBUG(L"ScanEngine", L"Stage 6 supplementary fuzzy hash computation failed");
+                }
+            }
+
             const auto stage6End = steady_clock::now();
+            SS_LOG_TRACE(L"ScanEngine",
+                L"Stage 6 polymorphic + fuzzy analysis completed in %llu us",
+                static_cast<uint64_t>(duration_cast<microseconds>(stage6End - stage6Start).count()));
         }
 
         // ====================================================================
