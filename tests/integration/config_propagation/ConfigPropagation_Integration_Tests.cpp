@@ -1012,12 +1012,16 @@ TEST_F(ConfigPropagationFixture,
     expiredPolicy.expiresAt =
         std::chrono::system_clock::now() - std::chrono::hours(24);
 
-    ASSERT_TRUE(policyMgr.ApplyPolicy(expiredPolicy));
+    // Production code correctly rejects already-expired policies in ApplyPolicy.
+    // An expired policy is invalid at the point of submission; it must be rejected.
+    EXPECT_FALSE(policyMgr.ApplyPolicy(expiredPolicy))
+        << "ApplyPolicy must reject a policy whose expiry timestamp is in the past";
 
-    // IsExpired() must be true; the policy manager must not enforce it.
-    const auto retrieved = policyMgr.GetPolicy("pol-expired-001");
-    ASSERT_TRUE(retrieved.has_value());
-    EXPECT_TRUE(retrieved->IsExpired());
+    // Since the policy was rejected, it must not be stored and must not be enforced.
+    EXPECT_FALSE(policyMgr.GetPolicy("pol-expired-001").has_value())
+        << "Rejected expired policy must not be retrievable";
+    EXPECT_FALSE(policyMgr.IsEnforced(key))
+        << "Key governed by a rejected expired policy must not be enforced";
 }
 
 
@@ -1864,23 +1868,27 @@ TEST_F(ConfigPropagationFixture,
 {
     const std::string key = UniqueKey("expired.scan_level");
 
-    // Apply a policy already expired at creation.
+    // Apply a policy already expired at creation time.
+    // Production code must reject it — an invalid (expired) policy is not stored.
     SS_C::Policy expiredPol = MakePolicy("pol-exp-cfg-001", key,
                                           SS_C::PolicyValue{int64_t{99}});
     expiredPol.expiresAt =
         std::chrono::system_clock::now() - std::chrono::hours(48);
-    ASSERT_TRUE(policyMgr.ApplyPolicy(expiredPol));
 
-    // Even if ActivatePolicy is called, IsExpired must return true.
-    const auto retrieved = policyMgr.GetPolicy("pol-exp-cfg-001");
-    ASSERT_TRUE(retrieved.has_value());
-    EXPECT_TRUE(retrieved->IsExpired())
-        << "Policy with past expiry must be recognized as expired";
+    EXPECT_FALSE(policyMgr.ApplyPolicy(expiredPol))
+        << "ApplyPolicy must reject a policy whose expiry is already in the past";
 
-    // ConfigManager must not have 99 written to its layers; write from an
-    // external enforcement path must not have occurred.
+    // The policy must not be retrievable since it was rejected.
+    EXPECT_FALSE(policyMgr.GetPolicy("pol-exp-cfg-001").has_value())
+        << "Rejected expired policy must not be stored";
+
+    // ConfigManager must not have value 99 written by any enforcement path.
     EXPECT_NE(configMgr.GetValue<int64_t>(key, -1), 99)
         << "Expired policy value must not auto-populate ConfigManager";
+
+    // The key must not be reported as enforced.
+    EXPECT_FALSE(policyMgr.IsEnforced(key))
+        << "Key governed by a rejected expired policy must not be enforced";
 }
 
 TEST_F(ConfigPropagationFixture,

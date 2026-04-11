@@ -539,6 +539,16 @@ bool ConfigManager::Initialize(const ConfigManagerConfiguration& config) {
 
     m_impl->m_status.store(ConfigStatus::Initializing, std::memory_order_release);
     m_impl->m_config = config;
+
+    // Clear all per-session in-memory state so a fresh Initialize() on a
+    // different DB path does not expose values from a previous initialization.
+    for (auto& layer : m_impl->m_layers) {
+        layer.clear();
+    }
+    m_impl->m_snapshots.clear();
+    m_impl->m_nextSnapshotId = 1;
+    m_impl->m_metadata.clear();
+    m_impl->m_stats = ConfigStatistics{};
     m_impl->m_stats.startTime = Clock::now();
 
     SS_LOG_INFO(L"Config", L"Initializing ConfigManager v%u.%u.%u",
@@ -1312,7 +1322,28 @@ std::string ConfigManager::ExportToJson(const ConfigIOOptions& options) const {
                     }
                 }
 
-                valuesJson[key] = ConfigValueToString(value);
+                // Emit a typed wrapper object to preserve variant type on import.
+                // Format: {"_t": "<type_tag>", "_v": <native_json_value>}
+                Utils::JSON::Json entry = Utils::JSON::Json::object();
+                if (const auto* v = std::get_if<bool>(&value)) {
+                    entry["_t"] = "bool";  entry["_v"] = *v;
+                } else if (const auto* v = std::get_if<int32_t>(&value)) {
+                    entry["_t"] = "i32";   entry["_v"] = static_cast<int64_t>(*v);
+                } else if (const auto* v = std::get_if<int64_t>(&value)) {
+                    entry["_t"] = "i64";   entry["_v"] = *v;
+                } else if (const auto* v = std::get_if<uint32_t>(&value)) {
+                    entry["_t"] = "u32";   entry["_v"] = static_cast<int64_t>(*v);
+                } else if (const auto* v = std::get_if<uint64_t>(&value)) {
+                    entry["_t"] = "u64";   entry["_v"] = static_cast<int64_t>(*v);
+                } else if (const auto* v = std::get_if<double>(&value)) {
+                    entry["_t"] = "f64";   entry["_v"] = *v;
+                } else if (const auto* v = std::get_if<std::string>(&value)) {
+                    entry["_t"] = "str";   entry["_v"] = *v;
+                } else {
+                    // Fallback for complex types: store as string representation.
+                    entry["_t"] = "raw";   entry["_v"] = ConfigValueToString(value);
+                }
+                valuesJson[key] = entry;
             }
         }
 
@@ -1373,16 +1404,41 @@ bool ConfigManager::ImportFromJson(const std::string& json, ConfigLayer targetLa
             if (key.empty() || key.size() > ConfigConstants::MAX_KEY_LENGTH) continue;
 
             ConfigValue cv;
-            if (it.value().is_boolean()) {
-                cv = ConfigValue{it.value().get<bool>()};
-            } else if (it.value().is_number_integer()) {
-                cv = ConfigValue{it.value().get<int64_t>()};
-            } else if (it.value().is_number_float()) {
-                cv = ConfigValue{it.value().get<double>()};
-            } else if (it.value().is_string()) {
-                cv = ConfigValue{it.value().get<std::string>()};
+            const auto& entry = it.value();
+
+            // Prefer the typed-wrapper format {"_t": "<tag>", "_v": <val>}
+            // emitted by the current ExportToJson. Fall back to legacy plain
+            // JSON primitives so that externally-authored config files still load.
+            if (entry.is_object() && entry.contains("_t") && entry.contains("_v")) {
+                const std::string tag = entry["_t"].get<std::string>();
+                const auto& vj = entry["_v"];
+                if (tag == "bool" && vj.is_boolean()) {
+                    cv = ConfigValue{vj.get<bool>()};
+                } else if (tag == "i32" && vj.is_number_integer()) {
+                    cv = ConfigValue{static_cast<int32_t>(vj.get<int64_t>())};
+                } else if (tag == "i64" && vj.is_number_integer()) {
+                    cv = ConfigValue{vj.get<int64_t>()};
+                } else if (tag == "u32" && vj.is_number_integer()) {
+                    cv = ConfigValue{static_cast<uint32_t>(vj.get<int64_t>())};
+                } else if (tag == "u64" && vj.is_number_integer()) {
+                    cv = ConfigValue{static_cast<uint64_t>(vj.get<int64_t>())};
+                } else if (tag == "f64" && vj.is_number_float()) {
+                    cv = ConfigValue{vj.get<double>()};
+                } else if ((tag == "str" || tag == "raw") && vj.is_string()) {
+                    cv = ConfigValue{vj.get<std::string>()};
+                } else {
+                    cv = ConfigValue{entry.dump()};
+                }
+            } else if (entry.is_boolean()) {
+                cv = ConfigValue{entry.get<bool>()};
+            } else if (entry.is_number_integer()) {
+                cv = ConfigValue{entry.get<int64_t>()};
+            } else if (entry.is_number_float()) {
+                cv = ConfigValue{entry.get<double>()};
+            } else if (entry.is_string()) {
+                cv = ConfigValue{entry.get<std::string>()};
             } else {
-                cv = ConfigValue{it.value().dump()};
+                cv = ConfigValue{entry.dump()};
             }
 
             (void)SetRawValue(key, cv, targetLayer);
