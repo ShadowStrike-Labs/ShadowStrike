@@ -106,6 +106,11 @@ public:
     void AddEvasionAttempt(const std::string& technique, float severity) noexcept;
     void AddCustomFactor(const ScoringFactor& factor) noexcept;
 
+    // ML classifier integration: blend ML confidence with heuristic scores
+    void AddMLVerdict(float malwareConfidence,
+                      const float* categoryScores,
+                      uint32_t categoryCount) noexcept;
+
     // === Verdict Generation ===
     [[nodiscard]] ThreatVerdict GenerateVerdict() const noexcept;
 

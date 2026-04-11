@@ -35,13 +35,16 @@ namespace Phantom::VirtualOS {
 // ============================================================================
 
 namespace FileAttr {
-    static constexpr uint32_t ReadOnly   = 0x00000001;
-    static constexpr uint32_t Hidden     = 0x00000002;
-    static constexpr uint32_t System     = 0x00000004;
-    static constexpr uint32_t Directory  = 0x00000010;
-    static constexpr uint32_t Archive    = 0x00000020;
-    static constexpr uint32_t Normal     = 0x00000080;
-    static constexpr uint32_t Temporary  = 0x00000100;
+    static constexpr uint32_t ReadOnly          = 0x00000001;
+    static constexpr uint32_t Hidden            = 0x00000002;
+    static constexpr uint32_t System            = 0x00000004;
+    static constexpr uint32_t Directory         = 0x00000010;
+    static constexpr uint32_t Archive           = 0x00000020;
+    static constexpr uint32_t Normal            = 0x00000080;
+    static constexpr uint32_t Temporary         = 0x00000100;
+    static constexpr uint32_t SparseFile        = 0x00000200;
+    static constexpr uint32_t ReparsePoint      = 0x00000400;
+    static constexpr uint32_t NotContentIndexed = 0x00002000;
 }
 
 // ============================================================================
@@ -78,6 +81,22 @@ enum class SeekOrigin : uint32_t {
 };
 
 // ============================================================================
+// Alternate Data Stream Entry — NTFS ADS emulation
+// ============================================================================
+// Malware uses ADS to:
+//   - Hide payloads: notepad.exe:evil.dll
+//   - Zone.Identifier bypass: file.exe:Zone.Identifier
+//   - Persistence via hidden execution (WMIC, PowerShell, forfiles)
+//   - Data exfiltration to hidden streams
+
+struct AlternateDataStream {
+    std::wstring          name;                 // Stream name (e.g., L"Zone.Identifier")
+    std::vector<uint8_t>  content;              // Stream data
+    uint64_t              creationTime   = 0;
+    uint64_t              lastWriteTime  = 0;
+};
+
+// ============================================================================
 // Virtual File Entry — A single node in the virtual file system tree
 // ============================================================================
 
@@ -91,6 +110,9 @@ struct VirtualFileEntry {
     uint64_t              lastAccessTime = 0;
     std::vector<uint8_t>  content;              // Actual bytes (malware-written files)
     bool                  isPrePopulated = true; // true = system file (metadata only)
+
+    // NTFS Alternate Data Streams (keyed by stream name, case-insensitive)
+    std::map<std::wstring, AlternateDataStream, std::less<>> alternateStreams;
 };
 
 // ============================================================================
@@ -112,9 +134,11 @@ struct DirectoryEntry {
 
 struct OpenFileState {
     std::wstring path;
+    std::wstring streamName;       // Empty = default stream; non-empty = ADS (e.g., L"Zone.Identifier")
     uint32_t     access      = 0;
     uint64_t     position    = 0;
     bool         isDirectory = false;
+    bool         isADS       = false;  // True when opening a named data stream
 };
 
 // ============================================================================
@@ -196,6 +220,26 @@ public:
     [[nodiscard]] std::vector<std::wstring> GetMalwareCreatedFiles() const noexcept;
     [[nodiscard]] std::vector<std::wstring> GetMalwareDeletedFiles() const noexcept;
 
+    // === ADS (Alternate Data Stream) Operations ===
+
+    // Enumerate all ADS names on a given file path.
+    [[nodiscard]] std::vector<std::wstring> EnumerateStreams(
+        std::wstring_view filePath) const noexcept;
+
+    // Delete a named stream from a file.
+    bool DeleteStream(std::wstring_view filePath,
+                      std::wstring_view streamName) noexcept;
+
+    // Get all ADS write events (for IOC reporting).
+    [[nodiscard]] std::vector<std::wstring> GetADSWriteEvents() const noexcept;
+
+    // === ADS Path Parsing ===
+
+    // Split "C:\path\file.exe:streamName" into {basePath, streamName}.
+    // Returns {path, L""} if no stream suffix is present.
+    [[nodiscard]] static std::pair<std::wstring, std::wstring>
+        ParseStreamPath(std::wstring_view fullPath) noexcept;
+
 private:
     VirtualFileSystem() noexcept = default;
     VirtualFileSystem(const VirtualFileSystem&) = delete;
@@ -217,6 +261,8 @@ private:
     static constexpr uint32_t kMaxFileCount       = 10'000;
     static constexpr uint64_t kMaxPerFileContent   = 64ULL * 1024 * 1024;
     static constexpr uint64_t kMaxTotalContent     = 256ULL * 1024 * 1024;
+    static constexpr uint32_t kMaxStreamsPerFile    = 64;
+    static constexpr uint64_t kMaxStreamContentSize = 16ULL * 1024 * 1024;
 
     mutable std::shared_mutex m_mutex;
 
@@ -230,6 +276,7 @@ private:
 
     std::vector<std::wstring> m_malwareCreatedFiles;
     std::vector<std::wstring> m_malwareDeletedFiles;
+    std::vector<std::wstring> m_adsWriteEvents;  // IOC: "path:streamName" entries
 
     uint64_t m_totalContentSize = 0;
     bool m_initialized = false;

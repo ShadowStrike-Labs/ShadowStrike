@@ -246,4 +246,36 @@ struct MD5Hash {
 using ByteSpan      = std::span<const uint8_t>;
 using MutableBytes  = std::span<uint8_t>;
 
+// ============================================================================
+// Taint Source Tags (for data-flow taint analysis)
+// ============================================================================
+
+enum class TaintSource : uint8_t {
+    None           = 0,
+    FileContent    = 1 << 0,   // Data read from the analyzed sample
+    NetworkData    = 1 << 1,   // Data from network APIs (recv, InternetReadFile)
+    UserInput      = 1 << 2,   // Keyboard/clipboard/dialog input
+    RegistryValue  = 1 << 3,   // Data read from registry
+    EnvironmentVar = 1 << 4,   // Environment variable contents
+    ProcessMemory  = 1 << 5,   // Data read from another process
+    CryptoOutput   = 1 << 6,   // Output of crypto/hashing APIs
+};
+
+[[nodiscard]] constexpr TaintSource operator|(TaintSource a, TaintSource b) noexcept {
+    return static_cast<TaintSource>(static_cast<uint8_t>(a) | static_cast<uint8_t>(b));
+}
+
+[[nodiscard]] constexpr TaintSource operator&(TaintSource a, TaintSource b) noexcept {
+    return static_cast<TaintSource>(static_cast<uint8_t>(a) & static_cast<uint8_t>(b));
+}
+
+[[nodiscard]] constexpr bool HasTaint(TaintSource tags, TaintSource flag) noexcept {
+    return (static_cast<uint8_t>(tags) & static_cast<uint8_t>(flag)) != 0;
+}
+
+constexpr TaintSource& operator|=(TaintSource& a, TaintSource b) noexcept {
+    a = a | b;
+    return a;
+}
+
 } // namespace Phantom

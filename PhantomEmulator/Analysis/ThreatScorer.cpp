@@ -1218,6 +1218,52 @@ void ThreatScorer::AddCustomFactor(const ScoringFactor& factor) noexcept {
 }
 
 // ============================================================================
+// AddMLVerdict — Integrate PhantomCortex ML classification
+// ============================================================================
+//
+// Blending strategy: the ML confidence is added as a high-weight scoring
+// factor. If the ML model returns high confidence (>0.85), it acts as a
+// strong signal. If low confidence, it has minimal impact — heuristics
+// dominate. Per-category scores from the ML model are blended into the
+// category distribution at 40% weight to avoid ML monoculture.
+//
+// This ensures defense-in-depth: ML bypass alone cannot suppress detection
+// because heuristic signals persist independently.
+
+void ThreatScorer::AddMLVerdict(
+    float malwareConfidence,
+    const float* categoryScores,
+    uint32_t categoryCount) noexcept
+{
+    if (!categoryScores && categoryCount > 0) return;
+
+    std::unique_lock lock(m_impl->mutex);
+
+    malwareConfidence = std::clamp(malwareConfidence, 0.0f, 1.0f);
+
+    // Weight the ML factor based on its own confidence (self-calibrated)
+    // High-confidence ML predictions get heavier weight
+    float mlWeight = 15.0f + (malwareConfidence > 0.85f ? 10.0f : 0.0f);
+
+    ScoringFactor factor;
+    factor.source      = "PhantomCortex-ML";
+    factor.description = "On-sensor ML behavioral classifier";
+    factor.weight      = mlWeight;
+    factor.score       = malwareConfidence;
+    factor.confidence  = malwareConfidence;  // ML calibration = self-confidence
+    m_impl->AddFactorInternal(std::move(factor));
+
+    // Blend ML category scores into the heuristic category distribution
+    // at 40% weight to prevent ML monoculture
+    static constexpr float kMLCategoryBlendWeight = 0.4f;
+    uint32_t count = std::min<uint32_t>(categoryCount, kCategoryCount);
+    for (uint32_t i = 0; i < count; ++i) {
+        float score = std::clamp(categoryScores[i], 0.0f, 1.0f);
+        m_impl->categoryScores[i] += score * kMLCategoryBlendWeight * 10.0f;
+    }
+}
+
+// ============================================================================
 // GenerateVerdict
 // ============================================================================
 
