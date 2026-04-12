@@ -127,22 +127,33 @@ def _get_api_id(name: str) -> int:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Common Windows error codes injected on ~5 % of calls
+# Common Windows error codes injected on ~5 % of calls.
+#
+# IMPORTANT:  Values are stored as *categorical indices* (1–11) rather
+# than raw Win32 / NTSTATUS codes.  Raw NTSTATUS values such as
+# 0xC0000005 (3 221 225 477) overflow float16 during AMP training
+# (max ≈ 65 504) and propagate NaN through the entire gradient graph.
+# Since error codes are *categorical* (ACCESS_DENIED is not "more than"
+# FILE_NOT_FOUND), ordinal magnitude is meaningless — small integer IDs
+# preserve all discriminative power.
 # ═══════════════════════════════════════════════════════════════════════════
 
-_COMMON_ERRORS: list[int] = [
-    5,            # ERROR_ACCESS_DENIED
-    2,            # ERROR_FILE_NOT_FOUND
-    3,            # ERROR_PATH_NOT_FOUND
-    6,            # ERROR_INVALID_HANDLE
-    87,           # ERROR_INVALID_PARAMETER
-    122,          # ERROR_INSUFFICIENT_BUFFER
-    1314,         # ERROR_PRIVILEGE_NOT_HELD
-    0xC0000005,   # STATUS_ACCESS_VIOLATION
-    0xC000000D,   # STATUS_INVALID_PARAMETER
-    0xC0000022,   # STATUS_ACCESS_DENIED
-    0xC0000034,   # STATUS_OBJECT_NAME_NOT_FOUND
+_COMMON_ERROR_IDS: list[int] = [
+    1,   # ERROR_ACCESS_DENIED         (Win32 5)
+    2,   # ERROR_FILE_NOT_FOUND        (Win32 2)
+    3,   # ERROR_PATH_NOT_FOUND        (Win32 3)
+    4,   # ERROR_INVALID_HANDLE        (Win32 6)
+    5,   # ERROR_INVALID_PARAMETER     (Win32 87)
+    6,   # ERROR_INSUFFICIENT_BUFFER   (Win32 122)
+    7,   # ERROR_PRIVILEGE_NOT_HELD    (Win32 1314)
+    8,   # STATUS_ACCESS_VIOLATION     (NTSTATUS 0xC0000005)
+    9,   # STATUS_INVALID_PARAMETER    (NTSTATUS 0xC000000D)
+    10,  # STATUS_ACCESS_DENIED        (NTSTATUS 0xC0000022)
+    11,  # STATUS_OBJECT_NAME_NOT_FOUND (NTSTATUS 0xC0000034)
 ]
+
+RETURN_CODE_VOCABULARY_SIZE: int = 12
+"""Feature 2 vocabulary size: 0 = success, 1–11 = categorised error codes."""
 
 # ═══════════════════════════════════════════════════════════════════════════
 # Benign "noise" API pool — calls commonly observed in normal applications
@@ -1576,7 +1587,7 @@ class BehavioralDataGenerator:
         n_failures = int(failure_mask.sum())
         if n_failures > 0:
             error_codes = self._rng.choice(
-                _COMMON_ERRORS, size=n_failures
+                _COMMON_ERROR_IDS, size=n_failures
             ).astype(np.float32)
             out[failure_mask, 2] = error_codes
 
