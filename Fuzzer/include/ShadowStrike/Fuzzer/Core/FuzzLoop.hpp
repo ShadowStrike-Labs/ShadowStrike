@@ -76,6 +76,7 @@ struct FuzzLoopConfig {
     uint64_t maxIterations = 0;                 ///< Maximum iterations (0 = unlimited)
     uint64_t maxDurationSeconds = 0;            ///< Maximum duration (0 = unlimited)
     size_t maxInputSize = 16 * 1024 * 1024;     ///< Maximum input size (16MB)
+    size_t maxCorpusSize = 50000;               ///< Maximum corpus entries (prevents OOM)
     size_t reportIntervalIterations = 1000;     ///< Report progress every N iterations
     size_t minSeedSize = 64;                    ///< Minimum seed size for generated seeds
     bool saveAllInputs = false;                 ///< Save all inputs (not just crashes)

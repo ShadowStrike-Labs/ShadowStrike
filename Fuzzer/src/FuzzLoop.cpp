@@ -379,6 +379,10 @@ struct FuzzLoop::Impl {
     std::vector<CrashInfo> crashes;
     std::set<std::string> uniqueCrashSignals;
     
+    // Per-instance corpus expansion heuristic state (was incorrectly static)
+    uint32_t lastAnomalyCount = 0;
+    uint32_t lastValidationCount = 0;
+    
     std::atomic<bool> stopRequested{false};
     std::atomic<bool> isRunning{false};
     
@@ -676,20 +680,19 @@ bool FuzzLoop::Run() noexcept {
             }
         }
         
-        // Corpus expansion (simplified - add if different anomaly count)
+        // Corpus expansion — use per-instance heuristic state (not static)
         if (m_impl->config.enableCorpusExpansion && !result.crashed && result.parsedOk) {
-            // Simple coverage heuristic: different validation results
-            static uint32_t lastAnomalyCount = 0;
-            static uint32_t lastValidationCount = 0;
-            
-            if (result.anomalyCount != lastAnomalyCount ||
-                result.validationIssueCount != lastValidationCount) {
-                lastAnomalyCount = result.anomalyCount;
-                lastValidationCount = result.validationIssueCount;
+            if (result.anomalyCount != m_impl->lastAnomalyCount ||
+                result.validationIssueCount != m_impl->lastValidationCount) {
+                m_impl->lastAnomalyCount = result.anomalyCount;
+                m_impl->lastValidationCount = result.validationIssueCount;
                 
-                // Add to corpus with small probability to avoid explosion
-                if ((m_impl->rng() % 100) < 5) {  // 5% chance
-                    (void)AddToCorpus(mutated.data);
+                // Cap corpus to prevent unbounded memory growth
+                if (m_impl->corpus.size() < m_impl->config.maxCorpusSize) {
+                    // Add to corpus with small probability to avoid explosion
+                    if ((m_impl->rng() % 100) < 5) {  // 5% chance
+                        (void)AddToCorpus(mutated.data);
+                    }
                 }
             }
         }

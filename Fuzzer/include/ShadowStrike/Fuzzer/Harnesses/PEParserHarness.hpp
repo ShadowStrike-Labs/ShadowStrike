@@ -105,24 +105,36 @@ public:
     [[nodiscard]] static std::string_view GetDescription() noexcept;
 
 private:
-    // Internal implementation separated for SEH compatibility
-    [[nodiscard]] static HarnessResult RunInternal(std::span<const uint8_t> input) noexcept;
+    // SEH wrapper functions — these contain __try/__except and MUST NOT
+    // declare any C++ objects with destructors (MSVC C2712 restriction).
+    // They call into *Impl functions that do the actual C++ work.
+    // If a hardware exception fires inside an Impl function, the SEH
+    // wrapper catches it and records the exception code. C++ destructors
+    // for stack objects in the Impl function will NOT run (/EHsc mode) —
+    // this is an accepted trade-off for in-process fuzzing crash survival.
+    [[nodiscard]] static unsigned long SEHCallParseBuffer(
+        const uint8_t* data,
+        size_t size,
+        HarnessResult* pResult) noexcept;
 
-    // SEH-wrapped parsing steps
-    [[nodiscard]] static bool TryParseBuffer(
+    [[nodiscard]] static unsigned long SEHCallStandaloneValidation(
+        const uint8_t* data,
+        size_t size,
+        HarnessResult* pResult) noexcept;
+
+    // C++ implementation functions (called from within SEH __try blocks)
+    [[nodiscard]] static bool ParseBufferImpl(
         const uint8_t* data,
         size_t size,
         HarnessResult& result) noexcept;
 
-    [[nodiscard]] static bool TryParseLazyLoaded(HarnessResult& result) noexcept;
-    [[nodiscard]] static bool TryValidate(HarnessResult& result) noexcept;
-    [[nodiscard]] static bool TryStandaloneValidation(
+    [[nodiscard]] static bool StandaloneValidationImpl(
         const uint8_t* data,
         size_t size,
         HarnessResult& result) noexcept;
 
     // Convert SEH exception code to string
-    [[nodiscard]] static std::string ExceptionCodeToString(unsigned int code) noexcept;
+    [[nodiscard]] static std::string ExceptionCodeToString(unsigned long code) noexcept;
 };
 
 /**

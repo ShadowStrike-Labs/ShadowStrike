@@ -286,8 +286,14 @@ void MutationEngine::EnsureMaxSize(std::vector<uint8_t>& data) noexcept {
 // ============================================================================
 
 MutationResult MutationEngine::Mutate(std::span<const uint8_t> input) noexcept {
+    // Generate per-iteration seed: capture current PRNG output, re-seed with it.
+    // This ensures crash replay: call Seed(result.seed) then Mutate() to reproduce.
+    const uint64_t iterSeed = m_rng();
+    m_rng.seed(iterSeed);
+    m_currentSeed = iterSeed;
+    
     MutationResult result;
-    result.seed = m_currentSeed;
+    result.seed = iterSeed;
     result.success = false;
     result.mutationCount = 0;
     
@@ -354,8 +360,12 @@ MutationResult MutationEngine::Mutate(
     std::span<const uint8_t> input,
     MutationStrategy strategy) noexcept
 {
+    const uint64_t iterSeed = m_rng();
+    m_rng.seed(iterSeed);
+    m_currentSeed = iterSeed;
+    
     MutationResult result;
-    result.seed = m_currentSeed;
+    result.seed = iterSeed;
     result.appliedStrategy = strategy;
     result.success = false;
     result.mutationCount = 0;
@@ -409,8 +419,12 @@ MutationResult MutationEngine::MutateWithSplice(
     std::span<const uint8_t> input,
     std::span<const uint8_t> spliceSource) noexcept
 {
+    const uint64_t iterSeed = m_rng();
+    m_rng.seed(iterSeed);
+    m_currentSeed = iterSeed;
+    
     MutationResult result;
-    result.seed = m_currentSeed;
+    result.seed = iterSeed;
     result.success = false;
     result.mutationCount = 0;
     
