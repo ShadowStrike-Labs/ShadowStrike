@@ -60,119 +60,36 @@
 namespace ShadowStrike::Fuzzer {
 
 // ============================================================================
-// Thread-local state for VEH crash detection
+// Exception code to string conversion
 // ============================================================================
 
 namespace {
 
-// Thread-local crash state for VEH
-thread_local bool g_inHarness = false;
-thread_local bool g_crashDetected = false;
-thread_local DWORD g_exceptionCode = 0;
-
-// Vectored Exception Handler
-LONG CALLBACK VectoredHandler(PEXCEPTION_POINTERS exceptionInfo) {
-    if (!g_inHarness) {
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-    
-    const DWORD code = exceptionInfo->ExceptionRecord->ExceptionCode;
-    
-    // Check for fatal exceptions
-    switch (code) {
-    case EXCEPTION_ACCESS_VIOLATION:
-    case EXCEPTION_STACK_OVERFLOW:
-    case EXCEPTION_INT_DIVIDE_BY_ZERO:
-    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-    case EXCEPTION_PRIV_INSTRUCTION:
-    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-    case EXCEPTION_DATATYPE_MISALIGNMENT:
-    case EXCEPTION_IN_PAGE_ERROR:
-    case EXCEPTION_GUARD_PAGE:
-    case STATUS_HEAP_CORRUPTION:
-        g_crashDetected = true;
-        g_exceptionCode = code;
-        // Note: We cannot safely longjmp out of here in C++
-        // Just record the crash and let it propagate
-        return EXCEPTION_CONTINUE_SEARCH;
-    default:
-        return EXCEPTION_CONTINUE_SEARCH;
-    }
-}
-
-// VEH registration
-class VEHGuard {
-public:
-    VEHGuard() noexcept {
-        m_handler = AddVectoredExceptionHandler(1, VectoredHandler);
-    }
-    
-    ~VEHGuard() {
-        if (m_handler) {
-            RemoveVectoredExceptionHandler(m_handler);
-        }
-    }
-    
-    VEHGuard(const VEHGuard&) = delete;
-    VEHGuard& operator=(const VEHGuard&) = delete;
-    
-private:
-    PVOID m_handler = nullptr;
-};
-
-// Global VEH guard - installs handler on startup
-VEHGuard g_vehGuard;
-
-// Convert Windows exception code to string
 std::string ExceptionCodeToStringInternal(DWORD code) noexcept {
     switch (code) {
-    case EXCEPTION_ACCESS_VIOLATION:
-        return "EXCEPTION_ACCESS_VIOLATION";
-    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
-        return "EXCEPTION_ARRAY_BOUNDS_EXCEEDED";
-    case EXCEPTION_BREAKPOINT:
-        return "EXCEPTION_BREAKPOINT";
-    case EXCEPTION_DATATYPE_MISALIGNMENT:
-        return "EXCEPTION_DATATYPE_MISALIGNMENT";
-    case EXCEPTION_FLT_DENORMAL_OPERAND:
-        return "EXCEPTION_FLT_DENORMAL_OPERAND";
-    case EXCEPTION_FLT_DIVIDE_BY_ZERO:
-        return "EXCEPTION_FLT_DIVIDE_BY_ZERO";
-    case EXCEPTION_FLT_INEXACT_RESULT:
-        return "EXCEPTION_FLT_INEXACT_RESULT";
-    case EXCEPTION_FLT_INVALID_OPERATION:
-        return "EXCEPTION_FLT_INVALID_OPERATION";
-    case EXCEPTION_FLT_OVERFLOW:
-        return "EXCEPTION_FLT_OVERFLOW";
-    case EXCEPTION_FLT_STACK_CHECK:
-        return "EXCEPTION_FLT_STACK_CHECK";
-    case EXCEPTION_FLT_UNDERFLOW:
-        return "EXCEPTION_FLT_UNDERFLOW";
-    case EXCEPTION_GUARD_PAGE:
-        return "EXCEPTION_GUARD_PAGE";
-    case EXCEPTION_ILLEGAL_INSTRUCTION:
-        return "EXCEPTION_ILLEGAL_INSTRUCTION";
-    case EXCEPTION_IN_PAGE_ERROR:
-        return "EXCEPTION_IN_PAGE_ERROR";
-    case EXCEPTION_INT_DIVIDE_BY_ZERO:
-        return "EXCEPTION_INT_DIVIDE_BY_ZERO";
-    case EXCEPTION_INT_OVERFLOW:
-        return "EXCEPTION_INT_OVERFLOW";
-    case EXCEPTION_INVALID_DISPOSITION:
-        return "EXCEPTION_INVALID_DISPOSITION";
-    case EXCEPTION_INVALID_HANDLE:
-        return "EXCEPTION_INVALID_HANDLE";
-    case EXCEPTION_NONCONTINUABLE_EXCEPTION:
-        return "EXCEPTION_NONCONTINUABLE_EXCEPTION";
-    case EXCEPTION_PRIV_INSTRUCTION:
-        return "EXCEPTION_PRIV_INSTRUCTION";
-    case EXCEPTION_SINGLE_STEP:
-        return "EXCEPTION_SINGLE_STEP";
-    case EXCEPTION_STACK_OVERFLOW:
-        return "EXCEPTION_STACK_OVERFLOW";
-    case STATUS_HEAP_CORRUPTION:
-        return "STATUS_HEAP_CORRUPTION";
+    case EXCEPTION_ACCESS_VIOLATION:       return "EXCEPTION_ACCESS_VIOLATION";
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:  return "EXCEPTION_ARRAY_BOUNDS_EXCEEDED";
+    case EXCEPTION_BREAKPOINT:             return "EXCEPTION_BREAKPOINT";
+    case EXCEPTION_DATATYPE_MISALIGNMENT:  return "EXCEPTION_DATATYPE_MISALIGNMENT";
+    case EXCEPTION_FLT_DENORMAL_OPERAND:   return "EXCEPTION_FLT_DENORMAL_OPERAND";
+    case EXCEPTION_FLT_DIVIDE_BY_ZERO:     return "EXCEPTION_FLT_DIVIDE_BY_ZERO";
+    case EXCEPTION_FLT_INEXACT_RESULT:     return "EXCEPTION_FLT_INEXACT_RESULT";
+    case EXCEPTION_FLT_INVALID_OPERATION:  return "EXCEPTION_FLT_INVALID_OPERATION";
+    case EXCEPTION_FLT_OVERFLOW:           return "EXCEPTION_FLT_OVERFLOW";
+    case EXCEPTION_FLT_STACK_CHECK:        return "EXCEPTION_FLT_STACK_CHECK";
+    case EXCEPTION_FLT_UNDERFLOW:          return "EXCEPTION_FLT_UNDERFLOW";
+    case EXCEPTION_GUARD_PAGE:             return "EXCEPTION_GUARD_PAGE";
+    case EXCEPTION_ILLEGAL_INSTRUCTION:    return "EXCEPTION_ILLEGAL_INSTRUCTION";
+    case EXCEPTION_IN_PAGE_ERROR:          return "EXCEPTION_IN_PAGE_ERROR";
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:     return "EXCEPTION_INT_DIVIDE_BY_ZERO";
+    case EXCEPTION_INT_OVERFLOW:           return "EXCEPTION_INT_OVERFLOW";
+    case EXCEPTION_INVALID_DISPOSITION:    return "EXCEPTION_INVALID_DISPOSITION";
+    case EXCEPTION_INVALID_HANDLE:         return "EXCEPTION_INVALID_HANDLE";
+    case EXCEPTION_NONCONTINUABLE_EXCEPTION: return "EXCEPTION_NONCONTINUABLE_EXCEPTION";
+    case EXCEPTION_PRIV_INSTRUCTION:       return "EXCEPTION_PRIV_INSTRUCTION";
+    case EXCEPTION_SINGLE_STEP:            return "EXCEPTION_SINGLE_STEP";
+    case EXCEPTION_STACK_OVERFLOW:         return "EXCEPTION_STACK_OVERFLOW";
+    case STATUS_HEAP_CORRUPTION:           return "STATUS_HEAP_CORRUPTION";
     default:
         char buf[32];
         snprintf(buf, sizeof(buf), "EXCEPTION_0x%08lX", code);
@@ -180,42 +97,25 @@ std::string ExceptionCodeToStringInternal(DWORD code) noexcept {
     }
 }
 
-// RAII guard for harness execution
-class HarnessGuard {
-public:
-    HarnessGuard() noexcept {
-        g_inHarness = true;
-        g_crashDetected = false;
-        g_exceptionCode = 0;
-    }
-    
-    ~HarnessGuard() {
-        g_inHarness = false;
-    }
-    
-    [[nodiscard]] bool WasCrashDetected() const noexcept {
-        return g_crashDetected;
-    }
-    
-    [[nodiscard]] DWORD GetExceptionCode() const noexcept {
-        return g_exceptionCode;
-    }
-    
-    HarnessGuard(const HarnessGuard&) = delete;
-    HarnessGuard& operator=(const HarnessGuard&) = delete;
-};
-
 }  // namespace
 
 // ============================================================================
 // PEParserHarness Implementation
 // ============================================================================
 
-std::string PEParserHarness::ExceptionCodeToString(unsigned int code) noexcept {
+std::string PEParserHarness::ExceptionCodeToString(unsigned long code) noexcept {
     return ExceptionCodeToStringInternal(static_cast<DWORD>(code));
 }
 
-bool PEParserHarness::TryParseBuffer(
+// ----------------------------------------------------------------------------
+// C++ implementation functions — these create C++ objects with destructors.
+// They are called from within SEH __try blocks. If a hardware exception fires,
+// destructors for stack-local C++ objects will NOT run under /EHsc. This is an
+// accepted trade-off: the small memory leak (PEParser PIMPL, vectors) only
+// occurs on genuine crashes, which are rare events we want to detect.
+// ----------------------------------------------------------------------------
+
+bool PEParserHarness::ParseBufferImpl(
     const uint8_t* data,
     size_t size,
     HarnessResult& result) noexcept
@@ -236,7 +136,7 @@ bool PEParserHarness::TryParseBuffer(
     result.anomalyCount = static_cast<uint32_t>(info.anomalies.size());
     
     if (result.parsedOk) {
-        // Exercise lazy-loaded parsers
+        // Exercise all lazy-loaded parsers
         {
             std::vector<PEParser::ImportInfo> imports;
             (void)parser.ParseImports(imports, &error);
@@ -285,10 +185,10 @@ bool PEParserHarness::TryParseBuffer(
             result.validationIssueCount = static_cast<uint32_t>(issues.size());
         }
         
-        // Checksum
+        // Checksum verification
         (void)parser.VerifyChecksum();
         
-        // Test RvaToOffset with various RVAs
+        // Test RvaToOffset with boundary and adversarial RVAs
         constexpr uint32_t testRvas[] = {
             0x0000, 0x0001, 0x0040, 0x0100,
             0x1000, 0x2000, 0x3000, 0x4000,
@@ -303,17 +203,7 @@ bool PEParserHarness::TryParseBuffer(
     return true;
 }
 
-bool PEParserHarness::TryParseLazyLoaded(HarnessResult& /* result */) noexcept {
-    // Lazy-loaded parsing is done inside TryParseBuffer
-    return true;
-}
-
-bool PEParserHarness::TryValidate(HarnessResult& /* result */) noexcept {
-    // Validation is done inside TryParseBuffer
-    return true;
-}
-
-bool PEParserHarness::TryStandaloneValidation(
+bool PEParserHarness::StandaloneValidationImpl(
     const uint8_t* data,
     size_t size,
     HarnessResult& result) noexcept
@@ -366,7 +256,50 @@ bool PEParserHarness::TryStandaloneValidation(
     return true;
 }
 
-HarnessResult PEParserHarness::RunInternal(std::span<const uint8_t> input) noexcept {
+// ----------------------------------------------------------------------------
+// SEH wrapper functions — MUST contain ZERO C++ objects with destructors.
+// Only primitives and raw pointers. MSVC enforces this: C2712 error if violated.
+// These wrap the C++ Impl functions in __try/__except to survive hardware
+// exceptions (access violations, stack overflows, heap corruption, etc.)
+// and return the exception code instead of terminating the process.
+// ----------------------------------------------------------------------------
+
+unsigned long PEParserHarness::SEHCallParseBuffer(
+    const uint8_t* data,
+    size_t size,
+    HarnessResult* pResult) noexcept
+{
+    DWORD exCode = 0;
+    __try {
+        ParseBufferImpl(data, size, *pResult);
+    }
+    __except (exCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        // Hardware exception caught — process survives.
+        // C++ destructors for objects in ParseBufferImpl did NOT run.
+    }
+    return exCode;
+}
+
+unsigned long PEParserHarness::SEHCallStandaloneValidation(
+    const uint8_t* data,
+    size_t size,
+    HarnessResult* pResult) noexcept
+{
+    DWORD exCode = 0;
+    __try {
+        StandaloneValidationImpl(data, size, *pResult);
+    }
+    __except (exCode = GetExceptionCode(), EXCEPTION_EXECUTE_HANDLER) {
+        // Hardware exception caught — process survives.
+    }
+    return exCode;
+}
+
+// ----------------------------------------------------------------------------
+// Public entry point
+// ----------------------------------------------------------------------------
+
+HarnessResult PEParserHarness::Run(std::span<const uint8_t> input) noexcept {
     HarnessResult result{};
     
     if (input.empty()) {
@@ -374,47 +307,33 @@ HarnessResult PEParserHarness::RunInternal(std::span<const uint8_t> input) noexc
         return result;
     }
     
-    // Enable crash detection
-    HarnessGuard guard;
-    
-    // Phase 1: Parse buffer through main API
-    (void)TryParseBuffer(input.data(), input.size(), result);
-    
-    // Check if VEH detected a crash
-    if (guard.WasCrashDetected()) {
-        result.crashed = true;
-        result.crashSignal = ExceptionCodeToStringInternal(guard.GetExceptionCode());
-        return result;
-    }
-    
-    // Phase 2: Standalone validation functions
-    (void)TryStandaloneValidation(input.data(), input.size(), result);
-    
-    // Check if VEH detected a crash
-    if (guard.WasCrashDetected()) {
-        result.crashed = true;
-        result.crashSignal = ExceptionCodeToStringInternal(guard.GetExceptionCode());
-    }
-    
-    return result;
-}
-
-HarnessResult PEParserHarness::Run(std::span<const uint8_t> input) noexcept {
-    // Outer try-catch for any C++ exceptions that escape
+    // Outer try-catch for C++ exceptions; SEH handles hardware faults.
     try {
-        return RunInternal(input);
+        // Phase 1: Main PE parser API through SEH wrapper
+        const DWORD parseEx = SEHCallParseBuffer(input.data(), input.size(), &result);
+        if (parseEx != 0) {
+            result.crashed = true;
+            result.crashSignal = ExceptionCodeToStringInternal(parseEx);
+            return result;
+        }
+        
+        // Phase 2: Standalone validation functions through SEH wrapper
+        const DWORD validEx = SEHCallStandaloneValidation(input.data(), input.size(), &result);
+        if (validEx != 0) {
+            result.crashed = true;
+            result.crashSignal = ExceptionCodeToStringInternal(validEx);
+            return result;
+        }
     } catch (const std::exception& e) {
-        HarnessResult result{};
         result.crashed = true;
         result.crashSignal = "CPP_EXCEPTION";
         result.errorMessage = e.what();
-        return result;
     } catch (...) {
-        HarnessResult result{};
         result.crashed = true;
         result.crashSignal = "CPP_UNKNOWN_EXCEPTION";
-        return result;
     }
+    
+    return result;
 }
 
 HarnessFunction PEParserHarness::GetHarnessFunction() noexcept {
