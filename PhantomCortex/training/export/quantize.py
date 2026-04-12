@@ -202,7 +202,7 @@ def quantize_dynamic(
 
     original_size = inp.stat().st_size
 
-    logger.info("Dynamic quantization: %s → %s", inp, out)
+    logger.info("Dynamic quantization: %s -> %s", inp, out)
 
     try:
         ort_quantize_dynamic(
@@ -228,7 +228,7 @@ def quantize_dynamic(
     reduction = (1.0 - quantized_size / max(original_size, 1)) * 100.0
 
     logger.info(
-        "Quantization complete: %.2f MB → %.2f MB (%.1f%% reduction)",
+        "Quantization complete: %.2f MB -> %.2f MB (%.1f%% reduction)",
         orig_mb,
         quant_mb,
         reduction,
@@ -297,7 +297,7 @@ def quantize_static(
     preprocessed_path = str(out.with_suffix(".preprocessed.onnx"))
 
     logger.info(
-        "Static quantization: %s → %s (calibration samples: %d)",
+        "Static quantization: %s -> %s (calibration samples: %d)",
         inp,
         out,
         calibration_data.shape[0],
@@ -349,7 +349,7 @@ def quantize_static(
     reduction = (1.0 - quantized_size / max(original_size, 1)) * 100.0
 
     logger.info(
-        "Static quantization complete: %.2f MB → %.2f MB (%.1f%% reduction)",
+        "Static quantization complete: %.2f MB -> %.2f MB (%.1f%% reduction)",
         orig_mb,
         quant_mb,
         reduction,

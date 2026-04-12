@@ -391,8 +391,16 @@ def _train_memory(
     epochs_override: Optional[int],
     batch_size: int,
     num_workers: int,
+    dataset_mode: str = "synthetic",
+    data_dir: Optional[str] = None,
 ) -> ModelResult:
-    """Train Cortex-Memory (MLP on synthetic memory regions)."""
+    """Train Cortex-Memory (MLP on memory regions).
+
+    dataset_mode:
+        "synthetic" — generated class-mean distributions (default)
+        "external"  — real CIC-MalMem-2022 + MemMal-D2024 Volatility data
+        "hybrid"    — real data augmented with synthetic samples
+    """
     result = ModelResult(name="cortex_memory")
     model_dir = output_dir / "memory"
     model_dir.mkdir(parents=True, exist_ok=True)
@@ -409,39 +417,72 @@ def _train_memory(
         )
 
         t0 = time.perf_counter()
-        n_samples = _SYNTH_COUNTS["memory"]
         n_classes = len(MemoryRegionClass)
         input_dim = 128
 
-        logger.info("Generating synthetic memory region data: %d samples...", n_samples)
-        rng = np.random.default_rng(seed)
+        if dataset_mode in ("external", "hybrid"):
+            from PhantomCortex.training.data.memory_external_loader import (
+                load_memory_external_dataset,
+            )
 
-        X = np.zeros((n_samples, input_dim), dtype=np.float32)
-        y = np.zeros(n_samples, dtype=np.int64)
+            raw_dir = data_dir or str(
+                Path(__file__).resolve().parent.parent / "data" / "raw"
+            )
+            X, y, meta = load_memory_external_dataset(
+                raw_dir, seed=seed, max_samples_per_class=30_000,
+            )
+            logger.info(
+                "Loaded real-world memory data: %d samples from %s",
+                X.shape[0], meta.get("source", "unknown"),
+            )
 
-        class_means = {
-            0: rng.standard_normal(input_dim).astype(np.float32) * 0.5,
-            1: rng.standard_normal(input_dim).astype(np.float32) * 0.5 + 2.0,
-            2: rng.standard_normal(input_dim).astype(np.float32) * 0.5 - 1.5,
-            3: rng.standard_normal(input_dim).astype(np.float32) * 0.5 + 1.0,
-            4: rng.standard_normal(input_dim).astype(np.float32) * 0.5 - 2.0,
-        }
+            if dataset_mode == "hybrid":
+                # Augment with synthetic for underrepresented classes
+                rng = np.random.default_rng(seed)
+                class_means = {
+                    c: rng.standard_normal(input_dim).astype(np.float32) * 0.5
+                    + float(c) for c in range(n_classes)
+                }
+                for cls in range(n_classes):
+                    n_existing = int(np.sum(y == cls))
+                    n_needed = max(0, 5000 - n_existing)
+                    if n_needed > 0:
+                        X_synth = (class_means[cls] +
+                                   rng.standard_normal((n_needed, input_dim)).astype(np.float32) * 0.8)
+                        y_synth = np.full(n_needed, cls, dtype=np.int64)
+                        X = np.concatenate([X, X_synth], axis=0)
+                        y = np.concatenate([y, y_synth], axis=0)
+                        logger.info("Augmented class %d with %d synthetic samples", cls, n_needed)
+        else:
+            n_samples = _SYNTH_COUNTS["memory"]
+            logger.info("Generating synthetic memory region data: %d samples...", n_samples)
+            rng = np.random.default_rng(seed)
 
-        for i in range(n_samples):
-            cls = int(rng.integers(0, n_classes))
-            y[i] = cls
-            X[i] = class_means[cls] + rng.standard_normal(input_dim).astype(np.float32) * 0.8
+            X = np.zeros((n_samples, input_dim), dtype=np.float32)
+            y = np.zeros(n_samples, dtype=np.int64)
 
-            # entropy features (last 32 dims)
-            if cls == 3:  # Encrypted
-                X[i, -32:] = rng.uniform(7.5, 8.0, size=32).astype(np.float32)
-            elif cls == 4:  # Packed
-                X[i, -32:] = rng.uniform(6.5, 7.8, size=32).astype(np.float32)
-            elif cls == 1:  # Shellcode
-                X[i, -32:] = rng.uniform(4.0, 6.0, size=32).astype(np.float32)
+            class_means = {
+                0: rng.standard_normal(input_dim).astype(np.float32) * 0.5,
+                1: rng.standard_normal(input_dim).astype(np.float32) * 0.5 + 2.0,
+                2: rng.standard_normal(input_dim).astype(np.float32) * 0.5 - 1.5,
+                3: rng.standard_normal(input_dim).astype(np.float32) * 0.5 + 1.0,
+                4: rng.standard_normal(input_dim).astype(np.float32) * 0.5 - 2.0,
+            }
 
-        shuffle = rng.permutation(n_samples)
-        X, y = X[shuffle], y[shuffle]
+            for i in range(n_samples):
+                cls = int(rng.integers(0, n_classes))
+                y[i] = cls
+                X[i] = class_means[cls] + rng.standard_normal(input_dim).astype(np.float32) * 0.8
+
+                if cls == 3:
+                    X[i, -32:] = rng.uniform(7.5, 8.0, size=32).astype(np.float32)
+                elif cls == 4:
+                    X[i, -32:] = rng.uniform(6.5, 7.8, size=32).astype(np.float32)
+                elif cls == 1:
+                    X[i, -32:] = rng.uniform(4.0, 6.0, size=32).astype(np.float32)
+
+            shuffle = rng.permutation(n_samples)
+            X, y = X[shuffle], y[shuffle]
 
         (X_tr, y_tr), (X_v, y_v), (X_te, y_te) = split_data(X, y, seed=seed)
         class_weights = compute_class_weights(y_tr)
@@ -751,6 +792,8 @@ def run_all(
     num_workers: int = 0,
     quantize: bool = True,
     validate: bool = True,
+    dataset_mode: str = "synthetic",
+    data_dir: Optional[str] = None,
 ) -> dict[str, Any]:
     """Execute the full multi-model training pipeline.
 
@@ -777,6 +820,10 @@ def run_all(
         Whether to quantize ONNX models to INT8.
     validate : bool
         Whether to validate ONNX models after export.
+    dataset_mode : str
+        "synthetic", "external", or "hybrid" — controls data source.
+    data_dir : str, optional
+        Root directory for external datasets.
 
     Returns
     -------
@@ -825,6 +872,11 @@ def run_all(
         if model_name != "static":
             kwargs["batch_size"] = batch_size
             kwargs["num_workers"] = num_workers
+
+        # Pass dataset_mode and data_dir for models that support external data
+        if model_name == "memory":
+            kwargs["dataset_mode"] = dataset_mode
+            kwargs["data_dir"] = data_dir
 
         model_result = trainer_fn(out, **kwargs)
         results.append(model_result)
@@ -927,6 +979,15 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=0, help="DataLoader workers")
     parser.add_argument("--no-quantize", action="store_true", help="Skip INT8 quantization")
     parser.add_argument("--no-validate", action="store_true", help="Skip ONNX validation")
+    parser.add_argument(
+        "--dataset-mode", type=str, default="synthetic",
+        choices=["synthetic", "external", "hybrid"],
+        help="Data source mode: synthetic (default), external (real-world), hybrid (both)",
+    )
+    parser.add_argument(
+        "--data-dir", type=str, default=None,
+        help="Root directory for external datasets (default: training/data/raw)",
+    )
 
     args = parser.parse_args()
 
@@ -955,6 +1016,8 @@ def main() -> None:
         num_workers=args.num_workers,
         quantize=not args.no_quantize,
         validate=not args.no_validate,
+        dataset_mode=args.dataset_mode,
+        data_dir=args.data_dir,
     )
 
     n_fail = summary.get("failure_count", 0)
