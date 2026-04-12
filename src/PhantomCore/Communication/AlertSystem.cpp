@@ -26,6 +26,8 @@
 #include <deque>
 #include <condition_variable>
 
+#include "../Utils/JSONUtils.hpp"
+
 #include <WinSock2.h>
 #include <ws2tcpip.h>
 #include <shellapi.h>
@@ -1934,11 +1936,46 @@ AlertSystem::~AlertSystem() = default;
 // ============================================================================
 
 bool AlertSystem::Initialize(const std::string& configJson) {
-    // JSON config parsing: production would use nlohmann::json or RapidJSON
-    // For now, accept programmatic config only
-    (void)configJson;
-    Utils::Logger::Error("[AlertSystem] JSON config parsing not implemented — use Initialize(AlertConfiguration)");
-    return false;
+    namespace JSON = ShadowStrike::Utils::JSON;
+
+    if (configJson.empty()) {
+        Utils::Logger::Error("[AlertSystem] Empty JSON configuration string");
+        return false;
+    }
+
+    JSON::Json root;
+    JSON::Error parseErr;
+    if (!JSON::Parse(configJson, root, &parseErr)) {
+        Utils::Logger::Error("[AlertSystem] JSON parse failed at byte {}: {}",
+            parseErr.byteOffset, parseErr.message);
+        return false;
+    }
+
+    try {
+        AlertConfiguration config;
+
+        config.enabled              = JSON::GetOr<bool>(root, "enabled", true);
+        config.smtp.server          = JSON::GetOr<std::string>(root, "smtp.server", "");
+        config.smtp.port            = JSON::GetOr<uint16_t>(root, "smtp.port", 587);
+        config.smtp.useTLS          = JSON::GetOr<bool>(root, "smtp.useTLS", true);
+        config.smtp.username        = JSON::GetOr<std::string>(root, "smtp.username", "");
+        config.smtp.password        = JSON::GetOr<std::string>(root, "smtp.password", "");
+        config.rateLimitPerMinute   = JSON::GetOr<size_t>(root, "rateLimitPerMinute",
+                                          AlertConstants::MAX_ALERTS_PER_MINUTE);
+        config.enableDeduplication  = JSON::GetOr<bool>(root, "enableDeduplication", true);
+        config.dedupWindowMinutes   = JSON::GetOr<uint32_t>(root, "dedupWindowMinutes", 5);
+        config.retryFailed          = JSON::GetOr<bool>(root, "retryFailed", true);
+        config.maxRetryAttempts     = JSON::GetOr<uint32_t>(root, "maxRetryAttempts",
+                                          AlertConstants::MAX_RETRY_ATTEMPTS);
+        config.syslogHost           = JSON::GetOr<std::string>(root, "syslogHost", "127.0.0.1");
+        config.syslogPort           = JSON::GetOr<uint16_t>(root, "syslogPort", 6514);
+
+        return Initialize(config);
+    }
+    catch (const std::exception& e) {
+        Utils::Logger::Error("[AlertSystem] Configuration extraction failed: {}", e.what());
+        return false;
+    }
 }
 
 bool AlertSystem::Initialize(const AlertConfiguration& config) {

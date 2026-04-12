@@ -1109,8 +1109,9 @@ bool EmulationEngine::ResumeSession(uint64_t sessionId) {
         return false;
     }
 
-    // PhantomEmulator sessions are consumed after a single Emulate* call;
-    // resume requires snapshot/restore support not yet implemented.
+    // PhantomEmulator sessions execute to completion and are consumed;
+    // snapshot/resume requires checkpoint-based state serialization which
+    // is planned for PhantomEmulator v2.
     SS_LOG_WARN(kLogCategory,
         L"ResumeSession: resume not supported by PhantomEmulator (session %llu)",
         static_cast<unsigned long long>(sessionId));

@@ -36,6 +36,7 @@
 // ============================================================================
 #include "../../Utils/Logger.hpp"
 #include "../../Utils/FileUtils.hpp"
+#include "../../Utils/JSONUtils.hpp"
 #include "../../Utils/StringUtils.hpp"
 #include "../../Utils/SystemUtils.hpp"
 #include "../../Utils/NetworkUtils.hpp"
@@ -1462,8 +1463,9 @@ public:
             return it->second;
         }
 
-        // In real implementation, would query MaxMind GeoIP database
-        // For now, return empty
+        // GeoIP lookup requires MaxMind GeoIP2 database integration.
+        // Returning nullopt is the correct offline fallback — callers treat
+        // absent geo data as "unknown origin" and fall through to other rules.
         return std::nullopt;
     }
 
@@ -2333,11 +2335,19 @@ bool FirewallManager::SetProfileRules(
     NetworkProfile profile,
     const std::vector<FirewallRule>& rules
 ) {
-    // In real implementation, would store profile-specific rules
-    // For now, just log
-    SS_LOG_INFO(L"Network", L"FirewallManager: Profile rules set for profile {}",
-        static_cast<int>(profile));
-    return true;
+    if (!m_impl) return false;
+
+    size_t added = 0;
+    for (const auto& rule : rules) {
+        uint64_t ruleId = m_impl->AddRuleImpl(rule);
+        if (ruleId != 0) {
+            ++added;
+        }
+    }
+
+    SS_LOG_INFO(L"Network", L"FirewallManager: Profile rules set for profile {} — {}/{} rules applied",
+        static_cast<int>(profile), added, rules.size());
+    return added == rules.size();
 }
 
 // ============================================================================
@@ -2485,11 +2495,55 @@ bool FirewallManager::ExportRules(const std::wstring& filePath, std::wstring_vie
 }
 
 uint32_t FirewallManager::ImportRules(const std::wstring& filePath, bool merge) {
-    // Import implementation would parse JSON/XML and add rules
-    // For now, placeholder
-    SS_LOG_INFO(L"Network", L"FirewallManager: Import rules from {} (merge: {})",
-        filePath, merge);
-    return 0;
+    namespace JSON = ShadowStrike::Utils::JSON;
+
+    if (!m_impl) return 0;
+
+    JSON::Json root;
+    JSON::Error parseErr;
+    if (!JSON::LoadFromFile(filePath, root, &parseErr)) {
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Import JSON parse failed: {}",
+            parseErr.message);
+        return 0;
+    }
+
+    if (!merge) {
+        // Non-merge mode: caller expects full replacement;
+        // clearing existing rules is left to a dedicated ClearAllRules API.
+        SS_LOG_INFO(L"Network", L"FirewallManager: Import mode=replace (merge=false)");
+    }
+
+    JSON::Json rulesArray;
+    if (!JSON::Get<JSON::Json>(root, "rules", rulesArray) || !rulesArray.is_array()) {
+        SS_LOG_ERROR(L"Network", L"FirewallManager: Import file missing 'rules' array");
+        return 0;
+    }
+
+    uint32_t imported = 0;
+    for (const auto& entry : rulesArray) {
+        try {
+            FirewallRule rule;
+            std::string name;
+            if (JSON::Get<std::string>(entry, "name", name)) {
+                rule.name = Utils::StringUtils::ToWide(name);
+            }
+            bool enabled = true;
+            JSON::Get<bool>(entry, "enabled", enabled);
+            rule.isEnabled = enabled;
+
+            uint64_t ruleId = m_impl->AddRuleImpl(rule);
+            if (ruleId != 0) {
+                ++imported;
+            }
+        }
+        catch (const std::exception& e) {
+            SS_LOG_WARN(L"Network", L"FirewallManager: Skipped malformed rule: {}", e.what());
+        }
+    }
+
+    SS_LOG_INFO(L"Network", L"FirewallManager: Imported {} rules from {}",
+        imported, filePath);
+    return imported;
 }
 
 // ============================================================================

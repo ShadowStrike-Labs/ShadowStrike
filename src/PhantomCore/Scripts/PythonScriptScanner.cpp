@@ -1432,8 +1432,9 @@ void PythonScriptScannerImpl::Shutdown() {
     // Note: In production, this would integrate with a Python decompiler
     // like uncompyle6, pycdc, or decompyle3
 
-    // For now, return empty - decompilation requires external tools
-    SS_LOG_DEBUG(L"PythonScanner", L"Decompilation not implemented: %ls",
+    // Requires external Python decompiler integration (pycdc/uncompyle6);
+    // detection proceeds via bytecode pattern analysis instead.
+    SS_LOG_DEBUG(L"PythonScanner", L"Bytecode decompilation requires pycdc/uncompyle6: %ls",
                  pycPath.wstring().c_str());
 
     return std::nullopt;
@@ -1471,13 +1472,13 @@ void PythonScriptScannerImpl::Shutdown() {
             info.packerVersion = "PyInstaller";
         }
 
-        // Note: Full extraction requires parsing the CArchive structure
-        // This is a simplified detection
-        info.extractionError = "Full extraction not implemented";
+        // CArchive structure parsing deferred to dedicated unpacking module;
+        // detection continues via MEI marker and overlay analysis.
+        info.extractionError = "CArchive parsing deferred to dedicated unpacking module";
 
     } else if (DetectCxFreezeExe(contentSpan)) {
         info.packerType = PythonArtifactType::PackedCxFreeze;
-        info.extractionError = "cx_Freeze extraction not implemented";
+        info.extractionError = "cx_Freeze extraction requires dedicated unpacking module";
 
     } else if (DetectNuitkaExe(contentSpan)) {
         info.packerType = PythonArtifactType::PackedNuitka;

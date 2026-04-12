@@ -35,8 +35,9 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
 
-#include <algorithm>
-#include <sstream>
+#include "../Utils/JSONUtils.hpp"
+
+#include <algorithm>#include <sstream>
 #include <chrono>
 
 namespace {
@@ -859,10 +860,33 @@ std::string CommunicationConfig::ToJson() const {
 }
 
 CommunicationConfig CommunicationConfig::FromJson(const std::string& json) {
-    // Basic JSON parsing - for production use nlohmann::json
+    namespace JSON = ShadowStrike::Utils::JSON;
+
     CommunicationConfig config;
-    // Parse implementation would go here
-    // For now, return defaults
+    if (json.empty()) {
+        return config;
+    }
+
+    JSON::Json root;
+    JSON::Error parseErr;
+    if (!JSON::Parse(json, root, &parseErr)) {
+        Utils::Logger::Warn("[CommunicationConfig] JSON parse failed: {}", parseErr.message);
+        return config;
+    }
+
+    std::string portNameNarrow;
+    if (JSON::Get<std::string>(root, "portName", portNameNarrow)) {
+        config.portName = Utils::StringUtils::ToWide(portNameNarrow);
+    }
+    config.replyTimeoutMs       = JSON::GetOr<uint32_t>(root, "replyTimeoutMs", config.replyTimeoutMs);
+    config.reconnectIntervalMs  = JSON::GetOr<uint32_t>(root, "reconnectIntervalMs", config.reconnectIntervalMs);
+    config.maxReconnectAttempts = JSON::GetOr<uint32_t>(root, "maxReconnectAttempts", config.maxReconnectAttempts);
+    config.messageQueueSize     = JSON::GetOr<uint32_t>(root, "messageQueueSize", config.messageQueueSize);
+    config.workerThreadCount    = JSON::GetOr<uint32_t>(root, "workerThreadCount", config.workerThreadCount);
+    config.autoReconnect        = JSON::GetOr<bool>(root, "autoReconnect", config.autoReconnect);
+    config.blockOnTimeout       = JSON::GetOr<bool>(root, "blockOnTimeout", config.blockOnTimeout);
+    config.enableStatistics     = JSON::GetOr<bool>(root, "enableStatistics", config.enableStatistics);
+
     return config;
 }
 
