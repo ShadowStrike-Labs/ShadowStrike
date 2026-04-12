@@ -120,6 +120,9 @@
     <ClCompile Include="src\PhantomCore\Config\PolicyManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\Config\ProductTier.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Config\ProfileManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2112,6 +2115,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Config\PolicyManager.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\Config\ProductTier.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Config\ProfileManager.hpp">
