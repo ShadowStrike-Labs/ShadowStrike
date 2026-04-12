@@ -302,12 +302,12 @@
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Debug|x64'">NotUsing</PrecompiledHeader>
       <PrecompiledHeader Condition="'$(Configuration)|$(Platform)'=='Release|x64'">NotUsing</PrecompiledHeader>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\ArtifactExtractor.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\EvidenceCollector.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\IncidentRecorder.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\MemoryDumper.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\NetworkCapture.cpp" />
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\TimelineAnalyzer.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\ArtifactExtractor.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\EvidenceCollector.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\IncidentRecorder.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\MemoryDumper.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\NetworkCapture.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\TimelineAnalyzer.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\BloomFilter_impl.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\HashBucket_impl.cpp" />
     <ClCompile Include="src\PhantomCore\HashStore\HashStore.cpp" />
