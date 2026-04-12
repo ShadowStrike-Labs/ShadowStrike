@@ -58,9 +58,9 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4834 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
@@ -74,9 +74,9 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4834 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 %(AdditionalOptions)</AdditionalOptions>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <Optimization>MaxSpeed</Optimization>
@@ -100,6 +100,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\RunnerExecutionRuntime.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\WorkerBackendRuntime.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DisassemblerHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\PEParserHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
@@ -111,6 +112,7 @@
     <ClCompile Include="src\CampaignPlanner.cpp" />
     <ClCompile Include="src\DispatchRuntime.cpp" />
     <ClCompile Include="src\DisassemblerHarness.cpp" />
+    <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EngineArchitecture.cpp" />
     <ClCompile Include="src\FuzzLoop.cpp" />
     <ClCompile Include="src\HarnessAdapterCatalog.cpp" />
@@ -127,6 +129,7 @@
     <ClCompile Include="..\src\PhantomCore\PEParser\PEParser.cpp" />
     <ClCompile Include="..\src\PhantomCore\PEParser\PEValidation.cpp" />
     <ClCompile Include="..\PhantomDisassembler\Decoder.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\Decoder\InstructionDecoder.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\Logger.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\StringUtils.cpp" />
