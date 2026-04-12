@@ -3,11 +3,11 @@ Cortex-Static Training Runner
 ==============================
 
 End-to-end training pipeline for the ShadowStrike Cortex-Static malware
-detection model using the EMBER 2018 dataset and LightGBM gradient boosted
-trees.
+detection model using EMBER-format datasets (EMBER 2018 or EMBER2024-PE)
+and LightGBM gradient boosted trees.
 
 Stages:
-    1. Load EMBER 2018 dataset (download if needed)
+    1. Load EMBER dataset (download if needed)
     2. Bayesian hyperparameter optimisation (Optuna, stratified CV)
     3. Train final model with best parameters + early stopping
     4. Evaluate on held-out test set
@@ -65,7 +65,7 @@ _SCRIPT_DIR = Path(__file__).resolve().parent
 _TRAINING_DIR = _SCRIPT_DIR.parent
 _DEFAULT_OUTPUT_DIR = _TRAINING_DIR / "data" / "models" / "cortex_static"
 
-FEATURE_COUNT: int = 2381
+DEFAULT_FEATURE_COUNT: int = 2381
 VALIDATION_FRACTION: float = 0.10
 DEFAULT_HPO_TRIALS: int = 100
 DEFAULT_HPO_CV_FOLDS: int = 5
@@ -82,19 +82,29 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="train_static",
         description=(
-            "Train Cortex-Static LightGBM malware classifier on the EMBER "
-            "2018 dataset with Optuna hyperparameter optimisation, ONNX "
+            "Train Cortex-Static LightGBM malware classifier on EMBER-format "
+            "datasets with Optuna hyperparameter optimisation, ONNX "
             "export, and INT8 quantization."
         ),
     )
 
     # --- data ---
     parser.add_argument(
+        "--dataset",
+        type=str,
+        choices=("ember2018", "ember2024-pe"),
+        default="ember2018",
+        help=(
+            "Dataset source. 'ember2024-pe' uses EMBER2024 PE subsets via "
+            "the thrember package; 'ember2018' preserves the legacy loader."
+        ),
+    )
+    parser.add_argument(
         "--data-dir",
         type=str,
         default=None,
         help=(
-            "Path to directory containing the EMBER dataset (or where it "
+            "Path to directory containing the selected dataset (or where it "
             "should be downloaded). Default: training/data/raw"
         ),
     )
@@ -209,25 +219,36 @@ def _load_data(
 ) -> tuple[
     np.ndarray, np.ndarray, np.ndarray, np.ndarray
 ]:
-    """Stage 1: Load EMBER dataset."""
-    from PhantomCortex.training.data.ember_loader import load_ember
+    """Stage 1: Load the selected EMBER dataset."""
 
     log.info(
         "stage.data_load.start",
+        dataset=args.dataset,
         data_dir=args.data_dir,
         download=not args.no_download,
     )
     t0 = time.monotonic()
 
-    X_train, y_train, X_test, y_test = load_ember(
-        data_dir=args.data_dir,
-        download=not args.no_download,
-        cache=not args.no_cache,
-    )
+    if args.dataset == "ember2024-pe":
+        from PhantomCortex.training.data.ember2024_loader import load_ember2024
+
+        X_train, y_train, X_test, y_test = load_ember2024(
+            data_dir=args.data_dir,
+            download=not args.no_download,
+        )
+    else:
+        from PhantomCortex.training.data.ember_loader import load_ember
+
+        X_train, y_train, X_test, y_test = load_ember(
+            data_dir=args.data_dir,
+            download=not args.no_download,
+            cache=not args.no_cache,
+        )
 
     elapsed = time.monotonic() - t0
     log.info(
         "stage.data_load.complete",
+        dataset=args.dataset,
         train_samples=X_train.shape[0],
         test_samples=X_test.shape[0],
         features=X_train.shape[1],
@@ -377,6 +398,7 @@ def _export_onnx(
     output_dir: Path,
     model_name: str,
     opset: int,
+    feature_count: int,
 ) -> Path:
     """Stage 5: Export trained LightGBM booster to ONNX."""
     from PhantomCortex.training.export.to_onnx import export_lgbm_to_onnx
@@ -387,14 +409,14 @@ def _export_onnx(
         "stage.onnx_export.start",
         output=str(onnx_path),
         opset=opset,
-        feature_count=FEATURE_COUNT,
+        feature_count=feature_count,
     )
     t0 = time.monotonic()
 
     export_lgbm_to_onnx(
         model.booster,
         onnx_path,
-        feature_count=FEATURE_COUNT,
+        feature_count=feature_count,
         opset=opset,
     )
 
@@ -459,6 +481,7 @@ def _save_artifacts(
     quantize_report: dict[str, Any] | None,
     args: argparse.Namespace,
     total_elapsed: float,
+    feature_count: int,
 ) -> None:
     """Stage 7: Persist model, metrics, and run metadata."""
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -471,9 +494,10 @@ def _save_artifacts(
     # Assemble full run report
     report: dict[str, Any] = {
         "model_name": model_name,
+        "dataset": args.dataset,
         "model_hash": model.model_hash,
         "num_iterations": model.num_iterations,
-        "feature_count": FEATURE_COUNT,
+        "feature_count": feature_count,
         "seed": args.seed,
         "threshold": args.threshold,
         "hpo_enabled": not args.skip_hpo,
@@ -512,6 +536,7 @@ def main(argv: list[str] | None = None) -> None:
         "pipeline.start",
         output_dir=str(output_dir),
         model_name=args.model_name,
+        dataset=args.dataset,
         seed=args.seed,
     )
 
@@ -533,10 +558,11 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 1. Load data -----------------------------------------------------
     X_train_full, y_train_full, X_test, y_test = _load_data(args)
+    feature_count = int(X_train_full.shape[1])
 
     # ---- 2. Instantiate trainer -------------------------------------------
     trainer = CortexStaticTrainer(
-        feature_count=FEATURE_COUNT,
+        feature_count=feature_count,
         seed=args.seed,
         n_jobs=args.n_jobs,
     )
@@ -576,7 +602,7 @@ def main(argv: list[str] | None = None) -> None:
 
     # ---- 7. ONNX export ---------------------------------------------------
     onnx_path = _export_onnx(
-        model, output_dir, args.model_name, args.opset
+        model, output_dir, args.model_name, args.opset, feature_count
     )
 
     # ---- 8. INT8 quantization ---------------------------------------------
@@ -598,6 +624,7 @@ def main(argv: list[str] | None = None) -> None:
         quantize_report,
         args,
         total_elapsed,
+        feature_count,
     )
 
     log.info(

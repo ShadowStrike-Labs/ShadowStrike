@@ -34,12 +34,16 @@ import numpy as np
 try:
     import lief
 
-    _LIEF_MAJOR, _LIEF_MINOR, _ = (int(x) for x in lief.__version__.split(".")[:3])
+    _lief_version_parts = [int(part) for part in re.findall(r"\d+", lief.__version__)]
+    if len(_lief_version_parts) < 2:
+        raise ValueError(f"Unsupported LIEF version string: {lief.__version__}")
+    _LIEF_MAJOR = _lief_version_parts[0]
+    _LIEF_MINOR = _lief_version_parts[1]
     _LIEF_EXPORT_OBJECT: bool = _LIEF_MAJOR > 0 or (_LIEF_MAJOR == 0 and _LIEF_MINOR >= 10)
     _LIEF_HAS_SIGNATURE: bool = _LIEF_MAJOR > 0 or (_LIEF_MAJOR == 0 and _LIEF_MINOR >= 11)
     _LIEF_GE_012: bool = _LIEF_MAJOR > 0 or (_LIEF_MAJOR == 0 and _LIEF_MINOR >= 12)
     _LIEF_AVAILABLE = True
-except ImportError:
+except (ImportError, ValueError):
     _LIEF_AVAILABLE = False
     _LIEF_EXPORT_OBJECT = False
     _LIEF_HAS_SIGNATURE = False

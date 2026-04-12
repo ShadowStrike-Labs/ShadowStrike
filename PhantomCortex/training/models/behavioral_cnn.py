@@ -18,7 +18,6 @@ from __future__ import annotations
 import enum
 import logging
 import math
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -312,6 +311,7 @@ class CortexBehavioralTrainer:
             if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
+        self._use_amp = self._device.type == "cuda"
         self._writer: Optional[SummaryWriter] = None
         if log_dir is not None:
             self._writer = SummaryWriter(log_dir=log_dir)
@@ -323,6 +323,12 @@ class CortexBehavioralTrainer:
         np.random.seed(self._seed)
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(self._seed)
+            if hasattr(torch, "set_float32_matmul_precision"):
+                torch.set_float32_matmul_precision("high")
+            if hasattr(torch.backends.cuda.matmul, "allow_tf32"):
+                torch.backends.cuda.matmul.allow_tf32 = True
+            if hasattr(torch.backends.cudnn, "allow_tf32"):
+                torch.backends.cudnn.allow_tf32 = True
         torch.backends.cudnn.deterministic = True
         torch.backends.cudnn.benchmark = False
 
@@ -382,6 +388,7 @@ class CortexBehavioralTrainer:
         loss_fn = nn.CrossEntropyLoss(
             weight=class_weights.to(self._device) if class_weights is not None else None
         )
+        scaler = torch.cuda.amp.GradScaler(enabled=self._use_amp)
 
         best_val_loss = float("inf")
         best_state: Optional[dict[str, Any]] = None
@@ -392,10 +399,11 @@ class CortexBehavioralTrainer:
             Path(checkpoint_dir).mkdir(parents=True, exist_ok=True)
 
         logger.info(
-            "Training CortexBehavioral: %d epochs, device=%s, lr=%.1e",
+            "Training CortexBehavioral: %d epochs, device=%s, lr=%.1e, amp=%s",
             epochs,
             self._device,
             self._lr,
+            self._use_amp,
         )
 
         for epoch in range(1, epochs + 1):
@@ -410,11 +418,18 @@ class CortexBehavioralTrainer:
                 batch_y = batch_y.to(self._device, non_blocking=True)
 
                 optimizer.zero_grad(set_to_none=True)
-                logits = model(batch_x)
-                loss = loss_fn(logits, batch_y)
-                loss.backward()
+                with torch.autocast(
+                    device_type=self._device.type,
+                    dtype=torch.float16,
+                    enabled=self._use_amp,
+                ):
+                    logits = model(batch_x)
+                    loss = loss_fn(logits, batch_y)
+                scaler.scale(loss).backward()
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), grad_clip)
-                optimizer.step()
+                scaler.step(optimizer)
+                scaler.update()
 
                 train_loss += loss.item() * batch_x.size(0)
                 train_correct += (logits.argmax(dim=1) == batch_y).sum().item()
@@ -498,8 +513,14 @@ class CortexBehavioralTrainer:
         for batch_x, batch_y in loader:
             batch_x = batch_x.to(self._device, non_blocking=True)
             batch_y = batch_y.to(self._device, non_blocking=True)
-            logits = model(batch_x)
-            total_loss += loss_fn(logits, batch_y).item() * batch_x.size(0)
+            with torch.autocast(
+                device_type=self._device.type,
+                dtype=torch.float16,
+                enabled=self._use_amp,
+            ):
+                logits = model(batch_x)
+                batch_loss = loss_fn(logits, batch_y)
+            total_loss += batch_loss.item() * batch_x.size(0)
             correct += (logits.argmax(dim=1) == batch_y).sum().item()
             total += batch_x.size(0)
         return total_loss / max(total, 1), correct / max(total, 1)
@@ -536,8 +557,14 @@ class CortexBehavioralTrainer:
             batch_x = batch_x.to(self._device, non_blocking=True)
             batch_y = batch_y.to(self._device, non_blocking=True)
 
-            logits = model(batch_x)
-            total_loss += loss_fn(logits, batch_y).item() * batch_x.size(0)
+            with torch.autocast(
+                device_type=self._device.type,
+                dtype=torch.float16,
+                enabled=self._use_amp,
+            ):
+                logits = model(batch_x)
+                batch_loss = loss_fn(logits, batch_y)
+            total_loss += batch_loss.item() * batch_x.size(0)
             total_samples += batch_x.size(0)
 
             preds = logits.argmax(dim=1).cpu().numpy()
