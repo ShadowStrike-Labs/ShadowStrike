@@ -66,34 +66,34 @@
     <ClCompile Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Backup\BackupManager.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Backup\BackupScheduler.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Backup\IncrementalBackup.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Backup\RestoreManager.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Backup\RestoreManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\BankingTrojanDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\BankingTrojanDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\CertificatePinning.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\CertificatePinning.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\KeyloggerProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\KeyloggerProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\ScreenshotBlocker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\ScreenshotBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\SecureBrowser.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\SecureBrowser.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Banking\TransactionMonitor.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\TransactionMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Communication\AlertSystem.cpp">
@@ -297,19 +297,19 @@
     <ClCompile Include="src\PhantomCore\Core\System\SystemInfo.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\BrowserMinerDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\BrowserMinerDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CPUUsageAnalyzer.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CPUUsageAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\CryptoMinerDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CryptoMinerDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\GPUMiningDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\GPUMiningDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\CryptoMinersProtection\PoolConnectionDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\PoolConnectionDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Database\ConfigurationDB.cpp">
@@ -324,22 +324,22 @@
     <ClCompile Include="src\PhantomCore\Database\QuarantineDB.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\AttachmentScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\AttachmentScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\EmailProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\OutlookScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\OutlookScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\PhishingEmailDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\PhishingEmailDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\SpamDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\SpamDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Email\ThunderbirdScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Email\ThunderbirdScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Exploits\BufferOverflowProtection.cpp">
@@ -414,37 +414,37 @@
     <ClCompile Include="src\PhantomCore\External\tlsh\tlsh_util.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\ArtifactExtractor.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\ArtifactExtractor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\EvidenceCollector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\EvidenceCollector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\IncidentRecorder.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\IncidentRecorder.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\MemoryDumper.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\MemoryDumper.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\NetworkCapture.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\NetworkCapture.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomEDR\Forensics\TimelineAnalyzer.cpp">
+    <ClCompile Include="src\Products\Community\PhantomEDR\Forensics\TimelineAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameCheatDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameCheatDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameModeManager.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameModeManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\GameMode\GameProcessDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\GameProcessDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\GameMode\OverlayProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\OverlayProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\GameMode\PerformanceOptimizer.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\GameMode\PerformanceOptimizer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\HashStore\BloomFilter_impl.cpp">
@@ -465,16 +465,16 @@
     <ClCompile Include="src\PhantomCore\HashStore\HashStore_query_operations.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\IoT\IoTDeviceScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\IoTDeviceScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\IoT\RouterSecurityChecker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\RouterSecurityChecker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\IoT\SmartHomeProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\SmartHomeProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\IoT\WiFiSecurityAnalyzer.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\IoT\WiFiSecurityAnalyzer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\PatternStore\aho_crsck_impl.cpp">
@@ -501,28 +501,28 @@
     <ClCompile Include="src\PhantomCore\Performance\NetworkPerformanceMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\CookieManager.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\CookieManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\DataLeakProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DataLeakProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\DNSLeakProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\DNSLeakProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\IPLeakProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\IPLeakProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\LocationPrivacy.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\LocationPrivacy.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\MicrophoneGuard.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\MicrophoneGuard.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\PrivacyCleaner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\PrivacyCleaner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\Privacy\WebcamProtector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\Privacy\WebcamProtector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\RansomwareProtection\BackupProtector.cpp">
@@ -774,19 +774,19 @@
     <ClCompile Include="src\PhantomCore\Update\UpdateVerifier.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\BadUSBDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\BadUSBDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\DeviceControlManager.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\DeviceControlManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBAutorunBlocker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBAutorunBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBDeviceMonitor.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBDeviceMonitor.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\USB_Protection\USBScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\USB_Protection\USBScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Utils\NetworkUtilsIpAddress.cpp">
@@ -888,28 +888,28 @@
     <ClCompile Include="src\PhantomCore\Utils\XMLUtils.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\AdBlocker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\AdBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\BrowserProtection.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\BrowserProtection.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\ChromeExtensionScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\ChromeExtensionScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\FirefoxAddonScanner.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\FirefoxAddonScanner.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\MaliciousDownloadBlocker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\MaliciousDownloadBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\PhishingDetector.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\PhishingDetector.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\SafeBrowsingAPI.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\SafeBrowsingAPI.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
-    <ClCompile Include="src\Products\PhantomHome\WebProtection\TrackerBlocker.cpp">
+    <ClCompile Include="src\Products\Community\PhantomHome\WebProtection\TrackerBlocker.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
     <ClCompile Include="src\PhantomCore\Whitelist\WhiteListBloomFilter.cpp">
@@ -1745,16 +1745,16 @@
     <ClInclude Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Products\PhantomHome\Backup\BackupManager.hpp">
+    <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Products\PhantomHome\Backup\BackupScheduler.hpp">
+    <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Products\PhantomHome\Backup\IncrementalBackup.hpp">
+    <ClInclude Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
-    <ClInclude Include="src\Products\PhantomHome\Backup\RestoreManager.hpp">
+    <ClInclude Include="src\Products\Community\PhantomHome\Backup\RestoreManager.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Core\System\BootTimeAnalyzer.hpp">
