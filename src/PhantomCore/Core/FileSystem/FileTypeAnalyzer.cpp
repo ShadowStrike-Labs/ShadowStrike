@@ -48,10 +48,12 @@
 
 // Infrastructure includes
 #include "../../Utils/Logger.hpp"
+#include "../../Utils/JSONUtils.hpp"
 
 // Standard library
 #include <algorithm>
 #include <cctype>
+#include <charconv>
 #include <fstream>
 #include <sstream>
 #include <map>
@@ -1789,9 +1791,73 @@ public:
     }
 
     size_t LoadSignatures(const std::wstring& signaturePath) {
-        (void)signaturePath;
-        SS_LOG_WARN(L"FileTypeAnalyzer", L"FileTypeAnalyzer: Custom signature loading not yet implemented");
-        return 0;
+        namespace JSON = ShadowStrike::Utils::JSON;
+
+        JSON::Json root;
+        JSON::Error parseErr;
+        if (!JSON::LoadFromFile(signaturePath, root, &parseErr)) {
+            SS_LOG_ERROR(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer: Failed to load signature file: %hs",
+                parseErr.message.c_str());
+            return 0;
+        }
+
+        if (!root.is_array()) {
+            SS_LOG_ERROR(L"FileTypeAnalyzer",
+                L"FileTypeAnalyzer: Signature file root must be a JSON array");
+            return 0;
+        }
+
+        size_t loaded = 0;
+        for (const auto& entry : root) {
+            try {
+                MagicSignature sig;
+
+                std::string desc;
+                if (JSON::Get<std::string>(entry, "name", desc)) {
+                    sig.description = desc;
+                }
+
+                sig.offset = JSON::GetOr<uint32_t>(entry, "offset", 0);
+
+                int categoryInt = JSON::GetOr<int>(entry, "category", 0);
+                sig.format = static_cast<FileFormat>(categoryInt);
+
+                // Parse hex pattern string into byte vector
+                std::string hexPattern;
+                if (JSON::Get<std::string>(entry, "pattern", hexPattern)) {
+                    sig.pattern.reserve(hexPattern.size() / 2);
+                    for (size_t i = 0; i + 1 < hexPattern.size(); i += 2) {
+                        unsigned int byte = 0;
+                        auto [ptr, ec] = std::from_chars(
+                            hexPattern.data() + i, hexPattern.data() + i + 2,
+                            byte, 16);
+                        if (ec != std::errc{}) {
+                            SS_LOG_WARN(L"FileTypeAnalyzer",
+                                L"FileTypeAnalyzer: Invalid hex in pattern for '%hs'", desc.c_str());
+                            break;
+                        }
+                        sig.pattern.push_back(static_cast<uint8_t>(byte));
+                    }
+                }
+
+                if (sig.pattern.empty()) {
+                    continue;
+                }
+
+                if (AddSignature(sig)) {
+                    ++loaded;
+                }
+            }
+            catch (const std::exception& e) {
+                SS_LOG_WARN(L"FileTypeAnalyzer",
+                    L"FileTypeAnalyzer: Skipped malformed signature entry: %hs", e.what());
+            }
+        }
+
+        SS_LOG_INFO(L"FileTypeAnalyzer",
+            L"FileTypeAnalyzer: Loaded %zu custom signatures", loaded);
+        return loaded;
     }
 
     // ========================================================================

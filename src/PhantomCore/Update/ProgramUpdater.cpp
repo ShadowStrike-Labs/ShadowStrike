@@ -605,11 +605,60 @@ public:
             return true;
         }
 
-        // Installer method — not implemented inline.
+        // Installer method — execute staged installer silently.
         if (package.installMethod == InstallMethod::Installer) {
-            SS_LOG_ERROR(kLogCategory,
-                L"Installer-based updates not supported for individual components");
-            return false;
+            std::wstring cmdLine = stagedPath.wstring()
+                + L" /S /SILENT /VERYSILENT /norestart";
+
+            STARTUPINFOW si{};
+            si.cb = sizeof(si);
+            PROCESS_INFORMATION pi{};
+
+            BOOL created = ::CreateProcessW(
+                nullptr,
+                cmdLine.data(),
+                nullptr,
+                nullptr,
+                FALSE,
+                CREATE_NO_WINDOW,
+                nullptr,
+                nullptr,
+                &si,
+                &pi);
+
+            if (!created) {
+                SS_LOG_LAST_ERROR(kLogCategory,
+                    L"CreateProcessW failed for installer: %ls", def.fileName);
+                return false;
+            }
+
+            constexpr DWORD kInstallerTimeoutMs = 5 * 60 * 1000; // 5 minutes
+            DWORD waitResult = ::WaitForSingleObject(pi.hProcess, kInstallerTimeoutMs);
+
+            if (waitResult == WAIT_TIMEOUT) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Installer timed out after %u ms: %ls",
+                    kInstallerTimeoutMs, def.fileName);
+                ::TerminateProcess(pi.hProcess, 1);
+                ::CloseHandle(pi.hProcess);
+                ::CloseHandle(pi.hThread);
+                return false;
+            }
+
+            DWORD exitCode = 0;
+            ::GetExitCodeProcess(pi.hProcess, &exitCode);
+            ::CloseHandle(pi.hProcess);
+            ::CloseHandle(pi.hThread);
+
+            if (exitCode != 0) {
+                SS_LOG_ERROR(kLogCategory,
+                    L"Installer exited with code %u: %ls", exitCode, def.fileName);
+                return false;
+            }
+
+            SS_LOG_INFO(kLogCategory,
+                L"Installer completed successfully: %ls", def.fileName);
+            return true;
         }
 
         return false;

@@ -982,7 +982,10 @@ public:
 
                 default:
                     result.success = false;
-                    result.errorMessage = "Mitigation action not implemented";
+                    result.errorMessage = "Unknown mitigation action type";
+                    SS_LOG_ERROR(L"Network",
+                        L"DDosProtection: Unknown MitigationAction enum value %d",
+                        static_cast<int>(action));
                     break;
             }
 

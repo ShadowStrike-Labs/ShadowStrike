@@ -51,9 +51,33 @@ namespace ShadowStrike {
 
             // Calculate average fill rate if we have entries
             if (stats.totalEntries > 0 && stats.treeHeight > 0) {
-                // Approximate: assume balanced tree for fill rate estimate
-                // Real implementation would traverse tree to calculate
-                stats.averageFillRate = 0.5;  // Placeholder - conservative estimate
+                // B+ tree fill rate: actual entries vs. theoretical max capacity.
+                // For a balanced tree of height h with branching factor B, max
+                // leaf entries ≈ B^(h-1). We estimate B from the index size and
+                // per-node overhead (4 KiB pages are standard).
+                constexpr uint64_t kNodePageSize = 4096;
+                uint64_t estimatedNodes = (stats.totalMemoryBytes > 0)
+                    ? (stats.totalMemoryBytes / kNodePageSize)
+                    : 1;
+                // Leaf nodes constitute roughly half the nodes at height 2+
+                uint64_t estimatedLeaves = (stats.treeHeight > 1)
+                    ? (estimatedNodes / 2) : estimatedNodes;
+                if (estimatedLeaves == 0) estimatedLeaves = 1;
+
+                // Each leaf can hold ~kNodePageSize / sizeof(IndexEntry) entries.
+                // IndexEntry is 32-byte SHA-256 hash + 8-byte offset = 40 bytes,
+                // plus 8 bytes overhead per slot ≈ 48 bytes effective.
+                constexpr uint64_t kEstimatedEntrySize = 48;
+                uint64_t entriesPerLeaf = kNodePageSize / kEstimatedEntrySize;
+                if (entriesPerLeaf == 0) entriesPerLeaf = 1;
+
+                uint64_t maxCapacity = estimatedLeaves * entriesPerLeaf;
+                stats.averageFillRate = (maxCapacity > 0)
+                    ? (static_cast<double>(stats.totalEntries) /
+                       static_cast<double>(maxCapacity))
+                    : 0.5;
+                // Clamp to [0.0, 1.0] — over-estimates possible from node sizing
+                stats.averageFillRate = std::clamp(stats.averageFillRate, 0.0, 1.0);
             }
 
             return stats;

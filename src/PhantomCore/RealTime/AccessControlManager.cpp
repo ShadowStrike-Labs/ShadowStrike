@@ -2584,8 +2584,10 @@ bool AccessControlManager::PerformDiagnostics() const {
 }
 
 void AccessControlManager::InvalidateCache() noexcept {
-    // No explicit cache in current implementation; placeholder for future
-    SS_LOG_DEBUG(L"ACM", L"Cache invalidated (no-op in current implementation)");
+    // ACM uses per-request SID validation via Windows token APIs.
+    // No explicit application-level cache exists; the Windows kernel
+    // handles token caching at the security subsystem level.
+    SS_LOG_DEBUG(L"ACM", L"InvalidateCache: no-op (per-request SID validation, kernel-cached)");
 }
 
 // ============================================================================

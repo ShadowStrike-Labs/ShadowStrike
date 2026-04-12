@@ -442,8 +442,16 @@ struct DNSMonitorImpl {
             analysis.isDGA = dgaScore >= 3;
             analysis.confidence = static_cast<double>(dgaScore) / 4.0;
 
-            // ML score placeholder (would integrate with MachineLearningDetector in real implementation)
-            analysis.mlScore = analysis.confidence;
+            // Weighted feature-based ML scoring:
+            //   entropy contributes 35%, consonant ratio 25%,
+            //   inverse vowel ratio 20%, uncommon bigrams 20%
+            double uncommonBigramFactor =
+                (!bigrams.empty() && uncommonCount > static_cast<int>(bigrams.size() * 0.7))
+                    ? 1.0 : 0.0;
+            analysis.mlScore = analysis.entropy * 0.35
+                             + analysis.consonantRatio * 0.25
+                             + (1.0 - analysis.vowelRatio) * 0.20
+                             + uncommonBigramFactor * 0.20;
 
             // Check against known DGA patterns
             if (m_patternStore) {

@@ -943,17 +943,26 @@ JSScanResult JavaScriptScannerImpl::ScanContent(
         // Compute content hash
         result.sha256 = ComputeContentHash(content);
 
-        // Whitelist check by hash
-        // NOTE: WhitelistStore doesn't yet expose a Meyers' singleton.
-        // When it does, re-enable the fast-path below.  Until then the
-        // catch-all ensures we degrade gracefully.
+        // Whitelist check by hash via WhitelistStore.
+        // WhitelistStore does not yet expose a Meyers' singleton (tracked SHADOW-4521).
+        // When it does, the fast-path below will skip scanning for known-good hashes.
         if (!result.sha256.empty()) {
             try {
-                // TODO(whitelist-singleton): Uncomment when WhitelistStore
-                //   gains Instance().  Tracked in SHADOW-4521.
-                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore singleton pending, skipping whitelist check");
+                Whitelist::WhitelistStore wlStore;
+                if (wlStore.IsInitialized()) {
+                    auto lookupResult = wlStore.IsHashWhitelisted(
+                        result.sha256, Whitelist::HashAlgorithm::SHA256);
+                    if (lookupResult.found) {
+                        result.status = JSScanStatus::Clean;
+                        result.description = "Whitelisted hash — scan skipped";
+                        SS_LOG_DEBUG(LOG_CATEGORY, L"Hash whitelisted, skipping: %hs",
+                            result.sha256.c_str());
+                        InsertCache(result.sha256, result);
+                        return result;
+                    }
+                }
             } catch (...) {
-                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore unavailable, skipping check");
+                SS_LOG_DEBUG(LOG_CATEGORY, L"WhitelistStore unavailable, continuing scan");
             }
         }
 

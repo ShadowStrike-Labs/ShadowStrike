@@ -25,8 +25,10 @@
 #include <condition_variable>
 #include <fstream>
 
-namespace ShadowStrike {
-namespace Communication {
+#include "../Database/LogDB.hpp"
+#include "../Core/Engine/ScanEngine.hpp"
+
+namespace ShadowStrike {namespace Communication {
 
 // ============================================================================
 // HELPERS
@@ -1528,17 +1530,74 @@ bool ReportGeneratorImpl::CancelJob(const std::string& jobId) {
 // DATA AGGREGATION
 // ============================================================================
 
-ThreatStatistics ReportGeneratorImpl::GetThreatStatistics(const TimeRange& /*range*/) {
+ThreatStatistics ReportGeneratorImpl::GetThreatStatistics(const TimeRange& range) {
     ThreatStatistics stats;
-    // Data aggregation placeholder — will be wired to ScanEngine / ThreatDB
-    // when those modules are implemented. Logs a warning so the gap is visible.
-    SS_LOG_DEBUG(L"ReportGen", L"GetThreatStatistics: data sources not yet wired");
+
+    try {
+        auto& logDb = ShadowStrike::Database::LogDB::Instance();
+
+        ShadowStrike::Database::LogDB::QueryFilter filter;
+        filter.minLevel  = ShadowStrike::Database::LogDB::LogLevel::Error;
+        filter.startTime = range.startTime;
+        filter.endTime   = range.endTime;
+        filter.maxResults = 10000;
+
+        auto entries = logDb.Query(filter);
+        stats.totalDetections = entries.size();
+
+        for (const auto& entry : entries) {
+            std::string narrow = ShadowStrike::Utils::StringUtils::ToNarrow(entry.message);
+
+            // Classify by severity
+            if (entry.level == ShadowStrike::Database::LogDB::LogLevel::Fatal) {
+                stats.bySeverity["Critical"]++;
+            } else {
+                stats.bySeverity["High"]++;
+            }
+
+            // Classify by type keywords
+            if (narrow.find("malware") != std::string::npos ||
+                narrow.find("Malware") != std::string::npos) {
+                stats.byType["Malware"]++;
+            } else if (narrow.find("exploit") != std::string::npos ||
+                       narrow.find("Exploit") != std::string::npos) {
+                stats.byType["Exploit"]++;
+            } else if (narrow.find("PUA") != std::string::npos ||
+                       narrow.find("pua") != std::string::npos) {
+                stats.byType["PUA"]++;
+            } else {
+                stats.byType["Other"]++;
+            }
+        }
+
+        SS_LOG_DEBUG(L"ReportGen", L"GetThreatStatistics: %zu detections from LogDB",
+            stats.totalDetections);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"ReportGen", L"GetThreatStatistics: LogDB query failed — %hs", e.what());
+    }
+
     return stats;
 }
 
 ScanStatistics ReportGeneratorImpl::GetScanStatistics(const TimeRange& /*range*/) {
     ScanStatistics stats;
-    SS_LOG_DEBUG(L"ReportGen", L"GetScanStatistics: data sources not yet wired");
+
+    try {
+        auto& engine = ShadowStrike::Core::Engine::ScanEngine::Instance();
+        auto engineStats = engine.GetStatistics();
+
+        stats.totalScans    = engineStats.totalScans;
+        stats.filesScanned  = engineStats.totalScans;
+        stats.avgScanTimeMs = static_cast<uint64_t>(engineStats.averageScanTimeMs);
+
+        SS_LOG_DEBUG(L"ReportGen", L"GetScanStatistics: %llu scans, avg %.2fms",
+            engineStats.totalScans, engineStats.averageScanTimeMs);
+    }
+    catch (const std::exception& e) {
+        SS_LOG_WARN(L"ReportGen", L"GetScanStatistics: ScanEngine query failed — %hs", e.what());
+    }
+
     return stats;
 }
 
