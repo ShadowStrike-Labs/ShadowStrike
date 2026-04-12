@@ -58,13 +58,14 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 %(AdditionalOptions)</AdditionalOptions>
     </ClCompile>
     <Link>
       <SubSystem>Console</SubSystem>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>bcrypt.lib;ncrypt.lib;crypt32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemDefinitionGroup Condition="'$(Configuration)|$(Platform)'=='Release|x64'">
@@ -74,9 +75,9 @@
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
       <LanguageStandard>stdcpp20</LanguageStandard>
-      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
+      <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
-      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 %(AdditionalOptions)</AdditionalOptions>
+      <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 %(AdditionalOptions)</AdditionalOptions>
       <FunctionLevelLinking>true</FunctionLevelLinking>
       <IntrinsicFunctions>true</IntrinsicFunctions>
       <Optimization>MaxSpeed</Optimization>
@@ -86,6 +87,7 @@
       <EnableCOMDATFolding>true</EnableCOMDATFolding>
       <OptimizeReferences>true</OptimizeReferences>
       <GenerateDebugInformation>true</GenerateDebugInformation>
+      <AdditionalDependencies>bcrypt.lib;ncrypt.lib;crypt32.lib;ws2_32.lib;%(AdditionalDependencies)</AdditionalDependencies>
     </Link>
   </ItemDefinitionGroup>
   <ItemGroup>
@@ -102,6 +104,9 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DisassemblerHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ParserUtilsHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\CryptoCertHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\PEParserHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
@@ -115,6 +120,10 @@
     <ClCompile Include="src\DisassemblerHarness.cpp" />
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
+    <ClCompile Include="src\ThreatIntelHarness.cpp" />
+    <ClCompile Include="src\ThreatIntelFeedManagerStub.cpp" />
+    <ClCompile Include="src\ParserUtilsHarness.cpp" />
+    <ClCompile Include="src\CryptoCertHarness.cpp" />
     <ClCompile Include="src\EngineArchitecture.cpp" />
     <ClCompile Include="src\FuzzLoop.cpp" />
     <ClCompile Include="src\HarnessAdapterCatalog.cpp" />
@@ -167,6 +176,25 @@
     <ClCompile Include="..\src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\StringUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\SystemUtils.cpp" />
+    <!-- ThreatIntel feed parsers -->
+    <ClCompile Include="..\src\PhantomCore\ThreatIntel\ThreatIntelFeedManager_parsers.cpp" />
+    <ClCompile Include="..\src\PhantomCore\ThreatIntel\ThreatIntelFormat.cpp" />
+    <!-- JSON / XML / Base64 parsers -->
+    <ClCompile Include="..\src\PhantomCore\Utils\JSONUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\XMLUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\Base64Utils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\External\pugixml\pugixml.cpp" />
+    <!-- Crypto / Certificate / Hash -->
+    <ClCompile Include="..\src\PhantomCore\Utils\CertUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtilsCommon.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_SymmetricCipher.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_AsymmetricCipher.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_SecureBuffer.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_Secure_Random.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_private_key.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\FileUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\HashUtils.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />
