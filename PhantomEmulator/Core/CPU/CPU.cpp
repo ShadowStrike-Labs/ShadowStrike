@@ -907,8 +907,8 @@ ErrorCode CPU::DispatchInstruction(
             }
         }
 
-        // === Non-VEX: MOVBE (0F 38 F0/F1) ===
-        if (op == 0xF0 || op == 0xF1) {
+        // === Non-VEX: MOVBE (0F 38 F0/F1) — NOT F2-prefixed (that's CRC32) ===
+        if ((op == 0xF0 || op == 0xF1) && !inst.prefixes.hasRepNE) {
             auto err = ExecuteDataTransfer(inst, memory);
             if (err == ErrorCode::Success) m_state.AdvanceRIP(inst.length);
             return err;

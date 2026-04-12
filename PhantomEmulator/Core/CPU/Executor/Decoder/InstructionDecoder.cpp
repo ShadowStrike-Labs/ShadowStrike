@@ -154,6 +154,11 @@ vex_opcode_done:
         return ErrorCode::InstructionTooLong;
     }
 
+    // Phase 7: Resolve operands into typed DecodedOperand objects.
+    // This bridges the raw decode (opcode, modrm, sib, displacement, immediate)
+    // and the executor which reads from inst.Op(0)/Op(1)/Op(2).
+    ResolveOperands(out, mode);
+
     out.length = static_cast<uint8_t>(offset);
     return ErrorCode::Success;
 }
@@ -1063,6 +1068,476 @@ bool InstructionDecoder::ReadQword(
     if (offset + 7 >= bytes.size()) return false;
     std::memcpy(&out, &bytes[offset], 8);
     return true;
+}
+
+// ============================================================================
+// Phase 7: Operand Resolution
+// ============================================================================
+// Maps the raw decode (opcode, opcodeMap, modrm, sib, displacement, immediate,
+// prefixes, operandSize) into typed DecodedOperand objects.
+//
+// This is the bridge between the byte-level decoder and the semantic executor.
+// Without this phase, the executor receives zero-initialized operands and
+// returns InvalidOperandSize for any instruction that reads Op(0)/Op(1).
+//
+// Coverage: All one-byte, two-byte (0F), and three-byte (0F 38 / 0F 3A)
+// encodings used by the emulator's dispatch table.
+
+void InstructionDecoder::ResolveOperands(
+    DecodedInstruction& inst,
+    CPUMode mode) noexcept
+{
+    const uint8_t op = inst.opcode;
+    const OperandSize sz = inst.operandSize;
+
+    auto sz8 = OperandSize::Size8;
+
+    // High-byte register detection (AH/CH/DH/BH = indices 4-7 without REX)
+    auto isHighByte8 = [&](uint8_t idx) -> bool {
+        return !inst.prefixes.hasREX && idx >= 4 && idx <= 7;
+    };
+
+    // Build r/m operand (register-direct or memory) into target slot
+    auto buildRM = [&](DecodedOperand& dst, OperandSize rmSz) {
+        uint8_t mod = inst.hasModRM ? Encoding::ModRM_Mod(inst.modrm) : 0;
+        if (mod == Encoding::kMod_Register) {
+            uint8_t rm = Encoding::ModRM_RM(inst.modrm);
+            if (inst.prefixes.hasREX && inst.prefixes.rexB) rm |= 0x08;
+            bool hi = (rmSz == OperandSize::Size8) && isHighByte8(rm);
+            BuildRegOperand(dst, RegType::GPR, hi ? (rm - 4) : rm, rmSz, hi);
+        } else {
+            dst.size = rmSz;
+            BuildMemOperand(dst, inst, mode, inst.prefixes);
+        }
+    };
+
+    // Build ModRM.reg operand into target slot
+    auto buildReg = [&](DecodedOperand& dst, OperandSize regSz) {
+        uint8_t reg = inst.hasModRM ? Encoding::ModRM_Reg(inst.modrm) : 0;
+        if (inst.prefixes.hasREX && inst.prefixes.rexR) reg |= 0x08;
+        bool hi = (regSz == OperandSize::Size8) && isHighByte8(reg);
+        BuildRegOperand(dst, RegType::GPR, hi ? (reg - 4) : reg, regSz, hi);
+    };
+
+    // ====================================================================
+    // One-byte opcode map
+    // ====================================================================
+    if (inst.opcodeMap == OpcodeMap::OneByte) {
+
+        // ALU group: 0x00-0x3F (ADD, OR, ADC, SBB, AND, SUB, XOR, CMP)
+        // Pattern repeats every 8: +0 r/m8,r8  +1 r/m,r  +2 r8,r/m8
+        //                          +3 r,r/m    +4 AL,imm8 +5 eAX,imm
+        if (op <= 0x3F) {
+            uint8_t form = op & 0x07;
+            if (form <= 5) {
+                switch (form) {
+                    case 0: DecodeModRMOperands(inst, sz8, sz8, false); return;
+                    case 1: DecodeModRMOperands(inst, sz, sz, false);  return;
+                    case 2: DecodeModRMOperands(inst, sz8, sz8, true); return;
+                    case 3: DecodeModRMOperands(inst, sz, sz, true);   return;
+                    case 4: DecodeAccumImm(inst, sz8); return;
+                    case 5: DecodeAccumImm(inst, sz);  return;
+                }
+            }
+            return;
+        }
+
+        // PUSH reg / POP reg (0x50-0x5F)
+        if (op >= 0x50 && op <= 0x5F) {
+            OperandSize pushSz = (mode == CPUMode::Long64) ? OperandSize::Size64 : sz;
+            DecodeOpcodeReg(inst, op, pushSz, inst.prefixes);
+            return;
+        }
+
+        // PUSH imm (0x68 = imm16/32, 0x6A = imm8)
+        if (op == 0x68 || op == 0x6A) {
+            OperandSize immSz = (op == 0x6A) ? OperandSize::Size8 : sz;
+            BuildImmOperand(inst.operands[0], inst.immediate, immSz, true);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // Jcc short (0x70-0x7F)
+        if (op >= 0x70 && op <= 0x7F) {
+            BuildRelOperand(inst.operands[0], inst.immediate, OperandSize::Size8);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // ALU group 1 (0x80-0x83): r/m, imm
+        if (op >= 0x80 && op <= 0x83) {
+            OperandSize rmSz = (op == 0x80 || op == 0x82) ? sz8 : sz;
+            OperandSize immSz = (op == 0x80 || op == 0x82) ? sz8 :
+                                (op == 0x83) ? OperandSize::Size8 : sz;
+            buildRM(inst.operands[0], rmSz);
+            BuildImmOperand(inst.operands[1], inst.immediate, immSz, true);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // TEST r/m, r (0x84 byte, 0x85 word/dword/qword)
+        if (op == 0x84 || op == 0x85) {
+            OperandSize testSz = (op == 0x84) ? sz8 : sz;
+            DecodeModRMOperands(inst, testSz, testSz, false);
+            return;
+        }
+
+        // XCHG r, r/m (0x86 byte, 0x87 word/dword/qword)
+        if (op == 0x86 || op == 0x87) {
+            OperandSize xchgSz = (op == 0x86) ? sz8 : sz;
+            DecodeModRMOperands(inst, xchgSz, xchgSz, true);
+            return;
+        }
+
+        // MOV (0x88-0x8B)
+        if (op >= 0x88 && op <= 0x8B) {
+            bool isByte = (op == 0x88 || op == 0x8A);
+            bool regIsDst = (op == 0x8A || op == 0x8B);
+            OperandSize movSz = isByte ? sz8 : sz;
+            DecodeModRMOperands(inst, movSz, movSz, regIsDst);
+            return;
+        }
+
+        // MOV segment (0x8C: r/m16,Sreg  0x8E: Sreg,r/m16)
+        if (op == 0x8C || op == 0x8E) {
+            uint8_t sreg = inst.hasModRM ? Encoding::ModRM_Reg(inst.modrm) : 0;
+            if (op == 0x8C) {
+                buildRM(inst.operands[0], OperandSize::Size16);
+                BuildRegOperand(inst.operands[1], RegType::Segment, sreg, OperandSize::Size16);
+            } else {
+                BuildRegOperand(inst.operands[0], RegType::Segment, sreg, OperandSize::Size16);
+                buildRM(inst.operands[1], OperandSize::Size16);
+            }
+            inst.operandCount = 2;
+            return;
+        }
+
+        // LEA r, m (0x8D)
+        if (op == 0x8D) {
+            buildReg(inst.operands[0], sz);
+            buildRM(inst.operands[1], sz);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // XCHG eAX, r (0x91-0x97) / NOP (0x90)
+        if (op >= 0x90 && op <= 0x97) {
+            if (op == 0x90) return; // NOP
+            BuildRegOperand(inst.operands[0], RegType::GPR, 0, sz);
+            uint8_t reg2 = op & 0x07;
+            if (inst.prefixes.hasREX && inst.prefixes.rexB) reg2 |= 0x08;
+            BuildRegOperand(inst.operands[1], RegType::GPR, reg2, sz);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // CBW/CWD (0x98/0x99), PUSHF/POPF (0x9C/0x9D), SAHF/LAHF (0x9E/0x9F)
+        if (op >= 0x98 && op <= 0x9F) return;
+
+        // MOV AL/AX moffs (0xA0-0xA3)
+        if (op >= 0xA0 && op <= 0xA3) {
+            bool isByte = (op == 0xA0 || op == 0xA2);
+            OperandSize mSz = isByte ? sz8 : sz;
+            if (op <= 0xA1) {
+                BuildRegOperand(inst.operands[0], RegType::GPR, 0, mSz);
+                inst.operands[1].type = OperandType::Memory;
+                inst.operands[1].size = mSz;
+                inst.operands[1].mem = {};
+                inst.operands[1].mem.displacement = inst.immediate;
+                inst.operands[1].mem.baseReg = 0xFF;
+                inst.operands[1].mem.indexReg = 0xFF;
+                inst.operands[1].mem.scale = 1;
+                inst.operands[1].mem.segment = SegReg::DS;
+            } else {
+                inst.operands[0].type = OperandType::Memory;
+                inst.operands[0].size = mSz;
+                inst.operands[0].mem = {};
+                inst.operands[0].mem.displacement = inst.immediate;
+                inst.operands[0].mem.baseReg = 0xFF;
+                inst.operands[0].mem.indexReg = 0xFF;
+                inst.operands[0].mem.scale = 1;
+                inst.operands[0].mem.segment = SegReg::DS;
+                BuildRegOperand(inst.operands[1], RegType::GPR, 0, mSz);
+            }
+            inst.operandCount = 2;
+            return;
+        }
+
+        // String ops (0xA4-0xA7, 0xAA-0xAF) — implicit operands
+        if ((op >= 0xA4 && op <= 0xA7) || (op >= 0xAA && op <= 0xAF)) return;
+
+        // TEST AL/eAX, imm (0xA8, 0xA9)
+        if (op == 0xA8 || op == 0xA9) {
+            DecodeAccumImm(inst, (op == 0xA8) ? sz8 : sz);
+            return;
+        }
+
+        // MOV reg, imm8 (0xB0-0xB7)
+        if (op >= 0xB0 && op <= 0xB7) {
+            uint8_t reg = op & 0x07;
+            if (inst.prefixes.hasREX && inst.prefixes.rexB) reg |= 0x08;
+            bool hi = isHighByte8(reg);
+            BuildRegOperand(inst.operands[0], RegType::GPR,
+                            hi ? (reg - 4) : reg, sz8, hi);
+            BuildImmOperand(inst.operands[1], inst.immediate, sz8, false);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // MOV reg, imm (0xB8-0xBF)
+        if (op >= 0xB8 && op <= 0xBF) {
+            uint8_t reg = op & 0x07;
+            if (inst.prefixes.hasREX && inst.prefixes.rexB) reg |= 0x08;
+            BuildRegOperand(inst.operands[0], RegType::GPR, reg, sz);
+            BuildImmOperand(inst.operands[1], inst.immediate, sz, false);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // Shift/Rotate group 2 (0xC0/0xC1: r/m, imm8)
+        if (op == 0xC0 || op == 0xC1) {
+            OperandSize shSz = (op == 0xC0) ? sz8 : sz;
+            buildRM(inst.operands[0], shSz);
+            BuildImmOperand(inst.operands[1], inst.immediate, OperandSize::Size8, false);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // RET near (0xC2: imm16, 0xC3: no operands)
+        if (op == 0xC2) {
+            BuildImmOperand(inst.operands[0], inst.immediate, OperandSize::Size16, false);
+            inst.operandCount = 1;
+            return;
+        }
+        if (op == 0xC3) return;
+
+        // MOV group 11 (0xC6: r/m8,imm8  0xC7: r/m,imm)
+        if (op == 0xC6 || op == 0xC7) {
+            OperandSize mSz = (op == 0xC6) ? sz8 : sz;
+            buildRM(inst.operands[0], mSz);
+            BuildImmOperand(inst.operands[1], inst.immediate, mSz, false);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // ENTER/LEAVE (0xC8/0xC9)
+        if (op == 0xC8 || op == 0xC9) return;
+
+        // INT3 (0xCC), INT imm8 (0xCD)
+        if (op == 0xCC) return;
+        if (op == 0xCD) {
+            BuildImmOperand(inst.operands[0], inst.immediate, OperandSize::Size8, false);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // Shift/Rotate (0xD0/0xD1: r/m,1  0xD2/0xD3: r/m,CL)
+        if (op >= 0xD0 && op <= 0xD3) {
+            OperandSize shSz = (op == 0xD0 || op == 0xD2) ? sz8 : sz;
+            buildRM(inst.operands[0], shSz);
+            if (op <= 0xD1) {
+                BuildImmOperand(inst.operands[1], 1, OperandSize::Size8, false);
+            } else {
+                BuildRegOperand(inst.operands[1], RegType::GPR, 1, OperandSize::Size8);
+            }
+            inst.operandCount = 2;
+            return;
+        }
+
+        // CALL rel (0xE8)
+        if (op == 0xE8) {
+            BuildRelOperand(inst.operands[0], inst.immediate, sz);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // JMP near (0xE9), JMP short (0xEB)
+        if (op == 0xE9) {
+            BuildRelOperand(inst.operands[0], inst.immediate, sz);
+            inst.operandCount = 1;
+            return;
+        }
+        if (op == 0xEB) {
+            BuildRelOperand(inst.operands[0], inst.immediate, OperandSize::Size8);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // IN/OUT (0xE4-0xE7, 0xEC-0xEF) — implicit
+        if ((op >= 0xE4 && op <= 0xE7) || (op >= 0xEC && op <= 0xEF)) return;
+
+        // HLT (0xF4)
+        if (op == 0xF4) return;
+
+        // Flag manipulation (0xF8-0xFD: CLC/STC/CLI/STI/CLD/STD)
+        if (op >= 0xF8 && op <= 0xFD) return;
+
+        // Unary group 3 (0xF6/0xF7): TEST/NOT/NEG/MUL/IMUL/DIV/IDIV
+        if (op == 0xF6 || op == 0xF7) {
+            OperandSize uSz = (op == 0xF6) ? sz8 : sz;
+            buildRM(inst.operands[0], uSz);
+            inst.operandCount = 1;
+            if (inst.opcodeExt == 0) {
+                BuildImmOperand(inst.operands[1], inst.immediate, uSz, false);
+                inst.operandCount = 2;
+            }
+            return;
+        }
+
+        // INC/DEC/CALL/JMP/PUSH group 5 (0xFE: byte, 0xFF)
+        if (op == 0xFE || op == 0xFF) {
+            OperandSize gSz = (op == 0xFE) ? sz8 : sz;
+            buildRM(inst.operands[0], gSz);
+            inst.operandCount = 1;
+            return;
+        }
+
+        return;
+    }
+
+    // ====================================================================
+    // Two-byte opcode map (0F xx)
+    // ====================================================================
+    if (inst.opcodeMap == OpcodeMap::TwoByte) {
+
+        // Jcc near (0x80-0x8F)
+        if (op >= 0x80 && op <= 0x8F) {
+            BuildRelOperand(inst.operands[0], inst.immediate, OperandSize::Size32);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // SETcc (0x90-0x9F)
+        if (op >= 0x90 && op <= 0x9F) {
+            buildRM(inst.operands[0], sz8);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // MOVZX (0xB6: r,r/m8  0xB7: r,r/m16)
+        if (op == 0xB6 || op == 0xB7) {
+            OperandSize srcSz = (op == 0xB6) ? sz8 : OperandSize::Size16;
+            buildReg(inst.operands[0], sz);
+            buildRM(inst.operands[1], srcSz);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // MOVSX (0xBE: r,r/m8  0xBF: r,r/m16)
+        if (op == 0xBE || op == 0xBF) {
+            OperandSize srcSz = (op == 0xBE) ? sz8 : OperandSize::Size16;
+            buildReg(inst.operands[0], sz);
+            buildRM(inst.operands[1], srcSz);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // POPCNT/BSF/TZCNT/BSR/LZCNT (0xB8, 0xBC, 0xBD)
+        if (op == 0xB8 || op == 0xBC || op == 0xBD) {
+            buildReg(inst.operands[0], sz);
+            buildRM(inst.operands[1], sz);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // IMUL r, r/m (0xAF)
+        if (op == 0xAF) {
+            DecodeModRMOperands(inst, sz, sz, true);
+            return;
+        }
+
+        // CMOVcc (0x40-0x4F)
+        if (op >= 0x40 && op <= 0x4F) {
+            DecodeModRMOperands(inst, sz, sz, true);
+            return;
+        }
+
+        // BT/BTS/BTR/BTC register form (0xA3/0xAB/0xB3/0xBB)
+        if (op == 0xA3 || op == 0xAB || op == 0xB3 || op == 0xBB) {
+            DecodeModRMOperands(inst, sz, sz, false);
+            return;
+        }
+
+        // BT group imm8 (0xBA)
+        if (op == 0xBA) {
+            buildRM(inst.operands[0], sz);
+            BuildImmOperand(inst.operands[1], inst.immediate, OperandSize::Size8, false);
+            inst.operandCount = 2;
+            return;
+        }
+
+        // BSWAP (0xC8-0xCF)
+        if (op >= 0xC8 && op <= 0xCF) {
+            uint8_t reg = op & 0x07;
+            if (inst.prefixes.hasREX && inst.prefixes.rexB) reg |= 0x08;
+            BuildRegOperand(inst.operands[0], RegType::GPR, reg, sz);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // XADD (0xC0/0xC1)
+        if (op == 0xC0 || op == 0xC1) {
+            OperandSize xSz = (op == 0xC0) ? sz8 : sz;
+            DecodeModRMOperands(inst, xSz, xSz, false);
+            return;
+        }
+
+        // CMPXCHG (0xB0/0xB1)
+        if (op == 0xB0 || op == 0xB1) {
+            OperandSize cSz = (op == 0xB0) ? sz8 : sz;
+            DecodeModRMOperands(inst, cSz, cSz, false);
+            return;
+        }
+
+        // No-operand: CPUID, RDTSC, UD2, SYSCALL, SYSENTER
+        if (op == 0xA2 || op == 0x31 || op == 0x0B ||
+            op == 0x05 || op == 0x34) {
+            return;
+        }
+
+        // RDRAND/RDSEED (0xC7)
+        if (op == 0xC7) {
+            buildRM(inst.operands[0], sz);
+            inst.operandCount = 1;
+            return;
+        }
+
+        // Generic two-byte with ModRM fallback (SSE, etc.)
+        if (inst.hasModRM) {
+            DecodeModRMOperands(inst, sz, sz, true);
+            return;
+        }
+
+        return;
+    }
+
+    // ====================================================================
+    // Three-byte opcode maps (0F 38 xx / 0F 3A xx)
+    // ====================================================================
+    if (inst.opcodeMap == OpcodeMap::ThreeByte38 ||
+        inst.opcodeMap == OpcodeMap::ThreeByte3A) {
+        if (inst.hasModRM) {
+            if (inst.opcodeMap == OpcodeMap::ThreeByte3A) {
+                buildReg(inst.operands[0], sz);
+                buildRM(inst.operands[1], sz);
+                BuildImmOperand(inst.operands[2], inst.immediate, OperandSize::Size8, false);
+                inst.operandCount = 3;
+            } else {
+                DecodeModRMOperands(inst, sz, sz, true);
+            }
+            return;
+        }
+        return;
+    }
+
+    // VEX/EVEX — the executor reads from prefixes/modrm directly in many
+    // cases; for critical paths resolve the standard reg,r/m form here.
+    if (inst.prefixes.hasVEX || inst.prefixes.hasEVEX) {
+        if (inst.hasModRM) {
+            DecodeModRMOperands(inst, sz, sz, true);
+        }
+        return;
+    }
 }
 
 } // namespace Phantom
