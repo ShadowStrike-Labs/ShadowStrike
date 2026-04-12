@@ -675,6 +675,16 @@ vex_done:
                 }
                 instruction.operand_count = 1;
                 instruction.operand_count_visible = 1;
+            } else if (op == 0xC7 && ModRM_Mod(ctx.modrm) == kMod_Register) {
+                uint8_t ext = ctx.opcodeExt;
+                if (ext == 6 || ext == 7) {
+                    uint8_t rm = ModRM_RM(ctx.modrm); if (ctx.rexB) rm |= 0x08;
+                    BuildRegOperand(operands[0], ResolveGPR(rm, sz, ctx.hasREX), sz);
+                    instruction.operand_count = 1;
+                    instruction.operand_count_visible = 1;
+                } else {
+                    DecodeModRMOperands(ctx, instruction, operands, sz, sz, true);
+                }
             } else if (op == 0xB6 || op == 0xBE) {
                 DecodeModRMOperands(ctx, instruction, operands, sz, 8, true);
             } else if (op == 0xB7 || op == 0xBF) {
@@ -1678,6 +1688,9 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0xB1: return Mnemonic::CMPXCHG;
         case 0xB6: return Mnemonic::MOVZX;
         case 0xB7: return Mnemonic::MOVZX;
+        case 0xB8:
+            if (ctx.hasRep) return Mnemonic::POPCNT;
+            return Mnemonic::UNKNOWN;
         case 0xBA: {
             switch (ext) {
             case 4: return Mnemonic::BT;
@@ -1715,6 +1728,11 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0xC7: {
             if (ext == 1) {
                 return ctx.rexW ? Mnemonic::CMPXCHG16B : Mnemonic::CMPXCHG8B;
+            }
+            uint8_t mod = ModRM_Mod(ctx.modrm);
+            if (mod == kMod_Register) {
+                if (ext == 6) return Mnemonic::RDRAND;
+                if (ext == 7) return Mnemonic::RDSEED;
             }
             return Mnemonic::UNKNOWN;
         }
@@ -1841,6 +1859,12 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0x3F: return Mnemonic::PMAXUD;
         case 0x40: return Mnemonic::PMULLD;
         case 0x41: return Mnemonic::PHMINPOSUW;
+        // AES-NI legacy (66 0F 38 DB-DF)
+        case 0xDB: if (ctx.hasOpSizeOverride) return Mnemonic::AESIMC;      return Mnemonic::UNKNOWN;
+        case 0xDC: if (ctx.hasOpSizeOverride) return Mnemonic::AESENC;      return Mnemonic::UNKNOWN;
+        case 0xDD: if (ctx.hasOpSizeOverride) return Mnemonic::AESENCLAST;  return Mnemonic::UNKNOWN;
+        case 0xDE: if (ctx.hasOpSizeOverride) return Mnemonic::AESDEC;      return Mnemonic::UNKNOWN;
+        case 0xDF: if (ctx.hasOpSizeOverride) return Mnemonic::AESDECLAST;  return Mnemonic::UNKNOWN;
         case 0xF0:
             if (ctx.hasRepNE) return Mnemonic::CRC32_INST;
             return Mnemonic::MOVBE;
@@ -1909,6 +1933,10 @@ Mnemonic Decoder::ResolveMnemonic(const DecodeContext& ctx) const noexcept {
         case 0x63: return Mnemonic::PCMPISTRI;
         // SHA-NI (map 3, NP)
         case 0xCC: return Mnemonic::SHA1RNDS4;
+        // AES-NI (66 0F 3A DF)
+        case 0xDF:
+            if (ctx.hasOpSizeOverride) return Mnemonic::AESKEYGENASSIST;
+            return Mnemonic::UNKNOWN;
         // GFNI affine legacy (66 prefix, map 3, with imm8)
         case 0xCE:
             if (ctx.hasOpSizeOverride) return Mnemonic::GF2P8AFFINEQB;
@@ -2743,6 +2771,23 @@ Mnemonic Decoder::ResolveEVEXMnemonic(const DecodeContext& ctx) const noexcept {
                 case 6: return Mnemonic::VPSLLD;
                 default: return Mnemonic::UNKNOWN;
                 }
+            // Packed integer arithmetic (EVEX 66.0F D0-FF range)
+            case 0xD4: return ctx.vexW ? Mnemonic::VPADDQ : Mnemonic::UNKNOWN;
+            case 0xD5: return Mnemonic::VPMULLW;
+            case 0xDB: return ctx.vexW ? Mnemonic::VPANDQ : Mnemonic::VPANDD;
+            case 0xDF: return ctx.vexW ? Mnemonic::VPANDNQ : Mnemonic::VPANDND;
+            case 0xEB: return ctx.vexW ? Mnemonic::VPORQ : Mnemonic::VPORD;
+            case 0xEF: return ctx.vexW ? Mnemonic::VPXORQ : Mnemonic::VPXORD;
+            case 0xF4: return Mnemonic::VPMULUDQ;
+            case 0xF5: return Mnemonic::VPMADDWD;
+            case 0xF6: return Mnemonic::VPSADBW;
+            case 0xF8: return Mnemonic::VPSUBB;
+            case 0xF9: return Mnemonic::VPSUBW;
+            case 0xFA: return Mnemonic::VPSUBD;
+            case 0xFB: return Mnemonic::VPSUBQ;
+            case 0xFC: return Mnemonic::VPADDB;
+            case 0xFD: return Mnemonic::VPADDW;
+            case 0xFE: return Mnemonic::VPADDD;
             default: break;
             }
         }
@@ -3254,6 +3299,7 @@ InstructionCategory Decoder::ResolveCategory(Mnemonic mnemonic) const noexcept {
     case Mnemonic::WBINVD: case Mnemonic::CLTS: case Mnemonic::SWAPGS:
     case Mnemonic::HLT: case Mnemonic::UD2:
     case Mnemonic::VERR: case Mnemonic::VERW:
+    case Mnemonic::RDRAND: case Mnemonic::RDSEED:
         return InstructionCategory::SYSTEM;
 
     case Mnemonic::NOP: case Mnemonic::PAUSE:
@@ -3494,6 +3540,8 @@ ISAExtension Decoder::ResolveISAExtension(const DecodeContext& ctx) const noexce
         uint8_t op = ctx.opcode;
         if (op == 0xCC) return ISAExtension::SHA_EXT;
         if (op == 0xCE || op == 0xCF) return ISAExtension::GFNI;
+        if (op == 0xDF) return ISAExtension::AES_NI;    // AESKEYGENASSIST
+        if (op == 0x44) return ISAExtension::CLMUL;     // PCLMULQDQ
         return ISAExtension::SSE4_1;
     }
 
@@ -3517,6 +3565,8 @@ ISAExtension Decoder::ResolveISAExtension(const DecodeContext& ctx) const noexce
         // CET: WRUSSD/WRUSSQ (66 0F 38 F5)
         if (op == 0xF5 && ctx.hasOpSizeOverride) return ISAExtension::CET;
         if (op >= 0xC8 && op <= 0xCD) return ISAExtension::SHA_EXT;
+        // AES-NI legacy: 66 0F 38 DB-DF
+        if (op >= 0xDB && op <= 0xDF) return ISAExtension::AES_NI;
         if (op == 0xCF) return ISAExtension::GFNI;
         if (op == 0xF8) {
             if (ctx.hasRep) return ISAExtension::ENQCMD_EXT;
@@ -3562,6 +3612,13 @@ ISAExtension Decoder::ResolveISAExtension(const DecodeContext& ctx) const noexce
             return ISAExtension::SSE;
         }
         if (op >= 0xC2 && op <= 0xC6) return ISAExtension::SSE;
+        if (op == 0xC7) {
+            uint8_t ext = ctx.opcodeExt;
+            uint8_t mod = ModRM_Mod(ctx.modrm);
+            if (mod == kMod_Register && ext == 6) return ISAExtension::RDRAND;
+            if (mod == kMod_Register && ext == 7) return ISAExtension::RDSEED;
+            return ISAExtension::BASE;
+        }
         if (op >= 0xD0 && op <= 0xFF) return ISAExtension::SSE2;
         return ISAExtension::BASE;
     }

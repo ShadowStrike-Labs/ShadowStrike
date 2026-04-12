@@ -52,6 +52,12 @@ public:
     void SetDF(bool v) noexcept { SetBit(Flags::DF, v); }
     void SetOF(bool v) noexcept { SetBit(Flags::OF, v); }
 
+    // === Bulk flag manipulation (bitmask-style) ===
+    // Used by SSE/SSE4 comparison instructions (COMISS, COMISD, PCMPESTRI, etc.)
+    // that need to set/clear multiple flags atomically based on comparison results.
+    void Set(uint64_t mask) noexcept { m_flags |= (mask & kWritableMask); }
+    void Clear(uint64_t mask) noexcept { m_flags &= ~(mask & kWritableMask); m_flags |= 0x2; }
+
     // === Parity flag computation ===
     // PF is based on the low 8 bits of the result only
     void UpdatePF(uint64_t result) noexcept {

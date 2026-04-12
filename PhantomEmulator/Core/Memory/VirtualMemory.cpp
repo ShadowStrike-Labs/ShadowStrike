@@ -346,15 +346,26 @@ ErrorCode VirtualMemory::MapRegion(
 {
     if (virtualSize == 0) return ErrorCode::InvalidAddress;
 
-    // Allocate the region first
-    auto result = Allocate(base, virtualSize, protection);
+    // Allocate as RW so we can populate the region with data.
+    // The final protection is applied after the copy completes.
+    auto result = Allocate(base, virtualSize, MemProt::RW);
     if (!result.has_value()) return ErrorCode::OutOfMemory;
 
-    // Write data into it
     if (data && dataSize > 0) {
         uint32_t writeSize = std::min(dataSize, static_cast<uint32_t>(virtualSize));
         auto err = Write(base, data, writeSize);
-        if (err != ErrorCode::Success) return err;
+        if (err != ErrorCode::Success) {
+            Free(base, virtualSize);
+            return err;
+        }
+    }
+
+    // Apply the requested protection now that data is written
+    if (protection != MemProt::RW) {
+        if (!Protect(base, virtualSize, protection)) {
+            Free(base, virtualSize);
+            return ErrorCode::AccessViolationWrite;
+        }
     }
 
     return ErrorCode::Success;

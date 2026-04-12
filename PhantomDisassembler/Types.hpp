@@ -82,7 +82,7 @@ enum class Mnemonic : uint16_t {
 
     // --- System / privileged ---
     SYSCALL, SYSENTER, SYSEXIT, SYSRET,
-    RDTSC, RDTSCP, RDPMC, CPUID, HLT,
+    RDTSC, RDTSCP, RDPMC, CPUID, HLT, RDRAND, RDSEED,
     IN_INST, OUT_INST, INS_INST, OUTS_INST,
 
     // --- Flags ---
@@ -696,6 +696,8 @@ enum class Mnemonic : uint16_t {
     case Mnemonic::RDPMC:         return "rdpmc";
     case Mnemonic::CPUID:         return "cpuid";
     case Mnemonic::HLT:           return "hlt";
+    case Mnemonic::RDRAND:        return "rdrand";
+    case Mnemonic::RDSEED:        return "rdseed";
     case Mnemonic::IN_INST:       return "in";
     case Mnemonic::OUT_INST:      return "out";
     case Mnemonic::INS_INST:      return "ins";

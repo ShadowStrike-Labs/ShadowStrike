@@ -153,6 +153,11 @@ private:
     // Determine the default segment for a memory operand
     [[nodiscard]] SegReg DefaultSegment(uint8_t baseReg) const noexcept;
 
+    // Phase 7: Resolve operands from opcode encoding form
+    // Maps the raw decoded fields (opcode, modrm, immediate) into typed
+    // DecodedOperand objects that the executor can consume directly.
+    void ResolveOperands(DecodedInstruction& inst, CPUMode mode) noexcept;
+
     // === Opcode decode functions (populate operands for specific instruction forms) ===
 
     // Standard ModRM r/m, reg encoding (most ALU ops)
