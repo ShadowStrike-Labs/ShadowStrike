@@ -184,6 +184,7 @@
     <ClCompile Include="src\PhantomCore\Communication\ThreatIntelPusher.cpp" />
     <ClCompile Include="src\PhantomCore\Config\ConfigManager.cpp" />
     <ClCompile Include="src\PhantomCore\Config\PolicyManager.cpp" />
+    <ClCompile Include="src\PhantomCore\Config\ProductTier.cpp" />
     <ClCompile Include="src\PhantomCore\Config\ProfileManager.cpp" />
     <ClCompile Include="src\PhantomCore\Config\SettingsManager.cpp" />
     <ClCompile Include="src\PhantomCore\Core\Engine\BehaviorAnalyzer.cpp" />
@@ -589,6 +590,7 @@
     <ClInclude Include="src\PhantomCore\Communication\ThreatIntelPusher.hpp" />
     <ClInclude Include="src\PhantomCore\Config\ConfigManager.hpp" />
     <ClInclude Include="src\PhantomCore\Config\PolicyManager.hpp" />
+    <ClInclude Include="src\PhantomCore\Config\ProductTier.hpp" />
     <ClInclude Include="src\PhantomCore\Config\ProfileManager.hpp" />
     <ClInclude Include="src\PhantomCore\Config\SettingsManager.hpp" />
     <ClInclude Include="src\PhantomCore\Core\Engine\BehaviorAnalyzer.hpp" />
