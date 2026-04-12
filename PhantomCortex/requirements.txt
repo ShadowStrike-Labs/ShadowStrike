@@ -22,6 +22,8 @@ onnxruntime-extensions>=0.10.0
 # PE Analysis
 lief>=0.14.0
 pefile>=2023.2.7
+signify==0.7.1
+thrember @ git+https://github.com/FutureComputing4AI/EMBER2024.git@main
 
 # Data
 numpy>=1.26.0
@@ -43,6 +45,7 @@ dvc>=3.47.0
 matplotlib>=3.8.0
 seaborn>=0.13.0
 plotly>=5.19.0
+tensorboard>=2.20.0
 
 # Networking (for feeds)
 aiohttp>=3.9.0

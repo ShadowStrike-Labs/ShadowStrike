@@ -24,6 +24,7 @@ mlruns/
 # Environment
 .env
 .venv/
+.venv_local/
 venv/
 
 # IDE
