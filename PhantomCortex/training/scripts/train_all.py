@@ -5,7 +5,7 @@ Master Training Orchestrator for All PhantomCortex Models
 Trains, evaluates, exports, quantizes, and validates all five Cortex models
 in a single invocation:
 
-    1. Cortex-Static   — LightGBM on EMBER PE features (binary)
+    1. Cortex-Static   — LightGBM on EMBER 2024 PE features (binary)
     2. Cortex-Behavioral — 1D-CNN + Attention on API call sequences (20 classes)
     3. Cortex-Memory   — MLP with skip connections on memory regions (5 classes)
     4. Cortex-Network   — Autoencoder + Classifier on network flows (8 classes)
@@ -212,42 +212,54 @@ def _train_static(
     device: str,
     epochs_override: Optional[int],
 ) -> ModelResult:
-    """Train Cortex-Static (LightGBM on EMBER)."""
+    """Train Cortex-Static (LightGBM on EMBER 2024).
+
+    Uses the memory-mapped ember2024_loader to handle the 45 GB+ dataset
+    without exceeding physical RAM.  Subsamples to 2M train / 500K test
+    for a 31 GB system.
+    """
     result = ModelResult(name="cortex_static")
     model_dir = output_dir / "static"
     model_dir.mkdir(parents=True, exist_ok=True)
 
-    try:
-        import ember  # type: ignore[import-untyped]
-    except ImportError:
-        result.error = (
-            "EMBER package not installed. Install with: "
-            "pip install ember (or use --skip-static to skip)"
-        )
-        logger.error(result.error)
-        return result
+    # RAM-safe caps: 2M * 2568 * 4B = ~20.5 GB (leaves headroom for LightGBM)
+    MAX_TRAIN = 2_000_000
+    MAX_TEST = 500_000
 
     try:
+        from PhantomCortex.training.data.ember2024_loader import load_ember2024
         from PhantomCortex.training.models.static_lgbm import CortexStaticTrainer
 
         t0 = time.perf_counter()
-        logger.info("Loading EMBER dataset...")
+        logger.info("Loading EMBER 2024 dataset (memmap + subsample)...")
 
-        ember_dir = output_dir / "data" / "ember"
-        ember_dir.mkdir(parents=True, exist_ok=True)
+        ember_dir = Path(__file__).resolve().parent.parent / "data" / "raw" / "ember2024_pe"
+        if not ember_dir.exists():
+            result.error = (
+                f"EMBER 2024 data directory not found: {ember_dir}. "
+                "Run vectorize_ember2024.py first."
+            )
+            logger.error(result.error)
+            return result
 
-        X_train, y_train, X_test, y_test = ember.read_vectorized_features(str(ember_dir))
+        X_train, y_train, X_test, y_test = load_ember2024(
+            data_dir=ember_dir,
+            download=False,
+            max_train_samples=MAX_TRAIN,
+            max_test_samples=MAX_TEST,
+            seed=seed,
+        )
 
-        train_mask = y_train != -1
-        test_mask = y_test != -1
-        X_train = X_train[train_mask].astype(np.float32)
-        y_train = y_train[train_mask].astype(np.int32)
-        X_test = X_test[test_mask].astype(np.float32)
-        y_test = y_test[test_mask].astype(np.int32)
+        n_features = X_train.shape[1]
+        logger.info(
+            "EMBER 2024 loaded: train=%d test=%d features=%d",
+            X_train.shape[0], X_test.shape[0], n_features,
+        )
 
+        # Split 10% of training data for validation (early stopping)
+        rng = np.random.default_rng(seed)
         n_total = len(y_train)
         n_val = max(1, int(n_total * 0.1))
-        rng = np.random.default_rng(seed)
         val_idx = rng.choice(n_total, size=n_val, replace=False)
         train_idx = np.setdiff1d(np.arange(n_total), val_idx)
 
@@ -256,7 +268,14 @@ def _train_static(
         X_train = X_train[train_idx]
         y_train = y_train[train_idx]
 
-        trainer = CortexStaticTrainer(seed=seed, device=device)
+        logger.info(
+            "Final splits: train=%d val=%d test=%d features=%d",
+            X_train.shape[0], X_val.shape[0], X_test.shape[0], n_features,
+        )
+
+        trainer = CortexStaticTrainer(
+            seed=seed, device="cpu", feature_count=n_features,
+        )
         model = trainer.train(
             X_train, y_train, X_val, y_val,
             early_stopping_rounds=epochs_override if epochs_override else 50,
@@ -269,8 +288,8 @@ def _train_static(
         result.training_time_s = time.perf_counter() - t0
         result.success = True
         logger.info(
-            "Cortex-Static trained: AUC-ROC=%.6f, F1=%.4f",
-            report.auc_roc, report.f1,
+            "Cortex-Static trained on EMBER 2024: AUC-ROC=%.6f, F1=%.4f (%.1fs)",
+            report.auc_roc, report.f1, result.training_time_s,
         )
     except Exception as exc:
         result.error = traceback.format_exc()
