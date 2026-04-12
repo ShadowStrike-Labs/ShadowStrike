@@ -64,6 +64,24 @@ Intel Neural Compressor for < 5 ms inference on any x86-64 CPU.
 
 ---
 
+## Dataset Strategy
+
+PhantomCortex uses **specialized datasets per model family** rather than forcing a
+single shared corpus across unrelated telemetry:
+
+| Model | Training data strategy |
+|-------|------------------------|
+| **Cortex-Static** | EMBER2024 PE subsets (commercial-friendly Apache-2.0 dataset) |
+| **Cortex-Behavioral** | Hybrid external API-trace corpus: Mal-API-2019 family traces + MalbehavD-V1 benign traces, with synthetic backfill for internal classes not covered by public labels |
+| **Cortex-Memory** | Internal / synthetic until a commercial-friendly raw-memory corpus matches the 128-feature contract |
+| **Cortex-Network** | Internal / synthetic until a commercial-friendly flow corpus cleanly maps to the network threat taxonomy |
+| **Cortex-Emulation** | Internal / synthetic until a commercial-friendly emulation-trace corpus is verified |
+
+This preserves model specialization and avoids weakening production classifiers with
+dataset/schema mismatches.
+
+---
+
 ## Quick Start
 
 ```bash

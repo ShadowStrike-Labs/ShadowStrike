@@ -43,6 +43,7 @@ logger = logging.getLogger("PhantomCortex.Training.Bridge")
 _BEHAVIORAL_DEFAULTS: dict[str, Any] = {
     "samples_per_class": 5_000,
     "sequence_length": 512,
+    "dataset_mode": "hybrid",
     "noise_low": 0.10,
     "noise_high": 0.30,
     "failure_rate": 0.05,
@@ -54,7 +55,7 @@ _BEHAVIORAL_DEFAULTS: dict[str, Any] = {
     "grad_clip": 1.0,
     "seed": 42,
     "onnx_opset": 17,
-    "num_workers": 0,
+    "num_workers": -1,
 }
 
 _MEMORY_DEFAULTS: dict[str, Any] = {
@@ -99,6 +100,7 @@ _EMULATION_DEFAULTS: dict[str, Any] = {
 }
 
 _STATIC_DEFAULTS: dict[str, Any] = {
+    "dataset": "ember2024-pe",
     "seed": 42,
     "n_jobs": -1,
     "early_stopping": 50,
@@ -195,7 +197,7 @@ def _dataset_has_new_data(model_name: str, data_dir: Path, output_dir: Path) -> 
 # Per-model training dispatchers
 # ---------------------------------------------------------------------------
 
-def _train_behavioral(output_dir: Path, device: str) -> dict[str, Any]:
+def _train_behavioral(output_dir: Path, data_dir: Path, device: str) -> dict[str, Any]:
     """Train the behavioral 1D-CNN model via its script's run_training()."""
     import argparse
     from PhantomCortex.training.scripts.train_behavioral import run_training
@@ -205,6 +207,10 @@ def _train_behavioral(output_dir: Path, device: str) -> dict[str, Any]:
 
     ns = argparse.Namespace(
         output_dir=model_output,
+        data_dir=str(data_dir / "behavioral"),
+        dataset_mode=defaults["dataset_mode"],
+        no_download=False,
+        no_cache=False,
         device=device,
         samples_per_class=defaults["samples_per_class"],
         sequence_length=defaults["sequence_length"],
@@ -255,8 +261,9 @@ def _train_behavioral(output_dir: Path, device: str) -> dict[str, Any]:
     }
 
 
-def _train_memory(output_dir: Path, device: str) -> dict[str, Any]:
+def _train_memory(output_dir: Path, data_dir: Path, device: str) -> dict[str, Any]:
     """Train the memory MLP model via its script's run_training()."""
+    _ = data_dir
     from PhantomCortex.training.scripts.train_memory import run_training
 
     model_output = str(output_dir / "memory")
@@ -301,8 +308,9 @@ def _train_memory(output_dir: Path, device: str) -> dict[str, Any]:
     }
 
 
-def _train_network(output_dir: Path, device: str) -> dict[str, Any]:
+def _train_network(output_dir: Path, data_dir: Path, device: str) -> dict[str, Any]:
     """Train the network autoencoder+classifier via its script's run_training()."""
+    _ = data_dir
     from PhantomCortex.training.scripts.train_network import run_training
 
     model_output = str(output_dir / "network")
@@ -350,8 +358,9 @@ def _train_network(output_dir: Path, device: str) -> dict[str, Any]:
     }
 
 
-def _train_emulation(output_dir: Path, device: str) -> dict[str, Any]:
+def _train_emulation(output_dir: Path, data_dir: Path, device: str) -> dict[str, Any]:
     """Train the emulation GRU model via its script's run_training()."""
+    _ = data_dir
     from PhantomCortex.training.scripts.train_emulation import run_training
 
     model_output = str(output_dir / "emulation")
@@ -410,10 +419,14 @@ def _train_static(output_dir: Path, data_dir: Path) -> dict[str, Any]:
     model_output = str(output_dir / "cortex_static")
     defaults = _STATIC_DEFAULTS.copy()
 
-    data_dir_str = str(data_dir / "ember") if (data_dir / "ember").is_dir() else str(data_dir)
+    if defaults["dataset"] == "ember2024-pe":
+        data_dir_str = str(data_dir / "ember2024_pe")
+    else:
+        data_dir_str = str(data_dir / "ember") if (data_dir / "ember").is_dir() else str(data_dir)
 
     argv = [
         "--output-dir", model_output,
+        "--dataset", defaults["dataset"],
         "--data-dir", data_dir_str,
         "--seed", str(defaults["seed"]),
         "--n-jobs", str(defaults["n_jobs"]),
@@ -546,7 +559,7 @@ def train_models(
                 result = _train_static(output_dir, data_dir)
             else:
                 trainer_fn = _TRAINERS[model_name]
-                result = trainer_fn(output_dir, device)
+                result = trainer_fn(output_dir, data_dir, device)
 
             results[model_name] = result
             trained_count += 1

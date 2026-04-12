@@ -28,10 +28,12 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import sys
 import time
 from pathlib import Path
 
+import numpy as np
 import torch
 
 # ---------------------------------------------------------------------------
@@ -50,6 +52,14 @@ for _p in (_REPO_DIR, _CORTEX_DIR):
 from PhantomCortex.training.data.behavioral_generator import (  # noqa: E402
     BehavioralDataGenerator,
     GeneratorConfig,
+)
+from PhantomCortex.training.data.behavioral_external_loader import (  # noqa: E402
+    load_behavioral_external_dataset,
+)
+from PhantomCortex.training.data.dataset_utils import (  # noqa: E402
+    compute_class_weights,
+    create_dataloader,
+    split_data,
 )
 from PhantomCortex.training.models.behavioral_cnn import (  # noqa: E402
     BehaviorCategory,
@@ -112,6 +122,15 @@ def _save_metrics(report: MetricsReport, output_dir: Path) -> Path:
     return metrics_path
 
 
+def _resolve_num_workers(requested_workers: int) -> int:
+    """Return the effective DataLoader worker count."""
+    if requested_workers >= 0:
+        return requested_workers
+
+    cpu_count = os.cpu_count() or 4
+    return max(2, min(8, cpu_count // 2))
+
+
 # ---------------------------------------------------------------------------
 # Main training orchestration
 # ---------------------------------------------------------------------------
@@ -137,7 +156,8 @@ def run_training(args: argparse.Namespace) -> None:
         logger.info("GPU: %s (%.1f GiB)", gpu_name, gpu_mem)
 
     # ── Data generation ──────────────────────────────────────────────
-    logger.info("=== Phase 1: Synthetic data generation ===")
+    logger.info("=== Phase 1: Dataset preparation ===")
+    effective_num_workers = _resolve_num_workers(args.num_workers)
     gen_cfg = GeneratorConfig(
         samples_per_class=args.samples_per_class,
         sequence_length=args.sequence_length,
@@ -146,14 +166,68 @@ def run_training(args: argparse.Namespace) -> None:
         failure_rate=args.failure_rate,
         batch_size=args.batch_size,
         seed=args.seed,
-        num_workers=args.num_workers,
+        num_workers=effective_num_workers,
     )
     generator = BehavioralDataGenerator(gen_cfg)
-    train_loader, val_loader, test_loader, class_weights = (
-        generator.generate_dataloaders()
+
+    if args.dataset_mode == "synthetic":
+        logger.info("Generating synthetic behavioral corpus")
+        X, y = generator.generate_dataset()
+    elif args.dataset_mode == "external":
+        logger.info("Loading external behavioral corpus from %s", args.data_dir)
+        X, y, external_meta = load_behavioral_external_dataset(
+            data_dir=args.data_dir,
+            sequence_length=args.sequence_length,
+            download=not args.no_download,
+            cache=not args.no_cache,
+        )
+        logger.info("External dataset summary: %s", external_meta)
+    else:
+        logger.info("Generating synthetic corpus and augmenting with external traces")
+        X_syn, y_syn = generator.generate_dataset()
+        X_ext, y_ext, external_meta = load_behavioral_external_dataset(
+            data_dir=args.data_dir,
+            sequence_length=args.sequence_length,
+            download=not args.no_download,
+            cache=not args.no_cache,
+        )
+        logger.info("External dataset summary: %s", external_meta)
+        X = np.concatenate((X_syn, X_ext), axis=0)
+        y = np.concatenate((y_syn, y_ext), axis=0)
+        logger.info(
+            "Hybrid corpus ready — synthetic=%d external=%d total=%d",
+            y_syn.shape[0],
+            y_ext.shape[0],
+            y.shape[0],
+        )
+
+    (X_train, y_train), (X_val, y_val), (X_test, y_test) = split_data(X, y, seed=args.seed)
+    class_weights = compute_class_weights(y_train)
+    train_loader = create_dataloader(
+        X_train,
+        y_train,
+        batch_size=args.batch_size,
+        shuffle=True,
+        num_workers=effective_num_workers,
+    )
+    val_loader = create_dataloader(
+        X_val,
+        y_val,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=effective_num_workers,
+    )
+    test_loader = create_dataloader(
+        X_test,
+        y_test,
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=effective_num_workers,
     )
     logger.info(
-        "Data ready — train batches=%d  val batches=%d  test batches=%d",
+        "Data ready — mode=%s workers=%d train=%d val=%d test=%d",
+        args.dataset_mode,
+        effective_num_workers,
         len(train_loader),
         len(val_loader),
         len(test_loader),
@@ -239,13 +313,37 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         description=(
             "Train the CortexBehavioral 1D-CNN malware classifier on "
-            "synthetic API-call-sequence data."
+            "synthetic or external API-call-sequence data."
         ),
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
 
     # Data generation
     data = p.add_argument_group("data generation")
+    data.add_argument(
+        "--dataset-mode",
+        choices=("synthetic", "external", "hybrid"),
+        default="synthetic",
+        help="Training corpus selection strategy.",
+    )
+    data.add_argument(
+        "--data-dir",
+        type=str,
+        default=str(_TRAINING_DIR / "data" / "raw" / "behavioral_external"),
+        help="Directory containing external behavioral datasets and caches.",
+    )
+    data.add_argument(
+        "--no-download",
+        action="store_true",
+        default=False,
+        help="Do not download external datasets automatically.",
+    )
+    data.add_argument(
+        "--no-cache",
+        action="store_true",
+        default=False,
+        help="Disable the external-dataset NPZ cache.",
+    )
     data.add_argument(
         "--samples-per-class",
         type=int,
@@ -335,8 +433,8 @@ def build_parser() -> argparse.ArgumentParser:
     out.add_argument(
         "--num-workers",
         type=int,
-        default=0,
-        help="DataLoader worker processes.",
+        default=-1,
+        help="DataLoader worker processes (-1 = auto-tune).",
     )
     out.add_argument(
         "-v",
