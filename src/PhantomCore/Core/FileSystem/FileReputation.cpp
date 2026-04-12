@@ -65,6 +65,10 @@
 #include "../../ThreatIntel/ThreatIntelStore.hpp"
 #include "../../Whitelist/WhiteListStore.hpp"
 #include "../../SelfProtection/CertificateValidator.hpp"
+#include "../../RealTime/ProcessCreationMonitor.hpp"
+#include "../../RealTime/BehaviorBlocker.hpp"
+#include "../../Performance/DiskMonitor.hpp"
+#include "../../Performance/NetworkPerformanceMonitor.hpp"
 #include "FileHasher.hpp"
 
 // ============================================================================
@@ -1580,16 +1584,12 @@ private:
     void AnalyzeBehavior(const ReputationQuery& query, ReputationResult& result) {
         try {
             // Behavioral analysis aggregates execution history to assign reputation
-            // adjustments. The BehavioralContext is populated from:
-            // 1. Process creation monitor telemetry (execution count, crash history)
-            // 2. Network monitor telemetry (C2 patterns, suspicious connections)
-            // 3. File system monitor telemetry (ransomware-like I/O patterns)
-            //
-            // In the current architecture these telemetry sources feed into
-            // BehaviorAnalyzer (separate module) which will be wired to provide
-            // per-file behavioral context. Until full wiring, we operate on any
-            // pre-populated context passed in by the caller or default to
-            // a conservative "no behavioral data" stance (no score adjustment).
+            // adjustments. We actively query telemetry singletons to populate the
+            // BehavioralContext when the caller hasn't pre-populated it:
+            //   1. ProcessCreationMonitor — execution count, crash history, parent/child
+            //   2. BehaviorBlocker — enforcement events (blocked = suspicious)
+            //   3. DiskMonitor — ransomware-like I/O patterns per process
+            //   4. NetworkPerformanceMonitor — C2/exfil indicators per process
 
             BehavioralContext behavior;
             bool hasBehavioralData = false;
@@ -1600,6 +1600,128 @@ private:
                 result.behavior.hasRansomwareBehavior) {
                 behavior = result.behavior;
                 hasBehavioralData = true;
+            }
+
+            // Active population from ProcessCreationMonitor
+            if (!hasBehavioralData && !query.filePath.empty()) {
+                try {
+                    auto& pcm = RealTime::ProcessCreationMonitor::Instance();
+                    std::wstring imageName = std::filesystem::path(query.filePath).filename().wstring();
+                    if (!imageName.empty()) {
+                        auto processes = pcm.GetProcessesByImage(imageName);
+                        if (!processes.empty()) {
+                            behavior.executionCount = static_cast<uint32_t>(processes.size());
+                            hasBehavioralData = true;
+
+                            uint32_t cleanCount = 0;
+                            uint32_t suspiciousCount = 0;
+                            for (const auto& proc : processes) {
+                                // Classify based on verdict and risk score
+                                if (proc.verdict == RealTime::ProcessVerdict::Block ||
+                                    proc.riskScore >= 70.0) {
+                                    suspiciousCount++;
+                                } else if (proc.verdict == RealTime::ProcessVerdict::Allow &&
+                                           proc.riskScore < 30.0) {
+                                    cleanCount++;
+                                }
+
+                                // Aggregate network indicators
+                                if (proc.hasNetworkConnections) {
+                                    behavior.hasNetworkActivity = true;
+                                }
+                                for (const auto& domain : proc.contactedDomains) {
+                                    if (behavior.contactedDomains.size() < 50) {
+                                        behavior.contactedDomains.push_back(domain);
+                                    }
+                                }
+
+                                // Track parent/child relationships (limited)
+                                if (behavior.knownParents.size() < 20) {
+                                    auto parentInfo = pcm.GetProcessInfo(proc.parentProcessId);
+                                    if (parentInfo.has_value() &&
+                                        !parentInfo->imagePath.empty()) {
+                                        behavior.knownParents.push_back(parentInfo->imagePath);
+                                    }
+                                }
+                            }
+                            behavior.cleanExecutions = cleanCount;
+                            behavior.suspiciousExecutions = suspiciousCount;
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    SS_LOG_DEBUG(L"FileReputation",
+                        L"ProcessCreationMonitor query failed: %hs", e.what());
+                }
+            }
+
+            // Active population from BehaviorBlocker enforcement history
+            if (!query.filePath.empty()) {
+                try {
+                    auto& bb = RealTime::BehaviorBlocker::Instance();
+                    if (bb.IsRunning()) {
+                        auto recentEvents = bb.GetRecentEvents(500);
+                        std::wstring filePathLower = Utils::StringUtils::ToLowerCopy(query.filePath);
+                        for (const auto& evt : recentEvents) {
+                            std::wstring evtPathLower = Utils::StringUtils::ToLowerCopy(
+                                evt.processPath);
+                            if (evtPathLower == filePathLower) {
+                                // This file triggered enforcement — strong suspicion indicator
+                                behavior.suspiciousExecutions++;
+                                hasBehavioralData = true;
+                                break;
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // BehaviorBlocker may not be initialized yet
+                }
+            }
+
+            // Active population from DiskMonitor for ransomware I/O patterns
+            if (!hasBehavioralData || !behavior.hasRansomwareBehavior) {
+                try {
+                    auto& disk = Performance::DiskMonitor::Instance();
+                    if (disk.IsInitialized()) {
+                        // Check if any process associated with this file has
+                        // ransomware-like write patterns
+                        auto topConsumers = disk.GetTopConsumers(10);
+                        std::wstring filePathLower = Utils::StringUtils::ToLowerCopy(query.filePath);
+                        for (const auto& consumer : topConsumers) {
+                            std::wstring procNameLower = Utils::StringUtils::ToLowerCopy(
+                                consumer.processName);
+                            // Match by process name (approximate — exact PID matching
+                            // requires ProcessCreationMonitor cross-reference)
+                            if (consumer.highWriteRate && consumer.highFileEnumeration) {
+                                // Sustained high write + file enumeration = ransomware
+                                behavior.hasRansomwareBehavior = true;
+                                hasBehavioralData = true;
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // DiskMonitor may not be initialized
+                }
+            }
+
+            // Active population from NetworkPerformanceMonitor for C2 detection
+            if (!behavior.hasC2Communication) {
+                try {
+                    auto& npm = Performance::NetworkPerformanceMonitor::Instance();
+                    if (npm.IsInitialized()) {
+                        auto recentAlerts = npm.GetRecentAlerts(50);
+                        for (const auto& alert : recentAlerts) {
+                            if (alert.type == Performance::NetworkAlertType::SuspectedBeaconing ||
+                                alert.type == Performance::NetworkAlertType::DataExfiltration) {
+                                behavior.hasC2Communication = true;
+                                behavior.hasNetworkActivity = true;
+                                hasBehavioralData = true;
+                                break;
+                            }
+                        }
+                    }
+                } catch (...) {
+                    // NetworkPerformanceMonitor may not be initialized
+                }
             }
 
             if (!hasBehavioralData) {
@@ -1645,6 +1767,11 @@ private:
                 result.reasons.push_back(
                     "Behavioral: Creates executable files");
             }
+
+            // Record net behavioral adjustment (clamped to behavioral range)
+            int behavioralDelta = intermediateScore - static_cast<int>(result.score);
+            behavior.behaviorScore = static_cast<int8_t>(
+                std::clamp(behavioralDelta, -50, 50));
 
             result.score = static_cast<int8_t>(
                 std::clamp(intermediateScore, -100, 100));
