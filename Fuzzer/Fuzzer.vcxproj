@@ -101,6 +101,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Core\WorkerBackendRuntime.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DisassemblerHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\PEParserHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
@@ -113,6 +114,7 @@
     <ClCompile Include="src\DispatchRuntime.cpp" />
     <ClCompile Include="src\DisassemblerHarness.cpp" />
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
+    <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
     <ClCompile Include="src\EngineArchitecture.cpp" />
     <ClCompile Include="src\FuzzLoop.cpp" />
     <ClCompile Include="src\HarnessAdapterCatalog.cpp" />
@@ -130,6 +132,37 @@
     <ClCompile Include="..\src\PhantomCore\PEParser\PEValidation.cpp" />
     <ClCompile Include="..\PhantomDisassembler\Decoder.cpp" />
     <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\Decoder\InstructionDecoder.cpp" />
+    <!-- PhantomEmulator CPU core -->
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\CPU.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\State\CPUState.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\ExceptionDispatcher.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\HardwareBreakpoints.cpp" />
+    <!-- PhantomEmulator CPU executor ops -->
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\ArithmeticOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\DataTransfer.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\ControlFlow.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\LogicOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\ShiftRotate.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\StringOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\BitManip.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\FlagOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\StackOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\SystemOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\SSE2Ops.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\SSE4Ops.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\AESNIOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\AVX2Ops.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\FPUOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\FMAOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\SHAOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\AVX512Ops.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\CETOps.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\AMXOps.cpp" />
+    <!-- PhantomEmulator memory subsystem -->
+    <ClCompile Include="..\PhantomEmulator\Core\Memory\VirtualMemory.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Memory\MemoryTracker.cpp" />
+    <!-- PhantomEmulator JIT (needed by CPU even when disabled) -->
+    <ClCompile Include="..\PhantomEmulator\Core\JIT\JITCompiler.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\Logger.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\StringUtils.cpp" />
