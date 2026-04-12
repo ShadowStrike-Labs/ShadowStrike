@@ -2,10 +2,13 @@
 #include "ShadowStrike/Fuzzer/Core/CampaignPlanner.hpp"
 #include "ShadowStrike/Fuzzer/Core/DispatchRuntime.hpp"
 #include "ShadowStrike/Fuzzer/Core/EngineArchitecture.hpp"
+#include "ShadowStrike/Fuzzer/Core/FuzzLoop.hpp"
 #include "ShadowStrike/Fuzzer/Core/HarnessAdapterCatalog.hpp"
+#include "ShadowStrike/Fuzzer/Core/MutationEngine.hpp"
 #include "ShadowStrike/Fuzzer/Core/OperationsPipeline.hpp"
 #include "ShadowStrike/Fuzzer/Core/RunnerExecutionRuntime.hpp"
 #include "ShadowStrike/Fuzzer/Core/WorkerBackendRuntime.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/PEParserHarness.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageSchema.hpp"
 #include "ShadowStrike/Fuzzer/Targets/KernelTargetCatalog.hpp"
@@ -50,6 +53,7 @@ void PrintUsage() {
     std::cout
         << "ShadowStrikeFuzzer\n"
         << "Usage:\n"
+        << "  ShadowStrikeFuzzer --fuzz-pe <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --list-targets\n"
         << "  ShadowStrikeFuzzer --describe-target <id>\n"
         << "  ShadowStrikeFuzzer --describe-campaign-plan <id>\n"
@@ -732,6 +736,53 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     const std::wstring_view command = argv[1];
+
+    // PE Parser Fuzzing Command
+    if (command == L"--fuzz-pe") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-pe requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;      // Unlimited by default
+        config.maxDurationSeconds = 0; // Unlimited by default
+        config.maxInputSize = 16 * 1024 * 1024;  // 16MB
+        config.reportIntervalIterations = 1000;
+
+        // Parse optional arguments
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+            
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunPEParserFuzzer(argv[2], config);
+    }
 
     if (command == L"--list-targets") {
         for (const auto& surface : SSF::AttackSurfaceRegistry::GetDefaultRegistry()) {
