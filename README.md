@@ -93,11 +93,11 @@ ShadowStrike Phantom is the alternative:
 |-----------|--------|--------|
 | Architecture | ✅ Complete | Designed and documented |
 | PhantomSensor.sys | ✅ Complete | 20 subsystems · Coverity 0.25 defect/KLoC · Driver Verifier passed |
-| User-Mode Shared Modules | 🔧 85% | 23 modules — security audit phase |
-| PhantomEmulator | 🔧 90% | CPU emulation · 10 DLL stubs · Analysis suite |
-| PhantomCortex AI/ML | 🔧 80% | 5 models trained · ONNX inference · Nightly retraining pipeline |
-| PhantomDisassembler | 📋 Planned | Custom x86/x64 decoder — replacing Zydis dependency |
-| Kernel ↔ User-Mode Wiring | 🔧 70% | Encrypted IPC · Module-by-module integration in progress |
+| User-Mode Shared Modules | 🔧 %96 | 23 modules — security audit phase |
+| PhantomEmulator | 🔧 95% | CPU emulation · 10 DLL stubs · Analysis suite |
+| PhantomCortex AI/ML | 🔧 85% | 5 models trained · ONNX inference · Nightly retraining pipeline |
+| PhantomDisassembler | ✅ Complete | Custom x86/x64 decoder — replacing Zydis dependency |
+| Kernel ↔ User-Mode Wiring | ✅ Complete | Encrypted IPC · Module-by-module integration in progress |
 | Product Tiers (Home/EDR/XDR) | 📋 Planned | After shared infrastructure |
 | Management Dashboard | 📋 Planned | EDR/XDR fleet management |
 | Public Beta | 🎯 Early 2027 | |
