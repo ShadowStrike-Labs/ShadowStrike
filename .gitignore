@@ -389,3 +389,7 @@ SHADOWSTRIKE_3_YEAR_ROADMAP.md
 # Documentation book (draft - not yet published)
 docs/book/
 
+# PhantomCortex training artifacts (large binary files)
+PhantomCortex/training/output/
+PhantomCortex/training/data/raw/
+PhantomCortex/training/data/*_combined.npz
