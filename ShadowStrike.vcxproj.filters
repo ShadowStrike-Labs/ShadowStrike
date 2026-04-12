@@ -123,6 +123,15 @@
     <ClCompile Include="src\PhantomCore\Config\ProductTier.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\API\Http\HttpTypes.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\PhantomCore\API\Http\HttpServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="src\PhantomCore\API\RESTServer.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Config\ProfileManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2118,6 +2127,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Config\ProductTier.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\API\Http\HttpTypes.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\API\Http\HttpServer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\API\RESTServer.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Config\ProfileManager.hpp">
