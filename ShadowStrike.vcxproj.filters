@@ -132,6 +132,9 @@
     <ClCompile Include="src\PhantomCore\API\RESTServer.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="src\PhantomCore\UI\SystemTray.cpp">
+      <Filter>Source Files</Filter>
+    </ClCompile>
     <ClCompile Include="src\PhantomCore\Config\ProfileManager.cpp">
       <Filter>Source Files</Filter>
     </ClCompile>
@@ -2136,6 +2139,9 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\API\RESTServer.hpp">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="src\PhantomCore\UI\SystemTray.hpp">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="src\PhantomCore\Config\ProfileManager.hpp">
