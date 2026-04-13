@@ -431,6 +431,12 @@ struct HighLoadEvent {
  * @brief Statistics
  */
 struct CPUAnalyzerStatistics {
+    CPUAnalyzerStatistics() noexcept = default;
+    CPUAnalyzerStatistics(const CPUAnalyzerStatistics& other) noexcept;
+    CPUAnalyzerStatistics& operator=(const CPUAnalyzerStatistics& other) noexcept;
+    CPUAnalyzerStatistics(CPUAnalyzerStatistics&& other) noexcept;
+    CPUAnalyzerStatistics& operator=(CPUAnalyzerStatistics&& other) noexcept;
+
     /// @brief Samples taken
     std::atomic<uint64_t> samplesTaken{0};
     
