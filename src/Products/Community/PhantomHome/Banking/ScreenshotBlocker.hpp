@@ -406,6 +406,30 @@ struct CaptureAPIHook {
 
     /// @brief Calls intercepted
     std::atomic<uint64_t> callsIntercepted{0};
+
+    CaptureAPIHook() = default;
+
+    CaptureAPIHook(const CaptureAPIHook& other)
+        : moduleName(other.moduleName)
+        , functionName(other.functionName)
+        , originalAddress(other.originalAddress)
+        , hookAddress(other.hookAddress)
+        , isInstalled(other.isInstalled)
+        , callsIntercepted(other.callsIntercepted.load(std::memory_order_relaxed))
+    {}
+
+    CaptureAPIHook& operator=(const CaptureAPIHook& other) {
+        if (this != &other) {
+            moduleName = other.moduleName;
+            functionName = other.functionName;
+            originalAddress = other.originalAddress;
+            hookAddress = other.hookAddress;
+            isInstalled = other.isInstalled;
+            callsIntercepted.store(other.callsIntercepted.load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+        return *this;
+    }
 };
 
 /**
@@ -441,6 +465,44 @@ struct ScreenshotBlockerStatistics {
 
     /// @brief Start time
     TimePoint startTime = Clock::now();
+
+    ScreenshotBlockerStatistics() = default;
+
+    ScreenshotBlockerStatistics(const ScreenshotBlockerStatistics& other) noexcept
+        : totalProtectedWindows(other.totalProtectedWindows.load(std::memory_order_relaxed))
+        , currentlyProtected(other.currentlyProtected.load(std::memory_order_relaxed))
+        , captureAttemptsDetected(other.captureAttemptsDetected.load(std::memory_order_relaxed))
+        , captureAttemptsBlocked(other.captureAttemptsBlocked.load(std::memory_order_relaxed))
+        , clipboardEventsFiltered(other.clipboardEventsFiltered.load(std::memory_order_relaxed))
+        , gdiCallsIntercepted(other.gdiCallsIntercepted.load(std::memory_order_relaxed))
+        , dxCallsIntercepted(other.dxCallsIntercepted.load(std::memory_order_relaxed))
+        , whitelistedPasses(other.whitelistedPasses.load(std::memory_order_relaxed))
+        , startTime(other.startTime)
+    {
+        for (size_t i = 0; i < byCaptureType.size(); ++i) {
+            byCaptureType[i].store(other.byCaptureType[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+    }
+
+    ScreenshotBlockerStatistics& operator=(const ScreenshotBlockerStatistics& other) noexcept {
+        if (this != &other) {
+            totalProtectedWindows.store(other.totalProtectedWindows.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            currentlyProtected.store(other.currentlyProtected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            captureAttemptsDetected.store(other.captureAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            captureAttemptsBlocked.store(other.captureAttemptsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            clipboardEventsFiltered.store(other.clipboardEventsFiltered.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            gdiCallsIntercepted.store(other.gdiCallsIntercepted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dxCallsIntercepted.store(other.dxCallsIntercepted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            whitelistedPasses.store(other.whitelistedPasses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+            for (size_t i = 0; i < byCaptureType.size(); ++i) {
+                byCaptureType[i].store(other.byCaptureType[i].load(std::memory_order_relaxed),
+                                       std::memory_order_relaxed);
+            }
+        }
+        return *this;
+    }
 
     /**
      * @brief Reset statistics
