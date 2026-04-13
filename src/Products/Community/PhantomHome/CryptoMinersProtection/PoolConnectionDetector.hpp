@@ -73,12 +73,14 @@
  *
  * INTEGRATION:
  * ============
- * - Utils::NetworkUtils for traffic capture
- * - ThreatIntel for pool blacklists
+ * - Snapshot-based connection inspection for live TCP telemetry
+ * - Optional parsing of caller-supplied cleartext Stratum payloads
+ * - ThreatIntel for domain/IP reputation when available
  * - CryptoMinerDetector for correlation
  *
- * @note Requires packet capture capability.
- * @note Deep packet inspection for non-encrypted traffic.
+ * @note Payload parsing only applies to caller-supplied cleartext traffic.
+ * @note Encrypted or proxied pools are identified via endpoint heuristics, not fake DPI.
+ * @note The detector blacklists indicators for external policy engines; it does not inline-block traffic.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -133,11 +135,11 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "../../../../PhantomCore/Utils/HashUtils.hpp"
+#include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "../../../../PhantomCore/Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -205,7 +207,10 @@ enum class PoolProtocolType : uint8_t {
     GetWork             = 5,    ///< Legacy getwork
     GetBlockTemplate    = 6,    ///< getblocktemplate
     EthereumStratum     = 7,    ///< eth-proxy stratum
-    CryptoNightStratum  = 8     ///< CryptoNight stratum
+    CryptoNightStratum  = 8,    ///< CryptoNight stratum
+    StratumOverTls      = 9,    ///< Stratum tunneled over TLS/SSL
+    StratumOverWebSocket= 10,   ///< WebSocket/WebSocket Secure pool traffic
+    JsonRpc             = 11    ///< Generic JSON-RPC mining channel
 };
 
 /**
@@ -248,7 +253,10 @@ enum class StratumCommand : uint8_t {
     Reconnect           = 7,    ///< client.reconnect
     GetVersion          = 8,    ///< client.get_version
     EthSubmitWork       = 9,    ///< eth_submitWork
-    EthSubmitHashrate   = 10    ///< eth_submitHashrate
+    EthSubmitHashrate   = 10,   ///< eth_submitHashrate
+    EthGetWork          = 11,   ///< eth_getWork
+    Login               = 12,   ///< login / eth_submitLogin
+    KeepAlive           = 13    ///< keepalived
 };
 
 /**
@@ -496,7 +504,13 @@ struct PoolDetectorStatistics {
     std::array<std::atomic<uint64_t>, 16> byProtocol{};
     std::array<std::atomic<uint64_t>, 16> byCrypto{};
     TimePoint startTime = Clock::now();
-    
+
+    PoolDetectorStatistics() = default;
+    PoolDetectorStatistics(const PoolDetectorStatistics& other) noexcept;
+    PoolDetectorStatistics& operator=(const PoolDetectorStatistics& other) noexcept;
+    PoolDetectorStatistics(PoolDetectorStatistics&&) = delete;
+    PoolDetectorStatistics& operator=(PoolDetectorStatistics&&) = delete;
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -508,18 +522,21 @@ struct PoolConnectionDetectorConfiguration {
     /// @brief Enable Stratum detection
     bool enableStratumDetection = true;
     
-    /// @brief Enable deep packet inspection
+    /// @brief Enable bounded parsing of caller-supplied cleartext payloads
     bool enableDeepPacketInspection = true;
     
-    /// @brief Block stratum traffic
+    /// @brief Flag Stratum detections for external policy enforcement (no inline blocking)
     bool blockStratumTraffic = true;
     
-    /// @brief Block known malicious pools
+    /// @brief Mark known malicious pools as blacklisted for policy decisions
     bool blockMaliciousPools = true;
     
     /// @brief Monitor ports (empty = all stratum ports)
     std::vector<uint16_t> monitorPorts;
     
+    /// @brief Track first-seen time across snapshots to estimate connection duration
+    bool trackConnectionDuration = true;
+
     /// @brief Extract wallet addresses
     bool extractWalletAddresses = true;
     
@@ -603,16 +620,16 @@ public:
         std::span<const uint8_t> payload);
     
     /// @brief Get active pool connections
-    [[nodiscard]] std::vector<PoolConnectionInfo> GetActiveConnections() const;
+    [[nodiscard]] std::vector<PoolConnectionInfo> GetActiveConnections();
     
     /// @brief Get connections for process
     [[nodiscard]] std::vector<PoolConnectionInfo> GetProcessConnections(
-        uint32_t processId) const;
+        uint32_t processId);
     
-    /// @brief Block pool address
+    /// @brief Blacklist pool address for policy evaluation
     [[nodiscard]] bool BlockPoolAddress(const std::string& address);
     
-    /// @brief Unblock pool address
+    /// @brief Remove pool address from the detector blacklist
     void UnblockPoolAddress(const std::string& address);
     
     /// @brief Load pool blacklist
