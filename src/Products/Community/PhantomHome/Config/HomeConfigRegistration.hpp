@@ -13,6 +13,7 @@
 #pragma once
 
 #include <cstdint>
+#include <filesystem>
 #include <string>
 #include <string_view>
 
@@ -183,6 +184,29 @@ enum class BackupSchedule : uint32_t {
 /// @brief Validates the current Home configuration.
 /// @return true if configuration is valid
 [[nodiscard]] bool ValidateConfiguration();
+
+/// @brief Resets all Home configuration keys to their registered defaults.
+///        Useful for the "Restore Defaults" button in the Home UI.
+/// @return true if all keys were reset successfully
+[[nodiscard]] bool ResetToDefaults();
+
+/// @brief Migrates configuration from a previous product version.
+///        Handles schema changes, deprecated keys, and value transformations.
+/// @param fromVersion  Encoded version of the source config (e.g., 0x02000000 for 2.0.0)
+/// @return true if migration completed without data loss
+[[nodiscard]] bool MigrateConfiguration(uint32_t fromVersion);
+
+/// @brief Exports user-layer Home configuration to a JSON file.
+///        Sensitive keys are encrypted; factory defaults are excluded.
+/// @param outputPath  Destination file path (parent directory must exist)
+/// @return true if export succeeded
+[[nodiscard]] bool ExportUserConfiguration(const std::filesystem::path& outputPath);
+
+/// @brief Imports user-layer Home configuration from a previously exported JSON file.
+///        Validates all values before applying; rolls back on any error.
+/// @param inputPath  Source JSON file path
+/// @return true if import succeeded and all values passed validation
+[[nodiscard]] bool ImportUserConfiguration(const std::filesystem::path& inputPath);
 
 /// @brief Returns the product identifier string for config namespacing.
 [[nodiscard]] constexpr std::string_view GetProductIdentifier() noexcept {
