@@ -57,7 +57,7 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpp23</LanguageStandard>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 %(AdditionalOptions)</AdditionalOptions>
@@ -74,7 +74,7 @@
       <TreatWarningAsError>true</TreatWarningAsError>
       <SDLCheck>true</SDLCheck>
       <ConformanceMode>true</ConformanceMode>
-      <LanguageStandard>stdcpp20</LanguageStandard>
+      <LanguageStandard>stdcpp23</LanguageStandard>
       <AdditionalIncludeDirectories>$(ProjectDir)include;$(ProjectDir)..;$(ProjectDir)..\include;$(ProjectDir)..\src;$(ProjectDir)..\src\PhantomCore;$(ProjectDir)..\PhantomEmulator\Core\CPU;%(AdditionalIncludeDirectories)</AdditionalIncludeDirectories>
       <PreprocessorDefinitions>UNICODE;_UNICODE;WIN32_LEAN_AND_MEAN;NOMINMAX;%(PreprocessorDefinitions)</PreprocessorDefinitions>
       <AdditionalOptions>/utf-8 /wd4201 /wd4100 /wd4189 /wd4834 /wd4005 /wd4458 /wd4324 /wd4459 /wd4456 /wd4244 %(AdditionalOptions)</AdditionalOptions>
@@ -104,6 +104,8 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DisassemblerHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\SignaturePatternHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\StringPathHashHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelFormatHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ParserUtilsHarness.hpp" />
@@ -122,6 +124,8 @@
     <ClCompile Include="src\DisassemblerHarness.cpp" />
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
+    <ClCompile Include="src\SignaturePatternHarness.cpp" />
+    <ClCompile Include="src\StringPathHashHarness.cpp" />
     <ClCompile Include="src\ThreatIntelHarness.cpp" />
     <ClCompile Include="src\ThreatIntelFormatHarness.cpp" />
     <ClCompile Include="src\ThreatIntelFeedManagerStub.cpp" />
@@ -200,6 +204,12 @@
     <ClCompile Include="..\src\PhantomCore\Utils\CryptoUtils_private_key.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\FileUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\HashUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\SignatureStore\SignatureFormat.cpp" />
+    <ClCompile Include="..\src\PhantomCore\PatternStore\PatternStore.cpp" />
+    <ClCompile Include="..\src\PhantomCore\PatternStore\PatternIndex.cpp" />
+    <ClCompile Include="..\src\PhantomCore\PatternStore\aho_crsck_impl.cpp" />
+    <ClCompile Include="..\src\PhantomCore\PatternStore\boyer_moore_impl.cpp" />
+    <ClCompile Include="..\src\PhantomCore\PatternStore\SIMD_matcher_impl.cpp" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

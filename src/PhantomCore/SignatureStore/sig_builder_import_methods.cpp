@@ -25,7 +25,7 @@
  *
  *
  * High-performance import methods for signature database building.
- * Supports: Hash files, CSV, JSON, YARA rules, ClamAV, Database merge
+ * Supports: Hash files, CSV, JSON, YARA rules, Database merge
  *
  * SECURITY: All inputs validated, DoS-protected, bounds-checked
  *
@@ -60,7 +60,6 @@ namespace {
     constexpr uint64_t MAX_CSV_FILE_SIZE = 500ULL * 1024 * 1024;       // 500MB
     constexpr uint64_t MAX_PATTERN_FILE_SIZE = 500ULL * 1024 * 1024;   // 500MB
     constexpr uint64_t MAX_YARA_FILE_SIZE = 100ULL * 1024 * 1024;      // 100MB
-    constexpr uint64_t MAX_CLAMAV_FILE_SIZE = 500ULL * 1024 * 1024;    // 500MB
     constexpr uint64_t MAX_JSON_SIZE = 100ULL * 1024 * 1024;           // 100MB
     constexpr uint64_t MAX_IMPORT_DB_SIZE = 10ULL * 1024 * 1024 * 1024; // 10GB
 
@@ -68,8 +67,6 @@ namespace {
     constexpr size_t MAX_LINE_LENGTH = 10000;
     constexpr size_t MAX_CSV_LINE_LENGTH = 50000;
     constexpr size_t MAX_PATTERN_LINE_LENGTH = 100000;
-    constexpr size_t MAX_CLAMAV_LINE_LENGTH = 50000;
-
     // Field length limits
     constexpr size_t MAX_NAME_LENGTH = 256;
     constexpr size_t MAX_DESCRIPTION_LENGTH = 4096;
@@ -80,8 +77,6 @@ namespace {
     constexpr size_t HASH_BATCH_SIZE = 1000;
     constexpr size_t CSV_BATCH_SIZE = 500;
     constexpr size_t PATTERN_BATCH_SIZE = 500;
-    constexpr size_t CLAMAV_BATCH_SIZE = 500;
-
     // Timeout limits (milliseconds)
     constexpr uint64_t IMPORT_TIMEOUT_MS = 300000;        // 5 minutes
     constexpr uint64_t DIRECTORY_IMPORT_TIMEOUT_MS = 600000; // 10 minutes
@@ -1882,324 +1877,6 @@ namespace {
             return batchResult;
         }
 
-        StoreError SignatureBuilder::ImportPatternsFromClamAV(
-            const std::wstring& filePath
-        ) noexcept {
-            SS_LOG_INFO(L"SignatureBuilder", L"ImportPatternsFromClamAV: %s", filePath.c_str());
-
-            // ========================================================================
-            // STEP 1: FILE VALIDATION
-            // ========================================================================
-            if (filePath.empty()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Empty file path");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path cannot be empty" };
-            }
-
-            if (filePath.length() > MAX_PATH) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromClamAV: Path too long (%zu > %u)",
-                    filePath.length(), MAX_PATH);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File path too long" };
-            }
-
-            // Check file existence
-            DWORD attribs = GetFileAttributesW(filePath.c_str());
-            if (attribs == INVALID_FILE_ATTRIBUTES || (attribs & FILE_ATTRIBUTE_DIRECTORY)) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromClamAV: File not found: %s", filePath.c_str());
-                return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "File not found" };
-            }
-
-            // Check file size using RAII guard
-            FileHandleGuard hFileGuard(CreateFileW(filePath.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr,
-                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr));
-
-            if (!hFileGuard.isValid()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Cannot open file");
-                return StoreError{ SignatureStoreError::FileNotFound, GetLastError(), "Cannot open file" };
-            }
-
-            LARGE_INTEGER fileSize{};
-            if (!GetFileSizeEx(hFileGuard.get(), &fileSize)) {
-                DWORD err = GetLastError();
-                return StoreError{ SignatureStoreError::Unknown, err, "Cannot get file size" };
-            }
-
-            if (fileSize.QuadPart == 0) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: File is empty");
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File is empty" };
-            }
-
-            if (static_cast<uint64_t>(fileSize.QuadPart) > MAX_CLAMAV_FILE_SIZE) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromClamAV: File too large (%llu bytes)",
-                    static_cast<uint64_t>(fileSize.QuadPart));
-                return StoreError{ SignatureStoreError::InvalidFormat, 0, "File too large" };
-            }
-            // FileHandleGuard auto-closes handle on scope exit
-
-            // ========================================================================
-            // STEP 2: OPEN FILE STREAM
-            // ========================================================================
-            std::ifstream file(filePath);
-            if (!file.is_open()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Cannot open file stream");
-                return StoreError{ SignatureStoreError::FileNotFound, 0, "Cannot open file stream" };
-            }
-
-            // ========================================================================
-            // STEP 3: PROCESS CLAMAV LINES
-            // ========================================================================
-            // Format: SignatureName:TargetType:Offset:HexSignature[:Flags]
-            std::string line;
-            size_t lineNum = 0;
-            size_t validCount = 0;
-            size_t invalidCount = 0;
-            std::vector<PatternSignatureInput> batchEntries;
-            
-            try {
-                batchEntries.reserve(5000);
-            } catch (const std::bad_alloc&) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Memory allocation failed");
-                return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
-            }
-
-            LARGE_INTEGER startTime{}, currentTime{};
-            QueryPerformanceCounter(&startTime);
-
-            // Ensure m_perfFrequency is valid
-            if (m_perfFrequency.QuadPart <= 0) {
-                QueryPerformanceFrequency(&m_perfFrequency);
-                if (m_perfFrequency.QuadPart <= 0) {
-                    m_perfFrequency.QuadPart = DEFAULT_PERF_FREQUENCY;
-                }
-            }
-
-            while (std::getline(file, line)) {
-                lineNum++;
-
-                // Overflow protection
-                if (lineNum == std::numeric_limits<size_t>::max()) {
-                    SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: Line counter overflow");
-                    break;
-                }
-
-                // ====================================================================
-                // TIMEOUT CHECK
-                // ====================================================================
-                if (lineNum % 500 == 0) {
-                    QueryPerformanceCounter(&currentTime);
-                    uint64_t elapsedMs = safeElapsedMs(startTime, currentTime, m_perfFrequency);
-
-                    if (elapsedMs > IMPORT_TIMEOUT_MS) {
-                        SS_LOG_ERROR(L"SignatureBuilder",
-                            L"ImportPatternsFromClamAV: Import timeout after %zu lines", lineNum);
-                        file.close();
-                        return StoreError{ SignatureStoreError::Unknown, 0, "Import timeout" };
-                    }
-                }
-
-                // ====================================================================
-                // LINE VALIDATION
-                // ====================================================================
-                if (line.empty() || line.front() == '#') {
-                    continue;
-                }
-
-                // Check for null bytes
-                if (line.find('\0') != std::string::npos) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu contains null bytes - skipping", lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                // Check line length
-                if (line.length() > MAX_CLAMAV_LINE_LENGTH) {
-                    SS_LOG_WARN(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu too long (%zu) - skipping",
-                        lineNum, line.length());
-                    invalidCount++;
-                    continue;
-                }
-
-                // Trim whitespace using safe function
-                safeTrim(line);
-
-                if (line.empty()) {
-                    continue;
-                }
-
-                // ====================================================================
-                // PARSE CLAMAV FORMAT
-                // ====================================================================
-                // Find delimiters: SignatureName:TargetType:Offset:HexSignature
-                size_t pos1 = line.find(':');
-                if (pos1 == std::string::npos || pos1 == 0) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu missing first colon", lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                size_t pos2 = line.find(':', pos1 + 1);
-                if (pos2 == std::string::npos) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu missing second colon", lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                size_t pos3 = line.find(':', pos2 + 1);
-                if (pos3 == std::string::npos) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu missing third colon", lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                // Extract components
-                std::string name = line.substr(0, pos1);
-                std::string targetType = line.substr(pos1 + 1, pos2 - pos1 - 1);
-                std::string offsetStr = line.substr(pos2 + 1, pos3 - pos2 - 1);
-                std::string hexSignature = line.substr(pos3 + 1);
-
-                // ====================================================================
-                // VALIDATE COMPONENTS
-                // ====================================================================
-                if (name.empty() || name.length() > 256) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu invalid name length (%zu)",
-                        lineNum, name.length());
-                    invalidCount++;
-                    continue;
-                }
-
-                if (hexSignature.empty() || hexSignature.length() > MAX_CLAMAV_LINE_LENGTH) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu invalid hex pattern length",
-                        lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                // Validate hex pattern contains only valid hex characters or wildcards
-                bool validHex = true;
-                for (char c : hexSignature) {
-                    if (!std::isxdigit(c) && c != '?' && c != ' ') {
-                        validHex = false;
-                        break;
-                    }
-                }
-
-                if (!validHex) {
-                    SS_LOG_DEBUG(L"SignatureBuilder",
-                        L"ImportPatternsFromClamAV: Line %zu invalid hex characters", lineNum);
-                    invalidCount++;
-                    continue;
-                }
-
-                // ====================================================================
-                // CREATE PATTERN INPUT
-                // ====================================================================
-                PatternSignatureInput input{};
-                input.name = name;
-                input.patternString = hexSignature;
-                input.threatLevel = ThreatLevel::High;
-                input.description = "ClamAV signature (target: " + targetType + ", offset: " + offsetStr + ")";
-                
-                try {
-                    input.source = ShadowStrike::Utils::StringUtils::ToNarrow(filePath);
-                } catch (...) {
-                    input.source = "clamav_import";
-                }
-
-                try {
-                    batchEntries.push_back(std::move(input));
-                    validCount++;
-                } catch (const std::bad_alloc&) {
-                    SS_LOG_ERROR(L"SignatureBuilder", 
-                        L"ImportPatternsFromClamAV: Memory allocation failed at line %zu", lineNum);
-                    return StoreError{ SignatureStoreError::OutOfMemory, 0, "Memory allocation failed" };
-                }
-
-                // ====================================================================
-                // BATCH PROCESSING
-                // ====================================================================
-                if (batchEntries.size() >= CLAMAV_BATCH_SIZE) {
-                    for (auto& entry : batchEntries) {
-                        try {
-                            StoreError err = AddPattern(entry);
-                            if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
-                                SS_LOG_WARN(L"SignatureBuilder",
-                                    L"ImportPatternsFromClamAV: Failed to add pattern: %S",
-                                    err.message.c_str());
-                            }
-                        } catch (const std::exception& ex) {
-                            SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportPatternsFromClamAV: Exception adding pattern: %S", ex.what());
-                        }
-                    }
-                    batchEntries.clear();
-                }
-            }
-
-            // ========================================================================
-            // STEP 4: PROCESS REMAINING ENTRIES
-            // ========================================================================
-            if (!batchEntries.empty()) {
-                for (auto& entry : batchEntries) {
-                    try {
-                        StoreError err = AddPattern(entry);
-                        if (!err.IsSuccess() && err.code != SignatureStoreError::DuplicateEntry) {
-                            SS_LOG_WARN(L"SignatureBuilder",
-                                L"ImportPatternsFromClamAV: Failed to add pattern: %S",
-                                err.message.c_str());
-                        }
-                    } catch (const std::exception& ex) {
-                        SS_LOG_WARN(L"SignatureBuilder",
-                            L"ImportPatternsFromClamAV: Exception adding pattern: %S", ex.what());
-                    }
-                }
-                batchEntries.clear();
-            }
-
-            // ========================================================================
-            // STEP 5: ERROR CHECKING
-            // ========================================================================
-            if (file.bad()) {
-                SS_LOG_ERROR(L"SignatureBuilder", L"ImportPatternsFromClamAV: File read error");
-                return StoreError{ SignatureStoreError::Unknown, 0, "File read error" };
-            }
-
-            file.close();
-
-            // ========================================================================
-            // STEP 6: VALIDATION & REPORTING
-            // ========================================================================
-            if (validCount == 0) {
-                SS_LOG_ERROR(L"SignatureBuilder",
-                    L"ImportPatternsFromClamAV: No valid patterns (lines: %zu, invalid: %zu)",
-                    lineNum, invalidCount);
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "No valid ClamAV signatures found" };
-            }
-
-            QueryPerformanceCounter(&currentTime);
-            uint64_t elapsedUs = safeElapsedUs(startTime, currentTime, m_perfFrequency);
-
-            SS_LOG_INFO(L"SignatureBuilder",
-                L"ImportPatternsFromClamAV: Complete - %zu valid, %zu invalid from %zu lines in %llu µs",
-                validCount, invalidCount, lineNum, elapsedUs);
-
-            if (invalidCount > 0) {
-                return StoreError{ SignatureStoreError::InvalidFormat, 0,
-                    "ClamAV import completed with errors: " + std::to_string(validCount) + " valid, " +
-                    std::to_string(invalidCount) + " invalid" };
-            }
-
-            return StoreError{ SignatureStoreError::Success };
-        }
         // ============================================================================
         // PRODUCTION-GRADE DATABASE IMPORT - COMPLETE IMPLEMENTATION
         // ============================================================================

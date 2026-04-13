@@ -455,7 +455,7 @@ StoreError BatchSignatureBuilder::AddSourceFiles(
  * @param recursive Whether to scan subdirectories
  * @return StoreError indicating success or failure reason
  *
- * Scans directory for supported signature file types (.yar, .yara, .txt, .csv, .clamav, .sigs)
+ * Scans directory for supported signature file types (.yar, .yara, .txt, .csv, .sigs)
  * with comprehensive security validation.
  */
 StoreError BatchSignatureBuilder::AddSourceDirectory(
@@ -572,7 +572,6 @@ StoreError BatchSignatureBuilder::AddSourceDirectory(
                     L".yar", L".yara",   // YARA rules
                     L".txt",             // Text/list files
                     L".csv",             // CSV files
-                    L".clamav",          // ClamAV signatures
                     L".sigs"             // Generic signatures
                 };
 
@@ -1113,7 +1112,7 @@ StoreError BatchSignatureBuilder::BuildParallel() noexcept {
                         // report the original error for the remainder
                     }
                 }
-                else if (ext == L".clamav" || ext == L".sigs") {
+                else if (ext == L".sigs") {
                     err = m_builder.ImportPatternsFromFile(filePath);
                 }
                 else {

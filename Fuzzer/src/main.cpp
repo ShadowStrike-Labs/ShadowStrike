@@ -15,6 +15,8 @@
 #include "ShadowStrike/Fuzzer/Harnesses/CryptoCertHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/CompressionHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ParserUtilsHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/SignaturePatternHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/StringPathHashHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ThreatIntelHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ThreatIntelFormatHarness.hpp"
 #include "ShadowStrike/Fuzzer/Protocol/KernelMessageFactory.hpp"
@@ -68,6 +70,8 @@ void PrintUsage() {
         << "  ShadowStrikeFuzzer --fuzz-crypto <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-compression <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-parsers <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-signature-pattern <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-string-path-hash <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-threatintel <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-threatintel-fmt <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --list-targets\n"
@@ -1074,6 +1078,98 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         return SSF::RunCompressionFuzzer(argv[2], config);
+    }
+
+    // Signature Format and PatternStore Fuzzing Command
+    if (command == L"--fuzz-signature-pattern") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-signature-pattern requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 4096;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunSignaturePatternFuzzer(argv[2], config);
+    }
+
+    // String, Path, and Hash Utility Fuzzing Command
+    if (command == L"--fuzz-string-path-hash") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-string-path-hash requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 4096;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunStringPathHashFuzzer(argv[2], config);
     }
 
     // ThreatIntel Feed Parser Fuzzing Command
