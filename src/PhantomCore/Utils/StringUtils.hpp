@@ -287,6 +287,18 @@ namespace ShadowStrike {
              */
             [[nodiscard]] std::wstring FormatV(const wchar_t* fmt, va_list args);
 
+            // ============================================================================
+            // JSON Escaping
+            // ============================================================================
+
+            /**
+             * @brief Escapes a narrow (UTF-8) string for safe embedding in JSON values.
+             * @param input String to escape.
+             * @return JSON-escaped string per RFC 8259.
+             * @note Escapes control characters, backslash, double quote, and solidus.
+             */
+            [[nodiscard]] std::string EscapeJson(std::string_view input);
+
         } // namespace StringUtils
 
     } // namespace Utils

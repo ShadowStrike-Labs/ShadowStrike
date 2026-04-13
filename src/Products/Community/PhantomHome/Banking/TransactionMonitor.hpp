@@ -143,6 +143,7 @@
 #include "../../../PhantomCore/Utils/NetworkUtils.hpp"
 #include "../../../PhantomCore/Utils/CryptoUtils.hpp"
 #include "../../../PhantomCore/Utils/HashUtils.hpp"
+#include "../../../PhantomCore/Utils/StringUtils.hpp"
 #include "../../../PhantomCore/HashStore/HashStore.hpp"
 #include "../../../PhantomCore/PatternStore/PatternStore.hpp"
 #include "../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
@@ -651,6 +652,47 @@ struct BeneficiaryProfile {
  * @brief Monitor statistics
  */
 struct TransactionMonitorStatistics {
+    TransactionMonitorStatistics() = default;
+
+    /// @brief Explicit copy constructor (std::atomic is non-copyable)
+    TransactionMonitorStatistics(const TransactionMonitorStatistics& other) noexcept
+        : totalTransactionsMonitored(other.totalTransactionsMonitored.load(std::memory_order_relaxed))
+        , transactionsValidated(other.transactionsValidated.load(std::memory_order_relaxed))
+        , anomaliesDetected(other.anomaliesDetected.load(std::memory_order_relaxed))
+        , transactionsBlocked(other.transactionsBlocked.load(std::memory_order_relaxed))
+        , userConfirmations(other.userConfirmations.load(std::memory_order_relaxed))
+        , domManipulationsDetected(other.domManipulationsDetected.load(std::memory_order_relaxed))
+        , uiPayloadMismatches(other.uiPayloadMismatches.load(std::memory_order_relaxed))
+        , newBeneficiaries(other.newBeneficiaries.load(std::memory_order_relaxed))
+        , totalAmountMonitoredCents(other.totalAmountMonitoredCents.load(std::memory_order_relaxed))
+        , startTime(other.startTime)
+    {
+        for (size_t i = 0; i < byAttackVector.size(); ++i)
+            byAttackVector[i].store(other.byAttackVector[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byRiskLevel.size(); ++i)
+            byRiskLevel[i].store(other.byRiskLevel[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    /// @brief Explicit copy assignment (std::atomic is non-copyable)
+    TransactionMonitorStatistics& operator=(const TransactionMonitorStatistics& other) noexcept {
+        if (this != &other) {
+            totalTransactionsMonitored.store(other.totalTransactionsMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            transactionsValidated.store(other.transactionsValidated.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            anomaliesDetected.store(other.anomaliesDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            transactionsBlocked.store(other.transactionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            userConfirmations.store(other.userConfirmations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            domManipulationsDetected.store(other.domManipulationsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            uiPayloadMismatches.store(other.uiPayloadMismatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            newBeneficiaries.store(other.newBeneficiaries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAmountMonitoredCents.store(other.totalAmountMonitoredCents.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+            for (size_t i = 0; i < byAttackVector.size(); ++i)
+                byAttackVector[i].store(other.byAttackVector[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byRiskLevel.size(); ++i)
+                byRiskLevel[i].store(other.byRiskLevel[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+        return *this;
+    }
     /// @brief Total transactions monitored
     std::atomic<uint64_t> totalTransactionsMonitored{0};
     

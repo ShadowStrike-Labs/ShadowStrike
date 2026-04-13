@@ -751,6 +751,36 @@ namespace ShadowStrike {
                 return result;
             }
 
+            // ================================================================
+            // JSON Escaping
+            // ================================================================
+
+            std::string EscapeJson(std::string_view input) {
+                std::string out;
+                out.reserve(input.size() + input.size() / 8);
+                for (unsigned char c : input) {
+                    switch (c) {
+                        case '"':  out += "\\\""; break;
+                        case '\\': out += "\\\\"; break;
+                        case '\b': out += "\\b";  break;
+                        case '\f': out += "\\f";  break;
+                        case '\n': out += "\\n";  break;
+                        case '\r': out += "\\r";  break;
+                        case '\t': out += "\\t";  break;
+                        default:
+                            if (c < 0x20) {
+                                char buf[8];
+                                std::snprintf(buf, sizeof(buf), "\\u%04x", c);
+                                out += buf;
+                            } else {
+                                out += static_cast<char>(c);
+                            }
+                            break;
+                    }
+                }
+                return out;
+            }
+
         } // namespace StringUtils
     } // namespace Utils
 } // namespace ShadowStrike

@@ -42,7 +42,9 @@
 #include <iomanip>
 #include <algorithm>
 #include <cmath>
+#include <cctype>
 #include <deque>
+#include <fstream>
 #include <shared_mutex>
 
 namespace ShadowStrike {
@@ -155,8 +157,11 @@ std::atomic<bool> TransactionMonitor::s_instanceCreated{false};
 }
 
 [[nodiscard]] std::string MaskAccountNumber(std::string_view account) {
+    if (account.empty()) {
+        return std::string{};
+    }
     if (account.length() <= 4) {
-        return std::string(account);
+        return std::string(account.length(), '*');
     }
     std::string masked(account.length(), '*');
     std::copy(account.end() - 4, account.end(), masked.end() - 4);
@@ -164,23 +169,63 @@ std::atomic<bool> TransactionMonitor::s_instanceCreated{false};
 }
 
 [[nodiscard]] Hash256 HashAccountNumber(std::string_view account) {
-    // In a real implementation, use Utils::CryptoUtils
-    // Here we use a stub implementation for demonstration
     Hash256 hash{};
-    uint64_t h = 0xcbf29ce484222325;
-    for (char c : account) {
-        h ^= c;
-        h *= 0x100000001b3;
+    if (account.empty()) return hash;
+
+    Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+    if (!hasher.Init()) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"HashAccountNumber: SHA-256 hasher init failed");
+        return hash;
     }
-    std::memcpy(hash.data(), &h, sizeof(h));
+    if (!hasher.Update(account.data(), account.size())) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"HashAccountNumber: SHA-256 update failed");
+        return hash;
+    }
+    std::vector<uint8_t> digest;
+    if (!hasher.Final(digest)) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"HashAccountNumber: SHA-256 finalize failed");
+        return hash;
+    }
+    const size_t copyLen = (std::min)(digest.size(), hash.size());
+    std::memcpy(hash.data(), digest.data(), copyLen);
     return hash;
 }
 
 [[nodiscard]] bool ValidateIBAN(std::string_view iban) {
-    // Basic length check for demonstration
-    // Real implementation would implement MOD-97 algorithm
     if (iban.length() < 15 || iban.length() > 34) return false;
-    return true;
+
+    // Country code: 2 letters, check digits: 2 digits
+    if (!std::isalpha(static_cast<unsigned char>(iban[0])) ||
+        !std::isalpha(static_cast<unsigned char>(iban[1]))) return false;
+    if (!std::isdigit(static_cast<unsigned char>(iban[2])) ||
+        !std::isdigit(static_cast<unsigned char>(iban[3]))) return false;
+
+    // Remaining characters must be alphanumeric
+    for (size_t i = 4; i < iban.length(); ++i) {
+        if (!std::isalnum(static_cast<unsigned char>(iban[i]))) return false;
+    }
+
+    // MOD-97 check per ISO 13616: move first 4 chars to end, convert letters
+    // to digits (A=10..Z=35), compute remainder mod 97 — must equal 1.
+    std::string numericStr;
+    numericStr.reserve(iban.length() * 2);
+    auto appendChar = [&](char c) {
+        if (std::isdigit(static_cast<unsigned char>(c))) {
+            numericStr += c;
+        } else {
+            int val = std::toupper(static_cast<unsigned char>(c)) - 'A' + 10;
+            numericStr += std::to_string(val);
+        }
+    };
+    for (size_t i = 4; i < iban.length(); ++i) appendChar(iban[i]);
+    for (size_t i = 0; i < 4; ++i) appendChar(iban[i]);
+
+    // Iterative MOD-97 to avoid big-integer arithmetic
+    uint32_t remainder = 0;
+    for (char c : numericStr) {
+        remainder = (remainder * 10 + static_cast<uint32_t>(c - '0')) % 97;
+    }
+    return remainder == 1;
 }
 
 [[nodiscard]] bool ValidateAccountNumber(std::string_view account) {
@@ -357,8 +402,16 @@ public:
 
             // Load whitelisted beneficiaries
             for (const auto& account : config.whitelistedBeneficiaries) {
-                // In production: Hash account number before storing
-                // Here we simulate loading
+                if (m_beneficiaryCache.size() >= TransactionMonitorConstants::MAX_BENEFICIARIES) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Beneficiary cache capacity reached during whitelist load");
+                    break;
+                }
+                Hash256 hash = HashAccountNumber(account);
+                auto& profile = m_beneficiaryCache[hash];
+                profile.accountMasked = MaskAccountNumber(account);
+                profile.accountHash = hash;
+                profile.trustLevel = BeneficiaryTrust::Whitelisted;
+                profile.isWhitelisted = true;
             }
 
             // Initialize anomaly rules engine
@@ -440,41 +493,56 @@ public:
     // ========================================================================
 
     [[nodiscard]] AnomalyDetectionResult ValidateTransaction(const TransactionContext& context) {
-        if (!m_running) return {};
+        if (!m_running.load(std::memory_order_acquire)) return {};
 
         AnomalyDetectionResult result;
         result.analysisTime = std::chrono::system_clock::now();
         auto start = Clock::now();
 
         m_stats.totalTransactionsMonitored++;
-        uint64_t amountCents = static_cast<uint64_t>(context.amount * 100);
+
+        // Snapshot config and callback under shared lock to avoid races
+        TransactionMonitorConfiguration config;
+        AnomalyCallback anomalyCallback;
+        {
+            std::shared_lock lock(m_mutex);
+            config = m_config;
+            anomalyCallback = m_anomalyCallback;
+        }
+
+        // Validate amount range before conversion to cents
+        if (context.amount < 0.0 || context.amount > 1e15) {
+            result.validationResult = ValidationResult::Error;
+            result.findings.push_back("Invalid transaction amount: out of range");
+            SS_LOG_WARN(LOG_CATEGORY, L"Transaction rejected: amount out of valid range");
+            return result;
+        }
+        uint64_t amountCents = static_cast<uint64_t>(std::llround(context.amount * 100.0));
         m_stats.totalAmountMonitoredCents += amountCents;
 
         try {
             // 1. Context Validation
-            if (m_config.enableNetworkValidation) {
-                // Check if domain is protected banking domain
+            if (config.enableNetworkValidation) {
                 if (!IsProtectedDomain(context.domain)) {
-                    // Log but proceed if configured
+                    result.riskScore += 10.0;
+                    result.findings.push_back("Transaction on non-protected domain");
                 }
             }
 
             // 2. Beneficiary Analysis
-            if (m_config.enableBeneficiaryTracking) {
+            if (config.enableBeneficiaryTracking) {
                 Hash256 accountHash = HashAccountNumber(context.beneficiaryAccount);
                 if (!IsBeneficiaryKnown(accountHash)) {
                     result.isNewBeneficiary = true;
                     m_stats.newBeneficiaries++;
 
-                    if (m_config.requireNewBeneficiaryConfirmation) {
+                    if (config.requireNewBeneficiaryConfirmation) {
                         result.riskScore += 40.0;
                         result.findings.push_back("New beneficiary detected");
                     }
                 } else {
-                    // Analyze historical pattern
                     auto profile = GetBeneficiaryProfile(accountHash);
                     if (profile) {
-                        // Check if amount is anomalous for this beneficiary
                         if (context.amount > profile->averageAmount * 3.0 && context.amount > 1000.0) {
                             result.isAmountAnomaly = true;
                             result.riskScore += 30.0;
@@ -485,8 +553,8 @@ public:
             }
 
             // 3. Velocity Analysis
-            if (m_config.enableVelocityAnalysis) {
-                if (!CheckVelocity(context)) {
+            if (config.enableVelocityAnalysis) {
+                if (!CheckVelocityWithThreshold(context, config.maxTransactionsPerHour)) {
                     result.isVelocityAnomaly = true;
                     result.riskScore += 50.0;
                     result.findings.push_back("Transaction velocity limit exceeded");
@@ -494,7 +562,7 @@ public:
             }
 
             // 4. Amount Analysis
-            if (context.amount >= m_config.highValueThreshold) {
+            if (context.amount >= config.highValueThreshold) {
                 result.isAmountAnomaly = true;
                 result.riskScore += 20.0;
                 result.findings.push_back("High value transaction");
@@ -503,17 +571,38 @@ public:
             // Calculate final risk and decision
             CalculateRiskLevel(result);
 
-            // Update stats
+            // Update attack vector stats
             if (result.isAnomalous) {
                 m_stats.anomaliesDetected++;
-                std::unique_lock lock(m_historyMutex);
-                m_recentAnomalies.push_back(result);
-                if (m_recentAnomalies.size() > 100) m_recentAnomalies.pop_front();
+                auto vecIdx = static_cast<size_t>(result.primaryVector);
+                if (vecIdx < m_stats.byAttackVector.size()) {
+                    m_stats.byAttackVector[vecIdx]++;
+                }
+                auto riskIdx = static_cast<size_t>(result.riskLevel);
+                if (riskIdx < m_stats.byRiskLevel.size()) {
+                    m_stats.byRiskLevel[riskIdx]++;
+                }
+                {
+                    std::unique_lock lock(m_historyMutex);
+                    m_recentAnomalies.push_back(result);
+                    if (m_recentAnomalies.size() > 100) m_recentAnomalies.pop_front();
+                }
             }
 
-            // Invoke callbacks
-            if (result.isAnomalous && m_anomalyCallback) {
-                m_anomalyCallback(result, context);
+            if (result.validationResult == ValidationResult::Blocked) {
+                m_stats.transactionsBlocked++;
+            }
+            if (result.validationResult == ValidationResult::UserConfirm) {
+                m_stats.userConfirmations++;
+            }
+
+            // Invoke callback outside locks to prevent deadlock
+            if (result.isAnomalous && anomalyCallback) {
+                try {
+                    anomalyCallback(result, context);
+                } catch (const std::exception& ex) {
+                    SS_LOG_ERROR(LOG_CATEGORY, L"Anomaly callback threw: %hs", ex.what());
+                }
             }
 
             // Store history
@@ -525,7 +614,6 @@ public:
                 }
             }
 
-            // Update beneficiary profile
             UpdateBeneficiaryProfile(context);
 
         } catch (const std::exception& ex) {
@@ -546,21 +634,25 @@ public:
 
         // Verify account
         if (uiValues.displayedAccount != payloadValues.payloadAccount) {
-            // Allow for masking differences (e.g. ****1234 vs 12345678901234)
             if (!VerifyAccountMatch(uiValues.displayedAccount, payloadValues.payloadAccount)) {
                 mismatch = true;
-                SS_LOG_WARN(LOG_CATEGORY, L"UI/Payload Account Mismatch: UI='%hs', Payload='%hs'",
-                    uiValues.displayedAccount.c_str(), payloadValues.payloadAccount.c_str());
+                SS_LOG_WARN(LOG_CATEGORY, L"UI/Payload Account Mismatch detected");
             }
         }
 
         // Verify amount
         if (uiValues.displayedAmount != payloadValues.payloadAmount) {
-            // Need robust number parsing here to handle formats (1,000.00 vs 1000.00)
             if (!VerifyAmountMatch(uiValues.displayedAmount, payloadValues.payloadAmount)) {
                 mismatch = true;
-                SS_LOG_WARN(LOG_CATEGORY, L"UI/Payload Amount Mismatch: UI='%hs', Payload='%hs'",
-                    uiValues.displayedAmount.c_str(), payloadValues.payloadAmount.c_str());
+                SS_LOG_WARN(LOG_CATEGORY, L"UI/Payload Amount Mismatch detected");
+            }
+        }
+
+        // Verify currency (critical: currency swap can redirect funds silently)
+        if (!uiValues.displayedCurrency.empty() && !payloadValues.payloadCurrency.empty()) {
+            if (uiValues.displayedCurrency != payloadValues.payloadCurrency) {
+                mismatch = true;
+                SS_LOG_WARN(LOG_CATEGORY, L"UI/Payload Currency Mismatch detected");
             }
         }
 
@@ -635,51 +727,111 @@ public:
     }
 
     bool CheckVelocity(const TransactionContext& ctx) {
-        // Simple sliding window check
+        uint32_t maxPerHour;
+        {
+            std::shared_lock configLock(m_mutex);
+            maxPerHour = m_config.maxTransactionsPerHour;
+        }
+        return CheckVelocityWithThreshold(ctx, maxPerHour);
+    }
+
+    bool CheckVelocityWithThreshold(const TransactionContext& ctx, uint32_t maxPerHour) {
         std::shared_lock lock(m_historyMutex);
 
         uint32_t count = 0;
         auto cutoff = ctx.timestamp - std::chrono::hours(1);
 
-        // Reverse iterate for efficiency
         for (auto it = m_transactionHistory.rbegin(); it != m_transactionHistory.rend(); ++it) {
             if (it->timestamp < cutoff) break;
 
-            // Check if same source account
             if (it->sourceAccount == ctx.sourceAccount) {
                 count++;
             }
         }
 
-        return count < m_config.maxTransactionsPerHour;
+        return count < maxPerHour;
     }
 
     bool VerifyAccountMatch(const std::string& ui, const std::string& payload) {
-        // Strip non-digits
         std::string uiClean, payloadClean;
-        std::copy_if(ui.begin(), ui.end(), std::back_inserter(uiClean), ::isdigit);
-        std::copy_if(payload.begin(), payload.end(), std::back_inserter(payloadClean), ::isdigit);
+        std::copy_if(ui.begin(), ui.end(), std::back_inserter(uiClean),
+            [](unsigned char c) { return std::isdigit(c); });
+        std::copy_if(payload.begin(), payload.end(), std::back_inserter(payloadClean),
+            [](unsigned char c) { return std::isdigit(c); });
 
         if (uiClean == payloadClean) return true;
 
-        // Check if UI is masked version of payload
-        // This is a naive check; enterprise grade would need more complex matching logic
-        if (uiClean.length() < payloadClean.length() && !uiClean.empty()) {
-            return payloadClean.ends_with(uiClean);
+        // Check if UI is a masked version of the payload.
+        // Only trust suffix match if the UI contains masking characters and
+        // the number of masked positions is consistent with the hidden portion.
+        bool uiIsMasked = (ui.find('*') != std::string::npos ||
+                           ui.find('X') != std::string::npos ||
+                           ui.find('x') != std::string::npos);
+
+        if (uiIsMasked && !uiClean.empty() && !payloadClean.empty()) {
+            if (payloadClean.length() >= uiClean.length() &&
+                payloadClean.ends_with(uiClean)) {
+                size_t maskCount = static_cast<size_t>(
+                    std::count_if(ui.begin(), ui.end(), [](char c) {
+                        return c == '*' || c == 'X' || c == 'x';
+                    }));
+                size_t hiddenDigits = payloadClean.length() - uiClean.length();
+                // Mask count should approximate the hidden digit count
+                if (hiddenDigits <= maskCount + 2 && maskCount <= hiddenDigits + 2) {
+                    return true;
+                }
+            }
         }
 
         return false;
     }
 
     bool VerifyAmountMatch(const std::string& ui, const std::string& payload) {
-        // Simple float comparison with tolerance
-        try {
-            double dUI = std::stod(ui); // Note: locale dependent, needs robust parsing
-            double dPayload = std::stod(payload);
-            return std::abs(dUI - dPayload) < 0.01;
-        } catch (...) {
-            return false;
-        }
+        // Locale-independent amount normalization to integer cents.
+        // Handles formats: "1,000.00", "1000.00", "1000", "1.000,50" (European).
+        auto parseToCents = [](const std::string& s) -> std::optional<int64_t> {
+            if (s.empty()) return std::nullopt;
+
+            std::string digits;
+            digits.reserve(s.size());
+            size_t lastSepPos = std::string::npos;
+
+            for (size_t i = 0; i < s.size(); ++i) {
+                auto c = static_cast<unsigned char>(s[i]);
+                if (std::isdigit(c)) {
+                    digits += static_cast<char>(c);
+                } else if (c == '.' || c == ',') {
+                    lastSepPos = digits.size();
+                }
+                // Skip currency symbols, whitespace, etc.
+            }
+
+            if (digits.empty() || digits.size() > 18) return std::nullopt;
+
+            if (lastSepPos != std::string::npos) {
+                size_t fracLen = digits.size() - lastSepPos;
+                if (fracLen <= 2) {
+                    // Decimal separator — pad to 2
+                    while (fracLen < 2) { digits += '0'; ++fracLen; }
+                } else {
+                    // 3+ digits after last separator → thousands separator
+                    digits += "00";
+                }
+            } else {
+                digits += "00";
+            }
+
+            try {
+                return std::stoll(digits);
+            } catch (...) {
+                return std::nullopt;
+            }
+        };
+
+        auto uiCents = parseToCents(ui);
+        auto payloadCents = parseToCents(payload);
+        if (!uiCents || !payloadCents) return false;
+        return *uiCents == *payloadCents;
     }
 
     void CalculateRiskLevel(AnomalyDetectionResult& result) {
@@ -712,10 +864,277 @@ public:
     UserConfirmationCallback m_userConfirmationCallback;
     ErrorCallback m_errorCallback;
 
+    // ========================================================================
+    // PAUSE / RESUME (thread-safe)
+    // ========================================================================
+
+    void PauseMonitor() noexcept {
+        std::unique_lock lock(m_mutex);
+        if (m_running && m_initialized) {
+            m_running = false;
+            m_status = ModuleStatus::Paused;
+            SS_LOG_INFO(LOG_CATEGORY, L"TransactionMonitor paused");
+        }
+    }
+
+    void ResumeMonitor() noexcept {
+        std::unique_lock lock(m_mutex);
+        if (!m_running && m_initialized &&
+            m_status.load(std::memory_order_relaxed) == ModuleStatus::Paused) {
+            m_running = true;
+            m_status = ModuleStatus::Running;
+            SS_LOG_INFO(LOG_CATEGORY, L"TransactionMonitor resumed");
+        }
+    }
+
+    // ========================================================================
+    // DOM ANALYSIS (real implementations)
+    // ========================================================================
+
+    [[nodiscard]] bool AnalyzeDOMChanges(const std::vector<DOMChangeEvent>& changes) {
+        if (!m_running.load(std::memory_order_acquire)) return true;
+        if (changes.empty()) return true;
+
+        bool integrity = true;
+
+        for (const auto& change : changes) {
+            // Script injection always breaks integrity
+            if (change.changeType == DOMChangeType::ScriptInjected) {
+                integrity = false;
+                m_stats.domManipulationsDetected++;
+                SS_LOG_WARN(LOG_CATEGORY, L"DOM: script injection at element '%hs'",
+                    change.elementId.c_str());
+            }
+
+            // Sensitive form field modification
+            if (change.changeType == DOMChangeType::FormModified && change.isSensitiveField) {
+                integrity = false;
+                m_stats.domManipulationsDetected++;
+                SS_LOG_WARN(LOG_CATEGORY, L"DOM: sensitive form field modified at '%hs'",
+                    change.xpath.c_str());
+            }
+
+            // Value change on sensitive fields (MitB hallmark)
+            if (change.changeType == DOMChangeType::ValueChanged && change.isSensitiveField) {
+                integrity = false;
+                m_stats.domManipulationsDetected++;
+            }
+
+            // Hidden iframe/script element added
+            if (change.changeType == DOMChangeType::ElementAdded) {
+                if (change.tagName == "iframe" || change.tagName == "script" ||
+                    change.tagName == "object" || change.tagName == "embed") {
+                    integrity = false;
+                    m_stats.domManipulationsDetected++;
+                    SS_LOG_WARN(LOG_CATEGORY, L"DOM: suspicious element <%hs> injected",
+                        change.tagName.c_str());
+                }
+            }
+
+            // Overlay-style attacks via CSS changes on sensitive fields
+            if (change.changeType == DOMChangeType::StyleChanged && change.isSuspicious) {
+                integrity = false;
+                m_stats.domManipulationsDetected++;
+            }
+        }
+
+        return integrity;
+    }
+
+    [[nodiscard]] bool AnalyzeDOMDiff(const std::string& domDiff) {
+        if (!m_running.load(std::memory_order_acquire)) return true;
+        if (domDiff.empty()) return true;
+
+        bool integrity = true;
+        // Check for injected script tags
+        if (domDiff.find("<script") != std::string::npos ||
+            domDiff.find("javascript:") != std::string::npos ||
+            domDiff.find("eval(") != std::string::npos ||
+            domDiff.find("document.write") != std::string::npos) {
+            integrity = false;
+            m_stats.domManipulationsDetected++;
+            SS_LOG_WARN(LOG_CATEGORY, L"DOM diff contains script injection indicators");
+        }
+
+        // Check for hidden iframe injection
+        if (domDiff.find("<iframe") != std::string::npos) {
+            integrity = false;
+            m_stats.domManipulationsDetected++;
+            SS_LOG_WARN(LOG_CATEGORY, L"DOM diff contains iframe injection");
+        }
+
+        // Check for form action modification
+        if (domDiff.find("action=") != std::string::npos ||
+            domDiff.find("formaction=") != std::string::npos) {
+            integrity = false;
+            m_stats.domManipulationsDetected++;
+            SS_LOG_WARN(LOG_CATEGORY, L"DOM diff contains form action modification");
+        }
+
+        return integrity;
+    }
+
+    [[nodiscard]] bool CheckDOMIntegrity(const std::string& domHash) {
+        if (!m_running.load(std::memory_order_acquire)) return true;
+        if (domHash.empty()) return false;
+
+        std::shared_lock lock(m_domMutex);
+        if (m_lastKnownDOMHash.empty()) {
+            return true; // First check — no baseline yet
+        }
+        bool match = (m_lastKnownDOMHash == domHash);
+        if (!match) {
+            m_stats.domManipulationsDetected++;
+            SS_LOG_WARN(LOG_CATEGORY, L"DOM integrity check failed: hash mismatch");
+        }
+        return match;
+    }
+
+    void UpdateDOMHash(const std::string& domHash) {
+        std::unique_lock lock(m_domMutex);
+        m_lastKnownDOMHash = domHash;
+    }
+
+    void ReportDOMChange(const DOMChangeEvent& change) {
+        if (!m_running.load(std::memory_order_acquire)) return;
+
+        {
+            std::unique_lock lock(m_domMutex);
+            m_recentDOMChanges.push_back(change);
+            if (m_recentDOMChanges.size() > TransactionMonitorConstants::MAX_DOM_CHANGES) {
+                m_recentDOMChanges.pop_front();
+            }
+        }
+
+        if (change.isSuspicious || change.changeType == DOMChangeType::ScriptInjected) {
+            m_stats.domManipulationsDetected++;
+            SS_LOG_WARN(LOG_CATEGORY, L"Suspicious DOM change reported: type=%hs, element='%hs'",
+                std::string(GetDOMChangeTypeName(change.changeType)).c_str(),
+                change.elementId.c_str());
+        }
+    }
+
+    // ========================================================================
+    // ADDITIONAL QUERY HELPERS
+    // ========================================================================
+
+    [[nodiscard]] size_t GetTransactionsInWindow(
+        const std::string& sourceAccount,
+        std::chrono::seconds window) const {
+        std::shared_lock lock(m_historyMutex);
+        size_t count = 0;
+        auto cutoff = std::chrono::system_clock::now() - window;
+        for (auto it = m_transactionHistory.rbegin();
+             it != m_transactionHistory.rend(); ++it) {
+            if (it->timestamp < cutoff) break;
+            if (it->sourceAccount == sourceAccount) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    [[nodiscard]] std::vector<AnomalyDetectionResult> GetRecentAnomalies(size_t maxCount) const {
+        std::shared_lock lock(m_historyMutex);
+        std::vector<AnomalyDetectionResult> result;
+        size_t count = (std::min)(maxCount, m_recentAnomalies.size());
+        result.reserve(count);
+        auto it = m_recentAnomalies.rbegin();
+        for (size_t i = 0; i < count && it != m_recentAnomalies.rend(); ++i, ++it) {
+            result.push_back(*it);
+        }
+        return result;
+    }
+
+    [[nodiscard]] std::vector<TransactionContext> GetTransactionHistory(size_t maxCount) const {
+        std::shared_lock lock(m_historyMutex);
+        std::vector<TransactionContext> result;
+        size_t count = (std::min)(maxCount, m_transactionHistory.size());
+        result.reserve(count);
+        auto it = m_transactionHistory.rbegin();
+        for (size_t i = 0; i < count && it != m_transactionHistory.rend(); ++i, ++it) {
+            result.push_back(*it);
+        }
+        return result;
+    }
+
+    void WhitelistBeneficiary(const Hash256& hash, const std::string& accountForMask,
+                              const std::string& reason) {
+        std::unique_lock lock(m_profileMutex);
+        if (m_beneficiaryCache.size() >= TransactionMonitorConstants::MAX_BENEFICIARIES) {
+            SS_LOG_WARN(LOG_CATEGORY, L"Beneficiary cache full, cannot whitelist");
+            return;
+        }
+        auto& profile = m_beneficiaryCache[hash];
+        profile.trustLevel = BeneficiaryTrust::Whitelisted;
+        profile.isWhitelisted = true;
+        profile.accountHash = hash;
+        if (profile.accountMasked.empty()) {
+            profile.accountMasked = MaskAccountNumber(accountForMask);
+        }
+        SS_LOG_INFO(LOG_CATEGORY, L"Beneficiary whitelisted (reason: %hs)",
+            reason.c_str());
+    }
+
+    void RemoveBeneficiaryFromWhitelist(const Hash256& hash) {
+        std::unique_lock lock(m_profileMutex);
+        auto it = m_beneficiaryCache.find(hash);
+        if (it != m_beneficiaryCache.end()) {
+            it->second.isWhitelisted = false;
+            if (it->second.transactionCount > 10) {
+                it->second.trustLevel = BeneficiaryTrust::Trusted;
+            } else if (it->second.transactionCount > 3) {
+                it->second.trustLevel = BeneficiaryTrust::Recent;
+            } else {
+                it->second.trustLevel = BeneficiaryTrust::New;
+            }
+        }
+    }
+
+    [[nodiscard]] bool LoadBankingDomains(const std::filesystem::path& path) {
+        std::error_code ec;
+        if (!std::filesystem::exists(path, ec) || ec) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"LoadBankingDomains: file not found or inaccessible");
+            return false;
+        }
+
+        auto fileSize = std::filesystem::file_size(path, ec);
+        if (ec || fileSize == 0 || fileSize > 10ULL * 1024 * 1024) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"LoadBankingDomains: invalid file size");
+            return false;
+        }
+
+        std::ifstream file(path);
+        if (!file.is_open()) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"LoadBankingDomains: failed to open file");
+            return false;
+        }
+
+        std::string line;
+        size_t loaded = 0;
+        while (std::getline(file, line) &&
+               loaded < TransactionMonitorConstants::MAX_PROTECTED_DOMAINS) {
+            auto start = line.find_first_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
+            auto end = line.find_last_not_of(" \t\r\n");
+            std::string domain = line.substr(start, end - start + 1);
+
+            if (domain.empty() || domain[0] == '#') continue;
+            if (domain.length() > 253) continue;
+
+            AddProtectedDomain(domain);
+            loaded++;
+        }
+
+        SS_LOG_INFO(LOG_CATEGORY, L"LoadBankingDomains: loaded %zu domains", loaded);
+        return loaded > 0;
+    }
+
     // Member variables
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_historyMutex;
     mutable std::shared_mutex m_profileMutex;
+    mutable std::shared_mutex m_domMutex;
 
     std::atomic<ModuleStatus> m_status;
     std::atomic<bool> m_initialized;
@@ -729,6 +1148,8 @@ public:
     std::deque<TransactionContext> m_transactionHistory;
     std::deque<AnomalyDetectionResult> m_recentAnomalies;
     std::map<Hash256, BeneficiaryProfile> m_beneficiaryCache;
+    std::deque<DOMChangeEvent> m_recentDOMChanges;
+    std::string m_lastKnownDOMHash;
 };
 
 // ============================================================================
@@ -781,18 +1202,11 @@ bool TransactionMonitor::Stop() {
 }
 
 void TransactionMonitor::Pause() {
-    // Basic implementation - could be enhanced in PIMPL
-    if (m_impl->m_running) {
-        m_impl->m_running = false;
-        m_impl->m_status = ModuleStatus::Paused;
-    }
+    m_impl->PauseMonitor();
 }
 
 void TransactionMonitor::Resume() {
-    if (!m_impl->m_running && m_impl->m_initialized) {
-        m_impl->m_running = true;
-        m_impl->m_status = ModuleStatus::Running;
-    }
+    m_impl->ResumeMonitor();
 }
 
 bool TransactionMonitor::UpdateConfiguration(const TransactionMonitorConfiguration& config) {
@@ -811,10 +1225,14 @@ AnomalyDetectionResult TransactionMonitor::ValidateTransactionWithUI(
     const TransactionContext& context,
     const UIDisplayValues& uiValues) {
 
-    // Create payload values from context for comparison
     NetworkPayloadValues payload;
     payload.payloadAccount = context.beneficiaryAccount;
-    payload.payloadAmount = std::to_string(context.amount); // Simple conversion
+    // Fixed-precision formatting — locale-independent via ostringstream with "C" locale
+    std::ostringstream oss;
+    oss.imbue(std::locale::classic());
+    oss << std::fixed << std::setprecision(2) << context.amount;
+    payload.payloadAmount = oss.str();
+    payload.payloadCurrency = context.currency;
 
     return ValidateTransactionFull(context, uiValues, payload);
 }
@@ -894,9 +1312,13 @@ bool TransactionMonitor::SelfTest() {
         return false;
     }
 
-    // 2. Test masking
+    // 2. Test masking — short accounts now fully masked, long accounts show last 4
     if (MaskAccountNumber("1234567890") != "******7890") {
-        SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: Masking failed");
+        SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: Long account masking failed");
+        return false;
+    }
+    if (MaskAccountNumber("1234") != "****") {
+        SS_LOG_ERROR(LOG_CATEGORY, L"Self-test: Short account masking failed");
         return false;
     }
 
@@ -914,24 +1336,98 @@ std::string TransactionMonitor::GetVersionString() noexcept {
     return "3.0.0";
 }
 
-// Stub implementations for methods not fully implemented in this iteration
-bool TransactionMonitor::AnalyzeDOMChanges(const std::vector<DOMChangeEvent>&) { return true; }
-bool TransactionMonitor::AnalyzeDOMDiff(const std::string&) { return true; }
-bool TransactionMonitor::CheckDOMIntegrity(const std::string&) { return true; }
-void TransactionMonitor::ReportDOMChange(const DOMChangeEvent&) {}
-size_t TransactionMonitor::GetTransactionsInWindow(const std::string&, std::chrono::seconds) const { return 0; }
-bool TransactionMonitor::IsBeneficiaryKnown(const std::string&) const { return false; }
-BeneficiaryTrust TransactionMonitor::GetBeneficiaryTrust(const std::string&) const { return BeneficiaryTrust::Unknown; }
-std::optional<BeneficiaryProfile> TransactionMonitor::GetBeneficiaryProfile(const std::string&) const { return std::nullopt; }
-void TransactionMonitor::WhitelistBeneficiary(const std::string&, const std::string&) {}
-void TransactionMonitor::RemoveBeneficiaryFromWhitelist(const std::string&) {}
-bool TransactionMonitor::LoadBankingDomains(const std::filesystem::path&) { return true; }
-void TransactionMonitor::RegisterValidationCallback(ValidationCallback) {}
-void TransactionMonitor::RegisterUserConfirmationCallback(UserConfirmationCallback) {}
-void TransactionMonitor::RegisterErrorCallback(ErrorCallback) {}
-void TransactionMonitor::UnregisterCallbacks() {}
-std::vector<AnomalyDetectionResult> TransactionMonitor::GetRecentAnomalies(size_t) const { return {}; }
-std::vector<TransactionContext> TransactionMonitor::GetTransactionHistory(size_t) const { return {}; }
+// ============================================================================
+// FORMERLY STUB IMPLEMENTATIONS — now properly delegated to PIMPL
+// ============================================================================
+
+bool TransactionMonitor::AnalyzeDOMChanges(const std::vector<DOMChangeEvent>& changes) {
+    return m_impl->AnalyzeDOMChanges(changes);
+}
+
+bool TransactionMonitor::AnalyzeDOMDiff(const std::string& domDiff) {
+    return m_impl->AnalyzeDOMDiff(domDiff);
+}
+
+bool TransactionMonitor::CheckDOMIntegrity(const std::string& domHash) {
+    return m_impl->CheckDOMIntegrity(domHash);
+}
+
+void TransactionMonitor::ReportDOMChange(const DOMChangeEvent& change) {
+    m_impl->ReportDOMChange(change);
+}
+
+size_t TransactionMonitor::GetTransactionsInWindow(
+    const std::string& sourceAccount, std::chrono::seconds window) const {
+    return m_impl->GetTransactionsInWindow(sourceAccount, window);
+}
+
+bool TransactionMonitor::IsBeneficiaryKnown(const std::string& accountNumber) const {
+    Hash256 hash = HashAccountNumber(accountNumber);
+    return m_impl->IsBeneficiaryKnown(hash);
+}
+
+BeneficiaryTrust TransactionMonitor::GetBeneficiaryTrust(const std::string& accountNumber) const {
+    Hash256 hash = HashAccountNumber(accountNumber);
+    auto profile = m_impl->GetBeneficiaryProfile(hash);
+    if (profile) return profile->trustLevel;
+    return BeneficiaryTrust::Unknown;
+}
+
+std::optional<BeneficiaryProfile> TransactionMonitor::GetBeneficiaryProfile(
+    const std::string& accountNumber) const {
+    Hash256 hash = HashAccountNumber(accountNumber);
+    return m_impl->GetBeneficiaryProfile(hash);
+}
+
+void TransactionMonitor::WhitelistBeneficiary(
+    const std::string& accountNumber, const std::string& reason) {
+    Hash256 hash = HashAccountNumber(accountNumber);
+    m_impl->WhitelistBeneficiary(hash, accountNumber, reason);
+}
+
+void TransactionMonitor::RemoveBeneficiaryFromWhitelist(const std::string& accountNumber) {
+    Hash256 hash = HashAccountNumber(accountNumber);
+    m_impl->RemoveBeneficiaryFromWhitelist(hash);
+}
+
+bool TransactionMonitor::LoadBankingDomains(const std::filesystem::path& path) {
+    if (!m_impl->m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(LOG_CATEGORY, L"LoadBankingDomains: monitor not initialized");
+        return false;
+    }
+    return m_impl->LoadBankingDomains(path);
+}
+
+void TransactionMonitor::RegisterValidationCallback(ValidationCallback callback) {
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_validationCallback = std::move(callback);
+}
+
+void TransactionMonitor::RegisterUserConfirmationCallback(UserConfirmationCallback callback) {
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_userConfirmationCallback = std::move(callback);
+}
+
+void TransactionMonitor::RegisterErrorCallback(ErrorCallback callback) {
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_errorCallback = std::move(callback);
+}
+
+void TransactionMonitor::UnregisterCallbacks() {
+    std::unique_lock lock(m_impl->m_mutex);
+    m_impl->m_anomalyCallback = nullptr;
+    m_impl->m_validationCallback = nullptr;
+    m_impl->m_userConfirmationCallback = nullptr;
+    m_impl->m_errorCallback = nullptr;
+}
+
+std::vector<AnomalyDetectionResult> TransactionMonitor::GetRecentAnomalies(size_t maxCount) const {
+    return m_impl->GetRecentAnomalies(maxCount);
+}
+
+std::vector<TransactionContext> TransactionMonitor::GetTransactionHistory(size_t maxCount) const {
+    return m_impl->GetTransactionHistory(maxCount);
+}
 
 } // namespace Banking
 } // namespace ShadowStrike
