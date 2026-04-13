@@ -130,6 +130,7 @@
 #include "../Utils/Logger.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/CryptoUtils.hpp"
+#include "../Utils/HashUtils.hpp"
 #include "../Utils/FileUtils.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
