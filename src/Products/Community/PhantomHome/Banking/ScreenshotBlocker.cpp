@@ -86,16 +86,22 @@ namespace ShadowStrike::Banking {
 
             // Load whitelist
             for (const auto& app : m_config.whitelistedApplications) {
-                m_whitelistedApps.insert(app);
+                if (m_whitelistedApps.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                    m_whitelistedApps.insert(app);
+                }
             }
 
             for (const auto& proc : m_config.whitelistedProcessNames) {
-                m_whitelistedProcesses.insert(proc);
+                if (m_whitelistedProcesses.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                    m_whitelistedProcesses.insert(proc);
+                }
             }
 
             if (m_config.allowAccessibilityTools) {
                 for (const auto& tool : ACCESSIBILITY_TOOLS) {
-                    m_whitelistedProcesses.insert(tool);
+                    if (m_whitelistedProcesses.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                        m_whitelistedProcesses.insert(tool);
+                    }
                 }
             }
 
@@ -103,7 +109,7 @@ namespace ShadowStrike::Banking {
 
             // Start background monitor if needed
             if (!m_monitoringThread.joinable()) {
-                m_stopMonitoring = false;
+                m_stopMonitoring.store(false, std::memory_order_release);
                 m_monitoringThread = std::thread(&ScreenshotBlockerImpl::MonitorThread, this);
             }
 
@@ -115,13 +121,22 @@ namespace ShadowStrike::Banking {
         }
 
         void Shutdown() {
-            std::unique_lock lock(m_mutex);
-            m_status = ModuleStatus::Stopping;
+            // Signal the monitor thread to stop BEFORE taking the lock.
+            // MonitorThread also acquires m_mutex, so joining while holding
+            // the lock would deadlock.
+            m_stopMonitoring.store(true, std::memory_order_release);
 
-            m_stopMonitoring = true;
             if (m_monitoringThread.joinable()) {
                 m_monitoringThread.join();
             }
+
+            std::unique_lock lock(m_mutex);
+
+            if (m_status == ModuleStatus::Stopped || m_status == ModuleStatus::Uninitialized) {
+                return;
+            }
+
+            m_status = ModuleStatus::Stopping;
 
             // Unprotect all windows
             for (auto it = m_protectedWindows.begin(); it != m_protectedWindows.end(); ) {
@@ -140,8 +155,93 @@ namespace ShadowStrike::Banking {
             UninstallGDIHooks();
             UninstallDirectXHooks();
 
+            m_whitelistedApps.clear();
+            m_whitelistedProcesses.clear();
+            m_blockedApplications.clear();
+
             m_status = ModuleStatus::Stopped;
             SS_LOG_INFO(L"ScreenshotBlocker", L"Shutdown complete");
+        }
+
+        // --------------------------------------------------------------------
+        // Status
+        // --------------------------------------------------------------------
+
+        [[nodiscard]] ModuleStatus GetStatus() const noexcept {
+            std::shared_lock lock(m_mutex);
+            return m_status;
+        }
+
+        [[nodiscard]] ScreenshotBlockerConfiguration GetConfig() const {
+            std::shared_lock lock(m_mutex);
+            return m_config;
+        }
+
+        void SetPaused(bool paused) {
+            std::unique_lock lock(m_mutex);
+            if (paused && m_status == ModuleStatus::Running) {
+                m_status = ModuleStatus::Paused;
+                SS_LOG_INFO(L"ScreenshotBlocker", L"Protection paused");
+            } else if (!paused && m_status == ModuleStatus::Paused) {
+                m_status = ModuleStatus::Running;
+                SS_LOG_INFO(L"ScreenshotBlocker", L"Protection resumed");
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // Configuration update (without full re-init)
+        // --------------------------------------------------------------------
+
+        bool UpdateConfig(const ScreenshotBlockerConfiguration& config) {
+            if (!config.IsValid()) {
+                SS_LOG_ERROR(L"ScreenshotBlocker", L"Invalid configuration update rejected");
+                return false;
+            }
+
+            std::unique_lock lock(m_mutex);
+            if (m_status != ModuleStatus::Running && m_status != ModuleStatus::Paused) {
+                SS_LOG_ERROR(L"ScreenshotBlocker", L"Cannot update config: module not running");
+                return false;
+            }
+
+            const bool printScreenChanged =
+                (m_config.enablePrintScreenBlocking != config.enablePrintScreenBlocking);
+            const bool clipboardChanged =
+                (m_config.enableClipboardFiltering != config.enableClipboardFiltering);
+
+            m_config = config;
+
+            // Rebuild whitelist
+            m_whitelistedApps.clear();
+            m_whitelistedProcesses.clear();
+
+            for (const auto& app : m_config.whitelistedApplications) {
+                if (m_whitelistedApps.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                    m_whitelistedApps.insert(app);
+                }
+            }
+            for (const auto& proc : m_config.whitelistedProcessNames) {
+                if (m_whitelistedProcesses.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                    m_whitelistedProcesses.insert(proc);
+                }
+            }
+            if (m_config.allowAccessibilityTools) {
+                for (const auto& tool : ACCESSIBILITY_TOOLS) {
+                    if (m_whitelistedProcesses.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                        m_whitelistedProcesses.insert(tool);
+                    }
+                }
+            }
+
+            lock.unlock();
+
+            // Apply changed settings outside the lock
+            if (printScreenChanged) {
+                BlockPrintScreen(config.enablePrintScreenBlocking);
+            }
+
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Configuration updated");
+            return true;
         }
 
         // --------------------------------------------------------------------
@@ -164,6 +264,11 @@ namespace ShadowStrike::Banking {
                 return false;
             }
 
+            // Already protected?
+            if (m_protectedWindows.count(hwnd)) {
+                return true;
+            }
+
             // Determine method
             if (method == BlockingMethod::None || method == BlockingMethod::Combined) {
                 method = BlockingMethod::DisplayAffinity;
@@ -175,8 +280,10 @@ namespace ShadowStrike::Banking {
                 success = ApplyDisplayAffinity(nativeHwnd);
             }
 
+            WindowProtectionCallback callbackCopy;
+            ProtectedWindowInfo info;
+
             if (success) {
-                ProtectedWindowInfo info;
                 info.hwnd = hwnd;
                 info.protectionStartTime = std::chrono::system_clock::now();
                 info.status = ProtectionStatus::Protected;
@@ -206,11 +313,16 @@ namespace ShadowStrike::Banking {
 
                 SS_LOG_INFO(L"ScreenshotBlocker", L"Protected window %p (%ls)", nativeHwnd, info.windowTitle.c_str());
 
-                if (m_windowCallback) {
-                    m_windowCallback(info, true);
-                }
+                callbackCopy = m_windowCallback;
             } else {
                 SS_LOG_ERROR(L"ScreenshotBlocker", L"Failed to protect window %p", nativeHwnd);
+            }
+
+            lock.unlock();
+
+            // Invoke callback outside the lock to prevent deadlock
+            if (success && callbackCopy) {
+                callbackCopy(info, true);
             }
 
             return success;
@@ -218,6 +330,7 @@ namespace ShadowStrike::Banking {
 
         bool UnprotectWindow(WindowHandle hwnd) {
             HWND nativeHwnd = reinterpret_cast<HWND>(hwnd);
+
             std::unique_lock lock(m_mutex);
 
             auto it = m_protectedWindows.find(hwnd);
@@ -232,15 +345,37 @@ namespace ShadowStrike::Banking {
 
             ProtectedWindowInfo info = it->second;
             m_protectedWindows.erase(it);
-            m_stats.currentlyProtected--;
+
+            if (m_stats.currentlyProtected.load(std::memory_order_relaxed) > 0) {
+                m_stats.currentlyProtected--;
+            }
+
+            WindowProtectionCallback callbackCopy = m_windowCallback;
 
             SS_LOG_INFO(L"ScreenshotBlocker", L"Unprotected window %p", nativeHwnd);
 
-            if (m_windowCallback) {
-                m_windowCallback(info, false);
+            lock.unlock();
+
+            // Invoke callback outside the lock
+            if (callbackCopy) {
+                callbackCopy(info, false);
             }
 
             return true;
+        }
+
+        [[nodiscard]] bool IsWindowProtected(WindowHandle hwnd) const {
+            std::shared_lock lock(m_mutex);
+            return m_protectedWindows.count(hwnd) > 0;
+        }
+
+        [[nodiscard]] std::optional<ProtectedWindowInfo> GetWindowInfo(WindowHandle hwnd) const {
+            std::shared_lock lock(m_mutex);
+            auto it = m_protectedWindows.find(hwnd);
+            if (it != m_protectedWindows.end()) {
+                return it->second;
+            }
+            return std::nullopt;
         }
 
         // --------------------------------------------------------------------
@@ -268,16 +403,119 @@ namespace ShadowStrike::Banking {
             m_config.enablePrintScreenBlocking = block;
         }
 
+        void BlockCaptureApp(std::wstring_view processName) {
+            std::wstring lower(processName);
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::unique_lock lock(m_mutex);
+            m_blockedApplications.insert(lower);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Blocked capture application: %ls", lower.c_str());
+        }
+
+        void UnblockCaptureApp(std::wstring_view processName) {
+            std::wstring lower(processName);
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::unique_lock lock(m_mutex);
+            m_blockedApplications.erase(lower);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Unblocked capture application: %ls", lower.c_str());
+        }
+
+        [[nodiscard]] bool IsCaptureAppBlocked(std::wstring_view processName) const {
+            std::wstring lower(processName);
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::shared_lock lock(m_mutex);
+            return m_blockedApplications.count(lower) > 0;
+        }
+
+        // --------------------------------------------------------------------
+        // Whitelist
+        // --------------------------------------------------------------------
+
+        void WhitelistApplication(const std::wstring& path, const std::string& reason) {
+            std::unique_lock lock(m_mutex);
+            if (m_whitelistedApps.size() >= ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                SS_LOG_WARN(L"ScreenshotBlocker", L"Whitelist capacity reached, cannot add application");
+                return;
+            }
+            m_whitelistedApps.insert(path);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Whitelisted application: %ls (reason: %hs)",
+                path.c_str(), reason.c_str());
+        }
+
+        void WhitelistProcess(const std::wstring& processName, const std::string& reason) {
+            std::wstring lower = processName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::unique_lock lock(m_mutex);
+            if (m_whitelistedProcesses.size() >= ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                SS_LOG_WARN(L"ScreenshotBlocker", L"Whitelist capacity reached, cannot add process");
+                return;
+            }
+            m_whitelistedProcesses.insert(lower);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Whitelisted process: %ls (reason: %hs)",
+                lower.c_str(), reason.c_str());
+        }
+
+        void RemoveFromWhitelist(const std::wstring& processName) {
+            std::wstring lower = processName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::unique_lock lock(m_mutex);
+            m_whitelistedProcesses.erase(lower);
+            m_whitelistedApps.erase(processName);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Removed from whitelist: %ls", lower.c_str());
+        }
+
+        [[nodiscard]] bool IsWhitelisted(uint32_t processId) const {
+            auto procName = ProcessUtils::GetProcessName(processId);
+            if (!procName) {
+                return false;
+            }
+
+            std::wstring lower = *procName;
+            std::transform(lower.begin(), lower.end(), lower.begin(), ::towlower);
+
+            std::shared_lock lock(m_mutex);
+            if (m_whitelistedProcesses.count(lower) > 0) {
+                return true;
+            }
+
+            // Also check by full path
+            auto procPath = ProcessUtils::GetProcessPath(processId);
+            if (procPath && m_whitelistedApps.count(*procPath) > 0) {
+                return true;
+            }
+
+            return false;
+        }
+
+        void LoadAccessibilityWhitelist() {
+            std::unique_lock lock(m_mutex);
+            for (const auto& tool : ACCESSIBILITY_TOOLS) {
+                if (m_whitelistedProcesses.size() < ScreenshotConstants::MAX_WHITELISTED_APPS) {
+                    m_whitelistedProcesses.insert(tool);
+                }
+            }
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Loaded %zu accessibility tools into whitelist",
+                ACCESSIBILITY_TOOLS.size());
+        }
+
         // --------------------------------------------------------------------
         // Clipboard
         // --------------------------------------------------------------------
 
         void EnableClipboardFiltering(bool enable) {
+            std::unique_lock lock(m_mutex);
             m_config.enableClipboardFiltering = enable;
-            // Note: In a full implementation, we would create a message-only window
-            // to register as a clipboard format listener.
-            // For this implementation, we will use a polling approach in the monitor thread
-            // to avoid UI thread complexity in this library.
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Clipboard filtering %ls",
+                enable ? L"enabled" : L"disabled");
+        }
+
+        [[nodiscard]] bool IsClipboardFilteringEnabled() const noexcept {
+            std::shared_lock lock(m_mutex);
+            return m_config.enableClipboardFiltering;
         }
 
         void SanitizeClipboard() {
@@ -306,16 +544,15 @@ namespace ShadowStrike::Banking {
         // Helpers
         // --------------------------------------------------------------------
 
-        bool IsExcludeFromCaptureSupported() const {
-            // Check for Windows 10 2004+ (Build 19041)
-            OSVersion osVer;
+        [[nodiscard]] bool IsExcludeFromCaptureSupported() const {
+            SystemUtils::OSVersion osVer;
             if (SystemUtils::QueryOSVersion(osVer)) {
-                return osVer.buildNumber >= 19041;
+                return osVer.build >= 19041;
             }
             return false;
         }
 
-        bool IsKnownScreenRecorder(std::wstring_view processName) {
+        [[nodiscard]] bool IsKnownScreenRecorder(std::wstring_view processName) const {
             std::wstring lowerName(processName);
             std::transform(lowerName.begin(), lowerName.end(), lowerName.begin(), ::towlower);
 
@@ -334,8 +571,11 @@ namespace ShadowStrike::Banking {
                 m_captureHistory.pop_front();
             }
 
-            if (m_captureCallback) {
-                m_captureCallback(event);
+            CaptureAttemptCallback callbackCopy = m_captureCallback;
+            lock.unlock();
+
+            if (callbackCopy) {
+                callbackCopy(event);
             }
         }
 
@@ -343,11 +583,27 @@ namespace ShadowStrike::Banking {
         // Stats & Info
         // --------------------------------------------------------------------
 
-        ScreenshotBlockerStatistics GetStatistics() const {
+        [[nodiscard]] ScreenshotBlockerStatistics GetStatistics() const {
             return m_stats;
         }
 
-        std::vector<ProtectedWindowInfo> GetProtectedWindows() const {
+        void ResetStatistics() {
+            m_stats.totalProtectedWindows.store(0, std::memory_order_relaxed);
+            m_stats.currentlyProtected.store(0, std::memory_order_relaxed);
+            m_stats.captureAttemptsDetected.store(0, std::memory_order_relaxed);
+            m_stats.captureAttemptsBlocked.store(0, std::memory_order_relaxed);
+            m_stats.clipboardEventsFiltered.store(0, std::memory_order_relaxed);
+            m_stats.gdiCallsIntercepted.store(0, std::memory_order_relaxed);
+            m_stats.dxCallsIntercepted.store(0, std::memory_order_relaxed);
+            m_stats.whitelistedPasses.store(0, std::memory_order_relaxed);
+            for (auto& counter : m_stats.byCaptureType) {
+                counter.store(0, std::memory_order_relaxed);
+            }
+            m_stats.startTime = Clock::now();
+            SS_LOG_INFO(L"ScreenshotBlocker", L"Statistics reset");
+        }
+
+        [[nodiscard]] std::vector<ProtectedWindowInfo> GetProtectedWindows() const {
             std::shared_lock lock(m_mutex);
             std::vector<ProtectedWindowInfo> windows;
             windows.reserve(m_protectedWindows.size());
@@ -357,24 +613,119 @@ namespace ShadowStrike::Banking {
             return windows;
         }
 
-        void RegisterCallbacks(CaptureAttemptCallback cb, WindowProtectionCallback wb, ErrorCallback eb) {
+        [[nodiscard]] std::vector<CaptureAttemptEvent> GetRecentAttempts(size_t maxCount) const {
+            std::unique_lock lock(m_historyMutex);
+            std::vector<CaptureAttemptEvent> result;
+
+            const size_t count = (std::min)(maxCount, m_captureHistory.size());
+            result.reserve(count);
+
+            // Return the most recent entries
+            auto it = m_captureHistory.end();
+            std::advance(it, -static_cast<ptrdiff_t>(count));
+            for (; it != m_captureHistory.end(); ++it) {
+                result.push_back(*it);
+            }
+            return result;
+        }
+
+        void RegisterCaptureCallback(CaptureAttemptCallback cb) {
             std::unique_lock lock(m_mutex);
-            m_captureCallback = cb;
-            m_windowCallback = wb;
-            m_errorCallback = eb;
+            m_captureCallback = std::move(cb);
+        }
+
+        void RegisterWindowCallback(WindowProtectionCallback cb) {
+            std::unique_lock lock(m_mutex);
+            m_windowCallback = std::move(cb);
+        }
+
+        void RegisterErrorCb(ErrorCallback cb) {
+            std::unique_lock lock(m_mutex);
+            m_errorCallback = std::move(cb);
+        }
+
+        void ClearCallbacks() {
+            std::unique_lock lock(m_mutex);
+            m_captureCallback = nullptr;
+            m_windowCallback = nullptr;
+            m_errorCallback = nullptr;
         }
 
         // --------------------------------------------------------------------
-        // Hooks (Stubs for User Mode)
+        // Hooks (User-mode stubs — require injection/detours framework)
         // --------------------------------------------------------------------
 
-        bool InstallGDIHooks() { return false; /* Requires injection/detours */ }
-        void UninstallGDIHooks() {}
-        bool InstallDirectXHooks() { return false; /* Requires injection/detours */ }
-        void UninstallDirectXHooks() {}
+        // GDI/DirectX hook installation requires an inline-hooking or
+        // detours library injected into target processes.  This module
+        // applies SetWindowDisplayAffinity + keyboard hook + clipboard
+        // filtering in the local process.  Cross-process API hooking is
+        // handled by the PhantomSensor kernel driver callbacks and the
+        // PhantomCortex injection pipeline; these entry points return false
+        // to signal "not supported at this layer".
 
-        bool IsPrintScreenBlocked() const noexcept {
+        bool InstallGDIHooks() {
+            SS_LOG_WARN(L"ScreenshotBlocker",
+                L"GDI hooks not available in user-mode module; "
+                L"use PhantomSensor for cross-process capture interception");
+            return false;
+        }
+
+        void UninstallGDIHooks() { /* No-op: hooks not installed at this layer */ }
+
+        bool InstallDirectXHooks() {
+            SS_LOG_WARN(L"ScreenshotBlocker",
+                L"DirectX hooks not available in user-mode module; "
+                L"use PhantomSensor for DXGI capture interception");
+            return false;
+        }
+
+        void UninstallDirectXHooks() { /* No-op: hooks not installed at this layer */ }
+
+        [[nodiscard]] bool IsPrintScreenBlocked() const noexcept {
             return m_keyboardHook != nullptr;
+        }
+
+        // --------------------------------------------------------------------
+        // Self-test
+        // --------------------------------------------------------------------
+
+        [[nodiscard]] bool SelfTest() {
+            // Create an invisible message-only window to verify
+            // SetWindowDisplayAffinity works on this system.
+            static constexpr wchar_t kClassName[] = L"SSScreenshotBlockerSelfTest";
+
+            WNDCLASSEXW wc = {};
+            wc.cbSize = sizeof(wc);
+            wc.lpfnWndProc = ::DefWindowProcW;
+            wc.hInstance = ::GetModuleHandleW(nullptr);
+            wc.lpszClassName = kClassName;
+
+            ATOM atom = ::RegisterClassExW(&wc);
+            if (!atom) {
+                SS_LOG_WARN(L"ScreenshotBlocker", L"SelfTest: RegisterClassEx failed");
+                return false;
+            }
+
+            HWND testHwnd = ::CreateWindowExW(
+                0, kClassName, L"", WS_OVERLAPPEDWINDOW,
+                CW_USEDEFAULT, CW_USEDEFAULT, 1, 1,
+                HWND_MESSAGE, nullptr, wc.hInstance, nullptr);
+
+            bool result = false;
+            if (testHwnd) {
+                result = ApplyDisplayAffinity(testHwnd);
+                if (result) {
+                    ::SetWindowDisplayAffinity(testHwnd, WDA_NONE);
+                }
+                ::DestroyWindow(testHwnd);
+            } else {
+                SS_LOG_WARN(L"ScreenshotBlocker", L"SelfTest: CreateWindowEx failed");
+            }
+
+            ::UnregisterClassW(kClassName, wc.hInstance);
+            SS_LOG_INFO(L"ScreenshotBlocker", L"SelfTest result: %ls",
+                result ? L"PASS" : L"FAIL");
+            return result;
         }
 
     private:
@@ -386,6 +737,7 @@ namespace ShadowStrike::Banking {
         std::unordered_map<WindowHandle, ProtectedWindowInfo> m_protectedWindows;
         std::unordered_set<std::wstring> m_whitelistedApps;
         std::unordered_set<std::wstring> m_whitelistedProcesses;
+        std::unordered_set<std::wstring> m_blockedApplications;
 
         // Hooks
         HHOOK m_keyboardHook = nullptr;
@@ -409,15 +761,23 @@ namespace ShadowStrike::Banking {
         // Static hook proc
         static LRESULT CALLBACK KeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
             if (nCode == HC_ACTION) {
-                KBDLLHOOKSTRUCT* pkb = (KBDLLHOOKSTRUCT*)lParam;
-                if (pkb->vkCode == VK_SNAPSHOT) { // PrintScreen
-                    // Block it
+                KBDLLHOOKSTRUCT* pkb = reinterpret_cast<KBDLLHOOKSTRUCT*>(lParam);
+                if (pkb && pkb->vkCode == VK_SNAPSHOT) {
                     auto& instance = ScreenshotBlocker::Instance();
                     if (instance.IsPrintScreenBlocked()) {
-                        // Log attempt (asynchronously)
-                        // Note: Can't access instance members easily here without static trampoline,
-                        // but for now we just return 1 to eat the key.
-                        return 1;
+                        // Record the blocked attempt
+                        instance.m_impl->m_stats.captureAttemptsDetected++;
+                        instance.m_impl->m_stats.captureAttemptsBlocked++;
+
+                        const auto idx = static_cast<size_t>(
+                            (wParam == WM_SYSKEYDOWN || wParam == WM_SYSKEYUP)
+                                ? CaptureAttemptType::AltPrintScreen
+                                : CaptureAttemptType::PrintScreenKey);
+                        if (idx < instance.m_impl->m_stats.byCaptureType.size()) {
+                            instance.m_impl->m_stats.byCaptureType[idx]++;
+                        }
+
+                        return 1; // Eat the key
                     }
                 }
             }
@@ -437,7 +797,7 @@ namespace ShadowStrike::Banking {
                 return true;
             }
 
-            // Fallback
+            // Fallback: if WDA_EXCLUDEFROMCAPTURE fails, try WDA_MONITOR
             if (affinity == ScreenshotConstants::WDA_EXCLUDEFROMCAPTURE) {
                 if (::SetWindowDisplayAffinity(hwnd, ScreenshotConstants::WDA_MONITOR)) {
                     return true;
@@ -449,40 +809,57 @@ namespace ShadowStrike::Banking {
         }
 
         void MonitorThread() {
-            while (!m_stopMonitoring) {
+            while (!m_stopMonitoring.load(std::memory_order_acquire)) {
                 try {
-                    // 1. Check integrity of protected windows
+                    // 1. Check integrity of protected windows and purge stale entries
                     {
                         std::unique_lock lock(m_mutex);
-                        for (auto& [handle, info] : m_protectedWindows) {
-                            HWND hwnd = reinterpret_cast<HWND>(handle);
+
+                        if (m_status != ModuleStatus::Running) {
+                            lock.unlock();
+                            std::this_thread::sleep_for(
+                                std::chrono::milliseconds(ScreenshotConstants::CAPTURE_SCAN_INTERVAL_MS));
+                            continue;
+                        }
+
+                        for (auto it = m_protectedWindows.begin(); it != m_protectedWindows.end(); ) {
+                            HWND hwnd = reinterpret_cast<HWND>(it->first);
                             if (!::IsWindow(hwnd)) {
-                                // Window destroyed
-                                info.status = ProtectionStatus::ProtectionFailed;
+                                // Window was destroyed — remove stale entry
+                                if (m_stats.currentlyProtected.load(std::memory_order_relaxed) > 0) {
+                                    m_stats.currentlyProtected--;
+                                }
+                                SS_LOG_DEBUG(L"ScreenshotBlocker",
+                                    L"Purging stale window %p from protection map", hwnd);
+                                it = m_protectedWindows.erase(it);
                                 continue;
                             }
 
-                            // Re-apply if necessary (paranoia mode)
+                            // Re-apply affinity in case it was removed externally
                             ApplyDisplayAffinity(hwnd);
+                            ++it;
                         }
                     }
 
-                    // 2. Check for screen recorders
-                    if (m_stats.captureAttemptsDetected.load() % 50 == 0) { // Throttle
-                         // Simple scan
-                         // (omitted for perf in this loop, would be done via event)
+                    // 2. Clipboard check (polling — used when clipboard listener hooks
+                    //    are not available at this layer)
+                    {
+                        std::shared_lock lock(m_mutex);
+                        if (m_config.enableClipboardFiltering &&
+                            m_status == ModuleStatus::Running) {
+                            lock.unlock();
+                            SanitizeClipboard();
+                        }
                     }
 
-                    // 3. Clipboard check (polling if hooks not possible)
-                    if (m_config.enableClipboardFiltering) {
-                        SanitizeClipboard();
-                    }
-
+                } catch (const std::exception& ex) {
+                    SS_LOG_ERROR(L"ScreenshotBlocker", L"Monitor thread exception: %hs", ex.what());
                 } catch (...) {
-                    // Prevent thread death
+                    SS_LOG_ERROR(L"ScreenshotBlocker", L"Monitor thread unknown exception");
                 }
 
-                std::this_thread::sleep_for(std::chrono::milliseconds(ScreenshotConstants::CAPTURE_SCAN_INTERVAL_MS));
+                std::this_thread::sleep_for(
+                    std::chrono::milliseconds(ScreenshotConstants::CAPTURE_SCAN_INTERVAL_MS));
             }
         }
     };
@@ -499,16 +876,16 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::HasInstance() noexcept {
-        return s_instanceCreated.load();
+        return s_instanceCreated.load(std::memory_order_acquire);
     }
 
     ScreenshotBlocker::ScreenshotBlocker()
         : m_impl(std::make_unique<ScreenshotBlockerImpl>()) {
-        s_instanceCreated = true;
+        s_instanceCreated.store(true, std::memory_order_release);
     }
 
     ScreenshotBlocker::~ScreenshotBlocker() {
-        s_instanceCreated = false;
+        s_instanceCreated.store(false, std::memory_order_release);
     }
 
     bool ScreenshotBlocker::Initialize(const ScreenshotBlockerConfiguration& config) {
@@ -520,13 +897,14 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::IsInitialized() const noexcept {
-        return m_impl != nullptr; // Simplified check
+        if (!m_impl) return false;
+        const auto status = m_impl->GetStatus();
+        return status != ModuleStatus::Uninitialized && status != ModuleStatus::Error;
     }
 
     ModuleStatus ScreenshotBlocker::GetStatus() const noexcept {
-        // Since PIMPL is opaque, we need to expose status.
-        // For this task, we'll assume Running if initialized.
-        return IsInitialized() ? ModuleStatus::Running : ModuleStatus::Uninitialized;
+        if (!m_impl) return ModuleStatus::Uninitialized;
+        return m_impl->GetStatus();
     }
 
     bool ScreenshotBlocker::IsRunning() const noexcept {
@@ -534,8 +912,16 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::Start() {
-        // Start is implicit in Initialize for this version
-        return true;
+        if (!m_impl) return false;
+        const auto status = m_impl->GetStatus();
+        if (status == ModuleStatus::Running) return true;
+        if (status == ModuleStatus::Paused) {
+            m_impl->SetPaused(false);
+            return true;
+        }
+        // Not initialized — caller should use Initialize() first
+        SS_LOG_ERROR(L"ScreenshotBlocker", L"Start() called but module is not initialized");
+        return false;
     }
 
     bool ScreenshotBlocker::Stop() {
@@ -544,19 +930,19 @@ namespace ShadowStrike::Banking {
     }
 
     void ScreenshotBlocker::Pause() {
-        // Implementation omitted for brevity
+        m_impl->SetPaused(true);
     }
 
     void ScreenshotBlocker::Resume() {
-        // Implementation omitted for brevity
+        m_impl->SetPaused(false);
     }
 
     bool ScreenshotBlocker::UpdateConfiguration(const ScreenshotBlockerConfiguration& config) {
-        return m_impl->Initialize(config); // Re-init
+        return m_impl->UpdateConfig(config);
     }
 
     ScreenshotBlockerConfiguration ScreenshotBlocker::GetConfiguration() const {
-        return {}; // Would return m_impl->config
+        return m_impl->GetConfig();
     }
 
     bool ScreenshotBlocker::ProtectWindow(WindowHandle hwnd) {
@@ -572,21 +958,16 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::IsWindowProtected(WindowHandle hwnd) const {
-        // Basic check, requires PIMPL access to map or caching
-        return false; // Placeholder
+        return m_impl->IsWindowProtected(hwnd);
     }
 
     ProtectionStatus ScreenshotBlocker::GetWindowProtectionStatus(WindowHandle hwnd) const {
-        auto info = GetProtectedWindowInfo(hwnd);
+        auto info = m_impl->GetWindowInfo(hwnd);
         return info ? info->status : ProtectionStatus::Unprotected;
     }
 
     std::optional<ProtectedWindowInfo> ScreenshotBlocker::GetProtectedWindowInfo(WindowHandle hwnd) const {
-        auto windows = m_impl->GetProtectedWindows();
-        for (const auto& w : windows) {
-            if (w.hwnd == hwnd) return w;
-        }
-        return std::nullopt;
+        return m_impl->GetWindowInfo(hwnd);
     }
 
     std::vector<ProtectedWindowInfo> ScreenshotBlocker::GetProtectedWindows() const {
@@ -621,8 +1002,47 @@ namespace ShadowStrike::Banking {
     }
 
     void ScreenshotBlocker::AutoProtectPasswordFields() {
-        // This would integrate with UI Automation to find edit controls with ES_PASSWORD
         SS_LOG_INFO(L"ScreenshotBlocker", L"Scanning for password fields to auto-protect");
+
+        // Enumerate top-level windows and look for edit controls with ES_PASSWORD style.
+        // Protects the parent window of each password field found.
+        struct EnumCtx {
+            ScreenshotBlocker* self;
+            size_t protectedCount;
+        } ctx{this, 0};
+
+        ::EnumWindows([](HWND hwnd, LPARAM lParam) -> BOOL {
+            auto* pCtx = reinterpret_cast<EnumCtx*>(lParam);
+            if (!::IsWindowVisible(hwnd)) return TRUE;
+
+            // Enumerate child controls looking for password edit fields
+            ::EnumChildWindows(hwnd, [](HWND child, LPARAM innerParam) -> BOOL {
+                wchar_t className[64] = {};
+                ::GetClassNameW(child, className, 64);
+
+                // Standard Edit control with ES_PASSWORD style
+                if (_wcsicmp(className, L"Edit") == 0) {
+                    LONG_PTR style = ::GetWindowLongPtrW(child, GWL_STYLE);
+                    if (style & ES_PASSWORD) {
+                        auto* ctx2 = reinterpret_cast<EnumCtx*>(innerParam);
+                        // Protect the top-level parent, not the edit control itself
+                        HWND topLevel = ::GetAncestor(child, GA_ROOT);
+                        if (topLevel && !ctx2->self->IsWindowProtected(
+                                reinterpret_cast<WindowHandle>(topLevel))) {
+                            if (ctx2->self->ProtectWindow(
+                                    reinterpret_cast<WindowHandle>(topLevel))) {
+                                ctx2->protectedCount++;
+                            }
+                        }
+                    }
+                }
+                return TRUE;
+            }, lParam);
+            return TRUE;
+        }, reinterpret_cast<LPARAM>(&ctx));
+
+        SS_LOG_INFO(L"ScreenshotBlocker", L"Auto-protected %zu windows containing password fields",
+            ctx.protectedCount);
     }
 
     void ScreenshotBlocker::BlockPrintScreen(bool block) {
@@ -634,15 +1054,15 @@ namespace ShadowStrike::Banking {
     }
 
     void ScreenshotBlocker::BlockCaptureApplication(std::wstring_view processName) {
-        // Add to blacklist
+        m_impl->BlockCaptureApp(processName);
     }
 
     void ScreenshotBlocker::UnblockCaptureApplication(std::wstring_view processName) {
-        // Remove from blacklist
+        m_impl->UnblockCaptureApp(processName);
     }
 
     bool ScreenshotBlocker::IsCaptureApplicationBlocked(std::wstring_view processName) const {
-        return false;
+        return m_impl->IsCaptureAppBlocked(processName);
     }
 
     void ScreenshotBlocker::EnableClipboardFiltering(bool enable) {
@@ -650,7 +1070,7 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::IsClipboardFilteringEnabled() const noexcept {
-        return true;
+        return m_impl->IsClipboardFilteringEnabled();
     }
 
     void ScreenshotBlocker::SanitizeClipboard() {
@@ -662,7 +1082,7 @@ namespace ShadowStrike::Banking {
     }
 
     bool ScreenshotBlocker::IsAdvancedProtectionAvailable() const noexcept {
-        return true;
+        return m_impl->IsExcludeFromCaptureSupported();
     }
 
     bool ScreenshotBlocker::IsExcludeFromCaptureSupported() const noexcept {
@@ -670,27 +1090,33 @@ namespace ShadowStrike::Banking {
     }
 
     std::vector<BlockingMethod> ScreenshotBlocker::GetSupportedMethods() const {
-        return { BlockingMethod::DisplayAffinity, BlockingMethod::ClipboardFilter };
+        std::vector<BlockingMethod> methods;
+        methods.push_back(BlockingMethod::DisplayAffinity);
+        methods.push_back(BlockingMethod::ClipboardFilter);
+        if (m_impl->IsExcludeFromCaptureSupported()) {
+            methods.push_back(BlockingMethod::Combined);
+        }
+        return methods;
     }
 
     void ScreenshotBlocker::WhitelistApplication(const std::wstring& path, const std::string& reason) {
-        // Forward to impl
+        m_impl->WhitelistApplication(path, reason);
     }
 
     void ScreenshotBlocker::WhitelistProcess(const std::wstring& processName, const std::string& reason) {
-        // Forward to impl
+        m_impl->WhitelistProcess(processName, reason);
     }
 
     void ScreenshotBlocker::RemoveFromWhitelist(const std::wstring& processName) {
-        // Forward to impl
+        m_impl->RemoveFromWhitelist(processName);
     }
 
     bool ScreenshotBlocker::IsWhitelisted(uint32_t processId) const {
-        return false;
+        return m_impl->IsWhitelisted(processId);
     }
 
     void ScreenshotBlocker::LoadAccessibilityWhitelist() {
-        // Forward to impl
+        m_impl->LoadAccessibilityWhitelist();
     }
 
     bool ScreenshotBlocker::InstallGDIHooks() {
@@ -710,23 +1136,25 @@ namespace ShadowStrike::Banking {
     }
 
     std::vector<CaptureAPIHook> ScreenshotBlocker::GetInstalledHooks() const {
+        // No user-mode hooks installed at this layer — cross-process
+        // hooking is performed by PhantomSensor.
         return {};
     }
 
     void ScreenshotBlocker::RegisterCaptureAttemptCallback(CaptureAttemptCallback callback) {
-        m_impl->RegisterCallbacks(callback, nullptr, nullptr);
+        m_impl->RegisterCaptureCallback(std::move(callback));
     }
 
     void ScreenshotBlocker::RegisterWindowProtectionCallback(WindowProtectionCallback callback) {
-        m_impl->RegisterCallbacks(nullptr, callback, nullptr);
+        m_impl->RegisterWindowCallback(std::move(callback));
     }
 
     void ScreenshotBlocker::RegisterErrorCallback(ErrorCallback callback) {
-        m_impl->RegisterCallbacks(nullptr, nullptr, callback);
+        m_impl->RegisterErrorCb(std::move(callback));
     }
 
     void ScreenshotBlocker::UnregisterCallbacks() {
-        m_impl->RegisterCallbacks(nullptr, nullptr, nullptr);
+        m_impl->ClearCallbacks();
     }
 
     ScreenshotBlockerStatistics ScreenshotBlocker::GetStatistics() const {
@@ -734,16 +1162,15 @@ namespace ShadowStrike::Banking {
     }
 
     void ScreenshotBlocker::ResetStatistics() {
-        // m_impl->ResetStatistics();
+        m_impl->ResetStatistics();
     }
 
     std::vector<CaptureAttemptEvent> ScreenshotBlocker::GetRecentCaptureAttempts(size_t maxCount) const {
-        return {};
+        return m_impl->GetRecentAttempts(maxCount);
     }
 
     bool ScreenshotBlocker::SelfTest() {
-        // Create dummy window and try to protect it
-        return true;
+        return m_impl->SelfTest();
     }
 
     std::string ScreenshotBlocker::GetVersionString() noexcept {
@@ -759,44 +1186,79 @@ namespace ShadowStrike::Banking {
 
     std::string ProtectedWindowInfo::ToJson() const {
         nlohmann::json j;
-        j["hwnd"] = (uint64_t)hwnd;
+        j["hwnd"] = static_cast<uint64_t>(hwnd);
         j["pid"] = processId;
-        j["process"] = StringUtils::WideToUtf8(processName);
-        j["title"] = StringUtils::WideToUtf8(windowTitle);
-        j["status"] = (int)status;
+        j["process"] = StringUtils::ToNarrow(processName);
+        j["title"] = StringUtils::ToNarrow(windowTitle);
+        j["class"] = StringUtils::ToNarrow(windowClass);
+        j["status"] = static_cast<int>(status);
         j["is_visible"] = isVisible;
+        j["is_minimized"] = isMinimized;
+        j["has_focus"] = hasFocus;
         return j.dump();
     }
 
     std::string CaptureAttemptEvent::ToJson() const {
         nlohmann::json j;
         j["id"] = eventId;
-        j["type"] = (int)captureType;
+        j["type"] = static_cast<int>(captureType);
+        j["type_name"] = std::string(GetCaptureAttemptTypeName(captureType));
         j["source_pid"] = sourceProcessId;
-        j["source"] = StringUtils::WideToUtf8(sourceProcessName);
+        j["source"] = StringUtils::ToNarrow(sourceProcessName);
+        j["target_hwnd"] = static_cast<uint64_t>(targetHwnd);
         j["blocked"] = wasBlocked;
+        j["result"] = static_cast<int>(blockingResult);
+        j["method"] = static_cast<int>(methodUsed);
+        j["whitelisted"] = isWhitelisted;
+        if (!details.empty()) {
+            j["details"] = details;
+        }
         return j.dump();
     }
 
     std::string ScreenshotBlockerStatistics::ToJson() const {
         nlohmann::json j;
-        j["total_protected"] = totalProtectedWindows.load();
-        j["currently_protected"] = currentlyProtected.load();
-        j["blocked_attempts"] = captureAttemptsBlocked.load();
-        j["clipboard_filtered"] = clipboardEventsFiltered.load();
+        j["total_protected"] = totalProtectedWindows.load(std::memory_order_relaxed);
+        j["currently_protected"] = currentlyProtected.load(std::memory_order_relaxed);
+        j["attempts_detected"] = captureAttemptsDetected.load(std::memory_order_relaxed);
+        j["blocked_attempts"] = captureAttemptsBlocked.load(std::memory_order_relaxed);
+        j["clipboard_filtered"] = clipboardEventsFiltered.load(std::memory_order_relaxed);
+        j["gdi_intercepted"] = gdiCallsIntercepted.load(std::memory_order_relaxed);
+        j["dx_intercepted"] = dxCallsIntercepted.load(std::memory_order_relaxed);
+        j["whitelisted_passes"] = whitelistedPasses.load(std::memory_order_relaxed);
         return j.dump();
     }
 
     bool ScreenshotBlockerConfiguration::IsValid() const noexcept {
+        // At least one protection method must be enabled
+        if (!enableDisplayAffinity && !enableGDIHooks && !enableDirectXHooks &&
+            !enableClipboardFiltering && !enablePrintScreenBlocking &&
+            !enableOverlayObfuscation) {
+            return false;
+        }
+
+        // Validate whitelist sizes
+        if (whitelistedApplications.size() > ScreenshotConstants::MAX_WHITELISTED_APPS ||
+            whitelistedProcessNames.size() > ScreenshotConstants::MAX_WHITELISTED_APPS) {
+            return false;
+        }
+
         return true;
     }
 
     void ScreenshotBlockerStatistics::Reset() noexcept {
-        totalProtectedWindows = 0;
-        currentlyProtected = 0;
-        captureAttemptsBlocked = 0;
-        clipboardEventsFiltered = 0;
-        // ... reset others
+        totalProtectedWindows.store(0, std::memory_order_relaxed);
+        currentlyProtected.store(0, std::memory_order_relaxed);
+        captureAttemptsDetected.store(0, std::memory_order_relaxed);
+        captureAttemptsBlocked.store(0, std::memory_order_relaxed);
+        clipboardEventsFiltered.store(0, std::memory_order_relaxed);
+        gdiCallsIntercepted.store(0, std::memory_order_relaxed);
+        dxCallsIntercepted.store(0, std::memory_order_relaxed);
+        whitelistedPasses.store(0, std::memory_order_relaxed);
+        for (auto& counter : byCaptureType) {
+            counter.store(0, std::memory_order_relaxed);
+        }
+        startTime = Clock::now();
     }
 
     // ========================================================================
@@ -818,9 +1280,24 @@ namespace ShadowStrike::Banking {
 
     std::string_view GetCaptureAttemptTypeName(CaptureAttemptType type) noexcept {
         switch(type) {
+            case CaptureAttemptType::Unknown: return "Unknown";
             case CaptureAttemptType::PrintScreenKey: return "PrintScreenKey";
+            case CaptureAttemptType::AltPrintScreen: return "AltPrintScreen";
             case CaptureAttemptType::SnippingTool: return "SnippingTool";
+            case CaptureAttemptType::SnipAndSketch: return "SnipAndSketch";
+            case CaptureAttemptType::GameBar: return "GameBar";
             case CaptureAttemptType::BitBltCapture: return "BitBltCapture";
+            case CaptureAttemptType::StretchBltCapture: return "StretchBltCapture";
+            case CaptureAttemptType::PrintWindow: return "PrintWindow";
+            case CaptureAttemptType::DesktopDuplication: return "DesktopDuplication";
+            case CaptureAttemptType::GetFrontBuffer: return "GetFrontBuffer";
+            case CaptureAttemptType::ThirdPartyRecorder: return "ThirdPartyRecorder";
+            case CaptureAttemptType::RemoteDesktop: return "RemoteDesktop";
+            case CaptureAttemptType::VNCCapture: return "VNCCapture";
+            case CaptureAttemptType::TeamViewerCapture: return "TeamViewerCapture";
+            case CaptureAttemptType::MagnifierAbuse: return "MagnifierAbuse";
+            case CaptureAttemptType::ClipboardCopy: return "ClipboardCopy";
+            case CaptureAttemptType::MalwareCapture: return "MalwareCapture";
             default: return "Unknown";
         }
     }
@@ -841,6 +1318,7 @@ namespace ShadowStrike::Banking {
             case BlockingResult::Failed: return "Failed";
             case BlockingResult::NotSupported: return "NotSupported";
             case BlockingResult::Whitelisted: return "Whitelisted";
+            case BlockingResult::Timeout: return "Timeout";
             default: return "Unknown";
         }
     }
