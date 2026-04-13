@@ -153,6 +153,7 @@
 #include "../SignatureStore/SignatureStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "../Utils/StringUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -730,6 +731,27 @@ struct DetectionStatistics {
 };
 
 /**
+ * @brief Thread-safe snapshot of detection statistics (copyable)
+ *
+ * DetectionStatistics contains std::atomic members and cannot be copied.
+ * This struct provides a plain-data snapshot for returning from public API.
+ */
+struct DetectionStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t threatsDetected = 0;
+    uint64_t threatsQuarantined = 0;
+    uint64_t threatsRemediated = 0;
+    uint64_t falsePositives = 0;
+    uint64_t whitelistHits = 0;
+    std::array<uint64_t, 32> byFamily{};
+    std::array<uint64_t, 16> byMethod{};
+    TimePoint startTime;
+    SystemTimePoint lastDetectionTime;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Detector configuration
  */
 struct BankingTrojanDetectorConfiguration {
@@ -1106,7 +1128,7 @@ public:
     /**
      * @brief Get statistics
      */
-    [[nodiscard]] DetectionStatistics GetStatistics() const;
+    [[nodiscard]] DetectionStatisticsSnapshot GetStatistics() const;
     
     /**
      * @brief Reset statistics
