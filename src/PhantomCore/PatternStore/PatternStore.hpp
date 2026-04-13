@@ -384,11 +384,6 @@ namespace ShadowStrike {
                 std::function<void(size_t current, size_t total)> progressCallback = nullptr
             ) noexcept;
 
-            // Import from ClamAV signature format
-            [[nodiscard]] StoreError ImportFromClamAV(
-                const std::wstring& filePath
-            ) noexcept;
-
             // Export patterns to JSON
             [[nodiscard]] std::string ExportToJson(
                 uint32_t maxEntries = UINT32_MAX

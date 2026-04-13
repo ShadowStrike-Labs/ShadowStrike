@@ -279,11 +279,6 @@ public:
         const std::wstring& filePath
     ) noexcept;
 
-    // Import patterns from ClamAV signature file
-    [[nodiscard]] StoreError ImportPatternsFromClamAV(
-        const std::wstring& filePath
-    ) noexcept;
-
     // Import YARA rules from file
     [[nodiscard]] StoreError ImportYaraRulesFromFile(
         const std::wstring& filePath,
@@ -652,7 +647,6 @@ enum class FileFormat {
     HashList,
     PatternList,
     YaraRules,
-    ClamAV,
     JSON,
     CSV
 };

@@ -29,7 +29,7 @@
  *
  * Test Categories:
  * 1. Hash Import Tests (File, CSV, JSON)
- * 2. Pattern Import Tests (File, ClamAV format)
+ * 2. Pattern Import Tests (File)
  * 3. YARA Rule Import Tests (File, Directory, Recursive)
  * 4. Database Import Tests (Merge functionality)
  * 5. Data Parsing & Validation Tests
@@ -540,37 +540,6 @@ TEST_F(SignatureBuilderImportTest, ImportPatternsFromFileInvalidFormat) {
     EXPECT_FALSE(err.IsSuccess());
     EXPECT_EQ(err.code, SignatureStoreError::InvalidFormat);
     EXPECT_EQ(m_builder->GetPendingPatternCount(), 0u);
-}
-
-// ============================================================================
-// 5. IMPORT PATTERNS FROM CLAMAV TESTS
-// ============================================================================
-
-TEST_F(SignatureBuilderImportTest, ImportPatternsFromClamAVNonExistent) {
-    std::wstring nonExistentPath = m_tempDir + L"\\nonexistent_clamav.txt";
-    
-    StoreError err = m_builder->ImportPatternsFromClamAV(nonExistentPath);
-    EXPECT_FALSE(err.IsSuccess());
-    EXPECT_EQ(err.code, SignatureStoreError::FileNotFound);
-}
-
-TEST_F(SignatureBuilderImportTest, ImportPatternsFromClamAVEmpty) {
-    std::string content = "";
-    auto filePath = CreateTempFile(content, L"clamav_empty.txt");
-    
-    StoreError err = m_builder->ImportPatternsFromClamAV(filePath);
-    EXPECT_FALSE(err.IsSuccess());
-}
-
-TEST_F(SignatureBuilderImportTest, ImportPatternsFromClamAVValidFormat) {
-    // ClamAV format: Name:TargetType:Offset:Signature
-    std::string content = "Trojan.Win32.Test:0:*:48 8B 05\n";
-    
-    auto filePath = CreateTempFile(content, L"clamav.txt");
-    
-    StoreError err = m_builder->ImportPatternsFromClamAV(filePath);
-    EXPECT_TRUE(err.IsSuccess());
-    EXPECT_EQ(m_builder->GetPendingPatternCount(), 1u);
 }
 
 // ============================================================================

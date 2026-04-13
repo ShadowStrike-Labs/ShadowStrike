@@ -250,7 +250,7 @@ std::optional<std::vector<uint8_t>> PatternCompiler::CompilePattern(
         if (!current.empty()) {
             tokens.push_back(current);
         }
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         SS_LOG_ERROR(L"PatternCompiler", L"Tokenization failed: exception");
         return std::nullopt;
     }
@@ -1386,7 +1386,7 @@ StoreError PatternStore::AddCompiledPattern(
     } catch (const std::bad_alloc&) {
         SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Memory allocation failed");
         return StoreError{SignatureStoreError::OutOfMemory, 0, "Memory allocation failed"};
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         SS_LOG_ERROR(L"PatternStore", L"AddCompiledPattern: Exception occurred");
         return StoreError{SignatureStoreError::Unknown, 0, "Exception during pattern addition"};
     }
@@ -2080,135 +2080,7 @@ StoreError PatternStore::ImportFromYaraFile(
     return AddPatternBatch(patterns, names, levels);
 }
 
-// ============================================================================
-// IMPORT FROM CLAMAV 
-// ============================================================================
-
-StoreError PatternStore::ImportFromClamAV(const std::wstring& filePath) noexcept {
-    SS_LOG_INFO(L"PatternStore", L"ImportFromClamAV: %ls", filePath.c_str());
-
-    if (m_readOnly.load(std::memory_order_acquire)) {
-        return StoreError{ SignatureStoreError::AccessDenied, 0, "Read-only mode" };
-    }
-
-    // Read ClamAV signature file
-    std::vector<std::byte> fileContent;
-    ShadowStrike::Utils::FileUtils::Error fileErr{};
-
-    if (!ShadowStrike::Utils::FileUtils::ReadAllBytes(filePath, fileContent, &fileErr)) {
-        SS_LOG_ERROR(L"PatternStore", L"ImportFromClamAV: Failed to read file: %u", fileErr.win32);
-        return StoreError{ SignatureStoreError::FileNotFound, fileErr.win32, "Cannot read file" };
-    }
-
-    // Cap file size (128 MB max for ClamAV .ndb files)
-    constexpr size_t MAX_CLAMAV_FILE_SIZE = 128 * 1024 * 1024;
-    if (fileContent.size() > MAX_CLAMAV_FILE_SIZE) {
-        SS_LOG_ERROR(L"PatternStore",
-            L"ImportFromClamAV: File exceeds 128 MB limit: %zu bytes", fileContent.size());
-        return StoreError{ SignatureStoreError::InvalidFormat, 0, "ClamAV file exceeds 128 MB" };
-    }
-
-    std::string content(reinterpret_cast<const char*>(fileContent.data()), fileContent.size());
-
-    // ClamAV .ndb format: SignatureName:TargetType:Offset:HexSignature[:MinFL[:MaxFL]]
-    // TargetType: 0=any, 1=PE, 2=OLE2, 3=HTML, 4=Mail, 5=Graphics, 6=ELF, 7=ASCII
-    std::vector<std::string> patterns;
-    std::vector<std::string> names;
-    std::vector<ThreatLevel> levels;
-
-    size_t pos = 0;
-    size_t importedCount = 0;
-    size_t skippedCount = 0;
-    constexpr size_t MAX_SIGNATURES = 500000;
-
-    while (pos < content.size() && importedCount < MAX_SIGNATURES) {
-        size_t nextNewline = content.find('\n', pos);
-        if (nextNewline == std::string::npos) nextNewline = content.size();
-
-        std::string line = content.substr(pos, nextNewline - pos);
-        pos = nextNewline + 1;
-
-        if (!line.empty() && line.back() == '\r') line.pop_back();
-        if (line.empty() || line[0] == '#') continue;
-
-        // Tokenize by ':'
-        std::vector<std::string> tokens;
-        size_t tokenStart = 0;
-
-        for (size_t i = 0; i <= line.size(); ++i) {
-            if (i == line.size() || line[i] == ':') {
-                tokens.push_back(line.substr(tokenStart, i - tokenStart));
-                tokenStart = i + 1;
-                if (tokens.size() >= 6) break; // Only need up to MaxFL
-            }
-        }
-
-        // Require at least 4 fields: Name:TargetType:Offset:HexSignature
-        if (tokens.size() < 4 || tokens[0].empty() || tokens[3].empty()) {
-            ++skippedCount;
-            continue;
-        }
-
-        std::string& sigName = tokens[0];
-        std::string& hexSig = tokens[3];
-
-        // Cap signature name length
-        if (sigName.size() > 256) sigName = sigName.substr(0, 256);
-
-        // Validate hex signature contains only valid hex chars and wildcards
-        bool validHex = true;
-        for (char c : hexSig) {
-            if (!std::isxdigit(static_cast<unsigned char>(c)) &&
-                c != '?' && c != '*' && c != '{' && c != '}' &&
-                c != '-' && c != '(' && c != ')' && c != '|' &&
-                c != '[' && c != ']' && c != '!' && c != 'n') {
-                validHex = false;
-                break;
-            }
-        }
-        if (!validHex || hexSig.size() < 4) {
-            ++skippedCount;
-            continue;
-        }
-
-        // Cap individual signature size
-        if (hexSig.size() > 32768) {
-            hexSig = hexSig.substr(0, 32768);
-        }
-
-        // Classify threat level from signature name prefix conventions
-        ThreatLevel level = ThreatLevel::High;
-        if (sigName.find("PUA.") == 0 || sigName.find("Adware.") == 0)
-            level = ThreatLevel::Low;
-        else if (sigName.find("Trojan.") == 0 || sigName.find("Exploit.") == 0 ||
-                 sigName.find("Ransomware.") == 0)
-            level = ThreatLevel::Critical;
-        else if (sigName.find("Worm.") == 0 || sigName.find("Backdoor.") == 0)
-            level = ThreatLevel::High;
-
-        patterns.push_back(std::move(hexSig));
-        names.push_back(std::move(sigName));
-        levels.push_back(level);
-        importedCount++;
-    }
-
-    if (skippedCount > 0) {
-        SS_LOG_INFO(L"PatternStore",
-            L"ImportFromClamAV: Skipped %zu malformed lines", skippedCount);
-    }
-
-    if (patterns.empty()) {
-        SS_LOG_WARN(L"PatternStore", L"ImportFromClamAV: No valid patterns found");
-        return StoreError{ SignatureStoreError::InvalidFormat, 0, "No valid patterns found" };
-    }
-
-    SS_LOG_INFO(L"PatternStore", L"ImportFromClamAV: Importing %zu patterns", patterns.size());
-
-    return AddPatternBatch(patterns, names, levels);
-}
-
-// ============================================================================
-// EXPORT TO JSON 
+// EXPORT TO JSON
 // ============================================================================
 
 std::string PatternStore::ExportToJson(uint32_t maxEntries) const noexcept {
@@ -2618,7 +2490,7 @@ std::vector<DetectionResult> PatternStore::ScanWithAutomaton(
                 SS_LOG_WARN(L"PatternStore", L"ScanWithAutomaton: Memory allocation failed for result");
             }
         });
-    } catch (const std::exception& e) {
+    } catch (const std::exception&) {
         SS_LOG_ERROR(L"PatternStore", L"ScanWithAutomaton: Exception during search");
     }
 
@@ -2705,7 +2577,7 @@ std::vector<DetectionResult> PatternStore::ScanWithSIMD(
                 results.push_back(std::move(result));
                 matchCount++;
             }
-        } catch (const std::exception& e) {
+        } catch (const std::exception&) {
             SS_LOG_WARN(L"PatternStore", 
                 L"ScanWithSIMD: Exception searching pattern %llu", meta.signatureId);
         }
