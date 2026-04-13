@@ -71,6 +71,7 @@
 #include <iomanip>
 #include <deque>
 #include <random>
+#include <filesystem>
 
 namespace ShadowStrike {
 namespace CryptoMiners {
@@ -80,6 +81,67 @@ namespace CryptoMiners {
 // ============================================================================
 
 namespace {
+
+/**
+ * @brief RAII wrapper for Win32 HANDLE resources.
+ * Automatically calls CloseHandle on destruction.
+ */
+struct ScopedHandle {
+    HANDLE h = NULL;
+
+    ScopedHandle() noexcept = default;
+    explicit ScopedHandle(HANDLE handle) noexcept : h(handle) {}
+    ~ScopedHandle() { if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h); }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : h(other.h) { other.h = NULL; }
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            reset();
+            h = other.h;
+            other.h = NULL;
+        }
+        return *this;
+    }
+
+    explicit operator bool() const noexcept { return h != NULL && h != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] HANDLE get() const noexcept { return h; }
+
+    void reset(HANDLE newHandle = NULL) noexcept {
+        if (h && h != INVALID_HANDLE_VALUE) CloseHandle(h);
+        h = newHandle;
+    }
+};
+
+/**
+ * @brief Escape a UTF-8 string for safe JSON embedding.
+ */
+std::string EscapeJsonString(const std::string& input) {
+    std::string output;
+    output.reserve(input.size() + 16);
+    for (const char c : input) {
+        switch (c) {
+            case '"':  output += "\\\""; break;
+            case '\\': output += "\\\\"; break;
+            case '\b': output += "\\b"; break;
+            case '\f': output += "\\f"; break;
+            case '\n': output += "\\n"; break;
+            case '\r': output += "\\r"; break;
+            case '\t': output += "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned char>(c));
+                    output += buf;
+                } else {
+                    output += c;
+                }
+        }
+    }
+    return output;
+}
 
 /**
  * @brief Calculate standard deviation
@@ -170,13 +232,11 @@ bool GetProcessCPUTime(HANDLE hProcess, uint64_t& kernelMs, uint64_t& userMs) {
  *          Miners like RandomX almost always require this privilege.
  */
 bool ProcessUsesLargePages(HANDLE hProcess) {
-    HANDLE hToken = NULL;
-    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hToken)) {
+    HANDLE hTokenRaw = NULL;
+    if (!OpenProcessToken(hProcess, TOKEN_QUERY, &hTokenRaw)) {
         return false;
     }
-
-    // Use RAII for handle cleanup
-    struct HandleGuard { HANDLE h; ~HandleGuard() { if(h) CloseHandle(h); } } guard{hToken};
+    ScopedHandle hToken(hTokenRaw);
 
     LUID luid;
     if (!LookupPrivilegeValueW(NULL, SE_LOCK_MEMORY_NAME, &luid)) {
@@ -190,7 +250,7 @@ bool ProcessUsesLargePages(HANDLE hProcess) {
     privs.Privilege[0].Attributes = 0;
 
     BOOL result = FALSE;
-    if (!PrivilegeCheck(hToken, &privs, &result)) {
+    if (!PrivilegeCheck(hToken.get(), &privs, &result)) {
         return false;
     }
 
@@ -198,7 +258,7 @@ bool ProcessUsesLargePages(HANDLE hProcess) {
 }
 
 /**
- * @brief Generate event ID
+ * @brief Generate event ID with timestamp and random suffix
  */
 std::string GenerateEventId() {
     auto now = std::chrono::system_clock::now();
@@ -206,8 +266,7 @@ std::string GenerateEventId() {
         now.time_since_epoch()
     ).count();
 
-    std::random_device rd;
-    std::mt19937 gen(rd());
+    static thread_local std::mt19937 gen{std::random_device{}()};
     std::uniform_int_distribution<> dis(1000, 9999);
 
     return std::format("CPU_EVENT_{}_{}", nowMs, dis(gen));
@@ -255,7 +314,7 @@ std::string ProcessCPUSignature::ToJson() const {
     std::ostringstream oss;
     oss << "{\n";
     oss << "  \"processId\": " << processId << ",\n";
-    oss << "  \"processName\": \"" << Utils::StringUtils::WideToUtf8(processName) << "\",\n";
+    oss << "  \"processName\": \"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(processName)) << "\",\n";
     oss << "  \"totalUsagePercent\": " << std::fixed << std::setprecision(2) << totalUsagePercent << ",\n";
     oss << "  \"avgUsagePercent\": " << std::fixed << std::setprecision(2) << avgUsagePercent << ",\n";
     oss << "  \"peakUsagePercent\": " << std::fixed << std::setprecision(2) << peakUsagePercent << ",\n";
@@ -277,7 +336,7 @@ std::string ProcessCPUSignature::ToJson() const {
 std::string HighLoadEvent::ToJson() const {
     std::ostringstream oss;
     oss << "{\n";
-    oss << "  \"eventId\": \"" << eventId << "\",\n";
+    oss << "  \"eventId\": \"" << EscapeJsonString(eventId) << "\",\n";
     oss << "  \"signature\": " << signature.ToJson() << ",\n";
     oss << "  \"isMiningBehavior\": " << (isMiningBehavior ? "true" : "false") << ",\n";
     oss << "  \"durationSecs\": " << durationSecs << "\n";
@@ -335,17 +394,23 @@ public:
     void AddSample(uint32_t pid, const ProcessSample& sample) {
         std::unique_lock lock(m_mutex);
 
+        // Enforce max tracked processes: reject new PIDs at capacity
+        if (m_history.find(pid) == m_history.end() &&
+            m_history.size() >= CPUAnalyzerConstants::MAX_TRACKED_PROCESSES) {
+            return;
+        }
+
         auto& history = m_history[pid];
         history.samples.push_back(sample);
         history.lastSeen = Clock::now();
 
-        // Limit samples
+        // Limit samples per process
         if (history.samples.size() > CPUAnalyzerConstants::MAX_SAMPLES_PER_PROCESS) {
             history.samples.pop_front();
         }
     }
 
-    std::optional<ProcessSample> GetLastSample(uint32_t pid) const {
+    [[nodiscard]] std::optional<ProcessSample> GetLastSample(uint32_t pid) const {
         std::shared_lock lock(m_mutex);
         auto it = m_history.find(pid);
         if (it != m_history.end() && !it->second.samples.empty()) {
@@ -354,7 +419,7 @@ public:
         return std::nullopt;
     }
 
-    std::vector<ProcessSample> GetHistory(uint32_t pid, size_t maxSamples) const {
+    [[nodiscard]] std::vector<ProcessSample> GetHistory(uint32_t pid, size_t maxSamples) const {
         std::shared_lock lock(m_mutex);
 
         auto it = m_history.find(pid);
@@ -373,6 +438,16 @@ public:
         );
     }
 
+    [[nodiscard]] std::vector<uint32_t> GetTrackedPids() const {
+        std::shared_lock lock(m_mutex);
+        std::vector<uint32_t> pids;
+        pids.reserve(m_history.size());
+        for (const auto& [pid, _] : m_history) {
+            pids.push_back(pid);
+        }
+        return pids;
+    }
+
     void CleanStale(std::chrono::seconds maxAge) {
         std::unique_lock lock(m_mutex);
 
@@ -388,10 +463,13 @@ public:
 
     void SetProcessName(uint32_t pid, const std::wstring& name) {
         std::unique_lock lock(m_mutex);
-        m_history[pid].processName = name;
+        auto it = m_history.find(pid);
+        if (it != m_history.end()) {
+            it->second.processName = name;
+        }
     }
 
-    std::wstring GetProcessName(uint32_t pid) const {
+    [[nodiscard]] std::wstring GetProcessName(uint32_t pid) const {
         std::shared_lock lock(m_mutex);
         auto it = m_history.find(pid);
         return (it != m_history.end()) ? it->second.processName : L"";
@@ -408,45 +486,22 @@ private:
 
 class PerformanceCounterReader {
 public:
-    PerformanceCounterData ReadCounters(uint32_t pid) {
+    /**
+     * @brief Read hardware performance counters for a process.
+     *
+     * Real PMU counter reading (IPC, L3 cache misses, branch prediction)
+     * requires kernel driver support (e.g., via ETW or custom driver).
+     * User-mode APIs do not expose these metrics. Returns invalid data
+     * so callers can correctly skip PMU-dependent analysis paths.
+     */
+    [[nodiscard]] PerformanceCounterData ReadCounters([[maybe_unused]] uint32_t pid) const {
         PerformanceCounterData data;
-
-        // Note: Actual PMU counter reading requires kernel driver
-        // This is a simplified implementation using available APIs
-
-        HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
-        if (!hProcess) {
-            return data;
-        }
-
-        // Get I/O counters as proxy for some measurements
-        IO_COUNTERS ioCounters = {};
-        if (GetProcessIoCounters(hProcess, &ioCounters)) {
-            // Use I/O operations as rough approximation
-            data.instructionsRetired = ioCounters.ReadOperationCount + ioCounters.WriteOperationCount;
-            data.isValid = true;
-        }
-
-        CloseHandle(hProcess);
-
-        // Calculate derived metrics
-        if (data.cpuCycles > 0) {
-            data.ipc = static_cast<double>(data.instructionsRetired) / data.cpuCycles;
-        }
-
-        if (data.l3CacheReferences > 0) {
-            data.l3MissRatio = static_cast<double>(data.l3CacheMisses) / data.l3CacheReferences;
-        }
-
-        if (data.branchInstructions > 0) {
-            data.branchMissRatio = static_cast<double>(data.branchMisses) / data.branchInstructions;
-        }
-
+        // isValid remains false: no real PMU data available from user mode.
+        // Callers must check isValid before using any counter fields.
         return data;
     }
 
-    bool IsRandomXSignature(const PerformanceCounterData& data) const {
-        // RandomX has high L3 cache miss rate (>15%)
+    [[nodiscard]] bool IsRandomXSignature(const PerformanceCounterData& data) const {
         return data.isValid && data.l3MissRatio > CPUAnalyzerConstants::RANDOMX_CACHE_MISS_THRESHOLD;
     }
 };
@@ -457,8 +512,8 @@ public:
 
 class AlgorithmDetector {
 public:
-    SuspectedAlgorithm DetectAlgorithm(const ProcessCPUSignature& signature) const {
-        // RandomX detection (Monero)
+    [[nodiscard]] SuspectedAlgorithm DetectAlgorithm(const ProcessCPUSignature& signature) const {
+        // RandomX detection (Monero): high L3 cache misses + large pages + high CPU
         if (signature.perfCounters.isValid &&
             signature.perfCounters.l3MissRatio > 0.15 &&
             signature.usesLargePages &&
@@ -466,7 +521,7 @@ public:
             return SuspectedAlgorithm::RandomX;
         }
 
-        // CryptoNight detection
+        // CryptoNight detection: moderate CPU, all cores, uniform distribution
         if (signature.avgUsagePercent > 50.0 &&
             signature.avgUsagePercent < 80.0 &&
             signature.activeThreadCount >= std::thread::hardware_concurrency() &&
@@ -500,14 +555,13 @@ public:
 
 class PatternAnalyzer {
 public:
-    CPUUsagePattern AnalyzePattern(const std::vector<double>& usageHistory) const {
+    [[nodiscard]] CPUUsagePattern AnalyzePattern(const std::vector<double>& usageHistory) const {
         if (usageHistory.size() < 5) {
             return CPUUsagePattern::Unknown;
         }
 
         const double avg = std::accumulate(usageHistory.begin(), usageHistory.end(), 0.0) / usageHistory.size();
         const double stdDev = CalculateStdDev(usageHistory);
-        const double cv = CalculateCV(usageHistory);
 
         // Sustained high usage (low variance, high average)
         if (avg > 80.0 && stdDev < 10.0) {
@@ -543,7 +597,7 @@ public:
     }
 
 private:
-    bool IsGradualIncrease(const std::vector<double>& values) const {
+    [[nodiscard]] bool IsGradualIncrease(const std::vector<double>& values) const {
         if (values.size() < 5) return false;
 
         uint32_t increaseCount = 0;
@@ -591,7 +645,8 @@ public:
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Logger::Error("HighLoadCallback exception: {}", e.what());
+                Utils::Logger::Error(L"CPUUsageAnalyzer: HighLoadCallback exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -602,7 +657,8 @@ public:
             try {
                 callback(signature);
             } catch (const std::exception& e) {
-                Logger::Error("MiningDetectedCallback exception: {}", e.what());
+                Utils::Logger::Error(L"CPUUsageAnalyzer: MiningDetectedCallback exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -613,7 +669,8 @@ public:
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
-                Logger::Error("ErrorCallback exception: {}", e.what());
+                Utils::Logger::Error(L"CPUUsageAnalyzer: ErrorCallback exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
     }
@@ -632,9 +689,11 @@ private:
 class CPUUsageAnalyzerImpl {
 public:
     CPUUsageAnalyzerImpl() = default;
+
     ~CPUUsageAnalyzerImpl() {
-        ShutdownPDH();
+        // Stop monitor thread first - it may reference PDH and other resources
         Stop();
+        ShutdownPDH();
     }
 
     // Prevent copying
@@ -649,10 +708,10 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Logger::Info("CPUUsageAnalyzer: Initializing...");
+            Utils::Logger::Info(L"CPUUsageAnalyzer: Initializing...");
 
             if (!config.IsValid()) {
-                Logger::Error("CPUUsageAnalyzer: Invalid configuration");
+                Utils::Logger::Error(L"CPUUsageAnalyzer: Invalid configuration");
                 return false;
             }
 
@@ -671,10 +730,10 @@ public:
             GetSystemInfo(&sysInfo);
             m_processorCount = sysInfo.dwNumberOfProcessors;
 
-            // Initialize PDH
+            // Initialize PDH for per-core CPU monitoring
             InitializePDH();
 
-            // Initialize system times
+            // Initialize system times baseline
             FILETIME idle, kernel, user;
             if (GetSystemTimes(&idle, &kernel, &user)) {
                 m_prevSysIdle = FileTimeToRaw(idle);
@@ -685,11 +744,13 @@ public:
             m_initialized = true;
             m_status = ModuleStatus::Stopped;
 
-            Logger::Info("CPUUsageAnalyzer: Initialized successfully (Cores: {})", m_processorCount);
+            Utils::Logger::Info(L"CPUUsageAnalyzer: Initialized successfully (Cores: {})",
+                m_processorCount);
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("CPUUsageAnalyzer: Initialization failed: {}", e.what());
+            Utils::Logger::Error(L"CPUUsageAnalyzer: Initialization failed: {}",
+                Utils::StringUtils::Utf8ToWide(e.what()));
             m_status = ModuleStatus::Error;
             return false;
         }
@@ -704,15 +765,15 @@ public:
         m_initialized = false;
         m_status = ModuleStatus::Uninitialized;
 
-        Logger::Info("CPUUsageAnalyzer: Shutdown complete");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Shutdown complete");
     }
 
-    bool IsInitialized() const noexcept {
+    [[nodiscard]] bool IsInitialized() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_initialized;
     }
 
-    ModuleStatus GetStatus() const noexcept {
+    [[nodiscard]] ModuleStatus GetStatus() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_status;
     }
@@ -725,31 +786,30 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Logger::Error("CPUUsageAnalyzer: Not initialized");
+            Utils::Logger::Error(L"CPUUsageAnalyzer: Cannot start - not initialized");
             return false;
         }
 
-        if (m_running) {
-            Logger::Warn("CPUUsageAnalyzer: Already running");
+        if (m_running.load(std::memory_order_acquire)) {
+            Utils::Logger::Warn(L"CPUUsageAnalyzer: Already running");
             return true;
         }
 
-        m_running = true;
-        m_paused = false;
+        m_running.store(true, std::memory_order_release);
+        m_paused.store(false, std::memory_order_release);
         m_status = ModuleStatus::Running;
         m_monitorThread = std::thread(&CPUUsageAnalyzerImpl::MonitorThreadFunc, this);
 
-        Logger::Info("CPUUsageAnalyzer: Monitoring started");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitoring started");
         return true;
     }
 
     bool Stop() {
-        {
-            std::unique_lock lock(m_mutex);
-            if (!m_running) return true;
-            m_running = false;
-        }
+        // Signal the thread to stop (atomic, no lock needed)
+        bool wasRunning = m_running.exchange(false, std::memory_order_acq_rel);
+        if (!wasRunning) return true;
 
+        // Join outside lock to avoid deadlock with monitor thread
         if (m_monitorThread.joinable()) {
             m_monitorThread.join();
         }
@@ -757,22 +817,24 @@ public:
         std::unique_lock lock(m_mutex);
         m_status = ModuleStatus::Stopped;
 
-        Logger::Info("CPUUsageAnalyzer: Monitoring stopped");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitoring stopped");
         return true;
     }
 
     void Pause() {
+        m_paused.store(true, std::memory_order_release);
+
         std::unique_lock lock(m_mutex);
-        m_paused = true;
         m_status = ModuleStatus::Paused;
-        Logger::Info("CPUUsageAnalyzer: Paused");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Paused");
     }
 
     void Resume() {
+        m_paused.store(false, std::memory_order_release);
+
         std::unique_lock lock(m_mutex);
-        m_paused = false;
         m_status = ModuleStatus::Running;
-        Logger::Info("CPUUsageAnalyzer: Resumed");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Resumed");
     }
 
     // ========================================================================
@@ -781,16 +843,17 @@ public:
 
     bool UpdateConfiguration(const CPUUsageAnalyzerConfiguration& config) {
         if (!config.IsValid()) {
+            Utils::Logger::Error(L"CPUUsageAnalyzer: Invalid configuration update rejected");
             return false;
         }
 
         std::unique_lock lock(m_mutex);
         m_config = config;
-        Logger::Info("CPUUsageAnalyzer: Configuration updated");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Configuration updated");
         return true;
     }
 
-    CPUUsageAnalyzerConfiguration GetConfiguration() const {
+    [[nodiscard]] CPUUsageAnalyzerConfiguration GetConfiguration() const {
         std::shared_lock lock(m_mutex);
         return m_config;
     }
@@ -800,43 +863,44 @@ public:
     // ========================================================================
 
     void CollectSample() {
-        std::shared_lock lock(m_mutex);
+        if (m_paused.load(std::memory_order_acquire)) return;
 
-        if (m_paused) return;
+        // unique_lock: this method writes m_lastOverallCPU, m_lastPerCoreUsage,
+        // m_prevSys*, m_lastSysTimeDelta
+        std::unique_lock lock(m_mutex);
 
         try {
             // Collect system-wide CPU
             m_lastOverallCPU = GetSystemCPUUsage();
 
-            // Collect per-core usage if available
+            // Collect per-core usage
             m_lastPerCoreUsage = GetPerCoreCPUUsage();
 
-            // Enumerate processes
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-            if (hSnapshot == INVALID_HANDLE_VALUE) {
+            // Enumerate processes with RAII snapshot
+            ScopedHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+            if (!hSnapshot) {
                 return;
             }
 
             PROCESSENTRY32W pe32;
             pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-            if (Process32FirstW(hSnapshot, &pe32)) {
+            if (Process32FirstW(hSnapshot.get(), &pe32)) {
                 do {
                     if (pe32.th32ProcessID > 4) {
                         CollectProcessSample(pe32.th32ProcessID, pe32.szExeFile);
                     }
-                } while (Process32NextW(hSnapshot, &pe32));
+                } while (Process32NextW(hSnapshot.get(), &pe32));
             }
-
-            CloseHandle(hSnapshot);
 
             m_stats.samplesTaken.fetch_add(1, std::memory_order_relaxed);
 
-            // Clean stale tracking
+            // Clean stale tracking data
             m_processTracker->CleanStale(std::chrono::seconds(60));
 
         } catch (const std::exception& e) {
-            Logger::Error("CPUUsageAnalyzer::CollectSample: {}", e.what());
+            Utils::Logger::Error(L"CPUUsageAnalyzer::CollectSample: {}",
+                Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
@@ -846,82 +910,7 @@ public:
 
     ProcessCPUSignature AnalyzeProcess(uint32_t processId) {
         std::shared_lock lock(m_mutex);
-
-        ProcessCPUSignature signature;
-        signature.processId = processId;
-        signature.analysisTime = std::chrono::system_clock::now();
-
-        try {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId);
-            if (!hProcess) {
-                return signature;
-            }
-
-            // Get process name
-            wchar_t imagePath[MAX_PATH];
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, imagePath, &size)) {
-                std::filesystem::path path(imagePath);
-                signature.processName = path.filename().wstring();
-            } else {
-                signature.processName = m_processTracker->GetProcessName(processId);
-            }
-
-            // Get historical samples
-            auto samples = m_processTracker->GetHistory(processId, 60);
-            signature.sampleCount = static_cast<uint32_t>(samples.size());
-
-            if (!samples.empty()) {
-                std::vector<double> cpuValues;
-                for (const auto& sample : samples) {
-                    cpuValues.push_back(sample.cpuPercent);
-                }
-
-                signature.totalUsagePercent = samples.back().cpuPercent;
-                signature.avgUsagePercent = std::accumulate(cpuValues.begin(), cpuValues.end(), 0.0) / cpuValues.size();
-                signature.peakUsagePercent = *std::max_element(cpuValues.begin(), cpuValues.end());
-                signature.usageStdDev = CalculateStdDev(cpuValues);
-
-                // Analyze pattern
-                signature.pattern = m_patternAnalyzer->AnalyzePattern(cpuValues);
-
-                // Thread count
-                signature.activeThreadCount = samples.back().threadCount;
-            }
-
-            // Performance counters
-            if (m_config.enablePerformanceCounters) {
-                signature.perfCounters = m_perfCounterReader->ReadCounters(processId);
-            }
-
-            // Large pages check
-            signature.usesLargePages = ProcessUsesLargePages(hProcess);
-
-            // Priority check
-            DWORD priorityClass = GetPriorityClass(hProcess);
-            signature.hasElevatedPriority = (priorityClass == HIGH_PRIORITY_CLASS ||
-                                            priorityClass == REALTIME_PRIORITY_CLASS);
-
-            // Core utilization
-            AnalyzeCoreUtilization(signature, samples);
-
-            // Algorithm fingerprinting
-            if (m_config.enableAlgorithmFingerprinting) {
-                signature.suspectedAlgorithm = m_algorithmDetector->DetectAlgorithm(signature);
-            }
-
-            // Calculate mining probability
-            signature.miningProbability = CalculateMiningProbability(signature);
-
-            CloseHandle(hProcess);
-
-            m_stats.processesAnalyzed.fetch_add(1, std::memory_order_relaxed);
-
-        } catch (const std::exception& e) {
-            Logger::Error("CPUUsageAnalyzer::AnalyzeProcess({}): {}", processId, e.what());
-        }
-
-        return signature;
+        return AnalyzeProcessUnlocked(processId);
     }
 
     bool IsMiningBehavior(uint32_t processId) {
@@ -929,30 +918,34 @@ public:
         return signature.miningProbability > 0.7;
     }
 
-    SuspectedAlgorithm GetSuspectedAlgorithm(uint32_t processId) const {
+    [[nodiscard]] SuspectedAlgorithm GetSuspectedAlgorithm(uint32_t processId) const {
         std::shared_lock lock(m_mutex);
 
-        // Quick check from cached data
         auto samples = m_processTracker->GetHistory(processId, 30);
         if (samples.empty()) {
             return SuspectedAlgorithm::Unknown;
         }
 
-        // Simplified algorithm detection from patterns
+        // Build a partial signature from cached sample data
+        ProcessCPUSignature signature;
+        signature.processId = processId;
+
         std::vector<double> cpuValues;
+        cpuValues.reserve(samples.size());
         for (const auto& sample : samples) {
             cpuValues.push_back(sample.cpuPercent);
         }
 
-        const double avg = std::accumulate(cpuValues.begin(), cpuValues.end(), 0.0) / cpuValues.size();
+        signature.avgUsagePercent = std::accumulate(
+            cpuValues.begin(), cpuValues.end(), 0.0) / cpuValues.size();
+        signature.peakUsagePercent = *std::max_element(cpuValues.begin(), cpuValues.end());
+        signature.activeThreadCount = samples.back().threadCount;
+        signature.allCoresUtilized = (signature.activeThreadCount >= m_processorCount);
+        signature.uniformCoreDistribution = signature.allCoresUtilized;
+        signature.pattern = m_patternAnalyzer->AnalyzePattern(cpuValues);
+        signature.miningProbability = CalculateMiningProbability(signature);
 
-        if (avg > 80.0) {
-            return SuspectedAlgorithm::RandomX;
-        } else if (avg > 60.0) {
-            return SuspectedAlgorithm::CryptoNight;
-        }
-
-        return SuspectedAlgorithm::Unknown;
+        return m_algorithmDetector->DetectAlgorithm(signature);
     }
 
     std::vector<ProcessCPUSignature> GetHighCPUProcesses(double threshold) {
@@ -960,31 +953,30 @@ public:
 
         std::shared_lock lock(m_mutex);
 
-        // Enumerate processes
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        // Enumerate processes with RAII snapshot
+        ScopedHandle hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot) {
             return results;
         }
 
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (Process32FirstW(hSnapshot, &pe32)) {
+        if (Process32FirstW(hSnapshot.get(), &pe32)) {
             do {
                 if (pe32.th32ProcessID > 4) {
                     auto samples = m_processTracker->GetHistory(pe32.th32ProcessID, 5);
                     if (!samples.empty()) {
                         const double recentCPU = samples.back().cpuPercent;
                         if (recentCPU >= threshold) {
-                            auto signature = AnalyzeProcess(pe32.th32ProcessID);
-                            results.push_back(signature);
+                            // Use unlocked version to avoid recursive shared_lock deadlock
+                            auto signature = AnalyzeProcessUnlocked(pe32.th32ProcessID);
+                            results.push_back(std::move(signature));
                         }
                     }
                 }
-            } while (Process32NextW(hSnapshot, &pe32));
+            } while (Process32NextW(hSnapshot.get(), &pe32));
         }
-
-        CloseHandle(hSnapshot);
 
         // Sort by CPU usage descending
         std::sort(results.begin(), results.end(),
@@ -999,17 +991,17 @@ public:
     // SYSTEM METRICS
     // ========================================================================
 
-    double GetOverallCPUUsage() const {
+    [[nodiscard]] double GetOverallCPUUsage() const {
         std::shared_lock lock(m_mutex);
         return m_lastOverallCPU;
     }
 
-    std::vector<double> GetPerCoreUsage() const {
+    [[nodiscard]] std::vector<double> GetPerCoreUsage() const {
         std::shared_lock lock(m_mutex);
         return m_lastPerCoreUsage;
     }
 
-    PerformanceCounterData GetPerformanceCounters(uint32_t processId) const {
+    [[nodiscard]] PerformanceCounterData GetPerformanceCounters(uint32_t processId) const {
         std::shared_lock lock(m_mutex);
         return m_perfCounterReader->ReadCounters(processId);
     }
@@ -1038,7 +1030,7 @@ public:
     // STATISTICS
     // ========================================================================
 
-    CPUAnalyzerStatistics GetStatistics() const {
+    [[nodiscard]] CPUAnalyzerStatistics GetStatistics() const {
         return m_stats;
     }
 
@@ -1046,7 +1038,7 @@ public:
         m_stats.Reset();
     }
 
-    std::vector<HighLoadEvent> GetRecentHighLoadEvents(size_t maxCount) const {
+    [[nodiscard]] std::vector<HighLoadEvent> GetRecentHighLoadEvents(size_t maxCount) const {
         std::shared_lock lock(m_mutex);
 
         if (m_highLoadEvents.size() <= maxCount) {
@@ -1064,27 +1056,31 @@ public:
     // ========================================================================
 
     bool SelfTest() {
-        Logger::Info("CPUUsageAnalyzer: Running self-test...");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Running self-test...");
 
         try {
             // Test configuration validation
             CPUUsageAnalyzerConfiguration testConfig;
             if (!testConfig.IsValid()) {
-                Logger::Error("SelfTest: Default config invalid");
+                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Default config invalid");
                 return false;
             }
 
-            // Test invalid config
+            // Test invalid config rejection
             testConfig.highUsageThreshold = -10.0;
             if (testConfig.IsValid()) {
-                Logger::Error("SelfTest: Invalid config accepted");
+                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Invalid config accepted");
                 return false;
             }
 
             // Test CPU sampling
-            const double cpu = GetSystemCPUUsage();
+            double cpu = 0.0;
+            {
+                std::unique_lock lock(m_mutex);
+                cpu = GetSystemCPUUsage();
+            }
             if (cpu < 0.0 || cpu > 100.0) {
-                Logger::Error("SelfTest: Invalid CPU reading: {}", cpu);
+                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Invalid CPU reading: {:.2f}", cpu);
                 return false;
             }
 
@@ -1092,47 +1088,230 @@ public:
             std::vector<double> testPattern = {80.0, 85.0, 90.0, 85.0, 80.0, 85.0};
             auto pattern = m_patternAnalyzer->AnalyzePattern(testPattern);
             if (pattern == CPUUsagePattern::Unknown) {
-                Logger::Warn("SelfTest: Pattern analysis returned Unknown");
+                Utils::Logger::Warn(L"CPUUsageAnalyzer: SelfTest - Pattern analysis returned Unknown");
             }
 
-            Logger::Info("CPUUsageAnalyzer: Self-test PASSED");
+            Utils::Logger::Info(L"CPUUsageAnalyzer: Self-test PASSED");
             return true;
 
         } catch (const std::exception& e) {
-            Logger::Error("CPUUsageAnalyzer: Self-test FAILED: {}", e.what());
+            Utils::Logger::Error(L"CPUUsageAnalyzer: Self-test FAILED: {}",
+                Utils::StringUtils::Utf8ToWide(e.what()));
             return false;
         }
     }
 
 private:
     // ========================================================================
+    // INTERNAL ANALYSIS (caller must hold at least shared_lock on m_mutex)
+    // ========================================================================
+
+    ProcessCPUSignature AnalyzeProcessUnlocked(uint32_t processId) {
+        ProcessCPUSignature signature;
+        signature.processId = processId;
+        signature.analysisTime = std::chrono::system_clock::now();
+
+        try {
+            ScopedHandle hProcess(OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, FALSE, processId));
+            if (!hProcess) {
+                return signature;
+            }
+
+            // Get process name
+            wchar_t imagePath[MAX_PATH];
+            DWORD size = MAX_PATH;
+            if (QueryFullProcessImageNameW(hProcess.get(), 0, imagePath, &size)) {
+                std::filesystem::path filePath(imagePath);
+                signature.processName = filePath.filename().wstring();
+            } else {
+                signature.processName = m_processTracker->GetProcessName(processId);
+            }
+
+            // Get historical samples
+            auto samples = m_processTracker->GetHistory(processId, 60);
+            signature.sampleCount = static_cast<uint32_t>(samples.size());
+
+            if (!samples.empty()) {
+                std::vector<double> cpuValues;
+                cpuValues.reserve(samples.size());
+                for (const auto& sample : samples) {
+                    cpuValues.push_back(sample.cpuPercent);
+                }
+
+                signature.totalUsagePercent = samples.back().cpuPercent;
+                signature.avgUsagePercent = std::accumulate(
+                    cpuValues.begin(), cpuValues.end(), 0.0) / cpuValues.size();
+                signature.peakUsagePercent = *std::max_element(
+                    cpuValues.begin(), cpuValues.end());
+                signature.usageStdDev = CalculateStdDev(cpuValues);
+
+                // Analyze pattern
+                signature.pattern = m_patternAnalyzer->AnalyzePattern(cpuValues);
+
+                // Thread count
+                signature.activeThreadCount = samples.back().threadCount;
+            }
+
+            // Performance counters
+            if (m_config.enablePerformanceCounters) {
+                signature.perfCounters = m_perfCounterReader->ReadCounters(processId);
+            }
+
+            // Large pages check
+            signature.usesLargePages = ProcessUsesLargePages(hProcess.get());
+
+            // Priority check
+            DWORD priorityClass = GetPriorityClass(hProcess.get());
+            signature.hasElevatedPriority = (priorityClass == HIGH_PRIORITY_CLASS ||
+                                            priorityClass == REALTIME_PRIORITY_CLASS);
+
+            // Core utilization analysis
+            AnalyzeCoreUtilization(signature, samples);
+
+            // Algorithm fingerprinting
+            if (m_config.enableAlgorithmFingerprinting) {
+                signature.suspectedAlgorithm = m_algorithmDetector->DetectAlgorithm(signature);
+            }
+
+            // Calculate mining probability
+            signature.miningProbability = CalculateMiningProbability(signature);
+
+            m_stats.processesAnalyzed.fetch_add(1, std::memory_order_relaxed);
+
+        } catch (const std::exception& e) {
+            Utils::Logger::Error(L"CPUUsageAnalyzer::AnalyzeProcess({}): {}",
+                processId, Utils::StringUtils::Utf8ToWide(e.what()));
+        }
+
+        return signature;
+    }
+
+    // ========================================================================
     // INTERNAL IMPLEMENTATION
     // ========================================================================
 
     void MonitorThreadFunc() {
-        Logger::Info("CPUUsageAnalyzer: Monitor thread started");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitor thread started");
 
-        const auto interval = std::chrono::milliseconds(m_config.sampleIntervalMs);
+        // Snapshot the sample interval under lock
+        uint32_t sampleIntervalMs;
+        {
+            std::shared_lock lock(m_mutex);
+            sampleIntervalMs = m_config.sampleIntervalMs;
+        }
 
-        while (m_running) {
+        while (m_running.load(std::memory_order_acquire)) {
             try {
-                if (!m_paused) {
+                if (!m_paused.load(std::memory_order_acquire)) {
                     CollectSample();
+                    EvaluateAndNotify();
                 }
 
-                std::this_thread::sleep_for(interval);
+                std::this_thread::sleep_for(std::chrono::milliseconds(sampleIntervalMs));
+
+                // Re-read config interval in case it was updated
+                {
+                    std::shared_lock lock(m_mutex);
+                    sampleIntervalMs = m_config.sampleIntervalMs;
+                }
 
             } catch (const std::exception& e) {
-                Logger::Error("CPUUsageAnalyzer: Monitor thread exception: {}", e.what());
+                Utils::Logger::Error(L"CPUUsageAnalyzer: Monitor thread exception: {}",
+                    Utils::StringUtils::Utf8ToWide(e.what()));
             }
         }
 
-        Logger::Info("CPUUsageAnalyzer: Monitor thread stopped");
+        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitor thread stopped");
+    }
+
+    /**
+     * @brief Evaluate tracked processes and invoke callbacks for high CPU / mining.
+     * Separate from CollectSample to keep sampling fast and decoupled from notifications.
+     */
+    void EvaluateAndNotify() {
+        auto trackedPids = m_processTracker->GetTrackedPids();
+        if (trackedPids.empty()) return;
+
+        std::vector<HighLoadEvent> newEvents;
+        std::vector<ProcessCPUSignature> miningSignatures;
+        const auto now = Clock::now();
+
+        {
+            std::shared_lock lock(m_mutex);
+
+            for (const uint32_t pid : trackedPids) {
+                auto samples = m_processTracker->GetHistory(pid, 5);
+                if (samples.empty()) continue;
+
+                const double recentCPU = samples.back().cpuPercent;
+                if (recentCPU < m_config.highUsageThreshold) continue;
+
+                // Deduplicate: skip PIDs alerted within the observation window
+                auto alertIt = m_lastAlertedPids.find(pid);
+                if (alertIt != m_lastAlertedPids.end()) {
+                    if (now - alertIt->second < std::chrono::seconds(m_config.observationWindowSecs)) {
+                        continue;
+                    }
+                }
+
+                auto signature = AnalyzeProcessUnlocked(pid);
+
+                HighLoadEvent event;
+                event.eventId = GenerateEventId();
+                event.signature = signature;
+                event.isMiningBehavior = (signature.miningProbability > 0.7);
+                event.detectionTime = std::chrono::system_clock::now();
+                event.durationSecs = static_cast<uint32_t>(
+                    signature.sampleCount * m_config.sampleIntervalMs / 1000);
+
+                newEvents.push_back(std::move(event));
+
+                if (signature.miningProbability > 0.7) {
+                    miningSignatures.push_back(std::move(signature));
+                }
+            }
+        }
+
+        if (newEvents.empty()) return;
+
+        // Store events and update alert dedup map under unique_lock
+        {
+            std::unique_lock lock(m_mutex);
+            for (const auto& event : newEvents) {
+                // Cap stored events
+                if (m_highLoadEvents.size() >= 1000) {
+                    m_highLoadEvents.erase(m_highLoadEvents.begin());
+                }
+                m_highLoadEvents.push_back(event);
+                m_lastAlertedPids[event.signature.processId] = now;
+            }
+
+            // Clean stale dedup entries
+            for (auto it = m_lastAlertedPids.begin(); it != m_lastAlertedPids.end();) {
+                if (now - it->second > std::chrono::seconds(m_config.observationWindowSecs * 2)) {
+                    it = m_lastAlertedPids.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
+
+        // Invoke callbacks without holding m_mutex to avoid deadlock
+        for (const auto& event : newEvents) {
+            m_stats.highUsageEvents.fetch_add(1, std::memory_order_relaxed);
+            m_callbackManager->InvokeHighLoad(event);
+        }
+
+        for (const auto& sig : miningSignatures) {
+            m_stats.miningPatternsDetected.fetch_add(1, std::memory_order_relaxed);
+            m_callbackManager->InvokeMiningDetected(sig);
+        }
     }
 
     void CollectProcessSample(uint32_t pid, const std::wstring& processName) {
         try {
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid);
+            ScopedHandle hProcess(OpenProcess(PROCESS_QUERY_INFORMATION, FALSE, pid));
             if (!hProcess) {
                 return;
             }
@@ -1142,11 +1321,11 @@ private:
 
             // Get CPU time
             uint64_t kernelMs = 0, userMs = 0;
-            if (GetProcessCPUTime(hProcess, kernelMs, userMs)) {
+            if (GetProcessCPUTime(hProcess.get(), kernelMs, userMs)) {
                 sample.kernelTimeMs = kernelMs;
                 sample.userTimeMs = userMs;
 
-                // Calculate CPU percent using previous sample
+                // Calculate CPU percent using delta from previous sample
                 auto prevSample = m_processTracker->GetLastSample(pid);
                 if (prevSample) {
                     uint64_t deltaProc = (kernelMs - prevSample->kernelTimeMs) +
@@ -1161,32 +1340,32 @@ private:
                 }
             }
 
-            // Get thread count
-            HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
-            if (hSnapshot != INVALID_HANDLE_VALUE) {
-                THREADENTRY32 te32;
-                te32.dwSize = sizeof(THREADENTRY32);
+            // Get thread count with RAII snapshot
+            {
+                ScopedHandle hThreadSnap(CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0));
+                if (hThreadSnap) {
+                    THREADENTRY32 te32;
+                    te32.dwSize = sizeof(THREADENTRY32);
 
-                uint32_t threadCount = 0;
-                if (Thread32First(hSnapshot, &te32)) {
-                    do {
-                        if (te32.th32OwnerProcessID == pid) {
-                            threadCount++;
-                        }
-                    } while (Thread32Next(hSnapshot, &te32));
+                    uint32_t threadCount = 0;
+                    if (Thread32First(hThreadSnap.get(), &te32)) {
+                        do {
+                            if (te32.th32OwnerProcessID == pid) {
+                                threadCount++;
+                            }
+                        } while (Thread32Next(hThreadSnap.get(), &te32));
+                    }
+
+                    sample.threadCount = threadCount;
                 }
-
-                sample.threadCount = threadCount;
-                CloseHandle(hSnapshot);
             }
 
             m_processTracker->AddSample(pid, sample);
             m_processTracker->SetProcessName(pid, processName);
 
-            CloseHandle(hProcess);
-
         } catch (const std::exception& e) {
-            Logger::Error("CPUUsageAnalyzer::CollectProcessSample({}): {}", pid, e.what());
+            Utils::Logger::Error(L"CPUUsageAnalyzer::CollectProcessSample({}): {}",
+                pid, Utils::StringUtils::Utf8ToWide(e.what()));
         }
     }
 
@@ -1220,7 +1399,7 @@ private:
 
     void InitializePDH() {
         if (PdhOpenQueryA(NULL, 0, &m_pdhQuery) != ERROR_SUCCESS) {
-            Logger::Warn("CPUUsageAnalyzer: Failed to open PDH query");
+            Utils::Logger::Warn(L"CPUUsageAnalyzer: Failed to open PDH query");
             return;
         }
 
@@ -1234,7 +1413,7 @@ private:
             }
         }
 
-        // Initial collection
+        // Initial collection to prime the counters
         PdhCollectQueryData(m_pdhQuery);
     }
 
@@ -1273,11 +1452,37 @@ private:
                                 const std::vector<ProcessTracker::ProcessSample>& samples) {
         if (samples.empty()) return;
 
-        // Check if all cores utilized
+        // Check if all cores utilized based on thread count
         signature.allCoresUtilized = (signature.activeThreadCount >= m_processorCount);
 
-        // Check uniform distribution (simplified)
-        signature.uniformCoreDistribution = signature.allCoresUtilized;
+        // Analyze per-core usage distribution from samples that carry it
+        size_t samplesWithCoreData = 0;
+        std::vector<double> coreAverages;
+
+        for (const auto& sample : samples) {
+            if (sample.perCoreUsage.empty()) continue;
+
+            if (coreAverages.empty()) {
+                coreAverages.resize(sample.perCoreUsage.size(), 0.0);
+            }
+            for (size_t i = 0; i < std::min(coreAverages.size(), sample.perCoreUsage.size()); ++i) {
+                coreAverages[i] += sample.perCoreUsage[i];
+            }
+            ++samplesWithCoreData;
+        }
+
+        if (samplesWithCoreData > 0 && !coreAverages.empty()) {
+            for (auto& avg : coreAverages) {
+                avg /= static_cast<double>(samplesWithCoreData);
+            }
+
+            // Uniform distribution: low coefficient of variation across cores
+            const double cv = CalculateCV(coreAverages);
+            signature.uniformCoreDistribution = (cv < 0.3 && signature.allCoresUtilized);
+        } else {
+            // Fallback when per-core data not available
+            signature.uniformCoreDistribution = signature.allCoresUtilized;
+        }
     }
 
     double CalculateMiningProbability(const ProcessCPUSignature& signature) {
@@ -1329,8 +1534,8 @@ private:
 
     mutable std::shared_mutex m_mutex;
     bool m_initialized{ false };
-    bool m_running{ false };
-    bool m_paused{ false };
+    std::atomic<bool> m_running{ false };
+    std::atomic<bool> m_paused{ false };
     ModuleStatus m_status{ ModuleStatus::Uninitialized };
     CPUUsageAnalyzerConfiguration m_config;
 
@@ -1358,6 +1563,9 @@ private:
 
     // Events
     std::vector<HighLoadEvent> m_highLoadEvents;
+
+    // Alert deduplication: PID -> last alert time
+    std::unordered_map<uint32_t, TimePoint> m_lastAlertedPids;
 
     // Monitoring thread
     std::thread m_monitorThread;
