@@ -104,6 +104,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\DisassemblerHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorPEHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\SignaturePatternHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\StringPathHashHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelHarness.hpp" />
@@ -124,6 +125,7 @@
     <ClCompile Include="src\DisassemblerHarness.cpp" />
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
+    <ClCompile Include="src\EmulatorPEHarness.cpp" />
     <ClCompile Include="src\SignaturePatternHarness.cpp" />
     <ClCompile Include="src\StringPathHashHarness.cpp" />
     <ClCompile Include="src\ThreatIntelHarness.cpp" />
@@ -149,6 +151,14 @@
     <ClCompile Include="..\src\PhantomCore\PEParser\PEValidation.cpp" />
     <ClCompile Include="..\PhantomDisassembler\Decoder.cpp" />
     <ClCompile Include="..\PhantomEmulator\Core\CPU\Executor\Decoder\InstructionDecoder.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\ExportResolver.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\ImportResolver.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\PELoader.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\PEParser.cpp">
+      <ObjectFileName>$(IntDir)EmulatorLoaderPEParser.obj</ObjectFileName>
+    </ClCompile>
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\RelocApplier.cpp" />
+    <ClCompile Include="..\PhantomEmulator\Core\Loader\TLSHandler.cpp" />
     <!-- PhantomEmulator CPU core -->
     <ClCompile Include="..\PhantomEmulator\Core\CPU\CPU.cpp" />
     <ClCompile Include="..\PhantomEmulator\Core\CPU\State\CPUState.cpp" />
