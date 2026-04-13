@@ -105,8 +105,10 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelFormatHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ParserUtilsHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\CryptoCertHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\CompressionHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\PEParserHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageFactory.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Protocol\KernelMessageSchema.hpp" />
@@ -121,9 +123,11 @@
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
     <ClCompile Include="src\ThreatIntelHarness.cpp" />
+    <ClCompile Include="src\ThreatIntelFormatHarness.cpp" />
     <ClCompile Include="src\ThreatIntelFeedManagerStub.cpp" />
     <ClCompile Include="src\ParserUtilsHarness.cpp" />
     <ClCompile Include="src\CryptoCertHarness.cpp" />
+    <ClCompile Include="src\CompressionHarness.cpp" />
     <ClCompile Include="src\EngineArchitecture.cpp" />
     <ClCompile Include="src\FuzzLoop.cpp" />
     <ClCompile Include="src\HarnessAdapterCatalog.cpp" />
@@ -183,6 +187,7 @@
     <ClCompile Include="..\src\PhantomCore\Utils\JSONUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\XMLUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\Base64Utils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\CompressionUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\External\pugixml\pugixml.cpp" />
     <!-- Crypto / Certificate / Hash -->
     <ClCompile Include="..\src\PhantomCore\Utils\CertUtils.cpp" />
