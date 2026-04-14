@@ -85,6 +85,13 @@ static std::string WideToUtf8(const std::wstring& w) {
     return s;
 }
 
+#ifdef SHADOWSTRIKE_FUZZING
+[[nodiscard]] bool IsFuzzLoopbackPipeName(const std::wstring& pipeName) {
+    constexpr std::wstring_view kFuzzPipePrefix = L"\\\\.\\pipe\\ShadowStrikeFuzzerIPC_";
+    return pipeName.rfind(kFuzzPipePrefix, 0) == 0;
+}
+#endif
+
 // CRC32 (ISO 3309 polynomial)
 static uint32_t Crc32Table[256];
 static std::once_flag s_crc32InitFlag;
@@ -353,7 +360,7 @@ public:
 private:
     // Server-side
     void ListenerLoop();
-    HANDLE CreateServerPipe();
+    HANDLE CreateServerPipe(bool requireFirstInstance);
     void AcceptClient(HANDLE pipeHandle);
     void ClientReaderLoop(const std::string& sessionId);
 
@@ -361,6 +368,11 @@ private:
     void ClientReaderLoopSelf();
 
     // Shared
+    bool WritePreparedMessage(HANDLE pipe, std::mutex& writeLock, const MessageHeader& hdr,
+                              const void* payload, size_t payloadLen,
+                              bool encryptionReady,
+                              std::span<const uint8_t> sessionKey,
+                              std::atomic<uint64_t>* nonceCounter);
     bool WriteMessage(HANDLE pipe, std::mutex& writeLock, const MessageHeader& hdr,
                       const void* payload, size_t payloadLen);
     bool ReadMessage(HANDLE pipe, MessageHeader& hdr, std::vector<uint8_t>& payload);
@@ -417,6 +429,7 @@ private:
     std::thread m_listenerThread;
     std::thread m_heartbeatThread;
     HANDLE m_listenerStopEvent = INVALID_HANDLE_VALUE;
+    std::atomic<bool> m_requireFirstPipeInstance{true};
     std::vector<std::unique_ptr<ConnectedClient>> m_clients;
     mutable std::shared_mutex m_clientsMutex;
 
@@ -498,6 +511,7 @@ bool ServiceCommunicationImpl::Start(bool isService) {
     m_running.store(true, std::memory_order_release);
 
     if (m_isService) {
+        m_requireFirstPipeInstance.store(true, std::memory_order_release);
         m_listenerStopEvent = CreateEventW(nullptr, TRUE, FALSE, nullptr);
         if (m_listenerStopEvent == nullptr || m_listenerStopEvent == INVALID_HANDLE_VALUE) {
             Utils::Logger::Error("[ServiceComm] CreateEvent failed: {}", GetLastError());
@@ -545,6 +559,7 @@ void ServiceCommunicationImpl::Stop() {
         CloseHandle(m_listenerStopEvent);
         m_listenerStopEvent = INVALID_HANDLE_VALUE;
     }
+    m_requireFirstPipeInstance.store(true, std::memory_order_release);
 
     // Fail all pending requests
     {
@@ -564,6 +579,7 @@ void ServiceCommunicationImpl::Stop() {
 void ServiceCommunicationImpl::Shutdown() {
     Stop();
     m_initialized.store(false, std::memory_order_release);
+    m_status.store(ServiceCommStatus::Uninitialized, std::memory_order_release);
 }
 
 bool ServiceCommunicationImpl::UpdateConfiguration(const ServiceCommConfiguration& config) {
@@ -876,8 +892,15 @@ bool ServiceCommunicationImpl::SendMessageToSession(const ServiceMessage& msg,
         std::min(msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
     hdr.checksum = ComputeCrc32(msg.payload.data(), hdr.payloadLength);
 
-    return WriteMessage(client->pipeHandle.h, client->writeMutex, hdr,
-                        msg.payload.data(), hdr.payloadLength);
+    return WritePreparedMessage(
+        client->pipeHandle.h,
+        client->writeMutex,
+        hdr,
+        msg.payload.data(),
+        hdr.payloadLength,
+        client->encryptionEstablished,
+        std::span<const uint8_t>(client->sessionKey.data(), client->sessionKey.size()),
+        &client->nonceCounter);
 }
 
 std::optional<ServiceMessage> ServiceCommunicationImpl::SendRequest(
@@ -927,8 +950,15 @@ void ServiceCommunicationImpl::Broadcast(const ServiceMessage& msg) {
             std::min(msg.payload.size(), ServiceCommConstants::MAX_MESSAGE_SIZE));
         hdr.checksum = ComputeCrc32(msg.payload.data(), hdr.payloadLength);
 
-        WriteMessage(client->pipeHandle.h, client->writeMutex, hdr,
-                     msg.payload.data(), hdr.payloadLength);
+        WritePreparedMessage(
+            client->pipeHandle.h,
+            client->writeMutex,
+            hdr,
+            msg.payload.data(),
+            hdr.payloadLength,
+            client->encryptionEstablished,
+            std::span<const uint8_t>(client->sessionKey.data(), client->sessionKey.size()),
+            &client->nonceCounter);
     }
 }
 
@@ -1074,8 +1104,10 @@ bool ServiceCommunicationImpl::DisconnectClient(const std::string& sessionId) {
         if (*it && (*it)->sessionId == sessionId) {
             (*it)->running.store(false, std::memory_order_release);
             (*it)->state.store(ConnectionState::Disconnected, std::memory_order_release);
-            if ((*it)->pipeHandle.IsValid())
+            if ((*it)->pipeHandle.IsValid()) {
+                DisconnectNamedPipe((*it)->pipeHandle.h);
                 CancelIoEx((*it)->pipeHandle.h, nullptr);
+            }
 
             // Must release lock before joining reader thread to avoid deadlock
             auto client = std::move(*it);
@@ -1105,8 +1137,10 @@ void ServiceCommunicationImpl::DisconnectAllClients() {
         if (!client) continue;
         client->running.store(false, std::memory_order_release);
         client->state.store(ConnectionState::Disconnected, std::memory_order_release);
-        if (client->pipeHandle.IsValid())
+        if (client->pipeHandle.IsValid()) {
+            DisconnectNamedPipe(client->pipeHandle.h);
             CancelIoEx(client->pipeHandle.h, nullptr);
+        }
         if (client->readerThread.joinable())
             client->readerThread.join();
     }
@@ -1172,7 +1206,7 @@ bool ServiceCommunicationImpl::SelfTest() {
 // SERVER — LISTENER
 // ============================================================================
 
-HANDLE ServiceCommunicationImpl::CreateServerPipe() {
+HANDLE ServiceCommunicationImpl::CreateServerPipe(bool requireFirstInstance) {
     SECURITY_ATTRIBUTES sa{};
     sa.nLength = sizeof(sa);
     SecurityDescriptorGuard sdGuard;
@@ -1182,6 +1216,20 @@ HANDLE ServiceCommunicationImpl::CreateServerPipe() {
     // intentionally excluded — GUI clients must communicate through an
     // elevated broker or run as admin. This matches IPCManager's DACL policy.
     const wchar_t* sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)";
+#ifdef SHADOWSTRIKE_FUZZING
+    // Fuzzer-only loopback relaxation: permit the current interactive token to
+    // connect only to the dedicated ShadowStrikeFuzzerIPC_* namespace so the
+    // production parser/auth path can be exercised without weakening shipping
+    // builds or non-fuzz service pipe instances.
+    std::wstring pipeNameForAcl;
+    {
+        std::shared_lock lock(m_configMutex);
+        pipeNameForAcl = m_config.pipeName;
+    }
+    if (IsFuzzLoopbackPipeName(pipeNameForAcl)) {
+        sddl = L"D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;GRGW;;;IU)";
+    }
+#endif
     if (!ConvertStringSecurityDescriptorToSecurityDescriptorW(
             sddl, SDDL_REVISION_1, &sdGuard.sd, nullptr)) {
         Utils::Logger::Error("[ServiceComm] SDDL conversion failed: {}", GetLastError());
@@ -1196,9 +1244,14 @@ HANDLE ServiceCommunicationImpl::CreateServerPipe() {
         pipeName = m_config.pipeName;
     }
 
+    DWORD openMode = PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED;
+    if (requireFirstInstance) {
+        openMode |= FILE_FLAG_FIRST_PIPE_INSTANCE;
+    }
+
     HANDLE hPipe = CreateNamedPipeW(
         pipeName.c_str(),
-        PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED | FILE_FLAG_FIRST_PIPE_INSTANCE,
+        openMode,
         PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_REJECT_REMOTE_CLIENTS,
         PIPE_UNLIMITED_INSTANCES,
         static_cast<DWORD>(ServiceCommConstants::MAX_MESSAGE_SIZE),
@@ -1208,8 +1261,12 @@ HANDLE ServiceCommunicationImpl::CreateServerPipe() {
 
     if (hPipe == INVALID_HANDLE_VALUE) {
         DWORD err = GetLastError();
-        Utils::Logger::Error("[ServiceComm] CreateNamedPipe with FIRST_PIPE_INSTANCE failed: {} "
-                             "— possible pipe squatting attack or prior instance not closed", err);
+        if (requireFirstInstance) {
+            Utils::Logger::Error("[ServiceComm] CreateNamedPipe with FIRST_PIPE_INSTANCE failed: {} "
+                                 "— possible pipe squatting attack or prior instance not closed", err);
+        } else {
+            Utils::Logger::Error("[ServiceComm] CreateNamedPipe failed: {}", err);
+        }
         return INVALID_HANDLE_VALUE;
     }
 
@@ -1220,12 +1277,16 @@ void ServiceCommunicationImpl::ListenerLoop() {
     Utils::Logger::Debug("[ServiceComm] Listener thread started");
 
     while (m_running.load(std::memory_order_acquire)) {
-        HANDLE hPipe = CreateServerPipe();
+        const bool requireFirstInstance =
+            m_requireFirstPipeInstance.load(std::memory_order_acquire);
+        HANDLE hPipe = CreateServerPipe(requireFirstInstance);
         if (hPipe == INVALID_HANDLE_VALUE) {
-            Utils::Logger::Error("[ServiceComm] CreateNamedPipe failed: {}", GetLastError());
             m_stats.errors.fetch_add(1, std::memory_order_relaxed);
             std::this_thread::sleep_for(std::chrono::seconds(1));
             continue;
+        }
+        if (requireFirstInstance) {
+            m_requireFirstPipeInstance.store(false, std::memory_order_release);
         }
 
         OVERLAPPED ov{};
@@ -1301,12 +1362,11 @@ void ServiceCommunicationImpl::AcceptClient(HANDLE pipeHandle) {
 
     const std::string sessionId = client->sessionId;
 
-    // Start reader thread for this client
-    client->readerThread = std::thread([this, sid = sessionId] { ClientReaderLoop(sid); });
-
     {
         std::unique_lock lock(m_clientsMutex);
         m_clients.push_back(std::move(client));
+        m_clients.back()->readerThread =
+            std::thread([this, sid = sessionId] { ClientReaderLoop(sid); });
     }
 
     Utils::Logger::Info("[ServiceComm] Client accepted: session={}, pid={}",
@@ -1493,11 +1553,18 @@ void ServiceCommunicationImpl::ClientReaderLoopSelf() {
 // SHARED I/O
 // ============================================================================
 
-bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
-                                             const MessageHeader& hdr,
-                                             const void* payload, size_t payloadLen) {
+bool ServiceCommunicationImpl::WritePreparedMessage(
+    HANDLE pipe, std::mutex& writeLock,
+    const MessageHeader& hdr,
+    const void* payload, size_t payloadLen,
+    bool encryptionReady,
+    std::span<const uint8_t> sessionKey,
+    std::atomic<uint64_t>* nonceCounter)
+{
     if (pipe == INVALID_HANDLE_VALUE || pipe == nullptr)
         return false;
+
+    auto& crypto = ShadowStrike::Security::CryptoManager::Instance();
 
     // Determine if encryption applies for this message.
     // Handshake, HandshakeChallenge, HandshakeResponse, and HandshakeAck are sent
@@ -1507,57 +1574,36 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
                                 hdr.type == MessageType::HandshakeChallenge ||
                                 hdr.type == MessageType::HandshakeResponse);
 
-    // Find the applicable session key and nonce counter.
-    // CRITICAL: Copy the session key under the lock to avoid use-after-free
-    // if the client disconnects between lock release and encryption.
     std::array<uint8_t, ServiceCommConstants::AES_KEY_SIZE> sessionKeyCopy{};
-    std::atomic<uint64_t>* nonceCounterPtr = nullptr;
-    bool encryptionReady = false;
-
-    if (!m_isService) {
-        // Client mode — no lock needed, m_client* fields are owned by this instance
-        sessionKeyCopy = m_clientSessionKey;
-        nonceCounterPtr = &m_clientNonceCounter;
-        encryptionReady = m_clientEncryptionEstablished;
-    } else {
-        // Server mode — find client by pipe handle, copy key under lock
-        std::shared_lock clientLock(m_clientsMutex);
-        for (auto& c : m_clients) {
-            if (c && c->pipeHandle.h == pipe) {
-                memcpy(sessionKeyCopy.data(), c->sessionKey.data(), sessionKeyCopy.size());
-                nonceCounterPtr = &c->nonceCounter;
-                encryptionReady = c->encryptionEstablished;
-                break;
-            }
+    const auto scrubSessionKeyCopy = [&]() noexcept {
+        if (encryptionReady) {
+            crypto.SecureZero(sessionKeyCopy.data(), sessionKeyCopy.size());
         }
+    };
+    if (encryptionReady) {
+        if (sessionKey.size() < sessionKeyCopy.size()) {
+            return false;
+        }
+        memcpy(sessionKeyCopy.data(), sessionKey.data(), sessionKeyCopy.size());
     }
 
     MessageHeader outHdr = hdr;
     std::vector<uint8_t> encryptedPayload;
 
-    if (encryptionReady && !isPreAuthMsg && nonceCounterPtr &&
+    if (encryptionReady && !isPreAuthMsg && nonceCounter &&
         payloadLen > 0 && payload) {
         // Encrypt the payload
         encryptedPayload.assign(static_cast<const uint8_t*>(payload),
                                  static_cast<const uint8_t*>(payload) + payloadLen);
-        if (!EncryptPayload(encryptedPayload, outHdr, sessionKeyCopy, *nonceCounterPtr)) {
+        if (!EncryptPayload(encryptedPayload, outHdr, sessionKeyCopy, *nonceCounter)) {
             Utils::Logger::Error("[ServiceComm] WriteMessage: encryption failed, dropping message");
-            // Scrub key copy
-            ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-                sessionKeyCopy.data(),
-                sessionKeyCopy.size()
-            );
+            scrubSessionKeyCopy();
             return false;
         }
-        // Scrub key copy after use
-        ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-            sessionKeyCopy.data(),
-            sessionKeyCopy.size()
-        );
 
         // ── APT DEFENSE: Append HMAC-SHA256 for message integrity ────
-        // Compute HMAC over header + encrypted payload. The HMAC key is the
-        // session key (which was scrubbed above, so re-derive a copy under lock).
+        // Compute HMAC over the finalized header + encrypted payload using the
+        // already-captured per-session key copy to avoid lock re-entry.
         // This protects against pipe injection by a rogue process.
         if (!encryptedPayload.empty()) {
             // Set final header values BEFORE computing HMAC so the receiver,
@@ -1574,48 +1620,16 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
             hmacInput.insert(hmacInput.end(),
                              encryptedPayload.begin(), encryptedPayload.end());
 
-            // Re-acquire key for HMAC computation
-            std::array<uint8_t, ServiceCommConstants::AES_KEY_SIZE> hmacKey{};
-            bool gotKey = false;
-            if (!m_isService) {
-                if (m_clientEncryptionEstablished) {
-                    hmacKey = m_clientSessionKey;
-                    gotKey = true;
-                }
+            auto hmac = crypto.ComputeKernelMessageHMAC(
+                std::span<const uint8_t>(hmacInput.data(), hmacInput.size()),
+                std::span<const uint8_t>(sessionKeyCopy.data(), sessionKeyCopy.size()));
+
+            if (hmac.size() == ServiceCommConstants::HMAC_SIZE) {
+                encryptedPayload.insert(encryptedPayload.end(),
+                                        hmac.begin(), hmac.end());
             } else {
-                std::shared_lock clientLock(m_clientsMutex);
-                for (auto& c : m_clients) {
-                    if (c && c->pipeHandle.h == pipe && c->encryptionEstablished) {
-                        memcpy(hmacKey.data(), c->sessionKey.data(), hmacKey.size());
-                        gotKey = true;
-                        break;
-                    }
-                }
-            }
-
-            if (gotKey) {
-                auto hmac = ShadowStrike::Security::CryptoManager::Instance()
-                    .ComputeKernelMessageHMAC(
-                        std::span<const uint8_t>(hmacInput.data(), hmacInput.size()),
-                        std::span<const uint8_t>(hmacKey.data(), hmacKey.size()));
-
-                ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-                    hmacKey.data(), hmacKey.size());
-
-                if (hmac.size() == 32) {
-                    encryptedPayload.insert(encryptedPayload.end(),
-                                            hmac.begin(), hmac.end());
-                } else {
-                    // HMAC computation failed — revert flags
-                    outHdr.flags &= ~ServiceCommConstants::MSG_FLAG_HMAC;
-                    outHdr.payloadLength = static_cast<uint32_t>(encryptedPayload.size());
-                }
-            } else {
-                // No session key available — revert flags
                 outHdr.flags &= ~ServiceCommConstants::MSG_FLAG_HMAC;
                 outHdr.payloadLength = static_cast<uint32_t>(encryptedPayload.size());
-                ShadowStrike::Security::CryptoManager::Instance().SecureZero(
-                    hmacKey.data(), hmacKey.size());
             }
         }
     } else {
@@ -1624,6 +1638,7 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
             outHdr.checksum = ComputeCrc32(payload, payloadLen);
         }
     }
+    scrubSessionKeyCopy();
 
     const void* writePayload = encryptedPayload.empty() ? payload : encryptedPayload.data();
     const size_t writePayloadLen = encryptedPayload.empty() ? payloadLen : encryptedPayload.size();
@@ -1670,6 +1685,47 @@ bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
     m_stats.messagesSent.fetch_add(1, std::memory_order_relaxed);
     m_stats.bytesSent.fetch_add(sizeof(outHdr) + writePayloadLen, std::memory_order_relaxed);
     return true;
+}
+
+bool ServiceCommunicationImpl::WriteMessage(HANDLE pipe, std::mutex& writeLock,
+                                             const MessageHeader& hdr,
+                                             const void* payload, size_t payloadLen) {
+    if (!m_isService) {
+        return WritePreparedMessage(
+            pipe,
+            writeLock,
+            hdr,
+            payload,
+            payloadLen,
+            m_clientEncryptionEstablished,
+            std::span<const uint8_t>(m_clientSessionKey.data(), m_clientSessionKey.size()),
+            &m_clientNonceCounter);
+    }
+
+    std::shared_lock clientLock(m_clientsMutex);
+    for (auto& c : m_clients) {
+        if (c && c->pipeHandle.h == pipe) {
+            return WritePreparedMessage(
+                pipe,
+                writeLock,
+                hdr,
+                payload,
+                payloadLen,
+                c->encryptionEstablished,
+                std::span<const uint8_t>(c->sessionKey.data(), c->sessionKey.size()),
+                &c->nonceCounter);
+        }
+    }
+
+    return WritePreparedMessage(
+        pipe,
+        writeLock,
+        hdr,
+        payload,
+        payloadLen,
+        false,
+        {},
+        nullptr);
 }
 
 bool ServiceCommunicationImpl::ReadMessage(HANDLE pipe, MessageHeader& hdr,
@@ -2069,8 +2125,15 @@ void ServiceCommunicationImpl::HandleHandshake(const std::string& sessionId,
     const auto* challengePayload = reinterpret_cast<const uint8_t*>(&challengeMsg) + sizeof(MessageHeader);
     challengeMsg.header.checksum = ComputeCrc32(challengePayload, challengeMsg.header.payloadLength);
 
-    WriteMessage(client->pipeHandle.h, client->writeMutex, challengeMsg.header,
-                 challengePayload, challengeMsg.header.payloadLength);
+    WritePreparedMessage(
+        client->pipeHandle.h,
+        client->writeMutex,
+        challengeMsg.header,
+        challengePayload,
+        challengeMsg.header.payloadLength,
+        false,
+        {},
+        nullptr);
 
     Utils::Logger::Debug("[ServiceComm] Sent challenge to session {} (pid={})", sessionId, client->processId);
 }
@@ -2108,8 +2171,15 @@ void ServiceCommunicationImpl::HandleCommand(const std::string& sessionId,
             ConnectedClient* client = FindClient(sessionId);
             if (client) {
                 resp.sequence = client->sequence.fetch_add(1, std::memory_order_relaxed);
-                WriteMessage(client->pipeHandle.h, client->writeMutex, resp,
-                             errJson.data(), errJson.size());
+                WritePreparedMessage(
+                    client->pipeHandle.h,
+                    client->writeMutex,
+                    resp,
+                    errJson.data(),
+                    errJson.size(),
+                    client->encryptionEstablished,
+                    std::span<const uint8_t>(client->sessionKey.data(), client->sessionKey.size()),
+                    &client->nonceCounter);
             }
             return;
         }
@@ -2145,8 +2215,15 @@ void ServiceCommunicationImpl::HandleCommand(const std::string& sessionId,
     ConnectedClient* client = FindClient(sessionId);
     if (client) {
         resp.sequence = client->sequence.fetch_add(1, std::memory_order_relaxed);
-        WriteMessage(client->pipeHandle.h, client->writeMutex, resp,
-                     response.empty() ? nullptr : response.data(), resp.payloadLength);
+        WritePreparedMessage(
+            client->pipeHandle.h,
+            client->writeMutex,
+            resp,
+            response.empty() ? nullptr : response.data(),
+            resp.payloadLength,
+            client->encryptionEstablished,
+            std::span<const uint8_t>(client->sessionKey.data(), client->sessionKey.size()),
+            &client->nonceCounter);
     }
 }
 
@@ -2167,7 +2244,15 @@ void ServiceCommunicationImpl::HandleHeartbeat(const std::string& sessionId,
     ack.payloadLength = 0;
     ack.checksum = 0;
 
-    WriteMessage(client->pipeHandle.h, client->writeMutex, ack, nullptr, 0);
+    WritePreparedMessage(
+        client->pipeHandle.h,
+        client->writeMutex,
+        ack,
+        nullptr,
+        0,
+        false,
+        {},
+        nullptr);
 }
 
 // ============================================================================
@@ -2411,7 +2496,15 @@ void ServiceCommunicationImpl::HandleChallengeResponse(
     ack.payloadLength = 0;
     ack.checksum = 0;
 
-    WriteMessage(client->pipeHandle.h, client->writeMutex, ack, nullptr, 0);
+    WritePreparedMessage(
+        client->pipeHandle.h,
+        client->writeMutex,
+        ack,
+        nullptr,
+        0,
+        false,
+        {},
+        nullptr);
 
     ClientSession session;
     session.sessionId = sessionId;
@@ -2457,8 +2550,10 @@ void ServiceCommunicationImpl::HeartbeatLoop() {
                 Utils::Logger::Warn("[ServiceComm] Client {} timed out", client->sessionId);
                 client->state.store(ConnectionState::Disconnected, std::memory_order_release);
                 client->running.store(false, std::memory_order_release);
-                if (client->pipeHandle.IsValid())
+                if (client->pipeHandle.IsValid()) {
+                    DisconnectNamedPipe(client->pipeHandle.h);
                     CancelIoEx(client->pipeHandle.h, nullptr);
+                }
                 continue;
             }
 
@@ -2470,7 +2565,15 @@ void ServiceCommunicationImpl::HeartbeatLoop() {
             hb.payloadLength = 0;
             hb.checksum = 0;
 
-            WriteMessage(client->pipeHandle.h, client->writeMutex, hb, nullptr, 0);
+            WritePreparedMessage(
+                client->pipeHandle.h,
+                client->writeMutex,
+                hb,
+                nullptr,
+                0,
+                false,
+                {},
+                nullptr);
         }
     }
 
