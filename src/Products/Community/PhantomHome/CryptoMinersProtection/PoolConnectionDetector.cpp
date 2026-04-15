@@ -937,7 +937,10 @@ public:
     std::vector<ErrorCallback> m_errorCallbacks;
     mutable std::mutex m_callbacksMutex;
 
-    ThreatIntel::ThreatIntelManager* m_threatIntel = nullptr;
+    // Use direct singleton access instead of storing a raw pointer — eliminates
+    // use-after-free risk if Shutdown() races with GetPoolInfoInternal().
+    // ThreatIntelManager is a Meyers' singleton and safe to call at any time.
+    static constexpr bool kUseThreatIntelDirectAccess = true;
 
     [[nodiscard]] bool Initialize(const PoolConnectionDetectorConfiguration& config);
     void Shutdown();
@@ -999,7 +1002,7 @@ bool PoolConnectionDetectorImpl::Initialize(const PoolConnectionDetectorConfigur
         }
 
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
-        m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
+        // ThreatIntel accessed via singleton directly — no raw pointer stored.
 
         {
             std::unique_lock lock(m_whitelistMutex);
@@ -1066,7 +1069,7 @@ void PoolConnectionDetectorImpl::Shutdown() {
         m_errorCallbacks.clear();
     }
 
-    m_threatIntel = nullptr;
+    // ThreatIntel accessed via singleton — no raw pointer to clear.
     m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 }
 
@@ -1302,8 +1305,9 @@ std::optional<PoolEndpointInfo> PoolConnectionDetectorImpl::GetPoolInfoInternal(
         endpointIndicator = true;
     }
 
-    if (m_threatIntel != nullptr && m_threatIntel->IsInitialized()) {
-        auto intel = isIp ? m_threatIntel->LookupIP(parsed.host) : m_threatIntel->LookupDomain(parsed.host);
+    const auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+    if (threatIntel.IsInitialized()) {
+        auto intel = isIp ? threatIntel.LookupIP(parsed.host) : threatIntel.LookupDomain(parsed.host);
         if (intel.IsKnownGood()) {
             return std::nullopt;
         }
@@ -1385,11 +1389,28 @@ std::optional<std::string> PoolConnectionDetectorImpl::ExtractWalletAddressInter
     }
 
     const std::string sanitized = SanitizeBoundedText(std::string_view(reinterpret_cast<const char*>(payload.data()), payload.size()), kMaxJsonMessageBytes);
-    for (const auto& [_, pattern] : CompiledWalletPatterns()) {
-        std::match_results<std::string::const_iterator> match;
-        if (std::regex_search(sanitized.cbegin(), sanitized.cend(), match, pattern)) {
-            m_statistics.walletsExtracted.fetch_add(1, std::memory_order_relaxed);
-            return std::string(match.str());
+    // Extract wallet-like tokens by scanning for alphanumeric runs, then validate each.
+    // This avoids running std::regex_search across the full payload on MSVC (known to be slow).
+    size_t pos = 0;
+    while (pos < sanitized.size()) {
+        // Skip non-alphanumeric characters
+        if (!std::isalnum(static_cast<unsigned char>(sanitized[pos]))) {
+            ++pos;
+            continue;
+        }
+        // Found start of an alphanumeric token
+        const size_t tokenStart = pos;
+        while (pos < sanitized.size() && std::isalnum(static_cast<unsigned char>(sanitized[pos]))) {
+            ++pos;
+        }
+        const size_t tokenLen = pos - tokenStart;
+        // Wallet addresses are typically 25-128 chars; skip tokens outside this range
+        if (tokenLen >= 25 && tokenLen <= kMaxWalletCandidateLength) {
+            const std::string_view candidate(sanitized.data() + tokenStart, tokenLen);
+            if (MatchWalletCrypto(candidate).has_value()) {
+                m_statistics.walletsExtracted.fetch_add(1, std::memory_order_relaxed);
+                return std::string(candidate);
+            }
         }
     }
 
