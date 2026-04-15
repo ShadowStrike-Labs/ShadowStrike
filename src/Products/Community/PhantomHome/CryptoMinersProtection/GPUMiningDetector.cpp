@@ -407,6 +407,45 @@ private:
     PDH_HQUERY m_query = nullptr;
 };
 
+/// @brief RAII wrapper for Win32 HANDLE (process handles, etc.)
+class ScopedHandle final {
+public:
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE h) noexcept : m_handle(h) {}
+    ~ScopedHandle() noexcept { Reset(); }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : m_handle(other.m_handle) {
+        other.m_handle = nullptr;
+    }
+
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            Reset();
+            m_handle = other.m_handle;
+            other.m_handle = nullptr;
+        }
+        return *this;
+    }
+
+    void Reset(HANDLE h = nullptr) noexcept {
+        if (m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(m_handle);
+        }
+        m_handle = h;
+    }
+
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return m_handle != nullptr && m_handle != INVALID_HANDLE_VALUE;
+    }
+
+private:
+    HANDLE m_handle = nullptr;
+};
+
 struct CounterRegistration {
     std::wstring path;
     std::wstring instance;
@@ -1128,13 +1167,24 @@ public:
             return false;
         }
 
-        if (processId == 0 || processId == ::GetCurrentProcessId() ||
+        if (processId == 0 || processId == 4 || processId == ::GetCurrentProcessId() ||
             Utils::ProcessUtils::IsProcessCritical(processId, nullptr) ||
             Utils::ProcessUtils::IsProcessProtected(processId, nullptr)) {
             Utils::Logger::Warn("GPUMiningDetector: refusing to terminate protected/system PID {}", processId);
             return false;
         }
 
+        // Pin the kernel process object by opening a handle early.
+        // This eliminates the TOCTOU window: even if the PID is recycled by the OS,
+        // this handle continues to reference the ORIGINAL process.
+        ScopedHandle pinnedHandle(::OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_TERMINATE, FALSE, processId));
+        if (!pinnedHandle) {
+            Utils::Logger::Warn("GPUMiningDetector: could not open handle for PID {}; aborting termination", processId);
+            return false;
+        }
+
+        // Capture identity via the pinned handle (not PID) to avoid races
         const auto originalPath = Utils::ProcessUtils::GetProcessPath(processId, nullptr);
         const auto originalName = Utils::ProcessUtils::GetProcessName(processId, nullptr);
         if (!originalPath && !originalName) {
@@ -1148,6 +1198,9 @@ public:
             return false;
         }
 
+        // Revalidate identity using the SAME pinned handle — if the process exited
+        // and PID was recycled, the handle still points to the original (now-exited) process,
+        // and GetProcessPath will fail or return the original path, not the new process's path.
         const auto revalidatedPath = Utils::ProcessUtils::GetProcessPath(processId, nullptr);
         const auto revalidatedName = Utils::ProcessUtils::GetProcessName(processId, nullptr);
         if ((originalPath && revalidatedPath && *originalPath != *revalidatedPath) ||
@@ -1158,8 +1211,10 @@ public:
             return false;
         }
 
-        if (!Utils::ProcessUtils::TerminateProcess(processId, 1, nullptr)) {
-            Utils::Logger::Error("GPUMiningDetector: failed to terminate PID {}", processId);
+        // Terminate using the pinned handle — guaranteed to target the original process
+        if (::TerminateProcess(pinnedHandle.Get(), 1) == FALSE) {
+            Utils::Logger::Error("GPUMiningDetector: failed to terminate PID {} (Win32={})",
+                processId, ::GetLastError());
             return false;
         }
 

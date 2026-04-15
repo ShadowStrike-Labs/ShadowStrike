@@ -196,6 +196,69 @@ struct UniqueHandle {
     return stream.str();
 }
 
+/// @brief Sanitize a command line for safe logging — strips known credential flags.
+[[nodiscard]] std::string SanitizeCommandLine(const std::wstring& commandLine) {
+    if (commandLine.empty()) {
+        return {};
+    }
+    std::string utf8 = WideToUtf8(commandLine);
+    // Redact values after known credential flags
+    static constexpr std::array<std::string_view, 8> kSensitiveFlags = {
+        "--pass=", "--pass ", "--password=", "--password ",
+        "--api-key=", "--api-key ", "--api-token=", "--api-token "
+    };
+    std::string lower = ToLowerUtf8(utf8);
+    for (std::string_view flag : kSensitiveFlags) {
+        size_t pos = 0;
+        while ((pos = lower.find(flag, pos)) != std::string::npos) {
+            const size_t valueStart = pos + flag.size();
+            size_t valueEnd = valueStart;
+            // Scan to next whitespace or end
+            while (valueEnd < utf8.size() && utf8[valueEnd] != ' ' && utf8[valueEnd] != '\t') {
+                ++valueEnd;
+            }
+            if (valueEnd > valueStart) {
+                const std::string redacted(valueEnd - valueStart, '*');
+                utf8.replace(valueStart, valueEnd - valueStart, redacted);
+                lower.replace(valueStart, valueEnd - valueStart, redacted);
+            }
+            pos = valueEnd;
+        }
+    }
+    return utf8;
+}
+
+/// @brief Redact a wallet address for safe logging — keeps first 6 and last 4 chars.
+[[nodiscard]] std::string RedactWalletAddress(const std::string& wallet) {
+    if (wallet.size() <= 14) {
+        return wallet; // Too short to meaningfully redact
+    }
+    return wallet.substr(0, 6) + "..." + wallet.substr(wallet.size() - 4);
+}
+
+/// @brief Sanitize a process path for logging — redact username from C:\Users\<username>\...
+[[nodiscard]] std::string SanitizeProcessPath(const std::wstring& processPath) {
+    std::string utf8 = WideToUtf8(processPath);
+    // Look for C:\Users\<username> or similar patterns and redact the username
+    static constexpr std::array<std::string_view, 2> kUserPrefixes = {
+        "\\Users\\", "/Users/"
+    };
+    for (std::string_view prefix : kUserPrefixes) {
+        const size_t prefixPos = utf8.find(prefix);
+        if (prefixPos == std::string::npos) continue;
+        const size_t userStart = prefixPos + prefix.size();
+        size_t userEnd = userStart;
+        while (userEnd < utf8.size() && utf8[userEnd] != '\\' && utf8[userEnd] != '/') {
+            ++userEnd;
+        }
+        if (userEnd > userStart) {
+            utf8.replace(userStart, userEnd - userStart, "<REDACTED>");
+        }
+        break;
+    }
+    return utf8;
+}
+
 [[nodiscard]] bool EndsWithPathComponent(std::wstring_view path, std::wstring_view component) {
     const auto normalizedPath = ToLowerWide(std::wstring(path));
     const auto normalizedComponent = ToLowerWide(std::wstring(component));
@@ -1446,6 +1509,28 @@ bool CryptoMinerDetectorImpl::ShouldPublishDetection(const MinerDetectionResult&
     const auto key = BuildDetectionKey(result);
     const auto now = Clock::now();
     std::lock_guard lock(m_cooldownMutex);
+
+    // Periodic eviction of expired entries to prevent unbounded growth (DoS vector).
+    // Amortized: only run when the map exceeds a safe threshold.
+    static constexpr size_t kMaxCooldownEntries = 10000;
+    static constexpr size_t kEvictionThreshold = kMaxCooldownEntries / 2;
+    if (m_detectionCooldowns.size() > kEvictionThreshold) {
+        for (auto it = m_detectionCooldowns.begin(); it != m_detectionCooldowns.end(); ) {
+            if ((now - it->second) >= kDetectionCooldown) {
+                it = m_detectionCooldowns.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        // Hard cap: if still over limit after eviction, drop oldest entries
+        if (m_detectionCooldowns.size() >= kMaxCooldownEntries) {
+            SS_LOG_WARN(L"CryptoMinerDetector",
+                L"Detection cooldown map at capacity (%zu entries); allowing detection without dedup tracking",
+                m_detectionCooldowns.size());
+            return true;
+        }
+    }
+
     const auto it = m_detectionCooldowns.find(key);
     if (it != m_detectionCooldowns.end() && (now - it->second) < kDetectionCooldown) {
         return false;
@@ -1745,17 +1830,27 @@ std::vector<MinerNetworkConnection> CryptoMinerDetectorImpl::GetActiveMiningConn
 }
 
 bool CryptoMinerDetectorImpl::LoadPoolBlacklistInternal(const std::filesystem::path& path) {
-    if (path.empty() || !std::filesystem::exists(path)) {
+    if (path.empty()) {
         return false;
     }
 
+    // Open directly — no exists() check to avoid TOCTOU race.
     std::ifstream input(path);
     if (!input) {
         return false;
     }
 
+    static constexpr size_t kMaxLineLength = 512;
+    static constexpr size_t kMaxEntries = MinerConstants::MAX_POOL_ADDRESSES;
+    size_t entriesLoaded = 0;
+
     std::string line;
     while (std::getline(input, line)) {
+        // Cap line length to prevent memory exhaustion from malicious blacklist files
+        if (line.size() > kMaxLineLength) {
+            line.resize(kMaxLineLength);
+        }
+
         const auto comment = line.find('#');
         if (comment != std::string::npos) {
             line.erase(comment);
@@ -1765,11 +1860,18 @@ bool CryptoMinerDetectorImpl::LoadPoolBlacklistInternal(const std::filesystem::p
             continue;
         }
 
+        if (entriesLoaded >= kMaxEntries) {
+            SS_LOG_WARN(L"CryptoMinerDetector",
+                L"Pool blacklist entry cap reached (%zu); ignoring remaining entries", kMaxEntries);
+            break;
+        }
+
         MiningPoolInfo info{};
         info.address = line;
         info.name = line;
         info.isMalicious = true;
         AddPoolToBlacklistInternal(info);
+        ++entriesLoaded;
     }
 
     if (m_poolDetector) {
@@ -2629,7 +2731,7 @@ std::string MinerNetworkConnection::ToJson() const {
     json["protocol"] = std::string(GetMiningProtocolName(protocol));
     json["poolAddress"] = poolAddress;
     json["poolName"] = poolName;
-    json["walletAddress"] = walletAddress;
+    json["walletAddress"] = RedactWalletAddress(walletAddress);
     json["workerName"] = workerName;
     json["bytesSent"] = bytesSent;
     json["bytesReceived"] = bytesReceived;
@@ -2642,8 +2744,8 @@ std::string ProcessMinerInfo::ToJson() const {
     nlohmann::json json;
     json["processId"] = processId;
     json["processName"] = WideToUtf8(processName);
-    json["processPath"] = WideToUtf8(processPath);
-    json["commandLine"] = WideToUtf8(commandLine);
+    json["processPath"] = SanitizeProcessPath(processPath);
+    json["commandLine"] = SanitizeCommandLine(commandLine);
     json["parentPid"] = parentPid;
     json["fileHash"] = HashToHex(fileHash);
     json["is64Bit"] = is64Bit;
@@ -2696,7 +2798,14 @@ std::string MinerDetectionResult::ToJson() const {
     }
     json["resourceStats"] = nlohmann::json::parse(resourceStats.ToJson());
     json["poolAddresses"] = poolAddresses;
-    json["walletAddresses"] = walletAddresses;
+    // Redact wallet addresses — may constitute financial PII in enterprise environments
+    {
+        nlohmann::json redactedWallets = nlohmann::json::array();
+        for (const auto& wallet : walletAddresses) {
+            redactedWallets.push_back(RedactWalletAddress(wallet));
+        }
+        json["walletAddresses"] = std::move(redactedWallets);
+    }
     json["actionTaken"] = static_cast<int>(actionTaken);
     json["detectionTime"] = ToUnixMillis(detectionTime);
     json["analysisDurationMs"] = analysisDuration.count();
@@ -2835,26 +2944,91 @@ bool ValidateWalletAddress(std::string_view address, Cryptocurrency crypto) {
         return false;
     }
 
-    const std::string value(address);
+    // Hand-written character class validators replace per-call std::regex construction.
+    // Each crypto has: prefix check, character class check, length bounds.
+
+    auto isHexChar = [](char ch) -> bool {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'f') || (ch >= 'A' && ch <= 'F');
+    };
+
+    auto isBase58 = [](char ch) -> bool {
+        return (ch >= '1' && ch <= '9') ||
+               (ch >= 'A' && ch <= 'H') || (ch >= 'J' && ch <= 'N') || (ch >= 'P' && ch <= 'Z') ||
+               (ch >= 'a' && ch <= 'k') || (ch >= 'm' && ch <= 'z');
+    };
+
+    auto isAlphaNum = [](char ch) -> bool {
+        return (ch >= '0' && ch <= '9') || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+    };
+
+    auto allMatch = [](std::string_view sv, auto&& predicate) -> bool {
+        return std::all_of(sv.begin(), sv.end(), predicate);
+    };
+
     switch (crypto) {
         case Cryptocurrency::Ethereum:
-            return std::regex_match(value, std::regex(R"(^0x[a-fA-F0-9]{40}$)"));
-        case Cryptocurrency::Bitcoin:
-            return std::regex_match(value, std::regex(R"(^(bc1|[13])[a-zA-HJ-NP-Z0-9]{20,90}$)"));
-        case Cryptocurrency::Monero:
-            return std::regex_match(value, std::regex(R"(^[48][0-9AB][1-9A-HJ-NP-Za-km-z]{93,104}$)"));
-        case Cryptocurrency::Litecoin:
-            return std::regex_match(value, std::regex(R"(^(ltc1|[LM3])[a-km-zA-HJ-NP-Z1-9]{25,90}$)"));
+            // 0x followed by exactly 40 hex characters
+            return address.size() == 42 &&
+                   address[0] == '0' && address[1] == 'x' &&
+                   allMatch(address.substr(2), isHexChar);
+
+        case Cryptocurrency::Bitcoin: {
+            // bc1... (bech32) or [13]... (base58check), 21-91 chars total
+            if (address.size() < 21 || address.size() > 91) return false;
+            const bool hasBech32Prefix = (address.size() >= 3 && address[0] == 'b' && address[1] == 'c' && address[2] == '1');
+            const bool hasLegacyPrefix = (address[0] == '1' || address[0] == '3');
+            if (!hasBech32Prefix && !hasLegacyPrefix) return false;
+            const size_t bodyStart = hasBech32Prefix ? 3 : 1;
+            const auto body = address.substr(bodyStart);
+            return body.size() >= 20 && body.size() <= 90 &&
+                   std::all_of(body.begin(), body.end(), [](char ch) {
+                       return (ch >= '0' && ch <= '9') ||
+                              (ch >= 'A' && ch <= 'H') || (ch >= 'J' && ch <= 'N') || (ch >= 'P' && ch <= 'Z') ||
+                              (ch >= 'a' && ch <= 'z');
+                   });
+        }
+
+        case Cryptocurrency::Monero: {
+            // [48] + [0-9AB] + 93-104 base58 chars => total 95-106
+            if (address.size() < 95 || address.size() > 106) return false;
+            if (address[0] != '4' && address[0] != '8') return false;
+            if (!((address[1] >= '0' && address[1] <= '9') || address[1] == 'A' || address[1] == 'B')) return false;
+            return allMatch(address.substr(2), isBase58);
+        }
+
+        case Cryptocurrency::Litecoin: {
+            // ltc1... or [LM3]..., 26-93 chars total
+            if (address.size() < 26 || address.size() > 93) return false;
+            const bool hasLtcPrefix = (address.size() >= 4 && address[0] == 'l' && address[1] == 't' && address[2] == 'c' && address[3] == '1');
+            const bool hasLegacyPrefix = (address[0] == 'L' || address[0] == 'M' || address[0] == '3');
+            if (!hasLtcPrefix && !hasLegacyPrefix) return false;
+            const size_t bodyStart = hasLtcPrefix ? 4 : 1;
+            return allMatch(address.substr(bodyStart), isBase58);
+        }
+
         case Cryptocurrency::Ravencoin:
-            return std::regex_match(value, std::regex(R"(^R[a-km-zA-HJ-NP-Z1-9]{25,34}$)"));
-        case Cryptocurrency::Zcash:
-            return std::regex_match(value, std::regex(R"(^(t1|t3|zs)[A-Za-z0-9]{30,120}$)"));
+            // R + 25-34 base58 chars => total 26-35
+            return address.size() >= 26 && address.size() <= 35 &&
+                   address[0] == 'R' && allMatch(address.substr(1), isBase58);
+
+        case Cryptocurrency::Zcash: {
+            // t1|t3|zs + 30-120 alphanumeric chars
+            if (address.size() < 32 || address.size() > 122) return false;
+            const bool hasT1 = (address[0] == 't' && address[1] == '1');
+            const bool hasT3 = (address[0] == 't' && address[1] == '3');
+            const bool hasZs = (address[0] == 'z' && address[1] == 's');
+            if (!hasT1 && !hasT3 && !hasZs) return false;
+            const auto body = address.substr(2);
+            return body.size() >= 30 && body.size() <= 120 && allMatch(body, isAlphaNum);
+        }
+
         case Cryptocurrency::EthClassic:
         case Cryptocurrency::Ergo:
         case Cryptocurrency::Other:
         case Cryptocurrency::Unknown:
         default:
-            return std::none_of(value.begin(), value.end(), [](unsigned char ch) { return std::isspace(ch) != 0; });
+            return std::none_of(address.begin(), address.end(),
+                [](unsigned char ch) { return std::isspace(ch) != 0; });
     }
 }
 

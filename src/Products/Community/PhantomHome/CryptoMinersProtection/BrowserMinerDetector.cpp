@@ -51,7 +51,9 @@ namespace {
 
 constexpr wchar_t kLogCategory[] = L"BrowserMinerDetector";
 constexpr uint8_t kWasmVersion1[4] = {0x01, 0x00, 0x00, 0x00};
+constexpr uint8_t kWasmSectionImport = 0x02;
 constexpr uint8_t kWasmSectionMemory = 0x05;
+constexpr uint8_t kWasmSectionExport = 0x07;
 constexpr uint8_t kWasmSectionCode = 0x0A;
 constexpr uint8_t kWasmOpcodeI32Mul = 0x6C;
 constexpr uint8_t kWasmOpcodeI64Mul = 0x7E;
@@ -602,6 +604,23 @@ constexpr auto KNOWN_MINING_DOMAINS = std::to_array<std::string_view>({
     "streamfe.com", "mine.torrent.pw"
 });
 
+constexpr auto WASM_SUSPICIOUS_IMPORT_NAMES = std::to_array<std::string_view>({
+    "memory", "table", "abort", "seed", "getentropy",
+    "emscripten_get_now", "emscripten_resize_heap",
+    "crypto", "randomx", "argon2", "hash", "keccak",
+    "sha3", "aes", "blake", "groestl", "jh", "skein",
+    "wasm_workers", "shared_memory", "atomics"
+});
+
+constexpr auto WASM_SUSPICIOUS_EXPORT_NAMES = std::to_array<std::string_view>({
+    "hash", "mine", "start", "stop", "init", "calculate",
+    "cryptonight", "randomx", "argon2", "cn_slow_hash",
+    "get_hashrate", "get_hashes", "set_throttle",
+    "scrypt", "blake256", "groestl256", "keccak256",
+    "_hash", "_mine", "_start_mining", "_stop_mining",
+    "getHashesPerSecond", "getAcceptedHashes", "getTotalHashes"
+});
+
 }  // namespace MiningSignatures
 
 class BrowserMinerDetectorImpl {
@@ -678,6 +697,8 @@ public:
         uint32_t functionCount = 0;
         uint32_t totalInstructions = 0;
         uint32_t sequenceScore = 0;
+        uint32_t i64InstructionCount = 0;
+        uint32_t i32InstructionCount = 0;
         bool structurallyValid = true;
     };
 
@@ -711,6 +732,9 @@ public:
     std::unordered_map<TabKey, std::vector<WebWorkerInfo>, TabKeyHasher> m_workers;
     mutable std::shared_mutex m_workersMutex;
 
+    /// @brief Dynamically discovered mining indicator domains (populated at runtime by threat intel)
+    std::unordered_set<std::string> m_dynamicIndicators;
+
     std::vector<MinerFoundCallback> m_minerFoundCallbacks;
     std::vector<TabMiningCallback> m_tabMiningCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
@@ -730,15 +754,21 @@ public:
         const BrowserScriptInfo& scriptInfo);
 
     [[nodiscard]] bool DetectJSMinerSignatures(
-        const std::string& script,
+        const std::string& lowerScript,
         std::vector<std::string>& matchedSigs) const;
-    [[nodiscard]] BrowserMinerFamily IdentifyMinerFamily(const std::string& script) const;
-    [[nodiscard]] bool DetectObfuscation(const std::string& script) const;
+    [[nodiscard]] BrowserMinerFamily IdentifyMinerFamily(const std::string& lowerScript) const;
+    [[nodiscard]] bool DetectObfuscation(
+        const std::string& originalScript,
+        const std::string& lowerScript) const;
     [[nodiscard]] std::optional<std::string> ExtractWalletAddress(const std::string& script) const;
     [[nodiscard]] std::optional<uint32_t> ExtractThrottle(const std::string& script) const;
-    [[nodiscard]] std::vector<std::string> ExtractPoolAddresses(const std::string& script) const;
+    [[nodiscard]] std::vector<std::string> ExtractPoolAddresses(
+        const std::string& originalScript,
+        const std::string& lowerScript) const;
 
     [[nodiscard]] WASMAnalysisResult AnalyzeWASMBinary(std::span<const uint8_t> wasmBinary);
+    void AnalyzeWASMImports(std::span<const uint8_t> sectionData, WASMAnalysisResult& result) const;
+    void AnalyzeWASMExports(std::span<const uint8_t> sectionData, WASMAnalysisResult& result) const;
     [[nodiscard]] bool IsValidWASM(std::span<const uint8_t> data) const;
     [[nodiscard]] bool HasCryptoInstructions(std::span<const uint8_t> wasmBinary);
     [[nodiscard]] double CalculateLoopDensity(std::span<const uint8_t> wasmBinary);
@@ -1007,6 +1037,9 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
             return result;
         }
 
+        // Single lowercase copy for all sub-analyses — avoids 4x redundant allocations
+        const std::string lowerScript = LowerAsciiCopy(scriptSource);
+
         std::vector<BrowserDetectionMethod> methods;
         auto addMethod = [&](BrowserDetectionMethod method, std::string_view evidence) {
             if (!ContainsMethod(methods, method)) {
@@ -1016,13 +1049,13 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
         };
 
         std::vector<std::string> matchedSignatures;
-        if (config.enableJSScanning && DetectJSMinerSignatures(scriptSource, matchedSignatures)) {
+        if (config.enableJSScanning && DetectJSMinerSignatures(lowerScript, matchedSignatures)) {
             result.matchedSignatures = std::move(matchedSignatures);
             addMethod(BrowserDetectionMethod::SignatureMatch, "Known browser-miner signature matched");
             IncrementCounter(m_statistics.byMethod, BrowserDetectionMethod::SignatureMatch);
         }
 
-        result.minerFamily = IdentifyMinerFamily(scriptSource);
+        result.minerFamily = IdentifyMinerFamily(lowerScript);
         if (result.minerFamily != BrowserMinerFamily::Unknown) {
             result.familyName = std::string(GetBrowserMinerFamilyName(result.minerFamily));
             addMethod(BrowserDetectionMethod::StringPattern, "Miner family indicators identified in script");
@@ -1050,12 +1083,12 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
             }
         }
 
-        result.poolAddresses = ExtractPoolAddresses(scriptSource);
+        result.poolAddresses = ExtractPoolAddresses(scriptSource, lowerScript);
         if (!result.poolAddresses.empty()) {
             addMethod(BrowserDetectionMethod::NetworkPool, "Mining pool endpoint found");
         }
 
-        if (config.enableHeuristics && DetectObfuscation(scriptSource)) {
+        if (config.enableHeuristics && DetectObfuscation(scriptSource, lowerScript)) {
             addMethod(BrowserDetectionMethod::HeuristicAnalysis, "Obfuscation consistent with miner loaders");
         }
 
@@ -1274,10 +1307,9 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
 }
 
 bool BrowserMinerDetectorImpl::DetectJSMinerSignatures(
-    const std::string& script,
+    const std::string& lowerScript,
     std::vector<std::string>& matchedSigs) const
 {
-    const std::string lowerScript = LowerAsciiCopy(script);
     bool detected = false;
 
     for (std::string_view signature : MiningSignatures::JS_MINER_STRINGS) {
@@ -1291,10 +1323,8 @@ bool BrowserMinerDetectorImpl::DetectJSMinerSignatures(
 }
 
 BrowserMinerFamily BrowserMinerDetectorImpl::IdentifyMinerFamily(
-    const std::string& script) const
+    const std::string& lowerScript) const
 {
-    const std::string lowerScript = LowerAsciiCopy(script);
-
     if (lowerScript.find("authedmine") != std::string::npos) {
         return BrowserMinerFamily::Authedmine;
     }
@@ -1335,13 +1365,13 @@ BrowserMinerFamily BrowserMinerDetectorImpl::IdentifyMinerFamily(
 }
 
 bool BrowserMinerDetectorImpl::DetectObfuscation(
-    const std::string& script) const
+    const std::string& script,
+    const std::string& lowerScript) const
 {
     if (script.empty()) {
         return false;
     }
 
-    const std::string lowerScript = LowerAsciiCopy(script);
     uint32_t score = 0;
 
     if (lowerScript.find("eval(") != std::string::npos) score += 10;
@@ -1375,11 +1405,51 @@ bool BrowserMinerDetectorImpl::DetectObfuscation(
 std::optional<std::string> BrowserMinerDetectorImpl::ExtractWalletAddress(
     const std::string& script) const
 {
-    static const std::regex moneroPattern(R"(4[0-9AB][1-9A-HJ-NP-Za-km-z]{93})",
-        std::regex_constants::optimize);
-    std::smatch match;
-    if (std::regex_search(script, match, moneroPattern) && !match.empty()) {
-        return match[0].str();
+    // Hand-written Monero wallet validator — avoids std::regex on attacker-crafted input.
+    // Monero addresses: start with '4' or '8', second char is [0-9AB],
+    // followed by 93 base58 characters ([1-9A-HJ-NP-Za-km-z]).
+    auto isBase58 = [](char ch) -> bool {
+        return (ch >= '1' && ch <= '9') ||
+               (ch >= 'A' && ch <= 'H') ||
+               (ch >= 'J' && ch <= 'N') ||
+               (ch >= 'P' && ch <= 'Z') ||
+               (ch >= 'a' && ch <= 'k') ||
+               (ch >= 'm' && ch <= 'z');
+    };
+
+    auto isSecondChar = [](char ch) -> bool {
+        return (ch >= '0' && ch <= '9') || ch == 'A' || ch == 'B';
+    };
+
+    constexpr size_t kMoneroAddrLen = 95; // 1 + 1 + 93
+    if (script.size() < kMoneroAddrLen) {
+        return std::nullopt;
+    }
+
+    for (size_t i = 0; i + kMoneroAddrLen <= script.size(); ++i) {
+        if ((script[i] != '4' && script[i] != '8') || !isSecondChar(script[i + 1])) {
+            continue;
+        }
+
+        bool valid = true;
+        for (size_t j = 2; j < kMoneroAddrLen; ++j) {
+            if (!isBase58(script[i + j])) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (valid) {
+            // Ensure not part of a longer alphanumeric token
+            if (i > 0 && std::isalnum(static_cast<unsigned char>(script[i - 1]))) {
+                continue;
+            }
+            if (i + kMoneroAddrLen < script.size() &&
+                std::isalnum(static_cast<unsigned char>(script[i + kMoneroAddrLen]))) {
+                continue;
+            }
+            return script.substr(i, kMoneroAddrLen);
+        }
     }
     return std::nullopt;
 }
@@ -1387,25 +1457,54 @@ std::optional<std::string> BrowserMinerDetectorImpl::ExtractWalletAddress(
 std::optional<uint32_t> BrowserMinerDetectorImpl::ExtractThrottle(
     const std::string& script) const
 {
-    static const std::regex throttlePattern(
-        R"((?:setThrottle|throttle)\s*[:=(]\s*(\d{1,3}))",
-        std::regex_constants::icase | std::regex_constants::optimize);
-    std::smatch match;
-    if (std::regex_search(script, match, throttlePattern) && match.size() >= 2) {
-        const uint32_t throttle = static_cast<uint32_t>(std::stoul(match[1].str()));
-        if (throttle <= 100U) {
-            return throttle;
+    // Hand-written matcher replaces std::regex to avoid ReDoS on attacker-crafted input.
+    // Matches: setThrottle|throttle  followed by optional whitespace, then [:=(], optional whitespace, then 1-3 digits.
+    static constexpr std::array<std::string_view, 2> kKeywords = {"setthrottle", "throttle"};
+    const std::string lower = LowerAsciiCopy(script);
+
+    for (std::string_view keyword : kKeywords) {
+        size_t pos = 0;
+        while ((pos = lower.find(keyword, pos)) != std::string::npos) {
+            size_t cursor = pos + keyword.size();
+            // Skip whitespace
+            while (cursor < lower.size() && std::isspace(static_cast<unsigned char>(lower[cursor]))) {
+                ++cursor;
+            }
+            // Expect one of : = (
+            if (cursor >= lower.size() || (lower[cursor] != ':' && lower[cursor] != '=' && lower[cursor] != '(')) {
+                pos = cursor;
+                continue;
+            }
+            ++cursor;
+            // Skip whitespace
+            while (cursor < lower.size() && std::isspace(static_cast<unsigned char>(lower[cursor]))) {
+                ++cursor;
+            }
+            // Extract 1-3 digits
+            const size_t digitStart = cursor;
+            while (cursor < lower.size() && cursor - digitStart < 3 &&
+                   std::isdigit(static_cast<unsigned char>(lower[cursor]))) {
+                ++cursor;
+            }
+            if (cursor > digitStart) {
+                const uint32_t throttle = static_cast<uint32_t>(
+                    std::stoul(lower.substr(digitStart, cursor - digitStart)));
+                if (throttle <= 100U) {
+                    return throttle;
+                }
+            }
+            pos = cursor;
         }
     }
     return std::nullopt;
 }
 
 std::vector<std::string> BrowserMinerDetectorImpl::ExtractPoolAddresses(
-    const std::string& script) const
+    const std::string& originalScript,
+    const std::string& lowerScript) const
 {
     std::vector<std::string> pools;
     std::unordered_set<std::string> seen;
-    const std::string lowerScript = LowerAsciiCopy(script);
 
     for (std::string_view endpoint : MiningSignatures::POOL_ENDPOINTS) {
         if (lowerScript.find(endpoint) != std::string::npos && seen.emplace(endpoint).second) {
@@ -1413,14 +1512,34 @@ std::vector<std::string> BrowserMinerDetectorImpl::ExtractPoolAddresses(
         }
     }
 
-    static const std::regex poolPattern(
-        R"(((?:wss?|stratum\+tcp)://[a-zA-Z0-9\-\._:\[\]]+))",
-        std::regex_constants::icase | std::regex_constants::optimize);
+    // Extract wss:/ws:/stratum+tcp:// URLs via manual scanning instead of std::regex
+    // to avoid ReDoS risk on attacker-crafted scripts up to 10MB.
+    static constexpr std::array<std::string_view, 3> kProtocolPrefixes = {
+        "wss://", "ws://", "stratum+tcp://"
+    };
 
-    for (std::sregex_iterator iter(script.begin(), script.end(), poolPattern), end; iter != end; ++iter) {
-        std::string pool = LowerAsciiCopy((*iter)[1].str());
-        if (!pool.empty() && seen.emplace(pool).second) {
-            pools.push_back(std::move(pool));
+    for (std::string_view prefix : kProtocolPrefixes) {
+        size_t pos = 0;
+        while ((pos = lowerScript.find(prefix, pos)) != std::string::npos) {
+            const size_t urlStart = pos;
+            pos += prefix.size();
+            // Scan valid URL characters: alphanumeric, -, ., _, :, [, ]
+            while (pos < lowerScript.size()) {
+                const char ch = lowerScript[pos];
+                if (std::isalnum(static_cast<unsigned char>(ch)) ||
+                    ch == '-' || ch == '.' || ch == '_' || ch == ':' ||
+                    ch == '[' || ch == ']') {
+                    ++pos;
+                } else {
+                    break;
+                }
+            }
+            if (pos > urlStart + prefix.size()) {
+                std::string pool(lowerScript.substr(urlStart, pos - urlStart));
+                if (seen.emplace(pool).second) {
+                    pools.push_back(std::move(pool));
+                }
+            }
         }
     }
 
@@ -1497,23 +1616,40 @@ BrowserMinerDetectorImpl::AnalyzeCodeSection(std::span<const uint8_t> sectionDat
         while (bodyCursor < bodyEnd) {
             const uint8_t opcode = *bodyCursor++;
             ++stats.totalInstructions;
+            // Classify opcodes for mining heuristic scoring
             switch (opcode) {
                 case kWasmOpcodeI32Xor:
+                    ++stats.xorCount;
+                    ++stats.i32InstructionCount;
+                    break;
                 case kWasmOpcodeI64Xor:
                     ++stats.xorCount;
+                    ++stats.i64InstructionCount;
                     break;
                 case kWasmOpcodeI32Mul:
+                    ++stats.mulCount;
+                    ++stats.i32InstructionCount;
+                    break;
                 case kWasmOpcodeI64Mul:
                     ++stats.mulCount;
+                    ++stats.i64InstructionCount;
                     break;
                 case kWasmOpcodeI32Rotl:
                 case kWasmOpcodeI32Rotr:
                     ++stats.rotateCount;
+                    ++stats.i32InstructionCount;
                     break;
                 case kWasmOpcodeLoop:
                     ++stats.loopCount;
                     break;
                 default:
+                    // Count i32/i64 operations by opcode range.
+                    // i32 arithmetic/comparison: 0x67–0x78, i64: 0x79–0x8A
+                    if (opcode >= 0x67U && opcode <= 0x78U) {
+                        ++stats.i32InstructionCount;
+                    } else if (opcode >= 0x79U && opcode <= 0x8AU) {
+                        ++stats.i64InstructionCount;
+                    }
                     break;
             }
 
@@ -1689,7 +1825,11 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
         const uint8_t* sectionData = cursor;
         const uint8_t* sectionEnd = cursor + static_cast<size_t>(sectionSize);
 
-        if (sectionId == kWasmSectionMemory) {
+        if (sectionId == kWasmSectionImport) {
+            AnalyzeWASMImports(std::span<const uint8_t>(sectionData, static_cast<size_t>(sectionSize)), result);
+        } else if (sectionId == kWasmSectionExport) {
+            AnalyzeWASMExports(std::span<const uint8_t>(sectionData, static_cast<size_t>(sectionSize)), result);
+        } else if (sectionId == kWasmSectionMemory) {
             const uint8_t* memoryCursor = sectionData;
             const uint64_t memoryCount = DecodeLEB128(memoryCursor, sectionEnd);
             if (memoryCount > 0U && memoryCount != std::numeric_limits<uint64_t>::max()) {
@@ -1700,6 +1840,9 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
                     result.memoryPages = static_cast<uint32_t>(
                         std::min<uint64_t>(initialPages, std::numeric_limits<uint32_t>::max()));
                     result.hasLargeMemory = result.memoryPages >= kLargeWasmMemoryPages;
+                    if ((flags & 0x02) != 0) {
+                        result.hasSharedArrayBufferUsage = true;
+                    }
                 }
             }
         } else if (sectionId == kWasmSectionCode) {
@@ -1714,6 +1857,8 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
             aggregateStats.rotateCount += stats.rotateCount;
             aggregateStats.loopCount += stats.loopCount;
             aggregateStats.totalInstructions += stats.totalInstructions;
+            aggregateStats.i64InstructionCount += stats.i64InstructionCount;
+            aggregateStats.i32InstructionCount += stats.i32InstructionCount;
             aggregateStats.functionCount += stats.functionCount;
             aggregateStats.sequenceScore = std::min<uint32_t>(100U,
                 aggregateStats.sequenceScore + stats.sequenceScore);
@@ -1723,6 +1868,11 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
     }
 
     result.functionCount = aggregateStats.functionCount;
+    
+    if (aggregateStats.totalInstructions > 0) {
+        result.i64InstructionRatio = static_cast<double>(aggregateStats.i64InstructionCount) / 
+            static_cast<double>(aggregateStats.totalInstructions);
+    }
 
     uint32_t miningScore = 0;
     if (result.hasCryptoInstructions) {
@@ -1741,6 +1891,26 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
         miningScore += 15U;
         result.suspiciousPatterns.emplace_back("Arithmetic sequence profile aligns with hashing workloads");
     }
+    
+    if (result.i64InstructionRatio > 0.3) {
+        miningScore += 15U;
+        result.suspiciousPatterns.emplace_back("High ratio of i64 operations typical for crypto workloads");
+    }
+    
+    if (result.hasSharedArrayBufferUsage) {
+        miningScore += 10U;
+        result.suspiciousPatterns.emplace_back("SharedArrayBuffer usage indicates multi-threaded mining");
+    }
+    
+    if (!result.suspiciousExports.empty()) {
+        miningScore += 15U;
+        result.suspiciousPatterns.emplace_back("Export names suggest mining functionality");
+    }
+    
+    if (result.functionCount > 100) {
+        miningScore += 5U;
+        result.suspiciousPatterns.emplace_back("High function count typical of crypto implementations");
+    }
 
     result.confidenceScore = std::min<double>(static_cast<double>(miningScore), 100.0);
     result.isMiningModule = miningScore >= 50U;
@@ -1751,6 +1921,116 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
     }
 
     return result;
+}
+
+void BrowserMinerDetectorImpl::AnalyzeWASMImports(
+    std::span<const uint8_t> sectionData, 
+    WASMAnalysisResult& result) const
+{
+    const uint8_t* cursor = sectionData.data();
+    const uint8_t* end = sectionData.data() + sectionData.size();
+    
+    const uint64_t importCount = DecodeLEB128(cursor, end);
+    if (importCount == std::numeric_limits<uint64_t>::max()) {
+        return;
+    }
+    
+    for (uint64_t i = 0; i < importCount && cursor < end; ++i) {
+        const uint64_t moduleLen = DecodeLEB128(cursor, end);
+        if (moduleLen == std::numeric_limits<uint64_t>::max() || 
+            moduleLen > static_cast<uint64_t>(end - cursor)) {
+            return;
+        }
+        std::string moduleName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(moduleLen));
+        cursor += static_cast<size_t>(moduleLen);
+        
+        const uint64_t fieldLen = DecodeLEB128(cursor, end);
+        if (fieldLen == std::numeric_limits<uint64_t>::max() || 
+            fieldLen > static_cast<uint64_t>(end - cursor)) {
+            return;
+        }
+        std::string fieldName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(fieldLen));
+        cursor += static_cast<size_t>(fieldLen);
+        
+        if (cursor >= end) return;
+        const uint8_t importKind = *cursor++;
+        
+        switch (importKind) {
+            case 0x00: // Function import: skip typeidx
+                if (!SkipLeb128(cursor, end)) return;
+                break;
+            case 0x01: // Table import: skip reftype, limits (flags + initial [+ max])
+                if (!SkipLeb128(cursor, end)) return; // reftype
+                {
+                    uint64_t limitsFlags = 0;
+                    if (!TryDecodeLeb128(cursor, end, limitsFlags)) return;
+                    if (!SkipLeb128(cursor, end)) return; // initial
+                    if ((limitsFlags & 0x01U) != 0) {
+                        if (!SkipLeb128(cursor, end)) return; // max
+                    }
+                }
+                break;
+            case 0x02: // Memory import: limits (flags + initial [+ max])
+                {
+                    uint64_t memFlags = 0;
+                    if (!TryDecodeLeb128(cursor, end, memFlags)) return; // flags
+                    if (!SkipLeb128(cursor, end)) return; // initial pages
+                    if ((memFlags & 0x01U) != 0) {
+                        if (!SkipLeb128(cursor, end)) return; // max pages
+                    }
+                }
+                break;
+            case 0x03: // Global import: valtype + mutability (2 bytes)
+                if (!SkipFixed(cursor, end, 2)) return;
+                break;
+            default:
+                return;
+        }
+        
+        const std::string lowerField = LowerAsciiCopy(fieldName);
+        for (std::string_view suspicious : MiningSignatures::WASM_SUSPICIOUS_IMPORT_NAMES) {
+            if (lowerField.find(suspicious) != std::string::npos) {
+                result.suspiciousImports.push_back(fieldName);
+                break;
+            }
+        }
+    }
+}
+
+void BrowserMinerDetectorImpl::AnalyzeWASMExports(
+    std::span<const uint8_t> sectionData,
+    WASMAnalysisResult& result) const
+{
+    const uint8_t* cursor = sectionData.data();
+    const uint8_t* end = sectionData.data() + sectionData.size();
+    
+    const uint64_t exportCount = DecodeLEB128(cursor, end);
+    if (exportCount == std::numeric_limits<uint64_t>::max()) {
+        return;
+    }
+    
+    for (uint64_t i = 0; i < exportCount && cursor < end; ++i) {
+        const uint64_t nameLen = DecodeLEB128(cursor, end);
+        if (nameLen == std::numeric_limits<uint64_t>::max() ||
+            nameLen > static_cast<uint64_t>(end - cursor)) {
+            return;
+        }
+        std::string exportName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(nameLen));
+        cursor += static_cast<size_t>(nameLen);
+        
+        if (cursor >= end) return;
+        ++cursor;
+        
+        if (!SkipLeb128(cursor, end)) return;
+        
+        const std::string lowerName = LowerAsciiCopy(exportName);
+        for (std::string_view suspicious : MiningSignatures::WASM_SUSPICIOUS_EXPORT_NAMES) {
+            if (lowerName.find(suspicious) != std::string::npos) {
+                result.suspiciousExports.push_back(exportName);
+                break;
+            }
+        }
+    }
 }
 
 bool BrowserMinerDetectorImpl::IsDomainBlockedInternal(
@@ -1768,7 +2048,8 @@ bool BrowserMinerDetectorImpl::IsDomainBlockedInternal(
         });
     };
 
-    return matches(m_builtinBlockedDomains) || matches(m_customBlockedDomains) || matches(m_manualBlockedDomains);
+    return matches(m_builtinBlockedDomains) || matches(m_customBlockedDomains) || 
+           matches(m_manualBlockedDomains) || matches(m_dynamicIndicators);
 }
 
 bool BrowserMinerDetectorImpl::IsDomainWhitelistedInternal(
@@ -2184,8 +2465,9 @@ bool BrowserMinerDetector::QuickSignatureCheck(const std::string& content) const
         return false;
     }
 
+    const std::string lowerContent = LowerAsciiCopy(content);
     std::vector<std::string> matches;
-    return impl->DetectJSMinerSignatures(content, matches);
+    return impl->DetectJSMinerSignatures(lowerContent, matches);
 }
 
 bool BrowserMinerDetector::IsTabMining(uint32_t browserPid, uint64_t tabId) {
@@ -2458,9 +2740,10 @@ bool BrowserMinerDetector::SelfTest() {
     try {
         const std::string script =
             "var miner = new CoinHive.Anonymous('site'); miner.setThrottle(25); miner.start();";
+        const std::string lowerTestScript = LowerAsciiCopy(script);
         std::vector<std::string> signatures;
-        const bool matchedSignatures = impl->DetectJSMinerSignatures(script, signatures);
-        const BrowserMinerFamily family = impl->IdentifyMinerFamily(script);
+        const bool matchedSignatures = impl->DetectJSMinerSignatures(lowerTestScript, signatures);
+        const BrowserMinerFamily family = impl->IdentifyMinerFamily(lowerTestScript);
         const auto throttle = impl->ExtractThrottle(script);
         if (!matchedSignatures || family != BrowserMinerFamily::Coinhive || !throttle.has_value() || *throttle != 25U) {
             SS_LOG_ERROR(kLogCategory, L"Self-test failed during JavaScript miner detection");
@@ -2610,7 +2893,7 @@ std::string WebWorkerInfo::ToJson() const {
         {"workerName", workerName},
         {"cpuUsage", cpuUsage},
         {"memoryUsage", memoryUsage},
-        {"isMiningSpected", isMiningSpected}
+        {"isMingSuspected", isMingSuspected}
     };
     return json.dump(2);
 }
@@ -2644,7 +2927,9 @@ std::string BrowserMinerDetectionResult::ToJson() const {
         {"severity", static_cast<int>(severity)},
         {"confidenceScore", confidenceScore},
         {"poolAddresses", poolAddresses},
-        {"walletAddress", walletAddress},
+        {"walletAddress", walletAddress.size() > 14
+            ? walletAddress.substr(0, 6) + "..." + walletAddress.substr(walletAddress.size() - 4)
+            : walletAddress},
         {"evidence", evidence},
         {"matchedSignatures", matchedSignatures},
         {"isWhitelisted", isWhitelisted},

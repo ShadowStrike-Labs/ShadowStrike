@@ -376,7 +376,7 @@ struct WebWorkerInfo {
     uint64_t memoryUsage = 0;
     
     /// @brief Is mining suspected
-    bool isMiningSpected = false;
+    bool isMingSuspected = false;
     
     /// @brief Start time
     SystemTimePoint startTime;
@@ -393,37 +393,49 @@ struct WebWorkerInfo {
 struct WASMAnalysisResult {
     /// @brief Is valid WASM
     bool isValidWASM = false;
-    
+
     /// @brief Module size (bytes)
     size_t moduleSize = 0;
-    
+
     /// @brief Is mining module
     bool isMiningModule = false;
-    
+
     /// @brief Detected algorithm
     BrowserMiningAlgorithm algorithm = BrowserMiningAlgorithm::Unknown;
-    
+
     /// @brief Has crypto instructions
     bool hasCryptoInstructions = false;
-    
+
     /// @brief Has large memory
     bool hasLargeMemory = false;
-    
+
     /// @brief Memory pages requested
     uint32_t memoryPages = 0;
-    
+
     /// @brief Function count
     uint32_t functionCount = 0;
-    
+
     /// @brief Loop density score
     double loopDensityScore = 0.0;
-    
+
     /// @brief Confidence score
     double confidenceScore = 0.0;
-    
+
+    /// @brief Ratio of i64 operations to total instructions (crypto workloads use i64 heavily)
+    double i64InstructionRatio = 0.0;
+
+    /// @brief Whether the module uses shared memory (SharedArrayBuffer), indicating multi-threaded mining
+    bool hasSharedArrayBufferUsage = false;
+
+    /// @brief Import names that match known mining patterns
+    std::vector<std::string> suspiciousImports;
+
+    /// @brief Export names that match known mining patterns
+    std::vector<std::string> suspiciousExports;
+
     /// @brief Suspicious patterns found
     std::vector<std::string> suspiciousPatterns;
-    
+
     /**
      * @brief Serialize to JSON
      */
