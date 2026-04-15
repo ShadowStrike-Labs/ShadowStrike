@@ -106,6 +106,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorPEHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\IPCHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ServiceProtocolHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\SignaturePatternHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\StringPathHashHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ThreatIntelHarness.hpp" />
@@ -128,6 +129,7 @@
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
     <ClCompile Include="src\EmulatorPEHarness.cpp" />
     <ClCompile Include="src\IPCHarness.cpp" />
+    <ClCompile Include="src\ServiceProtocolHarness.cpp" />
     <ClCompile Include="src\SignaturePatternHarness.cpp" />
     <ClCompile Include="src\StringPathHashHarness.cpp" />
     <ClCompile Include="src\ThreatIntelHarness.cpp" />
@@ -196,6 +198,8 @@
     <ClCompile Include="..\src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\StringUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\SystemUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\API\Http\HttpTypes.cpp" />
+    <ClCompile Include="..\src\PhantomCore\API\Http\HttpServer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Communication\ServiceCommunication.cpp" />
     <ClCompile Include="..\src\PhantomCore\SelfProtection\CryptoManager.cpp" />
     <!-- ThreatIntel feed parsers -->
