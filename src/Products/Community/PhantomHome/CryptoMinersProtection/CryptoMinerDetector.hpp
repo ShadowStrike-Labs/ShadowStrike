@@ -730,9 +730,9 @@ struct MinerDetectionStatistics {
     
     /// @brief Start time
     TimePoint startTime = Clock::now();
-    
-    /// @brief Last detection time
-    SystemTimePoint lastDetectionTime;
+
+    /// @brief Last detection time (epoch milliseconds, atomic to prevent data races)
+    std::atomic<int64_t> lastDetectionTimeMs{0};
     
     /**
      * @brief Reset statistics

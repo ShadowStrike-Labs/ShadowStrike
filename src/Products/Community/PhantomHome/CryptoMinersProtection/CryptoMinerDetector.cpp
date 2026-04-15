@@ -1616,7 +1616,10 @@ void CryptoMinerDetectorImpl::PublishDetection(MinerDetectionResult& result, boo
     if (const auto algorithmIndex = AlgorithmIndex(result.algorithm); algorithmIndex.has_value()) {
         m_statistics.byAlgorithm[*algorithmIndex].fetch_add(1, std::memory_order_relaxed);
     }
-    m_statistics.lastDetectionTime = result.detectionTime;
+    m_statistics.lastDetectionTimeMs.store(
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            result.detectionTime.time_since_epoch()).count(),
+        std::memory_order_relaxed);
 
     std::vector<MinerDetectedCallback> callbacks;
     {
@@ -2671,7 +2674,7 @@ MinerDetectionStatistics& MinerDetectionStatistics::operator=(const MinerDetecti
             byAlgorithm[index].store(other.byAlgorithm[index].load(std::memory_order_relaxed), std::memory_order_relaxed);
         }
         startTime = other.startTime;
-        lastDetectionTime = other.lastDetectionTime;
+        lastDetectionTimeMs.store(other.lastDetectionTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
     }
     return *this;
 }
@@ -2694,7 +2697,7 @@ void MinerDetectionStatistics::Reset() noexcept {
         counter.store(0, std::memory_order_relaxed);
     }
     startTime = Clock::now();
-    lastDetectionTime = {};
+    lastDetectionTimeMs.store(0, std::memory_order_relaxed);
 }
 
 std::string MinerDetectionStatistics::ToJson() const {
@@ -2709,7 +2712,7 @@ std::string MinerDetectionStatistics::ToJson() const {
     json["stratumConnectionsDetected"] = stratumConnectionsDetected.load(std::memory_order_relaxed);
     json["whitelistedPasses"] = whitelistedPasses.load(std::memory_order_relaxed);
     json["falsePositives"] = falsePositives.load(std::memory_order_relaxed);
-    json["lastDetectionTime"] = ToUnixMillis(lastDetectionTime);
+    json["lastDetectionTimeMs"] = lastDetectionTimeMs.load(std::memory_order_relaxed);
     return json.dump(2);
 }
 
