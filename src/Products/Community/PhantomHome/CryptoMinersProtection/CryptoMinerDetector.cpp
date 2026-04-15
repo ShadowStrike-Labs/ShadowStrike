@@ -265,7 +265,17 @@ struct UniqueHandle {
     if (normalizedPath.size() < normalizedComponent.size()) {
         return false;
     }
-    return normalizedPath.rfind(normalizedComponent) != std::wstring::npos;
+    // Exact suffix match — the component must appear at the very end of the path
+    const size_t expectedPos = normalizedPath.size() - normalizedComponent.size();
+    if (normalizedPath.compare(expectedPos, normalizedComponent.size(), normalizedComponent) != 0) {
+        return false;
+    }
+    // Ensure it's a full path component: preceded by a separator or at the start
+    if (expectedPos == 0) {
+        return true;
+    }
+    const wchar_t preceding = normalizedPath[expectedPos - 1];
+    return preceding == L'\\' || preceding == L'/';
 }
 
 [[nodiscard]] bool IsSuspiciousExecutableName(const std::wstring& processName) {
