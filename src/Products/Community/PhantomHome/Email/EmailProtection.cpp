@@ -2003,6 +2003,16 @@ std::string EmailProtection::GetVersionString() noexcept {
                       EmailProtectionConstants::VERSION_PATCH);
 }
 
+std::optional<EmailMessage> EmailProtection::ParseEML(const fs::path& path) {
+    if (!m_impl) return std::nullopt;
+    return m_impl->ParseEMLInternal(path);
+}
+
+std::optional<EmailMessage> EmailProtection::ParseRaw(const std::vector<uint8_t>& data) {
+    if (!m_impl) return std::nullopt;
+    return m_impl->ParseRawEmailInternal(data);
+}
+
 // ============================================================================
 // STRUCTURE IMPLEMENTATIONS
 // ============================================================================
@@ -2267,11 +2277,17 @@ std::string_view GetDLPCategoryName(DLPCategory category) noexcept {
 }
 
 std::optional<EmailMessage> ParseEMLFile(const fs::path& path) {
-    return EmailProtection::Instance().m_impl->ParseEMLInternal(path);
+    if (!EmailProtection::HasInstance() || !EmailProtection::Instance().IsInitialized()) {
+        return std::nullopt;
+    }
+    return EmailProtection::Instance().ParseEML(path);
 }
 
 std::optional<EmailMessage> ParseRawEmail(const std::vector<uint8_t>& data) {
-    return EmailProtection::Instance().m_impl->ParseRawEmailInternal(data);
+    if (!EmailProtection::HasInstance() || !EmailProtection::Instance().IsInitialized()) {
+        return std::nullopt;
+    }
+    return EmailProtection::Instance().ParseRaw(data);
 }
 
 std::vector<std::string> ExtractEmailUrls(

@@ -192,6 +192,30 @@ namespace IoTConstants {
         5683, 7547, 8008, 8080, 8443, 8883, 9100
     };
 
+    /// @brief Extended port list for full scan mode
+    inline constexpr uint16_t EXTENDED_IOT_PORTS[] = {
+        21, 22, 23, 25, 53, 80, 81, 110, 139, 143, 161, 443, 445, 554,
+        587, 993, 995, 1080, 1443, 1883, 1900, 2000, 2323, 3000, 3306,
+        3389, 4443, 5000, 5353, 5432, 5555, 5683, 5684, 6379, 7443,
+        7547, 8000, 8008, 8080, 8081, 8088, 8443, 8888, 8883, 9000,
+        9090, 9100, 9443, 10000, 49152
+    };
+
+    /// @brief Maximum concurrent port scan connections
+    inline constexpr uint32_t MAX_CONCURRENT_PORT_SCANS = 32;
+
+    /// @brief ARP response timeout (ms)
+    inline constexpr uint32_t ARP_RESPONSE_TIMEOUT_MS = 1000;
+
+    /// @brief Maximum banner read size (capped for security)
+    inline constexpr size_t MAX_BANNER_SIZE = 4096;
+
+    /// @brief Maximum subnet host count (limits scan scope)
+    inline constexpr uint32_t MAX_SUBNET_HOSTS = 1024;
+
+    /// @brief Passive monitoring buffer size
+    inline constexpr size_t PASSIVE_MONITOR_BUFFER_SIZE = 65536;
+
 }  // namespace IoTConstants
 
 // ============================================================================
@@ -275,6 +299,29 @@ enum class RiskFactor : uint32_t {
     DebugInterface          = 1 << 14,
     NoEncryption            = 1 << 15
 };
+
+/// @brief Bitwise OR for RiskFactor
+[[nodiscard]] inline constexpr RiskFactor operator|(RiskFactor lhs, RiskFactor rhs) noexcept {
+    return static_cast<RiskFactor>(
+        static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise OR assignment for RiskFactor
+inline constexpr RiskFactor& operator|=(RiskFactor& lhs, RiskFactor rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+/// @brief Bitwise AND for RiskFactor
+[[nodiscard]] inline constexpr RiskFactor operator&(RiskFactor lhs, RiskFactor rhs) noexcept {
+    return static_cast<RiskFactor>(
+        static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise AND test (non-zero = true)
+[[nodiscard]] inline constexpr bool HasFlag(RiskFactor flags, RiskFactor test) noexcept {
+    return (static_cast<uint32_t>(flags) & static_cast<uint32_t>(test)) != 0;
+}
 
 /**
  * @brief Service protocol

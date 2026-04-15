@@ -928,6 +928,16 @@ public:
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
 
+    // ========================================================================
+    // PARSING (public delegates for free functions)
+    // ========================================================================
+
+    /// @brief Parse .eml file into EmailMessage
+    [[nodiscard]] std::optional<EmailMessage> ParseEML(const fs::path& path);
+
+    /// @brief Parse raw email bytes into EmailMessage
+    [[nodiscard]] std::optional<EmailMessage> ParseRaw(const std::vector<uint8_t>& data);
+
 private:
     EmailProtection();
     ~EmailProtection();
