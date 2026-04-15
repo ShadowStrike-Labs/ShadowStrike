@@ -137,6 +137,7 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "EmailCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -183,14 +184,6 @@ namespace PhishingConstants {
     };
 
 }  // namespace PhishingConstants
-
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
 // ENUMERATIONS
@@ -268,20 +261,6 @@ enum class URLVerdict : uint8_t {
     Phishing            = 3,
     Redirect            = 4,
     Unknown             = 255
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Analyzing       = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================

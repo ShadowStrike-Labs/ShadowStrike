@@ -142,6 +142,7 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Scripts/MacroDetector.hpp"
+#include "EmailCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -191,14 +192,6 @@ namespace AttachmentConstants {
     };
 
 }  // namespace AttachmentConstants
-
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
 // ENUMERATIONS
@@ -269,20 +262,6 @@ enum class ScanDepth : uint8_t {
     Standard            = 1,    ///< Standard scan
     Deep                = 2,    ///< Deep analysis
     Forensic            = 3     ///< Full forensic analysis
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
