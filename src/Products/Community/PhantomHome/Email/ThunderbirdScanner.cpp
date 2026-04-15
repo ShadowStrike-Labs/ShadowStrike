@@ -1877,21 +1877,105 @@ void ThunderbirdScanner::ResetStatistics() {
 }
 
 [[nodiscard]] std::vector<ThunderbirdProfile> ParseProfilesIni(const fs::path& iniPath) {
-    ThunderbirdScanner& scanner = ThunderbirdScanner::Instance();
-    if (scanner.IsInitialized() && scanner.m_impl) {
-        return scanner.m_impl->ParseProfilesIniImpl(iniPath);
-    }
+    // Route through the singleton's public DiscoverProfiles which internally
+    // calls ParseProfilesIniImpl. For standalone parsing without full scanner
+    // init, use a lightweight local parser.
+    try {
+        if (!fs::exists(iniPath)) {
+            return {};
+        }
 
-    return {};
+        std::vector<ThunderbirdProfile> profiles;
+        std::ifstream iniFile(iniPath);
+        if (!iniFile) {
+            return profiles;
+        }
+
+        ThunderbirdProfile currentProfile;
+        std::string currentSection;
+        std::string line;
+
+        while (std::getline(iniFile, line)) {
+            StringUtils::Trim(line);
+
+            if (line.empty() || line[0] == ';' || line[0] == '#') {
+                continue;
+            }
+
+            if (line[0] == '[' && line.back() == ']') {
+                if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
+                    profiles.push_back(currentProfile);
+                    currentProfile = ThunderbirdProfile{};
+                }
+                currentSection = line.substr(1, line.length() - 2);
+                continue;
+            }
+
+            auto eqPos = line.find('=');
+            if (eqPos == std::string::npos) {
+                continue;
+            }
+
+            std::string key = line.substr(0, eqPos);
+            std::string value = line.substr(eqPos + 1);
+            StringUtils::Trim(key);
+            StringUtils::Trim(value);
+
+            if (currentSection.starts_with("Profile")) {
+                if (key == "Name") {
+                    currentProfile.name = value;
+                } else if (key == "Path") {
+                    fs::path basePath = iniPath.parent_path();
+                    currentProfile.path = basePath / value;
+                } else if (key == "Default") {
+                    currentProfile.isDefault = (value == "1");
+                }
+            }
+        }
+
+        if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
+            profiles.push_back(currentProfile);
+        }
+
+        return profiles;
+
+    } catch (const std::exception& e) {
+        Logger::Error("ParseProfilesIni: Exception - {}", e.what());
+        return {};
+    }
 }
 
 [[nodiscard]] MailboxFormat DetectMailboxFormat(const fs::path& path) {
-    ThunderbirdScanner& scanner = ThunderbirdScanner::Instance();
-    if (scanner.IsInitialized() && scanner.m_impl) {
-        return scanner.m_impl->DetectMailboxFormatImpl(path);
-    }
+    try {
+        if (!fs::exists(path) || !fs::is_regular_file(path)) {
+            return MailboxFormat::Unknown;
+        }
 
-    return MailboxFormat::Unknown;
+        std::string ext = StringUtils::ToLowerCase(path.extension().string());
+        if (ext == ".msf") {
+            return MailboxFormat::Unknown;
+        }
+
+        std::ifstream file(path);
+        std::string firstLine;
+        if (!std::getline(file, firstLine)) {
+            return MailboxFormat::Unknown;
+        }
+
+        if (firstLine.starts_with("From ")) {
+            return MailboxFormat::Mbox;
+        }
+
+        auto parentDir = path.parent_path().filename().string();
+        if (parentDir == "cur" || parentDir == "new" || parentDir == "tmp") {
+            return MailboxFormat::Maildir;
+        }
+
+        return MailboxFormat::Unknown;
+
+    } catch (...) {
+        return MailboxFormat::Unknown;
+    }
 }
 
 } // namespace Email
