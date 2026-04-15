@@ -2019,20 +2019,30 @@ bool PoolConnectionDetector::Stop() {
         return false;
     }
 
+    m_impl->m_status.store(ModuleStatus::Stopping, std::memory_order_release);
+    {
+        std::unique_lock lock(m_impl->m_connectionsMutex);
+        m_impl->m_activeConnections.clear();
+    }
     m_impl->m_status.store(ModuleStatus::Stopped, std::memory_order_release);
-    std::unique_lock lock(m_impl->m_connectionsMutex);
-    m_impl->m_activeConnections.clear();
     return true;
 }
 
 void PoolConnectionDetector::Pause() {
-    if (m_impl && m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    const auto current = m_impl->m_status.load(std::memory_order_acquire);
+    if (current == ModuleStatus::Running) {
         m_impl->m_status.store(ModuleStatus::Paused, std::memory_order_release);
     }
 }
 
 void PoolConnectionDetector::Resume() {
-    if (m_impl && m_impl->m_initialized.load(std::memory_order_acquire)) {
+    if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+        return;
+    }
+    if (m_impl->m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
         m_impl->m_status.store(ModuleStatus::Running, std::memory_order_release);
     }
 }
