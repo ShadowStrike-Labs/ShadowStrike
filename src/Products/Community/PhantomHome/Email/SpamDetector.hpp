@@ -132,6 +132,7 @@
 #include "../PatternStore/PatternStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "EmailCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -187,14 +188,6 @@ namespace SpamConstants {
     };
 
 }  // namespace SpamConstants
-
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
 
 // ============================================================================
 // ENUMERATIONS
@@ -257,21 +250,6 @@ enum class RBLResult : uint8_t {
 enum class TrainingType : uint8_t {
     Spam    = 0,
     Ham     = 1
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Analyzing       = 3,
-    Training        = 4,
-    Paused          = 5,
-    Stopping        = 6,
-    Stopped         = 7,
-    Error           = 8
 };
 
 // ============================================================================

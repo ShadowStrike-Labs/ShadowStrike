@@ -133,6 +133,7 @@
 #include "../Utils/COMUtils.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "EmailCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -185,13 +186,6 @@ namespace OutlookConstants {
 
 }  // namespace OutlookConstants
 
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
 namespace fs = std::filesystem;
 
 // ============================================================================
@@ -257,20 +251,6 @@ enum class OutlookFolderType : uint8_t {
     Tasks           = 8,
     Notes           = 9,
     Custom          = 10
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
