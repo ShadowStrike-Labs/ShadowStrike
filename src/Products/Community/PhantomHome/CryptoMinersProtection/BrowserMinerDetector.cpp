@@ -522,6 +522,18 @@ struct ControlFrame {
     const std::filesystem::path& path,
     Utils::FileUtils::Error& error)
 {
+    // Check file size before loading to prevent memory exhaustion from malicious files
+    static constexpr size_t kMaxBlacklistFileSize = 10 * 1024 * 1024; // 10 MB
+    static constexpr size_t kMaxBlacklistEntries = BrowserMinerConstants::MAX_BLOCKED_DOMAINS;
+    static constexpr size_t kMaxLineLength = 512;
+
+    std::error_code ec;
+    const auto fileSize = std::filesystem::file_size(path, ec);
+    if (ec || fileSize > kMaxBlacklistFileSize) {
+        error.win32 = ec ? static_cast<uint32_t>(ec.value()) : ERROR_FILE_TOO_LARGE;
+        return std::nullopt;
+    }
+
     std::string content;
     if (!Utils::FileUtils::ReadAllTextUtf8(path.native(), content, &error)) {
         return std::nullopt;
@@ -531,9 +543,18 @@ struct ControlFrame {
     std::istringstream stream(content);
     std::string line;
     while (std::getline(stream, line)) {
+        // Cap line length to prevent memory exhaustion
+        if (line.size() > kMaxLineLength) {
+            line.resize(kMaxLineLength);
+        }
+
         line = TrimAscii(line);
         if (line.empty() || line.front() == '#') {
             continue;
+        }
+
+        if (loadedDomains.size() >= kMaxBlacklistEntries) {
+            break;
         }
 
         const std::string normalized = NormalizeDomainValue(line);
@@ -1935,21 +1956,26 @@ void BrowserMinerDetectorImpl::AnalyzeWASMImports(
         return;
     }
     
+    static constexpr size_t kMaxImportNameLength = 4096;
+
     for (uint64_t i = 0; i < importCount && cursor < end; ++i) {
         const uint64_t moduleLen = DecodeLEB128(cursor, end);
-        if (moduleLen == std::numeric_limits<uint64_t>::max() || 
+        if (moduleLen == std::numeric_limits<uint64_t>::max() ||
             moduleLen > static_cast<uint64_t>(end - cursor)) {
             return;
         }
-        std::string moduleName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(moduleLen));
+        // Cap string construction to prevent multi-MB allocations from crafted WASM
+        const size_t safeModuleLen = std::min(static_cast<size_t>(moduleLen), kMaxImportNameLength);
+        std::string moduleName(reinterpret_cast<const char*>(cursor), safeModuleLen);
         cursor += static_cast<size_t>(moduleLen);
-        
+
         const uint64_t fieldLen = DecodeLEB128(cursor, end);
-        if (fieldLen == std::numeric_limits<uint64_t>::max() || 
+        if (fieldLen == std::numeric_limits<uint64_t>::max() ||
             fieldLen > static_cast<uint64_t>(end - cursor)) {
             return;
         }
-        std::string fieldName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(fieldLen));
+        const size_t safeFieldLen = std::min(static_cast<size_t>(fieldLen), kMaxImportNameLength);
+        std::string fieldName(reinterpret_cast<const char*>(cursor), safeFieldLen);
         cursor += static_cast<size_t>(fieldLen);
         
         if (cursor >= end) return;
@@ -2009,13 +2035,17 @@ void BrowserMinerDetectorImpl::AnalyzeWASMExports(
         return;
     }
     
+    static constexpr size_t kMaxExportNameLength = 4096;
+
     for (uint64_t i = 0; i < exportCount && cursor < end; ++i) {
         const uint64_t nameLen = DecodeLEB128(cursor, end);
         if (nameLen == std::numeric_limits<uint64_t>::max() ||
             nameLen > static_cast<uint64_t>(end - cursor)) {
             return;
         }
-        std::string exportName(reinterpret_cast<const char*>(cursor), static_cast<size_t>(nameLen));
+        // Cap string construction to prevent multi-MB allocations from crafted WASM
+        const size_t safeNameLen = std::min(static_cast<size_t>(nameLen), kMaxExportNameLength);
+        std::string exportName(reinterpret_cast<const char*>(cursor), safeNameLen);
         cursor += static_cast<size_t>(nameLen);
         
         if (cursor >= end) return;
@@ -2932,9 +2962,24 @@ std::string BrowserMinerDetectionResult::ToJson() const {
             : walletAddress},
         {"evidence", evidence},
         {"matchedSignatures", matchedSignatures},
-        {"isWhitelisted", isWhitelisted},
-        {"scriptInfo", nlohmann::json::parse(scriptInfo.ToJson())}
+        {"isWhitelisted", isWhitelisted}
     };
+
+    // Build scriptInfo as a JSON object directly — avoids serialize-then-reparse
+    // which is wasteful and can throw on invalid JSON from sub-objects.
+    {
+        nlohmann::json si;
+        si["browserPid"] = scriptInfo.browserPid;
+        si["tabId"] = scriptInfo.tabId;
+        si["frameId"] = scriptInfo.frameId;
+        si["sourceUrl"] = scriptInfo.sourceUrl;
+        si["domain"] = scriptInfo.domain;
+        si["scriptType"] = static_cast<int>(scriptInfo.scriptType);
+        si["scriptSize"] = scriptInfo.scriptSize;
+        si["isInline"] = scriptInfo.isInline;
+        si["isFromExtension"] = scriptInfo.isFromExtension;
+        json["scriptInfo"] = std::move(si);
+    }
 
     for (BrowserDetectionMethod method : additionalMethods) {
         json["additionalMethods"].push_back(static_cast<int>(method));
@@ -2943,12 +2988,33 @@ std::string BrowserMinerDetectionResult::ToJson() const {
         json["throttlePercent"] = *throttlePercent;
     }
     if (wasmAnalysis.has_value()) {
-        json["wasmAnalysis"] = nlohmann::json::parse(wasmAnalysis->ToJson());
+        nlohmann::json wa;
+        wa["isValidWASM"] = wasmAnalysis->isValidWASM;
+        wa["moduleSize"] = wasmAnalysis->moduleSize;
+        wa["isMiningModule"] = wasmAnalysis->isMiningModule;
+        wa["algorithm"] = static_cast<int>(wasmAnalysis->algorithm);
+        wa["hasCryptoInstructions"] = wasmAnalysis->hasCryptoInstructions;
+        wa["hasLargeMemory"] = wasmAnalysis->hasLargeMemory;
+        wa["memoryPages"] = wasmAnalysis->memoryPages;
+        wa["functionCount"] = wasmAnalysis->functionCount;
+        wa["loopDensityScore"] = wasmAnalysis->loopDensityScore;
+        wa["confidenceScore"] = wasmAnalysis->confidenceScore;
+        wa["suspiciousPatterns"] = wasmAnalysis->suspiciousPatterns;
+        json["wasmAnalysis"] = std::move(wa);
     }
     if (!relatedWorkers.empty()) {
         json["relatedWorkers"] = nlohmann::json::array();
         for (const auto& worker : relatedWorkers) {
-            json["relatedWorkers"].push_back(nlohmann::json::parse(worker.ToJson()));
+            nlohmann::json wj;
+            wj["workerId"] = worker.workerId;
+            wj["parentTabId"] = worker.parentTabId;
+            wj["workerType"] = static_cast<int>(worker.workerType);
+            wj["scriptUrl"] = worker.scriptUrl;
+            wj["workerName"] = worker.workerName;
+            wj["cpuUsage"] = worker.cpuUsage;
+            wj["memoryUsage"] = worker.memoryUsage;
+            wj["isMingSuspected"] = worker.isMingSuspected;
+            json["relatedWorkers"].push_back(std::move(wj));
         }
     }
 
