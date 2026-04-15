@@ -431,8 +431,8 @@ std::string CPUAnalyzerStatistics::ToJson() const {
 bool CPUUsageAnalyzerConfiguration::IsValid() const noexcept {
     return highUsageThreshold > 0.0 && highUsageThreshold <= 100.0 &&
            miningThreshold > 0.0 && miningThreshold <= 100.0 &&
-           observationWindowSecs > 0 &&
-           sampleIntervalMs > 0;
+           observationWindowSecs > 0 && observationWindowSecs <= 3600 &&
+           sampleIntervalMs > 0 && sampleIntervalMs <= 60000;
 }
 
 // ============================================================================
@@ -907,8 +907,13 @@ public:
     bool Stop() {
         // Signal the thread to stop (atomic, no lock needed)
         bool wasRunning = m_running.exchange(false, std::memory_order_acq_rel);
-        m_monitorWakeup.notify_all();
         if (!wasRunning) return true;
+
+        {
+            std::unique_lock lock(m_mutex);
+            m_status = ModuleStatus::Stopping;
+        }
+        m_monitorWakeup.notify_all();
 
         // Join outside lock to avoid deadlock with monitor thread
         if (m_monitorThread.joinable()) {
@@ -923,6 +928,14 @@ public:
     }
 
     void Pause() {
+        {
+            std::shared_lock lock(m_mutex);
+            if (!m_initialized || m_status != ModuleStatus::Running) {
+                Utils::Logger::Warn("CPUUsageAnalyzer: Pause rejected — module is not running");
+                return;
+            }
+        }
+
         m_paused.store(true, std::memory_order_release);
         m_monitorWakeup.notify_all();
 
@@ -932,6 +945,14 @@ public:
     }
 
     void Resume() {
+        {
+            std::shared_lock lock(m_mutex);
+            if (!m_initialized || m_status != ModuleStatus::Paused) {
+                Utils::Logger::Warn("CPUUsageAnalyzer: Resume rejected — module is not paused");
+                return;
+            }
+        }
+
         m_paused.store(false, std::memory_order_release);
         m_monitorWakeup.notify_all();
 
@@ -1405,12 +1426,16 @@ private:
         {
             std::unique_lock lock(m_mutex);
             for (const auto& event : newEvents) {
-                // Cap stored events
+                // Cap stored events — deque provides O(1) pop_front
                 if (m_highLoadEvents.size() >= 1000) {
-                    m_highLoadEvents.erase(m_highLoadEvents.begin());
+                    m_highLoadEvents.pop_front();
                 }
                 m_highLoadEvents.push_back(event);
-                m_lastAlertedPids[event.signature.processId] = now;
+
+                // Cap dedup map to prevent unbounded growth
+                if (m_lastAlertedPids.size() < kMaxAlertedPids) {
+                    m_lastAlertedPids[event.signature.processId] = now;
+                }
             }
 
             // Clean stale dedup entries
@@ -1721,11 +1746,12 @@ private:
     std::unique_ptr<PatternAnalyzer> m_patternAnalyzer;
     std::unique_ptr<CallbackManager> m_callbackManager;
 
-    // Events
-    std::vector<HighLoadEvent> m_highLoadEvents;
+    // Events — deque for O(1) front removal instead of O(N) vector::erase(begin())
+    std::deque<HighLoadEvent> m_highLoadEvents;
 
-    // Alert deduplication: PID -> last alert time
+    // Alert deduplication: PID -> last alert time (capped to prevent unbounded growth)
     std::unordered_map<uint32_t, TimePoint> m_lastAlertedPids;
+    static constexpr size_t kMaxAlertedPids = 4096;
 
     // Monitoring thread
     std::thread m_monitorThread;

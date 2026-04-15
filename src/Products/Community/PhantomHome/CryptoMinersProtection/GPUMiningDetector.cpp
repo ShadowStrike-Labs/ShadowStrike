@@ -1020,6 +1020,7 @@ public:
     }
 
     [[nodiscard]] bool Stop() {
+        m_status.store(ModuleStatus::Stopping, std::memory_order_release);
         m_stopRequested.store(true, std::memory_order_release);
         m_monitorCv.notify_all();
 
@@ -1043,6 +1044,10 @@ public:
     }
 
     void Pause() {
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            Utils::Logger::Warn("GPUMiningDetector: Pause rejected — module is not initialized");
+            return;
+        }
         const auto current = m_status.load(std::memory_order_acquire);
         if (current == ModuleStatus::Running || current == ModuleStatus::Scanning) {
             m_status.store(ModuleStatus::Paused, std::memory_order_release);
@@ -1051,6 +1056,10 @@ public:
     }
 
     void Resume() {
+        if (!m_initialized.load(std::memory_order_acquire)) {
+            Utils::Logger::Warn("GPUMiningDetector: Resume rejected — module is not initialized");
+            return;
+        }
         if (m_status.load(std::memory_order_acquire) == ModuleStatus::Paused) {
             m_status.store(ModuleStatus::Running, std::memory_order_release);
             m_monitorCv.notify_all();
