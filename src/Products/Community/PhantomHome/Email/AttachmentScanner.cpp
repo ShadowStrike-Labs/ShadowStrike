@@ -796,10 +796,11 @@ public:
             m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
 
             InvokeErrorCallback(e.what(), -1);
-            return result;
-        } finally {
             m_status.store(ModuleStatus::Running, std::memory_order_release);
+            return result;
         }
+
+        m_status.store(ModuleStatus::Running, std::memory_order_release);
     }
 
     [[nodiscard]] AttachmentScanResult ScanBufferImpl(

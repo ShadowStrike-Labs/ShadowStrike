@@ -211,7 +211,7 @@ enum class AttachmentVerdict : uint8_t {
     Clean               = 0,    ///< No threats detected
     Malicious           = 1,    ///< Confirmed malware
     Suspicious          = 2,    ///< Suspicious but not confirmed
-    Potentially Unwanted = 3,   ///< PUA/PUP
+    PotentiallyUnwanted = 3,    ///< PUA/PUP
     HighRisk            = 4,    ///< High-risk file type
     EncryptedArchive    = 5,    ///< Cannot scan (encrypted)
     CorruptedFile       = 6,    ///< File is corrupted

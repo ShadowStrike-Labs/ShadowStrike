@@ -375,7 +375,7 @@ struct URLAnalysisResult {
     bool impersonatesBrand = false;
     
     /// @brief Impersonated brand name
-    std::string impersonatedBrand = false;
+    std::string impersonatedBrand;
     
     /// @brief Domain age (days, -1 = unknown)
     int domainAgeDays = -1;
