@@ -226,20 +226,29 @@ const std::vector<std::wstring> kDagFilePatterns = {
 
     for (const auto& entry : config.whitelistedApplications) {
         const std::wstring loweredEntry = ToLowerCopy(entry);
+
+        // Exact match on process name (e.g., "blender.exe" == "blender.exe")
         if (!loweredName.empty() && loweredName == loweredEntry) {
             return true;
         }
 
+        // Exact match on full path (e.g., "C:\Program Files\Blender\blender.exe")
         if (!loweredPath.empty() && loweredPath == loweredEntry) {
             return true;
         }
 
-        if (!loweredName.empty() && loweredEntry.find(loweredName) != std::wstring::npos) {
-            return true;
-        }
-
-        if (!loweredPath.empty() && loweredPath.find(loweredEntry) != std::wstring::npos) {
-            return true;
+        // Path ends with the whitelisted entry as a full path component.
+        // Requires a path separator immediately before the match to prevent
+        // partial filename matches (e.g., "miner.exe" must not match "notminer.exe").
+        if (!loweredPath.empty() && !loweredEntry.empty() &&
+            loweredPath.size() > loweredEntry.size()) {
+            const size_t expectedPos = loweredPath.size() - loweredEntry.size();
+            if (loweredPath.compare(expectedPos, loweredEntry.size(), loweredEntry) == 0) {
+                const wchar_t precedingChar = loweredPath[expectedPos - 1];
+                if (precedingChar == L'\\' || precedingChar == L'/') {
+                    return true;
+                }
+            }
         }
     }
 
