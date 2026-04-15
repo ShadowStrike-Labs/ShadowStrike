@@ -22,7 +22,8 @@
  *
  * @file BrowserMinerDetector.hpp
  * @brief Enterprise-grade detection engine for in-browser cryptojacking attacks
- *        including JavaScript miners, WebAssembly miners, and Web Worker abuse.
+ *        including JavaScript miners, WebAssembly miners, and Web Worker abuse
+ *        signals only when upstream browser worker telemetry exists.
  *
  * Provides comprehensive detection of browser-based cryptocurrency mining
  * scripts that hijack user CPU resources for unauthorized mining operations.
@@ -45,11 +46,11 @@
  *    - Loop structure analysis
  *
  * 3. WEB WORKER DETECTION
- *    - Worker thread monitoring
- *    - CPU usage per worker
- *    - Worker script analysis
- *    - SharedArrayBuffer abuse
- *    - Dedicated vs shared workers
+ *    - Worker thread monitoring when browser-side telemetry is available
+ *    - CPU usage per worker when browser-side telemetry is available
+ *    - Worker script analysis when browser-side telemetry is available
+ *    - SharedArrayBuffer abuse signals when browser-side telemetry is available
+ *    - Dedicated vs shared workers when browser-side telemetry is available
  *
  * 4. NETWORK ANALYSIS
  *    - WebSocket connections
@@ -82,6 +83,7 @@
  *
  * @note Requires browser hook or extension for script interception.
  * @note WebAssembly analysis requires WASM parsing capability.
+ * @note PhantomHome currently ships without browser-side worker telemetry/enforcement; worker monitoring and worker termination remain explicit no-op/disabled paths.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -136,13 +138,9 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/NetworkUtils.hpp"
+#include "CryptoMinersTypes.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -284,7 +282,7 @@ enum class BrowserDetectionMethod : uint8_t {
     WASMAnalysis        = 3,    ///< WASM instruction analysis
     BehavioralCPU       = 4,    ///< CPU usage behavior
     NetworkPool         = 5,    ///< Pool connection detected
-    WorkerAbuse         = 6,    ///< Web Worker abuse
+    WorkerAbuse         = 6,    ///< Web Worker abuse (only when upstream worker telemetry exists)
     DomainBlacklist     = 7,    ///< Blocked domain
     HeuristicAnalysis   = 8,    ///< Heuristic detection
     ThreatIntel         = 9     ///< Threat intel match
@@ -300,29 +298,7 @@ enum class WebWorkerType : uint8_t {
     Service         = 3     ///< Service worker
 };
 
-/**
- * @brief Threat severity
- */
-enum class ThreatSeverity : uint8_t {
-    None        = 0,
-    Low         = 1,
-    Medium      = 2,
-    High        = 3,
-    Critical    = 4
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// ThreatSeverity and ModuleStatus defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // STRUCTURES
@@ -574,6 +550,10 @@ struct TabMiningInfo {
  * @brief Detection statistics
  */
 struct BrowserMinerStatistics {
+    BrowserMinerStatistics() noexcept = default;
+    BrowserMinerStatistics(const BrowserMinerStatistics& other) noexcept;
+    BrowserMinerStatistics& operator=(const BrowserMinerStatistics& other) noexcept;
+
     /// @brief Scripts scanned
     std::atomic<uint64_t> scriptsScanned{0};
     
@@ -628,8 +608,8 @@ struct BrowserMinerDetectorConfiguration {
     /// @brief Enable heuristic analysis
     bool enableHeuristics = true;
     
-    /// @brief Enable worker monitoring
-    bool enableWorkerMonitoring = true;
+    /// @brief Enable worker monitoring (forced off until browser worker telemetry is wired)
+    bool enableWorkerMonitoring = false;
     
     /// @brief Enable domain blocking
     bool enableDomainBlocking = true;
@@ -649,8 +629,8 @@ struct BrowserMinerDetectorConfiguration {
     /// @brief Confidence threshold
     double confidenceThreshold = BrowserMinerConstants::CONFIDENCE_THRESHOLD;
     
-    /// @brief Terminate mining workers
-    bool terminateMiningWorkers = true;
+    /// @brief Terminate mining workers (forced off until browser worker enforcement is wired)
+    bool terminateMiningWorkers = false;
     
     /// @brief Custom domain blacklist path
     std::wstring domainBlacklistPath;
@@ -677,8 +657,7 @@ using MinerFoundCallback = std::function<void(const BrowserMinerDetectionResult&
 /// @brief Tab mining callback
 using TabMiningCallback = std::function<void(const TabMiningInfo&)>;
 
-/// @brief Error callback
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+// ErrorCallback defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // BROWSER MINER DETECTOR CLASS
@@ -689,7 +668,9 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
  * @brief Enterprise-grade browser cryptojacking detection engine
  *
  * Provides comprehensive detection of in-browser cryptocurrency mining
- * including JavaScript miners, WASM miners, and Web Worker abuse.
+ * including JavaScript miners, WASM miners, and Web Worker abuse signals when
+ * browser-side telemetry exists. In PhantomHome, worker telemetry/enforcement is
+ * intentionally disabled until a browser backend provides authoritative worker data.
  *
  * THREAD SAFETY: All public methods are thread-safe.
  *
@@ -714,7 +695,7 @@ public:
     /**
      * @brief Get singleton instance
      */
-    [[nodiscard]] static BrowserMinerDetector& Instance() noexcept;
+    [[nodiscard]] static BrowserMinerDetector& Instance();
     
     /**
      * @brief Check if instance exists
@@ -819,7 +800,10 @@ public:
     [[nodiscard]] std::vector<TabMiningInfo> GetMiningTabs() const;
     
     /**
-     * @brief Start monitoring tab
+     * @brief Register tab state for detections
+     *
+     * This does not create browser-side worker telemetry. It only allows the
+     * detector to correlate future script or WASM findings with the tab.
      */
     void StartTabMonitoring(uint32_t browserPid, uint64_t tabId);
     
@@ -834,12 +818,17 @@ public:
     
     /**
      * @brief Get workers for tab
+     *
+     * Returns only worker telemetry supplied by browser instrumentation. When
+     * worker telemetry is not wired into PhantomHome this returns an empty set.
      */
     [[nodiscard]] std::vector<WebWorkerInfo> GetWorkers(
         uint32_t browserPid, uint64_t tabId) const;
     
     /**
      * @brief Terminate mining workers
+     *
+     * Safe no-op until browser-side worker enforcement is integrated.
      */
     [[nodiscard]] size_t TerminateMiningWorkers(uint32_t browserPid, uint64_t tabId);
     
@@ -942,7 +931,7 @@ public:
     /**
      * @brief Get version string
      */
-    [[nodiscard]] static std::string GetVersionString() noexcept;
+    [[nodiscard]] static std::string GetVersionString();
 
 private:
     // ========================================================================
@@ -956,7 +945,10 @@ private:
     // PIMPL
     // ========================================================================
     
-    std::unique_ptr<BrowserMinerDetectorImpl> m_impl;
+    [[nodiscard]] std::shared_ptr<BrowserMinerDetectorImpl> GetImplSnapshot() const noexcept;
+
+    mutable std::mutex m_implMutex;
+    std::shared_ptr<BrowserMinerDetectorImpl> m_impl;
     
     // ========================================================================
     // STATIC INSTANCE FLAG

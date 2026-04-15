@@ -1177,7 +1177,7 @@ public:
         m_anomalyCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterMiningDetectedCallback(MiningDetectedCallback callback) {
+    void RegisterMiningDetectedCallback(GPUMiningDetectedCallback callback) {
         if (!callback) {
             return;
         }
@@ -1945,7 +1945,7 @@ private:
     }
 
     void InvokeMiningCallbacks(const GPUMiningDetectionResult& detection) {
-        std::vector<MiningDetectedCallback> callbacks;
+        std::vector<GPUMiningDetectedCallback> callbacks;
         {
             std::shared_lock lock(m_mutex);
             callbacks = m_miningCallbacks;
@@ -2015,7 +2015,7 @@ private:
     bool m_monitorTransitionInProgress = false;
 
     std::vector<GPUAnomalyCallback> m_anomalyCallbacks;
-    std::vector<MiningDetectedCallback> m_miningCallbacks;
+    std::vector<GPUMiningDetectedCallback> m_miningCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 
     std::deque<GPUMiningDetectionResult> m_recentDetections;
@@ -2126,7 +2126,7 @@ void GPUMiningDetector::RegisterAnomalyCallback(GPUAnomalyCallback callback) {
     m_impl->RegisterAnomalyCallback(std::move(callback));
 }
 
-void GPUMiningDetector::RegisterMiningDetectedCallback(MiningDetectedCallback callback) {
+void GPUMiningDetector::RegisterMiningDetectedCallback(GPUMiningDetectedCallback callback) {
     m_impl->RegisterMiningDetectedCallback(std::move(callback));
 }
 

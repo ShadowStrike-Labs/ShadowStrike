@@ -140,6 +140,7 @@
 #include "../../../../PhantomCore/Utils/HashUtils.hpp"
 #include "../../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 #include "../../../../PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "CryptoMinersTypes.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -275,18 +276,7 @@ enum class MinedCryptocurrency : uint8_t {
     Other       = 255
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// ModuleStatus defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // STRUCTURES
@@ -561,7 +551,7 @@ struct PoolConnectionDetectorConfiguration {
 
 using PoolConnectionCallback = std::function<void(const PoolConnectionInfo&)>;
 using StratumDetectedCallback = std::function<void(const PoolDetectionResult&)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+// ErrorCallback defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // POOL CONNECTION DETECTOR CLASS

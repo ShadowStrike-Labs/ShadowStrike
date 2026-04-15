@@ -47,6 +47,8 @@
 #  include <Windows.h>
 #endif
 
+#include "CryptoMinersTypes.hpp"
+
 namespace ShadowStrike::CryptoMiners {
     class GPUMiningDetectorImpl;
 }
@@ -113,15 +115,7 @@ enum class DetectionConfidence : uint8_t {
     Confirmed = 4
 };
 
-enum class ModuleStatus : uint8_t {
-    Uninitialized = 0,
-    Initializing = 1,
-    Running = 2,
-    Scanning = 3,
-    Paused = 4,
-    Stopped = 5,
-    Error = 6
-};
+// ModuleStatus defined in CryptoMinersTypes.hpp
 
 struct GPUProcessInfo {
     uint32_t processId = 0;
@@ -225,8 +219,8 @@ struct GPUMiningDetectorConfiguration {
 };
 
 using GPUAnomalyCallback = std::function<void(const GPUDeviceStats&)>;
-using MiningDetectedCallback = std::function<void(const GPUMiningDetectionResult&)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using GPUMiningDetectedCallback = std::function<void(const GPUMiningDetectionResult&)>;
+// ErrorCallback defined in CryptoMinersTypes.hpp
 
 class GPUMiningDetector final {
 public:
@@ -263,7 +257,7 @@ public:
     [[nodiscard]] bool TerminateMiningProcess(uint32_t processId);
 
     void RegisterAnomalyCallback(GPUAnomalyCallback callback);
-    void RegisterMiningDetectedCallback(MiningDetectedCallback callback);
+    void RegisterMiningDetectedCallback(GPUMiningDetectedCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
 
