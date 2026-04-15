@@ -48,9 +48,9 @@
  * 3. BROWSER MINING DETECTION
  *    - WebAssembly (WASM) miner detection
  *    - JavaScript miner patterns
- *    - Web Worker abuse
  *    - Coinhive/CryptoLoot variants
  *    - Hidden iframe mining
+ *    - Browser worker abuse signals only when upstream browser telemetry exists
  *
  * 4. NETWORK DETECTION
  *    - Stratum protocol identification
@@ -91,7 +91,7 @@
  * - ThreatIntel for pool/wallet blacklists
  *
  * @note Requires elevated privileges for full GPU monitoring.
- * @note Browser mining detection requires browser integration.
+ * @note Browser mining detection requires browser integration. PhantomHome currently supports script/WASM submission and tab correlation, but browser-side worker telemetry/enforcement is intentionally unavailable.
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -145,19 +145,10 @@
 #endif
 
 // ============================================================================
-// SHADOWSTRIKE INFRASTRUCTURE INCLUDES
+// SHARED CRYPTO MINERS TYPES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/MemoryUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "CryptoMinersTypes.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -381,16 +372,7 @@ enum class MinerFamily : uint16_t {
     Custom              = 255
 };
 
-/**
- * @brief Threat severity
- */
-enum class ThreatSeverity : uint8_t {
-    None        = 0,
-    Low         = 1,
-    Medium      = 2,
-    High        = 3,
-    Critical    = 4
-};
+// ThreatSeverity and ModuleStatus defined in CryptoMinersTypes.hpp
 
 /**
  * @brief Detection action
@@ -402,20 +384,6 @@ enum class DetectionAction : uint8_t {
     Terminate       = 3,
     Quarantine      = 4,
     BlockNetwork    = 5
-};
-
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
 };
 
 // ============================================================================
@@ -576,10 +544,10 @@ struct BrowserMinerInfo {
     /// @brief Is WebAssembly
     bool isWASM = false;
     
-    /// @brief Is Web Worker
+    /// @brief Is Web Worker (true only when upstream browser worker telemetry is available)
     bool isWebWorker = false;
     
-    /// @brief CPU cores used
+    /// @brief CPU cores used; remains 0 when browser worker telemetry is unavailable
     uint32_t coresUsed = 0;
     
     /// @brief Throttle percent
@@ -720,6 +688,10 @@ struct MiningPoolInfo {
  * @brief Detection statistics
  */
 struct MinerDetectionStatistics {
+    MinerDetectionStatistics() noexcept = default;
+    MinerDetectionStatistics(const MinerDetectionStatistics& other) noexcept;
+    MinerDetectionStatistics& operator=(const MinerDetectionStatistics& other) noexcept;
+
     /// @brief Total scans performed
     std::atomic<uint64_t> totalScans{0};
     
@@ -786,7 +758,7 @@ struct CryptoMinerDetectorConfiguration {
     /// @brief Enable network monitoring
     bool enableNetworkMonitoring = true;
     
-    /// @brief Enable browser scanning
+    /// @brief Enable browser scanning via BrowserMinerDetector script/WASM submissions and tab correlation
     bool enableBrowserScanning = true;
     
     /// @brief Enable signature scanning
@@ -841,8 +813,7 @@ using MinerDetectedCallback = std::function<void(const MinerDetectionResult&)>;
 /// @brief Resource callback
 using ResourceAnomalyCallback = std::function<void(const ResourceUsageStats&)>;
 
-/// @brief Error callback
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+// ErrorCallback defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // CRYPTO MINER DETECTOR CLASS
@@ -853,7 +824,9 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
  * @brief Enterprise-grade cryptocurrency miner detection engine
  *
  * Provides comprehensive detection of unauthorized cryptocurrency mining
- * including CPU miners, GPU miners, and browser-based cryptojacking.
+ * including CPU miners, GPU miners, and browser-based cryptojacking. In PhantomHome,
+ * browser coverage is intentionally limited to script/WASM analysis and tab correlation;
+ * browser-side worker telemetry/enforcement is not claimed or exposed.
  *
  * THREAD SAFETY: All public methods are thread-safe.
  *
@@ -987,7 +960,10 @@ public:
     // ========================================================================
     
     /**
-     * @brief Scan browser for mining scripts
+     * @brief Return browser mining findings already correlated by BrowserMinerDetector
+     *
+     * This does not actively enumerate browser processes, tabs, or workers. It exposes
+     * browser findings that were previously supplied through BrowserMinerDetector inputs.
      */
     [[nodiscard]] std::vector<BrowserMinerInfo> ScanBrowsers();
     

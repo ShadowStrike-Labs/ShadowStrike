@@ -124,9 +124,10 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/ProcessUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
+#include "CryptoMinersTypes.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -228,17 +229,7 @@ enum class SuspectedAlgorithm : uint8_t {
     Generic         = 255   ///< Generic mining
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopped         = 4,
-    Error           = 5
-};
+// ModuleStatus defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // STRUCTURES
@@ -492,8 +483,8 @@ struct CPUUsageAnalyzerConfiguration {
 // ============================================================================
 
 using HighLoadCallback = std::function<void(const HighLoadEvent&)>;
-using MiningDetectedCallback = std::function<void(const ProcessCPUSignature&)>;
-using ErrorCallback = std::function<void(const std::string& message, int code)>;
+using CPUMiningDetectedCallback = std::function<void(const ProcessCPUSignature&)>;
+// ErrorCallback defined in CryptoMinersTypes.hpp
 
 // ============================================================================
 // CPU USAGE ANALYZER CLASS
@@ -552,7 +543,7 @@ public:
     [[nodiscard]] PerformanceCounterData GetPerformanceCounters(uint32_t processId) const;
     
     void RegisterHighLoadCallback(HighLoadCallback callback);
-    void RegisterMiningDetectedCallback(MiningDetectedCallback callback);
+    void RegisterMiningDetectedCallback(CPUMiningDetectedCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();
     

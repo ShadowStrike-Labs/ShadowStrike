@@ -45,10 +45,10 @@
 #include "CPUUsageAnalyzer.hpp"
 
 // Infrastructure includes
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
+#include "../../../../PhantomCore/Utils/Logger.hpp"
+#include "../../../../PhantomCore/Utils/StringUtils.hpp"
+#include "../../../../PhantomCore/Utils/ProcessUtils.hpp"
+#include "../../../../PhantomCore/Utils/SystemUtils.hpp"
 
 // Windows headers
 #include <windows.h>
@@ -346,7 +346,7 @@ std::string ProcessCPUSignature::ToJson() const {
     std::ostringstream oss;
     oss << "{\n";
     oss << "  \"processId\": " << processId << ",\n";
-    oss << "  \"processName\": \"" << EscapeJsonString(Utils::StringUtils::WideToUtf8(processName)) << "\",\n";
+    oss << "  \"processName\": \"" << EscapeJsonString(Utils::StringUtils::ToNarrow(processName)) << "\",\n";
     oss << "  \"totalUsagePercent\": " << std::fixed << std::setprecision(2) << totalUsagePercent << ",\n";
     oss << "  \"avgUsagePercent\": " << std::fixed << std::setprecision(2) << avgUsagePercent << ",\n";
     oss << "  \"peakUsagePercent\": " << std::fixed << std::setprecision(2) << peakUsagePercent << ",\n";
@@ -692,7 +692,7 @@ public:
         m_highLoadCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterMiningDetected(MiningDetectedCallback callback) {
+    void RegisterMiningDetected(CPUMiningDetectedCallback callback) {
         if (!callback) {
             return;
         }
@@ -723,8 +723,8 @@ public:
             try {
                 callback(event);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: HighLoadCallback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("CPUUsageAnalyzer: HighLoadCallback exception: {}",
+                    e.what());
             }
         }
     }
@@ -735,8 +735,8 @@ public:
             try {
                 callback(signature);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: MiningDetectedCallback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("CPUUsageAnalyzer: CPUMiningDetectedCallback exception: {}",
+                    e.what());
             }
         }
     }
@@ -747,8 +747,8 @@ public:
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: ErrorCallback exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("CPUUsageAnalyzer: ErrorCallback exception: {}",
+                    e.what());
             }
         }
     }
@@ -763,7 +763,7 @@ private:
 
     mutable std::shared_mutex m_mutex;
     std::vector<HighLoadCallback> m_highLoadCallbacks;
-    std::vector<MiningDetectedCallback> m_miningCallbacks;
+    std::vector<CPUMiningDetectedCallback> m_miningCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 };
 
@@ -793,15 +793,15 @@ public:
         std::unique_lock lock(m_mutex);
 
         try {
-            Utils::Logger::Info(L"CPUUsageAnalyzer: Initializing...");
+            Utils::Logger::Info("CPUUsageAnalyzer: Initializing...");
 
             if (m_initialized) {
-                Utils::Logger::Warn(L"CPUUsageAnalyzer: Already initialized");
+                Utils::Logger::Warn("CPUUsageAnalyzer: Already initialized");
                 return true;
             }
 
             if (!config.IsValid()) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: Invalid configuration");
+                Utils::Logger::Error("CPUUsageAnalyzer: Invalid configuration");
                 lock.unlock();
                 ReportError("Invalid CPU usage analyzer configuration", ERROR_INVALID_PARAMETER);
                 return false;
@@ -839,13 +839,13 @@ public:
             m_initialized = true;
             m_status = ModuleStatus::Stopped;
 
-            Utils::Logger::Info(L"CPUUsageAnalyzer: Initialized successfully (Cores: {})",
+            Utils::Logger::Info("CPUUsageAnalyzer: Initialized successfully (Cores: {})",
                 m_processorCount);
             return true;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer: Initialization failed: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("CPUUsageAnalyzer: Initialization failed: {}",
+                e.what());
             m_status = ModuleStatus::Error;
             lock.unlock();
             ReportError("CPU usage analyzer initialization failed", ERROR_GEN_FAILURE);
@@ -862,7 +862,7 @@ public:
         m_initialized = false;
         m_status = ModuleStatus::Uninitialized;
 
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Shutdown complete");
+        Utils::Logger::Info("CPUUsageAnalyzer: Shutdown complete");
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
@@ -883,7 +883,7 @@ public:
         std::unique_lock lock(m_mutex);
 
         if (!m_initialized) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer: Cannot start - not initialized");
+            Utils::Logger::Error("CPUUsageAnalyzer: Cannot start - not initialized");
             lock.unlock();
             ReportError("CPU usage analyzer start rejected because the module is not initialized",
                 ERROR_NOT_READY);
@@ -891,7 +891,7 @@ public:
         }
 
         if (m_running.load(std::memory_order_acquire)) {
-            Utils::Logger::Warn(L"CPUUsageAnalyzer: Already running");
+            Utils::Logger::Warn("CPUUsageAnalyzer: Already running");
             return true;
         }
 
@@ -900,7 +900,7 @@ public:
         m_status = ModuleStatus::Running;
         m_monitorThread = std::thread(&CPUUsageAnalyzerImpl::MonitorThreadFunc, this);
 
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitoring started");
+        Utils::Logger::Info("CPUUsageAnalyzer: Monitoring started");
         return true;
     }
 
@@ -918,7 +918,7 @@ public:
         std::unique_lock lock(m_mutex);
         m_status = ModuleStatus::Stopped;
 
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitoring stopped");
+        Utils::Logger::Info("CPUUsageAnalyzer: Monitoring stopped");
         return true;
     }
 
@@ -928,7 +928,7 @@ public:
 
         std::unique_lock lock(m_mutex);
         m_status = ModuleStatus::Paused;
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Paused");
+        Utils::Logger::Info("CPUUsageAnalyzer: Paused");
     }
 
     void Resume() {
@@ -937,7 +937,7 @@ public:
 
         std::unique_lock lock(m_mutex);
         m_status = ModuleStatus::Running;
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Resumed");
+        Utils::Logger::Info("CPUUsageAnalyzer: Resumed");
     }
 
     // ========================================================================
@@ -946,14 +946,14 @@ public:
 
     bool UpdateConfiguration(const CPUUsageAnalyzerConfiguration& config) {
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer: Invalid configuration update rejected");
+            Utils::Logger::Error("CPUUsageAnalyzer: Invalid configuration update rejected");
             ReportError("CPU usage analyzer configuration update rejected", ERROR_INVALID_PARAMETER);
             return false;
         }
 
         std::unique_lock lock(m_mutex);
         m_config = config;
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Configuration updated");
+        Utils::Logger::Info("CPUUsageAnalyzer: Configuration updated");
         lock.unlock();
         m_monitorWakeup.notify_all();
         return true;
@@ -1007,8 +1007,8 @@ public:
             m_processTracker->CleanStale(std::chrono::seconds(60));
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer::CollectSample: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("CPUUsageAnalyzer::CollectSample: {}",
+                e.what());
             ReportError("CPU usage analyzer sample collection failed", ERROR_GEN_FAILURE);
         }
     }
@@ -1126,7 +1126,7 @@ public:
         m_callbackManager->RegisterHighLoad(std::move(callback));
     }
 
-    void RegisterMiningDetectedCallback(MiningDetectedCallback callback) {
+    void RegisterMiningDetectedCallback(CPUMiningDetectedCallback callback) {
         m_callbackManager->RegisterMiningDetected(std::move(callback));
     }
 
@@ -1181,20 +1181,20 @@ public:
     // ========================================================================
 
     bool SelfTest() {
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Running self-test...");
+        Utils::Logger::Info("CPUUsageAnalyzer: Running self-test...");
 
         try {
             // Test configuration validation
             CPUUsageAnalyzerConfiguration testConfig;
             if (!testConfig.IsValid()) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Default config invalid");
+                Utils::Logger::Error("CPUUsageAnalyzer: SelfTest - Default config invalid");
                 return false;
             }
 
             // Test invalid config rejection
             testConfig.highUsageThreshold = -10.0;
             if (testConfig.IsValid()) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Invalid config accepted");
+                Utils::Logger::Error("CPUUsageAnalyzer: SelfTest - Invalid config accepted");
                 return false;
             }
 
@@ -1205,7 +1205,7 @@ public:
                 cpu = GetSystemCPUUsage();
             }
             if (cpu < 0.0 || cpu > 100.0) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: SelfTest - Invalid CPU reading: {:.2f}", cpu);
+                Utils::Logger::Error("CPUUsageAnalyzer: SelfTest - Invalid CPU reading: {:.2f}", cpu);
                 return false;
             }
 
@@ -1213,15 +1213,15 @@ public:
             std::vector<double> testPattern = {80.0, 85.0, 90.0, 85.0, 80.0, 85.0};
             auto pattern = m_patternAnalyzer->AnalyzePattern(testPattern);
             if (pattern == CPUUsagePattern::Unknown) {
-                Utils::Logger::Warn(L"CPUUsageAnalyzer: SelfTest - Pattern analysis returned Unknown");
+                Utils::Logger::Warn("CPUUsageAnalyzer: SelfTest - Pattern analysis returned Unknown");
             }
 
-            Utils::Logger::Info(L"CPUUsageAnalyzer: Self-test PASSED");
+            Utils::Logger::Info("CPUUsageAnalyzer: Self-test PASSED");
             return true;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer: Self-test FAILED: {}",
-                Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("CPUUsageAnalyzer: Self-test FAILED: {}",
+                e.what());
             return false;
         }
     }
@@ -1305,8 +1305,8 @@ private:
             m_stats.processesAnalyzed.fetch_add(1, std::memory_order_relaxed);
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer::AnalyzeProcess({}): {}",
-                processId, Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("CPUUsageAnalyzer::AnalyzeProcess({}): {}",
+                processId, e.what());
         }
 
         return signature;
@@ -1317,7 +1317,7 @@ private:
     // ========================================================================
 
     void MonitorThreadFunc() {
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitor thread started");
+        Utils::Logger::Info("CPUUsageAnalyzer: Monitor thread started");
 
         while (m_running.load(std::memory_order_acquire)) {
             try {
@@ -1339,13 +1339,13 @@ private:
                     [this]() { return !m_running.load(std::memory_order_acquire); });
 
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"CPUUsageAnalyzer: Monitor thread exception: {}",
-                    Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("CPUUsageAnalyzer: Monitor thread exception: {}",
+                    e.what());
                 ReportError("CPU usage analyzer monitor thread faulted", ERROR_GEN_FAILURE);
             }
         }
 
-        Utils::Logger::Info(L"CPUUsageAnalyzer: Monitor thread stopped");
+        Utils::Logger::Info("CPUUsageAnalyzer: Monitor thread stopped");
     }
 
     /**
@@ -1499,8 +1499,8 @@ private:
             m_processTracker->SetProcessName(pid, processName);
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"CPUUsageAnalyzer::CollectProcessSample({}): {}",
-                pid, Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("CPUUsageAnalyzer::CollectProcessSample({}): {}",
+                pid, e.what());
             ReportError("CPU usage analyzer failed to sample a process", ERROR_GEN_FAILURE);
         }
     }
@@ -1545,7 +1545,7 @@ private:
 
     void InitializePDH() {
         if (PdhOpenQueryA(NULL, 0, &m_pdhQuery) != ERROR_SUCCESS) {
-            Utils::Logger::Warn(L"CPUUsageAnalyzer: Failed to open PDH query");
+            Utils::Logger::Warn("CPUUsageAnalyzer: Failed to open PDH query");
             return;
         }
 
@@ -1645,7 +1645,7 @@ private:
         }
     }
 
-    double CalculateMiningProbability(const ProcessCPUSignature& signature) {
+    double CalculateMiningProbability(const ProcessCPUSignature& signature) const {
         double probability = 0.0;
 
         // High sustained CPU
@@ -1834,7 +1834,7 @@ void CPUUsageAnalyzer::RegisterHighLoadCallback(HighLoadCallback callback) {
     m_impl->RegisterHighLoadCallback(std::move(callback));
 }
 
-void CPUUsageAnalyzer::RegisterMiningDetectedCallback(MiningDetectedCallback callback) {
+void CPUUsageAnalyzer::RegisterMiningDetectedCallback(CPUMiningDetectedCallback callback) {
     m_impl->RegisterMiningDetectedCallback(std::move(callback));
 }
 
