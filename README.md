@@ -535,7 +535,7 @@ Any derivative work must also be released under AGPL-3.0. For commercial licensi
 
 **ShadowStrike-Labs** · Alpha · [shadowstrike.dev](https://www.shadowstrike.dev)
 
-*1.5 million lines of code. One developer. Every line auditable.*
+*1.5 million lines of code. Every line auditable.*
 
 For business inquiries: [contact@shadowstrike.dev](mailto:contact@shadowstrike.dev)
 
