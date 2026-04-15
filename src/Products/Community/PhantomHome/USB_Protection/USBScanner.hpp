@@ -186,10 +186,19 @@ namespace USBScannerConstants {
 // ============================================================================
 // TYPE ALIASES
 // ============================================================================
+// NOTE: These are scoped within USBScanner-specific sub-namespace to avoid
+// ODR violations with identical aliases in sibling USB_Protection headers.
+// Internal usage only — public API uses fully-qualified std::chrono types.
 
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
+namespace ScannerDetail {
+    using Clock = std::chrono::steady_clock;
+    using TimePoint = std::chrono::steady_clock::time_point;
+    using SystemTimePoint = std::chrono::system_clock::time_point;
+}  // namespace ScannerDetail
+
+using ScannerDetail::Clock;
+using ScannerDetail::TimePoint;
+using ScannerDetail::SystemTimePoint;
 
 // ============================================================================
 // ENUMERATIONS
@@ -261,9 +270,13 @@ enum class DetectionAction : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief Scanner module status
+ *
+ * Scoped under a distinct name to avoid ODR violation with identically-named
+ * enums in sibling USB_Protection headers (BadUSBDetector, DeviceControlManager,
+ * USBAutorunBlocker, USBDeviceMonitor) that all live in ShadowStrike::USB.
  */
-enum class ModuleStatus : uint8_t {
+enum class ScannerModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -602,7 +615,7 @@ public:
     [[nodiscard]] bool Initialize(const USBScannerConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] ScannerModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const USBScannerConfiguration& config);
     [[nodiscard]] USBScannerConfiguration GetConfiguration() const;
