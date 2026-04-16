@@ -84,6 +84,9 @@
 #include <sqlite3.h>
 #pragma comment(lib, "sqlite3.lib")
 
+// Ensure SHGetFolderPathW / CSIDL_* are available (needed by Common.hpp helpers)
+#include <shlobj.h>
+
 // Third-party JSON library
 #ifdef _MSC_VER
 #  pragma warning(push)
@@ -159,6 +162,53 @@ namespace {
         std::regex("^_kuid_")    // Krux
     };
 
+    /// @brief Atomic counter for unique temp file names (thread-safe)
+    std::atomic<uint64_t> s_tempFileCounter{0};
+
+    /// @brief Generate a unique temp file path to avoid name collisions across threads
+    [[nodiscard]] fs::path GenerateUniqueTempPath(const char* prefix) {
+        auto counter = s_tempFileCounter.fetch_add(1, std::memory_order_relaxed);
+        auto pid = ::GetCurrentProcessId();
+        auto tid = ::GetCurrentThreadId();
+        std::string name = std::string(prefix)
+            + std::to_string(pid) + "_"
+            + std::to_string(tid) + "_"
+            + std::to_string(counter) + ".db";
+        return fs::temp_directory_path() / name;
+    }
+
+    /// @brief RAII guard that deletes a temporary file on scope exit
+    struct TempFileGuard {
+        fs::path path;
+        explicit TempFileGuard(fs::path p) : path(std::move(p)) {}
+        ~TempFileGuard() {
+            if (!path.empty()) {
+                std::error_code ec;
+                fs::remove(path, ec);
+            }
+        }
+        TempFileGuard(const TempFileGuard&) = delete;
+        TempFileGuard& operator=(const TempFileGuard&) = delete;
+    };
+
+    /// @brief RAII wrapper for sqlite3* — closes database on scope exit
+    struct SqliteDbGuard {
+        sqlite3* db = nullptr;
+        explicit SqliteDbGuard(sqlite3* p) : db(p) {}
+        ~SqliteDbGuard() { if (db) sqlite3_close(db); }
+        SqliteDbGuard(const SqliteDbGuard&) = delete;
+        SqliteDbGuard& operator=(const SqliteDbGuard&) = delete;
+    };
+
+    /// @brief RAII wrapper for sqlite3_stmt* — finalizes statement on scope exit
+    struct SqliteStmtGuard {
+        sqlite3_stmt* stmt = nullptr;
+        explicit SqliteStmtGuard(sqlite3_stmt* p) : stmt(p) {}
+        ~SqliteStmtGuard() { if (stmt) sqlite3_finalize(stmt); }
+        SqliteStmtGuard(const SqliteStmtGuard&) = delete;
+        SqliteStmtGuard& operator=(const SqliteStmtGuard&) = delete;
+    };
+
 }  // anonymous namespace
 
 // ============================================================================
@@ -211,6 +261,14 @@ public:
     // ========================================================================
     // HELPER METHODS
     // ========================================================================
+
+    /**
+     * @brief Check if module is in Running state (thread-safe).
+     */
+    [[nodiscard]] bool IsRunning() const noexcept {
+        std::shared_lock lock(m_mutex);
+        return m_status == ModuleStatus::Running;
+    }
 
     /**
      * @brief Fire cookie callback
@@ -304,15 +362,14 @@ public:
                 }
             }
 
-            // Get AppData paths
-            wchar_t localAppData[MAX_PATH];
-            wchar_t roamingAppData[MAX_PATH];
+            // Get AppData paths using safe helper from Common.hpp
+            fs::path localPath = GetKnownFolderSafe(CSIDL_LOCAL_APPDATA);
+            fs::path roamingPath = GetKnownFolderSafe(CSIDL_APPDATA);
 
-            SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData);
-            SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, roamingAppData);
-
-            fs::path localPath(localAppData);
-            fs::path roamingPath(roamingAppData);
+            if (localPath.empty() || roamingPath.empty()) {
+                Utils::Logger::Error("CookieManager: Failed to resolve AppData folder paths");
+                return profiles;
+            }
 
             // Build profile paths based on browser
             std::vector<std::wstring> pathsToCheck;
@@ -403,26 +460,24 @@ public:
             }
 
             // Copy database to temp (browser may have it locked)
-            fs::path tempDb = fs::temp_directory_path() / ("cookie_temp_" +
-                std::to_string(GetCurrentProcessId()) + ".db");
+            fs::path tempDb = GenerateUniqueTempPath("cookie_temp_");
+            TempFileGuard tempGuard(tempDb);
 
             try {
                 fs::copy_file(cookieDbPath, tempDb, fs::copy_options::overwrite_existing);
-            } catch (...) {
-                // Database locked - skip
+            } catch (const std::exception& ex) {
+                Utils::Logger::Debug("CookieManager: Cookie DB locked or inaccessible: {}", ex.what());
                 return cookies;
             }
 
             // Open SQLite database
             sqlite3* db = nullptr;
-            if (sqlite3_open(tempDb.string().c_str(), &db) != SQLITE_OK) {
+            if (sqlite3_open_v2(tempDb.string().c_str(), &db,
+                                SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                if (db) sqlite3_close(db);
                 return cookies;
             }
-
-            struct DbHandle {
-                sqlite3* db;
-                ~DbHandle() { if (db) sqlite3_close(db); }
-            } dbHandle{db};
+            SqliteDbGuard dbGuard(db);
 
             // Query cookies
             const char* query =
@@ -435,16 +490,13 @@ public:
             if (sqlite3_prepare_v2(db, query, -1, &stmt, nullptr) != SQLITE_OK) {
                 return cookies;
             }
-
-            struct StmtHandle {
-                sqlite3_stmt* stmt;
-                ~StmtHandle() { if (stmt) sqlite3_finalize(stmt); }
-            } stmtHandle{stmt};
+            SqliteStmtGuard stmtGuard(stmt);
 
             // Process rows
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 BrowserCookie cookie;
                 cookie.browser = browser;
+                cookie.profile = profilePath.string();
 
                 // Domain
                 if (const char* domain = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))) {
@@ -524,8 +576,7 @@ public:
                 }
             }
 
-            // Clean up temp database
-            fs::remove(tempDb);
+            // TempFileGuard handles cleanup automatically
 
             Utils::Logger::Debug("CookieManager: Read {} cookies from Chromium profile",
                                 cookies.size());
@@ -551,26 +602,25 @@ public:
                 return cookies;
             }
 
-            // Copy to temp
-            fs::path tempDb = fs::temp_directory_path() / ("ff_cookie_temp_" +
-                std::to_string(GetCurrentProcessId()) + ".db");
+            // Copy to temp (browser may have it locked)
+            fs::path tempDb = GenerateUniqueTempPath("ff_cookie_temp_");
+            TempFileGuard tempGuard(tempDb);
 
             try {
                 fs::copy_file(cookieDbPath, tempDb, fs::copy_options::overwrite_existing);
-            } catch (...) {
+            } catch (const std::exception& ex) {
+                Utils::Logger::Debug("CookieManager: Firefox cookie DB locked or inaccessible: {}", ex.what());
                 return cookies;
             }
 
-            // Open database
+            // Open database (read-only for enumeration)
             sqlite3* db = nullptr;
-            if (sqlite3_open(tempDb.string().c_str(), &db) != SQLITE_OK) {
+            if (sqlite3_open_v2(tempDb.string().c_str(), &db,
+                                SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                if (db) sqlite3_close(db);
                 return cookies;
             }
-
-            struct DbHandle {
-                sqlite3* db;
-                ~DbHandle() { if (db) sqlite3_close(db); }
-            } dbHandle{db};
+            SqliteDbGuard dbGuard(db);
 
             // Query
             const char* query =
@@ -582,15 +632,12 @@ public:
             if (sqlite3_prepare_v2(db, query, -1, &stmt, nullptr) != SQLITE_OK) {
                 return cookies;
             }
-
-            struct StmtHandle {
-                sqlite3_stmt* stmt;
-                ~StmtHandle() { if (stmt) sqlite3_finalize(stmt); }
-            } stmtHandle{stmt};
+            SqliteStmtGuard stmtGuard(stmt);
 
             while (sqlite3_step(stmt) == SQLITE_ROW) {
                 BrowserCookie cookie;
                 cookie.browser = BrowserType::Firefox;
+                cookie.profile = profilePath.string();
 
                 // Domain
                 if (const char* host = reinterpret_cast<const char*>(sqlite3_column_text(stmt, 0))) {
@@ -661,7 +708,7 @@ public:
                 }
             }
 
-            fs::remove(tempDb);
+            // TempFileGuard handles cleanup automatically
 
             Utils::Logger::Debug("CookieManager: Read {} cookies from Firefox profile",
                                 cookies.size());
@@ -824,17 +871,32 @@ public:
             for (const auto& [id, entry] : m_whitelist) {
                 if (!entry.enabled) continue;
 
-                // Simple wildcard matching
-                if (entry.domainPattern.find('*') != std::string::npos) {
-                    std::string pattern = entry.domainPattern;
-                    std::replace(pattern.begin(), pattern.end(), '*', '.');
-                    std::regex regex(pattern);
-                    if (std::regex_search(domain, regex)) {
-                        return true;
+                if (entry.domainPattern.find('*') != std::string::npos ||
+                    entry.domainPattern.find('?') != std::string::npos) {
+                    // Glob pattern — use safe conversion from Common.hpp
+                    try {
+                        std::string regexStr = GlobToRegex(entry.domainPattern);
+                        std::regex re(regexStr, std::regex_constants::icase);
+                        if (std::regex_match(domain, re)) {
+                            return true;
+                        }
+                    } catch (const std::regex_error&) {
+                        // Malformed pattern — skip silently
+                        continue;
                     }
                 } else {
-                    // Exact match
-                    if (domain.find(entry.domainPattern) != std::string::npos) {
+                    // Exact domain-suffix match (case-insensitive)
+                    std::string lowerDomain = domain;
+                    std::string lowerPattern = entry.domainPattern;
+                    std::transform(lowerDomain.begin(), lowerDomain.end(),
+                                   lowerDomain.begin(), ::tolower);
+                    std::transform(lowerPattern.begin(), lowerPattern.end(),
+                                   lowerPattern.begin(), ::tolower);
+
+                    if (lowerDomain == lowerPattern ||
+                        (lowerDomain.size() > lowerPattern.size() &&
+                         lowerDomain.ends_with(lowerPattern) &&
+                         lowerDomain[lowerDomain.size() - lowerPattern.size() - 1] == '.')) {
                         return true;
                     }
                 }
@@ -917,8 +979,8 @@ bool CookieManager::Initialize(const CookieConfiguration& config) {
             m_impl->m_whitelist[entry.entryId] = entry;
         }
 
-        // Initialize statistics
-        m_impl->m_stats = CookieStatistics{};
+        // Reset statistics
+        m_impl->m_stats.Reset();
         m_impl->m_stats.startTime = Clock::now();
 
         m_impl->m_status = ModuleStatus::Running;
@@ -1049,6 +1111,11 @@ std::vector<BrowserCookie> CookieManager::GetCookies(BrowserType browser) {
     std::vector<BrowserCookie> cookies;
 
     try {
+        if (!m_impl->IsRunning()) {
+            Utils::Logger::Warn("CookieManager: GetCookies called while not running");
+            return cookies;
+        }
+
         auto profiles = m_impl->GetBrowserProfiles(browser);
 
         for (const auto& profile : profiles) {
@@ -1065,9 +1132,12 @@ std::vector<BrowserCookie> CookieManager::GetCookies(BrowserType browser) {
         }
 
         m_impl->m_stats.totalCookiesScanned += cookies.size();
-        m_impl->m_stats.byBrowser[static_cast<size_t>(browser)] += cookies.size();
+        if (auto idx = BrowserTypeToIndex(browser)) {
+            m_impl->m_stats.byBrowser[*idx] += cookies.size();
+        }
 
-        Utils::Logger::Debug("CookieManager: Found {} cookies for browser", cookies.size());
+        Utils::Logger::Debug("CookieManager: Found {} cookies for browser {}", 
+                            cookies.size(), std::string(GetBrowserTypeName(browser)));
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("CookieManager: GetCookies failed: {}", ex.what());
@@ -1082,11 +1152,22 @@ std::vector<BrowserCookie> CookieManager::GetCookiesForDomain(const std::string&
     std::vector<BrowserCookie> result;
 
     try {
+        std::string sanitized = SanitizeDomain(domain);
+        if (sanitized.empty()) {
+            Utils::Logger::Warn("CookieManager: GetCookiesForDomain rejected invalid domain input");
+            return result;
+        }
+
         auto allCookies = GetAllCookies();
 
         std::copy_if(allCookies.begin(), allCookies.end(), std::back_inserter(result),
-            [&domain](const BrowserCookie& cookie) {
-                return cookie.domain.find(domain) != std::string::npos;
+            [&sanitized](const BrowserCookie& cookie) {
+                std::string cookieDomain = SanitizeDomain(cookie.domain);
+                return !cookieDomain.empty() &&
+                       (cookieDomain == sanitized ||
+                        (cookieDomain.size() > sanitized.size() &&
+                         cookieDomain.ends_with(sanitized) &&
+                         cookieDomain[cookieDomain.size() - sanitized.size() - 1] == '.'));
             });
 
         Utils::Logger::Debug("CookieManager: Found {} cookies for domain {}",
@@ -1166,18 +1247,29 @@ std::vector<Supercookie> CookieManager::ScanForSupercookies() {
     std::vector<Supercookie> supercookies;
 
     try {
-        // Get AppData paths
-        wchar_t localAppData[MAX_PATH];
-        wchar_t roamingAppData[MAX_PATH];
+        if (!m_impl->IsRunning()) {
+            Utils::Logger::Warn("CookieManager: ScanForSupercookies called while not running");
+            return supercookies;
+        }
 
-        SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, localAppData);
-        SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, roamingAppData);
+        // Get AppData paths using safe helper from Common.hpp
+        fs::path localAppData = GetKnownFolderSafe(CSIDL_LOCAL_APPDATA);
+        fs::path roamingAppData = GetKnownFolderSafe(CSIDL_APPDATA);
+
+        if (localAppData.empty() || roamingAppData.empty()) {
+            Utils::Logger::Error("CookieManager: Failed to resolve AppData paths for supercookie scan");
+            return supercookies;
+        }
+
+        constexpr auto dirOpts = fs::directory_options::skip_permission_denied;
 
         // Scan Flash LSO
         {
-            fs::path flashPath = fs::path(roamingAppData) / L"Macromedia\\Flash Player\\#SharedObjects";
+            fs::path flashPath = roamingAppData / L"Macromedia\\Flash Player\\#SharedObjects";
             if (fs::exists(flashPath)) {
-                for (const auto& entry : fs::recursive_directory_iterator(flashPath)) {
+                std::error_code ec;
+                for (const auto& entry : fs::recursive_directory_iterator(flashPath, dirOpts, ec)) {
+                    if (ec) break;
                     if (entry.is_regular_file() && entry.path().extension() == ".sol") {
                         Supercookie sc;
                         sc.type = SupercookieType::FlashLSO;
@@ -1199,7 +1291,9 @@ std::vector<Supercookie> CookieManager::ScanForSupercookies() {
             for (const auto& profile : profiles) {
                 fs::path localStoragePath = profile / "Local Storage" / "leveldb";
                 if (fs::exists(localStoragePath)) {
-                    for (const auto& entry : fs::directory_iterator(localStoragePath)) {
+                    std::error_code ec;
+                    for (const auto& entry : fs::directory_iterator(localStoragePath, dirOpts, ec)) {
+                        if (ec) break;
                         if (entry.is_regular_file()) {
                             Supercookie sc;
                             sc.type = SupercookieType::LocalStorage;
@@ -1222,7 +1316,9 @@ std::vector<Supercookie> CookieManager::ScanForSupercookies() {
             for (const auto& profile : profiles) {
                 fs::path indexedDBPath = profile / "IndexedDB";
                 if (fs::exists(indexedDBPath)) {
-                    for (const auto& entry : fs::recursive_directory_iterator(indexedDBPath)) {
+                    std::error_code ec;
+                    for (const auto& entry : fs::recursive_directory_iterator(indexedDBPath, dirOpts, ec)) {
+                        if (ec) break;
                         if (entry.is_regular_file()) {
                             Supercookie sc;
                             sc.type = SupercookieType::IndexedDB;
@@ -1256,12 +1352,18 @@ std::vector<Supercookie> CookieManager::GetSupercookiesForDomain(const std::stri
     std::vector<Supercookie> result;
 
     try {
+        std::string sanitized = SanitizeDomain(domain);
+        if (sanitized.empty()) {
+            Utils::Logger::Warn("CookieManager: GetSupercookiesForDomain rejected invalid domain");
+            return result;
+        }
+
         auto allSupercookies = ScanForSupercookies();
 
         std::copy_if(allSupercookies.begin(), allSupercookies.end(), std::back_inserter(result),
-            [&domain](const Supercookie& sc) {
-                return sc.domain.find(domain) != std::string::npos ||
-                       sc.key.find(domain) != std::string::npos;
+            [&sanitized](const Supercookie& sc) {
+                return sc.domain.find(sanitized) != std::string::npos ||
+                       sc.key.find(sanitized) != std::string::npos;
             });
 
     } catch (const std::exception& ex) {
@@ -1277,8 +1379,17 @@ uint64_t CookieManager::DeleteSupercookies(const std::string& domain) {
     uint64_t deleted = 0;
 
     try {
-        auto supercookies = domain.empty() ? ScanForSupercookies() :
-                                             GetSupercookiesForDomain(domain);
+        std::vector<Supercookie> supercookies;
+        if (domain.empty()) {
+            supercookies = ScanForSupercookies();
+        } else {
+            std::string sanitized = SanitizeDomain(domain);
+            if (sanitized.empty()) {
+                Utils::Logger::Warn("CookieManager: DeleteSupercookies rejected invalid domain");
+                return 0;
+            }
+            supercookies = GetSupercookiesForDomain(sanitized);
+        }
 
         for (const auto& sc : supercookies) {
             try {
@@ -1346,7 +1457,12 @@ uint64_t CookieManager::PurgeTrackers() {
 
 bool CookieManager::IsTrackerDomain(const std::string& domain) {
     try {
-        std::string baseDomain = GetBaseDomain(domain);
+        std::string sanitized = SanitizeDomain(domain);
+        if (sanitized.empty()) {
+            return false;
+        }
+
+        std::string baseDomain = GetBaseDomain(sanitized);
 
         // Check built-in list
         if (KNOWN_TRACKERS.count(baseDomain) > 0) {
@@ -1359,7 +1475,7 @@ bool CookieManager::IsTrackerDomain(const std::string& domain) {
             if (!tracker.isActive) continue;
 
             if (!tracker.domainPattern.empty() &&
-                domain.find(tracker.domainPattern) != std::string::npos) {
+                sanitized.find(tracker.domainPattern) != std::string::npos) {
                 return true;
             }
         }
@@ -1487,14 +1603,88 @@ bool CookieManager::ImportTrackerList(const fs::path& listPath) {
 
 bool CookieManager::DeleteCookie(const BrowserCookie& cookie) {
     try {
-        // Note: Actual deletion requires modifying browser SQLite databases
-        // For safety, we return false to indicate this is a read-only implementation
-        // In production, this would:
-        // 1. Open the browser's cookie database
-        // 2. Execute DELETE statement
-        // 3. Close database
+        if (!m_impl->IsRunning()) {
+            Utils::Logger::Warn("CookieManager: DeleteCookie called while not running");
+            return false;
+        }
 
-        Utils::Logger::Debug("CookieManager: Cookie deletion requested (not implemented in read-only mode)");
+        if (cookie.domain.empty() || cookie.name.empty()) {
+            Utils::Logger::Warn("CookieManager: DeleteCookie called with empty domain or name");
+            return false;
+        }
+
+        if (cookie.profile.empty()) {
+            Utils::Logger::Warn("CookieManager: DeleteCookie requires a profile path (cookie must come from enumeration)");
+            return false;
+        }
+
+        // Determine the cookie database path based on browser type
+        fs::path cookieDbPath;
+        const char* deleteQuery = nullptr;
+
+        if (cookie.browser == BrowserType::Firefox) {
+            cookieDbPath = fs::path(cookie.profile) / "cookies.sqlite";
+            deleteQuery = "DELETE FROM moz_cookies WHERE host = ?1 AND name = ?2 AND path = ?3";
+        } else {
+            // Chromium-based browsers
+            cookieDbPath = fs::path(cookie.profile) / "Network" / "Cookies";
+            if (!fs::exists(cookieDbPath)) {
+                cookieDbPath = fs::path(cookie.profile) / "Cookies";
+            }
+            deleteQuery = "DELETE FROM cookies WHERE host_key = ?1 AND name = ?2 AND path = ?3";
+        }
+
+        if (!fs::exists(cookieDbPath)) {
+            Utils::Logger::Warn("CookieManager: Cookie database not found for deletion: {}",
+                               cookieDbPath.string());
+            return false;
+        }
+
+        // Open database for writing (not a temp copy — we modify the original)
+        sqlite3* db = nullptr;
+        int rc = sqlite3_open_v2(cookieDbPath.string().c_str(), &db,
+                                  SQLITE_OPEN_READWRITE, nullptr);
+        if (rc != SQLITE_OK) {
+            Utils::Logger::Debug("CookieManager: Cannot open cookie DB for writing (rc={}): {}",
+                                rc, db ? sqlite3_errmsg(db) : "null handle");
+            if (db) sqlite3_close(db);
+            return false;
+        }
+        SqliteDbGuard dbGuard(db);
+
+        // Use parameterized query — prevents SQL injection
+        sqlite3_stmt* stmt = nullptr;
+        rc = sqlite3_prepare_v2(db, deleteQuery, -1, &stmt, nullptr);
+        if (rc != SQLITE_OK) {
+            Utils::Logger::Error("CookieManager: Failed to prepare DELETE (rc={}): {}",
+                                rc, sqlite3_errmsg(db));
+            return false;
+        }
+        SqliteStmtGuard stmtGuard(stmt);
+
+        // Bind all parameters (safe from SQL injection)
+        sqlite3_bind_text(stmt, 1, cookie.domain.c_str(),
+                          static_cast<int>(cookie.domain.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 2, cookie.name.c_str(),
+                          static_cast<int>(cookie.name.size()), SQLITE_TRANSIENT);
+        sqlite3_bind_text(stmt, 3, cookie.path.c_str(),
+                          static_cast<int>(cookie.path.size()), SQLITE_TRANSIENT);
+
+        rc = sqlite3_step(stmt);
+        if (rc != SQLITE_DONE) {
+            Utils::Logger::Error("CookieManager: DELETE failed (rc={}): {}",
+                                rc, sqlite3_errmsg(db));
+            return false;
+        }
+
+        int changes = sqlite3_changes(db);
+        if (changes > 0) {
+            Utils::Logger::Debug("CookieManager: Deleted cookie {}@{} from {}",
+                                cookie.name, cookie.domain,
+                                std::string(GetBrowserTypeName(cookie.browser)));
+            return true;
+        }
+
         return false;
 
     } catch (const std::exception& ex) {
@@ -1510,7 +1700,13 @@ uint64_t CookieManager::DeleteCookiesForDomain(const std::string& domain) {
     uint64_t deleted = 0;
 
     try {
-        auto cookies = GetCookiesForDomain(domain);
+        std::string sanitized = SanitizeDomain(domain);
+        if (sanitized.empty()) {
+            Utils::Logger::Warn("CookieManager: DeleteCookiesForDomain rejected invalid domain input");
+            return 0;
+        }
+
+        auto cookies = GetCookiesForDomain(sanitized);
 
         for (const auto& cookie : cookies) {
             if (DeleteCookie(cookie)) {
@@ -1521,7 +1717,7 @@ uint64_t CookieManager::DeleteCookiesForDomain(const std::string& domain) {
         m_impl->m_stats.totalCookiesDeleted += deleted;
 
         Utils::Logger::Info("CookieManager: Deleted {} cookies for domain {}",
-                           deleted, domain);
+                           deleted, sanitized);
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("CookieManager: DeleteCookiesForDomain failed: {}", ex.what());
@@ -1536,19 +1732,26 @@ uint64_t CookieManager::DeleteAllCookies(bool respectWhitelist) {
     uint64_t deleted = 0;
 
     try {
+        // Snapshot config under lock to avoid data race
+        bool preserveEssential = false;
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            preserveEssential = m_impl->m_config.preserveEssential;
+        }
+
         auto allCookies = GetAllCookies();
 
         for (const auto& cookie : allCookies) {
             // Check whitelist
             if (respectWhitelist && m_impl->IsWhitelistedInternal(cookie.domain)) {
-                ++m_impl->m_stats.whitelistHits;
+                m_impl->m_stats.whitelistHits.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
             // Preserve essential if configured
-            if (m_impl->m_config.preserveEssential &&
+            if (preserveEssential &&
                 cookie.category == CookieCategory::Essential) {
-                ++m_impl->m_stats.essentialPreserved;
+                m_impl->m_stats.essentialPreserved.fetch_add(1, std::memory_order_relaxed);
                 continue;
             }
 
@@ -1672,7 +1875,11 @@ bool CookieManager::RemoveFromWhitelist(const std::string& entryId) {
 }
 
 bool CookieManager::IsDomainWhitelisted(const std::string& domain) {
-    return m_impl->IsWhitelistedInternal(domain);
+    std::string sanitized = SanitizeDomain(domain);
+    if (sanitized.empty()) {
+        return false;
+    }
+    return m_impl->IsWhitelistedInternal(sanitized);
 }
 
 std::vector<CookieWhitelistEntry> CookieManager::GetWhitelist() const {
@@ -1890,9 +2097,30 @@ void CookieManager::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-CookieStatistics CookieManager::GetStatistics() const {
+CookieStatisticsSnapshot CookieManager::GetStatistics() const {
     std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_stats;
+
+    CookieStatisticsSnapshot snap;
+    snap.totalCookiesScanned = m_impl->m_stats.totalCookiesScanned.load(std::memory_order_relaxed);
+    snap.totalCookiesDeleted = m_impl->m_stats.totalCookiesDeleted.load(std::memory_order_relaxed);
+    snap.trackersBlocked     = m_impl->m_stats.trackersBlocked.load(std::memory_order_relaxed);
+    snap.thirdPartyBlocked   = m_impl->m_stats.thirdPartyBlocked.load(std::memory_order_relaxed);
+    snap.supercookiesFound   = m_impl->m_stats.supercookiesFound.load(std::memory_order_relaxed);
+    snap.supercookiesDeleted = m_impl->m_stats.supercookiesDeleted.load(std::memory_order_relaxed);
+    snap.whitelistHits       = m_impl->m_stats.whitelistHits.load(std::memory_order_relaxed);
+    snap.essentialPreserved  = m_impl->m_stats.essentialPreserved.load(std::memory_order_relaxed);
+    snap.domainsScanned      = m_impl->m_stats.domainsScanned.load(std::memory_order_relaxed);
+    snap.bytesReclaimed      = m_impl->m_stats.bytesReclaimed.load(std::memory_order_relaxed);
+
+    for (size_t i = 0; i < m_impl->m_stats.byBrowser.size(); ++i) {
+        snap.byBrowser[i] = m_impl->m_stats.byBrowser[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < m_impl->m_stats.byCategory.size(); ++i) {
+        snap.byCategory[i] = m_impl->m_stats.byCategory[i].load(std::memory_order_relaxed);
+    }
+
+    snap.startTime = m_impl->m_stats.startTime;
+    return snap;
 }
 
 void CookieManager::ResetStatistics() {
@@ -1983,11 +2211,13 @@ bool CookieManager::SelfTest() {
 }
 
 std::string CookieManager::GetVersionString() noexcept {
-    std::ostringstream oss;
-    oss << CookieConstants::VERSION_MAJOR << "."
-        << CookieConstants::VERSION_MINOR << "."
-        << CookieConstants::VERSION_PATCH;
-    return oss.str();
+    try {
+        return std::to_string(CookieConstants::VERSION_MAJOR) + "." +
+               std::to_string(CookieConstants::VERSION_MINOR) + "." +
+               std::to_string(CookieConstants::VERSION_PATCH);
+    } catch (...) {
+        return "0.0.0";
+    }
 }
 
 // ============================================================================
@@ -2120,6 +2350,30 @@ void CookieStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
+std::string CookieStatisticsSnapshot::ToJson() const {
+    try {
+        nlohmann::json j;
+        j["totalCookiesScanned"] = totalCookiesScanned;
+        j["totalCookiesDeleted"] = totalCookiesDeleted;
+        j["trackersBlocked"] = trackersBlocked;
+        j["thirdPartyBlocked"] = thirdPartyBlocked;
+        j["supercookiesFound"] = supercookiesFound;
+        j["supercookiesDeleted"] = supercookiesDeleted;
+        j["whitelistHits"] = whitelistHits;
+        j["essentialPreserved"] = essentialPreserved;
+        j["domainsScanned"] = domainsScanned;
+        j["bytesReclaimed"] = bytesReclaimed;
+
+        const auto elapsed = Clock::now() - startTime;
+        const auto seconds = std::chrono::duration_cast<std::chrono::seconds>(elapsed).count();
+        j["uptimeSeconds"] = seconds;
+
+        return j.dump();
+    } catch (...) {
+        return "{}";
+    }
+}
+
 std::string CookieStatistics::ToJson() const {
     try {
         nlohmann::json j;
@@ -2145,8 +2399,41 @@ std::string CookieStatistics::ToJson() const {
 }
 
 bool CookieConfiguration::IsValid() const noexcept {
-    // All configurations are valid - no strict requirements
-    return true;
+    try {
+        // Reject excessively large tracker/whitelist lists
+        if (customTrackers.size() > CookieConstants::MAX_TRACKER_LIST) {
+            return false;
+        }
+        if (whitelist.size() > CookieConstants::MAX_TRACKER_LIST) {
+            return false;
+        }
+
+        // Validate tracker database path if specified (reject path traversal)
+        if (!trackerDatabasePath.empty()) {
+            auto pathStr = trackerDatabasePath.string();
+            if (pathStr.find("..") != std::string::npos) {
+                return false;
+            }
+        }
+
+        // Validate custom tracker entries have non-empty IDs
+        for (const auto& tracker : customTrackers) {
+            if (tracker.trackerId.empty()) {
+                return false;
+            }
+        }
+
+        // Validate whitelist entries have non-empty IDs and patterns
+        for (const auto& entry : whitelist) {
+            if (entry.entryId.empty() || entry.domainPattern.empty()) {
+                return false;
+            }
+        }
+
+        return true;
+    } catch (...) {
+        return false;
+    }
 }
 
 // ============================================================================
