@@ -126,11 +126,11 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -246,9 +246,12 @@ enum class AutorunPolicyMode : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief USBAutorunBlocker module status.
+ *
+ * Module-specific name avoids ODR violation with identically-named
+ * enums in sibling USB_Protection headers.
  */
-enum class ModuleStatus : uint8_t {
+enum class AutorunModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -407,6 +410,9 @@ struct VaccinationResult {
 /**
  * @brief Statistics
  */
+/**
+ * @brief Live statistics (atomic counters, not copyable).
+ */
 struct AutorunStatistics {
     std::atomic<uint64_t> drivesScanned{0};
     std::atomic<uint64_t> autorunFilesFound{0};
@@ -421,6 +427,24 @@ struct AutorunStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Point-in-time snapshot of AutorunStatistics (copyable).
+ */
+struct AutorunStatisticsSnapshot {
+    uint64_t drivesScanned = 0;
+    uint64_t autorunFilesFound = 0;
+    uint64_t maliciousDetected = 0;
+    uint64_t filesBlocked = 0;
+    uint64_t filesSanitized = 0;
+    uint64_t filesDeleted = 0;
+    uint64_t filesQuarantined = 0;
+    uint64_t drivesVaccinated = 0;
+    uint64_t vaccinationFailures = 0;
+    std::array<uint64_t, 16> byThreatType{};
+    TimePoint startTime;
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -491,7 +515,7 @@ public:
     [[nodiscard]] bool Initialize(const AutorunBlockerConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] AutorunModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const AutorunBlockerConfiguration& config);
     [[nodiscard]] AutorunBlockerConfiguration GetConfiguration() const;
@@ -558,7 +582,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] AutorunStatistics GetStatistics() const;
+    [[nodiscard]] AutorunStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

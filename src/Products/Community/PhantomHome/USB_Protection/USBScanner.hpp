@@ -128,14 +128,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -529,6 +529,9 @@ struct USBScanResultSummary {
 /**
  * @brief Statistics
  */
+/**
+ * @brief Live statistics (atomic counters, not copyable).
+ */
 struct USBScanStatistics {
     std::atomic<uint64_t> totalScans{0};
     std::atomic<uint64_t> completedScans{0};
@@ -547,6 +550,28 @@ struct USBScanStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Point-in-time snapshot of USBScanStatistics (copyable).
+ */
+struct USBScanStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t completedScans = 0;
+    uint64_t cancelledScans = 0;
+    uint64_t erroredScans = 0;
+    uint64_t totalFilesScanned = 0;
+    uint64_t totalBytesScanned = 0;
+    uint64_t totalThreatsFound = 0;
+    uint64_t totalFilesQuarantined = 0;
+    uint64_t totalFilesDeleted = 0;
+    uint64_t hashMatches = 0;
+    uint64_t signatureMatches = 0;
+    uint64_t yaraMatches = 0;
+    uint64_t heuristicDetections = 0;
+    std::array<uint64_t, 8> byDetectionType{};
+    TimePoint startTime;
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -676,7 +701,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] USBScanStatistics GetStatistics() const;
+    [[nodiscard]] USBScanStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

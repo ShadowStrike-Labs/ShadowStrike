@@ -132,11 +132,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "USBCommonTypes.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -234,16 +235,7 @@ enum class DeviceType : uint8_t {
     VendorSpecific      = 14
 };
 
-/**
- * @brief Access level
- */
-enum class AccessLevel : uint8_t {
-    FullAccess      = 0,
-    ReadOnly        = 1,
-    Blocked         = 2,
-    QuarantineOnly  = 3,
-    AuditOnly       = 4
-};
+// AccessLevel is defined in USBCommonTypes.hpp (canonical, shared definition).
 
 /**
  * @brief Device status
@@ -261,9 +253,12 @@ enum class DeviceStatus : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief USBDeviceMonitor module status.
+ *
+ * Module-specific name avoids ODR violation with identically-named
+ * enums in sibling USB_Protection headers.
  */
-enum class ModuleStatus : uint8_t {
+enum class MonitorModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -492,6 +487,9 @@ struct DeviceHistoryEntry {
 /**
  * @brief Statistics
  */
+/**
+ * @brief Live statistics (atomic counters, not copyable).
+ */
 struct USBMonitorStatistics {
     std::atomic<uint64_t> totalDevicesConnected{0};
     std::atomic<uint64_t> totalDevicesDisconnected{0};
@@ -510,6 +508,28 @@ struct USBMonitorStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Point-in-time snapshot of USBMonitorStatistics (copyable).
+ */
+struct USBMonitorStatisticsSnapshot {
+    uint64_t totalDevicesConnected = 0;
+    uint64_t totalDevicesDisconnected = 0;
+    uint64_t devicesBlocked = 0;
+    uint64_t devicesAllowed = 0;
+    uint64_t devicesReadOnly = 0;
+    uint64_t scansTriggered = 0;
+    uint64_t malwareDetected = 0;
+    uint64_t autorunBlocked = 0;
+    uint64_t badUSBDetected = 0;
+    uint64_t safeEjects = 0;
+    uint64_t emergencyBlocks = 0;
+    uint32_t currentlyConnected = 0;
+    std::array<uint64_t, 16> byDeviceType{};
+    std::array<uint64_t, 8> byEventType{};
+    TimePoint startTime;
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -576,7 +596,7 @@ public:
     [[nodiscard]] bool Initialize(const USBMonitorConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] MonitorModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const USBMonitorConfiguration& config);
     [[nodiscard]] USBMonitorConfiguration GetConfiguration() const;
@@ -674,7 +694,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] USBMonitorStatistics GetStatistics() const;
+    [[nodiscard]] USBMonitorStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
@@ -694,7 +714,7 @@ private:
 
 [[nodiscard]] std::string_view GetDeviceEventTypeName(DeviceEventType type) noexcept;
 [[nodiscard]] std::string_view GetDeviceTypeName(DeviceType type) noexcept;
-[[nodiscard]] std::string_view GetAccessLevelName(AccessLevel level) noexcept;
+// GetAccessLevelName is declared in USBCommonTypes.hpp.
 [[nodiscard]] std::string_view GetDeviceStatusName(DeviceStatus status) noexcept;
 [[nodiscard]] DeviceType ClassifyDeviceType(uint8_t classCode, uint8_t subclassCode) noexcept;
 [[nodiscard]] std::string FormatCapacity(uint64_t bytes);
