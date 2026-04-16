@@ -597,6 +597,29 @@ struct IPLeakStatistics {
     std::array<std::atomic<uint64_t>, 6> bySeverity{};
     TimePoint startTime = Clock::now();
 
+    IPLeakStatistics() = default;
+
+    /// @brief Copy constructor — loads each atomic with relaxed ordering.
+    IPLeakStatistics(const IPLeakStatistics& other) noexcept
+        : startTime(other.startTime)
+    {
+        totalChecks.store(other.totalChecks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        leaksDetected.store(other.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        vpnLeaks.store(other.vpnLeaks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dnsLeaks.store(other.dnsLeaks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        webrtcLeaks.store(other.webrtcLeaks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        ipv6Leaks.store(other.ipv6Leaks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        killSwitchActivations.store(other.killSwitchActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        autoReconnects.store(other.autoReconnects.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        currentVPNConnections.store(other.currentVPNConnections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byLeakType.size(); ++i)
+            byLeakType[i].store(other.byLeakType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < bySeverity.size(); ++i)
+            bySeverity[i].store(other.bySeverity[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    IPLeakStatistics& operator=(const IPLeakStatistics&) = delete;
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
