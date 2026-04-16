@@ -1188,13 +1188,11 @@ public:
         std::shared_lock lock(m_mutex);
 
         if (m_highLoadEvents.size() <= maxCount) {
-            return m_highLoadEvents;
+            return std::vector<HighLoadEvent>(m_highLoadEvents.begin(), m_highLoadEvents.end());
         }
 
-        return std::vector<HighLoadEvent>(
-            m_highLoadEvents.end() - maxCount,
-            m_highLoadEvents.end()
-        );
+        auto startIt = m_highLoadEvents.end() - static_cast<std::ptrdiff_t>(maxCount);
+        return std::vector<HighLoadEvent>(startIt, m_highLoadEvents.end());
     }
 
     // ========================================================================
