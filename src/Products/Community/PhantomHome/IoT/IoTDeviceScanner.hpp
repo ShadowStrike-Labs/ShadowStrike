@@ -124,9 +124,9 @@
 #  ifndef WIN32_LEAN_AND_MEAN
 #    define WIN32_LEAN_AND_MEAN
 #  endif
-#  include <Windows.h>
 #  include <WinSock2.h>
 #  include <WS2tcpip.h>
+#  include <Windows.h>
 #  include <iphlpapi.h>
 #else
 #  include <netinet/in.h>
@@ -702,6 +702,25 @@ struct IoTScanStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+
+    /// @brief Produce a copyable, non-atomic snapshot of current statistics
+    struct Snapshot {
+        uint64_t totalScans = 0;
+        uint64_t totalDevicesDiscovered = 0;
+        uint64_t totalVulnerabilitiesFound = 0;
+        uint64_t defaultCredentialsFound = 0;
+        uint64_t botnetIndicatorsDetected = 0;
+        uint64_t cvesMatched = 0;
+        uint64_t packetsAnalyzed = 0;
+        uint32_t activeDevices = 0;
+        std::array<uint64_t, 32> byCategory{};
+        std::array<uint64_t, 8> byVulnerabilityLevel{};
+        TimePoint startTime{};
+
+        [[nodiscard]] std::string ToJson() const;
+    };
+
+    [[nodiscard]] Snapshot ToSnapshot() const noexcept;
 };
 
 /**
@@ -844,7 +863,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] IoTScanStatistics GetStatistics() const;
+    [[nodiscard]] IoTScanStatistics::Snapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

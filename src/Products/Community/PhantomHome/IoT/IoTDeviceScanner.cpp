@@ -113,10 +113,6 @@ namespace {
     /// @brief Scan batch size
     constexpr size_t SCAN_BATCH_SIZE = 50;
 
-    /// @brief HTTP Basic Auth header template
-    constexpr const char* HTTP_AUTH_REQUEST =
-        "GET / HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nConnection: close\r\n\r\n";
-
     // ========================================================================
     // RAII SOCKET WRAPPER
     // ========================================================================
@@ -373,6 +369,17 @@ namespace {
         uint32_t mask = (prefixLen == 0) ? 0 : ~((1u << (32 - prefixLen)) - 1);
         uint32_t network = ip & mask;
         uint32_t broadcast = network | ~mask;
+
+        // Handle /32 (single host) and /31 (point-to-point) specially
+        if (prefixLen == 32) {
+            hosts.push_back(ipStr);
+            return hosts;
+        }
+
+        if (broadcast <= network + 1) {
+            // /31 point-to-point: no traditional host range
+            return hosts;
+        }
 
         uint32_t hostCount = broadcast - network - 1;
         if (hostCount > IoTConstants::MAX_SUBNET_HOSTS) {
@@ -1073,51 +1080,110 @@ public:
             return;
         }
 
-        // Parse the question section to extract the queried domain name
-        size_t offset = DNS_HEADER_SIZE;
-        std::string domain;
-
-        for (uint16_t q = 0; q < questions && offset < packet.size(); ++q) {
-            domain.clear();
-            while (offset < packet.size() && packet[offset] != 0) {
-                uint8_t labelLen = packet[offset++];
-                if (labelLen > 63 || offset + labelLen > packet.size()) {
-                    return; // Malformed
-                }
-                if (!domain.empty()) domain += '.';
-                domain.append(reinterpret_cast<const char*>(&packet[offset]), labelLen);
-                offset += labelLen;
-            }
-            if (offset >= packet.size()) return;
-            offset++; // null terminator
-            offset += 4; // QTYPE + QCLASS
-        }
-
-        if (domain.empty()) {
+        // Cap counts to prevent DoS from malformed packets
+        if (questions > 256 || answers > 256) {
             return;
         }
 
-        // Use the domain name as a hostname hint for any matching devices
-        // mDNS responses often contain device names (e.g., "myCamera._http._tcp.local")
-        std::string normalizedDomain = domain;
-        std::transform(normalizedDomain.begin(), normalizedDomain.end(),
-                       normalizedDomain.begin(), ::tolower);
+        const size_t packetLen = packet.size();
 
-        // Check for mDNS .local suffix indicating local network device
-        if (normalizedDomain.find(".local") != std::string::npos) {
-            size_t firstDot = normalizedDomain.find('.');
-            if (firstDot != std::string::npos) {
-                std::string hostPart = normalizedDomain.substr(0, firstDot);
+        // Lambda: parse a DNS name, handling compression pointers (RFC 1035 §4.1.4)
+        auto parseName = [&](size_t startOff, std::string& name, size_t& endOff) -> bool {
+            name.clear();
+            size_t pos = startOff;
+            bool jumped = false;
+            size_t jumpCount = 0;
+            endOff = 0;
 
-                std::shared_lock lock(m_mutex);
-                for (auto& [ip, device] : m_devices) {
-                    if (device.hostName.empty()) {
-                        // Very basic heuristic — assign to first device without hostname
-                        // In production this would correlate via source IP from transport layer
-                        break;
-                    }
+            while (pos < packetLen) {
+                uint8_t labelLen = packet[pos];
+
+                if (labelLen == 0) {
+                    if (!jumped) endOff = pos + 1;
+                    return true;
+                }
+
+                // Compression pointer: top 2 bits are 11
+                if ((labelLen & 0xC0) == 0xC0) {
+                    if (pos + 1 >= packetLen) return false;
+                    uint16_t ptr = static_cast<uint16_t>(
+                        ((labelLen & 0x3F) << 8) | packet[pos + 1]);
+                    if (ptr >= packetLen) return false;
+                    if (!jumped) endOff = pos + 2;
+                    jumped = true;
+                    pos = ptr;
+                    // Guard against infinite loops in malformed packets
+                    if (++jumpCount > packetLen) return false;
+                    continue;
+                }
+
+                if (labelLen > 63) return false;
+                pos++;
+
+                if (pos + labelLen > packetLen) return false;
+                if (name.size() + labelLen + 1 > 253) return false; // RFC max domain length
+
+                if (!name.empty()) name += '.';
+                name.append(reinterpret_cast<const char*>(&packet[pos]), labelLen);
+                pos += labelLen;
+            }
+            return false;
+        };
+
+        // Skip question section
+        size_t offset = DNS_HEADER_SIZE;
+        for (uint16_t q = 0; q < questions; ++q) {
+            std::string qname;
+            size_t nextOff = 0;
+            if (!parseName(offset, qname, nextOff)) return;
+            offset = nextOff;
+            if (offset + 4 > packetLen) return;
+            offset += 4; // QTYPE(2) + QCLASS(2)
+        }
+
+        // Parse answer section — extract A records to correlate hostnames with IPs
+        for (uint16_t a = 0; a < answers; ++a) {
+            std::string aname;
+            size_t nextOff = 0;
+            if (!parseName(offset, aname, nextOff)) return;
+            offset = nextOff;
+
+            if (offset + 10 > packetLen) return;
+
+            uint16_t rtype = static_cast<uint16_t>(
+                (packet[offset] << 8) | packet[offset + 1]);
+            // Skip: CLASS(2) + TTL(4)
+            uint16_t rdlength = static_cast<uint16_t>(
+                (packet[offset + 8] << 8) | packet[offset + 9]);
+            offset += 10;
+
+            if (offset + rdlength > packetLen) return;
+
+            // A record (type 1, 4-byte IPv4 address)
+            if (rtype == 1 && rdlength == 4 && !aname.empty()) {
+                std::string ip = FormatIPv4(&packet[offset]);
+
+                std::string hostname = aname;
+                std::transform(hostname.begin(), hostname.end(),
+                               hostname.begin(), ::tolower);
+
+                // Strip .local suffix for mDNS names
+                if (auto dotLocal = hostname.rfind(".local");
+                    dotLocal != std::string::npos && dotLocal + 6 == hostname.size()) {
+                    hostname.erase(dotLocal);
+                }
+
+                std::unique_lock lock(m_mutex);
+                auto it = m_devices.find(ip);
+                if (it != m_devices.end() && it->second.hostName.empty()) {
+                    it->second.hostName = hostname;
+                    lock.unlock();
+                    Utils::Logger::Debug("DNS: Resolved hostname '{}' for {}",
+                                         hostname, ip);
                 }
             }
+
+            offset += rdlength;
         }
     }
 
@@ -1273,8 +1339,10 @@ public:
         UpdateProgress(ScanStatus::Discovering, 0.0f, "");
 
         size_t count = 0;
+        bool cancelled = false;
         for (const auto& ip : targets) {
             if (!m_scanActive.load(std::memory_order_acquire)) {
+                cancelled = true;
                 break;
             }
 
@@ -1292,6 +1360,11 @@ public:
                     }
                     m_progress.devicesFound++;
                     m_progress.devicesScanned++;
+
+                    if (device.vulnerabilityLevel >= VulnerabilityLevel::Medium) {
+                        m_progress.vulnerabilitiesFound +=
+                            static_cast<uint32_t>(device.riskFactors.size());
+                    }
                 }
 
                 NotifyDeviceFound(device);
@@ -1300,8 +1373,6 @@ public:
                     for (auto risk : device.riskFactors) {
                         NotifyVulnerability(device, risk);
                     }
-                    m_progress.vulnerabilitiesFound +=
-                        static_cast<uint32_t>(device.riskFactors.size());
                 }
             } else {
                 std::unique_lock lock(m_mutex);
@@ -1311,13 +1382,20 @@ public:
             count++;
         }
 
-        UpdateProgress(ScanStatus::Completed, 100.0f, "");
+        if (cancelled) {
+            UpdateProgress(ScanStatus::Cancelled,
+                static_cast<float>(count) / static_cast<float>(targets.size()) * 100.0f, "");
+        } else {
+            UpdateProgress(ScanStatus::Completed, 100.0f, "");
+        }
+
         m_scanActive.store(false, std::memory_order_release);
 
         // Generate summary
         GenerateScanSummary(scanStartTime);
 
-        Utils::Logger::Info("Scan thread completed — {} devices found on {} targets",
+        Utils::Logger::Info("Scan thread {} — {} devices found on {} targets",
+                            cancelled ? "cancelled" : "completed",
                             m_progress.devicesFound, targets.size());
     }
 
@@ -1576,13 +1654,24 @@ void IoTDeviceScanner::Shutdown() {
 
 [[nodiscard]] bool IoTDeviceScanner::StartDiscovery(const IoTScanConfig& config) {
     try {
-        if (m_impl->m_scanActive.load(std::memory_order_acquire)) {
+        // Atomically claim the scan slot — prevents two concurrent calls from
+        // both passing the "is scan active?" check
+        bool expected = false;
+        if (!m_impl->m_scanActive.compare_exchange_strong(
+                expected, true, std::memory_order_acq_rel)) {
             Utils::Logger::Warn("Scan already in progress");
             return false;
         }
 
+        // From this point we own the scan slot.  Any failure path must
+        // reset m_scanActive to false before returning.
+        auto releaseOnFailure = [this]() noexcept {
+            m_impl->m_scanActive.store(false, std::memory_order_release);
+        };
+
         if (!IsInitialized()) {
             Utils::Logger::Error("Scanner not initialized");
+            releaseOnFailure();
             return false;
         }
 
@@ -1626,6 +1715,7 @@ void IoTDeviceScanner::Shutdown() {
 
         if (targets.empty()) {
             Utils::Logger::Error("No targets to scan");
+            releaseOnFailure();
             return false;
         }
 
@@ -1643,7 +1733,6 @@ void IoTDeviceScanner::Shutdown() {
             m_impl->m_scanThread.join();
         }
 
-        m_impl->m_scanActive.store(true, std::memory_order_release);
         m_impl->m_status = ModuleStatus::Scanning;
 
         m_impl->m_scanThread = std::thread(
@@ -1655,6 +1744,7 @@ void IoTDeviceScanner::Shutdown() {
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("StartDiscovery failed: {}", e.what());
+        m_impl->m_scanActive.store(false, std::memory_order_release);
         m_impl->NotifyError("Failed to start discovery: " + std::string(e.what()), -1);
         return false;
     }
@@ -1679,6 +1769,19 @@ void IoTDeviceScanner::StopScan() {
     const std::string& ipAddress)
 {
     try {
+        // Validate IP address before passing to network APIs
+        if (ipAddress.empty() || ipAddress.size() > 45) {
+            Utils::Logger::Error("DeepScanDevice: invalid IP address length");
+            return IoTDeviceInfo{};
+        }
+
+        in_addr validateAddr{};
+        if (::inet_pton(AF_INET, ipAddress.c_str(), &validateAddr) != 1) {
+            Utils::Logger::Error("DeepScanDevice: invalid IPv4 address: {}",
+                                 ipAddress);
+            return IoTDeviceInfo{};
+        }
+
         Utils::Logger::Debug("Deep scanning device: {}", ipAddress);
 
         auto device = m_impl->PerformDeepScan(ipAddress);
@@ -1700,7 +1803,11 @@ void IoTDeviceScanner::StopScan() {
 }
 
 [[nodiscard]] bool IoTDeviceScanner::ScanSubnet(const std::string& cidrSubnet) {
-    IoTScanConfig config = m_impl->m_config.defaultScanConfig;
+    IoTScanConfig config;
+    {
+        std::shared_lock lock(m_impl->m_mutex);
+        config = m_impl->m_config.defaultScanConfig;
+    }
     config.targetSubnets.clear();
     config.targetSubnets.push_back(cidrSubnet);
 
@@ -1926,9 +2033,8 @@ void IoTDeviceScanner::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-[[nodiscard]] IoTScanStatistics IoTDeviceScanner::GetStatistics() const {
-    // Atomics are safe to read without lock
-    return m_impl->m_stats;
+[[nodiscard]] IoTScanStatistics::Snapshot IoTDeviceScanner::GetStatistics() const {
+    return m_impl->m_stats.ToSnapshot();
 }
 
 void IoTDeviceScanner::ResetStatistics() {
@@ -2067,6 +2173,28 @@ void IoTScanStatistics::Reset() noexcept {
     }
 }
 
+[[nodiscard]] IoTScanStatistics::Snapshot IoTScanStatistics::ToSnapshot() const noexcept {
+    Snapshot snap;
+    snap.totalScans = totalScans.load(std::memory_order_relaxed);
+    snap.totalDevicesDiscovered = totalDevicesDiscovered.load(std::memory_order_relaxed);
+    snap.totalVulnerabilitiesFound = totalVulnerabilitiesFound.load(std::memory_order_relaxed);
+    snap.defaultCredentialsFound = defaultCredentialsFound.load(std::memory_order_relaxed);
+    snap.botnetIndicatorsDetected = botnetIndicatorsDetected.load(std::memory_order_relaxed);
+    snap.cvesMatched = cvesMatched.load(std::memory_order_relaxed);
+    snap.packetsAnalyzed = packetsAnalyzed.load(std::memory_order_relaxed);
+    snap.activeDevices = activeDevices.load(std::memory_order_relaxed);
+    snap.startTime = startTime;
+
+    for (size_t i = 0; i < byCategory.size(); ++i) {
+        snap.byCategory[i] = byCategory[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < byVulnerabilityLevel.size(); ++i) {
+        snap.byVulnerabilityLevel[i] = byVulnerabilityLevel[i].load(std::memory_order_relaxed);
+    }
+
+    return snap;
+}
+
 [[nodiscard]] std::string IoTScanStatistics::ToJson() const {
     using namespace ShadowStrike::Utils::JSON;
 
@@ -2080,6 +2208,27 @@ void IoTScanStatistics::Reset() noexcept {
     j["cvesMatched"] = cvesMatched.load(std::memory_order_relaxed);
     j["packetsAnalyzed"] = packetsAnalyzed.load(std::memory_order_relaxed);
     j["activeDevices"] = activeDevices.load(std::memory_order_relaxed);
+
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - startTime).count();
+    j["uptimeSeconds"] = uptime;
+
+    return j.dump(2);
+}
+
+[[nodiscard]] std::string IoTScanStatistics::Snapshot::ToJson() const {
+    using namespace ShadowStrike::Utils::JSON;
+
+    Json j = Json::object();
+
+    j["totalScans"] = totalScans;
+    j["totalDevicesDiscovered"] = totalDevicesDiscovered;
+    j["totalVulnerabilitiesFound"] = totalVulnerabilitiesFound;
+    j["defaultCredentialsFound"] = defaultCredentialsFound;
+    j["botnetIndicatorsDetected"] = botnetIndicatorsDetected;
+    j["cvesMatched"] = cvesMatched;
+    j["packetsAnalyzed"] = packetsAnalyzed;
+    j["activeDevices"] = activeDevices;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
