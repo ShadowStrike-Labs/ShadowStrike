@@ -835,10 +835,32 @@ public:
             }
 
             // Permit DHCP (UDP port 67/68) so network stays configured
+            // Outbound: client sends to server port 67
             {
                 FWPM_FILTER0 filter = {};
-                filter.displayData.name = const_cast<wchar_t*>(L"SS Permit DHCP");
+                filter.displayData.name = const_cast<wchar_t*>(L"SS Permit DHCP Out");
                 filter.layerKey = FWPM_LAYER_ALE_AUTH_CONNECT_V4;
+                filter.subLayerKey = SHADOWSTRIKE_SUBLAYER_GUID;
+                filter.weight.type = FWP_UINT8;
+                filter.weight.uint8 = 14;
+                filter.action.type = FWP_ACTION_PERMIT;
+
+                FWPM_FILTER_CONDITION0 cond = {};
+                cond.fieldKey = FWPM_CONDITION_IP_REMOTE_PORT;
+                cond.matchType = FWP_MATCH_EQUAL;
+                cond.conditionValue.type = FWP_UINT16;
+                cond.conditionValue.uint16 = 67;
+
+                filter.filterCondition = &cond;
+                filter.numFilterConditions = 1;
+
+                ::FwpmFilterAdd0(m_wfpEngine, &filter, nullptr, &filterId);
+            }
+            // Inbound: server responds from port 67 to client port 68
+            {
+                FWPM_FILTER0 filter = {};
+                filter.displayData.name = const_cast<wchar_t*>(L"SS Permit DHCP In");
+                filter.layerKey = FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V4;
                 filter.subLayerKey = SHADOWSTRIKE_SUBLAYER_GUID;
                 filter.weight.type = FWP_UINT8;
                 filter.weight.uint8 = 14;
