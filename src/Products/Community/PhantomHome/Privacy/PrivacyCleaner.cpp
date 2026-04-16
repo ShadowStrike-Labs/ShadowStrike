@@ -97,9 +97,12 @@
 #include <comdef.h>
 #include <wbemidl.h>
 #include <iphlpapi.h>
+#include <tlhelp32.h>
+#include <windns.h>
 #pragma comment(lib, "shell32.lib")
 #pragma comment(lib, "iphlpapi.lib")
 #pragma comment(lib, "wbemuuid.lib")
+#pragma comment(lib, "dnsapi.lib")
 #endif
 
 namespace ShadowStrike {
@@ -111,6 +114,18 @@ namespace Privacy {
 
 namespace {
 
+/// @brief ASCII-only lowercase for domain names (avoids wide-string round-trip)
+[[nodiscard]] std::string ToLowerAscii(std::string_view src) {
+    std::string result(src);
+    for (auto& ch : result) {
+        if (ch >= 'A' && ch <= 'Z') ch += ('a' - 'A');
+    }
+    return result;
+}
+
+/// @brief Shared directory iterator options: skip inaccessible directories
+constexpr auto kDirIterOpts = fs::directory_options::skip_permission_denied;
+
 /**
  * @brief Browser profile locations
  */
@@ -121,14 +136,15 @@ struct BrowserPaths {
 };
 
 /**
- * @brief Gutmann pass patterns
+ * @brief Gutmann pass patterns for passes 5-31 (27 deterministic passes).
+ *        Passes 1-4 and 32-35 are random.
+ *        Single-byte approximation of original multi-byte Gutmann sequences.
  */
-const std::array<uint8_t, 35> GUTMANN_PATTERNS = {
+constexpr std::array<uint8_t, 27> GUTMANN_DETERMINISTIC_PATTERNS = {
     0x55, 0xAA, 0x92, 0x49, 0x24, 0x00, 0x11, 0x22,
     0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA,
     0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x92, 0x49, 0x24,
-    0x92, 0x49, 0x24, 0x00, 0x00, 0x00, 0x11, 0x22,
-    0x33, 0x44, 0x55
+    0x6D, 0xB6, 0xDB
 };
 
 /**
@@ -333,19 +349,19 @@ private:
 // ============================================================================
 
 PrivacyCleanerImpl::PrivacyCleanerImpl() {
-    Logger::Info("[PrivacyCleaner] Instance created");
+    SS_LOG_INFO(L"PrivacyCleaner", L"Instance created");
 }
 
 PrivacyCleanerImpl::~PrivacyCleanerImpl() {
     Shutdown();
-    Logger::Info("[PrivacyCleaner] Instance destroyed");
+    SS_LOG_INFO(L"PrivacyCleaner", L"Instance destroyed");
 }
 
 bool PrivacyCleanerImpl::Initialize(const CleanerConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[PrivacyCleaner] Already initialized");
+        SS_LOG_WARN(L"PrivacyCleaner", L"Already initialized");
         return true;
     }
 
@@ -354,16 +370,17 @@ bool PrivacyCleanerImpl::Initialize(const CleanerConfiguration& config) {
 
         // Validate configuration
         if (!config.IsValid()) {
-            Logger::Error("[PrivacyCleaner] Invalid configuration");
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Invalid configuration");
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
 
         m_config = config;
 
-        // Initialize preserved domains
+        // Initialize preserved domains (case-insensitive via ASCII lowercase)
+        m_preservedDomains.clear();
         for (const auto& domain : m_config.preservedCookieDomains) {
-            m_preservedDomains.insert(StringUtils::ToLower(domain));
+            m_preservedDomains.insert(ToLowerAscii(domain));
         }
 
         // Load schedules
@@ -376,17 +393,17 @@ bool PrivacyCleanerImpl::Initialize(const CleanerConfiguration& config) {
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
 
-        Logger::Info("[PrivacyCleaner] Initialized successfully (Version {})",
-            PrivacyCleaner::GetVersionString());
+        SS_LOG_INFO(L"PrivacyCleaner", L"Initialized successfully (Version %hs)",
+            PrivacyCleaner::GetVersionString().c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Critical("[PrivacyCleaner] Initialization failed: {}", e.what());
+        SS_LOG_FATAL(L"PrivacyCleaner", L"Initialization failed: %hs", e.what());
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
-        Logger::Critical("[PrivacyCleaner] Initialization failed: Unknown error");
+        SS_LOG_FATAL(L"PrivacyCleaner", L"Initialization failed: Unknown error");
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -406,18 +423,26 @@ void PrivacyCleanerImpl::Shutdown() {
         m_schedules.clear();
         m_preservedDomains.clear();
 
-        // Clear callbacks
-        UnregisterCallbacks();
-
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Logger::Info("[PrivacyCleaner] Shutdown complete");
+        // Clear callbacks AFTER releasing m_initialized to prevent
+        // new operations from starting. Use separate lock scope.
+        {
+            std::lock_guard cbLock(m_callbackMutex);
+            m_progressCallback = nullptr;
+            m_completionCallback = nullptr;
+            m_scanCallback = nullptr;
+            m_confirmCallback = nullptr;
+            m_errorCallback = nullptr;
+        }
+
+        SS_LOG_INFO(L"PrivacyCleaner", L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] Shutdown error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"Shutdown error: %hs", e.what());
     } catch (...) {
-        Logger::Error("[PrivacyCleaner] Shutdown error: Unknown exception");
+        SS_LOG_ERROR(L"PrivacyCleaner", L"Shutdown error: Unknown exception");
     }
 }
 
@@ -425,12 +450,20 @@ bool PrivacyCleanerImpl::UpdateConfiguration(const CleanerConfiguration& config)
     std::unique_lock lock(m_mutex);
 
     if (!config.IsValid()) {
-        Logger::Error("[PrivacyCleaner] Invalid configuration");
+        SS_LOG_ERROR(L"PrivacyCleaner", L"Invalid configuration");
         return false;
     }
 
     m_config = config;
-    Logger::Info("[PrivacyCleaner] Configuration updated");
+
+    // Synchronize derived state from new configuration
+    m_preservedDomains.clear();
+    for (const auto& domain : m_config.preservedCookieDomains) {
+        m_preservedDomains.insert(ToLowerAscii(domain));
+    }
+    m_schedules = m_config.schedules;
+
+    SS_LOG_INFO(L"PrivacyCleaner", L"Configuration updated");
     return true;
 }
 
@@ -445,7 +478,7 @@ CleanerConfiguration PrivacyCleanerImpl::GetConfiguration() const {
 
 CleanScanResult PrivacyCleanerImpl::ScanForCleanableItems() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[PrivacyCleaner] Not initialized");
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanForCleanableItems: not initialized");
         return {};
     }
 
@@ -479,14 +512,14 @@ CleanScanResult PrivacyCleanerImpl::ScanForCleanableItems() {
 
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
 
-        Logger::Info("[PrivacyCleaner] Scan complete: {} items ({} bytes)",
-            result.totalFileCount, result.totalSizeBytes);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Scan complete: %u items (%llu bytes)",
+            result.totalFileCount, static_cast<unsigned long long>(result.totalSizeBytes));
 
         NotifyScan(result);
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] Scan failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"Scan failed: %hs", e.what());
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
         NotifyError(e.what(), -1);
         return result;
@@ -568,41 +601,44 @@ std::vector<BrowserProfile> PrivacyCleanerImpl::GetBrowserProfiles(BrowserType b
         auto browserPaths = GetBrowserPathsInternal(browser);
 
         for (const auto& basePath : browserPaths.profilePaths) {
-            if (!fs::exists(basePath)) continue;
+            std::error_code ec;
+            if (!fs::exists(basePath, ec) || ec) continue;
 
-            // Chromium-based: multiple profiles
+            // Chromium-based: multiple profiles (Default, Profile 1, etc.)
             if (browser != BrowserType::Firefox) {
-                for (const auto& entry : fs::directory_iterator(basePath)) {
-                    if (entry.is_directory()) {
-                        auto dirName = entry.path().filename().string();
-                        if (dirName.find("Profile") == 0 || dirName == "Default") {
-                            BrowserProfile profile;
-                            profile.browser = browser;
-                            profile.name = dirName;
-                            profile.path = entry.path();
-                            profile.sizeBytes = CalculateDirectorySize(entry.path());
-                            profile.isDefault = (dirName == "Default");
-                            profiles.push_back(profile);
-                        }
-                    }
+                for (const auto& entry : fs::directory_iterator(basePath, kDirIterOpts, ec)) {
+                    if (ec) break;
+                    if (!entry.is_directory(ec) || ec) continue;
+
+                    auto dirName = entry.path().filename().string();
+                    if (dirName.find("Profile") != 0 && dirName != "Default") continue;
+
+                    BrowserProfile profile;
+                    profile.browser = browser;
+                    profile.name = dirName;
+                    profile.path = entry.path();
+                    profile.sizeBytes = CalculateDirectorySize(entry.path());
+                    profile.isDefault = (dirName == "Default");
+                    profiles.push_back(std::move(profile));
                 }
             } else {
-                // Firefox: profiles.ini parsing would go here
-                for (const auto& entry : fs::directory_iterator(basePath)) {
-                    if (entry.is_directory()) {
-                        BrowserProfile profile;
-                        profile.browser = browser;
-                        profile.name = entry.path().filename().string();
-                        profile.path = entry.path();
-                        profile.sizeBytes = CalculateDirectorySize(entry.path());
-                        profiles.push_back(profile);
-                    }
+                // Firefox: iterate profile directories (named <random>.profilename)
+                for (const auto& entry : fs::directory_iterator(basePath, kDirIterOpts, ec)) {
+                    if (ec) break;
+                    if (!entry.is_directory(ec) || ec) continue;
+
+                    BrowserProfile profile;
+                    profile.browser = browser;
+                    profile.name = entry.path().filename().string();
+                    profile.path = entry.path();
+                    profile.sizeBytes = CalculateDirectorySize(entry.path());
+                    profiles.push_back(std::move(profile));
                 }
             }
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] GetBrowserProfiles error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"GetBrowserProfiles error: %hs", e.what());
     }
 
     return profiles;
@@ -614,7 +650,7 @@ std::vector<BrowserProfile> PrivacyCleanerImpl::GetBrowserProfiles(BrowserType b
 
 CleanResultDetails PrivacyCleanerImpl::CleanAll() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[PrivacyCleaner] Not initialized");
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CleanAll: not initialized");
         return {};
     }
 
@@ -649,16 +685,16 @@ CleanResultDetails PrivacyCleanerImpl::CleanAll() {
         result.result = (result.itemsFailed == 0) ? CleanResult::Success : CleanResult::PartialSuccess;
 
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
-        m_stats.totalCleanOperations++;
+        m_stats.totalCleanOperations.fetch_add(1, std::memory_order_relaxed);
 
-        Logger::Info("[PrivacyCleaner] CleanAll complete: {} items ({} bytes)",
-            result.itemsCleaned, result.bytesCleaned);
+        SS_LOG_INFO(L"PrivacyCleaner", L"CleanAll complete: %u items (%llu bytes)",
+            result.itemsCleaned, static_cast<unsigned long long>(result.bytesCleaned));
 
         NotifyCompletion(result);
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] CleanAll failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CleanAll failed: %hs", e.what());
         m_status.store(ModuleStatus::Ready, std::memory_order_release);
         result.result = CleanResult::Error;
         NotifyError(e.what(), -1);
@@ -667,16 +703,19 @@ CleanResultDetails PrivacyCleanerImpl::CleanAll() {
 }
 
 CleanResultDetails PrivacyCleanerImpl::CleanBrowser(const std::wstring& browserName) {
-    std::string name = StringUtils::WStringToString(browserName);
-    name = StringUtils::ToLower(name);
+    std::wstring lowerName = StringUtils::ToLowerCopy(browserName);
 
     BrowserType browser = BrowserType::Unknown;
-    if (name.find("chrome") != std::string::npos) browser = BrowserType::Chrome;
-    else if (name.find("firefox") != std::string::npos) browser = BrowserType::Firefox;
-    else if (name.find("edge") != std::string::npos) browser = BrowserType::Edge;
-    else if (name.find("opera") != std::string::npos) browser = BrowserType::Opera;
-    else if (name.find("brave") != std::string::npos) browser = BrowserType::Brave;
-    else if (name.find("vivaldi") != std::string::npos) browser = BrowserType::Vivaldi;
+    if (StringUtils::IContains(lowerName, L"chrome"))       browser = BrowserType::Chrome;
+    else if (StringUtils::IContains(lowerName, L"firefox")) browser = BrowserType::Firefox;
+    else if (StringUtils::IContains(lowerName, L"edge"))    browser = BrowserType::Edge;
+    else if (StringUtils::IContains(lowerName, L"opera"))   browser = BrowserType::Opera;
+    else if (StringUtils::IContains(lowerName, L"brave"))   browser = BrowserType::Brave;
+    else if (StringUtils::IContains(lowerName, L"vivaldi")) browser = BrowserType::Vivaldi;
+
+    if (browser == BrowserType::Unknown) {
+        SS_LOG_WARN(L"PrivacyCleaner", L"CleanBrowser: unrecognized browser name '%ls'", browserName.c_str());
+    }
 
     return CleanBrowser(browser, BrowserDataType::All);
 }
@@ -695,18 +734,19 @@ CleanResultDetails PrivacyCleanerImpl::CleanBrowser(BrowserType browser, Browser
         auto endTime = Clock::now();
         result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-        m_stats.browserCleans++;
+        m_stats.browserCleans.fetch_add(1, std::memory_order_relaxed);
         if (static_cast<size_t>(browser) < m_stats.byBrowser.size()) {
-            m_stats.byBrowser[static_cast<size_t>(browser)]++;
+            m_stats.byBrowser[static_cast<size_t>(browser)].fetch_add(1, std::memory_order_relaxed);
         }
 
-        Logger::Info("[PrivacyCleaner] Browser clean complete: {} ({} items, {} bytes)",
-            GetBrowserTypeName(browser), result.itemsCleaned, result.bytesCleaned);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Browser clean complete: %hs (%u items, %llu bytes)",
+            GetBrowserTypeName(browser).data(), result.itemsCleaned,
+            static_cast<unsigned long long>(result.bytesCleaned));
 
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] CleanBrowser failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CleanBrowser failed: %hs", e.what());
         result.result = CleanResult::Error;
         result.errors.push_back(e.what());
         return result;
@@ -734,15 +774,15 @@ CleanResultDetails PrivacyCleanerImpl::CleanSystem(SystemDataType dataTypes) {
         auto endTime = Clock::now();
         result.duration = std::chrono::duration_cast<std::chrono::milliseconds>(endTime - startTime);
 
-        m_stats.systemCleans++;
+        m_stats.systemCleans.fetch_add(1, std::memory_order_relaxed);
 
-        Logger::Info("[PrivacyCleaner] System clean complete: {} items ({} bytes)",
-            result.itemsCleaned, result.bytesCleaned);
+        SS_LOG_INFO(L"PrivacyCleaner", L"System clean complete: %u items (%llu bytes)",
+            result.itemsCleaned, static_cast<unsigned long long>(result.bytesCleaned));
 
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] CleanSystem failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CleanSystem failed: %hs", e.what());
         result.result = CleanResult::Error;
         result.errors.push_back(e.what());
         return result;
@@ -751,6 +791,11 @@ CleanResultDetails PrivacyCleanerImpl::CleanSystem(SystemDataType dataTypes) {
 
 CleanResultDetails PrivacyCleanerImpl::CleanTargets(const std::vector<CleanTarget>& targets) {
     CleanResultDetails result;
+
+    if (targets.empty()) {
+        result.result = CleanResult::Success;
+        return result;
+    }
 
     for (size_t i = 0; i < targets.size(); ++i) {
         const auto& target = targets[i];
@@ -762,7 +807,7 @@ CleanResultDetails PrivacyCleanerImpl::CleanTargets(const std::vector<CleanTarge
                 result.itemsCleaned++;
                 result.bytesCleaned += target.sizeBytes;
                 result.cleanedFiles.push_back(target.path);
-                m_stats.totalFilesDeleted++;
+                m_stats.totalFilesDeleted.fetch_add(1, std::memory_order_relaxed);
             } else {
                 result.itemsFailed++;
                 result.bytesFailed += target.sizeBytes;
@@ -772,12 +817,13 @@ CleanResultDetails PrivacyCleanerImpl::CleanTargets(const std::vector<CleanTarge
         } catch (const std::exception& e) {
             result.itemsFailed++;
             result.errors.push_back(target.path.string() + ": " + e.what());
-            Logger::Error("[PrivacyCleaner] Failed to clean {}: {}", target.path.string(), e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Failed to clean target %hs: %hs",
+                target.path.string().c_str(), e.what());
         }
     }
 
     result.result = (result.itemsFailed == 0) ? CleanResult::Success : CleanResult::PartialSuccess;
-    m_stats.totalBytesReclaimed += result.bytesCleaned;
+    m_stats.totalBytesReclaimed.fetch_add(result.bytesCleaned, std::memory_order_relaxed);
 
     return result;
 }
@@ -792,17 +838,24 @@ CleanResultDetails PrivacyCleanerImpl::CleanTempFiles(std::chrono::hours olderTh
         GetTempPathW(MAX_PATH, tempPath);
 
         fs::path tempDir = tempPath;
+        std::error_code ec;
 
-        for (const auto& entry : fs::recursive_directory_iterator(tempDir)) {
+        for (const auto& entry : fs::recursive_directory_iterator(tempDir, kDirIterOpts, ec)) {
+            if (ec) { ec.clear(); continue; }
+
             try {
-                if (entry.is_regular_file()) {
-                    auto lastWrite = fs::last_write_time(entry.path());
+                if (entry.is_regular_file(ec) && !ec) {
+                    auto lastWrite = fs::last_write_time(entry.path(), ec);
+                    if (ec) { ec.clear(); continue; }
+
                     auto sctp = std::chrono::time_point_cast<std::chrono::system_clock::duration>(
                         lastWrite - fs::file_time_type::clock::now() + std::chrono::system_clock::now()
                     );
 
                     if (sctp < cutoffTime) {
-                        auto size = entry.file_size();
+                        auto size = entry.file_size(ec);
+                        if (ec) { ec.clear(); size = 0; }
+
                         if (DeleteFileSecurely(entry.path(), m_config.defaultEraseMethod)) {
                             result.itemsCleaned++;
                             result.bytesCleaned += size;
@@ -817,11 +870,11 @@ CleanResultDetails PrivacyCleanerImpl::CleanTempFiles(std::chrono::hours olderTh
         }
 #endif
 
-        result.result = CleanResult::Success;
-        m_stats.totalBytesReclaimed += result.bytesCleaned;
+        result.result = (result.itemsFailed == 0) ? CleanResult::Success : CleanResult::PartialSuccess;
+        m_stats.totalBytesReclaimed.fetch_add(result.bytesCleaned, std::memory_order_relaxed);
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] CleanTempFiles failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CleanTempFiles failed: %hs", e.what());
         result.result = CleanResult::Error;
     }
 
@@ -833,20 +886,26 @@ CleanResultDetails PrivacyCleanerImpl::EmptyRecycleBin() {
 
     try {
 #ifdef _WIN32
-        HRESULT hr = SHEmptyRecycleBinW(nullptr, nullptr, SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
+        HRESULT hr = SHEmptyRecycleBinW(nullptr, nullptr,
+            SHERB_NOCONFIRMATION | SHERB_NOPROGRESSUI | SHERB_NOSOUND);
 
         if (SUCCEEDED(hr)) {
             result.result = CleanResult::Success;
             result.itemsCleaned = 1;
-            Logger::Info("[PrivacyCleaner] Recycle bin emptied");
+            SS_LOG_INFO(L"PrivacyCleaner", L"Recycle bin emptied");
+        } else if (hr == S_FALSE || hr == E_UNEXPECTED) {
+            // S_FALSE or E_UNEXPECTED: bin was already empty
+            result.result = CleanResult::Success;
+            SS_LOG_DEBUG(L"PrivacyCleaner", L"Recycle bin was already empty");
         } else {
             result.result = CleanResult::Error;
-            Logger::Error("[PrivacyCleaner] Failed to empty recycle bin: {}", hr);
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Failed to empty recycle bin: HRESULT 0x%08lX",
+                static_cast<unsigned long>(hr));
         }
 #endif
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] EmptyRecycleBin failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"EmptyRecycleBin failed: %hs", e.what());
         result.result = CleanResult::Error;
     }
 
@@ -856,14 +915,17 @@ CleanResultDetails PrivacyCleanerImpl::EmptyRecycleBin() {
 bool PrivacyCleanerImpl::ClearDNSCache() {
     try {
 #ifdef _WIN32
-        DWORD result = DnsFlushResolverCache();
-        if (result == ERROR_SUCCESS || result == 0) {
-            Logger::Info("[PrivacyCleaner] DNS cache cleared");
+        // DnsFlushResolverCache returns BOOL: nonzero on success, zero on failure
+        BOOL flushed = DnsFlushResolverCache();
+        if (flushed) {
+            SS_LOG_INFO(L"PrivacyCleaner", L"DNS cache cleared");
             return true;
+        } else {
+            SS_LOG_WARN(L"PrivacyCleaner", L"DNS cache flush returned failure");
         }
 #endif
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ClearDNSCache failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ClearDNSCache failed: %hs", e.what());
     }
 
     return false;
@@ -873,14 +935,19 @@ bool PrivacyCleanerImpl::ClearClipboard() {
     try {
 #ifdef _WIN32
         if (OpenClipboard(nullptr)) {
-            EmptyClipboard();
+            BOOL emptied = EmptyClipboard();
             CloseClipboard();
-            Logger::Info("[PrivacyCleaner] Clipboard cleared");
-            return true;
+            if (emptied) {
+                SS_LOG_INFO(L"PrivacyCleaner", L"Clipboard cleared");
+                return true;
+            }
+            SS_LOG_WARN(L"PrivacyCleaner", L"EmptyClipboard returned failure");
+            return false;
         }
+        SS_LOG_LAST_ERROR(L"PrivacyCleaner", L"OpenClipboard failed");
 #endif
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ClearClipboard failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ClearClipboard failed: %hs", e.what());
     }
 
     return false;
@@ -896,34 +963,45 @@ bool PrivacyCleanerImpl::SecureEraseFile(const fs::path& filePath, SecureEraseMe
     }
 
     try {
-        if (!fs::exists(filePath)) {
-            Logger::Warn("[PrivacyCleaner] File not found: {}", filePath.string());
+        std::error_code ec;
+        if (!fs::exists(filePath, ec) || ec) {
+            SS_LOG_WARN(L"PrivacyCleaner", L"SecureEraseFile: file not found or inaccessible: %hs",
+                filePath.string().c_str());
             return false;
         }
 
-        if (!fs::is_regular_file(filePath)) {
-            Logger::Error("[PrivacyCleaner] Not a regular file: {}", filePath.string());
+        if (!fs::is_regular_file(filePath, ec) || ec) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFile: not a regular file: %hs",
+                filePath.string().c_str());
             return false;
         }
 
-        auto size = fs::file_size(filePath);
+        auto size = fs::file_size(filePath, ec);
+        if (ec) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFile: cannot get file size: %hs",
+                filePath.string().c_str());
+            return false;
+        }
+
         if (size > CleanerConstants::MAX_SECURE_ERASE_SIZE) {
-            Logger::Error("[PrivacyCleaner] File too large for secure erase: {} bytes", size);
+            SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFile: file too large (%llu bytes) for secure erase",
+                static_cast<unsigned long long>(size));
             return false;
         }
 
         bool success = DeleteFileSecurely(filePath, method);
 
         if (success) {
-            m_stats.totalSecureErases++;
-            m_stats.totalBytesReclaimed += size;
-            Logger::Info("[PrivacyCleaner] Securely erased: {} ({} bytes)", filePath.string(), size);
+            m_stats.totalSecureErases.fetch_add(1, std::memory_order_relaxed);
+            m_stats.totalBytesReclaimed.fetch_add(size, std::memory_order_relaxed);
+            SS_LOG_DEBUG(L"PrivacyCleaner", L"Securely erased: %hs (%llu bytes)",
+                filePath.string().c_str(), static_cast<unsigned long long>(size));
         }
 
         return success;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] SecureEraseFile failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFile failed: %hs", e.what());
         return false;
     }
 }
@@ -932,14 +1010,18 @@ CleanResultDetails PrivacyCleanerImpl::SecureEraseDirectory(const fs::path& dirP
     CleanResultDetails result;
 
     try {
-        if (!fs::exists(dirPath) || !fs::is_directory(dirPath)) {
+        std::error_code ec;
+        if (!fs::exists(dirPath, ec) || ec || !fs::is_directory(dirPath, ec) || ec) {
             result.result = CleanResult::NotFound;
             return result;
         }
 
-        for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
-            if (entry.is_regular_file()) {
-                auto size = entry.file_size();
+        for (const auto& entry : fs::recursive_directory_iterator(dirPath, kDirIterOpts, ec)) {
+            if (ec) { ec.clear(); continue; }
+            if (entry.is_regular_file(ec) && !ec) {
+                auto size = entry.file_size(ec);
+                if (ec) { ec.clear(); size = 0; }
+
                 if (SecureEraseFile(entry.path(), method)) {
                     result.itemsCleaned++;
                     result.bytesCleaned += size;
@@ -949,13 +1031,17 @@ CleanResultDetails PrivacyCleanerImpl::SecureEraseDirectory(const fs::path& dirP
             }
         }
 
-        // Remove empty directory
-        fs::remove_all(dirPath);
+        // Remove empty directory tree after erasing contents
+        fs::remove_all(dirPath, ec);
+        if (ec) {
+            SS_LOG_WARN(L"PrivacyCleaner", L"SecureEraseDirectory: could not remove directory tree: %hs",
+                dirPath.string().c_str());
+        }
 
         result.result = (result.itemsFailed == 0) ? CleanResult::Success : CleanResult::PartialSuccess;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] SecureEraseDirectory failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseDirectory failed: %hs", e.what());
         result.result = CleanResult::Error;
         result.errors.push_back(e.what());
     }
@@ -964,10 +1050,162 @@ CleanResultDetails PrivacyCleanerImpl::SecureEraseDirectory(const fs::path& dirP
 }
 
 bool PrivacyCleanerImpl::SecureEraseFreeSpace(const std::wstring& driveLetter, SecureEraseMethod method) {
-    // Free space wiping is complex and resource-intensive
-    // This is a stub for enterprise implementation
-    Logger::Warn("[PrivacyCleaner] Free space wiping not yet implemented");
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: not initialized");
+        return false;
+    }
+
+#ifdef _WIN32
+    // Validate drive letter
+    if (driveLetter.empty()) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: empty drive letter");
+        return false;
+    }
+
+    wchar_t driveChar = std::towupper(driveLetter[0]);
+    if (driveChar < L'A' || driveChar > L'Z') {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: invalid drive letter '%lc'", driveChar);
+        return false;
+    }
+
+    std::wstring driveRoot = { driveChar, L':', L'\\' };
+
+    DWORD driveType = GetDriveTypeW(driveRoot.c_str());
+    if (driveType == DRIVE_UNKNOWN || driveType == DRIVE_NO_ROOT_DIR) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: drive %ls not found", driveRoot.c_str());
+        return false;
+    }
+
+    // Determine pass count based on erase method (cap for free-space wipe to stay practical)
+    int passCount = 1;
+    switch (method) {
+        case SecureEraseMethod::SinglePass:
+        case SecureEraseMethod::NIST_800_88:
+        case SecureEraseMethod::Random:
+            passCount = 1;
+            break;
+        case SecureEraseMethod::ThreePass:
+        case SecureEraseMethod::DoD_5220_22_M:
+            passCount = 3;
+            break;
+        case SecureEraseMethod::Gutmann:
+            // 35-pass on free space is impractical; cap at 3 passes for sanity
+            passCount = 3;
+            SS_LOG_WARN(L"PrivacyCleaner", L"Gutmann 35-pass capped to 3 for free-space wipe");
+            break;
+    }
+
+    // Create wipe file — attempt drive root, fall back to user temp on same drive
+    wchar_t tempFileName[MAX_PATH]{};
+    bool gotTempFile = (GetTempFileNameW(driveRoot.c_str(), L"SSW", 0, tempFileName) != 0);
+    if (!gotTempFile) {
+        wchar_t userTemp[MAX_PATH]{};
+        GetTempPathW(MAX_PATH, userTemp);
+        if (userTemp[0] != L'\0' && std::towupper(userTemp[0]) == driveChar) {
+            gotTempFile = (GetTempFileNameW(userTemp, L"SSW", 0, tempFileName) != 0);
+        }
+    }
+    if (!gotTempFile) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: cannot create wipe file on %ls", driveRoot.c_str());
+        return false;
+    }
+
+    // RAII guard to ensure wipe file is always deleted
+    struct WipeFileGuard {
+        const wchar_t* path;
+        ~WipeFileGuard() { if (path) DeleteFileW(path); }
+    } wipeGuard{ tempFileName };
+
+    try {
+        constexpr DWORD CHUNK_SIZE = 1024 * 1024; // 1 MB
+        std::vector<uint8_t> buffer(CHUNK_SIZE);
+
+        for (int pass = 0; pass < passCount; ++pass) {
+            // Determine fill pattern for this pass
+            bool useRandom = false;
+            uint8_t fillByte = 0x00;
+
+            switch (method) {
+                case SecureEraseMethod::SinglePass:
+                case SecureEraseMethod::NIST_800_88:
+                    fillByte = 0x00;
+                    break;
+                case SecureEraseMethod::Random:
+                case SecureEraseMethod::ThreePass:
+                    useRandom = true;
+                    break;
+                case SecureEraseMethod::DoD_5220_22_M:
+                    if (pass == 0) fillByte = 0xFF;
+                    else if (pass == 1) fillByte = 0x00;
+                    else useRandom = true;
+                    break;
+                case SecureEraseMethod::Gutmann:
+                    useRandom = true; // Simplified for free-space
+                    break;
+            }
+
+            if (!useRandom) {
+                std::memset(buffer.data(), fillByte, CHUNK_SIZE);
+            }
+
+            // Open wipe file for this pass
+            HANDLE hFile = CreateFileW(tempFileName, GENERIC_WRITE, 0, nullptr,
+                CREATE_ALWAYS, FILE_FLAG_WRITE_THROUGH | FILE_ATTRIBUTE_HIDDEN, nullptr);
+            if (hFile == INVALID_HANDLE_VALUE) {
+                SS_LOG_LAST_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: failed to open wipe file");
+                return false;
+            }
+
+            uint64_t totalWritten = 0;
+            bool diskFull = false;
+
+            while (!diskFull) {
+                // Fill with random data if needed
+                if (useRandom) {
+                    std::lock_guard rngLock(m_rngMutex);
+                    std::uniform_int_distribution<uint16_t> dist(0, 255);
+                    for (DWORD i = 0; i < CHUNK_SIZE; ++i) {
+                        buffer[i] = static_cast<uint8_t>(dist(m_rng));
+                    }
+                }
+
+                DWORD written = 0;
+                if (!WriteFile(hFile, buffer.data(), CHUNK_SIZE, &written, nullptr)) {
+                    DWORD err = GetLastError();
+                    if (err == ERROR_DISK_FULL || err == ERROR_HANDLE_DISK_FULL) {
+                        diskFull = true;
+                    } else {
+                        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace: write error %lu on pass %d",
+                            err, pass + 1);
+                        CloseHandle(hFile);
+                        return false;
+                    }
+                }
+                totalWritten += written;
+            }
+
+            CloseHandle(hFile);
+            // Delete wipe file between passes to reclaim space for next pass
+            DeleteFileW(tempFileName);
+
+            SS_LOG_INFO(L"PrivacyCleaner", L"Free-space wipe pass %d/%d complete: %llu bytes written",
+                pass + 1, passCount, static_cast<unsigned long long>(totalWritten));
+        }
+
+        wipeGuard.path = nullptr; // Already deleted in loop
+        m_stats.totalSecureErases.fetch_add(1, std::memory_order_relaxed);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Free-space wipe complete on drive %ls", driveRoot.c_str());
+        return true;
+
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"SecureEraseFreeSpace exception: %hs", e.what());
+        return false;
+    }
+#else
+    (void)driveLetter; (void)method;
+    SS_LOG_WARN(L"PrivacyCleaner", L"SecureEraseFreeSpace: not supported on this platform");
     return false;
+#endif
 }
 
 // ============================================================================
@@ -978,11 +1216,26 @@ bool PrivacyCleanerImpl::AddSchedule(const CleanSchedule& schedule) {
     std::unique_lock lock(m_mutex);
 
     try {
+        // Reject duplicate schedule IDs
+        for (const auto& existing : m_schedules) {
+            if (existing.scheduleId == schedule.scheduleId) {
+                SS_LOG_WARN(L"PrivacyCleaner", L"AddSchedule: duplicate schedule ID '%hs'",
+                    schedule.scheduleId.c_str());
+                return false;
+            }
+        }
+
+        // Validate schedule ID is non-empty
+        if (schedule.scheduleId.empty()) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"AddSchedule: empty schedule ID");
+            return false;
+        }
+
         m_schedules.push_back(schedule);
-        Logger::Info("[PrivacyCleaner] Added schedule: {}", schedule.scheduleId);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Added schedule: %hs", schedule.scheduleId.c_str());
         return true;
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] AddSchedule failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"AddSchedule failed: %hs", e.what());
         return false;
     }
 }
@@ -995,10 +1248,11 @@ bool PrivacyCleanerImpl::RemoveSchedule(const std::string& scheduleId) {
 
     if (it != m_schedules.end()) {
         m_schedules.erase(it, m_schedules.end());
-        Logger::Info("[PrivacyCleaner] Removed schedule: {}", scheduleId);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Removed schedule: %hs", scheduleId.c_str());
         return true;
     }
 
+    SS_LOG_WARN(L"PrivacyCleaner", L"RemoveSchedule: schedule '%hs' not found", scheduleId.c_str());
     return false;
 }
 
@@ -1008,11 +1262,13 @@ bool PrivacyCleanerImpl::SetScheduleEnabled(const std::string& scheduleId, bool 
     for (auto& schedule : m_schedules) {
         if (schedule.scheduleId == scheduleId) {
             schedule.enabled = enabled;
-            Logger::Info("[PrivacyCleaner] Schedule {} {}", scheduleId, enabled ? "enabled" : "disabled");
+            SS_LOG_INFO(L"PrivacyCleaner", L"Schedule '%hs' %ls",
+                scheduleId.c_str(), enabled ? L"enabled" : L"disabled");
             return true;
         }
     }
 
+    SS_LOG_WARN(L"PrivacyCleaner", L"SetScheduleEnabled: schedule '%hs' not found", scheduleId.c_str());
     return false;
 }
 
@@ -1030,7 +1286,7 @@ CleanResultDetails PrivacyCleanerImpl::RunScheduledClean(const std::string& sche
             [&scheduleId](const CleanSchedule& s) { return s.scheduleId == scheduleId; });
 
         if (it == m_schedules.end()) {
-            Logger::Error("[PrivacyCleaner] Schedule not found: {}", scheduleId);
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Schedule not found: %hs", scheduleId.c_str());
             return {};
         }
 
@@ -1038,7 +1294,7 @@ CleanResultDetails PrivacyCleanerImpl::RunScheduledClean(const std::string& sche
     }
 
     if (!schedule.enabled) {
-        Logger::Warn("[PrivacyCleaner] Schedule disabled: {}", scheduleId);
+        SS_LOG_WARN(L"PrivacyCleaner", L"Schedule disabled: %hs", scheduleId.c_str());
         return {};
     }
 
@@ -1062,9 +1318,11 @@ CleanResultDetails PrivacyCleanerImpl::RunScheduledClean(const std::string& sche
         result.itemsFailed += systemResult.itemsFailed;
     }
 
-    m_stats.scheduledCleans++;
-    Logger::Info("[PrivacyCleaner] Scheduled clean complete: {} ({} items)",
-        scheduleId, result.itemsCleaned);
+    result.result = (result.itemsFailed == 0) ? CleanResult::Success : CleanResult::PartialSuccess;
+    m_stats.scheduledCleans.fetch_add(1, std::memory_order_relaxed);
+
+    SS_LOG_INFO(L"PrivacyCleaner", L"Scheduled clean complete: %hs (%u items)",
+        scheduleId.c_str(), result.itemsCleaned);
 
     return result;
 }
@@ -1074,18 +1332,26 @@ CleanResultDetails PrivacyCleanerImpl::RunScheduledClean(const std::string& sche
 // ============================================================================
 
 bool PrivacyCleanerImpl::AddPreservedDomain(const std::string& domain) {
+    if (domain.empty()) {
+        SS_LOG_WARN(L"PrivacyCleaner", L"AddPreservedDomain: empty domain");
+        return false;
+    }
+
     std::unique_lock lock(m_mutex);
-    m_preservedDomains.insert(StringUtils::ToLower(domain));
-    Logger::Info("[PrivacyCleaner] Added preserved domain: {}", domain);
+    auto lowered = ToLowerAscii(domain);
+    auto [_, inserted] = m_preservedDomains.insert(std::move(lowered));
+    if (inserted) {
+        SS_LOG_INFO(L"PrivacyCleaner", L"Added preserved domain: %hs", domain.c_str());
+    }
     return true;
 }
 
 bool PrivacyCleanerImpl::RemovePreservedDomain(const std::string& domain) {
     std::unique_lock lock(m_mutex);
-    auto it = m_preservedDomains.find(StringUtils::ToLower(domain));
+    auto it = m_preservedDomains.find(ToLowerAscii(domain));
     if (it != m_preservedDomains.end()) {
         m_preservedDomains.erase(it);
-        Logger::Info("[PrivacyCleaner] Removed preserved domain: {}", domain);
+        SS_LOG_INFO(L"PrivacyCleaner", L"Removed preserved domain: %hs", domain.c_str());
         return true;
     }
     return false;
@@ -1139,13 +1405,32 @@ void PrivacyCleanerImpl::UnregisterCallbacks() {
 // ============================================================================
 
 CleanerStatistics PrivacyCleanerImpl::GetStatistics() const {
-    return m_stats;
+    // Manually load each atomic into a new default-constructed object.
+    // This is NOT an atomic snapshot across all fields, which is acceptable
+    // for telemetry counters — each individual read is atomic.
+    CleanerStatistics snapshot;
+    snapshot.totalCleanOperations.store(m_stats.totalCleanOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.totalBytesReclaimed.store(m_stats.totalBytesReclaimed.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.totalFilesDeleted.store(m_stats.totalFilesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.totalSecureErases.store(m_stats.totalSecureErases.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.browserCleans.store(m_stats.browserCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.systemCleans.store(m_stats.systemCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.scheduledCleans.store(m_stats.scheduledCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.failedOperations.store(m_stats.failedOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.cookiesDeleted.store(m_stats.cookiesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.cacheCleared.store(m_stats.cacheCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+    snapshot.historyCleared.store(m_stats.historyCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+    for (size_t i = 0; i < m_stats.byBrowser.size(); ++i) {
+        snapshot.byBrowser[i].store(m_stats.byBrowser[i].load(std::memory_order_acquire), std::memory_order_relaxed);
+    }
+    snapshot.startTime = m_stats.startTime;
+    return snapshot;
 }
 
 void PrivacyCleanerImpl::ResetStatistics() {
     m_stats.Reset();
     m_stats.startTime = Clock::now();
-    Logger::Info("[PrivacyCleaner] Statistics reset");
+    SS_LOG_INFO(L"PrivacyCleaner", L"Statistics reset");
 }
 
 // ============================================================================
@@ -1161,18 +1446,21 @@ CleanTarget PrivacyCleanerImpl::CreateCleanTarget(
     target.path = path;
     target.description = description;
     target.category = category;
-    target.isDirectory = fs::is_directory(path);
+
+    std::error_code ec;
+    target.isDirectory = fs::is_directory(path, ec);
 
     if (target.isDirectory) {
         target.sizeBytes = CalculateDirectorySize(path);
         target.fileCount = CountFilesInDirectory(path);
     } else {
-        target.sizeBytes = fs::file_size(path);
+        target.sizeBytes = fs::file_size(path, ec);
+        if (ec) target.sizeBytes = 0;
         target.fileCount = 1;
     }
 
     target.lastModified = std::chrono::system_clock::now();
-    target.isInUse = IsFileInUse(path);
+    target.isInUse = !target.isDirectory && IsFileInUse(path);
 
     return target;
 }
@@ -1181,13 +1469,13 @@ bool PrivacyCleanerImpl::DeleteFileSecurely(const fs::path& filePath, SecureEras
     try {
         switch (method) {
             case SecureEraseMethod::SinglePass:
-                OverwriteFile(filePath, 0x00);
+                if (!OverwriteFile(filePath, 0x00)) return false;
                 break;
 
             case SecureEraseMethod::ThreePass:
-                OverwriteFileRandom(filePath);
-                OverwriteFileRandom(filePath);
-                OverwriteFileRandom(filePath);
+                if (!OverwriteFileRandom(filePath)) return false;
+                if (!OverwriteFileRandom(filePath)) return false;
+                if (!OverwriteFileRandom(filePath)) return false;
                 break;
 
             case SecureEraseMethod::DoD_5220_22_M:
@@ -1203,16 +1491,23 @@ bool PrivacyCleanerImpl::DeleteFileSecurely(const fs::path& filePath, SecureEras
                 break;
 
             case SecureEraseMethod::Random:
-                OverwriteFileRandom(filePath);
+                if (!OverwriteFileRandom(filePath)) return false;
                 break;
         }
 
         // Delete file after overwriting
-        fs::remove(filePath);
+        std::error_code ec;
+        fs::remove(filePath, ec);
+        if (ec) {
+            SS_LOG_WARN(L"PrivacyCleaner", L"DeleteFileSecurely: overwrite succeeded but remove failed: %hs",
+                filePath.string().c_str());
+            return false;
+        }
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] DeleteFileSecurely failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"DeleteFileSecurely failed for %hs: %hs",
+            filePath.string().c_str(), e.what());
         return false;
     }
 }
@@ -1224,6 +1519,7 @@ bool PrivacyCleanerImpl::OverwriteFile(const fs::path& filePath, uint8_t pattern
 
         file.seekg(0, std::ios::end);
         auto size = file.tellg();
+        if (size <= 0) { file.close(); return true; }
         file.seekg(0, std::ios::beg);
 
         constexpr size_t BUFFER_SIZE = 64 * 1024;  // 64KB buffer
@@ -1232,7 +1528,12 @@ bool PrivacyCleanerImpl::OverwriteFile(const fs::path& filePath, uint8_t pattern
         for (std::streampos pos = 0; pos < size; pos += BUFFER_SIZE) {
             auto remaining = static_cast<size_t>(size - pos);
             auto writeSize = std::min(BUFFER_SIZE, remaining);
-            file.write(reinterpret_cast<const char*>(buffer.data()), writeSize);
+            file.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(writeSize));
+            if (!file) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"OverwriteFile: write failed at offset %lld",
+                    static_cast<long long>(pos));
+                return false;
+            }
         }
 
         file.flush();
@@ -1240,7 +1541,7 @@ bool PrivacyCleanerImpl::OverwriteFile(const fs::path& filePath, uint8_t pattern
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] OverwriteFile failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"OverwriteFile failed: %hs", e.what());
         return false;
     }
 }
@@ -1252,23 +1553,31 @@ bool PrivacyCleanerImpl::OverwriteFileRandom(const fs::path& filePath) {
 
         file.seekg(0, std::ios::end);
         auto size = file.tellg();
+        if (size <= 0) { file.close(); return true; }
         file.seekg(0, std::ios::beg);
 
         constexpr size_t BUFFER_SIZE = 64 * 1024;
         std::vector<uint8_t> buffer(BUFFER_SIZE);
 
-        std::lock_guard lock(m_rngMutex);
-        std::uniform_int_distribution<uint16_t> dist(0, 255);
-
         for (std::streampos pos = 0; pos < size; pos += BUFFER_SIZE) {
             auto remaining = static_cast<size_t>(size - pos);
             auto writeSize = std::min(BUFFER_SIZE, remaining);
 
-            for (size_t i = 0; i < writeSize; ++i) {
-                buffer[i] = static_cast<uint8_t>(dist(m_rng));
+            // Only hold the RNG mutex while filling the buffer, NOT during I/O
+            {
+                std::lock_guard lock(m_rngMutex);
+                std::uniform_int_distribution<uint16_t> dist(0, 255);
+                for (size_t i = 0; i < writeSize; ++i) {
+                    buffer[i] = static_cast<uint8_t>(dist(m_rng));
+                }
             }
 
-            file.write(reinterpret_cast<const char*>(buffer.data()), writeSize);
+            file.write(reinterpret_cast<const char*>(buffer.data()), static_cast<std::streamsize>(writeSize));
+            if (!file) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"OverwriteFileRandom: write failed at offset %lld",
+                    static_cast<long long>(pos));
+                return false;
+            }
         }
 
         file.flush();
@@ -1276,7 +1585,7 @@ bool PrivacyCleanerImpl::OverwriteFileRandom(const fs::path& filePath) {
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] OverwriteFileRandom failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"OverwriteFileRandom failed: %hs", e.what());
         return false;
     }
 }
@@ -1289,18 +1598,15 @@ void PrivacyCleanerImpl::DoD_5220_22_M_Erase(const fs::path& filePath) {
 }
 
 void PrivacyCleanerImpl::GutmannErase(const fs::path& filePath) {
-    // Gutmann 35-pass method
-    // Passes 1-4: Random
+    // Gutmann 35-pass: 4 random + 27 deterministic + 4 random
     for (int i = 0; i < 4; ++i) {
         OverwriteFileRandom(filePath);
     }
 
-    // Passes 5-31: Specific patterns
-    for (size_t i = 0; i < 27 && i < GUTMANN_PATTERNS.size(); ++i) {
-        OverwriteFile(filePath, GUTMANN_PATTERNS[i]);
+    for (const auto pattern : GUTMANN_DETERMINISTIC_PATTERNS) {
+        OverwriteFile(filePath, pattern);
     }
 
-    // Passes 32-35: Random
     for (int i = 0; i < 4; ++i) {
         OverwriteFileRandom(filePath);
     }
@@ -1311,67 +1617,155 @@ void PrivacyCleanerImpl::NIST_800_88_Erase(const fs::path& filePath) {
     OverwriteFile(filePath, 0x00);
 }
 
+bool PrivacyCleanerImpl::CleanChromiumCache(const fs::path& profilePath) {
+    bool success = true;
+    std::error_code ec;
+
+    // Chromium cache directories
+    const std::array<const char*, 3> cacheDirs = { "Cache", "Code Cache", "GPUCache" };
+    for (const auto* dirName : cacheDirs) {
+        fs::path cachePath = profilePath / dirName;
+        if (fs::exists(cachePath, ec) && !ec && fs::is_directory(cachePath, ec) && !ec) {
+            for (const auto& entry : fs::recursive_directory_iterator(cachePath, kDirIterOpts, ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (entry.is_regular_file(ec) && !ec) {
+                    if (!DeleteFileSecurely(entry.path(), m_config.defaultEraseMethod)) {
+                        success = false;
+                    }
+                }
+            }
+        }
+    }
+
+    if (success) {
+        m_stats.cacheCleared.fetch_add(1, std::memory_order_relaxed);
+    }
+    return success;
+}
+
+bool PrivacyCleanerImpl::CleanChromiumCookies(const fs::path& profilePath) {
+    std::error_code ec;
+    fs::path cookiesPath = profilePath / "Cookies";
+    if (!fs::exists(cookiesPath, ec) || ec) {
+        return true; // Nothing to clean
+    }
+
+    bool deleted = DeleteFileSecurely(cookiesPath, m_config.defaultEraseMethod);
+
+    // Also clean Cookies-journal if present
+    fs::path journalPath = profilePath / "Cookies-journal";
+    if (fs::exists(journalPath, ec) && !ec) {
+        DeleteFileSecurely(journalPath, m_config.defaultEraseMethod);
+    }
+
+    if (deleted) {
+        m_stats.cookiesDeleted.fetch_add(1, std::memory_order_relaxed);
+    }
+    return deleted;
+}
+
+bool PrivacyCleanerImpl::CleanChromiumHistory(const fs::path& profilePath) {
+    bool success = true;
+    std::error_code ec;
+
+    // Main history database
+    const std::array<const char*, 4> historyFiles = {
+        "History", "History-journal", "Visited Links", "Top Sites"
+    };
+
+    for (const auto* fileName : historyFiles) {
+        fs::path filePath = profilePath / fileName;
+        if (fs::exists(filePath, ec) && !ec) {
+            if (!DeleteFileSecurely(filePath, m_config.defaultEraseMethod)) {
+                success = false;
+            }
+        }
+    }
+
+    if (success) {
+        m_stats.historyCleared.fetch_add(1, std::memory_order_relaxed);
+    }
+    return success;
+}
+
 std::vector<CleanTarget> PrivacyCleanerImpl::ScanChromiumBrowser(BrowserType browser, BrowserDataType dataTypes) {
     std::vector<CleanTarget> targets;
 
     try {
         auto browserPaths = GetBrowserPathsInternal(browser);
+        uint32_t dtypes = static_cast<uint32_t>(dataTypes);
 
         for (const auto& basePath : browserPaths.profilePaths) {
-            if (!fs::exists(basePath)) continue;
+            std::error_code ec;
+            if (!fs::exists(basePath, ec) || ec) continue;
 
-            for (const auto& entry : fs::directory_iterator(basePath)) {
-                if (!entry.is_directory()) continue;
+            for (const auto& entry : fs::directory_iterator(basePath, kDirIterOpts, ec)) {
+                if (ec) { ec.clear(); break; }
+                if (!entry.is_directory(ec) || ec) continue;
 
                 auto dirName = entry.path().filename().string();
                 if (dirName.find("Profile") != 0 && dirName != "Default") continue;
 
                 auto profilePath = entry.path();
 
-                // Cache
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::Cache)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::Cache)) {
                     auto cachePath = profilePath / "Cache";
-                    if (fs::exists(cachePath)) {
+                    if (fs::exists(cachePath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(cachePath, "Browser Cache", "Cache"));
+                    }
+                    // Also check Cache2/Code Cache for newer Chromium
+                    auto codeCachePath = profilePath / "Code Cache";
+                    if (fs::exists(codeCachePath, ec) && !ec) {
+                        targets.push_back(CreateCleanTarget(codeCachePath, "Code Cache", "Cache"));
                     }
                 }
 
-                // Cookies
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::Cookies)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::Cookies)) {
                     auto cookiesPath = profilePath / "Cookies";
-                    if (fs::exists(cookiesPath)) {
+                    if (fs::exists(cookiesPath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(cookiesPath, "Browser Cookies", "Cookies"));
                     }
                 }
 
-                // History
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::History)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::History)) {
                     auto historyPath = profilePath / "History";
-                    if (fs::exists(historyPath)) {
+                    if (fs::exists(historyPath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(historyPath, "Browsing History", "History"));
                     }
                 }
 
-                // Local Storage
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::LocalStorage)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::LocalStorage)) {
                     auto localStoragePath = profilePath / "Local Storage";
-                    if (fs::exists(localStoragePath)) {
+                    if (fs::exists(localStoragePath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(localStoragePath, "Local Storage", "Storage"));
                     }
                 }
 
-                // Session Storage
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::SessionStorage)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::SessionStorage)) {
                     auto sessionPath = profilePath / "Session Storage";
-                    if (fs::exists(sessionPath)) {
+                    if (fs::exists(sessionPath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(sessionPath, "Session Storage", "Storage"));
+                    }
+                }
+
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::IndexedDB)) {
+                    auto indexedDBPath = profilePath / "IndexedDB";
+                    if (fs::exists(indexedDBPath, ec) && !ec) {
+                        targets.push_back(CreateCleanTarget(indexedDBPath, "IndexedDB", "Storage"));
+                    }
+                }
+
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::ServiceWorkers)) {
+                    auto swPath = profilePath / "Service Worker";
+                    if (fs::exists(swPath, ec) && !ec) {
+                        targets.push_back(CreateCleanTarget(swPath, "Service Workers", "Storage"));
                     }
                 }
             }
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanChromiumBrowser error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanChromiumBrowser error: %hs", e.what());
     }
 
     return targets;
@@ -1382,43 +1776,57 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanFirefox(BrowserDataType dataTyp
 
     try {
         auto browserPaths = GetBrowserPathsInternal(BrowserType::Firefox);
+        uint32_t dtypes = static_cast<uint32_t>(dataTypes);
 
         for (const auto& basePath : browserPaths.profilePaths) {
-            if (!fs::exists(basePath)) continue;
+            std::error_code ec;
+            if (!fs::exists(basePath, ec) || ec) continue;
 
-            for (const auto& entry : fs::directory_iterator(basePath)) {
-                if (!entry.is_directory()) continue;
+            for (const auto& entry : fs::directory_iterator(basePath, kDirIterOpts, ec)) {
+                if (ec) { ec.clear(); break; }
+                if (!entry.is_directory(ec) || ec) continue;
 
                 auto profilePath = entry.path();
 
-                // Cache
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::Cache)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::Cache)) {
                     auto cachePath = profilePath / "cache2";
-                    if (fs::exists(cachePath)) {
+                    if (fs::exists(cachePath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(cachePath, "Firefox Cache", "Cache"));
                     }
                 }
 
-                // Cookies
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::Cookies)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::Cookies)) {
                     auto cookiesPath = profilePath / "cookies.sqlite";
-                    if (fs::exists(cookiesPath)) {
+                    if (fs::exists(cookiesPath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(cookiesPath, "Firefox Cookies", "Cookies"));
                     }
                 }
 
-                // History
-                if (static_cast<uint32_t>(dataTypes) & static_cast<uint32_t>(BrowserDataType::History)) {
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::History)) {
                     auto historyPath = profilePath / "places.sqlite";
-                    if (fs::exists(historyPath)) {
+                    if (fs::exists(historyPath, ec) && !ec) {
                         targets.push_back(CreateCleanTarget(historyPath, "Firefox History", "History"));
+                    }
+                }
+
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::FormData)) {
+                    auto formPath = profilePath / "formhistory.sqlite";
+                    if (fs::exists(formPath, ec) && !ec) {
+                        targets.push_back(CreateCleanTarget(formPath, "Firefox Form Data", "FormData"));
+                    }
+                }
+
+                if (dtypes & static_cast<uint32_t>(BrowserDataType::SessionStorage)) {
+                    auto sessionPath = profilePath / "sessionstore.jsonlz4";
+                    if (fs::exists(sessionPath, ec) && !ec) {
+                        targets.push_back(CreateCleanTarget(sessionPath, "Firefox Session", "Storage"));
                     }
                 }
             }
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanFirefox error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanFirefox error: %hs", e.what());
     }
 
     return targets;
@@ -1430,15 +1838,15 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanRecentDocuments() {
 #ifdef _WIN32
     try {
         wchar_t recentPath[MAX_PATH] = {};
-        SHGetFolderPathW(nullptr, CSIDL_RECENT, nullptr, SHGFP_TYPE_CURRENT, recentPath);
-
-        fs::path recent = recentPath;
-        if (fs::exists(recent)) {
-            targets.push_back(CreateCleanTarget(recent, "Recent Documents", "System"));
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_RECENT, nullptr, SHGFP_TYPE_CURRENT, recentPath))) {
+            std::error_code ec;
+            fs::path recent = recentPath;
+            if (fs::exists(recent, ec) && !ec) {
+                targets.push_back(CreateCleanTarget(recent, "Recent Documents", "System"));
+            }
         }
-
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanRecentDocuments error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanRecentDocuments error: %hs", e.what());
     }
 #endif
 
@@ -1451,15 +1859,19 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanJumpLists() {
 #ifdef _WIN32
     try {
         wchar_t appDataPath[MAX_PATH] = {};
-        SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath);
-
-        fs::path jumpListPath = fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent" / "AutomaticDestinations";
-        if (fs::exists(jumpListPath)) {
-            targets.push_back(CreateCleanTarget(jumpListPath, "Jump Lists", "System"));
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, appDataPath))) {
+            std::error_code ec;
+            fs::path jumpListPath = fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent" / "AutomaticDestinations";
+            if (fs::exists(jumpListPath, ec) && !ec) {
+                targets.push_back(CreateCleanTarget(jumpListPath, "Jump Lists (Auto)", "System"));
+            }
+            fs::path customJumpPath = fs::path(appDataPath) / "Microsoft" / "Windows" / "Recent" / "CustomDestinations";
+            if (fs::exists(customJumpPath, ec) && !ec) {
+                targets.push_back(CreateCleanTarget(customJumpPath, "Jump Lists (Custom)", "System"));
+            }
         }
-
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanJumpLists error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanJumpLists error: %hs", e.what());
     }
 #endif
 
@@ -1472,19 +1884,20 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanThumbnailCache() {
 #ifdef _WIN32
     try {
         wchar_t localAppDataPath[MAX_PATH] = {};
-        SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppDataPath);
-
-        fs::path thumbCachePath = fs::path(localAppDataPath) / "Microsoft" / "Windows" / "Explorer";
-        if (fs::exists(thumbCachePath)) {
-            for (const auto& entry : fs::directory_iterator(thumbCachePath)) {
-                if (entry.path().extension() == ".db") {
-                    targets.push_back(CreateCleanTarget(entry.path(), "Thumbnail Cache", "System"));
+        if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, SHGFP_TYPE_CURRENT, localAppDataPath))) {
+            std::error_code ec;
+            fs::path thumbCachePath = fs::path(localAppDataPath) / "Microsoft" / "Windows" / "Explorer";
+            if (fs::exists(thumbCachePath, ec) && !ec) {
+                for (const auto& entry : fs::directory_iterator(thumbCachePath, kDirIterOpts, ec)) {
+                    if (ec) { ec.clear(); break; }
+                    if (entry.path().extension() == ".db") {
+                        targets.push_back(CreateCleanTarget(entry.path(), "Thumbnail Cache", "System"));
+                    }
                 }
             }
         }
-
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanThumbnailCache error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanThumbnailCache error: %hs", e.what());
     }
 #endif
 
@@ -1499,13 +1912,13 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanTempFiles() {
         wchar_t tempPath[MAX_PATH] = {};
         GetTempPathW(MAX_PATH, tempPath);
 
+        std::error_code ec;
         fs::path temp = tempPath;
-        if (fs::exists(temp)) {
+        if (fs::exists(temp, ec) && !ec) {
             targets.push_back(CreateCleanTarget(temp, "Temporary Files", "System"));
         }
-
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanTempFiles error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanTempFiles error: %hs", e.what());
     }
 #endif
 
@@ -1517,13 +1930,25 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanPrefetch() {
 
 #ifdef _WIN32
     try {
-        fs::path prefetchPath = "C:\\Windows\\Prefetch";
-        if (fs::exists(prefetchPath)) {
-            targets.push_back(CreateCleanTarget(prefetchPath, "Prefetch Files", "System"));
-        }
+        // Resolve Windows directory dynamically instead of hardcoding C:\Windows
+        wchar_t winDir[MAX_PATH] = {};
+        GetWindowsDirectoryW(winDir, MAX_PATH);
+        fs::path prefetchPath = fs::path(winDir) / L"Prefetch";
 
+        std::error_code ec;
+        if (fs::exists(prefetchPath, ec) && !ec) {
+            CleanTarget target;
+            target.path = prefetchPath;
+            target.description = "Prefetch Files";
+            target.category = "System";
+            target.isDirectory = true;
+            target.requiresElevation = true; // Prefetch typically requires admin
+            target.sizeBytes = CalculateDirectorySize(prefetchPath);
+            target.fileCount = CountFilesInDirectory(prefetchPath);
+            targets.push_back(std::move(target));
+        }
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] ScanPrefetch error: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"ScanPrefetch error: %hs", e.what());
     }
 #endif
 
@@ -1532,22 +1957,28 @@ std::vector<CleanTarget> PrivacyCleanerImpl::ScanPrefetch() {
 
 bool PrivacyCleanerImpl::DeleteTarget(const CleanTarget& target, SecureEraseMethod method) {
     try {
-        if (!fs::exists(target.path)) {
+        std::error_code ec;
+        if (!fs::exists(target.path, ec) || ec) {
             return false;
         }
 
         if (IsPathExcluded(target.path)) {
-            Logger::Info("[PrivacyCleaner] Skipping excluded path: {}", target.path.string());
+            SS_LOG_DEBUG(L"PrivacyCleaner", L"Skipping excluded path: %hs", target.path.string().c_str());
             return false;
         }
 
         if (target.isDirectory) {
-            for (const auto& entry : fs::recursive_directory_iterator(target.path)) {
-                if (entry.is_regular_file()) {
+            for (const auto& entry : fs::recursive_directory_iterator(target.path, kDirIterOpts, ec)) {
+                if (ec) { ec.clear(); continue; }
+                if (entry.is_regular_file(ec) && !ec) {
                     DeleteFileSecurely(entry.path(), method);
                 }
             }
-            fs::remove_all(target.path);
+            fs::remove_all(target.path, ec);
+            if (ec) {
+                SS_LOG_WARN(L"PrivacyCleaner", L"DeleteTarget: could not fully remove directory: %hs",
+                    target.path.string().c_str());
+            }
         } else {
             DeleteFileSecurely(target.path, method);
         }
@@ -1555,22 +1986,23 @@ bool PrivacyCleanerImpl::DeleteTarget(const CleanTarget& target, SecureEraseMeth
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] DeleteTarget failed: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"DeleteTarget failed for %hs: %hs",
+            target.path.string().c_str(), e.what());
         return false;
     }
 }
 
 uint64_t PrivacyCleanerImpl::CalculateDirectorySize(const fs::path& dirPath) {
     uint64_t totalSize = 0;
+    std::error_code ec;
 
-    try {
-        for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
-            if (entry.is_regular_file()) {
-                totalSize += entry.file_size();
-            }
+    for (const auto& entry : fs::recursive_directory_iterator(dirPath, kDirIterOpts, ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (entry.is_regular_file(ec) && !ec) {
+            auto sz = entry.file_size(ec);
+            if (!ec) totalSize += sz;
+            else ec.clear();
         }
-    } catch (...) {
-        // Ignore errors
     }
 
     return totalSize;
@@ -1578,15 +2010,13 @@ uint64_t PrivacyCleanerImpl::CalculateDirectorySize(const fs::path& dirPath) {
 
 uint32_t PrivacyCleanerImpl::CountFilesInDirectory(const fs::path& dirPath) {
     uint32_t count = 0;
+    std::error_code ec;
 
-    try {
-        for (const auto& entry : fs::recursive_directory_iterator(dirPath)) {
-            if (entry.is_regular_file()) {
-                count++;
-            }
+    for (const auto& entry : fs::recursive_directory_iterator(dirPath, kDirIterOpts, ec)) {
+        if (ec) { ec.clear(); continue; }
+        if (entry.is_regular_file(ec) && !ec) {
+            ++count;
         }
-    } catch (...) {
-        // Ignore errors
     }
 
     return count;
@@ -1597,7 +2027,7 @@ bool PrivacyCleanerImpl::IsFileInUse(const fs::path& filePath) {
     HANDLE hFile = CreateFileW(
         filePath.c_str(),
         GENERIC_READ,
-        0,  // No sharing
+        0,  // No sharing — probes for exclusive access
         nullptr,
         OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL,
@@ -1605,9 +2035,8 @@ bool PrivacyCleanerImpl::IsFileInUse(const fs::path& filePath) {
     );
 
     if (hFile == INVALID_HANDLE_VALUE) {
-        DWORD error = GetLastError();
-        CloseHandle(hFile);
-        return (error == ERROR_SHARING_VIOLATION);
+        // Do NOT call CloseHandle on INVALID_HANDLE_VALUE
+        return (GetLastError() == ERROR_SHARING_VIOLATION);
     }
 
     CloseHandle(hFile);
@@ -1619,10 +2048,22 @@ bool PrivacyCleanerImpl::IsFileInUse(const fs::path& filePath) {
 bool PrivacyCleanerImpl::IsPathExcluded(const fs::path& path) {
     std::shared_lock lock(m_mutex);
 
-    std::string pathStr = path.string();
+    // Normalize to canonical form for reliable comparison
+    std::error_code ec;
+    fs::path normalizedPath = fs::weakly_canonical(path, ec);
+    if (ec) normalizedPath = path; // Fallback to raw path
+
     for (const auto& excluded : m_config.excludedPaths) {
-        if (pathStr.find(excluded.string()) != std::string::npos) {
-            return true;
+        fs::path normalizedExcluded = fs::weakly_canonical(excluded, ec);
+        if (ec) { ec.clear(); normalizedExcluded = excluded; }
+
+        // Check if path starts with the excluded path (proper prefix)
+        auto [pathIt, exclIt] = std::mismatch(
+            normalizedPath.begin(), normalizedPath.end(),
+            normalizedExcluded.begin(), normalizedExcluded.end());
+
+        if (exclIt == normalizedExcluded.end()) {
+            return true; // Excluded path is a prefix of this path
         }
     }
 
@@ -1631,83 +2072,127 @@ bool PrivacyCleanerImpl::IsPathExcluded(const fs::path& path) {
 
 bool PrivacyCleanerImpl::IsDomainPreserved(const std::string& domain) {
     std::shared_lock lock(m_mutex);
-    return m_preservedDomains.find(StringUtils::ToLower(domain)) != m_preservedDomains.end();
+    return m_preservedDomains.find(ToLowerAscii(domain)) != m_preservedDomains.end();
 }
 
 void PrivacyCleanerImpl::NotifyProgress(const std::string& item, int percent) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_progressCallback) {
+    ProgressCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_progressCallback;
+    }
+    if (cb) {
         try {
-            m_progressCallback(item, percent);
+            cb(item, percent);
         } catch (const std::exception& e) {
-            Logger::Error("[PrivacyCleaner] Progress callback exception: {}", e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Progress callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Progress callback threw unknown exception");
         }
     }
 }
 
 void PrivacyCleanerImpl::NotifyCompletion(const CleanResultDetails& result) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_completionCallback) {
+    CompletionCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_completionCallback;
+    }
+    if (cb) {
         try {
-            m_completionCallback(result);
+            cb(result);
         } catch (const std::exception& e) {
-            Logger::Error("[PrivacyCleaner] Completion callback exception: {}", e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Completion callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Completion callback threw unknown exception");
         }
     }
 }
 
 void PrivacyCleanerImpl::NotifyScan(const CleanScanResult& result) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_scanCallback) {
+    ScanCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_scanCallback;
+    }
+    if (cb) {
         try {
-            m_scanCallback(result);
+            cb(result);
         } catch (const std::exception& e) {
-            Logger::Error("[PrivacyCleaner] Scan callback exception: {}", e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Scan callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Scan callback threw unknown exception");
         }
     }
 }
 
 bool PrivacyCleanerImpl::NotifyConfirm(const std::string& message) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_confirmCallback) {
+    ConfirmCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_confirmCallback;
+    }
+    if (cb) {
         try {
-            return m_confirmCallback(message);
+            return cb(message);
         } catch (const std::exception& e) {
-            Logger::Error("[PrivacyCleaner] Confirm callback exception: {}", e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Confirm callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Confirm callback threw unknown exception");
         }
     }
     return true;  // Default: proceed
 }
 
 void PrivacyCleanerImpl::NotifyError(const std::string& message, int code) {
-    std::lock_guard lock(m_callbackMutex);
-    if (m_errorCallback) {
+    ErrorCallback cb;
+    {
+        std::lock_guard lock(m_callbackMutex);
+        cb = m_errorCallback;
+    }
+    if (cb) {
         try {
-            m_errorCallback(message, code);
+            cb(message, code);
         } catch (const std::exception& e) {
-            Logger::Error("[PrivacyCleaner] Error callback exception: {}", e.what());
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Error callback exception: %hs", e.what());
+        } catch (...) {
+            SS_LOG_ERROR(L"PrivacyCleaner", L"Error callback threw unknown exception");
         }
     }
 }
 
 bool PrivacyCleanerImpl::SelfTest() {
-    Logger::Info("[PrivacyCleaner] Running self-test...");
+    SS_LOG_INFO(L"PrivacyCleaner", L"Running self-test...");
 
     try {
         // Test 1: Secure erase single pass
         {
-            fs::path testFile = fs::temp_directory_path() / "shadowstrike_test_erase.tmp";
-            std::ofstream file(testFile, std::ios::binary);
-            file << "Test data for secure erase";
-            file.close();
-
-            if (!SecureEraseFile(testFile, SecureEraseMethod::SinglePass)) {
-                Logger::Error("[PrivacyCleaner] Self-test failed: Secure erase");
+            std::error_code ec;
+            fs::path testFile = fs::temp_directory_path(ec) / "shadowstrike_test_erase.tmp";
+            if (ec) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test: cannot get temp directory");
                 return false;
             }
 
-            if (fs::exists(testFile)) {
-                Logger::Error("[PrivacyCleaner] Self-test failed: File not deleted");
+            {
+                std::ofstream file(testFile, std::ios::binary);
+                if (!file) {
+                    SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test: cannot create test file");
+                    return false;
+                }
+                file << "Test data for secure erase";
+                file.close();
+            }
+
+            if (!SecureEraseFile(testFile, SecureEraseMethod::SinglePass)) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test failed: Secure erase returned false");
+                fs::remove(testFile, ec); // Cleanup on failure
+                return false;
+            }
+
+            if (fs::exists(testFile, ec)) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test failed: File still exists after erase");
+                fs::remove(testFile, ec);
                 return false;
             }
         }
@@ -1715,32 +2200,30 @@ bool PrivacyCleanerImpl::SelfTest() {
         // Test 2: Browser profile detection
         {
             auto profiles = GetBrowserProfiles(BrowserType::Chrome);
-            Logger::Info("[PrivacyCleaner] Self-test: Found {} Chrome profiles", profiles.size());
+            SS_LOG_INFO(L"PrivacyCleaner", L"Self-test: Found %zu Chrome profiles", profiles.size());
         }
 
-        // Test 3: Preserved domain
+        // Test 3: Preserved domain management
         {
-            AddPreservedDomain("example.com");
-            if (!IsDomainPreserved("example.com")) {
-                Logger::Error("[PrivacyCleaner] Self-test failed: Domain preservation");
+            const std::string testDomain = "selftest.shadowstrike.internal";
+            AddPreservedDomain(testDomain);
+            if (!IsDomainPreserved(testDomain)) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test failed: Domain preservation add/check");
+                RemovePreservedDomain(testDomain);
                 return false;
             }
-            RemovePreservedDomain("example.com");
-        }
-
-        // Test 4: Statistics
-        {
-            auto stats = GetStatistics();
-            if (stats.totalSecureErases.load() == 0) {
-                Logger::Warn("[PrivacyCleaner] Self-test warning: No secure erases recorded");
+            RemovePreservedDomain(testDomain);
+            if (IsDomainPreserved(testDomain)) {
+                SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test failed: Domain still preserved after removal");
+                return false;
             }
         }
 
-        Logger::Info("[PrivacyCleaner] Self-test PASSED");
+        SS_LOG_INFO(L"PrivacyCleaner", L"Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[PrivacyCleaner] Self-test exception: {}", e.what());
+        SS_LOG_ERROR(L"PrivacyCleaner", L"Self-test exception: %hs", e.what());
         return false;
     }
 }
@@ -1937,6 +2420,45 @@ std::string PrivacyCleaner::GetVersionString() noexcept {
 // STRUCTURE SERIALIZATION
 // ============================================================================
 
+CleanerStatistics::CleanerStatistics(const CleanerStatistics& other) noexcept
+    : startTime(other.startTime) {
+    totalCleanOperations.store(other.totalCleanOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+    totalBytesReclaimed.store(other.totalBytesReclaimed.load(std::memory_order_acquire), std::memory_order_relaxed);
+    totalFilesDeleted.store(other.totalFilesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+    totalSecureErases.store(other.totalSecureErases.load(std::memory_order_acquire), std::memory_order_relaxed);
+    browserCleans.store(other.browserCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    systemCleans.store(other.systemCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    scheduledCleans.store(other.scheduledCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+    failedOperations.store(other.failedOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+    cookiesDeleted.store(other.cookiesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+    cacheCleared.store(other.cacheCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+    historyCleared.store(other.historyCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+    for (size_t i = 0; i < byBrowser.size(); ++i) {
+        byBrowser[i].store(other.byBrowser[i].load(std::memory_order_acquire), std::memory_order_relaxed);
+    }
+}
+
+CleanerStatistics& CleanerStatistics::operator=(const CleanerStatistics& other) noexcept {
+    if (this != &other) {
+        totalCleanOperations.store(other.totalCleanOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+        totalBytesReclaimed.store(other.totalBytesReclaimed.load(std::memory_order_acquire), std::memory_order_relaxed);
+        totalFilesDeleted.store(other.totalFilesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+        totalSecureErases.store(other.totalSecureErases.load(std::memory_order_acquire), std::memory_order_relaxed);
+        browserCleans.store(other.browserCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+        systemCleans.store(other.systemCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+        scheduledCleans.store(other.scheduledCleans.load(std::memory_order_acquire), std::memory_order_relaxed);
+        failedOperations.store(other.failedOperations.load(std::memory_order_acquire), std::memory_order_relaxed);
+        cookiesDeleted.store(other.cookiesDeleted.load(std::memory_order_acquire), std::memory_order_relaxed);
+        cacheCleared.store(other.cacheCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+        historyCleared.store(other.historyCleared.load(std::memory_order_acquire), std::memory_order_relaxed);
+        for (size_t i = 0; i < byBrowser.size(); ++i) {
+            byBrowser[i].store(other.byBrowser[i].load(std::memory_order_acquire), std::memory_order_relaxed);
+        }
+        startTime = other.startTime;
+    }
+    return *this;
+}
+
 void CleanerStatistics::Reset() noexcept {
     totalCleanOperations.store(0, std::memory_order_release);
     totalBytesReclaimed.store(0, std::memory_order_release);
@@ -2121,7 +2643,8 @@ bool IsBrowserRunning(BrowserType browser) {
     }
 
     try {
-        return ProcessUtils::IsProcessRunning(StringUtils::StringToWString(paths.processName));
+        std::wstring processNameW = StringUtils::ToWide(paths.processName);
+        return ProcessUtils::IsProcessRunning(processNameW);
     } catch (...) {
         return false;
     }
@@ -2133,11 +2656,50 @@ bool CloseBrowser(BrowserType browser) {
         return false;
     }
 
+#ifdef _WIN32
     try {
-        return ProcessUtils::KillProcess(StringUtils::StringToWString(paths.processName));
-    } catch (...) {
+        std::wstring processNameW = StringUtils::ToWide(paths.processName);
+
+        // Enumerate processes to find PIDs matching the browser process name
+        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+        if (hSnapshot == INVALID_HANDLE_VALUE) {
+            SS_LOG_LAST_ERROR(L"PrivacyCleaner", L"CloseBrowser: CreateToolhelp32Snapshot failed");
+            return false;
+        }
+
+        PROCESSENTRY32W pe32{};
+        pe32.dwSize = sizeof(pe32);
+
+        std::vector<DWORD> pids;
+        if (Process32FirstW(hSnapshot, &pe32)) {
+            do {
+                if (StringUtils::IEquals(pe32.szExeFile, processNameW)) {
+                    pids.push_back(pe32.th32ProcessID);
+                }
+            } while (Process32NextW(hSnapshot, &pe32));
+        }
+
+        CloseHandle(hSnapshot);
+
+        if (pids.empty()) {
+            return true; // Not running, nothing to close
+        }
+
+        bool anyTerminated = false;
+        for (DWORD pid : pids) {
+            if (ProcessUtils::TerminateProcess(pid, 0)) {
+                anyTerminated = true;
+            }
+        }
+
+        return anyTerminated;
+    } catch (const std::exception& e) {
+        SS_LOG_ERROR(L"PrivacyCleaner", L"CloseBrowser exception: %hs", e.what());
         return false;
     }
+#else
+    return false;
+#endif
 }
 
 }  // namespace Privacy

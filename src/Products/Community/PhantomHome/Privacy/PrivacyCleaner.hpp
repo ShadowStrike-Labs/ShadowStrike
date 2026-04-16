@@ -506,7 +506,14 @@ struct CleanerStatistics {
     std::atomic<uint64_t> historyCleared{0};
     std::array<std::atomic<uint64_t>, 8> byBrowser{};
     TimePoint startTime = Clock::now();
-    
+
+    /// @brief Default constructor
+    CleanerStatistics() noexcept = default;
+
+    /// @brief Explicit copy (std::atomic is non-copyable; loads each field individually)
+    CleanerStatistics(const CleanerStatistics& other) noexcept;
+    CleanerStatistics& operator=(const CleanerStatistics& other) noexcept;
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
