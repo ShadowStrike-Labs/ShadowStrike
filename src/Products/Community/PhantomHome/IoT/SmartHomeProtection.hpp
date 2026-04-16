@@ -274,6 +274,28 @@ enum class PrivacyConcern : uint32_t {
     HighBandwidthUsage      = 1 << 9
 };
 
+/// @brief Bitwise OR for PrivacyConcern flags
+[[nodiscard]] inline constexpr PrivacyConcern operator|(PrivacyConcern lhs, PrivacyConcern rhs) noexcept {
+    return static_cast<PrivacyConcern>(static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise AND for PrivacyConcern flags
+[[nodiscard]] inline constexpr PrivacyConcern operator&(PrivacyConcern lhs, PrivacyConcern rhs) noexcept {
+    return static_cast<PrivacyConcern>(static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise OR-assign for PrivacyConcern flags
+inline constexpr PrivacyConcern& operator|=(PrivacyConcern& lhs, PrivacyConcern rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+/// @brief Bitwise AND-assign for PrivacyConcern flags
+inline constexpr PrivacyConcern& operator&=(PrivacyConcern& lhs, PrivacyConcern rhs) noexcept {
+    lhs = lhs & rhs;
+    return lhs;
+}
+
 /**
  * @brief Protection mode
  */
@@ -492,7 +514,7 @@ struct SmartHomeStatistics {
     std::atomic<uint64_t> totalBytesMonitored{0};
     std::atomic<uint32_t> devicesMonitored{0};
     std::array<std::atomic<uint64_t>, 32> byEventType{};
-    std::array<std::atomic<uint64_t>, 8> byDeviceType{};
+    std::array<std::atomic<uint64_t>, 32> byDeviceType{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;

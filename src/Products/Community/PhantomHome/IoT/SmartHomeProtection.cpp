@@ -79,6 +79,7 @@
 #include <unordered_set>
 #include <deque>
 #include <ctime>
+#include <cctype>
 
 // ============================================================================
 // THIRD-PARTY INCLUDES
@@ -98,13 +99,11 @@ using SystemClock = std::chrono::system_clock;
 namespace {
 
 /**
- * @brief Generate unique alert ID
+ * @brief Generate unique alert ID (monotonic, collision-free)
  */
 uint64_t GenerateAlertId() {
-    static std::atomic<uint64_t> s_counter{0};
-    const auto now = SystemClock::now().time_since_epoch().count();
-    const uint64_t counter = s_counter.fetch_add(1, std::memory_order_relaxed);
-    return static_cast<uint64_t>(now) ^ (counter << 32);
+    static std::atomic<uint64_t> s_counter{1};
+    return s_counter.fetch_add(1, std::memory_order_relaxed);
 }
 
 /**
@@ -126,23 +125,40 @@ bool IsOffHours(int offHoursStart, int offHoursEnd) {
 }
 
 /**
- * @brief Check if IP is external (internet)
+ * @brief Check if IP is external (internet) — safe parsing, no exceptions
  */
 bool IsExternalIP(std::string_view ip) {
-    // Check if it's a private IP address
+    if (ip.empty() || ip.size() > 45) return true;  // Treat invalid as external (safer)
+
+    // IPv4 private ranges
     if (ip.starts_with("192.168.")) return false;
     if (ip.starts_with("10.")) return false;
     if (ip.starts_with("172.")) {
-        // Check 172.16.0.0 - 172.31.255.255
-        size_t secondDot = ip.find('.', 4);
-        if (secondDot != std::string::npos) {
-            std::string secondOctet = std::string(ip.substr(4, secondDot - 4));
-            int octet = std::stoi(secondOctet);
-            if (octet >= 16 && octet <= 31) return false;
+        // Parse second octet safely without exceptions
+        size_t firstDot = ip.find('.');
+        if (firstDot == std::string_view::npos) return true;
+        size_t secondDot = ip.find('.', firstDot + 1);
+        if (secondDot == std::string_view::npos || secondDot <= firstDot + 1) return true;
+
+        auto octetStr = ip.substr(firstDot + 1, secondDot - firstDot - 1);
+        if (octetStr.size() > 3) return true;
+
+        int octet = 0;
+        for (char c : octetStr) {
+            if (c < '0' || c > '9') return true;  // Non-digit = treat as external
+            octet = octet * 10 + (c - '0');
+            if (octet > 255) return true;
         }
+        if (octet >= 16 && octet <= 31) return false;
     }
-    if (ip.starts_with("127.")) return false;
+    if (ip.starts_with("127.")) return false;       // Loopback
+    if (ip.starts_with("169.254.")) return false;   // Link-local
     if (ip == "0.0.0.0") return false;
+
+    // IPv6 private/special ranges
+    if (ip == "::1" || ip == "::") return false;    // Loopback/unspecified
+    if (ip.starts_with("fc") || ip.starts_with("fd")) return false;  // ULA
+    if (ip.starts_with("fe80:") || ip.starts_with("fe80%")) return false;  // Link-local
 
     return true;
 }
@@ -155,6 +171,59 @@ bool IsPrivacyPort(uint16_t port) {
         if (port == privacyPort) return true;
     }
     return false;
+}
+
+/**
+ * @brief Validate MAC address format (XX:XX:XX:XX:XX:XX or XX-XX-XX-XX-XX-XX)
+ */
+bool IsValidMacAddress(std::string_view mac) {
+    if (mac.size() != 17) return false;
+    for (size_t i = 0; i < 17; ++i) {
+        if (i % 3 == 2) {
+            if (mac[i] != ':' && mac[i] != '-') return false;
+        } else {
+            const char c = static_cast<char>(
+                std::toupper(static_cast<unsigned char>(mac[i])));
+            if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'F'))) return false;
+        }
+    }
+    return true;
+}
+
+/**
+ * @brief Normalize MAC to uppercase colon-separated format
+ * @return Normalized MAC or empty string on invalid input
+ */
+std::string NormalizeMacAddress(std::string_view mac) {
+    if (!IsValidMacAddress(mac)) return {};
+    std::string result;
+    result.reserve(17);
+    for (size_t i = 0; i < 17; ++i) {
+        if (i % 3 == 2) {
+            result += ':';
+        } else {
+            result += static_cast<char>(
+                std::toupper(static_cast<unsigned char>(mac[i])));
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Basic IP address format validation (does not check range, just format)
+ */
+bool IsValidIpFormat(std::string_view ip) {
+    if (ip.empty() || ip.size() > 45) return false;
+    // Must contain at least one digit and either dots or colons
+    bool hasDot = false, hasColon = false, hasDigit = false;
+    for (char c : ip) {
+        if (c == '.') hasDot = true;
+        else if (c == ':') hasColon = true;
+        else if (c >= '0' && c <= '9') hasDigit = true;
+        else if (!((c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F') || c == '%'))
+            return false;  // Invalid character
+    }
+    return hasDigit && (hasDot || hasColon);
 }
 
 }  // namespace
@@ -327,6 +396,19 @@ public:
     std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
     std::shared_ptr<Whitelist::WhiteListStore> m_whitelist;
 
+    /// @brief Baseline window start times per device (protected by m_baselinesMutex)
+    std::unordered_map<std::string, TimePoint> m_baselineWindowStarts;
+
+    /// @brief Alert rate limiting: key = "deviceId:eventType", value = last alert time
+    ///        Protected by m_alertsMutex
+    std::unordered_map<std::string, TimePoint> m_alertRateLimit;
+
+    /// @brief Max tracked connections before eviction
+    static constexpr size_t MAX_TRACKED_CONNECTIONS = 10000;
+
+    /// @brief Minimum interval between duplicate alerts (same device + event type)
+    static constexpr std::chrono::seconds ALERT_RATE_LIMIT_INTERVAL{60};
+
     // ========================================================================
     // METHODS
     // ========================================================================
@@ -451,6 +533,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::Shutdown() {
         {
             std::unique_lock lock(m_baselinesMutex);
             m_trafficBaselines.clear();
+            m_baselineWindowStarts.clear();
         }
 
         {
@@ -461,6 +544,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::Shutdown() {
         {
             std::unique_lock lock(m_alertsMutex);
             m_alerts.clear();
+            m_alertRateLimit.clear();
         }
 
         {
@@ -537,40 +621,58 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::MonitorDeviceInternal(const s
             return false;
         }
 
-        std::unique_lock lock(m_devicesMutex);
-
-        // Check if already monitoring
-        if (m_devices.find(macAddress) != m_devices.end()) {
-            Utils::Logger::Warn(L"SmartHomeProtection: Device already monitored: {}",
-                              Utils::StringUtils::Utf8ToWide(macAddress));
-            return true;
-        }
-
-        // Check device limit
-        if (m_devices.size() >= SmartHomeConstants::MAX_MONITORED_DEVICES) {
-            Utils::Logger::Error(L"SmartHomeProtection: Maximum monitored devices reached");
+        // Validate and normalize MAC address format
+        std::string normalizedMac = NormalizeMacAddress(macAddress);
+        if (normalizedMac.empty()) {
+            Utils::Logger::Error(L"SmartHomeProtection: Invalid MAC address format: {}",
+                               Utils::StringUtils::Utf8ToWide(macAddress));
             return false;
         }
 
-        // Create new monitored device
-        MonitoredDeviceInfo device;
-        device.deviceId = macAddress;  // Use MAC as ID for now
-        device.macAddress = macAddress;
-        device.deviceName = "Unknown Device";
-        device.type = SmartDeviceType::Unknown;
-        device.isOnline = true;
-        device.monitoringSince = SystemClock::now();
-        device.lastActivity = SystemClock::now();
+        {
+            std::unique_lock lock(m_devicesMutex);
 
-        m_devices[macAddress] = device;
+            // Check if already monitoring
+            if (m_devices.find(normalizedMac) != m_devices.end()) {
+                Utils::Logger::Warn(L"SmartHomeProtection: Device already monitored: {}",
+                                  Utils::StringUtils::Utf8ToWide(normalizedMac));
+                return true;
+            }
 
-        m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
+            // Check device limit
+            if (m_devices.size() >= SmartHomeConstants::MAX_MONITORED_DEVICES) {
+                Utils::Logger::Error(L"SmartHomeProtection: Maximum monitored devices reached ({})",
+                                   SmartHomeConstants::MAX_MONITORED_DEVICES);
+                return false;
+            }
 
-        Utils::Logger::Info(L"SmartHomeProtection: Now monitoring device: {} (total: {})",
-                          Utils::StringUtils::Utf8ToWide(macAddress),
-                          m_devices.size());
+            // Create new monitored device
+            MonitoredDeviceInfo device;
+            device.deviceId = normalizedMac;
+            device.macAddress = normalizedMac;
+            device.deviceName = "Unknown Device";
+            device.type = SmartDeviceType::Unknown;
+            device.isOnline = true;
+            device.monitoringSince = SystemClock::now();
+            device.lastActivity = SystemClock::now();
 
-        InvokeEventCallbacks(macAddress, SmartDeviceEvent::DeviceOnline);
+            // Auto-classify privacy-sensitive based on future fingerprinting
+            device.isPrivacySensitive = false;
+
+            m_devices[normalizedMac] = std::move(device);
+
+            m_statistics.devicesMonitored.store(
+                static_cast<uint32_t>(std::min(m_devices.size(),
+                    static_cast<size_t>(UINT32_MAX))),
+                std::memory_order_relaxed);
+        }
+        // Lock released BEFORE callback invocation — prevents deadlock
+        // if callback re-enters any device method
+
+        Utils::Logger::Info(L"SmartHomeProtection: Now monitoring device: {}",
+                          Utils::StringUtils::Utf8ToWide(normalizedMac));
+
+        InvokeEventCallbacks(normalizedMac, SmartDeviceEvent::DeviceOnline);
 
         return true;
 
@@ -583,23 +685,34 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::MonitorDeviceInternal(const s
 
 bool SmartHomeProtection::SmartHomeProtectionImpl::UnmonitorDeviceInternal(const std::string& macAddress) {
     try {
-        std::unique_lock lock(m_devicesMutex);
-
-        auto it = m_devices.find(macAddress);
-        if (it == m_devices.end()) {
-            Utils::Logger::Warn(L"SmartHomeProtection: Device not found: {}",
-                              Utils::StringUtils::Utf8ToWide(macAddress));
-            return false;
+        std::string lookupKey = NormalizeMacAddress(macAddress);
+        if (lookupKey.empty()) {
+            lookupKey = macAddress;  // Fallback to raw input for legacy entries
         }
 
-        m_devices.erase(it);
+        {
+            std::unique_lock lock(m_devicesMutex);
 
-        m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
+            auto it = m_devices.find(lookupKey);
+            if (it == m_devices.end()) {
+                Utils::Logger::Warn(L"SmartHomeProtection: Device not found: {}",
+                                  Utils::StringUtils::Utf8ToWide(macAddress));
+                return false;
+            }
+
+            m_devices.erase(it);
+
+            m_statistics.devicesMonitored.store(
+                static_cast<uint32_t>(std::min(m_devices.size(),
+                    static_cast<size_t>(UINT32_MAX))),
+                std::memory_order_relaxed);
+        }
+        // Lock released BEFORE callback invocation
 
         Utils::Logger::Info(L"SmartHomeProtection: Stopped monitoring device: {}",
-                          Utils::StringUtils::Utf8ToWide(macAddress));
+                          Utils::StringUtils::Utf8ToWide(lookupKey));
 
-        InvokeEventCallbacks(macAddress, SmartDeviceEvent::DeviceOffline);
+        InvokeEventCallbacks(lookupKey, SmartDeviceEvent::DeviceOffline);
 
         return true;
 
@@ -649,29 +762,36 @@ DeviceTrafficStats SmartHomeProtection::SmartHomeProtectionImpl::GetDeviceTraffi
     stats.periodEnd = SystemClock::now();
 
     try {
-        std::shared_lock devLock(m_devicesMutex);
-
-        auto it = m_devices.find(deviceId);
-        if (it != m_devices.end()) {
-            stats.bytesReceived = it->second.todayTraffic;
-            stats.bytesSent = it->second.todayTraffic / 2;  // Estimate
+        {
+            std::shared_lock devLock(m_devicesMutex);
+            auto it = m_devices.find(deviceId);
+            if (it != m_devices.end()) {
+                stats.bytesReceived = it->second.todayTraffic;
+            }
         }
 
-        devLock.unlock();
-
-        // Count connections
-        std::shared_lock connLock(m_connectionsMutex);
-        for (const auto& conn : m_activeConnections) {
-            if (conn.sourceDeviceId == deviceId) {
-                stats.totalConnections++;
-                if (conn.isExternal) {
-                    stats.externalConnections++;
-                }
-                if (conn.isActive) {
-                    stats.uniqueDestinations++;
+        // Count connections, unique destinations, and streaming sessions
+        std::unordered_set<std::string> uniqueDests;
+        {
+            std::shared_lock connLock(m_connectionsMutex);
+            for (const auto& conn : m_activeConnections) {
+                if (conn.sourceDeviceId == deviceId) {
+                    stats.totalConnections++;
+                    stats.bytesSent += conn.bytesTransferred;
+                    if (conn.isExternal) {
+                        stats.externalConnections++;
+                    }
+                    uniqueDests.insert(
+                        conn.destinationIP + ":" + std::to_string(conn.destinationPort));
+                    if (conn.destinationPort == 554 || conn.destinationPort == 1935 ||
+                        conn.destinationPort == 8554) {
+                        stats.streamingSessions++;
+                    }
                 }
             }
         }
+        stats.uniqueDestinations = static_cast<uint32_t>(
+            std::min(uniqueDests.size(), static_cast<size_t>(UINT32_MAX)));
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"SmartHomeProtection: Failed to get traffic stats - {}",
@@ -692,56 +812,80 @@ void SmartHomeProtection::SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
             return;
         }
 
-        m_statistics.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
-        m_statistics.totalBytesMonitored.fetch_add(bytes, std::memory_order_relaxed);
+        // === INPUT VALIDATION ===
+        // All inputs come from network traffic — treat as hostile
+        if (sourceMac.empty() || sourceMac.size() > 17) return;
+        if (destIP.empty() || !IsValidIpFormat(destIP)) return;
 
-        // Check if device is monitored
-        std::unique_lock devLock(m_devicesMutex);
-        auto it = m_devices.find(sourceMac);
-        if (it == m_devices.end()) {
-            // Auto-monitor if configured
-            if (m_config.autoMonitorNewDevices) {
-                devLock.unlock();
-                MonitorDeviceInternal(sourceMac);
-                devLock.lock();
-                it = m_devices.find(sourceMac);
-            } else {
-                return;
+        // Cap per-packet byte count to prevent overflow attacks
+        constexpr size_t MAX_PACKET_BYTES = 64 * 1024;  // 64KB max
+        const size_t cappedBytes = std::min(bytes, MAX_PACKET_BYTES);
+
+        m_statistics.totalEventsProcessed.fetch_add(1, std::memory_order_relaxed);
+        m_statistics.totalBytesMonitored.fetch_add(cappedBytes, std::memory_order_relaxed);
+
+        // === SNAPSHOT CONFIGURATION (under lock) ===
+        SmartHomeConfiguration configSnapshot;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            configSnapshot = m_config;
+        }
+
+        // === AUTO-MONITOR CHECK ===
+        bool needAutoMonitor = false;
+        {
+            std::shared_lock devLock(m_devicesMutex);
+            if (m_devices.find(sourceMac) == m_devices.end()) {
+                needAutoMonitor = configSnapshot.autoMonitorNewDevices;
             }
         }
 
-        if (it == m_devices.end()) {
-            return;
+        if (needAutoMonitor) {
+            MonitorDeviceInternal(sourceMac);
         }
 
-        // Update device traffic
-        it->second.todayTraffic += bytes;
-        it->second.lastActivity = SystemClock::now();
+        // === UPDATE DEVICE TRAFFIC STATE ===
+        bool isPrivacyDevice = false;
+        bool wasAlreadyStreaming = false;
+        {
+            std::unique_lock devLock(m_devicesMutex);
+            auto it = m_devices.find(sourceMac);
+            if (it == m_devices.end()) {
+                return;  // Device not monitored and auto-monitor failed/disabled
+            }
 
-        bool isExternal = IsExternalIP(destIP);
-        bool isPrivacyPort = IsPrivacyPort(destPort);
-        bool isPrivacyDevice = it->second.isPrivacySensitive;
+            // Cap todayTraffic to prevent overflow
+            constexpr uint64_t MAX_DAILY_TRAFFIC = 100ULL * 1024 * 1024 * 1024;  // 100GB
+            if (it->second.todayTraffic <= MAX_DAILY_TRAFFIC - cappedBytes) {
+                it->second.todayTraffic += cappedBytes;
+            }
+            it->second.lastActivity = SystemClock::now();
+            isPrivacyDevice = it->second.isPrivacySensitive;
+            wasAlreadyStreaming = it->second.isStreaming;
+        }
+        // Device lock released
 
-        devLock.unlock();
+        const bool isExternal = IsExternalIP(destIP);
+        const bool isPrivacyPort = IsPrivacyPort(destPort);
 
-        // Update baseline
-        UpdateBaseline(sourceMac, bytes);
+        // === BASELINE UPDATE ===
+        UpdateBaseline(sourceMac, cappedBytes);
 
-        // Detect anomalies
-        if (m_config.alertOnAnomalies) {
-            DetectAnomalies(sourceMac, bytes);
+        // === ANOMALY DETECTION ===
+        if (configSnapshot.alertOnAnomalies) {
+            DetectAnomalies(sourceMac, cappedBytes);
         }
 
-        // Check for privacy concerns
-        if (m_config.privacyFocus && isPrivacyDevice && isExternal && isPrivacyPort) {
-            if (IsOffHours(m_config.offHoursStart, m_config.offHoursEnd)) {
+        // === PRIVACY CONCERN CHECK ===
+        if (configSnapshot.privacyFocus && isPrivacyDevice && isExternal && isPrivacyPort) {
+            if (IsOffHours(configSnapshot.offHoursStart, configSnapshot.offHoursEnd)) {
                 GenerateAlert(
                     sourceMac,
                     SmartDeviceEvent::UnusualTraffic,
                     AlertSeverity::High,
                     "Off-Hours Privacy Device Activity",
-                    std::format("Privacy-sensitive device {} sending data to {} during off-hours",
-                              sourceMac, destIP),
+                    std::format("Privacy-sensitive device {} sending data to {}:{} during off-hours",
+                              sourceMac, destIP, destPort),
                     PrivacyConcern::OffHoursActivity | PrivacyConcern::CloudUpload
                 );
 
@@ -749,50 +893,75 @@ void SmartHomeProtection::SmartHomeProtectionImpl::ProcessTrafficPacketInternal(
             }
         }
 
-        // Check for streaming
-        if (destPort == 554 || destPort == 1935 || destPort == 8554) {
-            devLock.lock();
-            it = m_devices.find(sourceMac);
-            if (it != m_devices.end() && !it->second.isStreaming) {
-                it->second.isStreaming = true;
-                devLock.unlock();
+        // === STREAMING DETECTION ===
+        if (!wasAlreadyStreaming &&
+            (destPort == 554 || destPort == 1935 || destPort == 8554)) {
+            bool didTransition = false;
+            {
+                std::unique_lock devLock(m_devicesMutex);
+                auto it = m_devices.find(sourceMac);
+                if (it != m_devices.end() && !it->second.isStreaming) {
+                    it->second.isStreaming = true;
+                    didTransition = true;
+                }
+            }
+            // Device lock released before callbacks
 
+            if (didTransition) {
                 m_statistics.streamingSessionsDetected.fetch_add(1, std::memory_order_relaxed);
 
-                if (m_config.alertOnStreaming) {
+                if (configSnapshot.alertOnStreaming) {
                     GenerateAlert(
                         sourceMac,
                         SmartDeviceEvent::StreamStarted,
                         AlertSeverity::Medium,
                         "Streaming Session Started",
-                        std::format("Device {} started streaming to {}", sourceMac, destIP),
+                        std::format("Device {} started streaming to {}:{}", sourceMac, destIP, destPort),
                         PrivacyConcern::CloudUpload
                     );
                 }
 
                 InvokeEventCallbacks(sourceMac, SmartDeviceEvent::StreamStarted);
-            } else {
-                devLock.unlock();
             }
         }
 
-        // Track connection
-        if (isExternal && m_config.alertOnExternalConnections) {
+        // === CONNECTION TRACKING (with bounded growth) ===
+        if (isExternal && configSnapshot.alertOnExternalConnections) {
             DeviceConnection conn;
             conn.sourceDeviceId = sourceMac;
             conn.destinationIP = destIP;
             conn.destinationPort = destPort;
-            conn.protocol = "TCP";
+            conn.protocol = (destPort == 443 || destPort == 8443) ? "TLS" : "TCP";
             conn.isExternal = true;
-            conn.isEncrypted = (destPort == 443);
-            conn.bytesTransferred = bytes;
+            conn.isEncrypted = (destPort == 443 || destPort == 8443);
+            conn.bytesTransferred = cappedBytes;
             conn.startTime = SystemClock::now();
             conn.isActive = true;
 
             {
                 std::unique_lock connLock(m_connectionsMutex);
+
+                // Evict stale connections before adding
+                if (m_activeConnections.size() >= MAX_TRACKED_CONNECTIONS) {
+                    // First pass: remove inactive connections
+                    auto removeIt = std::remove_if(
+                        m_activeConnections.begin(),
+                        m_activeConnections.end(),
+                        [](const DeviceConnection& c) { return !c.isActive; });
+                    m_activeConnections.erase(removeIt, m_activeConnections.end());
+
+                    // Still at cap: evict oldest entries
+                    if (m_activeConnections.size() >= MAX_TRACKED_CONNECTIONS) {
+                        const size_t toRemove = m_activeConnections.size() / 4;  // Evict 25%
+                        m_activeConnections.erase(
+                            m_activeConnections.begin(),
+                            m_activeConnections.begin() + static_cast<ptrdiff_t>(toRemove));
+                    }
+                }
+
                 m_activeConnections.push_back(conn);
             }
+            // Connection lock released before callback
 
             InvokeConnectionCallbacks(conn);
         }
@@ -845,7 +1014,7 @@ void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
         alert.alertTime = SystemClock::now();
         alert.acknowledged = false;
 
-        // Get device name
+        // Get device name (separate lock scope)
         {
             std::shared_lock lock(m_devicesMutex);
             auto it = m_devices.find(deviceId);
@@ -854,20 +1023,46 @@ void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
             }
         }
 
-        // Add recommendations based on severity
+        // Add recommendations based on severity and concern type
         if (severity >= AlertSeverity::High) {
             alert.recommendations.push_back("Review device activity immediately");
             alert.recommendations.push_back("Consider isolating device from network");
+        }
+        if (severity >= AlertSeverity::Critical) {
+            alert.recommendations.push_back("Check device firmware for known vulnerabilities");
+            alert.recommendations.push_back("Inspect all external connections from this device");
         }
         if (concerns != PrivacyConcern::None) {
             alert.recommendations.push_back("Check device privacy settings");
             alert.recommendations.push_back("Review device permissions");
         }
+        if ((concerns & PrivacyConcern::UnencryptedTransmission) != PrivacyConcern::None) {
+            alert.recommendations.push_back("Enable encryption on device or block unencrypted traffic");
+        }
 
-        // Store alert
+        // Store alert with rate limiting (single lock acquisition)
         {
             std::unique_lock lock(m_alertsMutex);
-            m_alerts.push_back(alert);
+
+            // Rate limit: suppress duplicate alerts (same device + event type) within interval
+            const std::string rateKey = deviceId + ":"
+                + std::to_string(static_cast<uint8_t>(eventType));
+            const auto now = Clock::now();
+            auto rateIt = m_alertRateLimit.find(rateKey);
+            if (rateIt != m_alertRateLimit.end()) {
+                if (std::chrono::duration_cast<std::chrono::seconds>(
+                        now - rateIt->second) < ALERT_RATE_LIMIT_INTERVAL) {
+                    return;  // Rate limited — suppress duplicate
+                }
+            }
+            m_alertRateLimit[rateKey] = now;
+
+            // Cap rate limit map to prevent unbounded growth
+            if (m_alertRateLimit.size() > 10000) {
+                m_alertRateLimit.clear();  // Reset on overflow
+            }
+
+            m_alerts.push_back(std::move(alert));
             if (m_alerts.size() > MAX_ALERTS) {
                 m_alerts.pop_front();
             }
@@ -875,11 +1070,21 @@ void SmartHomeProtection::SmartHomeProtectionImpl::GenerateAlert(
 
         m_statistics.alertsGenerated.fetch_add(1, std::memory_order_relaxed);
 
-        Utils::Logger::Warn(L"SmartHomeProtection: Alert generated - {} [{}]",
-                          Utils::StringUtils::Utf8ToWide(title),
-                          Utils::StringUtils::Utf8ToWide(std::string(GetAlertSeverityName(severity))));
+        // Re-read the alert from the deque for callback (we moved it above)
+        SmartHomeAlert alertCopy;
+        {
+            std::shared_lock lock(m_alertsMutex);
+            if (!m_alerts.empty()) {
+                alertCopy = m_alerts.back();
+            }
+        }
 
-        InvokeAlertCallbacks(alert);
+        Utils::Logger::Warn(L"SmartHomeProtection: Alert generated - {} [{}]",
+                          Utils::StringUtils::Utf8ToWide(alertCopy.title),
+                          Utils::StringUtils::Utf8ToWide(
+                              std::string(GetAlertSeverityName(alertCopy.severity))));
+
+        InvokeAlertCallbacks(alertCopy);
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"SmartHomeProtection: Failed to generate alert - {}",
@@ -899,13 +1104,46 @@ void SmartHomeProtection::SmartHomeProtectionImpl::UpdateBaseline(
         std::unique_lock lock(m_baselinesMutex);
 
         auto& baseline = m_trafficBaselines[deviceId];
+        auto& windowStart = m_baselineWindowStarts[deviceId];
+
         if (baseline.empty()) {
             baseline.resize(SmartHomeConstants::BASELINE_WINDOW_HOURS, 0);
+            windowStart = Clock::now();
         }
 
-        // Rotate baseline and add new data
-        baseline.erase(baseline.begin());
-        baseline.push_back(bytes);
+        // Check if we need to rotate to a new hour window
+        const auto elapsed = std::chrono::duration_cast<std::chrono::hours>(
+            Clock::now() - windowStart);
+
+        if (elapsed.count() > 0) {
+            const size_t hoursElapsed = std::min(
+                static_cast<size_t>(elapsed.count()),
+                baseline.size());
+
+            if (hoursElapsed >= baseline.size()) {
+                // All data is stale — reset entire baseline
+                std::fill(baseline.begin(), baseline.end(), 0);
+            } else {
+                // Shift left by hoursElapsed to make room for new window(s)
+                std::rotate(baseline.begin(),
+                           baseline.begin() + static_cast<ptrdiff_t>(hoursElapsed),
+                           baseline.end());
+                // Zero out the new slots at the end
+                std::fill(baseline.end() - static_cast<ptrdiff_t>(hoursElapsed),
+                          baseline.end(), 0);
+            }
+            windowStart = Clock::now();
+        }
+
+        // Accumulate bytes into current window (last element)
+        if (!baseline.empty()) {
+            constexpr uint64_t MAX_HOURLY_BYTES = 10ULL * 1024 * 1024 * 1024;  // 10GB/hr cap
+            if (baseline.back() <= MAX_HOURLY_BYTES - bytes) {
+                baseline.back() += bytes;
+            } else {
+                baseline.back() = MAX_HOURLY_BYTES;
+            }
+        }
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"SmartHomeProtection: Baseline update failed - {}",
@@ -918,6 +1156,13 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::IsAnomaly(
     uint64_t traffic) const
 {
     try {
+        // Snapshot threshold under config lock
+        float threshold;
+        {
+            std::shared_lock cfgLock(m_mutex);
+            threshold = m_config.anomalyThreshold;
+        }
+
         std::shared_lock lock(m_baselinesMutex);
 
         auto it = m_trafficBaselines.find(deviceId);
@@ -925,7 +1170,7 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::IsAnomaly(
             return false;  // No baseline yet
         }
 
-        // Calculate average baseline
+        // Calculate average hourly baseline
         uint64_t sum = std::accumulate(it->second.begin(), it->second.end(), 0ULL);
         uint64_t avg = sum / it->second.size();
 
@@ -933,9 +1178,10 @@ bool SmartHomeProtection::SmartHomeProtectionImpl::IsAnomaly(
             return false;  // Not enough data
         }
 
-        // Check if current traffic exceeds threshold
-        uint64_t threshold = static_cast<uint64_t>(avg * m_config.anomalyThreshold);
-        return traffic > threshold;
+        // Check if current traffic exceeds threshold multiple of average
+        uint64_t anomalyLimit = static_cast<uint64_t>(
+            static_cast<double>(avg) * static_cast<double>(threshold));
+        return traffic > anomalyLimit;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"SmartHomeProtection: Anomaly check failed - {}",
@@ -952,18 +1198,28 @@ void SmartHomeProtection::SmartHomeProtectionImpl::DetectAnomalies(
         if (IsAnomaly(deviceId, currentTraffic)) {
             m_statistics.anomaliesDetected.fetch_add(1, std::memory_order_relaxed);
 
+            // Snapshot threshold for log message
+            float threshold;
+            {
+                std::shared_lock cfgLock(m_mutex);
+                threshold = m_config.anomalyThreshold;
+            }
+
             GenerateAlert(
                 deviceId,
                 SmartDeviceEvent::UnusualTraffic,
                 AlertSeverity::Medium,
                 "Traffic Anomaly Detected",
-                std::format("Device {} traffic exceeded baseline by {}x",
-                          deviceId, m_config.anomalyThreshold),
+                std::format("Device {} traffic exceeded baseline by {:.1f}x",
+                          deviceId, threshold),
                 PrivacyConcern::HighBandwidthUsage
             );
 
             Utils::Logger::Warn(L"SmartHomeProtection: Traffic anomaly detected for device: {}",
                               Utils::StringUtils::Utf8ToWide(deviceId));
+
+            // On anomaly, run deep traffic analysis
+            AnalyzeTraffic(deviceId, currentTraffic);
         }
 
     } catch (const std::exception& e) {
@@ -973,14 +1229,125 @@ void SmartHomeProtection::SmartHomeProtectionImpl::DetectAnomalies(
 }
 
 // ============================================================================
+// IMPL: DEEP TRAFFIC ANALYSIS
+// ============================================================================
+
+void SmartHomeProtection::SmartHomeProtectionImpl::AnalyzeTraffic(
+    const std::string& deviceId,
+    uint64_t bytes)
+{
+    try {
+        // === PHASE 1: Gather connection intelligence (under lock, then release) ===
+        uint64_t totalExternalBytes = 0;
+        uint32_t uniqueExternalDests = 0;
+        bool hasUnencryptedPrivacy = false;
+        std::string unencryptedDest;
+        uint16_t unencryptedPort = 0;
+
+        {
+            std::shared_lock connLock(m_connectionsMutex);
+            std::unordered_set<std::string> externalDests;
+            for (const auto& conn : m_activeConnections) {
+                if (conn.sourceDeviceId == deviceId && conn.isExternal) {
+                    totalExternalBytes += conn.bytesTransferred;
+                    externalDests.insert(conn.destinationIP);
+                }
+            }
+            uniqueExternalDests = static_cast<uint32_t>(
+                std::min(externalDests.size(), static_cast<size_t>(UINT32_MAX)));
+        }
+
+        // === PHASE 2: Check device privacy classification ===
+        bool isPrivacyDevice = false;
+        {
+            std::shared_lock devLock(m_devicesMutex);
+            auto it = m_devices.find(deviceId);
+            if (it != m_devices.end()) {
+                isPrivacyDevice = it->second.isPrivacySensitive;
+            }
+        }
+
+        // === PHASE 3: Check for unencrypted privacy-device connections ===
+        if (isPrivacyDevice) {
+            std::shared_lock connLock(m_connectionsMutex);
+            for (const auto& conn : m_activeConnections) {
+                if (conn.sourceDeviceId == deviceId &&
+                    conn.isExternal && !conn.isEncrypted) {
+                    hasUnencryptedPrivacy = true;
+                    unencryptedDest = conn.destinationIP;
+                    unencryptedPort = conn.destinationPort;
+                    break;  // One finding per analysis pass
+                }
+            }
+        }
+
+        // === PHASE 4: Generate alerts (all locks released) ===
+
+        // Data exfiltration: high volume to external destinations
+        constexpr uint64_t EXFIL_THRESHOLD_BYTES = 50ULL * 1024 * 1024;  // 50MB
+        if (totalExternalBytes > EXFIL_THRESHOLD_BYTES) {
+            GenerateAlert(
+                deviceId,
+                SmartDeviceEvent::DataExfiltration,
+                AlertSeverity::Critical,
+                "Potential Data Exfiltration Detected",
+                std::format("Device {} sent {}MB to {} external destination(s)",
+                          deviceId, totalExternalBytes / (1024 * 1024),
+                          uniqueExternalDests),
+                PrivacyConcern::DataExfiltration
+            );
+        }
+
+        // Suspicious fan-out: too many unique external destinations
+        constexpr uint32_t MAX_NORMAL_DESTINATIONS = 20;
+        if (uniqueExternalDests > MAX_NORMAL_DESTINATIONS) {
+            GenerateAlert(
+                deviceId,
+                SmartDeviceEvent::ExternalConnection,
+                AlertSeverity::High,
+                "Unusual External Connection Count",
+                std::format("Device {} connected to {} unique external destinations "
+                          "(threshold: {})", deviceId, uniqueExternalDests,
+                          MAX_NORMAL_DESTINATIONS),
+                PrivacyConcern::UnknownDestination
+            );
+        }
+
+        // Privacy device sending unencrypted data externally
+        if (hasUnencryptedPrivacy) {
+            GenerateAlert(
+                deviceId,
+                SmartDeviceEvent::ExternalConnection,
+                AlertSeverity::High,
+                "Unencrypted External Connection from Privacy Device",
+                std::format("Privacy device {} sending unencrypted data to {}:{}",
+                          deviceId, unencryptedDest, unencryptedPort),
+                PrivacyConcern::UnencryptedTransmission
+            );
+        }
+
+    } catch (const std::exception& e) {
+        Utils::Logger::Error(L"SmartHomeProtection: Traffic analysis failed - {}",
+                           Utils::StringUtils::Utf8ToWide(e.what()));
+    }
+}
+
+// ============================================================================
 // IMPL: CALLBACKS
 // ============================================================================
 
 void SmartHomeProtection::SmartHomeProtectionImpl::InvokeAlertCallbacks(const SmartHomeAlert& alert) {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_alertCallbacks) {
+    // Copy callbacks under lock, then invoke without holding it.
+    // This prevents deadlock if a callback re-enters the module
+    // (e.g., registers another callback or queries device state).
+    std::vector<AlertCallback> callbacks;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacks = m_alertCallbacks;
+    }
+    for (const auto& callback : callbacks) {
         try {
-            callback(alert);
+            if (callback) callback(alert);
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"SmartHomeProtection: Alert callback error - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
@@ -992,10 +1359,14 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeEventCallbacks(
     const std::string& deviceId,
     SmartDeviceEvent event)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_eventCallbacks) {
+    std::vector<DeviceEventCallback> callbacks;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacks = m_eventCallbacks;
+    }
+    for (const auto& callback : callbacks) {
         try {
-            callback(deviceId, event);
+            if (callback) callback(deviceId, event);
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"SmartHomeProtection: Event callback error - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
@@ -1004,10 +1375,14 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeEventCallbacks(
 }
 
 void SmartHomeProtection::SmartHomeProtectionImpl::InvokeConnectionCallbacks(const DeviceConnection& connection) {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_connectionCallbacks) {
+    std::vector<ConnectionCallback> callbacks;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacks = m_connectionCallbacks;
+    }
+    for (const auto& callback : callbacks) {
         try {
-            callback(connection);
+            if (callback) callback(connection);
         } catch (const std::exception& e) {
             Utils::Logger::Error(L"SmartHomeProtection: Connection callback error - {}",
                                Utils::StringUtils::Utf8ToWide(e.what()));
@@ -1019,12 +1394,16 @@ void SmartHomeProtection::SmartHomeProtectionImpl::InvokeErrorCallbacks(
     const std::string& message,
     int code)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_errorCallbacks) {
+    std::vector<ErrorCallback> callbacks;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacks = m_errorCallbacks;
+    }
+    for (const auto& callback : callbacks) {
         try {
-            callback(message, code);
+            if (callback) callback(message, code);
         } catch (...) {
-            // Suppress errors in error handler
+            // Suppress errors in error handler to avoid infinite recursion
         }
     }
 }
@@ -1341,7 +1720,49 @@ void SmartHomeProtection::UnregisterCallbacks() {
 // ============================================================================
 
 SmartHomeStatistics SmartHomeProtection::GetStatistics() const {
-    return m_impl ? m_impl->m_statistics : SmartHomeStatistics{};
+    // SmartHomeStatistics contains std::atomic members which are non-copyable.
+    // We construct a fresh instance and populate from the source atomics.
+    // NRVO ensures no copy/move of the return value.
+    SmartHomeStatistics stats;
+    if (m_impl) {
+        const auto& src = m_impl->m_statistics;
+        stats.totalEventsProcessed.store(
+            src.totalEventsProcessed.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.alertsGenerated.store(
+            src.alertsGenerated.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.privacyConcernsDetected.store(
+            src.privacyConcernsDetected.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.anomaliesDetected.store(
+            src.anomaliesDetected.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.streamingSessionsDetected.store(
+            src.streamingSessionsDetected.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.externalConnectionsBlocked.store(
+            src.externalConnectionsBlocked.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.totalBytesMonitored.store(
+            src.totalBytesMonitored.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        stats.devicesMonitored.store(
+            src.devicesMonitored.load(std::memory_order_relaxed),
+            std::memory_order_relaxed);
+        for (size_t i = 0; i < stats.byEventType.size(); ++i) {
+            stats.byEventType[i].store(
+                src.byEventType[i].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < stats.byDeviceType.size(); ++i) {
+            stats.byDeviceType[i].store(
+                src.byDeviceType[i].load(std::memory_order_relaxed),
+                std::memory_order_relaxed);
+        }
+        stats.startTime = src.startTime;
+    }
+    return stats;
 }
 
 void SmartHomeProtection::ResetStatistics() {
@@ -1355,78 +1776,133 @@ bool SmartHomeProtection::SelfTest() {
     try {
         Utils::Logger::Info(L"SmartHomeProtection: Starting self-test");
 
-        // Test 1: Initialization
-        SmartHomeConfiguration config;
-        config.enabled = true;
-        config.mode = ProtectionMode::Monitor;
-        config.offHoursStart = 23;
-        config.offHoursEnd = 6;
-        config.anomalyThreshold = 3.0f;
+        // ======================================================================
+        // NOTE: SelfTest MUST NOT modify singleton production state.
+        // All tests verify logic in isolation or read-only from current state.
+        // ======================================================================
 
-        if (!Initialize(config)) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Initialization");
+        // Test 1: Configuration validation logic
+        {
+            SmartHomeConfiguration validConfig;
+            validConfig.enabled = true;
+            validConfig.mode = ProtectionMode::Monitor;
+            validConfig.offHoursStart = 23;
+            validConfig.offHoursEnd = 6;
+            validConfig.anomalyThreshold = 3.0f;
+
+            if (!validConfig.IsValid()) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - valid config rejected");
+                return false;
+            }
+
+            SmartHomeConfiguration invalidConfig1;
+            invalidConfig1.offHoursStart = 25;  // Out of range
+            if (invalidConfig1.IsValid()) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - invalid offHoursStart accepted");
+                return false;
+            }
+
+            SmartHomeConfiguration invalidConfig2;
+            invalidConfig2.anomalyThreshold = -1.0f;
+            if (invalidConfig2.IsValid()) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - negative threshold accepted");
+                return false;
+            }
+        }
+
+        // Test 2: IP classification helpers
+        {
+            if (!IsExternalIP("8.8.8.8")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 8.8.8.8 not external");
+                return false;
+            }
+            if (IsExternalIP("192.168.1.1")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 192.168.1.1 is external");
+                return false;
+            }
+            if (IsExternalIP("10.0.0.1")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 10.0.0.1 is external");
+                return false;
+            }
+            if (IsExternalIP("172.16.0.1")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - 172.16.0.1 is external");
+                return false;
+            }
+            if (IsExternalIP("169.254.1.1")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - link-local is external");
+                return false;
+            }
+            if (IsExternalIP("127.0.0.1")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - loopback is external");
+                return false;
+            }
+        }
+
+        // Test 3: MAC address validation
+        {
+            if (!IsValidMacAddress("00:11:22:33:44:55")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - valid MAC rejected");
+                return false;
+            }
+            if (!IsValidMacAddress("AA-BB-CC-DD-EE-FF")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - dash-format MAC rejected");
+                return false;
+            }
+            if (IsValidMacAddress("invalid")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - garbage MAC accepted");
+                return false;
+            }
+            if (IsValidMacAddress("00:11:22:33:44:GG")) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - non-hex MAC accepted");
+                return false;
+            }
+            if (NormalizeMacAddress("aa-bb-cc-dd-ee-ff") != "AA:BB:CC:DD:EE:FF") {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - MAC normalization");
+                return false;
+            }
+        }
+
+        // Test 4: Privacy port detection
+        {
+            if (!IsPrivacyPort(554)) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - RTSP port 554 not detected");
+                return false;
+            }
+            if (IsPrivacyPort(80)) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - port 80 marked as privacy");
+                return false;
+            }
+        }
+
+        // Test 5: Utility function coverage
+        {
+            if (GetSmartDeviceTypeName(SmartDeviceType::Camera) != "Camera") {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - device type name");
+                return false;
+            }
+            if (!IsPrivacySensitiveDevice(SmartDeviceType::Camera)) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - camera not privacy-sensitive");
+                return false;
+            }
+            if (IsPrivacySensitiveDevice(SmartDeviceType::LightBulb)) {
+                Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - lightbulb marked privacy-sensitive");
+                return false;
+            }
+        }
+
+        // Test 6: Verify impl pointer integrity
+        if (!m_impl) {
+            Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - null impl pointer");
             return false;
         }
 
-        // Test 2: Configuration validation
-        if (!config.IsValid()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Configuration invalid");
+        // Test 7: Version string
+        if (GetVersionString().empty()) {
+            Utils::Logger::Error(L"SmartHomeProtection: Self-test FAILED - empty version string");
             return false;
         }
 
-        // Test 3: Device monitoring
-        if (!MonitorDevice("00:11:22:33:44:55")) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Device monitoring");
-            return false;
-        }
-
-        auto devices = GetMonitoredDevices();
-        if (devices.empty()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - No devices monitored");
-            return false;
-        }
-
-        // Test 4: Protection start/stop
-        if (!StartProtection()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Start protection");
-            return false;
-        }
-
-        if (!IsProtectionActive()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Protection not active");
-            return false;
-        }
-
-        StopProtection();
-
-        if (IsProtectionActive()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Protection still active");
-            return false;
-        }
-
-        // Test 5: Statistics
-        auto stats = GetStatistics();
-        ResetStatistics();
-        stats = GetStatistics();
-        if (stats.totalEventsProcessed.load() != 0) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Statistics reset");
-            return false;
-        }
-
-        // Test 6: Alert generation
-        ClearAlerts();
-        auto alerts = GetAlerts();
-        if (!alerts.empty()) {
-            Utils::Logger::Error(L"SmartHomeProtection: Self-test failed - Alerts not cleared");
-            return false;
-        }
-
-        // Test 7: Helper functions
-        if (!IsOffHours(23, 6)) {
-            // May or may not be off-hours depending on time
-        }
-
-        Utils::Logger::Info(L"SmartHomeProtection: Self-test PASSED");
+        Utils::Logger::Info(L"SmartHomeProtection: Self-test PASSED (all 7 checks)");
         return true;
 
     } catch (const std::exception& e) {
