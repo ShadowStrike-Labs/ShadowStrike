@@ -124,7 +124,14 @@
 #    define WIN32_LEAN_AND_MEAN
 #  endif
 #  include <Windows.h>
+#  include <shlobj.h>
 #endif
+
+// ============================================================================
+// PRIVACY COMMON DEFINITIONS (shared enums, type aliases, utilities)
+// ============================================================================
+
+#include "Common.hpp"
 
 // ============================================================================
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
@@ -167,34 +174,7 @@ namespace CookieConstants {
 
 }  // namespace CookieConstants
 
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
-namespace fs = std::filesystem;
-
-// ============================================================================
-// ENUMERATIONS
-// ============================================================================
-
-/**
- * @brief Browser type (shared with PrivacyCleaner)
- */
-enum class BrowserType : uint8_t {
-    Unknown         = 0,
-    Chrome          = 1,
-    Firefox         = 2,
-    Edge            = 3,
-    Opera           = 4,
-    Brave           = 5,
-    Vivaldi         = 6,
-    IE              = 7,
-    Chromium        = 8,
-    All             = 255
-};
+// Type aliases and BrowserType now provided by Common.hpp
 
 /**
  * @brief Cookie category
@@ -260,19 +240,7 @@ enum class SupercookieType : uint8_t {
     AudioContext    = 11    ///< Audio fingerprinting
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by Common.hpp — do NOT redefine here (ODR violation).
 
 // ============================================================================
 // STRUCTURES
@@ -487,11 +455,35 @@ struct CookieStatistics {
     std::atomic<uint64_t> essentialPreserved{0};
     std::atomic<uint64_t> domainsScanned{0};
     std::atomic<uint64_t> bytesReclaimed{0};
-    std::array<std::atomic<uint64_t>, 8> byBrowser{};
+    std::array<std::atomic<uint64_t>, BROWSER_ARRAY_SIZE> byBrowser{};
     std::array<std::atomic<uint64_t>, 16> byCategory{};
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Thread-safe point-in-time snapshot of CookieStatistics (copyable).
+ *
+ * CookieStatistics contains std::atomic members and is non-copyable.
+ * Use CookieManager::GetStatistics() to obtain a copyable snapshot.
+ */
+struct CookieStatisticsSnapshot {
+    uint64_t totalCookiesScanned = 0;
+    uint64_t totalCookiesDeleted = 0;
+    uint64_t trackersBlocked = 0;
+    uint64_t thirdPartyBlocked = 0;
+    uint64_t supercookiesFound = 0;
+    uint64_t supercookiesDeleted = 0;
+    uint64_t whitelistHits = 0;
+    uint64_t essentialPreserved = 0;
+    uint64_t domainsScanned = 0;
+    uint64_t bytesReclaimed = 0;
+    std::array<uint64_t, BROWSER_ARRAY_SIZE> byBrowser{};
+    std::array<uint64_t, 16> byCategory{};
+    TimePoint startTime{};
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -709,7 +701,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] CookieStatistics GetStatistics() const;
+    [[nodiscard]] CookieStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
