@@ -66,11 +66,13 @@
 #include <windns.h>
 #include <iphlpapi.h>
 #include <winhttp.h>
+#include <ws2tcpip.h>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <thread>
-#include <regex>
+#include <fstream>
+#include <condition_variable>
 
 #pragma comment(lib, "dnsapi.lib")
 #pragma comment(lib, "iphlpapi.lib")
@@ -147,6 +149,107 @@ namespace {
         return s_counter++;
     }
 
+    /// Maximum DoH JSON response size (64KB) to prevent OOM from malicious servers
+    constexpr size_t MAX_DOH_RESPONSE_BYTES = 65536;
+
+    /// Maximum domains in an imported blocklist
+    constexpr size_t MAX_BLOCKLIST_DOMAINS = 500000;
+
+    /// Maximum blocklist file size (50MB)
+    constexpr uintmax_t MAX_BLOCKLIST_FILE_BYTES = 50ULL * 1024 * 1024;
+
+    /// Maximum recent events kept in history buffers
+    constexpr size_t MAX_EVENT_HISTORY = 1000;
+
+    /**
+     * @brief RAII wrapper for WinHTTP handles - prevents leaks on all exit paths
+     */
+    class WinHttpHandleGuard final {
+    public:
+        explicit WinHttpHandleGuard(HINTERNET h = nullptr) noexcept : m_handle(h) {}
+        ~WinHttpHandleGuard() noexcept { if (m_handle) ::WinHttpCloseHandle(m_handle); }
+
+        WinHttpHandleGuard(const WinHttpHandleGuard&) = delete;
+        WinHttpHandleGuard& operator=(const WinHttpHandleGuard&) = delete;
+        WinHttpHandleGuard(WinHttpHandleGuard&& other) noexcept
+            : m_handle(other.m_handle) { other.m_handle = nullptr; }
+        WinHttpHandleGuard& operator=(WinHttpHandleGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_handle) ::WinHttpCloseHandle(m_handle);
+                m_handle = other.m_handle;
+                other.m_handle = nullptr;
+            }
+            return *this;
+        }
+
+        [[nodiscard]] HINTERNET get() const noexcept { return m_handle; }
+        [[nodiscard]] explicit operator bool() const noexcept { return m_handle != nullptr; }
+    private:
+        HINTERNET m_handle = nullptr;
+    };
+
+    /**
+     * @brief URL-encode a domain name for safe use in DoH query parameters.
+     *        Prevents parameter injection attacks.
+     */
+    [[nodiscard]] std::string UrlEncodeDomain(const std::string& domain) {
+        std::string encoded;
+        encoded.reserve(domain.size());
+        for (unsigned char c : domain) {
+            if (std::isalnum(c) || c == '-' || c == '.' || c == '_' || c == '~') {
+                encoded += static_cast<char>(c);
+            } else {
+                char hex[4];
+                std::snprintf(hex, sizeof(hex), "%%%02X", c);
+                encoded += hex;
+            }
+        }
+        return encoded;
+    }
+
+    /**
+     * @brief Normalize domain name to canonical form (lowercase, no trailing dot).
+     *        Required for consistent cache/blocklist lookups.
+     */
+    [[nodiscard]] std::string NormalizeDomain(const std::string& domain) {
+        std::string normalized;
+        normalized.reserve(domain.size());
+        for (char c : domain) {
+            normalized += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        if (!normalized.empty() && normalized.back() == '.') {
+            normalized.pop_back();
+        }
+        return normalized;
+    }
+
+    /**
+     * @brief Flush system DNS resolver cache via dnsapi.dll private API.
+     *        Safe replacement for system("ipconfig /flushdns").
+     */
+    void FlushSystemDnsCache() {
+        using DnsFlushProc = BOOL(WINAPI*)();
+        HMODULE hDnsApi = ::GetModuleHandleW(L"dnsapi.dll");
+        if (hDnsApi) {
+            auto pfnFlush = reinterpret_cast<DnsFlushProc>(
+                ::GetProcAddress(hDnsApi, "DnsFlushResolverCache"));
+            if (pfnFlush) {
+                pfnFlush();
+            }
+        }
+    }
+
+    /**
+     * @brief Trim an event history vector to MAX_EVENT_HISTORY
+     */
+    template <typename T>
+    void TrimEventHistory(std::vector<T>& events) {
+        if (events.size() > MAX_EVENT_HISTORY) {
+            events.erase(events.begin(),
+                events.begin() + static_cast<ptrdiff_t>(events.size() - MAX_EVENT_HISTORY));
+        }
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -197,6 +300,13 @@ public:
 
     // Saved DNS settings
     std::vector<std::string> m_savedDnsServers;
+    // Per-adapter DNS settings for restoration
+    struct SavedAdapterDns {
+        std::wstring adapterGuid;
+        std::wstring adapterName;
+        std::string dnsServers;  // comma-separated, registry NameServer format
+    };
+    std::vector<SavedAdapterDns> m_savedAdapterDns;
 
     // Callbacks
     QueryCallback m_queryCallback;
@@ -208,6 +318,8 @@ public:
     // Monitoring
     std::thread m_monitoringThread;
     std::thread m_cacheCleanupThread;
+    std::mutex m_shutdownMtx;
+    std::condition_variable m_shutdownCv;
 
     // ========================================================================
     // HELPER METHODS
@@ -237,8 +349,10 @@ public:
         if (m_leakCallback) {
             try {
                 m_leakCallback(leak);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("Leak callback exception: {}", e.what());
             } catch (...) {
-                // Silently ignore callback exceptions
+                Utils::Logger::Error("Unknown leak callback exception");
             }
         }
     }
@@ -251,8 +365,10 @@ public:
         if (m_hijackCallback) {
             try {
                 m_hijackCallback(alert);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("Hijack callback exception: {}", e.what());
             } catch (...) {
-                // Silently ignore callback exceptions
+                Utils::Logger::Error("Unknown hijack callback exception");
             }
         }
     }
@@ -291,16 +407,24 @@ public:
     }
 
     /**
-     * @brief Check if VPN is active
+     * @brief Check if VPN is active by enumerating network adapters
      */
     [[nodiscard]] bool IsVPNActive() {
         try {
             ULONG bufferSize = 15000;
             std::vector<uint8_t> buffer(bufferSize);
 
-            if (::GetAdaptersInfo(reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data()),
-                                  &bufferSize) == ERROR_SUCCESS) {
-                IP_ADAPTER_INFO* adapter = reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data());
+            DWORD result = ::GetAdaptersInfo(
+                reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data()), &bufferSize);
+
+            if (result == ERROR_BUFFER_OVERFLOW) {
+                buffer.resize(bufferSize);
+                result = ::GetAdaptersInfo(
+                    reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data()), &bufferSize);
+            }
+
+            if (result == ERROR_SUCCESS) {
+                auto* adapter = reinterpret_cast<IP_ADAPTER_INFO*>(buffer.data());
 
                 while (adapter) {
                     std::string adapterName = adapter->Description;
@@ -309,17 +433,20 @@ public:
                     }
                     adapter = adapter->Next;
                 }
+            } else {
+                Utils::Logger::Error("IsVPNActive: GetAdaptersInfo failed, error={}", result);
             }
 
-        } catch (...) {
-            // Ignore errors
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("IsVPNActive check failed: {}", e.what());
         }
 
         return false;
     }
 
     /**
-     * @brief Perform DoH query
+     * @brief Perform DoH (DNS-over-HTTPS) query with RAII handle management,
+     *        URL injection prevention, response size cap, and proper JSON parsing.
      */
     [[nodiscard]] DNSResponse PerformDoHQuery(const std::string& domain, DNSRecordType recordType) {
         DNSResponse response;
@@ -329,139 +456,198 @@ public:
         try {
             auto startTime = std::chrono::steady_clock::now();
 
-            // Build DoH URL
-            std::wstring url = Utils::StringUtils::Utf8ToWide(m_currentProvider.primaryUrl);
-            std::wstring queryDomain = Utils::StringUtils::Utf8ToWide(domain);
+            // URL-encode the domain to prevent parameter injection (e.g., &type=TXT&name=evil)
+            std::string encodedDomain = UrlEncodeDomain(domain);
 
-            // Add query parameters
-            url += L"?name=" + queryDomain;
-            url += L"&type=";
+            // Build DoH URL with encoded domain
+            std::string urlStr = m_currentProvider.primaryUrl;
+            urlStr += "?name=" + encodedDomain + "&type=";
             switch (recordType) {
-                case DNSRecordType::A: url += L"A"; break;
-                case DNSRecordType::AAAA: url += L"AAAA"; break;
-                case DNSRecordType::CNAME: url += L"CNAME"; break;
-                case DNSRecordType::MX: url += L"MX"; break;
-                default: url += L"A"; break;
+                case DNSRecordType::A:     urlStr += "A"; break;
+                case DNSRecordType::AAAA:  urlStr += "AAAA"; break;
+                case DNSRecordType::CNAME: urlStr += "CNAME"; break;
+                case DNSRecordType::MX:    urlStr += "MX"; break;
+                case DNSRecordType::TXT:   urlStr += "TXT"; break;
+                default:                   urlStr += "A"; break;
             }
 
-            // Use WinHTTP for HTTPS request
-            HINTERNET hSession = ::WinHttpOpen(
+            std::wstring url = Utils::StringUtils::ToWide(urlStr);
+
+            // RAII WinHTTP session
+            WinHttpHandleGuard hSession(::WinHttpOpen(
                 L"ShadowStrike DNS/3.0",
                 WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                 WINHTTP_NO_PROXY_NAME,
                 WINHTTP_NO_PROXY_BYPASS,
-                0);
+                0));
 
             if (!hSession) {
+                Utils::Logger::Error("DoH: WinHttpOpen failed, error={}", ::GetLastError());
                 return response;
             }
 
-            // Parse URL
+            // Configure timeouts to prevent hanging on malicious/slow servers
+            ::WinHttpSetTimeouts(hSession.get(), 5000, 10000, 5000,
+                static_cast<int>(m_config.queryTimeoutMs));
+
+            // Parse URL components
             URL_COMPONENTS urlComp{};
             urlComp.dwStructSize = sizeof(urlComp);
             wchar_t hostName[256] = {};
-            wchar_t urlPath[1024] = {};
+            wchar_t urlPath[2048] = {};
             urlComp.lpszHostName = hostName;
-            urlComp.dwHostNameLength = sizeof(hostName) / sizeof(wchar_t);
+            urlComp.dwHostNameLength = _countof(hostName);
             urlComp.lpszUrlPath = urlPath;
-            urlComp.dwUrlPathLength = sizeof(urlPath) / sizeof(wchar_t);
+            urlComp.dwUrlPathLength = _countof(urlPath);
 
             if (!::WinHttpCrackUrl(url.c_str(), 0, 0, &urlComp)) {
-                ::WinHttpCloseHandle(hSession);
+                Utils::Logger::Error("DoH: WinHttpCrackUrl failed, error={}", ::GetLastError());
                 return response;
             }
 
-            HINTERNET hConnect = ::WinHttpConnect(
-                hSession,
-                urlComp.lpszHostName,
-                urlComp.nPort,
-                0);
+            // RAII connection handle
+            WinHttpHandleGuard hConnect(::WinHttpConnect(
+                hSession.get(), urlComp.lpszHostName, urlComp.nPort, 0));
 
             if (!hConnect) {
-                ::WinHttpCloseHandle(hSession);
+                Utils::Logger::Error("DoH: WinHttpConnect failed, error={}", ::GetLastError());
                 return response;
             }
 
-            HINTERNET hRequest = ::WinHttpOpenRequest(
-                hConnect,
-                L"GET",
-                urlComp.lpszUrlPath,
-                nullptr,
-                WINHTTP_NO_REFERER,
-                WINHTTP_DEFAULT_ACCEPT_TYPES,
-                WINHTTP_FLAG_SECURE);
+            // RAII request handle
+            WinHttpHandleGuard hRequest(::WinHttpOpenRequest(
+                hConnect.get(), L"GET", urlComp.lpszUrlPath,
+                nullptr, WINHTTP_NO_REFERER,
+                WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE));
 
             if (!hRequest) {
-                ::WinHttpCloseHandle(hConnect);
-                ::WinHttpCloseHandle(hSession);
+                Utils::Logger::Error("DoH: WinHttpOpenRequest failed, error={}", ::GetLastError());
                 return response;
             }
 
-            // Add Accept header
-            ::WinHttpAddRequestHeaders(
-                hRequest,
-                L"Accept: application/dns-json",
-                -1,
+            // Request JSON response format for DoH
+            ::WinHttpAddRequestHeaders(hRequest.get(),
+                L"Accept: application/dns-json", -1L,
                 WINHTTP_ADDREQ_FLAG_ADD);
 
-            // Send request
-            if (::WinHttpSendRequest(
-                    hRequest,
-                    WINHTTP_NO_ADDITIONAL_HEADERS,
-                    0,
-                    WINHTTP_NO_REQUEST_DATA,
-                    0,
-                    0,
-                    0) &&
-                ::WinHttpReceiveResponse(hRequest, nullptr)) {
+            // Send and receive
+            if (!::WinHttpSendRequest(hRequest.get(),
+                    WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+                    WINHTTP_NO_REQUEST_DATA, 0, 0, 0)) {
+                Utils::Logger::Error("DoH: WinHttpSendRequest failed, error={}", ::GetLastError());
+                return response;
+            }
 
-                DWORD bytesAvailable = 0;
-                std::string responseData;
+            if (!::WinHttpReceiveResponse(hRequest.get(), nullptr)) {
+                Utils::Logger::Error("DoH: WinHttpReceiveResponse failed, error={}", ::GetLastError());
+                return response;
+            }
 
-                while (::WinHttpQueryDataAvailable(hRequest, &bytesAvailable) && bytesAvailable > 0) {
-                    std::vector<char> buffer(bytesAvailable + 1);
-                    DWORD bytesRead = 0;
+            // Verify HTTP 200 status
+            DWORD statusCode = 0;
+            DWORD statusCodeSize = sizeof(statusCode);
+            ::WinHttpQueryHeaders(hRequest.get(),
+                WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                WINHTTP_HEADER_NAME_BY_INDEX, &statusCode,
+                &statusCodeSize, WINHTTP_NO_HEADER_INDEX);
 
-                    if (::WinHttpReadData(hRequest, buffer.data(), bytesAvailable, &bytesRead)) {
-                        responseData.append(buffer.data(), bytesRead);
-                    }
+            if (statusCode != 200) {
+                Utils::Logger::Warn("DoH: HTTP {} for domain '{}'", statusCode, domain);
+                response.status = DNSResponseStatus::ServerFailure;
+                return response;
+            }
+
+            // Read response with size cap to prevent OOM from malicious server
+            DWORD bytesAvailable = 0;
+            std::string responseData;
+            responseData.reserve(4096);
+
+            while (::WinHttpQueryDataAvailable(hRequest.get(), &bytesAvailable) &&
+                   bytesAvailable > 0) {
+                if (responseData.size() + bytesAvailable > MAX_DOH_RESPONSE_BYTES) {
+                    Utils::Logger::Warn("DoH: Response exceeded {}B limit for '{}'",
+                        MAX_DOH_RESPONSE_BYTES, domain);
+                    break;
                 }
 
-                // Parse JSON response (simplified)
-                if (!responseData.empty()) {
-                    response.status = DNSResponseStatus::Success;
+                std::vector<char> chunk(bytesAvailable);
+                DWORD bytesRead = 0;
+                if (::WinHttpReadData(hRequest.get(), chunk.data(),
+                                      bytesAvailable, &bytesRead)) {
+                    responseData.append(chunk.data(), bytesRead);
+                }
+            }
 
-                    // Simple JSON parsing for "Answer" section
-                    size_t answerPos = responseData.find("\"Answer\"");
-                    if (answerPos != std::string::npos) {
-                        size_t dataPos = responseData.find("\"data\"", answerPos);
-                        if (dataPos != std::string::npos) {
-                            size_t colonPos = responseData.find(":", dataPos);
-                            size_t quoteStart = responseData.find("\"", colonPos);
-                            size_t quoteEnd = responseData.find("\"", quoteStart + 1);
+            // Parse JSON response using nlohmann::json via Utils
+            if (!responseData.empty()) {
+                try {
+                    using ShadowStrike::Utils::JSON::Json;
+                    auto json = Json::parse(responseData, nullptr, false);
 
-                            if (quoteStart != std::string::npos && quoteEnd != std::string::npos) {
-                                std::string ip = responseData.substr(quoteStart + 1, quoteEnd - quoteStart - 1);
-                                response.addresses.push_back(ip);
+                    if (json.is_discarded()) {
+                        Utils::Logger::Error("DoH: Invalid JSON response for '{}'", domain);
+                        return response;
+                    }
+
+                    // Map DNS RCODE to our status enum
+                    int dnsStatus = json.value("Status", -1);
+                    switch (dnsStatus) {
+                        case 0: response.status = DNSResponseStatus::Success; break;
+                        case 1: response.status = DNSResponseStatus::FormatError; return response;
+                        case 2: response.status = DNSResponseStatus::ServerFailure; return response;
+                        case 3: response.status = DNSResponseStatus::NonExistent; return response;
+                        case 5: response.status = DNSResponseStatus::Refused; return response;
+                        default:
+                            response.status = DNSResponseStatus::NetworkError;
+                            return response;
+                    }
+
+                    // Parse all Answer records
+                    if (json.contains("Answer") && json["Answer"].is_array()) {
+                        for (const auto& answer : json["Answer"]) {
+                            if (answer.contains("data") && answer["data"].is_string()) {
+                                std::string data = answer["data"].get<std::string>();
+                                if (!data.empty() && data.size() <= 256) {
+                                    // Sanitize: only printable ASCII in addresses
+                                    bool safe = true;
+                                    for (char c : data) {
+                                        if (c < 0x20 || c > 0x7E) {
+                                            safe = false;
+                                            break;
+                                        }
+                                    }
+                                    if (safe) {
+                                        response.addresses.push_back(std::move(data));
+                                    }
+                                }
+                            }
+                            if (response.ttl == 0 && answer.contains("TTL")) {
+                                response.ttl = answer.value("TTL", 0u);
                             }
                         }
                     }
+
+                    // DNSSEC Authenticated Data flag
+                    response.dnssecValidated = json.value("AD", false);
+
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("DoH: JSON parse error for '{}': {}", domain, e.what());
+                    response.status = DNSResponseStatus::NetworkError;
+                    return response;
                 }
             }
 
-            ::WinHttpCloseHandle(hRequest);
-            ::WinHttpCloseHandle(hConnect);
-            ::WinHttpCloseHandle(hSession);
-
             auto endTime = std::chrono::steady_clock::now();
-            response.responseTimeMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                endTime - startTime).count();
+            response.responseTimeMs = static_cast<uint32_t>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    endTime - startTime).count());
             response.server = m_currentProvider.name;
+            response.queryId = GenerateQueryId();
 
             m_stats.encryptedQueries++;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error("DoH query failed: {}", e.what());
+            Utils::Logger::Error("DoH query failed for '{}': {}", domain, e.what());
             response.status = DNSResponseStatus::NetworkError;
         }
 
@@ -479,7 +665,7 @@ public:
         try {
             auto startTime = std::chrono::steady_clock::now();
 
-            std::wstring wideDomain = Utils::StringUtils::Utf8ToWide(domain);
+            std::wstring wideDomain = Utils::StringUtils::ToWide(domain);
             PDNS_RECORD pDnsRecord = nullptr;
 
             WORD wType = DNS_TYPE_A;
@@ -551,7 +737,7 @@ public:
     }
 
     /**
-     * @brief Monitoring thread function
+     * @brief Monitoring thread function with interruptible sleep
      */
     void MonitoringThreadFunc() {
         Utils::Logger::Info("DNS monitoring thread started");
@@ -572,101 +758,212 @@ public:
                 Utils::Logger::Error("Unknown monitoring thread error");
             }
 
-            // Sleep for interval
-            std::this_thread::sleep_for(std::chrono::milliseconds(MONITORING_INTERVAL_MS));
+            // Interruptible sleep - wakes immediately on shutdown signal
+            {
+                std::unique_lock lock(m_shutdownMtx);
+                m_shutdownCv.wait_for(lock,
+                    std::chrono::milliseconds(MONITORING_INTERVAL_MS),
+                    [this]{ return !m_monitoringActive.load(std::memory_order_acquire); });
+            }
         }
 
         Utils::Logger::Info("DNS monitoring thread stopped");
     }
 
     /**
-     * @brief Cache cleanup thread function
+     * @brief Cache cleanup thread - uses two-phase eviction to minimize lock hold time
      */
     void CacheCleanupThreadFunc() {
+        Utils::Logger::Info("DNS cache cleanup thread started");
+
         while (m_monitoringActive.load(std::memory_order_acquire)) {
             try {
-                std::unique_lock lock(m_mutex);
-
-                auto now = std::chrono::system_clock::now();
-
-                // Remove expired entries
-                for (auto it = m_dnsCache.begin(); it != m_dnsCache.end();) {
-                    if (it->second.IsExpired()) {
-                        it = m_dnsCache.erase(it);
-                    } else {
-                        ++it;
+                // Phase 1: identify expired keys under shared lock (no blocking)
+                std::vector<std::string> expiredKeys;
+                {
+                    std::shared_lock readLock(m_mutex);
+                    for (const auto& [domain, entry] : m_dnsCache) {
+                        if (entry.IsExpired()) {
+                            expiredKeys.push_back(domain);
+                        }
                     }
                 }
 
-            } catch (...) {
-                // Ignore errors
+                // Phase 2: erase under unique lock (brief hold)
+                if (!expiredKeys.empty()) {
+                    std::unique_lock writeLock(m_mutex);
+                    for (const auto& key : expiredKeys) {
+                        m_dnsCache.erase(key);
+                    }
+                }
+
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("Cache cleanup error: {}", e.what());
             }
 
-            std::this_thread::sleep_for(std::chrono::milliseconds(CACHE_CLEANUP_INTERVAL_MS));
+            // Interruptible sleep
+            {
+                std::unique_lock lock(m_shutdownMtx);
+                m_shutdownCv.wait_for(lock,
+                    std::chrono::milliseconds(CACHE_CLEANUP_INTERVAL_MS),
+                    [this]{ return !m_monitoringActive.load(std::memory_order_acquire); });
+            }
         }
+
+        Utils::Logger::Info("DNS cache cleanup thread stopped");
     }
 
     /**
-     * @brief Check for leaks (internal)
+     * @brief Check for DNS leaks by comparing system DNS servers against VPN adapter DNS.
+     *        Uses GetAdaptersAddresses for proper IPv4/IPv6 adapter enumeration.
      */
     void CheckForLeaksInternal() {
-        auto servers = GetSystemDnsServersInternal();
+        try {
+            // Enumerate adapters to discover VPN vs non-VPN DNS servers
+            ULONG flags = GAA_FLAG_INCLUDE_PREFIX | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST;
+            ULONG bufferSize = 16384;
+            std::vector<uint8_t> buffer(bufferSize);
 
-        // Expected VPN DNS servers (simplified - would check actual VPN config)
-        std::vector<std::string> expectedVPNServers = {
-            "10.0.0.1",  // Common VPN DNS
-            "10.8.0.1",  // OpenVPN default
-            "10.2.0.1"   // Another common VPN DNS
-        };
+            DWORD result = ::GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &bufferSize);
 
-        for (const auto& server : servers) {
-            // Check if server is NOT a VPN server
-            bool isVPNServer = false;
-            for (const auto& vpnServer : expectedVPNServers) {
-                if (server == vpnServer) {
-                    isVPNServer = true;
-                    break;
+            if (result == ERROR_BUFFER_OVERFLOW) {
+                buffer.resize(bufferSize);
+                result = ::GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                    reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &bufferSize);
+            }
+
+            if (result != ERROR_SUCCESS) {
+                Utils::Logger::Error("CheckForLeaks: GetAdaptersAddresses failed, error={}", result);
+                return;
+            }
+
+            std::unordered_set<std::string> vpnDnsServers;
+            std::unordered_set<std::string> nonVpnDnsServers;
+            bool vpnAdapterFound = false;
+
+            auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+            while (adapter) {
+                // Skip down/loopback adapters
+                if (adapter->OperStatus != IfOperStatusUp ||
+                    adapter->IfType == IF_TYPE_SOFTWARE_LOOPBACK) {
+                    adapter = adapter->Next;
+                    continue;
+                }
+
+                std::string adapterDesc = Utils::StringUtils::ToNarrow(adapter->Description);
+                bool isVpn = IsVPNAdapter(adapterDesc) ||
+                             adapter->IfType == IF_TYPE_TUNNEL ||
+                             adapter->IfType == IF_TYPE_PPP;
+
+                if (isVpn) vpnAdapterFound = true;
+
+                // Collect DNS servers for this adapter
+                auto* dnsServer = adapter->FirstDnsServerAddress;
+                while (dnsServer) {
+                    char ipStr[INET6_ADDRSTRLEN] = {};
+                    if (dnsServer->Address.lpSockaddr->sa_family == AF_INET) {
+                        auto* sa = reinterpret_cast<sockaddr_in*>(dnsServer->Address.lpSockaddr);
+                        ::inet_ntop(AF_INET, &sa->sin_addr, ipStr, sizeof(ipStr));
+                    } else if (dnsServer->Address.lpSockaddr->sa_family == AF_INET6) {
+                        auto* sa6 = reinterpret_cast<sockaddr_in6*>(dnsServer->Address.lpSockaddr);
+                        ::inet_ntop(AF_INET6, &sa6->sin6_addr, ipStr, sizeof(ipStr));
+                    }
+
+                    if (ipStr[0] != '\0') {
+                        if (isVpn) {
+                            vpnDnsServers.insert(ipStr);
+                        } else {
+                            nonVpnDnsServers.insert(ipStr);
+                        }
+                    }
+                    dnsServer = dnsServer->Next;
+                }
+
+                adapter = adapter->Next;
+            }
+
+            if (!vpnAdapterFound || vpnDnsServers.empty()) {
+                return;  // No VPN active or no VPN DNS configured
+            }
+
+            // Leak detection: system-level DNS servers not routed through VPN
+            auto systemServers = GetSystemDnsServersInternal();
+
+            for (const auto& server : systemServers) {
+                if (server == "127.0.0.1" || server == "::1") continue;
+
+                if (vpnDnsServers.find(server) == vpnDnsServers.end()) {
+                    DNSLeakEvent leak;
+                    leak.eventId = GenerateQueryId();
+                    leak.leakType = DNSLeakType::VPNBypass;
+                    leak.actualServer = server;
+                    leak.vpnActive = true;
+                    leak.severity = 8;
+                    leak.timestamp = std::chrono::system_clock::now();
+                    leak.description = "DNS server " + server +
+                        " is not in VPN tunnel DNS set - potential DNS leak";
+
+                    if (!vpnDnsServers.empty()) {
+                        leak.expectedServer = *vpnDnsServers.begin();
+                    }
+
+                    {
+                        std::unique_lock lock(m_mutex);
+                        m_recentLeaks.push_back(leak);
+                        TrimEventHistory(m_recentLeaks);
+                    }
+
+                    m_vpnLeakDetected.store(true, std::memory_order_release);
+                    m_stats.leaksDetected++;
+
+                    NotifyLeak(leak);
+
+                    Utils::Logger::Warn("DNS leak detected: server {} not in VPN DNS set", server);
                 }
             }
 
-            if (!isVPNServer && server != "127.0.0.1") {
-                // Potential leak detected
-                DNSLeakEvent leak;
-                leak.eventId = GenerateQueryId();
-                leak.leakType = DNSLeakType::VPNBypass;
-                leak.actualServer = server;
-                leak.vpnActive = true;
-                leak.description = "DNS query bypassing VPN tunnel";
-                leak.severity = 8;
-                leak.timestamp = std::chrono::system_clock::now();
+            // IPv6 leak detection
+            if (m_config.blockIPv6DNS) {
+                for (const auto& server : nonVpnDnsServers) {
+                    if (server.find(':') != std::string::npos) {
+                        DNSLeakEvent leak;
+                        leak.eventId = GenerateQueryId();
+                        leak.leakType = DNSLeakType::IPv6Leak;
+                        leak.actualServer = server;
+                        leak.vpnActive = true;
+                        leak.severity = 6;
+                        leak.timestamp = std::chrono::system_clock::now();
+                        leak.description = "IPv6 DNS server " + server +
+                            " on non-VPN adapter while VPN active";
 
-                std::unique_lock lock(m_mutex);
-                m_recentLeaks.push_back(leak);
-                if (m_recentLeaks.size() > 100) {
-                    m_recentLeaks.erase(m_recentLeaks.begin());
+                        {
+                            std::unique_lock lock(m_mutex);
+                            m_recentLeaks.push_back(leak);
+                            TrimEventHistory(m_recentLeaks);
+                        }
+
+                        m_stats.leaksDetected++;
+                        NotifyLeak(leak);
+                        Utils::Logger::Warn("IPv6 DNS leak detected: {}", server);
+                    }
                 }
-
-                m_vpnLeakDetected.store(true, std::memory_order_release);
-                m_stats.leaksDetected++;
-
-                lock.unlock();
-                NotifyLeak(leak);
-
-                Utils::Logger::Warn("DNS leak detected: VPN bypass to {}", server);
-                break;
             }
+
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("CheckForLeaksInternal failed: {}", e.what());
         }
     }
 
     /**
-     * @brief Check for hijacking (internal)
+     * @brief Check for DNS hijacking - compares current system DNS against saved baseline.
+     *        Updates saved state atomically before releasing lock to prevent race window.
      */
     void CheckForHijackingInternal() {
         auto currentServers = GetSystemDnsServersInternal();
 
         std::unique_lock lock(m_mutex);
 
-        // Check if DNS servers changed unexpectedly
         if (!m_savedDnsServers.empty() && currentServers != m_savedDnsServers) {
             DNSHijackAlert alert;
             alert.alertId = GenerateQueryId();
@@ -678,30 +975,99 @@ public:
             alert.timestamp = std::chrono::system_clock::now();
 
             m_recentHijacks.push_back(alert);
-            if (m_recentHijacks.size() > 100) {
-                m_recentHijacks.erase(m_recentHijacks.begin());
-            }
+            TrimEventHistory(m_recentHijacks);
 
             m_stats.hijackAttemptsDetected++;
+
+            // Update saved servers BEFORE releasing lock to prevent race
+            m_savedDnsServers = currentServers;
 
             lock.unlock();
             NotifyHijack(alert);
 
-            Utils::Logger::Warn("DNS hijack detected: servers changed from {} to {}",
-                               m_savedDnsServers.size(), currentServers.size());
-
-            // Update saved servers
-            lock.lock();
-            m_savedDnsServers = currentServers;
+            Utils::Logger::Warn("DNS hijack detected: servers changed ({} -> {} entries)",
+                               alert.previousServers.size(), alert.newServers.size());
         }
     }
 
     /**
-     * @brief Stop monitoring thread
+     * @brief Save per-adapter DNS settings from registry for later restoration
+     */
+    void SavePerAdapterDns() {
+        try {
+            m_savedAdapterDns.clear();
+
+            ULONG flags = GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_ANYCAST;
+            ULONG bufferSize = 16384;
+            std::vector<uint8_t> buffer(bufferSize);
+
+            DWORD result = ::GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &bufferSize);
+
+            if (result == ERROR_BUFFER_OVERFLOW) {
+                buffer.resize(bufferSize);
+                result = ::GetAdaptersAddresses(AF_UNSPEC, flags, nullptr,
+                    reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data()), &bufferSize);
+            }
+
+            if (result != ERROR_SUCCESS) {
+                Utils::Logger::Error("SavePerAdapterDns: GetAdaptersAddresses failed, error={}", result);
+                return;
+            }
+
+            auto* adapter = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer.data());
+            while (adapter) {
+                if (adapter->OperStatus == IfOperStatusUp) {
+                    SavedAdapterDns saved;
+                    saved.adapterGuid = adapter->AdapterName
+                        ? Utils::StringUtils::ToWide(adapter->AdapterName)
+                        : L"";
+                    saved.adapterName = adapter->FriendlyName
+                        ? adapter->FriendlyName
+                        : L"";
+
+                    // Read current NameServer from registry for this adapter
+                    std::wstring regPath =
+                        L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\"
+                        + saved.adapterGuid;
+
+                    HKEY hKey = nullptr;
+                    if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
+                                        0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                        wchar_t nameServer[512] = {};
+                        DWORD size = sizeof(nameServer);
+                        DWORD type = 0;
+                        if (::RegQueryValueExW(hKey, L"NameServer", nullptr, &type,
+                                reinterpret_cast<BYTE*>(nameServer), &size) == ERROR_SUCCESS
+                            && type == REG_SZ) {
+                            saved.dnsServers = Utils::StringUtils::ToNarrow(nameServer);
+                        }
+                        ::RegCloseKey(hKey);
+                    }
+
+                    if (!saved.adapterGuid.empty()) {
+                        m_savedAdapterDns.push_back(std::move(saved));
+                    }
+                }
+                adapter = adapter->Next;
+            }
+
+            Utils::Logger::Info("Saved DNS settings for {} adapters", m_savedAdapterDns.size());
+
+        } catch (const std::exception& e) {
+            Utils::Logger::Error("SavePerAdapterDns failed: {}", e.what());
+        }
+    }
+
+    /**
+     * @brief Stop monitoring threads with immediate wakeup via condition variable
      */
     void StopMonitoring() {
         if (m_monitoringActive.load(std::memory_order_acquire)) {
             m_monitoringActive.store(false, std::memory_order_release);
+
+            // Wake sleeping threads immediately instead of waiting up to 5s/60s
+            m_shutdownCv.notify_all();
 
             if (m_monitoringThread.joinable()) {
                 m_monitoringThread.join();
@@ -783,6 +1149,9 @@ DNSLeakProtection::~DNSLeakProtection() {
 
         // Save current DNS servers
         m_impl->m_savedDnsServers = m_impl->GetSystemDnsServersInternal();
+
+        // Save per-adapter DNS settings for restoration capability
+        m_impl->SavePerAdapterDns();
 
         // Reset statistics
         m_impl->m_stats.Reset();
@@ -886,9 +1255,15 @@ void DNSLeakProtection::Shutdown() {
 
 [[nodiscard]] bool DNSLeakProtection::EnableSecureDns(const std::string& providerUrl) {
     try {
+        if (providerUrl.empty()) {
+            Utils::Logger::Error("EnableSecureDns: Empty provider URL");
+            return false;
+        }
+
         std::unique_lock lock(m_impl->m_mutex);
 
-        // Find provider by URL
+        // Find provider by URL in known providers
+        bool found = false;
         for (const auto& provider : DEFAULT_PROVIDERS) {
             if (providerUrl == provider.url) {
                 m_impl->m_currentProvider.providerId = provider.id;
@@ -896,8 +1271,22 @@ void DNSLeakProtection::Shutdown() {
                 m_impl->m_currentProvider.primaryUrl = provider.url;
                 m_impl->m_currentProvider.primaryIp = provider.ip;
                 m_impl->m_currentProvider.protocol = DNSProtocol::DoH;
+                found = true;
                 break;
             }
+        }
+
+        if (!found) {
+            // Accept custom provider URL - must use HTTPS
+            if (providerUrl.rfind("https://", 0) != 0) {
+                Utils::Logger::Error("EnableSecureDns: Custom provider must use HTTPS, got '{}'",
+                    providerUrl.substr(0, std::min<size_t>(providerUrl.size(), 32)));
+                return false;
+            }
+            m_impl->m_currentProvider.providerId = "custom";
+            m_impl->m_currentProvider.name = "Custom";
+            m_impl->m_currentProvider.primaryUrl = providerUrl;
+            m_impl->m_currentProvider.protocol = DNSProtocol::DoH;
         }
 
         m_impl->m_secureDnsEnabled.store(true, std::memory_order_release);
@@ -1068,15 +1457,56 @@ void DNSLeakProtection::StopMonitoring() {
     try {
         std::unique_lock lock(m_impl->m_mutex);
 
-        if (m_impl->m_savedDnsServers.empty()) {
-            Utils::Logger::Warn("No saved DNS settings to restore");
+        if (m_impl->m_savedAdapterDns.empty()) {
+            Utils::Logger::Warn("No saved per-adapter DNS settings to restore");
             return false;
         }
 
-        // This would require elevated privileges to modify network adapter settings
-        // Simplified implementation
-        Utils::Logger::Info("DNS settings restored (requires admin privileges)");
-        return true;
+        bool allRestored = true;
+
+        for (const auto& saved : m_impl->m_savedAdapterDns) {
+            // Write original DNS server configuration back to the adapter registry key
+            std::wstring regPath =
+                L"SYSTEM\\CurrentControlSet\\Services\\Tcpip\\Parameters\\Interfaces\\"
+                + saved.adapterGuid;
+
+            HKEY hKey = nullptr;
+            LSTATUS status = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
+                0, KEY_SET_VALUE, &hKey);
+
+            if (status != ERROR_SUCCESS) {
+                Utils::Logger::Error("RestoreDNS: Failed to open registry for adapter '{}', error={}",
+                    Utils::StringUtils::ToNarrow(saved.adapterName), status);
+                allRestored = false;
+                continue;
+            }
+
+            // Write the NameServer value (comma-separated IP list matching original)
+            std::wstring wServers = Utils::StringUtils::ToWide(saved.dnsServers);
+            status = ::RegSetValueExW(hKey, L"NameServer", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(wServers.c_str()),
+                static_cast<DWORD>((wServers.length() + 1) * sizeof(wchar_t)));
+
+            ::RegCloseKey(hKey);
+
+            if (status != ERROR_SUCCESS) {
+                Utils::Logger::Error("RestoreDNS: Failed to write DNS for adapter '{}', error={}",
+                    Utils::StringUtils::ToNarrow(saved.adapterName), status);
+                allRestored = false;
+            } else {
+                Utils::Logger::Info("RestoreDNS: Restored DNS for adapter '{}'",
+                    Utils::StringUtils::ToNarrow(saved.adapterName));
+            }
+        }
+
+        lock.unlock();
+
+        // Flush system DNS resolver cache to apply the restored settings
+        FlushSystemDnsCache();
+
+        Utils::Logger::Info("DNS settings restoration {}",
+            allRestored ? "completed successfully" : "completed with errors");
+        return allRestored;
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("RestoreDNSSettings failed: {}", e.what());
@@ -1103,11 +1533,55 @@ void DNSLeakProtection::StopMonitoring() {
     std::vector<DNSCacheEntry> suspicious;
 
     try {
-        std::shared_lock lock(m_impl->m_mutex);
+        // Snapshot cache entries under shared lock to minimize lock duration
+        std::vector<std::pair<std::string, DNSCacheEntry>> snapshot;
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            snapshot.reserve(m_impl->m_dnsCache.size());
+            for (const auto& [domain, entry] : m_impl->m_dnsCache) {
+                snapshot.emplace_back(domain, entry);
+            }
+        }
 
-        for (const auto& [domain, entry] : m_impl->m_dnsCache) {
-            // Simple heuristic: check if TTL is suspiciously low
-            if (entry.originalTtl < 60) {
+        for (const auto& [domain, entry] : snapshot) {
+            bool isSuspicious = false;
+
+            // Heuristic 1: Extremely low TTL often indicates poisoned entries.
+            // CDNs typically use TTL >= 30; poisoned entries often use < 10.
+            if (entry.originalTtl > 0 && entry.originalTtl < 10) {
+                isSuspicious = true;
+            }
+
+            // Heuristic 2: Cross-reference with DoH if secure DNS is available.
+            // Mismatches between local cache and DoH resolution indicate tampering.
+            if (m_impl->m_secureDnsEnabled.load(std::memory_order_acquire) &&
+                !entry.addresses.empty()) {
+                auto dohResponse = m_impl->PerformDoHQuery(domain, entry.recordType);
+                if (dohResponse.status == DNSResponseStatus::Success &&
+                    !dohResponse.addresses.empty()) {
+                    bool hasMatch = false;
+                    for (const auto& cachedAddr : entry.addresses) {
+                        for (const auto& dohAddr : dohResponse.addresses) {
+                            if (cachedAddr == dohAddr) {
+                                hasMatch = true;
+                                break;
+                            }
+                        }
+                        if (hasMatch) break;
+                    }
+
+                    if (!hasMatch) {
+                        isSuspicious = true;
+                        Utils::Logger::Warn("Cache poisoning suspected for '{}': "
+                            "cached={}, DoH={}",
+                            domain,
+                            entry.addresses.empty() ? "none" : entry.addresses[0],
+                            dohResponse.addresses.empty() ? "none" : dohResponse.addresses[0]);
+                    }
+                }
+            }
+
+            if (isSuspicious) {
                 suspicious.push_back(entry);
                 m_impl->m_stats.poisoningAttemptsDetected++;
             }
@@ -1147,13 +1621,16 @@ void DNSLeakProtection::StopMonitoring() {
 
 [[nodiscard]] bool DNSLeakProtection::ClearDNSCache() {
     try {
-        std::unique_lock lock(m_impl->m_mutex);
-        m_impl->m_dnsCache.clear();
+        {
+            std::unique_lock lock(m_impl->m_mutex);
+            m_impl->m_dnsCache.clear();
+        }
 
-        // Also flush Windows DNS cache
-        system("ipconfig /flushdns");
+        // Flush system DNS resolver cache via dnsapi.dll API
+        // (replaces vulnerable system("ipconfig /flushdns") call)
+        FlushSystemDnsCache();
 
-        Utils::Logger::Info("DNS cache cleared");
+        Utils::Logger::Info("DNS cache cleared (internal + system resolver)");
         return true;
 
     } catch (const std::exception& e) {
@@ -1171,14 +1648,24 @@ void DNSLeakProtection::StopMonitoring() {
     DNSRecordType recordType)
 {
     DNSResponse response;
+    response.domain = domain;
 
     try {
+        // Validate domain name before any processing
+        if (!IsValidDomainName(domain)) {
+            Utils::Logger::Warn("ResolveDomain: Invalid domain name rejected");
+            response.status = DNSResponseStatus::FormatError;
+            return response;
+        }
+
+        std::string normalized = NormalizeDomain(domain);
+
         m_impl->m_stats.totalQueries++;
 
-        // Check cache first
+        // Check cache first (unique_lock needed since hitCount is modified)
         if (m_impl->m_config.enableCache) {
-            std::shared_lock lock(m_impl->m_mutex);
-            auto it = m_impl->m_dnsCache.find(domain);
+            std::unique_lock lock(m_impl->m_mutex);
+            auto it = m_impl->m_dnsCache.find(normalized);
             if (it != m_impl->m_dnsCache.end() && !it->second.IsExpired()) {
                 response.domain = domain;
                 response.addresses = it->second.addresses;
@@ -1198,8 +1685,7 @@ void DNSLeakProtection::StopMonitoring() {
         // Check if domain is blocked
         {
             std::shared_lock lock(m_impl->m_mutex);
-            if (m_impl->m_blockedDomains.find(domain) != m_impl->m_blockedDomains.end()) {
-                response.domain = domain;
+            if (m_impl->m_blockedDomains.count(normalized) > 0) {
                 response.status = DNSResponseStatus::Blocked;
                 m_impl->m_stats.blockedDomains++;
                 return response;
@@ -1213,12 +1699,25 @@ void DNSLeakProtection::StopMonitoring() {
             response = m_impl->PerformStandardQuery(domain, recordType);
         }
 
-        // Cache response
+        // Cache response with size limit enforcement
         if (response.status == DNSResponseStatus::Success && m_impl->m_config.enableCache) {
             std::unique_lock lock(m_impl->m_mutex);
 
+            // Enforce cache size limit - evict oldest entry
+            if (m_impl->m_dnsCache.size() >= DNSConstants::MAX_DNS_CACHE) {
+                auto oldest = m_impl->m_dnsCache.begin();
+                for (auto it = m_impl->m_dnsCache.begin(); it != m_impl->m_dnsCache.end(); ++it) {
+                    if (it->second.creationTime < oldest->second.creationTime) {
+                        oldest = it;
+                    }
+                }
+                if (oldest != m_impl->m_dnsCache.end()) {
+                    m_impl->m_dnsCache.erase(oldest);
+                }
+            }
+
             DNSCacheEntry entry;
-            entry.domain = domain;
+            entry.domain = normalized;
             entry.recordType = recordType;
             entry.addresses = response.addresses;
             entry.originalTtl = response.ttl;
@@ -1227,18 +1726,23 @@ void DNSLeakProtection::StopMonitoring() {
             entry.expirationTime = entry.creationTime + std::chrono::seconds(response.ttl);
             entry.source = response.server;
 
-            m_impl->m_dnsCache[domain] = entry;
+            m_impl->m_dnsCache[normalized] = std::move(entry);
         }
 
-        // Invoke callback
-        if (m_impl->m_responseCallback) {
-            try {
-                m_impl->m_responseCallback(response);
-            } catch (...) {}
+        // Invoke response callback safely under lock
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            if (m_impl->m_responseCallback) {
+                try {
+                    m_impl->m_responseCallback(response);
+                } catch (const std::exception& e) {
+                    Utils::Logger::Error("Response callback exception: {}", e.what());
+                }
+            }
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error("ResolveDomain failed: {}", e.what());
+        Utils::Logger::Error("ResolveDomain failed for '{}': {}", domain, e.what());
         response.status = DNSResponseStatus::NetworkError;
     }
 
@@ -1279,80 +1783,152 @@ void DNSLeakProtection::StopMonitoring() {
 
 [[nodiscard]] bool DNSLeakProtection::BlockDomain(const std::string& domain) {
     try {
+        if (!IsValidDomainName(domain)) {
+            Utils::Logger::Warn("BlockDomain: Invalid domain name '{}'", domain);
+            return false;
+        }
+
+        std::string normalized = NormalizeDomain(domain);
         std::unique_lock lock(m_impl->m_mutex);
-        m_impl->m_blockedDomains.insert(domain);
+        m_impl->m_blockedDomains.insert(std::move(normalized));
 
         Utils::Logger::Info("Domain blocked: {}", domain);
         return true;
 
-    } catch (...) {
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("BlockDomain failed: {}", e.what());
         return false;
     }
 }
 
 [[nodiscard]] bool DNSLeakProtection::UnblockDomain(const std::string& domain) {
     try {
+        std::string normalized = NormalizeDomain(domain);
         std::unique_lock lock(m_impl->m_mutex);
-        m_impl->m_blockedDomains.erase(domain);
+        m_impl->m_blockedDomains.erase(normalized);
 
         Utils::Logger::Info("Domain unblocked: {}", domain);
         return true;
 
-    } catch (...) {
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("UnblockDomain failed: {}", e.what());
         return false;
     }
 }
 
 [[nodiscard]] bool DNSLeakProtection::IsDomainBlocked(const std::string& domain) {
+    std::string normalized = NormalizeDomain(domain);
     std::shared_lock lock(m_impl->m_mutex);
-    return m_impl->m_blockedDomains.find(domain) != m_impl->m_blockedDomains.end();
+    return m_impl->m_blockedDomains.count(normalized) > 0;
 }
 
 [[nodiscard]] bool DNSLeakProtection::WhitelistDomain(const std::string& domain) {
     try {
+        if (!IsValidDomainName(domain)) {
+            Utils::Logger::Warn("WhitelistDomain: Invalid domain name '{}'", domain);
+            return false;
+        }
+
+        std::string normalized = NormalizeDomain(domain);
         std::unique_lock lock(m_impl->m_mutex);
-        m_impl->m_whitelistedDomains.insert(domain);
+        m_impl->m_whitelistedDomains.insert(std::move(normalized));
 
         Utils::Logger::Info("Domain whitelisted: {}", domain);
         return true;
 
-    } catch (...) {
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("WhitelistDomain failed: {}", e.what());
         return false;
     }
 }
 
 [[nodiscard]] bool DNSLeakProtection::ImportBlocklist(const fs::path& listPath) {
     try {
-        if (!fs::exists(listPath)) {
+        std::error_code ec;
+        if (!fs::exists(listPath, ec) || ec) {
             Utils::Logger::Error("Blocklist file not found: {}", listPath.string());
+            return false;
+        }
+
+        // Cap file size to prevent memory exhaustion from adversarial input
+        auto fileSize = fs::file_size(listPath, ec);
+        if (ec || fileSize > MAX_BLOCKLIST_FILE_BYTES) {
+            Utils::Logger::Error("Blocklist file too large or unreadable: {} bytes", fileSize);
             return false;
         }
 
         std::ifstream file(listPath);
         if (!file.is_open()) {
+            Utils::Logger::Error("Failed to open blocklist file: {}", listPath.string());
             return false;
         }
 
-        std::unique_lock lock(m_impl->m_mutex);
+        std::vector<std::string> validDomains;
+        validDomains.reserve(
+            std::min<size_t>(static_cast<size_t>(fileSize / 10), MAX_BLOCKLIST_DOMAINS));
 
         std::string line;
-        size_t count = 0;
+        size_t lineNum = 0;
 
         while (std::getline(file, line)) {
+            ++lineNum;
+
             // Skip comments and empty lines
             if (line.empty() || line[0] == '#') continue;
 
             // Trim whitespace
-            line.erase(0, line.find_first_not_of(" \t\r\n"));
-            line.erase(line.find_last_not_of(" \t\r\n") + 1);
+            size_t start = line.find_first_not_of(" \t\r\n");
+            size_t end = line.find_last_not_of(" \t\r\n");
+            if (start == std::string::npos) continue;
 
-            if (!line.empty()) {
-                m_impl->m_blockedDomains.insert(line);
-                count++;
+            line = line.substr(start, end - start + 1);
+            if (line.empty()) continue;
+
+            // Handle hosts-file format: "0.0.0.0 domain.com" or "127.0.0.1 domain.com"
+            if (line[0] >= '0' && line[0] <= '9') {
+                size_t spacePos = line.find_first_of(" \t");
+                if (spacePos != std::string::npos) {
+                    size_t domStart = line.find_first_not_of(" \t", spacePos);
+                    if (domStart != std::string::npos) {
+                        line = line.substr(domStart);
+                        // Strip trailing inline comments
+                        size_t commentPos = line.find('#');
+                        if (commentPos != std::string::npos) {
+                            line = line.substr(0, commentPos);
+                            size_t trimEnd = line.find_last_not_of(" \t\r\n");
+                            if (trimEnd != std::string::npos) {
+                                line = line.substr(0, trimEnd + 1);
+                            } else {
+                                continue;
+                            }
+                        }
+                    }
+                }
+            }
+
+            std::string normalized = NormalizeDomain(line);
+
+            if (!normalized.empty() && IsValidDomainName(normalized)) {
+                validDomains.push_back(std::move(normalized));
+            }
+
+            if (validDomains.size() >= MAX_BLOCKLIST_DOMAINS) {
+                Utils::Logger::Warn("Blocklist domain limit reached ({}) at line {}",
+                    MAX_BLOCKLIST_DOMAINS, lineNum);
+                break;
             }
         }
 
-        Utils::Logger::Info("Imported {} domains from blocklist", count);
+        // Bulk insert under single lock
+        {
+            std::unique_lock lock(m_impl->m_mutex);
+            for (auto& d : validDomains) {
+                m_impl->m_blockedDomains.insert(std::move(d));
+            }
+        }
+
+        Utils::Logger::Info("Imported {} domains from blocklist '{}'",
+            validDomains.size(), listPath.filename().string());
         return true;
 
     } catch (const std::exception& e) {
@@ -1726,9 +2302,60 @@ void DNSStatistics::Reset() noexcept {
         return false;
     }
 
-    // Basic domain validation
-    std::regex domainRegex(R"(^(?:[a-zA-Z0-9](?:[a-zA-Z0-9\-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$)");
-    return std::regex_match(domain, domainRegex);
+    // Must contain at least one dot
+    if (domain.find('.') == std::string::npos) {
+        return false;
+    }
+
+    size_t labelStart = 0;
+    size_t dotCount = 0;
+
+    for (size_t i = 0; i <= domain.length(); ++i) {
+        if (i == domain.length() || domain[i] == '.') {
+            size_t labelLen = i - labelStart;
+
+            // Each label must be 1-63 characters
+            if (labelLen == 0 || labelLen > 63) {
+                return false;
+            }
+
+            // Label must start and end with alphanumeric
+            if (!std::isalnum(static_cast<unsigned char>(domain[labelStart]))) {
+                return false;
+            }
+            if (!std::isalnum(static_cast<unsigned char>(domain[i - 1]))) {
+                return false;
+            }
+
+            // Label can only contain alphanumeric and hyphens
+            for (size_t j = labelStart; j < i; ++j) {
+                char c = domain[j];
+                if (!std::isalnum(static_cast<unsigned char>(c)) && c != '-') {
+                    return false;
+                }
+            }
+
+            if (i < domain.length()) {
+                ++dotCount;
+            }
+            labelStart = i + 1;
+        }
+    }
+
+    // TLD must be at least 2 characters and all alphabetic
+    size_t lastDot = domain.rfind('.');
+    if (lastDot == std::string::npos) return false;
+
+    std::string_view tld(domain.data() + lastDot + 1, domain.length() - lastDot - 1);
+    if (tld.length() < 2) return false;
+
+    for (char c : tld) {
+        if (!std::isalpha(static_cast<unsigned char>(c))) {
+            return false;
+        }
+    }
+
+    return dotCount >= 1;
 }
 
 [[nodiscard]] std::vector<std::string> ParseDNSResponse(
@@ -1736,13 +2363,101 @@ void DNSStatistics::Reset() noexcept {
 {
     std::vector<std::string> addresses;
 
-    // Simplified DNS response parsing
-    // Real implementation would parse full DNS wire format
+    // DNS wire format requires minimum 12-byte header
     if (response.size() < DNS_HEADER_SIZE) {
         return addresses;
     }
 
-    // This is a placeholder - full DNS parsing would be complex
+    // Parse header flags
+    uint16_t flags = (static_cast<uint16_t>(response[2]) << 8) | response[3];
+    bool isResponse = (flags & 0x8000) != 0;
+    uint8_t rcode = static_cast<uint8_t>(flags & 0x000F);
+
+    if (!isResponse || rcode != 0) {
+        return addresses;
+    }
+
+    uint16_t qdcount = (static_cast<uint16_t>(response[4]) << 8) | response[5];
+    uint16_t ancount = (static_cast<uint16_t>(response[6]) << 8) | response[7];
+
+    // Cap counts to prevent malicious packets from causing excessive processing
+    if (qdcount > 100 || ancount > 500) {
+        return addresses;
+    }
+
+    size_t offset = DNS_HEADER_SIZE;
+
+    // Skip question section
+    for (uint16_t i = 0; i < qdcount && offset < response.size(); ++i) {
+        // Skip QNAME: sequence of length-prefixed labels
+        while (offset < response.size()) {
+            uint8_t labelLen = response[offset];
+            if (labelLen == 0) {
+                ++offset;
+                break;
+            }
+            if ((labelLen & 0xC0) == 0xC0) {
+                offset += 2;  // compression pointer (2 bytes)
+                break;
+            }
+            if (offset + 1 + labelLen > response.size()) return addresses;
+            offset += 1 + labelLen;
+        }
+        // QTYPE (2 bytes) + QCLASS (2 bytes)
+        if (offset + 4 > response.size()) return addresses;
+        offset += 4;
+    }
+
+    // Parse answer section
+    for (uint16_t i = 0; i < ancount && offset < response.size(); ++i) {
+        // Skip NAME (may be compressed)
+        while (offset < response.size()) {
+            uint8_t labelLen = response[offset];
+            if (labelLen == 0) {
+                ++offset;
+                break;
+            }
+            if ((labelLen & 0xC0) == 0xC0) {
+                offset += 2;
+                break;
+            }
+            if (offset + 1 + labelLen > response.size()) return addresses;
+            offset += 1 + labelLen;
+        }
+
+        // Need TYPE(2) + CLASS(2) + TTL(4) + RDLENGTH(2) = 10 bytes minimum
+        if (offset + 10 > response.size()) break;
+
+        uint16_t rtype = (static_cast<uint16_t>(response[offset]) << 8) | response[offset + 1];
+        offset += 2;  // TYPE
+        offset += 2;  // CLASS
+        offset += 4;  // TTL
+        uint16_t rdlength = (static_cast<uint16_t>(response[offset]) << 8) | response[offset + 1];
+        offset += 2;  // RDLENGTH
+
+        if (offset + rdlength > response.size()) break;
+
+        if (rtype == 1 && rdlength == 4) {
+            // A record: 4-byte IPv4 address
+            char ipStr[INET_ADDRSTRLEN];
+            IN_ADDR addr;
+            std::memcpy(&addr, &response[offset], 4);
+            if (::inet_ntop(AF_INET, &addr, ipStr, sizeof(ipStr))) {
+                addresses.emplace_back(ipStr);
+            }
+        } else if (rtype == 28 && rdlength == 16) {
+            // AAAA record: 16-byte IPv6 address
+            char ipStr[INET6_ADDRSTRLEN];
+            IN6_ADDR addr;
+            std::memcpy(&addr, &response[offset], 16);
+            if (::inet_ntop(AF_INET6, &addr, ipStr, sizeof(ipStr))) {
+                addresses.emplace_back(ipStr);
+            }
+        }
+
+        offset += rdlength;
+    }
+
     return addresses;
 }
 
