@@ -1034,6 +1034,10 @@ public:
                     HKEY hKey = nullptr;
                     if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, regPath.c_str(),
                                         0, KEY_READ, &hKey) == ERROR_SUCCESS) {
+                        // RAII guard to prevent handle leak on exception
+                        auto keyGuard = [&hKey]() { if (hKey) { ::RegCloseKey(hKey); hKey = nullptr; } };
+                        struct KeyGuardRAII { decltype(keyGuard)& fn; ~KeyGuardRAII() { fn(); } } keyCleanup{keyGuard};
+
                         wchar_t nameServer[512] = {};
                         DWORD size = sizeof(nameServer);
                         DWORD type = 0;
@@ -1042,7 +1046,6 @@ public:
                             && type == REG_SZ) {
                             saved.dnsServers = Utils::StringUtils::ToNarrow(nameServer);
                         }
-                        ::RegCloseKey(hKey);
                     }
 
                     if (!saved.adapterGuid.empty()) {
@@ -2400,7 +2403,7 @@ void DNSStatistics::Reset() noexcept {
                 offset += 2;  // compression pointer (2 bytes)
                 break;
             }
-            if (offset + 1 + labelLen > response.size()) return addresses;
+            if (labelLen > response.size() || offset > response.size() - 1 - labelLen) return addresses;
             offset += 1 + labelLen;
         }
         // QTYPE (2 bytes) + QCLASS (2 bytes)
@@ -2421,7 +2424,7 @@ void DNSStatistics::Reset() noexcept {
                 offset += 2;
                 break;
             }
-            if (offset + 1 + labelLen > response.size()) return addresses;
+            if (labelLen > response.size() || offset > response.size() - 1 - labelLen) return addresses;
             offset += 1 + labelLen;
         }
 
