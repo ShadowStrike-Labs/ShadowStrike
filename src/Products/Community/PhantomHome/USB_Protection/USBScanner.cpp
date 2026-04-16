@@ -27,7 +27,8 @@
  * - HashUtils (BCrypt SHA-256/SHA-1/MD5) for file hashing
  * - HashStore for known-malware hash lookups (sub-microsecond)
  * - PatternStore for byte-pattern/Aho-Corasick signature matching
- * - ThreatIntel for IOC correlation
+ * - SignatureStore for YARA rule scanning
+ * - QuarantineManager for active file quarantine
  * - ThreadPool for concurrent scanning with priority scheduling
  * - Logger (SS_LOG_*) for enterprise audit logging
  *
@@ -50,8 +51,10 @@
 #include "../Utils/JSONUtils.hpp"
 #include "../HashStore/HashStore.hpp"
 #include "../PatternStore/PatternStore.hpp"
+#include "../SignatureStore/SignatureStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../Utils/ThreadPool.hpp"
+#include "PhantomCore/Core/Engine/QuarantineManager.hpp"
 
 #include <filesystem>
 #include <fstream>
@@ -79,31 +82,75 @@ static constexpr const wchar_t* LOG_CATEGORY = L"USBScanner";
 std::atomic<bool> USBScanner::s_instanceCreated{false};
 
 // ============================================================================
-// HELPER: Compute file hash using HashUtils::Hasher (BCrypt)
+// ANONYMOUS NAMESPACE — LOCAL HELPERS
 // ============================================================================
 
 namespace {
 
-/// @brief Compute SHA-256 of a file and return lowercase hex string.
-/// Uses the streaming Hasher to avoid loading entire files into memory.
-[[nodiscard]] bool ComputeFileSHA256(const fs::path& filePath,
-                                     std::string& outHex) noexcept {
-    try {
-        std::vector<uint8_t> digest;
-        Utils::HashUtils::Error err{};
-        if (!Utils::HashUtils::ComputeFile(
-                Utils::HashUtils::Algorithm::SHA256,
-                filePath.wstring(), digest, &err)) {
-            return false;
+// ────────────────────────────────────────────────────────────────────────────
+// RAII wrapper for Win32 HANDLE (prevents leaks on every exit path)
+// ────────────────────────────────────────────────────────────────────────────
+
+struct ScopedHandle {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE h) noexcept : handle(h) {}
+    ~ScopedHandle() { Close(); }
+
+    void Close() noexcept {
+        if (handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(handle);
+            handle = INVALID_HANDLE_VALUE;
         }
-        outHex = Utils::HashUtils::ToHexLower(digest);
-        return true;
+    }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& o) noexcept : handle(o.handle) {
+        o.handle = INVALID_HANDLE_VALUE;
+    }
+    ScopedHandle& operator=(ScopedHandle&& o) noexcept {
+        if (this != &o) { Close(); handle = o.handle; o.handle = INVALID_HANDLE_VALUE; }
+        return *this;
+    }
+
+    [[nodiscard]] bool IsValid() const noexcept { return handle != INVALID_HANDLE_VALUE; }
+    [[nodiscard]] HANDLE Get() const noexcept { return handle; }
+};
+
+// ────────────────────────────────────────────────────────────────────────────
+// Hash computation helpers
+// ────────────────────────────────────────────────────────────────────────────
+
+/// Compute SHA-256 from an already-opened HANDLE.  Reads in streaming
+/// chunks so arbitrarily large files never blow the working set.
+/// Returns lowercase hex or empty string on failure.
+[[nodiscard]] std::string ComputeSHA256FromHandle(HANDLE hFile) noexcept {
+    try {
+        Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
+        if (!hasher.Init()) return {};
+
+        constexpr DWORD kChunkSize = 256 * 1024;   // 256 KB read buffer
+        uint8_t buf[kChunkSize];
+        DWORD bytesRead = 0;
+
+        for (;;) {
+            if (!::ReadFile(hFile, buf, kChunkSize, &bytesRead, nullptr)) break;
+            if (bytesRead == 0) break;
+            if (!hasher.Update(buf, bytesRead)) return {};
+        }
+
+        std::vector<uint8_t> digest;
+        if (!hasher.Final(digest) || digest.size() != 32) return {};
+        return Utils::HashUtils::ToHexLower(digest);
     } catch (...) {
-        return false;
+        return {};
     }
 }
 
-/// @brief Compute SHA-1 of a file and return lowercase hex string.
+/// Compute SHA-1 of a file by path (forensic hash, used only post-detection).
 [[nodiscard]] bool ComputeFileSHA1(const fs::path& filePath,
                                     std::string& outHex) noexcept {
     try {
@@ -121,7 +168,7 @@ namespace {
     }
 }
 
-/// @brief Compute MD5 of a file and return lowercase hex string.
+/// Compute MD5 of a file by path (forensic hash, used only post-detection).
 [[nodiscard]] bool ComputeFileMD5(const fs::path& filePath,
                                    std::string& outHex) noexcept {
     try {
@@ -139,26 +186,7 @@ namespace {
     }
 }
 
-/// @brief Build a HashStore-compatible HashValue from a hex string.
-[[nodiscard]] SignatureStore::HashValue MakeHashValue(
-    SignatureStore::HashType type,
-    const std::string& hexStr) noexcept {
-
-    SignatureStore::HashValue hv{};
-    hv.type = type;
-
-    std::vector<uint8_t> bytes;
-    if (!Utils::HashUtils::FromHex(hexStr, bytes)) {
-        return hv;
-    }
-
-    hv.length = static_cast<uint8_t>(
-        std::min(bytes.size(), hv.data.size()));
-    std::memcpy(hv.data.data(), bytes.data(), hv.length);
-    return hv;
-}
-
-/// @brief Check if a file extension is among priority scan extensions.
+/// Check if a file extension is among priority scan extensions (case-insensitive).
 [[nodiscard]] bool IsPriorityScanExtension(std::string_view ext) noexcept {
     for (const char* pe : USBScannerConstants::PRIORITY_EXTENSIONS) {
         if (ext.size() == std::string_view(pe).size()) {
@@ -176,28 +204,22 @@ namespace {
     return false;
 }
 
-/// @brief Escape a string for safe JSON embedding.
-[[nodiscard]] std::string EscapeJsonString(const std::string& s) {
-    std::ostringstream o;
-    for (char c : s) {
-        switch (c) {
-            case '"':  o << "\\\""; break;
-            case '\\': o << "\\\\"; break;
-            case '\b': o << "\\b"; break;
-            case '\f': o << "\\f"; break;
-            case '\n': o << "\\n"; break;
-            case '\r': o << "\\r"; break;
-            case '\t': o << "\\t"; break;
-            default:
-                if (static_cast<unsigned char>(c) < 0x20) {
-                    o << "\\u" << std::hex << std::setfill('0')
-                      << std::setw(4) << static_cast<int>(c);
-                } else {
-                    o << c;
-                }
-        }
+/// Check whether a file is a reparse point (symlink, junction, etc.).
+[[nodiscard]] bool IsReparsePoint(const std::wstring& path) noexcept {
+    DWORD attrs = ::GetFileAttributesW(path.c_str());
+    return (attrs != INVALID_FILE_ATTRIBUTES) &&
+           (attrs & FILE_ATTRIBUTE_REPARSE_POINT);
+}
+
+/// Map a SignatureStore ThreatLevel to a 0-100 risk score.
+[[nodiscard]] int ThreatLevelToRiskScore(SignatureStore::ThreatLevel level) noexcept {
+    switch (level) {
+        case SignatureStore::ThreatLevel::Critical: return 100;
+        case SignatureStore::ThreatLevel::High:     return 85;
+        case SignatureStore::ThreatLevel::Medium:   return 60;
+        case SignatureStore::ThreatLevel::Low:      return 30;
+        default:                                    return 10;
     }
-    return o.str();
 }
 
 }  // anonymous namespace
@@ -214,7 +236,6 @@ public:
         Shutdown();
     }
 
-    // Non-copyable, non-movable
     USBScannerImpl(const USBScannerImpl&) = delete;
     USBScannerImpl& operator=(const USBScannerImpl&) = delete;
     USBScannerImpl(USBScannerImpl&&) = delete;
@@ -248,7 +269,7 @@ public:
         tpConfig.minThreads = 1;
         tpConfig.maxThreads = std::max<size_t>(2, config.threadPoolSize);
         tpConfig.threadNamePrefix = L"ShadowStrike-USBScan";
-        tpConfig.enableETW = false;  // USB scan threads don't need ETW
+        tpConfig.enableETW = false;
         tpConfig.enableDeadlockDetection = false;
 
         m_threadPool = std::make_unique<Utils::ThreadPool>(tpConfig);
@@ -256,6 +277,20 @@ public:
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to initialize scan thread pool");
             m_status = ScannerModuleStatus::Error;
             return false;
+        }
+
+        // Log detection layer readiness
+        if (!m_hashStore.IsInitialized()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"HashStore not initialized — hash-based detection layer disabled");
+        }
+        if (!m_signatureStore.IsInitialized()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"SignatureStore not initialized — YARA detection layer disabled");
+        }
+        if (!m_patternStore.IsInitialized()) {
+            SS_LOG_WARN(LOG_CATEGORY,
+                L"PatternStore not initialized — pattern detection layer disabled");
         }
 
         m_status = ScannerModuleStatus::Running;
@@ -300,19 +335,23 @@ public:
             m_threadPool.reset();
         }
 
-        // Clear callbacks
+        // Clear callbacks under lock
         m_progressCallback = nullptr;
         m_threatCallback = nullptr;
         m_completeCallback = nullptr;
         m_errorCallback = nullptr;
+
+        // Clear drive root
+        m_currentDriveRoot.clear();
 
         m_status = ScannerModuleStatus::Stopped;
         SS_LOG_INFO(LOG_CATEGORY, L"USBScanner shutdown complete");
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
-        return m_status.load(std::memory_order_acquire) == ScannerModuleStatus::Running ||
-               m_status.load(std::memory_order_acquire) == ScannerModuleStatus::Scanning;
+        auto s = m_status.load(std::memory_order_acquire);
+        return s == ScannerModuleStatus::Running ||
+               s == ScannerModuleStatus::Scanning;
     }
 
     [[nodiscard]] ScannerModuleStatus GetStatus() const noexcept {
@@ -355,10 +394,15 @@ public:
             return false;
         }
 
-        // Validate root path
         if (rootPath.empty() || rootPath.size() > 4) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Invalid drive root path");
             return false;
+        }
+
+        // Store drive root for symlink/junction validation (H2)
+        {
+            std::wstring wideRoot(rootPath.begin(), rootPath.end());
+            m_currentDriveRoot = std::move(wideRoot);
         }
 
         // Reset scan state
@@ -373,11 +417,10 @@ public:
         m_summary.status = ScanStatus::Initializing;
         m_progress.status = ScanStatus::Initializing;
 
-        m_statistics.totalScans++;
+        m_statistics.totalScans.fetch_add(1, std::memory_order_relaxed);
 
         SS_LOG_INFO(LOG_CATEGORY, L"Starting scan of drive: %hs", rootPath.c_str());
 
-        // Submit scan task to thread pool
         USBScanConfig scanConfig = config;
         m_scanFuture = m_threadPool->Submit(
             [this, rootPath, scanConfig](const Utils::TaskContext& ctx) {
@@ -398,76 +441,236 @@ public:
         }
         return ScanDrive(rootPath, m_config.defaultScanConfig);
     }
+    // ────────────────────────────────────────────────────────────────────────
+    // ScanFile — the per-file detection pipeline
+    // ────────────────────────────────────────────────────────────────────────
+    //
+    // Detection order (layered, cheapest first):
+    //   1. Path validation (symlink / junction / reparse point — H2)
+    //   2. Open with TOCTOU lock (FILE_SHARE_READ — H1)
+    //   3. SHA-256 hash from handle
+    //   4. HashStore lookup (C1)
+    //   5. SignatureStore YARA scan (C2)
+    //   6. PatternStore byte-pattern scan (C3)
+    //   7. Heuristic analysis
+    //   8. Forensic hashes (SHA-1/MD5) on detection
+    // ────────────────────────────────────────────────────────────────────────
 
     [[nodiscard]] FileScanResultInfo ScanFile(const fs::path& filePath) {
         FileScanResultInfo result;
         result.filePath = filePath;
         result.scanTime = std::chrono::system_clock::now();
         auto scanStart = Clock::now();
+        const std::wstring widePath = filePath.wstring();
 
-        // Validate file exists
+        // ── Validate file exists ────────────────────────────────────────────
         std::error_code ec;
         if (!fs::exists(filePath, ec) || ec) {
             result.result = FileScanResult::Error;
             return result;
         }
 
-        // Get file size
-        result.fileSize = fs::file_size(filePath, ec);
-        if (ec) {
-            result.result = FileScanResult::AccessDenied;
+        // ── H2: Symlink / junction / reparse-point guard ───────────────────
+        if (IsReparsePoint(widePath)) {
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Skipping reparse point: %ls", widePath.c_str());
+            result.result = FileScanResult::Skipped;
+            m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        // Skip files exceeding size limit
+        // If we are inside a drive scan, verify the resolved path stays
+        // under the USB drive root.  This prevents symlink-escape attacks.
+        {
+            std::wstring driveRoot;
+            {
+                std::shared_lock lock(m_mutex);
+                driveRoot = m_currentDriveRoot;
+            }
+            if (!driveRoot.empty()) {
+                Utils::FileUtils::Error fuErr{};
+                if (!Utils::FileUtils::IsPathUnderRoot(
+                        widePath, driveRoot, true, &fuErr)) {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"File resolves outside drive root, skipping: %ls",
+                        widePath.c_str());
+                    result.result = FileScanResult::Skipped;
+                    m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
+                    return result;
+                }
+            }
+        }
+
+        // ── H1: Open file with TOCTOU lock ─────────────────────────────────
+        // FILE_SHARE_READ allows our detection stores to read the same file
+        // while preventing any writer from modifying / replacing it.
+        ScopedHandle fileHandle(::CreateFileW(
+            widePath.c_str(),
+            GENERIC_READ,
+            FILE_SHARE_READ,           // deny writes and deletes
+            nullptr,
+            OPEN_EXISTING,
+            FILE_FLAG_SEQUENTIAL_SCAN, // optimise for sequential read
+            nullptr));
+
+        if (!fileHandle.IsValid()) {
+            DWORD lastErr = ::GetLastError();
+            if (lastErr == ERROR_ACCESS_DENIED || lastErr == ERROR_SHARING_VIOLATION) {
+                result.result = FileScanResult::AccessDenied;
+            } else {
+                result.result = FileScanResult::Error;
+            }
+            SS_LOG_DEBUG(LOG_CATEGORY,
+                L"Cannot open file (error %lu): %ls", lastErr, widePath.c_str());
+            m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+
+        // ── Get file size from the locked handle ────────────────────────────
+        LARGE_INTEGER fileSize{};
+        if (!::GetFileSizeEx(fileHandle.Get(), &fileSize)) {
+            result.result = FileScanResult::Error;
+            m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
+            return result;
+        }
+        result.fileSize = static_cast<uint64_t>(fileSize.QuadPart);
+
+        // Cap — skip files exceeding the configured size limit
         if (result.fileSize > m_config.defaultScanConfig.maxFileSize) {
             result.result = FileScanResult::Skipped;
-            m_statistics.totalFilesScanned++;
+            m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        // --- Phase 1: Hash computation (SHA-256) ---
-        if (!ComputeFileSHA256(filePath, result.sha256)) {
+        // ── Phase 1: SHA-256 from the locked handle ─────────────────────────
+        result.sha256 = ComputeSHA256FromHandle(fileHandle.Get());
+        if (result.sha256.empty()) {
             result.result = FileScanResult::AccessDenied;
-            m_statistics.totalFilesScanned++;
+            m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
-        // --- Phase 2: HashStore lookup (sub-microsecond) ---
-        auto hashValue = MakeHashValue(SignatureStore::HashType::SHA256, result.sha256);
+        // Reset file pointer for any subsequent reads by stores
+        LARGE_INTEGER zero{};
+        ::SetFilePointerEx(fileHandle.Get(), zero, nullptr, FILE_BEGIN);
 
-        // Try HashStore if available
-        // NOTE: HashStore::HashStore is in namespace ShadowStrike::HashStore
-        // The include path ../HashStore/HashStore.hpp gives us the class.
-        // We check Contains() first (bloom filter fast path), then LookupHash().
-        //
-        // Since HashStore is not a singleton but needs an initialized instance,
-        // and we don't have a global instance reference here, we perform the
-        // hash check through ThreatIntel if available, which wraps HashStore.
-        //
-        // For direct hash matching, we compare against ThreatIntelManager.
+        // ── Phase 2 (C1): HashStore lookup ──────────────────────────────────
+        if (m_hashStore.IsInitialized()) {
+            auto hashHit = m_hashStore.LookupHashString(
+                result.sha256, SignatureStore::HashType::SHA256);
 
-        // --- Phase 3: ThreatIntel IOC correlation ---
-        // ThreatIntelManager integration would go here when the module provides
-        // a hash-based lookup API. For now, hash detection is deferred to the
-        // calling module (USBDeviceMonitor/DeviceControlManager) which owns the
-        // HashStore instance.
+            if (hashHit.has_value()) {
+                const auto& det = hashHit.value();
+                DetectedThreat threat;
+                threat.type        = DetectionType::HashMatch;
+                threat.threatName  = det.signatureName;
+                threat.signatureId = det.signatureId;
+                threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
+                threat.confidence  = 100;
+                threat.details     = det.description;
+                result.threats.push_back(std::move(threat));
+                result.result = FileScanResult::Infected;
+                result.primaryThreatName = det.signatureName;
+                m_statistics.hashMatches.fetch_add(1, std::memory_order_relaxed);
 
-        // --- Phase 4: Heuristic analysis ---
+                SS_LOG_INFO(LOG_CATEGORY,
+                    L"HashStore hit: %ls — %hs",
+                    widePath.c_str(), det.signatureName.c_str());
+            }
+        }
+
+        // ── Phase 3 (C2): SignatureStore / YARA scan ────────────────────────
+        // Use SignatureStore with YARA-only (hash & pattern handled separately).
+        if (m_signatureStore.IsInitialized()) {
+            SignatureStore::ScanOptions sigOpts;
+            sigOpts.enableHashLookup  = false;   // handled in Phase 2
+            sigOpts.enablePatternScan = false;   // handled in Phase 4
+            sigOpts.enableYaraScan    = true;
+
+            auto sigResult = m_signatureStore.ScanFile(widePath, sigOpts);
+
+            for (auto& det : sigResult.detections) {
+                DetectedThreat threat;
+                threat.type        = DetectionType::YARAMatch;
+                threat.threatName  = det.signatureName;
+                threat.signatureId = det.signatureId;
+                threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
+                threat.confidence  = 95;
+                threat.details     = det.description;
+                result.threats.push_back(std::move(threat));
+                m_statistics.yaraMatches.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            for (const auto& ym : sigResult.yaraMatches) {
+                m_statistics.signatureMatches.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            if (sigResult.HasDetections() &&
+                result.result != FileScanResult::Infected) {
+                result.result = FileScanResult::Infected;
+                if (result.primaryThreatName.empty() &&
+                    !sigResult.detections.empty()) {
+                    result.primaryThreatName =
+                        sigResult.detections.front().signatureName;
+                }
+            }
+        }
+
+        // ── Phase 4 (C3): PatternStore byte-pattern scan ────────────────────
+        if (m_patternStore.IsInitialized()) {
+            SignatureStore::QueryOptions patOpts;
+            auto patternHits = m_patternStore.ScanFile(widePath, patOpts);
+
+            for (auto& det : patternHits) {
+                DetectedThreat threat;
+                threat.type        = DetectionType::SignatureMatch;
+                threat.threatName  = det.signatureName;
+                threat.signatureId = det.signatureId;
+                threat.riskScore   = ThreatLevelToRiskScore(det.threatLevel);
+                threat.confidence  = 90;
+                threat.details     = det.description;
+                result.threats.push_back(std::move(threat));
+                m_statistics.signatureMatches.fetch_add(1, std::memory_order_relaxed);
+            }
+
+            if (!patternHits.empty() &&
+                result.result != FileScanResult::Infected) {
+                result.result = FileScanResult::Infected;
+                if (result.primaryThreatName.empty()) {
+                    result.primaryThreatName =
+                        patternHits.front().signatureName;
+                }
+            }
+        }
+
+        // ── Phase 5: Heuristic analysis ─────────────────────────────────────
         if (m_config.defaultScanConfig.useHeuristics) {
             PerformHeuristicAnalysis(filePath, result);
         }
 
-        // Compute additional hashes for forensics if infected/suspicious
+        // ── Close the TOCTOU handle BEFORE quarantine (so quarantine can
+        //    move / delete the file). ────────────────────────────────────────
+        fileHandle.Close();
+
+        // ── Phase 6: Forensic hashes on detection ───────────────────────────
         if (result.result == FileScanResult::Infected ||
             result.result == FileScanResult::Suspicious) {
             ComputeFileSHA1(filePath, result.sha1);
             ComputeFileMD5(filePath, result.md5);
         }
 
+        // Default to clean if no detection layer triggered
+        if (result.result != FileScanResult::Infected &&
+            result.result != FileScanResult::Suspicious &&
+            result.result != FileScanResult::Skipped &&
+            result.result != FileScanResult::Error &&
+            result.result != FileScanResult::AccessDenied) {
+            result.result = FileScanResult::Clean;
+        }
+
         // Update statistics
-        m_statistics.totalFilesScanned++;
-        m_statistics.totalBytesScanned += result.fileSize;
+        m_statistics.totalFilesScanned.fetch_add(1, std::memory_order_relaxed);
+        m_statistics.totalBytesScanned.fetch_add(result.fileSize, std::memory_order_relaxed);
 
         auto scanEnd = Clock::now();
         result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
@@ -476,11 +679,18 @@ public:
         return result;
     }
 
+    // ────────────────────────────────────────────────────────────────────────
+    // Scan control
+    // ────────────────────────────────────────────────────────────────────────
+
     void PauseScan() {
         if (m_scanActive.load(std::memory_order_acquire)) {
             m_pauseFlag.store(true, std::memory_order_release);
-            m_progress.status = ScanStatus::Paused;
-            m_summary.status = ScanStatus::Paused;
+            {
+                std::unique_lock lock(m_mutex);
+                m_progress.status = ScanStatus::Paused;
+                m_summary.status  = ScanStatus::Paused;
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Scan paused");
         }
     }
@@ -490,8 +700,11 @@ public:
             m_pauseFlag.load(std::memory_order_acquire)) {
             m_pauseFlag.store(false, std::memory_order_release);
             m_pauseCV.notify_all();
-            m_progress.status = ScanStatus::Scanning;
-            m_summary.status = ScanStatus::Scanning;
+            {
+                std::unique_lock lock(m_mutex);
+                m_progress.status = ScanStatus::Scanning;
+                m_summary.status  = ScanStatus::Scanning;
+            }
             SS_LOG_INFO(LOG_CATEGORY, L"Scan resumed");
         }
     }
@@ -561,18 +774,37 @@ public:
     void UnregisterCallbacks() {
         std::unique_lock lock(m_mutex);
         m_progressCallback = nullptr;
-        m_threatCallback = nullptr;
+        m_threatCallback   = nullptr;
         m_completeCallback = nullptr;
-        m_errorCallback = nullptr;
+        m_errorCallback    = nullptr;
     }
 
     // ========================================================================
-    // STATISTICS
+    // STATISTICS  (H4 — snapshot of atomics)
     // ========================================================================
 
-    [[nodiscard]] USBScanStatistics GetStatistics() const {
-        // Atomics provide thread-safe reads without locking
-        return m_statistics;
+    [[nodiscard]] USBScanStatisticsSnapshot GetStatistics() const {
+        USBScanStatisticsSnapshot snap;
+        snap.totalScans           = m_statistics.totalScans.load(std::memory_order_relaxed);
+        snap.completedScans       = m_statistics.completedScans.load(std::memory_order_relaxed);
+        snap.cancelledScans       = m_statistics.cancelledScans.load(std::memory_order_relaxed);
+        snap.erroredScans         = m_statistics.erroredScans.load(std::memory_order_relaxed);
+        snap.totalFilesScanned    = m_statistics.totalFilesScanned.load(std::memory_order_relaxed);
+        snap.totalBytesScanned    = m_statistics.totalBytesScanned.load(std::memory_order_relaxed);
+        snap.totalThreatsFound    = m_statistics.totalThreatsFound.load(std::memory_order_relaxed);
+        snap.totalFilesQuarantined = m_statistics.totalFilesQuarantined.load(std::memory_order_relaxed);
+        snap.totalFilesDeleted    = m_statistics.totalFilesDeleted.load(std::memory_order_relaxed);
+        snap.hashMatches          = m_statistics.hashMatches.load(std::memory_order_relaxed);
+        snap.signatureMatches     = m_statistics.signatureMatches.load(std::memory_order_relaxed);
+        snap.yaraMatches          = m_statistics.yaraMatches.load(std::memory_order_relaxed);
+        snap.heuristicDetections  = m_statistics.heuristicDetections.load(std::memory_order_relaxed);
+
+        for (size_t i = 0; i < m_statistics.byDetectionType.size(); ++i) {
+            snap.byDetectionType[i] = m_statistics.byDetectionType[i].load(std::memory_order_relaxed);
+        }
+
+        snap.startTime = m_statistics.startTime;
+        return snap;
     }
 
     void ResetStatistics() {
@@ -587,27 +819,24 @@ public:
         SS_LOG_INFO(LOG_CATEGORY, L"Starting USBScanner self-test...");
 
         try {
-            // Test 1: Configuration validation
             USBScannerConfiguration goodConfig;
             if (!goodConfig.IsValid()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: default config invalid");
                 return false;
             }
 
-            // Test 2: Hash computation
+            // SHA-256 hasher smoke test
             {
                 Utils::HashUtils::Hasher hasher(Utils::HashUtils::Algorithm::SHA256);
                 if (!hasher.Init()) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: SHA-256 hasher init");
                     return false;
                 }
-
                 const char testData[] = "ShadowStrike USBScanner SelfTest";
                 if (!hasher.Update(testData, sizeof(testData) - 1)) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: SHA-256 update");
                     return false;
                 }
-
                 std::vector<uint8_t> digest;
                 if (!hasher.Final(digest) || digest.size() != 32) {
                     SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: SHA-256 final");
@@ -615,7 +844,7 @@ public:
                 }
             }
 
-            // Test 3: Priority extension detection
+            // Priority extension check
             if (!IsPriorityScanExtension(".exe")) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: .exe not detected as priority");
                 return false;
@@ -625,7 +854,7 @@ public:
                 return false;
             }
 
-            // Test 4: Thread pool health
+            // Thread pool health
             if (m_threadPool && !m_threadPool->IsInitialized()) {
                 SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: thread pool not initialized");
                 return false;
@@ -639,7 +868,6 @@ public:
             return false;
         }
     }
-
 private:
     // ========================================================================
     // PRIVATE: SCAN EXECUTION
@@ -653,7 +881,7 @@ private:
 
         {
             std::unique_lock lock(m_mutex);
-            m_summary.status = ScanStatus::Scanning;
+            m_summary.status  = ScanStatus::Scanning;
             m_progress.status = ScanStatus::Scanning;
         }
 
@@ -661,7 +889,7 @@ private:
 
         try {
             // Phase 1: Enumerate files
-            UpdateProgressStatus(L"Enumerating files...", 0.0f);
+            UpdateProgressStatus(0.0f);
 
             std::vector<fs::path> priorityFiles;
             std::vector<fs::path> normalFiles;
@@ -683,7 +911,7 @@ private:
             SS_LOG_INFO(LOG_CATEGORY, L"Enumerated %llu files (%zu priority, %zu normal)",
                 totalFiles, priorityFiles.size(), normalFiles.size());
 
-            // Phase 2: Scan priority files first (executables, scripts)
+            // Phase 2: Scan priority files first, then normal files
             uint64_t scannedCount = 0;
             auto scanStartTime = Clock::now();
 
@@ -692,14 +920,13 @@ private:
                     if (CheckCancellation(ctx)) return;
                     HandlePause();
 
-                    // Update current file in progress
+                    // Copy current-file name under lock, then release
                     {
                         std::unique_lock lock(m_mutex);
                         m_progress.currentFile = filePath.filename().string();
                         m_progress.currentDirectory = filePath.parent_path().string();
                     }
 
-                    // Scan the file
                     FileScanResultInfo result = ScanFile(filePath);
                     result.relativePath = fs::relative(filePath, rootPath);
 
@@ -719,6 +946,9 @@ private:
 
                     // Update counters and progress
                     scannedCount++;
+
+                    ProgressCallback progressCb;
+                    USBScanProgress progressCopy;
                     {
                         std::unique_lock lock(m_mutex);
                         m_progress.filesScanned = scannedCount;
@@ -732,7 +962,7 @@ private:
                                  static_cast<float>(totalFiles)) * 100.0f;
                         }
 
-                        // Calculate scan speed
+                        // Calculate scan speed and ETA
                         auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
                             Clock::now() - scanStartTime);
                         if (elapsed.count() > 0) {
@@ -740,7 +970,6 @@ private:
                                 (static_cast<double>(m_progress.bytesScanned) * 1000.0) /
                                 static_cast<double>(elapsed.count());
 
-                            // Estimate remaining time
                             if (scannedCount > 0 && totalFiles > scannedCount) {
                                 double msPerFile = static_cast<double>(elapsed.count()) /
                                                    static_cast<double>(scannedCount);
@@ -751,21 +980,28 @@ private:
                             }
                         }
 
-                        // Periodic progress notification
+                        // Copy callback + progress UNDER the lock for safe invocation
                         if (scannedCount % USBScannerConstants::PROGRESS_UPDATE_INTERVAL == 0) {
-                            NotifyProgress();
+                            progressCb   = m_progressCallback;
+                            progressCopy = m_progress;
                         }
+                    }
+
+                    // Invoke callback OUTSIDE the lock to avoid deadlock
+                    if (progressCb) {
+                        try { progressCb(progressCopy); } catch (...) {}
                     }
                 }
             };
 
-            // Scan priority files first, then normal files
             scanFileList(priorityFiles);
             if (!CheckCancellation(ctx)) {
                 scanFileList(normalFiles);
             }
 
             // Phase 3: Completion
+            ScanCompleteCallback completeCb;
+            USBScanResultSummary summaryCopy;
             {
                 std::unique_lock lock(m_mutex);
                 m_summary.endTime = std::chrono::system_clock::now();
@@ -779,56 +1015,67 @@ private:
                 }
 
                 if (m_cancelRequested.load(std::memory_order_acquire)) {
-                    m_summary.status = ScanStatus::Cancelled;
+                    m_summary.status  = ScanStatus::Cancelled;
                     m_progress.status = ScanStatus::Cancelled;
-                    m_statistics.cancelledScans++;
+                    m_statistics.cancelledScans.fetch_add(1, std::memory_order_relaxed);
                 } else {
-                    m_summary.status = ScanStatus::Completed;
+                    m_summary.status  = ScanStatus::Completed;
                     m_progress.status = ScanStatus::Completed;
                     m_progress.progressPercent = 100.0f;
-                    m_statistics.completedScans++;
+                    m_statistics.completedScans.fetch_add(1, std::memory_order_relaxed);
                 }
+
+                completeCb  = m_completeCallback;
+                summaryCopy = m_summary;
             }
 
             m_scanActive.store(false, std::memory_order_release);
             m_status.store(ScannerModuleStatus::Running, std::memory_order_release);
 
-            // Final notification
-            NotifyComplete();
+            // Notify completion outside the lock
+            if (completeCb) {
+                try { completeCb(summaryCopy); } catch (...) {}
+            }
 
             SS_LOG_INFO(LOG_CATEGORY,
-                L"Scan completed: %hs — Scanned: %llu, Infected: %llu, Suspicious: %llu, "
-                L"Duration: %llds",
-                rootPath.c_str(), m_summary.filesScanned,
-                m_summary.filesInfected, m_summary.filesSuspicious,
-                m_summary.totalDuration.count());
+                L"Scan completed: %hs — Scanned: %llu, Infected: %llu, "
+                L"Suspicious: %llu, Duration: %llds",
+                rootPath.c_str(), summaryCopy.filesScanned,
+                summaryCopy.filesInfected, summaryCopy.filesSuspicious,
+                summaryCopy.totalDuration.count());
 
         } catch (const std::exception& e) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Scan failed with exception: %hs", e.what());
 
+            ErrorCallback errCb;
             {
                 std::unique_lock lock(m_mutex);
-                m_summary.status = ScanStatus::Error;
+                m_summary.status  = ScanStatus::Error;
                 m_progress.status = ScanStatus::Error;
                 m_summary.endTime = std::chrono::system_clock::now();
-                m_statistics.erroredScans++;
+                m_statistics.erroredScans.fetch_add(1, std::memory_order_relaxed);
+                errCb = m_errorCallback;
             }
 
             m_scanActive.store(false, std::memory_order_release);
             m_status.store(ScannerModuleStatus::Running, std::memory_order_release);
 
-            NotifyError(e.what(), -1);
+            if (errCb) {
+                try { errCb(e.what(), -1); } catch (...) {}
+            }
         }
     }
 
     // ========================================================================
-    // PRIVATE: FILE ENUMERATION
+    // PRIVATE: FILE ENUMERATION  (H2 — skip reparse points + root check)
     // ========================================================================
 
     void EnumerateFiles(const std::string& rootPath,
                         const USBScanConfig& config,
                         std::vector<fs::path>& priorityFiles,
                         std::vector<fs::path>& normalFiles) {
+
+        const std::wstring wideRoot(rootPath.begin(), rootPath.end());
 
         try {
             for (auto it = fs::recursive_directory_iterator(
@@ -837,13 +1084,31 @@ private:
 
                 if (CheckCancellation()) return;
 
-                // Respect scan depth
                 if (static_cast<size_t>(it.depth()) > config.scanDepth) {
                     it.disable_recursion_pending();
                     continue;
                 }
 
                 std::error_code ec;
+                const auto& path = it->path();
+
+#ifdef _WIN32
+                // Skip reparse points (symlinks / junctions) early in enumeration
+                DWORD attrs = ::GetFileAttributesW(path.c_str());
+                if (attrs != INVALID_FILE_ATTRIBUTES) {
+                    if (attrs & FILE_ATTRIBUTE_REPARSE_POINT) {
+                        it.disable_recursion_pending();
+                        continue;
+                    }
+                    if (!config.scanHiddenFiles && (attrs & FILE_ATTRIBUTE_HIDDEN)) {
+                        continue;
+                    }
+                    if (!config.scanSystemFiles && (attrs & FILE_ATTRIBUTE_SYSTEM)) {
+                        continue;
+                    }
+                }
+#endif
+
                 if (!it->is_regular_file(ec) || ec) {
                     if (it->is_directory(ec) && !ec) {
                         std::unique_lock lock(m_mutex);
@@ -852,29 +1117,22 @@ private:
                     continue;
                 }
 
-                const auto& path = it->path();
+                // Validate the resolved path stays under the drive root
+                {
+                    Utils::FileUtils::Error fuErr{};
+                    if (!Utils::FileUtils::IsPathUnderRoot(
+                            path.wstring(), wideRoot, true, &fuErr)) {
+                        SS_LOG_WARN(LOG_CATEGORY,
+                            L"Enumeration: path escapes drive root, skipping: %ls",
+                            path.c_str());
+                        continue;
+                    }
+                }
 
-                // Check exclusions
                 if (IsPathExcluded(path, config)) {
                     continue;
                 }
 
-                // Skip hidden/system files if configured
-                if (!config.scanHiddenFiles || !config.scanSystemFiles) {
-#ifdef _WIN32
-                    DWORD attrs = GetFileAttributesW(path.c_str());
-                    if (attrs != INVALID_FILE_ATTRIBUTES) {
-                        if (!config.scanHiddenFiles && (attrs & FILE_ATTRIBUTE_HIDDEN)) {
-                            continue;
-                        }
-                        if (!config.scanSystemFiles && (attrs & FILE_ATTRIBUTE_SYSTEM)) {
-                            continue;
-                        }
-                    }
-#endif
-                }
-
-                // Classify as priority or normal
                 std::string ext = path.extension().string();
                 if (config.priorityFilesFirst && IsPriorityScanExtension(ext)) {
                     priorityFiles.push_back(path);
@@ -905,100 +1163,131 @@ private:
 
     void PerformHeuristicAnalysis(const fs::path& filePath,
                                   FileScanResultInfo& result) {
-        // Heuristic 1: Double extension detection (e.g., "document.pdf.exe")
         std::string filename = filePath.filename().string();
+
+        // Heuristic 1: Double extension (e.g. "document.pdf.exe")
         size_t firstDot = filename.find('.');
-        size_t lastDot = filename.rfind('.');
+        size_t lastDot  = filename.rfind('.');
         if (firstDot != lastDot && firstDot != std::string::npos) {
             std::string realExt = filename.substr(lastDot);
             if (IsPriorityScanExtension(realExt)) {
-                // Check if the inner extension is a document type
                 std::string innerExt = filename.substr(firstDot, lastDot - firstDot);
                 if (innerExt == ".pdf" || innerExt == ".doc" || innerExt == ".docx" ||
                     innerExt == ".xls" || innerExt == ".xlsx" || innerExt == ".txt" ||
                     innerExt == ".jpg" || innerExt == ".png" || innerExt == ".mp3") {
                     DetectedThreat threat;
-                    threat.type = DetectionType::Heuristic;
+                    threat.type       = DetectionType::Heuristic;
                     threat.threatName = "Heuristic.DoubleExtension";
-                    threat.details = "Double extension detected: " + filename;
-                    threat.riskScore = 60;
+                    threat.details    = "Double extension detected: " + filename;
+                    threat.riskScore  = 60;
                     threat.confidence = 70;
-                    result.threats.push_back(threat);
+                    result.threats.push_back(std::move(threat));
                     result.result = FileScanResult::Suspicious;
-                    result.primaryThreatName = threat.threatName;
-                    m_statistics.heuristicDetections++;
+                    result.primaryThreatName = "Heuristic.DoubleExtension";
+                    m_statistics.heuristicDetections.fetch_add(1, std::memory_order_relaxed);
                 }
             }
         }
 
-        // Heuristic 2: Hidden executable (hidden attribute + executable extension)
+        // Heuristic 2: Hidden executable
 #ifdef _WIN32
-        DWORD attrs = GetFileAttributesW(filePath.c_str());
+        DWORD attrs = ::GetFileAttributesW(filePath.c_str());
         if (attrs != INVALID_FILE_ATTRIBUTES &&
             (attrs & FILE_ATTRIBUTE_HIDDEN) &&
             IsPriorityScanExtension(filePath.extension().string())) {
             DetectedThreat threat;
-            threat.type = DetectionType::Heuristic;
+            threat.type       = DetectionType::Heuristic;
             threat.threatName = "Heuristic.HiddenExecutable";
-            threat.details = "Hidden executable: " + filename;
-            threat.riskScore = 50;
+            threat.details    = "Hidden executable: " + filename;
+            threat.riskScore  = 50;
             threat.confidence = 60;
-            result.threats.push_back(threat);
+            result.threats.push_back(std::move(threat));
             if (result.result == FileScanResult::Clean) {
                 result.result = FileScanResult::Suspicious;
-                result.primaryThreatName = threat.threatName;
+                result.primaryThreatName = "Heuristic.HiddenExecutable";
             }
-            m_statistics.heuristicDetections++;
+            m_statistics.heuristicDetections.fetch_add(1, std::memory_order_relaxed);
         }
 #endif
     }
-
     // ========================================================================
-    // PRIVATE: THREAT HANDLING
+    // PRIVATE: THREAT HANDLING  (C4 — real quarantine via QuarantineManager)
     // ========================================================================
 
     void HandleInfectedFile(FileScanResultInfo& result,
                             const USBScanConfig& config) {
-        m_statistics.totalThreatsFound++;
+        m_statistics.totalThreatsFound.fetch_add(1, std::memory_order_relaxed);
 
-        std::unique_lock lock(m_mutex);
-        m_summary.filesInfected++;
-        m_summary.infectedFiles.push_back(result);
-        m_progress.threatsFound++;
+        // Copy info needed for logging before acquiring lock
+        const std::string pathStr  = result.filePath.string();
+        const std::string threatNm = result.primaryThreatName;
+        const std::string sha256   = result.sha256;
+
+        ThreatDetectedCallback threatCb;
+        {
+            std::unique_lock lock(m_mutex);
+            m_summary.filesInfected++;
+            m_summary.infectedFiles.push_back(result);
+            m_progress.threatsFound++;
+            threatCb = m_threatCallback;
+        }
 
         SS_LOG_WARN(LOG_CATEGORY,
             L"THREAT DETECTED: %hs — %hs (SHA-256: %hs)",
-            result.filePath.string().c_str(),
-            result.primaryThreatName.c_str(),
-            result.sha256.c_str());
+            pathStr.c_str(), threatNm.c_str(), sha256.c_str());
 
-        // Execute response action
+        // Execute configured response action
         switch (config.detectionAction) {
             case DetectionAction::Quarantine:
-                // Quarantine integration would go here
-                result.actionTaken = DetectionAction::Quarantine;
-                m_summary.filesQuarantined++;
-                m_statistics.totalFilesQuarantined++;
-                SS_LOG_INFO(LOG_CATEGORY, L"File queued for quarantine: %hs",
-                    result.filePath.string().c_str());
+            {
+                // C4: Actually quarantine via QuarantineManager
+                auto& qm = Core::Engine::QuarantineManager::Instance();
+                if (qm.IsInitialized()) {
+                    std::wstring widePath(result.filePath.wstring());
+                    std::wstring wideThreat(threatNm.begin(), threatNm.end());
+                    auto qResult = qm.QuarantineFile(widePath, wideThreat, 0);
+
+                    if (qResult.IsSuccess()) {
+                        result.actionTaken = DetectionAction::Quarantine;
+                        {
+                            std::unique_lock lock(m_mutex);
+                            m_summary.filesQuarantined++;
+                        }
+                        m_statistics.totalFilesQuarantined.fetch_add(
+                            1, std::memory_order_relaxed);
+                        SS_LOG_INFO(LOG_CATEGORY,
+                            L"File quarantined successfully: %hs", pathStr.c_str());
+                    } else {
+                        SS_LOG_ERROR(LOG_CATEGORY,
+                            L"Quarantine failed for %hs: %ls",
+                            pathStr.c_str(), qResult.message.c_str());
+                        result.actionTaken = DetectionAction::Report;
+                    }
+                } else {
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"QuarantineManager not initialized — falling back to report");
+                    result.actionTaken = DetectionAction::Report;
+                }
                 break;
+            }
 
             case DetectionAction::Delete:
             {
-                lock.unlock();
                 std::error_code ec;
                 fs::remove(result.filePath, ec);
-                lock.lock();
-
                 if (!ec) {
                     result.actionTaken = DetectionAction::Delete;
-                    m_summary.filesDeleted++;
-                    m_statistics.totalFilesDeleted++;
-                    SS_LOG_WARN(LOG_CATEGORY, L"Infected file deleted: %hs",
-                        result.filePath.string().c_str());
+                    {
+                        std::unique_lock lock(m_mutex);
+                        m_summary.filesDeleted++;
+                    }
+                    m_statistics.totalFilesDeleted.fetch_add(1, std::memory_order_relaxed);
+                    SS_LOG_WARN(LOG_CATEGORY,
+                        L"Infected file deleted: %hs", pathStr.c_str());
                 } else {
-                    SS_LOG_ERROR(LOG_CATEGORY, L"Failed to delete infected file: %hs (error: %hs)",
-                        result.filePath.string().c_str(), ec.message().c_str());
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Failed to delete infected file: %hs (error: %hs)",
+                        pathStr.c_str(), ec.message().c_str());
                 }
                 break;
             }
@@ -1015,31 +1304,35 @@ private:
                 break;
         }
 
-        // Notify threat callback
-        if (m_threatCallback) {
-            try { m_threatCallback(result); } catch (...) {
+        // Notify threat callback OUTSIDE the lock
+        if (threatCb) {
+            try { threatCb(result); } catch (...) {
                 SS_LOG_WARN(LOG_CATEGORY, L"Threat callback threw exception");
             }
         }
     }
 
     void HandleSuspiciousFile(FileScanResultInfo& result) {
-        std::unique_lock lock(m_mutex);
-        m_summary.filesSuspicious++;
-        m_summary.suspiciousFiles.push_back(result);
+        ThreatDetectedCallback threatCb;
+        {
+            std::unique_lock lock(m_mutex);
+            m_summary.filesSuspicious++;
+            m_summary.suspiciousFiles.push_back(result);
+            threatCb = m_threatCallback;
+        }
 
         SS_LOG_INFO(LOG_CATEGORY,
             L"Suspicious file: %hs — %hs",
             result.filePath.string().c_str(),
             result.primaryThreatName.c_str());
 
-        if (m_threatCallback) {
-            try { m_threatCallback(result); } catch (...) {}
+        if (threatCb) {
+            try { threatCb(result); } catch (...) {}
         }
     }
 
     // ========================================================================
-    // PRIVATE: SYNCHRONIZATION HELPERS
+    // PRIVATE: SYNCHRONIZATION HELPERS  (H3)
     // ========================================================================
 
     [[nodiscard]] bool CheckCancellation() const noexcept {
@@ -1062,32 +1355,9 @@ private:
     // PRIVATE: NOTIFICATION HELPERS
     // ========================================================================
 
-    void UpdateProgressStatus(const wchar_t* status, float percent) {
+    void UpdateProgressStatus(float percent) {
         std::unique_lock lock(m_mutex);
-        // Use NarrowToWideTLS for the status — but we already have wchar_t
-        // so just convert to narrow for the currentFile field
         m_progress.progressPercent = percent;
-    }
-
-    void NotifyProgress() {
-        // Must be called with m_mutex held
-        if (m_progressCallback) {
-            try { m_progressCallback(m_progress); } catch (...) {}
-        }
-    }
-
-    void NotifyComplete() {
-        std::shared_lock lock(m_mutex);
-        if (m_completeCallback) {
-            try { m_completeCallback(m_summary); } catch (...) {}
-        }
-    }
-
-    void NotifyError(const std::string& message, int code) {
-        std::shared_lock lock(m_mutex);
-        if (m_errorCallback) {
-            try { m_errorCallback(message, code); } catch (...) {}
-        }
     }
 
     // ========================================================================
@@ -1101,7 +1371,12 @@ private:
     // Thread pool (owned)
     std::unique_ptr<Utils::ThreadPool> m_threadPool;
 
-    // Scan state (atomics for lock-free access from scan thread)
+    // Detection stores (owned; optionally initialized)
+    HashStore::HashStore           m_hashStore;
+    PatternStore::PatternStore     m_patternStore;
+    SignatureStore::SignatureStore  m_signatureStore;
+
+    // Scan state (atomics for lock-free reads from worker thread)
     std::atomic<bool> m_scanActive{false};
     std::atomic<bool> m_cancelRequested{false};
     std::atomic<bool> m_pauseFlag{false};
@@ -1109,18 +1384,21 @@ private:
     std::condition_variable m_pauseCV;
     std::shared_future<void> m_scanFuture;
 
+    // Drive root for symlink validation (protected by m_mutex)
+    std::wstring m_currentDriveRoot;
+
     // Progress and summary (protected by m_mutex)
     USBScanProgress m_progress;
     USBScanResultSummary m_summary;
 
-    // Statistics (all atomic — no lock needed)
+    // Statistics (all atomic — no lock needed for individual reads)
     USBScanStatistics m_statistics;
 
     // Callbacks (protected by m_mutex)
-    ProgressCallback m_progressCallback;
+    ProgressCallback       m_progressCallback;
     ThreatDetectedCallback m_threatCallback;
-    ScanCompleteCallback m_completeCallback;
-    ErrorCallback m_errorCallback;
+    ScanCompleteCallback   m_completeCallback;
+    ErrorCallback          m_errorCallback;
 };
 
 // ============================================================================
@@ -1249,10 +1527,10 @@ void USBScanner::UnregisterCallbacks() {
 }
 
 // ============================================================================
-// STATISTICS DELEGATIONS
+// STATISTICS DELEGATIONS  (H4 — returns snapshot, not the live struct)
 // ============================================================================
 
-USBScanStatistics USBScanner::GetStatistics() const {
+USBScanStatisticsSnapshot USBScanner::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1269,7 +1547,6 @@ std::string USBScanner::GetVersionString() noexcept {
            std::to_string(USBScannerConstants::VERSION_MINOR) + "." +
            std::to_string(USBScannerConstants::VERSION_PATCH);
 }
-
 // ============================================================================
 // STRUCTURE IMPLEMENTATIONS — ToJson()
 // ============================================================================
@@ -1283,17 +1560,17 @@ bool USBScanConfig::IsValid() const noexcept {
 
 std::string USBScanConfig::ToJson() const {
     Utils::JSON::Json json;
-    json["scanArchives"] = scanArchives;
-    json["scanHiddenFiles"] = scanHiddenFiles;
-    json["scanSystemFiles"] = scanSystemFiles;
-    json["useHeuristics"] = useHeuristics;
-    json["useYARA"] = useYARA;
-    json["checkThreatIntel"] = checkThreatIntel;
-    json["maxFileSize"] = maxFileSize;
-    json["scanDepth"] = scanDepth;
-    json["maxArchiveDepth"] = maxArchiveDepth;
-    json["priority"] = static_cast<uint8_t>(priority);
-    json["detectionAction"] = static_cast<uint8_t>(detectionAction);
+    json["scanArchives"]      = scanArchives;
+    json["scanHiddenFiles"]   = scanHiddenFiles;
+    json["scanSystemFiles"]   = scanSystemFiles;
+    json["useHeuristics"]     = useHeuristics;
+    json["useYARA"]           = useYARA;
+    json["checkThreatIntel"]  = checkThreatIntel;
+    json["maxFileSize"]       = maxFileSize;
+    json["scanDepth"]         = scanDepth;
+    json["maxArchiveDepth"]   = maxArchiveDepth;
+    json["priority"]          = static_cast<uint8_t>(priority);
+    json["detectionAction"]   = static_cast<uint8_t>(detectionAction);
     json["priorityFilesFirst"] = priorityFilesFirst;
     json["resumeOnReconnect"] = resumeOnReconnect;
     return json.dump();
@@ -1301,32 +1578,32 @@ std::string USBScanConfig::ToJson() const {
 
 std::string DetectedThreat::ToJson() const {
     Utils::JSON::Json json;
-    json["type"] = static_cast<uint8_t>(type);
-    json["typeName"] = std::string(GetDetectionTypeName(type));
-    json["threatName"] = threatName;
+    json["type"]         = static_cast<uint8_t>(type);
+    json["typeName"]     = std::string(GetDetectionTypeName(type));
+    json["threatName"]   = threatName;
     json["threatFamily"] = threatFamily;
-    json["signatureId"] = signatureId;
-    json["riskScore"] = riskScore;
-    json["confidence"] = confidence;
+    json["signatureId"]  = signatureId;
+    json["riskScore"]    = riskScore;
+    json["confidence"]   = confidence;
     json["mitreAttackId"] = mitreAttackId;
-    json["details"] = details;
+    json["details"]      = details;
     return json.dump();
 }
 
 std::string FileScanResultInfo::ToJson() const {
     Utils::JSON::Json json;
-    json["filePath"] = filePath.string();
-    json["relativePath"] = relativePath.string();
-    json["result"] = static_cast<uint8_t>(result);
-    json["resultName"] = std::string(GetFileScanResultName(result));
+    json["filePath"]          = filePath.string();
+    json["relativePath"]      = relativePath.string();
+    json["result"]            = static_cast<uint8_t>(result);
+    json["resultName"]        = std::string(GetFileScanResultName(result));
     json["primaryThreatName"] = primaryThreatName;
-    json["fileSize"] = fileSize;
-    json["sha256"] = sha256;
-    json["sha1"] = sha1;
-    json["md5"] = md5;
-    json["actionTaken"] = static_cast<uint8_t>(actionTaken);
-    json["actionName"] = std::string(GetDetectionActionName(actionTaken));
-    json["scanDurationUs"] = scanDuration.count();
+    json["fileSize"]          = fileSize;
+    json["sha256"]            = sha256;
+    json["sha1"]              = sha1;
+    json["md5"]               = md5;
+    json["actionTaken"]       = static_cast<uint8_t>(actionTaken);
+    json["actionName"]        = std::string(GetDetectionActionName(actionTaken));
+    json["scanDurationUs"]    = scanDuration.count();
 
     json["threats"] = Utils::JSON::Json::array();
     for (const auto& threat : threats) {
@@ -1340,38 +1617,38 @@ std::string FileScanResultInfo::ToJson() const {
 
 std::string USBScanProgress::ToJson() const {
     Utils::JSON::Json json;
-    json["status"] = static_cast<uint8_t>(status);
-    json["statusName"] = std::string(GetScanStatusName(status));
-    json["progressPercent"] = progressPercent;
-    json["filesScanned"] = filesScanned;
-    json["totalFiles"] = totalFiles;
-    json["bytesScanned"] = bytesScanned;
-    json["totalBytes"] = totalBytes;
-    json["currentFile"] = currentFile;
-    json["currentDirectory"] = currentDirectory;
-    json["threatsFound"] = threatsFound;
+    json["status"]              = static_cast<uint8_t>(status);
+    json["statusName"]          = std::string(GetScanStatusName(status));
+    json["progressPercent"]     = progressPercent;
+    json["filesScanned"]        = filesScanned;
+    json["totalFiles"]          = totalFiles;
+    json["bytesScanned"]        = bytesScanned;
+    json["totalBytes"]          = totalBytes;
+    json["currentFile"]         = currentFile;
+    json["currentDirectory"]    = currentDirectory;
+    json["threatsFound"]        = threatsFound;
     json["estimatedTimeRemainingSeconds"] = estimatedTimeRemaining.count();
-    json["scanSpeedBps"] = scanSpeedBps;
+    json["scanSpeedBps"]        = scanSpeedBps;
     return json.dump();
 }
 
 std::string USBScanResultSummary::ToJson() const {
     Utils::JSON::Json json;
-    json["status"] = static_cast<uint8_t>(status);
-    json["statusName"] = std::string(GetScanStatusName(status));
-    json["drivePath"] = drivePath;
-    json["volumeLabel"] = volumeLabel;
-    json["filesScanned"] = filesScanned;
-    json["directoriesScanned"] = directoriesScanned;
-    json["bytesScanned"] = bytesScanned;
-    json["filesInfected"] = filesInfected;
-    json["filesSuspicious"] = filesSuspicious;
-    json["filesQuarantined"] = filesQuarantined;
-    json["filesDeleted"] = filesDeleted;
-    json["filesSkipped"] = filesSkipped;
-    json["errors"] = errors;
-    json["totalDurationSeconds"] = totalDuration.count();
-    json["averageSpeedBps"] = averageSpeedBps;
+    json["status"]                = static_cast<uint8_t>(status);
+    json["statusName"]            = std::string(GetScanStatusName(status));
+    json["drivePath"]             = drivePath;
+    json["volumeLabel"]           = volumeLabel;
+    json["filesScanned"]          = filesScanned;
+    json["directoriesScanned"]    = directoriesScanned;
+    json["bytesScanned"]          = bytesScanned;
+    json["filesInfected"]         = filesInfected;
+    json["filesSuspicious"]       = filesSuspicious;
+    json["filesQuarantined"]      = filesQuarantined;
+    json["filesDeleted"]          = filesDeleted;
+    json["filesSkipped"]          = filesSkipped;
+    json["errors"]                = errors;
+    json["totalDurationSeconds"]  = totalDuration.count();
+    json["averageSpeedBps"]       = averageSpeedBps;
 
     json["infectedFiles"] = Utils::JSON::Json::array();
     for (const auto& f : infectedFiles) {
@@ -1420,26 +1697,29 @@ void USBScanStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
-std::string USBScanStatistics::ToJson() const {
+// ============================================================================
+// USBScanStatisticsSnapshot::ToJson  (H4)
+// ============================================================================
+
+std::string USBScanStatisticsSnapshot::ToJson() const {
     Utils::JSON::Json json;
-    json["totalScans"] = totalScans.load();
-    json["completedScans"] = completedScans.load();
-    json["cancelledScans"] = cancelledScans.load();
-    json["erroredScans"] = erroredScans.load();
-    json["totalFilesScanned"] = totalFilesScanned.load();
-    json["totalBytesScanned"] = totalBytesScanned.load();
-    json["totalThreatsFound"] = totalThreatsFound.load();
-    json["totalFilesQuarantined"] = totalFilesQuarantined.load();
-    json["totalFilesDeleted"] = totalFilesDeleted.load();
-    json["hashMatches"] = hashMatches.load();
-    json["signatureMatches"] = signatureMatches.load();
-    json["yaraMatches"] = yaraMatches.load();
-    json["heuristicDetections"] = heuristicDetections.load();
+    json["totalScans"]            = totalScans;
+    json["completedScans"]        = completedScans;
+    json["cancelledScans"]        = cancelledScans;
+    json["erroredScans"]          = erroredScans;
+    json["totalFilesScanned"]     = totalFilesScanned;
+    json["totalBytesScanned"]     = totalBytesScanned;
+    json["totalThreatsFound"]     = totalThreatsFound;
+    json["totalFilesQuarantined"] = totalFilesQuarantined;
+    json["totalFilesDeleted"]     = totalFilesDeleted;
+    json["hashMatches"]           = hashMatches;
+    json["signatureMatches"]      = signatureMatches;
+    json["yaraMatches"]           = yaraMatches;
+    json["heuristicDetections"]   = heuristicDetections;
 
-    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
+    auto uptimeSeconds = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
-    json["uptimeSeconds"] = uptime;
-
+    json["uptimeSeconds"]         = uptimeSeconds;
     return json.dump();
 }
 
