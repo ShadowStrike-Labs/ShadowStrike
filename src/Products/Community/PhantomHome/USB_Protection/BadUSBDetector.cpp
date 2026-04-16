@@ -27,8 +27,9 @@
  * - Known attack device fingerprinting (Rubber Ducky, Bash Bunny, etc.)
  * - Behavioral analysis (superhuman typing speed, perfect timing)
  * - Command pattern detection (PowerShell cradles, privilege escalation)
- * - Input buffer reconstruction and analysis
- * - Real-time response and countermeasures
+ * - Per-device input buffer reconstruction and analysis
+ * - Multi-window sliding CPS for slow-type evasion resistance
+ * - Real-time response and countermeasures with process termination
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -47,6 +48,7 @@
 #include "../Utils/FileUtils.hpp"
 #include "../Utils/JSONUtils.hpp"
 #include "../Utils/HashUtils.hpp"
+#include "../Utils/ProcessUtils.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -55,7 +57,6 @@
 #include <numeric>
 #include <cmath>
 
-// Windows-specific includes for device operations
 #ifdef _WIN32
 #include <SetupAPI.h>
 #include <cfgmgr32.h>
@@ -95,13 +96,16 @@ namespace CommandPatterns {
         std::regex(R"(powershell.*Invoke-WebRequest)", std::regex::icase),
         std::regex(R"(powershell.*wget\s+http)", std::regex::icase),
         std::regex(R"(powershell.*curl\s+http)", std::regex::icase),
+        std::regex(R"(pwsh.*-e[ncodema]*\s+[A-Za-z0-9+/=]+)", std::regex::icase),
+        std::regex(R"(powershell.*DownloadFile)", std::regex::icase),
+        std::regex(R"(pwsh.*IEX)", std::regex::icase),
     };
 
     // CMD execution patterns
     static const std::vector<std::regex> CMD_PATTERNS = {
         std::regex(R"(cmd\s*/c)", std::regex::icase),
-        std::regex(R"(cmd\.exe\s*/k)", std::regex::icase),
-        std::regex(R"(command\.com)", std::regex::icase),
+        std::regex(R"(cmd\s*/k)", std::regex::icase),
+        std::regex(R"(cmd\.exe)", std::regex::icase),
     };
 
     // Privilege escalation patterns
@@ -114,6 +118,13 @@ namespace CommandPatterns {
         std::regex(R"(wmic\s+process\s+call\s+create)", std::regex::icase),
     };
 
+    // UAC bypass patterns
+    static const std::vector<std::regex> UAC_BYPASS_PATTERNS = {
+        std::regex(R"(fodhelper)", std::regex::icase),
+        std::regex(R"(eventvwr)", std::regex::icase),
+        std::regex(R"(computerdefaults)", std::regex::icase),
+    };
+
     // Persistence mechanism patterns
     static const std::vector<std::regex> PERSISTENCE_PATTERNS = {
         std::regex(R"(\\Startup\\)", std::regex::icase),
@@ -122,6 +133,7 @@ namespace CommandPatterns {
         std::regex(R"(schtasks.*\/create)", std::regex::icase),
         std::regex(R"(sc\s+create)", std::regex::icase),
         std::regex(R"(reg\s+add.*\\services\\)", std::regex::icase),
+        std::regex(R"(reg\s+add.*\\Run)", std::regex::icase),
     };
 
     // Shell execution patterns
@@ -132,6 +144,8 @@ namespace CommandPatterns {
         std::regex(R"(mshta)", std::regex::icase),
         std::regex(R"(certutil.*-urlcache)", std::regex::icase),
         std::regex(R"(bitsadmin.*\/transfer)", std::regex::icase),
+        std::regex(R"(\bcurl\s+.*http)", std::regex::icase),
+        std::regex(R"(\bwget\s+.*http)", std::regex::icase),
     };
 
     // MITRE ATT&CK technique mappings
@@ -162,7 +176,32 @@ struct KeystrokeEvent {
     bool isKeyDown;
     TimePoint timestamp;
     std::string deviceId;
-    char character;  // Resolved character (0 if non-printable)
+    char character;
+};
+
+// ============================================================================
+// PER-DEVICE ANALYSIS STATE
+// ============================================================================
+
+struct DeviceAnalysisState {
+    std::deque<TimePoint> keystrokeTimes;
+    std::string reconstructedBuffer;
+    HIDInputStatistics stats;
+    std::vector<DetectedCommandPattern> detectedPatterns;
+    int cumulativeRiskScore = 0;
+    TimePoint firstKeystroke;
+    TimePoint lastKeystroke;
+    bool attackDetected = false;
+    TimePoint attackStartTime;
+
+    struct ModifierState {
+        bool ctrl = false;
+        bool shift = false;
+        bool alt = false;
+        bool win = false;
+    } modifierState;
+
+    std::deque<KeystrokeEvent> keystrokeBuffer;
 };
 
 // ============================================================================
@@ -174,7 +213,6 @@ public:
     BadUSBDetectorImpl() = default;
     ~BadUSBDetectorImpl() = default;
 
-    // Non-copyable, non-movable
     BadUSBDetectorImpl(const BadUSBDetectorImpl&) = delete;
     BadUSBDetectorImpl& operator=(const BadUSBDetectorImpl&) = delete;
     BadUSBDetectorImpl(BadUSBDetectorImpl&&) = delete;
@@ -187,18 +225,17 @@ public:
     [[nodiscard]] bool Initialize(const BadUSBConfiguration& config) {
         std::unique_lock lock(m_mutex);
 
-        if (m_status != ModuleStatus::Uninitialized &&
-            m_status != ModuleStatus::Stopped) {
+        if (m_status != BadUSBModuleStatus::Uninitialized &&
+            m_status != BadUSBModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"Already initialized or running");
             return false;
         }
 
-        m_status = ModuleStatus::Initializing;
+        m_status = BadUSBModuleStatus::Initializing;
 
-        // Validate configuration
         if (!config.IsValid()) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration provided");
-            m_status = ModuleStatus::Error;
+            m_status = BadUSBModuleStatus::Error;
             return false;
         }
 
@@ -206,21 +243,13 @@ public:
         m_stats.Reset();
         m_stats.startTime = Clock::now();
 
-        // Initialize keystroke buffer
-        m_keystrokeBuffer.clear();
-        m_keystrokeBuffer.reserve(config.analysisWindowSize);
-        m_commandBuffer.clear();
-        m_commandBuffer.reserve(4096);
+        m_deviceStates.clear();
 
-        // Reset state
         m_attackInProgress = false;
         m_currentAttackEvent = std::nullopt;
         m_nextEventId = 1;
 
-        // Initialize modifier key state
-        m_modifierState = {false, false, false, false};
-
-        m_status = ModuleStatus::Running;
+        m_status = BadUSBModuleStatus::Running;
 
         SS_LOG_INFO(LOG_CATEGORY, L"BadUSBDetector initialized successfully");
         SS_LOG_INFO(LOG_CATEGORY, L"  Behavioral analysis: %ls",
@@ -235,34 +264,32 @@ public:
     void Shutdown() {
         std::unique_lock lock(m_mutex);
 
-        if (m_status == ModuleStatus::Uninitialized ||
-            m_status == ModuleStatus::Stopped) {
+        if (m_status == BadUSBModuleStatus::Uninitialized ||
+            m_status == BadUSBModuleStatus::Stopped) {
             return;
         }
 
-        m_status = ModuleStatus::Stopping;
+        m_status = BadUSBModuleStatus::Stopping;
 
-        // Clear callbacks
         m_attackCallbacks.clear();
         m_deviceCallbacks.clear();
         m_errorCallbacks.clear();
 
-        // Clear buffers
-        m_keystrokeBuffer.clear();
-        m_commandBuffer.clear();
+        m_deviceStates.clear();
         m_trackedDevices.clear();
 
-        m_status = ModuleStatus::Stopped;
+        m_status = BadUSBModuleStatus::Stopped;
 
         SS_LOG_INFO(LOG_CATEGORY, L"BadUSBDetector shutdown complete");
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
         std::shared_lock lock(m_mutex);
-        return m_status == ModuleStatus::Running || m_status == ModuleStatus::Monitoring;
+        return m_status == BadUSBModuleStatus::Running ||
+               m_status == BadUSBModuleStatus::Monitoring;
     }
 
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept {
+    [[nodiscard]] BadUSBModuleStatus GetStatus() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_status;
     }
@@ -294,7 +321,6 @@ public:
 
         m_stats.totalDevicesAnalyzed++;
 
-        // Get device descriptor
         auto descriptor = GetDeviceDescriptorInternal(devicePath);
         if (!descriptor) {
             SS_LOG_WARN(LOG_CATEGORY, L"Failed to get device descriptor: %hs",
@@ -304,11 +330,13 @@ public:
 
         DeviceAnalysisResult result = AnalyzeDescriptor(*descriptor);
 
-        // Track device
         m_trackedDevices[devicePath] = *descriptor;
 
-        // Notify callbacks
-        for (const auto& callback : m_deviceCallbacks) {
+        // Copy callbacks under lock, invoke outside
+        auto callbacksCopy = m_deviceCallbacks;
+        lock.unlock();
+
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(*descriptor, result);
             } catch (...) {
@@ -326,7 +354,6 @@ public:
 
         m_stats.totalDevicesAnalyzed++;
 
-        // Check known bad devices first
         if (IsKnownBadDeviceInternal(vendorId, productId)) {
             m_stats.knownBadDevicesDetected++;
             SS_LOG_WARN(LOG_CATEGORY, L"Known bad device detected: VID=%04X PID=%04X",
@@ -334,7 +361,6 @@ public:
             return DeviceAnalysisResult::KnownBadDevice;
         }
 
-        // Check for suspicious VIDs (known attack hardware vendors)
         if (IsSuspiciousVendor(vendorId)) {
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::Suspicious;
@@ -358,37 +384,24 @@ public:
         uint16_t vendorId, uint16_t productId) const noexcept {
         std::shared_lock lock(m_mutex);
 
-        // USB Rubber Ducky
         if (vendorId == 0x1FC9 && productId == 0x000C) {
             return AttackDeviceType::RubberDucky;
         }
-
-        // Bash Bunny
         if (vendorId == 0x2E8A && productId == 0x000A) {
             return AttackDeviceType::BashBunny;
         }
-
-        // Digispark
         if (vendorId == 0x16D0 && productId == 0x0753) {
             return AttackDeviceType::Digispark;
         }
-
-        // Teensy
         if (vendorId == 0x16C0 && (productId == 0x0483 || productId == 0x0486)) {
             return AttackDeviceType::Teensy;
         }
-
-        // Arduino
         if (vendorId == 0x2341) {
             return AttackDeviceType::Arduino;
         }
-
-        // O.MG Cable (uses various VID/PID combinations)
         if (vendorId == 0x0483 && productId == 0x5740) {
             return AttackDeviceType::OMGCable;
         }
-
-        // P4wnP1 (Raspberry Pi Zero based)
         if (vendorId == 0x1D6B && productId == 0x0104) {
             return AttackDeviceType::P4wnP1;
         }
@@ -406,50 +419,52 @@ public:
 
         if (!m_config.enabled) return;
 
-        // Update modifier state
-        UpdateModifierState(virtualKey, isKeyDown);
+        auto& devState = GetOrCreateDeviceState_Locked(deviceId);
 
-        // Only process key down events for typing analysis
+        UpdateModifierState(devState, virtualKey, isKeyDown);
+
         if (!isKeyDown) return;
 
         m_stats.totalKeystrokesAnalyzed++;
 
-        // Create keystroke event
         KeystrokeEvent event;
         event.virtualKey = virtualKey;
         event.isKeyDown = isKeyDown;
         event.timestamp = timestamp;
         event.deviceId = deviceId;
-        event.character = VirtualKeyToChar(virtualKey);
+        event.character = VirtualKeyToChar(devState, virtualKey);
 
-        // Add to buffer
-        m_keystrokeBuffer.push_back(event);
+        devState.keystrokeBuffer.push_back(event);
+        devState.keystrokeTimes.push_back(timestamp);
 
-        // Trim buffer to window size
-        while (m_keystrokeBuffer.size() > m_config.analysisWindowSize) {
-            m_keystrokeBuffer.pop_front();
+        while (devState.keystrokeBuffer.size() > m_config.analysisWindowSize) {
+            devState.keystrokeBuffer.pop_front();
+        }
+        while (devState.keystrokeTimes.size() > m_config.analysisWindowSize) {
+            devState.keystrokeTimes.pop_front();
         }
 
-        // Update command buffer
+        if (devState.firstKeystroke == TimePoint{}) {
+            devState.firstKeystroke = timestamp;
+        }
+        devState.lastKeystroke = timestamp;
+
         if (event.character != 0) {
-            m_commandBuffer.push_back(event.character);
-            // Limit command buffer size
-            if (m_commandBuffer.size() > 8192) {
-                m_commandBuffer.erase(0, 4096);
+            devState.reconstructedBuffer.push_back(event.character);
+            if (devState.reconstructedBuffer.size() > 8192) {
+                devState.reconstructedBuffer.erase(0, 4096);
             }
         }
 
-        // Check for special key combinations
-        DetectSpecialCombinations(virtualKey);
+        DetectSpecialCombinations(devState, virtualKey);
 
-        // Perform analysis if we have enough data
-        if (m_keystrokeBuffer.size() >= 10) {
-            PerformBehavioralAnalysis();
+        if (devState.keystrokeBuffer.size() >= 10) {
+            PerformBehavioralAnalysis_Locked(devState, deviceId);
         }
 
-        // Check for command patterns
-        if (m_config.enableCommandPatternDetection && m_commandBuffer.size() >= 10) {
-            PerformCommandPatternAnalysis();
+        if (m_config.enableCommandPatternDetection &&
+            devState.reconstructedBuffer.size() >= 10) {
+            PerformCommandPatternAnalysis_Locked(devState, deviceId);
         }
     }
 
@@ -460,35 +475,201 @@ public:
 
     [[nodiscard]] HIDInputStatistics GetCurrentInputStatistics() const {
         std::shared_lock lock(m_mutex);
-        return CalculateInputStatistics();
+        // Aggregate across all devices
+        HIDInputStatistics agg;
+        for (const auto& [id, devState] : m_deviceStates) {
+            auto stats = CalculateInputStatistics(devState);
+            agg.totalKeystrokes += stats.totalKeystrokes;
+            agg.peakCPS = std::max(agg.peakCPS, stats.peakCPS);
+            if (stats.currentCPS > agg.currentCPS) {
+                agg.currentCPS = stats.currentCPS;
+                agg.timingVarianceMs = stats.timingVarianceMs;
+                agg.consistencyScore = stats.consistencyScore;
+                agg.minInterval = stats.minInterval;
+                agg.maxInterval = stats.maxInterval;
+                agg.avgInterval = stats.avgInterval;
+                agg.maxBurstLength = stats.maxBurstLength;
+            }
+            agg.winRDetected |= stats.winRDetected;
+            agg.ctrlEscDetected |= stats.ctrlEscDetected;
+            agg.usesSpecialCombos |= stats.usesSpecialCombos;
+        }
+        return agg;
     }
 
     [[nodiscard]] std::string GetReconstructedBuffer() const {
         std::shared_lock lock(m_mutex);
-        return m_commandBuffer;
+        std::string combined;
+        for (const auto& [id, devState] : m_deviceStates) {
+            if (!devState.reconstructedBuffer.empty()) {
+                if (!combined.empty()) combined += '\n';
+                combined += devState.reconstructedBuffer;
+            }
+        }
+        return combined;
     }
 
+    // Public ResetAnalysis acquires lock, calls _Locked
     void ResetAnalysis() {
         std::unique_lock lock(m_mutex);
-        m_keystrokeBuffer.clear();
-        m_commandBuffer.clear();
-        m_attackInProgress = false;
-        m_currentAttackEvent = std::nullopt;
-        m_modifierState = {false, false, false, false};
-        SS_LOG_INFO(LOG_CATEGORY, L"Analysis state reset");
+        ResetAnalysis_Locked();
     }
 
     // ========================================================================
-    // RESPONSE ACTIONS
+    // RESPONSE ACTIONS — PUBLIC (acquire lock, delegate to _Locked)
     // ========================================================================
 
     [[nodiscard]] bool BlockDevice(const std::string& devicePath) {
         std::unique_lock lock(m_mutex);
+        return BlockDevice_Locked(devicePath);
+    }
 
+    [[nodiscard]] bool EjectDevice(const std::string& devicePath) {
+        std::unique_lock lock(m_mutex);
+        return EjectDevice_Locked(devicePath);
+    }
+
+    void TerminateLaunchedProcesses() {
+        std::unique_lock lock(m_mutex);
+        TerminateLaunchedProcesses_Locked();
+    }
+
+    void ClearInputBuffer() {
+        std::unique_lock lock(m_mutex);
+        ClearInputBuffer_Locked();
+    }
+
+    // ========================================================================
+    // CALLBACKS
+    // ========================================================================
+
+    void RegisterAttackCallback(AttackEventCallback callback) {
+        std::unique_lock lock(m_mutex);
+        m_attackCallbacks.push_back(std::move(callback));
+    }
+
+    void RegisterDeviceCallback(DeviceAnalysisCallback callback) {
+        std::unique_lock lock(m_mutex);
+        m_deviceCallbacks.push_back(std::move(callback));
+    }
+
+    void RegisterErrorCallback(ErrorCallback callback) {
+        std::unique_lock lock(m_mutex);
+        m_errorCallbacks.push_back(std::move(callback));
+    }
+
+    void UnregisterCallbacks() {
+        std::unique_lock lock(m_mutex);
+        m_attackCallbacks.clear();
+        m_deviceCallbacks.clear();
+        m_errorCallbacks.clear();
+    }
+
+    // ========================================================================
+    // STATISTICS
+    // ========================================================================
+
+    [[nodiscard]] BadUSBStatisticsSnapshot GetStatistics() const {
+        std::shared_lock lock(m_mutex);
+        BadUSBStatisticsSnapshot snap;
+        snap.totalDevicesAnalyzed     = m_stats.totalDevicesAnalyzed.load(std::memory_order_relaxed);
+        snap.knownBadDevicesDetected  = m_stats.knownBadDevicesDetected.load(std::memory_order_relaxed);
+        snap.suspiciousDevicesDetected= m_stats.suspiciousDevicesDetected.load(std::memory_order_relaxed);
+        snap.attacksDetected          = m_stats.attacksDetected.load(std::memory_order_relaxed);
+        snap.attacksBlocked           = m_stats.attacksBlocked.load(std::memory_order_relaxed);
+        snap.superhumanInputDetected  = m_stats.superhumanInputDetected.load(std::memory_order_relaxed);
+        snap.commandInjectionDetected = m_stats.commandInjectionDetected.load(std::memory_order_relaxed);
+        snap.totalKeystrokesAnalyzed  = m_stats.totalKeystrokesAnalyzed.load(std::memory_order_relaxed);
+        snap.totalBurstEventsDetected = m_stats.totalBurstEventsDetected.load(std::memory_order_relaxed);
+        for (size_t i = 0; i < snap.byDeviceType.size(); ++i) {
+            snap.byDeviceType[i] = m_stats.byDeviceType[i].load(std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < snap.byPatternType.size(); ++i) {
+            snap.byPatternType[i] = m_stats.byPatternType[i].load(std::memory_order_relaxed);
+        }
+        snap.startTime = m_stats.startTime;
+        return snap;
+    }
+
+    void ResetStatistics() {
+        std::unique_lock lock(m_mutex);
+        m_stats.Reset();
+    }
+
+    // ========================================================================
+    // SELF-TEST — No main-mutex hold; calls public methods sequentially
+    // ========================================================================
+
+    [[nodiscard]] bool SelfTest() {
+        SS_LOG_INFO(LOG_CATEGORY, L"Starting self-test...");
+
+        try {
+            // Test 1: Known bad device detection (public API, manages own lock)
+            if (!IsKnownBadDevice(0x1FC9, 0x000C)) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Rubber Ducky not detected");
+                return false;
+            }
+
+            // Test 2: Attack device type identification
+            auto deviceType = IdentifyAttackDeviceType(0x16D0, 0x0753);
+            if (deviceType != AttackDeviceType::Digispark) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Device type mismatch");
+                return false;
+            }
+
+            // Test 3: Safe device check
+            auto result = AnalyzeDevice(0x046D, 0xC52B);
+            if (result == DeviceAnalysisResult::KnownBadDevice) {
+                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: False positive on safe device");
+                return false;
+            }
+
+            // Test 4: Keystroke processing
+            {
+                TimePoint now = Clock::now();
+                for (int i = 0; i < 20; i++) {
+                    ProcessKeyboardEvent(
+                        static_cast<uint16_t>('A' + i), true,
+                        now + std::chrono::milliseconds(i * 5), "SELFTEST");
+                }
+
+                auto stats = GetCurrentInputStatistics();
+                if (stats.totalKeystrokes < 20) {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Self-test failed: Keystroke count mismatch (got %llu)",
+                        static_cast<unsigned long long>(stats.totalKeystrokes));
+                    ResetAnalysis();
+                    return false;
+                }
+
+                ResetAnalysis();
+            }
+
+            SS_LOG_INFO(LOG_CATEGORY, L"Self-test completed successfully");
+            return true;
+
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CATEGORY, L"Self-test exception: %hs", e.what());
+            return false;
+        }
+    }
+
+private:
+    // ========================================================================
+    // _LOCKED METHODS (caller already holds m_mutex)
+    // ========================================================================
+
+    void ResetAnalysis_Locked() {
+        m_deviceStates.clear();
+        m_attackInProgress = false;
+        m_currentAttackEvent = std::nullopt;
+        SS_LOG_INFO(LOG_CATEGORY, L"Analysis state reset");
+    }
+
+    [[nodiscard]] bool BlockDevice_Locked(const std::string& devicePath) {
         SS_LOG_WARN(LOG_CATEGORY, L"Blocking device: %hs", devicePath.c_str());
 
 #ifdef _WIN32
-        // Disable the device using SetupAPI
         HDEVINFO devInfo = SetupDiGetClassDevsA(
             nullptr, devicePath.c_str(), nullptr,
             DIGCF_ALLCLASSES | DIGCF_DEVICEINTERFACE);
@@ -531,23 +712,20 @@ public:
 #endif
     }
 
-    [[nodiscard]] bool EjectDevice(const std::string& devicePath) {
-        std::unique_lock lock(m_mutex);
-
+    [[nodiscard]] bool EjectDevice_Locked(const std::string& devicePath) {
         SS_LOG_WARN(LOG_CATEGORY, L"Ejecting device: %hs", devicePath.c_str());
 
 #ifdef _WIN32
-        // Use CM_Request_Device_Eject
         DEVINST devInst = 0;
         CONFIGRET cr = CM_Locate_DevNodeA(&devInst, const_cast<char*>(devicePath.c_str()),
             CM_LOCATE_DEVNODE_NORMAL);
 
         if (cr != CR_SUCCESS) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to locate device node: %lu", cr);
+            SS_LOG_ERROR(LOG_CATEGORY, L"Failed to locate device node: %lu",
+                static_cast<unsigned long>(cr));
             return false;
         }
 
-        // Get parent (USB hub) for ejection
         DEVINST parentInst = 0;
         cr = CM_Get_Parent(&parentInst, devInst, 0);
         if (cr != CR_SUCCESS) {
@@ -563,7 +741,7 @@ public:
             return true;
         } else {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to eject device: %lu, Veto: %ls",
-                cr, vetoName);
+                static_cast<unsigned long>(cr), vetoName);
             return false;
         }
 #else
@@ -571,40 +749,93 @@ public:
 #endif
     }
 
-    void TerminateLaunchedProcesses() {
-        std::unique_lock lock(m_mutex);
-
+    void TerminateLaunchedProcesses_Locked() {
         if (!m_config.terminateLaunchedProcesses) return;
 
-        SS_LOG_WARN(LOG_CATEGORY, L"Terminating processes launched by attack");
+        SS_LOG_WARN(LOG_CATEGORY, L"Terminating processes launched by BadUSB attack");
 
-        // Get list of recently spawned processes
-        // This would integrate with ProcessUtils to find and terminate
-        // processes that were likely launched by the attack
-
-        // For now, we target common attack targets
-        const wchar_t* targetProcesses[] = {
+        static constexpr const wchar_t* kTargetProcesses[] = {
             L"powershell.exe",
+            L"pwsh.exe",
             L"cmd.exe",
             L"wscript.exe",
             L"cscript.exe",
             L"mshta.exe",
         };
 
-        for (const auto& processName : targetProcesses) {
-            // TODO: Integrate with ProcessUtils to terminate specific instances
-            // that were launched during the attack window
-            SS_LOG_INFO(LOG_CATEGORY, L"Would terminate: %ls", processName);
+        // Determine the attack start time. If unknown, use a 30-second window.
+        TimePoint attackStart = Clock::now() - std::chrono::seconds(30);
+        for (const auto& [id, state] : m_deviceStates) {
+            if (state.attackDetected && state.attackStartTime != TimePoint{}) {
+                if (state.attackStartTime < attackStart) {
+                    attackStart = state.attackStartTime;
+                }
+            }
+        }
+
+        // Convert steady_clock attack start to system FILETIME for comparison
+        auto sysNow = std::chrono::system_clock::now();
+        auto steadyNow = Clock::now();
+        auto attackAge = std::chrono::duration_cast<std::chrono::milliseconds>(
+            steadyNow - attackStart);
+        auto sysAttackStart = sysNow - attackAge;
+
+        // Convert to FILETIME for process creation comparison
+        auto sysEpoch = sysAttackStart.time_since_epoch();
+        auto ftCount = std::chrono::duration_cast<std::chrono::duration<int64_t, std::ratio<1, 10000000>>>(
+            sysEpoch).count();
+        // Windows FILETIME epoch is Jan 1, 1601. system_clock is Jan 1, 1970.
+        constexpr int64_t kEpochDiff = 116444736000000000LL;
+        int64_t attackFt = ftCount + kEpochDiff;
+
+        Utils::ProcessUtils::Error procErr;
+
+        for (const auto& processName : kTargetProcesses) {
+            procErr.Clear();
+            auto pids = Utils::ProcessUtils::GetProcessIdsByName(processName, &procErr);
+            if (procErr.HasError() || pids.empty()) {
+                continue;
+            }
+
+            for (auto pid : pids) {
+                // Check if process was created after attack start
+                Utils::ProcessUtils::ProcessBasicInfo pInfo;
+                procErr.Clear();
+                if (!Utils::ProcessUtils::GetProcessBasicInfo(pid, pInfo, &procErr)) {
+                    continue;
+                }
+
+                int64_t creationFt = (static_cast<int64_t>(pInfo.creationTime.dwHighDateTime) << 32) |
+                                     static_cast<int64_t>(pInfo.creationTime.dwLowDateTime);
+
+                if (creationFt < attackFt) {
+                    // Process predates the attack — skip
+                    continue;
+                }
+
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Terminating attack-spawned process: %ls (PID %lu)",
+                    processName, static_cast<unsigned long>(pid));
+
+                procErr.Clear();
+                if (Utils::ProcessUtils::TerminateProcessTree(pid, 1, &procErr)) {
+                    SS_LOG_INFO(LOG_CATEGORY,
+                        L"Successfully terminated process tree for PID %lu",
+                        static_cast<unsigned long>(pid));
+                } else {
+                    SS_LOG_ERROR(LOG_CATEGORY,
+                        L"Failed to terminate PID %lu: %ls",
+                        static_cast<unsigned long>(pid),
+                        procErr.message.c_str());
+                }
+            }
         }
     }
 
-    void ClearInputBuffer() {
-        std::unique_lock lock(m_mutex);
-
+    void ClearInputBuffer_Locked() {
         SS_LOG_INFO(LOG_CATEGORY, L"Clearing input buffer");
 
 #ifdef _WIN32
-        // Flush the keyboard buffer
         while (true) {
             MSG msg;
             if (!PeekMessageW(&msg, nullptr, WM_KEYFIRST, WM_KEYLAST, PM_REMOVE)) {
@@ -612,13 +843,11 @@ public:
             }
         }
 
-        // Also clear any pending input
         INPUT input{};
         input.type = INPUT_KEYBOARD;
         input.ki.wVk = 0;
         input.ki.dwFlags = KEYEVENTF_KEYUP;
 
-        // Send key up for all modifier keys to reset state
         uint16_t modifiers[] = {VK_CONTROL, VK_SHIFT, VK_MENU, VK_LWIN, VK_RWIN};
         for (auto vk : modifiers) {
             input.ki.wVk = vk;
@@ -628,98 +857,23 @@ public:
     }
 
     // ========================================================================
-    // CALLBACKS
+    // PER-DEVICE STATE
     // ========================================================================
 
-    void RegisterAttackCallback(AttackEventCallback callback) {
-        std::unique_lock lock(m_mutex);
-        m_attackCallbacks.push_back(std::move(callback));
-    }
+    [[nodiscard]] DeviceAnalysisState& GetOrCreateDeviceState_Locked(
+        const std::string& deviceId) {
 
-    void RegisterDeviceCallback(DeviceAnalysisCallback callback) {
-        std::unique_lock lock(m_mutex);
-        m_deviceCallbacks.push_back(std::move(callback));
-    }
-
-    void RegisterErrorCallback(ErrorCallback callback) {
-        std::unique_lock lock(m_mutex);
-        m_errorCallbacks.push_back(std::move(callback));
-    }
-
-    void UnregisterCallbacks() {
-        std::unique_lock lock(m_mutex);
-        m_attackCallbacks.clear();
-        m_deviceCallbacks.clear();
-        m_errorCallbacks.clear();
-    }
-
-    // ========================================================================
-    // STATISTICS
-    // ========================================================================
-
-    [[nodiscard]] BadUSBStatistics GetStatistics() const {
-        std::shared_lock lock(m_mutex);
-        return m_stats;
-    }
-
-    void ResetStatistics() {
-        std::unique_lock lock(m_mutex);
-        m_stats.Reset();
-    }
-
-    [[nodiscard]] bool SelfTest() {
-        SS_LOG_INFO(LOG_CATEGORY, L"Starting self-test...");
-
-        try {
-            // Test 1: Known bad device detection
-            if (!IsKnownBadDeviceInternal(0x1FC9, 0x000C)) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Rubber Ducky not detected");
-                return false;
-            }
-
-            // Test 2: Attack device type identification
-            auto deviceType = IdentifyAttackDeviceType(0x16D0, 0x0753);
-            if (deviceType != AttackDeviceType::Digispark) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Device type mismatch");
-                return false;
-            }
-
-            // Test 3: Safe device check
-            auto result = AnalyzeDevice(0x046D, 0xC52B);  // Logitech receiver
-            if (result == DeviceAnalysisResult::KnownBadDevice) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: False positive on safe device");
-                return false;
-            }
-
-            // Test 4: Keystroke processing
-            TimePoint now = Clock::now();
-            for (int i = 0; i < 20; i++) {
-                ProcessKeyboardEvent('A' + i, true,
-                    now + std::chrono::milliseconds(i * 5), "TEST");
-            }
-
-            auto stats = CalculateInputStatistics();
-            if (stats.totalKeystrokes != 20) {
-                SS_LOG_ERROR(LOG_CATEGORY, L"Self-test failed: Keystroke count mismatch");
-                ResetAnalysis();
-                return false;
-            }
-
-            // Cleanup
-            ResetAnalysis();
-
-            SS_LOG_INFO(LOG_CATEGORY, L"Self-test completed successfully");
-            return true;
-
-        } catch (const std::exception& e) {
-            SS_LOG_ERROR(LOG_CATEGORY, L"Self-test exception: %hs", e.what());
-            return false;
+        auto it = m_deviceStates.find(deviceId);
+        if (it != m_deviceStates.end()) {
+            return it->second;
         }
+
+        auto [newIt, _] = m_deviceStates.emplace(deviceId, DeviceAnalysisState{});
+        return newIt->second;
     }
 
-private:
     // ========================================================================
-    // PRIVATE HELPERS
+    // PRIVATE HELPERS — Device descriptor & classification
     // ========================================================================
 
     [[nodiscard]] std::optional<HIDDeviceDescriptor> GetDeviceDescriptorInternal(
@@ -730,7 +884,6 @@ private:
         descriptor.devicePath = devicePath;
         descriptor.firstSeen = std::chrono::system_clock::now();
 
-        // Open HID device
         HANDLE hDevice = CreateFileA(
             devicePath.c_str(),
             GENERIC_READ,
@@ -744,7 +897,6 @@ private:
             return std::nullopt;
         }
 
-        // Get HID attributes
         HIDD_ATTRIBUTES attributes{};
         attributes.Size = sizeof(HIDD_ATTRIBUTES);
         if (HidD_GetAttributes(hDevice, &attributes)) {
@@ -752,38 +904,33 @@ private:
             descriptor.productId = attributes.ProductID;
         }
 
-        // Get manufacturer string
         wchar_t buffer[256] = {0};
         if (HidD_GetManufacturerString(hDevice, buffer, sizeof(buffer))) {
             descriptor.manufacturer = Utils::StringUtils::ToNarrow(buffer);
         }
 
-        // Get product string
         if (HidD_GetProductString(hDevice, buffer, sizeof(buffer))) {
             descriptor.product = Utils::StringUtils::ToNarrow(buffer);
         }
 
-        // Get serial number
         if (HidD_GetSerialNumberString(hDevice, buffer, sizeof(buffer))) {
             descriptor.serialNumber = Utils::StringUtils::ToNarrow(buffer);
         }
 
-        // Get preparsed data for interface info
         PHIDP_PREPARSED_DATA preparsedData = nullptr;
         if (HidD_GetPreparsedData(hDevice, &preparsedData)) {
             HIDP_CAPS caps{};
             if (HidP_GetCaps(preparsedData, &caps) == HIDP_STATUS_SUCCESS) {
                 descriptor.hasHIDInterface = true;
-                // Check usage page for keyboard/mouse
                 if (caps.UsagePage == HID_USAGE_PAGE_GENERIC) {
                     if (caps.Usage == HID_USAGE_GENERIC_KEYBOARD) {
-                        descriptor.classCode = 0x03;  // HID
-                        descriptor.subclassCode = 0x01;  // Boot interface
-                        descriptor.protocolCode = 0x01;  // Keyboard
+                        descriptor.classCode = 0x03;
+                        descriptor.subclassCode = 0x01;
+                        descriptor.protocolCode = 0x01;
                     } else if (caps.Usage == HID_USAGE_GENERIC_MOUSE) {
                         descriptor.classCode = 0x03;
                         descriptor.subclassCode = 0x01;
-                        descriptor.protocolCode = 0x02;  // Mouse
+                        descriptor.protocolCode = 0x02;
                     }
                 }
             }
@@ -808,7 +955,6 @@ private:
     }
 
     [[nodiscard]] bool IsSuspiciousVendor(uint16_t vendorId) const {
-        // Check for known attack hardware vendors
         switch (vendorId) {
             case 0x16C0:  // Teensy
             case 0x16D0:  // Digispark/MCS
@@ -823,26 +969,21 @@ private:
     }
 
     [[nodiscard]] DeviceAnalysisResult AnalyzeDescriptor(const HIDDeviceDescriptor& desc) {
-        // Check known bad devices
         if (IsKnownBadDeviceInternal(desc.vendorId, desc.productId)) {
             m_stats.knownBadDevicesDetected++;
             return DeviceAnalysisResult::KnownBadDevice;
         }
 
-        // Check for composite device (HID + Storage)
         if (desc.hasHIDInterface && desc.hasMassStorage) {
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::MultipleInterfaces;
         }
 
-        // Check for descriptor anomalies
         if (desc.manufacturer.empty() && desc.product.empty()) {
-            // Missing strings can indicate attack device
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::AnomalousDescriptor;
         }
 
-        // Check suspicious vendor
         if (IsSuspiciousVendor(desc.vendorId)) {
             m_stats.suspiciousDevicesDetected++;
             return DeviceAnalysisResult::Suspicious;
@@ -860,37 +1001,39 @@ private:
     }
 
     // ========================================================================
-    // KEYSTROKE ANALYSIS
+    // KEYSTROKE ANALYSIS — per-device
     // ========================================================================
 
-    void UpdateModifierState(uint16_t virtualKey, bool isKeyDown) {
+    static void UpdateModifierState(DeviceAnalysisState& devState,
+                                    uint16_t virtualKey, bool isKeyDown) {
         switch (virtualKey) {
             case VK_CONTROL:
             case VK_LCONTROL:
             case VK_RCONTROL:
-                m_modifierState.ctrl = isKeyDown;
+                devState.modifierState.ctrl = isKeyDown;
                 break;
             case VK_SHIFT:
             case VK_LSHIFT:
             case VK_RSHIFT:
-                m_modifierState.shift = isKeyDown;
+                devState.modifierState.shift = isKeyDown;
                 break;
             case VK_MENU:
             case VK_LMENU:
             case VK_RMENU:
-                m_modifierState.alt = isKeyDown;
+                devState.modifierState.alt = isKeyDown;
                 break;
             case VK_LWIN:
             case VK_RWIN:
-                m_modifierState.win = isKeyDown;
+                devState.modifierState.win = isKeyDown;
                 break;
         }
     }
 
-    [[nodiscard]] char VirtualKeyToChar(uint16_t vk) const {
-        // Convert virtual key to ASCII character
+    [[nodiscard]] static char VirtualKeyToChar(const DeviceAnalysisState& devState,
+                                               uint16_t vk) {
         if (vk >= 'A' && vk <= 'Z') {
-            return m_modifierState.shift ? static_cast<char>(vk) : static_cast<char>(vk + 32);
+            return devState.modifierState.shift ?
+                static_cast<char>(vk) : static_cast<char>(vk + 32);
         }
         if (vk >= '0' && vk <= '9') {
             return static_cast<char>(vk);
@@ -899,20 +1042,19 @@ private:
         if (vk == VK_RETURN) return '\n';
         if (vk == VK_TAB) return '\t';
 
-        // Handle punctuation with shift
-        if (m_modifierState.shift) {
+        if (devState.modifierState.shift) {
             switch (vk) {
-                case VK_OEM_1: return ':';  // ;:
+                case VK_OEM_1: return ':';
                 case VK_OEM_PLUS: return '+';
                 case VK_OEM_COMMA: return '<';
                 case VK_OEM_MINUS: return '_';
                 case VK_OEM_PERIOD: return '>';
-                case VK_OEM_2: return '?';  // /?
-                case VK_OEM_3: return '~';  // `~
-                case VK_OEM_4: return '{';  // [{
-                case VK_OEM_5: return '|';  // \|
-                case VK_OEM_6: return '}';  // ]}
-                case VK_OEM_7: return '"';  // '"
+                case VK_OEM_2: return '?';
+                case VK_OEM_3: return '~';
+                case VK_OEM_4: return '{';
+                case VK_OEM_5: return '|';
+                case VK_OEM_6: return '}';
+                case VK_OEM_7: return '"';
             }
         } else {
             switch (vk) {
@@ -930,53 +1072,87 @@ private:
             }
         }
 
-        return 0;  // Non-printable
+        return 0;
     }
 
-    void DetectSpecialCombinations(uint16_t virtualKey) {
-        // Win+R detection (Run dialog)
-        if (m_modifierState.win && virtualKey == 'R') {
-            m_inputStats.winRDetected = true;
+    void DetectSpecialCombinations(DeviceAnalysisState& devState, uint16_t virtualKey) {
+        if (devState.modifierState.win && virtualKey == 'R') {
+            devState.stats.winRDetected = true;
             SS_LOG_WARN(LOG_CATEGORY, L"Win+R combination detected");
         }
 
-        // Ctrl+Esc (Start menu)
-        if (m_modifierState.ctrl && virtualKey == VK_ESCAPE) {
-            m_inputStats.ctrlEscDetected = true;
+        if (devState.modifierState.ctrl && virtualKey == VK_ESCAPE) {
+            devState.stats.ctrlEscDetected = true;
         }
 
-        // Alt+Tab (could be used for evasion)
-        if (m_modifierState.alt && virtualKey == VK_TAB) {
+        if (devState.modifierState.alt && virtualKey == VK_TAB) {
             SS_LOG_INFO(LOG_CATEGORY, L"Alt+Tab detected during analysis");
         }
 
-        // Ctrl+Shift+Esc (Task Manager)
-        if (m_modifierState.ctrl && m_modifierState.shift && virtualKey == VK_ESCAPE) {
+        if (devState.modifierState.ctrl && devState.modifierState.shift &&
+            virtualKey == VK_ESCAPE) {
             SS_LOG_WARN(LOG_CATEGORY, L"Ctrl+Shift+Esc (Task Manager) detected");
         }
 
-        if (m_inputStats.winRDetected || m_inputStats.ctrlEscDetected) {
-            m_inputStats.usesSpecialCombos = true;
+        if (devState.stats.winRDetected || devState.stats.ctrlEscDetected) {
+            devState.stats.usesSpecialCombos = true;
         }
     }
 
-    [[nodiscard]] HIDInputStatistics CalculateInputStatistics() const {
-        HIDInputStatistics stats;
+    // ========================================================================
+    // SLIDING WINDOW CPS CALCULATION
+    // ========================================================================
 
-        if (m_keystrokeBuffer.size() < 2) {
+    struct SlidingWindowCPS {
+        double cps100ms  = 0.0;
+        double cps1s     = 0.0;
+        double cps5s     = 0.0;
+        double cps30s    = 0.0;
+    };
+
+    [[nodiscard]] SlidingWindowCPS CalculateSlidingWindowCPS(
+        const DeviceAnalysisState& devState, TimePoint now) const {
+
+        SlidingWindowCPS result;
+        const auto& times = devState.keystrokeTimes;
+        if (times.empty()) return result;
+
+        auto countInWindow = [&](std::chrono::milliseconds window) -> double {
+            TimePoint cutoff = now - window;
+            auto it = std::lower_bound(times.begin(), times.end(), cutoff);
+            auto count = static_cast<double>(std::distance(it, times.end()));
+            double windowSec = static_cast<double>(window.count()) / 1000.0;
+            return (windowSec > 0.0) ? (count / windowSec) : 0.0;
+        };
+
+        result.cps100ms = countInWindow(std::chrono::milliseconds(100));
+        result.cps1s    = countInWindow(std::chrono::milliseconds(1000));
+        result.cps5s    = countInWindow(std::chrono::milliseconds(5000));
+        result.cps30s   = countInWindow(std::chrono::milliseconds(30000));
+
+        return result;
+    }
+
+    [[nodiscard]] HIDInputStatistics CalculateInputStatistics(
+        const DeviceAnalysisState& devState) const {
+
+        HIDInputStatistics stats;
+        const auto& buf = devState.keystrokeBuffer;
+
+        if (buf.size() < 2) {
+            stats.totalKeystrokes = buf.size();
             return stats;
         }
 
-        stats.totalKeystrokes = m_keystrokeBuffer.size();
-        stats.windowStart = m_keystrokeBuffer.front().timestamp;
+        stats.totalKeystrokes = buf.size();
+        stats.windowStart = buf.front().timestamp;
 
-        // Calculate intervals
         std::vector<Duration> intervals;
-        intervals.reserve(m_keystrokeBuffer.size() - 1);
+        intervals.reserve(buf.size() - 1);
 
-        for (size_t i = 1; i < m_keystrokeBuffer.size(); i++) {
+        for (size_t i = 1; i < buf.size(); i++) {
             auto interval = std::chrono::duration_cast<Duration>(
-                m_keystrokeBuffer[i].timestamp - m_keystrokeBuffer[i-1].timestamp);
+                buf[i].timestamp - buf[i-1].timestamp);
             intervals.push_back(interval);
         }
 
@@ -984,31 +1160,28 @@ private:
             return stats;
         }
 
-        // Min/Max interval
         auto [minIt, maxIt] = std::minmax_element(intervals.begin(), intervals.end());
         stats.minInterval = *minIt;
         stats.maxInterval = *maxIt;
 
-        // Average interval
         Duration total{0};
         for (const auto& interval : intervals) {
             total += interval;
         }
-        stats.avgInterval = Duration(total.count() / intervals.size());
+        stats.avgInterval = Duration(total.count() /
+            static_cast<int64_t>(intervals.size()));
 
-        // Calculate CPS
         auto windowDuration = std::chrono::duration_cast<std::chrono::milliseconds>(
-            m_keystrokeBuffer.back().timestamp - m_keystrokeBuffer.front().timestamp);
+            buf.back().timestamp - buf.front().timestamp);
 
         if (windowDuration.count() > 0) {
-            stats.currentCPS = (static_cast<double>(m_keystrokeBuffer.size()) * 1000.0) /
+            stats.currentCPS = (static_cast<double>(buf.size()) * 1000.0) /
                                static_cast<double>(windowDuration.count());
         }
 
         stats.peakCPS = std::max(stats.peakCPS, stats.currentCPS);
-        stats.averageCPS = stats.currentCPS;  // Simplified
+        stats.averageCPS = stats.currentCPS;
 
-        // Calculate timing variance (standard deviation)
         if (intervals.size() >= 2) {
             double mean = static_cast<double>(stats.avgInterval.count());
             double sumSquares = 0.0;
@@ -1019,14 +1192,11 @@ private:
             }
 
             double variance = sumSquares / static_cast<double>(intervals.size());
-            stats.timingVarianceMs = std::sqrt(variance) / 1000.0;  // Convert to ms
+            stats.timingVarianceMs = std::sqrt(variance) / 1000.0;
 
-            // Consistency score: higher variance = more human-like
-            // Very low variance indicates scripted/automated input
             stats.consistencyScore = std::min(1.0, stats.timingVarianceMs / 20.0);
         }
 
-        // Detect bursts (consecutive keystrokes under threshold)
         uint32_t currentBurst = 0;
         for (const auto& interval : intervals) {
             if (interval.count() < BadUSBConstants::MIN_HUMAN_INTERVAL_MS * 1000) {
@@ -1037,61 +1207,97 @@ private:
             }
         }
 
-        // Copy special combo flags
-        stats.winRDetected = m_inputStats.winRDetected;
-        stats.ctrlEscDetected = m_inputStats.ctrlEscDetected;
-        stats.usesSpecialCombos = m_inputStats.usesSpecialCombos;
+        stats.winRDetected = devState.stats.winRDetected;
+        stats.ctrlEscDetected = devState.stats.ctrlEscDetected;
+        stats.usesSpecialCombos = devState.stats.usesSpecialCombos;
 
         return stats;
     }
 
-    void PerformBehavioralAnalysis() {
+    // ========================================================================
+    // BEHAVIORAL ANALYSIS — multi-layer, per-device, _Locked
+    // ========================================================================
+
+    void PerformBehavioralAnalysis_Locked(DeviceAnalysisState& devState,
+                                          const std::string& deviceId) {
         if (!m_config.enableBehavioralAnalysis) return;
 
-        auto stats = CalculateInputStatistics();
+        auto stats = CalculateInputStatistics(devState);
+        auto now = devState.keystrokeBuffer.back().timestamp;
+        auto windowCPS = CalculateSlidingWindowCPS(devState, now);
 
         bool isSuspicious = false;
         std::string reason;
+        int riskIncrement = 0;
 
-        // Check 1: Superhuman typing speed
-        if (stats.currentCPS > static_cast<double>(m_config.maxAllowedCPS)) {
+        // Layer 1: Superhuman typing speed (any window)
+        double maxCPS = std::max({windowCPS.cps100ms, windowCPS.cps1s,
+                                  windowCPS.cps5s, windowCPS.cps30s});
+        if (maxCPS > static_cast<double>(m_config.maxAllowedCPS)) {
             isSuspicious = true;
             reason = "Superhuman typing speed detected: " +
-                     std::to_string(static_cast<int>(stats.currentCPS)) + " CPS";
+                     std::to_string(static_cast<int>(maxCPS)) + " CPS";
+            riskIncrement += 30;
             m_stats.superhumanInputDetected++;
         }
 
-        // Check 2: Perfect timing (too consistent = robot)
+        // Layer 2: Short-window burst that exceeds human max even if long-window
+        //          average is below threshold (catches slow-type with micro-bursts)
+        if (windowCPS.cps100ms > static_cast<double>(BadUSBConstants::BADUSB_CPS_THRESHOLD) &&
+            stats.totalKeystrokes > 5) {
+            isSuspicious = true;
+            reason = "Short-window burst detected: " +
+                     std::to_string(static_cast<int>(windowCPS.cps100ms)) + " CPS (100ms)";
+            riskIncrement += 25;
+        }
+
+        // Layer 3: Robotic timing variance
         if (stats.timingVarianceMs < m_config.minTimingVarianceMs &&
             stats.totalKeystrokes > 20) {
             isSuspicious = true;
             reason = "Robotic timing pattern detected (variance: " +
                      std::to_string(stats.timingVarianceMs) + "ms)";
+            riskIncrement += 25;
         }
 
-        // Check 3: Burst input
+        // Layer 4: Burst input
         if (stats.maxBurstLength > BadUSBConstants::BURST_THRESHOLD) {
             isSuspicious = true;
             reason = "Input burst detected (" +
                      std::to_string(stats.maxBurstLength) + " rapid keystrokes)";
+            riskIncrement += 20;
             m_stats.totalBurstEventsDetected++;
         }
 
-        // Check 4: Special combinations with high speed
+        // Layer 5: Special combinations with elevated speed
         if (stats.usesSpecialCombos &&
             stats.currentCPS > static_cast<double>(BadUSBConstants::MAX_HUMAN_CPS)) {
             isSuspicious = true;
             reason = "Automated hotkey sequence detected";
+            riskIncrement += 15;
         }
 
-        if (isSuspicious) {
-            TriggerAttackDetection(InputPatternType::SuperhumanSpeed, reason, stats);
+        // Accumulate cumulative risk score per device
+        devState.cumulativeRiskScore += riskIncrement;
+
+        // Clamp cumulative to 100
+        if (devState.cumulativeRiskScore > 100) {
+            devState.cumulativeRiskScore = 100;
+        }
+
+        if (isSuspicious || devState.cumulativeRiskScore >= 50) {
+            TriggerAttackDetection_Locked(devState, deviceId,
+                InputPatternType::SuperhumanSpeed, reason, stats);
         }
     }
 
-    void PerformCommandPatternAnalysis() {
-        // Convert command buffer to lowercase for matching
-        std::string lowerBuffer = m_commandBuffer;
+    // ========================================================================
+    // COMMAND PATTERN ANALYSIS — enhanced, _Locked
+    // ========================================================================
+
+    void PerformCommandPatternAnalysis_Locked(DeviceAnalysisState& devState,
+                                              const std::string& deviceId) {
+        std::string lowerBuffer = devState.reconstructedBuffer;
         std::transform(lowerBuffer.begin(), lowerBuffer.end(),
                        lowerBuffer.begin(), ::tolower);
 
@@ -1100,12 +1306,28 @@ private:
             if (std::regex_search(lowerBuffer, pattern)) {
                 DetectedCommandPattern detected;
                 detected.patternType = InputPatternType::DownloadCradle;
-                detected.commandString = m_commandBuffer;
+                detected.commandString = devState.reconstructedBuffer;
                 detected.riskScore = 90;
                 detected.mitreAttackId = "T1059.001";
                 detected.detectionTime = Clock::now();
 
-                TriggerPatternDetection(detected);
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
+                m_stats.commandInjectionDetected++;
+                return;
+            }
+        }
+
+        // Check UAC bypass patterns
+        for (const auto& pattern : CommandPatterns::UAC_BYPASS_PATTERNS) {
+            if (std::regex_search(lowerBuffer, pattern)) {
+                DetectedCommandPattern detected;
+                detected.patternType = InputPatternType::PrivilegeEscalation;
+                detected.commandString = devState.reconstructedBuffer;
+                detected.riskScore = 95;
+                detected.mitreAttackId = "T1548.002";
+                detected.detectionTime = Clock::now();
+
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
                 m_stats.commandInjectionDetected++;
                 return;
             }
@@ -1116,12 +1338,12 @@ private:
             if (std::regex_search(lowerBuffer, pattern)) {
                 DetectedCommandPattern detected;
                 detected.patternType = InputPatternType::PrivilegeEscalation;
-                detected.commandString = m_commandBuffer;
+                detected.commandString = devState.reconstructedBuffer;
                 detected.riskScore = 95;
                 detected.mitreAttackId = "T1548";
                 detected.detectionTime = Clock::now();
 
-                TriggerPatternDetection(detected);
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
                 m_stats.commandInjectionDetected++;
                 return;
             }
@@ -1132,12 +1354,12 @@ private:
             if (std::regex_search(lowerBuffer, pattern)) {
                 DetectedCommandPattern detected;
                 detected.patternType = InputPatternType::PersistenceMechanism;
-                detected.commandString = m_commandBuffer;
+                detected.commandString = devState.reconstructedBuffer;
                 detected.riskScore = 85;
                 detected.mitreAttackId = "T1547";
                 detected.detectionTime = Clock::now();
 
-                TriggerPatternDetection(detected);
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
                 m_stats.commandInjectionDetected++;
                 return;
             }
@@ -1148,12 +1370,12 @@ private:
             if (std::regex_search(lowerBuffer, pattern)) {
                 DetectedCommandPattern detected;
                 detected.patternType = InputPatternType::CommandInjection;
-                detected.commandString = m_commandBuffer;
+                detected.commandString = devState.reconstructedBuffer;
                 detected.riskScore = 75;
                 detected.mitreAttackId = "T1059.003";
                 detected.detectionTime = Clock::now();
 
-                TriggerPatternDetection(detected);
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
                 return;
             }
         }
@@ -1163,94 +1385,121 @@ private:
             if (std::regex_search(lowerBuffer, pattern)) {
                 DetectedCommandPattern detected;
                 detected.patternType = InputPatternType::ShellExecution;
-                detected.commandString = m_commandBuffer;
+                detected.commandString = devState.reconstructedBuffer;
                 detected.riskScore = 70;
                 detected.mitreAttackId = "T1059";
                 detected.detectionTime = Clock::now();
 
-                TriggerPatternDetection(detected);
+                TriggerPatternDetection_Locked(devState, deviceId, detected);
                 return;
             }
         }
     }
 
-    void TriggerAttackDetection(InputPatternType patternType,
-                                 const std::string& reason,
-                                 const HIDInputStatistics& stats) {
+    // ========================================================================
+    // ATTACK TRIGGERING — _Locked versions
+    // ========================================================================
 
-        SS_LOG_WARN(LOG_CATEGORY, L"BadUSB ATTACK DETECTED: %hs", reason.c_str());
+    void TriggerAttackDetection_Locked(DeviceAnalysisState& devState,
+                                        const std::string& deviceId,
+                                        InputPatternType patternType,
+                                        const std::string& reason,
+                                        const HIDInputStatistics& stats) {
+
+        SS_LOG_WARN(LOG_CATEGORY, L"BadUSB ATTACK DETECTED on device '%hs': %hs",
+            deviceId.c_str(), reason.c_str());
 
         m_attackInProgress = true;
+        devState.attackDetected = true;
+        if (devState.attackStartTime == TimePoint{}) {
+            devState.attackStartTime = Clock::now();
+        }
         m_stats.attacksDetected++;
 
-        // Create attack event
         BadUSBAttackEvent event;
         event.eventId = m_nextEventId++;
         event.analysisResult = DeviceAnalysisResult::Suspicious;
         event.attackType = AttackDeviceType::Unknown;
         event.confidence = DetectionConfidence::High;
         event.inputStats = stats;
-        event.reconstructedBuffer = m_commandBuffer;
+        event.reconstructedBuffer = devState.reconstructedBuffer;
         event.detectionReason = reason;
         event.detectionTime = std::chrono::system_clock::now();
 
-        // Add pattern
         DetectedCommandPattern pattern;
         pattern.patternType = patternType;
-        pattern.commandString = m_commandBuffer;
+        pattern.commandString = devState.reconstructedBuffer;
         pattern.riskScore = 80;
         pattern.detectionTime = Clock::now();
         event.detectedPatterns.push_back(pattern);
 
-        event.riskScore = CalculateRiskScore(event);
+        event.riskScore = CalculateRiskScore(event, devState);
         event.responseTaken = DetermineResponse(event);
 
         m_currentAttackEvent = event;
 
-        // Execute response
-        ExecuteResponse(event);
+        // Execute response — calls _Locked versions (no re-lock)
+        ExecuteResponse_Locked(event);
 
-        // Notify callbacks
-        NotifyAttackCallbacks(event);
+        // Copy callbacks under lock, invoke outside
+        auto callbacksCopy = m_attackCallbacks;
+        // We need to release the lock before invoking callbacks, but we are
+        // called from within ProcessKeyboardEvent which holds the lock.
+        // Store the callbacks for deferred invocation after we finish processing.
+        m_pendingAttackEvents.push_back(event);
+        m_pendingAttackCallbacks = callbacksCopy;
     }
 
-    void TriggerPatternDetection(const DetectedCommandPattern& pattern) {
-        SS_LOG_WARN(LOG_CATEGORY, L"Command pattern detected: %hs (MITRE: %hs)",
+    void TriggerPatternDetection_Locked(DeviceAnalysisState& devState,
+                                         const std::string& deviceId,
+                                         const DetectedCommandPattern& pattern) {
+        SS_LOG_WARN(LOG_CATEGORY,
+            L"Command pattern detected on device '%hs': %hs (MITRE: %hs)",
+            deviceId.c_str(),
             std::string(GetInputPatternTypeName(pattern.patternType)).c_str(),
             pattern.mitreAttackId.c_str());
 
         m_attackInProgress = true;
+        devState.attackDetected = true;
+        if (devState.attackStartTime == TimePoint{}) {
+            devState.attackStartTime = Clock::now();
+        }
         m_stats.attacksDetected++;
+        devState.cumulativeRiskScore += pattern.riskScore / 2;
+        if (devState.cumulativeRiskScore > 100) {
+            devState.cumulativeRiskScore = 100;
+        }
 
-        // Create or update attack event
         if (!m_currentAttackEvent) {
             BadUSBAttackEvent event;
             event.eventId = m_nextEventId++;
             event.analysisResult = DeviceAnalysisResult::Suspicious;
             event.confidence = DetectionConfidence::High;
-            event.inputStats = CalculateInputStatistics();
-            event.reconstructedBuffer = m_commandBuffer;
+            event.inputStats = CalculateInputStatistics(devState);
+            event.reconstructedBuffer = devState.reconstructedBuffer;
             event.detectionTime = std::chrono::system_clock::now();
             m_currentAttackEvent = event;
         }
 
         m_currentAttackEvent->detectedPatterns.push_back(pattern);
-        m_currentAttackEvent->riskScore = CalculateRiskScore(*m_currentAttackEvent);
+        devState.detectedPatterns.push_back(pattern);
+        m_currentAttackEvent->riskScore = CalculateRiskScore(
+            *m_currentAttackEvent, devState);
         m_currentAttackEvent->responseTaken = DetermineResponse(*m_currentAttackEvent);
         m_currentAttackEvent->detectionReason = "Command pattern: " +
             std::string(GetInputPatternTypeName(pattern.patternType));
 
-        // Execute response
-        ExecuteResponse(*m_currentAttackEvent);
+        ExecuteResponse_Locked(*m_currentAttackEvent);
 
-        // Notify callbacks
-        NotifyAttackCallbacks(*m_currentAttackEvent);
+        auto callbacksCopy = m_attackCallbacks;
+        m_pendingAttackEvents.push_back(*m_currentAttackEvent);
+        m_pendingAttackCallbacks = callbacksCopy;
     }
 
-    [[nodiscard]] int CalculateRiskScore(const BadUSBAttackEvent& event) {
-        int score = 0;
+    [[nodiscard]] int CalculateRiskScore(const BadUSBAttackEvent& event,
+                                          const DeviceAnalysisState& devState) {
+        int score = devState.cumulativeRiskScore;
 
-        // Base score from analysis result
         switch (event.analysisResult) {
             case DeviceAnalysisResult::KnownBadDevice: score += 40; break;
             case DeviceAnalysisResult::MultipleInterfaces: score += 30; break;
@@ -1258,12 +1507,10 @@ private:
             default: break;
         }
 
-        // Add pattern scores
         for (const auto& pattern : event.detectedPatterns) {
-            score += pattern.riskScore / 2;  // Partial contribution
+            score += pattern.riskScore / 2;
         }
 
-        // Adjust for input statistics
         if (event.inputStats.currentCPS > BadUSBConstants::BADUSB_CPS_THRESHOLD) {
             score += 20;
         }
@@ -1292,39 +1539,50 @@ private:
         return BadUSBResponse::Allow;
     }
 
-    void ExecuteResponse(const BadUSBAttackEvent& event) {
+    void ExecuteResponse_Locked(const BadUSBAttackEvent& event) {
         SS_LOG_WARN(LOG_CATEGORY, L"Executing response: %hs (Risk: %d)",
             std::string(GetBadUSBResponseName(event.responseTaken)).c_str(),
             event.riskScore);
 
         switch (event.responseTaken) {
             case BadUSBResponse::BlockAndEject:
-                ClearInputBuffer();
+                ClearInputBuffer_Locked();
                 if (!event.device.devicePath.empty()) {
-                    EjectDevice(event.device.devicePath);
+                    EjectDevice_Locked(event.device.devicePath);
                 }
                 if (m_config.terminateLaunchedProcesses) {
-                    TerminateLaunchedProcesses();
+                    TerminateLaunchedProcesses_Locked();
                 }
                 m_stats.attacksBlocked++;
                 break;
 
             case BadUSBResponse::BlockAndAlert:
             case BadUSBResponse::Block:
-                ClearInputBuffer();
+                ClearInputBuffer_Locked();
                 if (!event.device.devicePath.empty()) {
-                    BlockDevice(event.device.devicePath);
+                    BlockDevice_Locked(event.device.devicePath);
+                }
+                if (m_config.terminateLaunchedProcesses) {
+                    TerminateLaunchedProcesses_Locked();
                 }
                 m_stats.attacksBlocked++;
                 break;
 
             case BadUSBResponse::Monitor:
-                // Continue monitoring, log only
                 break;
 
             case BadUSBResponse::Quarantine:
-                ClearInputBuffer();
-                // TODO: Implement quarantine
+                // HID-based attacks have no file to quarantine directly.
+                // Clear input buffer and escalate to USBDeviceMonitor for
+                // device-level quarantine.
+                ClearInputBuffer_Locked();
+                if (!event.device.devicePath.empty()) {
+                    BlockDevice_Locked(event.device.devicePath);
+                }
+                SS_LOG_WARN(LOG_CATEGORY,
+                    L"Quarantine requested for HID device — "
+                    L"escalating to USBDeviceMonitor for device-level quarantine");
+                m_stats.attacksBlocked++;
                 break;
 
             case BadUSBResponse::Allow:
@@ -1333,18 +1591,12 @@ private:
         }
     }
 
-    void NotifyAttackCallbacks(const BadUSBAttackEvent& event) {
-        for (const auto& callback : m_attackCallbacks) {
-            try {
-                callback(event);
-            } catch (...) {
-                SS_LOG_WARN(LOG_CATEGORY, L"Attack callback threw exception");
-            }
-        }
-    }
-
     void NotifyError(const std::string& message, int code) {
-        for (const auto& callback : m_errorCallbacks) {
+        // Copy callbacks under lock, invoke outside
+        auto callbacksCopy = m_errorCallbacks;
+        // Release lock not possible here as callers may/may not hold it.
+        // Since error callbacks are rare, invoke inline with exception guard.
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(message, code);
             } catch (...) {
@@ -1358,28 +1610,18 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    ModuleStatus m_status{ModuleStatus::Uninitialized};
+    BadUSBModuleStatus m_status{BadUSBModuleStatus::Uninitialized};
     BadUSBConfiguration m_config;
 
-    // Keystroke analysis
-    std::deque<KeystrokeEvent> m_keystrokeBuffer;
-    std::string m_commandBuffer;
-    HIDInputStatistics m_inputStats;
-
-    // Modifier key state
-    struct ModifierState {
-        bool ctrl = false;
-        bool shift = false;
-        bool alt = false;
-        bool win = false;
-    } m_modifierState;
+    // Per-device analysis state (keyed by deviceId)
+    std::unordered_map<std::string, DeviceAnalysisState> m_deviceStates;
 
     // Attack state
     bool m_attackInProgress{false};
     std::optional<BadUSBAttackEvent> m_currentAttackEvent;
     uint64_t m_nextEventId{1};
 
-    // Tracked devices
+    // Tracked device descriptors
     std::unordered_map<std::string, HIDDeviceDescriptor> m_trackedDevices;
 
     // Statistics
@@ -1389,6 +1631,13 @@ private:
     std::vector<AttackEventCallback> m_attackCallbacks;
     std::vector<DeviceAnalysisCallback> m_deviceCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
+
+    // Deferred callback invocation storage
+    std::vector<BadUSBAttackEvent> m_pendingAttackEvents;
+    std::vector<AttackEventCallback> m_pendingAttackCallbacks;
+
+    // Grant outer ProcessKeyboardEvent access to flush pending callbacks
+    friend class BadUSBDetector;
 };
 
 // ============================================================================
@@ -1432,7 +1681,7 @@ bool BadUSBDetector::IsInitialized() const noexcept {
     return m_impl->IsInitialized();
 }
 
-ModuleStatus BadUSBDetector::GetStatus() const noexcept {
+BadUSBModuleStatus BadUSBDetector::GetStatus() const noexcept {
     return m_impl->GetStatus();
 }
 
@@ -1477,6 +1726,24 @@ AttackDeviceType BadUSBDetector::IdentifyAttackDeviceType(
 void BadUSBDetector::ProcessKeyboardEvent(uint16_t virtualKey, bool isKeyDown,
                                            TimePoint timestamp, const std::string& deviceId) {
     m_impl->ProcessKeyboardEvent(virtualKey, isKeyDown, timestamp, deviceId);
+
+    // Flush any pending attack callbacks OUTSIDE the lock
+    std::vector<BadUSBAttackEvent> pendingEvents;
+    std::vector<AttackEventCallback> pendingCallbacks;
+    {
+        std::unique_lock lock(m_impl->m_mutex);
+        pendingEvents.swap(m_impl->m_pendingAttackEvents);
+        pendingCallbacks.swap(m_impl->m_pendingAttackCallbacks);
+    }
+    for (const auto& event : pendingEvents) {
+        for (const auto& cb : pendingCallbacks) {
+            try {
+                cb(event);
+            } catch (...) {
+                SS_LOG_WARN(LOG_CATEGORY, L"Attack callback threw exception");
+            }
+        }
+    }
 }
 
 bool BadUSBDetector::IsAttackInProgress() const noexcept {
@@ -1539,7 +1806,7 @@ void BadUSBDetector::UnregisterCallbacks() {
 // STATISTICS DELEGATIONS
 // ============================================================================
 
-BadUSBStatistics BadUSBDetector::GetStatistics() const {
+BadUSBStatisticsSnapshot BadUSBDetector::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1668,17 +1935,17 @@ void BadUSBStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
-std::string BadUSBStatistics::ToJson() const {
+std::string BadUSBStatisticsSnapshot::ToJson() const {
     Utils::JSON::Json json;
-    json["totalDevicesAnalyzed"] = totalDevicesAnalyzed.load();
-    json["knownBadDevicesDetected"] = knownBadDevicesDetected.load();
-    json["suspiciousDevicesDetected"] = suspiciousDevicesDetected.load();
-    json["attacksDetected"] = attacksDetected.load();
-    json["attacksBlocked"] = attacksBlocked.load();
-    json["superhumanInputDetected"] = superhumanInputDetected.load();
-    json["commandInjectionDetected"] = commandInjectionDetected.load();
-    json["totalKeystrokesAnalyzed"] = totalKeystrokesAnalyzed.load();
-    json["totalBurstEventsDetected"] = totalBurstEventsDetected.load();
+    json["totalDevicesAnalyzed"] = totalDevicesAnalyzed;
+    json["knownBadDevicesDetected"] = knownBadDevicesDetected;
+    json["suspiciousDevicesDetected"] = suspiciousDevicesDetected;
+    json["attacksDetected"] = attacksDetected;
+    json["attacksBlocked"] = attacksBlocked;
+    json["superhumanInputDetected"] = superhumanInputDetected;
+    json["commandInjectionDetected"] = commandInjectionDetected;
+    json["totalKeystrokesAnalyzed"] = totalKeystrokesAnalyzed;
+    json["totalBurstEventsDetected"] = totalBurstEventsDetected;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
