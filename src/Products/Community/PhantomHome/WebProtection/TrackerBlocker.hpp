@@ -130,10 +130,11 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -300,36 +301,7 @@ inline constexpr bool HasCategory(TrackerCategory value, TrackerCategory check) 
     return (static_cast<uint32_t>(value) & static_cast<uint32_t>(check)) != 0;
 }
 
-/**
- * @brief Request type for filtering
- */
-enum class RequestType : uint32_t {
-    Unknown         = 0x00000000,
-    Document        = 0x00000001,
-    SubDocument     = 0x00000002,
-    Stylesheet      = 0x00000004,
-    Script          = 0x00000008,
-    Image           = 0x00000010,
-    Font            = 0x00000020,
-    Object          = 0x00000040,
-    XMLHttpRequest  = 0x00000080,
-    Ping            = 0x00000100,
-    CSPReport       = 0x00000200,
-    Media           = 0x00000400,
-    WebSocket       = 0x00000800,
-    WebRTC          = 0x00001000,
-    Other           = 0x00002000,
-
-    All             = 0xFFFFFFFF
-};
-
-inline constexpr RequestType operator|(RequestType a, RequestType b) noexcept {
-    return static_cast<RequestType>(static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
-}
-
-inline constexpr RequestType operator&(RequestType a, RequestType b) noexcept {
-    return static_cast<RequestType>(static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
-}
+// RequestType is provided by WebProtectionCommon.hpp (unified across modules).
 
 /**
  * @brief Block decision type
@@ -373,19 +345,7 @@ enum class BlocklistSource : uint8_t {
     Enterprise      = 7     ///< Enterprise policy
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Degraded        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 // ============================================================================
 // STRUCTURES
@@ -511,6 +471,79 @@ struct BlockRule {
 
     /// @brief Compiled regex (if type is UrlRegex)
     mutable std::optional<std::regex> compiledRegex;
+
+    BlockRule() = default;
+    ~BlockRule() = default;
+
+    BlockRule(const BlockRule& other)
+        : id(other.id), pattern(other.pattern), type(other.type),
+          category(other.category), requestTypes(other.requestTypes),
+          source(other.source), isException(other.isException),
+          firstPartyOnly(other.firstPartyOnly), thirdPartyOnly(other.thirdPartyOnly),
+          domains(other.domains), excludeDomains(other.excludeDomains),
+          redirectUrl(other.redirectUrl), priority(other.priority),
+          enabled(other.enabled), createdAt(other.createdAt),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)),
+          compiledRegex(other.compiledRegex) {}
+
+    BlockRule& operator=(const BlockRule& other) {
+        if (this != &other) {
+            id = other.id;
+            pattern = other.pattern;
+            type = other.type;
+            category = other.category;
+            requestTypes = other.requestTypes;
+            source = other.source;
+            isException = other.isException;
+            firstPartyOnly = other.firstPartyOnly;
+            thirdPartyOnly = other.thirdPartyOnly;
+            domains = other.domains;
+            excludeDomains = other.excludeDomains;
+            redirectUrl = other.redirectUrl;
+            priority = other.priority;
+            enabled = other.enabled;
+            createdAt = other.createdAt;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+            compiledRegex = other.compiledRegex;
+        }
+        return *this;
+    }
+
+    BlockRule(BlockRule&& other) noexcept
+        : id(std::move(other.id)), pattern(std::move(other.pattern)), type(other.type),
+          category(other.category), requestTypes(other.requestTypes),
+          source(other.source), isException(other.isException),
+          firstPartyOnly(other.firstPartyOnly), thirdPartyOnly(other.thirdPartyOnly),
+          domains(std::move(other.domains)), excludeDomains(std::move(other.excludeDomains)),
+          redirectUrl(std::move(other.redirectUrl)), priority(other.priority),
+          enabled(other.enabled), createdAt(other.createdAt),
+          hitCount(other.hitCount.load(std::memory_order_relaxed)),
+          compiledRegex(std::move(other.compiledRegex)) {}
+
+    BlockRule& operator=(BlockRule&& other) noexcept {
+        if (this != &other) {
+            id = std::move(other.id);
+            pattern = std::move(other.pattern);
+            type = other.type;
+            category = other.category;
+            requestTypes = other.requestTypes;
+            source = other.source;
+            isException = other.isException;
+            firstPartyOnly = other.firstPartyOnly;
+            thirdPartyOnly = other.thirdPartyOnly;
+            domains = std::move(other.domains);
+            excludeDomains = std::move(other.excludeDomains);
+            redirectUrl = std::move(other.redirectUrl);
+            priority = other.priority;
+            enabled = other.enabled;
+            createdAt = other.createdAt;
+            hitCount.store(other.hitCount.load(std::memory_order_relaxed),
+                           std::memory_order_relaxed);
+            compiledRegex = std::move(other.compiledRegex);
+        }
+        return *this;
+    }
 };
 
 /**
@@ -726,6 +759,69 @@ struct TrackerBlockerStatistics {
 
     /// @brief Last event time
     TimePoint lastEventTime;
+
+    TrackerBlockerStatistics() = default;
+    ~TrackerBlockerStatistics() = default;
+
+    TrackerBlockerStatistics(const TrackerBlockerStatistics& other)
+        : totalRequests(other.totalRequests.load(std::memory_order_relaxed)),
+          totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
+          totalModified(other.totalModified.load(std::memory_order_relaxed)),
+          totalAllowed(other.totalAllowed.load(std::memory_order_relaxed)),
+          cacheHits(other.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(other.cacheMisses.load(std::memory_order_relaxed)),
+          bloomFilterHits(other.bloomFilterHits.load(std::memory_order_relaxed)),
+          totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
+          activeRuleCount(other.activeRuleCount.load(std::memory_order_relaxed)),
+          whitelistExceptions(other.whitelistExceptions.load(std::memory_order_relaxed)),
+          startTime(other.startTime), lastEventTime(other.lastEventTime) {
+        for (size_t i = 0; i < 16; ++i) {
+            blocksByCategory[i].store(other.blocksByCategory[i].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+        }
+    }
+
+    TrackerBlockerStatistics& operator=(const TrackerBlockerStatistics& other) {
+        if (this != &other) {
+            totalRequests.store(other.totalRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalModified.store(other.totalModified.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalAllowed.store(other.totalAllowed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            bloomFilterHits.store(other.bloomFilterHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalProcessingTimeUs.store(other.totalProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < 16; ++i) {
+                blocksByCategory[i].store(other.blocksByCategory[i].load(std::memory_order_relaxed),
+                                          std::memory_order_relaxed);
+            }
+            activeRuleCount.store(other.activeRuleCount.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            whitelistExceptions.store(other.whitelistExceptions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+            lastEventTime = other.lastEventTime;
+        }
+        return *this;
+    }
+
+    TrackerBlockerStatistics(TrackerBlockerStatistics&& other) noexcept
+        : totalRequests(other.totalRequests.load(std::memory_order_relaxed)),
+          totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
+          totalModified(other.totalModified.load(std::memory_order_relaxed)),
+          totalAllowed(other.totalAllowed.load(std::memory_order_relaxed)),
+          cacheHits(other.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(other.cacheMisses.load(std::memory_order_relaxed)),
+          bloomFilterHits(other.bloomFilterHits.load(std::memory_order_relaxed)),
+          totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
+          activeRuleCount(other.activeRuleCount.load(std::memory_order_relaxed)),
+          whitelistExceptions(other.whitelistExceptions.load(std::memory_order_relaxed)),
+          startTime(other.startTime), lastEventTime(other.lastEventTime) {
+        for (size_t i = 0; i < 16; ++i) {
+            blocksByCategory[i].store(other.blocksByCategory[i].load(std::memory_order_relaxed),
+                                      std::memory_order_relaxed);
+        }
+    }
+
+    TrackerBlockerStatistics& operator=(TrackerBlockerStatistics&&) = delete;
 
     /**
      * @brief Reset statistics

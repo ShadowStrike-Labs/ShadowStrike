@@ -129,14 +129,16 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/CryptoUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -205,6 +207,14 @@ namespace fs = std::filesystem;
 // ============================================================================
 // ENUMERATIONS
 // ============================================================================
+//
+// All download-specific types live in the nested `Downloads` namespace so they
+// do not collide with the public-facing simpler DownloadInfo / DownloadVerdict
+// / DownloadScanResult declared by BrowserProtection.hpp. The orchestrator
+// translation unit pulls in both headers, so co-existing top-level types would
+// be ill-formed.
+//
+namespace Downloads {
 
 /**
  * @brief Download scan verdict
@@ -289,19 +299,7 @@ enum class ThreatIndicator : uint32_t {
     PersistenceMechanism    = 1 << 19
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 // ============================================================================
 // STRUCTURES
@@ -598,7 +596,65 @@ struct DownloadBlockerStatistics {
     std::array<std::atomic<uint64_t>, 16> byVerdict{};
     std::array<std::atomic<uint64_t>, 32> byIndicator{};
     TimePoint startTime = Clock::now();
-    
+
+    DownloadBlockerStatistics() noexcept = default;
+
+    DownloadBlockerStatistics(const DownloadBlockerStatistics& o) noexcept
+        : totalDownloads(o.totalDownloads.load(std::memory_order_relaxed)),
+          scannedDownloads(o.scannedDownloads.load(std::memory_order_relaxed)),
+          cleanDownloads(o.cleanDownloads.load(std::memory_order_relaxed)),
+          blockedDownloads(o.blockedDownloads.load(std::memory_order_relaxed)),
+          quarantinedDownloads(o.quarantinedDownloads.load(std::memory_order_relaxed)),
+          malwareDetected(o.malwareDetected.load(std::memory_order_relaxed)),
+          pupDetected(o.pupDetected.load(std::memory_order_relaxed)),
+          suspiciousDetected(o.suspiciousDetected.load(std::memory_order_relaxed)),
+          sandboxedFiles(o.sandboxedFiles.load(std::memory_order_relaxed)),
+          signatureMatches(o.signatureMatches.load(std::memory_order_relaxed)),
+          heuristicMatches(o.heuristicMatches.load(std::memory_order_relaxed)),
+          reputationBlocks(o.reputationBlocks.load(std::memory_order_relaxed)),
+          policyBlocks(o.policyBlocks.load(std::memory_order_relaxed)),
+          scanErrors(o.scanErrors.load(std::memory_order_relaxed)),
+          bytesScanned(o.bytesScanned.load(std::memory_order_relaxed)),
+          startTime(o.startTime) {
+        for (size_t i = 0; i < byVerdict.size(); ++i) {
+            byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byIndicator.size(); ++i) {
+            byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        }
+    }
+
+    DownloadBlockerStatistics& operator=(const DownloadBlockerStatistics& o) noexcept {
+        if (this == &o) return *this;
+        totalDownloads.store(o.totalDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        scannedDownloads.store(o.scannedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cleanDownloads.store(o.cleanDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        blockedDownloads.store(o.blockedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        quarantinedDownloads.store(o.quarantinedDownloads.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        malwareDetected.store(o.malwareDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        pupDetected.store(o.pupDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        suspiciousDetected.store(o.suspiciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        sandboxedFiles.store(o.sandboxedFiles.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        signatureMatches.store(o.signatureMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        heuristicMatches.store(o.heuristicMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        reputationBlocks.store(o.reputationBlocks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        policyBlocks.store(o.policyBlocks.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        scanErrors.store(o.scanErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        bytesScanned.store(o.bytesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byVerdict.size(); ++i) {
+            byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byIndicator.size(); ++i) {
+            byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        }
+        startTime = o.startTime;
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -685,6 +741,8 @@ using ErrorCallback = std::function<void(const std::string& message, int code)>;
 /// @brief Pre-download callback (return false to block)
 using PreDownloadCallback = std::function<bool(const DownloadInfo&)>;
 
+}  // namespace Downloads
+
 // ============================================================================
 // MALICIOUS DOWNLOAD BLOCKER CLASS
 // ============================================================================
@@ -707,13 +765,13 @@ public:
     // LIFECYCLE
     // ========================================================================
     
-    [[nodiscard]] bool Initialize(const DownloadBlockerConfiguration& config = {});
+    [[nodiscard]] bool Initialize(const Downloads::DownloadBlockerConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] ModuleStatus GetStatus() const noexcept;
     
-    [[nodiscard]] bool UpdateConfiguration(const DownloadBlockerConfiguration& config);
-    [[nodiscard]] DownloadBlockerConfiguration GetConfiguration() const;
+    [[nodiscard]] bool UpdateConfiguration(const Downloads::DownloadBlockerConfiguration& config);
+    [[nodiscard]] Downloads::DownloadBlockerConfiguration GetConfiguration() const;
 
     // ========================================================================
     // DOWNLOAD EVENTS
@@ -723,25 +781,25 @@ public:
     void OnDownloadComplete(const std::wstring& filePath, const std::string& sourceUrl);
     
     /// @brief Handle download complete (extended)
-    void OnDownloadComplete(const DownloadInfo& download);
+    void OnDownloadComplete(const Downloads::DownloadInfo& download);
     
     /// @brief Handle download start (for pre-filtering)
-    [[nodiscard]] bool OnDownloadStart(const DownloadInfo& download);
+    [[nodiscard]] bool OnDownloadStart(const Downloads::DownloadInfo& download);
 
     // ========================================================================
     // SCANNING
     // ========================================================================
     
     /// @brief Scan downloaded file
-    [[nodiscard]] DownloadScanResult ScanFile(const fs::path& filePath);
+    [[nodiscard]] Downloads::DownloadScanResult ScanFile(const fs::path& filePath);
     
     /// @brief Scan file with source info
-    [[nodiscard]] DownloadScanResult ScanFile(
+    [[nodiscard]] Downloads::DownloadScanResult ScanFile(
         const fs::path& filePath,
         const std::string& sourceUrl);
     
     /// @brief Scan asynchronously
-    [[nodiscard]] std::future<DownloadScanResult> ScanFileAsync(
+    [[nodiscard]] std::future<Downloads::DownloadScanResult> ScanFileAsync(
         const fs::path& filePath,
         const std::string& sourceUrl = "");
     
@@ -778,10 +836,10 @@ public:
     // ========================================================================
     
     /// @brief Submit file to sandbox
-    [[nodiscard]] std::future<SandboxResult> SubmitToSandbox(const fs::path& filePath);
+    [[nodiscard]] std::future<Downloads::SandboxResult> SubmitToSandbox(const fs::path& filePath);
     
     /// @brief Get sandbox result
-    [[nodiscard]] std::optional<SandboxResult> GetSandboxResult(
+    [[nodiscard]] std::optional<Downloads::SandboxResult> GetSandboxResult(
         const std::string& downloadId);
 
     // ========================================================================
@@ -814,18 +872,18 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterScanCallback(ScanResultCallback callback);
-    void RegisterBlockedCallback(DownloadBlockedCallback callback);
-    void RegisterSandboxCallback(SandboxCompleteCallback callback);
-    void RegisterPreDownloadCallback(PreDownloadCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterScanCallback(Downloads::ScanResultCallback callback);
+    void RegisterBlockedCallback(Downloads::DownloadBlockedCallback callback);
+    void RegisterSandboxCallback(Downloads::SandboxCompleteCallback callback);
+    void RegisterPreDownloadCallback(Downloads::PreDownloadCallback callback);
+    void RegisterErrorCallback(Downloads::ErrorCallback callback);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] DownloadBlockerStatistics GetStatistics() const;
+    [[nodiscard]] Downloads::DownloadBlockerStatistics GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
@@ -843,11 +901,11 @@ private:
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetDownloadVerdictName(DownloadVerdict verdict) noexcept;
-[[nodiscard]] std::string_view GetDownloadActionName(DownloadAction action) noexcept;
-[[nodiscard]] std::string_view GetDownloadStatusName(DownloadStatus status) noexcept;
-[[nodiscard]] std::string_view GetRiskLevelName(RiskLevel level) noexcept;
-[[nodiscard]] std::string_view GetThreatIndicatorName(ThreatIndicator indicator) noexcept;
+[[nodiscard]] std::string_view GetDownloadVerdictName(Downloads::DownloadVerdict verdict) noexcept;
+[[nodiscard]] std::string_view GetDownloadActionName(Downloads::DownloadAction action) noexcept;
+[[nodiscard]] std::string_view GetDownloadStatusName(Downloads::DownloadStatus status) noexcept;
+[[nodiscard]] std::string_view GetRiskLevelName(Downloads::RiskLevel level) noexcept;
+[[nodiscard]] std::string_view GetThreatIndicatorName(Downloads::ThreatIndicator indicator) noexcept;
 
 /// @brief Check if file is high-risk type
 [[nodiscard]] bool IsHighRiskFile(const fs::path& filePath);

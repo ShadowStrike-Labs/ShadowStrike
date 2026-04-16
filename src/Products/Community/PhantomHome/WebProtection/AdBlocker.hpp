@@ -124,10 +124,11 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -215,27 +216,7 @@ enum class FilterType : uint8_t {
     Exception       = 5     ///< Exception rule
 };
 
-/**
- * @brief Request type
- */
-enum class RequestType : uint32_t {
-    None            = 0,
-    Document        = 1 << 0,
-    SubDocument     = 1 << 1,
-    Stylesheet      = 1 << 2,
-    Script          = 1 << 3,
-    Image           = 1 << 4,
-    Font            = 1 << 5,
-    Object          = 1 << 6,
-    XMLHTTPRequest  = 1 << 7,
-    Ping            = 1 << 8,
-    Media           = 1 << 9,
-    WebSocket       = 1 << 10,
-    Other           = 1 << 11,
-    Popup           = 1 << 12,
-    WebRTC          = 1 << 13,
-    All             = 0xFFFF
-};
+// RequestType is provided by WebProtectionCommon.hpp (unified across modules).
 
 /**
  * @brief Filter list status
@@ -249,20 +230,7 @@ enum class FilterListStatus : uint8_t {
     Disabled        = 5
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Filtering       = 3,
-    Updating        = 4,
-    Paused          = 5,
-    Stopping        = 6,
-    Stopped         = 7,
-    Error           = 8
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 // ============================================================================
 // STRUCTURES
@@ -440,7 +408,51 @@ struct AdBlockerStatistics {
     std::atomic<uint64_t> bytesBlocked{0};
     std::array<std::atomic<uint64_t>, 16> byRequestType{};
     TimePoint startTime = Clock::now();
-    
+
+    AdBlockerStatistics() noexcept = default;
+
+    AdBlockerStatistics(const AdBlockerStatistics& o) noexcept
+        : totalRequests(o.totalRequests.load(std::memory_order_relaxed)),
+          blockedRequests(o.blockedRequests.load(std::memory_order_relaxed)),
+          allowedRequests(o.allowedRequests.load(std::memory_order_relaxed)),
+          hiddenElements(o.hiddenElements.load(std::memory_order_relaxed)),
+          redirectedRequests(o.redirectedRequests.load(std::memory_order_relaxed)),
+          exceptionsApplied(o.exceptionsApplied.load(std::memory_order_relaxed)),
+          popupsBlocked(o.popupsBlocked.load(std::memory_order_relaxed)),
+          cryptominersBlocked(o.cryptominersBlocked.load(std::memory_order_relaxed)),
+          malvertisementBlocked(o.malvertisementBlocked.load(std::memory_order_relaxed)),
+          cacheHits(o.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(o.cacheMisses.load(std::memory_order_relaxed)),
+          bytesBlocked(o.bytesBlocked.load(std::memory_order_relaxed)),
+          startTime(o.startTime) {
+        for (size_t i = 0; i < byRequestType.size(); ++i) {
+            byRequestType[i].store(o.byRequestType[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+    }
+
+    AdBlockerStatistics& operator=(const AdBlockerStatistics& o) noexcept {
+        if (this == &o) return *this;
+        totalRequests.store(o.totalRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        blockedRequests.store(o.blockedRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        allowedRequests.store(o.allowedRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        hiddenElements.store(o.hiddenElements.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        redirectedRequests.store(o.redirectedRequests.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        exceptionsApplied.store(o.exceptionsApplied.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        popupsBlocked.store(o.popupsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cryptominersBlocked.store(o.cryptominersBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        malvertisementBlocked.store(o.malvertisementBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheHits.store(o.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheMisses.store(o.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        bytesBlocked.store(o.bytesBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byRequestType.size(); ++i) {
+            byRequestType[i].store(o.byRequestType[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+        startTime = o.startTime;
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -498,7 +510,7 @@ struct AdBlockerConfiguration {
 // CALLBACK TYPES
 // ============================================================================
 
-using BlockCallback = std::function<void(const std::string& url, const FilterMatchResult&)>;
+using AdBlockCallback = std::function<void(const std::string& url, const FilterMatchResult&)>;
 using UpdateCallback = std::function<void(const FilterListInfo&, bool success)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
@@ -614,7 +626,7 @@ public:
     // CALLBACKS
     // ========================================================================
     
-    void RegisterBlockCallback(BlockCallback callback);
+    void RegisterBlockCallback(AdBlockCallback callback);
     void RegisterUpdateCallback(UpdateCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
     void UnregisterCallbacks();

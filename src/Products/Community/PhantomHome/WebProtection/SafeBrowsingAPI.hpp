@@ -86,8 +86,8 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../ThreatIntel/ThreatIntelLookup.hpp"
-#include "../Utils/Logger.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -384,6 +384,63 @@ struct SafeBrowsingStatistics {
 
     /// @brief Start time
     SteadyTimePoint startTime = std::chrono::steady_clock::now();
+
+    SafeBrowsingStatistics() = default;
+    ~SafeBrowsingStatistics() = default;
+
+    SafeBrowsingStatistics(const SafeBrowsingStatistics& other)
+        : totalLookups(other.totalLookups.load(std::memory_order_relaxed)),
+          urlLookups(other.urlLookups.load(std::memory_order_relaxed)),
+          hashLookups(other.hashLookups.load(std::memory_order_relaxed)),
+          domainLookups(other.domainLookups.load(std::memory_order_relaxed)),
+          cacheHits(other.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(other.cacheMisses.load(std::memory_order_relaxed)),
+          maliciousDetected(other.maliciousDetected.load(std::memory_order_relaxed)),
+          suspiciousDetected(other.suspiciousDetected.load(std::memory_order_relaxed)),
+          phishingDetected(other.phishingDetected.load(std::memory_order_relaxed)),
+          puaDetected(other.puaDetected.load(std::memory_order_relaxed)),
+          totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
+          lookupErrors(other.lookupErrors.load(std::memory_order_relaxed)),
+          totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
+          startTime(other.startTime) {}
+
+    SafeBrowsingStatistics& operator=(const SafeBrowsingStatistics& other) {
+        if (this != &other) {
+            totalLookups.store(other.totalLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            urlLookups.store(other.urlLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hashLookups.store(other.hashLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            domainLookups.store(other.domainLookups.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            maliciousDetected.store(other.maliciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousDetected.store(other.suspiciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            phishingDetected.store(other.phishingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            puaDetected.store(other.puaDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalBlocked.store(other.totalBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            lookupErrors.store(other.lookupErrors.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalProcessingTimeUs.store(other.totalProcessingTimeUs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
+    SafeBrowsingStatistics(SafeBrowsingStatistics&& other) noexcept
+        : totalLookups(other.totalLookups.load(std::memory_order_relaxed)),
+          urlLookups(other.urlLookups.load(std::memory_order_relaxed)),
+          hashLookups(other.hashLookups.load(std::memory_order_relaxed)),
+          domainLookups(other.domainLookups.load(std::memory_order_relaxed)),
+          cacheHits(other.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(other.cacheMisses.load(std::memory_order_relaxed)),
+          maliciousDetected(other.maliciousDetected.load(std::memory_order_relaxed)),
+          suspiciousDetected(other.suspiciousDetected.load(std::memory_order_relaxed)),
+          phishingDetected(other.phishingDetected.load(std::memory_order_relaxed)),
+          puaDetected(other.puaDetected.load(std::memory_order_relaxed)),
+          totalBlocked(other.totalBlocked.load(std::memory_order_relaxed)),
+          lookupErrors(other.lookupErrors.load(std::memory_order_relaxed)),
+          totalProcessingTimeUs(other.totalProcessingTimeUs.load(std::memory_order_relaxed)),
+          startTime(other.startTime) {}
+
+    SafeBrowsingStatistics& operator=(SafeBrowsingStatistics&&) = delete;
 
     /**
      * @brief Reset all statistics
