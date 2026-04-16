@@ -1831,6 +1831,14 @@ void CryptoMinerDetectorImpl::AggregateResult(MinerDetectionResult& result) cons
     DetectionSource primarySource = result.source;
     size_t strongestWeight = 0;
 
+    // Track which detection categories are present for cross-source correlation
+    bool hasCpuEvidence = false;
+    bool hasGpuEvidence = false;
+    bool hasNetworkEvidence = false;
+    bool hasBrowserEvidence = false;
+    bool hasSignatureEvidence = false;
+    bool hasBehavioralEvidence = false;
+
     for (const auto source : result.additionalSources) {
         const auto weight = DetectionSourceWeight(source);
         confidence += static_cast<double>(weight);
@@ -1838,10 +1846,51 @@ void CryptoMinerDetectorImpl::AggregateResult(MinerDetectionResult& result) cons
             strongestWeight = weight;
             primarySource = source;
         }
+
+        switch (source) {
+            case DetectionSource::CPUHeuristic:
+                hasCpuEvidence = true; break;
+            case DetectionSource::GPUHeuristic:
+                hasGpuEvidence = true; break;
+            case DetectionSource::NetworkStratum:
+            case DetectionSource::NetworkPoolDomain:
+            case DetectionSource::NetworkPoolIP:
+                hasNetworkEvidence = true; break;
+            case DetectionSource::BrowserScript:
+            case DetectionSource::BrowserWASM:
+                hasBrowserEvidence = true; break;
+            case DetectionSource::SignatureBinary:
+            case DetectionSource::SignatureMemory:
+                hasSignatureEvidence = true; break;
+            case DetectionSource::ProcessBehavior:
+                hasBehavioralEvidence = true; break;
+            default: break;
+        }
     }
 
     if (!result.additionalSources.empty()) {
         confidence /= static_cast<double>(result.additionalSources.size());
+    }
+
+    // Cross-source correlation bonus: independent evidence from different detection
+    // categories significantly increases confidence (like witness testimony from
+    // unrelated observers)
+    uint32_t independentCategories = static_cast<uint32_t>(hasCpuEvidence)
+        + static_cast<uint32_t>(hasGpuEvidence)
+        + static_cast<uint32_t>(hasNetworkEvidence)
+        + static_cast<uint32_t>(hasBrowserEvidence)
+        + static_cast<uint32_t>(hasSignatureEvidence)
+        + static_cast<uint32_t>(hasBehavioralEvidence);
+
+    if (independentCategories >= 3) {
+        confidence += 15.0; // Strong multi-source corroboration
+    } else if (independentCategories == 2) {
+        confidence += 8.0;  // Two independent sources corroborate
+    }
+
+    // Signature evidence is definitive — floor the confidence
+    if (hasSignatureEvidence) {
+        confidence = std::max(confidence, 95.0);
     }
 
     if (result.browserInfo.has_value()) {
@@ -1861,6 +1910,12 @@ void CryptoMinerDetectorImpl::AggregateResult(MinerDetectionResult& result) cons
     }
     if (result.resourceStats.gpuUsagePercent >= MinerConstants::GPU_LOAD_THRESHOLD) {
         confidence += 5.0;
+    }
+
+    // Signed-binary penalty: known-signed processes get a confidence reduction
+    // because legitimate software sometimes triggers heuristics
+    if (result.processInfo.isSigned && !hasSignatureEvidence && independentCategories < 2) {
+        confidence *= 0.7;
     }
 
     result.source = primarySource;
@@ -1894,6 +1949,9 @@ void CryptoMinerDetectorImpl::AggregateResult(MinerDetectionResult& result) cons
     result.mitreTechniques = {"T1496"};
     if (!result.networkConnections.empty()) {
         result.mitreTechniques.push_back("T1071");
+    }
+    if (hasBrowserEvidence) {
+        result.mitreTechniques.push_back("T1059.007"); // JavaScript execution
     }
 
     if (result.minerType == MinerType::Unknown) {
@@ -1948,26 +2006,38 @@ void CryptoMinerDetectorImpl::PublishDetection(MinerDetectionResult& result, boo
     }
 
     if (executeRemediation) {
-        if (m_config.terminateOnDetection) {
-            if (TerminateMinerInternal(result.processInfo.processId)) {
-                result.actionTaken = DetectionAction::Terminate;
-            }
-        } else if (m_config.blockStratumProtocol) {
+        // Graduated response ladder: severity determines maximum escalation level.
+        // The ladder is: Alert → BlockNetwork → Terminate/Quarantine
+        // Higher severity unlocks more aggressive responses. Config flags act as
+        // gates — the ladder only escalates to actions the admin has enabled.
+        const auto severity = result.severity;
+        const auto pid = result.processInfo.processId;
+
+        // Step 1 (always): Alert — notify operators of the detection
+        if (m_config.alertOnDetection) {
+            result.actionTaken = DetectionAction::Alert;
+        }
+
+        // Step 2 (Medium+): Block network — sever mining pool connections
+        if (severity >= ThreatSeverity::Medium && m_config.blockStratumProtocol) {
             bool blocked = false;
             if (result.browserInfo.has_value() && m_browserDetector && !result.browserInfo->domain.empty()) {
                 m_browserDetector->BlockDomain(result.browserInfo->domain);
                 blocked = true;
             }
             if (!result.poolAddresses.empty()) {
-                blocked = BlockMinerNetworkInternal(result.processInfo.processId) || blocked;
+                blocked = BlockMinerNetworkInternal(pid) || blocked;
             }
             if (blocked) {
                 result.actionTaken = DetectionAction::BlockNetwork;
             }
         }
 
-        if (result.actionTaken == DetectionAction::None && m_config.alertOnDetection) {
-            result.actionTaken = DetectionAction::Alert;
+        // Step 3 (Critical only): Terminate — kill the miner process outright
+        if (severity >= ThreatSeverity::Critical && m_config.terminateOnDetection) {
+            if (TerminateMinerInternal(pid)) {
+                result.actionTaken = DetectionAction::Terminate;
+            }
         }
     }
 
