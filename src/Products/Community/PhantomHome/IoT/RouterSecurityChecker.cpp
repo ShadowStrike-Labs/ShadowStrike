@@ -63,8 +63,8 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
+#include "../Utils/CryptoUtils.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../PatternStore/PatternStore.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -87,8 +87,10 @@
 #include <WinSock2.h>
 #include <iphlpapi.h>
 #include <ws2tcpip.h>
+#include <wlanapi.h>
 #pragma comment(lib, "Ws2_32.lib")
 #pragma comment(lib, "iphlpapi.lib")
+#pragma comment(lib, "wlanapi.lib")
 #endif
 
 // ============================================================================
@@ -189,9 +191,239 @@ std::vector<std::string> GetKnownGoodDNS() {
         "8.8.8.8", "8.8.4.4",           // Google
         "1.1.1.1", "1.0.0.1",           // Cloudflare
         "9.9.9.9", "149.112.112.112",   // Quad9
-        "208.67.222.222", "208.67.220.220" // OpenDNS
+        "208.67.222.222", "208.67.220.220", // OpenDNS
+        "76.76.2.0", "76.76.10.0",      // ControlD
+        "94.140.14.14", "94.140.15.15"   // AdGuard
     };
 }
+
+/**
+ * @brief OUI (MAC prefix) to vendor mapping for router identification.
+ * Each entry maps a 3-byte OUI prefix (as "XX:XX:XX") to a vendor.
+ */
+struct OUIEntry {
+    const char* prefix; // "XX:XX:XX" uppercase
+    RouterVendor vendor;
+};
+
+const OUIEntry g_ouiDatabase[] = {
+    // Cisco
+    {"00:1A:A1", RouterVendor::Cisco}, {"00:1B:D4", RouterVendor::Cisco},
+    {"00:1C:58", RouterVendor::Cisco}, {"00:23:EA", RouterVendor::Cisco},
+    {"00:24:C4", RouterVendor::Cisco}, {"00:25:45", RouterVendor::Cisco},
+    {"00:26:0B", RouterVendor::Cisco}, {"58:AC:78", RouterVendor::Cisco},
+    {"D4:6D:50", RouterVendor::Cisco}, {"F4:4E:05", RouterVendor::Cisco},
+    // Netgear
+    {"00:14:6C", RouterVendor::Netgear}, {"00:1B:2F", RouterVendor::Netgear},
+    {"00:1E:2A", RouterVendor::Netgear}, {"00:1F:33", RouterVendor::Netgear},
+    {"20:0C:C8", RouterVendor::Netgear}, {"28:C6:8E", RouterVendor::Netgear},
+    {"2C:B0:5D", RouterVendor::Netgear}, {"44:94:FC", RouterVendor::Netgear},
+    {"6C:B0:CE", RouterVendor::Netgear}, {"84:1B:5E", RouterVendor::Netgear},
+    // TP-Link
+    {"14:CC:20", RouterVendor::TPLink}, {"30:B5:C2", RouterVendor::TPLink},
+    {"50:C7:BF", RouterVendor::TPLink}, {"54:C8:0F", RouterVendor::TPLink},
+    {"60:E3:27", RouterVendor::TPLink}, {"64:70:02", RouterVendor::TPLink},
+    {"98:DA:C4", RouterVendor::TPLink}, {"B0:BE:76", RouterVendor::TPLink},
+    {"C0:25:E9", RouterVendor::TPLink}, {"EC:08:6B", RouterVendor::TPLink},
+    // D-Link
+    {"00:17:9A", RouterVendor::DLink}, {"00:1B:11", RouterVendor::DLink},
+    {"00:1C:F0", RouterVendor::DLink}, {"00:21:91", RouterVendor::DLink},
+    {"14:D6:4D", RouterVendor::DLink}, {"1C:7E:E5", RouterVendor::DLink},
+    {"28:10:7B", RouterVendor::DLink}, {"34:08:04", RouterVendor::DLink},
+    {"C8:BE:19", RouterVendor::DLink}, {"F0:7D:68", RouterVendor::DLink},
+    // Asus
+    {"00:11:D8", RouterVendor::Asus}, {"00:15:F2", RouterVendor::Asus},
+    {"00:1A:92", RouterVendor::Asus}, {"00:1D:60", RouterVendor::Asus},
+    {"10:C3:7B", RouterVendor::Asus}, {"2C:56:DC", RouterVendor::Asus},
+    {"30:85:A9", RouterVendor::Asus}, {"50:46:5D", RouterVendor::Asus},
+    {"AC:9E:17", RouterVendor::Asus}, {"D8:50:E6", RouterVendor::Asus},
+    // Linksys
+    {"00:14:BF", RouterVendor::Linksys}, {"00:18:F8", RouterVendor::Linksys},
+    {"00:1A:70", RouterVendor::Linksys}, {"00:1C:10", RouterVendor::Linksys},
+    {"00:1E:E5", RouterVendor::Linksys}, {"00:21:29", RouterVendor::Linksys},
+    {"C0:56:27", RouterVendor::Linksys}, {"20:AA:4B", RouterVendor::Linksys},
+    // Huawei
+    {"00:18:82", RouterVendor::Huawei}, {"00:1E:10", RouterVendor::Huawei},
+    {"00:25:68", RouterVendor::Huawei}, {"00:46:4B", RouterVendor::Huawei},
+    {"04:F9:38", RouterVendor::Huawei}, {"20:F3:A3", RouterVendor::Huawei},
+    {"48:DB:50", RouterVendor::Huawei}, {"AC:CF:85", RouterVendor::Huawei},
+    // ZTE
+    {"00:15:EB", RouterVendor::ZTE}, {"00:19:C6", RouterVendor::ZTE},
+    {"00:1A:2B", RouterVendor::ZTE}, {"00:22:93", RouterVendor::ZTE},
+    {"34:4B:50", RouterVendor::ZTE}, {"54:22:F8", RouterVendor::ZTE},
+    // Ubiquiti
+    {"00:15:6D", RouterVendor::Ubiquiti}, {"00:27:22", RouterVendor::Ubiquiti},
+    {"04:18:D6", RouterVendor::Ubiquiti}, {"24:A4:3C", RouterVendor::Ubiquiti},
+    {"44:D9:E7", RouterVendor::Ubiquiti}, {"68:72:51", RouterVendor::Ubiquiti},
+    {"74:83:C2", RouterVendor::Ubiquiti}, {"78:8A:20", RouterVendor::Ubiquiti},
+    {"B4:FB:E4", RouterVendor::Ubiquiti}, {"DC:9F:DB", RouterVendor::Ubiquiti},
+    // MikroTik
+    {"00:0C:42", RouterVendor::MikroTik}, {"4C:5E:0C", RouterVendor::MikroTik},
+    {"6C:3B:6B", RouterVendor::MikroTik}, {"D4:CA:6D", RouterVendor::MikroTik},
+    {"E4:8D:8C", RouterVendor::MikroTik}, {"48:A9:8A", RouterVendor::MikroTik},
+    // Belkin
+    {"00:11:50", RouterVendor::Belkin}, {"00:17:3F", RouterVendor::Belkin},
+    {"08:86:3B", RouterVendor::Belkin}, {"94:10:3E", RouterVendor::Belkin},
+    {"B4:75:0E", RouterVendor::Belkin}, {"C0:56:27", RouterVendor::Belkin},
+    // Fortinet
+    {"00:09:0F", RouterVendor::Fortinet}, {"70:4C:A5", RouterVendor::Fortinet},
+    // Juniper
+    {"00:05:85", RouterVendor::Juniper}, {"00:10:DB", RouterVendor::Juniper},
+    {"00:12:1E", RouterVendor::Juniper}, {"00:14:F6", RouterVendor::Juniper},
+    // Aruba
+    {"00:0B:86", RouterVendor::Aruba}, {"00:1A:1E", RouterVendor::Aruba},
+    {"00:24:6C", RouterVendor::Aruba}, {"04:BD:88", RouterVendor::Aruba},
+    // Meraki (Cisco Meraki)
+    {"00:18:0A", RouterVendor::Meraki}, {"AC:17:02", RouterVendor::Meraki},
+};
+
+/**
+ * @brief Lookup vendor by MAC OUI prefix.
+ * @param mac MAC address string (any common format: XX:XX:XX:XX:XX:XX,
+ *            XX-XX-XX-XX-XX-XX, or XXXXXXXXXXXX)
+ * @return RouterVendor or Unknown
+ */
+RouterVendor LookupOUI(const std::string& mac) {
+    if (mac.size() < 8) return RouterVendor::Unknown;
+
+    // Normalize MAC to "XX:XX:XX" uppercase OUI prefix
+    std::string normalized;
+    normalized.reserve(8);
+    for (char c : mac) {
+        if (c == ':' || c == '-') continue;
+        if (normalized.size() >= 6) break;
+        normalized.push_back(static_cast<char>(std::toupper(static_cast<unsigned char>(c))));
+    }
+    if (normalized.size() < 6) return RouterVendor::Unknown;
+
+    // Format as XX:XX:XX
+    std::string oui;
+    oui.reserve(8);
+    oui += normalized[0]; oui += normalized[1]; oui += ':';
+    oui += normalized[2]; oui += normalized[3]; oui += ':';
+    oui += normalized[4]; oui += normalized[5];
+
+    for (const auto& entry : g_ouiDatabase) {
+        if (oui == entry.prefix) {
+            return entry.vendor;
+        }
+    }
+    return RouterVendor::Unknown;
+}
+
+/**
+ * @brief Known router CVE identifiers indexed by vendor.
+ * These represent commonly exploited router vulnerabilities.
+ */
+struct KnownRouterCVE {
+    const char* cveId;
+    RouterVendor vendor;
+    const char* description;
+    float cvssScore;
+};
+
+const KnownRouterCVE g_knownRouterCVEs[] = {
+    // Cisco
+    {"CVE-2023-20198", RouterVendor::Cisco, "Cisco IOS XE Web UI Privilege Escalation", 10.0f},
+    {"CVE-2023-20273", RouterVendor::Cisco, "Cisco IOS XE Web UI Command Injection", 7.2f},
+    {"CVE-2019-1653",  RouterVendor::Cisco, "Cisco RV320/RV325 Information Disclosure", 7.5f},
+    // Netgear
+    {"CVE-2021-45388", RouterVendor::Netgear, "Netgear Nighthawk R6700v3 Stack Overflow", 8.8f},
+    {"CVE-2020-26919", RouterVendor::Netgear, "Netgear ProSafe Plus Remote Code Execution", 9.8f},
+    {"CVE-2022-48196", RouterVendor::Netgear, "Netgear Nighthawk RAX30 Authentication Bypass", 9.8f},
+    // TP-Link
+    {"CVE-2023-1389",  RouterVendor::TPLink, "TP-Link Archer AX21 Command Injection", 8.8f},
+    {"CVE-2022-30075", RouterVendor::TPLink, "TP-Link Archer AX50 Remote Code Execution", 8.8f},
+    // D-Link
+    {"CVE-2024-0769",  RouterVendor::DLink, "D-Link DIR-859 Information Disclosure", 9.8f},
+    {"CVE-2023-32169", RouterVendor::DLink, "D-Link D-View 8 Authentication Bypass", 9.8f},
+    {"CVE-2019-17621", RouterVendor::DLink, "D-Link DIR-859 UPnP Command Injection", 9.8f},
+    // Asus
+    {"CVE-2023-35086", RouterVendor::Asus, "Asus RT-AX56U V2 Format String Vulnerability", 9.8f},
+    {"CVE-2022-35401", RouterVendor::Asus, "Asus RT-AX82U Authentication Bypass", 8.1f},
+    // Linksys
+    {"CVE-2022-38841", RouterVendor::Linksys, "Linksys E5350 Command Injection", 9.8f},
+    // MikroTik
+    {"CVE-2023-30799", RouterVendor::MikroTik, "MikroTik RouterOS Privilege Escalation", 7.2f},
+    {"CVE-2019-3924",  RouterVendor::MikroTik, "MikroTik RouterOS DNS Cache Poisoning", 7.5f},
+    // Huawei
+    {"CVE-2017-17215", RouterVendor::Huawei, "Huawei HG532 Remote Code Execution", 8.8f},
+    // ZTE
+    {"CVE-2014-2321",  RouterVendor::ZTE, "ZTE F460/F660 Backdoor", 10.0f},
+    // Generic / multi-vendor
+    {"CVE-2014-9222",  RouterVendor::Unknown, "Misfortune Cookie (Allegro RomPager)", 10.0f},
+    {"CVE-2017-17562", RouterVendor::Unknown, "GoAhead Web Server Remote Code Execution", 8.1f},
+};
+
+/**
+ * @brief Validate an IPv4 address string. Rejects empty, overlong, or malformed addresses.
+ */
+[[nodiscard]] bool IsValidIPv4(const std::string& ip) {
+    if (ip.empty() || ip.size() > 15) return false;
+    struct sockaddr_in sa{};
+    return (inet_pton(AF_INET, ip.c_str(), &sa.sin_addr) == 1);
+}
+
+/**
+ * @brief Convert narrow IP to wide IpAddress for NetworkUtils calls.
+ */
+[[nodiscard]] bool ParseToIpAddress(
+    const std::string& ip,
+    Utils::NetworkUtils::IpAddress& out)
+{
+    std::wstring wideIP = Utils::StringUtils::ToWide(ip);
+    return Utils::NetworkUtils::ParseIpAddress(wideIP, out);
+}
+
+/**
+ * @brief RAII wrapper for WLAN handle.
+ */
+#ifdef _WIN32
+class WlanHandleGuard {
+public:
+    WlanHandleGuard() noexcept = default;
+    ~WlanHandleGuard() noexcept {
+        if (m_handle) {
+            WlanCloseHandle(m_handle, nullptr);
+        }
+    }
+    WlanHandleGuard(const WlanHandleGuard&) = delete;
+    WlanHandleGuard& operator=(const WlanHandleGuard&) = delete;
+
+    [[nodiscard]] bool Open() noexcept {
+        DWORD negotiatedVersion = 0;
+        DWORD clientVersion = 2;
+        DWORD result = WlanOpenHandle(clientVersion, nullptr, &negotiatedVersion, &m_handle);
+        return (result == ERROR_SUCCESS && m_handle != nullptr);
+    }
+    [[nodiscard]] HANDLE Get() const noexcept { return m_handle; }
+private:
+    HANDLE m_handle = nullptr;
+};
+#endif
+
+/**
+ * @brief RAII socket wrapper for SSDP/UDP.
+ */
+#ifdef _WIN32
+class SocketGuard {
+public:
+    explicit SocketGuard(SOCKET s = INVALID_SOCKET) noexcept : m_socket(s) {}
+    ~SocketGuard() noexcept {
+        if (m_socket != INVALID_SOCKET) {
+            closesocket(m_socket);
+        }
+    }
+    SocketGuard(const SocketGuard&) = delete;
+    SocketGuard& operator=(const SocketGuard&) = delete;
+    SocketGuard(SocketGuard&& o) noexcept : m_socket(o.m_socket) { o.m_socket = INVALID_SOCKET; }
+
+    [[nodiscard]] SOCKET Get() const noexcept { return m_socket; }
+    [[nodiscard]] bool IsValid() const noexcept { return m_socket != INVALID_SOCKET; }
+private:
+    SOCKET m_socket;
+};
+#endif
 
 /**
  * @brief Calculate security score based on issues
@@ -452,9 +684,11 @@ public:
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
-    /// @brief Infrastructure integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
-    std::shared_ptr<PatternStore::PatternStore> m_patternStore;
+    /// @brief Infrastructure: reference ThreatIntel singleton (non-owning)
+    ThreatIntel::ThreatIntelManager* m_threatIntel = nullptr;
+
+    /// @brief Auto-assessment future (replaces detached thread for safe lifetime)
+    std::future<void> m_autoAssessmentFuture;
 
     // ========================================================================
     // METHODS
@@ -522,18 +756,18 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::Initialize(
 
         m_config = config;
 
-        // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
-        m_patternStore = std::make_shared<PatternStore::PatternStore>();
+        // Bind to ThreatIntel singleton (non-owning)
+        m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
         Utils::Logger::Info(L"RouterSecurityChecker: Initialized successfully");
 
-        // Auto-assess if configured
+        // Auto-assess if configured — use stored future (NOT detached thread)
+        // to ensure safe lifetime management
         if (m_config.autoAssessOnStartup && m_config.enabled) {
             Utils::Logger::Info(L"RouterSecurityChecker: Auto-assessing gateway on startup");
-            std::thread([this]() {
+            m_autoAssessmentFuture = std::async(std::launch::async, [this]() {
                 try {
                     auto report = AuditGatewaySyncInternal("", m_config.defaultAssessmentConfig);
                     InvokeAssessmentCallbacks(report);
@@ -541,7 +775,7 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::Initialize(
                     Utils::Logger::Error(L"RouterSecurityChecker: Auto-assessment failed - {}",
                                        Utils::StringUtils::Utf8ToWide(e.what()));
                 }
-            }).detach();
+            });
         }
 
         return true;
@@ -567,6 +801,17 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::Shutdown() {
 
         // Cancel any ongoing assessment
         m_cancelRequested.store(true, std::memory_order_release);
+
+        // Wait for auto-assessment future to complete safely
+        if (m_autoAssessmentFuture.valid()) {
+            try {
+                // Wait up to 5 seconds, then abandon
+                auto status = m_autoAssessmentFuture.wait_for(std::chrono::seconds(5));
+                if (status == std::future_status::timeout) {
+                    Utils::Logger::Warn(L"RouterSecurityChecker: Auto-assessment did not finish within shutdown timeout");
+                }
+            } catch (...) {}
+        }
 
         // Clear data structures
         {
@@ -624,13 +869,32 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
         }
 
         report.routerIP = targetIP;
+
+        // Validate target IP format
+        if (!IsValidIPv4(targetIP)) {
+            Utils::Logger::Error(L"RouterSecurityChecker: Invalid gateway IP format");
+            report.status = AssessmentStatus::Failed;
+            return report;
+        }
+
         Utils::Logger::Info(L"RouterSecurityChecker: Auditing router at {}",
                           Utils::StringUtils::Utf8ToWide(targetIP));
+
+        // Check cancellation early
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
+        }
 
         // Detect vendor
         UpdateProgress(10.0f, "Detecting router vendor");
         report.vendor = DetectVendor(targetIP);
         report.routerName = std::string(GetRouterVendorName(report.vendor));
+
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
+        }
 
         // Check default credentials
         if (config.checkDefaultCredentials) {
@@ -652,6 +916,11 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
             }
         }
 
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
+        }
+
         // Check UPnP
         if (config.checkUPnP) {
             UpdateProgress(35.0f, "Checking UPnP configuration");
@@ -668,6 +937,11 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
 
                 InvokeIssueCallbacks(issue);
             }
+        }
+
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
         }
 
         // Check DNS hijacking
@@ -690,6 +964,11 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
 
                 InvokeIssueCallbacks(issue);
             }
+        }
+
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
         }
 
         // Check wireless security
@@ -733,6 +1012,11 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
             }
         }
 
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
+        }
+
         // Scan external ports
         if (config.scanExternalPorts) {
             UpdateProgress(80.0f, "Scanning external ports");
@@ -748,6 +1032,11 @@ RouterSecurityReport RouterSecurityChecker::RouterSecurityCheckerImpl::AuditGate
                 report.securityIssues.push_back(issue);
                 InvokeIssueCallbacks(issue);
             }
+        }
+
+        if (m_cancelRequested.load(std::memory_order_acquire)) {
+            report.status = AssessmentStatus::Cancelled;
+            return report;
         }
 
         // Check CVEs
@@ -823,15 +1112,85 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDefaultCredentialsIn
     try {
         auto credDatabase = GetDefaultCredentialsDatabase();
 
-        // Simplified credential testing
-        // In production, would attempt HTTP/HTTPS authentication
-        // For stub, simulate detection based on randomness
-
         Utils::Logger::Info(L"RouterSecurityChecker: Testing {} default credentials for {}",
                           credDatabase.size(),
                           Utils::StringUtils::Utf8ToWide(ip));
 
-        // Stub: return false (no default creds found)
+        // Attempt HTTP Basic Authentication against common admin endpoints
+        constexpr uint16_t adminPorts[] = { 80, 443, 8080, 8443 };
+        constexpr const wchar_t* adminPaths[] = { L"/", L"/login", L"/admin", L"/cgi-bin/luci" };
+        constexpr size_t kMaxAttempts = 50; // Cap total attempts to avoid account lockout
+        constexpr uint32_t kPerAttemptDelayMs = 250; // Rate-limit between attempts
+
+        size_t attemptCount = 0;
+
+        for (uint16_t port : adminPorts) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) return false;
+
+            // Determine protocol
+            const bool useTLS = (port == 443 || port == 8443);
+            const std::wstring proto = useTLS ? L"https" : L"http";
+
+            for (const wchar_t* path : adminPaths) {
+                if (m_cancelRequested.load(std::memory_order_acquire)) return false;
+
+                std::wstring baseURL = std::format(L"{}://{}:{}{}", proto,
+                    Utils::StringUtils::ToWide(ip), port, path);
+
+                for (const auto& cred : credDatabase) {
+                    if (m_cancelRequested.load(std::memory_order_acquire)) return false;
+                    if (++attemptCount > kMaxAttempts) {
+                        Utils::Logger::Info(
+                            L"RouterSecurityChecker: Reached credential test cap ({} attempts)",
+                            kMaxAttempts);
+                        return false;
+                    }
+
+                    // Build HTTP Basic Auth header: base64(username:password)
+                    std::string authPlain = cred.username + ":" + cred.password;
+                    std::string authEncoded = Utils::CryptoUtils::Base64::Encode(
+                        reinterpret_cast<const uint8_t*>(authPlain.data()), authPlain.size());
+
+                    Utils::NetworkUtils::HttpRequestOptions opts;
+                    opts.timeoutMs = std::min(m_config.defaultAssessmentConfig.timeoutMs, 5000u);
+                    opts.headers.push_back({L"Authorization",
+                        std::format(L"Basic {}", Utils::StringUtils::ToWide(authEncoded))});
+                    opts.allowRedirects = false; // Don't follow redirects (avoid loops)
+                    opts.verifySSL = false; // Router self-signed certs are common
+
+                    Utils::NetworkUtils::HttpResponse response;
+                    Utils::NetworkUtils::Error netErr;
+                    bool ok = Utils::NetworkUtils::HttpRequest(baseURL, response, opts, &netErr);
+
+                    if (!ok) {
+                        // Connection refused or timeout — try next port
+                        break;
+                    }
+
+                    // 200 or 301/302 (authenticated redirect) means creds work
+                    if (response.statusCode == 200 || response.statusCode == 301 || response.statusCode == 302) {
+                        Utils::Logger::Warn(
+                            L"RouterSecurityChecker: DEFAULT CREDENTIALS ACCEPTED on {}:{} user={}",
+                            Utils::StringUtils::ToWide(ip), port,
+                            Utils::StringUtils::ToWide(cred.username));
+                        return true;
+                    }
+
+                    // 401/403 means credentials failed — try next credential
+                    if (response.statusCode == 401 || response.statusCode == 403) {
+                        // Rate-limit to avoid triggering lockout
+                        Sleep(kPerAttemptDelayMs);
+                        continue;
+                    }
+
+                    // Other status codes — admin page may not be at this path
+                    break;
+                }
+            }
+        }
+
+        Utils::Logger::Info(L"RouterSecurityChecker: No default credentials found for {}",
+                          Utils::StringUtils::Utf8ToWide(ip));
         return false;
 
     } catch (const std::exception& e) {
@@ -846,14 +1205,156 @@ UPnPInfo RouterSecurityChecker::RouterSecurityCheckerImpl::CheckUPnPInternal(con
     info.enabled = false;
 
     try {
-        // Simplified UPnP discovery
-        // In production, would send SSDP M-SEARCH multicast
-        // and parse device description XML
-
         Utils::Logger::Info(L"RouterSecurityChecker: Checking UPnP for {}",
                           Utils::StringUtils::Utf8ToWide(ip));
 
-        // Stub: return disabled
+#ifdef _WIN32
+        // Send SSDP M-SEARCH multicast to discover UPnP devices
+        constexpr const char* SSDP_MULTICAST = "239.255.255.250";
+        constexpr uint16_t SSDP_PORT = 1900;
+        constexpr uint32_t SSDP_TIMEOUT_MS = 3000;
+        constexpr size_t MAX_RESPONSE_SIZE = 4096;
+
+        SocketGuard sock(socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP));
+        if (!sock.IsValid()) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to create SSDP socket");
+            return info;
+        }
+
+        // Set socket timeout
+        DWORD timeout = SSDP_TIMEOUT_MS;
+        setsockopt(sock.Get(), SOL_SOCKET, SO_RCVTIMEO,
+                   reinterpret_cast<const char*>(&timeout), sizeof(timeout));
+
+        // Enable broadcast
+        BOOL bOptVal = TRUE;
+        setsockopt(sock.Get(), SOL_SOCKET, SO_BROADCAST,
+                   reinterpret_cast<const char*>(&bOptVal), sizeof(bOptVal));
+
+        // Build M-SEARCH request targeting Internet Gateway Device
+        std::string mSearch =
+            "M-SEARCH * HTTP/1.1\r\n"
+            "HOST: 239.255.255.250:1900\r\n"
+            "MAN: \"ssdp:discover\"\r\n"
+            "MX: 2\r\n"
+            "ST: urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\n"
+            "\r\n";
+
+        struct sockaddr_in destAddr{};
+        destAddr.sin_family = AF_INET;
+        destAddr.sin_port = htons(SSDP_PORT);
+        inet_pton(AF_INET, SSDP_MULTICAST, &destAddr.sin_addr);
+
+        int sent = sendto(sock.Get(), mSearch.c_str(), static_cast<int>(mSearch.size()), 0,
+                          reinterpret_cast<struct sockaddr*>(&destAddr), sizeof(destAddr));
+        if (sent <= 0) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to send SSDP M-SEARCH");
+            return info;
+        }
+
+        // Wait for responses using select()
+        fd_set readFds;
+        FD_ZERO(&readFds);
+        FD_SET(sock.Get(), &readFds);
+        struct timeval tv{};
+        tv.tv_sec = static_cast<long>(SSDP_TIMEOUT_MS / 1000);
+        tv.tv_usec = static_cast<long>((SSDP_TIMEOUT_MS % 1000) * 1000);
+
+        int selectResult = select(0, &readFds, nullptr, nullptr, &tv);
+        if (selectResult <= 0) {
+            // No response — UPnP likely disabled
+            return info;
+        }
+
+        std::array<char, MAX_RESPONSE_SIZE> recvBuf{};
+        struct sockaddr_in srcAddr{};
+        int srcAddrLen = sizeof(srcAddr);
+        int recvLen = recvfrom(sock.Get(), recvBuf.data(),
+                               static_cast<int>(recvBuf.size() - 1), 0,
+                               reinterpret_cast<struct sockaddr*>(&srcAddr), &srcAddrLen);
+
+        if (recvLen <= 0) {
+            return info;
+        }
+
+        // Null-terminate and cap
+        recvBuf[static_cast<size_t>(std::min(recvLen, static_cast<int>(MAX_RESPONSE_SIZE - 1)))] = '\0';
+        std::string ssdpResponse(recvBuf.data(), static_cast<size_t>(recvLen));
+
+        // UPnP device responded — it's enabled
+        info.enabled = true;
+
+        // Parse LOCATION header to get device description URL
+        std::string locationUrl;
+        auto locPos = ssdpResponse.find("LOCATION:");
+        if (locPos == std::string::npos) {
+            locPos = ssdpResponse.find("Location:");
+        }
+        if (locPos != std::string::npos) {
+            auto lineEnd = ssdpResponse.find("\r\n", locPos);
+            if (lineEnd != std::string::npos) {
+                auto valueStart = locPos + 9; // strlen("LOCATION:")
+                while (valueStart < lineEnd && ssdpResponse[valueStart] == ' ') ++valueStart;
+                locationUrl = ssdpResponse.substr(valueStart, lineEnd - valueStart);
+            }
+        }
+
+        // Parse SERVER header for device info
+        auto serverPos = ssdpResponse.find("SERVER:");
+        if (serverPos == std::string::npos) {
+            serverPos = ssdpResponse.find("Server:");
+        }
+        if (serverPos != std::string::npos) {
+            auto lineEnd = ssdpResponse.find("\r\n", serverPos);
+            if (lineEnd != std::string::npos) {
+                auto valueStart = serverPos + 7;
+                while (valueStart < lineEnd && ssdpResponse[valueStart] == ' ') ++valueStart;
+                // Use modelNumber to store the server identification string
+                info.modelNumber = ssdpResponse.substr(valueStart, lineEnd - valueStart);
+                if (info.modelNumber.size() > 256) info.modelNumber.resize(256);
+            }
+        }
+
+        // If we have a LOCATION URL, try to fetch device description for more info
+        if (!locationUrl.empty() && locationUrl.size() < 512) {
+            Utils::NetworkUtils::HttpRequestOptions opts;
+            opts.timeoutMs = 3000;
+            opts.verifySSL = false;
+            Utils::NetworkUtils::HttpResponse xmlResp;
+            std::wstring wideLocUrl = Utils::StringUtils::ToWide(locationUrl);
+
+            if (Utils::NetworkUtils::HttpRequest(wideLocUrl, xmlResp, opts) &&
+                xmlResp.statusCode == 200 && !xmlResp.body.empty())
+            {
+                // Parse XML for friendlyName and manufacturer (lightweight text search)
+                std::string xmlBody(xmlResp.body.begin(), xmlResp.body.end());
+                // Cap to 32KB to prevent DoS
+                if (xmlBody.size() > 32768) xmlBody.resize(32768);
+
+                auto extractXmlTag = [&](const std::string& tag) -> std::string {
+                    std::string openTag = "<" + tag + ">";
+                    std::string closeTag = "</" + tag + ">";
+                    auto start = xmlBody.find(openTag);
+                    if (start == std::string::npos) return "";
+                    start += openTag.size();
+                    auto end = xmlBody.find(closeTag, start);
+                    if (end == std::string::npos || (end - start) > 256) return "";
+                    return xmlBody.substr(start, end - start);
+                };
+
+                info.friendlyName = extractXmlTag("friendlyName");
+                info.manufacturer = extractXmlTag("manufacturer");
+                info.modelName = extractXmlTag("modelName");
+                info.serialNumber = extractXmlTag("serialNumber");
+                info.descriptionUrl = locationUrl;
+            }
+        }
+
+        Utils::Logger::Warn(L"RouterSecurityChecker: UPnP ENABLED on {} - device: {}",
+                          Utils::StringUtils::Utf8ToWide(ip),
+                          Utils::StringUtils::ToWide(info.friendlyName.empty() ? "(unknown)" : info.friendlyName));
+#endif
+
         return info;
 
     } catch (const std::exception& e) {
@@ -879,7 +1380,22 @@ bool RouterSecurityChecker::RouterSecurityCheckerImpl::CheckDNSHijackingInternal
             // Also check if it's a private/local IP (ISP DNS)
             bool isLocal = dns.starts_with("192.168.") ||
                           dns.starts_with("10.") ||
-                          dns.starts_with("172.");
+                          dns.starts_with("127.");
+
+            // Correct RFC 1918 range: 172.16.0.0 - 172.31.255.255
+            if (!isLocal && dns.starts_with("172.")) {
+                try {
+                    auto dotPos = dns.find('.', 4);
+                    if (dotPos != std::string::npos) {
+                        int secondOctet = std::stoi(dns.substr(4, dotPos - 4));
+                        if (secondOctet >= 16 && secondOctet <= 31) {
+                            isLocal = true;
+                        }
+                    }
+                } catch (...) {
+                    // Malformed IP — not local
+                }
+            }
 
             if (!isKnownGood && !isLocal) {
                 // Suspicious DNS server
@@ -906,24 +1422,33 @@ std::string RouterSecurityChecker::RouterSecurityCheckerImpl::GetDefaultGatewayI
 
         PIP_ADAPTER_INFO pAdapterInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
 
-        if (GetAdaptersInfo(pAdapterInfo, &bufferSize) == ERROR_BUFFER_OVERFLOW) {
+        DWORD result = GetAdaptersInfo(pAdapterInfo, &bufferSize);
+        if (result == ERROR_BUFFER_OVERFLOW) {
+            if (bufferSize > 256 * 1024) {
+                Utils::Logger::Warn(L"RouterSecurityChecker: GetAdaptersInfo requested excessive buffer");
+                return "192.168.1.1";
+            }
             buffer.resize(bufferSize);
             pAdapterInfo = reinterpret_cast<PIP_ADAPTER_INFO>(buffer.data());
+            result = GetAdaptersInfo(pAdapterInfo, &bufferSize);
         }
 
-        if (GetAdaptersInfo(pAdapterInfo, &bufferSize) == NO_ERROR) {
+        if (result == NO_ERROR) {
             PIP_ADAPTER_INFO pAdapter = pAdapterInfo;
-            while (pAdapter) {
+            constexpr size_t kMaxAdapters = 64;
+            size_t count = 0;
+            while (pAdapter && count < kMaxAdapters) {
                 if (pAdapter->Type == MIB_IF_TYPE_ETHERNET ||
                     pAdapter->Type == IF_TYPE_IEEE80211) {
                     std::string gateway = pAdapter->GatewayList.IpAddress.String;
-                    if (!gateway.empty() && gateway != "0.0.0.0") {
+                    if (!gateway.empty() && gateway != "0.0.0.0" && IsValidIPv4(gateway)) {
                         Utils::Logger::Info(L"RouterSecurityChecker: Detected gateway: {}",
                                           Utils::StringUtils::Utf8ToWide(gateway));
                         return gateway;
                     }
                 }
                 pAdapter = pAdapter->Next;
+                ++count;
             }
         }
 #endif
@@ -948,17 +1473,187 @@ std::vector<WirelessNetworkInfo> RouterSecurityChecker::RouterSecurityCheckerImp
     std::vector<WirelessNetworkInfo> networks;
 
     try {
-        // Simplified wireless enumeration
-        // In production, would query router web interface or use WLAN API
+#ifdef _WIN32
+        WlanHandleGuard wlanHandle;
+        if (!wlanHandle.Open()) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: WLAN API not available");
+            return networks;
+        }
 
-        // Stub: return empty list
-        return networks;
+        // Enumerate wireless interfaces
+        PWLAN_INTERFACE_INFO_LIST pInterfaceList = nullptr;
+        DWORD result = WlanEnumInterfaces(wlanHandle.Get(), nullptr, &pInterfaceList);
+        if (result != ERROR_SUCCESS || !pInterfaceList) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: No wireless interfaces found");
+            return networks;
+        }
+
+        // RAII cleanup for the interface list
+        struct InterfaceListGuard {
+            PWLAN_INTERFACE_INFO_LIST ptr;
+            ~InterfaceListGuard() { if (ptr) WlanFreeMemory(ptr); }
+        } interfaceGuard{pInterfaceList};
+
+        constexpr size_t kMaxNetworks = 64; // Cap to prevent excessive allocations
+
+        for (DWORD i = 0; i < pInterfaceList->dwNumberOfItems && networks.size() < kMaxNetworks; ++i) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) break;
+
+            const auto& iface = pInterfaceList->InterfaceInfo[i];
+            if (iface.isState != wlan_interface_state_connected &&
+                iface.isState != wlan_interface_state_disconnected) {
+                continue;
+            }
+
+            // Get available network list (visible SSIDs)
+            PWLAN_AVAILABLE_NETWORK_LIST pNetworkList = nullptr;
+            result = WlanGetAvailableNetworkList(
+                wlanHandle.Get(), &iface.InterfaceGuid,
+                0, nullptr, &pNetworkList);
+            if (result != ERROR_SUCCESS || !pNetworkList) continue;
+
+            struct NetworkListGuard {
+                PWLAN_AVAILABLE_NETWORK_LIST ptr;
+                ~NetworkListGuard() { if (ptr) WlanFreeMemory(ptr); }
+            } netGuard{pNetworkList};
+
+            for (DWORD j = 0; j < pNetworkList->dwNumberOfItems && networks.size() < kMaxNetworks; ++j) {
+                const auto& avail = pNetworkList->Network[j];
+
+                WirelessNetworkInfo netInfo;
+
+                // Extract SSID (safely bounded)
+                if (avail.dot11Ssid.uSSIDLength > 0 && avail.dot11Ssid.uSSIDLength <= 32) {
+                    netInfo.ssid.assign(
+                        reinterpret_cast<const char*>(avail.dot11Ssid.ucSSID),
+                        avail.dot11Ssid.uSSIDLength);
+                } else {
+                    netInfo.ssid = "(hidden)";
+                }
+
+                // Signal strength: wlanSignalQuality is 0-100%
+                netInfo.signalStrength = static_cast<int>(avail.wlanSignalQuality);
+
+                // Map authentication algorithm to our encryption enum
+                switch (avail.dot11DefaultAuthAlgorithm) {
+                    case DOT11_AUTH_ALGO_80211_OPEN:
+                        netInfo.encryption = WirelessEncryption::Open;
+                        break;
+                    case DOT11_AUTH_ALGO_80211_SHARED_KEY:
+                        netInfo.encryption = WirelessEncryption::WEP;
+                        break;
+                    case DOT11_AUTH_ALGO_WPA:
+                    case DOT11_AUTH_ALGO_WPA_PSK:
+                        netInfo.encryption = (avail.dot11DefaultAuthAlgorithm == DOT11_AUTH_ALGO_WPA_PSK)
+                            ? WirelessEncryption::WPA_Personal
+                            : WirelessEncryption::WPA_Enterprise;
+                        break;
+                    case DOT11_AUTH_ALGO_RSNA:
+                    case DOT11_AUTH_ALGO_RSNA_PSK:
+                        netInfo.encryption = (avail.dot11DefaultAuthAlgorithm == DOT11_AUTH_ALGO_RSNA_PSK)
+                            ? WirelessEncryption::WPA2_Personal
+                            : WirelessEncryption::WPA2_Enterprise;
+                        break;
+                    default:
+                        // WPA3/SAE (DOT11_AUTH_ALGO_WPA3_SAE = 0x0009 in newer SDKs)
+                        if (avail.dot11DefaultAuthAlgorithm >= 0x0009) {
+                            netInfo.encryption = WirelessEncryption::WPA3_SAE;
+                        } else {
+                            netInfo.encryption = WirelessEncryption::Unknown;
+                        }
+                        break;
+                }
+
+                // WPS detection: check BSS capabilities via WlanGetNetworkBssList
+                // Note: WPS detection is best-effort through the profile/cap flags
+                netInfo.wpsEnabled = false; // Default; enhanced detection below
+
+                networks.push_back(std::move(netInfo));
+            }
+
+            // For connected interfaces, try to get BSS info for WPS/BSSID/channel
+            PWLAN_BSS_LIST pBssList = nullptr;
+            result = WlanGetNetworkBssList(
+                wlanHandle.Get(), &iface.InterfaceGuid,
+                nullptr, dot11_BSS_type_any, FALSE, nullptr, &pBssList);
+
+            if (result == ERROR_SUCCESS && pBssList) {
+                struct BssListGuard {
+                    PWLAN_BSS_LIST ptr;
+                    ~BssListGuard() { if (ptr) WlanFreeMemory(ptr); }
+                } bssGuard{pBssList};
+
+                for (DWORD b = 0; b < pBssList->dwNumberOfItems; ++b) {
+                    const auto& bss = pBssList->wlanBssEntries[b];
+
+                    // Match BSS entry to our network list by SSID
+                    std::string bssSsid;
+                    if (bss.dot11Ssid.uSSIDLength > 0 && bss.dot11Ssid.uSSIDLength <= 32) {
+                        bssSsid.assign(
+                            reinterpret_cast<const char*>(bss.dot11Ssid.ucSSID),
+                            bss.dot11Ssid.uSSIDLength);
+                    }
+
+                    for (auto& net : networks) {
+                        if (net.ssid == bssSsid && net.bssid.empty()) {
+                            // Format BSSID from MAC
+                            char bssidStr[18]{};
+                            snprintf(bssidStr, sizeof(bssidStr),
+                                     "%02X:%02X:%02X:%02X:%02X:%02X",
+                                     bss.dot11Bssid[0], bss.dot11Bssid[1],
+                                     bss.dot11Bssid[2], bss.dot11Bssid[3],
+                                     bss.dot11Bssid[4], bss.dot11Bssid[5]);
+                            net.bssid = bssidStr;
+
+                            // Extract channel from PHY-specific info
+                            net.channel = static_cast<int>(bss.ulChCenterFrequency / 1000);
+                            // Convert frequency to channel number
+                            uint32_t freqMHz = bss.ulChCenterFrequency / 1000;
+                            if (freqMHz >= 2412 && freqMHz <= 2484) {
+                                net.channel = static_cast<int>((freqMHz - 2407) / 5);
+                            } else if (freqMHz >= 5180 && freqMHz <= 5825) {
+                                net.channel = static_cast<int>((freqMHz - 5000) / 5);
+                                net.is5GHz = true;
+                            }
+
+                            // WPS detection: scan IE data for WPS IE (vendor-specific OUI 00:50:F2:04)
+                            if (bss.ulIeSize > 0 && bss.ulIeOffset > 0) {
+                                const uint8_t* ieData = reinterpret_cast<const uint8_t*>(&bss) + bss.ulIeOffset;
+                                size_t ieSize = bss.ulIeSize;
+                                // Cap IE parsing to prevent DoS
+                                if (ieSize > 4096) ieSize = 4096;
+                                constexpr uint8_t wpsOUI[] = {0x00, 0x50, 0xF2, 0x04};
+
+                                for (size_t pos = 0; pos + 6 < ieSize;) {
+                                    uint8_t elemId = ieData[pos];
+                                    uint8_t elemLen = ieData[pos + 1];
+                                    if (pos + 2 + elemLen > ieSize) break;
+                                    if (elemId == 0xDD && elemLen >= 4) { // Vendor-specific
+                                        if (memcmp(ieData + pos + 2, wpsOUI, 4) == 0) {
+                                            net.wpsEnabled = true;
+                                            break;
+                                        }
+                                    }
+                                    pos += 2 + elemLen;
+                                }
+                            }
+
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        Utils::Logger::Info(L"RouterSecurityChecker: Found {} wireless networks", networks.size());
+#endif
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"RouterSecurityChecker: Wireless enumeration failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return networks;
     }
+
+    return networks;
 }
 
 std::vector<std::string> RouterSecurityChecker::RouterSecurityCheckerImpl::GetDNSServers() {
@@ -966,23 +1661,37 @@ std::vector<std::string> RouterSecurityChecker::RouterSecurityCheckerImpl::GetDN
 
     try {
 #ifdef _WIN32
-        FIXED_INFO fixedInfo;
         ULONG bufferSize = sizeof(FIXED_INFO);
+        std::vector<BYTE> buffer(bufferSize);
+        PFIXED_INFO pFixedInfo = reinterpret_cast<PFIXED_INFO>(buffer.data());
 
-        if (GetNetworkParams(&fixedInfo, &bufferSize) == ERROR_BUFFER_OVERFLOW) {
-            std::vector<BYTE> buffer(bufferSize);
-            PFIXED_INFO pFixedInfo = reinterpret_cast<PFIXED_INFO>(buffer.data());
-
-            if (GetNetworkParams(pFixedInfo, &bufferSize) == NO_ERROR) {
-                PIP_ADDR_STRING pDnsServer = &pFixedInfo->DnsServerList;
-                while (pDnsServer) {
-                    std::string dns = pDnsServer->IpAddress.String;
-                    if (!dns.empty() && dns != "0.0.0.0") {
-                        dnsServers.push_back(dns);
-                    }
-                    pDnsServer = pDnsServer->Next;
-                }
+        DWORD result = GetNetworkParams(pFixedInfo, &bufferSize);
+        if (result == ERROR_BUFFER_OVERFLOW) {
+            // Reallocate with the size the API told us
+            if (bufferSize > 64 * 1024) {
+                // Sanity cap — prevent hostile allocation
+                Utils::Logger::Warn(L"RouterSecurityChecker: GetNetworkParams requested excessive buffer ({})", bufferSize);
+                return dnsServers;
             }
+            buffer.resize(bufferSize);
+            pFixedInfo = reinterpret_cast<PFIXED_INFO>(buffer.data());
+            result = GetNetworkParams(pFixedInfo, &bufferSize);
+        }
+
+        if (result == NO_ERROR) {
+            PIP_ADDR_STRING pDnsServer = &pFixedInfo->DnsServerList;
+            constexpr size_t kMaxDnsEntries = 32; // Cap to prevent infinite loop from corrupt data
+            size_t count = 0;
+            while (pDnsServer && count < kMaxDnsEntries) {
+                std::string dns = pDnsServer->IpAddress.String;
+                if (!dns.empty() && dns != "0.0.0.0" && IsValidIPv4(dns)) {
+                    dnsServers.push_back(std::move(dns));
+                }
+                pDnsServer = pDnsServer->Next;
+                ++count;
+            }
+        } else {
+            Utils::Logger::Warn(L"RouterSecurityChecker: GetNetworkParams failed with error {}", result);
         }
 #endif
 
@@ -1000,25 +1709,158 @@ std::vector<uint16_t> RouterSecurityChecker::RouterSecurityCheckerImpl::ScanOpen
     std::vector<uint16_t> openPorts;
 
     try {
-        // Simplified port scanning
-        // In production, would perform TCP SYN scanning
+        Utils::Logger::Info(L"RouterSecurityChecker: Scanning ports on {}",
+                          Utils::StringUtils::Utf8ToWide(ip));
 
-        // Stub: return empty list
-        return openPorts;
+        // Common ports of interest on router WAN interfaces
+        const std::vector<uint16_t> portsToScan = {
+            21,   // FTP
+            22,   // SSH
+            23,   // Telnet (critical if open)
+            25,   // SMTP
+            53,   // DNS
+            80,   // HTTP admin
+            135,  // MSRPC
+            139,  // NetBIOS
+            443,  // HTTPS admin
+            445,  // SMB
+            993,  // IMAPS
+            995,  // POP3S
+            1723, // PPTP VPN
+            1900, // UPnP SSDP
+            3389, // RDP
+            5060, // SIP
+            7547, // TR-069 (ISP management — dangerous if exposed)
+            8080, // HTTP alternate
+            8443, // HTTPS alternate
+            8888, // HTTP proxy
+            9100, // RAW printing
+        };
+
+        // Use NetworkUtils::ScanPorts for real TCP connect scanning
+        Utils::NetworkUtils::IpAddress targetAddr;
+        std::wstring wideIP = Utils::StringUtils::ToWide(ip);
+        Utils::NetworkUtils::Error netErr;
+
+        if (!Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: Failed to parse IP for port scan: {}",
+                              Utils::StringUtils::Utf8ToWide(ip));
+            return openPorts;
+        }
+
+        // Use configured timeout, cap at 2 seconds per port
+        uint32_t timeoutMs = std::min(m_config.defaultAssessmentConfig.timeoutMs / 10, 2000u);
+        if (timeoutMs < 500) timeoutMs = 500;
+
+        std::vector<Utils::NetworkUtils::PortScanResult> scanResults;
+        if (!Utils::NetworkUtils::ScanPorts(targetAddr, portsToScan, scanResults, timeoutMs, &netErr)) {
+            Utils::Logger::Warn(L"RouterSecurityChecker: Port scan call failed");
+            return openPorts;
+        }
+
+        openPorts.reserve(scanResults.size());
+        for (const auto& result : scanResults) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) break;
+            if (result.isOpen) {
+                openPorts.push_back(result.port);
+
+                Utils::Logger::Warn(L"RouterSecurityChecker: Open port {} ({}) on {}",
+                                  result.port,
+                                  result.serviceName.empty() ? L"unknown" : result.serviceName,
+                                  Utils::StringUtils::Utf8ToWide(ip));
+            }
+        }
+
+        Utils::Logger::Info(L"RouterSecurityChecker: Port scan complete - {} open ports found",
+                          openPorts.size());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"RouterSecurityChecker: Port scan failed - {}",
                            Utils::StringUtils::Utf8ToWide(e.what()));
-        return openPorts;
     }
+
+    return openPorts;
 }
 
 RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(const std::string& ip) {
     try {
-        // Simplified vendor detection
-        // In production, would use MAC OUI lookup and banner grabbing
+        Utils::Logger::Info(L"RouterSecurityChecker: Detecting vendor for {}",
+                          Utils::StringUtils::Utf8ToWide(ip));
 
-        // Stub: return Unknown
+        // Strategy 1: MAC OUI lookup via ARP table / GetMacAddress
+        Utils::NetworkUtils::IpAddress targetAddr;
+        std::wstring wideIP = Utils::StringUtils::ToWide(ip);
+        Utils::NetworkUtils::Error netErr;
+
+        if (Utils::NetworkUtils::ParseIpAddress(wideIP, targetAddr, &netErr)) {
+            Utils::NetworkUtils::MacAddress mac;
+            if (Utils::NetworkUtils::GetMacAddress(targetAddr, mac, &netErr)) {
+                // Format MAC as string for OUI lookup
+                char macStr[18]{};
+                snprintf(macStr, sizeof(macStr), "%02X:%02X:%02X:%02X:%02X:%02X",
+                         mac.bytes[0], mac.bytes[1], mac.bytes[2],
+                         mac.bytes[3], mac.bytes[4], mac.bytes[5]);
+
+                RouterVendor ouiVendor = LookupOUI(std::string(macStr));
+                if (ouiVendor != RouterVendor::Unknown) {
+                    Utils::Logger::Info(L"RouterSecurityChecker: Vendor identified by OUI: {}",
+                                      Utils::StringUtils::ToWide(std::string(GetRouterVendorName(ouiVendor))));
+                    return ouiVendor;
+                }
+            }
+        }
+
+        // Strategy 2: HTTP banner fingerprinting from admin interface
+        constexpr uint16_t adminPorts[] = { 80, 443, 8080 };
+        for (uint16_t port : adminPorts) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) break;
+
+            bool useTLS = (port == 443);
+            std::wstring url = std::format(L"{}://{}:{}/",
+                useTLS ? L"https" : L"http",
+                Utils::StringUtils::ToWide(ip), port);
+
+            Utils::NetworkUtils::HttpRequestOptions opts;
+            opts.timeoutMs = 3000;
+            opts.verifySSL = false;
+            opts.allowRedirects = false;
+
+            Utils::NetworkUtils::HttpResponse response;
+            if (Utils::NetworkUtils::HttpRequest(url, response, opts) &&
+                response.statusCode > 0)
+            {
+                // Collect all headers and body for banner analysis
+                std::string banner;
+                banner.reserve(1024);
+
+                for (const auto& hdr : response.headers) {
+                    std::string narrow;
+                    narrow.reserve(hdr.name.size() + hdr.value.size() + 4);
+                    for (wchar_t wc : hdr.name)  narrow.push_back(static_cast<char>(wc & 0x7F));
+                    narrow += ": ";
+                    for (wchar_t wc : hdr.value) narrow.push_back(static_cast<char>(wc & 0x7F));
+                    banner += narrow;
+                    banner += "\n";
+                }
+
+                // Also check response body (first 2KB only for safety)
+                if (!response.body.empty()) {
+                    size_t bodyLen = std::min(response.body.size(), size_t{2048});
+                    banner.append(reinterpret_cast<const char*>(response.body.data()), bodyLen);
+                }
+
+                // Use the DetectRouterVendor helper
+                RouterVendor bannerVendor = DetectRouterVendor("", banner);
+                if (bannerVendor != RouterVendor::Unknown) {
+                    Utils::Logger::Info(L"RouterSecurityChecker: Vendor identified by banner: {}",
+                                      Utils::StringUtils::ToWide(std::string(GetRouterVendorName(bannerVendor))));
+                    return bannerVendor;
+                }
+            }
+        }
+
+        Utils::Logger::Info(L"RouterSecurityChecker: Could not identify vendor for {}",
+                          Utils::StringUtils::Utf8ToWide(ip));
         return RouterVendor::Unknown;
 
     } catch (const std::exception& e) {
@@ -1030,16 +1872,73 @@ RouterVendor RouterSecurityChecker::RouterSecurityCheckerImpl::DetectVendor(cons
 
 void RouterSecurityChecker::RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurityReport& report) {
     try {
-        if (!m_threatIntel) {
-            return;
+        Utils::Logger::Info(L"RouterSecurityChecker: Analyzing CVEs for vendor {}",
+                          Utils::StringUtils::ToWide(std::string(GetRouterVendorName(report.vendor))));
+
+        // Step 1: Match CVEs from our curated known-router-CVE database by vendor
+        std::vector<const KnownRouterCVE*> matchedCVEs;
+        for (const auto& cve : g_knownRouterCVEs) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) return;
+
+            // Match vendor-specific CVEs or generic (Unknown vendor = multi-vendor)
+            if (cve.vendor == report.vendor || cve.vendor == RouterVendor::Unknown) {
+                matchedCVEs.push_back(&cve);
+            }
         }
 
-        // In production, would query ThreatIntel for CVEs matching:
-        // - Vendor + Model + Firmware Version
-        // - Known router CVEs
+        // Step 2: Optionally enrich with ThreatIntelManager for active exploitation data
+        auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+        bool hasThreatIntel = threatIntel.IsInitialized();
 
-        // Stub: no CVEs matched
-        return;
+        for (const auto* cve : matchedCVEs) {
+            if (m_cancelRequested.load(std::memory_order_acquire)) return;
+
+            SecurityIssue issue;
+            issue.type = SecurityIssueType::KnownCVE;
+            issue.title = std::format("Known Vulnerability: {}", cve->cveId);
+            issue.description = cve->description;
+            issue.evidence = std::format("CVSS Score: {:.1f} | Vendor: {}",
+                cve->cvssScore, GetRouterVendorName(cve->vendor));
+
+            // Assign risk level based on CVSS score
+            if (cve->cvssScore >= 9.0f) {
+                issue.riskLevel = SecurityRiskLevel::Critical;
+            } else if (cve->cvssScore >= 7.0f) {
+                issue.riskLevel = SecurityRiskLevel::High;
+            } else if (cve->cvssScore >= 4.0f) {
+                issue.riskLevel = SecurityRiskLevel::Medium;
+            } else {
+                issue.riskLevel = SecurityRiskLevel::Low;
+            }
+
+            issue.remediation = "Update router firmware to the latest version. "
+                               "Check vendor security advisories for " + std::string(cve->cveId);
+
+            // Enrich with threat intel if available
+            if (hasThreatIntel) {
+                auto tiResult = threatIntel.LookupDomain(cve->cveId);
+                if (tiResult.found && tiResult.IsMalicious()) {
+                    issue.evidence += " | ACTIVE EXPLOITATION detected in threat intelligence";
+                    // Upgrade to Critical if actively exploited
+                    issue.riskLevel = SecurityRiskLevel::Critical;
+                }
+            }
+
+            // Track the CVE ID in the report
+            report.cveMatches.push_back(std::string(cve->cveId));
+            report.securityIssues.push_back(std::move(issue));
+        }
+
+        if (!matchedCVEs.empty()) {
+            m_statistics.cvesMatched.fetch_add(
+                static_cast<uint64_t>(matchedCVEs.size()), std::memory_order_relaxed);
+
+            Utils::Logger::Warn(L"RouterSecurityChecker: {} potential CVEs matched for {}",
+                              matchedCVEs.size(),
+                              Utils::StringUtils::ToWide(std::string(GetRouterVendorName(report.vendor))));
+        } else {
+            Utils::Logger::Info(L"RouterSecurityChecker: No known CVEs matched for vendor");
+        }
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"RouterSecurityChecker: CVE analysis failed - {}",
@@ -1054,8 +1953,13 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::AnalyzeCVEs(RouterSecurit
 void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeAssessmentCallbacks(
     const RouterSecurityReport& report)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_assessmentCallbacks) {
+    // Copy callbacks under lock, then invoke outside lock to prevent deadlock
+    std::vector<AssessmentCallback> callbacksCopy;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacksCopy = m_assessmentCallbacks;
+    }
+    for (const auto& callback : callbacksCopy) {
         try {
             callback(report);
         } catch (const std::exception& e) {
@@ -1068,8 +1972,13 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeAssessmentCallbacks
 void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeIssueCallbacks(
     const SecurityIssue& issue)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_issueCallbacks) {
+    // Copy callbacks under lock, then invoke outside lock to prevent deadlock
+    std::vector<IssueFoundCallback> callbacksCopy;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacksCopy = m_issueCallbacks;
+    }
+    for (const auto& callback : callbacksCopy) {
         try {
             callback(issue);
         } catch (const std::exception& e) {
@@ -1083,8 +1992,12 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeProgressCallbacks(
     float progress,
     const std::string& status)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_progressCallbacks) {
+    std::vector<ProgressCallback> callbacksCopy;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacksCopy = m_progressCallbacks;
+    }
+    for (const auto& callback : callbacksCopy) {
         try {
             callback(progress, status);
         } catch (const std::exception& e) {
@@ -1098,8 +2011,12 @@ void RouterSecurityChecker::RouterSecurityCheckerImpl::InvokeErrorCallbacks(
     const std::string& message,
     int code)
 {
-    std::lock_guard lock(m_callbacksMutex);
-    for (const auto& callback : m_errorCallbacks) {
+    std::vector<ErrorCallback> callbacksCopy;
+    {
+        std::lock_guard lock(m_callbacksMutex);
+        callbacksCopy = m_errorCallbacks;
+    }
+    for (const auto& callback : callbacksCopy) {
         try {
             callback(message, code);
         } catch (...) {
@@ -1490,24 +2407,81 @@ std::string_view GetSecurityIssueTypeName(SecurityIssueType type) noexcept {
 }
 
 RouterVendor DetectRouterVendor(const std::string& mac, const std::string& banner) {
-    // Simplified vendor detection based on MAC OUI and banner strings
+    // Step 1: Try OUI lookup from MAC address
+    if (!mac.empty()) {
+        RouterVendor ouiResult = LookupOUI(mac);
+        if (ouiResult != RouterVendor::Unknown) {
+            return ouiResult;
+        }
+    }
 
-    std::string lowerBanner = banner;
-    std::transform(lowerBanner.begin(), lowerBanner.end(), lowerBanner.begin(), ::tolower);
+    // Step 2: Banner string fingerprinting (case-insensitive)
+    if (banner.empty()) {
+        return RouterVendor::Unknown;
+    }
 
-    if (lowerBanner.find("cisco") != std::string::npos) return RouterVendor::Cisco;
-    if (lowerBanner.find("netgear") != std::string::npos) return RouterVendor::Netgear;
-    if (lowerBanner.find("tp-link") != std::string::npos) return RouterVendor::TPLink;
-    if (lowerBanner.find("tplink") != std::string::npos) return RouterVendor::TPLink;
-    if (lowerBanner.find("d-link") != std::string::npos) return RouterVendor::DLink;
-    if (lowerBanner.find("dlink") != std::string::npos) return RouterVendor::DLink;
-    if (lowerBanner.find("asus") != std::string::npos) return RouterVendor::Asus;
-    if (lowerBanner.find("linksys") != std::string::npos) return RouterVendor::Linksys;
-    if (lowerBanner.find("belkin") != std::string::npos) return RouterVendor::Belkin;
-    if (lowerBanner.find("huawei") != std::string::npos) return RouterVendor::Huawei;
-    if (lowerBanner.find("zte") != std::string::npos) return RouterVendor::ZTE;
-    if (lowerBanner.find("ubiquiti") != std::string::npos) return RouterVendor::Ubiquiti;
-    if (lowerBanner.find("mikrotik") != std::string::npos) return RouterVendor::MikroTik;
+    // Cap banner analysis to 8KB to prevent DoS from hostile responses
+    std::string lowerBanner;
+    size_t safeLen = std::min(banner.size(), size_t{8192});
+    lowerBanner.reserve(safeLen);
+    for (size_t i = 0; i < safeLen; ++i) {
+        lowerBanner.push_back(
+            static_cast<char>(std::tolower(static_cast<unsigned char>(banner[i]))));
+    }
+
+    // Vendor keyword matching with multiple patterns per vendor
+    struct VendorPattern {
+        const char* pattern;
+        RouterVendor vendor;
+    };
+
+    static constexpr VendorPattern patterns[] = {
+        {"cisco",       RouterVendor::Cisco},
+        {"ios xe",      RouterVendor::Cisco},
+        {"aironet",     RouterVendor::Cisco},
+        {"meraki",      RouterVendor::Meraki},
+        {"netgear",     RouterVendor::Netgear},
+        {"nighthawk",   RouterVendor::Netgear},
+        {"orbi",        RouterVendor::Netgear},
+        {"tp-link",     RouterVendor::TPLink},
+        {"tplink",      RouterVendor::TPLink},
+        {"archer",      RouterVendor::TPLink},
+        {"deco",        RouterVendor::TPLink},
+        {"d-link",      RouterVendor::DLink},
+        {"dlink",       RouterVendor::DLink},
+        {"dir-",        RouterVendor::DLink},
+        {"dap-",        RouterVendor::DLink},
+        {"asus",        RouterVendor::Asus},
+        {"asuswrt",     RouterVendor::Asus},
+        {"rt-ax",       RouterVendor::Asus},
+        {"rt-ac",       RouterVendor::Asus},
+        {"linksys",     RouterVendor::Linksys},
+        {"velop",       RouterVendor::Linksys},
+        {"belkin",      RouterVendor::Belkin},
+        {"huawei",      RouterVendor::Huawei},
+        {"echolife",    RouterVendor::Huawei},
+        {"zte",         RouterVendor::ZTE},
+        {"zxhn",        RouterVendor::ZTE},
+        {"ubiquiti",    RouterVendor::Ubiquiti},
+        {"unifi",       RouterVendor::Ubiquiti},
+        {"edgerouter",  RouterVendor::Ubiquiti},
+        {"mikrotik",    RouterVendor::MikroTik},
+        {"routeros",    RouterVendor::MikroTik},
+        {"juniper",     RouterVendor::Juniper},
+        {"junos",       RouterVendor::Juniper},
+        {"srx",         RouterVendor::Juniper},
+        {"aruba",       RouterVendor::Aruba},
+        {"arubaos",     RouterVendor::Aruba},
+        {"fortinet",    RouterVendor::Fortinet},
+        {"fortigate",   RouterVendor::Fortinet},
+        {"fortios",     RouterVendor::Fortinet},
+    };
+
+    for (const auto& p : patterns) {
+        if (lowerBanner.find(p.pattern) != std::string::npos) {
+            return p.vendor;
+        }
+    }
 
     return RouterVendor::Unknown;
 }
