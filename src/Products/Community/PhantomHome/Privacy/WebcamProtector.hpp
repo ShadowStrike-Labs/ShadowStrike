@@ -132,6 +132,7 @@
 #include "../Utils/SystemUtils.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -252,18 +253,7 @@ enum class CameraRiskLevel : uint8_t {
     Critical        = 4
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Paused          = 3,
-    Stopping        = 4,
-    Stopped         = 5,
-    Error           = 6
-};
+// NOTE: ModuleStatus is defined in Common.hpp (shared across all Privacy modules).
 
 // ============================================================================
 // STRUCTURES
@@ -432,7 +422,43 @@ struct WebcamStatistics {
     std::atomic<uint64_t> devicesMonitored{0};
     std::atomic<uint64_t> virtualCameraBlocked{0};
     TimePoint startTime = Clock::now();
-    
+
+    WebcamStatistics() noexcept = default;
+    ~WebcamStatistics() noexcept = default;
+
+    /// Copy constructor — loads each atomic for snapshot semantics.
+    WebcamStatistics(const WebcamStatistics& o) noexcept
+        : totalAccessAttempts(o.totalAccessAttempts.load(std::memory_order_relaxed))
+        , accessAllowed(o.accessAllowed.load(std::memory_order_relaxed))
+        , accessBlocked(o.accessBlocked.load(std::memory_order_relaxed))
+        , accessPrompted(o.accessPrompted.load(std::memory_order_relaxed))
+        , suspiciousAccess(o.suspiciousAccess.load(std::memory_order_relaxed))
+        , malwareBlocked(o.malwareBlocked.load(std::memory_order_relaxed))
+        , ratDetected(o.ratDetected.load(std::memory_order_relaxed))
+        , whitelistHits(o.whitelistHits.load(std::memory_order_relaxed))
+        , devicesMonitored(o.devicesMonitored.load(std::memory_order_relaxed))
+        , virtualCameraBlocked(o.virtualCameraBlocked.load(std::memory_order_relaxed))
+        , startTime(o.startTime)
+    {}
+
+    /// Copy assignment — stores each atomic for snapshot semantics.
+    WebcamStatistics& operator=(const WebcamStatistics& o) noexcept {
+        if (this != &o) {
+            totalAccessAttempts.store(o.totalAccessAttempts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessAllowed.store(o.accessAllowed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessBlocked.store(o.accessBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            accessPrompted.store(o.accessPrompted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousAccess.store(o.suspiciousAccess.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            malwareBlocked.store(o.malwareBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ratDetected.store(o.ratDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            whitelistHits.store(o.whitelistHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            devicesMonitored.store(o.devicesMonitored.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            virtualCameraBlocked.store(o.virtualCameraBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = o.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
