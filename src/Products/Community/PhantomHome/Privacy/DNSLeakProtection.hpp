@@ -230,7 +230,7 @@ enum class DNSLeakType : uint8_t {
 /**
  * @brief DNS record type
  */
-enum class DNSRecordType : uint8_t {
+enum class DNSRecordType : uint16_t {
     A               = 1,    ///< IPv4 address
     AAAA            = 28,   ///< IPv6 address
     CNAME           = 5,    ///< Canonical name
@@ -527,7 +527,52 @@ struct DNSStatistics {
     std::atomic<uint64_t> averageResponseTimeMs{0};
     std::array<std::atomic<uint64_t>, 8> byProtocol{};
     TimePoint startTime = Clock::now();
-    
+
+    DNSStatistics() noexcept = default;
+
+    /// @brief Copy constructor (snapshot semantics for atomic members)
+    DNSStatistics(const DNSStatistics& other) noexcept
+        : startTime(other.startTime) {
+        totalQueries.store(other.totalQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        encryptedQueries.store(other.encryptedQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        leaksDetected.store(other.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        leaksBlocked.store(other.leaksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        hijackAttemptsDetected.store(other.hijackAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        poisoningAttemptsDetected.store(other.poisoningAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        blockedDomains.store(other.blockedDomains.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dnssecValidations.store(other.dnssecValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        dnssecFailures.store(other.dnssecFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        averageResponseTimeMs.store(other.averageResponseTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byProtocol.size(); ++i) {
+            byProtocol[i].store(other.byProtocol[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        }
+    }
+
+    /// @brief Copy assignment (snapshot semantics for atomic members)
+    DNSStatistics& operator=(const DNSStatistics& other) noexcept {
+        if (this != &other) {
+            totalQueries.store(other.totalQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            encryptedQueries.store(other.encryptedQueries.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            leaksDetected.store(other.leaksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            leaksBlocked.store(other.leaksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hijackAttemptsDetected.store(other.hijackAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            poisoningAttemptsDetected.store(other.poisoningAttemptsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheMisses.store(other.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            blockedDomains.store(other.blockedDomains.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dnssecValidations.store(other.dnssecValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            dnssecFailures.store(other.dnssecFailures.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            averageResponseTimeMs.store(other.averageResponseTimeMs.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byProtocol.size(); ++i) {
+                byProtocol[i].store(other.byProtocol[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            }
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
