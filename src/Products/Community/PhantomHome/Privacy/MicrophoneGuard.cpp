@@ -98,6 +98,7 @@
 #pragma comment(lib, "Ole32.lib")
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "Wintrust.lib")
+#pragma comment(lib, "Crypt32.lib")
 #endif
 
 // ============================================================================
@@ -108,7 +109,6 @@
 namespace ShadowStrike {
 namespace Privacy {
 
-using Clock = std::chrono::steady_clock;
 using SystemClock = std::chrono::system_clock;
 
 // ============================================================================
@@ -116,6 +116,38 @@ using SystemClock = std::chrono::system_clock;
 // ============================================================================
 
 namespace {
+
+/**
+ * @brief RAII wrapper for COM interface pointers to prevent leaks on exception paths.
+ */
+template<typename T>
+struct ComPtr {
+    T* ptr = nullptr;
+    ComPtr() = default;
+    ~ComPtr() { reset(); }
+    ComPtr(const ComPtr&) = delete;
+    ComPtr& operator=(const ComPtr&) = delete;
+    void reset() noexcept { if (ptr) { ptr->Release(); ptr = nullptr; } }
+    [[nodiscard]] T* get() const noexcept { return ptr; }
+    T** put() noexcept { reset(); return &ptr; }
+    T* operator->() const noexcept { return ptr; }
+    explicit operator bool() const noexcept { return ptr != nullptr; }
+};
+
+/**
+ * @brief RAII wrapper for COM initialization per-thread.
+ */
+struct ComInitGuard {
+    bool m_needsUninit = false;
+    explicit ComInitGuard() noexcept {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        m_needsUninit = SUCCEEDED(hr);
+    }
+    ~ComInitGuard() { if (m_needsUninit) CoUninitialize(); }
+    ComInitGuard(const ComInitGuard&) = delete;
+    ComInitGuard& operator=(const ComInitGuard&) = delete;
+    [[nodiscard]] bool succeeded() const noexcept { return m_needsUninit; }
+};
 
 /**
  * @brief Generate unique event ID
@@ -210,13 +242,64 @@ bool VerifySignature(const fs::path& filePath) {
 }
 
 /**
- * @brief Get publisher name from digital signature
+ * @brief Get publisher name from Authenticode digital signature certificate.
  */
 std::string GetPublisher(const fs::path& filePath) {
-    if (VerifySignature(filePath)) {
-        return "Verified Publisher";
+#ifdef _WIN32
+    try {
+        WINTRUST_FILE_INFO fileInfo = {};
+        fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+        fileInfo.pcwszFilePath = filePath.c_str();
+
+        GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+        WINTRUST_DATA winTrustData = {};
+        winTrustData.cbStruct = sizeof(WINTRUST_DATA);
+        winTrustData.dwUIChoice = WTD_UI_NONE;
+        winTrustData.fdwRevocationChecks = WTD_REVOKE_NONE;
+        winTrustData.dwUnionChoice = WTD_CHOICE_FILE;
+        winTrustData.dwStateAction = WTD_STATEACTION_VERIFY;
+        winTrustData.dwProvFlags = WTD_SAFER_FLAG;
+        winTrustData.pFile = &fileInfo;
+
+        LONG result = WinVerifyTrust(nullptr, &policyGUID, &winTrustData);
+
+        std::string publisher;
+        if (result == ERROR_SUCCESS) {
+            CRYPT_PROVIDER_DATA* pProvData =
+                WTHelperProvDataFromStateData(winTrustData.hWVTStateData);
+            if (pProvData) {
+                CRYPT_PROVIDER_SGNR* pSigner =
+                    WTHelperGetProvSignerFromChain(pProvData, 0, FALSE, 0);
+                if (pSigner && pSigner->pasCertChain && pSigner->csCertChain > 0) {
+                    PCCERT_CONTEXT pCert = pSigner->pasCertChain[0].pCert;
+                    if (pCert) {
+                        DWORD nameLen = CertGetNameStringA(
+                            pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0,
+                            nullptr, nullptr, 0);
+                        if (nameLen > 1) {
+                            publisher.resize(nameLen - 1);
+                            CertGetNameStringA(
+                                pCert, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0,
+                                nullptr, publisher.data(), nameLen);
+                        }
+                    }
+                }
+            }
+        }
+
+        // Close state data (required regardless of verify result)
+        winTrustData.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(nullptr, &policyGUID, &winTrustData);
+
+        return publisher;
+
+    } catch (...) {
+        return "";
     }
+#else
     return "";
+#endif
 }
 
 }  // namespace
@@ -352,6 +435,45 @@ std::string MicrophoneStatistics::ToJson() const {
     return j.dump(2);
 }
 
+MicrophoneStatisticsSnapshot MicrophoneStatistics::TakeSnapshot() const noexcept {
+    MicrophoneStatisticsSnapshot snap;
+    snap.totalAccessAttempts = totalAccessAttempts.load(std::memory_order_relaxed);
+    snap.accessAllowed = accessAllowed.load(std::memory_order_relaxed);
+    snap.accessBlocked = accessBlocked.load(std::memory_order_relaxed);
+    snap.accessMuted = accessMuted.load(std::memory_order_relaxed);
+    snap.accessPrompted = accessPrompted.load(std::memory_order_relaxed);
+    snap.suspiciousAccess = suspiciousAccess.load(std::memory_order_relaxed);
+    snap.malwareBlocked = malwareBlocked.load(std::memory_order_relaxed);
+    snap.ratDetected = ratDetected.load(std::memory_order_relaxed);
+    snap.whitelistHits = whitelistHits.load(std::memory_order_relaxed);
+    snap.devicesMonitored = devicesMonitored.load(std::memory_order_relaxed);
+    snap.activeStreams = activeStreams.load(std::memory_order_relaxed);
+    snap.totalCaptureTime = totalCaptureTime.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < byAPI.size(); ++i) {
+        snap.byAPI[i] = byAPI[i].load(std::memory_order_relaxed);
+    }
+    snap.startTime = startTime;
+    return snap;
+}
+
+std::string MicrophoneStatisticsSnapshot::ToJson() const {
+    nlohmann::json j = {
+        {"totalAccessAttempts", totalAccessAttempts},
+        {"accessAllowed", accessAllowed},
+        {"accessBlocked", accessBlocked},
+        {"accessMuted", accessMuted},
+        {"accessPrompted", accessPrompted},
+        {"suspiciousAccess", suspiciousAccess},
+        {"malwareBlocked", malwareBlocked},
+        {"ratDetected", ratDetected},
+        {"whitelistHits", whitelistHits},
+        {"devicesMonitored", devicesMonitored},
+        {"activeStreams", activeStreams},
+        {"totalCaptureTime", totalCaptureTime}
+    };
+    return j.dump(2);
+}
+
 bool MicrophoneConfiguration::IsValid() const noexcept {
     if (notificationDurationMs == 0) return false;
     if (notificationDurationMs > 60000) return false;  // Max 1 minute
@@ -427,7 +549,6 @@ public:
     std::mutex m_callbacksMutex;
 
     /// @brief Infrastructure integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
     std::shared_ptr<Whitelist::WhiteListStore> m_whitelistStore;
 
     /// @brief Monitoring thread
@@ -512,21 +633,23 @@ bool MicrophoneGuard::MicrophoneGuardImpl::Initialize(
             return false;
         }
 
-        m_config = config;
-
-        // Initialize COM for audio APIs
-#ifdef _WIN32
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        if (FAILED(hr) && hr != RPC_E_CHANGED_MODE) {
-            Utils::Logger::Error(L"MicrophoneGuard: COM initialization failed");
-            m_initialized.store(false, std::memory_order_release);
-            m_status.store(ModuleStatus::Error, std::memory_order_release);
-            return false;
+        {
+            std::unique_lock lock(m_mutex);
+            m_config = config;
         }
-#endif
 
-        // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
+        // Verify ThreatIntel infrastructure is available
+        try {
+            auto& ti = ThreatIntel::ThreatIntelManager::Instance();
+            if (!ti.IsInitialized()) {
+                Utils::Logger::Warn(L"MicrophoneGuard: ThreatIntel not yet initialized; "
+                                    L"spyware checks will be deferred");
+            }
+        } catch (...) {
+            Utils::Logger::Warn(L"MicrophoneGuard: ThreatIntel unavailable");
+        }
+
+        // Initialize whitelist store
         m_whitelistStore = std::make_shared<Whitelist::WhiteListStore>();
 
         // Enumerate audio devices
@@ -535,7 +658,7 @@ bool MicrophoneGuard::MicrophoneGuardImpl::Initialize(
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
         Utils::Logger::Info(L"MicrophoneGuard: Initialized successfully (mode: {})",
-                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(m_config.mode))));
+                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(config.mode))));
 
         return true;
 
@@ -609,10 +732,6 @@ void MicrophoneGuard::MicrophoneGuardImpl::Shutdown() {
             m_errorCallbacks.clear();
         }
 
-#ifdef _WIN32
-        CoUninitialize();
-#endif
-
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
         Utils::Logger::Info(L"MicrophoneGuard: Shutdown complete");
@@ -668,26 +787,58 @@ bool MicrophoneGuard::MicrophoneGuardImpl::RefreshDevicesInternal() {
     try {
         auto newDevices = EnumerateAudioDevices();
 
-        std::unique_lock lock(m_devicesMutex);
+        std::vector<AudioDevice> addedDevices;
+        std::vector<AudioDevice> removedDevices;
 
-        // Update existing devices and add new ones
-        for (const auto& newDevice : newDevices) {
-            auto it = m_devices.find(newDevice.deviceId);
-            if (it != m_devices.end()) {
-                // Update existing device
-                it->second.isActive = newDevice.isActive;
-                it->second.isMuted = newDevice.isMuted;
-                it->second.currentVolume = newDevice.currentVolume;
-            } else {
-                // Add new device
-                m_devices[newDevice.deviceId] = newDevice;
-                InvokeDeviceCallbacks(newDevice, true);
+        {
+            std::unique_lock lock(m_devicesMutex);
+
+            // Build set of newly-discovered device IDs
+            std::unordered_set<std::string> newDeviceIds;
+            newDeviceIds.reserve(newDevices.size());
+            for (const auto& nd : newDevices) {
+                newDeviceIds.insert(nd.deviceId);
             }
+
+            // Remove devices that are no longer present
+            for (auto it = m_devices.begin(); it != m_devices.end(); ) {
+                if (!newDeviceIds.contains(it->first)) {
+                    AudioDevice removed = it->second;
+                    removed.isActive = false;
+                    removedDevices.push_back(std::move(removed));
+                    it = m_devices.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
+            // Update existing devices and add new ones
+            for (const auto& newDevice : newDevices) {
+                auto it = m_devices.find(newDevice.deviceId);
+                if (it != m_devices.end()) {
+                    it->second.isActive = newDevice.isActive;
+                    it->second.isMuted = newDevice.isMuted;
+                    it->second.currentVolume = newDevice.currentVolume;
+                } else {
+                    m_devices[newDevice.deviceId] = newDevice;
+                    addedDevices.push_back(newDevice);
+                }
+            }
+
+            m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
+        }
+        // Lock released — invoke callbacks outside the lock to prevent deadlock
+
+        for (const auto& device : addedDevices) {
+            InvokeDeviceCallbacks(device, true);
+        }
+        for (const auto& device : removedDevices) {
+            InvokeDeviceCallbacks(device, false);
         }
 
-        m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
-
-        Utils::Logger::Info(L"MicrophoneGuard: Enumerated {} audio devices", m_devices.size());
+        Utils::Logger::Info(L"MicrophoneGuard: Refreshed audio devices (total: {}, added: {}, removed: {})",
+                          m_statistics.devicesMonitored.load(std::memory_order_relaxed),
+                          addedDevices.size(), removedDevices.size());
 
         return true;
 
@@ -708,7 +859,33 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
 {
     try {
         m_statistics.totalAccessAttempts.fetch_add(1, std::memory_order_relaxed);
-        m_statistics.byAPI[static_cast<size_t>(api)].fetch_add(1, std::memory_order_relaxed);
+
+        // Bounds-checked API counter update
+        const auto apiIndex = static_cast<size_t>(api);
+        if (apiIndex < m_statistics.byAPI.size()) {
+            m_statistics.byAPI[apiIndex].fetch_add(1, std::memory_order_relaxed);
+        }
+
+        // Take a snapshot of configuration under lock to avoid data race
+        MicrophoneConfiguration configSnapshot;
+        {
+            std::shared_lock lock(m_mutex);
+            configSnapshot = m_config;
+        }
+
+        // Periodically purge expired temporary access entries
+        const auto attemptCount = m_statistics.totalAccessAttempts.load(std::memory_order_relaxed);
+        if (attemptCount % 100 == 0) {
+            std::unique_lock lock(m_temporaryMutex);
+            auto now = SystemClock::now();
+            for (auto it = m_temporaryAccess.begin(); it != m_temporaryAccess.end(); ) {
+                if (now >= it->second) {
+                    it = m_temporaryAccess.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+        }
 
         // Create access event
         AudioAccessEvent event;
@@ -765,8 +942,8 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
             }
         }
 
-        // Check protection mode
-        switch (m_config.mode) {
+        // Check protection mode (using snapshot to avoid race)
+        switch (configSnapshot.mode) {
             case MicrophoneProtectionMode::Disabled:
                 event.decision = AudioAccessDecision::Allow;
                 m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
@@ -826,8 +1003,8 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
         }
 
         // Check spyware/malware
-        if (m_config.checkThreatIntel && IsKnownSpywareInternal(processId)) {
-            event.decision = m_config.autoBlockSpyware ? AudioAccessDecision::Block : AudioAccessDecision::Mute;
+        if (configSnapshot.checkThreatIntel && IsKnownSpywareInternal(processId)) {
+            event.decision = configSnapshot.autoBlockSpyware ? AudioAccessDecision::Block : AudioAccessDecision::Mute;
             event.riskLevel = AudioRiskLevel::Critical;
             event.reason = AudioAccessReason::Malware;
             event.notes = "Known spyware/malware detected";
@@ -835,7 +1012,7 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
             RecordAccessEvent(event);
             InvokeAccessCallbacks(event);
 
-            if (m_config.autoBlockSpyware) {
+            if (configSnapshot.autoBlockSpyware) {
                 m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
                 return AudioAccessDecision::Block;
             } else {
@@ -855,11 +1032,11 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
         }
 
         // Check if unsigned and blocking enabled
-        if (m_config.blockUnsigned && !event.isSigned) {
-            event.decision = m_config.preferMuteOverBlock ? AudioAccessDecision::Mute : AudioAccessDecision::Block;
+        if (configSnapshot.blockUnsigned && !event.isSigned) {
+            event.decision = configSnapshot.preferMuteOverBlock ? AudioAccessDecision::Mute : AudioAccessDecision::Block;
             event.notes = "Unsigned process";
 
-            if (m_config.preferMuteOverBlock) {
+            if (configSnapshot.preferMuteOverBlock) {
                 m_statistics.accessMuted.fetch_add(1, std::memory_order_relaxed);
             } else {
                 m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -882,10 +1059,10 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
         }
 
         // Not whitelisted in WhitelistOnly mode
-        event.decision = m_config.preferMuteOverBlock ? AudioAccessDecision::Mute : AudioAccessDecision::Block;
+        event.decision = configSnapshot.preferMuteOverBlock ? AudioAccessDecision::Mute : AudioAccessDecision::Block;
         event.notes = "Not in whitelist";
 
-        if (m_config.preferMuteOverBlock) {
+        if (configSnapshot.preferMuteOverBlock) {
             m_statistics.accessMuted.fetch_add(1, std::memory_order_relaxed);
         } else {
             m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
@@ -905,6 +1082,11 @@ AudioAccessDecision MicrophoneGuard::MicrophoneGuardImpl::EvaluateAccessInternal
 
 bool MicrophoneGuard::MicrophoneGuardImpl::BlockAudioForProcessInternal(uint32_t pid) {
     try {
+        if (pid == 0) {
+            Utils::Logger::Error(L"MicrophoneGuard: Cannot block PID 0 (idle process)");
+            return false;
+        }
+
         std::unique_lock lock(m_blockedMutex);
         m_blockedProcesses.insert(pid);
 
@@ -938,6 +1120,11 @@ bool MicrophoneGuard::MicrophoneGuardImpl::UnblockAudioForProcessInternal(uint32
 
 bool MicrophoneGuard::MicrophoneGuardImpl::MuteAudioForProcessInternal(uint32_t pid) {
     try {
+        if (pid == 0) {
+            Utils::Logger::Error(L"MicrophoneGuard: Cannot mute PID 0 (idle process)");
+            return false;
+        }
+
         std::unique_lock lock(m_mutedMutex);
         m_mutedProcesses.insert(pid);
 
@@ -1084,6 +1271,9 @@ std::vector<AudioAccessEvent> MicrophoneGuard::MicrophoneGuardImpl::GetRecentEve
 {
     std::shared_lock lock(m_eventsMutex);
 
+    // Cap limit to prevent excessive allocation
+    limit = std::min(limit, MAX_EVENTS);
+
     std::vector<AudioAccessEvent> result;
     result.reserve(std::min(limit, m_events.size()));
 
@@ -1102,15 +1292,28 @@ std::vector<AudioAccessEvent> MicrophoneGuard::MicrophoneGuardImpl::GetRecentEve
 
 bool MicrophoneGuard::MicrophoneGuardImpl::IsKnownSpywareInternal(uint32_t processId) {
     try {
-        if (!m_threatIntel) {
-            return false;
-        }
-
         auto processPath = Utils::ProcessUtils::GetProcessPath(processId);
         auto hash = Utils::HashUtils::CalculateSHA256(processPath);
 
-        // Query ThreatIntel (would check against malware database)
-        // For stub, return false
+        // Query ThreatIntel singleton for known malicious hash
+        try {
+            auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+            if (threatIntel.IsInitialized()) {
+                std::string threatName;
+                if (threatIntel.IsKnownMalicious(hash, threatName)) {
+                    Utils::Logger::Warn(
+                        L"MicrophoneGuard: Spyware detected (PID {}) threat='{}' hash='{}'",
+                        processId,
+                        Utils::StringUtils::Utf8ToWide(threatName),
+                        Utils::StringUtils::Utf8ToWide(hash));
+                    return true;
+                }
+            }
+        } catch (const std::exception& ex) {
+            Utils::Logger::Debug(L"MicrophoneGuard: ThreatIntel query failed - {}",
+                                Utils::StringUtils::Utf8ToWide(ex.what()));
+        }
+
         return false;
 
     } catch (const std::exception& e) {
@@ -1181,15 +1384,34 @@ void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
         try {
             // Get processes capturing audio
             auto capturingProcesses = GetProcessesCapturingAudio();
+            std::unordered_set<uint32_t> capturingSet(
+                capturingProcesses.begin(), capturingProcesses.end());
 
-            // Update active streams
+            // Update active streams: remove ended, add new
             {
                 std::unique_lock lock(m_streamsMutex);
 
+                // Remove streams whose process is no longer capturing
+                for (auto it = m_activeStreams.begin(); it != m_activeStreams.end(); ) {
+                    if (it->second.isCapturing &&
+                        !capturingSet.contains(it->second.processId)) {
+                        it->second.isCapturing = false;
+                        it->second.duration = std::chrono::duration_cast<std::chrono::seconds>(
+                            SystemClock::now() - it->second.startTime);
+                        m_statistics.activeStreams.fetch_sub(1, std::memory_order_relaxed);
+                        m_statistics.totalCaptureTime.fetch_add(
+                            static_cast<uint64_t>(it->second.duration.count()),
+                            std::memory_order_relaxed);
+                        it = m_activeStreams.erase(it);
+                    } else {
+                        ++it;
+                    }
+                }
+
+                // Detect new streams
                 for (uint32_t pid : capturingProcesses) {
-                    // Check if already tracked
                     bool found = false;
-                    for (auto& [id, stream] : m_activeStreams) {
+                    for (const auto& [id, stream] : m_activeStreams) {
                         if (stream.processId == pid && stream.isCapturing) {
                             found = true;
                             break;
@@ -1197,11 +1419,10 @@ void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
                     }
 
                     if (!found) {
-                        // New stream detected
                         AudioStreamInfo stream;
                         stream.streamId = GenerateEventId();
                         stream.processId = pid;
-                        stream.api = AudioCaptureAPI::Unknown;  // Would detect actual API
+                        stream.api = AudioCaptureAPI::WASAPI;
                         stream.isCapturing = true;
                         stream.startTime = SystemClock::now();
 
@@ -1218,7 +1439,9 @@ void MicrophoneGuard::MicrophoneGuardImpl::MonitorThreadFunc() {
 
                         InvokeStreamCallbacks(stream);
 
-                        Utils::Logger::Info(L"MicrophoneGuard: New audio stream from PID {}", pid);
+                        Utils::Logger::Info(L"MicrophoneGuard: New audio stream from PID {} ({})",
+                                          pid,
+                                          Utils::StringUtils::Utf8ToWide(stream.processName));
                     }
                 }
             }
@@ -1553,6 +1776,12 @@ bool MicrophoneGuard::MonitorAudioStreams() {
     }
 
     try {
+        // Join any previous monitoring thread to avoid overwriting a
+        // joinable std::thread (which would call std::terminate)
+        if (m_impl->m_monitorThread && m_impl->m_monitorThread->joinable()) {
+            m_impl->m_monitorThread->join();
+        }
+
         m_impl->m_monitorThread = std::make_unique<std::thread>(
             &MicrophoneGuardImpl::MonitorThreadFunc, m_impl.get());
 
@@ -1617,6 +1846,20 @@ bool MicrophoneGuard::AllowProcessTemporarily(
 {
     if (!m_impl) return false;
 
+    if (processId == 0) {
+        Utils::Logger::Error(L"MicrophoneGuard: Cannot grant temporary access to PID 0");
+        return false;
+    }
+
+    // Cap maximum duration to 24 hours to prevent unbounded grants
+    static constexpr auto MAX_TEMP_DURATION = std::chrono::hours(24);
+    if (duration <= std::chrono::seconds::zero() || duration > MAX_TEMP_DURATION) {
+        Utils::Logger::Error(
+            L"MicrophoneGuard: Invalid temporary access duration {} seconds (max: {} hours)",
+            duration.count(), MAX_TEMP_DURATION.count());
+        return false;
+    }
+
     try {
         auto expiration = SystemClock::now() + duration;
 
@@ -1667,7 +1910,7 @@ bool MicrophoneGuard::ImportDefaultTrustedApps() {
             entry.entryId = std::string("DEFAULT_") + appName;
             entry.processPattern = appName;
             entry.enabled = true;
-            entry.requireSigned = false;
+            entry.requireSigned = true;  // Default apps must be signed to prevent spoofing
             entry.addedBy = "System";
             entry.addedTime = SystemClock::now();
             entry.notes = "Default trusted application";
@@ -1785,8 +2028,9 @@ void MicrophoneGuard::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-MicrophoneStatistics MicrophoneGuard::GetStatistics() const {
-    return m_impl ? m_impl->m_statistics : MicrophoneStatistics{};
+MicrophoneStatisticsSnapshot MicrophoneGuard::GetStatistics() const {
+    if (!m_impl) return MicrophoneStatisticsSnapshot{};
+    return m_impl->m_statistics.TakeSnapshot();
 }
 
 void MicrophoneGuard::ResetStatistics() {
@@ -1800,18 +2044,22 @@ bool MicrophoneGuard::SelfTest() {
     try {
         Utils::Logger::Info(L"MicrophoneGuard: Starting self-test");
 
-        // Test 1: Initialization
-        MicrophoneConfiguration config;
-        config.mode = MicrophoneProtectionMode::WhitelistOnly;
-        config.notificationDurationMs = 5000;
+        // Test 1: Initialization — only initialize if not already running
+        if (!IsInitialized()) {
+            MicrophoneConfiguration config;
+            config.mode = MicrophoneProtectionMode::WhitelistOnly;
+            config.notificationDurationMs = 5000;
 
-        if (!Initialize(config)) {
-            Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Initialization");
-            return false;
+            if (!Initialize(config)) {
+                Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Initialization");
+                return false;
+            }
         }
 
         // Test 2: Configuration validation
-        if (!config.IsValid()) {
+        MicrophoneConfiguration testConfig;
+        testConfig.notificationDurationMs = 5000;
+        if (!testConfig.IsValid()) {
             Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Configuration invalid");
             return false;
         }
@@ -1870,7 +2118,7 @@ bool MicrophoneGuard::SelfTest() {
         auto stats = GetStatistics();
         ResetStatistics();
         stats = GetStatistics();
-        if (stats.totalAccessAttempts.load() != 0) {
+        if (stats.totalAccessAttempts != 0) {
             Utils::Logger::Error(L"MicrophoneGuard: Self-test failed - Statistics reset");
             return false;
         }
@@ -1983,81 +2231,120 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
 
 #ifdef _WIN32
     try {
-        // Initialize COM
-        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-        bool needsUninit = SUCCEEDED(hr);
+        ComInitGuard comGuard;
 
-        // Get device enumerator
-        IMMDeviceEnumerator* pEnumerator = nullptr;
-        hr = CoCreateInstance(
+        ComPtr<IMMDeviceEnumerator> pEnumerator;
+        HRESULT hr = CoCreateInstance(
             __uuidof(MMDeviceEnumerator),
             nullptr,
             CLSCTX_ALL,
             __uuidof(IMMDeviceEnumerator),
-            reinterpret_cast<void**>(&pEnumerator));
+            reinterpret_cast<void**>(pEnumerator.put()));
 
         if (FAILED(hr)) {
-            if (needsUninit) CoUninitialize();
+            Utils::Logger::Error(L"EnumerateAudioDevices: Failed to create device enumerator");
             return devices;
         }
 
-        // Get collection of audio capture endpoints
-        IMMDeviceCollection* pCollection = nullptr;
+        ComPtr<IMMDeviceCollection> pCollection;
         hr = pEnumerator->EnumAudioEndpoints(
             eCapture,
             DEVICE_STATE_ACTIVE,
-            &pCollection);
+            pCollection.put());
 
-        if (SUCCEEDED(hr)) {
-            UINT count = 0;
-            pCollection->GetCount(&count);
+        if (FAILED(hr)) {
+            Utils::Logger::Error(L"EnumerateAudioDevices: Failed to enumerate endpoints");
+            return devices;
+        }
 
-            for (UINT i = 0; i < count && devices.size() < MicrophoneConstants::MAX_DEVICES; i++) {
-                IMMDevice* pDevice = nullptr;
-                if (SUCCEEDED(pCollection->Item(i, &pDevice))) {
-                    AudioDevice device;
+        UINT count = 0;
+        pCollection->GetCount(&count);
 
-                    // Get device ID
-                    LPWSTR pwszID = nullptr;
-                    if (SUCCEEDED(pDevice->GetId(&pwszID))) {
-                        device.endpointId = Utils::StringUtils::WideToUtf8(pwszID);
-                        device.deviceId = std::format("MIC_{}", i);
-                        CoTaskMemFree(pwszID);
+        for (UINT i = 0; i < count && devices.size() < MicrophoneConstants::MAX_DEVICES; i++) {
+            ComPtr<IMMDevice> pDevice;
+            if (FAILED(pCollection->Item(i, pDevice.put()))) {
+                continue;
+            }
+
+            AudioDevice device;
+
+            // Get device ID
+            LPWSTR pwszID = nullptr;
+            if (SUCCEEDED(pDevice->GetId(&pwszID))) {
+                device.endpointId = Utils::StringUtils::WideToUtf8(pwszID);
+                device.deviceId = std::format("MIC_{}", i);
+                CoTaskMemFree(pwszID);
+            }
+
+            // Get properties
+            ComPtr<IPropertyStore> pProps;
+            if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, pProps.put()))) {
+                PROPVARIANT varName;
+                PropVariantInit(&varName);
+
+                if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName)) &&
+                    varName.pwszVal != nullptr) {
+                    device.friendlyName = Utils::StringUtils::WideToUtf8(varName.pwszVal);
+
+                    // Heuristic device type detection from friendly name
+                    std::string lowerName = device.friendlyName;
+                    std::transform(lowerName.begin(), lowerName.end(),
+                                   lowerName.begin(), ::tolower);
+
+                    if (lowerName.find("bluetooth") != std::string::npos) {
+                        device.type = AudioDeviceType::Bluetooth;
+                    } else if (lowerName.find("usb") != std::string::npos) {
+                        device.type = AudioDeviceType::ExternalUSB;
+                    } else if (lowerName.find("webcam") != std::string::npos ||
+                               lowerName.find("camera") != std::string::npos) {
+                        device.type = AudioDeviceType::WebcamMic;
+                    } else if (lowerName.find("headset") != std::string::npos ||
+                               lowerName.find("headphone") != std::string::npos) {
+                        device.type = AudioDeviceType::Headset;
+                    } else if (lowerName.find("array") != std::string::npos) {
+                        device.type = AudioDeviceType::ArrayMic;
+                    } else if (lowerName.find("virtual") != std::string::npos ||
+                               lowerName.find("cable") != std::string::npos) {
+                        device.type = AudioDeviceType::Virtual;
+                    } else {
+                        device.type = AudioDeviceType::IntegratedMic;
                     }
+                }
 
-                    // Get properties
-                    IPropertyStore* pProps = nullptr;
-                    if (SUCCEEDED(pDevice->OpenPropertyStore(STGM_READ, &pProps))) {
-                        PROPVARIANT varName;
-                        PropVariantInit(&varName);
+                PropVariantClear(&varName);
+            }
 
-                        // Get friendly name
-                        if (SUCCEEDED(pProps->GetValue(PKEY_Device_FriendlyName, &varName))) {
-                            device.friendlyName = Utils::StringUtils::WideToUtf8(varName.pwszVal);
-                        }
-
-                        PropVariantClear(&varName);
-                        pProps->Release();
-                    }
-
-                    device.type = AudioDeviceType::IntegratedMic;  // Default
-                    device.isActive = false;
-                    device.isMuted = false;
-                    device.isBlocked = false;
-                    device.currentVolume = 100;
-
-                    devices.push_back(device);
-                    pDevice->Release();
+            // Check if this is the default device
+            ComPtr<IMMDevice> pDefaultDevice;
+            if (SUCCEEDED(pEnumerator->GetDefaultAudioEndpoint(
+                    eCapture, eConsole, pDefaultDevice.put()))) {
+                LPWSTR pwszDefaultID = nullptr;
+                if (SUCCEEDED(pDefaultDevice->GetId(&pwszDefaultID))) {
+                    std::string defaultId = Utils::StringUtils::WideToUtf8(pwszDefaultID);
+                    device.isDefault = (device.endpointId == defaultId);
+                    CoTaskMemFree(pwszDefaultID);
                 }
             }
 
-            pCollection->Release();
-        }
+            // Query endpoint volume for mute state
+            ComPtr<IAudioEndpointVolume> pVolume;
+            if (SUCCEEDED(pDevice->Activate(
+                    __uuidof(IAudioEndpointVolume), CLSCTX_ALL,
+                    nullptr, reinterpret_cast<void**>(pVolume.put())))) {
+                BOOL muted = FALSE;
+                if (SUCCEEDED(pVolume->GetMute(&muted))) {
+                    device.isMuted = (muted != FALSE);
+                }
+                float level = 1.0f;
+                if (SUCCEEDED(pVolume->GetMasterVolumeLevelScalar(&level))) {
+                    device.currentVolume = static_cast<int>(level * 100.0f);
+                }
+            }
 
-        pEnumerator->Release();
+            device.isActive = false;
+            device.isBlocked = false;
 
-        if (needsUninit) {
-            CoUninitialize();
+            devices.push_back(std::move(device));
         }
 
     } catch (const std::exception& e) {
@@ -2072,8 +2359,96 @@ std::vector<AudioDevice> EnumerateAudioDevices() {
 std::vector<uint32_t> GetProcessesCapturingAudio() {
     std::vector<uint32_t> processes;
 
-    // In production, would enumerate audio sessions and extract PIDs
-    // For stub, return empty
+#ifdef _WIN32
+    try {
+        ComInitGuard comGuard;
+
+        ComPtr<IMMDeviceEnumerator> pEnumerator;
+        HRESULT hr = CoCreateInstance(
+            __uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL,
+            __uuidof(IMMDeviceEnumerator),
+            reinterpret_cast<void**>(pEnumerator.put()));
+
+        if (FAILED(hr) || !pEnumerator) {
+            return processes;
+        }
+
+        // Enumerate all active capture endpoints
+        ComPtr<IMMDeviceCollection> pCollection;
+        hr = pEnumerator->EnumAudioEndpoints(
+            eCapture, DEVICE_STATE_ACTIVE, pCollection.put());
+
+        if (FAILED(hr) || !pCollection) {
+            return processes;
+        }
+
+        UINT deviceCount = 0;
+        pCollection->GetCount(&deviceCount);
+
+        std::unordered_set<uint32_t> uniquePids;
+
+        for (UINT d = 0; d < deviceCount; ++d) {
+            ComPtr<IMMDevice> pDevice;
+            if (FAILED(pCollection->Item(d, pDevice.put())) || !pDevice) {
+                continue;
+            }
+
+            ComPtr<IAudioSessionManager2> pSessionManager;
+            hr = pDevice->Activate(
+                __uuidof(IAudioSessionManager2), CLSCTX_ALL, nullptr,
+                reinterpret_cast<void**>(pSessionManager.put()));
+
+            if (FAILED(hr) || !pSessionManager) {
+                continue;
+            }
+
+            ComPtr<IAudioSessionEnumerator> pSessionEnum;
+            hr = pSessionManager->GetSessionEnumerator(pSessionEnum.put());
+
+            if (FAILED(hr) || !pSessionEnum) {
+                continue;
+            }
+
+            int sessionCount = 0;
+            pSessionEnum->GetCount(&sessionCount);
+
+            for (int i = 0; i < sessionCount; ++i) {
+                ComPtr<IAudioSessionControl> pSessionControl;
+                if (FAILED(pSessionEnum->GetSession(i, pSessionControl.put())) ||
+                    !pSessionControl) {
+                    continue;
+                }
+
+                // Check if session is active
+                AudioSessionState state = AudioSessionStateInactive;
+                if (FAILED(pSessionControl->GetState(&state)) ||
+                    state != AudioSessionStateActive) {
+                    continue;
+                }
+
+                // Get PID from IAudioSessionControl2
+                ComPtr<IAudioSessionControl2> pSessionControl2;
+                hr = pSessionControl->QueryInterface(
+                    __uuidof(IAudioSessionControl2),
+                    reinterpret_cast<void**>(pSessionControl2.put()));
+
+                if (SUCCEEDED(hr) && pSessionControl2) {
+                    DWORD pid = 0;
+                    if (SUCCEEDED(pSessionControl2->GetProcessId(&pid)) && pid != 0) {
+                        uniquePids.insert(pid);
+                    }
+                }
+            }
+        }
+
+        processes.assign(uniquePids.begin(), uniquePids.end());
+
+    } catch (const std::exception& e) {
+        Utils::Logger::Error(L"GetProcessesCapturingAudio: Exception - {}",
+                           Utils::StringUtils::Utf8ToWide(e.what()));
+    }
+#endif
+
     return processes;
 }
 

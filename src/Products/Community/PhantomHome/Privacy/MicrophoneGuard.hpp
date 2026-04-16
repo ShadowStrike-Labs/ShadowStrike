@@ -125,6 +125,12 @@
 #endif
 
 // ============================================================================
+// COMMON PRIVACY DEFINITIONS (ModuleStatus, type aliases, utilities)
+// ============================================================================
+
+#include "Common.hpp"
+
+// ============================================================================
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
@@ -178,14 +184,7 @@ namespace MicrophoneConstants {
 
 }  // namespace MicrophoneConstants
 
-// ============================================================================
-// TYPE ALIASES
-// ============================================================================
-
-using Clock = std::chrono::steady_clock;
-using TimePoint = std::chrono::steady_clock::time_point;
-using SystemTimePoint = std::chrono::system_clock::time_point;
-namespace fs = std::filesystem;
+// Type aliases Clock, TimePoint, SystemTimePoint, fs are provided by Common.hpp
 
 // ============================================================================
 // ENUMERATIONS
@@ -267,19 +266,7 @@ enum class AudioRiskLevel : uint8_t {
     Critical        = 4
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus enum is provided by Common.hpp (shared across all Privacy modules)
 
 // ============================================================================
 // STRUCTURES
@@ -500,6 +487,30 @@ struct MicrophoneStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+    [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] struct MicrophoneStatisticsSnapshot TakeSnapshot() const noexcept;
+};
+
+/**
+ * @brief Thread-safe snapshot of statistics (no atomics, freely copyable).
+ *        Use MicrophoneStatistics::TakeSnapshot() to produce one.
+ */
+struct MicrophoneStatisticsSnapshot {
+    uint64_t totalAccessAttempts = 0;
+    uint64_t accessAllowed = 0;
+    uint64_t accessBlocked = 0;
+    uint64_t accessMuted = 0;
+    uint64_t accessPrompted = 0;
+    uint64_t suspiciousAccess = 0;
+    uint64_t malwareBlocked = 0;
+    uint64_t ratDetected = 0;
+    uint64_t whitelistHits = 0;
+    uint64_t devicesMonitored = 0;
+    uint64_t activeStreams = 0;
+    uint64_t totalCaptureTime = 0;
+    std::array<uint64_t, 8> byAPI{};
+    TimePoint startTime;
+
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -734,7 +745,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] MicrophoneStatistics GetStatistics() const;
+    [[nodiscard]] MicrophoneStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
