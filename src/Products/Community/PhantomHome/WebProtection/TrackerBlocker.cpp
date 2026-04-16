@@ -36,11 +36,11 @@
 
 #include "pch.h"
 #include "TrackerBlocker.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../ThreatIntel/ThreatIntelLookup.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
 
 #include <shared_mutex>
 #include <mutex>
@@ -442,7 +442,7 @@ public:
         }
 
         m_status = ModuleStatus::Running;
-        TB_LOG_INFO("TrackerBlocker initialized with %zu rules", m_rules.size());
+        TB_LOG_INFO("TrackerBlocker initialized with {} rules", m_rules.size());
         return true;
     }
 
@@ -716,10 +716,81 @@ public:
     [[nodiscard]] bool LoadBlocklistFromUrl(std::string_view url,
                                              BlocklistSource source,
                                              std::string_view name) {
-        // Would use NetworkUtils to fetch the blocklist
-        // For now, return false as network fetch is complex
-        TB_LOG_WARN("URL-based blocklist loading not implemented: %s", std::string(url).c_str());
-        return false;
+        if (url.empty()) {
+            TB_LOG_ERROR("Cannot load blocklist from empty URL");
+            return false;
+        }
+
+        if (url.length() > TrackerBlockerConstants::MAX_URL_LENGTH) {
+            TB_LOG_ERROR("Blocklist URL exceeds maximum allowed length");
+            return false;
+        }
+
+        std::wstring wideUrl = StringUtils::ToWide(url);
+        std::vector<uint8_t> data;
+        NetworkUtils::HttpRequestOptions options;
+        options.timeoutMs = 30000;
+        options.userAgent = L"ShadowStrike-AntiVirus/3.0";
+        NetworkUtils::Error netErr;
+
+        if (!NetworkUtils::HttpGet(wideUrl, data, options, &netErr)) {
+            TB_LOG_ERROR("Failed to download blocklist from URL: HTTP error code {}",
+                         netErr.httpStatus);
+            return false;
+        }
+
+        if (data.empty()) {
+            TB_LOG_WARN("Downloaded blocklist is empty");
+            return false;
+        }
+
+        std::string blocklistContent(data.begin(), data.end());
+        std::string blocklistId = std::string(name.empty() ? url.substr(url.rfind('/') + 1) : name);
+
+        std::unique_lock lock(m_mutex);
+        size_t ruleCount = 0;
+        std::istringstream stream(blocklistContent);
+        std::string line;
+
+        while (std::getline(stream, line)) {
+            if (line.empty() || line[0] == '!' || line[0] == '#' || line[0] == '[') {
+                continue;
+            }
+
+            BlockRule rule = ParseBlocklistRule(line, source);
+            if (!rule.pattern.empty()) {
+                std::string ruleId = rule.id.empty() ? GenerateRuleId() : rule.id;
+                rule.id = ruleId;
+                rule.createdAt = Clock::now();
+
+                if (m_rules.size() < TrackerBlockerConstants::MAX_BLOCKLIST_RULES) {
+                    m_rules[ruleId] = rule;
+                    if (rule.type == RuleType::Domain || rule.type == RuleType::DomainSuffix) {
+                        m_blockedDomains.insert(rule.pattern);
+                        if (m_bloomFilter) {
+                            m_bloomFilter->Add(rule.pattern);
+                        }
+                    }
+                    ruleCount++;
+                }
+            }
+        }
+
+        BlocklistInfo info;
+        info.id = blocklistId;
+        info.name = std::string(name.empty() ? blocklistId : name);
+        info.source = source;
+        info.updateUrl = std::string(url);
+        info.ruleCount = ruleCount;
+        info.enabled = true;
+        info.lastUpdated = Clock::now();
+        info.lastChecked = Clock::now();
+        m_blocklists[blocklistId] = info;
+
+        m_stats.activeRuleCount = m_rules.size();
+
+        TB_LOG_INFO("Loaded {} rules from URL-based blocklist '{}'", ruleCount, blocklistId);
+        return true;
     }
 
     [[nodiscard]] bool UnloadBlocklist(std::string_view id) {
@@ -738,7 +809,7 @@ public:
         m_blocklists.erase(it);
         RebuildBloomFilter();
 
-        TB_LOG_INFO("Unloaded blocklist: %s", std::string(id).c_str());
+        TB_LOG_INFO("Unloaded blocklist: {}", id);
         return true;
     }
 
@@ -767,8 +838,36 @@ public:
     }
 
     [[nodiscard]] bool UpdateBlocklist(std::string_view id) {
-        // Would trigger re-fetch from URL
-        return false;
+        std::shared_lock lock(m_mutex);
+
+        auto it = m_blocklists.find(std::string(id));
+        if (it == m_blocklists.end()) {
+            TB_LOG_WARN("Cannot update blocklist: '{}' not found", id);
+            return false;
+        }
+
+        if (it->second.updateUrl.empty()) {
+            TB_LOG_WARN("Cannot update blocklist '{}': no update URL configured", id);
+            return false;
+        }
+
+        BlocklistSource source = it->second.source;
+        std::string updateUrl = it->second.updateUrl;
+        std::string name = it->second.name;
+        lock.unlock();
+
+        if (!UnloadBlocklist(id)) {
+            TB_LOG_ERROR("Failed to unload blocklist '{}' before update", id);
+            return false;
+        }
+
+        if (!LoadBlocklistFromUrl(updateUrl, source, name)) {
+            TB_LOG_ERROR("Failed to re-download blocklist '{}' from {}", id, updateUrl);
+            return false;
+        }
+
+        TB_LOG_INFO("Successfully updated blocklist '{}'", id);
+        return true;
     }
 
     void UpdateAllBlocklists() {
@@ -1146,7 +1245,7 @@ private:
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_cacheMutex;
     mutable std::shared_mutex m_logMutex;
-    mutable std::mutex m_callbackMutex;
+    mutable std::shared_mutex m_callbackMutex;
 
     ModuleStatus m_status{ModuleStatus::Uninitialized};
     TrackerBlockerConfiguration m_config;
@@ -1510,7 +1609,7 @@ private:
         builtIn.enabled = true;
         m_blocklists["builtin"] = builtIn;
 
-        TB_LOG_INFO("Loaded %zu built-in tracker rules", builtInTrackers.size());
+        TB_LOG_INFO("Loaded {} built-in tracker rules", builtInTrackers.size());
     }
 
     [[nodiscard]] bool LoadBlocklistFromFile(const std::filesystem::path& path,
@@ -1521,7 +1620,7 @@ private:
         try {
             std::ifstream file(path);
             if (!file.is_open()) {
-                TB_LOG_ERROR("Failed to open blocklist: %s", path.string().c_str());
+                TB_LOG_ERROR("Failed to open blocklist: {}", path.string());
                 return false;
             }
 
@@ -1554,11 +1653,11 @@ private:
             info.lastUpdated = Clock::now();
             m_blocklists[blocklistId] = info;
 
-            TB_LOG_INFO("Loaded blocklist '%s' with %zu rules", name.c_str(), ruleCount);
+            TB_LOG_INFO("Loaded blocklist '{}' with {} rules", name, ruleCount);
             return true;
 
         } catch (const std::exception& e) {
-            TB_LOG_ERROR("Error loading blocklist: %s", e.what());
+            TB_LOG_ERROR("Error loading blocklist: {}", e.what());
             return false;
         }
     }
@@ -1680,7 +1779,7 @@ private:
             try {
                 callback(request, result);
             } catch (const std::exception& e) {
-                TB_LOG_ERROR("Block callback %llu threw exception: %s", id, e.what());
+                TB_LOG_ERROR("Block callback {} threw exception: {}", id, e.what());
             }
         }
     }

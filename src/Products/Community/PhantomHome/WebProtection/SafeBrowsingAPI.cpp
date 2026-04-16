@@ -35,11 +35,11 @@
 
 #include "pch.h"
 #include "SafeBrowsingAPI.hpp"
-#include "../ThreatIntel/ThreatIntelLookup.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/HashUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
 
 #include <shared_mutex>
 #include <mutex>
@@ -297,31 +297,24 @@ public:
             m_ownsLookup = false;
             SB_LOG_INFO("Using provided ThreatIntelLookup instance");
         } else {
-            // Try to get the global ThreatIntelLookup instance
-            if (ThreatIntelLookup::HasInstance()) {
-                m_threatLookup = &ThreatIntelLookup::Instance();
-                m_ownsLookup = false;
-                SB_LOG_INFO("Using global ThreatIntelLookup instance");
-            } else {
-                m_threatLookup = nullptr;
-                m_ownsLookup = false;
-                SB_LOG_WARN("No ThreatIntelLookup available - running in degraded mode");
-                m_status = SafeBrowsingStatus::Degraded;
-            }
+            m_threatLookup = nullptr;
+            m_ownsLookup = false;
+            SB_LOG_WARN("No ThreatIntelLookup available - running in degraded mode");
+            m_status = SafeBrowsingStatus::Degraded;
         }
 
         // Initialize caches
         if (m_config.enableLocalCache) {
             ClearCacheInternal();
-            SB_LOG_INFO("Cache initialized with max size: %zu", m_config.maxCacheEntries);
+            SB_LOG_INFO("Cache initialized with max size: {}", m_config.maxCacheEntries);
         }
 
         if (m_status != SafeBrowsingStatus::Degraded) {
             m_status = SafeBrowsingStatus::Running;
         }
 
-        SB_LOG_INFO("SafeBrowsingAPI initialized successfully (Status: %s)",
-                    std::string(GetStatusName(m_status)).c_str());
+        SB_LOG_INFO("SafeBrowsingAPI initialized successfully (Status: {})",
+                    GetStatusName(m_status));
         return true;
     }
 
@@ -407,13 +400,13 @@ public:
             try {
                 UnifiedLookupOptions options;
                 options.includeMetadata = true;
-                options.confidenceThreshold = m_config.minConfidenceThreshold;
+                options.minConfidence = static_cast<uint8_t>(m_config.minConfidenceThreshold);
 
                 auto tiResult = m_threatLookup->LookupURL(normalizedUrl, options);
                 MapThreatResultToSafeBrowsing(tiResult, result);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
-                SB_LOG_ERROR("ThreatIntel lookup failed: %s", e.what());
+                SB_LOG_ERROR("ThreatIntel lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
 
                 // Fail-closed or fail-open based on config
@@ -452,8 +445,8 @@ public:
         m_stats.totalProcessingTimeUs += result.latencyUs;
 
         if (m_config.verboseLogging) {
-            SB_LOG_DEBUG("URL check: %s -> Safe=%d, Latency=%llu us",
-                        urlStr.c_str(), result.isSafe, result.latencyUs);
+            SB_LOG_DEBUG("URL check: {} -> Safe={}, Latency={} us",
+                        urlStr, result.isSafe, result.latencyUs);
         }
 
         return result;
@@ -479,7 +472,7 @@ public:
         BatchLookupResult batchResult;
 
         if (urls.size() > SafeBrowsingConstants::MAX_BATCH_SIZE) {
-            SB_LOG_WARN("Batch size %zu exceeds maximum %zu, truncating",
+            SB_LOG_WARN("Batch size {} exceeds maximum {}, truncating",
                         urls.size(), SafeBrowsingConstants::MAX_BATCH_SIZE);
         }
 
@@ -556,7 +549,7 @@ public:
                 MapThreatResultToSafeBrowsing(tiResult, result);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
-                SB_LOG_ERROR("Domain lookup failed: %s", e.what());
+                SB_LOG_ERROR("Domain lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
                 result.isSafe = !m_config.failClosed;
             }
@@ -652,7 +645,7 @@ public:
                 MapThreatResultToSafeBrowsing(tiResult, result);
                 result.source = LookupSource::ThreatIntel;
             } catch (const std::exception& e) {
-                SB_LOG_ERROR("Hash lookup failed: %s", e.what());
+                SB_LOG_ERROR("Hash lookup failed: {}", e.what());
                 m_stats.lookupErrors++;
                 result.isSafe = !m_config.failClosed;
             }
@@ -735,7 +728,7 @@ public:
     }
 
     void PreloadCache(std::span<const std::string> urls) {
-        SB_LOG_INFO("Preloading %zu URLs into cache", urls.size());
+        SB_LOG_INFO("Preloading {} URLs into cache", urls.size());
 
         for (const auto& url : urls) {
             CheckUrl(url);
@@ -850,7 +843,7 @@ private:
 
     mutable std::shared_mutex m_mutex;
     mutable std::shared_mutex m_cacheMutex;
-    mutable std::mutex m_callbackMutex;
+    mutable std::shared_mutex m_callbackMutex;
 
     SafeBrowsingStatus m_status{SafeBrowsingStatus::Uninitialized};
     SafeBrowsingConfig m_config;
@@ -909,14 +902,14 @@ private:
         result.category = tiResult.category;
         result.reputation = tiResult.reputation;
         result.confidence = static_cast<uint8_t>(tiResult.confidence);
-        result.threatScore = static_cast<uint8_t>(tiResult.threatScore);
+        result.threatScore = tiResult.threatScore;
 
         // Map category to flags
         if (tiResult.category == ThreatCategory::Phishing) {
             result.isPhishing = true;
         }
-        if (tiResult.category == ThreatCategory::PUA ||
-            tiResult.category == ThreatCategory::Adware) {
+        if (tiResult.category == ThreatCategory::Adware ||
+            tiResult.category == ThreatCategory::Spyware) {
             result.isPUA = true;
         }
 
@@ -933,16 +926,18 @@ private:
             result.severity = ThreatSeverity::Low;
         }
 
-        // Extract threat details
-        if (tiResult.entry) {
-            result.threatName = tiResult.entry->threatName;
-            result.threatFamily = tiResult.entry->threatFamily;
+        // Extract threat details from the IOC entry
+        if (tiResult.entry.has_value()) {
+            result.threatName = tiResult.description;
+            result.threatFamily = std::string(ThreatCategoryToString(tiResult.category));
 
-            if (tiResult.entry->firstSeen.time_since_epoch().count() > 0) {
-                result.firstSeen = tiResult.entry->firstSeen;
+            if (tiResult.entry->firstSeen > 0) {
+                result.firstSeen = std::chrono::system_clock::from_time_t(
+                    static_cast<time_t>(tiResult.entry->firstSeen));
             }
-            if (tiResult.entry->lastSeen.time_since_epoch().count() > 0) {
-                result.lastSeen = tiResult.entry->lastSeen;
+            if (tiResult.entry->lastSeen > 0) {
+                result.lastSeen = std::chrono::system_clock::from_time_t(
+                    static_cast<time_t>(tiResult.entry->lastSeen));
             }
         }
 
@@ -1062,7 +1057,7 @@ private:
             try {
                 callback(url, result);
             } catch (const std::exception& e) {
-                SB_LOG_ERROR("Callback %llu threw exception: %s", id, e.what());
+                SB_LOG_ERROR("Callback {} threw exception: {}", id, e.what());
             }
         }
     }

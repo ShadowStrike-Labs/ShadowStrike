@@ -129,12 +129,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -282,16 +284,7 @@ enum class FormFieldType : uint8_t {
 /**
  * @brief Module status
  */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Analyzing       = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 // ============================================================================
 // STRUCTURES
@@ -589,7 +582,55 @@ struct PhishingDetectorStatistics {
     std::array<std::atomic<uint64_t>, 8> byVerdict{};
     std::array<std::atomic<uint64_t>, 32> byIndicator{};
     TimePoint startTime = Clock::now();
-    
+
+    PhishingDetectorStatistics() noexcept = default;
+
+    PhishingDetectorStatistics(const PhishingDetectorStatistics& o) noexcept
+        : totalAnalyzed(o.totalAnalyzed.load(std::memory_order_relaxed)),
+          phishingDetected(o.phishingDetected.load(std::memory_order_relaxed)),
+          suspiciousDetected(o.suspiciousDetected.load(std::memory_order_relaxed)),
+          safeDetected(o.safeDetected.load(std::memory_order_relaxed)),
+          homographsDetected(o.homographsDetected.load(std::memory_order_relaxed)),
+          typosquattingDetected(o.typosquattingDetected.load(std::memory_order_relaxed)),
+          brandImpersonationDetected(o.brandImpersonationDetected.load(std::memory_order_relaxed)),
+          loginFormsAnalyzed(o.loginFormsAnalyzed.load(std::memory_order_relaxed)),
+          certificatesChecked(o.certificatesChecked.load(std::memory_order_relaxed)),
+          threatIntelMatches(o.threatIntelMatches.load(std::memory_order_relaxed)),
+          startTime(o.startTime) {
+        for (size_t i = 0; i < byVerdict.size(); ++i) {
+            byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byIndicator.size(); ++i) {
+            byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        }
+    }
+
+    PhishingDetectorStatistics& operator=(const PhishingDetectorStatistics& o) noexcept {
+        if (this == &o) return *this;
+        totalAnalyzed.store(o.totalAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        phishingDetected.store(o.phishingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        suspiciousDetected.store(o.suspiciousDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        safeDetected.store(o.safeDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        homographsDetected.store(o.homographsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        typosquattingDetected.store(o.typosquattingDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        brandImpersonationDetected.store(o.brandImpersonationDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        loginFormsAnalyzed.store(o.loginFormsAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        certificatesChecked.store(o.certificatesChecked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        threatIntelMatches.store(o.threatIntelMatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byVerdict.size(); ++i) {
+            byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byIndicator.size(); ++i) {
+            byIndicator[i].store(o.byIndicator[i].load(std::memory_order_relaxed),
+                                 std::memory_order_relaxed);
+        }
+        startTime = o.startTime;
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

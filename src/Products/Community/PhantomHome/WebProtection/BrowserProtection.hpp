@@ -130,13 +130,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -264,7 +265,8 @@ enum class BlockReason : uint32_t {
     C2Server            = 1 << 17,
     DGA                 = 1 << 18,   // Domain Generation Algorithm
     Typosquatting       = 1 << 19,
-    Reputation          = 1 << 20
+    Reputation          = 1 << 20,
+    Advertising         = 1 << 21
 };
 
 /**
@@ -312,19 +314,7 @@ enum class DownloadVerdict : uint8_t {
     Blocked         = 5
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Processing      = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 /**
  * @brief Extension status
@@ -610,7 +600,71 @@ struct BrowserProtectionStatistics {
     std::array<std::atomic<uint64_t>, 32> byCategory{};
     std::array<std::atomic<uint64_t>, 16> byBrowser{};
     TimePoint startTime = Clock::now();
-    
+
+    BrowserProtectionStatistics() noexcept = default;
+
+    BrowserProtectionStatistics(const BrowserProtectionStatistics& o) noexcept
+        : totalNavigations(o.totalNavigations.load(std::memory_order_relaxed)),
+          allowedNavigations(o.allowedNavigations.load(std::memory_order_relaxed)),
+          blockedNavigations(o.blockedNavigations.load(std::memory_order_relaxed)),
+          warnedNavigations(o.warnedNavigations.load(std::memory_order_relaxed)),
+          malwareBlocked(o.malwareBlocked.load(std::memory_order_relaxed)),
+          phishingBlocked(o.phishingBlocked.load(std::memory_order_relaxed)),
+          categoryBlocked(o.categoryBlocked.load(std::memory_order_relaxed)),
+          downloadsScanned(o.downloadsScanned.load(std::memory_order_relaxed)),
+          downloadsBlocked(o.downloadsBlocked.load(std::memory_order_relaxed)),
+          adsBlocked(o.adsBlocked.load(std::memory_order_relaxed)),
+          trackersBlocked(o.trackersBlocked.load(std::memory_order_relaxed)),
+          safeSearchEnforced(o.safeSearchEnforced.load(std::memory_order_relaxed)),
+          cacheHits(o.cacheHits.load(std::memory_order_relaxed)),
+          cacheMisses(o.cacheMisses.load(std::memory_order_relaxed)),
+          startTime(o.startTime) {
+        for (size_t i = 0; i < byBlockReason.size(); ++i) {
+            byBlockReason[i].store(o.byBlockReason[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byCategory.size(); ++i) {
+            byCategory[i].store(o.byCategory[i].load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byBrowser.size(); ++i) {
+            byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+    }
+
+    BrowserProtectionStatistics& operator=(const BrowserProtectionStatistics& o) noexcept {
+        if (this == &o) return *this;
+        totalNavigations.store(o.totalNavigations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        allowedNavigations.store(o.allowedNavigations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        blockedNavigations.store(o.blockedNavigations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        warnedNavigations.store(o.warnedNavigations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        malwareBlocked.store(o.malwareBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        phishingBlocked.store(o.phishingBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        categoryBlocked.store(o.categoryBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        downloadsScanned.store(o.downloadsScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        downloadsBlocked.store(o.downloadsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        adsBlocked.store(o.adsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        trackersBlocked.store(o.trackersBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        safeSearchEnforced.store(o.safeSearchEnforced.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheHits.store(o.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cacheMisses.store(o.cacheMisses.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byBlockReason.size(); ++i) {
+            byBlockReason[i].store(o.byBlockReason[i].load(std::memory_order_relaxed),
+                                   std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byCategory.size(); ++i) {
+            byCategory[i].store(o.byCategory[i].load(std::memory_order_relaxed),
+                                std::memory_order_relaxed);
+        }
+        for (size_t i = 0; i < byBrowser.size(); ++i) {
+            byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed),
+                               std::memory_order_relaxed);
+        }
+        startTime = o.startTime;
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

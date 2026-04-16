@@ -133,12 +133,14 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "WebProtectionCommon.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -278,16 +280,7 @@ enum class ScanType : uint8_t {
 /**
  * @brief Module status
  */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Scanning        = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is provided by WebProtectionCommon.hpp (unified across modules).
 
 // ============================================================================
 // STRUCTURES
@@ -548,6 +541,47 @@ struct ChromeExtensionScannerStatistics {
     std::array<std::atomic<uint64_t>, 8> byVerdict{};
     std::array<std::atomic<uint64_t>, 8> byBrowser{};
     TimePoint startTime = Clock::now();
+
+    ChromeExtensionScannerStatistics() noexcept = default;
+
+    ChromeExtensionScannerStatistics(const ChromeExtensionScannerStatistics& o) noexcept
+        : startTime(o.startTime) {
+        totalScanned.store(o.totalScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        safeFound.store(o.safeFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        suspiciousFound.store(o.suspiciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        maliciousFound.store(o.maliciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        sideloadedFound.store(o.sideloadedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        overPrivilegedFound.store(o.overPrivilegedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        profilesScanned.store(o.profilesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        jsFilesAnalyzed.store(o.jsFilesAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        obfuscatedFound.store(o.obfuscatedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        cryptominersFound.store(o.cryptominersFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byVerdict.size(); ++i)
+            byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byBrowser.size(); ++i)
+            byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+    }
+
+    ChromeExtensionScannerStatistics& operator=(const ChromeExtensionScannerStatistics& o) noexcept {
+        if (this != &o) {
+            totalScanned.store(o.totalScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            safeFound.store(o.safeFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            suspiciousFound.store(o.suspiciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            maliciousFound.store(o.maliciousFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            sideloadedFound.store(o.sideloadedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            overPrivilegedFound.store(o.overPrivilegedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            profilesScanned.store(o.profilesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            jsFilesAnalyzed.store(o.jsFilesAnalyzed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            obfuscatedFound.store(o.obfuscatedFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cryptominersFound.store(o.cryptominersFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byVerdict.size(); ++i)
+                byVerdict[i].store(o.byVerdict[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byBrowser.size(); ++i)
+                byBrowser[i].store(o.byBrowser[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = o.startTime;
+        }
+        return *this;
+    }
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
