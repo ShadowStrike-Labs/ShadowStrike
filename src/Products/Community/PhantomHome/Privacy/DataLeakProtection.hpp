@@ -170,6 +170,15 @@ namespace DLPConstants {
     /// @brief Match context size (chars before/after)
     inline constexpr size_t MATCH_CONTEXT_SIZE = 50;
 
+    /// @brief Maximum matches per pattern per scan (DoS protection)
+    inline constexpr size_t MAX_MATCHES_PER_PATTERN = 1000;
+
+    /// @brief Maximum custom patterns allowed
+    inline constexpr size_t MAX_CUSTOM_PATTERNS = 500;
+
+    /// @brief Maximum policies allowed
+    inline constexpr size_t MAX_POLICIES = 200;
+
     /// @brief Credit card regex patterns
     inline constexpr const char* CC_PATTERNS[] = {
         R"(\b4[0-9]{12}(?:[0-9]{3})?\b)",           // Visa
@@ -529,6 +538,30 @@ struct DLPStatistics {
 };
 
 /**
+ * @brief Thread-safe snapshot of DLP statistics (non-atomic, copyable)
+ */
+struct DLPStatisticsSnapshot {
+    uint64_t totalScans = 0;
+    uint64_t sensitiveDataFound = 0;
+    uint64_t operationsBlocked = 0;
+    uint64_t operationsAllowed = 0;
+    uint64_t incidentsLogged = 0;
+    uint64_t bytesScanned = 0;
+    uint64_t clipboardBlocks = 0;
+    uint64_t networkBlocks = 0;
+    uint64_t fileBlocks = 0;
+    uint64_t creditCardsDetected = 0;
+    uint64_t ssnDetected = 0;
+    uint64_t piiDetected = 0;
+    std::array<uint64_t, 32> byCategory{};
+    std::array<uint64_t, 16> byChannel{};
+    std::array<uint64_t, 8> bySeverity{};
+    TimePoint startTime;
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
  * @brief Configuration
  */
 struct DLPConfiguration {
@@ -752,7 +785,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] DLPStatistics GetStatistics() const;
+    [[nodiscard]] DLPStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

@@ -80,6 +80,8 @@
 #include <thread>
 #include <condition_variable>
 #include <cctype>
+#include <cstring>
+#include <deque>
 #include <numeric>
 
 // Third-party libraries
@@ -233,6 +235,58 @@ std::vector<PIIPattern> CreateBuiltInPatterns() {
     return patterns;
 }
 
+/// @brief Convert bitmask to 0-based bit index for array indexing
+constexpr uint32_t BitIndex(uint32_t bitmask) noexcept {
+    uint32_t idx = 0;
+    uint32_t val = bitmask;
+    while (val > 1) {
+        val >>= 1;
+        ++idx;
+    }
+    return idx;
+}
+
+/// @brief Restrictiveness ordering for DLP actions (higher = more restrictive)
+constexpr int ActionRestrictiveness(DLPAction action) noexcept {
+    switch (action) {
+        case DLPAction::Allow:      return 0;
+        case DLPAction::Alert:      return 1;
+        case DLPAction::Justify:    return 2;
+        case DLPAction::Approve:    return 3;
+        case DLPAction::Redact:     return 4;
+        case DLPAction::Encrypt:    return 5;
+        case DLPAction::Block:      return 6;
+        case DLPAction::Quarantine: return 7;
+        default:                    return 0;
+    }
+}
+
+/// @brief Case-insensitive narrow string comparison
+bool NarrowIEquals(const std::string& a, const std::string& b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// @brief RAII clipboard wrapper for Windows
+#ifdef _WIN32
+class ClipboardGuard {
+public:
+    explicit ClipboardGuard(bool opened) noexcept : m_opened(opened) {}
+    ~ClipboardGuard() { if (m_opened) CloseClipboard(); }
+    ClipboardGuard(const ClipboardGuard&) = delete;
+    ClipboardGuard& operator=(const ClipboardGuard&) = delete;
+    [[nodiscard]] bool IsOpen() const noexcept { return m_opened; }
+private:
+    bool m_opened;
+};
+#endif
+
 } // anonymous namespace
 
 // ============================================================================
@@ -305,7 +359,7 @@ public:
     void UnregisterCallbacks();
 
     // Statistics
-    DLPStatistics GetStatistics() const;
+    DLPStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
 
     bool SelfTest();
@@ -326,6 +380,10 @@ private:
     void NotifyError(const std::string& message, int code);
     std::string GetClipboardText();
     std::string NormalizeNumber(const std::string& str);
+
+    // Internal clipboard management (caller must hold or manage m_mutex)
+    bool StartClipboardMonitoringInternal();
+    void StopClipboardMonitoringInternal(std::unique_lock<std::shared_mutex>& lock);
 
     // Member variables
     mutable std::shared_mutex m_mutex;
@@ -457,7 +515,7 @@ bool DataLeakProtectionImpl::Initialize(const DLPConfiguration& config) {
 
         // Start clipboard monitoring if enabled
         if (m_config.monitorClipboard) {
-            StartClipboardMonitoring();
+            StartClipboardMonitoringInternal();
         }
 
         m_initialized.store(true, std::memory_order_release);
@@ -489,23 +547,17 @@ void DataLeakProtectionImpl::Shutdown() {
     try {
         m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
-        // Stop clipboard monitoring
-        if (m_clipboardMonitoring.load(std::memory_order_acquire)) {
-            m_clipboardMonitoring.store(false, std::memory_order_release);
-            m_clipboardCV.notify_all();
-
-            if (m_clipboardThread && m_clipboardThread->joinable()) {
-                lock.unlock();  // Release lock before joining
-                m_clipboardThread->join();
-                lock.lock();
-            }
-            m_clipboardThread.reset();
-        }
+        // Stop clipboard monitoring (releases lock internally for thread join)
+        StopClipboardMonitoringInternal(lock);
 
         // Clear state
         m_patterns.clear();
         m_policies.clear();
-        m_incidents.clear();
+
+        {
+            std::lock_guard incidentLock(m_incidentMutex);
+            m_incidents.clear();
+        }
 
         // Clear callbacks
         UnregisterCallbacks();
@@ -530,8 +582,49 @@ bool DataLeakProtectionImpl::UpdateConfiguration(const DLPConfiguration& config)
         return false;
     }
 
+    bool wasClipboardEnabled = m_config.monitorClipboard;
     m_config = config;
-    Logger::Info("[DataLeakProtection] Configuration updated");
+
+    // Rebuild patterns: start with built-in, then add custom
+    m_patterns = CreateBuiltInPatterns();
+    for (auto& pattern : m_patterns) {
+        try {
+            pattern.compiledRegex = std::regex(
+                pattern.regexPattern,
+                std::regex_constants::ECMAScript | std::regex_constants::optimize
+            );
+        } catch (const std::regex_error& e) {
+            Logger::Error("[DataLeakProtection] Failed to compile pattern {}: {}",
+                pattern.patternId, e.what());
+            pattern.enabled = false;
+        }
+    }
+
+    for (auto& custom : m_config.customPatterns) {
+        try {
+            custom.compiledRegex = std::regex(
+                custom.regexPattern,
+                std::regex_constants::ECMAScript | std::regex_constants::optimize
+            );
+            m_patterns.push_back(custom);
+        } catch (const std::regex_error& e) {
+            Logger::Error("[DataLeakProtection] Failed to compile custom pattern {}: {}",
+                custom.patternId, e.what());
+        }
+    }
+
+    // Reload policies
+    m_policies = m_config.policies;
+
+    // Manage clipboard monitoring state change
+    if (m_config.monitorClipboard && !wasClipboardEnabled) {
+        StartClipboardMonitoringInternal();
+    } else if (!m_config.monitorClipboard && wasClipboardEnabled) {
+        StopClipboardMonitoringInternal(lock);
+    }
+
+    Logger::Info("[DataLeakProtection] Configuration updated ({} patterns, {} policies)",
+        m_patterns.size(), m_policies.size());
     return true;
 }
 
@@ -550,6 +643,10 @@ DLPScanResult DataLeakProtectionImpl::ScanBuffer(const std::vector<uint8_t>& buf
         return {};
     }
 
+    if (!m_config.enabled) {
+        return {};
+    }
+
     if (buffer.empty() || buffer.size() > m_config.maxContentSize) {
         return {};
     }
@@ -562,6 +659,10 @@ DLPScanResult DataLeakProtectionImpl::ScanBuffer(const std::vector<uint8_t>& buf
 DLPScanResult DataLeakProtectionImpl::ScanString(const std::string& content) {
     if (!m_initialized.load(std::memory_order_acquire)) {
         Logger::Error("[DataLeakProtection] Not initialized");
+        return {};
+    }
+
+    if (!m_config.enabled) {
         return {};
     }
 
@@ -587,24 +688,15 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
         return {};
     }
 
+    if (!m_config.enabled) {
+        return {};
+    }
+
     try {
-        // Check if file exists
-        if (!fs::exists(filePath)) {
-            Logger::Warn("[DataLeakProtection] File not found: {}", filePath.string());
-            return {};
-        }
-
-        // Check file size
-        auto fileSize = fs::file_size(filePath);
-        if (fileSize > m_config.maxContentSize) {
-            Logger::Warn("[DataLeakProtection] File too large: {} bytes", fileSize);
-            return {};
-        }
-
-        // Check excluded extensions
+        // Check excluded extensions first (no filesystem access needed)
         std::string ext = filePath.extension().string();
         for (const auto& excluded : m_config.excludedExtensions) {
-            if (StringUtils::EqualsIgnoreCase(ext, excluded)) {
+            if (NarrowIEquals(ext, excluded)) {
                 return {};
             }
         }
@@ -617,26 +709,54 @@ DLPScanResult DataLeakProtectionImpl::ScanFile(const fs::path& filePath) {
             }
         }
 
-        // Read file content
-        std::ifstream file(filePath, std::ios::binary);
+        // Open file first to avoid TOCTOU race (exists + size + open)
+        std::ifstream file(filePath, std::ios::binary | std::ios::ate);
         if (!file) {
-            Logger::Error("[DataLeakProtection] Cannot open file: {}", filePath.string());
+            Logger::Warn("[DataLeakProtection] Cannot open file for DLP scanning");
             return {};
         }
 
+        // Get size from open handle (no TOCTOU)
+        auto tellPos = file.tellg();
+        if (tellPos < 0) {
+            Logger::Error("[DataLeakProtection] Failed to determine file size");
+            return {};
+        }
+        auto fileSize = static_cast<size_t>(tellPos);
+        if (fileSize == 0 || fileSize > m_config.maxContentSize) {
+            if (fileSize > m_config.maxContentSize) {
+                Logger::Warn("[DataLeakProtection] File too large for DLP scan: {} bytes", fileSize);
+            }
+            return {};
+        }
+
+        file.seekg(0, std::ios::beg);
         std::vector<uint8_t> buffer(fileSize);
-        file.read(reinterpret_cast<char*>(buffer.data()), fileSize);
+        if (!file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(fileSize))) {
+            Logger::Error("[DataLeakProtection] Failed to read file content");
+            return {};
+        }
 
-        auto result = ScanBuffer(buffer);
+        // Scan directly via PerformScan to avoid double-counting in ScanBuffer→ScanString chain
+        std::string content(buffer.begin(), buffer.end());
+        auto result = PerformScan(content);
+
         m_stats.totalScans++;
+        m_stats.bytesScanned += content.size();
 
-        Logger::Info("[DataLeakProtection] Scanned file: {} ({} bytes, {} matches)",
-            filePath.string(), fileSize, result.totalMatches);
+        if (result.hasSensitiveData) {
+            m_stats.sensitiveDataFound++;
+        }
+
+        NotifyScanResult(result);
+
+        Logger::Info("[DataLeakProtection] Scanned file ({} bytes, {} matches)",
+            fileSize, result.totalMatches);
 
         return result;
 
     } catch (const std::exception& e) {
-        Logger::Error("[DataLeakProtection] ScanFile failed: {}", e.what());
+        Logger::Error("[DataLeakProtection] ScanFile exception: {}", e.what());
         return {};
     }
 }
@@ -661,11 +781,11 @@ DLPScanResult DataLeakProtectionImpl::ScanClipboard() {
 }
 
 bool DataLeakProtectionImpl::HasSensitiveData(const std::string& content) {
-    if (!m_initialized.load(std::memory_order_acquire)) {
+    if (!m_initialized.load(std::memory_order_acquire) || !m_config.enabled) {
         return false;
     }
 
-    if (content.empty()) {
+    if (content.empty() || content.size() > m_config.maxContentSize) {
         return false;
     }
 
@@ -698,12 +818,18 @@ DLPScanResult DataLeakProtectionImpl::AnalyzeOutboundData(
     ChannelType channel,
     const std::string& destination) {
 
+    if (!m_initialized.load(std::memory_order_acquire)) {
+        return {};
+    }
+
     auto result = ScanBuffer(data);
 
     if (result.hasSensitiveData) {
-        // Evaluate policies
+        // Evaluate policies (only escalate, never downgrade from scan recommendation)
         DLPAction action = EvaluatePolicies(result, channel, "");
-        result.recommendedAction = action;
+        if (ActionRestrictiveness(action) > ActionRestrictiveness(result.recommendedAction)) {
+            result.recommendedAction = action;
+        }
 
         // Update channel statistics
         if (static_cast<size_t>(channel) < m_stats.byChannel.size()) {
@@ -804,7 +930,7 @@ DLPAction DataLeakProtectionImpl::EvaluatePolicies(
         if (!user.empty()) {
             bool excluded = false;
             for (const auto& excludedUser : policy.excludedUsers) {
-                if (StringUtils::EqualsIgnoreCase(user, excludedUser)) {
+                if (NarrowIEquals(user, excludedUser)) {
                     excluded = true;
                     break;
                 }
@@ -817,8 +943,8 @@ DLPAction DataLeakProtectionImpl::EvaluatePolicies(
         // Policy matched - determine action
         DLPAction policyAction = DetermineAction(scanResult, policy);
 
-        // Keep most restrictive action
-        if (static_cast<int>(policyAction) > static_cast<int>(mostRestrictiveAction)) {
+        // Keep most restrictive action using proper restrictiveness ordering
+        if (ActionRestrictiveness(policyAction) > ActionRestrictiveness(mostRestrictiveAction)) {
             mostRestrictiveAction = policyAction;
         }
 
@@ -835,7 +961,10 @@ DLPAction DataLeakProtectionImpl::EvaluatePolicies(
 
 bool DataLeakProtectionImpl::StartClipboardMonitoring() {
     std::unique_lock lock(m_mutex);
+    return StartClipboardMonitoringInternal();
+}
 
+bool DataLeakProtectionImpl::StartClipboardMonitoringInternal() {
     if (m_clipboardMonitoring.load(std::memory_order_acquire)) {
         Logger::Warn("[DataLeakProtection] Clipboard monitoring already active");
         return true;
@@ -877,12 +1006,52 @@ void DataLeakProtectionImpl::StopClipboardMonitoring() {
     }
 }
 
+void DataLeakProtectionImpl::StopClipboardMonitoringInternal(
+    std::unique_lock<std::shared_mutex>& lock) {
+    if (!m_clipboardMonitoring.load(std::memory_order_acquire)) {
+        return;
+    }
+
+    m_clipboardMonitoring.store(false, std::memory_order_release);
+    m_clipboardCV.notify_all();
+
+    if (m_clipboardThread && m_clipboardThread->joinable()) {
+        lock.unlock();  // Release m_mutex so clipboard thread can finish its scans
+        try {
+            m_clipboardThread->join();
+        } catch (const std::exception& e) {
+            Logger::Error("[DataLeakProtection] Failed to join clipboard thread: {}", e.what());
+        }
+        lock.lock();
+    }
+    m_clipboardThread.reset();
+}
+
 // ============================================================================
 // PATTERNS & POLICIES
 // ============================================================================
 
 bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
     std::unique_lock lock(m_mutex);
+
+    if (pattern.patternId.empty() || pattern.regexPattern.empty()) {
+        Logger::Error("[DataLeakProtection] Invalid pattern: empty ID or regex");
+        return false;
+    }
+
+    if (m_patterns.size() >= DLPConstants::MAX_CUSTOM_PATTERNS) {
+        Logger::Error("[DataLeakProtection] Pattern limit reached ({})",
+            DLPConstants::MAX_CUSTOM_PATTERNS);
+        return false;
+    }
+
+    // Check for duplicate pattern ID
+    for (const auto& existing : m_patterns) {
+        if (existing.patternId == pattern.patternId) {
+            Logger::Error("[DataLeakProtection] Duplicate pattern ID: {}", pattern.patternId);
+            return false;
+        }
+    }
 
     try {
         PIIPattern newPattern = pattern;
@@ -893,7 +1062,7 @@ bool DataLeakProtectionImpl::AddPattern(const PIIPattern& pattern) {
             std::regex_constants::ECMAScript | std::regex_constants::optimize
         );
 
-        m_patterns.push_back(newPattern);
+        m_patterns.push_back(std::move(newPattern));
 
         Logger::Info("[DataLeakProtection] Added pattern: {}", pattern.patternId);
         return true;
@@ -927,6 +1096,26 @@ std::vector<PIIPattern> DataLeakProtectionImpl::GetPatterns() const {
 
 bool DataLeakProtectionImpl::AddPolicy(const DLPPolicy& policy) {
     std::unique_lock lock(m_mutex);
+
+    if (policy.policyId.empty()) {
+        Logger::Error("[DataLeakProtection] Invalid policy: empty ID");
+        return false;
+    }
+
+    if (m_policies.size() >= DLPConstants::MAX_POLICIES) {
+        Logger::Error("[DataLeakProtection] Policy limit reached ({})",
+            DLPConstants::MAX_POLICIES);
+        return false;
+    }
+
+    // Check for duplicate policy ID
+    for (const auto& existing : m_policies) {
+        if (existing.policyId == policy.policyId) {
+            Logger::Error("[DataLeakProtection] Duplicate policy ID: {}", policy.policyId);
+            return false;
+        }
+    }
+
     m_policies.push_back(policy);
     Logger::Info("[DataLeakProtection] Added policy: {}", policy.policyId);
     return true;
@@ -1094,17 +1283,26 @@ std::optional<DLPIncident> DataLeakProtectionImpl::GetIncident(const std::string
 }
 
 void DataLeakProtectionImpl::ReportIncident(const DLPIncident& incident) {
-    std::lock_guard lock(m_incidentMutex);
+    // Sanitize: strip raw sensitive values before persisting in memory
+    DLPIncident sanitized = incident;
+    for (auto& match : sanitized.scanResult.matches) {
+        match.fullValue.clear();
+    }
 
-    m_incidents.push_front(incident);
+    {
+        std::lock_guard lock(m_incidentMutex);
 
-    // Limit history size
-    if (m_incidents.size() > MAX_INCIDENT_HISTORY) {
-        m_incidents.pop_back();
+        m_incidents.push_front(std::move(sanitized));
+
+        // Limit history size
+        while (m_incidents.size() > MAX_INCIDENT_HISTORY) {
+            m_incidents.pop_back();
+        }
     }
 
     m_stats.incidentsLogged++;
 
+    // Notify outside m_incidentMutex to prevent deadlock if callback re-enters
     NotifyIncident(incident);
 
     Logger::Warn("[DataLeakProtection] Incident reported: {} (Policy: {}, Action: {})",
@@ -1153,8 +1351,31 @@ void DataLeakProtectionImpl::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-DLPStatistics DataLeakProtectionImpl::GetStatistics() const {
-    return m_stats;
+DLPStatisticsSnapshot DataLeakProtectionImpl::GetStatistics() const {
+    DLPStatisticsSnapshot snapshot;
+    snapshot.totalScans = m_stats.totalScans.load(std::memory_order_acquire);
+    snapshot.sensitiveDataFound = m_stats.sensitiveDataFound.load(std::memory_order_acquire);
+    snapshot.operationsBlocked = m_stats.operationsBlocked.load(std::memory_order_acquire);
+    snapshot.operationsAllowed = m_stats.operationsAllowed.load(std::memory_order_acquire);
+    snapshot.incidentsLogged = m_stats.incidentsLogged.load(std::memory_order_acquire);
+    snapshot.bytesScanned = m_stats.bytesScanned.load(std::memory_order_acquire);
+    snapshot.clipboardBlocks = m_stats.clipboardBlocks.load(std::memory_order_acquire);
+    snapshot.networkBlocks = m_stats.networkBlocks.load(std::memory_order_acquire);
+    snapshot.fileBlocks = m_stats.fileBlocks.load(std::memory_order_acquire);
+    snapshot.creditCardsDetected = m_stats.creditCardsDetected.load(std::memory_order_acquire);
+    snapshot.ssnDetected = m_stats.ssnDetected.load(std::memory_order_acquire);
+    snapshot.piiDetected = m_stats.piiDetected.load(std::memory_order_acquire);
+    for (size_t i = 0; i < m_stats.byCategory.size(); ++i) {
+        snapshot.byCategory[i] = m_stats.byCategory[i].load(std::memory_order_acquire);
+    }
+    for (size_t i = 0; i < m_stats.byChannel.size(); ++i) {
+        snapshot.byChannel[i] = m_stats.byChannel[i].load(std::memory_order_acquire);
+    }
+    for (size_t i = 0; i < m_stats.bySeverity.size(); ++i) {
+        snapshot.bySeverity[i] = m_stats.bySeverity[i].load(std::memory_order_acquire);
+    }
+    snapshot.startTime = m_stats.startTime;
+    return snapshot;
 }
 
 void DataLeakProtectionImpl::ResetStatistics() {
@@ -1242,9 +1463,10 @@ DLPScanResult DataLeakProtectionImpl::PerformScan(const std::string& content) {
             // Add matches
             result.matches.insert(result.matches.end(), matches.begin(), matches.end());
 
-            // Update statistics
-            if (static_cast<size_t>(pattern.category) < m_stats.byCategory.size()) {
-                m_stats.byCategory[static_cast<size_t>(pattern.category)] += matches.size();
+            // Update statistics (use bit index, not raw bitmask value)
+            uint32_t catIdx = BitIndex(static_cast<uint32_t>(pattern.category));
+            if (catIdx < m_stats.byCategory.size()) {
+                m_stats.byCategory[catIdx] += matches.size();
             }
 
             if (pattern.category == DataCategory::CreditCard) {
@@ -1295,7 +1517,8 @@ std::vector<SensitiveDataMatch> DataLeakProtectionImpl::ScanWithPattern(
         std::sregex_iterator it(content.begin(), content.end(), *pattern.compiledRegex);
         std::sregex_iterator end;
 
-        for (; it != end; ++it) {
+        size_t matchLimit = DLPConstants::MAX_MATCHES_PER_PATTERN;
+        for (; it != end && matchLimit > 0; ++it, --matchLimit) {
             const std::smatch& match = *it;
             std::string value = match.str();
 
@@ -1397,10 +1620,12 @@ DLPAction DataLeakProtectionImpl::DetermineAction(
     // Policy specifies action
     DLPAction action = policy.action;
 
-    // Override based on risk score
-    if (result.riskScore >= 80 && action < DLPAction::Block) {
+    // Override based on risk score (only escalate, never downgrade)
+    if (result.riskScore >= 80 &&
+        ActionRestrictiveness(action) < ActionRestrictiveness(DLPAction::Block)) {
         action = DLPAction::Block;
-    } else if (result.riskScore >= 60 && action < DLPAction::Justify) {
+    } else if (result.riskScore >= 60 &&
+               ActionRestrictiveness(action) < ActionRestrictiveness(DLPAction::Justify)) {
         action = DLPAction::Justify;
     }
 
@@ -1466,27 +1691,32 @@ void DataLeakProtectionImpl::NotifyError(const std::string& message, int code) {
 
 std::string DataLeakProtectionImpl::GetClipboardText() {
 #ifdef _WIN32
-    if (!OpenClipboard(nullptr)) {
+    ClipboardGuard guard(OpenClipboard(nullptr) != FALSE);
+    if (!guard.IsOpen()) {
         return "";
     }
 
     HANDLE hData = GetClipboardData(CF_UNICODETEXT);
     if (!hData) {
-        CloseClipboard();
         return "";
     }
 
     wchar_t* pszText = static_cast<wchar_t*>(GlobalLock(hData));
     if (!pszText) {
-        CloseClipboard();
         return "";
     }
 
-    std::string text = StringUtils::WStringToString(pszText);
+    std::string text;
+    try {
+        // Cap clipboard read length to prevent memory exhaustion
+        size_t len = wcsnlen(pszText, DLPConstants::MAX_CONTENT_SCAN_SIZE);
+        text = StringUtils::WStringToString(std::wstring_view(pszText, len));
+    } catch (...) {
+        GlobalUnlock(hData);
+        throw;
+    }
 
     GlobalUnlock(hData);
-    CloseClipboard();
-
     return text;
 #else
     return "";
@@ -1758,7 +1988,7 @@ void DataLeakProtection::UnregisterCallbacks() {
     m_impl->UnregisterCallbacks();
 }
 
-DLPStatistics DataLeakProtection::GetStatistics() const {
+DLPStatisticsSnapshot DataLeakProtection::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1829,6 +2059,28 @@ std::string DLPStatistics::ToJson() const {
     return j.dump();
 }
 
+std::string DLPStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["totalScans"] = totalScans;
+    j["sensitiveDataFound"] = sensitiveDataFound;
+    j["operationsBlocked"] = operationsBlocked;
+    j["operationsAllowed"] = operationsAllowed;
+    j["incidentsLogged"] = incidentsLogged;
+    j["bytesScanned"] = bytesScanned;
+    j["clipboardBlocks"] = clipboardBlocks;
+    j["networkBlocks"] = networkBlocks;
+    j["fileBlocks"] = fileBlocks;
+    j["creditCardsDetected"] = creditCardsDetected;
+    j["ssnDetected"] = ssnDetected;
+    j["piiDetected"] = piiDetected;
+
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        Clock::now() - startTime).count();
+    j["uptimeSeconds"] = elapsed;
+
+    return j.dump();
+}
+
 std::string PIIPattern::ToJson() const {
     nlohmann::json j;
     j["patternId"] = patternId;
@@ -1855,8 +2107,7 @@ std::string SensitiveDataMatch::ToJson() const {
 
 bool DLPScanResult::ShouldBlock() const noexcept {
     return (recommendedAction == DLPAction::Block ||
-            recommendedAction == DLPAction::Quarantine ||
-            riskScore >= 70);
+            recommendedAction == DLPAction::Quarantine);
 }
 
 std::string DLPScanResult::ToJson() const {
