@@ -753,7 +753,9 @@ public:
     std::unordered_map<TabKey, std::vector<WebWorkerInfo>, TabKeyHasher> m_workers;
     mutable std::shared_mutex m_workersMutex;
 
-    /// @brief Dynamically discovered mining indicator domains (populated at runtime by threat intel)
+    /// @brief Reserved for dynamically discovered mining indicator domains from external threat intel feeds.
+    /// Currently unpopulated — ThreatIntelManager results route through BlockDomainInternal instead.
+    /// Retained for ABI stability; will be wired when the threat intel push-subscription channel ships.
     std::unordered_set<std::string> m_dynamicIndicators;
 
     std::vector<MinerFoundCallback> m_minerFoundCallbacks;
@@ -1022,12 +1024,18 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
     const auto startTime = Clock::now();
     BrowserMinerDetectionResult result;
 
+    // Ensure analysisDuration is always set regardless of which return path is taken
+    auto finalizeDuration = [&]() noexcept {
+        result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - startTime);
+    };
+
     try {
         result.detectionId = GenerateDetectionId();
         result.detectionTime = std::chrono::system_clock::now();
         result.scriptInfo = SanitizeScriptInfo(scriptInfo, scriptSource.size(), ScriptType::JavaScript);
         if (!IsOperational()) {
             AppendEvidence(result.evidence, "Detector is not initialized");
+            finalizeDuration();
             return result;
         }
 
@@ -1035,12 +1043,14 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
 
         if (!IsOperational()) {
             AppendEvidence(result.evidence, "Detector stopped before analysis could begin");
+            finalizeDuration();
             return result;
         }
 
         const BrowserMinerDetectorConfiguration config = SnapshotConfiguration();
         if (!config.enableJSScanning) {
             AppendEvidence(result.evidence, "JavaScript scanning disabled by configuration");
+            finalizeDuration();
             return result;
         }
 
@@ -1049,12 +1059,14 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
         if (scriptSource.size() > config.maxScriptScanSize) {
             AppendEvidence(result.evidence, "Script exceeds configured scan limit");
             SS_LOG_WARN(kLogCategory, L"Skipped oversized browser script (%zu bytes)", scriptSource.size());
+            finalizeDuration();
             return result;
         }
 
         if (!result.scriptInfo.domain.empty() && IsDomainWhitelistedInternal(result.scriptInfo.domain)) {
             result.isWhitelisted = true;
             AppendEvidence(result.evidence, "Domain is explicitly whitelisted");
+            finalizeDuration();
             return result;
         }
 
@@ -1085,7 +1097,6 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
 
         if (!result.scriptInfo.domain.empty() && config.enableDomainBlocking && IsDomainBlockedInternal(result.scriptInfo.domain)) {
             addMethod(BrowserDetectionMethod::DomainBlacklist, "Domain matches browser-miner blacklist");
-            m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
         }
 
         const auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
@@ -1152,6 +1163,7 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
         if (result.isMinerDetected) {
             if (!IsOperational()) {
                 AppendEvidence(result.evidence, "Detector stopped before result publication");
+                finalizeDuration();
                 return result;
             }
 
@@ -1185,7 +1197,7 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeScriptInternal(
             L"Error");
     }
 
-    result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - startTime);
+    finalizeDuration();
     return result;
 }
 
@@ -1196,12 +1208,18 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
     const auto startTime = Clock::now();
     BrowserMinerDetectionResult result;
 
+    // Ensure analysisDuration is always set regardless of which return path is taken
+    auto finalizeDuration = [&]() noexcept {
+        result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - startTime);
+    };
+
     try {
         result.detectionId = GenerateDetectionId();
         result.detectionTime = std::chrono::system_clock::now();
         result.scriptInfo = SanitizeScriptInfo(scriptInfo, wasmBinary.size(), ScriptType::WebAssembly);
         if (!IsOperational()) {
             AppendEvidence(result.evidence, "Detector is not initialized");
+            finalizeDuration();
             return result;
         }
 
@@ -1209,6 +1227,7 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
 
         if (!IsOperational()) {
             AppendEvidence(result.evidence, "Detector stopped before analysis could begin");
+            finalizeDuration();
             return result;
         }
 
@@ -1217,23 +1236,27 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
 
         if (wasmBinary.size() > config.maxWASMSize) {
             AppendEvidence(result.evidence, "WASM module exceeds configured scan limit");
+            finalizeDuration();
             return result;
         }
 
         if (!result.scriptInfo.domain.empty() && IsDomainWhitelistedInternal(result.scriptInfo.domain)) {
             result.isWhitelisted = true;
             AppendEvidence(result.evidence, "Domain is explicitly whitelisted");
+            finalizeDuration();
             return result;
         }
 
         if (!config.enableWASMScanning) {
             AppendEvidence(result.evidence, "WASM scanning disabled by configuration");
+            finalizeDuration();
             return result;
         }
 
         result.wasmAnalysis = AnalyzeWASMBinary(wasmBinary);
         if (!result.wasmAnalysis->isValidWASM) {
             AppendEvidence(result.evidence, "Module is not valid WebAssembly");
+            finalizeDuration();
             return result;
         }
 
@@ -1291,6 +1314,7 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
         if (result.isMinerDetected) {
             if (!IsOperational()) {
                 AppendEvidence(result.evidence, "Detector stopped before result publication");
+                finalizeDuration();
                 return result;
             }
 
@@ -1323,7 +1347,7 @@ BrowserMinerDetectionResult BrowserMinerDetectorImpl::AnalyzeWASMInternal(
             L"Error");
     }
 
-    result.analysisDuration = std::chrono::duration_cast<std::chrono::milliseconds>(Clock::now() - startTime);
+    finalizeDuration();
     return result;
 }
 
@@ -1928,6 +1952,12 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
         result.suspiciousPatterns.emplace_back("Export names suggest mining functionality");
     }
     
+    // HIGH-1: Suspicious imports contribute to score alongside exports
+    if (!result.suspiciousImports.empty()) {
+        miningScore += 10U;
+        result.suspiciousPatterns.emplace_back("Import names suggest mining-related module dependencies");
+    }
+    
     if (result.functionCount > 100) {
         miningScore += 5U;
         result.suspiciousPatterns.emplace_back("High function count typical of crypto implementations");
@@ -1937,8 +1967,41 @@ WASMAnalysisResult BrowserMinerDetectorImpl::AnalyzeWASMBinary(
     result.isMiningModule = miningScore >= 50U;
 
     if (result.isMiningModule) {
-        result.algorithm = result.hasLargeMemory ? BrowserMiningAlgorithm::RandomX
-                                                 : BrowserMiningAlgorithm::CryptoNight;
+        // Attribute algorithm from export/import name patterns before falling back to memory heuristics
+        auto containsAny = [](const std::vector<std::string>& names, std::initializer_list<std::string_view> patterns) {
+            for (const auto& name : names) {
+                const std::string lower = LowerAsciiCopy(name);
+                for (std::string_view pattern : patterns) {
+                    if (lower.find(pattern) != std::string::npos) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        };
+
+        std::vector<std::string> allNames;
+        allNames.reserve(result.suspiciousExports.size() + result.suspiciousImports.size());
+        allNames.insert(allNames.end(), result.suspiciousExports.begin(), result.suspiciousExports.end());
+        allNames.insert(allNames.end(), result.suspiciousImports.begin(), result.suspiciousImports.end());
+
+        if (containsAny(allNames, {"randomx"})) {
+            result.algorithm = BrowserMiningAlgorithm::RandomX;
+        } else if (containsAny(allNames, {"cryptonight"})) {
+            result.algorithm = (result.memoryPages >= 64)
+                ? BrowserMiningAlgorithm::CryptoNightR
+                : BrowserMiningAlgorithm::CryptoNight;
+        } else if (containsAny(allNames, {"argon2"})) {
+            result.algorithm = BrowserMiningAlgorithm::Argon2;
+        } else if (containsAny(allNames, {"sha256", "ethash", "keccak256"})) {
+            result.algorithm = BrowserMiningAlgorithm::Unknown;
+        } else if (result.hasLargeMemory && result.hasCryptoInstructions) {
+            result.algorithm = BrowserMiningAlgorithm::RandomX;
+        } else if (containsAny(allNames, {"aes"}) && result.hasCryptoInstructions) {
+            result.algorithm = BrowserMiningAlgorithm::CryptoNight;
+        } else {
+            result.algorithm = BrowserMiningAlgorithm::Unknown;
+        }
     }
 
     return result;
@@ -2079,7 +2142,7 @@ bool BrowserMinerDetectorImpl::IsDomainBlockedInternal(
     };
 
     return matches(m_builtinBlockedDomains) || matches(m_customBlockedDomains) || 
-           matches(m_manualBlockedDomains) || matches(m_dynamicIndicators);
+           matches(m_manualBlockedDomains);
 }
 
 bool BrowserMinerDetectorImpl::IsDomainWhitelistedInternal(
@@ -2107,6 +2170,14 @@ void BrowserMinerDetectorImpl::BlockDomainInternal(
     }
 
     std::unique_lock lock(m_domainsMutex);
+
+    // Only count as newly blocked if the domain is not already present in any set
+    if (m_builtinBlockedDomains.contains(normalized) ||
+        m_customBlockedDomains.contains(normalized) ||
+        m_manualBlockedDomains.contains(normalized)) {
+        return;
+    }
+
     const size_t totalCount = m_builtinBlockedDomains.size() +
                               m_customBlockedDomains.size() +
                               m_manualBlockedDomains.size();
@@ -2116,6 +2187,7 @@ void BrowserMinerDetectorImpl::BlockDomainInternal(
     }
 
     m_manualBlockedDomains.insert(normalized);
+    m_statistics.domainsBlocked.fetch_add(1, std::memory_order_relaxed);
 }
 
 void BrowserMinerDetectorImpl::LoadBuiltinBlacklist() {
@@ -2579,6 +2651,11 @@ std::vector<WebWorkerInfo> BrowserMinerDetector::GetWorkers(
     return it != impl->m_workers.end() ? it->second : std::vector<WebWorkerInfo>{};
 }
 
+// Worker termination requires browser extension IPC channel — not available in standalone detector mode.
+// m_workers is intentionally unpopulated and config.enableWorkerMonitoring is force-disabled during
+// initialization because PhantomHome operates without a browser-side enforcement backend. When a
+// browser extension provides an IPC channel for worker lifecycle control, this method will issue
+// termination commands over that channel and increment m_statistics.workersTerminated accordingly.
 size_t BrowserMinerDetector::TerminateMiningWorkers(uint32_t browserPid, uint64_t tabId) {
     const auto impl = GetImplSnapshot();
     if (!impl) {
@@ -2842,8 +2919,10 @@ BrowserMinerStatistics& BrowserMinerStatistics::operator=(const BrowserMinerStat
     scriptsScanned.store(other.scriptsScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
     wasmModulesScanned.store(other.wasmModulesScanned.load(std::memory_order_relaxed), std::memory_order_relaxed);
     minersDetected.store(other.minersDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    // minersBlocked: no code path currently blocks miners — counter remains at zero
     minersBlocked.store(other.minersBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
     domainsBlocked.store(other.domainsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+    // workersTerminated: reserved for browser extension IPC integration
     workersTerminated.store(other.workersTerminated.load(std::memory_order_relaxed), std::memory_order_relaxed);
     tabsFlagged.store(other.tabsFlagged.load(std::memory_order_relaxed), std::memory_order_relaxed);
 
