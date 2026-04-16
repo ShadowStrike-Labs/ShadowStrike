@@ -64,7 +64,8 @@ enum class ModuleStatus : uint8_t {
     Paused          = 4,
     Stopping        = 5,
     Stopped         = 6,
-    Error           = 7
+    Error           = 7,
+    Degraded        = 8     ///< Running with reduced capability (some sub-detectors failed)
 };
 
 /**
