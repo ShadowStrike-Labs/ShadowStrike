@@ -131,6 +131,7 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/NetworkUtils.hpp"
 #include "../Whitelist/WhiteListStore.hpp"
+#include "Common.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -238,19 +239,7 @@ enum class GeofenceShape : uint8_t {
     Polygon         = 2     ///< Custom polygon
 };
 
-/**
- * @brief Module status
- */
-enum class ModuleStatus : uint8_t {
-    Uninitialized   = 0,
-    Initializing    = 1,
-    Running         = 2,
-    Monitoring      = 3,
-    Paused          = 4,
-    Stopping        = 5,
-    Stopped         = 6,
-    Error           = 7
-};
+// ModuleStatus is defined in Common.hpp (shared across Privacy modules)
 
 // ============================================================================
 // STRUCTURES
@@ -449,7 +438,26 @@ struct LocationWhitelistEntry {
 };
 
 /**
- * @brief Statistics
+ * @brief Thread-safe snapshot of location statistics (copyable/returnable by value)
+ */
+struct LocationStatisticsSnapshot {
+    uint64_t totalAccessAttempts = 0;
+    uint64_t accessAllowed = 0;
+    uint64_t accessBlocked = 0;
+    uint64_t accessMocked = 0;
+    uint64_t whitelistHits = 0;
+    uint64_t geofenceTriggered = 0;
+    uint64_t ipGeolocationBlocked = 0;
+    uint64_t wifiPositioningBlocked = 0;
+    uint64_t backgroundAccessBlocked = 0;
+    std::array<uint64_t, 8> bySource{};
+    int64_t uptimeSeconds = 0;
+
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics (internal, non-copyable due to atomics)
  */
 struct LocationStatistics {
     std::atomic<uint64_t> totalAccessAttempts{0};
@@ -466,6 +474,7 @@ struct LocationStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+    [[nodiscard]] LocationStatisticsSnapshot Snapshot() const noexcept;
 };
 
 /**
@@ -698,7 +707,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] LocationStatistics GetStatistics() const;
+    [[nodiscard]] LocationStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
