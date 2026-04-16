@@ -28,8 +28,8 @@
  * - Rule-based policy evaluation with priority ordering
  * - Time-based and user-based conditional rules
  * - Audit logging for compliance
- * - Emergency override capabilities
- * - Thread-safe concurrent access
+ * - Emergency override capabilities with auto-expiry
+ * - Thread-safe concurrent access with separate audit mutex
  *
  * @author ShadowStrike Security Team
  * @version 3.0.0
@@ -43,17 +43,24 @@
 #include "pch.h"
 #include "DeviceControlManager.hpp"
 #include "USBDeviceMonitor.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/CryptoUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <algorithm>
 #include <sstream>
 #include <iomanip>
 #include <regex>
 #include <random>
+#include <lmaccess.h>
+#include <lmapibuf.h>
+#include <sddl.h>
+
+#pragma comment(lib, "netapi32.lib")
+#pragma comment(lib, "advapi32.lib")
 
 namespace ShadowStrike {
 namespace USB {
@@ -62,13 +69,43 @@ namespace USB {
 // LOGGING CATEGORY
 // ============================================================================
 
-static constexpr const wchar_t* LOG_CATEGORY = L"DeviceControlManager";
+static constexpr const wchar_t* LOG_CATEGORY = L"DevCtrlMgr";
+
+// ============================================================================
+// EMERGENCY OVERRIDE CONSTANTS
+// ============================================================================
+
+static constexpr std::chrono::hours EMERGENCY_OVERRIDE_DURATION{4};
+
+// ============================================================================
+// REGEX SAFETY CONSTANTS
+// ============================================================================
+
+static constexpr size_t MAX_REGEX_PATTERN_LENGTH = 256;
+static constexpr size_t MAX_REGEX_INPUT_LENGTH = 1024;
 
 // ============================================================================
 // STATIC MEMBER INITIALIZATION
 // ============================================================================
 
 std::atomic<bool> DeviceControlManager::s_instanceCreated{false};
+
+// ============================================================================
+// CONSTANT-TIME COMPARISON (C5 FIX)
+// ============================================================================
+
+[[nodiscard]] static bool ConstantTimeCompare(const std::string& a, const std::string& b) noexcept {
+    if (a.size() != b.size()) {
+        return false;
+    }
+    
+    uint8_t result = 0;
+    for (size_t i = 0; i < a.size(); ++i) {
+        result |= static_cast<uint8_t>(a[i] ^ b[i]);
+    }
+    
+    return result == 0;
+}
 
 // ============================================================================
 // IMPLEMENTATION CLASS (PIMPL)
@@ -92,18 +129,18 @@ public:
     [[nodiscard]] bool Initialize(const DeviceControlConfiguration& config) {
         std::unique_lock lock(m_mutex);
 
-        if (m_status != ModuleStatus::Uninitialized &&
-            m_status != ModuleStatus::Stopped) {
+        if (m_status != DCModuleStatus::Uninitialized &&
+            m_status != DCModuleStatus::Stopped) {
             SS_LOG_WARN(LOG_CATEGORY, L"Already initialized or running");
             return false;
         }
 
-        m_status = ModuleStatus::Initializing;
+        m_status = DCModuleStatus::Initializing;
 
         // Validate configuration
         if (!config.IsValid()) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Invalid configuration provided");
-            m_status = ModuleStatus::Error;
+            m_status = DCModuleStatus::Error;
             return false;
         }
 
@@ -115,7 +152,7 @@ public:
         m_nextAuditEntryId = 1;
         m_nextRuleId = 1;
 
-        m_status = ModuleStatus::Running;
+        m_status = DCModuleStatus::Running;
 
         SS_LOG_INFO(LOG_CATEGORY, L"DeviceControlManager initialized successfully");
         SS_LOG_INFO(LOG_CATEGORY, L"  Default action: %hs",
@@ -129,12 +166,12 @@ public:
     void Shutdown() {
         std::unique_lock lock(m_mutex);
 
-        if (m_status == ModuleStatus::Uninitialized ||
-            m_status == ModuleStatus::Stopped) {
+        if (m_status == DCModuleStatus::Uninitialized ||
+            m_status == DCModuleStatus::Stopped) {
             return;
         }
 
-        m_status = ModuleStatus::Stopping;
+        m_status = DCModuleStatus::Stopping;
 
         // Clear callbacks
         m_evaluationCallbacks.clear();
@@ -145,17 +182,17 @@ public:
         // Clear rules (keep audit log for forensics)
         m_rules.clear();
 
-        m_status = ModuleStatus::Stopped;
+        m_status = DCModuleStatus::Stopped;
 
         SS_LOG_INFO(LOG_CATEGORY, L"DeviceControlManager shutdown complete");
     }
 
     [[nodiscard]] bool IsInitialized() const noexcept {
         std::shared_lock lock(m_mutex);
-        return m_status == ModuleStatus::Running;
+        return m_status == DCModuleStatus::Running;
     }
 
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept {
+    [[nodiscard]] DCModuleStatus GetStatus() const noexcept {
         std::shared_lock lock(m_mutex);
         return m_status;
     }
@@ -179,7 +216,7 @@ public:
     }
 
     // ========================================================================
-    // POLICY EVALUATION
+    // POLICY EVALUATION (C1 FIX: Audit log uses separate mutex)
     // ========================================================================
 
     [[nodiscard]] PolicyEvaluationResult EvaluateDevice(const USBDeviceInfo& device) {
@@ -188,7 +225,24 @@ public:
         PolicyEvaluationResult result;
         result.evaluationTime = std::chrono::system_clock::now();
 
-        m_stats.totalEvaluations++;
+        m_stats.totalEvaluations.fetch_add(1, std::memory_order_relaxed);
+
+        // C4 FIX: Check emergency override expiry
+        if (m_emergencyOverrideActive) {
+            auto now = std::chrono::system_clock::now();
+            if (now > m_emergencyOverrideExpiry) {
+                // Override expired - need exclusive lock to modify
+                lock.unlock();
+                std::unique_lock exLock(m_mutex);
+                if (m_emergencyOverrideActive && now > m_emergencyOverrideExpiry) {
+                    m_emergencyOverrideActive = false;
+                    SS_LOG_WARN(LOG_CATEGORY, L"Emergency override auto-expired after %d hours",
+                        static_cast<int>(EMERGENCY_OVERRIDE_DURATION.count()));
+                }
+                exLock.unlock();
+                lock.lock();
+            }
+        }
 
         // Check emergency override
         if (m_emergencyOverrideActive) {
@@ -196,10 +250,14 @@ public:
             result.accessLevel = AccessLevel::FullAccess;
             result.userMessage = "Emergency override active";
             result.matchingRuleName = "EMERGENCY_OVERRIDE";
-            m_stats.devicesAllowed++;
+            m_stats.devicesAllowed.fetch_add(1, std::memory_order_relaxed);
 
+            // C1 FIX: Log audit OUTSIDE shared_lock by copying callbacks
+            auto evalCallbacks = m_evaluationCallbacks;
+            lock.unlock();
+            
             LogAuditEntry(device, result);
-            NotifyEvaluationCallbacks(device, result);
+            NotifyCallbacks(evalCallbacks, device, result);
             return result;
         }
 
@@ -208,7 +266,7 @@ public:
             result.result = EvaluationResult::Allowed;
             result.accessLevel = AccessLevel::FullAccess;
             result.userMessage = "Device control disabled";
-            m_stats.devicesAllowed++;
+            m_stats.devicesAllowed.fetch_add(1, std::memory_order_relaxed);
             return result;
         }
 
@@ -226,14 +284,14 @@ public:
                 continue;
             }
 
-            // Check user condition
+            // Check user condition (C2 FIX implemented in AllowsCurrentUser)
             if (rule.userCondition.enabled && !rule.userCondition.AllowsCurrentUser()) {
                 continue;
             }
 
             // Check if device matches criteria
             if (rule.criteria.Matches(device)) {
-                m_stats.ruleMatches++;
+                m_stats.ruleMatches.fetch_add(1, std::memory_order_relaxed);
 
                 result.matchingRuleId = rule.ruleId;
                 result.matchingRuleName = rule.name;
@@ -246,25 +304,25 @@ public:
                     case RuleAction::Allow:
                         result.result = EvaluationResult::Allowed;
                         result.accessLevel = rule.accessLevel;
-                        m_stats.devicesAllowed++;
+                        m_stats.devicesAllowed.fetch_add(1, std::memory_order_relaxed);
                         break;
 
                     case RuleAction::AllowReadOnly:
                         result.result = EvaluationResult::AllowedReadOnly;
                         result.accessLevel = AccessLevel::ReadOnly;
-                        m_stats.devicesReadOnly++;
+                        m_stats.devicesReadOnly.fetch_add(1, std::memory_order_relaxed);
                         break;
 
                     case RuleAction::Deny:
                         result.result = EvaluationResult::Blocked;
                         result.accessLevel = AccessLevel::Blocked;
-                        m_stats.devicesBlocked++;
+                        m_stats.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
                         break;
 
                     case RuleAction::Quarantine:
                         result.result = EvaluationResult::Quarantined;
                         result.accessLevel = AccessLevel::QuarantineOnly;
-                        m_stats.devicesQuarantined++;
+                        m_stats.devicesQuarantined.fetch_add(1, std::memory_order_relaxed);
                         break;
 
                     case RuleAction::RequireApproval:
@@ -276,15 +334,19 @@ public:
                         result.result = EvaluationResult::Allowed;
                         result.accessLevel = AccessLevel::FullAccess;
                         result.auditLog = true;
-                        m_stats.devicesAllowed++;
+                        m_stats.devicesAllowed.fetch_add(1, std::memory_order_relaxed);
                         break;
                 }
+
+                // H2 FIX: Copy callbacks under lock, invoke outside lock
+                auto evalCallbacks = m_evaluationCallbacks;
+                lock.unlock();
 
                 // Log and notify
                 if (result.auditLog) {
                     LogAuditEntry(device, result);
                 }
-                NotifyEvaluationCallbacks(device, result);
+                NotifyCallbacks(evalCallbacks, device, result);
 
                 SS_LOG_INFO(LOG_CATEGORY,
                     L"Device evaluated: VID=%04X PID=%04X -> %hs (Rule: %hs)",
@@ -297,7 +359,7 @@ public:
         }
 
         // No matching rule - apply default action
-        m_stats.noRuleMatches++;
+        m_stats.noRuleMatches.fetch_add(1, std::memory_order_relaxed);
         result.result = EvaluationResult::NoMatchingRule;
         result.userMessage = "No matching policy rule";
 
@@ -305,21 +367,25 @@ public:
             case RuleAction::Allow:
                 result.result = EvaluationResult::Allowed;
                 result.accessLevel = m_config.defaultAccessLevel;
-                m_stats.devicesAllowed++;
+                m_stats.devicesAllowed.fetch_add(1, std::memory_order_relaxed);
                 break;
 
             case RuleAction::Deny:
             default:
                 result.result = EvaluationResult::Blocked;
                 result.accessLevel = AccessLevel::Blocked;
-                m_stats.devicesBlocked++;
+                m_stats.devicesBlocked.fetch_add(1, std::memory_order_relaxed);
                 break;
         }
+
+        // H2 FIX: Copy callbacks, invoke outside lock
+        auto evalCallbacks = m_evaluationCallbacks;
+        lock.unlock();
 
         if (m_config.enableAuditLog) {
             LogAuditEntry(device, result);
         }
-        NotifyEvaluationCallbacks(device, result);
+        NotifyCallbacks(evalCallbacks, device, result);
 
         SS_LOG_INFO(LOG_CATEGORY,
             L"Device evaluated (default): VID=%04X PID=%04X -> %hs",
@@ -388,8 +454,11 @@ public:
         m_rules.push_back(newRule);
         UpdateRuleStats();
 
-        // Notify callbacks
-        for (const auto& callback : m_ruleChangeCallbacks) {
+        // H2 FIX: Copy callbacks under lock, invoke outside
+        auto callbacks = m_ruleChangeCallbacks;
+        lock.unlock();
+
+        for (const auto& callback : callbacks) {
             try {
                 callback(newRule, true);
             } catch (...) {
@@ -440,8 +509,11 @@ public:
         m_rules.erase(it);
         UpdateRuleStats();
 
-        // Notify callbacks
-        for (const auto& callback : m_ruleChangeCallbacks) {
+        // H2 FIX: Copy callbacks under lock, invoke outside
+        auto callbacks = m_ruleChangeCallbacks;
+        lock.unlock();
+
+        for (const auto& callback : callbacks) {
             try {
                 callback(removedRule, false);
             } catch (...) {
@@ -644,7 +716,7 @@ public:
     }
 
     // ========================================================================
-    // EMERGENCY OVERRIDE
+    // EMERGENCY OVERRIDE (C4 & C5 FIXES)
     // ========================================================================
 
     [[nodiscard]] bool EnableEmergencyOverride(const std::string& password) {
@@ -660,27 +732,33 @@ public:
             return false;
         }
 
-        // Hash the provided password and compare
-        std::array<uint8_t, 32> hashBytes{};
-        if (!Utils::HashUtils::SHA256(
-            reinterpret_cast<const uint8_t*>(password.data()),
+        // Hash the provided password
+        std::vector<uint8_t> hashBytes;
+        if (!Utils::HashUtils::Compute(
+            Utils::HashUtils::Algorithm::SHA256,
+            password.data(),
             password.size(),
-            hashBytes.data())) {
+            hashBytes)) {
             SS_LOG_ERROR(LOG_CATEGORY, L"Failed to hash password");
             return false;
         }
 
-        std::string hashHex = Utils::HashUtils::ToHexString(hashBytes);
+        std::string hashHex = Utils::HashUtils::ToHexLower(hashBytes);
 
-        if (hashHex != m_config.emergencyOverridePasswordHash) {
+        // C5 FIX: Constant-time comparison to prevent timing attacks
+        if (!ConstantTimeCompare(hashHex, m_config.emergencyOverridePasswordHash)) {
             SS_LOG_WARN(LOG_CATEGORY, L"Emergency override: invalid password");
             return false;
         }
 
+        // C4 FIX: Set expiry time
         m_emergencyOverrideActive = true;
-        m_emergencyOverrideTime = std::chrono::system_clock::now();
+        auto now = std::chrono::system_clock::now();
+        m_emergencyOverrideTime = now;
+        m_emergencyOverrideExpiry = now + EMERGENCY_OVERRIDE_DURATION;
 
-        SS_LOG_WARN(LOG_CATEGORY, L"EMERGENCY OVERRIDE ENABLED");
+        SS_LOG_WARN(LOG_CATEGORY, L"EMERGENCY OVERRIDE ENABLED - Expires in %d hours",
+            static_cast<int>(EMERGENCY_OVERRIDE_DURATION.count()));
         return true;
     }
 
@@ -692,7 +770,14 @@ public:
 
     [[nodiscard]] bool IsEmergencyOverrideActive() const noexcept {
         std::shared_lock lock(m_mutex);
-        return m_emergencyOverrideActive;
+        
+        // C4 FIX: Check expiry
+        if (m_emergencyOverrideActive) {
+            auto now = std::chrono::system_clock::now();
+            return now <= m_emergencyOverrideExpiry;
+        }
+        
+        return false;
     }
 
     // ========================================================================
@@ -728,12 +813,26 @@ public:
     }
 
     // ========================================================================
-    // STATISTICS
+    // STATISTICS (H3 FIX: Return snapshot, not non-copyable struct)
     // ========================================================================
 
-    [[nodiscard]] DeviceControlStatistics GetStatistics() const {
+    [[nodiscard]] DeviceControlStatisticsSnapshot GetStatistics() const {
         std::shared_lock lock(m_mutex);
-        return m_stats;
+        
+        DeviceControlStatisticsSnapshot snap;
+        snap.totalEvaluations = m_stats.totalEvaluations.load(std::memory_order_relaxed);
+        snap.devicesAllowed = m_stats.devicesAllowed.load(std::memory_order_relaxed);
+        snap.devicesBlocked = m_stats.devicesBlocked.load(std::memory_order_relaxed);
+        snap.devicesReadOnly = m_stats.devicesReadOnly.load(std::memory_order_relaxed);
+        snap.devicesQuarantined = m_stats.devicesQuarantined.load(std::memory_order_relaxed);
+        snap.ruleMatches = m_stats.ruleMatches.load(std::memory_order_relaxed);
+        snap.noRuleMatches = m_stats.noRuleMatches.load(std::memory_order_relaxed);
+        snap.policyErrors = m_stats.policyErrors.load(std::memory_order_relaxed);
+        snap.activeRules = m_stats.activeRules.load(std::memory_order_relaxed);
+        snap.disabledRules = m_stats.disabledRules.load(std::memory_order_relaxed);
+        snap.startTime = m_stats.startTime;
+        
+        return snap;
     }
 
     void ResetStatistics() {
@@ -827,26 +926,16 @@ private:
             }
         }
 
-        m_stats.activeRules.store(active);
-        m_stats.disabledRules.store(disabled);
+        m_stats.activeRules.store(active, std::memory_order_relaxed);
+        m_stats.disabledRules.store(disabled, std::memory_order_relaxed);
     }
 
+    // C1 FIX: Audit log uses separate mutex
     void LogAuditEntry(const USBDeviceInfo& device, const PolicyEvaluationResult& result) {
         if (!m_config.enableAuditLog) return;
 
         AuditLogEntry entry;
-        entry.entryId = m_nextAuditEntryId++;
-        entry.deviceId = device.deviceId;
-        entry.vendorId = device.vendorId;
-        entry.productId = device.productId;
-        entry.serialNumber = device.serialNumber;
-        entry.deviceName = device.friendlyName;
-        entry.result = result.result;
-        entry.accessLevel = result.accessLevel;
-        entry.ruleId = result.matchingRuleId;
-        entry.ruleName = result.matchingRuleName;
-        entry.timestamp = result.evaluationTime;
-
+        
         // Get current user info
         wchar_t userName[256] = {0};
         DWORD userNameSize = sizeof(userName) / sizeof(wchar_t);
@@ -860,15 +949,34 @@ private:
             entry.machineName = Utils::StringUtils::ToNarrow(machineName);
         }
 
-        // Trim audit log if needed
+        // Acquire audit mutex separately
+        std::unique_lock auditLock(m_auditMutex);
+        
+        entry.entryId = m_nextAuditEntryId++;
+        entry.deviceId = device.deviceId;
+        entry.vendorId = device.vendorId;
+        entry.productId = device.productId;
+        entry.serialNumber = device.serialNumber;
+        entry.deviceName = device.friendlyName;
+        entry.result = result.result;
+        entry.accessLevel = result.accessLevel;
+        entry.ruleId = result.matchingRuleId;
+        entry.ruleName = result.matchingRuleName;
+        entry.timestamp = result.evaluationTime;
+
+        // H5 FIX: Evict old entries if limit reached (thread-safe now)
         while (m_auditLog.size() >= m_config.maxAuditEntries) {
             m_auditLog.pop_front();
         }
 
         m_auditLog.push_back(entry);
+        
+        // Copy callbacks under lock
+        auto callbacks = m_auditCallbacks;
+        auditLock.unlock();
 
-        // Notify callbacks
-        for (const auto& callback : m_auditCallbacks) {
+        // Notify callbacks outside lock
+        for (const auto& callback : callbacks) {
             try {
                 callback(entry);
             } catch (...) {
@@ -877,9 +985,10 @@ private:
         }
     }
 
-    void NotifyEvaluationCallbacks(const USBDeviceInfo& device,
-                                    const PolicyEvaluationResult& result) {
-        for (const auto& callback : m_evaluationCallbacks) {
+    void NotifyCallbacks(const std::vector<EvaluationCallback>& callbacks,
+                        const USBDeviceInfo& device,
+                        const PolicyEvaluationResult& result) {
+        for (const auto& callback : callbacks) {
             try {
                 callback(device, result);
             } catch (...) {
@@ -928,22 +1037,24 @@ private:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
-    ModuleStatus m_status{ModuleStatus::Uninitialized};
+    mutable std::mutex m_auditMutex;  // C1 FIX: Separate mutex for audit log
+    DCModuleStatus m_status{DCModuleStatus::Uninitialized};
     DeviceControlConfiguration m_config;
 
     std::vector<DeviceRule> m_rules;
-    std::deque<AuditLogEntry> m_auditLog;
+    std::deque<AuditLogEntry> m_auditLog;  // Protected by m_auditMutex
 
     uint64_t m_nextAuditEntryId{1};
     uint64_t m_nextRuleId{1};
 
     bool m_emergencyOverrideActive{false};
     SystemTimePoint m_emergencyOverrideTime;
+    SystemTimePoint m_emergencyOverrideExpiry;  // C4 FIX: Auto-expiry
 
     DeviceControlStatistics m_stats;
 
     std::vector<EvaluationCallback> m_evaluationCallbacks;
-    std::vector<AuditCallback> m_auditCallbacks;
+    std::vector<AuditCallback> m_auditCallbacks;  // Copied when logging audit
     std::vector<RuleChangeCallback> m_ruleChangeCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 };
@@ -989,7 +1100,7 @@ bool DeviceControlManager::IsInitialized() const noexcept {
     return m_impl->IsInitialized();
 }
 
-ModuleStatus DeviceControlManager::GetStatus() const noexcept {
+DCModuleStatus DeviceControlManager::GetStatus() const noexcept {
     return m_impl->GetStatus();
 }
 
@@ -1126,10 +1237,10 @@ void DeviceControlManager::UnregisterCallbacks() {
 }
 
 // ============================================================================
-// STATISTICS DELEGATIONS
+// STATISTICS DELEGATIONS (H3 FIX)
 // ============================================================================
 
-DeviceControlStatistics DeviceControlManager::GetStatistics() const {
+DeviceControlStatisticsSnapshot DeviceControlManager::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1197,9 +1308,23 @@ bool DeviceCriteria::Matches(const USBDeviceInfo& device) const {
                 matches = MatchWildcard(device.serialNumber, serialNumberPattern);
                 break;
             case RuleMatchType::Regex:
+                // C3 FIX: ReDoS protection
+                if (serialNumberPattern.size() > MAX_REGEX_PATTERN_LENGTH) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Regex pattern too long, rejecting");
+                    matches = false;
+                    break;
+                }
+                if (device.serialNumber.size() > MAX_REGEX_INPUT_LENGTH) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Regex input too long, truncating");
+                    matches = false;
+                    break;
+                }
                 try {
-                    std::regex re(serialNumberPattern);
+                    std::regex re(serialNumberPattern, std::regex::optimize);
                     matches = std::regex_match(device.serialNumber, re);
+                } catch (const std::regex_error& e) {
+                    SS_LOG_WARN(LOG_CATEGORY, L"Regex error: %hs", e.what());
+                    matches = false;
                 } catch (...) {
                     matches = false;
                 }
@@ -1338,7 +1463,7 @@ std::string TimeCondition::ToJson() const {
 }
 
 // ============================================================================
-// USER CONDITION IMPLEMENTATION
+// USER CONDITION IMPLEMENTATION (C2 FIX: Group membership checking)
 // ============================================================================
 
 bool UserCondition::AllowsCurrentUser() const {
@@ -1353,10 +1478,49 @@ bool UserCondition::AllowsCurrentUser() const {
 
     std::string currentUser = Utils::StringUtils::ToNarrow(userName);
 
-    // Check denied users first
+    // Check denied users first (highest priority)
     for (const auto& denied : deniedUsers) {
         if (_stricmp(currentUser.c_str(), denied.c_str()) == 0) {
             return false;
+        }
+    }
+
+    // C2 FIX: Check denied groups using Windows API
+    if (!deniedGroups.empty()) {
+        HANDLE hToken = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            for (const auto& deniedGroup : deniedGroups) {
+                std::wstring groupNameWide = Utils::StringUtils::ToWide(deniedGroup);
+                
+                // Convert group name to SID
+                PSID pSid = NULL;
+                DWORD sidSize = 0;
+                wchar_t* domainName = NULL;
+                DWORD domainSize = 0;
+                SID_NAME_USE sidUse;
+                
+                // First call to get sizes
+                LookupAccountNameW(NULL, groupNameWide.c_str(), NULL, &sidSize, NULL, &domainSize, &sidUse);
+                
+                if (sidSize > 0) {
+                    pSid = (PSID)LocalAlloc(LPTR, sidSize);
+                    domainName = new wchar_t[domainSize];
+                    
+                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainName, &domainSize, &sidUse)) {
+                        BOOL isMember = FALSE;
+                        if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
+                            delete[] domainName;
+                            LocalFree(pSid);
+                            CloseHandle(hToken);
+                            return false;  // User is in denied group
+                        }
+                    }
+                    
+                    delete[] domainName;
+                    LocalFree(pSid);
+                }
+            }
+            CloseHandle(hToken);
         }
     }
 
@@ -1372,8 +1536,47 @@ bool UserCondition::AllowsCurrentUser() const {
         if (!found) return false;
     }
 
-    // TODO: Implement group membership checking via Windows API
-    // For now, group conditions are not evaluated
+    // C2 FIX: Check allowed groups using Windows API
+    if (!allowedGroups.empty()) {
+        bool foundInGroup = false;
+        
+        HANDLE hToken = NULL;
+        if (OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &hToken)) {
+            for (const auto& allowedGroup : allowedGroups) {
+                std::wstring groupNameWide = Utils::StringUtils::ToWide(allowedGroup);
+                
+                PSID pSid = NULL;
+                DWORD sidSize = 0;
+                wchar_t* domainName = NULL;
+                DWORD domainSize = 0;
+                SID_NAME_USE sidUse;
+                
+                // First call to get sizes
+                LookupAccountNameW(NULL, groupNameWide.c_str(), NULL, &sidSize, NULL, &domainSize, &sidUse);
+                
+                if (sidSize > 0) {
+                    pSid = (PSID)LocalAlloc(LPTR, sidSize);
+                    domainName = new wchar_t[domainSize];
+                    
+                    if (LookupAccountNameW(NULL, groupNameWide.c_str(), pSid, &sidSize, domainName, &domainSize, &sidUse)) {
+                        BOOL isMember = FALSE;
+                        if (CheckTokenMembership(hToken, pSid, &isMember) && isMember) {
+                            foundInGroup = true;
+                            delete[] domainName;
+                            LocalFree(pSid);
+                            break;
+                        }
+                    }
+                    
+                    delete[] domainName;
+                    LocalFree(pSid);
+                }
+            }
+            CloseHandle(hToken);
+        }
+        
+        if (!foundInGroup) return false;
+    }
 
     return true;
 }
@@ -1437,9 +1640,27 @@ std::optional<DeviceRule> DeviceRule::FromJson(const std::string& json) {
         rule.ruleId = j.value("ruleId", "");
         rule.name = j.value("name", "");
         rule.description = j.value("description", "");
-        rule.action = static_cast<RuleAction>(j.value("action", 1));
-        rule.accessLevel = static_cast<AccessLevel>(j.value("accessLevel", 4));
-        rule.priority = static_cast<RulePriority>(j.value("priority", 50));
+        
+        // H1 FIX: Validate enum ranges
+        uint8_t actionVal = j.value("action", 1);
+        if (actionVal > static_cast<uint8_t>(RuleAction::Quarantine)) {
+            return std::nullopt;
+        }
+        rule.action = static_cast<RuleAction>(actionVal);
+        
+        uint8_t accessLevelVal = j.value("accessLevel", 4);
+        if (accessLevelVal > static_cast<uint8_t>(AccessLevel::Custom) && 
+            accessLevelVal != static_cast<uint8_t>(AccessLevel::Custom)) {
+            return std::nullopt;
+        }
+        rule.accessLevel = static_cast<AccessLevel>(accessLevelVal);
+        
+        uint8_t priorityVal = j.value("priority", 50);
+        if (priorityVal > static_cast<uint8_t>(RulePriority::Default)) {
+            return std::nullopt;
+        }
+        rule.priority = static_cast<RulePriority>(priorityVal);
+        
         rule.enabled = j.value("enabled", true);
         rule.logAudit = j.value("logAudit", true);
         rule.notifyUser = j.value("notifyUser", true);
@@ -1453,12 +1674,25 @@ std::optional<DeviceRule> DeviceRule::FromJson(const std::string& json) {
             rule.criteria.serialNumberPattern = c.value("serialNumberPattern", "");
             rule.criteria.manufacturerPattern = c.value("manufacturerPattern", "");
             rule.criteria.productNamePattern = c.value("productNamePattern", "");
-            rule.criteria.matchType = static_cast<RuleMatchType>(c.value("matchType", 5));
+            
+            // H1 FIX: Validate RuleMatchType
+            uint8_t matchTypeVal = c.value("matchType", 5);
+            if (matchTypeVal > static_cast<uint8_t>(RuleMatchType::Wildcard)) {
+                return std::nullopt;
+            }
+            rule.criteria.matchType = static_cast<RuleMatchType>(matchTypeVal);
+            
             rule.criteria.isAnyCriteria = c.value("isAnyCriteria", false);
             if (c.contains("deviceClass")) {
                 rule.criteria.deviceClass = c["deviceClass"].get<uint8_t>();
             }
-            rule.criteria.category = static_cast<DeviceCategory>(c.value("category", 0));
+            
+            // H1 FIX: Validate DeviceCategory (H4: updated range for new enum values)
+            uint8_t categoryVal = c.value("category", 0);
+            if (categoryVal > static_cast<uint8_t>(DeviceCategory::WirelessDevice)) {
+                return std::nullopt;
+            }
+            rule.criteria.category = static_cast<DeviceCategory>(categoryVal);
         }
 
         return rule;
@@ -1516,31 +1750,32 @@ std::string AuditLogEntry::ToJson() const {
 // ============================================================================
 
 void DeviceControlStatistics::Reset() noexcept {
-    totalEvaluations.store(0);
-    devicesAllowed.store(0);
-    devicesBlocked.store(0);
-    devicesReadOnly.store(0);
-    devicesQuarantined.store(0);
-    ruleMatches.store(0);
-    noRuleMatches.store(0);
-    policyErrors.store(0);
-    activeRules.store(0);
-    disabledRules.store(0);
+    totalEvaluations.store(0, std::memory_order_relaxed);
+    devicesAllowed.store(0, std::memory_order_relaxed);
+    devicesBlocked.store(0, std::memory_order_relaxed);
+    devicesReadOnly.store(0, std::memory_order_relaxed);
+    devicesQuarantined.store(0, std::memory_order_relaxed);
+    ruleMatches.store(0, std::memory_order_relaxed);
+    noRuleMatches.store(0, std::memory_order_relaxed);
+    policyErrors.store(0, std::memory_order_relaxed);
+    activeRules.store(0, std::memory_order_relaxed);
+    disabledRules.store(0, std::memory_order_relaxed);
     startTime = Clock::now();
 }
 
-std::string DeviceControlStatistics::ToJson() const {
+// H3 FIX: Snapshot has ToJson, not the non-copyable original
+std::string DeviceControlStatisticsSnapshot::ToJson() const {
     Utils::JSON::Json json;
-    json["totalEvaluations"] = totalEvaluations.load();
-    json["devicesAllowed"] = devicesAllowed.load();
-    json["devicesBlocked"] = devicesBlocked.load();
-    json["devicesReadOnly"] = devicesReadOnly.load();
-    json["devicesQuarantined"] = devicesQuarantined.load();
-    json["ruleMatches"] = ruleMatches.load();
-    json["noRuleMatches"] = noRuleMatches.load();
-    json["policyErrors"] = policyErrors.load();
-    json["activeRules"] = activeRules.load();
-    json["disabledRules"] = disabledRules.load();
+    json["totalEvaluations"] = totalEvaluations;
+    json["devicesAllowed"] = devicesAllowed;
+    json["devicesBlocked"] = devicesBlocked;
+    json["devicesReadOnly"] = devicesReadOnly;
+    json["devicesQuarantined"] = devicesQuarantined;
+    json["ruleMatches"] = ruleMatches;
+    json["noRuleMatches"] = noRuleMatches;
+    json["policyErrors"] = policyErrors;
+    json["activeRules"] = activeRules;
+    json["disabledRules"] = disabledRules;
 
     auto uptime = std::chrono::duration_cast<std::chrono::seconds>(
         Clock::now() - startTime).count();
@@ -1581,6 +1816,7 @@ std::string_view GetAccessLevelName(AccessLevel level) noexcept {
     }
 }
 
+// H4 FIX: Updated for new DeviceCategory enum values
 std::string_view GetDeviceCategoryName(DeviceCategory cat) noexcept {
     switch (cat) {
         case DeviceCategory::Unknown:        return "Unknown";
@@ -1589,14 +1825,14 @@ std::string_view GetDeviceCategoryName(DeviceCategory cat) noexcept {
         case DeviceCategory::HIDMouse:       return "HIDMouse";
         case DeviceCategory::HIDOther:       return "HIDOther";
         case DeviceCategory::NetworkAdapter: return "NetworkAdapter";
-        case DeviceCategory::ImagingDevice:  return "ImagingDevice";
-        case DeviceCategory::Printer:        return "Printer";
         case DeviceCategory::AudioDevice:    return "AudioDevice";
         case DeviceCategory::VideoDevice:    return "VideoDevice";
+        case DeviceCategory::Printer:        return "Printer";
+        case DeviceCategory::ImagingDevice:  return "ImagingDevice";
         case DeviceCategory::SmartCard:      return "SmartCard";
-        case DeviceCategory::WirelessDevice: return "WirelessDevice";
         case DeviceCategory::Hub:            return "Hub";
         case DeviceCategory::Composite:      return "Composite";
+        case DeviceCategory::WirelessDevice: return "WirelessDevice";
         default:                             return "Unknown";
     }
 }
@@ -1626,6 +1862,7 @@ std::string_view GetEvaluationResultName(EvaluationResult result) noexcept {
     }
 }
 
+// H4 FIX: Updated DeviceCategory mapping
 DeviceCategory ClassifyDeviceClass(uint8_t classCode) noexcept {
     using namespace DeviceControlConstants::DeviceClass;
 

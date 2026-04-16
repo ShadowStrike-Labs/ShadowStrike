@@ -43,12 +43,12 @@
 #include "pch.h"
 #include "BadUSBDetector.hpp"
 #include "USBDeviceMonitor.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
 
 #include <algorithm>
 #include <sstream>

@@ -131,12 +131,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -190,7 +190,9 @@ namespace BadUSBConstants {
         {0x16C0, 0x0483, "Teensy HID"},
         {0x1B4F, 0x9203, "SparkFun Pro Micro"},
         {0x239A, 0x000E, "Adafruit HID"},
-        {0x0403, 0x6001, "FTDI-based (potential)"},
+        // FTDI 0x0403:0x6001 intentionally excluded — too many legitimate
+        // FTDI-based devices in the wild (serial adapters, lab equipment,
+        // industrial controllers).  False-positive rate is unacceptable.
     };
 
 }  // namespace BadUSBConstants
@@ -280,9 +282,12 @@ enum class DetectionConfidence : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief BadUSBDetector module status.
+ *
+ * Module-specific name avoids ODR violation with identically-named
+ * enums in sibling USB_Protection headers.
  */
-enum class ModuleStatus : uint8_t {
+enum class BadUSBModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -472,6 +477,9 @@ struct BadUSBAttackEvent {
 /**
  * @brief Statistics
  */
+/**
+ * @brief Live statistics (atomic counters, not copyable).
+ */
 struct BadUSBStatistics {
     std::atomic<uint64_t> totalDevicesAnalyzed{0};
     std::atomic<uint64_t> knownBadDevicesDetected{0};
@@ -487,6 +495,25 @@ struct BadUSBStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Point-in-time snapshot of BadUSBStatistics (copyable).
+ */
+struct BadUSBStatisticsSnapshot {
+    uint64_t totalDevicesAnalyzed = 0;
+    uint64_t knownBadDevicesDetected = 0;
+    uint64_t suspiciousDevicesDetected = 0;
+    uint64_t attacksDetected = 0;
+    uint64_t attacksBlocked = 0;
+    uint64_t superhumanInputDetected = 0;
+    uint64_t commandInjectionDetected = 0;
+    uint64_t totalKeystrokesAnalyzed = 0;
+    uint64_t totalBurstEventsDetected = 0;
+    std::array<uint64_t, 16> byDeviceType{};
+    std::array<uint64_t, 16> byPatternType{};
+    TimePoint startTime;
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -566,7 +593,7 @@ public:
     [[nodiscard]] bool Initialize(const BadUSBConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] BadUSBModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const BadUSBConfiguration& config);
     [[nodiscard]] BadUSBConfiguration GetConfiguration() const;
@@ -648,7 +675,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] BadUSBStatistics GetStatistics() const;
+    [[nodiscard]] BadUSBStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

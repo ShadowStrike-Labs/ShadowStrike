@@ -130,11 +130,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "USBCommonTypes.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -202,22 +203,14 @@ using SystemTimePoint = std::chrono::system_clock::time_point;
 // ENUMERATIONS
 // ============================================================================
 
-/**
- * @brief Access level
- */
-enum class AccessLevel : uint8_t {
-    FullAccess      = 0,    ///< Read, write, execute
-    ReadOnly        = 1,    ///< Read only access
-    WriteOnly       = 2,    ///< Write only (rare)
-    NoExecute       = 3,    ///< Read/write but no execute
-    Blocked         = 4,    ///< No access allowed
-    QuarantineOnly  = 5,    ///< Scan/quarantine only
-    AuditOnly       = 6,    ///< Log but don't enforce
-    Custom          = 255   ///< Custom permissions
-};
+// AccessLevel is defined in USBCommonTypes.hpp (canonical, shared definition).
 
 /**
- * @brief Device type category
+ * @brief Device type category.
+ *
+ * Numeric values are intentionally aligned with DeviceType in
+ * USBDeviceMonitor.hpp so that a static_cast between them is
+ * valid for the overlapping range [0, 13].
  */
 enum class DeviceCategory : uint8_t {
     Unknown         = 0,
@@ -226,14 +219,14 @@ enum class DeviceCategory : uint8_t {
     HIDMouse        = 3,
     HIDOther        = 4,
     NetworkAdapter  = 5,
-    ImagingDevice   = 6,
-    Printer         = 7,
-    AudioDevice     = 8,
-    VideoDevice     = 9,
+    AudioDevice     = 6,
+    VideoDevice     = 7,
+    Printer         = 8,
+    ImagingDevice   = 9,
     SmartCard       = 10,
-    WirelessDevice  = 11,
-    Hub             = 12,
-    Composite       = 13
+    Hub             = 11,
+    Composite       = 12,
+    WirelessDevice  = 13
 };
 
 /**
@@ -285,9 +278,12 @@ enum class EvaluationResult : uint8_t {
 };
 
 /**
- * @brief Module status
+ * @brief DeviceControlManager module status.
+ *
+ * Module-specific name avoids ODR violation with identically-named
+ * enums in sibling USB_Protection headers.
  */
-enum class ModuleStatus : uint8_t {
+enum class DCModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
     Running         = 2,
@@ -513,6 +509,12 @@ struct AuditLogEntry {
 /**
  * @brief Statistics
  */
+/**
+ * @brief Live statistics (atomic counters, not copyable).
+ *
+ * Owned by the Impl and updated concurrently.  Use
+ * DeviceControlStatisticsSnapshot for read-outs.
+ */
 struct DeviceControlStatistics {
     std::atomic<uint64_t> totalEvaluations{0};
     std::atomic<uint64_t> devicesAllowed{0};
@@ -527,6 +529,24 @@ struct DeviceControlStatistics {
     TimePoint startTime = Clock::now();
     
     void Reset() noexcept;
+};
+
+/**
+ * @brief Point-in-time snapshot of DeviceControlStatistics (copyable).
+ */
+struct DeviceControlStatisticsSnapshot {
+    uint64_t totalEvaluations = 0;
+    uint64_t devicesAllowed = 0;
+    uint64_t devicesBlocked = 0;
+    uint64_t devicesReadOnly = 0;
+    uint64_t devicesQuarantined = 0;
+    uint64_t ruleMatches = 0;
+    uint64_t noRuleMatches = 0;
+    uint64_t policyErrors = 0;
+    uint32_t activeRules = 0;
+    uint32_t disabledRules = 0;
+    TimePoint startTime;
+    
     [[nodiscard]] std::string ToJson() const;
 };
 
@@ -607,7 +627,7 @@ public:
     [[nodiscard]] bool Initialize(const DeviceControlConfiguration& config = {});
     void Shutdown();
     [[nodiscard]] bool IsInitialized() const noexcept;
-    [[nodiscard]] ModuleStatus GetStatus() const noexcept;
+    [[nodiscard]] DCModuleStatus GetStatus() const noexcept;
     
     [[nodiscard]] bool UpdateConfiguration(const DeviceControlConfiguration& config);
     [[nodiscard]] DeviceControlConfiguration GetConfiguration() const;
@@ -708,7 +728,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] DeviceControlStatistics GetStatistics() const;
+    [[nodiscard]] DeviceControlStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
@@ -726,7 +746,7 @@ private:
 // UTILITY FUNCTIONS
 // ============================================================================
 
-[[nodiscard]] std::string_view GetAccessLevelName(AccessLevel level) noexcept;
+// GetAccessLevelName is declared in USBCommonTypes.hpp.
 [[nodiscard]] std::string_view GetDeviceCategoryName(DeviceCategory cat) noexcept;
 [[nodiscard]] std::string_view GetRuleActionName(RuleAction action) noexcept;
 [[nodiscard]] std::string_view GetEvaluationResultName(EvaluationResult result) noexcept;
