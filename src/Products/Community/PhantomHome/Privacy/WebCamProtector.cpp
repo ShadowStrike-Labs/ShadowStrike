@@ -98,6 +98,7 @@
 #pragma comment(lib, "Cfgmgr32.lib")
 #pragma comment(lib, "Wintrust.lib")
 #pragma comment(lib, "Psapi.lib")
+#pragma comment(lib, "Crypt32.lib")
 #endif
 
 // ============================================================================
@@ -108,8 +109,15 @@
 namespace ShadowStrike {
 namespace Privacy {
 
-using Clock = std::chrono::steady_clock;
 using SystemClock = std::chrono::system_clock;
+
+// KSCATEGORY_VIDEO_CAMERA {E5323777-F976-4F5B-9B55-B94699C46E44}
+static const GUID s_ksCategoryVideoCamera =
+    { 0xe5323777, 0xf976, 0x4f5b, { 0x9b, 0x55, 0xb9, 0x46, 0x99, 0xc4, 0x6e, 0x44 } };
+
+// KSCATEGORY_VIDEO {6994AD05-93EF-11D0-A3CC-00A0C9223196}
+static const GUID s_ksCategoryVideo =
+    { 0x6994ad05, 0x93ef, 0x11d0, { 0xa3, 0xcc, 0x00, 0xa0, 0xc9, 0x22, 0x31, 0x96 } };
 
 // ============================================================================
 // HELPER FUNCTIONS
@@ -213,13 +221,126 @@ bool VerifySignature(const fs::path& filePath) {
  * @brief Get publisher name from digital signature
  */
 std::string GetPublisher(const fs::path& filePath) {
-    // Simplified publisher extraction
-    // In production, would parse certificate info
-    if (VerifySignature(filePath)) {
-        return "Verified Publisher";
+#ifdef _WIN32
+    try {
+        WINTRUST_FILE_INFO fileInfo = {};
+        fileInfo.cbStruct = sizeof(WINTRUST_FILE_INFO);
+        fileInfo.pcwszFilePath = filePath.c_str();
+
+        GUID policyGUID = WINTRUST_ACTION_GENERIC_VERIFY_V2;
+
+        WINTRUST_DATA wtd = {};
+        wtd.cbStruct = sizeof(WINTRUST_DATA);
+        wtd.dwUIChoice = WTD_UI_NONE;
+        wtd.fdwRevocationChecks = WTD_REVOKE_NONE;
+        wtd.dwUnionChoice = WTD_CHOICE_FILE;
+        wtd.dwStateAction = WTD_STATEACTION_VERIFY;
+        wtd.dwProvFlags = WTD_SAFER_FLAG;
+        wtd.pFile = &fileInfo;
+
+        LONG result = WinVerifyTrust(nullptr, &policyGUID, &wtd);
+        std::string publisher;
+
+        if (result == ERROR_SUCCESS && wtd.hWVTStateData) {
+            CRYPT_PROVIDER_DATA* provData =
+                WTHelperProvDataFromStateData(wtd.hWVTStateData);
+            if (provData) {
+                CRYPT_PROVIDER_SGNR* signer =
+                    WTHelperGetProvSignerFromChain(provData, 0, FALSE, 0);
+                if (signer && signer->pasCertChain && signer->csCertChain > 0) {
+                    PCCERT_CONTEXT cert = signer->pasCertChain[0].pCert;
+                    if (cert) {
+                        wchar_t name[256] = {};
+                        DWORD nameLen = CertGetNameStringW(
+                            cert, CERT_NAME_SIMPLE_DISPLAY_TYPE,
+                            0, nullptr, name, static_cast<DWORD>(std::size(name)));
+                        if (nameLen > 1) {
+                            publisher = Utils::StringUtils::ToNarrow(name);
+                        }
+                    }
+                }
+            }
+        }
+
+        wtd.dwStateAction = WTD_STATEACTION_CLOSE;
+        WinVerifyTrust(nullptr, &policyGUID, &wtd);
+        return publisher;
+    } catch (...) {
+        return {};
     }
-    return "";
+#else
+    return {};
+#endif
 }
+
+/**
+ * @brief Convert raw hash bytes to lowercase hex string.
+ */
+std::string BytesToHex(const std::vector<uint8_t>& bytes) {
+    std::string hex;
+    hex.reserve(bytes.size() * 2);
+    static constexpr char digits[] = "0123456789abcdef";
+    for (uint8_t b : bytes) {
+        hex += digits[(b >> 4) & 0xF];
+        hex += digits[b & 0xF];
+    }
+    return hex;
+}
+
+#ifdef _WIN32
+/**
+ * @brief Check whether the workstation is currently locked.
+ */
+bool IsWorkstationLocked() noexcept {
+    HDESK hDesktop = OpenInputDesktop(0, FALSE, GENERIC_READ);
+    if (!hDesktop) {
+        return true;  // Cannot open input desktop → likely locked
+    }
+    wchar_t name[256] = {};
+    DWORD needed = 0;
+    bool locked = true;
+    if (GetUserObjectInformationW(hDesktop, UOI_NAME, name, sizeof(name), &needed)) {
+        locked = (_wcsicmp(name, L"Default") != 0);
+    }
+    CloseDesktop(hDesktop);
+    return locked;
+}
+
+/**
+ * @brief Check whether the screensaver is currently running.
+ */
+bool IsScreensaverRunning() noexcept {
+    BOOL running = FALSE;
+    SystemParametersInfoW(SPI_GETSCREENSAVERRUNNING, 0, &running, 0);
+    return running != FALSE;
+}
+
+/**
+ * @brief Detect virtual camera devices by checking hardware/device IDs.
+ */
+bool IsVirtualCameraDevice(const std::wstring& hardwareId, const std::wstring& friendlyName) {
+    std::wstring hwLower = hardwareId;
+    std::transform(hwLower.begin(), hwLower.end(), hwLower.begin(), ::towlower);
+    std::wstring nameLower = friendlyName;
+    std::transform(nameLower.begin(), nameLower.end(), nameLower.begin(), ::towlower);
+
+    // Root-enumerated or software devices are typically virtual
+    if (hwLower.find(L"root\") != std::wstring::npos ||
+        hwLower.find(L"sw\") != std::wstring::npos) {
+        return true;
+    }
+    // Name-based heuristics for known virtual cameras
+    if (nameLower.find(L"virtual") != std::wstring::npos ||
+        nameLower.find(L"manycam") != std::wstring::npos ||
+        nameLower.find(L"obs-camera") != std::wstring::npos ||
+        nameLower.find(L"snap camera") != std::wstring::npos ||
+        nameLower.find(L"xsplit") != std::wstring::npos ||
+        nameLower.find(L"droidcam") != std::wstring::npos) {
+        return true;
+    }
+    return false;
+}
+#endif
 
 }  // namespace
 
@@ -393,9 +514,9 @@ public:
     std::vector<ErrorCallback> m_errorCallbacks;
     std::mutex m_callbacksMutex;
 
-    /// @brief Infrastructure integrations
-    std::shared_ptr<ThreatIntel::ThreatIntelManager> m_threatIntel;
-    std::shared_ptr<Whitelist::WhiteListStore> m_whitelistStore;
+    /// @brief Cooldown cleanup counter — prune stale entries periodically
+    uint32_t m_cooldownCleanupCounter{0};
+    static constexpr uint32_t COOLDOWN_CLEANUP_INTERVAL = 64;
 
     // ========================================================================
     // METHODS
@@ -456,17 +577,17 @@ bool WebcamProtector::WebcamProtectorImpl::Initialize(
 {
     try {
         if (m_initialized.exchange(true, std::memory_order_acq_rel)) {
-            Utils::Logger::Warn(L"WebcamProtector: Already initialized");
+            SS_LOG_WARN(L"WebcamProtector", L"Already initialized");
             return true;
         }
 
-        Utils::Logger::Info(L"WebcamProtector: Initializing...");
+        SS_LOG_INFO(L"WebcamProtector", L"Initializing...");
 
         m_status.store(ModuleStatus::Initializing, std::memory_order_release);
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"WebcamProtector: Invalid configuration");
+            SS_LOG_ERROR(L"WebcamProtector", L"Invalid configuration");
             m_initialized.store(false, std::memory_order_release);
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
@@ -474,23 +595,18 @@ bool WebcamProtector::WebcamProtectorImpl::Initialize(
 
         m_config = config;
 
-        // Initialize infrastructure integrations
-        m_threatIntel = std::make_shared<ThreatIntel::ThreatIntelManager>();
-        m_whitelistStore = std::make_shared<Whitelist::WhiteListStore>();
-
         // Enumerate camera devices
         RefreshDevicesInternal();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"WebcamProtector: Initialized successfully (mode: {})",
-                          Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(m_config.mode))));
+        SS_LOG_INFO(L"WebcamProtector", L"Initialized successfully (mode: %hs)",
+                      std::string(GetProtectionModeName(m_config.mode)).c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Initialization failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Initialization failed - %hs", e.what());
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
@@ -503,7 +619,7 @@ void WebcamProtector::WebcamProtectorImpl::Shutdown() {
             return;
         }
 
-        Utils::Logger::Info(L"WebcamProtector: Shutting down...");
+        SS_LOG_INFO(L"WebcamProtector", L"Shutting down...");
 
         m_status.store(ModuleStatus::Stopping, std::memory_order_release);
 
@@ -541,10 +657,10 @@ void WebcamProtector::WebcamProtectorImpl::Shutdown() {
 
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"WebcamProtector: Shutdown complete");
+        SS_LOG_INFO(L"WebcamProtector", L"Shutdown complete");
 
     } catch (...) {
-        Utils::Logger::Error(L"WebcamProtector: Exception during shutdown");
+        SS_LOG_ERROR(L"WebcamProtector", L"Exception during shutdown");
     }
 }
 
@@ -582,31 +698,41 @@ bool WebcamProtector::WebcamProtectorImpl::RefreshDevicesInternal() {
     try {
         auto newDevices = EnumerateCameraDevices();
 
-        std::unique_lock lock(m_devicesMutex);
+        // Collect newly-added devices to invoke callbacks OUTSIDE the lock,
+        // preventing deadlock (m_devicesMutex → m_callbacksMutex ordering).
+        std::vector<CameraDevice> addedDevices;
 
-        // Update existing devices and add new ones
-        for (const auto& newDevice : newDevices) {
-            auto it = m_devices.find(newDevice.deviceId);
-            if (it != m_devices.end()) {
-                // Update existing device
-                it->second.isActive = newDevice.isActive;
-                it->second.isHardwareEnabled = newDevice.isHardwareEnabled;
-            } else {
-                // Add new device
-                m_devices[newDevice.deviceId] = newDevice;
-                InvokeDeviceCallbacks(newDevice, true);
+        {
+            std::unique_lock lock(m_devicesMutex);
+
+            for (const auto& newDevice : newDevices) {
+                auto it = m_devices.find(newDevice.deviceId);
+                if (it != m_devices.end()) {
+                    it->second.isActive = newDevice.isActive;
+                    it->second.isHardwareEnabled = newDevice.isHardwareEnabled;
+                    it->second.isVirtual = newDevice.isVirtual;
+                    it->second.type = newDevice.type;
+                    it->second.vendorId = newDevice.vendorId;
+                    it->second.productId = newDevice.productId;
+                } else {
+                    m_devices[newDevice.deviceId] = newDevice;
+                    addedDevices.push_back(newDevice);
+                }
             }
+
+            m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
         }
 
-        m_statistics.devicesMonitored.store(m_devices.size(), std::memory_order_relaxed);
+        // Fire callbacks without holding the devices lock
+        for (const auto& dev : addedDevices) {
+            InvokeDeviceCallbacks(dev, true);
+        }
 
-        Utils::Logger::Info(L"WebcamProtector: Enumerated {} camera devices", m_devices.size());
-
+        SS_LOG_INFO(L"WebcamProtector", L"Enumerated %zu camera devices", newDevices.size());
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Device enumeration failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Device enumeration failed - %hs", e.what());
         return false;
     }
 }
@@ -631,13 +757,17 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
         event.isOngoing = true;
 
         // Get process information
-        try {
-            event.processPath = Utils::ProcessUtils::GetProcessPath(processId);
-            event.processName = event.processPath.filename().string();
-            event.isSigned = VerifySignature(event.processPath);
-            event.publisher = GetPublisher(event.processPath);
-        } catch (...) {
-            event.processName = "Unknown";
+        {
+            auto optPath = Utils::ProcessUtils::GetProcessPath(processId);
+            if (optPath.has_value()) {
+                event.processPath = fs::path(*optPath);
+                event.processName = event.processPath.filename().string();
+                event.isSigned = VerifySignature(event.processPath);
+                event.publisher = GetPublisher(event.processPath);
+            } else {
+                event.processName = "Unknown";
+                event.riskLevel = CameraRiskLevel::Medium;
+            }
         }
 
         // Check if camera is globally blocked
@@ -649,6 +779,47 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
             m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
             InvokeAccessCallbacks(event);
             return CameraAccessDecision::Block;
+        }
+
+        // Block if workstation is locked (if configured)
+#ifdef _WIN32
+        if (m_config.blockOnLockScreen && IsWorkstationLocked()) {
+            event.decision = CameraAccessDecision::Block;
+            event.riskLevel = CameraRiskLevel::High;
+            event.notes = "Workstation locked - camera access denied";
+            RecordAccessEvent(event);
+            m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
+            m_statistics.suspiciousAccess.fetch_add(1, std::memory_order_relaxed);
+            InvokeAccessCallbacks(event);
+            return CameraAccessDecision::Block;
+        }
+
+        // Block if screensaver is running (if configured)
+        if (m_config.blockOnScreensaver && IsScreensaverRunning()) {
+            event.decision = CameraAccessDecision::Block;
+            event.riskLevel = CameraRiskLevel::High;
+            event.notes = "Screensaver active - camera access denied";
+            RecordAccessEvent(event);
+            m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
+            m_statistics.suspiciousAccess.fetch_add(1, std::memory_order_relaxed);
+            InvokeAccessCallbacks(event);
+            return CameraAccessDecision::Block;
+        }
+#endif
+
+        // Block virtual cameras if configured
+        if (m_config.blockVirtualCameras && !deviceId.empty()) {
+            std::shared_lock devLock(m_devicesMutex);
+            auto devIt = m_devices.find(deviceId);
+            if (devIt != m_devices.end() && devIt->second.isVirtual) {
+                event.decision = CameraAccessDecision::Block;
+                event.notes = "Virtual camera blocked by policy";
+                m_statistics.accessBlocked.fetch_add(1, std::memory_order_relaxed);
+                m_statistics.virtualCameraBlocked.fetch_add(1, std::memory_order_relaxed);
+                RecordAccessEvent(event);
+                InvokeAccessCallbacks(event);
+                return CameraAccessDecision::Block;
+            }
         }
 
         // Check protection mode
@@ -693,19 +864,28 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
                 break;  // Continue to whitelist check
         }
 
-        // Check temporary access
+        // Check temporary access (and purge expired entries)
         {
-            std::shared_lock lock(m_temporaryMutex);
+            std::unique_lock lock(m_temporaryMutex);
+            auto now = SystemClock::now();
+
+            // Purge expired grants
+            for (auto it = m_temporaryAccess.begin(); it != m_temporaryAccess.end(); ) {
+                if (now >= it->second) {
+                    it = m_temporaryAccess.erase(it);
+                } else {
+                    ++it;
+                }
+            }
+
             auto it = m_temporaryAccess.find(processId);
             if (it != m_temporaryAccess.end()) {
-                if (SystemClock::now() < it->second) {
-                    event.decision = CameraAccessDecision::AllowTimed;
-                    event.notes = "Temporary access granted";
-                    m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
-                    RecordAccessEvent(event);
-                    InvokeAccessCallbacks(event);
-                    return CameraAccessDecision::AllowTimed;
-                }
+                event.decision = CameraAccessDecision::AllowTimed;
+                event.notes = "Temporary access granted";
+                m_statistics.accessAllowed.fetch_add(1, std::memory_order_relaxed);
+                RecordAccessEvent(event);
+                InvokeAccessCallbacks(event);
+                return CameraAccessDecision::AllowTimed;
             }
         }
 
@@ -762,8 +942,7 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
         return CameraAccessDecision::Block;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Access evaluation failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Access evaluation failed - %hs", e.what());
         return CameraAccessDecision::Block;  // Fail secure
     }
 }
@@ -771,28 +950,33 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::EvaluateAccessInterna
 bool WebcamProtector::WebcamProtectorImpl::OnCameraAccessAttemptInternal(uint32_t pid) {
     try {
         if (!m_monitoringActive.load(std::memory_order_acquire)) {
-            return true;  // Monitoring not active, allow by default
+            return true;
         }
 
-        // Check cooldown to prevent spam
+        // Skip full re-evaluation during cooldown to avoid notification spam,
+        // but still enforce the current protection mode.
         if (IsInCooldown(pid)) {
-            return true;  // Already notified recently
+            if (m_cameraBlocked.load(std::memory_order_acquire) ||
+                m_config.mode == WebcamProtectionMode::BlockAll) {
+                return false;
+            }
+            return true;
         }
 
         auto decision = EvaluateAccessInternal(pid, "");
 
+        UpdateCooldown(pid);
+
         if (decision == CameraAccessDecision::Block) {
-            Utils::Logger::Warn(L"WebcamProtector: Blocked camera access from PID {}", pid);
+            SS_LOG_WARN(L"WebcamProtector", L"Blocked camera access from PID %u", pid);
             return false;
         }
 
-        UpdateCooldown(pid);
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Access attempt handling failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
-        return false;  // Fail secure
+        SS_LOG_ERROR(L"WebcamProtector", L"Access attempt handling failed - %hs", e.what());
+        return false;
     }
 }
 
@@ -805,27 +989,25 @@ bool WebcamProtector::WebcamProtectorImpl::AddToWhitelistInternal(
 {
     try {
         if (entry.entryId.empty()) {
-            Utils::Logger::Error(L"WebcamProtector: Empty entry ID");
+            SS_LOG_ERROR(L"WebcamProtector", L"Empty entry ID");
             return false;
         }
 
         std::unique_lock lock(m_whitelistMutex);
 
         if (m_whitelist.size() >= WebcamConstants::MAX_WHITELIST) {
-            Utils::Logger::Error(L"WebcamProtector: Whitelist full");
+            SS_LOG_ERROR(L"WebcamProtector", L"Whitelist full");
             return false;
         }
 
         m_whitelist[entry.entryId] = entry;
 
-        Utils::Logger::Info(L"WebcamProtector: Added to whitelist: {}",
-                          Utils::StringUtils::Utf8ToWide(entry.processPattern));
+        SS_LOG_INFO(L"WebcamProtector", L"Added to whitelist: %hs", entry.processPattern.c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to add to whitelist - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to add to whitelist - %hs", e.what());
         return false;
     }
 }
@@ -841,14 +1023,12 @@ bool WebcamProtector::WebcamProtectorImpl::RemoveFromWhitelistInternal(const std
 
         m_whitelist.erase(it);
 
-        Utils::Logger::Info(L"WebcamProtector: Removed from whitelist: {}",
-                          Utils::StringUtils::Utf8ToWide(entryId));
+        SS_LOG_INFO(L"WebcamProtector", L"Removed from whitelist: %hs", entryId.c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to remove from whitelist - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to remove from whitelist - %hs", e.what());
         return false;
     }
 }
@@ -874,12 +1054,13 @@ bool WebcamProtector::WebcamProtectorImpl::IsProcessWhitelistedInternal(
 
             // Check hash if specified
             if (!entry.sha256Hash.empty() && !processPath.empty()) {
-                try {
-                    auto hash = Utils::HashUtils::CalculateSHA256(processPath);
-                    if (hash != entry.sha256Hash) {
-                        continue;
-                    }
-                } catch (...) {
+                std::vector<uint8_t> hashBytes;
+                if (!Utils::HashUtils::ComputeFile(
+                        Utils::HashUtils::Algorithm::SHA256,
+                        processPath.wstring(), hashBytes)) {
+                    continue;
+                }
+                if (BytesToHex(hashBytes) != entry.sha256Hash) {
                     continue;
                 }
             }
@@ -918,8 +1099,7 @@ void WebcamProtector::WebcamProtectorImpl::RecordAccessEvent(const CameraAccessE
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to record event - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to record event - %hs", e.what());
     }
 }
 
@@ -930,9 +1110,10 @@ std::vector<CameraAccessEvent> WebcamProtector::WebcamProtectorImpl::GetRecentEv
     std::shared_lock lock(m_eventsMutex);
 
     std::vector<CameraAccessEvent> result;
-    result.reserve(std::min(limit, m_events.size()));
+    const size_t cappedLimit = std::min(limit, static_cast<size_t>(10000));
+    result.reserve(std::min(cappedLimit, m_events.size()));
 
-    for (auto it = m_events.rbegin(); it != m_events.rend() && result.size() < limit; ++it) {
+    for (auto it = m_events.rbegin(); it != m_events.rend() && result.size() < cappedLimit; ++it) {
         if (!since.has_value() || it->timestamp >= since.value()) {
             result.push_back(*it);
         }
@@ -947,27 +1128,41 @@ std::vector<CameraAccessEvent> WebcamProtector::WebcamProtectorImpl::GetRecentEv
 
 bool WebcamProtector::WebcamProtectorImpl::IsKnownSpywareInternal(uint32_t processId) {
     try {
-        if (!m_threatIntel) {
+        auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+        if (!threatIntel.IsInitialized()) {
             return false;
         }
 
-        auto processPath = Utils::ProcessUtils::GetProcessPath(processId);
-        auto hash = Utils::HashUtils::CalculateSHA256(processPath);
+        auto optPath = Utils::ProcessUtils::GetProcessPath(processId);
+        if (!optPath.has_value()) {
+            return false;
+        }
 
-        // Query ThreatIntel (would check against malware database)
-        // For stub, return false
-        return false;
+        std::vector<uint8_t> hashBytes;
+        if (!Utils::HashUtils::ComputeFile(
+                Utils::HashUtils::Algorithm::SHA256,
+                *optPath, hashBytes)) {
+            return false;
+        }
+
+        std::string hexHash = BytesToHex(hashBytes);
+        double riskScore = 0.0;
+        std::string threatName;
+        return threatIntel.IsKnownMalicious(hexHash, riskScore, threatName);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Spyware check failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Spyware check failed - %hs", e.what());
         return false;
     }
 }
 
 CameraRiskLevel WebcamProtector::WebcamProtectorImpl::AnalyzeProcessInternal(uint32_t processId) {
     try {
-        auto processPath = Utils::ProcessUtils::GetProcessPath(processId);
+        auto optPath = Utils::ProcessUtils::GetProcessPath(processId);
+        if (!optPath.has_value()) {
+            return CameraRiskLevel::Medium;
+        }
+        fs::path processPath(*optPath);
         auto processName = processPath.filename().string();
 
         CameraRiskLevel risk = CameraRiskLevel::Safe;
@@ -1004,8 +1199,7 @@ CameraRiskLevel WebcamProtector::WebcamProtectorImpl::AnalyzeProcessInternal(uin
         return risk;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Process analysis failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Process analysis failed - %hs", e.what());
         return CameraRiskLevel::Medium;  // Unknown = medium risk
     }
 }
@@ -1020,8 +1214,7 @@ void WebcamProtector::WebcamProtectorImpl::InvokeAccessCallbacks(const CameraAcc
         try {
             callback(event);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"WebcamProtector: Access callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"WebcamProtector", L"Access callback error - %hs", e.what());
         }
     }
 }
@@ -1035,8 +1228,7 @@ void WebcamProtector::WebcamProtectorImpl::InvokeDeviceCallbacks(
         try {
             callback(device, added);
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"WebcamProtector: Device callback error - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            SS_LOG_ERROR(L"WebcamProtector", L"Device callback error - %hs", e.what());
         }
     }
 }
@@ -1054,8 +1246,7 @@ CameraAccessDecision WebcamProtector::WebcamProtectorImpl::InvokeDecisionCallbac
     try {
         return m_decisionCallbacks[0](event);
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Decision callback error - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Decision callback error - %hs", e.what());
         return CameraAccessDecision::Block;  // Fail secure
     }
 }
@@ -1095,6 +1286,21 @@ bool WebcamProtector::WebcamProtectorImpl::IsInCooldown(uint32_t processId) {
 void WebcamProtector::WebcamProtectorImpl::UpdateCooldown(uint32_t processId) {
     std::lock_guard lock(m_cooldownMutex);
     m_cooldownTracker[processId] = SystemClock::now();
+
+    // Periodically prune stale cooldown entries to prevent unbounded growth
+    if (++m_cooldownCleanupCounter >= COOLDOWN_CLEANUP_INTERVAL) {
+        m_cooldownCleanupCounter = 0;
+        auto now = SystemClock::now();
+        for (auto it = m_cooldownTracker.begin(); it != m_cooldownTracker.end(); ) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
+                now - it->second).count();
+            if (elapsed > static_cast<long long>(WebcamConstants::ACCESS_COOLDOWN_MS) * 10) {
+                it = m_cooldownTracker.erase(it);
+            } else {
+                ++it;
+            }
+        }
+    }
 }
 
 // ============================================================================
@@ -1120,14 +1326,14 @@ bool WebcamProtector::HasInstance() noexcept {
 WebcamProtector::WebcamProtector()
     : m_impl(std::make_unique<WebcamProtectorImpl>())
 {
-    Utils::Logger::Info(L"WebcamProtector: Constructor called");
+    SS_LOG_INFO(L"WebcamProtector", L"Constructor called");
 }
 
 WebcamProtector::~WebcamProtector() {
     if (m_impl) {
         m_impl->Shutdown();
     }
-    Utils::Logger::Info(L"WebcamProtector: Destructor called");
+    SS_LOG_INFO(L"WebcamProtector", L"Destructor called");
 }
 
 bool WebcamProtector::Initialize(const WebcamConfiguration& config) {
@@ -1151,7 +1357,7 @@ ModuleStatus WebcamProtector::GetStatus() const noexcept {
 
 bool WebcamProtector::UpdateConfiguration(const WebcamConfiguration& config) {
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"WebcamProtector: Invalid configuration");
+        SS_LOG_ERROR(L"WebcamProtector", L"Invalid configuration");
         return false;
     }
 
@@ -1162,7 +1368,7 @@ bool WebcamProtector::UpdateConfiguration(const WebcamConfiguration& config) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config = config;
 
-    Utils::Logger::Info(L"WebcamProtector: Configuration updated");
+    SS_LOG_INFO(L"WebcamProtector", L"Configuration updated");
     return true;
 }
 
@@ -1185,8 +1391,8 @@ void WebcamProtector::SetProtectionMode(WebcamProtectionMode mode) {
     std::unique_lock lock(m_impl->m_mutex);
     m_impl->m_config.mode = mode;
 
-    Utils::Logger::Info(L"WebcamProtector: Protection mode changed to: {}",
-                      Utils::StringUtils::Utf8ToWide(std::string(GetProtectionModeName(mode))));
+    SS_LOG_INFO(L"WebcamProtector", L"Protection mode changed to: %hs",
+                      std::string(GetProtectionModeName(mode)).c_str());
 }
 
 WebcamProtectionMode WebcamProtector::GetProtectionMode() const noexcept {
@@ -1201,7 +1407,7 @@ bool WebcamProtector::SetCameraBlocked(bool blocked) {
 
     m_impl->m_cameraBlocked.store(blocked, std::memory_order_release);
 
-    Utils::Logger::Info(L"WebcamProtector: Camera globally {}",
+    SS_LOG_INFO(L"WebcamProtector", L"Camera globally %ls",
                       blocked ? L"BLOCKED" : L"UNBLOCKED");
 
     return true;
@@ -1224,14 +1430,12 @@ bool WebcamProtector::BlockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = true;
 
-        Utils::Logger::Info(L"WebcamProtector: Device blocked: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId));
+        SS_LOG_INFO(L"WebcamProtector", L"Device blocked: %hs", deviceId.c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to block device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to block device - %hs", e.what());
         return false;
     }
 }
@@ -1249,14 +1453,12 @@ bool WebcamProtector::UnblockDevice(const std::string& deviceId) {
 
         it->second.isBlocked = false;
 
-        Utils::Logger::Info(L"WebcamProtector: Device unblocked: {}",
-                          Utils::StringUtils::Utf8ToWide(deviceId));
+        SS_LOG_INFO(L"WebcamProtector", L"Device unblocked: %hs", deviceId.c_str());
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to unblock device - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to unblock device - %hs", e.what());
         return false;
     }
 }
@@ -1334,14 +1536,13 @@ bool WebcamProtector::AllowProcessTemporarily(
         std::unique_lock lock(m_impl->m_temporaryMutex);
         m_impl->m_temporaryAccess[processId] = expiration;
 
-        Utils::Logger::Info(L"WebcamProtector: Temporary access granted to PID {} for {} seconds",
-                          processId, duration.count());
+        SS_LOG_INFO(L"WebcamProtector", L"Temporary access granted to PID %u for %lld seconds",
+                          processId, static_cast<long long>(duration.count()));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to grant temporary access - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to grant temporary access - %hs", e.what());
         return false;
     }
 }
@@ -1352,7 +1553,7 @@ void WebcamProtector::RevokeTemporaryAccess(uint32_t processId) {
     std::unique_lock lock(m_impl->m_temporaryMutex);
     m_impl->m_temporaryAccess.erase(processId);
 
-    Utils::Logger::Info(L"WebcamProtector: Temporary access revoked for PID {}", processId);
+    SS_LOG_INFO(L"WebcamProtector", L"Temporary access revoked for PID %u", processId);
 }
 
 // ============================================================================
@@ -1387,7 +1588,7 @@ bool WebcamProtector::ImportDefaultTrustedApps() {
             entry.entryId = std::string("DEFAULT_") + appName;
             entry.processPattern = appName;
             entry.enabled = true;
-            entry.requireSigned = false;
+            entry.requireSigned = true;
             entry.addedBy = "System";
             entry.addedTime = SystemClock::now();
             entry.notes = "Default trusted application";
@@ -1395,14 +1596,13 @@ bool WebcamProtector::ImportDefaultTrustedApps() {
             m_impl->AddToWhitelistInternal(entry);
         }
 
-        Utils::Logger::Info(L"WebcamProtector: Imported {} default trusted apps",
+        SS_LOG_INFO(L"WebcamProtector", L"Imported %zu default trusted apps",
                           std::size(WebcamConstants::DEFAULT_TRUSTED_APPS));
 
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Failed to import default apps - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Failed to import default apps - %hs", e.what());
         return false;
     }
 }
@@ -1416,7 +1616,7 @@ bool WebcamProtector::StartMonitoring() {
 
     m_impl->m_monitoringActive.store(true, std::memory_order_release);
 
-    Utils::Logger::Info(L"WebcamProtector: Monitoring started");
+    SS_LOG_INFO(L"WebcamProtector", L"Monitoring started");
 
     return true;
 }
@@ -1426,7 +1626,7 @@ void WebcamProtector::StopMonitoring() {
 
     m_impl->m_monitoringActive.store(false, std::memory_order_release);
 
-    Utils::Logger::Info(L"WebcamProtector: Monitoring stopped");
+    SS_LOG_INFO(L"WebcamProtector", L"Monitoring stopped");
 }
 
 bool WebcamProtector::IsMonitoringActive() const noexcept {
@@ -1468,7 +1668,7 @@ void WebcamProtector::ClearEventHistory() {
     std::unique_lock lock(m_impl->m_eventsMutex);
     m_impl->m_events.clear();
 
-    Utils::Logger::Info(L"WebcamProtector: Event history cleared");
+    SS_LOG_INFO(L"WebcamProtector", L"Event history cleared");
 }
 
 // ============================================================================
@@ -1531,102 +1731,98 @@ WebcamStatistics WebcamProtector::GetStatistics() const {
 void WebcamProtector::ResetStatistics() {
     if (m_impl) {
         m_impl->m_statistics.Reset();
-        Utils::Logger::Info(L"WebcamProtector: Statistics reset");
+        SS_LOG_INFO(L"WebcamProtector", L"Statistics reset");
     }
 }
 
 bool WebcamProtector::SelfTest() {
     try {
-        Utils::Logger::Info(L"WebcamProtector: Starting self-test");
+        SS_LOG_INFO(L"WebcamProtector", L"Starting self-test");
 
-        // Test 1: Initialization
-        WebcamConfiguration config;
-        config.mode = WebcamProtectionMode::WhitelistOnly;
-        config.notificationDurationMs = 5000;
-
-        if (!Initialize(config)) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Initialization");
+        if (!m_impl || !m_impl->m_initialized.load(std::memory_order_acquire)) {
+            SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - module not initialized");
             return false;
         }
 
-        // Test 2: Configuration validation
-        if (!config.IsValid()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Configuration invalid");
-            return false;
+        // Test 1: Configuration validation
+        {
+            WebcamConfiguration validCfg;
+            validCfg.notificationDurationMs = 5000;
+            if (!validCfg.IsValid()) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - default config invalid");
+                return false;
+            }
+            WebcamConfiguration badCfg;
+            badCfg.notificationDurationMs = 0;
+            if (badCfg.IsValid()) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - bad config accepted");
+                return false;
+            }
         }
 
-        // Test 3: Device enumeration
-        auto devices = GetCameraDevices();
-        Utils::Logger::Info(L"WebcamProtector: Enumerated {} devices", devices.size());
-
-        // Test 4: Whitelist management
-        CameraWhitelistEntry entry;
-        entry.entryId = "TEST_ENTRY";
-        entry.processPattern = "test.exe";
-        entry.enabled = true;
-
-        if (!AddToWhitelist(entry)) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Whitelist add");
-            return false;
+        // Test 2: Device enumeration (read-only)
+        {
+            auto devices = GetCameraDevices();
+            SS_LOG_INFO(L"WebcamProtector", L"Self-test: enumerated %zu devices", devices.size());
         }
 
-        if (!IsProcessWhitelisted("test.exe", fs::path{})) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Whitelist check");
-            return false;
+        // Test 3: Whitelist add/check/remove cycle (cleans up after itself)
+        {
+            CameraWhitelistEntry entry;
+            entry.entryId = "__SS_SELFTEST__";
+            entry.processPattern = "__selftest_dummy__.exe";
+            entry.enabled = true;
+
+            if (!AddToWhitelist(entry)) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - whitelist add");
+                return false;
+            }
+            bool found = IsProcessWhitelisted("__selftest_dummy__.exe", fs::path{});
+            RemoveFromWhitelist("__SS_SELFTEST__");
+            if (!found) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - whitelist lookup");
+                return false;
+            }
         }
 
-        if (!RemoveFromWhitelist("TEST_ENTRY")) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Whitelist remove");
-            return false;
+        // Test 4: Camera block/unblock (restores original state)
+        {
+            bool wasBlocked = IsCameraBlocked();
+            SetCameraBlocked(true);
+            if (!IsCameraBlocked()) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - block camera");
+                SetCameraBlocked(wasBlocked);
+                return false;
+            }
+            SetCameraBlocked(false);
+            if (IsCameraBlocked()) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - unblock camera");
+                SetCameraBlocked(wasBlocked);
+                return false;
+            }
+            SetCameraBlocked(wasBlocked);
         }
 
-        // Test 5: Protection control
-        SetCameraBlocked(true);
-        if (!IsCameraBlocked()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Block camera");
-            return false;
+        // Test 5: Statistics snapshot
+        {
+            auto stats = GetStatistics();
+            (void)stats.totalAccessAttempts.load(std::memory_order_relaxed);
         }
 
-        SetCameraBlocked(false);
-        if (IsCameraBlocked()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Unblock camera");
-            return false;
+        // Test 6: Version string sanity
+        {
+            auto ver = GetVersionString();
+            if (ver.empty()) {
+                SS_LOG_ERROR(L"WebcamProtector", L"Self-test failed - empty version");
+                return false;
+            }
         }
 
-        // Test 6: Monitoring
-        if (!StartMonitoring()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Start monitoring");
-            return false;
-        }
-
-        if (!IsMonitoringActive()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Monitoring not active");
-            return false;
-        }
-
-        StopMonitoring();
-
-        // Test 7: Statistics
-        auto stats = GetStatistics();
-        ResetStatistics();
-        stats = GetStatistics();
-        if (stats.totalAccessAttempts.load() != 0) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Statistics reset");
-            return false;
-        }
-
-        // Test 8: Default trusted apps
-        if (!ImportDefaultTrustedApps()) {
-            Utils::Logger::Error(L"WebcamProtector: Self-test failed - Import default apps");
-            return false;
-        }
-
-        Utils::Logger::Info(L"WebcamProtector: Self-test PASSED");
+        SS_LOG_INFO(L"WebcamProtector", L"Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"WebcamProtector: Self-test exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"Self-test exception - %hs", e.what());
         return false;
     }
 }
@@ -1708,7 +1904,7 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
     try {
         // Use SetupAPI to enumerate camera devices
         HDEVINFO deviceInfo = SetupDiGetClassDevsW(
-            &KSCATEGORY_VIDEO_CAMERA,
+            &s_ksCategoryVideoCamera,
             nullptr,
             nullptr,
             DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
@@ -1721,7 +1917,7 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
         interfaceData.cbSize = sizeof(SP_DEVICE_INTERFACE_DATA);
 
         for (DWORD i = 0; SetupDiEnumDeviceInterfaces(
-                 deviceInfo, nullptr, &KSCATEGORY_VIDEO_CAMERA, i, &interfaceData);
+                 deviceInfo, nullptr, &s_ksCategoryVideoCamera, i, &interfaceData);
              i++) {
 
             // Get required size
@@ -1743,7 +1939,7 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
                     deviceInfo, &interfaceData, detailData, requiredSize, nullptr, &devInfoData)) {
 
                 CameraDevice device;
-                device.devicePath = Utils::StringUtils::WideToUtf8(detailData->DevicePath);
+                device.devicePath = Utils::StringUtils::ToNarrow(detailData->DevicePath);
                 device.deviceId = std::format("CAM_{}", i);
 
                 // Get friendly name
@@ -1751,7 +1947,7 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
                 if (SetupDiGetDeviceRegistryPropertyW(
                         deviceInfo, &devInfoData, SPDRP_FRIENDLYNAME, nullptr,
                         reinterpret_cast<PBYTE>(friendlyName), sizeof(friendlyName), nullptr)) {
-                    device.friendlyName = Utils::StringUtils::WideToUtf8(friendlyName);
+                    device.friendlyName = Utils::StringUtils::ToNarrow(friendlyName);
                 }
 
                 // Get manufacturer
@@ -1759,12 +1955,58 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
                 if (SetupDiGetDeviceRegistryPropertyW(
                         deviceInfo, &devInfoData, SPDRP_MFG, nullptr,
                         reinterpret_cast<PBYTE>(manufacturer), sizeof(manufacturer), nullptr)) {
-                    device.manufacturer = Utils::StringUtils::WideToUtf8(manufacturer);
+                    device.manufacturer = Utils::StringUtils::ToNarrow(manufacturer);
                 }
 
-                device.type = CameraDeviceType::IntegratedUSB;  // Default
-                device.isHardwareEnabled = true;
-                device.isActive = false;
+                // Detect device type and virtual camera status
+                wchar_t hwId[512] = {};
+                if (SetupDiGetDeviceRegistryPropertyW(
+                        deviceInfo, &devInfoData, SPDRP_HARDWAREID, nullptr,
+                        reinterpret_cast<PBYTE>(hwId), sizeof(hwId), nullptr)) {
+
+                    std::wstring hwIdStr(hwId);
+                    std::wstring nameW = Utils::StringUtils::ToWide(device.friendlyName);
+                    device.isVirtual = IsVirtualCameraDevice(hwIdStr, nameW);
+
+                    if (device.isVirtual) {
+                        device.type = CameraDeviceType::Virtual;
+                    } else {
+                        // Extract VID/PID from hardware ID (e.g. "USB\\VID_046D&PID_082D...")
+                        std::wstring hwLower = hwIdStr;
+                        std::transform(hwLower.begin(), hwLower.end(), hwLower.begin(), ::towlower);
+
+                        auto vidPos = hwLower.find(L"vid_");
+                        auto pidPos = hwLower.find(L"pid_");
+                        if (vidPos != std::wstring::npos && vidPos + 8 <= hwLower.size()) {
+                            device.vendorId = static_cast<uint16_t>(
+                                std::wcstoul(hwLower.c_str() + vidPos + 4, nullptr, 16));
+                        }
+                        if (pidPos != std::wstring::npos && pidPos + 8 <= hwLower.size()) {
+                            device.productId = static_cast<uint16_t>(
+                                std::wcstoul(hwLower.c_str() + pidPos + 4, nullptr, 16));
+                        }
+
+                        if (hwLower.find(L"usb\\") != std::wstring::npos) {
+                            device.type = CameraDeviceType::ExternalUSB;
+                        } else {
+                            device.type = CameraDeviceType::IntegratedUSB;
+                        }
+                    }
+                } else {
+                    device.type = CameraDeviceType::Unknown;
+                }
+
+                // Check device status via Configuration Manager
+                DEVINST devInst = devInfoData.DevInst;
+                ULONG devStatus = 0, devProblem = 0;
+                if (CM_Get_DevNode_Status(&devStatus, &devProblem, devInst, 0) == CR_SUCCESS) {
+                    device.isHardwareEnabled = !(devStatus & DN_DISABLEABLE &&
+                                                  devProblem == CM_PROB_DISABLED);
+                    device.isActive = (devStatus & DN_STARTED) != 0;
+                } else {
+                    device.isHardwareEnabled = true;
+                    device.isActive = false;
+                }
 
                 devices.push_back(device);
 
@@ -1777,8 +2019,7 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
         SetupDiDestroyDeviceInfoList(deviceInfo);
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"EnumerateCameraDevices: Exception - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        SS_LOG_ERROR(L"WebcamProtector", L"EnumerateCameraDevices exception - %hs", e.what());
     }
 #endif
 
@@ -1786,11 +2027,52 @@ std::vector<CameraDevice> EnumerateCameraDevices() {
 }
 
 std::vector<uint32_t> GetProcessesUsingCamera(const std::string& deviceId) {
-    std::vector<uint32_t> processes;
+    std::vector<uint32_t> pids;
 
-    // In production, would enumerate handles to the camera device
-    // For stub, return empty
-    return processes;
+#ifdef _WIN32
+    // Enumerate running processes and check for camera-related modules.
+    // This is a user-mode heuristic; kernel-mode callbacks (PhantomSensor)
+    // provide authoritative device-handle tracking.
+    DWORD procIds[4096];
+    DWORD bytesReturned = 0;
+    if (!EnumProcesses(procIds, sizeof(procIds), &bytesReturned)) {
+        SS_LOG_LAST_ERROR(L"WebcamProtector", L"EnumProcesses failed");
+        return pids;
+    }
+
+    const DWORD procCount = bytesReturned / sizeof(DWORD);
+    constexpr size_t MAX_RESULTS = 64;
+
+    for (DWORD i = 0; i < procCount && pids.size() < MAX_RESULTS; ++i) {
+        if (procIds[i] == 0) continue;
+
+        HANDLE hProc = OpenProcess(
+            PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+            FALSE, procIds[i]);
+        if (!hProc) continue;
+
+        HMODULE modules[1024];
+        DWORD cbNeeded = 0;
+        if (EnumProcessModulesEx(hProc, modules, sizeof(modules),
+                                 &cbNeeded, LIST_MODULES_ALL)) {
+            const DWORD modCount = std::min<DWORD>(
+                cbNeeded / sizeof(HMODULE),
+                static_cast<DWORD>(std::size(modules)));
+            for (DWORD m = 0; m < modCount; ++m) {
+                wchar_t modName[MAX_PATH] = {};
+                if (GetModuleBaseNameW(hProc, modules[m], modName, MAX_PATH)) {
+                    if (_wcsicmp(modName, L"FrameServerClient.dll") == 0) {
+                        pids.push_back(procIds[i]);
+                        break;
+                    }
+                }
+            }
+        }
+        CloseHandle(hProc);
+    }
+#endif
+
+    return pids;
 }
 
 }  // namespace Privacy
