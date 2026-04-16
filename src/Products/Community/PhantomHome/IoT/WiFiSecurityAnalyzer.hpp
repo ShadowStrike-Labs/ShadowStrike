@@ -134,7 +134,7 @@
 #include "../Utils/NetworkUtils.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../PatternStore/PatternStore.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -260,6 +260,29 @@ enum class WiFiThreatType : uint32_t {
     UnknownAP               = 1 << 14,
     ChannelInterference     = 1 << 15
 };
+
+/// @brief Bitwise OR for WiFiThreatType flags
+[[nodiscard]] inline constexpr WiFiThreatType operator|(WiFiThreatType a, WiFiThreatType b) noexcept {
+    return static_cast<WiFiThreatType>(
+        static_cast<uint32_t>(a) | static_cast<uint32_t>(b));
+}
+
+/// @brief Bitwise AND for WiFiThreatType flags
+[[nodiscard]] inline constexpr WiFiThreatType operator&(WiFiThreatType a, WiFiThreatType b) noexcept {
+    return static_cast<WiFiThreatType>(
+        static_cast<uint32_t>(a) & static_cast<uint32_t>(b));
+}
+
+/// @brief Bitwise OR-assign for WiFiThreatType flags
+inline constexpr WiFiThreatType& operator|=(WiFiThreatType& a, WiFiThreatType b) noexcept {
+    a = a | b;
+    return a;
+}
+
+/// @brief Test if any flag is set
+[[nodiscard]] inline constexpr bool HasFlag(WiFiThreatType value, WiFiThreatType flag) noexcept {
+    return (static_cast<uint32_t>(value) & static_cast<uint32_t>(flag)) != 0;
+}
 
 /**
  * @brief Security level
@@ -511,7 +534,44 @@ struct WiFiStatistics {
     std::array<std::atomic<uint64_t>, 16> byThreatType{};
     std::array<std::atomic<uint64_t>, 8> bySecurityLevel{};
     TimePoint startTime = Clock::now();
-    
+
+    WiFiStatistics() noexcept = default;
+
+    WiFiStatistics(const WiFiStatistics& other) noexcept {
+        totalScans.store(other.totalScans.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        networksDiscovered.store(other.networksDiscovered.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        threatsDetected.store(other.threatsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        evilTwinsDetected.store(other.evilTwinsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        rogueAPsDetected.store(other.rogueAPsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        weakNetworksFound.store(other.weakNetworksFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        deauthAttacksDetected.store(other.deauthAttacksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        currentNetworksTracked.store(other.currentNetworksTracked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < byThreatType.size(); ++i)
+            byThreatType[i].store(other.byThreatType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        for (size_t i = 0; i < bySecurityLevel.size(); ++i)
+            bySecurityLevel[i].store(other.bySecurityLevel[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+        startTime = other.startTime;
+    }
+
+    WiFiStatistics& operator=(const WiFiStatistics& other) noexcept {
+        if (this != &other) {
+            totalScans.store(other.totalScans.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            networksDiscovered.store(other.networksDiscovered.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threatsDetected.store(other.threatsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            evilTwinsDetected.store(other.evilTwinsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            rogueAPsDetected.store(other.rogueAPsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            weakNetworksFound.store(other.weakNetworksFound.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            deauthAttacksDetected.store(other.deauthAttacksDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            currentNetworksTracked.store(other.currentNetworksTracked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < byThreatType.size(); ++i)
+                byThreatType[i].store(other.byThreatType[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            for (size_t i = 0; i < bySecurityLevel.size(); ++i)
+                bySecurityLevel[i].store(other.bySecurityLevel[i].load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };

@@ -81,7 +81,6 @@
 #include "../Utils/StringUtils.hpp"
 #include "../Utils/SystemUtils.hpp"
 #include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
 
 // Windows-specific headers
 #ifdef _WIN32
@@ -103,41 +102,164 @@ namespace IoT {
 
 namespace {
 
+// ============================================================================
+// LOG CATEGORY
+// ============================================================================
+
+constexpr const wchar_t* LOG_CAT = L"WiFiSecurity";
+
+// ============================================================================
+// SSID SANITIZATION
+// ============================================================================
+
 /**
- * @brief OUI vendor database (simplified subset)
+ * @brief Sanitize an SSID for safe display, logging, and JSON embedding.
+ *
+ * SSIDs are raw byte sequences (up to 32 bytes). They can contain null bytes,
+ * control characters, non-UTF-8 sequences, and other hostile content.
+ * An attacker controlling a nearby AP can craft SSIDs to:
+ * - Inject into log files (CRLF injection)
+ * - Break JSON serialization
+ * - Exploit downstream parsers
+ *
+ * This function replaces non-printable-ASCII bytes with hex escapes.
+ */
+[[nodiscard]] std::string SanitizeSSID(const std::string& raw) noexcept {
+    if (raw.empty()) return "<hidden>";
+
+    std::string sanitized;
+    sanitized.reserve(raw.size() * 2);
+
+    for (unsigned char ch : raw) {
+        if (ch >= 0x20 && ch < 0x7F && ch != '\\' && ch != '"') {
+            sanitized.push_back(static_cast<char>(ch));
+        } else {
+            // Hex-escape non-printable and special characters
+            sanitized += "\\x";
+            constexpr char hex[] = "0123456789abcdef";
+            sanitized.push_back(hex[(ch >> 4) & 0x0F]);
+            sanitized.push_back(hex[ch & 0x0F]);
+        }
+    }
+    return sanitized;
+}
+
+/**
+ * @brief Validate and normalize a BSSID string (MAC address format).
+ * @return Uppercased BSSID in XX:XX:XX:XX:XX:XX format, or empty on invalid input.
+ */
+[[nodiscard]] std::string ValidateAndNormalizeBSSID(const std::string& bssid) noexcept {
+    if (bssid.size() != 17) return {};
+
+    std::string normalized;
+    normalized.reserve(17);
+
+    for (size_t i = 0; i < 17; ++i) {
+        char c = bssid[i];
+        if (i % 3 == 2) {
+            if (c != ':') return {};
+            normalized.push_back(':');
+        } else {
+            char upper = static_cast<char>(::toupper(static_cast<unsigned char>(c)));
+            if ((upper >= '0' && upper <= '9') || (upper >= 'A' && upper <= 'F')) {
+                normalized.push_back(upper);
+            } else {
+                return {};
+            }
+        }
+    }
+    return normalized;
+}
+
+// ============================================================================
+// OUI VENDOR DATABASE
+// ============================================================================
+
+/**
+ * @brief OUI vendor database — production subset covering major AP manufacturers.
+ *
+ * In production, this would be loaded from an updatable file (IEEE OUI database).
+ * This embedded subset covers the most common AP, router, and IoT device vendors
+ * to provide vendor identification without requiring external file I/O.
  */
 const std::unordered_map<std::string, std::string> OUI_VENDORS = {
-    {"00:1B:63", "Apple"},
-    {"00:50:F2", "Microsoft"},
-    {"00:25:00", "Apple"},
-    {"B8:27:EB", "Raspberry Pi"},
-    {"DC:A6:32", "Raspberry Pi"},
-    {"00:1E:C2", "Apple"},
-    {"00:26:BB", "Apple"},
-    {"00:0C:29", "VMware"},
-    {"00:50:56", "VMware"},
-    {"08:00:27", "VirtualBox"},
-    {"00:1C:42", "Parallels"},
-    {"00:03:93", "Apple"},
-    {"00:0D:93", "Apple"},
-    {"00:17:F2", "Apple"},
-    {"00:1F:5B", "Apple"},
-    {"00:21:E9", "Apple"},
-    {"00:22:41", "Apple"},
-    {"00:23:12", "Apple"},
-    {"00:23:32", "Apple"},
-    {"00:23:6C", "Apple"},
-    {"00:24:36", "Apple"},
-    {"00:25:BC", "Apple"},
-    {"00:26:08", "Apple"}
+    // Apple
+    {"00:1B:63", "Apple"}, {"00:25:00", "Apple"}, {"00:1E:C2", "Apple"},
+    {"00:26:BB", "Apple"}, {"00:03:93", "Apple"}, {"00:0D:93", "Apple"},
+    {"00:17:F2", "Apple"}, {"00:1F:5B", "Apple"}, {"00:21:E9", "Apple"},
+    {"00:22:41", "Apple"}, {"00:23:12", "Apple"}, {"00:23:32", "Apple"},
+    {"00:23:6C", "Apple"}, {"00:24:36", "Apple"}, {"00:25:BC", "Apple"},
+    {"00:26:08", "Apple"}, {"AC:DE:48", "Apple"}, {"A8:5C:2C", "Apple"},
+    {"3C:15:C2", "Apple"}, {"70:56:81", "Apple"}, {"F0:D1:A9", "Apple"},
+    // Microsoft
+    {"00:50:F2", "Microsoft"}, {"00:15:5D", "Microsoft"}, {"28:18:78", "Microsoft"},
+    // Cisco / Meraki
+    {"00:0C:41", "Cisco"}, {"00:17:94", "Cisco"}, {"00:1A:A1", "Cisco"},
+    {"00:1B:D4", "Cisco"}, {"00:22:BD", "Cisco"}, {"00:23:04", "Cisco"},
+    {"00:26:52", "Cisco"}, {"00:40:96", "Cisco"}, {"0C:75:BD", "Cisco"},
+    {"AC:17:C8", "Cisco"}, {"00:18:0A", "Cisco Meraki"}, {"0C:8D:DB", "Cisco Meraki"},
+    // Aruba / HPE
+    {"00:0B:86", "Aruba"}, {"00:1A:1E", "Aruba"}, {"00:24:6C", "Aruba"},
+    {"24:DE:C6", "Aruba"}, {"6C:F3:7F", "Aruba"}, {"AC:A3:1E", "Aruba"},
+    // Ruckus
+    {"00:22:7A", "Ruckus"}, {"C4:10:8A", "Ruckus"}, {"EC:58:EA", "Ruckus"},
+    // Ubiquiti
+    {"00:27:22", "Ubiquiti"}, {"04:18:D6", "Ubiquiti"}, {"24:A4:3C", "Ubiquiti"},
+    {"44:D9:E7", "Ubiquiti"}, {"68:72:51", "Ubiquiti"}, {"78:8A:20", "Ubiquiti"},
+    {"80:2A:A8", "Ubiquiti"}, {"B4:FB:E4", "Ubiquiti"}, {"F0:9F:C2", "Ubiquiti"},
+    // TP-Link
+    {"00:23:CD", "TP-Link"}, {"14:CC:20", "TP-Link"}, {"30:B5:C2", "TP-Link"},
+    {"50:C7:BF", "TP-Link"}, {"54:C8:0F", "TP-Link"}, {"60:32:B1", "TP-Link"},
+    {"C0:25:E9", "TP-Link"}, {"EC:08:6B", "TP-Link"}, {"F4:F2:6D", "TP-Link"},
+    // Netgear
+    {"00:14:6C", "Netgear"}, {"00:1B:2F", "Netgear"}, {"00:1E:2A", "Netgear"},
+    {"00:26:F2", "Netgear"}, {"20:0C:C8", "Netgear"}, {"A0:21:B7", "Netgear"},
+    {"A4:2B:8C", "Netgear"}, {"C4:3D:C7", "Netgear"}, {"B0:B9:8A", "Netgear"},
+    // Linksys
+    {"00:14:BF", "Linksys"}, {"00:18:F8", "Linksys"}, {"00:1A:70", "Linksys"},
+    {"00:21:29", "Linksys"}, {"C0:56:27", "Linksys"},
+    // ASUS
+    {"00:1D:60", "ASUS"}, {"08:60:6E", "ASUS"}, {"10:BF:48", "ASUS"},
+    {"1C:87:2C", "ASUS"}, {"2C:56:DC", "ASUS"}, {"50:46:5D", "ASUS"},
+    {"AC:9E:17", "ASUS"}, {"F0:2F:74", "ASUS"},
+    // D-Link
+    {"00:05:5D", "D-Link"}, {"00:17:9A", "D-Link"}, {"00:1B:11", "D-Link"},
+    {"00:1C:F0", "D-Link"}, {"1C:7E:E5", "D-Link"}, {"28:10:7B", "D-Link"},
+    {"84:C9:B2", "D-Link"}, {"FC:75:16", "D-Link"},
+    // Huawei
+    {"00:25:9E", "Huawei"}, {"00:46:4B", "Huawei"}, {"20:F3:A3", "Huawei"},
+    {"48:46:FB", "Huawei"}, {"58:2A:F7", "Huawei"}, {"70:72:3C", "Huawei"},
+    {"88:28:B3", "Huawei"}, {"AC:E8:7B", "Huawei"}, {"CC:A2:23", "Huawei"},
+    // Samsung
+    {"00:12:47", "Samsung"}, {"00:21:19", "Samsung"}, {"00:26:37", "Samsung"},
+    {"08:D4:2B", "Samsung"}, {"34:23:BA", "Samsung"}, {"50:01:BB", "Samsung"},
+    {"78:47:1D", "Samsung"}, {"A8:F2:74", "Samsung"}, {"C0:BD:D1", "Samsung"},
+    // Intel
+    {"00:02:B3", "Intel"}, {"00:13:02", "Intel"}, {"00:1B:21", "Intel"},
+    {"00:1F:3B", "Intel"}, {"3C:97:0E", "Intel"}, {"68:05:CA", "Intel"},
+    {"8C:EC:4B", "Intel"}, {"B4:6B:FC", "Intel"},
+    // Virtualization (security-relevant for rogue AP detection)
+    {"00:0C:29", "VMware"}, {"00:50:56", "VMware"}, {"08:00:27", "VirtualBox"},
+    {"00:1C:42", "Parallels"}, {"52:54:00", "QEMU/KVM"},
+    // Raspberry Pi (common rogue AP platform)
+    {"B8:27:EB", "Raspberry Pi"}, {"DC:A6:32", "Raspberry Pi"},
+    {"E4:5F:01", "Raspberry Pi"},
+    // Amazon (Echo, Ring, etc.)
+    {"00:FC:8B", "Amazon"}, {"10:CE:A9", "Amazon"}, {"40:B4:CD", "Amazon"},
+    {"44:65:0D", "Amazon"}, {"68:54:FD", "Amazon"}, {"74:C2:46", "Amazon"},
+    // Google / Nest
+    {"00:1A:11", "Google"}, {"3C:5A:B4", "Google"}, {"54:60:09", "Google"},
+    {"A4:77:33", "Google"}, {"F4:F5:D8", "Google"},
 };
 
 /**
- * @brief Known weak/default SSIDs
+ * @brief Known weak/default SSIDs (lowercased for comparison)
  */
 const std::vector<std::string> WEAK_SSIDS = {
-    "linksys", "default", "NETGEAR", "dlink", "asus", "TP-LINK",
-    "belkin", "router", "wireless", "network", "wifi", "internet"
+    "linksys", "default", "netgear", "dlink", "asus", "tp-link",
+    "belkin", "router", "wireless", "network", "wifi", "internet",
+    "admin", "home", "setup", "guest", "test", "xfinity",
+    "att-wifi", "tmobile", "verizon", "comcast"
 };
 
 /**
@@ -148,6 +270,9 @@ struct BSSIDTracker {
     std::deque<BSSIDHistoryEntry> history;
     std::unordered_map<std::string, SystemTimePoint> bssidLastSeen;
 };
+
+/// @brief Maximum stale age before a tracked network is evicted
+static constexpr auto STALE_NETWORK_AGE = std::chrono::hours(24);
 
 } // anonymous namespace
 
@@ -277,7 +402,10 @@ private:
 
     // Infrastructure references
     ThreatIntel::ThreatIntelManager* m_threatIntel = nullptr;
-    Whitelist::WhiteListStore* m_whitelist = nullptr;
+
+    // Internal BSSID whitelist (WhiteListStore is for file-based whitelisting,
+    // not WiFi BSSID management — we manage our own BSSID whitelist)
+    std::unordered_set<std::string> m_whitelistedBSSIDs;
 };
 
 // ============================================================================
@@ -285,19 +413,19 @@ private:
 // ============================================================================
 
 WiFiSecurityAnalyzerImpl::WiFiSecurityAnalyzerImpl() {
-    Logger::Info("[WiFiSecurityAnalyzer] Instance created");
+    SS_LOG_INFO(LOG_CAT, L"Instance created");
 }
 
 WiFiSecurityAnalyzerImpl::~WiFiSecurityAnalyzerImpl() {
     Shutdown();
-    Logger::Info("[WiFiSecurityAnalyzer] Instance destroyed");
+    SS_LOG_INFO(LOG_CAT, L"Instance destroyed");
 }
 
 bool WiFiSecurityAnalyzerImpl::Initialize(const WiFiAnalyzerConfiguration& config) {
     std::unique_lock lock(m_mutex);
 
     if (m_initialized.load(std::memory_order_acquire)) {
-        Logger::Warn("[WiFiSecurityAnalyzer] Already initialized");
+        SS_LOG_WARN(LOG_CAT, L"Already initialized");
         return true;
     }
 
@@ -306,31 +434,29 @@ bool WiFiSecurityAnalyzerImpl::Initialize(const WiFiAnalyzerConfiguration& confi
 
         // Validate configuration
         if (!config.IsValid()) {
-            Logger::Error("[WiFiSecurityAnalyzer] Invalid configuration");
+            SS_LOG_ERROR(LOG_CAT, L"Invalid configuration: scanInterval=%u, evilTwinThreshold=%d",
+                         config.scanIntervalSeconds, config.evilTwinSignalThreshold);
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
 
         m_config = config;
 
-        // Initialize infrastructure references
+        // Initialize ThreatIntel reference (optional dependency)
         try {
             m_threatIntel = &ThreatIntel::ThreatIntelManager::Instance();
+            if (!m_threatIntel->IsInitialized()) {
+                SS_LOG_WARN(LOG_CAT, L"ThreatIntelManager available but not initialized");
+                m_threatIntel = nullptr;
+            }
         } catch (const std::exception& e) {
-            Logger::Warn("[WiFiSecurityAnalyzer] ThreatIntel not available: {}", e.what());
+            SS_LOG_WARN(LOG_CAT, L"ThreatIntel not available: %hs", e.what());
             m_threatIntel = nullptr;
-        }
-
-        try {
-            m_whitelist = &Whitelist::WhiteListStore::Instance();
-        } catch (const std::exception& e) {
-            Logger::Warn("[WiFiSecurityAnalyzer] WhiteListStore not available: {}", e.what());
-            m_whitelist = nullptr;
         }
 
         // Initialize WLAN API
         if (!InitializeWLAN()) {
-            Logger::Error("[WiFiSecurityAnalyzer] Failed to initialize WLAN API");
+            SS_LOG_ERROR(LOG_CAT, L"Failed to initialize WLAN API");
             m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
@@ -342,15 +468,15 @@ bool WiFiSecurityAnalyzerImpl::Initialize(const WiFiAnalyzerConfiguration& confi
         m_initialized.store(true, std::memory_order_release);
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Logger::Info("[WiFiSecurityAnalyzer] Initialized successfully (Version {})", GetVersionString());
+        SS_LOG_INFO(LOG_CAT, L"Initialized successfully (Version %hs)", GetVersionString().c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Critical("[WiFiSecurityAnalyzer] Initialization failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Initialization failed: %hs", e.what());
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     } catch (...) {
-        Logger::Critical("[WiFiSecurityAnalyzer] Initialization failed: Unknown error");
+        SS_LOG_ERROR(LOG_CAT, L"Initialization failed: Unknown error");
         m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -372,7 +498,7 @@ void WiFiSecurityAnalyzerImpl::Shutdown() {
             m_monitoringCV.notify_all();
 
             if (m_monitoringThread && m_monitoringThread->joinable()) {
-                lock.unlock();  // Release lock before joining
+                lock.unlock();  // Release lock before joining to avoid deadlock
                 m_monitoringThread->join();
                 lock.lock();
             }
@@ -386,7 +512,11 @@ void WiFiSecurityAnalyzerImpl::Shutdown() {
         m_trackedNetworks.clear();
         m_bssidHistory.clear();
         m_blockedBSSIDs.clear();
-        m_detectedThreats.clear();
+        m_whitelistedBSSIDs.clear();
+        {
+            std::lock_guard threatLock(m_threatMutex);
+            m_detectedThreats.clear();
+        }
 
         // Clear callbacks
         UnregisterCallbacks();
@@ -394,12 +524,12 @@ void WiFiSecurityAnalyzerImpl::Shutdown() {
         m_initialized.store(false, std::memory_order_release);
         m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Logger::Info("[WiFiSecurityAnalyzer] Shutdown complete");
+        SS_LOG_INFO(LOG_CAT, L"Shutdown complete");
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] Shutdown error: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Shutdown error: %hs", e.what());
     } catch (...) {
-        Logger::Error("[WiFiSecurityAnalyzer] Shutdown error: Unknown exception");
+        SS_LOG_ERROR(LOG_CAT, L"Shutdown error: Unknown exception");
     }
 }
 
@@ -411,7 +541,7 @@ bool WiFiSecurityAnalyzerImpl::InitializeWLAN() {
         DWORD result = WlanOpenHandle(2, nullptr, &negotiatedVersion, &m_wlanHandle);
 
         if (result != ERROR_SUCCESS) {
-            Logger::Error("[WiFiSecurityAnalyzer] WlanOpenHandle failed: {}", result);
+            SS_LOG_ERROR(LOG_CAT, L"WlanOpenHandle failed: error=%u", result);
             return false;
         }
 
@@ -420,34 +550,36 @@ bool WiFiSecurityAnalyzerImpl::InitializeWLAN() {
         result = WlanEnumInterfaces(m_wlanHandle, nullptr, &interfaceList);
 
         if (result != ERROR_SUCCESS) {
-            Logger::Error("[WiFiSecurityAnalyzer] WlanEnumInterfaces failed: {}", result);
+            SS_LOG_ERROR(LOG_CAT, L"WlanEnumInterfaces failed: error=%u", result);
             WlanCloseHandle(m_wlanHandle, nullptr);
             m_wlanHandle = nullptr;
             return false;
         }
 
         // Use first available interface
-        if (interfaceList->dwNumberOfItems > 0) {
+        if (interfaceList && interfaceList->dwNumberOfItems > 0) {
             m_interfaceGuid = interfaceList->InterfaceInfo[0].InterfaceGuid;
             m_hasInterface = true;
 
             wchar_t guidStr[40] = {};
             StringFromGUID2(m_interfaceGuid, guidStr, 40);
-            Logger::Info("[WiFiSecurityAnalyzer] Using interface: {}", StringUtils::WStringToString(guidStr));
+            SS_LOG_INFO(LOG_CAT, L"Using WiFi interface: %ls", guidStr);
         } else {
-            Logger::Warn("[WiFiSecurityAnalyzer] No WiFi interface found");
+            SS_LOG_WARN(LOG_CAT, L"No WiFi interface found");
             m_hasInterface = false;
         }
 
-        WlanFreeMemory(interfaceList);
+        if (interfaceList) {
+            WlanFreeMemory(interfaceList);
+        }
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] WLAN initialization error: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"WLAN initialization error: %hs", e.what());
         return false;
     }
 #else
-    Logger::Warn("[WiFiSecurityAnalyzer] WLAN API not available on this platform");
+    SS_LOG_WARN(LOG_CAT, L"WLAN API not available on this platform");
     return false;
 #endif
 }
@@ -466,12 +598,13 @@ bool WiFiSecurityAnalyzerImpl::UpdateConfiguration(const WiFiAnalyzerConfigurati
     std::unique_lock lock(m_mutex);
 
     if (!config.IsValid()) {
-        Logger::Error("[WiFiSecurityAnalyzer] Invalid configuration");
+        SS_LOG_ERROR(LOG_CAT, L"Invalid configuration: scanInterval=%u, evilTwinThreshold=%d",
+                     config.scanIntervalSeconds, config.evilTwinSignalThreshold);
         return false;
     }
 
     m_config = config;
-    Logger::Info("[WiFiSecurityAnalyzer] Configuration updated");
+    SS_LOG_INFO(LOG_CAT, L"Configuration updated");
     return true;
 }
 
@@ -486,7 +619,7 @@ WiFiAnalyzerConfiguration WiFiSecurityAnalyzerImpl::GetConfiguration() const {
 
 WiFiConnectionInfo WiFiSecurityAnalyzerImpl::GetCurrentConnectionInfo() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[WiFiSecurityAnalyzer] Not initialized");
+        SS_LOG_ERROR(LOG_CAT, L"GetCurrentConnectionInfo called before initialization");
         return {};
     }
 
@@ -499,7 +632,18 @@ bool WiFiSecurityAnalyzerImpl::IsConnected() const noexcept {
     }
 
 #ifdef _WIN32
-    if (!m_wlanHandle || !m_hasInterface) {
+    // Read WLAN handle/interface under shared lock to prevent races during shutdown
+    HANDLE wlanHandle = nullptr;
+    GUID interfaceGuid{};
+    bool hasInterface = false;
+    {
+        std::shared_lock lock(m_mutex);
+        wlanHandle = m_wlanHandle;
+        interfaceGuid = m_interfaceGuid;
+        hasInterface = m_hasInterface;
+    }
+
+    if (!wlanHandle || !hasInterface) {
         return false;
     }
 
@@ -507,8 +651,8 @@ bool WiFiSecurityAnalyzerImpl::IsConnected() const noexcept {
     DWORD dataSize = 0;
 
     DWORD result = WlanQueryInterface(
-        m_wlanHandle,
-        &m_interfaceGuid,
+        wlanHandle,
+        &interfaceGuid,
         wlan_intf_opcode_current_connection,
         nullptr,
         &dataSize,
@@ -549,7 +693,7 @@ std::optional<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::GetConnectedNetwork() c
 
 std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[WiFiSecurityAnalyzer] Not initialized");
+        SS_LOG_ERROR(LOG_CAT, L"Scan requested before initialization");
         return {};
     }
 
@@ -559,9 +703,22 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
     try {
         auto networks = QueryNetworksWLAN();
 
-        // Update tracked networks and detect threats
+        // Collect notification payloads outside the lock to avoid deadlocks.
+        // Callbacks are user-provided and could re-enter the analyzer.
+        std::vector<WiFiNetworkInfo> newNetworks;
+        std::vector<WiFiSecurityThreat> allThreats;
+
         {
             std::unique_lock lock(m_mutex);
+
+            // Evict stale networks if we're at the tracking cap
+            if (m_trackedNetworks.size() >= WiFiConstants::MAX_TRACKED_NETWORKS) {
+                auto now = std::chrono::system_clock::now();
+                std::erase_if(m_trackedNetworks, [&](const auto& pair) {
+                    auto age = std::chrono::duration_cast<std::chrono::hours>(now - pair.second.lastSeen);
+                    return age >= STALE_NETWORK_AGE;
+                });
+            }
 
             for (auto& network : networks) {
                 // Calculate security level
@@ -573,10 +730,8 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
                 // Get vendor
                 network.vendor = GetVendorFromBSSID(network.bssid);
 
-                // Check whitelist
-                if (m_whitelist) {
-                    network.isWhitelisted = m_whitelist->IsWhitelisted(StringUtils::StringToWString(network.bssid));
-                }
+                // Check internal BSSID whitelist
+                network.isWhitelisted = m_whitelistedBSSIDs.contains(network.bssid);
 
                 // Update timestamps
                 auto now = std::chrono::system_clock::now();
@@ -585,41 +740,51 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::ScanNearbyNetworks() {
                     network.firstSeen = now;
                     network.lastSeen = now;
                     m_stats.networksDiscovered++;
-
-                    // Notify new network found
-                    NotifyNetworkFound(network);
+                    newNetworks.push_back(network);
                 } else {
                     network.firstSeen = it->second.firstSeen;
                     network.lastSeen = now;
                 }
 
-                // Update tracking
-                m_trackedNetworks[network.bssid] = network;
+                // Enforce tracking cap — skip insertion if at limit after eviction
+                if (m_trackedNetworks.size() < WiFiConstants::MAX_TRACKED_NETWORKS ||
+                    m_trackedNetworks.contains(network.bssid)) {
+                    m_trackedNetworks[network.bssid] = network;
+                }
 
                 // Update BSSID history
                 if (m_config.trackBSSIDHistory) {
                     UpdateBSSIDHistory(network);
                 }
 
-                // Check for threats
+                // Collect threats for notification (outside lock later)
                 if (network.threats != WiFiThreatType::None) {
                     auto threats = CheckNetworkSecurity(network);
-                    for (const auto& threat : threats) {
-                        NotifyThreat(threat);
-                    }
+                    allThreats.insert(allThreats.end(),
+                        std::make_move_iterator(threats.begin()),
+                        std::make_move_iterator(threats.end()));
                 }
             }
 
             m_stats.currentNetworksTracked = static_cast<uint32_t>(m_trackedNetworks.size());
         }
+        // Lock released — safe to invoke callbacks now
+
+        // Fire notifications without holding m_mutex
+        for (const auto& net : newNetworks) {
+            NotifyNetworkFound(net);
+        }
+        for (const auto& threat : allThreats) {
+            NotifyThreat(threat);
+        }
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Logger::Info("[WiFiSecurityAnalyzer] Scan complete: {} networks found", networks.size());
+        SS_LOG_INFO(LOG_CAT, L"Scan complete: %zu networks found", networks.size());
         return networks;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] Scan failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Scan failed: %hs", e.what());
         m_status.store(ModuleStatus::Running, std::memory_order_release);
         NotifyError(e.what(), -1);
         return {};
@@ -630,12 +795,12 @@ bool WiFiSecurityAnalyzerImpl::StartMonitoring() {
     std::unique_lock lock(m_mutex);
 
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[WiFiSecurityAnalyzer] Cannot start monitoring: Not initialized");
+        SS_LOG_ERROR(LOG_CAT, L"Cannot start monitoring: Not initialized");
         return false;
     }
 
     if (m_monitoringActive.load(std::memory_order_acquire)) {
-        Logger::Warn("[WiFiSecurityAnalyzer] Monitoring already active");
+        SS_LOG_WARN(LOG_CAT, L"Monitoring already active");
         return true;
     }
 
@@ -644,11 +809,11 @@ bool WiFiSecurityAnalyzerImpl::StartMonitoring() {
         m_monitoringThread = std::make_unique<std::thread>(&WiFiSecurityAnalyzerImpl::MonitoringThreadFunc, this);
 
         m_status.store(ModuleStatus::Monitoring, std::memory_order_release);
-        Logger::Info("[WiFiSecurityAnalyzer] Monitoring started");
+        SS_LOG_INFO(LOG_CAT, L"Monitoring started (interval=%u s)", m_config.scanIntervalSeconds);
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] Start monitoring failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Start monitoring failed: %hs", e.what());
         m_monitoringActive.store(false, std::memory_order_release);
         return false;
     }
@@ -669,10 +834,10 @@ void WiFiSecurityAnalyzerImpl::StopMonitoring() {
         m_monitoringThread.reset();
 
         m_status.store(ModuleStatus::Running, std::memory_order_release);
-        Logger::Info("[WiFiSecurityAnalyzer] Monitoring stopped");
+        SS_LOG_INFO(LOG_CAT, L"Monitoring stopped");
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] Stop monitoring failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Stop monitoring failed: %hs", e.what());
     }
 }
 
@@ -682,7 +847,7 @@ void WiFiSecurityAnalyzerImpl::StopMonitoring() {
 
 EvilTwinDetectionResult WiFiSecurityAnalyzerImpl::DetectEvilTwin() {
     if (!m_initialized.load(std::memory_order_acquire)) {
-        Logger::Error("[WiFiSecurityAnalyzer] Not initialized");
+        SS_LOG_ERROR(LOG_CAT, L"Not initialized");
         return {};
     }
 
@@ -704,38 +869,47 @@ EvilTwinDetectionResult WiFiSecurityAnalyzerImpl::DetectEvilTwin() {
 std::vector<WiFiSecurityThreat> WiFiSecurityAnalyzerImpl::CheckNetworkSecurity(const WiFiNetworkInfo& network) {
     std::vector<WiFiSecurityThreat> threats;
 
+    // Take a snapshot of config under lock (may be called outside m_mutex context)
+    WiFiAnalyzerConfiguration configSnap;
+    {
+        std::shared_lock lock(m_mutex);
+        configSnap = m_config;
+    }
+
     try {
+        const std::string safeSSID = SanitizeSSID(network.ssid);
+
         // Check encryption weakness
-        if (m_config.alertOnWeakEncryption) {
+        if (configSnap.alertOnWeakEncryption) {
             if (network.encryption == EncryptionType::WEP) {
                 WiFiSecurityThreat threat;
                 threat.type = WiFiThreatType::WeakEncryption;
                 threat.severity = SecurityLevel::Critical;
-                threat.affectedSSID = network.ssid;
+                threat.affectedSSID = safeSSID;
                 threat.affectedBSSID = network.bssid;
                 threat.description = "WEP encryption is critically insecure and can be cracked in minutes";
                 threat.recommendation = "Upgrade to WPA2/WPA3 immediately";
                 threat.detectionTime = std::chrono::system_clock::now();
-                threats.push_back(threat);
+                threats.push_back(std::move(threat));
 
                 m_stats.weakNetworksFound++;
-                m_stats.byThreatType[4]++;  // WeakEncryption
+                m_stats.byThreatType[4]++;
             }
         }
 
         // Check open network
-        if (m_config.alertOnOpenNetworks && network.encryption == EncryptionType::Open) {
+        if (configSnap.alertOnOpenNetworks && network.encryption == EncryptionType::Open) {
             WiFiSecurityThreat threat;
             threat.type = WiFiThreatType::OpenNetwork;
             threat.severity = SecurityLevel::Weak;
-            threat.affectedSSID = network.ssid;
+            threat.affectedSSID = safeSSID;
             threat.affectedBSSID = network.bssid;
             threat.description = "Open network with no encryption - traffic can be intercepted";
             threat.recommendation = "Enable WPA2/WPA3 encryption";
             threat.detectionTime = std::chrono::system_clock::now();
-            threats.push_back(threat);
+            threats.push_back(std::move(threat));
 
-            m_stats.byThreatType[5]++;  // OpenNetwork
+            m_stats.byThreatType[5]++;
         }
 
         // Check WPS
@@ -743,14 +917,14 @@ std::vector<WiFiSecurityThreat> WiFiSecurityAnalyzerImpl::CheckNetworkSecurity(c
             WiFiSecurityThreat threat;
             threat.type = WiFiThreatType::WPSEnabled;
             threat.severity = SecurityLevel::Moderate;
-            threat.affectedSSID = network.ssid;
+            threat.affectedSSID = safeSSID;
             threat.affectedBSSID = network.bssid;
-            threat.description = "WPS is vulnerable to brute-force attacks";
+            threat.description = "WPS is vulnerable to brute-force PIN attacks (Reaver/Bully)";
             threat.recommendation = "Disable WPS in router settings";
             threat.detectionTime = std::chrono::system_clock::now();
-            threats.push_back(threat);
+            threats.push_back(std::move(threat));
 
-            m_stats.byThreatType[6]++;  // WPSEnabled
+            m_stats.byThreatType[6]++;
         }
 
         // Check KRACK vulnerability (WPA2 without PMF)
@@ -758,32 +932,32 @@ std::vector<WiFiSecurityThreat> WiFiSecurityAnalyzerImpl::CheckNetworkSecurity(c
             WiFiSecurityThreat threat;
             threat.type = WiFiThreatType::KRACKVulnerable;
             threat.severity = SecurityLevel::Moderate;
-            threat.affectedSSID = network.ssid;
+            threat.affectedSSID = safeSSID;
             threat.affectedBSSID = network.bssid;
-            threat.description = "WPA2 without PMF is vulnerable to KRACK attacks";
-            threat.recommendation = "Enable Protected Management Frames (PMF/802.11w)";
+            threat.description = "WPA2 without PMF is vulnerable to key reinstallation attacks (KRACK)";
+            threat.recommendation = "Enable Protected Management Frames (PMF/802.11w) or upgrade to WPA3";
             threat.cveId = "CVE-2017-13077";
             threat.detectionTime = std::chrono::system_clock::now();
-            threats.push_back(threat);
+            threats.push_back(std::move(threat));
 
-            m_stats.byThreatType[7]++;  // KRACKVulnerable
+            m_stats.byThreatType[7]++;
         }
 
-        // Check rogue AP
-        if (m_config.enableRogueAPDetection) {
+        // Check rogue AP against ThreatIntel
+        if (configSnap.enableRogueAPDetection) {
             if (IsKnownRogueAP(network.bssid)) {
                 WiFiSecurityThreat threat;
                 threat.type = WiFiThreatType::RogueAP;
                 threat.severity = SecurityLevel::Critical;
-                threat.affectedSSID = network.ssid;
+                threat.affectedSSID = safeSSID;
                 threat.affectedBSSID = network.bssid;
-                threat.description = "Rogue access point detected - known malicious AP";
-                threat.recommendation = "Do not connect. Report to network administrator";
+                threat.description = "Rogue access point detected - BSSID matched threat intelligence database";
+                threat.recommendation = "Do not connect. Report to network administrator. Disconnect if connected.";
                 threat.detectionTime = std::chrono::system_clock::now();
-                threats.push_back(threat);
+                threats.push_back(std::move(threat));
 
                 m_stats.rogueAPsDetected++;
-                m_stats.byThreatType[2]++;  // RogueAP
+                m_stats.byThreatType[2]++;
             }
         }
 
@@ -800,7 +974,7 @@ std::vector<WiFiSecurityThreat> WiFiSecurityAnalyzerImpl::CheckNetworkSecurity(c
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] CheckNetworkSecurity failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"CheckNetworkSecurity failed: %hs", e.what());
     }
 
     return threats;
@@ -865,45 +1039,47 @@ std::optional<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::GetNetworkByBSSID(const
 }
 
 bool WiFiSecurityAnalyzerImpl::AddToWhitelist(const std::string& bssid) {
-    if (!m_whitelist) {
-        Logger::Warn("[WiFiSecurityAnalyzer] WhiteListStore not available");
-        return false;
-    }
-
     try {
-        std::wstring wbssid = StringUtils::StringToWString(NormalizeBSSID(bssid));
-        bool result = m_whitelist->AddToWhitelist(wbssid);
-
-        if (result) {
-            Logger::Info("[WiFiSecurityAnalyzer] Added to whitelist: {}", bssid);
+        std::string normalized = NormalizeBSSID(bssid);
+        if (normalized.empty()) {
+            SS_LOG_ERROR(LOG_CAT, L"AddToWhitelist: Invalid BSSID format");
+            return false;
         }
 
-        return result;
+        std::unique_lock lock(m_mutex);
+        auto [it, inserted] = m_whitelistedBSSIDs.insert(normalized);
+
+        if (inserted) {
+            SS_LOG_INFO(LOG_CAT, L"Added BSSID to whitelist: %hs", normalized.c_str());
+        }
+
+        return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] AddToWhitelist failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"AddToWhitelist failed: %hs", e.what());
         return false;
     }
 }
 
 bool WiFiSecurityAnalyzerImpl::RemoveFromWhitelist(const std::string& bssid) {
-    if (!m_whitelist) {
-        Logger::Warn("[WiFiSecurityAnalyzer] WhiteListStore not available");
-        return false;
-    }
-
     try {
-        std::wstring wbssid = StringUtils::StringToWString(NormalizeBSSID(bssid));
-        bool result = m_whitelist->RemoveFromWhitelist(wbssid);
-
-        if (result) {
-            Logger::Info("[WiFiSecurityAnalyzer] Removed from whitelist: {}", bssid);
+        std::string normalized = NormalizeBSSID(bssid);
+        if (normalized.empty()) {
+            SS_LOG_ERROR(LOG_CAT, L"RemoveFromWhitelist: Invalid BSSID format");
+            return false;
         }
 
-        return result;
+        std::unique_lock lock(m_mutex);
+        size_t removed = m_whitelistedBSSIDs.erase(normalized);
+
+        if (removed > 0) {
+            SS_LOG_INFO(LOG_CAT, L"Removed BSSID from whitelist: %hs", normalized.c_str());
+        }
+
+        return removed > 0;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] RemoveFromWhitelist failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"RemoveFromWhitelist failed: %hs", e.what());
         return false;
     }
 }
@@ -913,13 +1089,18 @@ bool WiFiSecurityAnalyzerImpl::BlockNetwork(const std::string& bssid) {
 
     try {
         std::string normalized = NormalizeBSSID(bssid);
+        if (normalized.empty()) {
+            SS_LOG_ERROR(LOG_CAT, L"BlockNetwork: Invalid BSSID format");
+            return false;
+        }
+
         m_blockedBSSIDs.insert(normalized);
 
-        Logger::Info("[WiFiSecurityAnalyzer] Blocked network: {}", bssid);
+        SS_LOG_INFO(LOG_CAT, L"Blocked network: %hs", normalized.c_str());
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] BlockNetwork failed: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"BlockNetwork failed: %hs", e.what());
         return false;
     }
 }
@@ -990,7 +1171,7 @@ WiFiStatistics WiFiSecurityAnalyzerImpl::GetStatistics() const {
 void WiFiSecurityAnalyzerImpl::ResetStatistics() {
     m_stats.Reset();
     m_stats.startTime = Clock::now();
-    Logger::Info("[WiFiSecurityAnalyzer] Statistics reset");
+    SS_LOG_INFO(LOG_CAT, L"Statistics reset");
 }
 
 // ============================================================================
@@ -998,24 +1179,30 @@ void WiFiSecurityAnalyzerImpl::ResetStatistics() {
 // ============================================================================
 
 void WiFiSecurityAnalyzerImpl::MonitoringThreadFunc() {
-    Logger::Info("[WiFiSecurityAnalyzer] Monitoring thread started");
+    SS_LOG_INFO(LOG_CAT, L"Monitoring thread started");
 
     while (m_monitoringActive.load(std::memory_order_acquire)) {
         try {
             ProcessMonitoringTick();
 
-            // Sleep for scan interval
+            // Read scan interval under lock (it can be updated via UpdateConfiguration)
+            uint32_t intervalSec;
+            {
+                std::shared_lock lock(m_mutex);
+                intervalSec = m_config.scanIntervalSeconds;
+            }
+
             std::unique_lock lock(m_monitoringMutex);
-            m_monitoringCV.wait_for(lock, std::chrono::seconds(m_config.scanIntervalSeconds),
+            m_monitoringCV.wait_for(lock, std::chrono::seconds(intervalSec),
                 [this] { return !m_monitoringActive.load(std::memory_order_acquire); });
 
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Monitoring error: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Monitoring error: %hs", e.what());
             std::this_thread::sleep_for(std::chrono::seconds(5));
         }
     }
 
-    Logger::Info("[WiFiSecurityAnalyzer] Monitoring thread stopped");
+    SS_LOG_INFO(LOG_CAT, L"Monitoring thread stopped");
 }
 
 void WiFiSecurityAnalyzerImpl::ProcessMonitoringTick() {
@@ -1064,28 +1251,51 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
         );
 
         if (result != ERROR_SUCCESS || !networkList) {
-            Logger::Warn("[WiFiSecurityAnalyzer] WlanGetAvailableNetworkList failed: {}", result);
+            SS_LOG_WARN(LOG_CAT, L"WlanGetAvailableNetworkList failed: error=%u", result);
             return networks;
         }
 
-        // Parse networks
-        for (DWORD i = 0; i < networkList->dwNumberOfItems; ++i) {
+        // RAII guard for networkList
+        struct WlanListGuard {
+            PVOID ptr;
+            ~WlanListGuard() { if (ptr) WlanFreeMemory(ptr); }
+        } networkListGuard{networkList};
+
+        // Cap the number of networks we process to prevent runaway allocation
+        const DWORD maxItems = std::min(networkList->dwNumberOfItems,
+                                         static_cast<DWORD>(WiFiConstants::MAX_TRACKED_NETWORKS));
+
+        for (DWORD i = 0; i < maxItems; ++i) {
             const auto& entry = networkList->Network[i];
 
             WiFiNetworkInfo network;
 
-            // SSID
+            // SSID — raw bytes from the driver (potentially hostile)
+            if (entry.dot11Ssid.uSSIDLength > DOT11_SSID_MAX_LENGTH) {
+                SS_LOG_WARN(LOG_CAT, L"Skipping network with invalid SSID length: %u",
+                            entry.dot11Ssid.uSSIDLength);
+                continue;
+            }
             network.ssid = std::string(
                 reinterpret_cast<const char*>(entry.dot11Ssid.ucSSID),
                 entry.dot11Ssid.uSSIDLength
             );
 
-            // BSSID (get from BSS list)
+            // Hidden SSID detection: empty SSID or all-zero SSID bytes
+            network.isHidden = (entry.dot11Ssid.uSSIDLength == 0);
+            if (!network.isHidden) {
+                bool allZero = true;
+                for (ULONG b = 0; b < entry.dot11Ssid.uSSIDLength; ++b) {
+                    if (entry.dot11Ssid.ucSSID[b] != 0) { allZero = false; break; }
+                }
+                network.isHidden = allZero;
+            }
+
             // Signal strength
             network.signalQuality = entry.wlanSignalQuality;
-            network.signalStrength = -100 + (entry.wlanSignalQuality / 2);  // Approximate conversion
+            network.signalStrength = -100 + (entry.wlanSignalQuality / 2);
 
-            // Encryption
+            // Encryption mapping
             switch (entry.dot11DefaultCipherAlgorithm) {
                 case DOT11_CIPHER_ALGO_NONE:
                     network.encryption = EncryptionType::Open;
@@ -1110,13 +1320,10 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
                     network.encryption = EncryptionType::Unknown;
             }
 
-            // Hidden network
-            network.isHidden = (entry.dwFlags & WLAN_AVAILABLE_NETWORK_HAS_PROFILE) == 0;
-
-            // Connected
+            // Connected flag
             network.isConnected = (entry.dwFlags & WLAN_AVAILABLE_NETWORK_CONNECTED) != 0;
 
-            // Get detailed BSS information
+            // Get detailed BSS information for BSSID and frequency
             PWLAN_BSS_LIST bssList = nullptr;
             result = WlanGetNetworkBssList(
                 m_wlanHandle,
@@ -1131,14 +1338,23 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
             if (result == ERROR_SUCCESS && bssList && bssList->dwNumberOfItems > 0) {
                 const auto& bss = bssList->wlanBssEntries[0];
 
-                // BSSID
+                // Format BSSID from raw MAC bytes
                 std::ostringstream bssidStr;
-                bssidStr << std::hex << std::setfill('0');
+                bssidStr << std::hex << std::setfill('0') << std::uppercase;
                 for (int j = 0; j < 6; ++j) {
                     if (j > 0) bssidStr << ":";
                     bssidStr << std::setw(2) << static_cast<int>(bss.dot11Bssid[j]);
                 }
                 network.bssid = bssidStr.str();
+
+                // Validate BSSID format
+                std::string validatedBSSID = ValidateAndNormalizeBSSID(network.bssid);
+                if (validatedBSSID.empty()) {
+                    SS_LOG_WARN(LOG_CAT, L"Skipping network with invalid BSSID format");
+                    WlanFreeMemory(bssList);
+                    continue;
+                }
+                network.bssid = validatedBSSID;
 
                 // Frequency and channel
                 network.frequency = bss.ulChCenterFrequency / 1000;  // kHz to MHz
@@ -1146,17 +1362,17 @@ std::vector<WiFiNetworkInfo> WiFiSecurityAnalyzerImpl::QueryNetworksWLAN() {
                 network.band = GetBandFromFrequency(network.frequency);
 
                 WlanFreeMemory(bssList);
+            } else {
+                if (bssList) WlanFreeMemory(bssList);
             }
 
             if (!network.bssid.empty()) {
-                networks.push_back(network);
+                networks.push_back(std::move(network));
             }
         }
 
-        WlanFreeMemory(networkList);
-
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] QueryNetworksWLAN error: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"QueryNetworksWLAN error: %hs", e.what());
     }
 #endif
 
@@ -1186,38 +1402,46 @@ WiFiConnectionInfo WiFiSecurityAnalyzerImpl::QueryConnectionWLAN() {
         );
 
         if (result == ERROR_SUCCESS && connAttr) {
+            // RAII guard
+            struct ConnAttrGuard {
+                PVOID ptr;
+                ~ConnAttrGuard() { if (ptr) WlanFreeMemory(ptr); }
+            } guard{connAttr};
+
             if (connAttr->isState == wlan_interface_state_connected) {
                 connInfo.isConnected = true;
 
-                // Network info
-                connInfo.network.ssid = std::string(
-                    reinterpret_cast<const char*>(connAttr->wlanAssociationAttributes.dot11Ssid.ucSSID),
-                    connAttr->wlanAssociationAttributes.dot11Ssid.uSSIDLength
-                );
+                // SSID — validate length before use
+                const auto ssidLen = connAttr->wlanAssociationAttributes.dot11Ssid.uSSIDLength;
+                if (ssidLen <= DOT11_SSID_MAX_LENGTH) {
+                    connInfo.network.ssid = std::string(
+                        reinterpret_cast<const char*>(connAttr->wlanAssociationAttributes.dot11Ssid.ucSSID),
+                        ssidLen
+                    );
+                }
 
                 // BSSID
                 const auto& bssid = connAttr->wlanAssociationAttributes.dot11Bssid;
                 std::ostringstream bssidStr;
-                bssidStr << std::hex << std::setfill('0');
+                bssidStr << std::hex << std::setfill('0') << std::uppercase;
                 for (int i = 0; i < 6; ++i) {
                     if (i > 0) bssidStr << ":";
                     bssidStr << std::setw(2) << static_cast<int>(bssid[i]);
                 }
-                connInfo.network.bssid = bssidStr.str();
+                connInfo.network.bssid = ValidateAndNormalizeBSSID(bssidStr.str());
 
                 // Signal quality
                 connInfo.network.signalQuality = connAttr->wlanAssociationAttributes.wlanSignalQuality;
                 connInfo.network.signalStrength = -100 + (connInfo.network.signalQuality / 2);
 
-                // Link speed
-                connInfo.linkSpeed = connAttr->wlanAssociationAttributes.ulRxRate / 1000;  // bps to Mbps
+                // Link speed (bps to Mbps, with overflow check)
+                auto rxRate = connAttr->wlanAssociationAttributes.ulRxRate;
+                connInfo.linkSpeed = static_cast<int>(rxRate / 1000);
             }
-
-            WlanFreeMemory(connAttr);
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] QueryConnectionWLAN error: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"QueryConnectionWLAN error: %hs", e.what());
     }
 #endif
 
@@ -1307,7 +1531,18 @@ std::string WiFiSecurityAnalyzerImpl::GetVendorFromBSSID(const std::string& bssi
 }
 
 bool WiFiSecurityAnalyzerImpl::IsWeakSSID(const std::string& ssid) const {
-    std::string lower = StringUtils::ToLower(ssid);
+    if (ssid.empty()) return false;
+
+    // ASCII-lowercase for case-insensitive comparison
+    std::string lower;
+    lower.reserve(ssid.size());
+    for (unsigned char c : ssid) {
+        if (c >= 'A' && c <= 'Z') {
+            lower.push_back(static_cast<char>(c + ('a' - 'A')));
+        } else {
+            lower.push_back(static_cast<char>(c));
+        }
+    }
 
     for (const auto& weak : WEAK_SSIDS) {
         if (lower.find(weak) != std::string::npos) {
@@ -1319,24 +1554,47 @@ bool WiFiSecurityAnalyzerImpl::IsWeakSSID(const std::string& ssid) const {
 }
 
 bool WiFiSecurityAnalyzerImpl::IsKnownRogueAP(const std::string& bssid) {
-    if (!m_threatIntel) {
-        return false;
+    // Check internal blocklist first (maintained via BlockBSSID())
+    if (m_blockedBSSIDs.contains(bssid)) {
+        return true;
     }
 
-    try {
-        // Query ThreatIntel for known malicious BSSIDs
-        // This is a simplified check - production would use full threat database
-        return false;
-
-    } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] IsKnownRogueAP error: {}", e.what());
-        return false;
+    // Query ThreatIntelManager for known malicious BSSIDs.
+    // The threat feed stores BSSID IOCs using algorithm="bssid" in the hash index.
+    if (m_threatIntel && m_threatIntel->IsInitialized()) {
+        try {
+            auto result = m_threatIntel->LookupHash("bssid", bssid);
+            if (result.found && result.IsMalicious()) {
+                SS_LOG_WARN(LOG_CAT, L"Rogue AP matched threat intel: score=%u",
+                            static_cast<unsigned>(result.score));
+                return true;
+            }
+        } catch (const std::exception& e) {
+            SS_LOG_ERROR(LOG_CAT, L"ThreatIntel lookup error: %hs", e.what());
+        }
     }
+
+    return false;
 }
 
 void WiFiSecurityAnalyzerImpl::UpdateBSSIDHistory(const WiFiNetworkInfo& network) {
+    // Cap total BSSID history entries to prevent unbounded growth
+    static constexpr size_t MAX_BSSID_HISTORY_ENTRIES = 1000;
+    if (m_bssidHistory.size() >= MAX_BSSID_HISTORY_ENTRIES &&
+        !m_bssidHistory.contains(NormalizeSSID(network.ssid))) {
+        return;  // Don't add new entries past the cap
+    }
+
     auto& tracker = m_bssidHistory[NormalizeSSID(network.ssid)];
     tracker.ssid = network.ssid;
+
+    // Cap per-SSID BSSID count to prevent memory exhaustion from
+    // an attacker broadcasting many BSSIDs for the same SSID
+    static constexpr size_t MAX_BSSIDS_PER_SSID = 100;
+    if (tracker.bssidLastSeen.size() >= MAX_BSSIDS_PER_SSID &&
+        !tracker.bssidLastSeen.contains(network.bssid)) {
+        return;
+    }
 
     // Update last seen time
     tracker.bssidLastSeen[network.bssid] = network.lastSeen;
@@ -1348,7 +1606,7 @@ void WiFiSecurityAnalyzerImpl::UpdateBSSIDHistory(const WiFiNetworkInfo& network
     entry.channel = network.channel;
     entry.observationTime = network.lastSeen;
 
-    tracker.history.push_back(entry);
+    tracker.history.push_back(std::move(entry));
 
     // Limit history size
     if (tracker.history.size() > WiFiConstants::BSSID_HISTORY_SIZE) {
@@ -1413,7 +1671,7 @@ EvilTwinDetectionResult WiFiSecurityAnalyzerImpl::DetectEvilTwinForSSID(const st
         }
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] DetectEvilTwinForSSID error: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"DetectEvilTwinForSSID error: %hs", e.what());
     }
 
     return result;
@@ -1445,7 +1703,7 @@ void WiFiSecurityAnalyzerImpl::NotifyNetworkFound(const WiFiNetworkInfo& network
         try {
             m_networkFoundCallback(network);
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Network found callback exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Network found callback exception: %hs", e.what());
         }
     }
 }
@@ -1456,7 +1714,7 @@ void WiFiSecurityAnalyzerImpl::NotifyThreat(const WiFiSecurityThreat& threat) {
         try {
             m_threatCallback(threat);
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Threat callback exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Threat callback exception: %hs", e.what());
         }
     }
 }
@@ -1467,7 +1725,7 @@ void WiFiSecurityAnalyzerImpl::NotifyEvilTwin(const EvilTwinDetectionResult& res
         try {
             m_evilTwinCallback(result);
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Evil twin callback exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Evil twin callback exception: %hs", e.what());
         }
     }
 }
@@ -1478,7 +1736,7 @@ void WiFiSecurityAnalyzerImpl::NotifyConnectionChange(const WiFiConnectionInfo& 
         try {
             m_connectionCallback(conn);
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Connection callback exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Connection callback exception: %hs", e.what());
         }
     }
 }
@@ -1489,27 +1747,65 @@ void WiFiSecurityAnalyzerImpl::NotifyError(const std::string& message, int code)
         try {
             m_errorCallback(message, code);
         } catch (const std::exception& e) {
-            Logger::Error("[WiFiSecurityAnalyzer] Error callback exception: {}", e.what());
+            SS_LOG_ERROR(LOG_CAT, L"Error callback exception: %hs", e.what());
         }
     }
 }
 
 std::string WiFiSecurityAnalyzerImpl::NormalizeSSID(const std::string& ssid) const {
-    return StringUtils::ToLower(StringUtils::Trim(ssid));
+    // SSIDs are raw byte sequences — normalize by trimming whitespace
+    // and ASCII-lowercasing for consistent lookup keys
+    std::string result;
+    result.reserve(ssid.size());
+
+    // Trim leading whitespace
+    size_t start = 0;
+    while (start < ssid.size() && static_cast<unsigned char>(ssid[start]) <= ' ') ++start;
+
+    // Trim trailing whitespace
+    size_t end = ssid.size();
+    while (end > start && static_cast<unsigned char>(ssid[end - 1]) <= ' ') --end;
+
+    for (size_t i = start; i < end; ++i) {
+        unsigned char c = static_cast<unsigned char>(ssid[i]);
+        if (c >= 'A' && c <= 'Z') {
+            result.push_back(static_cast<char>(c + ('a' - 'A')));
+        } else {
+            result.push_back(static_cast<char>(c));
+        }
+    }
+    return result;
 }
 
 std::string WiFiSecurityAnalyzerImpl::NormalizeBSSID(const std::string& bssid) const {
-    return StringUtils::ToUpper(StringUtils::Trim(bssid));
+    // Trim and uppercase a BSSID string
+    std::string result;
+    result.reserve(bssid.size());
+
+    size_t start = 0;
+    while (start < bssid.size() && static_cast<unsigned char>(bssid[start]) <= ' ') ++start;
+    size_t end = bssid.size();
+    while (end > start && static_cast<unsigned char>(bssid[end - 1]) <= ' ') --end;
+
+    for (size_t i = start; i < end; ++i) {
+        unsigned char c = static_cast<unsigned char>(bssid[i]);
+        if (c >= 'a' && c <= 'z') {
+            result.push_back(static_cast<char>(c - ('a' - 'A')));
+        } else {
+            result.push_back(static_cast<char>(c));
+        }
+    }
+    return result;
 }
 
 bool WiFiSecurityAnalyzerImpl::SelfTest() {
-    Logger::Info("[WiFiSecurityAnalyzer] Running self-test...");
+    SS_LOG_INFO(LOG_CAT, L"Running self-test...");
 
     try {
         // Test 1: WLAN handle
         {
             if (!m_wlanHandle) {
-                Logger::Error("[WiFiSecurityAnalyzer] Self-test failed: No WLAN handle");
+                SS_LOG_ERROR(LOG_CAT, L"Self-test failed: No WLAN handle");
                 return false;
             }
         }
@@ -1520,7 +1816,7 @@ bool WiFiSecurityAnalyzerImpl::SelfTest() {
             testNetwork.encryption = EncryptionType::WPA3_Personal;
             auto level = CalculateSecurityLevel(testNetwork);
             if (level != SecurityLevel::Excellent) {
-                Logger::Error("[WiFiSecurityAnalyzer] Self-test failed: Security level calculation");
+                SS_LOG_ERROR(LOG_CAT, L"Self-test failed: Security level calculation");
                 return false;
             }
         }
@@ -1529,7 +1825,7 @@ bool WiFiSecurityAnalyzerImpl::SelfTest() {
         {
             std::string test = NormalizeBSSID(" aa:bb:cc:dd:ee:ff ");
             if (test != "AA:BB:CC:DD:EE:FF") {
-                Logger::Error("[WiFiSecurityAnalyzer] Self-test failed: BSSID normalization");
+                SS_LOG_ERROR(LOG_CAT, L"Self-test failed: BSSID normalization");
                 return false;
             }
         }
@@ -1538,15 +1834,15 @@ bool WiFiSecurityAnalyzerImpl::SelfTest() {
         {
             std::string vendor = GetVendorFromBSSID("00:1B:63:00:00:00");
             if (vendor != "Apple") {
-                Logger::Warn("[WiFiSecurityAnalyzer] Self-test warning: Vendor lookup may be incomplete");
+                SS_LOG_WARN(LOG_CAT, L"Self-test warning: Vendor lookup may be incomplete");
             }
         }
 
-        Logger::Info("[WiFiSecurityAnalyzer] Self-test PASSED");
+        SS_LOG_INFO(LOG_CAT, L"Self-test PASSED");
         return true;
 
     } catch (const std::exception& e) {
-        Logger::Error("[WiFiSecurityAnalyzer] Self-test exception: {}", e.what());
+        SS_LOG_ERROR(LOG_CAT, L"Self-test exception: %hs", e.what());
         return false;
     }
 }
@@ -1758,7 +2054,7 @@ std::string WiFiStatistics::ToJson() const {
 
 std::string WiFiNetworkInfo::ToJson() const {
     nlohmann::json j;
-    j["ssid"] = ssid;
+    j["ssid"] = SanitizeSSID(ssid);
     j["bssid"] = bssid;
     j["encryption"] = static_cast<int>(encryption);
     j["authentication"] = static_cast<int>(authentication);
@@ -1771,8 +2067,12 @@ std::string WiFiNetworkInfo::ToJson() const {
     j["wpsEnabled"] = wpsEnabled;
     j["pmfEnabled"] = pmfEnabled;
     j["isConnected"] = isConnected;
+    j["isWhitelisted"] = isWhitelisted;
+    j["isKnown"] = isKnown;
     j["securityLevel"] = static_cast<int>(securityLevel);
+    j["threats"] = static_cast<uint32_t>(threats);
     j["vendor"] = vendor;
+    j["overallScore"] = GetOverallScore();
     return j.dump();
 }
 
@@ -1834,6 +2134,9 @@ std::string WiFiConnectionInfo::ToJson() const {
     j["linkSpeed"] = linkSpeed;
     j["bytesSent"] = bytesSent;
     j["bytesReceived"] = bytesReceived;
+    if (isConnected) {
+        j["network"] = nlohmann::json::parse(network.ToJson(), nullptr, false);
+    }
     return j.dump();
 }
 
@@ -1844,6 +2147,8 @@ std::string EvilTwinDetectionResult::ToJson() const {
     j["detectionReason"] = detectionReason;
     j["signalDifference"] = signalDifference;
     j["bssidSimilarity"] = bssidSimilarity;
+    j["suspectedBSSID"] = suspectedBSSID;
+    j["legitimateBSSID"] = legitimateBSSID;
     return j.dump();
 }
 
@@ -1980,16 +2285,43 @@ WiFiBand GetBandFromFrequency(int frequency) noexcept {
 }
 
 int GetChannelFromFrequency(int frequency) noexcept {
-    // 2.4 GHz band
+    // 2.4 GHz band — use lookup table
     for (const auto& entry : WiFiConstants::CHANNEL_2GHZ) {
         if (entry.frequency == frequency) {
             return entry.channel;
         }
     }
 
-    // 5 GHz band (simplified)
-    if (frequency >= 5000 && frequency <= 6000) {
-        return (frequency - 5000) / 5;
+    // 5 GHz band — defined channels per IEEE 802.11
+    // UNII-1: 5180-5240 MHz (channels 36-48)
+    // UNII-2: 5260-5320 MHz (channels 52-64, DFS)
+    // UNII-2 Extended: 5500-5720 MHz (channels 100-144, DFS)
+    // UNII-3: 5745-5825 MHz (channels 149-165)
+    if (frequency >= 5170 && frequency <= 5835) {
+        // Channel = (freq_MHz - 5000) / 5
+        // Validate the result is a known 5 GHz channel number
+        int ch = (frequency - 5000) / 5;
+        // Known valid 5 GHz channels
+        static constexpr int valid5GHz[] = {
+            36, 38, 40, 42, 44, 46, 48,               // UNII-1
+            52, 54, 56, 58, 60, 62, 64,               // UNII-2
+            100, 102, 104, 106, 108, 110, 112,        // UNII-2 Ext
+            116, 118, 120, 122, 124, 126, 128,
+            132, 134, 136, 138, 140, 142, 144,
+            149, 151, 153, 155, 157, 159, 161, 165    // UNII-3
+        };
+        for (int v : valid5GHz) {
+            if (ch == v) return ch;
+        }
+        // Close enough — return calculated channel for non-standard frequencies
+        if (ch > 0 && ch < 200) return ch;
+    }
+
+    // 6 GHz band (Wi-Fi 6E) — IEEE 802.11ax
+    // 5955 MHz = channel 1, then every 5 MHz
+    if (frequency >= 5945 && frequency <= 7125) {
+        int ch = (frequency - 5950) / 5;
+        if (ch > 0 && ch <= 233) return ch;
     }
 
     return 0;
