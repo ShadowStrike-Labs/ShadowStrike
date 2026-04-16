@@ -479,7 +479,11 @@ struct IPLeakStatistics {
     std::atomic<uint64_t> connectionsBlocked{0};
     std::array<std::atomic<uint64_t>, 16> byLeakType{};
     TimePoint startTime = Clock::now();
-    
+
+    IPLeakStatistics() noexcept = default;
+    IPLeakStatistics(const IPLeakStatistics& other) noexcept;
+    IPLeakStatistics& operator=(const IPLeakStatistics& other) noexcept;
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
