@@ -274,7 +274,8 @@ enum class MinerType : uint8_t {
     BrowserMiner    = 3,    ///< JavaScript/WASM browser miner
     BotnetMiner     = 4,    ///< Integrated botnet miner
     CloudMiner      = 5,    ///< Cloud instance abuse
-    HybridMiner     = 6     ///< CPU + GPU combined
+    HybridMiner     = 6,    ///< CPU + GPU combined
+    NetworkMiner    = 7     ///< Detected via network only (pool/stratum connection)
 };
 
 /**
@@ -793,6 +794,9 @@ struct CryptoMinerDetectorConfiguration {
     
     /// @brief Custom pool blacklist path
     std::wstring poolBlacklistPath;
+    
+    /// @brief Whitelisted browser domains (for known-safe mining-related domains)
+    std::vector<std::string> whitelistedDomains;
     
     /// @brief Verbose logging
     bool verboseLogging = false;
