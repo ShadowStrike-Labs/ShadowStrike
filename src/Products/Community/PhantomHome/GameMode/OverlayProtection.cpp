@@ -175,18 +175,23 @@ namespace {
         L"narrator.dll"
     };
 
-    /// @brief DirectX function patterns for hook detection
-    constexpr std::array<const char*, 10> DX_FUNCTIONS = {
-        "D3D9CreateDevice",
+    /// @brief Exported DirectX functions resolvable via GetProcAddress for hook detection
+    constexpr std::array<const char*, 3> DX_EXPORTED_FUNCTIONS = {
         "D3D11CreateDevice",
+        "CreateDXGIFactory",
+        "Direct3DCreate9"
+    };
+
+    /// @brief DirectX VTable method identifiers — NOT GetProcAddress targets.
+    /// Used as display names when reporting hooks found via VTable scanning.
+    constexpr std::array<const char*, 7> DX_VTABLE_METHODS = {
         "DXGISwapChain::Present",
         "DXGISwapChain::ResizeBuffers",
         "IDirect3DDevice9::Present",
         "IDirect3DDevice9::Reset",
         "IDirect3DDevice9::EndScene",
         "ID3D11DeviceContext::DrawIndexed",
-        "ID3D11DeviceContext::Draw",
-        "CreateDXGIFactory"
+        "ID3D11DeviceContext::Draw"
     };
 
     /// @brief OpenGL function patterns
@@ -353,7 +358,7 @@ namespace {
             swprintf_s(buf, L"%016llX", val);
             return std::wstring(buf);
         } catch (...) {
-            return L"DefaultSuffix";
+            return std::to_wstring(::GetTickCount64());
         }
     }
 
@@ -1372,7 +1377,7 @@ public:
             HMODULE hD3D11 = GetModuleHandleW(L"d3d11.dll");
             HMODULE hDXGI = GetModuleHandleW(L"dxgi.dll");
 
-            for (const char* funcName : DX_FUNCTIONS) {
+            for (const char* funcName : DX_EXPORTED_FUNCTIONS) {
                 for (HMODULE hMod : {hD3D9, hD3D11, hDXGI}) {
                     if (hMod) {
                         FARPROC proc = GetProcAddress(hMod, funcName);
@@ -3175,6 +3180,22 @@ GraphicsAPI DetectActiveGraphicsAPI(uint32_t pid) {
 
         const DWORD moduleCount = needed / sizeof(HMODULE);
 
+        // L5-FIX: Collect all detected APIs and return the highest-priority one.
+        // Priority: DX12 > DX11 > Vulkan > DX10 > DX9 > OpenGL
+        auto apiPriority = [](GraphicsAPI api) -> int {
+            switch (api) {
+                case GraphicsAPI::DirectX12: return 6;
+                case GraphicsAPI::DirectX11: return 5;
+                case GraphicsAPI::Vulkan:    return 4;
+                case GraphicsAPI::DirectX10: return 3;
+                case GraphicsAPI::DirectX9:  return 2;
+                case GraphicsAPI::OpenGL:    return 1;
+                default:                     return 0;
+            }
+        };
+
+        GraphicsAPI bestAPI = GraphicsAPI::Unknown;
+
         for (DWORD i = 0; i < moduleCount && i < modules.size(); ++i) {
             std::array<wchar_t, MAX_PATH> moduleName{};
 
@@ -3184,26 +3205,32 @@ GraphicsAPI DetectActiveGraphicsAPI(uint32_t pid) {
                 std::wstring name(moduleName.data());
                 std::transform(name.begin(), name.end(), name.begin(), ::towlower);
 
+                GraphicsAPI detected = GraphicsAPI::Unknown;
+
                 if (name.find(L"d3d12") != std::wstring::npos) {
-                    return GraphicsAPI::DirectX12;
+                    detected = GraphicsAPI::DirectX12;
+                } else if (name.find(L"d3d11") != std::wstring::npos) {
+                    detected = GraphicsAPI::DirectX11;
+                } else if (name.find(L"vulkan") != std::wstring::npos) {
+                    detected = GraphicsAPI::Vulkan;
+                } else if (name.find(L"d3d10") != std::wstring::npos) {
+                    detected = GraphicsAPI::DirectX10;
+                } else if (name.find(L"d3d9") != std::wstring::npos) {
+                    detected = GraphicsAPI::DirectX9;
+                } else if (name.find(L"opengl32") != std::wstring::npos) {
+                    detected = GraphicsAPI::OpenGL;
                 }
-                if (name.find(L"d3d11") != std::wstring::npos) {
-                    return GraphicsAPI::DirectX11;
-                }
-                if (name.find(L"d3d10") != std::wstring::npos) {
-                    return GraphicsAPI::DirectX10;
-                }
-                if (name.find(L"d3d9") != std::wstring::npos) {
-                    return GraphicsAPI::DirectX9;
-                }
-                if (name.find(L"vulkan") != std::wstring::npos) {
-                    return GraphicsAPI::Vulkan;
-                }
-                if (name.find(L"opengl32") != std::wstring::npos) {
-                    return GraphicsAPI::OpenGL;
+
+                if (apiPriority(detected) > apiPriority(bestAPI)) {
+                    bestAPI = detected;
+                    if (bestAPI == GraphicsAPI::DirectX12) {
+                        return bestAPI;  // Highest priority — early exit
+                    }
                 }
             }
         }
+
+        return bestAPI;
 
     } catch (...) {
     }

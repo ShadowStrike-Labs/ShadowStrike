@@ -633,7 +633,7 @@ public:
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
-    [[nodiscard]] static std::string GetVersionString() noexcept;
+    [[nodiscard]] static std::string GetVersionString();
 
 private:
     GameProcessDetector();
