@@ -378,10 +378,11 @@ SHADOWSTRIKE_3_YEAR_ROADMAP.md
 src/Products/Pro/
 src/Products/Enterprise/
 
-# Cloud dashboard, cloud backend, and driver signing material.
+# Cloud dashboard, cloud backend, driver signing material, and planning docs.
 dashboard-cloud/
 cloud-backend/
 WDK/
+comprehensive_plan.md
 
 # .github — only allow FUNDING.yml and workflows/
 .github/*
