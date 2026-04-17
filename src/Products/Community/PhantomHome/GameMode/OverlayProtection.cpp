@@ -118,8 +118,8 @@ namespace GameMode {
 
 namespace {
     /// @brief Known overlay DLL patterns (all lowercase for case-insensitive match)
-    /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size to 29
-    constexpr std::array<std::wstring_view, 29> KNOWN_OVERLAY_MODULES = {
+    /// FIX #21: Removed duplicate RTSSHooks.dll, adjusted array size
+    constexpr std::array<std::wstring_view, 33> KNOWN_OVERLAY_MODULES = {
         // Discord
         L"discord_hook.dll",
         L"discordhook64.dll",
@@ -163,6 +163,12 @@ namespace {
         // GeForce Experience
         L"nvcontainer.dll",
         L"nvframeviewhook.dll",
+
+        // Xbox Game Bar
+        L"gamebarftserver.dll",
+        L"gamebar.dll",
+        L"gamebarpresencewriter.dll",
+        L"gameoverlaypresenter64.dll",
 
         // Accessibility
         L"magnification.dll",
@@ -277,6 +283,28 @@ namespace {
         return false;
     }
 
+    /// @brief VirtualQuery-based memory readability check (anonymous namespace copy for early use)
+    [[nodiscard]] bool IsMemoryReadableLocal(const void* addr, size_t size) noexcept {
+        if (!addr || size == 0) return false;
+        constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE |
+                                    PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                                    PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
+        auto current = reinterpret_cast<uintptr_t>(addr);
+        const auto requestEnd = current + size;
+        while (current < requestEnd) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0)
+                return false;
+            if (mbi.State != MEM_COMMIT) return false;
+            if ((mbi.Protect & kReadable) == 0) return false;
+            if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+            const auto regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= current) return false;
+            current = regionEnd;
+        }
+        return true;
+    }
+
     /// @brief Check if an address falls within any code section (.text) of a module
     [[nodiscard]] bool IsAddressInCodeSection(HMODULE hModule, uint64_t address) noexcept {
         __try {
@@ -284,11 +312,26 @@ namespace {
             auto dos = reinterpret_cast<IMAGE_DOS_HEADER*>(base);
             if (dos->e_magic != IMAGE_DOS_SIGNATURE) return false;
 
-            auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + dos->e_lfanew);
+            // Validate e_lfanew: must be positive and within a sane bound
+            const auto lfanew = dos->e_lfanew;
+            if (lfanew <= 0) return false;
+            constexpr LONG kMaxLfanew = 1024 * 1024;  // 1 MiB — well beyond any real PE
+            if (lfanew > kMaxLfanew) return false;
+
+            const auto ntOffset = static_cast<size_t>(lfanew);
+            if (!IsMemoryReadableLocal(base + ntOffset, sizeof(IMAGE_NT_HEADERS))) return false;
+
+            auto nt = reinterpret_cast<IMAGE_NT_HEADERS*>(base + ntOffset);
             if (nt->Signature != IMAGE_NT_SIGNATURE) return false;
 
+            // Cap section count to PE specification maximum (96)
+            constexpr WORD kMaxSections = 96;
+            const WORD numSections = (std::min)(nt->FileHeader.NumberOfSections, kMaxSections);
+
             auto section = IMAGE_FIRST_SECTION(nt);
-            for (WORD i = 0; i < nt->FileHeader.NumberOfSections; ++i, ++section) {
+            if (!IsMemoryReadableLocal(section, numSections * sizeof(IMAGE_SECTION_HEADER))) return false;
+
+            for (WORD i = 0; i < numSections; ++i, ++section) {
                 if (section->Characteristics & IMAGE_SCN_CNT_CODE) {
                     const auto secStart = reinterpret_cast<uint64_t>(base + section->VirtualAddress);
                     const auto secEnd = secStart + section->Misc.VirtualSize;
@@ -802,17 +845,34 @@ public:
      */
     [[nodiscard]] static bool IsMemoryReadable(const void* addr, size_t size) noexcept {
         if (!addr || size == 0) return false;
-        MEMORY_BASIC_INFORMATION mbi{};
-        if (::VirtualQuery(addr, &mbi, sizeof(mbi)) == 0) return false;
-        if (mbi.State != MEM_COMMIT) return false;
+
         constexpr DWORD kReadable = PAGE_READONLY | PAGE_READWRITE |
                                     PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
                                     PAGE_WRITECOPY | PAGE_EXECUTE_WRITECOPY;
-        if ((mbi.Protect & kReadable) == 0) return false;
-        if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
-        const auto regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
-        const auto requestEnd = reinterpret_cast<uintptr_t>(addr) + size;
-        return requestEnd <= regionEnd;
+
+        auto current = reinterpret_cast<uintptr_t>(addr);
+        const auto requestEnd = current + size;
+
+        // Walk through memory regions covering the full [addr, addr+size) range.
+        // A single VirtualQuery only describes one contiguous region, so a range
+        // that spans two adjacent committed regions would pass incorrectly.
+        while (current < requestEnd) {
+            MEMORY_BASIC_INFORMATION mbi{};
+            if (::VirtualQuery(reinterpret_cast<const void*>(current), &mbi, sizeof(mbi)) == 0) {
+                return false;
+            }
+            if (mbi.State != MEM_COMMIT) return false;
+            if ((mbi.Protect & kReadable) == 0) return false;
+            if (mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS)) return false;
+
+            const auto regionEnd = reinterpret_cast<uintptr_t>(mbi.BaseAddress) + mbi.RegionSize;
+            if (regionEnd <= current) {
+                // No forward progress — avoid infinite loop on degenerate input
+                return false;
+            }
+            current = regionEnd;
+        }
+        return true;
     }
 
     /**
@@ -1146,59 +1206,61 @@ public:
                 HWND tempWnd = CreateWindowExW(0, L"STATIC", L"", WS_POPUP,
                                                0, 0, 1, 1, nullptr, nullptr,
                                                GetModuleHandleW(nullptr), nullptr);
-                if (!tempWnd) return;
+                if (!tempWnd) {
+                    // Skip D3D11 scan but continue to subsequent API scans
+                } else {
+                    DXGI_SWAP_CHAIN_DESC scd{};
+                    scd.BufferCount = 1;
+                    scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+                    scd.BufferDesc.Width = 1;
+                    scd.BufferDesc.Height = 1;
+                    scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+                    scd.OutputWindow = tempWnd;
+                    scd.SampleDesc.Count = 1;
+                    scd.Windowed = TRUE;
+                    scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
 
-                DXGI_SWAP_CHAIN_DESC scd{};
-                scd.BufferCount = 1;
-                scd.BufferDesc.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-                scd.BufferDesc.Width = 1;
-                scd.BufferDesc.Height = 1;
-                scd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
-                scd.OutputWindow = tempWnd;
-                scd.SampleDesc.Count = 1;
-                scd.Windowed = TRUE;
-                scd.SwapEffect = DXGI_SWAP_EFFECT_DISCARD;
+                    ID3D11Device* pDevice = nullptr;
+                    ID3D11DeviceContext* pContext = nullptr;
+                    IDXGISwapChain* pSwapChain = nullptr;
 
-                ID3D11Device* pDevice = nullptr;
-                ID3D11DeviceContext* pContext = nullptr;
-                IDXGISwapChain* pSwapChain = nullptr;
-
-                const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
-                HRESULT hr = E_FAIL;
-                __try {
-                    hr = D3D11CreateDeviceAndSwapChain(
-                        nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
-                        &featureLevel, 1, D3D11_SDK_VERSION,
-                        &scd, &pSwapChain, &pDevice, nullptr, &pContext);
-
-                    // Fall back to WARP if hardware fails
-                    if (FAILED(hr)) {
+                    const D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
+                    HRESULT hr = E_FAIL;
+                    __try {
                         hr = D3D11CreateDeviceAndSwapChain(
-                            nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                            nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, 0,
                             &featureLevel, 1, D3D11_SDK_VERSION,
                             &scd, &pSwapChain, &pDevice, nullptr, &pContext);
-                    }
-                } __except (EXCEPTION_EXECUTE_HANDLER) {
-                    hr = E_FAIL;
-                }
 
-                if (SUCCEEDED(hr)) {
-                    if (pContext && hD3D11) {
-                        auto** vtable = *reinterpret_cast<void***>(pContext);
-                        (void)CheckVTableEntry(vtable, VTABLE_ID3D11DeviceContext_Draw,
-                                       hD3D11, "ID3D11DeviceContext::Draw", results);
+                        // Fall back to WARP if hardware fails
+                        if (FAILED(hr)) {
+                            hr = D3D11CreateDeviceAndSwapChain(
+                                nullptr, D3D_DRIVER_TYPE_WARP, nullptr, 0,
+                                &featureLevel, 1, D3D11_SDK_VERSION,
+                                &scd, &pSwapChain, &pDevice, nullptr, &pContext);
+                        }
+                    } __except (EXCEPTION_EXECUTE_HANDLER) {
+                        hr = E_FAIL;
                     }
-                    if (pSwapChain && hDXGI) {
-                        auto** vtable = *reinterpret_cast<void***>(pSwapChain);
-                        (void)CheckVTableEntry(vtable, VTABLE_IDXGISwapChain_Present,
-                                       hDXGI, "IDXGISwapChain::Present", results);
-                    }
-                }
 
-                if (pSwapChain) pSwapChain->Release();
-                if (pContext) pContext->Release();
-                if (pDevice) pDevice->Release();
-                DestroyWindow(tempWnd);
+                    if (SUCCEEDED(hr)) {
+                        if (pContext && hD3D11) {
+                            auto** vtable = *reinterpret_cast<void***>(pContext);
+                            (void)CheckVTableEntry(vtable, VTABLE_ID3D11DeviceContext_Draw,
+                                           hD3D11, "ID3D11DeviceContext::Draw", results);
+                        }
+                        if (pSwapChain && hDXGI) {
+                            auto** vtable = *reinterpret_cast<void***>(pSwapChain);
+                            (void)CheckVTableEntry(vtable, VTABLE_IDXGISwapChain_Present,
+                                           hDXGI, "IDXGISwapChain::Present", results);
+                        }
+                    }
+
+                    if (pSwapChain) pSwapChain->Release();
+                    if (pContext) pContext->Release();
+                    if (pDevice) pDevice->Release();
+                    DestroyWindow(tempWnd);
+                }
             }
         }
     }
@@ -1363,12 +1425,11 @@ public:
                 HMODULE handle;
                 const wchar_t* name;
             };
-            const std::array<ModuleScan, 5> graphicsModules = {{
+            const std::array<ModuleScan, 4> graphicsModules = {{
                 {hD3D9, L"d3d9.dll"},
                 {hD3D11, L"d3d11.dll"},
                 {hDXGI, L"dxgi.dll"},
-                {hOpenGL, L"opengl32.dll"},
-                {GetModuleHandleW(L"vulkan-1.dll"), L"vulkan-1.dll"}
+                {hOpenGL, L"opengl32.dll"}
             }};
 
             for (const auto& mod : graphicsModules) {
@@ -1423,14 +1484,22 @@ public:
                     PAINTSTRUCT ps;
                     HDC hdc = BeginPaint(hwnd, &ps);
 
-                    // Get custom renderer if any
-                    auto& instance = OverlayProtection::Instance();
-                    std::lock_guard lock(instance.m_impl->m_rendererMutex);
+                    // Copy the renderer under lock, then invoke outside the lock
+                    // to avoid holding m_rendererMutex during user callback
+                    std::function<void(HDC, RECT)> rendererCopy;
+                    {
+                        auto& instance = OverlayProtection::Instance();
+                        std::lock_guard lock(instance.m_impl->m_rendererMutex);
 
-                    auto it = instance.m_impl->m_renderers.find(hwnd);
-                    if (it != instance.m_impl->m_renderers.end() && it->second) {
+                        auto it = instance.m_impl->m_renderers.find(hwnd);
+                        if (it != instance.m_impl->m_renderers.end() && it->second) {
+                            rendererCopy = it->second;
+                        }
+                    }
+
+                    if (rendererCopy) {
                         try {
-                            it->second(hdc, ps.rcPaint);
+                            rendererCopy(hdc, ps.rcPaint);
                         } catch (...) {
                             // Renderer threw - continue
                         }
@@ -1752,44 +1821,56 @@ OverlayProtectionConfiguration OverlayProtection::GetConfiguration() const {
  */
 bool OverlayProtection::SecureOverlay() {
     try {
-        // FIX #9: unique_lock because we write m_status
-        std::unique_lock lock(m_impl->m_mutex);
+        // Snapshot config and status under shared lock (no mutation yet)
+        OverlayProtectionConfiguration configSnapshot;
+        {
+            std::shared_lock lock(m_impl->m_mutex);
 
-        if (m_impl->m_status != OverlayProtectionStatus::Running &&
-            m_impl->m_status != OverlayProtectionStatus::Protected) {
-            Utils::Logger::Warn("OverlayProtection: Not initialized");
-            return false;
-        }
-
-        // FIX #18: DWM check - skip on Win8+
-        if (!m_impl->m_isWindows8Plus) {
-            BOOL compositionEnabled = FALSE;
-            if (FAILED(DwmIsCompositionEnabled(&compositionEnabled)) || !compositionEnabled) {
-                Utils::Logger::Warn("OverlayProtection: DWM composition not enabled (Win7)");
+            if (m_impl->m_status != OverlayProtectionStatus::Running &&
+                m_impl->m_status != OverlayProtectionStatus::Protected) {
+                Utils::Logger::Warn("OverlayProtection: Not initialized");
                 return false;
             }
+
+            // FIX #18: DWM check - skip on Win8+
+            if (!m_impl->m_isWindows8Plus) {
+                BOOL compositionEnabled = FALSE;
+                if (FAILED(DwmIsCompositionEnabled(&compositionEnabled)) || !compositionEnabled) {
+                    Utils::Logger::Warn("OverlayProtection: DWM composition not enabled (Win7)");
+                    return false;
+                }
+            }
+
+            configSnapshot = m_impl->m_config;
         }
 
-        // Scan for hooks
-        if (m_impl->m_config.enableHookDetection) {
-            auto hooks = m_impl->ScanForHooksInternal();
+        // Perform expensive hook scan WITHOUT holding m_mutex
+        std::vector<HookDetectionResult> hooks;
+        size_t maliciousHooks = 0;
+        if (configSnapshot.enableHookDetection) {
+            hooks = m_impl->ScanForHooksInternal();
 
-            size_t maliciousHooks = 0;
             for (const auto& hook : hooks) {
                 if (!hook.isWhitelisted && !hook.isKnownOverlay) {
                     ++maliciousHooks;
                     m_impl->FireHookCallbacks(hook);
                 }
             }
+        }
+
+        // Re-acquire exclusive lock to write results
+        {
+            std::unique_lock lock(m_impl->m_mutex);
 
             if (maliciousHooks > 0) {
                 Utils::Logger::Warn("OverlayProtection: {} malicious hooks detected", maliciousHooks);
                 m_impl->m_status = OverlayProtectionStatus::Compromised;
                 return false;
             }
+
+            m_impl->m_status = OverlayProtectionStatus::Protected;
         }
 
-        m_impl->m_status = OverlayProtectionStatus::Protected;
         Utils::Logger::Info("OverlayProtection: Overlay secured");
         return true;
 
@@ -1874,6 +1955,9 @@ HWND OverlayProtection::CreateSecureOverlay(
         Utils::Logger::Info("OverlayProtection: Created overlay window 0x{:X}",
                            reinterpret_cast<uintptr_t>(hwnd));
 
+        // Release m_windowsMutex before firing callbacks to avoid holding it
+        // during potentially long user callback invocations
+        lock.unlock();
         m_impl->FireOverlayEventCallbacks(info, true);
 
         return hwnd;
@@ -1889,30 +1973,34 @@ HWND OverlayProtection::CreateSecureOverlay(
 
 void OverlayProtection::DestroyOverlay(HWND hwnd) {
     try {
-        std::unique_lock lock(m_impl->m_windowsMutex);
-
-        auto it = m_impl->m_overlayWindows.find(hwnd);
-        if (it == m_impl->m_overlayWindows.end()) {
-            return;
-        }
-
-        OverlayWindowInfo info = it->second;
-
-        if (IsWindow(hwnd)) {
-            DestroyWindow(hwnd);
-        }
-
-        m_impl->m_overlayWindows.erase(it);
-
-        // Remove renderer
+        OverlayWindowInfo info;
         {
-            std::lock_guard rendererLock(m_impl->m_rendererMutex);
-            m_impl->m_renderers.erase(hwnd);
+            std::unique_lock lock(m_impl->m_windowsMutex);
+
+            auto it = m_impl->m_overlayWindows.find(hwnd);
+            if (it == m_impl->m_overlayWindows.end()) {
+                return;
+            }
+
+            info = it->second;
+
+            if (IsWindow(hwnd)) {
+                DestroyWindow(hwnd);
+            }
+
+            m_impl->m_overlayWindows.erase(it);
+
+            // Remove renderer
+            {
+                std::lock_guard rendererLock(m_impl->m_rendererMutex);
+                m_impl->m_renderers.erase(hwnd);
+            }
+
+            Utils::Logger::Info("OverlayProtection: Destroyed overlay window 0x{:X}",
+                               reinterpret_cast<uintptr_t>(hwnd));
         }
 
-        Utils::Logger::Info("OverlayProtection: Destroyed overlay window 0x{:X}",
-                           reinterpret_cast<uintptr_t>(hwnd));
-
+        // Release m_windowsMutex before firing callbacks
         m_impl->FireOverlayEventCallbacks(info, false);
 
     } catch (const std::exception& ex) {
@@ -1965,7 +2053,10 @@ void OverlayProtection::HideOverlay(HWND hwnd) {
         ShowWindow(hwnd, SW_HIDE);
         it->second.isVisible = false;
 
+    } catch (const std::exception& ex) {
+        Utils::Logger::Error("OverlayProtection: HideOverlay failed: {}", ex.what());
     } catch (...) {
+        Utils::Logger::Error("OverlayProtection: HideOverlay failed with unknown exception");
     }
 }
 
@@ -2487,13 +2578,17 @@ void OverlayProtection::SetOverlayPosition(HWND hwnd, OverlayPosition position) 
 
 void OverlayProtection::SetOverlayOpacity(HWND hwnd, uint8_t opacity) {
     try {
-        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), opacity, LWA_ALPHA);
-
-        std::unique_lock lock(m_impl->m_windowsMutex);
-        auto it = m_impl->m_overlayWindows.find(hwnd);
-        if (it != m_impl->m_overlayWindows.end()) {
+        // Validate ownership BEFORE calling Win32 API on the hwnd
+        {
+            std::unique_lock lock(m_impl->m_windowsMutex);
+            auto it = m_impl->m_overlayWindows.find(hwnd);
+            if (it == m_impl->m_overlayWindows.end()) {
+                return;
+            }
             it->second.opacity = opacity;
         }
+
+        SetLayeredWindowAttributes(hwnd, RGB(0, 0, 0), opacity, LWA_ALPHA);
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: SetOverlayOpacity failed: {}", ex.what());
@@ -2504,6 +2599,16 @@ void OverlayProtection::SetOverlayOpacity(HWND hwnd, uint8_t opacity) {
 
 void OverlayProtection::SetClickThrough(HWND hwnd, bool enabled) {
     try {
+        // Validate ownership BEFORE modifying the hwnd's window style
+        {
+            std::unique_lock lock(m_impl->m_windowsMutex);
+            auto it = m_impl->m_overlayWindows.find(hwnd);
+            if (it == m_impl->m_overlayWindows.end()) {
+                return;
+            }
+            it->second.isClickThrough = enabled;
+        }
+
         LONG_PTR exStyle = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
 
         if (enabled) {
@@ -2513,12 +2618,6 @@ void OverlayProtection::SetClickThrough(HWND hwnd, bool enabled) {
         }
 
         SetWindowLongPtrW(hwnd, GWL_EXSTYLE, exStyle);
-
-        std::unique_lock lock(m_impl->m_windowsMutex);
-        auto it = m_impl->m_overlayWindows.find(hwnd);
-        if (it != m_impl->m_overlayWindows.end()) {
-            it->second.isClickThrough = enabled;
-        }
 
     } catch (const std::exception& ex) {
         Utils::Logger::Error("OverlayProtection: SetClickThrough failed: {}", ex.what());

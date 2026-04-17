@@ -325,15 +325,18 @@ struct SystemResourceSnapshot {
  */
 struct ThrottleSettings {
     /// @brief Disk throughput limit (MB/s)
+    /// Advisory limit communicated to orchestrator; local enforcement requires scan pipeline integration
     uint32_t diskThroughputMBps = OptimizerConstants::DEFAULT_THROTTLE_MBPS;
     
     /// @brief IOPS limit
+    /// Advisory limit communicated to orchestrator; local enforcement requires scan pipeline integration
     uint32_t iopsLimit = 100;
     
     /// @brief Scan rate limit (files/sec)
     uint32_t scanRateLimit = OptimizerConstants::DEFAULT_SCAN_RATE_LIMIT;
     
     /// @brief Network bandwidth limit (Mbps)
+    /// Advisory limit communicated to orchestrator; local enforcement requires scan pipeline integration
     uint32_t networkBandwidthMbps = 0;  // 0 = no limit
     
     /// @brief CPU usage limit (%)
@@ -374,6 +377,7 @@ struct ProfileSettings {
     bool useEfficiencyCoresOnly = false;
     
     /// @brief Defer background work
+    /// Communicated to orchestrator via action dispatcher callback; not enforced locally
     bool deferBackgroundWork = true;
     
     [[nodiscard]] std::string ToJson() const;

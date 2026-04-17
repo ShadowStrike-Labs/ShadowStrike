@@ -502,6 +502,7 @@ public:
     void RegisterGameDetectedCallback(GameDetectedCallback callback);
     void RegisterActionDeferredCallback(ActionDeferredCallback callback);
     void RegisterErrorCallback(ErrorCallback callback);
+    void RegisterActionDispatcher(ActionDispatcherCallback dispatcher);
     void UnregisterCallbacks();
 
     // Statistics
@@ -519,6 +520,7 @@ private:
     bool DetectFullscreenApps();
     bool DetectLaunchers();
     bool DetectVRApps();
+    bool DetectStreamingApps();
     void NotifyStateChange(bool active, ActivationReason reason);
     void NotifyError(const std::string& message, int code);
     void CreateDefaultProfiles();
@@ -581,6 +583,7 @@ private:
     GameDetectedCallback m_gameDetectedCallback;
     ActionDeferredCallback m_actionDeferredCallback;
     ErrorCallback m_errorCallback;
+    ActionDispatcherCallback m_actionDispatcher;
 
     // Statistics
     GameModeStatistics m_stats;
@@ -591,6 +594,9 @@ private:
     // Fix #21: Fullscreen detection hysteresis state
     std::atomic<uint32_t> m_consecutiveFullscreenCount{0};
     TimePoint m_lastFullscreenDeactivation{};
+
+    // H1: Launcher detected flag (does not activate game mode by itself)
+    std::atomic<bool> m_launcherDetected{false};
 };
 
 // ============================================================================
@@ -666,6 +672,24 @@ bool GameModeManagerImpl::Initialize(const GameModeConfiguration& config) {
 
     } catch (const std::exception& e) {
         Utils::Logger::Fatal("GameModeManager initialization failed: {}", e.what());
+
+        // Stop any threads that were launched before the exception
+        m_stopDetection.store(true, std::memory_order_release);
+        m_stopSchedule.store(true, std::memory_order_release);
+        m_stopResume.store(true, std::memory_order_release);
+        m_resumeCv.notify_all();
+
+        // Move threads out before unlocking so we can join outside the lock
+        auto detThread = std::move(m_detectionThread);
+        auto schThread = std::move(m_scheduleThread);
+        auto resThread = std::move(m_resumeThread);
+
+        lock.unlock();
+
+        if (detThread && detThread->joinable()) detThread->join();
+        if (schThread && schThread->joinable()) schThread->join();
+        if (resThread && resThread->joinable()) resThread->join();
+
         m_status = GameModeStatus::Error;
         return false;
     }
@@ -953,6 +977,9 @@ void GameModeManagerImpl::OnGameDetected(uint32_t pid, const std::wstring& proce
             // Get default profile
             auto profileIt = m_profiles.find(m_config.defaultProfile);
             if (profileIt == m_profiles.end()) {
+                Utils::Logger::Warn("GameModeManager: default profile '{}' not found, "
+                    "cannot activate game mode for detected process", m_config.defaultProfile);
+                m_status = GameModeStatus::Inactive;
                 return;
             }
 
@@ -986,7 +1013,11 @@ void GameModeManagerImpl::OnGameDetected(uint32_t pid, const std::wstring& proce
         if (cbCopy) {
             try {
                 cbCopy(pid, processName);
-            } catch (...) {}
+            } catch (const std::exception& ex) {
+                Utils::Logger::Error("GameModeManager: game detected callback exception: {}", ex.what());
+            } catch (...) {
+                Utils::Logger::Error("GameModeManager: unknown game detected callback exception");
+            }
         }
 
         NotifyStateChange(true, ActivationReason::GameDetected);
@@ -1238,7 +1269,11 @@ void GameModeManagerImpl::DeferAction(const DeferredAction& action) {
     if (cbCopy) {
         try {
             cbCopy(action);
-        } catch (...) {}
+        } catch (const std::exception& ex) {
+            Utils::Logger::Error("GameModeManager: action deferred callback exception: {}", ex.what());
+        } catch (...) {
+            Utils::Logger::Error("GameModeManager: unknown action deferred callback exception");
+        }
     }
 
     Utils::Logger::Info("Action deferred: {}", action.description);
@@ -1249,14 +1284,16 @@ std::vector<DeferredAction> GameModeManagerImpl::GetDeferredActions() const {
     return m_deferredActions;
 }
 
-// Fix #4: Real dispatch logic instead of fake 100ms sleep
+// Fix #4: Dispatch via registered callback instead of log-only stubs
 void GameModeManagerImpl::ExecuteDeferredActions() {
     std::vector<DeferredAction> actions;
+    ActionDispatcherCallback dispatcher;
 
     {
         std::unique_lock lock(m_mutex);
         actions = std::move(m_deferredActions);
         m_deferredActions.clear();
+        dispatcher = m_actionDispatcher;
     }
 
     if (actions.empty()) {
@@ -1273,67 +1310,20 @@ void GameModeManagerImpl::ExecuteDeferredActions() {
 
     for (const auto& action : actions) {
         try {
-            switch (action.actionType) {
-                case DeferredActionType::Scan: {
-                    Utils::Logger::Info("Dispatching deferred scan: {}", action.description);
-                    // Signal scan engine via context data if a callback path is provided
-                    auto scanPathIt = action.context.find("scanPath");
-                    if (scanPathIt != action.context.end()) {
-                        Utils::Logger::Info("Scan target path: {}", scanPathIt->second);
-                    }
-                    // The scan engine will pick up the deferred scan on its next cycle.
-                    // In production, this would post a message to the scan engine's work queue.
-                    m_stats.scansPostponed++;
-                    break;
-                }
+            if (dispatcher) {
+                dispatcher(action.actionType, action.context);
+                Utils::Logger::Info("Dispatched deferred action via dispatcher: {} (type: {})",
+                    action.description, static_cast<int>(action.actionType));
+            } else {
+                Utils::Logger::Warn("No action dispatcher registered, logging deferred action: {} (type: {})",
+                    action.description, static_cast<int>(action.actionType));
+            }
 
-                case DeferredActionType::Update: {
-                    Utils::Logger::Info("Dispatching deferred update: {}", action.description);
-                    // Signal update subsystem to resume checking
-                    auto updateTypeIt = action.context.find("updateType");
-                    if (updateTypeIt != action.context.end()) {
-                        Utils::Logger::Info("Update type: {}", updateTypeIt->second);
-                    }
-                    break;
-                }
-
-                case DeferredActionType::Cleanup: {
-                    Utils::Logger::Info("Dispatching deferred cleanup: {}", action.description);
-                    // Invoke cleanup via context callback identifier
-                    auto targetIt = action.context.find("cleanupTarget");
-                    if (targetIt != action.context.end()) {
-                        Utils::Logger::Info("Cleanup target: {}", targetIt->second);
-                    }
-                    break;
-                }
-
-                case DeferredActionType::Maintenance: {
-                    Utils::Logger::Info("Dispatching deferred maintenance: {}", action.description);
-                    auto taskIt = action.context.find("maintenanceTask");
-                    if (taskIt != action.context.end()) {
-                        Utils::Logger::Info("Maintenance task: {}", taskIt->second);
-                    }
-                    break;
-                }
-
-                case DeferredActionType::Notification: {
-                    Utils::Logger::Info("Dispatching deferred notification: {}", action.description);
-                    auto msgIt = action.context.find("message");
-                    auto sevIt = action.context.find("severity");
-                    if (msgIt != action.context.end()) {
-                        Utils::Logger::Info("Notification message: {}", msgIt->second);
-                    }
-                    if (sevIt != action.context.end()) {
-                        Utils::Logger::Info("Notification severity: {}", sevIt->second);
-                    }
-                    m_stats.notificationsSuppressed++;
-                    break;
-                }
-
-                default:
-                    Utils::Logger::Warn("Unknown deferred action type: {}",
-                        static_cast<int>(action.actionType));
-                    break;
+            // Track statistics regardless of dispatch path
+            if (action.actionType == DeferredActionType::Scan) {
+                m_stats.scansPostponed++;
+            } else if (action.actionType == DeferredActionType::Notification) {
+                m_stats.notificationsSuppressed++;
             }
 
         } catch (const std::exception& e) {
@@ -1435,12 +1425,18 @@ void GameModeManagerImpl::RegisterErrorCallback(ErrorCallback callback) {
     m_errorCallback = std::move(callback);
 }
 
+void GameModeManagerImpl::RegisterActionDispatcher(ActionDispatcherCallback dispatcher) {
+    std::unique_lock lock(m_mutex);
+    m_actionDispatcher = std::move(dispatcher);
+}
+
 void GameModeManagerImpl::UnregisterCallbacks() {
     std::unique_lock lock(m_mutex);
     m_stateChangeCallback = nullptr;
     m_gameDetectedCallback = nullptr;
     m_actionDeferredCallback = nullptr;
     m_errorCallback = nullptr;
+    m_actionDispatcher = nullptr;
 }
 
 // ============================================================================
@@ -1483,6 +1479,17 @@ void GameModeManagerImpl::ResetStatistics() {
 bool GameModeManagerImpl::SelfTest() {
     Utils::Logger::Info("Running GameModeManager self-test...");
 
+    // RAII guard ensures test artifacts are cleaned up on every exit path
+    struct TestCleanup {
+        GameModeManagerImpl* self;
+        bool profileCreated = false;
+        bool actionsDeferred = false;
+        ~TestCleanup() {
+            if (actionsDeferred) self->ClearDeferredActions();
+            if (profileCreated) self->DeleteProfile("TestProfile");
+        }
+    } guard{this};
+
     try {
         // Test 1: Profile creation
         GameModeProfile testProfile;
@@ -1494,6 +1501,7 @@ bool GameModeManagerImpl::SelfTest() {
             Utils::Logger::Error("Self-test failed: Profile creation");
             return false;
         }
+        guard.profileCreated = true;
         Utils::Logger::Info("[PASS] Profile creation test passed");
 
         // Test 2: Schedule evaluation
@@ -1520,6 +1528,7 @@ bool GameModeManagerImpl::SelfTest() {
         testAction.priority = 5;
 
         DeferAction(testAction);
+        guard.actionsDeferred = true;
 
         auto actions = GetDeferredActions();
         if (actions.empty()) {
@@ -1540,10 +1549,6 @@ bool GameModeManagerImpl::SelfTest() {
             return false;
         }
         Utils::Logger::Info("[PASS] Configuration validation test passed");
-
-        // Cleanup
-        ClearDeferredActions();
-        DeleteProfile("TestProfile");
 
         Utils::Logger::Info("All GameModeManager self-tests passed!");
         return true;
@@ -1605,6 +1610,11 @@ void GameModeManagerImpl::DetectionThreadFunc() {
             // Detect VR apps
             if (vrDetect) {
                 gameDetected |= DetectVRApps();
+            }
+
+            // Detect streaming apps
+            if (autoDetect) {
+                gameDetected |= DetectStreamingApps();
             }
 
             // Check auto-disable timeout using snapshotted values
@@ -1846,12 +1856,20 @@ bool GameModeManagerImpl::DetectGames() {
 // Fix #12: Blocklist for non-game processes
 // Fix #18: ScopedHandle RAII for CreateToolhelp32Snapshot
 // Fix #21: Fullscreen hysteresis - require consecutive detections and cooldown
+// C4: Read m_lastFullscreenDeactivation under shared_lock to avoid data race
 bool GameModeManagerImpl::DetectFullscreenApps() {
+    // C4: Acquire lock to read m_lastFullscreenDeactivation safely
+    TimePoint lastDeactivation;
+    {
+        std::shared_lock lock(m_mutex);
+        lastDeactivation = m_lastFullscreenDeactivation;
+    }
+
     // Fix #21: Enforce cooldown after deactivation
     auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-        Clock::now() - m_lastFullscreenDeactivation);
+        Clock::now() - lastDeactivation);
     if (elapsed.count() < FULLSCREEN_COOLDOWN_SECONDS &&
-        m_lastFullscreenDeactivation.time_since_epoch().count() > 0) {
+        lastDeactivation.time_since_epoch().count() > 0) {
         return false;
     }
 
@@ -1922,6 +1940,7 @@ bool GameModeManagerImpl::DetectFullscreenApps() {
 
 // Fix #13: Case-insensitive launcher match using _wcsicmp
 // Fix #18: ScopedHandle RAII
+// H1: Launcher detection sets flag only — does not activate game mode
 bool GameModeManagerImpl::DetectLaunchers() {
     ScopedHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
     if (!snapshot) {
@@ -1943,7 +1962,9 @@ bool GameModeManagerImpl::DetectLaunchers() {
         for (const auto& launcher : KNOWN_LAUNCHERS) {
             // Fix #13: Case-insensitive comparison
             if (_wcsicmp(processName.c_str(), launcher.c_str()) == 0) {
-                OnGameDetected(entry.th32ProcessID, processName);
+                Utils::Logger::Info("Launcher detected: {} (PID: {}), flagging for sensitivity increase",
+                    Utils::StringUtils::WStringToString(processName), entry.th32ProcessID);
+                m_launcherDetected.store(true, std::memory_order_release);
                 detected = true;
                 break;
             }
@@ -1953,7 +1974,11 @@ bool GameModeManagerImpl::DetectLaunchers() {
 
     } while (Process32NextW(snapshot.Get(), &entry));
 
-    return detected;
+    if (!detected) {
+        m_launcherDetected.store(false, std::memory_order_release);
+    }
+
+    return false;  // Launcher alone does not activate game mode
 }
 
 // Fix #18: ScopedHandle RAII + case-insensitive match for consistency
@@ -1978,6 +2003,46 @@ bool GameModeManagerImpl::DetectVRApps() {
         for (const auto& vrApp : VR_APPLICATIONS) {
             if (_wcsicmp(processName.c_str(), vrApp.c_str()) == 0) {
                 OnGameDetected(entry.th32ProcessID, processName);
+                detected = true;
+                break;
+            }
+        }
+
+        if (detected) break;
+
+    } while (Process32NextW(snapshot.Get(), &entry));
+
+    return detected;
+}
+
+// H2: Detect streaming/recording applications and activate game mode
+bool GameModeManagerImpl::DetectStreamingApps() {
+    if (m_gameModeActive.load(std::memory_order_acquire)) {
+        return false;  // Already active
+    }
+
+    ScopedHandle snapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+    if (!snapshot) {
+        return false;
+    }
+
+    PROCESSENTRY32W entry;
+    entry.dwSize = sizeof(PROCESSENTRY32W);
+
+    if (!Process32FirstW(snapshot.Get(), &entry)) {
+        return false;
+    }
+
+    bool detected = false;
+
+    do {
+        std::wstring processName = entry.szExeFile;
+
+        for (const auto& streamApp : STREAMING_APPS) {
+            if (_wcsicmp(processName.c_str(), streamApp.c_str()) == 0) {
+                Utils::Logger::Info("Streaming app detected: {} (PID: {})",
+                    Utils::StringUtils::WStringToString(processName), entry.th32ProcessID);
+                Activate("", ActivationReason::StreamingActive);
                 detected = true;
                 break;
             }
@@ -2295,6 +2360,10 @@ void GameModeManager::RegisterActionDeferredCallback(ActionDeferredCallback call
 
 void GameModeManager::RegisterErrorCallback(ErrorCallback callback) {
     m_impl->RegisterErrorCallback(std::move(callback));
+}
+
+void GameModeManager::RegisterActionDispatcher(ActionDispatcherCallback dispatcher) {
+    m_impl->RegisterActionDispatcher(std::move(dispatcher));
 }
 
 void GameModeManager::UnregisterCallbacks() {
