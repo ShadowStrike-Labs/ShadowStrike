@@ -1537,12 +1537,12 @@ public:
             for (const auto* keyPath : PERSISTENCE_RUN_KEYS) {
                 Utils::RegistryUtils::RegistryKey regKey;
                 Utils::RegistryUtils::Error regErr;
-                Utils::RegistryUtils::RegistryKey::OpenOptions opts;
-                opts.desiredAccess = KEY_READ | KEY_WRITE;
+                Utils::RegistryUtils::OpenOptions opts;
+                opts.access = KEY_READ | KEY_WRITE;
 
                 if (!regKey.Open(root, keyPath, opts)) continue;
 
-                std::vector<Utils::RegistryUtils::RegistryKey::ValueInfo> values;
+                std::vector<Utils::RegistryUtils::ValueInfo> values;
                 if (!regKey.EnumValues(values)) continue;
 
                 for (const auto& val : values) {

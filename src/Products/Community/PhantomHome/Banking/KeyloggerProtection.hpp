@@ -308,6 +308,8 @@ enum class DetectionAction : uint8_t {
 /**
  * @brief Module status
  */
+#ifndef SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
+#define SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 enum class ModuleStatus : uint8_t {
     Uninitialized   = 0,
     Initializing    = 1,
@@ -317,6 +319,7 @@ enum class ModuleStatus : uint8_t {
     Stopped         = 5,
     Error           = 6
 };
+#endif  // SHADOWSTRIKE_BANKING_MODULESTATUS_DEFINED
 
 // ============================================================================
 // STRUCTURES
@@ -436,7 +439,7 @@ struct ClipboardThreatInfo {
 /**
  * @brief Protected window info
  */
-struct ProtectedWindowInfo {
+struct KeyloggerProtectedWindow {
     /// @brief Window handle
     uint64_t windowHandle = 0;
     
@@ -562,6 +565,34 @@ struct KeyloggerProtectionStatistics {
      * @brief Serialize to JSON
      */
     [[nodiscard]] std::string ToJson() const;
+
+    KeyloggerProtectionStatistics() = default;
+
+    KeyloggerProtectionStatistics(const KeyloggerProtectionStatistics& other) noexcept
+        : totalScans{other.totalScans.load(std::memory_order_relaxed)},
+          threatsDetected{other.threatsDetected.load(std::memory_order_relaxed)},
+          hooksBlocked{other.hooksBlocked.load(std::memory_order_relaxed)},
+          apiCallsIntercepted{other.apiCallsIntercepted.load(std::memory_order_relaxed)},
+          clipboardBlocked{other.clipboardBlocked.load(std::memory_order_relaxed)},
+          protectedKeystrokes{other.protectedKeystrokes.load(std::memory_order_relaxed)},
+          falsePositives{other.falsePositives.load(std::memory_order_relaxed)},
+          startTime{other.startTime},
+          lastDetectionTime{other.lastDetectionTime} {}
+
+    KeyloggerProtectionStatistics& operator=(const KeyloggerProtectionStatistics& other) noexcept {
+        if (this != &other) {
+            totalScans.store(other.totalScans.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threatsDetected.store(other.threatsDetected.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            hooksBlocked.store(other.hooksBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            apiCallsIntercepted.store(other.apiCallsIntercepted.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            clipboardBlocked.store(other.clipboardBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            protectedKeystrokes.store(other.protectedKeystrokes.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            falsePositives.store(other.falsePositives.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+            lastDetectionTime = other.lastDetectionTime;
+        }
+        return *this;
+    }
 };
 
 /**
@@ -801,7 +832,7 @@ public:
     /**
      * @brief Get protected windows
      */
-    [[nodiscard]] std::vector<ProtectedWindowInfo> GetProtectedWindows() const;
+    [[nodiscard]] std::vector<KeyloggerProtectedWindow> GetProtectedWindows() const;
     
     /**
      * @brief Auto-detect and protect password fields

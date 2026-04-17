@@ -1258,9 +1258,9 @@ void RestoreManager::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-RestoreStatistics RestoreManager::GetStatistics() const {
+RestoreStatistics::Snapshot RestoreManager::GetStatistics() const {
     // Atomics are individually thread-safe; no mutex needed for snapshot reads
-    RestoreStatistics s;
+    RestoreStatistics::Snapshot s;
     s.totalRestores       = m_impl->m_stats.totalRestores.load(std::memory_order_relaxed);
     s.successfulRestores  = m_impl->m_stats.successfulRestores.load(std::memory_order_relaxed);
     s.failedRestores      = m_impl->m_stats.failedRestores.load(std::memory_order_relaxed);

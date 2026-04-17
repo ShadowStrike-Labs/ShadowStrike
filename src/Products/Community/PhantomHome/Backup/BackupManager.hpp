@@ -550,6 +550,40 @@ struct BackupStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+
+    struct Snapshot {
+        uint64_t totalBackups{0};
+        uint64_t successfulBackups{0};
+        uint64_t failedBackups{0};
+        uint64_t totalBytesBackedUp{0};
+        uint64_t totalFilesBackedUp{0};
+        uint64_t totalRestores{0};
+        uint64_t successfulRestores{0};
+        uint64_t bytesSavedByDedup{0};
+        uint64_t bytesSavedByCompression{0};
+        uint64_t vssSnapshotsCreated{0};
+        uint64_t ransomwareBlockedAttempts{0};
+        TimePoint startTime{Clock::now()};
+
+        [[nodiscard]] std::string ToJson() const;
+    };
+
+    [[nodiscard]] Snapshot TakeSnapshot() const noexcept {
+        Snapshot s;
+        s.totalBackups = totalBackups.load(std::memory_order_relaxed);
+        s.successfulBackups = successfulBackups.load(std::memory_order_relaxed);
+        s.failedBackups = failedBackups.load(std::memory_order_relaxed);
+        s.totalBytesBackedUp = totalBytesBackedUp.load(std::memory_order_relaxed);
+        s.totalFilesBackedUp = totalFilesBackedUp.load(std::memory_order_relaxed);
+        s.totalRestores = totalRestores.load(std::memory_order_relaxed);
+        s.successfulRestores = successfulRestores.load(std::memory_order_relaxed);
+        s.bytesSavedByDedup = bytesSavedByDedup.load(std::memory_order_relaxed);
+        s.bytesSavedByCompression = bytesSavedByCompression.load(std::memory_order_relaxed);
+        s.vssSnapshotsCreated = vssSnapshotsCreated.load(std::memory_order_relaxed);
+        s.ransomwareBlockedAttempts = ransomwareBlockedAttempts.load(std::memory_order_relaxed);
+        s.startTime = startTime;
+        return s;
+    }
 };
 
 /**
@@ -768,7 +802,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] BackupStatistics GetStatistics() const;
+    [[nodiscard]] BackupStatistics::Snapshot GetStatistics() const;
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();

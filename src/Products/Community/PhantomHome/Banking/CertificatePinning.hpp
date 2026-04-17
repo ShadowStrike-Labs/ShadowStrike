@@ -559,6 +559,36 @@ struct PinningStatistics {
      * @brief Serialize to JSON
      */
     [[nodiscard]] std::string ToJson() const;
+
+    PinningStatistics() = default;
+
+    PinningStatistics(const PinningStatistics& other) noexcept
+        : totalValidations{other.totalValidations.load(std::memory_order_relaxed)},
+          successfulValidations{other.successfulValidations.load(std::memory_order_relaxed)},
+          pinMismatches{other.pinMismatches.load(std::memory_order_relaxed)},
+          mitmDetections{other.mitmDetections.load(std::memory_order_relaxed)},
+          expiredCerts{other.expiredCerts.load(std::memory_order_relaxed)},
+          revokedCerts{other.revokedCerts.load(std::memory_order_relaxed)},
+          ctViolations{other.ctViolations.load(std::memory_order_relaxed)},
+          connectionsBlocked{other.connectionsBlocked.load(std::memory_order_relaxed)},
+          cacheHits{other.cacheHits.load(std::memory_order_relaxed)},
+          startTime{other.startTime} {}
+
+    PinningStatistics& operator=(const PinningStatistics& other) noexcept {
+        if (this != &other) {
+            totalValidations.store(other.totalValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            successfulValidations.store(other.successfulValidations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            pinMismatches.store(other.pinMismatches.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            mitmDetections.store(other.mitmDetections.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            expiredCerts.store(other.expiredCerts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            revokedCerts.store(other.revokedCerts.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            ctViolations.store(other.ctViolations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            connectionsBlocked.store(other.connectionsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            cacheHits.store(other.cacheHits.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
 };
 
 /**

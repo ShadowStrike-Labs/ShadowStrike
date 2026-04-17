@@ -34,6 +34,7 @@
 #include "SecureBrowser.hpp"
 #include "KeyloggerProtection.hpp"
 #include "ScreenshotBlocker.hpp"
+#include "../Utils/StringUtils.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
