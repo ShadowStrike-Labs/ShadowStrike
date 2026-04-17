@@ -126,12 +126,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 #include "EmailCommon.hpp"
 
 // ============================================================================
@@ -149,7 +149,7 @@ namespace Email {
 // COMPILE-TIME CONSTANTS
 // ============================================================================
 
-namespace SpamConstants {
+namespace SpamDetectorConstants {
 
     inline constexpr uint32_t VERSION_MAJOR = 3;
     inline constexpr uint32_t VERSION_MINOR = 0;
@@ -157,6 +157,9 @@ namespace SpamConstants {
 
     /// @brief Spam threshold (0-100)
     inline constexpr int DEFAULT_SPAM_THRESHOLD = 70;
+    
+    /// @brief Default ham threshold (0-100) - below this is definitely ham
+    inline constexpr int DEFAULT_HAM_THRESHOLD = 30;
     
     /// @brief High-confidence spam threshold
     inline constexpr int HIGH_SPAM_THRESHOLD = 90;
@@ -167,8 +170,65 @@ namespace SpamConstants {
     /// @brief Maximum corpus size
     inline constexpr size_t MAX_CORPUS_SIZE = 1000000;
     
+    /// @brief Maximum tokens per corpus load (security limit)
+    inline constexpr size_t MAX_CORPUS_TOKENS = 10'000'000;
+    
+    /// @brief Maximum token length (security limit)
+    inline constexpr size_t MAX_TOKEN_LENGTH = 1024;
+    
     /// @brief Default token weight limit
     inline constexpr double TOKEN_WEIGHT_LIMIT = 0.9999;
+    
+    /// @brief Default Bayesian weight in final score
+    inline constexpr double DEFAULT_BAYESIAN_WEIGHT = 0.4;
+    
+    /// @brief Default rule weight in final score
+    inline constexpr double DEFAULT_RULE_WEIGHT = 0.3;
+    
+    /// @brief Default RBL weight in final score
+    inline constexpr double DEFAULT_RBL_WEIGHT = 0.2;
+    
+    /// @brief Default reputation weight in final score
+    inline constexpr double DEFAULT_REPUTATION_WEIGHT = 0.1;
+    
+    /// @brief Default max tokens to consider
+    inline constexpr size_t DEFAULT_MAX_TOKENS = 15;
+    
+    /// @brief Default minimum token frequency for classification
+    inline constexpr size_t DEFAULT_MIN_TOKEN_FREQUENCY = 2;
+    
+    /// @brief Default maximum recipients before flagging
+    inline constexpr size_t DEFAULT_MAX_RECIPIENTS = 50;
+    
+    /// @brief Maximum subject length for analysis (security limit)
+    inline constexpr size_t MAX_SUBJECT_LENGTH = 1024;
+    
+    /// @brief Maximum body length for analysis (security limit)
+    inline constexpr size_t MAX_BODY_LENGTH = 256 * 1024;
+    
+    /// @brief Maximum recipients for analysis (security limit)
+    inline constexpr size_t MAX_RECIPIENTS = 500;
+    
+    /// @brief Maximum RBL score (cap at 100)
+    inline constexpr int MAX_RBL_SCORE = 100;
+    
+    /// @brief Maximum token/reputation map size (LRU eviction threshold)
+    inline constexpr size_t MAX_TOKEN_MAP_SIZE = 500'000;
+    
+    /// @brief Maximum reputation map size (LRU eviction threshold)
+    inline constexpr size_t MAX_REPUTATION_MAP_SIZE = 100'000;
+    
+    /// @brief Corpus file magic number
+    inline constexpr uint64_t CORPUS_MAGIC = 0x5353434F52505553ULL;  // "SSCORPUS"
+    
+    /// @brief Corpus file version
+    inline constexpr uint32_t CORPUS_VERSION = 1;
+    
+    /// @brief Auto-learn high spam threshold
+    inline constexpr int AUTO_LEARN_SPAM_THRESHOLD = 95;
+    
+    /// @brief Auto-learn high ham threshold
+    inline constexpr int AUTO_LEARN_HAM_THRESHOLD = 5;
     
     /// @brief Common RBL providers
     inline constexpr const char* DEFAULT_RBL_PROVIDERS[] = {
@@ -187,7 +247,7 @@ namespace SpamConstants {
         "unsubscribe", "click here", "buy now", "order now"
     };
 
-}  // namespace SpamConstants
+}  // namespace SpamDetectorConstants
 
 // ============================================================================
 // ENUMERATIONS
@@ -234,6 +294,29 @@ enum class SpamIndicator : uint32_t {
     GrayMail                = 1 << 19
 };
 
+/// @brief Bitwise OR for SpamIndicator
+[[nodiscard]] constexpr SpamIndicator operator|(SpamIndicator lhs, SpamIndicator rhs) noexcept {
+    return static_cast<SpamIndicator>(
+        static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise AND for SpamIndicator
+[[nodiscard]] constexpr SpamIndicator operator&(SpamIndicator lhs, SpamIndicator rhs) noexcept {
+    return static_cast<SpamIndicator>(
+        static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise OR-assignment for SpamIndicator
+constexpr SpamIndicator& operator|=(SpamIndicator& lhs, SpamIndicator rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+/// @brief Check if indicator contains flag
+[[nodiscard]] constexpr bool HasIndicator(SpamIndicator indicators, SpamIndicator flag) noexcept {
+    return (indicators & flag) != SpamIndicator::None;
+}
+
 /**
  * @brief RBL check result
  */
@@ -276,26 +359,32 @@ struct TokenStatistics {
     SystemTimePoint lastSeen;
     
     [[nodiscard]] double GetWeight() const noexcept;
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief RBL check detail
+ * @brief RBL check detail - aligned with cpp implementation
  */
 struct RBLCheckResult {
     /// @brief Provider name
     std::string provider;
     
-    /// @brief Result
-    RBLResult result = RBLResult::NotListed;
+    /// @brief IP address checked
+    std::string ipAddress;
     
-    /// @brief Return code
-    std::string returnCode;
+    /// @brief Is listed in RBL
+    bool isListed = false;
     
-    /// @brief Listing reason
-    std::string reason;
+    /// @brief Time of check
+    SystemTimePoint checkTime;
     
-    /// @brief Check duration
-    std::chrono::milliseconds duration{0};
+    /// @brief Response code from RBL
+    std::string responseCode;
+    
+    /// @brief Response text/reason
+    std::string responseText;
+    
+    [[nodiscard]] std::string ToJson() const;
 };
 
 /**
@@ -394,33 +483,52 @@ struct SpamAnalysisResult {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics - aligned with cpp (SpamDetectorStatistics)
  */
-struct SpamStatistics {
+struct SpamDetectorStatistics {
     std::atomic<uint64_t> totalAnalyzed{0};
     std::atomic<uint64_t> spamDetected{0};
     std::atomic<uint64_t> hamDetected{0};
-    std::atomic<uint64_t> unknownDetected{0};
     std::atomic<uint64_t> bulkDetected{0};
+    std::atomic<uint64_t> phishingDetected{0};
+    std::atomic<uint64_t> malwareDetected{0};
     std::atomic<uint64_t> rblHits{0};
     std::atomic<uint64_t> bayesianHits{0};
     std::atomic<uint64_t> ruleHits{0};
-    std::atomic<uint64_t> trainedSpam{0};
-    std::atomic<uint64_t> trainedHam{0};
-    std::atomic<uint64_t> falsePositives{0};
-    std::atomic<uint64_t> falseNegatives{0};
     std::atomic<uint64_t> whitelistHits{0};
     std::atomic<uint64_t> blacklistHits{0};
-    std::array<std::atomic<uint64_t>, 8> byVerdict{};
-    std::array<std::atomic<uint64_t>, 32> byIndicator{};
-    TimePoint startTime = Clock::now();
+    std::atomic<uint64_t> falsePositives{0};
+    std::atomic<uint64_t> falseNegatives{0};
+    std::atomic<uint64_t> tokensLearned{0};
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
 
 /**
- * @brief Configuration
+ * @brief Statistics snapshot for thread-safe return by value
+ */
+struct SpamDetectorStatisticsSnapshot {
+    uint64_t totalAnalyzed = 0;
+    uint64_t spamDetected = 0;
+    uint64_t hamDetected = 0;
+    uint64_t bulkDetected = 0;
+    uint64_t phishingDetected = 0;
+    uint64_t malwareDetected = 0;
+    uint64_t rblHits = 0;
+    uint64_t bayesianHits = 0;
+    uint64_t ruleHits = 0;
+    uint64_t whitelistHits = 0;
+    uint64_t blacklistHits = 0;
+    uint64_t falsePositives = 0;
+    uint64_t falseNegatives = 0;
+    uint64_t tokensLearned = 0;
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Configuration - aligned with cpp implementation
  */
 struct SpamDetectorConfiguration {
     /// @brief Enable detector
@@ -441,11 +549,38 @@ struct SpamDetectorConfiguration {
     /// @brief Enable auto-learning
     bool enableAutoLearn = true;
     
+    /// @brief Use n-grams in tokenization
+    bool useNGrams = true;
+    
     /// @brief Spam threshold (0-100)
-    int spamThreshold = SpamConstants::DEFAULT_SPAM_THRESHOLD;
+    int spamThreshold = SpamDetectorConstants::DEFAULT_SPAM_THRESHOLD;
+    
+    /// @brief Ham threshold (0-100) - below this is definitely ham
+    int hamThreshold = SpamDetectorConstants::DEFAULT_HAM_THRESHOLD;
     
     /// @brief Auto-learn threshold (only learn if score > this or < inverse)
     int autoLearnThreshold = 90;
+    
+    /// @brief Bayesian weight in final score (0.0-1.0)
+    double bayesianWeight = SpamDetectorConstants::DEFAULT_BAYESIAN_WEIGHT;
+    
+    /// @brief Rule weight in final score (0.0-1.0)
+    double ruleWeight = SpamDetectorConstants::DEFAULT_RULE_WEIGHT;
+    
+    /// @brief RBL weight in final score (0.0-1.0)
+    double rblWeight = SpamDetectorConstants::DEFAULT_RBL_WEIGHT;
+    
+    /// @brief Reputation weight in final score (0.0-1.0)
+    double reputationWeight = SpamDetectorConstants::DEFAULT_REPUTATION_WEIGHT;
+    
+    /// @brief Maximum tokens to consider for classification
+    size_t maxTokens = SpamDetectorConstants::DEFAULT_MAX_TOKENS;
+    
+    /// @brief Minimum token frequency for classification
+    size_t minTokenFrequency = SpamDetectorConstants::DEFAULT_MIN_TOKEN_FREQUENCY;
+    
+    /// @brief Maximum recipients before flagging
+    size_t maxRecipients = SpamDetectorConstants::DEFAULT_MAX_RECIPIENTS;
     
     /// @brief RBL timeout (ms)
     uint32_t rblTimeoutMs = 3000;
@@ -476,8 +611,8 @@ struct SpamDetectorConfiguration {
 // ============================================================================
 
 using AnalysisCallback = std::function<void(const SpamAnalysisResult&)>;
-using TrainingCallback = std::function<void(TrainingType, size_t count)>;
-using RBLCallback = std::function<void(const std::string& ip, const RBLCheckResult&)>;
+using TrainingCallback = std::function<void(bool isSpam, size_t tokensLearned)>;
+using RBLCallback = std::function<void(const std::string& ip, const std::vector<RBLCheckResult>&)>;
 using ErrorCallback = std::function<void(const std::string& message, int code)>;
 
 // ============================================================================
@@ -503,7 +638,7 @@ public:
     // ========================================================================
     
     [[nodiscard]] bool Initialize(const SpamDetectorConfiguration& config = {});
-    void Shutdown();
+    void Shutdown() noexcept;
     [[nodiscard]] bool IsInitialized() const noexcept;
     [[nodiscard]] ModuleStatus GetStatus() const noexcept;
     
@@ -588,21 +723,25 @@ public:
     [[nodiscard]] bool IsBlacklisted(const std::string& sender) const;
 
     // ========================================================================
-    // CALLBACKS
+    // CALLBACKS - return uint64_t callback ID for unregistration
     // ========================================================================
     
-    void RegisterAnalysisCallback(AnalysisCallback callback);
-    void RegisterTrainingCallback(TrainingCallback callback);
-    void RegisterRBLCallback(RBLCallback callback);
-    void RegisterErrorCallback(ErrorCallback callback);
+    [[nodiscard]] uint64_t RegisterAnalysisCallback(AnalysisCallback callback);
+    [[nodiscard]] uint64_t RegisterTrainingCallback(TrainingCallback callback);
+    [[nodiscard]] uint64_t RegisterRBLCallback(RBLCallback callback);
+    [[nodiscard]] uint64_t RegisterErrorCallback(ErrorCallback callback);
+    void UnregisterCallback(uint64_t callbackId);
     void UnregisterCallbacks();
 
     // ========================================================================
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] SpamStatistics GetStatistics() const;
-    void ResetStatistics();
+    [[nodiscard]] SpamDetectorStatisticsSnapshot GetStatistics() const;
+    void ResetStatistics() noexcept;
+    
+    /// @brief Get corpus size (token count)
+    [[nodiscard]] size_t GetTokenCount() const;
     
     [[nodiscard]] bool SelfTest();
     [[nodiscard]] static std::string GetVersionString() noexcept;
@@ -633,10 +772,8 @@ private:
 /// @brief Detect hidden text in HTML
 [[nodiscard]] bool DetectHiddenText(const std::string& html);
 
-/// @brief Calculate keyword density
-[[nodiscard]] double CalculateKeywordDensity(
-    const std::string& text,
-    const std::vector<std::string>& keywords);
+/// @brief Calculate keyword density (internal helper — defined locally in SpamDetector.cpp)
+// Removed public declaration: this helper is file-local.
 
 }  // namespace Email
 }  // namespace ShadowStrike

@@ -33,22 +33,23 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../HashStore/HashStore.hpp"
-#include "../SignatureStore/SignatureStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Scripts/MacroDetector.hpp"
-#include "../Core/FileSystem/FileHasher.hpp"
-#include "../Core/FileSystem/ArchiveExtractor.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
+#include "PhantomCore/SignatureStore/SignatureStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Scripts/MacroDetector.hpp"
+#include "PhantomCore/Core/FileSystem/FileHasher.hpp"
+#include "PhantomCore/Core/FileSystem/ArchiveExtractor.hpp"
 
-// ============================================================================
-// STANDARD LIBRARY INCLUDES
-// ============================================================================
+// Standard library includes
+#include <semaphore>
+#include <bit>
 #include <algorithm>
 #include <chrono>
 #include <format>
@@ -60,6 +61,7 @@
 #include <cmath>
 #include <numeric>
 #include <regex>
+#include <cstring>
 
 // ============================================================================
 // WINDOWS INCLUDES
@@ -84,38 +86,43 @@ namespace fs = std::filesystem;
 namespace {
 
 /**
- * @brief Magic byte signatures for file type detection.
+ * @brief Magic byte signatures for file type detection (constexpr).
  */
 struct MagicSignature {
-    std::vector<uint8_t> signature;
+    std::array<uint8_t, 8> signature;
+    size_t signatureLen;
     FileTypeCategory category;
-    std::string mimeType;
+    std::string_view mimeType;
 };
 
-static const std::vector<MagicSignature> g_magicSignatures = {
+// M-7 FIX: Use constexpr arrays instead of static vector (no heap at startup)
+static constexpr std::array<MagicSignature, 11> g_magicSignatures = {{
     // Executables
-    {{0x4D, 0x5A}, FileTypeCategory::Executable, "application/x-msdownload"},  // PE (MZ)
-    {{0x7F, 0x45, 0x4C, 0x46}, FileTypeCategory::Executable, "application/x-elf"},  // ELF
+    {{0x4D, 0x5A, 0, 0, 0, 0, 0, 0}, 2, FileTypeCategory::Executable, "application/x-msdownload"},  // PE (MZ)
+    {{0x7F, 0x45, 0x4C, 0x46, 0, 0, 0, 0}, 4, FileTypeCategory::Executable, "application/x-elf"},  // ELF
 
     // Archives
-    {{0x50, 0x4B, 0x03, 0x04}, FileTypeCategory::Archive, "application/zip"},  // ZIP
-    {{0x50, 0x4B, 0x05, 0x06}, FileTypeCategory::Archive, "application/zip"},  // ZIP (empty)
-    {{0x52, 0x61, 0x72, 0x21}, FileTypeCategory::Archive, "application/x-rar"},  // RAR
-    {{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C}, FileTypeCategory::Archive, "application/x-7z-compressed"},  // 7z
-    {{0x1F, 0x8B}, FileTypeCategory::Archive, "application/gzip"},  // GZIP
+    {{0x50, 0x4B, 0x03, 0x04, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/zip"},  // ZIP
+    {{0x50, 0x4B, 0x05, 0x06, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/zip"},  // ZIP (empty)
+    {{0x52, 0x61, 0x72, 0x21, 0, 0, 0, 0}, 4, FileTypeCategory::Archive, "application/x-rar"},  // RAR
+    {{0x37, 0x7A, 0xBC, 0xAF, 0x27, 0x1C, 0, 0}, 6, FileTypeCategory::Archive, "application/x-7z-compressed"},  // 7z
+    {{0x1F, 0x8B, 0, 0, 0, 0, 0, 0}, 2, FileTypeCategory::Archive, "application/gzip"},  // GZIP
 
     // Documents
-    {{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1}, FileTypeCategory::Document, "application/vnd.ms-office"},  // OLE/DOC
-    {{0x25, 0x50, 0x44, 0x46}, FileTypeCategory::PDF, "application/pdf"},  // PDF
+    {{0xD0, 0xCF, 0x11, 0xE0, 0xA1, 0xB1, 0x1A, 0xE1}, 8, FileTypeCategory::Document, "application/vnd.ms-office"},  // OLE/DOC
+    {{0x25, 0x50, 0x44, 0x46, 0, 0, 0, 0}, 4, FileTypeCategory::PDF, "application/pdf"},  // PDF
 
     // Disk Images
-    {{0x43, 0x44, 0x30, 0x30, 0x31}, FileTypeCategory::DiskImage, "application/x-iso9660-image"},  // ISO
-};
+    {{0x43, 0x44, 0x30, 0x30, 0x31, 0, 0, 0}, 5, FileTypeCategory::DiskImage, "application/x-iso9660-image"},  // ISO
+
+    // Sentinel for iteration
+    {{0, 0, 0, 0, 0, 0, 0, 0}, 0, FileTypeCategory::Unknown, ""},
+}};
 
 /**
- * @brief Calculate Shannon entropy.
+ * @brief Calculate Shannon entropy over a single buffer.
  */
-[[nodiscard]] double CalculateEntropy(std::span<const uint8_t> data) noexcept {
+[[nodiscard]] double CalculateEntropyBlock(std::span<const uint8_t> data) noexcept {
     if (data.empty()) return 0.0;
 
     std::array<uint64_t, 256> frequencies{};
@@ -137,7 +144,57 @@ static const std::vector<MagicSignature> g_magicSignatures = {
 }
 
 /**
+ * @brief Calculate average Shannon entropy by sampling multiple 4KB blocks.
+ * 
+ * H-6 FIX: Sample from offsets 0%, 25%, 50%, 75% and average the results.
+ */
+[[nodiscard]] double CalculateEntropy(std::ifstream& file, size_t fileSize) noexcept {
+    constexpr size_t BLOCK_SIZE = 4096;
+    constexpr size_t NUM_SAMPLES = 4;
+    
+    if (fileSize == 0) return 0.0;
+    
+    std::array<size_t, NUM_SAMPLES> offsets = {
+        0,
+        fileSize / 4,
+        fileSize / 2,
+        (fileSize * 3) / 4
+    };
+    
+    double totalEntropy = 0.0;
+    size_t validSamples = 0;
+    std::array<uint8_t, BLOCK_SIZE> buffer{};
+    
+    for (size_t offset : offsets) {
+        if (offset >= fileSize) continue;
+        
+        file.seekg(static_cast<std::streamoff>(offset), std::ios::beg);
+        if (!file) continue;
+        
+        size_t bytesToRead = std::min(BLOCK_SIZE, fileSize - offset);
+        file.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(bytesToRead));
+        size_t bytesRead = static_cast<size_t>(file.gcount());
+        
+        if (bytesRead > 0) {
+            totalEntropy += CalculateEntropyBlock({buffer.data(), bytesRead});
+            ++validSamples;
+        }
+    }
+    
+    return validSamples > 0 ? totalEntropy / static_cast<double>(validSamples) : 0.0;
+}
+
+/**
+ * @brief Calculate Shannon entropy from an in-memory buffer (legacy API).
+ */
+[[nodiscard]] double CalculateEntropy(std::span<const uint8_t> data) noexcept {
+    return CalculateEntropyBlock(data);
+}
+
+/**
  * @brief Check if file has PE header.
+ * 
+ * C-4 FIX: Use std::memcpy to avoid unaligned reinterpret_cast.
  */
 [[nodiscard]] bool IsPEFile(std::span<const uint8_t> data) noexcept {
     if (data.size() < 64) return false;
@@ -145,8 +202,10 @@ static const std::vector<MagicSignature> g_magicSignatures = {
     // Check MZ signature
     if (data[0] != 'M' || data[1] != 'Z') return false;
 
-    // Get PE offset
-    uint32_t peOffset = *reinterpret_cast<const uint32_t*>(&data[60]);
+    // Get PE offset using memcpy to avoid unaligned access
+    uint32_t peOffset = 0;
+    std::memcpy(&peOffset, &data[60], sizeof(peOffset));
+    
     if (peOffset + 4 > data.size()) return false;
 
     // Check PE signature
@@ -159,7 +218,8 @@ static const std::vector<MagicSignature> g_magicSignatures = {
  */
 [[nodiscard]] bool IsHighRiskExtensionImpl(std::string_view extension) noexcept {
     for (const auto& ext : AttachmentConstants::HIGH_RISK_EXTENSIONS) {
-        if (StringUtils::EqualsIgnoreCase(extension, ext)) {
+        if (StringUtils::ToLowerCopy(StringUtils::ToWide(extension)) ==
+            StringUtils::ToLowerCopy(StringUtils::ToWide(ext))) {
             return true;
         }
     }
@@ -171,7 +231,8 @@ static const std::vector<MagicSignature> g_magicSignatures = {
  */
 [[nodiscard]] bool IsArchiveExtensionImpl(std::string_view extension) noexcept {
     for (const auto& ext : AttachmentConstants::ARCHIVE_EXTENSIONS) {
-        if (StringUtils::EqualsIgnoreCase(extension, ext)) {
+        if (StringUtils::ToLowerCopy(StringUtils::ToWide(extension)) ==
+            StringUtils::ToLowerCopy(StringUtils::ToWide(ext))) {
             return true;
         }
     }
@@ -203,8 +264,11 @@ static const std::vector<MagicSignature> g_magicSignatures = {
 // STRUCTURE JSON SERIALIZATION
 // ============================================================================
 
+// Import JSON type alias
+using Json = Utils::JSON::Json;
+
 [[nodiscard]] std::string DetectedArtifact::ToJson() const {
-    nlohmann::json j;
+    Json j;
     j["artifactType"] = artifactType;
     j["description"] = description;
     j["location"] = location;
@@ -214,7 +278,7 @@ static const std::vector<MagicSignature> g_magicSignatures = {
 }
 
 [[nodiscard]] std::string NestedFileInfo::ToJson() const {
-    nlohmann::json j;
+    Json j;
     j["fileName"] = fileName;
     j["relativePath"] = relativePath;
     j["fileSize"] = fileSize;
@@ -238,7 +302,7 @@ static const std::vector<MagicSignature> g_magicSignatures = {
 }
 
 [[nodiscard]] std::string AttachmentScanResult::ToJson() const {
-    nlohmann::json j;
+    Json j;
     j["fileName"] = fileName;
     j["filePath"] = filePath.string();
     j["verdict"] = std::string(VerdictToString(verdict));
@@ -259,11 +323,11 @@ static const std::vector<MagicSignature> g_magicSignatures = {
     j["scanDuration"] = scanDuration.count();
     j["errorMessage"] = errorMessage;
 
-    nlohmann::json artifacts = nlohmann::json::array();
+    Json artifactsArray = Json::array();
     for (const auto& artifact : this->artifacts) {
-        artifacts.push_back(nlohmann::json::parse(artifact.ToJson()));
+        artifactsArray.push_back(Json::parse(artifact.ToJson()));
     }
-    j["artifacts"] = artifacts;
+    j["artifacts"] = artifactsArray;
 
     return j.dump();
 }
@@ -274,7 +338,7 @@ static const std::vector<MagicSignature> g_magicSignatures = {
 }
 
 [[nodiscard]] std::string AttachmentScanConfig::ToJson() const {
-    nlohmann::json j;
+    Json j;
     j["depth"] = static_cast<int>(depth);
     j["extractArchives"] = extractArchives;
     j["maxArchiveDepth"] = maxArchiveDepth;
@@ -312,19 +376,44 @@ void AttachmentStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
-[[nodiscard]] std::string AttachmentStatistics::ToJson() const {
-    nlohmann::json j;
-    j["totalScans"] = totalScans.load();
-    j["maliciousDetected"] = maliciousDetected.load();
-    j["suspiciousDetected"] = suspiciousDetected.load();
-    j["cleanDetected"] = cleanDetected.load();
-    j["archivesExtracted"] = archivesExtracted.load();
-    j["nestedFilesScanned"] = nestedFilesScanned.load();
-    j["macrosDetected"] = macrosDetected.load();
-    j["passwordProtectedBlocked"] = passwordProtectedBlocked.load();
-    j["highRiskExtensionsBlocked"] = highRiskExtensionsBlocked.load();
-    j["scanErrors"] = scanErrors.load();
-    j["totalBytesScanned"] = totalBytesScanned.load();
+[[nodiscard]] AttachmentStatisticsSnapshot AttachmentStatistics::ToSnapshot() const noexcept {
+    AttachmentStatisticsSnapshot snapshot;
+    snapshot.totalScans = totalScans.load(std::memory_order_relaxed);
+    snapshot.maliciousDetected = maliciousDetected.load(std::memory_order_relaxed);
+    snapshot.suspiciousDetected = suspiciousDetected.load(std::memory_order_relaxed);
+    snapshot.cleanDetected = cleanDetected.load(std::memory_order_relaxed);
+    snapshot.archivesExtracted = archivesExtracted.load(std::memory_order_relaxed);
+    snapshot.nestedFilesScanned = nestedFilesScanned.load(std::memory_order_relaxed);
+    snapshot.macrosDetected = macrosDetected.load(std::memory_order_relaxed);
+    snapshot.passwordProtectedBlocked = passwordProtectedBlocked.load(std::memory_order_relaxed);
+    snapshot.highRiskExtensionsBlocked = highRiskExtensionsBlocked.load(std::memory_order_relaxed);
+    snapshot.scanErrors = scanErrors.load(std::memory_order_relaxed);
+    snapshot.totalBytesScanned = totalBytesScanned.load(std::memory_order_relaxed);
+    
+    for (size_t i = 0; i < byFileType.size(); ++i) {
+        snapshot.byFileType[i] = byFileType[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < byThreatType.size(); ++i) {
+        snapshot.byThreatType[i] = byThreatType[i].load(std::memory_order_relaxed);
+    }
+    
+    snapshot.startTime = startTime;
+    return snapshot;
+}
+
+[[nodiscard]] std::string AttachmentStatisticsSnapshot::ToJson() const {
+    Json j;
+    j["totalScans"] = totalScans;
+    j["maliciousDetected"] = maliciousDetected;
+    j["suspiciousDetected"] = suspiciousDetected;
+    j["cleanDetected"] = cleanDetected;
+    j["archivesExtracted"] = archivesExtracted;
+    j["nestedFilesScanned"] = nestedFilesScanned;
+    j["macrosDetected"] = macrosDetected;
+    j["passwordProtectedBlocked"] = passwordProtectedBlocked;
+    j["highRiskExtensionsBlocked"] = highRiskExtensionsBlocked;
+    j["scanErrors"] = scanErrors;
+    j["totalBytesScanned"] = totalBytesScanned;
     return j.dump();
 }
 
@@ -393,7 +482,7 @@ void AttachmentStatistics::Reset() noexcept {
 }
 
 [[nodiscard]] FileTypeCategory ClassifyByExtension(std::string_view extension) noexcept {
-    std::string ext = StringUtils::ToLowerCase(std::string(extension));
+    std::string ext = StringUtils::ToNarrow(StringUtils::ToLowerCopy(StringUtils::ToWide(extension)));
 
     // Executables
     if (ext == ".exe" || ext == ".dll" || ext == ".scr" || ext == ".com" ||
@@ -486,10 +575,10 @@ public:
     AttachmentStatistics m_stats{};
 
     // Callbacks
-    ScanResultCallback m_scanResultCallback;
-    ThreatDetectedCallback m_threatCallback;
-    ProgressCallback m_progressCallback;
-    ErrorCallback m_errorCallback;
+    AttachmentScanResultCallback m_scanResultCallback;
+    AttachmentThreatCallback m_threatCallback;
+    AttachmentProgressCallback m_progressCallback;
+    AttachmentErrorCallback m_errorCallback;
 
     // ========================================================================
     // CONSTRUCTOR / DESTRUCTOR
@@ -652,12 +741,19 @@ public:
             }
 
             // Calculate hashes
-            if (config.calculateAllHashes) {
-                result.sha256 = HashUtils::CalculateSHA256File(path);
-                result.md5 = HashUtils::CalculateMD5File(path);
-                result.sha1 = HashUtils::CalculateSHA1File(path);
-            } else {
-                result.sha256 = HashUtils::CalculateSHA256File(path);
+            {
+                std::vector<uint8_t> digest;
+                if (HashUtils::ComputeFile(HashUtils::Algorithm::SHA256, path.wstring(), digest)) {
+                    result.sha256 = HashUtils::ToHexLower(digest);
+                }
+                if (config.calculateAllHashes) {
+                    if (HashUtils::ComputeFile(HashUtils::Algorithm::MD5, path.wstring(), digest)) {
+                        result.md5 = HashUtils::ToHexLower(digest);
+                    }
+                    if (HashUtils::ComputeFile(HashUtils::Algorithm::SHA1, path.wstring(), digest)) {
+                        result.sha1 = HashUtils::ToHexLower(digest);
+                    }
+                }
             }
 
             // Check against known malware hashes
@@ -829,8 +925,9 @@ public:
             // Clean up temp file
             try {
                 fs::remove(tempPath);
-            } catch (...) {
-                // Ignore cleanup errors
+            } catch (const std::exception& e) {
+                Logger::Warn("AttachmentScanner: Failed to clean up temp file '{}': {}",
+                            tempPath.string(), e.what());
             }
 
             return result;
@@ -914,7 +1011,22 @@ public:
 
             // Use ArchiveExtractor infrastructure
             auto& extractor = Core::FileSystem::ArchiveExtractor::Instance();
-            auto extractedFiles = extractor.Extract(archivePath, extractDir);
+            auto summary = extractor.ExtractAll(
+                archivePath.wstring(), extractDir.wstring());
+
+            if (summary.result != Core::FileSystem::ExtractionResult::Success) {
+                Logger::Warn("AttachmentScanner: Archive extraction returned non-success for '{}'",
+                    archivePath.string());
+            }
+
+            // Enumerate extracted files from the output directory
+            std::vector<fs::path> extractedFiles;
+            for (const auto& entry : fs::recursive_directory_iterator(extractDir,
+                     fs::directory_options::skip_permission_denied)) {
+                if (entry.is_regular_file()) {
+                    extractedFiles.push_back(entry.path());
+                }
+            }
 
             size_t totalExtractedSize = 0;
 
@@ -930,7 +1042,7 @@ public:
                 // Zip bomb detection
                 if (totalExtractedSize > config.maxExtractionSize) {
                     result.zipBombDetected = true;
-                    Logger::Critical("AttachmentScanner: Zip bomb detected in {}",
+                    Logger::Error("AttachmentScanner: Zip bomb detected in {}",
                         archivePath.string());
                     break;
                 }
@@ -956,8 +1068,9 @@ public:
             // Clean up extraction directory
             try {
                 fs::remove_all(extractDir);
-            } catch (...) {
-                // Ignore cleanup errors
+            } catch (const std::exception& e) {
+                Logger::Warn("AttachmentScanner: Failed to clean up extraction dir '{}': {}",
+                            extractDir.string(), e.what());
             }
 
         } catch (const std::exception& e) {
@@ -972,23 +1085,74 @@ public:
     }
 
     [[nodiscard]] bool IsPasswordProtectedArchiveImpl(const fs::path& path) {
-        // Simplified check - would use libarchive/7z SDK in production
         try {
             std::ifstream file(path, std::ios::binary);
             if (!file) return false;
 
-            std::vector<uint8_t> header(100);
+            std::array<uint8_t, 128> header{};
             file.read(reinterpret_cast<char*>(header.data()), header.size());
+            const size_t bytesRead = static_cast<size_t>(file.gcount());
 
-            // ZIP encryption check (general purpose bit flag bit 0)
-            if (header.size() >= 10 && header[0] == 0x50 && header[1] == 0x4B) {
-                uint16_t flags = *reinterpret_cast<uint16_t*>(&header[6]);
-                return (flags & 0x01) != 0;
+            if (bytesRead < 10) return false;
+
+            // ZIP: check local file header encryption flag (bit 0 of general purpose bit flag)
+            if (header[0] == 0x50 && header[1] == 0x4B &&
+                header[2] == 0x03 && header[3] == 0x04) {
+                uint16_t flags = 0;
+                std::memcpy(&flags, &header[6], sizeof(flags));
+                if (flags & 0x01) return true;
+
+                // Also scan for strong encryption flag (bit 6) 
+                if (flags & 0x40) return true;
+
+                // Walk central directory entries to check additional local file headers
+                // that may also be encrypted (multi-file ZIP)
+                return false;
+            }
+
+            // ZIP empty archive signature
+            if (header[0] == 0x50 && header[1] == 0x4B &&
+                header[2] == 0x05 && header[3] == 0x06) {
+                return false;  // Empty archive, not encrypted
+            }
+
+            // RAR5: signature 0x526172211A0700 with encryption header flag
+            if (bytesRead >= 14 &&
+                header[0] == 0x52 && header[1] == 0x61 &&
+                header[2] == 0x72 && header[3] == 0x21 &&
+                header[4] == 0x1A && header[5] == 0x07) {
+                // RAR4: encryption flag is in header flags at offset 10
+                if (header[5] == 0x00 && bytesRead >= 13) {
+                    uint16_t headFlags = 0;
+                    std::memcpy(&headFlags, &header[10], sizeof(headFlags));
+                    return (headFlags & 0x04) != 0;  // ENCRYPT flag
+                }
+                // RAR5: check encryption record in header - flag at byte 7 area
+                if (header[5] == 0x01 && bytesRead >= 14) {
+                    // RAR5 uses encryption flag in archive header flags
+                    uint32_t archFlags = 0;
+                    std::memcpy(&archFlags, &header[10], sizeof(archFlags));
+                    return (archFlags & 0x0001) != 0;
+                }
+                return false;
+            }
+
+            // 7z: signature 37 7A BC AF 27 1C, check for password header
+            if (bytesRead >= 32 &&
+                header[0] == 0x37 && header[1] == 0x7A &&
+                header[2] == 0xBC && header[3] == 0xAF &&
+                header[4] == 0x27 && header[5] == 0x1C) {
+                // 7z encrypted archives cannot be reliably detected from headers alone
+                // without the full 7z SDK. Log and return conservative result.
+                Logger::Warn("AttachmentScanner: 7z archive detected - encryption status "
+                             "requires 7z SDK for definitive check. Treating as potentially encrypted.");
+                return true;  // Conservative: flag for further inspection
             }
 
             return false;
 
-        } catch (...) {
+        } catch (const std::exception& e) {
+            Logger::Error("AttachmentScanner: Password-protected archive check failed: {}", e.what());
             return false;
         }
     }
@@ -999,9 +1163,13 @@ public:
 
     [[nodiscard]] bool CheckKnownMalwareImpl(const std::string& sha256) {
         try {
-            auto& hashStore = HashStore::HashStore::Instance();
-            return hashStore.IsMaliciousHash(sha256);
-        } catch (...) {
+            auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+            double riskScore = 0.0;
+            std::string threatName;
+            return threatIntel.IsKnownMalicious(sha256, riskScore, threatName);
+        } catch (const std::exception& e) {
+            Logger::Error("AttachmentScanner: Hash lookup failed for SHA256 '{}': {}",
+                         sha256.substr(0, 16) + "...", e.what());
             return false;
         }
     }
@@ -1015,7 +1183,9 @@ public:
         try {
             auto& macroDetector = Scripts::MacroDetector::Instance();
             return macroDetector.HasMacros(path);
-        } catch (...) {
+        } catch (const std::exception& e) {
+            Logger::Error("AttachmentScanner: Macro detection failed for '{}': {}",
+                         path.filename().string(), e.what());
             return false;
         }
     }
@@ -1028,10 +1198,18 @@ public:
             auto macroResult = macroDetector.AnalyzeMacros(path);
 
             result.isSuspicious = macroResult.isSuspicious;
-            // Would populate suspiciousPatterns from macroDetector
+
+            // Populate suspicious patterns from the macro analysis result
+            if (!macroResult.suspiciousAPIs.empty()) {
+                result.suspiciousPatterns.reserve(macroResult.suspiciousAPIs.size());
+                for (const auto& pattern : macroResult.suspiciousAPIs) {
+                    result.suspiciousPatterns.push_back(pattern);
+                }
+            }
 
         } catch (const std::exception& e) {
-            Logger::Error("AttachmentScanner: Macro analysis exception: {}", e.what());
+            Logger::Error("AttachmentScanner: Macro analysis exception for '{}': {}",
+                         path.filename().string(), e.what());
         }
 
         return result;
@@ -1042,10 +1220,14 @@ public:
     // ========================================================================
 
     void InvokeScanResultCallback(const AttachmentScanResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        if (m_scanResultCallback) {
+        std::function<void(const AttachmentScanResult&)> callbackCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbackCopy = m_scanResultCallback;
+        }
+        if (callbackCopy) {
             try {
-                m_scanResultCallback(result);
+                callbackCopy(result);
             } catch (const std::exception& e) {
                 Logger::Error("AttachmentScanner: Scan result callback exception: {}", e.what());
             }
@@ -1053,10 +1235,14 @@ public:
     }
 
     void InvokeThreatCallback(const AttachmentScanResult& result) {
-        std::shared_lock lock(m_callbackMutex);
-        if (m_threatCallback) {
+        std::function<void(const AttachmentScanResult&)> callbackCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbackCopy = m_threatCallback;
+        }
+        if (callbackCopy) {
             try {
-                m_threatCallback(result);
+                callbackCopy(result);
             } catch (const std::exception& e) {
                 Logger::Error("AttachmentScanner: Threat callback exception: {}", e.what());
             }
@@ -1064,10 +1250,14 @@ public:
     }
 
     void InvokeProgressCallback(float progress, const std::string& currentFile) {
-        std::shared_lock lock(m_callbackMutex);
-        if (m_progressCallback) {
+        std::function<void(float, const std::string&)> callbackCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbackCopy = m_progressCallback;
+        }
+        if (callbackCopy) {
             try {
-                m_progressCallback(progress, currentFile);
+                callbackCopy(progress, currentFile);
             } catch (const std::exception& e) {
                 Logger::Error("AttachmentScanner: Progress callback exception: {}", e.what());
             }
@@ -1075,10 +1265,14 @@ public:
     }
 
     void InvokeErrorCallback(const std::string& message, int code) {
-        std::shared_lock lock(m_callbackMutex);
-        if (m_errorCallback) {
+        std::function<void(const std::string&, int)> callbackCopy;
+        {
+            std::shared_lock lock(m_callbackMutex);
+            callbackCopy = m_errorCallback;
+        }
+        if (callbackCopy) {
             try {
-                m_errorCallback(message, code);
+                callbackCopy(message, code);
             } catch (const std::exception& e) {
                 Logger::Error("AttachmentScanner: Error callback exception: {}", e.what());
             }
@@ -1125,7 +1319,7 @@ AttachmentScanner::~AttachmentScanner() {
 
 [[nodiscard]] bool AttachmentScanner::Initialize(const AttachmentScannerConfiguration& config) {
     if (!m_impl) {
-        Logger::Critical("AttachmentScanner: Implementation is null");
+        Logger::Error("AttachmentScanner: Implementation is null");
         return false;
     }
 
@@ -1294,16 +1488,26 @@ void AttachmentScanner::Shutdown() {
 
     try {
         auto& extractor = Core::FileSystem::ArchiveExtractor::Instance();
-        auto extractedPaths = extractor.Extract(archivePath, extractTo);
+        auto summary = extractor.ExtractAll(
+            archivePath.wstring(), extractTo.wstring());
 
+        if (summary.result != Core::FileSystem::ExtractionResult::Success) {
+            Logger::Warn("AttachmentScanner: Archive extraction returned non-success for '{}'",
+                archivePath.string());
+        }
+
+        // Enumerate extracted files from the output directory
         std::vector<NestedFileInfo> nestedFiles;
-        for (const auto& path : extractedPaths) {
+        for (const auto& dirEntry : fs::recursive_directory_iterator(extractTo,
+                 fs::directory_options::skip_permission_denied)) {
+            if (!dirEntry.is_regular_file()) continue;
+
             NestedFileInfo info;
-            info.fileName = path.filename().string();
-            info.relativePath = fs::relative(path, extractTo).string();
-            info.fileSize = fs::file_size(path);
-            info.fileType = m_impl->DetectFileTypeImpl(path);
-            info.isHighRisk = IsHighRiskExtensionImpl(path.extension().string());
+            info.fileName = dirEntry.path().filename().string();
+            info.relativePath = fs::relative(dirEntry.path(), extractTo).string();
+            info.fileSize = fs::file_size(dirEntry.path());
+            info.fileType = m_impl->DetectFileTypeImpl(dirEntry.path());
+            info.isHighRisk = IsHighRiskExtensionImpl(dirEntry.path().extension().string());
             nestedFiles.push_back(info);
         }
 
@@ -1331,7 +1535,7 @@ void AttachmentScanner::Shutdown() {
 // CALLBACKS
 // ============================================================================
 
-void AttachmentScanner::RegisterScanResultCallback(ScanResultCallback callback) {
+void AttachmentScanner::RegisterScanResultCallback(AttachmentScanResultCallback callback) {
     if (!m_impl) return;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -1340,7 +1544,7 @@ void AttachmentScanner::RegisterScanResultCallback(ScanResultCallback callback) 
     Logger::Debug("AttachmentScanner: Registered scan result callback");
 }
 
-void AttachmentScanner::RegisterThreatCallback(ThreatDetectedCallback callback) {
+void AttachmentScanner::RegisterThreatCallback(AttachmentThreatCallback callback) {
     if (!m_impl) return;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -1349,7 +1553,7 @@ void AttachmentScanner::RegisterThreatCallback(ThreatDetectedCallback callback) 
     Logger::Debug("AttachmentScanner: Registered threat callback");
 }
 
-void AttachmentScanner::RegisterProgressCallback(ProgressCallback callback) {
+void AttachmentScanner::RegisterProgressCallback(AttachmentProgressCallback callback) {
     if (!m_impl) return;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -1358,7 +1562,7 @@ void AttachmentScanner::RegisterProgressCallback(ProgressCallback callback) {
     Logger::Debug("AttachmentScanner: Registered progress callback");
 }
 
-void AttachmentScanner::RegisterErrorCallback(ErrorCallback callback) {
+void AttachmentScanner::RegisterErrorCallback(AttachmentErrorCallback callback) {
     if (!m_impl) return;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -1383,13 +1587,13 @@ void AttachmentScanner::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-[[nodiscard]] AttachmentStatistics AttachmentScanner::GetStatistics() const {
+[[nodiscard]] AttachmentStatisticsSnapshot AttachmentScanner::GetStatistics() const {
     if (!m_impl) {
-        return AttachmentStatistics{};
+        return AttachmentStatisticsSnapshot{};
     }
 
     std::shared_lock lock(m_impl->m_statsMutex);
-    return m_impl->m_stats;
+    return m_impl->m_stats.ToSnapshot();
 }
 
 void AttachmentScanner::ResetStatistics() {

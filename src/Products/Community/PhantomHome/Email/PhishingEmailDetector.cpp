@@ -57,12 +57,12 @@
 
 #include "pch.h"
 #include "PhishingEmailDetector.hpp"
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 
 #include <algorithm>
 #include <sstream>
@@ -79,6 +79,12 @@ namespace Email {
 // ============================================================================
 
 namespace {
+    /// @brief Maximum body size for analysis (256KB) - prevents ReDoS
+    constexpr size_t MAX_BODY_SIZE = 256 * 1024;
+    
+    /// @brief Minimum brand length for impersonation detection (avoid false positives)
+    constexpr size_t MIN_BRAND_LENGTH = 4;
+    
     // Urgency keywords
     constexpr const char* URGENCY_KEYWORDS[] = {
         "urgent", "immediately", "asap", "right now", "time sensitive",
@@ -105,7 +111,7 @@ namespace {
         "is.gd", "bl.ink", "shorturl.at", "rebrand.ly", "cutt.ly"
     };
 
-    // Homograph lookalike characters (Cyrillic/Latin)
+    // Homograph lookalike characters (Cyrillic/Greek → Latin)
     const std::unordered_map<char32_t, char> HOMOGRAPH_CHARS = {
         {0x0430, 'a'}, {0x0435, 'e'}, {0x043E, 'o'}, {0x0440, 'p'},
         {0x0441, 'c'}, {0x0445, 'x'}, {0x0443, 'y'}, {0x0456, 'i'},
@@ -114,6 +120,115 @@ namespace {
         {0x041E, 'O'}, {0x0420, 'P'}, {0x0421, 'C'}, {0x0422, 'T'},
         {0x0425, 'X'}, {0x03BF, 'o'}, {0x03C1, 'p'}
     };
+    
+    // Legitimate brand domains for impersonation checks
+    const std::unordered_map<std::string, std::vector<std::string>> LEGITIMATE_BRAND_DOMAINS = {
+        {"microsoft", {"microsoft.com", "office.com", "outlook.com", "live.com", "hotmail.com"}},
+        {"google", {"google.com", "gmail.com", "googlemail.com"}},
+        {"apple", {"apple.com", "icloud.com", "me.com"}},
+        {"amazon", {"amazon.com", "amazon.co.uk", "amazon.de", "aws.amazon.com"}},
+        {"paypal", {"paypal.com"}},
+        {"facebook", {"facebook.com", "fb.com"}},
+        {"netflix", {"netflix.com"}},
+        {"chase", {"chase.com", "jpmorganchase.com"}},
+        {"wellsfargo", {"wellsfargo.com"}},
+        {"bankofamerica", {"bankofamerica.com", "bofa.com"}},
+        {"ups", {"ups.com"}},
+        {"fedex", {"fedex.com"}},
+        {"dhl", {"dhl.com"}},
+        {"usps", {"usps.com"}}
+    };
+    
+    // Pre-compiled static regex patterns (P0-6 fix: avoid recompilation)
+    const std::regex& GetDomainRegex() {
+        static const std::regex regex(R"(https?://([^/:]+))", std::regex::icase | std::regex::optimize);
+        return regex;
+    }
+    
+    const std::regex& GetURLRegex() {
+        static const std::regex regex(
+            R"((https?://[^\s<>"{}|\\^\[\]`]+))",
+            std::regex::icase | std::regex::optimize
+        );
+        return regex;
+    }
+    
+    const std::regex& GetHrefRegex() {
+        static const std::regex regex(
+            R"(href\s*=\s*["']([^"']+)["'])",
+            std::regex::icase | std::regex::optimize
+        );
+        return regex;
+    }
+    
+    const std::regex& GetSrcRegex() {
+        static const std::regex regex(
+            R"(src\s*=\s*["']([^"']+)["'])",
+            std::regex::icase | std::regex::optimize
+        );
+        return regex;
+    }
+    
+    const std::regex& GetActionRegex() {
+        static const std::regex regex(
+            R"(action\s*=\s*["']([^"']+)["'])",
+            std::regex::icase | std::regex::optimize
+        );
+        return regex;
+    }
+    
+    const std::regex& GetMetaRefreshRegex() {
+        static const std::regex regex(
+            R"(<meta\s+http-equiv\s*=\s*["']refresh["'][^>]*content\s*=\s*["'][^"']*url\s*=\s*([^"'\s>]+))",
+            std::regex::icase | std::regex::optimize
+        );
+        return regex;
+    }
+    
+    /**
+     * @brief ASCII-only lowercase for narrow strings (keyword matching).
+     * @param str Input string
+     * @return Lowercase copy using ASCII rules
+     */
+    [[nodiscard]] std::string AsciiToLower(std::string_view str) {
+        std::string result(str);
+        for (auto& c : result) {
+            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        }
+        return result;
+    }
+
+    /**
+     * @brief Escape a string for safe JSON embedding (P0-4 fix)
+     * @param str Input string (may contain special chars)
+     * @return Escaped string safe for JSON
+     */
+    [[nodiscard]] std::string EscapeJsonString(const std::string& str) {
+        std::string result;
+        result.reserve(str.size() + 16);
+        for (unsigned char c : str) {
+            switch (c) {
+                case '"':  result += "\\\""; break;
+                case '\\': result += "\\\\"; break;
+                case '\b': result += "\\b";  break;
+                case '\f': result += "\\f";  break;
+                case '\n': result += "\\n";  break;
+                case '\r': result += "\\r";  break;
+                case '\t': result += "\\t";  break;
+                default:
+                    if (c < 0x20) {
+                        // Control character - escape as \uXXXX
+                        char buf[8];
+                        snprintf(buf, sizeof(buf), "\\u%04x", static_cast<unsigned>(c));
+                        result += buf;
+                    } else {
+                        result += static_cast<char>(c);
+                    }
+                    break;
+            }
+        }
+        return result;
+    }
 }
 
 // ============================================================================
@@ -142,25 +257,52 @@ void PhishingStatistics::Reset() noexcept {
     startTime = Clock::now();
 }
 
+PhishingStatisticsSnapshot PhishingStatistics::ToSnapshot() const noexcept {
+    PhishingStatisticsSnapshot snap;
+    snap.totalAnalyzed = totalAnalyzed.load(std::memory_order_relaxed);
+    snap.phishingDetected = phishingDetected.load(std::memory_order_relaxed);
+    snap.suspiciousDetected = suspiciousDetected.load(std::memory_order_relaxed);
+    snap.cleanDetected = cleanDetected.load(std::memory_order_relaxed);
+    snap.becDetected = becDetected.load(std::memory_order_relaxed);
+    snap.spearPhishingDetected = spearPhishingDetected.load(std::memory_order_relaxed);
+    snap.urlsAnalyzed = urlsAnalyzed.load(std::memory_order_relaxed);
+    snap.maliciousUrlsDetected = maliciousUrlsDetected.load(std::memory_order_relaxed);
+    snap.homographsDetected = homographsDetected.load(std::memory_order_relaxed);
+    snap.brandImpersonationDetected = brandImpersonationDetected.load(std::memory_order_relaxed);
+    
+    for (size_t i = 0; i < byCampaignType.size(); ++i) {
+        snap.byCampaignType[i] = byCampaignType[i].load(std::memory_order_relaxed);
+    }
+    for (size_t i = 0; i < byIndicator.size(); ++i) {
+        snap.byIndicator[i] = byIndicator[i].load(std::memory_order_relaxed);
+    }
+    snap.startTime = startTime;
+    return snap;
+}
+
 std::string PhishingStatistics::ToJson() const {
+    return ToSnapshot().ToJson();
+}
+
+std::string PhishingStatisticsSnapshot::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"totalAnalyzed\":" << totalAnalyzed.load()
-        << ",\"phishingDetected\":" << phishingDetected.load()
-        << ",\"suspiciousDetected\":" << suspiciousDetected.load()
-        << ",\"cleanDetected\":" << cleanDetected.load()
-        << ",\"becDetected\":" << becDetected.load()
-        << ",\"spearPhishingDetected\":" << spearPhishingDetected.load()
-        << ",\"urlsAnalyzed\":" << urlsAnalyzed.load()
-        << ",\"maliciousUrlsDetected\":" << maliciousUrlsDetected.load()
-        << ",\"homographsDetected\":" << homographsDetected.load()
-        << ",\"brandImpersonationDetected\":" << brandImpersonationDetected.load()
+        << "\"totalAnalyzed\":" << totalAnalyzed
+        << ",\"phishingDetected\":" << phishingDetected
+        << ",\"suspiciousDetected\":" << suspiciousDetected
+        << ",\"cleanDetected\":" << cleanDetected
+        << ",\"becDetected\":" << becDetected
+        << ",\"spearPhishingDetected\":" << spearPhishingDetected
+        << ",\"urlsAnalyzed\":" << urlsAnalyzed
+        << ",\"maliciousUrlsDetected\":" << maliciousUrlsDetected
+        << ",\"homographsDetected\":" << homographsDetected
+        << ",\"brandImpersonationDetected\":" << brandImpersonationDetected
         << "}";
     return oss.str();
 }
 
 // ============================================================================
-// STRUCTURE TO_JSON IMPLEMENTATIONS
+// STRUCTURE TO_JSON IMPLEMENTATIONS (P0-4 fix: JSON escaping)
 // ============================================================================
 
 std::string PhishingIndicators::ToJson() const {
@@ -175,7 +317,7 @@ std::string PhishingIndicators::ToJson() const {
         << ",\"hasMismatchedSender\":" << (hasMismatchedSender ? "true" : "false")
         << ",\"hasHomographAttack\":" << (hasHomographAttack ? "true" : "false")
         << ",\"hasBrandImpersonation\":" << (hasBrandImpersonation ? "true" : "false")
-        << ",\"impersonatedBrand\":\"" << impersonatedBrand << "\""
+        << ",\"impersonatedBrand\":\"" << EscapeJsonString(impersonatedBrand) << "\""
         << ",\"nlpSuspicionScore\":" << nlpSuspicionScore
         << ",\"urlAnalysisScore\":" << urlAnalysisScore
         << ",\"senderReputationScore\":" << senderReputationScore
@@ -186,10 +328,10 @@ std::string PhishingIndicators::ToJson() const {
 std::string URLAnalysisResult::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"originalUrl\":\"" << originalUrl << "\""
-        << ",\"expandedUrl\":\"" << expandedUrl << "\""
-        << ",\"finalUrl\":\"" << finalUrl << "\""
-        << ",\"domain\":\"" << domain << "\""
+        << "\"originalUrl\":\"" << EscapeJsonString(originalUrl) << "\""
+        << ",\"expandedUrl\":\"" << EscapeJsonString(expandedUrl) << "\""
+        << ",\"finalUrl\":\"" << EscapeJsonString(finalUrl) << "\""
+        << ",\"domain\":\"" << EscapeJsonString(domain) << "\""
         << ",\"verdict\":\"" << GetURLVerdictName(verdict).data() << "\""
         << ",\"isShortened\":" << (isShortened ? "true" : "false")
         << ",\"hasRedirects\":" << (hasRedirects ? "true" : "false")
@@ -207,10 +349,10 @@ std::string URLAnalysisResult::ToJson() const {
 std::string SenderAnalysisResult::ToJson() const {
     std::ostringstream oss;
     oss << "{"
-        << "\"senderEmail\":\"" << senderEmail << "\""
-        << ",\"displayName\":\"" << displayName << "\""
-        << ",\"fromDomain\":\"" << fromDomain << "\""
-        << ",\"envelopeDomain\":\"" << envelopeDomain << "\""
+        << "\"senderEmail\":\"" << EscapeJsonString(senderEmail) << "\""
+        << ",\"displayName\":\"" << EscapeJsonString(displayName) << "\""
+        << ",\"fromDomain\":\"" << EscapeJsonString(fromDomain) << "\""
+        << ",\"envelopeDomain\":\"" << EscapeJsonString(envelopeDomain) << "\""
         << ",\"spfPass\":" << (spfPass ? "true" : "false")
         << ",\"dkimPass\":" << (dkimPass ? "true" : "false")
         << ",\"dmarcPass\":" << (dmarcPass ? "true" : "false")
@@ -236,8 +378,8 @@ std::string PhishingAnalysisResult::ToJson() const {
         << ",\"riskScore\":" << riskScore
         << ",\"campaignType\":\"" << GetCampaignTypeName(campaignType).data() << "\""
         << ",\"indicators\":" << indicators.ToJson()
-        << ",\"targetBrand\":\"" << targetBrand << "\""
-        << ",\"analysisSummary\":\"" << analysisSummary << "\""
+        << ",\"targetBrand\":\"" << EscapeJsonString(targetBrand) << "\""
+        << ",\"analysisSummary\":\"" << EscapeJsonString(analysisSummary) << "\""
         << "}";
     return oss.str();
 }
@@ -246,7 +388,7 @@ std::string PhishingAnalysisResult::ToJson() const {
 // PIMPL IMPLEMENTATION
 // ============================================================================
 
-struct PhishingEmailDetector::PhishingEmailDetectorImpl {
+struct PhishingEmailDetectorImpl {
     // Thread synchronization
     mutable std::shared_mutex m_mutex;
 
@@ -274,13 +416,19 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
     PhishingEmailDetectorImpl() = default;
 
     // ========================================================================
-    // NLP ANALYSIS
+    // HEURISTIC KEYWORD ANALYSIS (P3-1: renamed from "NLP")
     // ========================================================================
 
     int AnalyzeNLPSuspicion(const std::string& subject, const std::string& body) {
         int score = 0;
         std::string combinedText = subject + " " + body;
-        std::string lowerText = Utils::StringUtils::ToLower(combinedText);
+        
+        // P1-3: Truncate to MAX_BODY_SIZE to prevent ReDoS
+        if (combinedText.size() > MAX_BODY_SIZE) {
+            combinedText.resize(MAX_BODY_SIZE);
+        }
+        
+        std::string lowerText = AsciiToLower(combinedText);
 
         // Check urgency keywords
         for (const auto& keyword : URGENCY_KEYWORDS) {
@@ -309,9 +457,11 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             score += 10;
         }
 
-        // Check for ALL CAPS (more than 30% of text)
-        size_t upperCount = std::count_if(combinedText.begin(), combinedText.end(), ::isupper);
-        size_t letterCount = std::count_if(combinedText.begin(), combinedText.end(), ::isalpha);
+        // P0-5 fix: Use lambdas with unsigned char for isupper/isalpha
+        size_t upperCount = std::count_if(combinedText.begin(), combinedText.end(),
+            [](unsigned char c) { return std::isupper(c); });
+        size_t letterCount = std::count_if(combinedText.begin(), combinedText.end(),
+            [](unsigned char c) { return std::isalpha(c); });
         if (letterCount > 0 && (upperCount * 100 / letterCount) > 30) {
             score += 15;
         }
@@ -320,7 +470,7 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
     }
 
     bool HasUrgencyLanguage(const std::string& text) const {
-        std::string lowerText = Utils::StringUtils::ToLower(text);
+        std::string lowerText = AsciiToLower(text);
         for (const auto& keyword : URGENCY_KEYWORDS) {
             if (lowerText.find(keyword) != std::string::npos) {
                 return true;
@@ -330,7 +480,7 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
     }
 
     bool HasFearTactics(const std::string& text) const {
-        std::string lowerText = Utils::StringUtils::ToLower(text);
+        std::string lowerText = AsciiToLower(text);
         for (const auto& keyword : FEAR_KEYWORDS) {
             if (lowerText.find(keyword) != std::string::npos) {
                 return true;
@@ -365,9 +515,64 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
                 result.spfPass = (spfIt->second.find("pass") != std::string::npos);
             }
 
+            // Validate DKIM-Signature header structure and fields
             auto dkimIt = headers.find("DKIM-Signature");
             if (dkimIt != headers.end()) {
-                result.dkimPass = true;  // Simplified - presence implies pass
+                const auto& dkimValue = dkimIt->second;
+                // RFC 6376: DKIM-Signature must contain required tags:
+                //   v= (version), a= (algorithm), d= (domain), s= (selector),
+                //   b= (signature), bh= (body hash), h= (signed headers)
+                bool hasVersion = (dkimValue.find("v=") != std::string::npos);
+                bool hasAlgorithm = (dkimValue.find("a=") != std::string::npos);
+                bool hasDomain = (dkimValue.find("d=") != std::string::npos);
+                bool hasSelector = (dkimValue.find("s=") != std::string::npos);
+                bool hasSignature = (dkimValue.find("b=") != std::string::npos);
+                bool hasBodyHash = (dkimValue.find("bh=") != std::string::npos);
+                bool hasSignedHeaders = (dkimValue.find("h=") != std::string::npos);
+
+                if (hasVersion && hasAlgorithm && hasDomain && hasSelector &&
+                    hasSignature && hasBodyHash && hasSignedHeaders) {
+                    // Verify algorithm is acceptable (rsa-sha256 or ed25519-sha256)
+                    bool validAlgo = (dkimValue.find("a=rsa-sha256") != std::string::npos ||
+                                     dkimValue.find("a=ed25519-sha256") != std::string::npos);
+                    // Verify signature body is non-empty (b= tag must have content after it)
+                    size_t bPos = dkimValue.find("b=");
+                    bool nonEmptySig = false;
+                    if (bPos != std::string::npos) {
+                        size_t valStart = bPos + 2;
+                        // Skip whitespace after b=
+                        while (valStart < dkimValue.size() &&
+                               (dkimValue[valStart] == ' ' || dkimValue[valStart] == '\t')) {
+                            ++valStart;
+                        }
+                        // Check it's not immediately followed by a semicolon or end
+                        if (valStart < dkimValue.size() && dkimValue[valStart] != ';') {
+                            nonEmptySig = true;
+                        }
+                    }
+
+                    result.dkimPass = validAlgo && nonEmptySig;
+                } else {
+                    // Malformed DKIM-Signature: missing required tags
+                    result.dkimPass = false;
+                    Utils::Logger::Warn("PhishingEmailDetector: DKIM-Signature header present "
+                                        "but missing required tags for sender '{}'",
+                                        senderEmail);
+                }
+
+                // Also check Authentication-Results header for authoritative DKIM result
+                auto authResultsIt = headers.find("Authentication-Results");
+                if (authResultsIt != headers.end()) {
+                    const auto& authValue = authResultsIt->second;
+                    if (authValue.find("dkim=pass") != std::string::npos) {
+                        result.dkimPass = true;  // MTA confirmed DKIM pass
+                    } else if (authValue.find("dkim=fail") != std::string::npos ||
+                               authValue.find("dkim=neutral") != std::string::npos ||
+                               authValue.find("dkim=temperror") != std::string::npos ||
+                               authValue.find("dkim=permerror") != std::string::npos) {
+                        result.dkimPass = false;  // MTA reported DKIM failure
+                    }
+                }
             }
 
             auto dmarcIt = headers.find("DMARC");
@@ -394,10 +599,10 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             }
 
             // Check display name spoofing
-            std::string lowerDisplayName = Utils::StringUtils::ToLower(displayName);
+            std::string lowerDisplayName = AsciiToLower(displayName);
             for (const auto& brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
                 if (lowerDisplayName.find(brand) != std::string::npos) {
-                    std::string lowerDomain = Utils::StringUtils::ToLower(result.fromDomain);
+                    std::string lowerDomain = AsciiToLower(result.fromDomain);
                     if (lowerDomain.find(brand) == std::string::npos) {
                         result.displayNameSpoofing = true;
                         break;
@@ -405,21 +610,57 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
                 }
             }
 
-            // Check if whitelisted (known sender)
-            if (Whitelist::WhiteListStore::HasInstance()) {
-                result.isKnownSender = Whitelist::WhiteListStore::Instance().IsWhitelisted(
-                    Utils::StringUtils::Utf8ToWide(result.fromDomain)
-                );
+            // Known-sender check: WhiteListStore is a non-singleton file-path
+            // whitelist, not a domain whitelist. Domain sender reputation is
+            // handled via ThreatIntel LookupDomain above.  Leaving isKnownSender
+            // at its default (false) unless ThreatIntel reports the domain safe.
+            if (!result.fromDomain.empty()) {
+                try {
+                    auto& tiMgr = ThreatIntel::ThreatIntelManager::Instance();
+                    if (tiMgr.IsInitialized()) {
+                        auto domResult = tiMgr.LookupDomain(result.fromDomain);
+                        if (domResult.found && domResult.IsKnownGood()) {
+                            result.isKnownSender = true;
+                        }
+                    }
+                } catch (...) {}
             }
 
-            // Simplified domain reputation (would use ThreatIntel in production)
-            result.domainReputation = 50;  // Neutral
+            // Query ThreatIntel for domain reputation
+            result.domainReputation = 50;  // Default neutral
+            if (!result.fromDomain.empty()) {
+                try {
+                    auto& threatIntelMgr = ThreatIntel::ThreatIntelManager::Instance();
+                    if (threatIntelMgr.IsInitialized()) {
+                        auto lookupResult = threatIntelMgr.LookupDomain(result.fromDomain);
+                        if (lookupResult.found) {
+                            // Map ThreatIntel threat score (0-100, higher=more dangerous) to
+                            // reputation (0-100, higher=better). Invert the scale.
+                            result.domainReputation = std::max(0, 100 - static_cast<int>(lookupResult.score));
+
+                            if (lookupResult.IsMalicious()) {
+                                result.riskScore += 40;
+                                result.domainReputation = std::min(result.domainReputation, 10);
+                            } else if (lookupResult.IsSuspicious()) {
+                                result.riskScore += 20;
+                                result.domainReputation = std::min(result.domainReputation, 35);
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    Utils::Logger::Warn("PhishingEmailDetector: ThreatIntel domain lookup failed "
+                                        "for '{}': {}",
+                                        result.fromDomain,
+                                        e.what());
+                }
+            }
+
+            // Boost reputation if all authentication checks pass
             if (result.spfPass && result.dkimPass && result.dmarcPass) {
-                result.domainReputation = 80;
+                result.domainReputation = std::min(100, result.domainReputation + 20);
             }
 
-            // Calculate risk score
-            result.riskScore = 0;
+            // Calculate risk score (additive from authentication failures)
             if (!result.spfPass) result.riskScore += 20;
             if (!result.dkimPass) result.riskScore += 20;
             if (!result.dmarcPass) result.riskScore += 15;
@@ -427,8 +668,8 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             if (result.isFirstTimeSender) result.riskScore += 10;
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"PhishingEmailDetector: Sender analysis failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("PhishingEmailDetector: Sender analysis failed - {}",
+                               e.what());
         }
 
         return result;
@@ -479,13 +720,14 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             }
 
             // Check with ThreatIntel
-            if (ThreatIntel::ThreatIntelManager::HasInstance()) {
-                bool isMalicious = ThreatIntel::ThreatIntelManager::Instance().IsKnownMaliciousURL(
-                    Utils::StringUtils::Utf8ToWide(url)
-                );
-                if (isMalicious) {
-                    result.verdict = URLVerdict::Malicious;
-                    m_statistics.maliciousUrlsDetected.fetch_add(1, std::memory_order_relaxed);
+            {
+                auto& threatIntel = ThreatIntel::ThreatIntelManager::Instance();
+                if (threatIntel.IsInitialized()) {
+                    auto lookupResult = threatIntel.LookupURL(url);
+                    if (lookupResult.found && lookupResult.IsMalicious()) {
+                        result.verdict = URLVerdict::Malicious;
+                        m_statistics.maliciousUrlsDetected.fetch_add(1, std::memory_order_relaxed);
+                    }
                 }
             }
 
@@ -512,8 +754,8 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             InvokeURLCallbacks(result);
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"PhishingEmailDetector: URL analysis failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("PhishingEmailDetector: URL analysis failed - {}",
+                               e.what());
             result.verdict = URLVerdict::Unknown;
         }
 
@@ -521,7 +763,7 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
     }
 
     std::optional<std::string> DetectBrandImpersonationInternal(const std::string& domain) const {
-        std::string lowerDomain = Utils::StringUtils::ToLower(domain);
+        std::string lowerDomain = AsciiToLower(domain);
 
         for (const auto& brand : PhishingConstants::COMMONLY_SPOOFED_BRANDS) {
             std::string brandStr(brand);
@@ -560,7 +802,7 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
                                           const std::string& subject,
                                           const std::string& body) const
     {
-        std::string combinedText = Utils::StringUtils::ToLower(subject + " " + body);
+        std::string combinedText = AsciiToLower(subject + " " + body);
 
         // BEC indicators
         if (combinedText.find("wire transfer") != std::string::npos ||
@@ -709,8 +951,8 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
             InvokeAnalysisCallbacks(result);
 
         } catch (const std::exception& e) {
-            Utils::Logger::Error(L"PhishingEmailDetector: Content analysis failed - {}",
-                               Utils::StringUtils::Utf8ToWide(e.what()));
+            Utils::Logger::Error("PhishingEmailDetector: Content analysis failed - {}",
+                               e.what());
             InvokeErrorCallbacks(e.what(), -1);
         }
 
@@ -722,37 +964,58 @@ struct PhishingEmailDetector::PhishingEmailDetectorImpl {
     // ========================================================================
 
     void InvokeAnalysisCallbacks(const PhishingAnalysisResult& result) {
-        std::lock_guard lock(m_callbacksMutex);
-        for (const auto& callback : m_analysisCallbacks) {
+        std::vector<std::function<void(const PhishingAnalysisResult&)>> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbacksMutex);
+            callbacksCopy.reserve(m_analysisCallbacks.size());
+            for (const auto& cb : m_analysisCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"PhishingEmailDetector: Analysis callback failed - {}",
-                                   Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("PhishingEmailDetector: Analysis callback failed - {}",
+                                   e.what());
             }
         }
     }
 
     void InvokeURLCallbacks(const URLAnalysisResult& result) {
-        std::lock_guard lock(m_callbacksMutex);
-        for (const auto& callback : m_urlCallbacks) {
+        std::vector<std::function<void(const URLAnalysisResult&)>> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbacksMutex);
+            callbacksCopy.reserve(m_urlCallbacks.size());
+            for (const auto& cb : m_urlCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(result);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"PhishingEmailDetector: URL callback failed - {}",
-                                   Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("PhishingEmailDetector: URL callback failed - {}",
+                                   e.what());
             }
         }
     }
 
     void InvokeErrorCallbacks(const std::string& message, int code) {
-        std::lock_guard lock(m_callbacksMutex);
-        for (const auto& callback : m_errorCallbacks) {
+        std::vector<std::function<void(const std::string&, int)>> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbacksMutex);
+            callbacksCopy.reserve(m_errorCallbacks.size());
+            for (const auto& cb : m_errorCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
-                Utils::Logger::Error(L"PhishingEmailDetector: Error callback failed - {}",
-                                   Utils::StringUtils::Utf8ToWide(e.what()));
+                Utils::Logger::Error("PhishingEmailDetector: Error callback failed - {}",
+                                   e.what());
             }
         }
     }
@@ -781,19 +1044,19 @@ bool PhishingEmailDetector::HasInstance() noexcept {
 PhishingEmailDetector::PhishingEmailDetector()
     : m_impl(std::make_unique<PhishingEmailDetectorImpl>())
 {
-    Utils::Logger::Info(L"PhishingEmailDetector: Constructor called");
+    Utils::Logger::Info("PhishingEmailDetector: Constructor called");
 }
 
 PhishingEmailDetector::~PhishingEmailDetector() {
     Shutdown();
-    Utils::Logger::Info(L"PhishingEmailDetector: Destructor called");
+    Utils::Logger::Info("PhishingEmailDetector: Destructor called");
 }
 
 bool PhishingEmailDetector::Initialize(const PhishingDetectorConfiguration& config) {
     std::unique_lock lock(m_impl->m_mutex);
 
     if (m_impl->m_initialized.load(std::memory_order_acquire)) {
-        Utils::Logger::Warn(L"PhishingEmailDetector: Already initialized");
+        Utils::Logger::Warn("PhishingEmailDetector: Already initialized");
         return true;
     }
 
@@ -803,7 +1066,7 @@ bool PhishingEmailDetector::Initialize(const PhishingDetectorConfiguration& conf
 
         // Validate configuration
         if (!config.IsValid()) {
-            Utils::Logger::Error(L"PhishingEmailDetector: Invalid configuration");
+            Utils::Logger::Error("PhishingEmailDetector: Invalid configuration");
             m_impl->m_status.store(ModuleStatus::Error, std::memory_order_release);
             return false;
         }
@@ -811,12 +1074,12 @@ bool PhishingEmailDetector::Initialize(const PhishingDetectorConfiguration& conf
         m_impl->m_initialized.store(true, std::memory_order_release);
         m_impl->m_status.store(ModuleStatus::Running, std::memory_order_release);
 
-        Utils::Logger::Info(L"PhishingEmailDetector: Initialized successfully");
+        Utils::Logger::Info("PhishingEmailDetector: Initialized successfully");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"PhishingEmailDetector: Initialization failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("PhishingEmailDetector: Initialization failed - {}",
+                            e.what());
         m_impl->m_status.store(ModuleStatus::Error, std::memory_order_release);
         return false;
     }
@@ -843,11 +1106,11 @@ void PhishingEmailDetector::Shutdown() {
         m_impl->m_initialized.store(false, std::memory_order_release);
         m_impl->m_status.store(ModuleStatus::Stopped, std::memory_order_release);
 
-        Utils::Logger::Info(L"PhishingEmailDetector: Shutdown complete");
+        Utils::Logger::Info("PhishingEmailDetector: Shutdown complete");
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"PhishingEmailDetector: Shutdown error - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("PhishingEmailDetector: Shutdown error - {}",
+                            e.what());
     }
 }
 
@@ -863,12 +1126,12 @@ bool PhishingEmailDetector::UpdateConfiguration(const PhishingDetectorConfigurat
     std::unique_lock lock(m_impl->m_mutex);
 
     if (!config.IsValid()) {
-        Utils::Logger::Error(L"PhishingEmailDetector: Invalid configuration");
+        Utils::Logger::Error("PhishingEmailDetector: Invalid configuration");
         return false;
     }
 
     m_impl->m_config = config;
-    Utils::Logger::Info(L"PhishingEmailDetector: Configuration updated");
+    Utils::Logger::Info("PhishingEmailDetector: Configuration updated");
     return true;
 }
 
@@ -939,8 +1202,8 @@ PhishingAnalysisResult PhishingEmailDetector::AnalyzeEmail(
         return result;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"PhishingEmailDetector: Email analysis failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("PhishingEmailDetector: Email analysis failed - {}",
+                            e.what());
         m_impl->m_status.store(ModuleStatus::Running, std::memory_order_release);
         return PhishingAnalysisResult{};
     }
@@ -1027,13 +1290,13 @@ void PhishingEmailDetector::UnregisterCallbacks() {
 // STATISTICS & DIAGNOSTICS
 // ============================================================================
 
-PhishingStatistics PhishingEmailDetector::GetStatistics() const {
-    return m_impl->m_statistics;
+PhishingStatisticsSnapshot PhishingEmailDetector::GetStatistics() const {
+    return m_impl->m_statistics.ToSnapshot();
 }
 
 void PhishingEmailDetector::ResetStatistics() {
     m_impl->m_statistics.Reset();
-    Utils::Logger::Info(L"PhishingEmailDetector: Statistics reset");
+    Utils::Logger::Info("PhishingEmailDetector: Statistics reset");
 }
 
 std::string PhishingEmailDetector::GetVersionString() noexcept {
@@ -1044,7 +1307,7 @@ std::string PhishingEmailDetector::GetVersionString() noexcept {
 
 bool PhishingEmailDetector::SelfTest() {
     try {
-        Utils::Logger::Info(L"PhishingEmailDetector: Starting self-test");
+        Utils::Logger::Info("PhishingEmailDetector: Starting self-test");
 
         // Test NLP analysis
         int nlpScore = m_impl->AnalyzeNLPSuspicion(
@@ -1052,43 +1315,43 @@ bool PhishingEmailDetector::SelfTest() {
             "Click here immediately to verify your identity or face termination."
         );
         if (nlpScore < 30) {
-            Utils::Logger::Error(L"PhishingEmailDetector: NLP test failed (score too low)");
+            Utils::Logger::Error("PhishingEmailDetector: NLP test failed (score too low)");
             return false;
         }
 
         // Test URL analysis
         auto urlResult = m_impl->AnalyzeURLInternal("http://paypa1.com/verify");
         if (urlResult.riskScore < 20) {
-            Utils::Logger::Error(L"PhishingEmailDetector: URL analysis test failed");
+            Utils::Logger::Error("PhishingEmailDetector: URL analysis test failed");
             return false;
         }
 
         // Test homograph detection
         if (!ContainsHomographCharacters("p\xD0\xB0ypal.com")) {  // Cyrillic 'a'
-            Utils::Logger::Error(L"PhishingEmailDetector: Homograph detection test failed");
+            Utils::Logger::Error("PhishingEmailDetector: Homograph detection test failed");
             return false;
         }
 
         // Test brand detection
         auto brand = m_impl->DetectBrandImpersonationInternal("microsoft-login.xyz");
         if (!brand.has_value() || brand.value() != "microsoft") {
-            Utils::Logger::Error(L"PhishingEmailDetector: Brand detection test failed");
+            Utils::Logger::Error("PhishingEmailDetector: Brand detection test failed");
             return false;
         }
 
         // Test URL extraction
         auto urls = ExtractURLsFromText("Click here: http://example.com/test");
         if (urls.empty()) {
-            Utils::Logger::Error(L"PhishingEmailDetector: URL extraction test failed");
+            Utils::Logger::Error("PhishingEmailDetector: URL extraction test failed");
             return false;
         }
 
-        Utils::Logger::Info(L"PhishingEmailDetector: Self-test passed");
+        Utils::Logger::Info("PhishingEmailDetector: Self-test passed");
         return true;
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"PhishingEmailDetector: Self-test failed - {}",
-                            Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("PhishingEmailDetector: Self-test failed - {}",
+                            e.what());
         return false;
     }
 }
@@ -1174,7 +1437,9 @@ bool PhishingEmailDetector::ExportReport(const std::wstring& outputPath) const {
         file.close();
         return true;
 
-    } catch (...) {
+    } catch (const std::exception& e) {
+        Utils::Logger::Error("PhishingEmailDetector: Failed to export report: {}",
+                           e.what());
         return false;
     }
 }
@@ -1275,8 +1540,8 @@ std::vector<std::string> ExtractURLsFromText(const std::string& text) {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ExtractURLsFromText failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("ExtractURLsFromText failed - {}",
+                           e.what());
     }
 
     return urls;
@@ -1311,8 +1576,8 @@ std::vector<std::string> ExtractURLsFromHTML(const std::string& html) {
         urls.erase(std::unique(urls.begin(), urls.end()), urls.end());
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ExtractURLsFromHTML failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("ExtractURLsFromHTML failed - {}",
+                           e.what());
     }
 
     return urls;
@@ -1328,7 +1593,7 @@ bool ContainsHomographCharacters(const std::string& text) {
         }
 
         // Check for common Cyrillic lookalikes in UTF-8
-        std::wstring wtext = Utils::StringUtils::Utf8ToWide(text);
+        std::wstring wtext = Utils::StringUtils::ToWide(text);
         for (wchar_t wc : wtext) {
             // Cyrillic range: U+0400 to U+04FF
             if (wc >= 0x0400 && wc <= 0x04FF) {
@@ -1341,8 +1606,8 @@ bool ContainsHomographCharacters(const std::string& text) {
         }
 
     } catch (const std::exception& e) {
-        Utils::Logger::Error(L"ContainsHomographCharacters failed - {}",
-                           Utils::StringUtils::Utf8ToWide(e.what()));
+        Utils::Logger::Error("ContainsHomographCharacters failed - {}",
+                           e.what());
     }
 
     return false;

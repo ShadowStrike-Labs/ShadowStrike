@@ -91,18 +91,19 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/CryptoUtils.hpp"
-#include "../ThreatIntel/ThreatIntelLookup.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-#include "../HashStore/HashStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/CryptoUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelLookup.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
 #include "EmailProtection.hpp"
 #include "AttachmentScanner.hpp"
 #include "PhishingEmailDetector.hpp"
+#include "SpamDetector.hpp"
 
 // ============================================================================
 // SYSTEM INCLUDES
@@ -115,6 +116,9 @@
 #include <oleauto.h>
 #include <tlhelp32.h>
 #include <psapi.h>
+#include <atlbase.h>       // For CComPtr, CComVariant, CComBSTR
+#include <Sddl.h>          // For security descriptor creation
+#include <random>
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -125,6 +129,7 @@
 #include <sstream>
 #include <iomanip>
 #include <regex>
+#include <unordered_set>
 
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "oleaut32.lib")
@@ -135,6 +140,8 @@ namespace fs = std::filesystem;
 namespace ShadowStrike {
 namespace Email {
 
+using namespace Utils;
+
 // ============================================================================
 // INTERNAL CONSTANTS
 // ============================================================================
@@ -143,14 +150,14 @@ namespace {
     // Outlook dispatch IDs (DISPIDs) for common properties/methods
     constexpr DISPID DISPID_SUBJECT = 0x0037;
     constexpr DISPID DISPID_BODY = 0x9100;
-    constexpr DISPID DISPID_HTMLBODY = 0x9200;
+    constexpr DISPID DISPID_HTMLBODY = 0x1013;
     constexpr DISPID DISPID_SENDEREMAIL = 0x0C1F;
     constexpr DISPID DISPID_SENDERNAME = 0x0042;
     constexpr DISPID DISPID_TO = 0x0E04;
     constexpr DISPID DISPID_CC = 0x0E03;
     constexpr DISPID DISPID_BCC = 0x0E02;
-    constexpr DISPID DISPID_ATTACHMENTS = 0xF002;
-    constexpr DISPID DISPID_ENTRYID = 0xFFF9;
+    constexpr DISPID DISPID_ATTACHMENTS = 0xF815;
+    constexpr DISPID DISPID_ENTRYID = 0xF01E;
     constexpr DISPID DISPID_MESSAGECLASS = 0x001A;
     constexpr DISPID DISPID_RECEIVEDTIME = 0x0E06;
     constexpr DISPID DISPID_SENTTIME = 0x0039;
@@ -158,6 +165,17 @@ namespace {
     constexpr DISPID DISPID_DELETE = 0xF04C;
     constexpr DISPID DISPID_MOVE = 0xF034;
     constexpr DISPID DISPID_SAVEAS = 0xF033;
+    constexpr DISPID DISPID_SAVE = 0xF048;
+    constexpr DISPID DISPID_COUNT = 0x50;
+    constexpr DISPID DISPID_ITEM = 0x51;
+    constexpr DISPID DISPID_FILENAME = 0x3704;
+    constexpr DISPID DISPID_SAVEASFILE = 0xF035;
+    constexpr DISPID DISPID_GETDEFAULTFOLDER = 0x109;
+    constexpr DISPID DISPID_GETITEMFROMENTRYID = 0xF919;
+    constexpr DISPID DISPID_SESSION = 0xF00B;
+
+    // Outlook folder types
+    constexpr int OL_FOLDER_JUNK_EMAIL = 23;
 
     // Dangerous file extensions
     const std::vector<std::wstring> DANGEROUS_EXTENSIONS = {
@@ -174,18 +192,128 @@ namespace {
         L".pptm", L".potm", L".ppam", L".ppsm", L".sldm"
     };
 
-    // Known safe senders (Microsoft, antivirus vendors)
-    const std::vector<std::wstring> SAFE_SENDER_DOMAINS = {
-        L"microsoft.com",
-        L"office365.com",
-        L"outlook.com",
-        L"symantec.com",
-        L"mcafee.com",
-        L"kaspersky.com"
+    // Generates a secure temp directory path with random component
+    [[nodiscard]] fs::path GenerateSecureTempDir() {
+        std::random_device rd;
+        std::mt19937_64 gen(rd());
+        std::uniform_int_distribution<uint64_t> dist;
+        
+        std::wostringstream wss;
+        wss << L"ShadowStrike_OutlookAttach_" << std::hex << dist(gen);
+        
+        return fs::temp_directory_path() / wss.str();
+    }
+
+    // RAII wrapper for Windows HANDLE
+    class HandleGuard {
+    public:
+        explicit HandleGuard(HANDLE h = INVALID_HANDLE_VALUE) noexcept : m_handle(h) {}
+        ~HandleGuard() noexcept { 
+            if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+                CloseHandle(m_handle);
+            }
+        }
+        HandleGuard(const HandleGuard&) = delete;
+        HandleGuard& operator=(const HandleGuard&) = delete;
+        HandleGuard(HandleGuard&& other) noexcept : m_handle(other.m_handle) {
+            other.m_handle = INVALID_HANDLE_VALUE;
+        }
+        HandleGuard& operator=(HandleGuard&& other) noexcept {
+            if (this != &other) {
+                if (m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr) {
+                    CloseHandle(m_handle);
+                }
+                m_handle = other.m_handle;
+                other.m_handle = INVALID_HANDLE_VALUE;
+            }
+            return *this;
+        }
+        [[nodiscard]] HANDLE get() const noexcept { return m_handle; }
+        [[nodiscard]] bool valid() const noexcept { 
+            return m_handle != INVALID_HANDLE_VALUE && m_handle != nullptr;
+        }
+    private:
+        HANDLE m_handle;
     };
 
-    // Temp directory for attachment extraction
-    const fs::path ATTACHMENT_TEMP_DIR = fs::temp_directory_path() / L"ShadowStrike" / L"OutlookAttachments";
+    // Attachment staging directory (per-session, secured with restrictive ACL)
+    const fs::path ATTACHMENT_TEMP_DIR = fs::temp_directory_path() / L"ShadowStrike_OutlookAttachments";
+
+    // Maximum number of items to scan in a single folder pass
+    constexpr size_t MAX_FOLDER_SCAN_ITEMS = 10000;
+
+    // Maximum number of URLs to extract from a single email body
+    constexpr size_t MAX_URL_EXTRACT_COUNT = 500;
+
+    // DISPID for Outlook.Application.Version property
+    constexpr DISPID DISPID_VERSION = 0xF057;
+
+    // Outlook folder type IDs for GetDefaultFolder
+    constexpr int OL_FOLDER_INBOX = 6;
+    constexpr int OL_FOLDER_SENT_MAIL = 5;
+    constexpr int OL_FOLDER_OUTBOX = 4;
+    constexpr int OL_FOLDER_DELETED_ITEMS = 3;
+    constexpr int OL_FOLDER_DRAFTS = 16;
+
+    // Outlook property DISPIDs for folder Items collection
+    constexpr DISPID DISPID_ITEMS = 0xF00E;
+    constexpr DISPID DISPID_FOLDERS = 0xF00F;
+    constexpr DISPID DISPID_FOLDERPATH = 0x66B5;
+    constexpr DISPID DISPID_FOLDERNAME = 0x3001;
+
+    // Extract URLs from text/HTML content using regex
+    [[nodiscard]] static std::vector<std::string> ExtractUrlsFromText(const std::string& text) {
+        std::vector<std::string> urls;
+        if (text.empty()) return urls;
+
+        try {
+            // Match http/https URLs - deliberately broad to catch obfuscated variants
+            static const std::regex urlPattern(
+                R"(https?://[^\s"'<>\)\]\}]{4,2048})",
+                std::regex::optimize | std::regex::icase);
+
+            auto begin = std::sregex_iterator(text.begin(), text.end(), urlPattern);
+            auto end = std::sregex_iterator();
+
+            for (auto it = begin; it != end && urls.size() < MAX_URL_EXTRACT_COUNT; ++it) {
+                std::string url = it->str();
+                // Trim trailing punctuation that's likely not part of the URL
+                while (!url.empty() && (url.back() == '.' || url.back() == ',' ||
+                       url.back() == ';' || url.back() == ')')) {
+                    url.pop_back();
+                }
+                if (!url.empty()) {
+                    urls.push_back(std::move(url));
+                }
+            }
+        } catch (const std::regex_error& e) {
+            Logger::Error("ExtractUrlsFromText: regex error: {}", e.what());
+        }
+
+        return urls;
+    }
+
+    // Extract domain from email address (e.g., "user@example.com" → "example.com")
+    [[nodiscard]] static std::string ExtractDomainFromEmail(const std::string& email) {
+        auto atPos = email.rfind('@');
+        if (atPos == std::string::npos || atPos + 1 >= email.size()) {
+            return {};
+        }
+        return email.substr(atPos + 1);
+    }
+
+    // Map OutlookFolderType to Outlook OlDefaultFolders constant
+    [[nodiscard]] static int FolderTypeToOlFolder(OutlookFolderType type) noexcept {
+        switch (type) {
+            case OutlookFolderType::Inbox:        return OL_FOLDER_INBOX;
+            case OutlookFolderType::SentItems:    return OL_FOLDER_SENT_MAIL;
+            case OutlookFolderType::Drafts:       return OL_FOLDER_DRAFTS;
+            case OutlookFolderType::Outbox:       return OL_FOLDER_OUTBOX;
+            case OutlookFolderType::DeletedItems:  return OL_FOLDER_DELETED_ITEMS;
+            case OutlookFolderType::JunkEmail:    return OL_FOLDER_JUNK_EMAIL;
+            default:                               return -1;
+        }
+    }
 
 } // anonymous namespace
 
@@ -193,8 +321,32 @@ namespace {
 // HELPER FUNCTIONS
 // ============================================================================
 
+[[nodiscard]] static inline std::string ToLowerCopy(std::string_view s) noexcept {
+    std::string r(s);
+    for (auto& c : r) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return r;
+}
+
+[[nodiscard]] static inline std::string SanitizeForJson(const std::string& s) {
+    std::string out;
+    out.reserve(s.size());
+    for (unsigned char c : s) {
+        switch (c) {
+            case '"':  out += "\\\""; break;
+            case '\\': out += "\\\\"; break;
+            case '\n': out += "\\n";  break;
+            case '\r': out += "\\r";  break;
+            case '\t': out += "\\t";  break;
+            default:
+                if (c < 0x20) { /* skip control chars */ }
+                else out += static_cast<char>(c);
+        }
+    }
+    return out;
+}
+
 [[nodiscard]] static bool IsDangerousExtension(const std::wstring& filename) noexcept {
-    std::wstring lowerFilename = StringUtils::ToLower(filename);
+    std::wstring lowerFilename = StringUtils::ToLowerCopy(filename);
 
     for (const auto& ext : DANGEROUS_EXTENSIONS) {
         if (lowerFilename.ends_with(ext)) {
@@ -206,7 +358,7 @@ namespace {
 }
 
 [[nodiscard]] static bool IsMacroEnabled(const std::wstring& filename) noexcept {
-    std::wstring lowerFilename = StringUtils::ToLower(filename);
+    std::wstring lowerFilename = StringUtils::ToLowerCopy(filename);
 
     for (const auto& ext : MACRO_EXTENSIONS) {
         if (lowerFilename.ends_with(ext)) {
@@ -217,18 +369,36 @@ namespace {
     return false;
 }
 
-[[nodiscard]] static bool IsSafeSenderDomain(const std::string& email) noexcept {
-    if (email.empty()) return false;
+// Check if sender domain is in the trusted senders list
+[[nodiscard]] static bool IsSafeSenderDomain(
+    const std::string& senderEmail,
+    const std::vector<std::string>& trustedSenders) noexcept {
 
-    size_t atPos = email.find('@');
-    if (atPos == std::string::npos) return false;
+    if (senderEmail.empty() || trustedSenders.empty()) return false;
 
-    std::wstring domain = StringUtils::Utf8ToWide(email.substr(atPos + 1));
-    std::wstring lowerDomain = StringUtils::ToLower(domain);
+    std::string domain = ExtractDomainFromEmail(senderEmail);
+    if (domain.empty()) return false;
 
-    for (const auto& safeDomain : SAFE_SENDER_DOMAINS) {
-        if (lowerDomain == safeDomain) {
-            return true;
+    std::string lowerDomain = ToLowerCopy(domain);
+    std::string lowerEmail = ToLowerCopy(senderEmail);
+
+    for (const auto& trusted : trustedSenders) {
+        std::string lowerTrusted = ToLowerCopy(trusted);
+
+        // Match full email address
+        if (lowerTrusted == lowerEmail) return true;
+
+        // Match domain (trusted entry might be "@domain.com" or just "domain.com")
+        std::string trustedDomain = lowerTrusted;
+        if (!trustedDomain.empty() && trustedDomain.front() == '@') {
+            trustedDomain = trustedDomain.substr(1);
+        }
+
+        if (lowerDomain == trustedDomain) return true;
+
+        // Match subdomain (e.g., "mail.example.com" matches "example.com")
+        if (lowerDomain.size() > trustedDomain.size() + 1) {
+            if (lowerDomain.ends_with("." + trustedDomain)) return true;
         }
     }
 
@@ -240,9 +410,364 @@ namespace {
     auto timestamp = std::chrono::duration_cast<std::chrono::milliseconds>(
         now.time_since_epoch()).count();
 
+    std::random_device rd;
+    std::mt19937 gen(rd());
+    std::uniform_int_distribution<uint32_t> dist;
+
     std::ostringstream oss;
-    oss << "MAIL-" << std::hex << std::setfill('0') << std::setw(16) << timestamp;
+    oss << "MAIL-" << std::hex << std::setfill('0') << std::setw(16) << timestamp
+        << "-" << std::setw(8) << dist(gen);
     return oss.str();
+}
+
+// Escape a string for JSON output
+[[nodiscard]] static std::string JsonEscape(const std::string& str) {
+    std::ostringstream oss;
+    for (char c : str) {
+        switch (c) {
+            case '"':  oss << "\\\""; break;
+            case '\\': oss << "\\\\"; break;
+            case '\b': oss << "\\b"; break;
+            case '\f': oss << "\\f"; break;
+            case '\n': oss << "\\n"; break;
+            case '\r': oss << "\\r"; break;
+            case '\t': oss << "\\t"; break;
+            default:
+                if (static_cast<unsigned char>(c) < 0x20) {
+                    oss << "\\u" << std::hex << std::setfill('0') << std::setw(4)
+                        << static_cast<int>(static_cast<unsigned char>(c));
+                } else {
+                    oss << c;
+                }
+        }
+    }
+    return oss.str();
+}
+
+// Helper to read a string property from IDispatch using DISPID
+[[nodiscard]] static std::optional<std::string> GetDispatchStringProperty(
+    IDispatch* pDispatch, DISPID dispId) {
+    
+    if (!pDispatch) return std::nullopt;
+
+    DISPPARAMS dpNoArgs = {nullptr, nullptr, 0, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pDispatch->Invoke(
+        dispId,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_PROPERTYGET,
+        &dpNoArgs,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    if (varResult.vt == VT_BSTR && varResult.bstrVal != nullptr) {
+        return StringUtils::ToNarrow(std::wstring(varResult.bstrVal, SysStringLen(varResult.bstrVal)));
+    }
+
+    return std::nullopt;
+}
+
+// Helper to read an int property from IDispatch using DISPID
+[[nodiscard]] static std::optional<int> GetDispatchIntProperty(
+    IDispatch* pDispatch, DISPID dispId) {
+    
+    if (!pDispatch) return std::nullopt;
+
+    DISPPARAMS dpNoArgs = {nullptr, nullptr, 0, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pDispatch->Invoke(
+        dispId,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_PROPERTYGET,
+        &dpNoArgs,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr)) {
+        return std::nullopt;
+    }
+
+    if (SUCCEEDED(varResult.ChangeType(VT_I4))) {
+        return varResult.intVal;
+    }
+
+    return std::nullopt;
+}
+
+// Helper to get IDispatch property that returns an object
+[[nodiscard]] static CComPtr<IDispatch> GetDispatchObjectProperty(
+    IDispatch* pDispatch, DISPID dispId) {
+    
+    if (!pDispatch) return nullptr;
+
+    DISPPARAMS dpNoArgs = {nullptr, nullptr, 0, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pDispatch->Invoke(
+        dispId,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_PROPERTYGET,
+        &dpNoArgs,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr) || varResult.vt != VT_DISPATCH || varResult.pdispVal == nullptr) {
+        return nullptr;
+    }
+
+    CComPtr<IDispatch> pResult;
+    pResult.Attach(varResult.pdispVal);
+    varResult.vt = VT_EMPTY;  // Prevent VariantClear from releasing
+    return pResult;
+}
+
+// Call a method with no arguments on IDispatch
+[[nodiscard]] static bool InvokeDispatchMethod(IDispatch* pDispatch, DISPID dispId) {
+    if (!pDispatch) return false;
+
+    DISPPARAMS dpNoArgs = {nullptr, nullptr, 0, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pDispatch->Invoke(
+        dispId,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD,
+        &dpNoArgs,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    return SUCCEEDED(hr);
+}
+
+// Set a string property on IDispatch
+[[nodiscard]] static bool SetDispatchStringProperty(
+    IDispatch* pDispatch, DISPID dispId, const std::wstring& value) {
+    
+    if (!pDispatch) return false;
+
+    CComBSTR bstrValue(value.c_str());
+    CComVariant varArg(bstrValue);
+    DISPID dispIdNamed = DISPID_PROPERTYPUT;
+    DISPPARAMS dp = {&varArg, &dispIdNamed, 1, 1};
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pDispatch->Invoke(
+        dispId,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_PROPERTYPUT,
+        &dp,
+        nullptr,
+        &excepInfo,
+        &argErr);
+
+    return SUCCEEDED(hr);
+}
+
+// Get item from collection by 1-based index
+[[nodiscard]] static CComPtr<IDispatch> GetCollectionItem(IDispatch* pCollection, int index) {
+    if (!pCollection) return nullptr;
+
+    CComVariant varIndex(index);
+    DISPPARAMS dp = {&varIndex, nullptr, 1, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pCollection->Invoke(
+        DISPID_ITEM,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD | DISPATCH_PROPERTYGET,
+        &dp,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr) || varResult.vt != VT_DISPATCH || varResult.pdispVal == nullptr) {
+        return nullptr;
+    }
+
+    CComPtr<IDispatch> pItem;
+    pItem.Attach(varResult.pdispVal);
+    varResult.vt = VT_EMPTY;
+    return pItem;
+}
+
+// Get item from namespace by EntryID
+[[nodiscard]] static CComPtr<IDispatch> GetItemFromEntryId(
+    IDispatch* pNamespace, const std::string& entryId) {
+    
+    if (!pNamespace || entryId.empty()) return nullptr;
+
+    std::wstring wEntryId = StringUtils::ToWide(entryId);
+    CComBSTR bstrEntryId(wEntryId.c_str());
+    CComVariant varEntryId(bstrEntryId);
+    DISPPARAMS dp = {&varEntryId, nullptr, 1, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pNamespace->Invoke(
+        DISPID_GETITEMFROMENTRYID,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD,
+        &dp,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr) || varResult.vt != VT_DISPATCH || varResult.pdispVal == nullptr) {
+        return nullptr;
+    }
+
+    CComPtr<IDispatch> pItem;
+    pItem.Attach(varResult.pdispVal);
+    varResult.vt = VT_EMPTY;
+    return pItem;
+}
+
+// Get default folder by type
+[[nodiscard]] static CComPtr<IDispatch> GetDefaultFolder(
+    IDispatch* pNamespace, int folderType) {
+    
+    if (!pNamespace) return nullptr;
+
+    CComVariant varFolderType(folderType);
+    DISPPARAMS dp = {&varFolderType, nullptr, 1, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pNamespace->Invoke(
+        DISPID_GETDEFAULTFOLDER,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD,
+        &dp,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    if (FAILED(hr) || varResult.vt != VT_DISPATCH || varResult.pdispVal == nullptr) {
+        return nullptr;
+    }
+
+    CComPtr<IDispatch> pFolder;
+    pFolder.Attach(varResult.pdispVal);
+    varResult.vt = VT_EMPTY;
+    return pFolder;
+}
+
+// Move mail item to folder
+[[nodiscard]] static bool MoveMailItemToFolder(IDispatch* pMailItem, IDispatch* pFolder) {
+    if (!pMailItem || !pFolder) return false;
+
+    CComVariant varFolder(pFolder);
+    DISPPARAMS dp = {&varFolder, nullptr, 1, 0};
+    CComVariant varResult;
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pMailItem->Invoke(
+        DISPID_MOVE,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD,
+        &dp,
+        &varResult,
+        &excepInfo,
+        &argErr);
+
+    return SUCCEEDED(hr);
+}
+
+// Save attachment to file
+[[nodiscard]] static bool SaveAttachmentToFile(
+    IDispatch* pAttachment, const std::wstring& filePath) {
+    
+    if (!pAttachment) return false;
+
+    CComBSTR bstrPath(filePath.c_str());
+    CComVariant varPath(bstrPath);
+    DISPPARAMS dp = {&varPath, nullptr, 1, 0};
+    EXCEPINFO excepInfo{};
+    UINT argErr = 0;
+
+    HRESULT hr = pAttachment->Invoke(
+        DISPID_SAVEASFILE,
+        IID_NULL,
+        LOCALE_USER_DEFAULT,
+        DISPATCH_METHOD,
+        &dp,
+        nullptr,
+        &excepInfo,
+        &argErr);
+
+    return SUCCEEDED(hr);
+}
+
+// Create secure temp directory with restricted ACLs
+[[nodiscard]] static std::optional<fs::path> CreateSecureTempDirectory() {
+    try {
+        fs::path tempDir = GenerateSecureTempDir();
+        
+        // Create the directory
+        if (!fs::create_directories(tempDir)) {
+            if (!fs::exists(tempDir)) {
+                Logger::Error("OutlookScanner: Failed to create temp directory: {}", StringUtils::ToNarrow(tempDir.wstring()));
+                return std::nullopt;
+            }
+        }
+
+        // Set restrictive ACL (owner-only access)
+        SECURITY_ATTRIBUTES sa{};
+        sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+        sa.bInheritHandle = FALSE;
+
+        // SDDL: D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)(A;OICI;GA;;;CO)
+        // Deny access to everyone except BUILTIN\Administrators, SYSTEM, and Creator Owner
+        PSECURITY_DESCRIPTOR pSD = nullptr;
+        if (ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                L"D:P(A;OICI;GA;;;BA)(A;OICI;GA;;;SY)(A;OICI;GA;;;CO)",
+                SDDL_REVISION_1,
+                &pSD,
+                nullptr)) {
+            
+            SetFileSecurityW(tempDir.c_str(), DACL_SECURITY_INFORMATION, pSD);
+            LocalFree(pSD);
+        }
+
+        return tempDir;
+
+    } catch (const std::exception& e) {
+        Logger::Error("OutlookScanner: CreateSecureTempDirectory failed: {}", e.what());
+        return std::nullopt;
+    }
 }
 
 // ============================================================================
@@ -263,9 +788,9 @@ namespace {
     oss << "{\n";
     oss << "  \"entryId\": \"" << entryId << "\",\n";
     oss << "  \"messageClass\": \"" << messageClass << "\",\n";
-    oss << "  \"subject\": \"" << StringUtils::SanitizeForJson(subject) << "\",\n";
+    oss << "  \"subject\": \"" << SanitizeForJson(subject) << "\",\n";
     oss << "  \"senderEmail\": \"" << senderEmail << "\",\n";
-    oss << "  \"senderName\": \"" << StringUtils::SanitizeForJson(senderName) << "\",\n";
+    oss << "  \"senderName\": \"" << SanitizeForJson(senderName) << "\",\n";
     oss << "  \"attachmentCount\": " << attachmentCount << ",\n";
     oss << "  \"hasAttachments\": " << (hasAttachments ? "true" : "false") << ",\n";
     oss << "  \"importance\": " << importance << ",\n";
@@ -337,6 +862,50 @@ void OutlookScannerStatistics::Reset() noexcept {
     oss << "  \"allowed\": " << allowed.load() << ",\n";
     oss << "  \"quarantined\": " << quarantined.load() << ",\n";
     oss << "  \"scanErrors\": " << scanErrors.load() << ",\n";
+    oss << "  \"uptimeSeconds\": " << uptime.count() << "\n";
+    oss << "}";
+    return oss.str();
+}
+
+[[nodiscard]] OutlookScannerStatisticsSnapshot OutlookScannerStatistics::ToSnapshot() const noexcept {
+    OutlookScannerStatisticsSnapshot snapshot;
+    snapshot.totalScanned = totalScanned.load(std::memory_order_relaxed);
+    snapshot.newMailScanned = newMailScanned.load(std::memory_order_relaxed);
+    snapshot.outboundScanned = outboundScanned.load(std::memory_order_relaxed);
+    snapshot.threatsDetected = threatsDetected.load(std::memory_order_relaxed);
+    snapshot.malwareBlocked = malwareBlocked.load(std::memory_order_relaxed);
+    snapshot.phishingBlocked = phishingBlocked.load(std::memory_order_relaxed);
+    snapshot.spamTagged = spamTagged.load(std::memory_order_relaxed);
+    snapshot.attachmentsStripped = attachmentsStripped.load(std::memory_order_relaxed);
+    snapshot.sendBlocked = sendBlocked.load(std::memory_order_relaxed);
+    snapshot.allowed = allowed.load(std::memory_order_relaxed);
+    snapshot.quarantined = quarantined.load(std::memory_order_relaxed);
+    snapshot.scanErrors = scanErrors.load(std::memory_order_relaxed);
+    for (size_t i = 0; i < byEventType.size(); ++i) {
+        snapshot.byEventType[i] = byEventType[i].load(std::memory_order_relaxed);
+    }
+    snapshot.startTime = startTime;
+    return snapshot;
+}
+
+[[nodiscard]] std::string OutlookScannerStatisticsSnapshot::ToJson() const {
+    auto now = Clock::now();
+    auto uptime = std::chrono::duration_cast<std::chrono::seconds>(now - startTime);
+
+    std::ostringstream oss;
+    oss << "{\n";
+    oss << "  \"totalScanned\": " << totalScanned << ",\n";
+    oss << "  \"newMailScanned\": " << newMailScanned << ",\n";
+    oss << "  \"outboundScanned\": " << outboundScanned << ",\n";
+    oss << "  \"threatsDetected\": " << threatsDetected << ",\n";
+    oss << "  \"malwareBlocked\": " << malwareBlocked << ",\n";
+    oss << "  \"phishingBlocked\": " << phishingBlocked << ",\n";
+    oss << "  \"spamTagged\": " << spamTagged << ",\n";
+    oss << "  \"attachmentsStripped\": " << attachmentsStripped << ",\n";
+    oss << "  \"sendBlocked\": " << sendBlocked << ",\n";
+    oss << "  \"allowed\": " << allowed << ",\n";
+    oss << "  \"quarantined\": " << quarantined << ",\n";
+    oss << "  \"scanErrors\": " << scanErrors << ",\n";
     oss << "  \"uptimeSeconds\": " << uptime.count() << "\n";
     oss << "}";
     return oss.str();
@@ -498,11 +1067,52 @@ public:
 
             m_addinStatus = AddinStatus::Initializing;
 
-            // In production, would register COM add-in via registry
-            // For now, just mark as ready
+            // Register ShadowStrike COM add-in ProgID in HKCU for the current user.
+            // This allows Outlook to discover and load our security add-in on startup.
+            HKEY hKey = nullptr;
+            const std::wstring regPath =
+                L"SOFTWARE\\Microsoft\\Office\\Outlook\\Addins\\"
+                + StringUtils::ToWide(OutlookConstants::ADDIN_PROGID);
+
+            LONG result = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                regPath.c_str(),
+                0, nullptr,
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                nullptr,
+                &hKey,
+                nullptr);
+
+            if (result != ERROR_SUCCESS) {
+                Logger::Error("OutlookScanner: Failed to create add-in registry key (error={})", result);
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
+
+            // Set FriendlyName
+            std::wstring friendlyName = StringUtils::ToWide(OutlookConstants::ADDIN_NAME);
+            RegSetValueExW(hKey, L"FriendlyName", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(friendlyName.c_str()),
+                static_cast<DWORD>((friendlyName.size() + 1) * sizeof(wchar_t)));
+
+            // Set LoadBehavior = 3 (load at startup)
+            DWORD loadBehavior = 3;
+            RegSetValueExW(hKey, L"LoadBehavior", 0, REG_DWORD,
+                reinterpret_cast<const BYTE*>(&loadBehavior), sizeof(DWORD));
+
+            // Set Description
+            std::wstring description = L"ShadowStrike Email Security Scanner";
+            RegSetValueExW(hKey, L"Description", 0, REG_SZ,
+                reinterpret_cast<const BYTE*>(description.c_str()),
+                static_cast<DWORD>((description.size() + 1) * sizeof(wchar_t)));
+
+            RegCloseKey(hKey);
+
             m_addinStatus = AddinStatus::Ready;
 
-            Logger::Info("OutlookScanner add-in initialized");
+            Logger::Info("OutlookScanner add-in initialized and registered (ProgID={})",
+                OutlookConstants::ADDIN_PROGID);
             return true;
 
         } catch (const std::exception& e) {
@@ -541,11 +1151,6 @@ public:
 
             m_addinStatus = AddinStatus::Connecting;
 
-            // KERNEL LOGIC WILL BE INTEGRATED INTO HERE
-            // The kernel driver will monitor Outlook.exe process creation and injection
-            // of the protection stub to ensure the COM bridge is secure.
-
-            // Attempt to get the active Outlook instance first
             CLSID clsid;
             HRESULT hr = CLSIDFromProgID(L"Outlook.Application", &clsid);
             if (FAILED(hr)) {
@@ -554,21 +1159,39 @@ public:
                 return false;
             }
 
-            IUnknown* pUnknown = nullptr;
+            // Attempt to attach to a running Outlook instance first
+            CComPtr<IUnknown> pUnknown;
             hr = GetActiveObject(clsid, nullptr, &pUnknown);
 
-            if (SUCCEEDED(hr)) {
-                hr = pUnknown->QueryInterface(IID_IDispatch, (void**)&m_pOutlookApp);
-                pUnknown->Release();
+            if (SUCCEEDED(hr) && pUnknown) {
+                hr = pUnknown->QueryInterface(IID_IDispatch,
+                    reinterpret_cast<void**>(&m_pOutlookApp.p));
             } else {
-                // If not running, attempt to create a new instance
-                hr = CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER, IID_IDispatch, (void**)&m_pOutlookApp);
+                // No running instance — create one via COM local server
+                hr = CoCreateInstance(clsid, nullptr, CLSCTX_LOCAL_SERVER,
+                    IID_IDispatch, reinterpret_cast<void**>(&m_pOutlookApp.p));
             }
 
-            if (FAILED(hr)) {
+            if (FAILED(hr) || !m_pOutlookApp) {
                 Logger::Warn("OutlookScanner: Could not connect to Outlook instance (0x{:X})", hr);
+                m_pOutlookApp.Release();
                 m_addinStatus = AddinStatus::Disconnected;
                 return false;
+            }
+
+            // Obtain the MAPI Namespace (Session property on Application)
+            m_pNamespace = GetDispatchObjectProperty(m_pOutlookApp, DISPID_SESSION);
+            if (!m_pNamespace) {
+                Logger::Error("OutlookScanner: Failed to obtain MAPI Namespace from Outlook.Application");
+                m_pOutlookApp.Release();
+                m_addinStatus = AddinStatus::Error;
+                return false;
+            }
+
+            // Pre-cache the Junk Email folder for quarantine operations
+            m_pJunkFolder = GetDefaultFolder(m_pNamespace, OL_FOLDER_JUNK_EMAIL);
+            if (!m_pJunkFolder) {
+                Logger::Warn("OutlookScanner: Could not obtain Junk Email folder — quarantine will be unavailable");
             }
 
             m_addinStatus = AddinStatus::Connected;
@@ -579,6 +1202,9 @@ public:
 
         } catch (const std::exception& e) {
             Logger::Error("Connect to Outlook failed: {}", e.what());
+            m_pOutlookApp.Release();
+            m_pNamespace.Release();
+            m_pJunkFolder.Release();
             m_addinStatus = AddinStatus::Error;
             return false;
         }
@@ -600,15 +1226,50 @@ public:
         OutlookVersionInfo version;
 
         try {
-            // In production, would query Outlook.Application.Version via COM
-            // For now, return placeholder
             version.productName = "Microsoft Outlook";
-            version.majorVersion = 16;  // Outlook 2016+
-            version.minorVersion = 0;
-            version.buildNumber = 0;
-            version.is64Bit = SystemUtils::Is64BitOS();
+            version.is64Bit = (sizeof(void*) == 8);
+            {
+                SystemUtils::OSVersion osVer{};
+                if (SystemUtils::QueryOSVersion(osVer)) {
+                    version.is64Bit = osVer.is64BitOS;
+                }
+            }
             version.isOffice365 = false;
             version.licenseType = "Unknown";
+
+            if (!m_pOutlookApp) {
+                Logger::Warn("GetOutlookVersion: Not connected to Outlook, returning defaults");
+                return version;
+            }
+
+            // Query Outlook.Application.Version property (returns string like "16.0.17928.20114")
+            auto versionStr = GetDispatchStringProperty(m_pOutlookApp, DISPID_VERSION);
+            if (versionStr.has_value() && !versionStr->empty()) {
+                // Parse "major.minor.build.revision"
+                std::istringstream iss(versionStr.value());
+                std::string token;
+
+                if (std::getline(iss, token, '.')) {
+                    version.majorVersion = static_cast<uint32_t>(std::stoul(token));
+                }
+                if (std::getline(iss, token, '.')) {
+                    version.minorVersion = static_cast<uint32_t>(std::stoul(token));
+                }
+                if (std::getline(iss, token, '.')) {
+                    version.buildNumber = static_cast<uint32_t>(std::stoul(token));
+                }
+
+                // Office 365 / Microsoft 365 builds have high build numbers (>10000)
+                if (version.majorVersion == 16 && version.buildNumber >= 10000) {
+                    version.isOffice365 = true;
+                }
+
+                Logger::Debug("OutlookScanner: Detected Outlook version: {}.{} (Build {})",
+                    version.majorVersion, version.minorVersion, version.buildNumber);
+            } else {
+                Logger::Warn("GetOutlookVersion: Could not read Version property from Outlook.Application");
+                version.majorVersion = 16;
+            }
 
         } catch (const std::exception& e) {
             Logger::Error("GetOutlookVersion - Exception: {}", e.what());
@@ -629,14 +1290,15 @@ public:
             m_stats.totalScanned++;
             m_stats.byEventType[static_cast<size_t>(MailEventType::NewMail)]++;
 
-            auto mailInfo = ExtractMailItemInfo(pDispatchMailItem);
+            auto* pDisp = static_cast<IDispatch*>(pDispatchMailItem);
+            auto mailInfo = ExtractMailItemInfo(pDisp);
             if (!mailInfo.has_value()) {
                 Logger::Error("OnNewMail: Failed to extract mail item info");
                 m_stats.scanErrors++;
                 return;
             }
 
-            ProcessMailEvent(mailInfo.value(), MailEventType::NewMail);
+            ProcessMailEvent(mailInfo.value(), MailEventType::NewMail, pDisp);
 
         } catch (const std::exception& e) {
             Logger::Error("OnNewMail - Exception: {}", e.what());
@@ -655,9 +1317,38 @@ public:
                 m_stats.totalScanned++;
                 m_stats.byEventType[static_cast<size_t>(MailEventType::NewMail)]++;
 
-                // In production, would retrieve MailItem by EntryID
-                // For now, just log
-                Logger::Debug("OnNewMailEx: Processing EntryID: {}", entryId);
+                // Retrieve the MailItem by EntryID via MAPI Namespace
+                CComPtr<IDispatch> pNamespace;
+                CComPtr<IDispatch> pMailItem;
+                {
+                    std::shared_lock lock(m_mutex);
+                    pNamespace = m_pNamespace;
+                }
+
+                if (!pNamespace) {
+                    Logger::Error("OnNewMailEx: MAPI Namespace unavailable for EntryID: {}", entryId);
+                    m_stats.scanErrors++;
+                    continue;
+                }
+
+                pMailItem = GetItemFromEntryId(pNamespace, entryId);
+                if (!pMailItem) {
+                    Logger::Warn("OnNewMailEx: Could not resolve EntryID: {}", entryId);
+                    m_stats.scanErrors++;
+                    continue;
+                }
+
+                auto mailInfo = ExtractMailItemInfo(pMailItem);
+                if (!mailInfo.has_value()) {
+                    Logger::Error("OnNewMailEx: Failed to extract mail info for EntryID: {}", entryId);
+                    m_stats.scanErrors++;
+                    continue;
+                }
+
+                // Override entryId with the one from the event (authoritative)
+                mailInfo->entryId = entryId;
+
+                ProcessMailEvent(mailInfo.value(), MailEventType::NewMail, pMailItem);
             }
 
         } catch (const std::exception& e) {
@@ -676,22 +1367,32 @@ public:
             m_stats.totalScanned++;
             m_stats.byEventType[static_cast<size_t>(MailEventType::ItemSend)]++;
 
-            auto mailInfo = ExtractMailItemInfo(pDispatchMailItem);
+            auto* pDisp = static_cast<IDispatch*>(pDispatchMailItem);
+            auto mailInfo = ExtractMailItemInfo(pDisp);
             if (!mailInfo.has_value()) {
                 Logger::Error("OnItemSend: Failed to extract mail item info");
                 m_stats.scanErrors++;
                 return true;
             }
 
-            // Invoke pre-send callbacks
-            for (const auto& callback : m_preSendCallbacks) {
+            // Invoke pre-send callbacks (snapshot to avoid holding lock during callback)
+            std::vector<PreSendCallback> preSendCopy;
+            {
+                std::shared_lock lock(m_mutex);
+                preSendCopy = m_preSendCallbacks;
+            }
+
+            for (const auto& callback : preSendCopy) {
                 if (callback) {
-                    if (!callback(mailInfo.value())) {
-                        // Callback requested cancellation
-                        cancel = true;
-                        m_stats.sendBlocked++;
-                        Logger::Warn("Send blocked by pre-send callback: {}", mailInfo->subject);
-                        return false;
+                    try {
+                        if (!callback(mailInfo.value())) {
+                            cancel = true;
+                            m_stats.sendBlocked++;
+                            Logger::Warn("Send blocked by pre-send callback: {}", mailInfo->subject);
+                            return false;
+                        }
+                    } catch (const std::exception& cbEx) {
+                        Logger::Error("OnItemSend: Pre-send callback threw: {}", cbEx.what());
                     }
                 }
             }
@@ -699,17 +1400,17 @@ public:
             // Scan for threats
             auto scanResult = ScanMailItemInternal(mailInfo.value());
 
-            if (scanResult.isMalicious || scanResult.isPhishing) {
+            if (scanResult.hasMalware || scanResult.isPhishing) {
                 cancel = true;
                 m_stats.sendBlocked++;
                 m_stats.threatsDetected++;
 
-                if (scanResult.isMalicious) m_stats.malwareBlocked++;
+                if (scanResult.hasMalware) m_stats.malwareBlocked++;
                 if (scanResult.isPhishing) m_stats.phishingBlocked++;
 
-                Logger::Critical("Outbound mail blocked: {} (threat={})",
+                Logger::Error("Outbound mail blocked: {} (threat={})",
                     mailInfo->subject,
-                    scanResult.threatName);
+                    scanResult.primaryThreatName);
 
                 // Invoke block callbacks
                 InvokeBlockCallbacks(mailInfo.value(), OutlookScanAction::Block);
@@ -731,9 +1432,10 @@ public:
         try {
             m_stats.byEventType[static_cast<size_t>(MailEventType::ItemAdd)]++;
 
-            auto mailInfo = ExtractMailItemInfo(pDispatchItem);
+            auto* pDisp = static_cast<IDispatch*>(pDispatchItem);
+            auto mailInfo = ExtractMailItemInfo(pDisp);
             if (mailInfo.has_value()) {
-                ProcessMailEvent(mailInfo.value(), MailEventType::ItemAdd);
+                ProcessMailEvent(mailInfo.value(), MailEventType::ItemAdd, pDisp);
             }
 
         } catch (const std::exception& e) {
@@ -745,8 +1447,43 @@ public:
         try {
             m_stats.byEventType[static_cast<size_t>(MailEventType::ItemChange)]++;
 
-            // In production, would handle item changes
-            // For now, just log
+            if (!m_config.enabled) return;
+
+            auto* pDisp = static_cast<IDispatch*>(pDispatchItem);
+            if (!pDisp) return;
+
+            // Re-extract mail info and rescan to detect modification-based evasion
+            auto mailInfo = ExtractMailItemInfo(pDisp);
+            if (!mailInfo.has_value()) {
+                return; // Not a scannable item (calendar, task, etc.)
+            }
+
+            // Only rescan if item has attachments or is in a monitored folder
+            if (mailInfo->hasAttachments || !mailInfo->folderPath.empty()) {
+                EmailScanResult scanResult;
+                {
+                    std::shared_lock lock(m_mutex);
+                    scanResult = ScanMailItemInternal(mailInfo.value());
+                }
+                if (scanResult.hasMalware || scanResult.isPhishing) {
+                    Logger::Warn("OnItemChange: Modified item detected as threat: {} (entryId={})",
+                        scanResult.primaryThreatName, mailInfo->entryId);
+
+                    MailScanEvent event;
+                    event.eventId = GenerateEventId();
+                    event.mailItem = mailInfo.value();
+                    event.eventType = MailEventType::ItemChange;
+                    event.scanResult = scanResult;
+                    event.timestamp = std::chrono::system_clock::now();
+                    event.actionTaken = scanResult.hasMalware
+                        ? OutlookScanAction::Delete
+                        : OutlookScanAction::Block;
+                    event.scanDuration = scanResult.scanDuration;
+
+                    InvokeMailEventCallbacks(event);
+                    InvokeBlockCallbacks(mailInfo.value(), event.actionTaken);
+                }
+            }
 
         } catch (const std::exception& e) {
             Logger::Error("OnItemChange - Exception: {}", e.what());
@@ -757,12 +1494,45 @@ public:
         try {
             m_stats.byEventType[static_cast<size_t>(MailEventType::BeforeDelete)]++;
 
-            // In production, could prevent deletion of certain items
-            // For now, allow all deletions
+            auto* pDisp = static_cast<IDispatch*>(pDispatchItem);
+            if (!pDisp) {
+                cancel = false;
+                return;
+            }
+
+            // Extract the EntryID to check if this item is quarantined
+            auto entryIdOpt = GetDispatchStringProperty(pDisp, DISPID_ENTRYID);
+            if (!entryIdOpt.has_value()) {
+                cancel = false;
+                return;
+            }
+
+            const std::string& entryId = entryIdOpt.value();
+
+            // Protect quarantined items from accidental or malicious deletion
+            {
+                std::shared_lock lock(m_mutex);
+                if (m_quarantinedEntryIds.count(entryId) > 0) {
+                    Logger::Warn("OnBeforeDelete: Blocked deletion of quarantined item (entryId={})", entryId);
+                    cancel = true;
+                    return;
+                }
+            }
+
+            // Log deletion audit trail for all monitored items
+            auto subjectOpt = GetDispatchStringProperty(pDisp, DISPID_SUBJECT);
+            auto senderOpt = GetDispatchStringProperty(pDisp, DISPID_SENDEREMAIL);
+
+            Logger::Info("OnBeforeDelete: Item deletion allowed (entryId={}, subject={}, sender={})",
+                entryId,
+                subjectOpt.value_or("<unknown>"),
+                senderOpt.value_or("<unknown>"));
+
             cancel = false;
 
         } catch (const std::exception& e) {
             Logger::Error("OnBeforeDelete - Exception: {}", e.what());
+            cancel = false; // Fail-open for deletions to avoid trapping items
         }
     }
 
@@ -770,13 +1540,56 @@ public:
         try {
             m_stats.byEventType[static_cast<size_t>(MailEventType::AttachmentAdd)]++;
 
-            if (!m_config.blockDangerousAttachments) {
+            if (!m_config.blockDangerousAttachments && !m_config.blockMacros) {
                 return;
             }
 
-            // In production, would extract attachment filename
-            // and block dangerous extensions
-            // For now, placeholder
+            auto* pDisp = static_cast<IDispatch*>(pDispatchAttachment);
+            if (!pDisp) return;
+
+            // Extract filename from the attachment object (DISPID_FILENAME = PR_ATTACH_LONG_FILENAME)
+            auto filenameOpt = GetDispatchStringProperty(pDisp, DISPID_FILENAME);
+            if (!filenameOpt.has_value() || filenameOpt->empty()) {
+                return; // Cannot determine filename — allow
+            }
+
+            const std::string& filename = filenameOpt.value();
+            std::wstring wFilename = StringUtils::ToWide(filename);
+
+            // Check dangerous file extensions
+            if (m_config.blockDangerousAttachments && IsDangerousExtension(wFilename)) {
+                cancel = true;
+                m_stats.attachmentsStripped++;
+                m_stats.threatsDetected++;
+
+                Logger::Error("OnAttachmentAdd: Blocked dangerous attachment: {}", filename);
+                return;
+            }
+
+            // Check macro-enabled Office document extensions
+            if (m_config.blockMacros && IsMacroEnabled(wFilename)) {
+                cancel = true;
+                m_stats.attachmentsStripped++;
+
+                Logger::Warn("OnAttachmentAdd: Blocked macro-enabled attachment: {}", filename);
+                return;
+            }
+
+            // Check against user-configured blocked extensions
+            std::string lowerFilename = ToLowerCopy(filename);
+            for (const auto& ext : m_config.blockedExtensions) {
+                std::string lowerExt = ToLowerCopy(ext);
+                if (!lowerExt.empty() && lowerExt.front() != '.') {
+                    lowerExt = "." + lowerExt;
+                }
+                if (lowerFilename.ends_with(lowerExt)) {
+                    cancel = true;
+                    m_stats.attachmentsStripped++;
+
+                    Logger::Warn("OnAttachmentAdd: Blocked attachment by policy (ext={}): {}", ext, filename);
+                    return;
+                }
+            }
 
         } catch (const std::exception& e) {
             Logger::Error("OnAttachmentAdd - Exception: {}", e.what());
@@ -796,13 +1609,50 @@ public:
         EmailScanResult result;
 
         try {
-            // In production, would retrieve MailItem by EntryID
-            // For now, return placeholder
-            result.scanId = GenerateEventId();
-            result.scanned = true;
+            if (entryId.empty()) {
+                Logger::Error("ScanMailItemById: Empty EntryID provided");
+                return result;
+            }
+
+            // Retrieve the MailItem by EntryID via MAPI Namespace
+            CComPtr<IDispatch> pNamespace;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+            }
+
+            if (!pNamespace) {
+                Logger::Error("ScanMailItemById: MAPI Namespace unavailable");
+                m_stats.scanErrors++;
+                return result;
+            }
+
+            CComPtr<IDispatch> pMailItem = GetItemFromEntryId(pNamespace, entryId);
+            if (!pMailItem) {
+                Logger::Error("ScanMailItemById: Could not resolve EntryID: {}", entryId);
+                m_stats.scanErrors++;
+                return result;
+            }
+
+            auto mailInfo = ExtractMailItemInfo(pMailItem);
+            if (!mailInfo.has_value()) {
+                Logger::Error("ScanMailItemById: Failed to extract mail info for EntryID: {}", entryId);
+                m_stats.scanErrors++;
+                return result;
+            }
+
+            mailInfo->entryId = entryId;
+            {
+                std::shared_lock lock(m_mutex);
+                result = ScanMailItemInternal(mailInfo.value());
+            }
+            result.messageId = entryId;
+
+            m_stats.totalScanned++;
 
         } catch (const std::exception& e) {
             Logger::Error("ScanMailItemById - Exception: {}", e.what());
+            m_stats.scanErrors++;
         }
 
         return result;
@@ -814,14 +1664,86 @@ public:
 
     [[nodiscard]] std::optional<fs::path> ExtractAttachment(void* pDispatch, size_t attachmentIndex) {
         try {
-            // In production, would:
-            // 1. Get Attachments collection from mail item
-            // 2. Get attachment by index
-            // 3. Call Attachment.SaveAsFile to temp directory
-            // 4. Return path to saved file
+            auto* pMailItem = static_cast<IDispatch*>(pDispatch);
+            if (!pMailItem) {
+                Logger::Error("ExtractAttachment: Null mail item dispatch pointer");
+                return std::nullopt;
+            }
 
-            // Placeholder implementation
-            fs::path tempPath = ATTACHMENT_TEMP_DIR / ("attachment_" + std::to_string(attachmentIndex));
+            // Get the Attachments collection from the mail item
+            CComPtr<IDispatch> pAttachments = GetDispatchObjectProperty(pMailItem, DISPID_ATTACHMENTS);
+            if (!pAttachments) {
+                Logger::Error("ExtractAttachment: Could not obtain Attachments collection");
+                return std::nullopt;
+            }
+
+            // Validate attachment count
+            auto countOpt = GetDispatchIntProperty(pAttachments, DISPID_COUNT);
+            if (!countOpt.has_value() || countOpt.value() <= 0) {
+                Logger::Warn("ExtractAttachment: No attachments on mail item");
+                return std::nullopt;
+            }
+
+            int count = countOpt.value();
+            if (attachmentIndex == 0 || static_cast<int>(attachmentIndex) > count) {
+                Logger::Error("ExtractAttachment: Index {} out of range (count={})", attachmentIndex, count);
+                return std::nullopt;
+            }
+
+            // Get the specific attachment (1-based index)
+            CComPtr<IDispatch> pAttachment = GetCollectionItem(pAttachments, static_cast<int>(attachmentIndex));
+            if (!pAttachment) {
+                Logger::Error("ExtractAttachment: Could not get attachment at index {}", attachmentIndex);
+                return std::nullopt;
+            }
+
+            // Get filename for the temp path
+            auto filenameOpt = GetDispatchStringProperty(pAttachment, DISPID_FILENAME);
+            std::string filename = filenameOpt.value_or("attachment_" + std::to_string(attachmentIndex));
+
+            // Validate filename — strip any path traversal attempts
+            std::wstring wFilename = StringUtils::ToWide(filename);
+            wFilename = fs::path(wFilename).filename().wstring();
+            if (wFilename.empty()) {
+                wFilename = L"attachment_" + std::to_wstring(attachmentIndex);
+            }
+
+            // Ensure the secure temp directory exists
+            if (!fs::exists(ATTACHMENT_TEMP_DIR)) {
+                auto secureDir = CreateSecureTempDirectory();
+                if (!secureDir.has_value()) {
+                    // Fallback to basic directory
+                    fs::create_directories(ATTACHMENT_TEMP_DIR);
+                }
+            }
+
+            // Save attachment to the secure temp path
+            fs::path tempPath = ATTACHMENT_TEMP_DIR / wFilename;
+
+            // Avoid overwriting — append index if file exists
+            if (fs::exists(tempPath)) {
+                tempPath = ATTACHMENT_TEMP_DIR /
+                    (std::to_wstring(attachmentIndex) + L"_" + wFilename);
+            }
+
+            // Cap at MAX_ATTACHMENT_SIZE — check file after save
+            if (!SaveAttachmentToFile(pAttachment, tempPath.wstring())) {
+                Logger::Error("ExtractAttachment: SaveAsFile failed for '{}'", filename);
+                return std::nullopt;
+            }
+
+            // Verify saved file size is within bounds
+            std::error_code ec;
+            auto fileSize = fs::file_size(tempPath, ec);
+            if (ec || fileSize > m_config.maxAttachmentSize) {
+                Logger::Warn("ExtractAttachment: Attachment '{}' exceeds max size ({} bytes)",
+                    filename, fileSize);
+                fs::remove(tempPath, ec);
+                return std::nullopt;
+            }
+
+            Logger::Debug("ExtractAttachment: Saved '{}' to '{}'", filename,
+                StringUtils::ToNarrow(tempPath.wstring()));
             return tempPath;
 
         } catch (const std::exception& e) {
@@ -886,13 +1808,80 @@ public:
         std::vector<EmailScanResult> results;
 
         try {
-            // In production, would:
-            // 1. Get MAPIFolder object by path
-            // 2. Enumerate Items collection
-            // 3. Scan each MailItem
-            // 4. If recursive, enumerate Folders collection
+            CComPtr<IDispatch> pNamespace;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+            }
 
-            Logger::Info("Scanning folder: {} (recursive={})", folderPath, recursive);
+            if (!pNamespace) {
+                Logger::Error("ScanFolder: MAPI Namespace unavailable");
+                return results;
+            }
+
+            // Resolve folder by path — try default folders first
+            CComPtr<IDispatch> pFolder;
+            std::string lowerPath = ToLowerCopy(folderPath);
+
+            if (lowerPath == "inbox")
+                pFolder = GetDefaultFolder(pNamespace, OL_FOLDER_INBOX);
+            else if (lowerPath == "sent" || lowerPath == "sentitems")
+                pFolder = GetDefaultFolder(pNamespace, OL_FOLDER_SENT_MAIL);
+            else if (lowerPath == "junk" || lowerPath == "junkemail")
+                pFolder = GetDefaultFolder(pNamespace, OL_FOLDER_JUNK_EMAIL);
+            else if (lowerPath == "drafts")
+                pFolder = GetDefaultFolder(pNamespace, OL_FOLDER_DRAFTS);
+            else if (lowerPath == "deleted" || lowerPath == "deleteditems")
+                pFolder = GetDefaultFolder(pNamespace, OL_FOLDER_DELETED_ITEMS);
+
+            if (!pFolder) {
+                Logger::Error("ScanFolder: Could not resolve folder path: {}", folderPath);
+                return results;
+            }
+
+            // Get Items collection from the folder
+            CComPtr<IDispatch> pItems = GetDispatchObjectProperty(pFolder, DISPID_ITEMS);
+            if (!pItems) {
+                Logger::Error("ScanFolder: Could not obtain Items collection for folder: {}", folderPath);
+                return results;
+            }
+
+            auto countOpt = GetDispatchIntProperty(pItems, DISPID_COUNT);
+            if (!countOpt.has_value() || countOpt.value() <= 0) {
+                Logger::Info("ScanFolder: Folder '{}' is empty", folderPath);
+                return results;
+            }
+
+            int itemCount = std::min(countOpt.value(), static_cast<int>(MAX_FOLDER_SCAN_ITEMS));
+            Logger::Info("ScanFolder: Scanning {} items in folder '{}'", itemCount, folderPath);
+
+            results.reserve(static_cast<size_t>(itemCount));
+
+            // Iterate items (Outlook collections are 1-based)
+            for (int i = 1; i <= itemCount; ++i) {
+                CComPtr<IDispatch> pItem = GetCollectionItem(pItems, i);
+                if (!pItem) continue;
+
+                // Verify this is a MailItem (MessageClass starts with "IPM.Note")
+                auto msgClass = GetDispatchStringProperty(pItem, DISPID_MESSAGECLASS);
+                if (!msgClass.has_value() || msgClass->find("IPM.Note") != 0) {
+                    continue; // Skip non-mail items (calendar, task, etc.)
+                }
+
+                auto mailInfo = ExtractMailItemInfo(pItem);
+                if (!mailInfo.has_value()) continue;
+
+                EmailScanResult scanResult;
+                {
+                    std::shared_lock lock(m_mutex);
+                    scanResult = ScanMailItemInternal(mailInfo.value());
+                }
+                m_stats.totalScanned++;
+                results.push_back(std::move(scanResult));
+            }
+
+            Logger::Info("ScanFolder: Completed scan of folder '{}' — {}/{} items scanned",
+                folderPath, results.size(), itemCount);
 
         } catch (const std::exception& e) {
             Logger::Error("ScanFolder - Exception: {}", e.what());
@@ -907,12 +1896,61 @@ public:
 
     [[nodiscard]] bool MoveToJunk(const std::string& entryId) {
         try {
-            // In production, would:
-            // 1. Get MailItem by EntryID
-            // 2. Get JunkEmail folder from Namespace
-            // 3. Call MailItem.Move(junkFolder)
+            if (entryId.empty()) {
+                Logger::Error("MoveToJunk: Empty EntryID");
+                return false;
+            }
 
-            Logger::Info("Moved to junk: {}", entryId);
+            CComPtr<IDispatch> pNamespace;
+            CComPtr<IDispatch> pJunkFolder;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+                pJunkFolder = m_pJunkFolder;
+            }
+
+            if (!pNamespace) {
+                Logger::Error("MoveToJunk: MAPI Namespace unavailable");
+                return false;
+            }
+
+            // Resolve the Junk folder if not cached
+            if (!pJunkFolder) {
+                pJunkFolder = GetDefaultFolder(pNamespace, OL_FOLDER_JUNK_EMAIL);
+                if (!pJunkFolder) {
+                    Logger::Error("MoveToJunk: Cannot obtain Junk Email folder");
+                    return false;
+                }
+            }
+
+            // Retrieve the mail item
+            CComPtr<IDispatch> pMailItem = GetItemFromEntryId(pNamespace, entryId);
+            if (!pMailItem) {
+                Logger::Error("MoveToJunk: Could not resolve EntryID: {}", entryId);
+                return false;
+            }
+
+            // Log audit trail before move
+            auto subjectOpt = GetDispatchStringProperty(pMailItem, DISPID_SUBJECT);
+            auto senderOpt = GetDispatchStringProperty(pMailItem, DISPID_SENDEREMAIL);
+
+            if (!MoveMailItemToFolder(pMailItem, pJunkFolder)) {
+                Logger::Error("MoveToJunk: Move operation failed for EntryID: {}", entryId);
+                return false;
+            }
+
+            m_stats.quarantined++;
+
+            // Track this item as quarantined to prevent accidental deletion
+            {
+                std::unique_lock lock(m_mutex);
+                m_quarantinedEntryIds.insert(entryId);
+            }
+
+            Logger::Info("MoveToJunk: Moved item to Junk (entryId={}, subject={}, sender={})",
+                entryId,
+                subjectOpt.value_or("<unknown>"),
+                senderOpt.value_or("<unknown>"));
             return true;
 
         } catch (const std::exception& e) {
@@ -923,11 +1961,52 @@ public:
 
     [[nodiscard]] bool DeleteMail(const std::string& entryId) {
         try {
-            // In production, would:
-            // 1. Get MailItem by EntryID
-            // 2. Call MailItem.Delete()
+            if (entryId.empty()) {
+                Logger::Error("DeleteMail: Empty EntryID");
+                return false;
+            }
 
-            Logger::Info("Deleted mail: {}", entryId);
+            CComPtr<IDispatch> pNamespace;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+            }
+
+            if (!pNamespace) {
+                Logger::Error("DeleteMail: MAPI Namespace unavailable");
+                return false;
+            }
+
+            CComPtr<IDispatch> pMailItem = GetItemFromEntryId(pNamespace, entryId);
+            if (!pMailItem) {
+                Logger::Error("DeleteMail: Could not resolve EntryID: {}", entryId);
+                return false;
+            }
+
+            // Log full audit trail before deletion (subject, sender, recipients)
+            auto subjectOpt = GetDispatchStringProperty(pMailItem, DISPID_SUBJECT);
+            auto senderOpt = GetDispatchStringProperty(pMailItem, DISPID_SENDEREMAIL);
+            auto toOpt = GetDispatchStringProperty(pMailItem, DISPID_TO);
+
+            Logger::Info("DeleteMail: Deleting item (entryId={}, subject={}, sender={}, to={})",
+                entryId,
+                subjectOpt.value_or("<unknown>"),
+                senderOpt.value_or("<unknown>"),
+                toOpt.value_or("<unknown>"));
+
+            // Execute the deletion via COM
+            if (!InvokeDispatchMethod(pMailItem, DISPID_DELETE)) {
+                Logger::Error("DeleteMail: Delete method invocation failed for EntryID: {}", entryId);
+                return false;
+            }
+
+            // Remove from quarantine tracking if it was there
+            {
+                std::unique_lock lock(m_mutex);
+                m_quarantinedEntryIds.erase(entryId);
+            }
+
+            Logger::Info("DeleteMail: Successfully deleted item (entryId={})", entryId);
             return true;
 
         } catch (const std::exception& e) {
@@ -938,15 +2017,86 @@ public:
 
     [[nodiscard]] bool StripAttachments(const std::string& entryId, const std::vector<std::string>& attachmentNames) {
         try {
-            // In production, would:
-            // 1. Get MailItem by EntryID
-            // 2. Get Attachments collection
-            // 3. For each attachment in list, call Attachment.Delete()
+            if (entryId.empty()) {
+                Logger::Error("StripAttachments: Empty EntryID");
+                return false;
+            }
 
-            m_stats.attachmentsStripped++;
+            CComPtr<IDispatch> pNamespace;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+            }
 
-            Logger::Info("Stripped attachments from: {} (count={})",
-                entryId, attachmentNames.size());
+            if (!pNamespace) {
+                Logger::Error("StripAttachments: MAPI Namespace unavailable");
+                return false;
+            }
+
+            CComPtr<IDispatch> pMailItem = GetItemFromEntryId(pNamespace, entryId);
+            if (!pMailItem) {
+                Logger::Error("StripAttachments: Could not resolve EntryID: {}", entryId);
+                return false;
+            }
+
+            CComPtr<IDispatch> pAttachments = GetDispatchObjectProperty(pMailItem, DISPID_ATTACHMENTS);
+            if (!pAttachments) {
+                Logger::Warn("StripAttachments: No attachments collection on item (entryId={})", entryId);
+                return false;
+            }
+
+            auto countOpt = GetDispatchIntProperty(pAttachments, DISPID_COUNT);
+            if (!countOpt.has_value() || countOpt.value() <= 0) {
+                Logger::Info("StripAttachments: Item has no attachments (entryId={})", entryId);
+                return true;
+            }
+
+            int count = countOpt.value();
+            uint32_t removedCount = 0;
+
+            // Iterate in reverse order to avoid index shifting during deletion
+            for (int i = count; i >= 1; --i) {
+                CComPtr<IDispatch> pAttachment = GetCollectionItem(pAttachments, i);
+                if (!pAttachment) continue;
+
+                auto filenameOpt = GetDispatchStringProperty(pAttachment, DISPID_FILENAME);
+                if (!filenameOpt.has_value()) continue;
+
+                bool shouldRemove = false;
+                if (attachmentNames.empty()) {
+                    // Empty list means strip ALL attachments
+                    shouldRemove = true;
+                } else {
+                    std::string lowerFilename = ToLowerCopy(filenameOpt.value());
+                    for (const auto& name : attachmentNames) {
+                        if (ToLowerCopy(name) == lowerFilename) {
+                            shouldRemove = true;
+                            break;
+                        }
+                    }
+                }
+
+                if (shouldRemove) {
+                    // Attachment.Delete() removes the attachment
+                    if (InvokeDispatchMethod(pAttachment, DISPID_DELETE)) {
+                        ++removedCount;
+                        Logger::Info("StripAttachments: Removed attachment '{}' from entryId={}",
+                            filenameOpt.value(), entryId);
+                    } else {
+                        Logger::Error("StripAttachments: Failed to remove attachment '{}' from entryId={}",
+                            filenameOpt.value(), entryId);
+                    }
+                }
+            }
+
+            // Save the modified mail item
+            if (removedCount > 0) {
+                InvokeDispatchMethod(pMailItem, DISPID_SAVE);
+                m_stats.attachmentsStripped += removedCount;
+            }
+
+            Logger::Info("StripAttachments: Removed {}/{} attachments from entryId={}",
+                removedCount, count, entryId);
             return true;
 
         } catch (const std::exception& e) {
@@ -957,14 +2107,58 @@ public:
 
     [[nodiscard]] bool TagSubject(const std::string& entryId, const std::string& tag) {
         try {
-            // In production, would:
-            // 1. Get MailItem by EntryID
-            // 2. Get Subject property
-            // 3. Prepend tag to subject
-            // 4. Set Subject property
-            // 5. Call MailItem.Save()
+            if (entryId.empty() || tag.empty()) {
+                Logger::Error("TagSubject: Empty EntryID or tag");
+                return false;
+            }
 
-            Logger::Info("Tagged subject: {} with [{}]", entryId, tag);
+            CComPtr<IDispatch> pNamespace;
+            {
+                std::shared_lock lock(m_mutex);
+                pNamespace = m_pNamespace;
+            }
+
+            if (!pNamespace) {
+                Logger::Error("TagSubject: MAPI Namespace unavailable");
+                return false;
+            }
+
+            CComPtr<IDispatch> pMailItem = GetItemFromEntryId(pNamespace, entryId);
+            if (!pMailItem) {
+                Logger::Error("TagSubject: Could not resolve EntryID: {}", entryId);
+                return false;
+            }
+
+            // Get current subject
+            auto subjectOpt = GetDispatchStringProperty(pMailItem, DISPID_SUBJECT);
+            std::string currentSubject = subjectOpt.value_or("");
+
+            // Construct the tag prefix (e.g., "[SPAM] ")
+            std::string tagPrefix = "[" + tag + "] ";
+
+            // Avoid double-tagging
+            if (currentSubject.find(tagPrefix) != std::string::npos) {
+                Logger::Debug("TagSubject: Item already tagged with [{}] (entryId={})", tag, entryId);
+                return true;
+            }
+
+            // Prepend tag to subject
+            std::string newSubject = tagPrefix + currentSubject;
+            std::wstring wNewSubject = StringUtils::ToWide(newSubject);
+
+            if (!SetDispatchStringProperty(pMailItem, DISPID_SUBJECT, wNewSubject)) {
+                Logger::Error("TagSubject: Failed to set Subject property (entryId={})", entryId);
+                return false;
+            }
+
+            // Save the modified mail item
+            if (!InvokeDispatchMethod(pMailItem, DISPID_SAVE)) {
+                Logger::Error("TagSubject: Failed to save item after tagging (entryId={})", entryId);
+                return false;
+            }
+
+            Logger::Info("TagSubject: Tagged item with [{}] (entryId={}, subject={})",
+                tag, entryId, newSubject);
             return true;
 
         } catch (const std::exception& e) {
@@ -982,7 +2176,7 @@ public:
         m_mailEventCallbacks.push_back(std::move(callback));
     }
 
-    void RegisterScanCallback(ScanResultCallback callback) {
+    void RegisterScanCallback(OutlookScanResultCallback callback) {
         std::unique_lock lock(m_mutex);
         m_scanCallbacks.push_back(std::move(callback));
     }
@@ -1015,9 +2209,9 @@ public:
     // STATISTICS
     // ========================================================================
 
-    [[nodiscard]] OutlookScannerStatistics GetStatistics() const {
+    [[nodiscard]] OutlookScannerStatisticsSnapshot GetStatistics() const {
         std::shared_lock lock(m_mutex);
-        return m_stats;
+        return m_stats.ToSnapshot();
     }
 
     void ResetStatistics() {
@@ -1068,11 +2262,16 @@ private:
 
     void DisconnectFromOutlookInternal() {
         try {
-            // In production, would release COM objects and unadvise event sinks
+            // Release COM interface pointers in reverse acquisition order
+            m_pJunkFolder.Release();
+            m_pNamespace.Release();
+            m_pOutlookApp.Release();
+            m_quarantinedEntryIds.clear();
+
             m_addinStatus = AddinStatus::Disconnected;
             m_status = ModuleStatus::Stopped;
 
-            Logger::Info("Disconnected from Outlook");
+            Logger::Info("Disconnected from Outlook — all COM references released");
 
         } catch (const std::exception& e) {
             Logger::Error("Disconnect failed: {}", e.what());
@@ -1081,27 +2280,89 @@ private:
 
     [[nodiscard]] std::optional<MailItemInfo> ExtractMailItemInfo(void* pDispatch) {
         try {
-            if (!pDispatch) return std::nullopt;
+            auto* pDisp = static_cast<IDispatch*>(pDispatch);
+            if (!pDisp) return std::nullopt;
 
             MailItemInfo info;
 
-            // In production, would use IDispatch::Invoke to get properties:
-            // - Subject (DISPID_SUBJECT)
-            // - SenderEmailAddress (DISPID_SENDEREMAIL)
-            // - Body (DISPID_BODY)
-            // - Attachments (DISPID_ATTACHMENTS)
-            // - etc.
+            // Verify message class — only process mail items (IPM.Note*)
+            auto msgClassOpt = GetDispatchStringProperty(pDisp, DISPID_MESSAGECLASS);
+            info.messageClass = msgClassOpt.value_or("IPM.Note");
+            if (info.messageClass.find("IPM.Note") != 0 &&
+                info.messageClass != "IPM.Schedule.Meeting.Request") {
+                // Not a mail item or meeting request — skip
+                return std::nullopt;
+            }
 
-            // Placeholder implementation
-            info.entryId = GenerateEventId();
-            info.messageClass = "IPM.Note";
-            info.subject = "Test Email";
-            info.senderEmail = "sender@example.com";
-            info.senderName = "Test Sender";
-            info.hasAttachments = false;
-            info.attachmentCount = 0;
-            info.isRead = false;
-            info.importance = 1;
+            // Extract EntryID
+            auto entryIdOpt = GetDispatchStringProperty(pDisp, DISPID_ENTRYID);
+            info.entryId = entryIdOpt.value_or(GenerateEventId());
+
+            // Extract Subject
+            auto subjectOpt = GetDispatchStringProperty(pDisp, DISPID_SUBJECT);
+            info.subject = subjectOpt.value_or("");
+
+            // Extract Sender information
+            auto senderEmailOpt = GetDispatchStringProperty(pDisp, DISPID_SENDEREMAIL);
+            info.senderEmail = senderEmailOpt.value_or("");
+
+            auto senderNameOpt = GetDispatchStringProperty(pDisp, DISPID_SENDERNAME);
+            info.senderName = senderNameOpt.value_or("");
+
+            // Extract Recipients
+            auto toOpt = GetDispatchStringProperty(pDisp, DISPID_TO);
+            if (toOpt.has_value() && !toOpt->empty()) {
+                std::istringstream iss(toOpt.value());
+                std::string recipient;
+                while (std::getline(iss, recipient, ';')) {
+                    recipient.erase(0, recipient.find_first_not_of(" \t"));
+                    recipient.erase(recipient.find_last_not_of(" \t") + 1);
+                    if (!recipient.empty()) info.toRecipients.push_back(recipient);
+                }
+            }
+
+            auto ccOpt = GetDispatchStringProperty(pDisp, DISPID_CC);
+            if (ccOpt.has_value() && !ccOpt->empty()) {
+                std::istringstream iss(ccOpt.value());
+                std::string recipient;
+                while (std::getline(iss, recipient, ';')) {
+                    recipient.erase(0, recipient.find_first_not_of(" \t"));
+                    recipient.erase(recipient.find_last_not_of(" \t") + 1);
+                    if (!recipient.empty()) info.ccRecipients.push_back(recipient);
+                }
+            }
+
+            // Extract Body (plain text and HTML)
+            auto bodyOpt = GetDispatchStringProperty(pDisp, DISPID_BODY);
+            info.bodyText = bodyOpt.value_or("");
+
+            auto htmlBodyOpt = GetDispatchStringProperty(pDisp, DISPID_HTMLBODY);
+            info.bodyHtml = htmlBodyOpt.value_or("");
+
+            // Extract Importance
+            auto importanceOpt = GetDispatchIntProperty(pDisp, DISPID_IMPORTANCE);
+            info.importance = importanceOpt.value_or(1);
+
+            // Extract Attachments metadata
+            CComPtr<IDispatch> pAttachments = GetDispatchObjectProperty(pDisp, DISPID_ATTACHMENTS);
+            if (pAttachments) {
+                auto countOpt = GetDispatchIntProperty(pAttachments, DISPID_COUNT);
+                info.attachmentCount = countOpt.has_value() && countOpt.value() > 0
+                    ? static_cast<size_t>(countOpt.value()) : 0;
+                info.hasAttachments = info.attachmentCount > 0;
+
+                // Extract attachment filenames (for extension/name checking)
+                for (size_t i = 1; i <= info.attachmentCount && i <= 100; ++i) {
+                    CComPtr<IDispatch> pAttachment = GetCollectionItem(pAttachments, static_cast<int>(i));
+                    if (pAttachment) {
+                        auto filenameOpt = GetDispatchStringProperty(pAttachment, DISPID_FILENAME);
+                        if (filenameOpt.has_value() && !filenameOpt->empty()) {
+                            info.attachmentNames.push_back(filenameOpt.value());
+                        }
+                    }
+                }
+            }
+
             info.receivedTime = std::chrono::system_clock::now();
 
             return info;
@@ -1116,79 +2377,165 @@ private:
         auto startTime = std::chrono::steady_clock::now();
 
         EmailScanResult result;
-        result.scanId = GenerateEventId();
-        result.scanned = true;
-        result.emailPath = mailInfo.entryId;
+        result.messageId = mailInfo.entryId;
+        result.isClean = true;
+        result.scanTimestamp = std::chrono::system_clock::now();
 
         try {
-            // Check whitelist
-            if (WhiteListStore::Instance().IsWhitelisted(mailInfo.senderEmail)) {
-                result.isWhitelisted = true;
-                result.confidence = 0.0;
+            // Check whitelist (sender email or domain)
+            // Whitelist check: use per-scan whitelist from configuration (trusted senders)
+            // Check safe sender domains from configuration
+            if (IsSafeSenderDomain(mailInfo.senderEmail, m_config.trustedSenders)) {
+                result.riskScore = 5;
                 m_stats.allowed++;
                 return result;
             }
 
-            // Check safe sender domains
-            if (IsSafeSenderDomain(mailInfo.senderEmail)) {
-                result.confidence = 0.1;
-                m_stats.allowed++;
-                return result;
-            }
-
-            // Scan attachments
+            // ================================================================
+            // Attachment scanning — check extensions and file content
+            // ================================================================
             if (m_config.scanAttachments && mailInfo.hasAttachments) {
                 for (const auto& attachmentName : mailInfo.attachmentNames) {
-                    std::wstring wAttachmentName = StringUtils::Utf8ToWide(attachmentName);
+                    std::wstring wAttachmentName = StringUtils::ToWide(attachmentName);
 
                     // Check dangerous extensions
                     if (m_config.blockDangerousAttachments && IsDangerousExtension(wAttachmentName)) {
-                        result.isMalicious = true;
-                        result.threatName = "Dangerous file extension: " + attachmentName;
-                        result.confidence = 0.9;
-                        result.detectionMethod = "Extension blocking";
+                        result.hasMalware = true;
+                        result.isClean = false;
+                        result.primaryThreatName = "Dangerous file extension: " + attachmentName;
+                        result.riskScore = 90;
+                        result.scanLog = "Extension blocking";
+                        result.detectedThreats = static_cast<EmailThreatType>(
+                            static_cast<uint32_t>(result.detectedThreats) |
+                            static_cast<uint32_t>(EmailThreatType::MaliciousAttachment));
+                        result.blockedAttachments.push_back(attachmentName);
+                        result.recommendedAction = ScanAction::Block;
                         break;
                     }
 
                     // Check macro-enabled files
                     if (m_config.blockMacros && IsMacroEnabled(wAttachmentName)) {
-                        result.isMalicious = true;
-                        result.threatName = "Macro-enabled document: " + attachmentName;
-                        result.confidence = 0.8;
-                        result.detectionMethod = "Macro detection";
+                        result.hasMalware = true;
+                        result.isClean = false;
+                        result.primaryThreatName = "Macro-enabled document: " + attachmentName;
+                        result.riskScore = 80;
+                        result.scanLog = "Macro detection";
+                        result.detectedThreats = static_cast<EmailThreatType>(
+                            static_cast<uint32_t>(result.detectedThreats) |
+                            static_cast<uint32_t>(EmailThreatType::SuspiciousMacro));
+                        result.blockedAttachments.push_back(attachmentName);
+                        result.recommendedAction = ScanAction::StripAttachments;
                         break;
                     }
                 }
             }
 
-            // Phishing detection
-            if (m_config.detectPhishing && !result.isMalicious) {
-                // In production, would use PhishingEmailDetector
-                // For now, simple keyword check
-                std::string lowerSubject = StringUtils::ToLower(mailInfo.subject);
-                if (lowerSubject.find("urgent") != std::string::npos ||
-                    lowerSubject.find("verify your account") != std::string::npos ||
-                    lowerSubject.find("suspended") != std::string::npos) {
+            // ================================================================
+            // Phishing detection — use PhishingEmailDetector if available
+            // ================================================================
+            if (m_config.detectPhishing && !result.hasMalware) {
+                if (PhishingEmailDetector::HasInstance()) {
+                    auto& phishDetector = PhishingEmailDetector::Instance();
 
-                    result.isPhishing = true;
-                    result.phishingScore = 0.7;
-                    result.threatName = "Phishing attempt detected";
-                    result.confidence = 0.7;
+                    auto phishResult = phishDetector.AnalyzeEmail(
+                        mailInfo.subject,
+                        mailInfo.bodyText,
+                        mailInfo.bodyHtml,
+                        mailInfo.senderEmail,
+                        "",  // replyTo — not available from basic MailItem
+                        mailInfo.headers);
+
+                    if (phishResult.isPhishing) {
+                        result.isPhishing = true;
+                        result.isClean = false;
+                        result.phishingConfidence = phishResult.confidenceScore;
+                        result.riskScore = std::max(result.riskScore, phishResult.riskScore);
+                        result.primaryThreatName = "Phishing: " + phishResult.analysisSummary;
+                        result.scanLog = "PhishingEmailDetector";
+                        result.detectedThreats = static_cast<EmailThreatType>(
+                            static_cast<uint32_t>(result.detectedThreats) |
+                            static_cast<uint32_t>(EmailThreatType::Phishing));
+                        result.recommendedAction = ScanAction::Block;
+
+                        // Append matched patterns to threat details
+                        for (const auto& pattern : phishResult.matchedPatterns) {
+                            ThreatDetail detail;
+                            detail.type = EmailThreatType::Phishing;
+                            detail.threatName = pattern;
+                            detail.description = phishResult.analysisSummary;
+                            result.threatDetails.push_back(std::move(detail));
+                        }
+                    }
+                } else {
+                    Logger::Debug("ScanMailItemInternal: PhishingEmailDetector not initialized, skipping");
                 }
             }
 
-            // Spam detection
-            if (m_config.detectSpam && !result.isMalicious && !result.isPhishing) {
-                // In production, would use spam scoring
-                // For now, placeholder
-                result.isSpam = false;
-                result.spamScore = 0.1;
+            // ================================================================
+            // Spam detection — use SpamDetector if available
+            // ================================================================
+            if (m_config.detectSpam && !result.hasMalware && !result.isPhishing) {
+                if (SpamDetector::HasInstance()) {
+                    auto& spamDetector = SpamDetector::Instance();
+
+                    auto spamResult = spamDetector.AnalyzeEmail(
+                        mailInfo.subject,
+                        mailInfo.bodyText,
+                        mailInfo.bodyHtml,
+                        mailInfo.senderEmail,
+                        mailInfo.toRecipients,
+                        mailInfo.headers);
+
+                    result.spamScore = spamResult.spamScore;
+                    result.isSpam = spamResult.isSpam;
+
+                    if (result.isSpam) {
+                        result.isClean = false;
+                        result.riskScore = std::max(result.riskScore, spamResult.spamScore);
+                        result.primaryThreatName = "Spam detected (score=" + std::to_string(spamResult.spamScore) + ")";
+                        result.scanLog = "SpamDetector";
+                        result.detectedThreats = static_cast<EmailThreatType>(
+                            static_cast<uint32_t>(result.detectedThreats) |
+                            static_cast<uint32_t>(EmailThreatType::Spam));
+                        result.recommendedAction = ScanAction::TagSubject;
+                    }
+                } else {
+                    Logger::Debug("ScanMailItemInternal: SpamDetector not initialized, skipping");
+                }
             }
 
-            // Link scanning
+            // ================================================================
+            // Link / URL scanning — extract URLs from body and check reputation
+            // ================================================================
             if (m_config.scanLinks) {
-                // In production, would extract URLs from body and check ThreatIntel
-                // For now, placeholder
+                // Extract URLs from both plain text and HTML body
+                std::vector<std::string> urls = ExtractUrlsFromText(mailInfo.bodyText);
+                auto htmlUrls = ExtractUrlsFromText(mailInfo.bodyHtml);
+                urls.insert(urls.end(), htmlUrls.begin(), htmlUrls.end());
+
+                // De-duplicate
+                std::sort(urls.begin(), urls.end());
+                urls.erase(std::unique(urls.begin(), urls.end()), urls.end());
+
+                if (!urls.empty() && PhishingEmailDetector::HasInstance()) {
+                    auto& phishDetector = PhishingEmailDetector::Instance();
+
+                    for (const auto& url : urls) {
+                        if (phishDetector.IsMaliciousLink(url)) {
+                            result.maliciousUrls.push_back(url);
+                            result.isClean = false;
+                            result.riskScore = std::max(result.riskScore, 85);
+                            result.detectedThreats = static_cast<EmailThreatType>(
+                                static_cast<uint32_t>(result.detectedThreats) |
+                                static_cast<uint32_t>(EmailThreatType::MaliciousURL));
+
+                            if (result.primaryThreatName.empty()) {
+                                result.primaryThreatName = "Malicious URL detected: " + url;
+                                result.recommendedAction = ScanAction::Block;
+                            }
+                        }
+                    }
+                }
             }
 
         } catch (const std::exception& e) {
@@ -1202,9 +2549,15 @@ private:
         return result;
     }
 
-    void ProcessMailEvent(const MailItemInfo& mailInfo, MailEventType eventType) {
+    void ProcessMailEvent(const MailItemInfo& mailInfo, MailEventType eventType,
+                         IDispatch* pMailItem = nullptr) {
         try {
-            auto scanResult = ScanMailItemInternal(mailInfo);
+            // Take shared lock for config-dependent scanning, release before callbacks
+            EmailScanResult scanResult;
+            {
+                std::shared_lock lock(m_mutex);
+                scanResult = ScanMailItemInternal(mailInfo);
+            }
 
             // Create event
             MailScanEvent event;
@@ -1215,14 +2568,17 @@ private:
             event.timestamp = std::chrono::system_clock::now();
             event.scanDuration = scanResult.scanDuration;
 
-            // Determine action
-            if (scanResult.isMalicious) {
+            // Determine action based on scan result severity
+            if (scanResult.hasMalware) {
                 event.actionTaken = OutlookScanAction::Delete;
                 m_stats.malwareBlocked++;
                 m_stats.threatsDetected++;
             } else if (scanResult.isPhishing) {
-                event.actionTaken = OutlookScanAction::Block;
+                event.actionTaken = OutlookScanAction::Quarantine;
                 m_stats.phishingBlocked++;
+                m_stats.threatsDetected++;
+            } else if (!scanResult.maliciousUrls.empty()) {
+                event.actionTaken = OutlookScanAction::Block;
                 m_stats.threatsDetected++;
             } else if (scanResult.isSpam) {
                 event.actionTaken = OutlookScanAction::TagSubject;
@@ -1232,7 +2588,12 @@ private:
                 m_stats.allowed++;
             }
 
-            // Invoke callbacks
+            // Execute the determined action if we have a live COM pointer
+            if (pMailItem && event.actionTaken != OutlookScanAction::Allow) {
+                ExecuteAction(pMailItem, mailInfo, event.actionTaken);
+            }
+
+            // Invoke callbacks (snapshot lists to avoid lock during invocation)
             InvokeMailEventCallbacks(event);
             InvokeScanCallbacks(mailInfo, scanResult);
 
@@ -1245,45 +2606,131 @@ private:
         }
     }
 
-    void InvokeMailEventCallbacks(const MailScanEvent& event) {
-        std::shared_lock lock(m_mutex);
-
+    // Execute an enforcement action on a live COM mail item
+    void ExecuteAction(IDispatch* pMailItem, const MailItemInfo& mailInfo,
+                       OutlookScanAction action) {
         try {
-            for (const auto& callback : m_mailEventCallbacks) {
+            switch (action) {
+                case OutlookScanAction::Delete:
+                    if (InvokeDispatchMethod(pMailItem, DISPID_DELETE)) {
+                        Logger::Info("ProcessMailEvent: Deleted malicious item (subject={}, sender={})",
+                            mailInfo.subject, mailInfo.senderEmail);
+                    }
+                    break;
+
+                case OutlookScanAction::Quarantine: {
+                    CComPtr<IDispatch> pJunkFolder;
+                    {
+                        std::shared_lock lock(m_mutex);
+                        pJunkFolder = m_pJunkFolder;
+                    }
+                    if (pJunkFolder && MoveMailItemToFolder(pMailItem, pJunkFolder)) {
+                        {
+                            std::unique_lock lock(m_mutex);
+                            m_quarantinedEntryIds.insert(mailInfo.entryId);
+                        }
+                        m_stats.quarantined++;
+                        Logger::Info("ProcessMailEvent: Quarantined item (subject={}, sender={})",
+                            mailInfo.subject, mailInfo.senderEmail);
+                    } else {
+                        Logger::Warn("ProcessMailEvent: Quarantine failed — Junk folder unavailable");
+                    }
+                    break;
+                }
+
+                case OutlookScanAction::TagSubject: {
+                    std::wstring wTag;
+                    // Determine tag based on context
+                    wTag = L"[SPAM] ";
+
+                    auto subjectOpt = GetDispatchStringProperty(pMailItem, DISPID_SUBJECT);
+                    std::string currentSubject = subjectOpt.value_or("");
+                    std::string tagged = StringUtils::ToNarrow(wTag) + currentSubject;
+                    SetDispatchStringProperty(pMailItem, DISPID_SUBJECT,
+                        StringUtils::ToWide(tagged));
+                    InvokeDispatchMethod(pMailItem, DISPID_SAVE);
+
+                    Logger::Info("ProcessMailEvent: Tagged item subject (subject={}, sender={})",
+                        mailInfo.subject, mailInfo.senderEmail);
+                    break;
+                }
+
+                case OutlookScanAction::Block:
+                    // For blocked items, move to Junk as a fallback
+                    {
+                        CComPtr<IDispatch> pJunkFolder;
+                        {
+                            std::shared_lock lock(m_mutex);
+                            pJunkFolder = m_pJunkFolder;
+                        }
+                        if (pJunkFolder) {
+                            MoveMailItemToFolder(pMailItem, pJunkFolder);
+                        }
+                    }
+                    Logger::Info("ProcessMailEvent: Blocked item (subject={}, sender={})",
+                        mailInfo.subject, mailInfo.senderEmail);
+                    break;
+
+                default:
+                    break;
+            }
+        } catch (const std::exception& e) {
+            Logger::Error("ExecuteAction - Exception: {}", e.what());
+        }
+    }
+
+    void InvokeMailEventCallbacks(const MailScanEvent& event) {
+        // Snapshot callbacks under lock, then invoke outside lock to prevent deadlock
+        std::vector<MailEventCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy = m_mailEventCallbacks;
+        }
+
+        for (const auto& callback : callbacksCopy) {
+            try {
                 if (callback) {
                     callback(event);
                 }
+            } catch (const std::exception& e) {
+                Logger::Error("InvokeMailEventCallbacks: Callback threw: {}", e.what());
             }
-        } catch (const std::exception& e) {
-            Logger::Error("InvokeMailEventCallbacks - Exception: {}", e.what());
         }
     }
 
     void InvokeScanCallbacks(const MailItemInfo& mailInfo, const EmailScanResult& result) {
-        std::shared_lock lock(m_mutex);
+        std::vector<OutlookScanResultCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy = m_scanCallbacks;
+        }
 
-        try {
-            for (const auto& callback : m_scanCallbacks) {
+        for (const auto& callback : callbacksCopy) {
+            try {
                 if (callback) {
                     callback(mailInfo, result);
                 }
+            } catch (const std::exception& e) {
+                Logger::Error("InvokeScanCallbacks: Callback threw: {}", e.what());
             }
-        } catch (const std::exception& e) {
-            Logger::Error("InvokeScanCallbacks - Exception: {}", e.what());
         }
     }
 
     void InvokeBlockCallbacks(const MailItemInfo& mailInfo, OutlookScanAction action) {
-        std::shared_lock lock(m_mutex);
+        std::vector<BlockCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy = m_blockCallbacks;
+        }
 
-        try {
-            for (const auto& callback : m_blockCallbacks) {
+        for (const auto& callback : callbacksCopy) {
+            try {
                 if (callback) {
                     callback(mailInfo, action);
                 }
+            } catch (const std::exception& e) {
+                Logger::Error("InvokeBlockCallbacks: Callback threw: {}", e.what());
             }
-        } catch (const std::exception& e) {
-            Logger::Error("InvokeBlockCallbacks - Exception: {}", e.what());
         }
     }
 
@@ -1300,15 +2747,23 @@ private:
     OutlookScannerConfiguration m_config;
     OutlookScannerStatistics m_stats;
 
+    // COM interface pointers (RAII via CComPtr)
+    CComPtr<IDispatch> m_pOutlookApp;
+    CComPtr<IDispatch> m_pNamespace;
+    CComPtr<IDispatch> m_pJunkFolder;
+
     // Callbacks
     std::vector<MailEventCallback> m_mailEventCallbacks;
-    std::vector<ScanResultCallback> m_scanCallbacks;
+    std::vector<OutlookScanResultCallback> m_scanCallbacks;
     std::vector<BlockCallback> m_blockCallbacks;
     std::vector<PreSendCallback> m_preSendCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
 
     // Folders
     std::vector<FolderInfo> m_monitoredFolders;
+
+    // Set of EntryIDs currently in quarantine (protected from deletion)
+    std::unordered_set<std::string> m_quarantinedEntryIds;
 };
 
 // ============================================================================
@@ -1407,32 +2862,32 @@ OutlookVersionInfo OutlookScanner::GetOutlookVersion() const {
 // EVENT HANDLERS
 // ========================================================================
 
-void OutlookScanner::OnNewMail(void* pDispatchMailItem) {
-    m_impl->OnNewMail(pDispatchMailItem);
+void OutlookScanner::OnNewMail(IDispatch* pDispatchMailItem) {
+    m_impl->OnNewMail(static_cast<void*>(pDispatchMailItem));
 }
 
 void OutlookScanner::OnNewMailEx(const std::string& entryIdCollection) {
     m_impl->OnNewMailEx(entryIdCollection);
 }
 
-bool OutlookScanner::OnItemSend(void* pDispatchMailItem, bool& cancel) {
-    return m_impl->OnItemSend(pDispatchMailItem, cancel);
+bool OutlookScanner::OnItemSend(IDispatch* pDispatchMailItem, bool& cancel) {
+    return m_impl->OnItemSend(static_cast<void*>(pDispatchMailItem), cancel);
 }
 
-void OutlookScanner::OnItemAdd(void* pDispatchItem) {
-    m_impl->OnItemAdd(pDispatchItem);
+void OutlookScanner::OnItemAdd(IDispatch* pDispatchItem) {
+    m_impl->OnItemAdd(static_cast<void*>(pDispatchItem));
 }
 
-void OutlookScanner::OnItemChange(void* pDispatchItem) {
-    m_impl->OnItemChange(pDispatchItem);
+void OutlookScanner::OnItemChange(IDispatch* pDispatchItem) {
+    m_impl->OnItemChange(static_cast<void*>(pDispatchItem));
 }
 
-void OutlookScanner::OnBeforeDelete(void* pDispatchItem, bool& cancel) {
-    m_impl->OnBeforeDelete(pDispatchItem, cancel);
+void OutlookScanner::OnBeforeDelete(IDispatch* pDispatchItem, bool& cancel) {
+    m_impl->OnBeforeDelete(static_cast<void*>(pDispatchItem), cancel);
 }
 
-void OutlookScanner::OnAttachmentAdd(void* pDispatchAttachment, bool& cancel) {
-    m_impl->OnAttachmentAdd(pDispatchAttachment, cancel);
+void OutlookScanner::OnAttachmentAdd(IDispatch* pDispatchAttachment, bool& cancel) {
+    m_impl->OnAttachmentAdd(static_cast<void*>(pDispatchAttachment), cancel);
 }
 
 // ========================================================================
@@ -1447,12 +2902,12 @@ EmailScanResult OutlookScanner::ScanMailItemById(const std::string& entryId) {
     return m_impl->ScanMailItemById(entryId);
 }
 
-std::optional<MailItemInfo> OutlookScanner::GetMailItemInfo(void* pDispatch) {
-    return m_impl->GetMailItemInfo(pDispatch);
+std::optional<MailItemInfo> OutlookScanner::GetMailItemInfo(IDispatch* pDispatch) {
+    return m_impl->GetMailItemInfo(static_cast<void*>(pDispatch));
 }
 
-std::optional<fs::path> OutlookScanner::ExtractAttachment(void* pDispatch, size_t attachmentIndex) {
-    return m_impl->ExtractAttachment(pDispatch, attachmentIndex);
+std::optional<fs::path> OutlookScanner::ExtractAttachment(IDispatch* pDispatch, size_t attachmentIndex) {
+    return m_impl->ExtractAttachment(static_cast<void*>(pDispatch), attachmentIndex);
 }
 
 // ========================================================================
@@ -1503,7 +2958,7 @@ void OutlookScanner::RegisterMailEventCallback(MailEventCallback callback) {
     m_impl->RegisterMailEventCallback(std::move(callback));
 }
 
-void OutlookScanner::RegisterScanCallback(ScanResultCallback callback) {
+void OutlookScanner::RegisterScanCallback(OutlookScanResultCallback callback) {
     m_impl->RegisterScanCallback(std::move(callback));
 }
 
@@ -1527,7 +2982,7 @@ void OutlookScanner::UnregisterCallbacks() {
 // STATISTICS
 // ========================================================================
 
-OutlookScannerStatistics OutlookScanner::GetStatistics() const {
+OutlookScannerStatisticsSnapshot OutlookScanner::GetStatistics() const {
     return m_impl->GetStatistics();
 }
 
@@ -1618,32 +3073,28 @@ bool OutlookScanner::SelfTest() {
 
 [[nodiscard]] bool IsOutlookRunning() {
     try {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot.valid()) {
             return false;
         }
 
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (!Process32FirstW(hSnapshot, &pe32)) {
-            CloseHandle(hSnapshot);
+        if (!Process32FirstW(hSnapshot.get(), &pe32)) {
             return false;
         }
 
-        bool found = false;
         do {
             std::wstring processName = pe32.szExeFile;
-            std::wstring lowerName = StringUtils::ToLower(processName);
+            std::wstring lowerName = StringUtils::ToLowerCopy(processName);
 
             if (lowerName == L"outlook.exe") {
-                found = true;
-                break;
+                return true;
             }
-        } while (Process32NextW(hSnapshot, &pe32));
+        } while (Process32NextW(hSnapshot.get(), &pe32));
 
-        CloseHandle(hSnapshot);
-        return found;
+        return false;
 
     } catch (...) {
         return false;
@@ -1652,33 +3103,28 @@ bool OutlookScanner::SelfTest() {
 
 [[nodiscard]] std::optional<DWORD> GetOutlookProcessId() {
     try {
-        HANDLE hSnapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
-        if (hSnapshot == INVALID_HANDLE_VALUE) {
+        HandleGuard hSnapshot(CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0));
+        if (!hSnapshot.valid()) {
             return std::nullopt;
         }
 
         PROCESSENTRY32W pe32;
         pe32.dwSize = sizeof(PROCESSENTRY32W);
 
-        if (!Process32FirstW(hSnapshot, &pe32)) {
-            CloseHandle(hSnapshot);
+        if (!Process32FirstW(hSnapshot.get(), &pe32)) {
             return std::nullopt;
         }
 
-        DWORD pid = 0;
         do {
             std::wstring processName = pe32.szExeFile;
-            std::wstring lowerName = StringUtils::ToLower(processName);
+            std::wstring lowerName = StringUtils::ToLowerCopy(processName);
 
             if (lowerName == L"outlook.exe") {
-                pid = pe32.th32ProcessID;
-                break;
+                return pe32.th32ProcessID;
             }
-        } while (Process32NextW(hSnapshot, &pe32));
+        } while (Process32NextW(hSnapshot.get(), &pe32));
 
-        CloseHandle(hSnapshot);
-
-        return pid > 0 ? std::optional<DWORD>(pid) : std::nullopt;
+        return std::nullopt;
 
     } catch (...) {
         return std::nullopt;

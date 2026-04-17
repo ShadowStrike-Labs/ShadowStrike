@@ -32,18 +32,24 @@
 // ============================================================================
 // INFRASTRUCTURE INCLUDES
 // ============================================================================
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../Utils/SystemUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/ProcessUtils.hpp"
-#include "../HashStore/HashStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/ProcessUtils.hpp"
+#include "PhantomCore/Utils/Base64Utils.hpp"
+#include "PhantomCore/HashStore/HashStore.hpp"
 #include "AttachmentScanner.hpp"
 #include "PhishingEmailDetector.hpp"
 #include "SpamDetector.hpp"
 #include "EmailProtection.hpp"
+
+// ============================================================================
+// JSON LIBRARY (L1 fix)
+// ============================================================================
+#include <nlohmann/json.hpp>
 
 // ============================================================================
 // STANDARD LIBRARY INCLUDES
@@ -80,6 +86,27 @@ using namespace Utils;
 
 namespace {
 
+inline void TrimNarrow(std::string& s) {
+    auto notspace = [](unsigned char c) { return !std::isspace(c); };
+    s.erase(s.begin(), std::find_if(s.begin(), s.end(), notspace));
+    s.erase(std::find_if(s.rbegin(), s.rend(), notspace).base(), s.end());
+}
+
+[[nodiscard]] inline std::string ToLowerCopy(std::string_view s) noexcept {
+    std::string r(s);
+    for (auto& c : r) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return r;
+}
+
+inline bool IEquals(std::string_view a, std::string_view b) noexcept {
+    if (a.size() != b.size()) return false;
+    for (size_t i = 0; i < a.size(); ++i) {
+        if (std::tolower(static_cast<unsigned char>(a[i])) !=
+            std::tolower(static_cast<unsigned char>(b[i]))) return false;
+    }
+    return true;
+}
+
 /**
  * @brief Parse From_ line in mbox format.
  */
@@ -103,7 +130,7 @@ namespace {
 }
 
 /**
- * @brief Parse email header line.
+ * @brief Parse email header line (M7 fix - safe isspace).
  */
 [[nodiscard]] bool ParseHeaderLine(std::string_view line, std::string& key, std::string& value) {
     auto colonPos = line.find(':');
@@ -113,9 +140,9 @@ namespace {
 
     key = std::string(line.substr(0, colonPos));
 
-    // Skip colon and whitespace
+    // Skip colon and whitespace (M7 fix - cast to unsigned char)
     size_t valueStart = colonPos + 1;
-    while (valueStart < line.length() && std::isspace(line[valueStart])) {
+    while (valueStart < line.length() && std::isspace(static_cast<unsigned char>(line[valueStart]))) {
         valueStart++;
     }
 
@@ -138,7 +165,7 @@ namespace {
 
     // No brackets, assume entire header is email
     std::string email(header);
-    StringUtils::Trim(email);
+    TrimNarrow(email);
     return email;
 }
 
@@ -157,7 +184,7 @@ namespace {
         } else if (ch == '>') {
             inBrackets = false;
         } else if (ch == ',' && !inBrackets) {
-            StringUtils::Trim(current);
+            TrimNarrow(current);
             if (!current.empty()) {
                 recipients.push_back(ExtractEmailAddress(current));
             }
@@ -168,7 +195,7 @@ namespace {
     }
 
     // Don't forget last recipient
-    StringUtils::Trim(current);
+    TrimNarrow(current);
     if (!current.empty()) {
         recipients.push_back(ExtractEmailAddress(current));
     }
@@ -177,14 +204,93 @@ namespace {
 }
 
 /**
- * @brief Check if line is mbox separator.
+ * @brief Check if line is mbox separator (H2 fix - more lenient matching).
+ * Standard mbox From line: "From <sender> <date>" (not all have @)
+ * Also handles >From quoting for body lines.
  */
 [[nodiscard]] bool IsMboxSeparator(std::string_view line) {
-    return line.starts_with("From ") && line.find('@') != std::string_view::npos;
+    // Must start with "From " (not ">From ")
+    if (!line.starts_with("From ") || line.starts_with(">From ")) {
+        return false;
+    }
+    
+    // Remove "From " prefix and check rest
+    auto rest = line.substr(5);
+    
+    // Must have at least one space (between sender and date)
+    auto spacePos = rest.find(' ');
+    if (spacePos == std::string_view::npos || spacePos == 0) {
+        return false;
+    }
+    
+    // Validate the date portion - RFC 5322 mbox envelope line date
+    // typically starts with a day-of-week abbreviation (Mon Tue Wed...) or
+    // month abbreviation (Jan Feb Mar...). We accept both formats.
+    auto datePart = rest.substr(spacePos + 1);
+    if (datePart.empty()) {
+        return false;
+    }
+
+    // Trim leading whitespace from date
+    size_t dateStart = 0;
+    while (dateStart < datePart.size() &&
+           std::isspace(static_cast<unsigned char>(datePart[dateStart]))) {
+        ++dateStart;
+    }
+    if (dateStart >= datePart.size()) {
+        return false;
+    }
+    datePart.remove_prefix(dateStart);
+
+    // Extract the first token of the date
+    auto tokenEnd = datePart.find(' ');
+    auto firstToken = datePart.substr(0, tokenEnd);
+
+    // RFC 5322 day-of-week abbreviations
+    static constexpr std::string_view kDays[] = {
+        "Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"
+    };
+    // RFC 5322 month abbreviations
+    static constexpr std::string_view kMonths[] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+
+    for (auto d : kDays) {
+        if (firstToken == d) return true;
+    }
+    for (auto m : kMonths) {
+        if (firstToken == m) return true;
+    }
+
+    // Also accept numeric day (1-31) as first token for non-standard generators
+    if (firstToken.size() <= 2 && firstToken.size() >= 1) {
+        bool allDigits = true;
+        for (char c : firstToken) {
+            if (!std::isdigit(static_cast<unsigned char>(c))) {
+                allDigits = false;
+                break;
+            }
+        }
+        if (allDigits) {
+            int day = 0;
+            for (char c : firstToken) day = day * 10 + (c - '0');
+            if (day >= 1 && day <= 31) return true;
+        }
+    }
+
+    return false;
 }
 
 /**
- * @brief Get user profile directory.
+ * @brief Check if line is quoted From in body (H2 fix).
+ */
+[[nodiscard]] bool IsQuotedFromLine(std::string_view line) {
+    return line.starts_with(">From ");
+}
+
+/**
+ * @brief Get user profile directory (L5 fix - log on error).
  */
 [[nodiscard]] std::optional<fs::path> GetUserProfileDir() {
     try {
@@ -194,7 +300,10 @@ namespace {
             return fs::path(path);
         }
 #endif
+    } catch (const std::exception& e) {
+        Logger::Warn("ThunderbirdScanner: GetUserProfileDir exception: {}", e.what());
     } catch (...) {
+        Logger::Warn("ThunderbirdScanner: GetUserProfileDir unknown exception");
     }
     return std::nullopt;
 }
@@ -241,6 +350,550 @@ namespace {
         default: return "Unknown";
     }
 }
+
+// ============================================================================
+// MIME & ENCODING HELPER FUNCTIONS
+// ============================================================================
+
+namespace {
+
+/// @brief Maximum MIME nesting depth to prevent pathological multipart bombs.
+inline constexpr size_t kMaxMimeNestingDepth = 10;
+
+/**
+ * @brief Decode a quoted-printable encoded string per RFC 2045.
+ */
+[[nodiscard]] std::string DecodeQuotedPrintable(std::string_view input) {
+    std::string output;
+    output.reserve(input.size());
+
+    for (size_t i = 0; i < input.size(); ++i) {
+        if (input[i] == '=') {
+            // Soft line break: =\r\n or =\n
+            if (i + 1 < input.size() && input[i + 1] == '\n') {
+                ++i; // skip \n
+                continue;
+            }
+            if (i + 2 < input.size() && input[i + 1] == '\r' && input[i + 2] == '\n') {
+                i += 2; // skip \r\n
+                continue;
+            }
+            // Hex pair
+            if (i + 2 < input.size()) {
+                auto hexVal = [](char c) -> int {
+                    if (c >= '0' && c <= '9') return c - '0';
+                    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                    return -1;
+                };
+                int hi = hexVal(input[i + 1]);
+                int lo = hexVal(input[i + 2]);
+                if (hi >= 0 && lo >= 0) {
+                    output += static_cast<char>((hi << 4) | lo);
+                    i += 2;
+                    continue;
+                }
+            }
+            // Malformed =, pass through
+            output += '=';
+        } else {
+            output += input[i];
+        }
+    }
+    return output;
+}
+
+/**
+ * @brief Decode a base64 encoded string using the infrastructure Base64Utils.
+ */
+[[nodiscard]] std::string DecodeBase64String(std::string_view input) {
+    // Strip whitespace from base64 input (line breaks are common in MIME)
+    std::string cleaned;
+    cleaned.reserve(input.size());
+    for (char c : input) {
+        if (!std::isspace(static_cast<unsigned char>(c))) {
+            cleaned += c;
+        }
+    }
+
+    std::vector<uint8_t> decoded;
+    Utils::Base64DecodeError err = Utils::Base64DecodeError::None;
+    Utils::Base64DecodeOptions opts;
+    opts.ignoreWhitespace = true;
+
+    if (Utils::Base64Decode(cleaned, decoded, err, opts)) {
+        return std::string(decoded.begin(), decoded.end());
+    }
+
+    Logger::Debug("ThunderbirdScanner: Base64 decode failed: {}",
+                  Utils::Base64DecodeErrorToString(err));
+    return {};
+}
+
+/**
+ * @brief Decode message body based on Content-Transfer-Encoding.
+ */
+[[nodiscard]] std::string DecodeTransferEncoding(
+    std::string_view body,
+    std::string_view encoding
+) {
+    if (encoding.empty() || encoding == "7bit" || encoding == "8bit" || encoding == "binary") {
+        return std::string(body);
+    }
+    if (encoding == "quoted-printable") {
+        return DecodeQuotedPrintable(body);
+    }
+    if (encoding == "base64") {
+        return DecodeBase64String(body);
+    }
+    // Unknown encoding - return raw
+    return std::string(body);
+}
+
+/**
+ * @brief Extract a parameter value from a MIME header (e.g., boundary from Content-Type).
+ * Handles both quoted and unquoted parameter values.
+ */
+[[nodiscard]] std::string ExtractMimeParam(std::string_view header, std::string_view paramName) {
+    // Search case-insensitively for paramName=
+    std::string lowerHeader(header);
+    std::string lowerParam(paramName);
+    for (auto& c : lowerHeader) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    for (auto& c : lowerParam) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+    std::string searchKey = lowerParam + "=";
+    auto pos = lowerHeader.find(searchKey);
+    if (pos == std::string::npos) {
+        return {};
+    }
+
+    size_t valueStart = pos + searchKey.size();
+    if (valueStart >= header.size()) {
+        return {};
+    }
+
+    // Handle quoted value
+    if (header[valueStart] == '"') {
+        ++valueStart;
+        auto endQuote = header.find('"', valueStart);
+        if (endQuote == std::string_view::npos) {
+            return std::string(header.substr(valueStart));
+        }
+        return std::string(header.substr(valueStart, endQuote - valueStart));
+    }
+
+    // Unquoted value - ends at ; or whitespace or end of string
+    size_t valueEnd = valueStart;
+    while (valueEnd < header.size() && header[valueEnd] != ';' &&
+           !std::isspace(static_cast<unsigned char>(header[valueEnd]))) {
+        ++valueEnd;
+    }
+    return std::string(header.substr(valueStart, valueEnd - valueStart));
+}
+
+/**
+ * @brief Check if a Content-Type indicates multipart.
+ */
+[[nodiscard]] bool IsMultipartContentType(std::string_view contentType) {
+    std::string lower(contentType.substr(0, 20));
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    return lower.starts_with("multipart/");
+}
+
+/**
+ * @brief Check if Content-Disposition indicates an attachment.
+ */
+[[nodiscard]] bool IsAttachmentDisposition(std::string_view disposition) {
+    if (disposition.empty()) return false;
+    std::string lower(disposition);
+    for (auto& c : lower) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    // "attachment" or "attachment; filename=..."
+    return lower.starts_with("attachment");
+}
+
+/**
+ * @brief Extract filename from Content-Disposition header.
+ */
+[[nodiscard]] std::string ExtractAttachmentFilename(std::string_view disposition) {
+    return ExtractMimeParam(disposition, "filename");
+}
+
+/**
+ * @brief Represents a single MIME part.
+ */
+struct MimePart {
+    std::map<std::string, std::string> headers;
+    std::string body;
+    std::string contentType;
+    std::string contentDisposition;
+    std::string transferEncoding;
+    bool isAttachment = false;
+    std::string filename;
+};
+
+/**
+ * @brief Parse MIME multipart body into parts.
+ * @param body       Raw body content after headers.
+ * @param boundary   The multipart boundary (without -- prefix).
+ * @param depth      Current nesting depth for recursion protection.
+ * @return Vector of parsed MIME parts.
+ */
+[[nodiscard]] std::vector<MimePart> ParseMultipartBody(
+    std::string_view body,
+    std::string_view boundary,
+    size_t depth = 0
+) {
+    std::vector<MimePart> parts;
+
+    if (depth > kMaxMimeNestingDepth || boundary.empty()) {
+        return parts;
+    }
+
+    std::string delimiter = "--" + std::string(boundary);
+    std::string closeDelimiter = delimiter + "--";
+
+    // Find the first boundary
+    auto pos = body.find(delimiter);
+    if (pos == std::string_view::npos) {
+        return parts;
+    }
+
+    // Skip past first delimiter line
+    pos += delimiter.size();
+    if (pos < body.size() && body[pos] == '\r') ++pos;
+    if (pos < body.size() && body[pos] == '\n') ++pos;
+
+    while (pos < body.size()) {
+        // Find next boundary
+        auto nextBoundary = body.find(delimiter, pos);
+        if (nextBoundary == std::string_view::npos) {
+            break;
+        }
+
+        // Extract this part's content (between current pos and next boundary)
+        auto partContent = body.substr(pos, nextBoundary - pos);
+
+        // Remove trailing \r\n before boundary
+        if (partContent.size() >= 2 && partContent.ends_with("\r\n")) {
+            partContent.remove_suffix(2);
+        } else if (partContent.size() >= 1 && partContent.ends_with("\n")) {
+            partContent.remove_suffix(1);
+        }
+
+        // Parse part headers and body
+        MimePart part;
+        auto headerEnd = partContent.find("\r\n\r\n");
+        size_t bodyStart = 0;
+        if (headerEnd != std::string_view::npos) {
+            bodyStart = headerEnd + 4;
+        } else {
+            headerEnd = partContent.find("\n\n");
+            if (headerEnd != std::string_view::npos) {
+                bodyStart = headerEnd + 2;
+            }
+        }
+
+        if (headerEnd != std::string_view::npos) {
+            // Parse part headers (with folding support)
+            auto headersStr = partContent.substr(0, headerEnd);
+            std::string currentKey, currentValue;
+
+            auto commitHeader = [&]() {
+                if (!currentKey.empty()) {
+                    part.headers[currentKey] = currentValue;
+                    if (IEquals(currentKey, "Content-Type")) {
+                        part.contentType = currentValue;
+                    } else if (IEquals(currentKey, "Content-Disposition")) {
+                        part.contentDisposition = currentValue;
+                    } else if (IEquals(currentKey, "Content-Transfer-Encoding")) {
+                        part.transferEncoding = currentValue;
+                        // Normalize to lowercase
+                        for (auto& c : part.transferEncoding)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    }
+                }
+            };
+
+            std::istringstream headerStream{std::string(headersStr)};
+            std::string hLine;
+            while (std::getline(headerStream, hLine)) {
+                // Remove trailing \r
+                if (!hLine.empty() && hLine.back() == '\r') hLine.pop_back();
+
+                // Folded continuation line (starts with whitespace)
+                if (!hLine.empty() &&
+                    (hLine[0] == ' ' || hLine[0] == '\t') &&
+                    !currentKey.empty()) {
+                    currentValue += " ";
+                    size_t ws = 0;
+                    while (ws < hLine.size() &&
+                           std::isspace(static_cast<unsigned char>(hLine[ws]))) ++ws;
+                    currentValue += hLine.substr(ws);
+                    continue;
+                }
+
+                // Commit previous header
+                commitHeader();
+
+                // Parse new header
+                auto colon = hLine.find(':');
+                if (colon != std::string::npos) {
+                    currentKey = hLine.substr(0, colon);
+                    size_t valStart = colon + 1;
+                    while (valStart < hLine.size() &&
+                           std::isspace(static_cast<unsigned char>(hLine[valStart]))) ++valStart;
+                    currentValue = hLine.substr(valStart);
+                } else {
+                    currentKey.clear();
+                    currentValue.clear();
+                }
+            }
+            commitHeader();
+
+            part.body = std::string(partContent.substr(bodyStart));
+        } else {
+            // No headers - entire content is body
+            part.body = std::string(partContent);
+        }
+
+        // Determine if this is an attachment
+        if (IsAttachmentDisposition(part.contentDisposition)) {
+            part.isAttachment = true;
+            part.filename = ExtractAttachmentFilename(part.contentDisposition);
+        } else if (!part.contentType.empty()) {
+            // Also check Content-Type name= for inline attachments
+            auto name = ExtractMimeParam(part.contentType, "name");
+            if (!name.empty() && !part.contentType.starts_with("text/") &&
+                !IsMultipartContentType(part.contentType)) {
+                part.isAttachment = true;
+                part.filename = name;
+            }
+        }
+
+        parts.push_back(std::move(part));
+
+        // Advance past boundary
+        pos = nextBoundary + delimiter.size();
+
+        // Check for closing boundary
+        if (pos + 2 <= body.size() && body[pos] == '-' && body[pos + 1] == '-') {
+            break; // End of multipart
+        }
+
+        // Skip line ending after boundary
+        if (pos < body.size() && body[pos] == '\r') ++pos;
+        if (pos < body.size() && body[pos] == '\n') ++pos;
+    }
+
+    return parts;
+}
+
+/**
+ * @brief Recursively extract text bodies and count attachments from MIME parts.
+ */
+void ExtractMimeContent(
+    const std::vector<MimePart>& parts,
+    std::string& bodyText,
+    std::string& bodyHtml,
+    size_t& attachmentCount,
+    size_t maxBodySize,
+    size_t depth = 0
+) {
+    if (depth > kMaxMimeNestingDepth) return;
+
+    for (const auto& part : parts) {
+        if (part.isAttachment) {
+            ++attachmentCount;
+            continue;
+        }
+
+        // Check if this part is itself multipart
+        if (IsMultipartContentType(part.contentType)) {
+            auto innerBoundary = ExtractMimeParam(part.contentType, "boundary");
+            if (!innerBoundary.empty()) {
+                auto innerParts = ParseMultipartBody(part.body, innerBoundary, depth + 1);
+                ExtractMimeContent(innerParts, bodyText, bodyHtml,
+                                   attachmentCount, maxBodySize, depth + 1);
+            }
+            continue;
+        }
+
+        // Decode the body
+        std::string decodedBody = DecodeTransferEncoding(part.body, part.transferEncoding);
+
+        // Determine content type
+        std::string lowerCT(part.contentType);
+        for (auto& c : lowerCT) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+        if (lowerCT.starts_with("text/plain") && bodyText.size() < maxBodySize) {
+            size_t remaining = maxBodySize - bodyText.size();
+            bodyText += decodedBody.substr(0, remaining);
+        } else if (lowerCT.starts_with("text/html") && bodyHtml.size() < maxBodySize) {
+            size_t remaining = maxBodySize - bodyHtml.size();
+            bodyHtml += decodedBody.substr(0, remaining);
+        }
+    }
+}
+
+/**
+ * @brief Unescape a JavaScript string literal value from prefs.js.
+ * Handles standard escape sequences: \\, \", \n, \r, \t, \uXXXX.
+ */
+[[nodiscard]] std::string UnescapeJsString(std::string_view value) {
+    std::string result;
+    result.reserve(value.size());
+
+    for (size_t i = 0; i < value.size(); ++i) {
+        if (value[i] == '\\' && i + 1 < value.size()) {
+            char next = value[i + 1];
+            switch (next) {
+                case '\\': result += '\\'; ++i; break;
+                case '"':  result += '"';  ++i; break;
+                case '\'': result += '\''; ++i; break;
+                case 'n':  result += '\n'; ++i; break;
+                case 'r':  result += '\r'; ++i; break;
+                case 't':  result += '\t'; ++i; break;
+                case 'u': {
+                    // \uXXXX - Unicode escape
+                    if (i + 5 < value.size()) {
+                        auto hexToInt = [](char c) -> int {
+                            if (c >= '0' && c <= '9') return c - '0';
+                            if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+                            if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+                            return -1;
+                        };
+                        int h3 = hexToInt(value[i + 2]);
+                        int h2 = hexToInt(value[i + 3]);
+                        int h1 = hexToInt(value[i + 4]);
+                        int h0 = hexToInt(value[i + 5]);
+                        if (h3 >= 0 && h2 >= 0 && h1 >= 0 && h0 >= 0) {
+                            uint32_t codepoint = (h3 << 12) | (h2 << 8) | (h1 << 4) | h0;
+                            // Encode as UTF-8
+                            if (codepoint < 0x80) {
+                                result += static_cast<char>(codepoint);
+                            } else if (codepoint < 0x800) {
+                                result += static_cast<char>(0xC0 | (codepoint >> 6));
+                                result += static_cast<char>(0x80 | (codepoint & 0x3F));
+                            } else {
+                                result += static_cast<char>(0xE0 | (codepoint >> 12));
+                                result += static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F));
+                                result += static_cast<char>(0x80 | (codepoint & 0x3F));
+                            }
+                            i += 5;
+                            break;
+                        }
+                    }
+                    // Malformed \u - pass through
+                    result += '\\';
+                    break;
+                }
+                default:
+                    // Unknown escape - pass through
+                    result += '\\';
+                    break;
+            }
+        } else {
+            result += value[i];
+        }
+    }
+    return result;
+}
+
+/**
+ * @brief Parse a single user_pref() line from Thunderbird's prefs.js.
+ * @return pair of (key, value) or empty strings on failure.
+ */
+[[nodiscard]] std::pair<std::string, std::string> ParsePrefsJsLine(std::string_view line) {
+    // Format: user_pref("key", "value");  or  user_pref("key", value);
+    static constexpr std::string_view kPrefix = "user_pref(\"";
+
+    // Trim whitespace
+    while (!line.empty() && std::isspace(static_cast<unsigned char>(line.front()))) {
+        line.remove_prefix(1);
+    }
+
+    if (!line.starts_with(kPrefix)) {
+        return {};
+    }
+    line.remove_prefix(kPrefix.size());
+
+    // Find the closing quote for the key (handling escaped quotes)
+    std::string key;
+    size_t i = 0;
+    while (i < line.size()) {
+        if (line[i] == '\\' && i + 1 < line.size()) {
+            key += line[i];
+            key += line[i + 1];
+            i += 2;
+        } else if (line[i] == '"') {
+            break;
+        } else {
+            key += line[i];
+            ++i;
+        }
+    }
+    if (i >= line.size()) return {};
+
+    // Unescape the key
+    key = UnescapeJsString(key);
+    line.remove_prefix(i + 1); // skip closing "
+
+    // Expect ", " or ","
+    while (!line.empty() && (line.front() == ',' || line.front() == ' ')) {
+        line.remove_prefix(1);
+    }
+
+    // Parse value - may be quoted string, number, or boolean
+    std::string value;
+    if (!line.empty() && line.front() == '"') {
+        // Quoted string value
+        line.remove_prefix(1);
+        size_t j = 0;
+        while (j < line.size()) {
+            if (line[j] == '\\' && j + 1 < line.size()) {
+                value += line[j];
+                value += line[j + 1];
+                j += 2;
+            } else if (line[j] == '"') {
+                break;
+            } else {
+                value += line[j];
+                ++j;
+            }
+        }
+        value = UnescapeJsString(value);
+    } else {
+        // Unquoted value (number or boolean)
+        while (!line.empty() && line.front() != ')' && line.front() != ';') {
+            value += line.front();
+            line.remove_prefix(1);
+        }
+        // Trim
+        while (!value.empty() &&
+               std::isspace(static_cast<unsigned char>(value.back()))) {
+            value.pop_back();
+        }
+    }
+
+    return {key, value};
+}
+
+/**
+ * @brief Validate that a file path is safe (no directory traversal relative to base).
+ */
+[[nodiscard]] bool IsPathSafe(const fs::path& candidate, const fs::path& base) {
+    try {
+        auto canonicalCandidate = fs::weakly_canonical(candidate);
+        auto canonicalBase = fs::weakly_canonical(base);
+        auto candidateStr = canonicalCandidate.string();
+        auto baseStr = canonicalBase.string();
+        return candidateStr.starts_with(baseStr);
+    } catch (...) {
+        return false;
+    }
+}
+
+} // anonymous namespace (MIME helpers)
 
 } // anonymous namespace
 
@@ -347,6 +1000,30 @@ namespace {
     return j.dump();
 }
 
+[[nodiscard]] std::string ThunderbirdScannerStatisticsSnapshot::ToJson() const {
+    nlohmann::json j;
+    j["totalScanned"] = totalScanned;
+    j["newMessagesScanned"] = newMessagesScanned;
+    j["foldersMonitored"] = foldersMonitored;
+    j["threatsDetected"] = threatsDetected;
+    j["malwareBlocked"] = malwareBlocked;
+    j["phishingBlocked"] = phishingBlocked;
+    j["spamMarked"] = spamMarked;
+    j["nativeMessagesReceived"] = nativeMessagesReceived;
+    j["nativeMessagesProcessed"] = nativeMessagesProcessed;
+    j["fileChangesDetected"] = fileChangesDetected;
+    j["parseErrors"] = parseErrors;
+    j["scanErrors"] = scanErrors;
+    
+    nlohmann::json eventTypes = nlohmann::json::array();
+    for (const auto& count : byEventType) {
+        eventTypes.push_back(count);
+    }
+    j["byEventType"] = eventTypes;
+    
+    return j.dump();
+}
+
 void ThunderbirdScannerStatistics::Reset() noexcept {
     totalScanned.store(0, std::memory_order_relaxed);
     newMessagesScanned.store(0, std::memory_order_relaxed);
@@ -366,6 +1043,29 @@ void ThunderbirdScannerStatistics::Reset() noexcept {
     }
 
     startTime = Clock::now();
+}
+
+[[nodiscard]] ThunderbirdScannerStatisticsSnapshot ThunderbirdScannerStatistics::ToSnapshot() const noexcept {
+    ThunderbirdScannerStatisticsSnapshot snapshot;
+    snapshot.totalScanned = totalScanned.load(std::memory_order_relaxed);
+    snapshot.newMessagesScanned = newMessagesScanned.load(std::memory_order_relaxed);
+    snapshot.foldersMonitored = foldersMonitored.load(std::memory_order_relaxed);
+    snapshot.threatsDetected = threatsDetected.load(std::memory_order_relaxed);
+    snapshot.malwareBlocked = malwareBlocked.load(std::memory_order_relaxed);
+    snapshot.phishingBlocked = phishingBlocked.load(std::memory_order_relaxed);
+    snapshot.spamMarked = spamMarked.load(std::memory_order_relaxed);
+    snapshot.nativeMessagesReceived = nativeMessagesReceived.load(std::memory_order_relaxed);
+    snapshot.nativeMessagesProcessed = nativeMessagesProcessed.load(std::memory_order_relaxed);
+    snapshot.fileChangesDetected = fileChangesDetected.load(std::memory_order_relaxed);
+    snapshot.parseErrors = parseErrors.load(std::memory_order_relaxed);
+    snapshot.scanErrors = scanErrors.load(std::memory_order_relaxed);
+    
+    for (size_t i = 0; i < byEventType.size(); ++i) {
+        snapshot.byEventType[i] = byEventType[i].load(std::memory_order_relaxed);
+    }
+    
+    snapshot.startTime = startTime;
+    return snapshot;
 }
 
 [[nodiscard]] std::string ThunderbirdScannerStatistics::ToJson() const {
@@ -396,7 +1096,7 @@ void ThunderbirdScannerStatistics::Reset() noexcept {
 /**
  * @brief Private implementation class for ThunderbirdScanner.
  */
-class ThunderbirdScanner::ThunderbirdScannerImpl {
+class ThunderbirdScannerImpl final {
 public:
     // ========================================================================
     // MEMBERS
@@ -426,7 +1126,7 @@ public:
 
     // Callbacks
     MessageEventCallback m_messageEventCallback;
-    ScanResultCallback m_scanResultCallback;
+    ThunderbirdScanResultCallback m_scanResultCallback;
     NativeMessageCallback m_nativeMessageCallback;
     ErrorCallback m_errorCallback;
 
@@ -434,6 +1134,7 @@ public:
     std::vector<MailboxFolder> m_monitoredFolders;
     std::unordered_map<std::wstring, HANDLE> m_directoryHandles;
     std::unordered_map<std::wstring, size_t> m_lastKnownSizes;  // For mbox file size tracking
+    std::unordered_map<std::wstring, size_t> m_lastScannedOffsets; // Byte offset of last-scanned position
 
     // Native messaging
     std::unique_ptr<std::jthread> m_nativeHostThread;
@@ -552,7 +1253,7 @@ public:
 
             // Try standard Thunderbird profile locations
             for (const char* relativePath : ThunderbirdConstants::PROFILE_PATHS_WINDOWS) {
-                fs::path profilesPath = *userProfileDir / StringUtils::Utf8ToWide(relativePath);
+                fs::path profilesPath = *userProfileDir / StringUtils::ToWide(relativePath);
 
                 if (!fs::exists(profilesPath)) {
                     continue;
@@ -587,9 +1288,12 @@ public:
             ThunderbirdProfile currentProfile;
             std::string currentSection;
             std::string line;
+            std::string currentPath;
+            bool isRelative = true;  // M3 fix: track IsRelative flag
+            fs::path basePath = iniPath.parent_path();
 
             while (std::getline(iniFile, line)) {
-                StringUtils::Trim(line);
+                TrimNarrow(line);
 
                 if (line.empty() || line[0] == ';' || line[0] == '#') {
                     continue;
@@ -599,8 +1303,38 @@ public:
                 if (line[0] == '[' && line.back() == ']') {
                     // Save previous profile
                     if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
-                        profiles.push_back(currentProfile);
+                        // M3 fix: Apply IsRelative logic
+                        if (isRelative) {
+                            currentProfile.path = basePath / currentPath;
+                        } else {
+                            currentProfile.path = fs::path(currentPath);
+                        }
+                        
+                        // M2 fix: Canonicalize and validate path
+                        try {
+                            currentProfile.path = fs::weakly_canonical(currentProfile.path);
+                            
+                            // Verify it's under the Thunderbird profiles directory
+                            auto canonicalBase = fs::weakly_canonical(basePath);
+                            auto profileStr = currentProfile.path.string();
+                            auto baseStr = canonicalBase.string();
+                            
+                            // Path traversal check: profile path must start with base or be absolute outside
+                            if (isRelative && profileStr.find(baseStr) != 0) {
+                                Logger::Warn("ThunderbirdScanner: Potential path traversal detected in profile path: {}", 
+                                             currentPath);
+                                // Skip this profile
+                            } else {
+                                profiles.push_back(currentProfile);
+                            }
+                        } catch (const std::exception& e) {
+                            Logger::Warn("ThunderbirdScanner: Failed to canonicalize profile path {}: {}", 
+                                         currentPath, e.what());
+                        }
+                        
                         currentProfile = ThunderbirdProfile{};
+                        currentPath.clear();
+                        isRelative = true;
                     }
 
                     currentSection = line.substr(1, line.length() - 2);
@@ -615,17 +1349,16 @@ public:
 
                 std::string key = line.substr(0, eqPos);
                 std::string value = line.substr(eqPos + 1);
-                StringUtils::Trim(key);
-                StringUtils::Trim(value);
+                TrimNarrow(key);
+                TrimNarrow(value);
 
                 if (currentSection.starts_with("Profile")) {
                     if (key == "Name") {
                         currentProfile.name = value;
                     } else if (key == "Path") {
-                        fs::path basePath = iniPath.parent_path();
-                        currentProfile.path = basePath / value;
+                        currentPath = value;
                     } else if (key == "IsRelative") {
-                        // Already handled in Path
+                        isRelative = (value == "1");  // M3 fix: properly handle IsRelative flag
                     } else if (key == "Default") {
                         currentProfile.isDefault = (value == "1");
                     }
@@ -634,7 +1367,31 @@ public:
 
             // Don't forget last profile
             if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
-                profiles.push_back(currentProfile);
+                // M3 fix: Apply IsRelative logic
+                if (isRelative) {
+                    currentProfile.path = basePath / currentPath;
+                } else {
+                    currentProfile.path = fs::path(currentPath);
+                }
+                
+                // M2 fix: Canonicalize and validate
+                try {
+                    currentProfile.path = fs::weakly_canonical(currentProfile.path);
+                    
+                    auto canonicalBase = fs::weakly_canonical(basePath);
+                    auto profileStr = currentProfile.path.string();
+                    auto baseStr = canonicalBase.string();
+                    
+                    if (isRelative && profileStr.find(baseStr) != 0) {
+                        Logger::Warn("ThunderbirdScanner: Potential path traversal detected in profile path: {}", 
+                                     currentPath);
+                    } else {
+                        profiles.push_back(currentProfile);
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Warn("ThunderbirdScanner: Failed to canonicalize profile path {}: {}", 
+                                 currentPath, e.what());
+                }
             }
 
         } catch (const std::exception& e) {
@@ -650,19 +1407,168 @@ public:
         try {
             fs::path prefsPath = profilePath / "prefs.js";
             if (!fs::exists(prefsPath)) {
+                Logger::Debug("ThunderbirdScanner: prefs.js not found at: {}", prefsPath.string());
+                return accounts;
+            }
+
+            // Validate prefs.js path is under the profile directory
+            if (!IsPathSafe(prefsPath, profilePath)) {
+                Logger::Warn("ThunderbirdScanner: prefs.js path traversal detected: {}",
+                             prefsPath.string());
+                return accounts;
+            }
+
+            // Check file size to prevent DoS on pathological files
+            auto fileSize = fs::file_size(prefsPath);
+            if (fileSize > 10 * 1024 * 1024) { // 10MB cap for prefs.js
+                Logger::Warn("ThunderbirdScanner: prefs.js exceeds size limit ({} bytes)", fileSize);
                 return accounts;
             }
 
             std::ifstream prefsFile(prefsPath);
-            std::string line;
+            if (!prefsFile) {
+                Logger::Error("ThunderbirdScanner: Failed to open prefs.js: {}", prefsPath.string());
+                return accounts;
+            }
 
-            // Simplified account detection - would use proper JS parser in production
-            while (std::getline(prefsFile, line)) {
-                if (line.find("mail.account.") != std::string::npos) {
-                    // Extract account information
-                    // This is simplified - real implementation would parse JavaScript properly
+            // Parse all user_pref() lines into a key-value map
+            std::unordered_map<std::string, std::string> prefs;
+            std::string line;
+            size_t lineCount = 0;
+            constexpr size_t kMaxLines = 500000;
+
+            while (std::getline(prefsFile, line) && lineCount < kMaxLines) {
+                ++lineCount;
+                auto [key, value] = ParsePrefsJsLine(line);
+                if (!key.empty()) {
+                    prefs[key] = value;
                 }
             }
+
+            Logger::Debug("ThunderbirdScanner: Parsed {} preferences from prefs.js", prefs.size());
+
+            // Get account list: mail.accountmanager.accounts = "account1,account2,..."
+            auto accountListIt = prefs.find("mail.accountmanager.accounts");
+            if (accountListIt == prefs.end()) {
+                Logger::Debug("ThunderbirdScanner: No mail.accountmanager.accounts found");
+                return accounts;
+            }
+
+            // Split comma-separated account IDs
+            std::vector<std::string> accountIds;
+            {
+                std::istringstream stream(accountListIt->second);
+                std::string accountId;
+                while (std::getline(stream, accountId, ',')) {
+                    TrimNarrow(accountId);
+                    if (!accountId.empty()) {
+                        accountIds.push_back(accountId);
+                    }
+                }
+            }
+
+            // Cap account count to prevent pathological inputs
+            constexpr size_t kMaxAccounts = 200;
+            if (accountIds.size() > kMaxAccounts) {
+                Logger::Warn("ThunderbirdScanner: Account count {} exceeds limit, truncating",
+                             accountIds.size());
+                accountIds.resize(kMaxAccounts);
+            }
+
+            for (const auto& acctId : accountIds) {
+                ThunderbirdAccount account;
+                account.accountId = acctId;
+
+                // Get server key: mail.account.<id>.server = "server1"
+                std::string serverKeyPref = "mail.account." + acctId + ".server";
+                auto serverKeyIt = prefs.find(serverKeyPref);
+                if (serverKeyIt == prefs.end()) continue;
+
+                std::string serverKey = serverKeyIt->second;
+
+                // Get server properties
+                auto getServerPref = [&](const std::string& prop) -> std::string {
+                    auto it = prefs.find("mail.server." + serverKey + "." + prop);
+                    return (it != prefs.end()) ? it->second : std::string{};
+                };
+
+                // Server type determines account type
+                std::string serverType = getServerPref("type");
+                if (serverType == "imap") {
+                    account.type = AccountType::IMAP;
+                } else if (serverType == "pop3") {
+                    account.type = AccountType::POP3;
+                } else if (serverType == "none" || serverType == "movemail") {
+                    account.type = AccountType::Local;
+                } else if (serverType == "nntp") {
+                    account.type = AccountType::NNTP;
+                } else if (serverType == "rss") {
+                    account.type = AccountType::RSS;
+                }
+
+                account.serverHost = getServerPref("hostname");
+                account.name = getServerPref("name");
+                if (account.name.empty()) {
+                    account.name = account.serverHost;
+                }
+
+                // Get root folder path (directory on disk)
+                std::string directory = getServerPref("directory");
+                if (!directory.empty()) {
+                    account.rootFolderPath = fs::path(directory);
+                } else {
+                    // Fallback: construct from server key
+                    std::string dirRel = getServerPref("directory-rel");
+                    if (dirRel.starts_with("[ProfD]")) {
+                        account.rootFolderPath = profilePath / dirRel.substr(7);
+                    }
+                }
+
+                // Validate root folder path against traversal
+                if (!account.rootFolderPath.empty()) {
+                    try {
+                        account.rootFolderPath = fs::weakly_canonical(account.rootFolderPath);
+                    } catch (...) {
+                        Logger::Warn("ThunderbirdScanner: Failed to canonicalize account path for {}",
+                                     acctId);
+                    }
+                }
+
+                // Get identity (email address)
+                std::string identitiesPref = "mail.account." + acctId + ".identities";
+                auto identitiesIt = prefs.find(identitiesPref);
+                if (identitiesIt != prefs.end() && !identitiesIt->second.empty()) {
+                    // Take the first identity
+                    std::string firstIdentity = identitiesIt->second;
+                    auto commaPos = firstIdentity.find(',');
+                    if (commaPos != std::string::npos) {
+                        firstIdentity = firstIdentity.substr(0, commaPos);
+                    }
+                    TrimNarrow(firstIdentity);
+
+                    auto emailIt = prefs.find("mail.identity." + firstIdentity + ".useremail");
+                    if (emailIt != prefs.end()) {
+                        account.email = emailIt->second;
+                    }
+
+                    // Get user-friendly name from identity if server name is empty
+                    if (account.name.empty()) {
+                        auto fullNameIt = prefs.find("mail.identity." + firstIdentity + ".fullName");
+                        if (fullNameIt != prefs.end()) {
+                            account.name = fullNameIt->second;
+                        }
+                    }
+                }
+
+                // Check if account is enabled (default: true)
+                std::string enabledStr = getServerPref("hidden");
+                account.isEnabled = (enabledStr != "true");
+
+                accounts.push_back(std::move(account));
+            }
+
+            Logger::Info("ThunderbirdScanner: Enumerated {} accounts from profile: {}",
+                         accounts.size(), profilePath.string());
 
         } catch (const std::exception& e) {
             Logger::Error("ThunderbirdScanner: Account enumeration exception: {}", e.what());
@@ -695,10 +1601,11 @@ public:
                 folder.path = entry.path();
                 folder.format = format;
                 folder.fileSize = fs::file_size(entry.path());
-                folder.lastModified = FileUtils::GetFileTime(entry.path());
+                folder.lastModified = std::chrono::clock_cast<std::chrono::system_clock>(
+                    fs::last_write_time(entry.path()));
 
                 // Detect special folders
-                std::string lowerName = StringUtils::ToLowerCase(folder.name);
+                std::string lowerName = ToLowerCopy(folder.name);
                 if (lowerName == "inbox") {
                     folder.isSpecial = true;
                     folder.specialType = "Inbox";
@@ -736,30 +1643,120 @@ public:
                 return messages;
             }
 
+            // Validate file size against cap
+            auto mboxFileSize = fs::file_size(mboxPath);
+            if (mboxFileSize > ThunderbirdConstants::MAX_MBOX_FILE_SIZE) {
+                Logger::Error("ThunderbirdScanner: Mbox file exceeds size limit ({} bytes): {}",
+                              mboxFileSize, mboxPath.string());
+                return messages;
+            }
+
             std::ifstream mboxFile(mboxPath, std::ios::binary);
             if (!mboxFile) {
                 Logger::Error("ThunderbirdScanner: Failed to open mbox file: {}", mboxPath.string());
                 return messages;
             }
 
+            const size_t bodyLimit = m_config.maxBodyTextSize > 0
+                ? m_config.maxBodyTextSize
+                : ThunderbirdConstants::DEFAULT_BODY_TEXT_LIMIT;
+            const size_t msgLimit = (maxMessages > 0)
+                ? std::min(maxMessages, ThunderbirdConstants::MAX_MESSAGES_PER_MBOX)
+                : ThunderbirdConstants::MAX_MESSAGES_PER_MBOX;
+
             std::string line;
             MboxMessage currentMessage;
             bool inHeaders = false;
             bool inBody = false;
             size_t currentOffset = 0;
+            std::string rawBody;                   // Accumulate raw body for MIME parsing
+            std::string topContentType;            // Top-level Content-Type
+            std::string topTransferEncoding;       // Top-level Content-Transfer-Encoding
+            std::string currentHeaderKey;          // For header folding
+            std::string currentHeaderValue;
+
+            auto finalizeHeaders = [&]() {
+                // Commit last folded header
+                if (!currentHeaderKey.empty()) {
+                    currentMessage.headers[currentHeaderKey] = currentHeaderValue;
+                    if (IEquals(currentHeaderKey, "Message-ID")) {
+                        currentMessage.messageId = currentHeaderValue;
+                    } else if (IEquals(currentHeaderKey, "Subject")) {
+                        currentMessage.subject = currentHeaderValue;
+                    } else if (IEquals(currentHeaderKey, "From")) {
+                        currentMessage.from = ExtractEmailAddress(currentHeaderValue);
+                    } else if (IEquals(currentHeaderKey, "To")) {
+                        currentMessage.to = ParseRecipients(currentHeaderValue);
+                    } else if (IEquals(currentHeaderKey, "Date")) {
+                        currentMessage.date = currentHeaderValue;
+                    } else if (IEquals(currentHeaderKey, "Content-Type")) {
+                        topContentType = currentHeaderValue;
+                    } else if (IEquals(currentHeaderKey, "Content-Transfer-Encoding")) {
+                        topTransferEncoding = currentHeaderValue;
+                        for (auto& c : topTransferEncoding)
+                            c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                    }
+                }
+                currentHeaderKey.clear();
+                currentHeaderValue.clear();
+            };
+
+            auto finalizeMessage = [&]() {
+                finalizeHeaders();
+
+                // Parse body using MIME structure
+                if (IsMultipartContentType(topContentType)) {
+                    auto boundary = ExtractMimeParam(topContentType, "boundary");
+                    if (!boundary.empty()) {
+                        auto mimeParts = ParseMultipartBody(rawBody, boundary);
+                        currentMessage.attachmentCount = 0;
+                        ExtractMimeContent(mimeParts,
+                                           currentMessage.bodyText,
+                                           currentMessage.bodyHtml,
+                                           currentMessage.attachmentCount,
+                                           bodyLimit);
+                    } else {
+                        // Multipart with no boundary - treat as plain text
+                        currentMessage.bodyText = rawBody.substr(0, bodyLimit);
+                    }
+                } else {
+                    // Single-part message
+                    std::string decoded = DecodeTransferEncoding(rawBody, topTransferEncoding);
+
+                    std::string lowerCT(topContentType);
+                    for (auto& c : lowerCT)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                    if (lowerCT.starts_with("text/html")) {
+                        currentMessage.bodyHtml = decoded.substr(0, bodyLimit);
+                    } else {
+                        // Default to text/plain
+                        currentMessage.bodyText = decoded.substr(0, bodyLimit);
+                    }
+                    currentMessage.attachmentCount = 0;
+                }
+            };
 
             while (std::getline(mboxFile, line)) {
+                // Handle \r\n line endings
+                if (!line.empty() && line.back() == '\r') {
+                    line.pop_back();
+                }
                 size_t lineSize = line.size() + 1;  // +1 for newline
 
                 // Check for From_ separator (message boundary)
                 if (IsMboxSeparator(line)) {
                     // Save previous message
-                    if (!currentMessage.messageId.empty()) {
-                        currentMessage.messageSize = currentOffset - currentMessage.fileOffset;
-                        messages.push_back(currentMessage);
+                    if (inHeaders || inBody) {
+                        if (!currentMessage.messageId.empty() || !currentMessage.subject.empty()) {
+                            // Finalize MIME body parsing
+                            finalizeMessage();
+                            currentMessage.messageSize = currentOffset - currentMessage.fileOffset;
+                            messages.push_back(currentMessage);
 
-                        if (maxMessages > 0 && messages.size() >= maxMessages) {
-                            break;
+                            if (messages.size() >= msgLimit) {
+                                break;
+                            }
                         }
                     }
 
@@ -768,6 +1765,11 @@ public:
                     currentMessage.fileOffset = currentOffset;
                     inHeaders = true;
                     inBody = false;
+                    rawBody.clear();
+                    topContentType.clear();
+                    topTransferEncoding.clear();
+                    currentHeaderKey.clear();
+                    currentHeaderValue.clear();
 
                     // Parse From_ line
                     std::string from, date;
@@ -779,38 +1781,62 @@ public:
 
                 if (inHeaders) {
                     if (line.empty()) {
-                        // Empty line marks end of headers
+                        // Empty line marks end of headers - commit last header
+                        finalizeHeaders();
                         inHeaders = false;
                         inBody = true;
+                    } else if (!line.empty() &&
+                               (line[0] == ' ' || line[0] == '\t') &&
+                               !currentHeaderKey.empty()) {
+                        // Header folding (continuation line per RFC 5322)
+                        size_t ws = 0;
+                        while (ws < line.size() &&
+                               std::isspace(static_cast<unsigned char>(line[ws]))) ++ws;
+                        currentHeaderValue += " " + line.substr(ws);
                     } else {
-                        // Parse header
+                        // Commit previous header
+                        if (!currentHeaderKey.empty()) {
+                            currentMessage.headers[currentHeaderKey] = currentHeaderValue;
+                            if (IEquals(currentHeaderKey, "Message-ID")) {
+                                currentMessage.messageId = currentHeaderValue;
+                            } else if (IEquals(currentHeaderKey, "Subject")) {
+                                currentMessage.subject = currentHeaderValue;
+                            } else if (IEquals(currentHeaderKey, "From")) {
+                                currentMessage.from = ExtractEmailAddress(currentHeaderValue);
+                            } else if (IEquals(currentHeaderKey, "To")) {
+                                currentMessage.to = ParseRecipients(currentHeaderValue);
+                            } else if (IEquals(currentHeaderKey, "Date")) {
+                                currentMessage.date = currentHeaderValue;
+                            } else if (IEquals(currentHeaderKey, "Content-Type")) {
+                                topContentType = currentHeaderValue;
+                            } else if (IEquals(currentHeaderKey, "Content-Transfer-Encoding")) {
+                                topTransferEncoding = currentHeaderValue;
+                                for (auto& c : topTransferEncoding)
+                                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                            }
+                        }
+
+                        // Parse new header
                         std::string key, value;
                         if (ParseHeaderLine(line, key, value)) {
-                            currentMessage.headers[key] = value;
-
-                            // Extract common headers
-                            if (StringUtils::EqualsIgnoreCase(key, "Message-ID")) {
-                                currentMessage.messageId = value;
-                            } else if (StringUtils::EqualsIgnoreCase(key, "Subject")) {
-                                currentMessage.subject = value;
-                            } else if (StringUtils::EqualsIgnoreCase(key, "From")) {
-                                currentMessage.from = ExtractEmailAddress(value);
-                            } else if (StringUtils::EqualsIgnoreCase(key, "To")) {
-                                currentMessage.to = ParseRecipients(value);
-                            } else if (StringUtils::EqualsIgnoreCase(key, "Date")) {
-                                currentMessage.date = value;
-                            } else if (StringUtils::EqualsIgnoreCase(key, "Content-Type")) {
-                                if (value.find("multipart") != std::string::npos) {
-                                    // Has attachments (simplified detection)
-                                    currentMessage.attachmentCount++;
-                                }
-                            }
+                            currentHeaderKey = key;
+                            currentHeaderValue = value;
+                        } else {
+                            currentHeaderKey.clear();
+                            currentHeaderValue.clear();
                         }
                     }
                 } else if (inBody) {
-                    // Simplified body extraction
-                    if (currentMessage.bodyText.size() < 10000) {  // Limit body size
-                        currentMessage.bodyText += line + "\n";
+                    // Unquote mboxrd ">From " lines in body
+                    if (line.starts_with(">From ")) {
+                        rawBody += line.substr(1) + "\n";
+                    } else {
+                        rawBody += line + "\n";
+                    }
+
+                    // Safety cap on raw body accumulation
+                    if (rawBody.size() > m_config.maxMessageSize) {
+                        rawBody.resize(m_config.maxMessageSize);
                     }
                 }
 
@@ -818,7 +1844,9 @@ public:
             }
 
             // Don't forget last message
-            if (!currentMessage.messageId.empty()) {
+            if ((inHeaders || inBody) &&
+                (!currentMessage.messageId.empty() || !currentMessage.subject.empty())) {
+                finalizeMessage();
                 currentMessage.messageSize = currentOffset - currentMessage.fileOffset;
                 messages.push_back(currentMessage);
             }
@@ -843,46 +1871,123 @@ public:
                 return std::nullopt;
             }
 
-            mboxFile.seekg(offset);
+            mboxFile.seekg(static_cast<std::streamoff>(offset));
+            if (!mboxFile.good()) {
+                Logger::Error("ThunderbirdScanner: Failed to seek to offset {} in {}",
+                              offset, mboxPath.string());
+                return std::nullopt;
+            }
+
+            const size_t bodyLimit = m_config.maxBodyTextSize > 0
+                ? m_config.maxBodyTextSize
+                : ThunderbirdConstants::DEFAULT_BODY_TEXT_LIMIT;
 
             MboxMessage message;
             message.fileOffset = offset;
 
             std::string line;
             bool inHeaders = true;
+            bool firstLine = true;
             size_t bytesRead = 0;
+            std::string rawBody;
+            std::string topContentType;
+            std::string topTransferEncoding;
+            std::string currentHeaderKey, currentHeaderValue;
+
+            auto commitHeader = [&]() {
+                if (currentHeaderKey.empty()) return;
+                message.headers[currentHeaderKey] = currentHeaderValue;
+                if (IEquals(currentHeaderKey, "Message-ID")) {
+                    message.messageId = currentHeaderValue;
+                } else if (IEquals(currentHeaderKey, "Subject")) {
+                    message.subject = currentHeaderValue;
+                } else if (IEquals(currentHeaderKey, "From")) {
+                    message.from = ExtractEmailAddress(currentHeaderValue);
+                } else if (IEquals(currentHeaderKey, "To")) {
+                    message.to = ParseRecipients(currentHeaderValue);
+                } else if (IEquals(currentHeaderKey, "Date")) {
+                    message.date = currentHeaderValue;
+                } else if (IEquals(currentHeaderKey, "Content-Type")) {
+                    topContentType = currentHeaderValue;
+                } else if (IEquals(currentHeaderKey, "Content-Transfer-Encoding")) {
+                    topTransferEncoding = currentHeaderValue;
+                    for (auto& c : topTransferEncoding)
+                        c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+                }
+                currentHeaderKey.clear();
+                currentHeaderValue.clear();
+            };
 
             while (std::getline(mboxFile, line)) {
+                if (!line.empty() && line.back() == '\r') line.pop_back();
                 bytesRead += line.size() + 1;
 
-                // Check for next message boundary
-                if (bytesRead > 0 && IsMboxSeparator(line)) {
+                // Skip the From_ line at the start if we seeked to it
+                if (firstLine) {
+                    firstLine = false;
+                    if (IsMboxSeparator(line)) {
+                        continue; // Skip the envelope From_ line
+                    }
+                }
+
+                // Check for next message boundary (end of this message)
+                if (!firstLine && IsMboxSeparator(line)) {
                     break;
                 }
 
                 if (inHeaders) {
                     if (line.empty()) {
+                        commitHeader();
                         inHeaders = false;
+                    } else if ((line[0] == ' ' || line[0] == '\t') && !currentHeaderKey.empty()) {
+                        // Header folding
+                        size_t ws = 0;
+                        while (ws < line.size() &&
+                               std::isspace(static_cast<unsigned char>(line[ws]))) ++ws;
+                        currentHeaderValue += " " + line.substr(ws);
                     } else {
+                        commitHeader();
                         std::string key, value;
                         if (ParseHeaderLine(line, key, value)) {
-                            message.headers[key] = value;
-
-                            if (StringUtils::EqualsIgnoreCase(key, "Message-ID")) {
-                                message.messageId = value;
-                            } else if (StringUtils::EqualsIgnoreCase(key, "Subject")) {
-                                message.subject = value;
-                            } else if (StringUtils::EqualsIgnoreCase(key, "From")) {
-                                message.from = ExtractEmailAddress(value);
-                            } else if (StringUtils::EqualsIgnoreCase(key, "To")) {
-                                message.to = ParseRecipients(value);
-                            }
+                            currentHeaderKey = key;
+                            currentHeaderValue = value;
                         }
                     }
                 } else {
-                    if (message.bodyText.size() < 10000) {
-                        message.bodyText += line + "\n";
+                    // Body
+                    if (line.starts_with(">From ")) {
+                        rawBody += line.substr(1) + "\n";
+                    } else {
+                        rawBody += line + "\n";
                     }
+                    if (rawBody.size() > m_config.maxMessageSize) {
+                        rawBody.resize(m_config.maxMessageSize);
+                    }
+                }
+            }
+
+            // Finalize MIME body
+            commitHeader();
+            if (IsMultipartContentType(topContentType)) {
+                auto boundary = ExtractMimeParam(topContentType, "boundary");
+                if (!boundary.empty()) {
+                    auto mimeParts = ParseMultipartBody(rawBody, boundary);
+                    message.attachmentCount = 0;
+                    ExtractMimeContent(mimeParts, message.bodyText, message.bodyHtml,
+                                       message.attachmentCount, bodyLimit);
+                } else {
+                    message.bodyText = rawBody.substr(0, bodyLimit);
+                }
+            } else {
+                std::string decoded = DecodeTransferEncoding(rawBody, topTransferEncoding);
+                std::string lowerCT(topContentType);
+                for (auto& c : lowerCT)
+                    c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+
+                if (lowerCT.starts_with("text/html")) {
+                    message.bodyHtml = decoded.substr(0, bodyLimit);
+                } else {
+                    message.bodyText = decoded.substr(0, bodyLimit);
                 }
             }
 
@@ -890,7 +1995,8 @@ public:
             return message;
 
         } catch (const std::exception& e) {
-            Logger::Error("ThunderbirdScanner: Message parse exception: {}", e.what());
+            Logger::Error("ThunderbirdScanner: Message parse exception at offset {}: {}",
+                          offset, e.what());
             return std::nullopt;
         }
     }
@@ -933,28 +2039,140 @@ public:
 
     [[nodiscard]] EmailScanResult ScanMessageImpl(const MboxMessage& message) {
         EmailScanResult result;
+        auto scanStart = std::chrono::steady_clock::now();
 
         try {
-            // Use PhishingEmailDetector if available
-            // result = PhishingEmailDetector::Instance().Scan(message);
+            result.messageId = message.messageId;
+            result.scanTimestamp = std::chrono::system_clock::now();
 
-            // Simplified scanning for now
-            result.isMalicious = false;
-            result.isPhishing = false;
-            result.isSpam = false;
-
-            // Check against trusted senders
+            // Check trusted senders first for early-out
             for (const auto& trustedSender : m_config.trustedSenders) {
-                if (StringUtils::Contains(message.from, trustedSender)) {
-                    result.isTrusted = true;
-                    break;
+                if (message.from.find(trustedSender) != std::string::npos) {
+                    result.isClean = true;
+                    result.recommendedAction = ScanAction::Allow;
+                    result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+                        std::chrono::steady_clock::now() - scanStart);
+                    return result;
                 }
             }
 
+            // Phishing detection via PhishingEmailDetector
+            if (m_config.detectPhishing) {
+                try {
+                    auto& phishingDetector = PhishingEmailDetector::Instance();
+                    if (phishingDetector.IsInitialized()) {
+                        // Extract URLs from body for analysis
+                        auto phishingResult = phishingDetector.AnalyzeEmail(
+                            message.subject,
+                            message.bodyText,
+                            message.bodyHtml,
+                            message.from,
+                            /*replyTo=*/"",  // Would come from Reply-To header
+                            message.headers);
+
+                        if (phishingResult.isPhishing) {
+                            result.isPhishing = true;
+                            result.phishingConfidence = phishingResult.confidenceScore;
+                            result.isClean = false;
+                            result.riskScore = std::max(result.riskScore, phishingResult.riskScore);
+                            result.primaryThreatName = "Phishing: " + phishingResult.analysisSummary;
+                            result.recommendedAction = ScanAction::Block;
+
+                            m_stats.phishingBlocked.fetch_add(1, std::memory_order_relaxed);
+                            m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
+                        }
+
+                        // Collect malicious URLs from phishing analysis
+                        for (const auto& urlResult : phishingResult.urlAnalyses) {
+                            if (urlResult.verdict == URLVerdict::Malicious ||
+                                urlResult.verdict == URLVerdict::Phishing) {
+                                result.maliciousUrls.push_back(urlResult.originalUrl);
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Warn("ThunderbirdScanner: Phishing detection failed for message {}: {}",
+                                 message.messageId, e.what());
+                }
+            }
+
+            // Spam detection via SpamDetector
+            if (m_config.detectSpam && !result.isPhishing) {
+                try {
+                    auto& spamDetector = SpamDetector::Instance();
+                    if (spamDetector.IsInitialized()) {
+                        auto spamResult = spamDetector.AnalyzeEmail(
+                            message.subject,
+                            message.bodyText,
+                            message.bodyHtml,
+                            message.from,
+                            message.to,
+                            message.headers);
+
+                        if (spamResult.isSpam) {
+                            result.isSpam = true;
+                            result.spamScore = spamResult.spamScore;
+                            result.isClean = false;
+                            result.riskScore = std::max(result.riskScore, spamResult.spamScore);
+                            if (result.primaryThreatName.empty()) {
+                                result.primaryThreatName = "Spam detected (score=" +
+                                    std::to_string(spamResult.spamScore) + ")";
+                            }
+                            result.recommendedAction = ScanAction::TagSubject;
+
+                            m_stats.spamMarked.fetch_add(1, std::memory_order_relaxed);
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Warn("ThunderbirdScanner: Spam detection failed for message {}: {}",
+                                 message.messageId, e.what());
+                }
+            }
+
+            // Attachment scanning - check if message has attachment metadata
+            if (m_config.scanAttachments && message.attachmentCount > 0) {
+                try {
+                    auto& attachmentScanner = AttachmentScanner::Instance();
+                    if (attachmentScanner.IsInitialized()) {
+                        // Check for high-risk attachment types from Content-Type headers
+                        for (const auto& [hdrKey, hdrVal] : message.headers) {
+                            if (IEquals(hdrKey, "Content-Disposition") &&
+                                IsAttachmentDisposition(hdrVal)) {
+                                auto filename = ExtractAttachmentFilename(hdrVal);
+                                if (!filename.empty()) {
+                                    fs::path attachPath(filename);
+                                    if (attachmentScanner.IsHighRiskExtension(
+                                            attachPath.extension().string())) {
+                                        result.hasMalware = true;
+                                        result.isClean = false;
+                                        result.maliciousAttachments.push_back(filename);
+                                        result.primaryThreatName = "High-risk attachment: " + filename;
+                                        result.recommendedAction = ScanAction::Block;
+                                        m_stats.malwareBlocked.fetch_add(1, std::memory_order_relaxed);
+                                        m_stats.threatsDetected.fetch_add(1, std::memory_order_relaxed);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } catch (const std::exception& e) {
+                    Logger::Warn("ThunderbirdScanner: Attachment scan failed for message {}: {}",
+                                 message.messageId, e.what());
+                }
+            }
+
+            // If nothing was detected, mark as clean
+            if (result.isClean && !result.isPhishing && !result.isSpam && !result.hasMalware) {
+                result.recommendedAction = ScanAction::Allow;
+            }
+
         } catch (const std::exception& e) {
-            Logger::Error("ThunderbirdScanner: Message scan exception: {}", e.what());
+            Logger::Error("ThunderbirdScanner: Message scan exception for {}: {}",
+                          message.messageId, e.what());
         }
 
+        result.scanDuration = std::chrono::duration_cast<std::chrono::microseconds>(
+            std::chrono::steady_clock::now() - scanStart);
         return result;
     }
 
@@ -981,8 +2199,9 @@ public:
                 folder.isMonitored = true;
                 m_monitoredFolders.push_back(folder);
 
-                // Track initial size
+                // Track initial size and scanned offset
                 m_lastKnownSizes[folder.path.wstring()] = folder.fileSize;
+                m_lastScannedOffsets[folder.path.wstring()] = folder.fileSize;
             }
 
             m_stats.foldersMonitored.store(m_monitoredFolders.size(), std::memory_order_relaxed);
@@ -1021,6 +2240,7 @@ public:
 
         m_monitoredFolders.clear();
         m_lastKnownSizes.clear();
+        m_lastScannedOffsets.clear();
 
         m_monitoring.store(false, std::memory_order_release);
         m_scannerStatus.store(ScannerStatus::Disconnected, std::memory_order_release);
@@ -1048,20 +2268,75 @@ public:
                     }
 
                     size_t currentSize = fs::file_size(folder.path);
-                    size_t lastSize = m_lastKnownSizes[folder.path.wstring()];
+                    auto folderKey = folder.path.wstring();
+                    size_t lastSize = m_lastKnownSizes[folderKey];
 
                     if (currentSize > lastSize) {
                         // File grew - new messages likely
-                        Logger::Info("ThunderbirdScanner: Detected changes in {}", folder.path.string());
+                        Logger::Info("ThunderbirdScanner: Detected {} bytes of new data in {}",
+                                     currentSize - lastSize, folder.path.string());
 
                         m_stats.fileChangesDetected.fetch_add(1, std::memory_order_relaxed);
-                        m_lastKnownSizes[folder.path.wstring()] = currentSize;
+                        m_lastKnownSizes[folderKey] = currentSize;
 
-                        // Scan new messages (simplified - would track exact offset)
+                        // Incremental scanning: seek to the last scanned offset
+                        // and parse only new messages from that point forward
                         if (m_config.scanNewMessages) {
-                            auto results = ScanMboxFileImpl(folder.path, false);
-                            m_stats.newMessagesScanned.fetch_add(results.size(), std::memory_order_relaxed);
+                            size_t scanOffset = m_lastScannedOffsets[folderKey];
+
+                            try {
+                                std::ifstream mboxFile(folder.path, std::ios::binary);
+                                if (!mboxFile) continue;
+
+                                mboxFile.seekg(static_cast<std::streamoff>(scanOffset));
+                                if (!mboxFile.good()) continue;
+
+                                // Scan forward from the last known offset to find new messages
+                                std::string scanLine;
+                                size_t localOffset = scanOffset;
+                                size_t newMsgCount = 0;
+
+                                // Find the next From_ separator at or after scanOffset
+                                while (std::getline(mboxFile, scanLine)) {
+                                    if (!scanLine.empty() && scanLine.back() == '\r')
+                                        scanLine.pop_back();
+                                    size_t lineLen = scanLine.size() + 1;
+
+                                    if (IsMboxSeparator(scanLine) && localOffset >= scanOffset) {
+                                        // Parse the message starting at this offset
+                                        auto msg = ParseMboxMessageImpl(folder.path, localOffset);
+                                        if (msg.has_value()) {
+                                            auto scanResult = ScanMessageImpl(msg.value());
+                                            InvokeScanCallback(msg.value(), scanResult);
+                                            ++newMsgCount;
+
+                                            m_stats.totalScanned.fetch_add(1, std::memory_order_relaxed);
+                                        }
+                                    }
+                                    localOffset += lineLen;
+                                }
+
+                                // Update the scanned offset to current end of file
+                                m_lastScannedOffsets[folderKey] = currentSize;
+                                m_stats.newMessagesScanned.fetch_add(newMsgCount, std::memory_order_relaxed);
+
+                                if (newMsgCount > 0) {
+                                    Logger::Info("ThunderbirdScanner: Scanned {} new messages from {}",
+                                                 newMsgCount, folder.path.string());
+                                }
+
+                            } catch (const std::exception& e) {
+                                Logger::Error("ThunderbirdScanner: Incremental scan exception for {}: {}",
+                                              folder.path.string(), e.what());
+                                m_stats.scanErrors.fetch_add(1, std::memory_order_relaxed);
+                            }
                         }
+                    } else if (currentSize < lastSize) {
+                        // File shrank - possibly compacted; reset offset tracking
+                        Logger::Info("ThunderbirdScanner: File shrank (compaction?) in {}",
+                                     folder.path.string());
+                        m_lastKnownSizes[folderKey] = currentSize;
+                        m_lastScannedOffsets[folderKey] = 0;
                     }
                 }
 
@@ -1069,7 +2344,7 @@ public:
                 Logger::Error("ThunderbirdScanner: Monitor worker exception: {}", e.what());
             }
 
-            // Sleep for debounce period
+            // Release lock before sleeping
             std::this_thread::sleep_for(milliseconds(m_config.fileChangeDebounceMs));
         }
 
@@ -1243,13 +2518,92 @@ public:
         try {
             Logger::Info("ThunderbirdScanner: Registering native messaging host");
 
-            // Would write registry keys for native host registration
+#ifdef _WIN32
+            // Write registry key:
             // HKCU\Software\Mozilla\NativeMessagingHosts\com.shadowstrike.thunderbird
+            // Default value = path to the native messaging manifest JSON file
 
-            // Simplified - not actually writing registry in this implementation
+            // Build the manifest path: alongside our executable
+            wchar_t exePath[MAX_PATH] = {};
+            if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) == 0) {
+                Logger::Error("ThunderbirdScanner: GetModuleFileName failed (error={})",
+                              GetLastError());
+                return false;
+            }
 
-            Logger::Info("ThunderbirdScanner: Native host registered");
+            fs::path exeDir = fs::path(exePath).parent_path();
+            fs::path manifestPath = exeDir / "com.shadowstrike.thunderbird.json";
+
+            // Create the manifest JSON file
+            nlohmann::json manifest;
+            manifest["name"] = ThunderbirdConstants::NATIVE_HOST_NAME;
+            manifest["description"] = "ShadowStrike Email Security for Thunderbird";
+            manifest["path"] = fs::path(exePath).string();
+            manifest["type"] = "stdio";
+            manifest["allowed_extensions"] = nlohmann::json::array({
+                ThunderbirdConstants::EXTENSION_ID
+            });
+
+            {
+                std::ofstream manifestFile(manifestPath);
+                if (!manifestFile) {
+                    Logger::Error("ThunderbirdScanner: Failed to create manifest file at: {}",
+                                  manifestPath.string());
+                    return false;
+                }
+                manifestFile << manifest.dump(2);
+                if (!manifestFile.good()) {
+                    Logger::Error("ThunderbirdScanner: Failed to write manifest file");
+                    return false;
+                }
+            }
+
+            // Write registry key pointing to the manifest
+            std::wstring regKeyPath =
+                L"Software\\Mozilla\\NativeMessagingHosts\\" +
+                StringUtils::ToWide(ThunderbirdConstants::NATIVE_HOST_NAME);
+
+            HKEY hKey = nullptr;
+            LONG result = RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                regKeyPath.c_str(),
+                0,
+                nullptr,
+                REG_OPTION_NON_VOLATILE,
+                KEY_WRITE,
+                nullptr,
+                &hKey,
+                nullptr);
+
+            if (result != ERROR_SUCCESS) {
+                Logger::Error("ThunderbirdScanner: RegCreateKeyEx failed (error={})", result);
+                return false;
+            }
+
+            // RAII guard for the registry key
+            auto keyGuard = std::unique_ptr<std::remove_pointer_t<HKEY>, decltype(&RegCloseKey)>(
+                hKey, RegCloseKey);
+
+            std::wstring manifestPathW = manifestPath.wstring();
+            result = RegSetValueExW(
+                hKey,
+                nullptr,  // Default value
+                0,
+                REG_SZ,
+                reinterpret_cast<const BYTE*>(manifestPathW.c_str()),
+                static_cast<DWORD>((manifestPathW.size() + 1) * sizeof(wchar_t)));
+
+            if (result != ERROR_SUCCESS) {
+                Logger::Error("ThunderbirdScanner: RegSetValueEx failed (error={})", result);
+                return false;
+            }
+
+            Logger::Info("ThunderbirdScanner: Native host registered at: {}", manifestPath.string());
             return true;
+#else
+            Logger::Warn("ThunderbirdScanner: Registry registration not supported on this platform");
+            return false;
+#endif
 
         } catch (const std::exception& e) {
             Logger::Error("ThunderbirdScanner: Native host registration exception: {}", e.what());
@@ -1261,10 +2615,37 @@ public:
         try {
             Logger::Info("ThunderbirdScanner: Unregistering native messaging host");
 
-            // Would delete registry keys
+#ifdef _WIN32
+            // Delete registry key
+            std::wstring regKeyPath =
+                L"Software\\Mozilla\\NativeMessagingHosts\\" +
+                StringUtils::ToWide(ThunderbirdConstants::NATIVE_HOST_NAME);
+
+            LONG result = RegDeleteKeyW(HKEY_CURRENT_USER, regKeyPath.c_str());
+            if (result != ERROR_SUCCESS && result != ERROR_FILE_NOT_FOUND) {
+                Logger::Error("ThunderbirdScanner: RegDeleteKey failed (error={})", result);
+                return false;
+            }
+
+            // Also remove the manifest file
+            wchar_t exePath[MAX_PATH] = {};
+            if (GetModuleFileNameW(nullptr, exePath, MAX_PATH) != 0) {
+                fs::path manifestPath = fs::path(exePath).parent_path() /
+                    "com.shadowstrike.thunderbird.json";
+                std::error_code ec;
+                fs::remove(manifestPath, ec);
+                if (ec) {
+                    Logger::Warn("ThunderbirdScanner: Failed to remove manifest file: {}",
+                                 ec.message());
+                }
+            }
 
             Logger::Info("ThunderbirdScanner: Native host unregistered");
             return true;
+#else
+            Logger::Warn("ThunderbirdScanner: Registry unregistration not supported on this platform");
+            return false;
+#endif
 
         } catch (const std::exception& e) {
             Logger::Error("ThunderbirdScanner: Native host unregistration exception: {}", e.what());
@@ -1283,7 +2664,7 @@ public:
             }
 
             // Check file extension
-            std::string ext = StringUtils::ToLowerCase(path.extension().string());
+            std::string ext = ToLowerCopy(path.extension().string());
             if (ext == ".msf") {
                 return MailboxFormat::Unknown;  // Summary file, not mailbox
             }
@@ -1381,7 +2762,7 @@ ThunderbirdScanner::~ThunderbirdScanner() {
 
 [[nodiscard]] bool ThunderbirdScanner::Initialize(const ThunderbirdScannerConfiguration& config) {
     if (!m_impl) {
-        Logger::Critical("ThunderbirdScanner: Implementation is null");
+        Logger::Error("ThunderbirdScanner: Implementation is null");
         return false;
     }
 
@@ -1473,6 +2854,7 @@ void ThunderbirdScanner::StopMonitoring() {
         if (fs::exists(folderPath)) {
             folder.fileSize = fs::file_size(folderPath);
             m_impl->m_lastKnownSizes[folderPath.wstring()] = folder.fileSize;
+            m_impl->m_lastScannedOffsets[folderPath.wstring()] = folder.fileSize;
         }
 
         m_impl->m_monitoredFolders.push_back(folder);
@@ -1503,6 +2885,7 @@ void ThunderbirdScanner::StopMonitoring() {
         if (it != m_impl->m_monitoredFolders.end()) {
             m_impl->m_monitoredFolders.erase(it, m_impl->m_monitoredFolders.end());
             m_impl->m_lastKnownSizes.erase(folderPath.wstring());
+            m_impl->m_lastScannedOffsets.erase(folderPath.wstring());
             m_impl->m_stats.foldersMonitored.store(m_impl->m_monitoredFolders.size(), std::memory_order_relaxed);
 
             Logger::Info("ThunderbirdScanner: Removed monitored folder: {}", folderPath.string());
@@ -1587,10 +2970,119 @@ void ThunderbirdScanner::StopNativeMessagingHost() {
     std::vector<ThunderbirdVersionInfo> installations;
 
     try {
-        // Would check Program Files for thunderbird.exe
-        // Parse version from binary or registry
+#ifdef _WIN32
+        // Check standard installation paths for thunderbird.exe
+        static constexpr std::wstring_view kSearchPaths[] = {
+            L"C:\\Program Files\\Mozilla Thunderbird",
+            L"C:\\Program Files (x86)\\Mozilla Thunderbird",
+        };
 
-        Logger::Debug("ThunderbirdScanner: Installation discovery not fully implemented");
+        for (auto searchPath : kSearchPaths) {
+            fs::path tbDir(searchPath);
+            fs::path tbExe = tbDir / "thunderbird.exe";
+
+            if (!fs::exists(tbExe)) continue;
+
+            ThunderbirdVersionInfo info;
+            info.installPath = tbDir;
+
+            // Try to read version from application.ini
+            fs::path appIni = tbDir / "application.ini";
+            if (fs::exists(appIni)) {
+                std::ifstream iniFile(appIni);
+                std::string line;
+                std::string versionStr;
+                while (std::getline(iniFile, line)) {
+                    if (line.starts_with("Version=")) {
+                        versionStr = line.substr(8);
+                        while (!versionStr.empty() &&
+                               std::isspace(static_cast<unsigned char>(versionStr.back()))) {
+                            versionStr.pop_back();
+                        }
+                    }
+                }
+
+                // Parse major.minor.patch from version string
+                if (!versionStr.empty()) {
+                    info.versionString = versionStr;
+
+                    // Check for ESR suffix
+                    if (versionStr.find("esr") != std::string::npos) {
+                        info.isESR = true;
+                    }
+                    if (versionStr.find("beta") != std::string::npos ||
+                        versionStr.find("b") != std::string::npos) {
+                        info.isBeta = true;
+                    }
+
+                    // Parse numeric version components
+                    auto dotPos1 = versionStr.find('.');
+                    if (dotPos1 != std::string::npos) {
+                        try {
+                            info.majorVersion = static_cast<uint32_t>(
+                                std::stoul(versionStr.substr(0, dotPos1)));
+                        } catch (...) {}
+
+                        auto dotPos2 = versionStr.find('.', dotPos1 + 1);
+                        if (dotPos2 != std::string::npos) {
+                            try {
+                                info.minorVersion = static_cast<uint32_t>(
+                                    std::stoul(versionStr.substr(dotPos1 + 1, dotPos2 - dotPos1 - 1)));
+                                // Patch may have non-numeric suffixes (e.g. "1esr")
+                                std::string patchStr = versionStr.substr(dotPos2 + 1);
+                                size_t patchEnd = 0;
+                                while (patchEnd < patchStr.size() &&
+                                       std::isdigit(static_cast<unsigned char>(patchStr[patchEnd]))) {
+                                    ++patchEnd;
+                                }
+                                if (patchEnd > 0) {
+                                    info.patchVersion = static_cast<uint32_t>(
+                                        std::stoul(patchStr.substr(0, patchEnd)));
+                                }
+                            } catch (...) {}
+                        } else {
+                            try {
+                                // Only major.minor, no patch
+                                std::string minorStr = versionStr.substr(dotPos1 + 1);
+                                size_t end = 0;
+                                while (end < minorStr.size() &&
+                                       std::isdigit(static_cast<unsigned char>(minorStr[end]))) ++end;
+                                if (end > 0) {
+                                    info.minorVersion = static_cast<uint32_t>(
+                                        std::stoul(minorStr.substr(0, end)));
+                                }
+                            } catch (...) {}
+                        }
+                    }
+                }
+            }
+
+            // Fallback: query registry for installed version
+            if (info.versionString.empty()) {
+                HKEY hKey = nullptr;
+                LONG result = RegOpenKeyExW(
+                    HKEY_LOCAL_MACHINE,
+                    L"SOFTWARE\\Mozilla\\Mozilla Thunderbird",
+                    0, KEY_READ | KEY_WOW64_64KEY, &hKey);
+                if (result == ERROR_SUCCESS) {
+                    auto keyGuard = std::unique_ptr<
+                        std::remove_pointer_t<HKEY>, decltype(&RegCloseKey)>(hKey, RegCloseKey);
+                    wchar_t versionBuf[256] = {};
+                    DWORD bufSize = sizeof(versionBuf);
+                    result = RegQueryValueExW(hKey, L"CurrentVersion", nullptr, nullptr,
+                                              reinterpret_cast<LPBYTE>(versionBuf), &bufSize);
+                    if (result == ERROR_SUCCESS) {
+                        info.versionString = StringUtils::ToNarrow(versionBuf);
+                    }
+                }
+            }
+
+            installations.push_back(std::move(info));
+        }
+
+        Logger::Debug("ThunderbirdScanner: Discovered {} Thunderbird installations",
+                       installations.size());
+#endif
 
     } catch (const std::exception& e) {
         Logger::Error("ThunderbirdScanner: Installation discovery exception: {}", e.what());
@@ -1688,7 +3180,7 @@ void ThunderbirdScanner::RegisterMessageEventCallback(MessageEventCallback callb
     Logger::Debug("ThunderbirdScanner: Registered message event callback");
 }
 
-void ThunderbirdScanner::RegisterScanCallback(ScanResultCallback callback) {
+void ThunderbirdScanner::RegisterScanCallback(ThunderbirdScanResultCallback callback) {
     if (!m_impl) return;
 
     std::unique_lock lock(m_impl->m_callbackMutex);
@@ -1731,12 +3223,12 @@ void ThunderbirdScanner::UnregisterCallbacks() {
 // STATISTICS
 // ============================================================================
 
-[[nodiscard]] ThunderbirdScannerStatistics ThunderbirdScanner::GetStatistics() const {
+[[nodiscard]] ThunderbirdScannerStatisticsSnapshot ThunderbirdScanner::GetStatistics() const {
     if (!m_impl) {
-        return ThunderbirdScannerStatistics{};
+        return ThunderbirdScannerStatisticsSnapshot{};
     }
 
-    return m_impl->m_stats;
+    return m_impl->m_stats.ToSnapshot();
 }
 
 void ThunderbirdScanner::ResetStatistics() {
@@ -1885,29 +3377,75 @@ void ThunderbirdScanner::ResetStatistics() {
             return {};
         }
 
+        // Cap file size to prevent DoS
+        auto fileSize = fs::file_size(iniPath);
+        if (fileSize > 1 * 1024 * 1024) { // 1MB cap for profiles.ini
+            Logger::Warn("ParseProfilesIni: File exceeds size limit ({} bytes): {}",
+                         fileSize, iniPath.string());
+            return {};
+        }
+
         std::vector<ThunderbirdProfile> profiles;
         std::ifstream iniFile(iniPath);
         if (!iniFile) {
             return profiles;
         }
 
+        fs::path basePath = iniPath.parent_path();
         ThunderbirdProfile currentProfile;
         std::string currentSection;
+        bool currentIsRelative = true; // Default: paths are relative
+        std::string currentRawPath;
         std::string line;
 
+        auto commitProfile = [&]() {
+            if (!currentSection.starts_with("Profile") || currentProfile.name.empty()) {
+                return;
+            }
+
+            // Resolve path based on IsRelative flag
+            if (!currentRawPath.empty()) {
+                if (currentIsRelative) {
+                    currentProfile.path = basePath / currentRawPath;
+                } else {
+                    currentProfile.path = fs::path(currentRawPath);
+                }
+
+                // Canonicalize and validate against directory traversal
+                try {
+                    currentProfile.path = fs::weakly_canonical(currentProfile.path);
+                } catch (...) {
+                    Logger::Warn("ParseProfilesIni: Failed to canonicalize path for profile: {}",
+                                 currentProfile.name);
+                }
+
+                // Verify the profile path is under the Thunderbird data directory
+                // (relative paths must stay under basePath)
+                if (currentIsRelative && !IsPathSafe(currentProfile.path, basePath)) {
+                    Logger::Warn("ParseProfilesIni: Directory traversal detected in profile {}: {}",
+                                 currentProfile.name, currentRawPath);
+                    return; // Skip this profile
+                }
+            }
+
+            profiles.push_back(currentProfile);
+        };
+
         while (std::getline(iniFile, line)) {
-            StringUtils::Trim(line);
+            TrimNarrow(line);
 
             if (line.empty() || line[0] == ';' || line[0] == '#') {
                 continue;
             }
 
             if (line[0] == '[' && line.back() == ']') {
-                if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
-                    profiles.push_back(currentProfile);
-                    currentProfile = ThunderbirdProfile{};
-                }
+                // Commit previous profile section
+                commitProfile();
+
                 currentSection = line.substr(1, line.length() - 2);
+                currentProfile = ThunderbirdProfile{};
+                currentIsRelative = true;
+                currentRawPath.clear();
                 continue;
             }
 
@@ -1918,24 +3456,24 @@ void ThunderbirdScanner::ResetStatistics() {
 
             std::string key = line.substr(0, eqPos);
             std::string value = line.substr(eqPos + 1);
-            StringUtils::Trim(key);
-            StringUtils::Trim(value);
+            TrimNarrow(key);
+            TrimNarrow(value);
 
             if (currentSection.starts_with("Profile")) {
                 if (key == "Name") {
                     currentProfile.name = value;
+                } else if (key == "IsRelative") {
+                    currentIsRelative = (value == "1");
                 } else if (key == "Path") {
-                    fs::path basePath = iniPath.parent_path();
-                    currentProfile.path = basePath / value;
+                    currentRawPath = value;
                 } else if (key == "Default") {
                     currentProfile.isDefault = (value == "1");
                 }
             }
         }
 
-        if (currentSection.starts_with("Profile") && !currentProfile.name.empty()) {
-            profiles.push_back(currentProfile);
-        }
+        // Commit final section
+        commitProfile();
 
         return profiles;
 
@@ -1951,7 +3489,7 @@ void ThunderbirdScanner::ResetStatistics() {
             return MailboxFormat::Unknown;
         }
 
-        std::string ext = StringUtils::ToLowerCase(path.extension().string());
+        std::string ext = ToLowerCopy(path.extension().string());
         if (ext == ".msf") {
             return MailboxFormat::Unknown;
         }

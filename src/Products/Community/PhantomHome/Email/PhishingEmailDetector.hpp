@@ -131,12 +131,12 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../PatternStore/PatternStore.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
 #include "EmailCommon.hpp"
 
 // ============================================================================
@@ -231,6 +231,29 @@ enum class PhishingIndicator : uint32_t {
     DMARCFailure            = 1 << 20,
     IPReputation            = 1 << 21
 };
+
+/// @brief Bitwise OR for PhishingIndicator
+[[nodiscard]] inline constexpr PhishingIndicator operator|(PhishingIndicator lhs, PhishingIndicator rhs) noexcept {
+    return static_cast<PhishingIndicator>(
+        static_cast<uint32_t>(lhs) | static_cast<uint32_t>(rhs));
+}
+
+/// @brief Bitwise OR assignment for PhishingIndicator
+inline constexpr PhishingIndicator& operator|=(PhishingIndicator& lhs, PhishingIndicator rhs) noexcept {
+    lhs = lhs | rhs;
+    return lhs;
+}
+
+/// @brief Bitwise AND for PhishingIndicator
+[[nodiscard]] inline constexpr PhishingIndicator operator&(PhishingIndicator lhs, PhishingIndicator rhs) noexcept {
+    return static_cast<PhishingIndicator>(
+        static_cast<uint32_t>(lhs) & static_cast<uint32_t>(rhs));
+}
+
+/// @brief Check if indicator flag is set
+[[nodiscard]] inline constexpr bool HasIndicator(PhishingIndicator mask, PhishingIndicator flag) noexcept {
+    return (static_cast<uint32_t>(mask) & static_cast<uint32_t>(flag)) != 0;
+}
 
 /**
  * @brief Campaign type
@@ -474,7 +497,28 @@ struct PhishingAnalysisResult {
 };
 
 /**
- * @brief Statistics
+ * @brief Statistics snapshot (copyable, for GetStatistics return)
+ */
+struct PhishingStatisticsSnapshot {
+    uint64_t totalAnalyzed{0};
+    uint64_t phishingDetected{0};
+    uint64_t suspiciousDetected{0};
+    uint64_t cleanDetected{0};
+    uint64_t becDetected{0};
+    uint64_t spearPhishingDetected{0};
+    uint64_t urlsAnalyzed{0};
+    uint64_t maliciousUrlsDetected{0};
+    uint64_t homographsDetected{0};
+    uint64_t brandImpersonationDetected{0};
+    std::array<uint64_t, 16> byCampaignType{};
+    std::array<uint64_t, 32> byIndicator{};
+    TimePoint startTime = Clock::now();
+    
+    [[nodiscard]] std::string ToJson() const;
+};
+
+/**
+ * @brief Statistics (internal, non-copyable atomics)
  */
 struct PhishingStatistics {
     std::atomic<uint64_t> totalAnalyzed{0};
@@ -493,6 +537,9 @@ struct PhishingStatistics {
     
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
+    
+    /// @brief Create copyable snapshot
+    [[nodiscard]] PhishingStatisticsSnapshot ToSnapshot() const noexcept;
 };
 
 /**
@@ -639,7 +686,7 @@ public:
     // STATISTICS
     // ========================================================================
     
-    [[nodiscard]] PhishingStatistics GetStatistics() const;
+    [[nodiscard]] PhishingStatisticsSnapshot GetStatistics() const;
     void ResetStatistics();
 
     [[nodiscard]] bool SelfTest();

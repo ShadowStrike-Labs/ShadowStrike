@@ -46,14 +46,14 @@
 #include "SpamDetector.hpp"
 
 // Infrastructure includes
-#include "../Utils/Logger.hpp"
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/NetworkUtils.hpp"
-#include "../Utils/FileUtils.hpp"
-#include "../Utils/HashUtils.hpp"
-#include "../ThreatIntel/ThreatIntelManager.hpp"
-#include "../Whitelist/WhiteListStore.hpp"
-#include "../PatternStore/PatternStore.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/NetworkUtils.hpp"
+#include "PhantomCore/Utils/FileUtils.hpp"
+#include "PhantomCore/Utils/HashUtils.hpp"
+#include "PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
+#include "PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "PhantomCore/PatternStore/PatternStore.hpp"
 
 // Windows headers
 #include <windows.h>
@@ -82,13 +82,25 @@ namespace Email {
 namespace {
 
 /**
+ * @brief ASCII-only lowercase for narrow strings (keyword matching).
+ * @param sv Input string view
+ * @return Lowercase copy using ASCII rules
+ */
+[[nodiscard]] std::string AsciiToLower(std::string_view sv) {
+    std::string result(sv);
+    std::transform(result.begin(), result.end(), result.begin(),
+        [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    return result;
+}
+
+/**
  * @brief Tokenize text into words/n-grams
  */
 std::vector<std::string> TokenizeText(const std::string& text, bool useNGrams = true) {
     std::vector<std::string> tokens;
 
     // Convert to lowercase
-    std::string lower = Utils::StringUtils::ToLower(text);
+    std::string lower = AsciiToLower(text);
 
     // Extract words (alphanumeric sequences)
     std::regex wordRegex(R"([a-z0-9]+)");
@@ -119,7 +131,7 @@ std::vector<std::string> TokenizeText(const std::string& text, bool useNGrams = 
 double CalculateKeywordDensity(const std::string& text, const std::vector<std::string>& keywords) {
     if (text.empty() || keywords.empty()) return 0.0;
 
-    const std::string lower = Utils::StringUtils::ToLower(text);
+    const std::string lower = AsciiToLower(text);
     uint32_t matches = 0;
 
     for (const auto& keyword : keywords) {
@@ -137,23 +149,66 @@ double CalculateKeywordDensity(const std::string& text, const std::vector<std::s
 }
 
 /**
- * @brief Detect hidden text in HTML
+ * @brief Detect hidden text in HTML using comprehensive CSS/style analysis
  */
 bool HasHiddenText(const std::string& html) {
     if (html.empty()) return false;
 
-    // Check for color=#ffffff on white background
+    // White/near-white text on white background
     if (html.find("color:#fff") != std::string::npos ||
         html.find("color:white") != std::string::npos ||
-        html.find("color:#ffffff") != std::string::npos) {
+        html.find("color:#ffffff") != std::string::npos ||
+        html.find("color: #fff") != std::string::npos ||
+        html.find("color: white") != std::string::npos ||
+        html.find("color: #ffffff") != std::string::npos) {
         return true;
     }
 
-    // Check for font-size:0 or display:none
+    // Zero-size or hidden elements
     if (html.find("font-size:0") != std::string::npos ||
+        html.find("font-size: 0") != std::string::npos ||
         html.find("display:none") != std::string::npos ||
-        html.find("visibility:hidden") != std::string::npos) {
+        html.find("display: none") != std::string::npos ||
+        html.find("visibility:hidden") != std::string::npos ||
+        html.find("visibility: hidden") != std::string::npos) {
         return true;
+    }
+
+    // Opacity-based hiding
+    if (html.find("opacity:0") != std::string::npos ||
+        html.find("opacity: 0") != std::string::npos) {
+        return true;
+    }
+
+    // Off-screen positioning via large negative values
+    if (html.find("left:-9999") != std::string::npos ||
+        html.find("left: -9999") != std::string::npos ||
+        html.find("top:-9999") != std::string::npos ||
+        html.find("top: -9999") != std::string::npos ||
+        html.find("margin-left:-9999") != std::string::npos ||
+        html.find("text-indent:-9999") != std::string::npos ||
+        html.find("text-indent: -9999") != std::string::npos) {
+        return true;
+    }
+
+    // Zero-dimension containers
+    if (html.find("width:0") != std::string::npos ||
+        html.find("width: 0") != std::string::npos ||
+        html.find("height:0") != std::string::npos ||
+        html.find("height: 0") != std::string::npos ||
+        html.find("max-height:0") != std::string::npos ||
+        html.find("max-width:0") != std::string::npos) {
+        return true;
+    }
+
+    // Overflow hidden with constrained dimensions (common spam technique)
+    if (html.find("overflow:hidden") != std::string::npos ||
+        html.find("overflow: hidden") != std::string::npos) {
+        if (html.find("height:1px") != std::string::npos ||
+            html.find("height: 1px") != std::string::npos ||
+            html.find("max-height:1px") != std::string::npos) {
+            return true;
+        }
     }
 
     return false;
@@ -202,15 +257,46 @@ std::string ExtractDomain(const std::string& email) {
 }
 
 /**
- * @brief Extract IP from Received header
+ * @brief Extract and validate IP from Received header
  */
 std::string ExtractIPFromReceived(const std::string& received) {
-    // Simple IPv4 extraction
-    std::regex ipRegex(R"(\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b)");
+    // Match IPv4 addresses with capture groups for validation
+    std::regex ipRegex(R"(\b(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\b)");
     std::smatch match;
 
-    if (std::regex_search(received, match, ipRegex)) {
-        return match[0].str();
+    std::string::const_iterator searchStart = received.cbegin();
+    while (std::regex_search(searchStart, received.cend(), match, ipRegex)) {
+        // Validate each octet is in range [0, 255]
+        bool valid = true;
+        for (int i = 1; i <= 4; ++i) {
+            int octet = std::stoi(match[i].str());
+            if (octet < 0 || octet > 255) {
+                valid = false;
+                break;
+            }
+        }
+
+        if (valid) {
+            std::string ip = match[0].str();
+            // Skip private/loopback addresses as they're not meaningful for RBL checks
+            if (ip.starts_with("127.") || ip.starts_with("10.") ||
+                ip.starts_with("0.") || ip == "255.255.255.255") {
+                searchStart = match.suffix().first;
+                continue;
+            }
+            // Skip 192.168.x.x and 172.16-31.x.x private ranges
+            if (ip.starts_with("192.168.")) {
+                searchStart = match.suffix().first;
+                continue;
+            }
+            int secondOctet = std::stoi(match[2].str());
+            if (ip.starts_with("172.") && secondOctet >= 16 && secondOctet <= 31) {
+                searchStart = match.suffix().first;
+                continue;
+            }
+            return ip;
+        }
+        searchStart = match.suffix().first;
     }
 
     return "";
@@ -230,6 +316,9 @@ const std::vector<std::string> SPAM_KEYWORDS = {
 };
 
 } // anonymous namespace
+
+// Bring Logger into scope for all class implementations in this TU
+using Utils::Logger;
 
 // ============================================================================
 // JSON SERIALIZATION IMPLEMENTATIONS
@@ -361,7 +450,7 @@ public:
             auto& stats = m_tokenStats[token];
             stats.token = token;
             stats.spamCount++;
-            stats.lastSeen = std::chrono::steady_clock::now();
+            stats.lastSeen = std::chrono::system_clock::now();
             UpdateProbability(stats);
         }
 
@@ -375,7 +464,7 @@ public:
             auto& stats = m_tokenStats[token];
             stats.token = token;
             stats.hamCount++;
-            stats.lastSeen = std::chrono::steady_clock::now();
+            stats.lastSeen = std::chrono::system_clock::now();
             UpdateProbability(stats);
         }
 
@@ -437,6 +526,11 @@ public:
         return m_tokenStats.size();
     }
 
+    std::pair<size_t, size_t> GetCorpusSize() const {
+        std::shared_lock lock(m_mutex);
+        return {m_totalSpamEmails, m_totalHamEmails};
+    }
+
     bool SaveCorpus(const std::string& filePath) const {
         std::shared_lock lock(m_mutex);
 
@@ -463,7 +557,8 @@ public:
 
             return true;
 
-        } catch (...) {
+        } catch (const std::exception& e) {
+            Logger::Error("BayesianClassifier: Failed to save corpus to '{}': {}", filePath, e.what());
             return false;
         }
     }
@@ -504,7 +599,8 @@ public:
 
             return true;
 
-        } catch (...) {
+        } catch (const std::exception& e) {
+            Logger::Error("BayesianClassifier: Failed to load corpus from '{}': {}", filePath, e.what());
             return false;
         }
     }
@@ -589,14 +685,20 @@ private:
         try {
             PDNS_RECORD pDnsRecord = nullptr;
 
-            const DNS_STATUS status = DnsQuery_A(
-                Utils::StringUtils::Utf8ToWide(query).c_str(),
+            const DNS_STATUS status = DnsQuery_W(
+                Utils::StringUtils::ToWide(query).c_str(),
                 DNS_TYPE_A,
                 DNS_QUERY_STANDARD,
                 nullptr,
                 &pDnsRecord,
                 nullptr
             );
+
+            // RAII guard for DNS record cleanup
+            struct DnsRecordGuard {
+                PDNS_RECORD record;
+                ~DnsRecordGuard() { if (record) DnsRecordListFree(record, DnsFreeRecordList); }
+            } dnsGuard{pDnsRecord};
 
             if (status == 0 && pDnsRecord) {
                 // Listed in RBL
@@ -609,13 +711,13 @@ private:
                         addr->S_un.S_un_b.s_b4);
                 }
 
-                DnsRecordListFree(pDnsRecord, DnsFreeRecordList);
                 return true;
             }
 
             return false;
 
-        } catch (...) {
+        } catch (const std::exception& e) {
+            Logger::Error("SpamDetector: RBL DNS lookup failed for query '{}': {}", query, e.what());
             return false;
         }
     }
@@ -650,7 +752,7 @@ public:
         rep.domain = ExtractDomain(sender);
         rep.ipAddress = ipAddress;
         rep.reputationScore = 50;  // Neutral
-        rep.firstSeen = std::chrono::steady_clock::now();
+        rep.firstSeen = std::chrono::system_clock::now();
         rep.lastSeen = rep.firstSeen;
 
         return rep;
@@ -667,11 +769,11 @@ public:
             rep.domain = ExtractDomain(sender);
             rep.ipAddress = ipAddress;
             rep.reputationScore = 50;
-            rep.firstSeen = std::chrono::steady_clock::now();
+            rep.firstSeen = std::chrono::system_clock::now();
         }
 
         rep.totalEmails++;
-        rep.lastSeen = std::chrono::steady_clock::now();
+        rep.lastSeen = std::chrono::system_clock::now();
 
         if (isSpam) {
             rep.spamEmails++;
@@ -689,17 +791,17 @@ public:
 
     void AddToWhitelist(const std::string& sender) {
         std::unique_lock lock(m_mutex);
-        m_whitelist.insert(Utils::StringUtils::ToLower(sender));
+        m_whitelist.insert(AsciiToLower(sender));
     }
 
     void AddToBlacklist(const std::string& sender) {
         std::unique_lock lock(m_mutex);
-        m_blacklist.insert(Utils::StringUtils::ToLower(sender));
+        m_blacklist.insert(AsciiToLower(sender));
     }
 
     bool IsWhitelisted(const std::string& sender) const {
         std::shared_lock lock(m_mutex);
-        const std::string lower = Utils::StringUtils::ToLower(sender);
+        const std::string lower = AsciiToLower(sender);
 
         // Check exact match
         if (m_whitelist.count(lower)) return true;
@@ -711,7 +813,7 @@ public:
 
     bool IsBlacklisted(const std::string& sender) const {
         std::shared_lock lock(m_mutex);
-        const std::string lower = Utils::StringUtils::ToLower(sender);
+        const std::string lower = AsciiToLower(sender);
 
         // Check exact match
         if (m_blacklist.count(lower)) return true;
@@ -719,6 +821,36 @@ public:
         // Check domain
         const std::string domain = ExtractDomain(lower);
         return m_blacklist.count(domain);
+    }
+
+    bool RemoveFromWhitelist(const std::string& sender) {
+        std::unique_lock lock(m_mutex);
+        const std::string lower = AsciiToLower(sender);
+        return m_whitelist.erase(lower) > 0;
+    }
+
+    bool RemoveFromBlacklist(const std::string& sender) {
+        std::unique_lock lock(m_mutex);
+        const std::string lower = AsciiToLower(sender);
+        return m_blacklist.erase(lower) > 0;
+    }
+
+    SenderReputation GetSenderReputation(const std::string& sender) {
+        std::shared_lock lock(m_mutex);
+        // Search across all keys containing this sender
+        for (const auto& [key, rep] : m_reputations) {
+            if (key.starts_with(sender + "|") || rep.email == sender) {
+                return rep;
+            }
+        }
+        // Return neutral reputation for unknown senders
+        SenderReputation rep;
+        rep.email = sender;
+        rep.domain = ExtractDomain(sender);
+        rep.reputationScore = 50;
+        rep.firstSeen = std::chrono::system_clock::now();
+        rep.lastSeen = rep.firstSeen;
+        return rep;
     }
 
 private:
@@ -771,8 +903,15 @@ public:
     }
 
     void InvokeAnalysis(const SpamAnalysisResult& result) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_analysisCallbacks) {
+        std::vector<AnalysisCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_analysisCallbacks.size());
+            for (const auto& [id, cb] : m_analysisCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(result);
             } catch (const std::exception& e) {
@@ -782,8 +921,15 @@ public:
     }
 
     void InvokeTraining(bool isSpam, size_t tokensLearned) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_trainingCallbacks) {
+        std::vector<TrainingCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_trainingCallbacks.size());
+            for (const auto& [id, cb] : m_trainingCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(isSpam, tokensLearned);
             } catch (const std::exception& e) {
@@ -793,8 +939,15 @@ public:
     }
 
     void InvokeRBL(const std::string& ipAddress, const std::vector<RBLCheckResult>& results) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_rblCallbacks) {
+        std::vector<RBLCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_rblCallbacks.size());
+            for (const auto& [id, cb] : m_rblCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(ipAddress, results);
             } catch (const std::exception& e) {
@@ -804,8 +957,15 @@ public:
     }
 
     void InvokeError(const std::string& message, int code) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& [id, callback] : m_errorCallbacks) {
+        std::vector<ErrorCallback> callbacksCopy;
+        {
+            std::shared_lock lock(m_mutex);
+            callbacksCopy.reserve(m_errorCallbacks.size());
+            for (const auto& [id, cb] : m_errorCallbacks) {
+                callbacksCopy.push_back(cb);
+            }
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
@@ -1034,9 +1194,9 @@ public:
             if (result.spamScore >= m_config.spamThreshold) {
                 result.isSpam = true;
 
-                if (result.indicators & SpamIndicator::RBLListed) {
-                    result.verdict = SpamVerdict::Phishing;
-                    m_stats.phishingDetected.fetch_add(1, std::memory_order_relaxed);
+                if (HasIndicator(result.indicators, SpamIndicator::RBLListed)) {
+                    result.verdict = SpamVerdict::Spam;
+                    m_stats.spamDetected.fetch_add(1, std::memory_order_relaxed);
                 } else {
                     result.verdict = SpamVerdict::Spam;
                     m_stats.spamDetected.fetch_add(1, std::memory_order_relaxed);
@@ -1240,6 +1400,39 @@ public:
         return m_reputationTracker->IsBlacklisted(sender);
     }
 
+    bool RemoveFromWhitelist(const std::string& sender) {
+        std::shared_lock lock(m_mutex);
+        if (!m_initialized) return false;
+
+        bool removed = m_reputationTracker->RemoveFromWhitelist(sender);
+        if (removed) {
+            Logger::Info("SpamDetector: Removed from whitelist: {}", sender);
+        }
+        return removed;
+    }
+
+    bool RemoveFromBlacklist(const std::string& sender) {
+        std::shared_lock lock(m_mutex);
+        if (!m_initialized) return false;
+
+        bool removed = m_reputationTracker->RemoveFromBlacklist(sender);
+        if (removed) {
+            Logger::Info("SpamDetector: Removed from blacklist: {}", sender);
+        }
+        return removed;
+    }
+
+    SenderReputation GetSenderReputation(const std::string& sender) {
+        std::shared_lock lock(m_mutex);
+        if (!m_initialized) {
+            SenderReputation rep;
+            rep.email = sender;
+            rep.reputationScore = 50;
+            return rep;
+        }
+        return m_reputationTracker->GetSenderReputation(sender);
+    }
+
     // ========================================================================
     // CONFIGURATION
     // ========================================================================
@@ -1293,6 +1486,25 @@ public:
         return m_stats;
     }
 
+    [[nodiscard]] SpamDetectorStatisticsSnapshot GetStatisticsSnapshot() const noexcept {
+        SpamDetectorStatisticsSnapshot snapshot;
+        snapshot.totalAnalyzed = m_stats.totalAnalyzed.load(std::memory_order_acquire);
+        snapshot.spamDetected = m_stats.spamDetected.load(std::memory_order_acquire);
+        snapshot.hamDetected = m_stats.hamDetected.load(std::memory_order_acquire);
+        snapshot.bulkDetected = m_stats.bulkDetected.load(std::memory_order_acquire);
+        snapshot.phishingDetected = m_stats.phishingDetected.load(std::memory_order_acquire);
+        snapshot.malwareDetected = m_stats.malwareDetected.load(std::memory_order_acquire);
+        snapshot.rblHits = m_stats.rblHits.load(std::memory_order_acquire);
+        snapshot.bayesianHits = m_stats.bayesianHits.load(std::memory_order_acquire);
+        snapshot.ruleHits = m_stats.ruleHits.load(std::memory_order_acquire);
+        snapshot.whitelistHits = m_stats.whitelistHits.load(std::memory_order_acquire);
+        snapshot.blacklistHits = m_stats.blacklistHits.load(std::memory_order_acquire);
+        snapshot.falsePositives = m_stats.falsePositives.load(std::memory_order_acquire);
+        snapshot.falseNegatives = m_stats.falseNegatives.load(std::memory_order_acquire);
+        snapshot.tokensLearned = m_stats.tokensLearned.load(std::memory_order_acquire);
+        return snapshot;
+    }
+
     void ResetStatistics() noexcept {
         m_stats.Reset();
     }
@@ -1303,6 +1515,12 @@ public:
         if (!m_initialized) return 0;
 
         return m_bayesianClassifier->GetTokenCount();
+    }
+
+    std::pair<size_t, size_t> GetCorpusSize() const {
+        std::shared_lock lock(m_mutex);
+        if (!m_initialized) return {0, 0};
+        return m_bayesianClassifier->GetCorpusSize();
     }
 
     // ========================================================================
@@ -1469,6 +1687,18 @@ bool SpamDetector::IsBlacklisted(const std::string& sender) const {
     return m_impl->IsBlacklisted(sender);
 }
 
+bool SpamDetector::RemoveFromWhitelist(const std::string& emailOrDomain) {
+    return m_impl->RemoveFromWhitelist(emailOrDomain);
+}
+
+bool SpamDetector::RemoveFromBlacklist(const std::string& emailOrDomain) {
+    return m_impl->RemoveFromBlacklist(emailOrDomain);
+}
+
+SenderReputation SpamDetector::GetSenderReputation(const std::string& sender) {
+    return m_impl->GetSenderReputation(sender);
+}
+
 bool SpamDetector::UpdateConfiguration(const SpamDetectorConfiguration& config) {
     return m_impl->UpdateConfiguration(config);
 }
@@ -1497,8 +1727,8 @@ void SpamDetector::UnregisterCallback(uint64_t callbackId) {
     m_impl->UnregisterCallback(callbackId);
 }
 
-const SpamDetectorStatistics& SpamDetector::GetStatistics() const noexcept {
-    return m_impl->GetStatistics();
+SpamDetectorStatisticsSnapshot SpamDetector::GetStatistics() const {
+    return m_impl->GetStatisticsSnapshot();
 }
 
 void SpamDetector::ResetStatistics() noexcept {
@@ -1507,6 +1737,10 @@ void SpamDetector::ResetStatistics() noexcept {
 
 size_t SpamDetector::GetTokenCount() const {
     return m_impl->GetTokenCount();
+}
+
+std::pair<size_t, size_t> SpamDetector::GetCorpusSize() const {
+    return m_impl->GetCorpusSize();
 }
 
 bool SpamDetector::SelfTest() {
