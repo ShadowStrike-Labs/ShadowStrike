@@ -14,6 +14,7 @@
 #include "ShadowStrike/Fuzzer/Harnesses/EmulatorExecutionHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/EmulatorPEHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/BehaviorHarness.hpp"
+#include "ShadowStrike/Fuzzer/Harnesses/ScanEngineHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/IPCHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/ServiceProtocolHarness.hpp"
 #include "ShadowStrike/Fuzzer/Harnesses/TrafficHarness.hpp"
@@ -74,6 +75,7 @@ void PrintUsage() {
         << "  ShadowStrikeFuzzer --fuzz-emu-execution <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-emu-pe <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-behavior <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
+        << "  ShadowStrikeFuzzer --fuzz-scan-engine <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-ipc <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-service-proto <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
         << "  ShadowStrikeFuzzer --fuzz-traffic <workspace-dir> [--iterations N] [--duration N] [--max-size N]\n"
@@ -1042,6 +1044,51 @@ int wmain(int argc, wchar_t* argv[]) {
         }
 
         return SSF::RunBehaviorFuzzer(argv[2], config);
+    }
+
+    if (command == L"--fuzz-scan-engine") {
+        if (argc < 3) {
+            std::cerr << "--fuzz-scan-engine requires a workspace directory\n";
+            return 1;
+        }
+
+        SSF::FuzzLoopConfig config;
+        config.maxIterations = 0;
+        config.maxDurationSeconds = 0;
+        config.maxInputSize = 4096;
+        config.reportIntervalIterations = 1000;
+
+        for (int i = 3; i < argc; ++i) {
+            const std::wstring_view arg = argv[i];
+
+            if (arg == L"--iterations" && i + 1 < argc) {
+                try {
+                    config.maxIterations = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --iterations value\n";
+                    return 1;
+                }
+            } else if (arg == L"--duration" && i + 1 < argc) {
+                try {
+                    config.maxDurationSeconds = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --duration value\n";
+                    return 1;
+                }
+            } else if (arg == L"--max-size" && i + 1 < argc) {
+                try {
+                    config.maxInputSize = std::stoull(NarrowAscii(argv[++i]));
+                } catch (...) {
+                    std::cerr << "Invalid --max-size value\n";
+                    return 1;
+                }
+            } else {
+                std::cerr << "Unknown option: " << NarrowAscii(arg) << '\n';
+                return 1;
+            }
+        }
+
+        return SSF::RunScanEngineFuzzer(argv[2], config);
     }
 
     // IPC Named-Pipe Protocol Fuzzing Command

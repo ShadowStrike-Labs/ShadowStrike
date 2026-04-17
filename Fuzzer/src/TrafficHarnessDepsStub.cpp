@@ -130,10 +130,37 @@ ThreatLookupResult ThreatIntelLookup::LookupHash(
 namespace ShadowStrike::SignatureStore {
 
 ScanResult SignatureStore::ScanBuffer(
-    std::span<const uint8_t>,
-    const ScanOptions&) const noexcept
+    std::span<const uint8_t> buffer,
+    const ScanOptions& options) const noexcept
 {
-    return {};
+    ScanResult result{};
+    result.totalBytesScanned = buffer.size();
+
+    if (!options.enablePatternScan && !options.enableYaraScan) {
+        return result;
+    }
+
+    const std::string_view haystack(
+        reinterpret_cast<const char*>(buffer.data()),
+        buffer.size());
+
+    auto appendDetection = [&](std::string_view name, ThreatLevel level, std::string_view description) {
+        DetectionResult detection{};
+        detection.signatureId = 0x5452414646494355ull;
+        detection.signatureName.assign(name.begin(), name.end());
+        detection.threatLevel = level;
+        detection.description.assign(description.begin(), description.end());
+        detection.tags.emplace_back("fuzz");
+        result.detections.push_back(std::move(detection));
+    };
+
+    if (haystack.find("FUZZ_SIG_INFECTED") != std::string_view::npos) {
+        appendDetection("Fuzz.Shared.Infected", ThreatLevel::Critical, "Deterministic infected marker");
+    } else if (haystack.find("FUZZ_SIG_SUSPICIOUS") != std::string_view::npos) {
+        appendDetection("Fuzz.Shared.Suspicious", ThreatLevel::Medium, "Deterministic suspicious marker");
+    }
+
+    return result;
 }
 
 }  // namespace ShadowStrike::SignatureStore
