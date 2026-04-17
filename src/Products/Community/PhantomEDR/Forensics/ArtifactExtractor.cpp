@@ -78,12 +78,18 @@
 // STANDARD LIBRARY INCLUDES
 // ============================================================================
 #include <algorithm>
-#include <numeric>
-#include <sstream>
-#include <iomanip>
-#include <thread>
+#include <bit>
+#include <cctype>
+#include <cwctype>
+#include <cstring>
 #include <fstream>
 #include <format>
+#include <iomanip>
+#include <limits>
+#include <numeric>
+#include <sstream>
+#include <system_error>
+#include <thread>
 
 // ============================================================================
 // WINDOWS API INCLUDES
@@ -94,6 +100,7 @@
 #include <comutil.h>
 #include <Wbemidl.h>
 #include <shlobj.h>
+#include <winioctl.h>
 #pragma comment(lib, "Psapi.lib")
 #pragma comment(lib, "taskschd.lib")
 #pragma comment(lib, "comsuppw.lib")
@@ -104,7 +111,10 @@
 // ============================================================================
 // THIRD-PARTY INCLUDES
 // ============================================================================
+#include <sqlite3.h>
 #include <nlohmann/json.hpp>
+
+#pragma comment(lib, "sqlite3.lib")
 
 namespace ShadowStrike {
 namespace Forensics {
@@ -233,6 +243,869 @@ std::wstring GetFirefoxHistoryPath(std::wstring_view profile) {
 
     return L"";
 }
+
+
+constexpr wchar_t kArtifactExtractorLogCategory[] = L"ArtifactExtractor";
+constexpr DWORD kMaxRegistryBinaryBytes = 32UL * 1024UL * 1024UL;
+constexpr uint64_t kMaxBrowserDatabaseBytes = 512ULL * 1024ULL * 1024ULL;
+constexpr size_t kMaxShellbagValueBytes = 64U * 1024U;
+constexpr size_t kMaxResidentAttributeBytes = 1024U * 1024U;
+constexpr size_t kShimcacheExecutionFlagBytes = sizeof(uint32_t);
+constexpr uint32_t kShimcacheExecutedFlag = 0x00000002U;
+std::atomic<uint64_t> s_artifactTempCounter{0};
+
+struct ScopedHandle {
+    HANDLE handle = INVALID_HANDLE_VALUE;
+
+    ScopedHandle() = default;
+    explicit ScopedHandle(HANDLE h) noexcept : handle(h) {}
+    ~ScopedHandle() {
+        if (handle != INVALID_HANDLE_VALUE && handle != nullptr) {
+            ::CloseHandle(handle);
+        }
+    }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept : handle(other.handle) {
+        other.handle = INVALID_HANDLE_VALUE;
+    }
+
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            if (handle != INVALID_HANDLE_VALUE && handle != nullptr) {
+                ::CloseHandle(handle);
+            }
+            handle = other.handle;
+            other.handle = INVALID_HANDLE_VALUE;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool IsValid() const noexcept {
+        return handle != INVALID_HANDLE_VALUE && handle != nullptr;
+    }
+};
+
+struct RegKeyHandle {
+    HKEY key = nullptr;
+
+    RegKeyHandle() = default;
+    explicit RegKeyHandle(HKEY h) noexcept : key(h) {}
+    ~RegKeyHandle() {
+        if (key != nullptr) {
+            ::RegCloseKey(key);
+        }
+    }
+
+    RegKeyHandle(const RegKeyHandle&) = delete;
+    RegKeyHandle& operator=(const RegKeyHandle&) = delete;
+
+    RegKeyHandle(RegKeyHandle&& other) noexcept : key(other.key) {
+        other.key = nullptr;
+    }
+
+    RegKeyHandle& operator=(RegKeyHandle&& other) noexcept {
+        if (this != &other) {
+            if (key != nullptr) {
+                ::RegCloseKey(key);
+            }
+            key = other.key;
+            other.key = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] bool IsValid() const noexcept {
+        return key != nullptr;
+    }
+};
+
+struct TempFileGuard {
+    std::filesystem::path path;
+
+    explicit TempFileGuard(std::filesystem::path tempPath) : path(std::move(tempPath)) {}
+    ~TempFileGuard() {
+        if (!path.empty()) {
+            std::error_code ec;
+            std::filesystem::remove(path, ec);
+        }
+    }
+
+    TempFileGuard(const TempFileGuard&) = delete;
+    TempFileGuard& operator=(const TempFileGuard&) = delete;
+};
+
+struct SqliteDbGuard {
+    sqlite3* db = nullptr;
+
+    explicit SqliteDbGuard(sqlite3* database) noexcept : db(database) {}
+    ~SqliteDbGuard() {
+        if (db != nullptr) {
+            sqlite3_close(db);
+        }
+    }
+
+    SqliteDbGuard(const SqliteDbGuard&) = delete;
+    SqliteDbGuard& operator=(const SqliteDbGuard&) = delete;
+};
+
+struct SqliteStmtGuard {
+    sqlite3_stmt* stmt = nullptr;
+
+    explicit SqliteStmtGuard(sqlite3_stmt* statement) noexcept : stmt(statement) {}
+    ~SqliteStmtGuard() {
+        if (stmt != nullptr) {
+            sqlite3_finalize(stmt);
+        }
+    }
+
+    SqliteStmtGuard(const SqliteStmtGuard&) = delete;
+    SqliteStmtGuard& operator=(const SqliteStmtGuard&) = delete;
+};
+
+#pragma pack(push, 1)
+struct NtfsFileRecordHeader {
+    uint32_t signature;
+    uint16_t updateSequenceOffset;
+    uint16_t updateSequenceCount;
+    uint64_t logFileSequenceNumber;
+    uint16_t sequenceNumber;
+    uint16_t hardLinkCount;
+    uint16_t firstAttributeOffset;
+    uint16_t flags;
+    uint32_t bytesInUse;
+    uint32_t bytesAllocated;
+    uint64_t baseFileRecord;
+    uint16_t nextAttributeId;
+    uint16_t align;
+    uint32_t recordNumber;
+};
+
+struct NtfsAttributeHeader {
+    uint32_t type;
+    uint32_t length;
+    uint8_t nonResident;
+    uint8_t nameLength;
+    uint16_t nameOffset;
+    uint16_t flags;
+    uint16_t attributeId;
+};
+
+struct NtfsResidentAttributeHeader {
+    NtfsAttributeHeader common;
+    uint32_t valueLength;
+    uint16_t valueOffset;
+    uint8_t indexedFlag;
+    uint8_t reserved;
+};
+
+struct NtfsNonResidentAttributeHeader {
+    NtfsAttributeHeader common;
+    uint64_t startingVcn;
+    uint64_t lastVcn;
+    uint16_t dataRunsOffset;
+    uint16_t compressionUnit;
+    uint32_t padding;
+    uint64_t allocatedSize;
+    uint64_t dataSize;
+    uint64_t initializedSize;
+    uint64_t compressedSize;
+};
+
+struct NtfsStandardInformationValue {
+    int64_t creationTime;
+    int64_t modificationTime;
+    int64_t mftModificationTime;
+    int64_t accessTime;
+};
+
+struct NtfsFileNameValueHeader {
+    uint64_t parentFileReference;
+    int64_t creationTime;
+    int64_t modificationTime;
+    int64_t mftModificationTime;
+    int64_t accessTime;
+    uint64_t allocatedSize;
+    uint64_t dataSize;
+    uint32_t flags;
+    uint32_t reparseValue;
+    uint8_t fileNameLength;
+    uint8_t fileNameNamespace;
+};
+#pragma pack(pop)
+
+struct ShellItemExtensionInfo {
+    std::wstring longName;
+    std::optional<SystemTimePoint> creationTime;
+    std::optional<SystemTimePoint> accessTime;
+};
+
+struct ParsedShellItem {
+    std::wstring name;
+    std::string itemType{"unknown"};
+    std::optional<SystemTimePoint> creationTime;
+    std::optional<SystemTimePoint> accessTime;
+};
+
+[[nodiscard]] uint64_t FileTimeToUInt64(const FILETIME& fileTime) noexcept {
+    ULARGE_INTEGER value{};
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
+[[nodiscard]] std::optional<SystemTimePoint> SystemTimeToTimePoint(const SYSTEMTIME& systemTime) {
+    if (systemTime.wYear == 0 || systemTime.wMonth == 0 || systemTime.wDay == 0) {
+        return std::nullopt;
+    }
+
+    const auto ymd = std::chrono::year_month_day{
+        std::chrono::year{static_cast<int>(systemTime.wYear)},
+        std::chrono::month{static_cast<unsigned>(systemTime.wMonth)},
+        std::chrono::day{static_cast<unsigned>(systemTime.wDay)}};
+
+    if (!ymd.ok()) {
+        return std::nullopt;
+    }
+
+    return std::chrono::sys_days{ymd}
+         + std::chrono::hours{systemTime.wHour}
+         + std::chrono::minutes{systemTime.wMinute}
+         + std::chrono::seconds{systemTime.wSecond}
+         + std::chrono::milliseconds{systemTime.wMilliseconds};
+}
+
+[[nodiscard]] std::optional<SystemTimePoint> FileTimeValueToTimePoint(uint64_t fileTimeValue) {
+    if (fileTimeValue == 0) {
+        return std::nullopt;
+    }
+
+    FILETIME fileTime{};
+    fileTime.dwLowDateTime = static_cast<DWORD>(fileTimeValue & 0xFFFFFFFFULL);
+    fileTime.dwHighDateTime = static_cast<DWORD>(fileTimeValue >> 32U);
+
+    SYSTEMTIME systemTime{};
+    if (!::FileTimeToSystemTime(&fileTime, &systemTime)) {
+        return std::nullopt;
+    }
+
+    if (systemTime.wYear <= 1601) {
+        return std::nullopt;
+    }
+
+    return SystemTimeToTimePoint(systemTime);
+}
+
+[[nodiscard]] std::optional<SystemTimePoint> FileTimeToTimePointChecked(const FILETIME& fileTime) {
+    return FileTimeValueToTimePoint(FileTimeToUInt64(fileTime));
+}
+
+[[nodiscard]] std::optional<SystemTimePoint> DosDateTimeToTimePoint(uint32_t dosDateTime) {
+    if (dosDateTime == 0) {
+        return std::nullopt;
+    }
+
+    const uint16_t timePart = static_cast<uint16_t>(dosDateTime & 0xFFFFU);
+    const uint16_t datePart = static_cast<uint16_t>((dosDateTime >> 16U) & 0xFFFFU);
+
+    const unsigned day = datePart & 0x1FU;
+    const unsigned month = (datePart >> 5U) & 0x0FU;
+    const int year = static_cast<int>(((datePart >> 9U) & 0x7FU) + 1980U);
+    const unsigned seconds = (timePart & 0x1FU) * 2U;
+    const unsigned minutes = (timePart >> 5U) & 0x3FU;
+    const unsigned hours = (timePart >> 11U) & 0x1FU;
+
+    if (day == 0 || month == 0 || seconds >= 60U || minutes >= 60U || hours >= 24U) {
+        return std::nullopt;
+    }
+
+    const auto ymd = std::chrono::year_month_day{
+        std::chrono::year{year},
+        std::chrono::month{month},
+        std::chrono::day{day}};
+
+    if (!ymd.ok()) {
+        return std::nullopt;
+    }
+
+    return std::chrono::sys_days{ymd}
+         + std::chrono::hours{hours}
+         + std::chrono::minutes{minutes}
+         + std::chrono::seconds{seconds};
+}
+
+[[nodiscard]] std::wstring TrimNtPathPrefix(std::wstring_view path) {
+    std::wstring normalized(path);
+    constexpr std::wstring_view ntPrefix = L"\\??\\";
+    constexpr std::wstring_view longPrefix = L"\\\\?\\";
+
+    if (normalized.starts_with(ntPrefix)) {
+        normalized.erase(0, ntPrefix.size());
+    } else if (normalized.starts_with(longPrefix)) {
+        normalized.erase(0, 4);
+    }
+
+    return normalized;
+}
+
+[[nodiscard]] std::wstring JoinPathComponent(const std::wstring& parentPath, std::wstring_view component) {
+    if (component.empty()) {
+        return parentPath;
+    }
+    if (parentPath.empty()) {
+        return std::wstring(component);
+    }
+    return parentPath + L"\\" + std::wstring(component);
+}
+
+[[nodiscard]] std::wstring BrowserTypeToWide(BrowserType browser) {
+    switch (browser) {
+        case BrowserType::Chrome:
+            return L"Chrome";
+        case BrowserType::Firefox:
+            return L"Firefox";
+        case BrowserType::Edge:
+            return L"Edge";
+        case BrowserType::IE:
+            return L"Internet Explorer";
+        case BrowserType::Opera:
+            return L"Opera";
+        case BrowserType::Brave:
+            return L"Brave";
+        case BrowserType::Vivaldi:
+            return L"Vivaldi";
+        case BrowserType::Safari:
+            return L"Safari";
+        default:
+            return L"Unknown";
+    }
+}
+
+[[nodiscard]] std::filesystem::path GetArtifactExtractorTempDirectory() {
+    std::filesystem::path tempDirectory = std::filesystem::current_path() / L"build" / L"artifactextractor_tmp";
+    std::error_code ec;
+    std::filesystem::create_directories(tempDirectory, ec);
+    if (ec) {
+        tempDirectory = std::filesystem::current_path();
+    }
+    return tempDirectory;
+}
+
+[[nodiscard]] std::filesystem::path GenerateArtifactTempPath(std::wstring_view prefix, std::wstring_view extension) {
+    const auto counter = s_artifactTempCounter.fetch_add(1, std::memory_order_relaxed);
+    std::wstringstream builder;
+    builder << prefix << ::GetCurrentProcessId() << L'_' << ::GetCurrentThreadId() << L'_' << counter << extension;
+    return GetArtifactExtractorTempDirectory() / builder.str();
+}
+
+[[nodiscard]] std::optional<std::filesystem::path> CopyFileToWorkingTemp(const std::filesystem::path& sourcePath,
+                                                                          std::wstring_view prefix)
+{
+    std::error_code ec;
+    if (!std::filesystem::exists(sourcePath, ec) || ec) {
+        return std::nullopt;
+    }
+
+    const auto sourceSize = std::filesystem::file_size(sourcePath, ec);
+    if (ec || sourceSize == static_cast<uintmax_t>(-1) || sourceSize > kMaxBrowserDatabaseBytes) {
+        return std::nullopt;
+    }
+
+    const auto tempPath = GenerateArtifactTempPath(prefix, L".sqlite");
+    std::filesystem::copy_file(sourcePath, tempPath, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+        return std::nullopt;
+    }
+
+    return tempPath;
+}
+
+[[nodiscard]] std::optional<std::vector<uint8_t>> QueryBinaryValue(HKEY key,
+                                                                   std::wstring_view valueName,
+                                                                   DWORD maxBytes = kMaxRegistryBinaryBytes)
+{
+    DWORD type = 0;
+    DWORD byteCount = 0;
+    auto result = ::RegQueryValueExW(key, std::wstring(valueName).c_str(), nullptr, &type, nullptr, &byteCount);
+    if (result != ERROR_SUCCESS || byteCount == 0 || byteCount > maxBytes) {
+        return std::nullopt;
+    }
+
+    if (type != REG_BINARY && type != REG_NONE) {
+        return std::nullopt;
+    }
+
+    std::vector<uint8_t> data(byteCount);
+    result = ::RegQueryValueExW(key,
+                                std::wstring(valueName).c_str(),
+                                nullptr,
+                                &type,
+                                reinterpret_cast<LPBYTE>(data.data()),
+                                &byteCount);
+    if (result != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+
+    data.resize(byteCount);
+    return data;
+}
+
+[[nodiscard]] std::optional<std::wstring> QueryStringValue(HKEY key, std::wstring_view valueName) {
+    DWORD type = 0;
+    DWORD byteCount = 0;
+    auto result = ::RegQueryValueExW(key, std::wstring(valueName).c_str(), nullptr, &type, nullptr, &byteCount);
+    if (result != ERROR_SUCCESS || byteCount == 0) {
+        return std::nullopt;
+    }
+
+    if (type != REG_SZ && type != REG_EXPAND_SZ) {
+        return std::nullopt;
+    }
+
+    std::wstring buffer((byteCount / sizeof(wchar_t)) + 1U, L'\0');
+    result = ::RegQueryValueExW(key,
+                                std::wstring(valueName).c_str(),
+                                nullptr,
+                                &type,
+                                reinterpret_cast<LPBYTE>(buffer.data()),
+                                &byteCount);
+    if (result != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+
+    buffer.resize(byteCount / sizeof(wchar_t));
+    while (!buffer.empty() && buffer.back() == L'\0') {
+        buffer.pop_back();
+    }
+
+    return buffer;
+}
+
+[[nodiscard]] std::optional<uint32_t> QueryDwordValue(HKEY key, std::wstring_view valueName) {
+    DWORD type = 0;
+    DWORD value = 0;
+    DWORD byteCount = sizeof(value);
+    const auto result = ::RegQueryValueExW(key,
+                                           std::wstring(valueName).c_str(),
+                                           nullptr,
+                                           &type,
+                                           reinterpret_cast<LPBYTE>(&value),
+                                           &byteCount);
+    if (result != ERROR_SUCCESS || type != REG_DWORD) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::optional<uint64_t> QueryQwordValue(HKEY key, std::wstring_view valueName) {
+    DWORD type = 0;
+    uint64_t value = 0;
+    DWORD byteCount = sizeof(value);
+    const auto result = ::RegQueryValueExW(key,
+                                           std::wstring(valueName).c_str(),
+                                           nullptr,
+                                           &type,
+                                           reinterpret_cast<LPBYTE>(&value),
+                                           &byteCount);
+    if (result != ERROR_SUCCESS || type != REG_QWORD) {
+        return std::nullopt;
+    }
+    return value;
+}
+
+[[nodiscard]] std::optional<SystemTimePoint> QueryKeyLastWriteTime(HKEY key) {
+    FILETIME lastWrite{};
+    const auto result = ::RegQueryInfoKeyW(key,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           nullptr,
+                                           &lastWrite);
+    if (result != ERROR_SUCCESS) {
+        return std::nullopt;
+    }
+    return FileTimeToTimePointChecked(lastWrite);
+}
+
+[[nodiscard]] std::wstring ExtractUtf16String(const uint8_t* data, size_t byteCount) {
+    if (data == nullptr || byteCount < sizeof(wchar_t)) {
+        return {};
+    }
+
+    const size_t evenLength = byteCount - (byteCount % sizeof(wchar_t));
+    size_t length = 0;
+    while (length + sizeof(wchar_t) <= evenLength) {
+        wchar_t current = L'\0';
+        std::memcpy(&current, data + length, sizeof(current));
+        if (current == L'\0') {
+            break;
+        }
+        length += sizeof(wchar_t);
+    }
+
+    if (length == 0) {
+        return {};
+    }
+
+    std::wstring result(length / sizeof(wchar_t), L'\0');
+    std::memcpy(result.data(), data, length);
+    return result;
+}
+
+[[nodiscard]] std::wstring ExtractAnsiString(const uint8_t* data, size_t byteCount) {
+    if (data == nullptr || byteCount == 0) {
+        return {};
+    }
+
+    size_t length = 0;
+    while (length < byteCount && data[length] != 0) {
+        ++length;
+    }
+
+    if (length == 0) {
+        return {};
+    }
+
+    return Utils::StringUtils::ToWide(std::string_view(reinterpret_cast<const char*>(data), length));
+}
+
+[[nodiscard]] std::wstring ExtractBestEffortShellItemName(std::span<const uint8_t> shellItem) {
+    for (size_t offset = 0; offset + 4 <= shellItem.size(); ++offset) {
+        if (shellItem[offset] >= 0x20 && shellItem[offset + 1] == 0) {
+            size_t end = offset;
+            while (end + 1 < shellItem.size() && shellItem[end] >= 0x20 && shellItem[end + 1] == 0) {
+                end += 2;
+            }
+            const auto extracted = ExtractUtf16String(shellItem.data() + offset, end - offset);
+            if (!extracted.empty()) {
+                return extracted;
+            }
+        }
+    }
+
+    for (size_t offset = 0; offset < shellItem.size(); ++offset) {
+        if (std::isprint(static_cast<unsigned char>(shellItem[offset])) != 0) {
+            size_t end = offset;
+            while (end < shellItem.size() && std::isprint(static_cast<unsigned char>(shellItem[end])) != 0) {
+                ++end;
+            }
+            const auto extracted = ExtractAnsiString(shellItem.data() + offset, end - offset);
+            if (!extracted.empty()) {
+                return extracted;
+            }
+        }
+    }
+
+    return {};
+}
+
+[[nodiscard]] std::optional<ShellItemExtensionInfo> ParseShellItemExtension(std::span<const uint8_t> shellItem) {
+    if (shellItem.size() < 18) {
+        return std::nullopt;
+    }
+
+    std::vector<size_t> candidateOffsets;
+    const uint16_t trailingOffset = static_cast<uint16_t>(shellItem[shellItem.size() - 2])
+                                  | (static_cast<uint16_t>(shellItem[shellItem.size() - 1]) << 8U);
+    if (trailingOffset >= 14U && trailingOffset + 10U <= shellItem.size()) {
+        candidateOffsets.push_back(trailingOffset);
+    }
+
+    for (size_t offset = 14; offset + 10 <= shellItem.size(); ++offset) {
+        uint32_t signature = 0;
+        std::memcpy(&signature, shellItem.data() + offset + 4, sizeof(signature));
+        if (signature == 0xBEEF0004U &&
+            std::find(candidateOffsets.begin(), candidateOffsets.end(), offset) == candidateOffsets.end()) {
+            candidateOffsets.push_back(offset);
+        }
+    }
+
+    for (const auto offset : candidateOffsets) {
+        if (offset + 18 > shellItem.size()) {
+            continue;
+        }
+
+        uint16_t extensionSize = 0;
+        uint16_t extensionVersion = 0;
+        uint32_t signature = 0;
+        uint32_t creationDosTime = 0;
+        uint32_t accessDosTime = 0;
+
+        std::memcpy(&extensionSize, shellItem.data() + offset, sizeof(extensionSize));
+        std::memcpy(&extensionVersion, shellItem.data() + offset + 2, sizeof(extensionVersion));
+        std::memcpy(&signature, shellItem.data() + offset + 4, sizeof(signature));
+        std::memcpy(&creationDosTime, shellItem.data() + offset + 8, sizeof(creationDosTime));
+        std::memcpy(&accessDosTime, shellItem.data() + offset + 12, sizeof(accessDosTime));
+
+        if (signature != 0xBEEF0004U || extensionSize < 18 || offset + extensionSize > shellItem.size()) {
+            continue;
+        }
+
+        ShellItemExtensionInfo info;
+        info.creationTime = DosDateTimeToTimePoint(creationDosTime);
+        info.accessTime = DosDateTimeToTimePoint(accessDosTime);
+
+        size_t cursor = offset + 16;
+        if (extensionVersion >= 7) {
+            if (cursor + 2 + 8 + 8 > offset + extensionSize) {
+                return info;
+            }
+            cursor += 2;
+            cursor += 8;
+            cursor += 8;
+        }
+
+        uint16_t longStringSize = 0;
+        if (extensionVersion >= 3) {
+            if (cursor + 2 > offset + extensionSize) {
+                return info;
+            }
+            std::memcpy(&longStringSize, shellItem.data() + cursor, sizeof(longStringSize));
+            cursor += 2;
+        }
+
+        if (extensionVersion >= 9) {
+            if (cursor + 4 > offset + extensionSize) {
+                return info;
+            }
+            cursor += 4;
+        }
+        if (extensionVersion >= 8) {
+            if (cursor + 4 > offset + extensionSize) {
+                return info;
+            }
+            cursor += 4;
+        }
+        if (extensionVersion >= 3) {
+            if (cursor + 4 > offset + extensionSize) {
+                return info;
+            }
+            cursor += 4;
+        }
+
+        if (longStringSize > 0 && cursor < offset + extensionSize) {
+            const auto availableBytes = std::min<size_t>(longStringSize, (offset + extensionSize) - cursor);
+            info.longName = ExtractUtf16String(shellItem.data() + cursor, availableBytes);
+        }
+
+        return info;
+    }
+
+    return std::nullopt;
+}
+
+[[nodiscard]] ParsedShellItem ParseShellItem(std::span<const uint8_t> shellItem) {
+    ParsedShellItem parsed;
+    if (shellItem.size() < 3) {
+        return parsed;
+    }
+
+    const uint8_t classType = shellItem[2];
+    const uint8_t classMask = classType & 0x70U;
+
+    if (classMask == 0x30U) {
+        parsed.itemType = ((classType & 0x01U) != 0U) ? "folder" : (((classType & 0x02U) != 0U) ? "file" : "file_entry");
+
+        uint16_t extensionOffset = 0;
+        if (shellItem.size() >= 2) {
+            extensionOffset = static_cast<uint16_t>(shellItem[shellItem.size() - 2])
+                            | (static_cast<uint16_t>(shellItem[shellItem.size() - 1]) << 8U);
+        }
+
+        size_t nameEnd = shellItem.size();
+        if (extensionOffset >= 14U && extensionOffset < shellItem.size()) {
+            nameEnd = extensionOffset;
+        }
+
+        if (nameEnd > 14U) {
+            const auto nameBytes = nameEnd - 14U;
+            parsed.name = ((classType & 0x04U) != 0U)
+                ? ExtractUtf16String(shellItem.data() + 14U, nameBytes)
+                : ExtractAnsiString(shellItem.data() + 14U, nameBytes);
+        }
+
+        if (const auto extension = ParseShellItemExtension(shellItem); extension.has_value()) {
+            if (!extension->longName.empty()) {
+                parsed.name = extension->longName;
+            }
+            parsed.creationTime = extension->creationTime;
+            parsed.accessTime = extension->accessTime;
+        }
+    } else if (classMask == 0x20U) {
+        parsed.itemType = "volume";
+        parsed.name = ((classType & 0x01U) != 0U)
+            ? ExtractAnsiString(shellItem.data() + 3U, shellItem.size() - 3U)
+            : L"This PC";
+    } else if (classMask == 0x40U) {
+        parsed.itemType = "network";
+        if (shellItem.size() > 5U) {
+            parsed.name = ExtractAnsiString(shellItem.data() + 5U, shellItem.size() - 5U);
+        }
+    } else if (classType == 0x1FU) {
+        parsed.itemType = "root";
+        parsed.name = L"Desktop";
+    } else if (classType == 0x61U) {
+        parsed.itemType = "uri";
+        if (shellItem.size() > 6U) {
+            parsed.name = ExtractBestEffortShellItemName(shellItem.subspan(6U));
+        }
+    } else {
+        parsed.name = ExtractBestEffortShellItemName(shellItem);
+    }
+
+    if (parsed.name.empty()) {
+        parsed.name = ExtractBestEffortShellItemName(shellItem);
+    }
+
+    return parsed;
+}
+
+[[nodiscard]] ParsedShellItem ParseShellItemList(std::span<const uint8_t> rawData) {
+    ParsedShellItem lastItem;
+    size_t offset = 0;
+
+    while (offset + sizeof(uint16_t) <= rawData.size()) {
+        uint16_t itemSize = 0;
+        std::memcpy(&itemSize, rawData.data() + offset, sizeof(itemSize));
+        if (itemSize == 0) {
+            break;
+        }
+        if (itemSize < sizeof(uint16_t) || offset + itemSize > rawData.size()) {
+            break;
+        }
+
+        auto current = ParseShellItem(rawData.subspan(offset, itemSize));
+        if (!current.name.empty()) {
+            lastItem = std::move(current);
+        }
+
+        offset += itemSize;
+    }
+
+    return lastItem;
+}
+
+[[nodiscard]] bool ApplyNtfsUpdateSequenceArray(std::vector<uint8_t>& record,
+                                                uint16_t updateSequenceOffset,
+                                                uint16_t updateSequenceCount,
+                                                uint32_t bytesPerSector)
+{
+    if (updateSequenceCount <= 1 || bytesPerSector < sizeof(uint16_t)) {
+        return false;
+    }
+
+    const auto usaSize = static_cast<size_t>(updateSequenceCount) * sizeof(uint16_t);
+    if (updateSequenceOffset < sizeof(uint16_t) || updateSequenceOffset + usaSize > record.size()) {
+        return false;
+    }
+
+    uint16_t updateSequenceValue = 0;
+    std::memcpy(&updateSequenceValue, record.data() + updateSequenceOffset, sizeof(updateSequenceValue));
+
+    const auto* replacements = record.data() + updateSequenceOffset + sizeof(uint16_t);
+    for (uint16_t sectorIndex = 1; sectorIndex < updateSequenceCount; ++sectorIndex) {
+        const auto sectorEndOffset = static_cast<size_t>(sectorIndex) * bytesPerSector;
+        if (sectorEndOffset < sizeof(uint16_t) || sectorEndOffset > record.size()) {
+            return false;
+        }
+
+        uint16_t actualValue = 0;
+        std::memcpy(&actualValue, record.data() + sectorEndOffset - sizeof(uint16_t), sizeof(actualValue));
+        if (actualValue != updateSequenceValue) {
+            return false;
+        }
+
+        std::memcpy(record.data() + sectorEndOffset - sizeof(uint16_t),
+                    replacements + (static_cast<size_t>(sectorIndex - 1U) * sizeof(uint16_t)),
+                    sizeof(uint16_t));
+    }
+
+    return true;
+}
+
+[[nodiscard]] uint8_t ScoreFileNameNamespace(uint8_t nameSpace) noexcept {
+    switch (nameSpace) {
+        case 0x03:
+            return 3;
+        case 0x01:
+            return 2;
+        case 0x00:
+            return 1;
+        default:
+            return 0;
+    }
+}
+
+[[nodiscard]] bool TryParseAmcacheDateString(std::wstring_view value, SystemTimePoint& output) {
+    if (value.empty()) {
+        return false;
+    }
+
+    SYSTEMTIME systemTime{};
+    unsigned short first = 0;
+    unsigned short second = 0;
+    unsigned short third = 0;
+    unsigned short hour = 0;
+    unsigned short minute = 0;
+    unsigned short secondValue = 0;
+
+    auto assignAndValidate = [&](unsigned short year, unsigned short month, unsigned short day) -> bool {
+        systemTime.wYear = year;
+        systemTime.wMonth = month;
+        systemTime.wDay = day;
+        systemTime.wHour = hour;
+        systemTime.wMinute = minute;
+        systemTime.wSecond = secondValue;
+        systemTime.wMilliseconds = 0;
+        const auto maybeTime = SystemTimeToTimePoint(systemTime);
+        if (!maybeTime.has_value()) {
+            return false;
+        }
+        output = *maybeTime;
+        return true;
+    };
+
+    if (swscanf_s(value.data(), L"%hu-%hu-%huT%hu:%hu:%hu", &first, &second, &third, &hour, &minute, &secondValue) == 6) {
+        return assignAndValidate(first, second, third);
+    }
+    if (swscanf_s(value.data(), L"%hu-%hu-%hu %hu:%hu:%hu", &first, &second, &third, &hour, &minute, &secondValue) == 6) {
+        return assignAndValidate(first, second, third);
+    }
+    if (swscanf_s(value.data(), L"%hu/%hu/%hu %hu:%hu:%hu", &first, &second, &third, &hour, &minute, &secondValue) == 6) {
+        if (third > 1900U) {
+            return assignAndValidate(third, first, second);
+        }
+        return assignAndValidate(first, second, third);
+    }
+    if (swscanf_s(value.data(), L"%hu/%hu/%hu", &first, &second, &third) == 3) {
+        if (third > 1900U) {
+            return assignAndValidate(third, first, second);
+        }
+        return assignAndValidate(first, second, third);
+    }
+
+    return false;
+}
+
+[[nodiscard]] std::string NormalizeAmcacheSha1(std::wstring_view rawValue) {
+    auto hash = Utils::StringUtils::ToNarrow(rawValue);
+    while (hash.rfind("0000", 0) == 0) {
+        hash.erase(0, 4);
+    }
+    for (auto& ch : hash) {
+        ch = static_cast<char>(std::toupper(static_cast<unsigned char>(ch)));
+    }
+    return hash;
+}
+
 
 }  // namespace
 
@@ -711,41 +1584,245 @@ std::vector<MFTRecord> ArtifactExtractor::ArtifactExtractorImpl::ParseMFTInterna
     std::vector<MFTRecord> records;
 
     try {
-        Utils::Logger::Info(L"ArtifactExtractor: Parsing MFT for drive {}:", driveLetter);
+        if (m_config.maxArtifactsPerType == 0) {
+            return records;
+        }
 
-        // Open MFT (requires raw disk access - simplified for stub)
-        std::wstring mftPath = std::format(L"\\\\.\\{}:", driveLetter);
+        const std::wstring volumePath = std::format(L"\\\\.\\{}:", driveLetter);
+        SS_LOG_INFO(kArtifactExtractorLogCategory, L"Opening volume %ls for MFT parsing", volumePath.c_str());
 
-        // In production, would use:
-        // - CreateFileW with FILE_FLAG_NO_BUFFERING
-        // - DeviceIoControl with FSCTL_GET_RETRIEVAL_POINTERS
-        // - Parse $MFT file records
+        ScopedHandle volumeHandle(::CreateFileW(volumePath.c_str(),
+                                                GENERIC_READ,
+                                                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                                                nullptr,
+                                                OPEN_EXISTING,
+                                                FILE_ATTRIBUTE_NORMAL,
+                                                nullptr));
+        if (!volumeHandle.IsValid()) {
+            const auto lastError = ::GetLastError();
+            if (lastError == ERROR_ACCESS_DENIED) {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"Skipping MFT parsing on %ls because raw volume access was denied",
+                            volumePath.c_str());
+            } else {
+                SS_LOG_ERROR(kArtifactExtractorLogCategory,
+                             L"Failed to open %ls for MFT parsing (Win32=%lu)",
+                             volumePath.c_str(),
+                             lastError);
+            }
+            return records;
+        }
 
-        // For now, simulate with limited records
-        for (size_t i = 0; i < 100 && i < m_config.maxArtifactsPerType; i++) {
+        NTFS_VOLUME_DATA_BUFFER volumeData{};
+        DWORD bytesReturned = 0;
+        if (!::DeviceIoControl(volumeHandle.handle,
+                               FSCTL_GET_NTFS_VOLUME_DATA,
+                               nullptr,
+                               0,
+                               &volumeData,
+                               sizeof(volumeData),
+                               &bytesReturned,
+                               nullptr)) {
+            SS_LOG_ERROR(kArtifactExtractorLogCategory,
+                         L"FSCTL_GET_NTFS_VOLUME_DATA failed for %ls (Win32=%lu)",
+                         volumePath.c_str(),
+                         ::GetLastError());
+            return records;
+        }
+
+        const auto bytesPerRecord = static_cast<size_t>(volumeData.BytesPerFileRecordSegment);
+        const auto bytesPerSector = static_cast<uint32_t>(volumeData.BytesPerSector);
+        if (bytesPerRecord < 512U || bytesPerRecord > 64U * 1024U || bytesPerSector < 512U) {
+            SS_LOG_WARN(kArtifactExtractorLogCategory,
+                        L"NTFS volume %ls returned unsupported file record sizing (%zu bytes)",
+                        volumePath.c_str(),
+                        bytesPerRecord);
+            return records;
+        }
+
+        const uint64_t validRecordCount = (volumeData.MftValidDataLength.QuadPart > 0)
+            ? static_cast<uint64_t>(volumeData.MftValidDataLength.QuadPart) / bytesPerRecord
+            : 0ULL;
+        const auto maxRecords = std::min<uint64_t>(
+            static_cast<uint64_t>(m_config.maxArtifactsPerType),
+            validRecordCount == 0ULL ? ArtifactConstants::MAX_MFT_RECORDS
+                                     : std::min<uint64_t>(validRecordCount, ArtifactConstants::MAX_MFT_RECORDS));
+
+        if (maxRecords == 0ULL) {
+            return records;
+        }
+
+        LARGE_INTEGER mftOffset{};
+        mftOffset.QuadPart = volumeData.MftStartLcn.QuadPart * static_cast<LONGLONG>(volumeData.BytesPerCluster);
+        if (!::SetFilePointerEx(volumeHandle.handle, mftOffset, nullptr, FILE_BEGIN)) {
+            SS_LOG_ERROR(kArtifactExtractorLogCategory,
+                         L"Failed to seek to the MFT on %ls (Win32=%lu)",
+                         volumePath.c_str(),
+                         ::GetLastError());
+            return records;
+        }
+
+        std::vector<uint8_t> recordBuffer(bytesPerRecord);
+        records.reserve(static_cast<size_t>(std::min<uint64_t>(maxRecords, 1024ULL)));
+
+        constexpr uint32_t kAttributeTypeStandardInformation = 0x10U;
+        constexpr uint32_t kAttributeTypeFileName = 0x30U;
+        constexpr uint32_t kAttributeTypeData = 0x80U;
+        constexpr uint32_t kAttributeTypeEnd = 0xFFFFFFFFU;
+
+        for (uint64_t recordIndex = 0; recordIndex < maxRecords && records.size() < m_config.maxArtifactsPerType; ++recordIndex) {
+            DWORD bytesRead = 0;
+            if (!::ReadFile(volumeHandle.handle,
+                            recordBuffer.data(),
+                            static_cast<DWORD>(recordBuffer.size()),
+                            &bytesRead,
+                            nullptr)) {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"Stopping MFT parsing on %ls after ReadFile failed at record %llu (Win32=%lu)",
+                            volumePath.c_str(),
+                            recordIndex,
+                            ::GetLastError());
+                break;
+            }
+
+            if (bytesRead != recordBuffer.size()) {
+                break;
+            }
+
+            auto fixedRecord = recordBuffer;
+            const auto* rawHeader = reinterpret_cast<const NtfsFileRecordHeader*>(fixedRecord.data());
+            if (rawHeader->signature != ArtifactConstants::MFT_FILE_SIGNATURE) {
+                continue;
+            }
+
+            if (!ApplyNtfsUpdateSequenceArray(fixedRecord,
+                                              rawHeader->updateSequenceOffset,
+                                              rawHeader->updateSequenceCount,
+                                              bytesPerSector)) {
+                continue;
+            }
+
+            const auto* header = reinterpret_cast<const NtfsFileRecordHeader*>(fixedRecord.data());
+            if (header->bytesInUse < header->firstAttributeOffset || header->bytesInUse > fixedRecord.size()) {
+                continue;
+            }
+
             MFTRecord record;
             record.artifactId = GenerateArtifactId();
             record.type = ArtifactType::MFTRecord;
-            record.recordNumber = i;
-            record.sequenceNumber = 1;
-            record.flags = MFTRecordFlags::InUse;
-            record.fileName = std::format(L"file_{}.txt", i);
-            record.fileSize = 1024 * i;
-            record.allocatedSize = ((record.fileSize + 4095) / 4096) * 4096;
-            record.isDirectory = (i % 10 == 0);
-            record.isDeleted = (i % 20 == 0);
+            record.sourcePath = volumePath;
             record.collectionTime = SystemClock::now();
+            record.recordNumber = (header->recordNumber != 0U) ? header->recordNumber : recordIndex;
+            record.sequenceNumber = header->sequenceNumber;
+            record.flags = static_cast<MFTRecordFlags>(header->flags);
+            record.isDirectory = (header->flags & static_cast<uint16_t>(MFTRecordFlags::Directory)) != 0U;
+            record.isDeleted = (header->flags & static_cast<uint16_t>(MFTRecordFlags::InUse)) == 0U;
+
+            if (record.isDeleted && !m_config.parseDeletedFiles) {
+                continue;
+            }
+
+            uint8_t bestNameScore = 0;
+            size_t attributeOffset = header->firstAttributeOffset;
+            while (attributeOffset + sizeof(NtfsAttributeHeader) <= header->bytesInUse) {
+                const auto* attribute = reinterpret_cast<const NtfsAttributeHeader*>(fixedRecord.data() + attributeOffset);
+                if (attribute->type == kAttributeTypeEnd) {
+                    break;
+                }
+                if (attribute->length < sizeof(NtfsAttributeHeader) || attributeOffset + attribute->length > header->bytesInUse) {
+                    break;
+                }
+
+                if (attribute->nonResident == 0U) {
+                    if (attribute->length >= sizeof(NtfsResidentAttributeHeader)) {
+                        const auto* resident = reinterpret_cast<const NtfsResidentAttributeHeader*>(attribute);
+                        if (resident->valueOffset + resident->valueLength <= attribute->length) {
+                            const auto* value = fixedRecord.data() + attributeOffset + resident->valueOffset;
+                            const auto valueLength = static_cast<size_t>(resident->valueLength);
+
+                            if (attribute->type == kAttributeTypeStandardInformation && valueLength >= sizeof(NtfsStandardInformationValue)) {
+                                NtfsStandardInformationValue info{};
+                                std::memcpy(&info, value, sizeof(info));
+                                if (const auto creation = FileTimeValueToTimePoint(static_cast<uint64_t>(info.creationTime)); creation.has_value()) {
+                                    record.creationTime = *creation;
+                                }
+                                if (const auto modification = FileTimeValueToTimePoint(static_cast<uint64_t>(info.modificationTime)); modification.has_value()) {
+                                    record.modificationTime = *modification;
+                                }
+                                if (const auto mftModification = FileTimeValueToTimePoint(static_cast<uint64_t>(info.mftModificationTime)); mftModification.has_value()) {
+                                    record.mftModificationTime = *mftModification;
+                                }
+                                if (const auto access = FileTimeValueToTimePoint(static_cast<uint64_t>(info.accessTime)); access.has_value()) {
+                                    record.accessTime = *access;
+                                }
+                            } else if (attribute->type == kAttributeTypeFileName && valueLength >= sizeof(NtfsFileNameValueHeader)) {
+                                NtfsFileNameValueHeader fileNameHeader{};
+                                std::memcpy(&fileNameHeader, value, sizeof(fileNameHeader));
+                                const auto fileNameBytes = static_cast<size_t>(fileNameHeader.fileNameLength) * sizeof(wchar_t);
+                                if (sizeof(fileNameHeader) + fileNameBytes <= valueLength) {
+                                    std::wstring candidateName(fileNameHeader.fileNameLength, L'\0');
+                                    std::memcpy(candidateName.data(),
+                                                value + sizeof(fileNameHeader),
+                                                fileNameBytes);
+                                    const auto candidateScore = ScoreFileNameNamespace(fileNameHeader.fileNameNamespace);
+                                    if (!candidateName.empty() && candidateScore >= bestNameScore) {
+                                        bestNameScore = candidateScore;
+                                        record.fileName = candidateName;
+                                        record.parentRecordNumber = fileNameHeader.parentFileReference & 0x0000FFFFFFFFFFFFULL;
+                                        record.fileSize = fileNameHeader.dataSize;
+                                        record.allocatedSize = fileNameHeader.allocatedSize;
+                                        record.isDirectory = (fileNameHeader.flags & FILE_ATTRIBUTE_DIRECTORY) != 0U;
+                                        if (const auto creation = FileTimeValueToTimePoint(static_cast<uint64_t>(fileNameHeader.creationTime)); creation.has_value()) {
+                                            record.creationTime = *creation;
+                                        }
+                                        if (const auto modification = FileTimeValueToTimePoint(static_cast<uint64_t>(fileNameHeader.modificationTime)); modification.has_value()) {
+                                            record.modificationTime = *modification;
+                                        }
+                                        if (const auto mftModification = FileTimeValueToTimePoint(static_cast<uint64_t>(fileNameHeader.mftModificationTime)); mftModification.has_value()) {
+                                            record.mftModificationTime = *mftModification;
+                                        }
+                                        if (const auto access = FileTimeValueToTimePoint(static_cast<uint64_t>(fileNameHeader.accessTime)); access.has_value()) {
+                                            record.accessTime = *access;
+                                        }
+                                    }
+                                }
+                            } else if (attribute->type == kAttributeTypeData) {
+                                record.hasResidentData = true;
+                                record.fileSize = resident->valueLength;
+                                record.allocatedSize = resident->valueLength;
+                                if (m_config.includeRawData && resident->valueLength > 0U && resident->valueLength <= kMaxResidentAttributeBytes) {
+                                    record.residentData.assign(value, value + resident->valueLength);
+                                }
+                            }
+                        }
+                    }
+                } else if (attribute->type == kAttributeTypeData && attribute->length >= sizeof(NtfsNonResidentAttributeHeader)) {
+                    const auto* nonResident = reinterpret_cast<const NtfsNonResidentAttributeHeader*>(attribute);
+                    record.hasResidentData = false;
+                    record.fileSize = nonResident->dataSize;
+                    record.allocatedSize = nonResident->allocatedSize;
+                }
+
+                attributeOffset += attribute->length;
+            }
+
+            if (record.fileName.empty()) {
+                record.fileName = std::format(L"MFTRecord_{}", record.recordNumber);
+            }
+            record.artifactTime = record.modificationTime;
 
             if (record.isDeleted) {
                 m_statistics.deletedFilesFound.fetch_add(1, std::memory_order_relaxed);
             }
 
-            records.push_back(record);
+            records.push_back(std::move(record));
         }
 
         m_statistics.mftRecordsParsed.fetch_add(records.size(), std::memory_order_relaxed);
-
-        Utils::Logger::Info(L"ArtifactExtractor: Parsed {} MFT records", records.size());
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsed %zu MFT records from %ls",
+                    records.size(),
+                    volumePath.c_str());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ArtifactExtractor: MFT parsing failed - {}",
@@ -836,49 +1913,210 @@ std::vector<ShimcacheEntry> ArtifactExtractor::ArtifactExtractorImpl::ParseShimc
     std::vector<ShimcacheEntry> entries;
 
     try {
-        Utils::Logger::Info(L"ArtifactExtractor: Parsing Shimcache...");
-
-        // Shimcache is in registry: HKLM\SYSTEM\CurrentControlSet\Control\Session Manager\AppCompatCache
-        HKEY hKey = nullptr;
-        LONG result = RegOpenKeyExW(HKEY_LOCAL_MACHINE,
-                                     L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache",
-                                     0, KEY_READ, &hKey);
-
-        if (result == ERROR_SUCCESS) {
-            DWORD dataSize = 0;
-            result = RegQueryValueExW(hKey, L"AppCompatCache", nullptr, nullptr, nullptr, &dataSize);
-
-            if (result == ERROR_SUCCESS && dataSize > 0) {
-                std::vector<BYTE> data(dataSize);
-                result = RegQueryValueExW(hKey, L"AppCompatCache", nullptr, nullptr, data.data(), &dataSize);
-
-                if (result == ERROR_SUCCESS) {
-                    // In production, would parse binary shimcache structure
-                    // Format varies by Windows version (XP, Vista, 7, 8, 10, 11)
-                    // Contains: path, file size, last modified, execution flag
-
-                    // Stub: Create sample entries
-                    for (size_t i = 0; i < 10 && i < m_config.maxArtifactsPerType; i++) {
-                        ShimcacheEntry entry;
-                        entry.artifactId = GenerateArtifactId();
-                        entry.type = ArtifactType::ShimcacheEntry;
-                        entry.filePath = std::format(L"C:\\Windows\\System32\\app{}.exe", i);
-                        entry.fileSize = 1024 * 100 * i;
-                        entry.executed = (i % 2 == 0);
-                        entry.cacheIndex = static_cast<uint32_t>(i);
-                        entry.controlSet = 1;
-                        entry.collectionTime = SystemClock::now();
-                        entry.lastModifiedTime = SystemClock::now();
-
-                        entries.push_back(entry);
-                    }
-                }
-            }
-
-            RegCloseKey(hKey);
+        if (m_config.maxArtifactsPerType == 0) {
+            return entries;
         }
 
-        Utils::Logger::Info(L"ArtifactExtractor: Parsed {} Shimcache entries", entries.size());
+        SS_LOG_INFO(kArtifactExtractorLogCategory, L"Parsing Shimcache/AppCompatCache data");
+
+        RegKeyHandle shimcacheKey;
+        LONG result = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                      L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache",
+                                      0,
+                                      KEY_READ,
+                                      &shimcacheKey.key);
+        if (result != ERROR_SUCCESS) {
+            result = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE,
+                                     L"SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatibility",
+                                     0,
+                                     KEY_READ,
+                                     &shimcacheKey.key);
+        }
+
+        if (result != ERROR_SUCCESS) {
+            if (result == ERROR_ACCESS_DENIED) {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"Access denied while reading Shimcache registry data; continuing without Shimcache artifacts");
+            }
+            return entries;
+        }
+
+        const auto rawData = QueryBinaryValue(shimcacheKey.key, L"AppCompatCache");
+        if (!rawData.has_value() || rawData->empty()) {
+            return entries;
+        }
+
+        uint32_t controlSet = 1;
+        RegKeyHandle selectKey;
+        if (::RegOpenKeyExW(HKEY_LOCAL_MACHINE, L"SYSTEM\\Select", 0, KEY_READ, &selectKey.key) == ERROR_SUCCESS) {
+            if (const auto current = QueryDwordValue(selectKey.key, L"Current"); current.has_value()) {
+                controlSet = *current;
+            }
+        }
+
+        const auto addEntry = [&](std::wstring path,
+                                  uint64_t fileSize,
+                                  bool executed,
+                                  uint32_t cacheIndex,
+                                  std::optional<SystemTimePoint> lastModified) {
+            if (path.empty() || entries.size() >= m_config.maxArtifactsPerType) {
+                return;
+            }
+
+            ShimcacheEntry entry;
+            entry.artifactId = GenerateArtifactId();
+            entry.type = ArtifactType::ShimcacheEntry;
+            entry.sourcePath = L"HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\AppCompatCache";
+            entry.filePath = TrimNtPathPrefix(path);
+            entry.fileSize = fileSize;
+            entry.executed = executed;
+            entry.cacheIndex = cacheIndex;
+            entry.controlSet = controlSet;
+            entry.collectionTime = SystemClock::now();
+            if (lastModified.has_value()) {
+                entry.lastModifiedTime = *lastModified;
+                entry.artifactTime = *lastModified;
+            }
+            entries.push_back(std::move(entry));
+        };
+
+        const auto& data = *rawData;
+        uint32_t offsetToRecords = 0;
+        if (data.size() >= sizeof(offsetToRecords)) {
+            std::memcpy(&offsetToRecords, data.data(), sizeof(offsetToRecords));
+        }
+
+        if (offsetToRecords == 0x30U || offsetToRecords == 0x34U) {
+            size_t index = offsetToRecords;
+            uint32_t cacheIndex = 0;
+
+            while (index + 22U <= data.size() && entries.size() < m_config.maxArtifactsPerType) {
+                if (std::memcmp(data.data() + index, "10ts", 4) != 0) {
+                    break;
+                }
+                index += 4U;
+                index += 4U;
+
+                uint32_t entrySizeField = 0;
+                uint16_t pathSize = 0;
+                std::memcpy(&entrySizeField, data.data() + index, sizeof(entrySizeField));
+                index += sizeof(entrySizeField);
+                std::memcpy(&pathSize, data.data() + index, sizeof(pathSize));
+                index += sizeof(pathSize);
+
+                if (pathSize == 0U || (pathSize % sizeof(wchar_t)) != 0U || index + pathSize + 12U > data.size()) {
+                    break;
+                }
+
+                auto path = ExtractUtf16String(data.data() + index, pathSize);
+                index += pathSize;
+
+                uint64_t lastModifiedValue = 0;
+                uint32_t dataSize = 0;
+                std::memcpy(&lastModifiedValue, data.data() + index, sizeof(lastModifiedValue));
+                index += sizeof(lastModifiedValue);
+                std::memcpy(&dataSize, data.data() + index, sizeof(dataSize));
+                index += sizeof(dataSize);
+
+                if (dataSize > kMaxRegistryBinaryBytes || index + dataSize > data.size()) {
+                    break;
+                }
+
+                bool executed = false;
+                if (dataSize >= kShimcacheExecutionFlagBytes) {
+                    uint32_t executionFlag = 0;
+                    std::memcpy(&executionFlag,
+                                data.data() + index + dataSize - kShimcacheExecutionFlagBytes,
+                                sizeof(executionFlag));
+                    executed = executionFlag == 1U;
+                }
+
+                addEntry(std::move(path),
+                         (entrySizeField != 0U) ? entrySizeField : dataSize,
+                         executed,
+                         cacheIndex,
+                         FileTimeValueToTimePoint(lastModifiedValue));
+                index += dataSize;
+                ++cacheIndex;
+            }
+        } else if (data.size() >= 132U) {
+            size_t index = 128U;
+            uint32_t cacheIndex = 0;
+            const std::string_view signature(reinterpret_cast<const char*>(data.data() + index), 4U);
+            const bool hasPackageData = signature == "10ts";
+            const std::string expectedSignature = hasPackageData ? "10ts" : "00ts";
+
+            while (index + 26U <= data.size() && entries.size() < m_config.maxArtifactsPerType) {
+                if (std::memcmp(data.data() + index, expectedSignature.data(), 4U) != 0) {
+                    break;
+                }
+                index += 4U;
+                index += 4U;
+
+                uint32_t entrySizeField = 0;
+                uint16_t pathSize = 0;
+                std::memcpy(&entrySizeField, data.data() + index, sizeof(entrySizeField));
+                index += sizeof(entrySizeField);
+                std::memcpy(&pathSize, data.data() + index, sizeof(pathSize));
+                index += sizeof(pathSize);
+
+                if (pathSize == 0U || (pathSize % sizeof(wchar_t)) != 0U || index + pathSize > data.size()) {
+                    break;
+                }
+
+                auto path = ExtractUtf16String(data.data() + index, pathSize);
+                index += pathSize;
+
+                if (hasPackageData) {
+                    uint16_t packageSize = 0;
+                    std::memcpy(&packageSize, data.data() + index, sizeof(packageSize));
+                    index += sizeof(packageSize);
+                    if (index + packageSize > data.size()) {
+                        break;
+                    }
+                    index += packageSize;
+                }
+
+                if (index + 20U > data.size()) {
+                    break;
+                }
+
+                uint32_t insertFlags = 0;
+                uint32_t shimFlags = 0;
+                uint64_t lastModifiedValue = 0;
+                uint32_t dataSize = 0;
+                std::memcpy(&insertFlags, data.data() + index, sizeof(insertFlags));
+                index += sizeof(insertFlags);
+                std::memcpy(&shimFlags, data.data() + index, sizeof(shimFlags));
+                index += sizeof(shimFlags);
+                std::memcpy(&lastModifiedValue, data.data() + index, sizeof(lastModifiedValue));
+                index += sizeof(lastModifiedValue);
+                std::memcpy(&dataSize, data.data() + index, sizeof(dataSize));
+                index += sizeof(dataSize);
+
+                if (dataSize > kMaxRegistryBinaryBytes || index + dataSize > data.size()) {
+                    break;
+                }
+
+                const bool executed = (insertFlags & kShimcacheExecutedFlag) != 0U;
+                addEntry(std::move(path),
+                         (entrySizeField != 0U) ? entrySizeField : dataSize,
+                         executed,
+                         cacheIndex,
+                         FileTimeValueToTimePoint(lastModifiedValue));
+                index += dataSize;
+                ++cacheIndex;
+                static_cast<void>(shimFlags);
+            }
+        } else {
+            SS_LOG_WARN(kArtifactExtractorLogCategory,
+                        L"Encountered an unrecognized Shimcache format (%zu bytes)",
+                        data.size());
+        }
+
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsed %zu Shimcache entries",
+                    entries.size());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ArtifactExtractor: Shimcache parsing failed - {}",
@@ -896,42 +2134,157 @@ std::vector<AmcacheEntry> ArtifactExtractor::ArtifactExtractorImpl::ParseAmcache
     std::vector<AmcacheEntry> entries;
 
     try {
-        Utils::Logger::Info(L"ArtifactExtractor: Parsing Amcache...");
-
-        // Amcache is at: C:\Windows\AppCompat\Programs\Amcache.hve
-        std::wstring amcachePath = L"C:\\Windows\\AppCompat\\Programs\\Amcache.hve";
-
-        if (!std::filesystem::exists(amcachePath)) {
-            Utils::Logger::Warn(L"ArtifactExtractor: Amcache.hve not found");
+        if (m_config.maxArtifactsPerType == 0) {
             return entries;
         }
 
-        // In production, would:
-        // - Load registry hive using RegLoadAppKeyW
-        // - Parse Root\File entries
-        // - Extract: SHA1, path, size, PE metadata, timestamps
+        SS_LOG_INFO(kArtifactExtractorLogCategory, L"Parsing Amcache inventory data");
 
-        // Stub: Create sample entries
-        for (size_t i = 0; i < 20 && i < m_config.maxArtifactsPerType; i++) {
+        const std::wstring amcacheHivePath = L"C:\\Windows\\AppCompat\\Programs\\Amcache.hve";
+        if (!std::filesystem::exists(amcacheHivePath)) {
+            SS_LOG_WARN(kArtifactExtractorLogCategory,
+                        L"Amcache hive not found at %ls",
+                        amcacheHivePath.c_str());
+            return entries;
+        }
+
+        RegKeyHandle hiveRoot;
+        const auto loadResult = ::RegLoadAppKeyW(amcacheHivePath.c_str(),
+                                                 &hiveRoot.key,
+                                                 KEY_READ,
+                                                 0,
+                                                 REG_PROCESS_APPKEY);
+        if (loadResult != ERROR_SUCCESS) {
+            if (loadResult == ERROR_ACCESS_DENIED) {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"Access denied while loading %ls for Amcache parsing",
+                            amcacheHivePath.c_str());
+            } else {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"RegLoadAppKeyW failed for %ls (Win32=%ld)",
+                            amcacheHivePath.c_str(),
+                            loadResult);
+            }
+            return entries;
+        }
+
+        RegKeyHandle inventoryKey;
+        if (::RegOpenKeyExW(hiveRoot.key,
+                            L"Root\\InventoryApplicationFile",
+                            0,
+                            KEY_READ,
+                            &inventoryKey.key) != ERROR_SUCCESS) {
+            SS_LOG_WARN(kArtifactExtractorLogCategory,
+                        L"InventoryApplicationFile key was not found in %ls",
+                        amcacheHivePath.c_str());
+            return entries;
+        }
+
+        DWORD subKeyCount = 0;
+        DWORD maxSubKeyLength = 0;
+        if (::RegQueryInfoKeyW(inventoryKey.key,
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               &subKeyCount,
+                               &maxSubKeyLength,
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               nullptr,
+                               nullptr) != ERROR_SUCCESS) {
+            return entries;
+        }
+
+        std::vector<wchar_t> subKeyName(maxSubKeyLength + 2U, L'\0');
+        for (DWORD index = 0; index < subKeyCount && entries.size() < m_config.maxArtifactsPerType; ++index) {
+            DWORD subKeyNameLength = maxSubKeyLength + 1U;
+            FILETIME lastWriteTime{};
+            const auto enumResult = ::RegEnumKeyExW(inventoryKey.key,
+                                                    index,
+                                                    subKeyName.data(),
+                                                    &subKeyNameLength,
+                                                    nullptr,
+                                                    nullptr,
+                                                    nullptr,
+                                                    &lastWriteTime);
+            if (enumResult != ERROR_SUCCESS) {
+                continue;
+            }
+
+            std::wstring keyName(subKeyName.data(), subKeyNameLength);
+            RegKeyHandle fileKey;
+            if (::RegOpenKeyExW(inventoryKey.key, keyName.c_str(), 0, KEY_READ, &fileKey.key) != ERROR_SUCCESS) {
+                continue;
+            }
+
+            const auto pathValue = QueryStringValue(fileKey.key, L"LowerCaseLongPath");
+            const auto nameValue = QueryStringValue(fileKey.key, L"Name");
+            const auto sha1Value = QueryStringValue(fileKey.key, L"FileId");
+            const auto productNameValue = QueryStringValue(fileKey.key, L"ProductName");
+            const auto publisherValue = QueryStringValue(fileKey.key, L"Publisher");
+            const auto versionValue = QueryStringValue(fileKey.key, L"Version");
+            const auto linkDateValue = QueryStringValue(fileKey.key, L"LinkDate");
+
+            uint64_t sizeBytes = 0;
+            if (const auto qwordSize = QueryQwordValue(fileKey.key, L"Size"); qwordSize.has_value()) {
+                sizeBytes = *qwordSize;
+            } else if (const auto dwordSize = QueryDwordValue(fileKey.key, L"Size"); dwordSize.has_value()) {
+                sizeBytes = *dwordSize;
+            } else if (const auto sizeString = QueryStringValue(fileKey.key, L"Size"); sizeString.has_value()) {
+                try {
+                    sizeBytes = std::stoull(*sizeString);
+                } catch (...) {
+                    sizeBytes = 0;
+                }
+            }
+
+            const auto path = pathValue.value_or(L"");
+            const auto name = nameValue.value_or(L"");
+            if (path.empty() && name.empty() && !sha1Value.has_value()) {
+                continue;
+            }
+
             AmcacheEntry entry;
             entry.artifactId = GenerateArtifactId();
             entry.type = ArtifactType::AmcacheEntry;
-            entry.filePath = std::format(L"C:\\Program Files\\App{}\\executable.exe", i);
-            entry.sha1Hash = std::format("{:040X}", i * 12345);
-            entry.fileSize = 1024 * 500 * i;
-            entry.productName = std::format(L"Application {}", i);
-            entry.companyName = L"Software Vendor";
-            entry.fileVersion = L"1.0.0.0";
-            entry.description = L"Application executable";
-            entry.isPE = true;
+            entry.sourcePath = amcacheHivePath;
+            entry.filePath = path.empty() ? name : path;
+            entry.sha1Hash = NormalizeAmcacheSha1(sha1Value.value_or(L""));
+            entry.fileSize = sizeBytes;
+            entry.productName = productNameValue.value_or(L"");
+            entry.companyName = publisherValue.value_or(L"");
+            entry.fileVersion = versionValue.value_or(L"");
+            entry.description = name;
+            entry.originalFileName = name;
             entry.collectionTime = SystemClock::now();
-            entry.linkTimestamp = SystemClock::now();
-            entry.lastWriteTime = SystemClock::now();
+            if (const auto lastWrite = FileTimeToTimePointChecked(lastWriteTime); lastWrite.has_value()) {
+                entry.lastWriteTime = *lastWrite;
+                entry.artifactTime = *lastWrite;
+            }
 
-            entries.push_back(entry);
+            if (linkDateValue.has_value()) {
+                SystemTimePoint parsedLinkTime{};
+                if (TryParseAmcacheDateString(*linkDateValue, parsedLinkTime)) {
+                    entry.linkTimestamp = parsedLinkTime;
+                    entry.artifactTime = parsedLinkTime;
+                }
+            }
+
+            std::wstring normalizedPath = Utils::StringUtils::ToLowerCopy(entry.filePath);
+            entry.isPE = Utils::StringUtils::EndsWith(normalizedPath, L".exe") ||
+                         Utils::StringUtils::EndsWith(normalizedPath, L".dll") ||
+                         Utils::StringUtils::EndsWith(normalizedPath, L".sys") ||
+                         Utils::StringUtils::EndsWith(normalizedPath, L".ocx") ||
+                         Utils::StringUtils::EndsWith(normalizedPath, L".cpl");
+
+            entries.push_back(std::move(entry));
         }
 
-        Utils::Logger::Info(L"ArtifactExtractor: Parsed {} Amcache entries", entries.size());
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsed %zu Amcache entries",
+                    entries.size());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ArtifactExtractor: Amcache parsing failed - {}",
@@ -951,14 +2304,160 @@ std::vector<BrowserHistoryEntry> ArtifactExtractor::ArtifactExtractorImpl::Parse
     std::vector<BrowserHistoryEntry> entries;
 
     try {
-        Utils::Logger::Info(L"ArtifactExtractor: Parsing browser history for type {}",
-                          static_cast<int>(browser));
+        if (m_config.maxArtifactsPerType == 0) {
+            return entries;
+        }
+
+        const auto browserName = BrowserTypeToWide(browser);
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsing browser history for %ls",
+                    browserName.c_str());
 
         auto profiles = GetUserProfiles();
+        auto remainingLimit = [&]() -> int {
+            const auto remaining = m_config.maxArtifactsPerType > entries.size()
+                ? (m_config.maxArtifactsPerType - entries.size())
+                : 0U;
+            return static_cast<int>(std::min<size_t>(remaining, static_cast<size_t>(std::numeric_limits<int>::max())));
+        };
+
+        const auto addChromiumEntries = [&](const std::wstring& profilePath,
+                                            const std::filesystem::path& historyPath,
+                                            BrowserType chromiumBrowser,
+                                            std::wstring_view tempPrefix) {
+            if (entries.size() >= m_config.maxArtifactsPerType) {
+                return;
+            }
+
+            const auto tempCopy = CopyFileToWorkingTemp(historyPath, tempPrefix);
+            if (!tempCopy.has_value()) {
+                SS_LOG_DEBUG(kArtifactExtractorLogCategory,
+                             L"Unable to copy history database %ls for %ls",
+                             historyPath.c_str(),
+                             browserName.c_str());
+                return;
+            }
+
+            TempFileGuard tempGuard(*tempCopy);
+            sqlite3* database = nullptr;
+            const auto databasePath = Utils::StringUtils::ToNarrow(tempCopy->wstring());
+            if (sqlite3_open_v2(databasePath.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                if (database != nullptr) {
+                    sqlite3_close(database);
+                }
+                return;
+            }
+            SqliteDbGuard dbGuard(database);
+
+            constexpr const char* query =
+                "SELECT url, title, visit_count, last_visit_time, typed_count "
+                "FROM urls ORDER BY last_visit_time DESC LIMIT ?1";
+
+            sqlite3_stmt* statement = nullptr;
+            if (sqlite3_prepare_v2(database, query, -1, &statement, nullptr) != SQLITE_OK) {
+                return;
+            }
+            SqliteStmtGuard stmtGuard(statement);
+            sqlite3_bind_int(statement, 1, remainingLimit());
+
+            constexpr int64_t kChromeEpochOffsetMicros = 11644473600LL * 1000000LL;
+            while (sqlite3_step(statement) == SQLITE_ROW && entries.size() < m_config.maxArtifactsPerType) {
+                BrowserHistoryEntry entry;
+                entry.artifactId = GenerateArtifactId();
+                entry.type = ArtifactType::BrowserHistory;
+                entry.browser = chromiumBrowser;
+                entry.sourcePath = historyPath.wstring();
+                entry.profile = profilePath;
+                entry.collectionTime = SystemClock::now();
+
+                if (const auto* url = reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)); url != nullptr) {
+                    entry.url = url;
+                }
+                if (const auto* title = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1)); title != nullptr) {
+                    entry.title = Utils::StringUtils::ToWide(title);
+                }
+                entry.visitCount = static_cast<uint32_t>(std::max(sqlite3_column_int(statement, 2), 0));
+
+                const auto chromeTime = sqlite3_column_int64(statement, 3);
+                if (chromeTime > kChromeEpochOffsetMicros) {
+                    entry.visitTime = SystemClock::time_point{std::chrono::microseconds{chromeTime - kChromeEpochOffsetMicros}};
+                    entry.artifactTime = entry.visitTime;
+                }
+
+                entry.isTyped = sqlite3_column_int(statement, 4) > 0;
+                entries.push_back(std::move(entry));
+            }
+        };
+
+        const auto addFirefoxEntries = [&](const std::wstring& profilePath,
+                                           const std::filesystem::path& historyPath) {
+            if (entries.size() >= m_config.maxArtifactsPerType) {
+                return;
+            }
+
+            const auto tempCopy = CopyFileToWorkingTemp(historyPath, L"firefox_history_");
+            if (!tempCopy.has_value()) {
+                SS_LOG_DEBUG(kArtifactExtractorLogCategory,
+                             L"Unable to copy Firefox history database %ls",
+                             historyPath.c_str());
+                return;
+            }
+
+            TempFileGuard tempGuard(*tempCopy);
+            sqlite3* database = nullptr;
+            const auto databasePath = Utils::StringUtils::ToNarrow(tempCopy->wstring());
+            if (sqlite3_open_v2(databasePath.c_str(), &database, SQLITE_OPEN_READONLY, nullptr) != SQLITE_OK) {
+                if (database != nullptr) {
+                    sqlite3_close(database);
+                }
+                return;
+            }
+            SqliteDbGuard dbGuard(database);
+
+            constexpr const char* query =
+                "SELECT url, title, visit_count, last_visit_date "
+                "FROM moz_places ORDER BY last_visit_date DESC LIMIT ?1";
+
+            sqlite3_stmt* statement = nullptr;
+            if (sqlite3_prepare_v2(database, query, -1, &statement, nullptr) != SQLITE_OK) {
+                return;
+            }
+            SqliteStmtGuard stmtGuard(statement);
+            sqlite3_bind_int(statement, 1, remainingLimit());
+
+            while (sqlite3_step(statement) == SQLITE_ROW && entries.size() < m_config.maxArtifactsPerType) {
+                BrowserHistoryEntry entry;
+                entry.artifactId = GenerateArtifactId();
+                entry.type = ArtifactType::BrowserHistory;
+                entry.browser = BrowserType::Firefox;
+                entry.sourcePath = historyPath.wstring();
+                entry.profile = profilePath;
+                entry.collectionTime = SystemClock::now();
+
+                if (const auto* url = reinterpret_cast<const char*>(sqlite3_column_text(statement, 0)); url != nullptr) {
+                    entry.url = url;
+                }
+                if (const auto* title = reinterpret_cast<const char*>(sqlite3_column_text(statement, 1)); title != nullptr) {
+                    entry.title = Utils::StringUtils::ToWide(title);
+                }
+                entry.visitCount = static_cast<uint32_t>(std::max(sqlite3_column_int(statement, 2), 0));
+
+                const auto firefoxVisitMicros = sqlite3_column_int64(statement, 3);
+                if (firefoxVisitMicros > 0) {
+                    entry.visitTime = SystemClock::time_point{std::chrono::microseconds{firefoxVisitMicros}};
+                    entry.artifactTime = entry.visitTime;
+                }
+
+                entries.push_back(std::move(entry));
+            }
+        };
 
         for (const auto& profile : profiles) {
-            std::wstring dbPath;
+            if (entries.size() >= m_config.maxArtifactsPerType) {
+                break;
+            }
 
+            std::wstring dbPath;
             switch (browser) {
                 case BrowserType::Chrome:
                     dbPath = GetChromeHistoryPath(profile);
@@ -973,36 +2472,24 @@ std::vector<BrowserHistoryEntry> ArtifactExtractor::ArtifactExtractorImpl::Parse
                     continue;
             }
 
-            if (!std::filesystem::exists(dbPath)) {
+            if (dbPath.empty() || !std::filesystem::exists(dbPath)) {
                 continue;
             }
 
-            // In production, would:
-            // - Open SQLite database (History or places.sqlite)
-            // - Query urls table: SELECT url, title, visit_count, last_visit_time
-            // - Convert Chrome epoch (1601) to standard time
-
-            // Stub: Create sample entries
-            for (size_t i = 0; i < 50 && entries.size() < m_config.maxArtifactsPerType; i++) {
-                BrowserHistoryEntry entry;
-                entry.artifactId = GenerateArtifactId();
-                entry.type = ArtifactType::BrowserHistory;
-                entry.browser = browser;
-                entry.url = std::format("https://example{}.com", i);
-                entry.title = std::format(L"Example Site {}", i);
-                entry.visitCount = i + 1;
-                entry.isTyped = (i % 5 == 0);
-                entry.profile = profile;
-                entry.collectionTime = SystemClock::now();
-                entry.visitTime = SystemClock::now();
-
-                entries.push_back(entry);
+            if (browser == BrowserType::Firefox) {
+                addFirefoxEntries(profile, dbPath);
+            } else if (browser == BrowserType::Chrome) {
+                addChromiumEntries(profile, dbPath, browser, L"chrome_history_");
+            } else if (browser == BrowserType::Edge) {
+                addChromiumEntries(profile, dbPath, browser, L"edge_history_");
             }
         }
 
         m_statistics.browserEntriesFound.fetch_add(entries.size(), std::memory_order_relaxed);
-
-        Utils::Logger::Info(L"ArtifactExtractor: Parsed {} browser history entries", entries.size());
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsed %zu browser history entries for %ls",
+                    entries.size(),
+                    browserName.c_str());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ArtifactExtractor: Browser history parsing failed - {}",
@@ -1272,41 +2759,149 @@ std::vector<ShellbagEntry> ArtifactExtractor::ArtifactExtractorImpl::ParseShellb
     std::vector<ShellbagEntry> entries;
 
     try {
-        Utils::Logger::Info(L"ArtifactExtractor: Parsing Shellbags...");
+        if (m_config.maxArtifactsPerType == 0) {
+            return entries;
+        }
 
-        // Shellbags are in multiple locations:
-        // - HKCU\Software\Microsoft\Windows\Shell\Bags
-        // - HKCU\Software\Microsoft\Windows\Shell\BagMRU
-        // - NTUSER.DAT offline parsing for other users
+        SS_LOG_INFO(kArtifactExtractorLogCategory, L"Parsing Shellbags");
 
-        HKEY hKey = nullptr;
-        LONG result = RegOpenKeyExW(HKEY_CURRENT_USER,
-                                     L"Software\\Microsoft\\Windows\\Shell\\BagMRU",
-                                     0, KEY_READ, &hKey);
+        std::wstring bagMruPath;
+        std::wstring bagsPath;
+        HKEY rootHive = HKEY_CURRENT_USER;
 
-        if (result == ERROR_SUCCESS) {
-            // In production, would recursively enumerate registry tree
-            // and parse shellbag binary structures
+        if (!userSID.empty()) {
+            rootHive = HKEY_USERS;
+            bagMruPath = std::wstring(userSID) + L"\\Software\\Microsoft\\Windows\\Shell\\BagMRU";
+            bagsPath = std::wstring(userSID) + L"\\Software\\Microsoft\\Windows\\Shell\\Bags";
+        } else {
+            bagMruPath = L"Software\\Microsoft\\Windows\\Shell\\BagMRU";
+            bagsPath = L"Software\\Microsoft\\Windows\\Shell\\Bags";
+        }
 
-            // Stub: Create sample entries
-            for (size_t i = 0; i < 30 && i < m_config.maxArtifactsPerType; i++) {
+        RegKeyHandle bagMruRoot;
+        const auto openResult = ::RegOpenKeyExW(rootHive,
+                                                bagMruPath.c_str(),
+                                                0,
+                                                KEY_READ,
+                                                &bagMruRoot.key);
+        if (openResult != ERROR_SUCCESS) {
+            if (openResult == ERROR_ACCESS_DENIED) {
+                SS_LOG_WARN(kArtifactExtractorLogCategory,
+                            L"Access denied while reading Shellbag BagMRU data from %ls",
+                            bagMruPath.c_str());
+            }
+            return entries;
+        }
+
+        RegKeyHandle bagsRoot;
+        ::RegOpenKeyExW(rootHive, bagsPath.c_str(), 0, KEY_READ, &bagsRoot.key);
+
+        std::function<void(HKEY, const std::wstring&, const std::wstring&)> walkBagMru;
+        walkBagMru = [&](HKEY currentKey, const std::wstring& registryPath, const std::wstring& parentPath) {
+            if (entries.size() >= m_config.maxArtifactsPerType) {
+                return;
+            }
+
+            DWORD subKeyCount = 0;
+            DWORD maxSubKeyLength = 0;
+            DWORD valueCount = 0;
+            DWORD maxValueNameLength = 0;
+            DWORD maxValueLength = 0;
+            FILETIME keyLastWrite{};
+            if (::RegQueryInfoKeyW(currentKey,
+                                   nullptr,
+                                   nullptr,
+                                   nullptr,
+                                   &subKeyCount,
+                                   &maxSubKeyLength,
+                                   nullptr,
+                                   &valueCount,
+                                   &maxValueNameLength,
+                                   &maxValueLength,
+                                   nullptr,
+                                   &keyLastWrite) != ERROR_SUCCESS) {
+                return;
+            }
+
+            const auto keyWriteTime = FileTimeToTimePointChecked(keyLastWrite).value_or(SystemClock::now());
+            std::vector<wchar_t> valueName(maxValueNameLength + 2U, L'\0');
+            std::vector<uint8_t> valueData(std::min<DWORD>(maxValueLength + 2U, static_cast<DWORD>(kMaxShellbagValueBytes)));
+
+            for (DWORD valueIndex = 0; valueIndex < valueCount && entries.size() < m_config.maxArtifactsPerType; ++valueIndex) {
+                DWORD nameLength = maxValueNameLength + 1U;
+                DWORD dataLength = static_cast<DWORD>(valueData.size());
+                DWORD type = 0;
+                auto enumResult = ::RegEnumValueW(currentKey,
+                                                  valueIndex,
+                                                  valueName.data(),
+                                                  &nameLength,
+                                                  nullptr,
+                                                  &type,
+                                                  valueData.data(),
+                                                  &dataLength);
+                if (enumResult == ERROR_MORE_DATA || enumResult != ERROR_SUCCESS || type != REG_BINARY || dataLength == 0U) {
+                    continue;
+                }
+
+                std::wstring childName(valueName.data(), nameLength);
+                if (childName.empty() ||
+                    !std::all_of(childName.begin(), childName.end(), [](wchar_t ch) { return std::iswdigit(ch) != 0; })) {
+                    continue;
+                }
+
+                auto parsedItem = ParseShellItemList(std::span<const uint8_t>(valueData.data(), dataLength));
+                if (parsedItem.name.empty()) {
+                    continue;
+                }
+
+                std::wstring fullPath = JoinPathComponent(parentPath, parsedItem.name);
+                SystemTimePoint slotModifiedTime = keyWriteTime;
+
+                RegKeyHandle childKey;
+                if (::RegOpenKeyExW(currentKey, childName.c_str(), 0, KEY_READ, &childKey.key) == ERROR_SUCCESS) {
+                    if (bagsRoot.IsValid()) {
+                        if (const auto nodeSlot = QueryDwordValue(childKey.key, L"NodeSlot"); nodeSlot.has_value()) {
+                            RegKeyHandle bagKey;
+                            if (::RegOpenKeyExW(bagsRoot.key,
+                                                std::to_wstring(*nodeSlot).c_str(),
+                                                0,
+                                                KEY_READ,
+                                                &bagKey.key) == ERROR_SUCCESS) {
+                                slotModifiedTime = QueryKeyLastWriteTime(bagKey.key).value_or(slotModifiedTime);
+                            }
+                        }
+                    }
+                }
+
                 ShellbagEntry entry;
                 entry.artifactId = GenerateArtifactId();
                 entry.type = ArtifactType::Shellbag;
-                entry.path = std::format(L"C:\\Users\\User\\Documents\\Folder{}", i);
-                entry.itemType = "folder";
-                entry.registryPath = L"BagMRU";
+                entry.sourcePath = registryPath;
+                entry.registryPath = registryPath + L"\\" + childName;
+                entry.path = std::move(fullPath);
+                entry.itemType = parsedItem.itemType;
                 entry.collectionTime = SystemClock::now();
-                entry.firstExploredTime = SystemClock::now();
-                entry.lastExploredTime = SystemClock::now();
+                entry.slotModifiedTime = slotModifiedTime;
+                entry.firstExploredTime = parsedItem.creationTime.value_or(slotModifiedTime);
+                entry.lastExploredTime = parsedItem.accessTime.value_or(slotModifiedTime);
+                if (!userSID.empty()) {
+                    entry.userSID = std::wstring(userSID);
+                }
+                entry.artifactTime = entry.lastExploredTime;
+                entries.push_back(std::move(entry));
 
-                entries.push_back(entry);
+                if (childKey.IsValid()) {
+                    walkBagMru(childKey.key,
+                               registryPath + L"\\" + childName,
+                               entries.back().path);
+                }
             }
+        };
 
-            RegCloseKey(hKey);
-        }
-
-        Utils::Logger::Info(L"ArtifactExtractor: Parsed {} Shellbag entries", entries.size());
+        walkBagMru(bagMruRoot.key, bagMruPath, L"");
+        SS_LOG_INFO(kArtifactExtractorLogCategory,
+                    L"Parsed %zu Shellbag entries",
+                    entries.size());
 
     } catch (const std::exception& e) {
         Utils::Logger::Error(L"ArtifactExtractor: Shellbags parsing failed - {}",
