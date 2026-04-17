@@ -1334,7 +1334,10 @@ SIMDScanForPattern PROC
     cmp rcx, r12
     jge @pattern_found
     
-    movzx eax, byte ptr [rdi + r13 + rcx]
+    ; MASM only allows [base + index*scale + disp] - at most two registers.
+    ; Stage (buffer + buffer_index) into RAX, then index by the pattern offset.
+    lea rax, [rdi + r13]
+    movzx eax, byte ptr [rax + rcx]
     movzx edx, byte ptr [rsi + rcx]
     cmp al, dl
     jne @pattern_next
