@@ -116,8 +116,8 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../Utils/Logger.hpp"
-#include "../Utils/SystemUtils.hpp"
+#include "PhantomCore/Utils/Logger.hpp"
+#include "PhantomCore/Utils/SystemUtils.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS
@@ -384,7 +384,39 @@ struct GameModeStatistics {
     std::atomic<uint64_t> scansPostponed{0};
     std::atomic<uint64_t> notificationsSuppressed{0};
     TimePoint startTime = Clock::now();
-    
+
+    GameModeStatistics() = default;
+
+    // Snapshot-style copy: atomics cannot be trivially copied, so we
+    // explicitly load each counter. The resulting snapshot is not guaranteed
+    // to be transactionally consistent across counters (acceptable for
+    // telemetry).
+    GameModeStatistics(const GameModeStatistics& other) noexcept
+        : totalSessions(other.totalSessions.load(std::memory_order_relaxed)),
+          totalDurationSeconds(other.totalDurationSeconds.load(std::memory_order_relaxed)),
+          autoActivations(other.autoActivations.load(std::memory_order_relaxed)),
+          manualActivations(other.manualActivations.load(std::memory_order_relaxed)),
+          threatsBlocked(other.threatsBlocked.load(std::memory_order_relaxed)),
+          actionsDeferred(other.actionsDeferred.load(std::memory_order_relaxed)),
+          scansPostponed(other.scansPostponed.load(std::memory_order_relaxed)),
+          notificationsSuppressed(other.notificationsSuppressed.load(std::memory_order_relaxed)),
+          startTime(other.startTime) {}
+
+    GameModeStatistics& operator=(const GameModeStatistics& other) noexcept {
+        if (this != &other) {
+            totalSessions.store(other.totalSessions.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            totalDurationSeconds.store(other.totalDurationSeconds.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            autoActivations.store(other.autoActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            manualActivations.store(other.manualActivations.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            threatsBlocked.store(other.threatsBlocked.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            actionsDeferred.store(other.actionsDeferred.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            scansPostponed.store(other.scansPostponed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            notificationsSuppressed.store(other.notificationsSuppressed.load(std::memory_order_relaxed), std::memory_order_relaxed);
+            startTime = other.startTime;
+        }
+        return *this;
+    }
+
     void Reset() noexcept;
     [[nodiscard]] std::string ToJson() const;
 };
@@ -476,7 +508,8 @@ public:
     void SetEnabled(bool enabled);
     
     /// @brief Manually activate game mode
-    [[nodiscard]] bool Activate(const std::string& profileName = "");
+    [[nodiscard]] bool Activate(const std::string& profileName = "",
+                                ActivationReason reason = ActivationReason::Manual);
     
     /// @brief Manually deactivate game mode
     void Deactivate();
@@ -591,7 +624,7 @@ public:
     void ResetStatistics();
     
     [[nodiscard]] bool SelfTest();
-    [[nodiscard]] static std::string GetVersionString() noexcept;
+    [[nodiscard]] static std::string GetVersionString();
 
 private:
     GameModeManager();

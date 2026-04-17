@@ -58,27 +58,41 @@
 // ADDITIONAL INCLUDES
 // ============================================================================
 
-#include "../Utils/StringUtils.hpp"
-#include "../Utils/JSONUtils.hpp"
-#include "../Utils/Timer.hpp"
+#include "PhantomCore/Utils/StringUtils.hpp"
+#include "PhantomCore/Utils/JSONUtils.hpp"
+#include "PhantomCore/Utils/Timer.hpp"
 #include <psapi.h>
 #include <winternl.h>
 #include <powrprof.h>
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <iphlpapi.h>
+#include <netioapi.h>
 #include <sstream>
 #include <iomanip>
 #include <algorithm>
 #include <thread>
+#include <filesystem>            // Fix #2: missing include
+
+#if __has_include(<dxgi1_4.h>)
+#  include <dxgi1_4.h>
+#  define SS_HAS_DXGI 1
+#else
+#  define SS_HAS_DXGI 0
+#endif
 
 #pragma comment(lib, "psapi.lib")
 #pragma comment(lib, "ntdll.lib")
 #pragma comment(lib, "powrprof.lib")
+#pragma comment(lib, "iphlpapi.lib")
 
 // ============================================================================
-// INTERNAL CONSTANTS
+// INTERNAL CONSTANTS AND HELPERS
 // ============================================================================
 
 namespace {
     using namespace ShadowStrike::GameMode;
+    namespace Utils = ShadowStrike::Utils;
 
     /// @brief Maximum processes to track
     constexpr size_t MAX_TRACKED_PROCESSES = 1024;
@@ -92,31 +106,89 @@ namespace {
     /// @brief Performance counter update interval (ms)
     constexpr uint32_t PERF_COUNTER_UPDATE_MS = 500;
 
-    /**
-     * @brief NT API declarations
-     */
-    typedef enum _PROCESSINFOCLASS {
-        ProcessBasicInformation = 0,
-        ProcessIoPriority = 33,
-        ProcessMemoryPriority = 39
-    } PROCESSINFOCLASS;
+    /// @brief Initial EnumProcesses buffer size (number of DWORDs)
+    constexpr size_t ENUM_PROCESSES_INITIAL_COUNT = 2048;
 
-    typedef struct _MEMORY_PRIORITY_INFORMATION {
+    /// @brief Maximum EnumProcesses buffer size (number of DWORDs)
+    constexpr size_t ENUM_PROCESSES_MAX_COUNT = 65536;
+
+    // ========================================================================
+    // Fix #6: Remove PROCESSINFOCLASS enum. Use plain ULONG constants to avoid
+    // ODR violation with Windows SDK's own PROCESSINFOCLASS declaration.
+    // ========================================================================
+    constexpr ULONG SS_ProcessIoPriority = 33;
+    constexpr ULONG SS_ProcessMemoryPriority = 39;
+
+    /// @brief NT API SystemPerformanceInformation class (for disk I/O)
+    constexpr ULONG SS_SystemPerformanceInformation = 2;
+
+    typedef struct _SS_MEMORY_PRIORITY_INFORMATION {
         ULONG MemoryPriority;
-    } MEMORY_PRIORITY_INFORMATION;
+    } SS_MEMORY_PRIORITY_INFORMATION;
 
+    /// @brief Partial SYSTEM_PERFORMANCE_INFORMATION for disk I/O tracking.
+    /// Only the first seven fields are needed; we allocate a larger buffer to
+    /// satisfy the kernel's minimum size requirement.
+    struct SS_SYSTEM_PERFORMANCE_INFORMATION {
+        LARGE_INTEGER IdleProcessTime;
+        LARGE_INTEGER IoReadTransferCount;
+        LARGE_INTEGER IoWriteTransferCount;
+        LARGE_INTEGER IoOtherTransferCount;
+        ULONG IoReadOperationCount;
+        ULONG IoWriteOperationCount;
+        ULONG IoOtherOperationCount;
+    };
+
+    // ========================================================================
+    // Fix #11: SYSTEM_CPU_SET_INFORMATION for hybrid CPU detection
+    // ========================================================================
+    struct SS_SYSTEM_CPU_SET_INFORMATION {
+        ULONG Size;
+        ULONG Type;
+        struct {
+            ULONG Id;
+            USHORT Group;
+            UCHAR LogicalProcessorIndex;
+            UCHAR CoreIndex;
+            UCHAR LastLevelCacheIndex;
+            UCHAR NumaNodeIndex;
+            UCHAR EfficiencyClass;
+            UCHAR AllFlags;
+            ULONG Reserved;
+            ULONG64 AllocationTag;
+        } CpuSet;
+    };
+
+    using GetSystemCpuSetInformationFunc = BOOL(WINAPI*)(
+        SS_SYSTEM_CPU_SET_INFORMATION* Information,
+        ULONG BufferLength,
+        PULONG ReturnedLength,
+        HANDLE Process,
+        ULONG Flags
+    );
+
+    // ========================================================================
+    // Fix #6: NT function typedefs use ULONG for info class (not enum)
+    // ========================================================================
     typedef NTSTATUS(NTAPI* NtSetInformationProcessFunc)(
         HANDLE ProcessHandle,
-        PROCESSINFOCLASS ProcessInformationClass,
+        ULONG ProcessInformationClass,
         PVOID ProcessInformation,
         ULONG ProcessInformationLength
     );
 
     typedef NTSTATUS(NTAPI* NtQueryInformationProcessFunc)(
         HANDLE ProcessHandle,
-        PROCESSINFOCLASS ProcessInformationClass,
+        ULONG ProcessInformationClass,
         PVOID ProcessInformation,
         ULONG ProcessInformationLength,
+        PULONG ReturnLength
+    );
+
+    typedef NTSTATUS(NTAPI* NtQuerySystemInformationFunc)(
+        ULONG SystemInformationClass,
+        PVOID SystemInformation,
+        ULONG SystemInformationLength,
         PULONG ReturnLength
     );
 
@@ -133,6 +205,179 @@ namespace {
         return func;
     }
 
+    NtQuerySystemInformationFunc GetNtQuerySystemInformation() {
+        static NtQuerySystemInformationFunc func = reinterpret_cast<NtQuerySystemInformationFunc>(
+            ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQuerySystemInformation"));
+        return func;
+    }
+
+    // ========================================================================
+    // Fix #15: RAII handle wrapper for Windows HANDLEs
+    // ========================================================================
+    struct ScopedHandle {
+        HANDLE h = nullptr;
+        explicit ScopedHandle(HANDLE handle) : h(handle) {}
+        ~ScopedHandle() { if (h && h != INVALID_HANDLE_VALUE) ::CloseHandle(h); }
+        ScopedHandle(const ScopedHandle&) = delete;
+        ScopedHandle& operator=(const ScopedHandle&) = delete;
+        ScopedHandle(ScopedHandle&& other) noexcept : h(other.h) { other.h = nullptr; }
+        ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+            if (this != &other) {
+                if (h && h != INVALID_HANDLE_VALUE) ::CloseHandle(h);
+                h = other.h;
+                other.h = nullptr;
+            }
+            return *this;
+        }
+        operator HANDLE() const noexcept { return h; }
+        explicit operator bool() const noexcept { return h != nullptr && h != INVALID_HANDLE_VALUE; }
+        [[nodiscard]] HANDLE get() const noexcept { return h; }
+    };
+
+    // ========================================================================
+    // Fix #5: I/O priority translation (our enum is reversed vs Windows)
+    // Windows IO_PRIORITY_HINT: VeryLow=0, Low=1, Normal=2, High=3, Critical=4
+    // Our enum:                 Critical=0, High=1, Normal=2, Low=3, VeryLow=4
+    // ========================================================================
+    [[nodiscard]] static ULONG ToWindowsIOPriority(IOPriority priority) noexcept {
+        switch (priority) {
+            case IOPriority::Critical: return 4; // IoPriorityCritical
+            case IOPriority::High:     return 3; // IoPriorityHigh
+            case IOPriority::Normal:   return 2; // IoPriorityNormal
+            case IOPriority::Low:      return 1; // IoPriorityLow
+            case IOPriority::VeryLow:  return 0; // IoPriorityVeryLow
+            default:                   return 2; // IoPriorityNormal
+        }
+    }
+
+    // ========================================================================
+    // PO-H5: Reverse translation from Windows I/O priority to our enum
+    // ========================================================================
+    [[nodiscard]] static IOPriority FromWindowsIOPriority(ULONG windowsPriority) noexcept {
+        switch (windowsPriority) {
+            case 4: return IOPriority::Critical;
+            case 3: return IOPriority::High;
+            case 2: return IOPriority::Normal;
+            case 1: return IOPriority::Low;
+            case 0: return IOPriority::VeryLow;
+            default: return IOPriority::Normal;
+        }
+    }
+
+    // ========================================================================
+    // PO-H5: Reverse translation from Windows memory priority to our enum
+    // ========================================================================
+    [[nodiscard]] static MemoryPriority FromWindowsMemoryPriority(ULONG windowsPriority) noexcept {
+        switch (windowsPriority) {
+            case 5: return MemoryPriority::VeryHigh;
+            case 4: return MemoryPriority::High;
+            case 3: return MemoryPriority::Medium;
+            case 2: return MemoryPriority::Low;
+            case 1: return MemoryPriority::VeryLow;
+            default: return MemoryPriority::VeryHigh;
+        }
+    }
+
+    // ========================================================================
+    // Fix #14: Explicit memory priority translation
+    // Windows MEMORY_PRIORITY: 1 (lowest) to 5 (default/highest)
+    // ========================================================================
+    [[nodiscard]] static ULONG ToWindowsMemoryPriority(MemoryPriority p) noexcept {
+        switch (p) {
+            case MemoryPriority::VeryHigh: return 5;
+            case MemoryPriority::High:     return 4;
+            case MemoryPriority::Medium:   return 3;
+            case MemoryPriority::Low:      return 2;
+            case MemoryPriority::VeryLow:  return 1;
+            case MemoryPriority::Lowest:   return 1; // Clamp to valid Windows range
+            default:                       return 5;
+        }
+    }
+
+    // ========================================================================
+    // Fix #7: System-critical process blocklist for EmptyWorkingSet
+    // ========================================================================
+    [[nodiscard]] static bool IsSystemCriticalProcess(const std::wstring& processName) noexcept {
+        static const std::array<const wchar_t*, 8> kBlocklist = {
+            L"csrss.exe",
+            L"lsass.exe",
+            L"smss.exe",
+            L"dwm.exe",
+            L"services.exe",
+            L"svchost.exe",
+            L"System",
+            L"wininit.exe"
+        };
+        for (const auto* name : kBlocklist) {
+            if (_wcsicmp(processName.c_str(), name) == 0) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ========================================================================
+    // Fix #18: Heap-allocated EnumProcesses with retry loop
+    // Returns a vector of PIDs. Empty on failure.
+    // ========================================================================
+    [[nodiscard]] static std::vector<DWORD> EnumAllProcesses() {
+        size_t capacity = ENUM_PROCESSES_INITIAL_COUNT;
+        std::vector<DWORD> pids;
+
+        while (capacity <= ENUM_PROCESSES_MAX_COUNT) {
+            pids.resize(capacity);
+            DWORD bytesNeeded = 0;
+
+            if (!::EnumProcesses(pids.data(),
+                                 static_cast<DWORD>(capacity * sizeof(DWORD)),
+                                 &bytesNeeded)) {
+                Utils::Logger::Error("EnumProcesses failed: error {}",
+                                     ::GetLastError());
+                return {};
+            }
+
+            size_t processCount = bytesNeeded / sizeof(DWORD);
+
+            // If the buffer was fully used, there may be more processes
+            if (processCount < capacity) {
+                pids.resize(processCount);
+                return pids;
+            }
+
+            // Double capacity and retry
+            capacity *= 2;
+        }
+
+        Utils::Logger::Error("EnumProcesses: exceeded maximum buffer size");
+        return {};
+    }
+
+    // ========================================================================
+    // Helper: Enable a named privilege on the current process token
+    // ========================================================================
+    [[nodiscard]] static bool EnablePrivilege(const wchar_t* privilegeName) {
+        HANDLE hToken = nullptr;
+        if (!::OpenProcessToken(::GetCurrentProcess(),
+                                TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY,
+                                &hToken)) {
+            return false;
+        }
+        ScopedHandle tokenGuard(hToken);
+
+        TOKEN_PRIVILEGES tp{};
+        if (!::LookupPrivilegeValueW(nullptr, privilegeName, &tp.Privileges[0].Luid)) {
+            return false;
+        }
+        tp.PrivilegeCount = 1;
+        tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+        if (!::AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr)) {
+            return false;
+        }
+
+        return ::GetLastError() != ERROR_NOT_ALL_ASSIGNED;
+    }
+
 } // anonymous namespace
 
 // ============================================================================
@@ -146,6 +391,8 @@ public:
     PerformanceOptimizerImpl() = default;
     ~PerformanceOptimizerImpl() {
         StopMonitoring();
+        CloseThrottleJobObject();
+        ReleaseDxgiResources();
     }
 
     // Delete copy/move
@@ -159,6 +406,9 @@ public:
     // ========================================================================
 
     mutable std::shared_mutex m_mutex;
+
+    // Fix #12: Separate mutex for callbacks to avoid contention with m_mutex
+    mutable std::mutex m_callbackMutex;
 
     std::atomic<OptimizerStatus> m_status{OptimizerStatus::Uninitialized};
     PerformanceOptimizerConfiguration m_config;
@@ -175,7 +425,7 @@ public:
     // Process state tracking
     std::unordered_map<uint32_t, ProcessResourceState> m_processStates;
 
-    // Callbacks
+    // Callbacks (guarded by m_callbackMutex, NOT m_mutex)
     std::vector<OptimizationCallback> m_optimizationCallbacks;
     std::vector<ResourceCallback> m_resourceCallbacks;
     std::vector<ErrorCallback> m_errorCallbacks;
@@ -185,10 +435,46 @@ public:
     std::thread m_monitoringThread;
     uint32_t m_monitoringIntervalMs = MONITORING_INTERVAL_MS;
 
-    // Performance counters
+    // PO-C2: Dedicated mutex for performance counter fields below
+    mutable std::mutex m_perfCounterMutex;
+
+    // Performance counters (guarded by m_perfCounterMutex)
     uint64_t m_lastCpuIdleTime = 0;
     uint64_t m_lastCpuKernelTime = 0;
     uint64_t m_lastCpuUserTime = 0;
+
+    // Fix #8: Disk I/O tracking for delta computation
+    uint64_t m_lastDiskReadBytes = 0;
+    uint64_t m_lastDiskWriteBytes = 0;
+    // PO-M1: Previous I/O operation counts for delta-based queue length
+    uint32_t m_lastDiskReadOps = 0;
+    uint32_t m_lastDiskWriteOps = 0;
+    TimePoint m_lastDiskSampleTime = Clock::now();
+    bool m_diskBaselineSet = false;
+
+    // Network I/O tracking (guarded by m_perfCounterMutex) — computes
+    // Mbps delta across snapshots using IP Helper GetIfTable2.
+    uint64_t m_lastNetInBytes = 0;
+    uint64_t m_lastNetOutBytes = 0;
+    TimePoint m_lastNetSampleTime = Clock::now();
+    bool m_netBaselineSet = false;
+
+    // Fix #10: Job object for CPU throttling
+    HANDLE m_throttleJobHandle = nullptr;
+
+    // Fix #10: Scan rate limiting state
+    mutable std::mutex m_scanRateMutex;
+    uint32_t m_scanRateLimit = OptimizerConstants::DEFAULT_SCAN_RATE_LIMIT;
+    mutable TimePoint m_lastScanTime = Clock::now();
+    // PO-L3: Plain uint32_t since all access is under m_scanRateMutex
+    mutable uint32_t m_scansThisSecond = 0;
+    mutable TimePoint m_scanWindowStart = Clock::now();
+
+    // PO-H4: Cached DXGI objects to avoid per-tick recreation
+#if SS_HAS_DXGI
+    IDXGIFactory1* m_cachedDxgiFactory = nullptr;
+    IDXGIAdapter3* m_cachedDxgiAdapter3 = nullptr;
+#endif
 
     // ========================================================================
     // HELPER METHODS
@@ -196,10 +482,15 @@ public:
 
     /**
      * @brief Invoke error callbacks
+     * Fix #12: Uses m_callbackMutex. Copies callbacks under lock, invokes outside.
      */
     void NotifyError(const std::string& message, int code = 0) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_errorCallbacks) {
+        std::vector<ErrorCallback> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            callbacksCopy = m_errorCallbacks;
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(message, code);
             } catch (const std::exception& e) {
@@ -212,28 +503,42 @@ public:
 
     /**
      * @brief Invoke optimization callbacks
+     * Fix #12: Uses m_callbackMutex. Copies callbacks under lock, invokes outside.
      */
     void NotifyOptimization(const OptimizationResult& result) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_optimizationCallbacks) {
+        std::vector<OptimizationCallback> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            callbacksCopy = m_optimizationCallbacks;
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(result);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("Optimization callback exception: {}", e.what());
             } catch (...) {
-                // Silently ignore callback exceptions
+                Utils::Logger::Error("Unknown optimization callback exception");
             }
         }
     }
 
     /**
      * @brief Invoke resource callbacks
+     * Fix #12: Uses m_callbackMutex. Copies callbacks under lock, invokes outside.
      */
     void NotifyResourceUpdate(const SystemResourceSnapshot& snapshot) {
-        std::shared_lock lock(m_mutex);
-        for (const auto& callback : m_resourceCallbacks) {
+        std::vector<ResourceCallback> callbacksCopy;
+        {
+            std::lock_guard lock(m_callbackMutex);
+            callbacksCopy = m_resourceCallbacks;
+        }
+        for (const auto& callback : callbacksCopy) {
             try {
                 callback(snapshot);
+            } catch (const std::exception& e) {
+                Utils::Logger::Error("Resource callback exception: {}", e.what());
             } catch (...) {
-                // Silently ignore callback exceptions
+                Utils::Logger::Error("Unknown resource callback exception");
             }
         }
     }
@@ -242,6 +547,9 @@ public:
      * @brief Get current CPU usage
      */
     [[nodiscard]] double GetCPUUsage() {
+        // PO-C2: Guard perf counter fields against concurrent access
+        std::lock_guard perfLock(m_perfCounterMutex);
+
         FILETIME idleTime, kernelTime, userTime;
         if (!::GetSystemTimes(&idleTime, &kernelTime, &userTime)) {
             return 0.0;
@@ -311,6 +619,7 @@ public:
 
     /**
      * @brief Open process with required privileges
+     * Fix #15: Callers should wrap in ScopedHandle.
      */
     [[nodiscard]] HANDLE OpenProcessWithPrivileges(uint32_t pid) {
         DWORD access = PROCESS_QUERY_INFORMATION | PROCESS_SET_INFORMATION |
@@ -320,6 +629,7 @@ public:
 
     /**
      * @brief Save process state before modification
+     * Fix #4: Assumes caller already holds m_mutex. No internal locking.
      */
     void SaveProcessState(uint32_t pid, HANDLE hProcess) {
         ProcessResourceState state;
@@ -344,8 +654,32 @@ public:
             state.currentAffinityMask = processAffinity;
         }
 
-        // Save to map
-        std::unique_lock lock(m_mutex);
+        // PO-H5: Query original I/O priority via NtQueryInformationProcess
+        if (auto ntQueryInfo = GetNtQueryInformationProcess()) {
+            ULONG ioPriority = 2; // Default: IoPriorityNormal
+            ULONG returnLength = 0;
+            NTSTATUS status = ntQueryInfo(hProcess, SS_ProcessIoPriority,
+                                          &ioPriority, sizeof(ioPriority), &returnLength);
+            if (status == 0) {
+                state.originalIOPriority = FromWindowsIOPriority(ioPriority);
+                state.currentIOPriority = state.originalIOPriority;
+            }
+        }
+
+        // PO-H5: Query original memory priority via NtQueryInformationProcess
+        if (auto ntQueryInfo = GetNtQueryInformationProcess()) {
+            SS_MEMORY_PRIORITY_INFORMATION memPriInfo{};
+            memPriInfo.MemoryPriority = 5; // Default: MEMORY_PRIORITY_NORMAL
+            ULONG returnLength = 0;
+            NTSTATUS status = ntQueryInfo(hProcess, SS_ProcessMemoryPriority,
+                                          &memPriInfo, sizeof(memPriInfo), &returnLength);
+            if (status == 0) {
+                state.originalMemoryPriority = FromWindowsMemoryPriority(memPriInfo.MemoryPriority);
+                state.currentMemoryPriority = state.originalMemoryPriority;
+            }
+        }
+
+        // Save to map (no lock here; caller holds m_mutex)
         m_processStates[pid] = state;
     }
 
@@ -382,6 +716,9 @@ public:
     void MonitoringThreadFunc() {
         Utils::Logger::Info("Resource monitoring thread started");
 
+        // PO-L4: Use sleep_until to prevent drift accumulation
+        auto nextTick = Clock::now() + std::chrono::milliseconds(m_monitoringIntervalMs);
+
         while (m_monitoringActive.load(std::memory_order_acquire)) {
             try {
                 // Get resource snapshot
@@ -396,15 +733,255 @@ public:
                 Utils::Logger::Error("Unknown monitoring thread error");
             }
 
-            // Sleep for interval
-            std::this_thread::sleep_for(std::chrono::milliseconds(m_monitoringIntervalMs));
+            // PO-L4: Sleep until next tick, then advance; reset if we fell behind
+            std::this_thread::sleep_until(nextTick);
+            auto now = Clock::now();
+            nextTick += std::chrono::milliseconds(m_monitoringIntervalMs);
+            if (nextTick < now) {
+                nextTick = now + std::chrono::milliseconds(m_monitoringIntervalMs);
+            }
         }
 
         Utils::Logger::Info("Resource monitoring thread stopped");
     }
 
     /**
+     * @brief Capture disk I/O rates via NtQuerySystemInformation
+     * Fix #8: Real disk I/O monitoring using SystemPerformanceInformation
+     */
+    void CaptureDiskIO(double& readMBps, double& writeMBps, double& queueLength) {
+        readMBps = 0.0;
+        writeMBps = 0.0;
+        queueLength = 0.0;
+
+        auto ntQuerySysInfo = GetNtQuerySystemInformation();
+        if (!ntQuerySysInfo) {
+            return;
+        }
+
+        // Allocate a buffer large enough for the full struct (~512 bytes is
+        // more than sufficient for SYSTEM_PERFORMANCE_INFORMATION)
+        alignas(16) uint8_t buffer[512] = {};
+        ULONG returnLength = 0;
+
+        NTSTATUS status = ntQuerySysInfo(SS_SystemPerformanceInformation,
+                                         buffer, sizeof(buffer), &returnLength);
+        if (status != 0) {
+            Utils::Logger::Warn("NtQuerySystemInformation(SystemPerformanceInformation) "
+                                "failed: NTSTATUS 0x{:08X}", static_cast<uint32_t>(status));
+            return;
+        }
+
+        // Cast to our partial struct to read I/O counters
+        const auto* perfInfo = reinterpret_cast<const SS_SYSTEM_PERFORMANCE_INFORMATION*>(buffer);
+
+        uint64_t currentReadBytes = static_cast<uint64_t>(perfInfo->IoReadTransferCount.QuadPart);
+        uint64_t currentWriteBytes = static_cast<uint64_t>(perfInfo->IoWriteTransferCount.QuadPart);
+        uint32_t currentReadOps = perfInfo->IoReadOperationCount;
+        uint32_t currentWriteOps = perfInfo->IoWriteOperationCount;
+        auto now = Clock::now();
+
+        // PO-C2: Guard perf counter fields against concurrent access
+        std::lock_guard perfLock(m_perfCounterMutex);
+
+        if (m_diskBaselineSet) {
+            double elapsedSec = std::chrono::duration<double>(now - m_lastDiskSampleTime).count();
+            if (elapsedSec > 0.01) { // Avoid division by near-zero
+                uint64_t readDelta = (currentReadBytes >= m_lastDiskReadBytes)
+                    ? (currentReadBytes - m_lastDiskReadBytes) : 0;
+                uint64_t writeDelta = (currentWriteBytes >= m_lastDiskWriteBytes)
+                    ? (currentWriteBytes - m_lastDiskWriteBytes) : 0;
+
+                readMBps = static_cast<double>(readDelta) / (1024.0 * 1024.0 * elapsedSec);
+                writeMBps = static_cast<double>(writeDelta) / (1024.0 * 1024.0 * elapsedSec);
+
+                // PO-M1: Compute proper delta for I/O operation counts
+                uint32_t opsReadDelta = (currentReadOps >= m_lastDiskReadOps)
+                    ? (currentReadOps - m_lastDiskReadOps) : 0;
+                uint32_t opsWriteDelta = (currentWriteOps >= m_lastDiskWriteOps)
+                    ? (currentWriteOps - m_lastDiskWriteOps) : 0;
+                queueLength = static_cast<double>(opsReadDelta + opsWriteDelta) / (elapsedSec * 1000.0);
+                queueLength = std::min(queueLength, 100.0); // Cap at reasonable value
+            }
+        }
+
+        m_lastDiskReadBytes = currentReadBytes;
+        m_lastDiskWriteBytes = currentWriteBytes;
+        m_lastDiskReadOps = currentReadOps;
+        m_lastDiskWriteOps = currentWriteOps;
+        m_lastDiskSampleTime = now;
+        m_diskBaselineSet = true;
+    }
+
+    /**
+     * @brief Capture network throughput in Mbps using IP Helper GetIfTable2.
+     *
+     * Design:
+     *   - Enumerates all NDIS-managed interfaces and sums InOctets / OutOctets
+     *     across those that are operational (IfOperStatusUp) and not
+     *     loopback / tunnel pseudo-adapters (those would double-count local
+     *     traffic and inflate the measurement).
+     *   - Computes a delta over the last sample. First call establishes a
+     *     baseline and returns 0.0 (avoids spurious spike on startup).
+     *   - Protected against counter wrap / interface table restructuring by
+     *     treating any negative delta as 0.
+     *   - Called from the monitoring thread only; state is guarded by
+     *     m_perfCounterMutex to allow safe concurrent GetResourceSnapshot().
+     *
+     * @return Combined RX+TX throughput in megabits per second.
+     */
+    [[nodiscard]] double CaptureNetworkMbps() {
+        PMIB_IF_TABLE2 table = nullptr;
+        NETIO_STATUS status = ::GetIfTable2(&table);
+        if (status != NO_ERROR || table == nullptr) {
+            if (table != nullptr) {
+                ::FreeMibTable(table);
+            }
+            Utils::Logger::Warn("GetIfTable2 failed: status {}", static_cast<uint32_t>(status));
+            return 0.0;
+        }
+
+        uint64_t currentIn = 0;
+        uint64_t currentOut = 0;
+
+        for (ULONG i = 0; i < table->NumEntries; ++i) {
+            const MIB_IF_ROW2& row = table->Table[i];
+
+            if (row.OperStatus != IfOperStatusUp) {
+                continue;
+            }
+            // Filter out interfaces that would skew real network throughput:
+            //  - Software loopback (IF_TYPE_SOFTWARE_LOOPBACK = 24)
+            //  - Tunnel pseudo-interfaces (IF_TYPE_TUNNEL = 131) — they
+            //    reflect traffic already accounted for on a physical adapter.
+            if (row.Type == IF_TYPE_SOFTWARE_LOOPBACK ||
+                row.Type == IF_TYPE_TUNNEL) {
+                continue;
+            }
+            if (row.InterfaceAndOperStatusFlags.FilterInterface) {
+                continue;
+            }
+
+            currentIn += row.InOctets;
+            currentOut += row.OutOctets;
+        }
+
+        ::FreeMibTable(table);
+
+        const auto now = Clock::now();
+        double mbps = 0.0;
+
+        // PO-C2: Guard network counter fields against concurrent access
+        std::lock_guard perfLock(m_perfCounterMutex);
+
+        if (m_netBaselineSet) {
+            const double elapsedSec =
+                std::chrono::duration<double>(now - m_lastNetSampleTime).count();
+            if (elapsedSec > 0.01) {
+                const uint64_t inDelta = (currentIn >= m_lastNetInBytes)
+                    ? (currentIn - m_lastNetInBytes) : 0;
+                const uint64_t outDelta = (currentOut >= m_lastNetOutBytes)
+                    ? (currentOut - m_lastNetOutBytes) : 0;
+                const uint64_t totalDeltaBytes = inDelta + outDelta;
+
+                // Bytes -> bits -> megabits = * 8 / 1'000'000
+                mbps = (static_cast<double>(totalDeltaBytes) * 8.0) /
+                       (1'000'000.0 * elapsedSec);
+                // Cap at a sane ceiling to suppress measurement artifacts on
+                // counter rollover or interface reconfiguration.
+                mbps = std::max(0.0, std::min(mbps, 1'000'000.0));
+            }
+        }
+
+        m_lastNetInBytes = currentIn;
+        m_lastNetOutBytes = currentOut;
+        m_lastNetSampleTime = now;
+        m_netBaselineSet = true;
+
+        return mbps;
+    }
+
+    /**
+     * @brief Capture GPU memory usage via DXGI
+     * Fix #8: Attempt to load dxgi.dll and query adapter memory.
+     * Returns GPU memory usage as a percentage. Returns 0.0 if unavailable.
+     */
+    [[nodiscard]] double CaptureGPUUsage() {
+#if SS_HAS_DXGI
+        // Dynamically load dxgi.dll to avoid hard dependency
+        static HMODULE hDxgi = ::LoadLibraryW(L"dxgi.dll");
+        if (!hDxgi) {
+            static bool sWarned = false;
+            if (!sWarned) {
+                Utils::Logger::Warn("dxgi.dll not available - GPU memory monitoring disabled");
+                sWarned = true;
+            }
+            return 0.0;
+        }
+
+        using CreateDXGIFactory1Func = HRESULT(WINAPI*)(REFIID riid, void** ppFactory);
+        static auto pCreateDXGIFactory1 = reinterpret_cast<CreateDXGIFactory1Func>(
+            ::GetProcAddress(hDxgi, "CreateDXGIFactory1"));
+        if (!pCreateDXGIFactory1) {
+            return 0.0;
+        }
+
+        // PO-H4: Lazily initialize and cache DXGI factory + adapter
+        if (!m_cachedDxgiFactory) {
+            HRESULT hr = pCreateDXGIFactory1(__uuidof(IDXGIFactory1),
+                                             reinterpret_cast<void**>(&m_cachedDxgiFactory));
+            if (FAILED(hr) || !m_cachedDxgiFactory) {
+                m_cachedDxgiFactory = nullptr;
+                return 0.0;
+            }
+
+            IDXGIAdapter1* adapter = nullptr;
+            if (SUCCEEDED(m_cachedDxgiFactory->EnumAdapters1(0, &adapter)) && adapter) {
+                HRESULT qihr = adapter->QueryInterface(__uuidof(IDXGIAdapter3),
+                                                       reinterpret_cast<void**>(&m_cachedDxgiAdapter3));
+                adapter->Release();
+                if (FAILED(qihr)) {
+                    m_cachedDxgiAdapter3 = nullptr;
+                }
+            }
+        }
+
+        if (!m_cachedDxgiAdapter3) {
+            return 0.0;
+        }
+
+        DXGI_QUERY_VIDEO_MEMORY_INFO memInfo{};
+        HRESULT hr = m_cachedDxgiAdapter3->QueryVideoMemoryInfo(
+            0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &memInfo);
+
+        if (FAILED(hr)) {
+            // Adapter may have been removed or reset; release and retry next tick
+            ReleaseDxgiResources();
+            return 0.0;
+        }
+
+        double gpuUsage = 0.0;
+        if (memInfo.Budget > 0) {
+            gpuUsage = 100.0 * static_cast<double>(memInfo.CurrentUsage) /
+                       static_cast<double>(memInfo.Budget);
+            gpuUsage = std::min(100.0, std::max(0.0, gpuUsage));
+        }
+
+        return gpuUsage;
+#else
+        static bool sWarned = false;
+        if (!sWarned) {
+            Utils::Logger::Warn("DXGI headers not available at build time - "
+                                "GPU memory monitoring disabled");
+            sWarned = true;
+        }
+        return 0.0;
+#endif
+    }
+
+    /**
      * @brief Capture current resource snapshot
+     * Fix #8: Implements real disk I/O and GPU monitoring.
      */
     [[nodiscard]] SystemResourceSnapshot CaptureResourceSnapshot() {
         SystemResourceSnapshot snapshot;
@@ -420,18 +997,16 @@ public:
         }
 
         // Power status
-        GetPowerStatus(snapshot.onBattery, snapshot.batteryPercent);
+        (void)GetPowerStatus(snapshot.onBattery, snapshot.batteryPercent);
 
-        // Disk I/O would require performance counters - simplified for now
-        snapshot.diskReadMBps = 0.0;
-        snapshot.diskWriteMBps = 0.0;
-        snapshot.diskQueueLength = 0.0;
+        // Disk I/O via NtQuerySystemInformation
+        CaptureDiskIO(snapshot.diskReadMBps, snapshot.diskWriteMBps, snapshot.diskQueueLength);
 
-        // Network - would require performance counters
-        snapshot.networkMbps = 0.0;
+        // Network I/O via IP Helper GetIfTable2 (delta Mbps over sample interval)
+        snapshot.networkMbps = CaptureNetworkMbps();
 
-        // GPU - would require GPU API integration
-        snapshot.gpuUsage = 0.0;
+        // GPU via DXGI
+        snapshot.gpuUsage = CaptureGPUUsage();
 
         return snapshot;
     }
@@ -445,6 +1020,119 @@ public:
             if (m_monitoringThread.joinable()) {
                 m_monitoringThread.join();
             }
+        }
+    }
+
+    // ========================================================================
+    // Fix #3 / #10: Internal throttling methods (no locking)
+    // The public EnableThrottling/DisableThrottling lock and delegate here.
+    // ApplyCustomSettings and RestoreSystem call these directly while
+    // already holding m_mutex, avoiding recursive lock deadlocks.
+    // ========================================================================
+
+    /**
+     * @brief PO-H4: Release cached DXGI objects
+     */
+    void ReleaseDxgiResources() {
+#if SS_HAS_DXGI
+        if (m_cachedDxgiAdapter3) {
+            m_cachedDxgiAdapter3->Release();
+            m_cachedDxgiAdapter3 = nullptr;
+        }
+        if (m_cachedDxgiFactory) {
+            m_cachedDxgiFactory->Release();
+            m_cachedDxgiFactory = nullptr;
+        }
+#endif
+    }
+
+    /**
+     * @brief Enable throttling (no lock). Caller must hold m_mutex.
+     * Fix #10: Creates a Job Object for CPU rate control and stores the
+     * scan rate limit for ShouldThrottleScan().
+     */
+    void EnableThrottlingInternal(const ThrottleSettings& settings) {
+        m_throttleSettings = settings;
+        m_throttlingActive.store(true, std::memory_order_release);
+        m_stats.throttleActivations++;
+
+        // Store scan rate limit for ShouldThrottleScan()
+        {
+            std::lock_guard scanLock(m_scanRateMutex);
+            m_scanRateLimit = settings.scanRateLimit;
+            m_scansThisSecond = 0;
+            m_scanWindowStart = Clock::now();
+        }
+
+        // Create or update Job Object for CPU rate control
+        if (settings.cpuUsageLimit > 0 && settings.cpuUsageLimit < 100) {
+            CloseThrottleJobObject(); // Close any existing job
+
+            m_throttleJobHandle = ::CreateJobObjectW(nullptr, nullptr);
+            if (!m_throttleJobHandle) {
+                Utils::Logger::Error("CreateJobObjectW failed: error {}",
+                                     ::GetLastError());
+            } else {
+                JOBOBJECT_CPU_RATE_CONTROL_INFORMATION cpuRate{};
+                cpuRate.ControlFlags = JOB_OBJECT_CPU_RATE_CONTROL_ENABLE |
+                                      JOB_OBJECT_CPU_RATE_CONTROL_HARD_CAP;
+                // CpuRate is in hundredths of a percent (100 = 1%)
+                cpuRate.CpuRate = static_cast<DWORD>(settings.cpuUsageLimit) * 100;
+
+                if (!::SetInformationJobObject(m_throttleJobHandle,
+                                               JobObjectCpuRateControlInformation,
+                                               &cpuRate, sizeof(cpuRate))) {
+                    Utils::Logger::Error("SetInformationJobObject(CpuRateControl) "
+                                         "failed: error {}", ::GetLastError());
+                    CloseThrottleJobObject();
+                } else {
+                    // Assign tracked ShadowStrike processes to the job
+                    for (const auto& [pid, state] : m_processStates) {
+                        ScopedHandle hProcess(::OpenProcess(
+                            PROCESS_SET_QUOTA | PROCESS_TERMINATE,
+                            FALSE, pid));
+                        if (hProcess) {
+                            if (!::AssignProcessToJobObject(m_throttleJobHandle, hProcess.get())) {
+                                Utils::Logger::Warn("Failed to assign PID {} to throttle "
+                                                     "job: error {}", pid, ::GetLastError());
+                            }
+                        }
+                    }
+                    Utils::Logger::Info("CPU throttle job created: {}% hard cap",
+                                        settings.cpuUsageLimit);
+                }
+            }
+        }
+
+        Utils::Logger::Info("Throttling enabled: {} MB/s disk, {}% CPU, {} scans/sec",
+                           settings.diskThroughputMBps, settings.cpuUsageLimit,
+                           settings.scanRateLimit);
+    }
+
+    /**
+     * @brief Disable throttling (no lock). Caller must hold m_mutex.
+     * Fix #10: Closes the Job Object and resets scan rate state.
+     */
+    void DisableThrottlingInternal() {
+        m_throttlingActive.store(false, std::memory_order_release);
+        CloseThrottleJobObject();
+
+        {
+            std::lock_guard scanLock(m_scanRateMutex);
+            m_scanRateLimit = OptimizerConstants::DEFAULT_SCAN_RATE_LIMIT;
+            m_scansThisSecond = 0;
+        }
+
+        Utils::Logger::Info("Throttling disabled");
+    }
+
+    /**
+     * @brief Close the throttle Job Object if open
+     */
+    void CloseThrottleJobObject() {
+        if (m_throttleJobHandle) {
+            ::CloseHandle(m_throttleJobHandle);
+            m_throttleJobHandle = nullptr;
         }
     }
 };
@@ -507,6 +1195,12 @@ PerformanceOptimizer::~PerformanceOptimizer() {
 
         m_impl->m_config = config;
 
+        // PO-M3: Enable SeDebugPrivilege for cross-process operations
+        if (!EnablePrivilege(SE_DEBUG_NAME)) {
+            Utils::Logger::Warn("Failed to enable SE_DEBUG_NAME privilege; "
+                                "some cross-process operations may fail");
+        }
+
         // Reset statistics
         m_impl->m_stats.Reset();
         m_impl->m_stats.startTime = Clock::now();
@@ -527,8 +1221,24 @@ PerformanceOptimizer::~PerformanceOptimizer() {
     }
 }
 
+/**
+ * Fix #19: Shutdown lock juggling.
+ * 1. Signal m_monitoringActive = false BEFORE acquiring m_mutex.
+ * 2. Join the monitoring thread outside the lock.
+ * 3. Then acquire m_mutex for the remaining cleanup.
+ */
 void PerformanceOptimizer::Shutdown() {
     try {
+        // Step 1: Signal monitoring thread to stop (no lock needed; atomic)
+        m_impl->m_monitoringActive.store(false, std::memory_order_release);
+
+        // Step 2: Join monitoring thread outside of m_mutex to avoid
+        // deadlock with the monitoring thread's own lock acquisitions
+        if (m_impl->m_monitoringThread.joinable()) {
+            m_impl->m_monitoringThread.join();
+        }
+
+        // Step 3: Now acquire the main lock for state cleanup
         std::unique_lock lock(m_impl->m_mutex);
 
         if (m_impl->m_status == OptimizerStatus::Uninitialized ||
@@ -538,33 +1248,49 @@ void PerformanceOptimizer::Shutdown() {
 
         m_impl->m_status = OptimizerStatus::Stopping;
 
-        // Stop monitoring
-        lock.unlock();
-        m_impl->StopMonitoring();
-        lock.lock();
-
         // Restore all modified processes
         for (auto& [pid, state] : m_impl->m_processStates) {
             if (state.isModified) {
-                HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+                ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
                 if (hProcess) {
-                    ::SetPriorityClass(hProcess, GetWindowsPriorityClass(state.originalPriority));
-                    ::SetProcessAffinityMask(hProcess, state.originalAffinityMask);
-                    ::CloseHandle(hProcess);
+                    ::SetPriorityClass(hProcess.get(), GetWindowsPriorityClass(state.originalPriority));
+                    ::SetProcessAffinityMask(hProcess.get(), state.originalAffinityMask);
+
+                    // PO-C1: Restore I/O priority
+                    if (auto ntSetInfo = GetNtSetInformationProcess()) {
+                        ULONG ioPriority = ToWindowsIOPriority(state.originalIOPriority);
+                        ntSetInfo(hProcess.get(), SS_ProcessIoPriority,
+                                  &ioPriority, sizeof(ioPriority));
+                    }
+
+                    // PO-C1: Restore memory priority
+                    if (auto ntSetInfo = GetNtSetInformationProcess()) {
+                        SS_MEMORY_PRIORITY_INFORMATION memPriority{};
+                        memPriority.MemoryPriority = ToWindowsMemoryPriority(state.originalMemoryPriority);
+                        ntSetInfo(hProcess.get(), SS_ProcessMemoryPriority,
+                                  &memPriority, sizeof(memPriority));
+                    }
                 }
             }
         }
 
         m_impl->m_processStates.clear();
 
-        // Clear callbacks
-        m_impl->m_optimizationCallbacks.clear();
-        m_impl->m_resourceCallbacks.clear();
-        m_impl->m_errorCallbacks.clear();
+        // Disable throttling (internal, no extra lock)
+        m_impl->DisableThrottlingInternal();
 
         m_impl->m_isBoosted.store(false, std::memory_order_release);
-        m_impl->m_throttlingActive.store(false, std::memory_order_release);
         m_impl->m_status = OptimizerStatus::Stopped;
+
+        lock.unlock();
+
+        // Clear callbacks under callback mutex
+        {
+            std::lock_guard cbLock(m_impl->m_callbackMutex);
+            m_impl->m_optimizationCallbacks.clear();
+            m_impl->m_resourceCallbacks.clear();
+            m_impl->m_errorCallbacks.clear();
+        }
 
         Utils::Logger::Info("PerformanceOptimizer shut down");
 
@@ -636,6 +1362,9 @@ PerformanceOptimizer::GetConfiguration() const {
         // Get profile settings
         ProfileSettings settings = GetProfileSettings(profile);
 
+        // PO-C3: Store profile before applying so GetCurrentProfile() is up-to-date
+        m_impl->m_currentProfile.store(profile, std::memory_order_release);
+
         // Apply custom settings
         return ApplyCustomSettings(settings);
 
@@ -661,30 +1390,25 @@ PerformanceOptimizer::GetConfiguration() const {
         uint32_t processesModified = 0;
         uint64_t memoryFreed = 0;
 
-        // Enumerate all processes
-        DWORD processes[1024];
-        DWORD bytesNeeded = 0;
-
-        if (!::EnumProcesses(processes, sizeof(processes), &bytesNeeded)) {
+        // Fix #18: Use heap-allocated EnumProcesses with retry loop
+        auto pids = EnumAllProcesses();
+        if (pids.empty()) {
             result.errorMessage = "Failed to enumerate processes";
             return result;
         }
 
-        size_t processCount = bytesNeeded / sizeof(DWORD);
-
         // Apply to ShadowStrike processes
-        for (size_t i = 0; i < processCount; ++i) {
-            DWORD pid = processes[i];
+        for (DWORD pid : pids) {
             if (pid == 0) continue;
 
-            HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+            // Fix #15: RAII handle
+            ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
             if (!hProcess) continue;
 
             // Get process name
             wchar_t processPath[MAX_PATH] = {};
             DWORD pathSize = MAX_PATH;
-            if (!::QueryFullProcessImageNameW(hProcess, 0, processPath, &pathSize)) {
-                ::CloseHandle(hProcess);
+            if (!::QueryFullProcessImageNameW(hProcess.get(), 0, processPath, &pathSize)) {
                 continue;
             }
 
@@ -695,18 +1419,18 @@ PerformanceOptimizer::GetConfiguration() const {
             bool isExcluded = m_impl->IsProcessExcluded(processName);
 
             if (!isShadowStrike || isExcluded) {
-                ::CloseHandle(hProcess);
                 continue;
             }
 
             // Save original state if not already saved
+            // Fix #4: SaveProcessState no longer locks internally
             if (m_impl->m_processStates.find(pid) == m_impl->m_processStates.end()) {
-                m_impl->SaveProcessState(pid, hProcess);
+                m_impl->SaveProcessState(pid, hProcess.get());
             }
 
             // Apply priority
             DWORD winPriority = GetWindowsPriorityClass(settings.processPriority);
-            if (::SetPriorityClass(hProcess, winPriority)) {
+            if (::SetPriorityClass(hProcess.get(), winPriority)) {
                 auto& state = m_impl->m_processStates[pid];
                 state.currentPriority = settings.processPriority;
                 state.isModified = true;
@@ -714,41 +1438,56 @@ PerformanceOptimizer::GetConfiguration() const {
                 m_impl->m_stats.priorityChanges++;
             }
 
-            // Apply I/O priority
+            // Fix #5 + #16: Apply I/O priority with proper translation and error check
             if (auto ntSetInfo = GetNtSetInformationProcess()) {
-                ULONG ioPriority = static_cast<ULONG>(settings.ioPriority);
-                ntSetInfo(hProcess, ProcessIoPriority, &ioPriority, sizeof(ioPriority));
+                ULONG ioPriority = ToWindowsIOPriority(settings.ioPriority);
+                NTSTATUS ntStatus = ntSetInfo(hProcess.get(), SS_ProcessIoPriority,
+                                              &ioPriority, sizeof(ioPriority));
+                if (ntStatus != 0) {
+                    Utils::Logger::Warn("NtSetInformationProcess(IoPriority) failed for "
+                                        "PID {}: NTSTATUS 0x{:08X}", pid,
+                                        static_cast<uint32_t>(ntStatus));
+                }
             }
 
-            // Apply memory priority
+            // Fix #14 + #16: Apply memory priority with explicit lookup and error check
             if (auto ntSetInfo = GetNtSetInformationProcess()) {
-                MEMORY_PRIORITY_INFORMATION memPriority{};
-                memPriority.MemoryPriority = 5 - static_cast<ULONG>(settings.memoryPriority);
-                ntSetInfo(hProcess, ProcessMemoryPriority, &memPriority, sizeof(memPriority));
+                SS_MEMORY_PRIORITY_INFORMATION memPriority{};
+                memPriority.MemoryPriority = ToWindowsMemoryPriority(settings.memoryPriority);
+                NTSTATUS ntStatus = ntSetInfo(hProcess.get(), SS_ProcessMemoryPriority,
+                                              &memPriority, sizeof(memPriority));
+                if (ntStatus != 0) {
+                    Utils::Logger::Warn("NtSetInformationProcess(MemoryPriority) failed for "
+                                        "PID {}: NTSTATUS 0x{:08X}", pid,
+                                        static_cast<uint32_t>(ntStatus));
+                }
             }
 
             // Apply CPU affinity if efficiency cores requested
             if (settings.useEfficiencyCoresOnly) {
                 uint64_t efficiencyMask = GetEfficiencyCoresMask();
                 if (efficiencyMask != 0) {
-                    ::SetProcessAffinityMask(hProcess, efficiencyMask);
+                    ::SetProcessAffinityMask(hProcess.get(), efficiencyMask);
                     auto& state = m_impl->m_processStates[pid];
                     state.currentAffinityMask = efficiencyMask;
                 }
             }
 
-            ::CloseHandle(hProcess);
+            // ScopedHandle releases hProcess automatically
         }
 
-        // Trim working set if requested
+        // Trim working set if requested (does not lock m_mutex)
         if (settings.trimWorkingSet) {
+            lock.unlock();
             memoryFreed = TrimWorkingSet();
+            lock.lock();
         }
 
-        // Enable throttling
+        // Fix #3: Call EnableThrottlingInternal (no lock) instead of
+        // EnableThrottling (which would deadlock by re-locking m_mutex)
         if (settings.throttle.diskThroughputMBps > 0 ||
             settings.throttle.cpuUsageLimit < 100) {
-            EnableThrottling(settings.throttle);
+            m_impl->EnableThrottlingInternal(settings.throttle);
         }
 
         // Update state
@@ -797,29 +1536,29 @@ PerformanceOptimizer::GetConfiguration() const {
         for (auto& [pid, state] : m_impl->m_processStates) {
             if (!state.isModified) continue;
 
-            HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+            // Fix #15: RAII handle
+            ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
             if (!hProcess) continue;
 
             // Restore priority
             DWORD winPriority = GetWindowsPriorityClass(state.originalPriority);
-            if (::SetPriorityClass(hProcess, winPriority)) {
+            if (::SetPriorityClass(hProcess.get(), winPriority)) {
                 state.currentPriority = state.originalPriority;
                 processesRestored++;
             }
 
             // Restore affinity
             if (state.currentAffinityMask != state.originalAffinityMask) {
-                ::SetProcessAffinityMask(hProcess, state.originalAffinityMask);
+                ::SetProcessAffinityMask(hProcess.get(), state.originalAffinityMask);
                 state.currentAffinityMask = state.originalAffinityMask;
             }
 
             state.isModified = false;
-
-            ::CloseHandle(hProcess);
+            // ScopedHandle releases hProcess automatically
         }
 
-        // Disable throttling
-        DisableThrottling();
+        // Fix #3: Use internal variant to avoid re-locking deadlock
+        m_impl->DisableThrottlingInternal();
 
         // Update state
         m_impl->m_isBoosted.store(false, std::memory_order_release);
@@ -869,19 +1608,21 @@ PerformanceOptimizer::GetConfiguration() const {
     ProcessPriorityClass priority)
 {
     try {
-        HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+        // Fix #15: RAII handle
+        ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
             return false;
         }
 
         DWORD winPriority = GetWindowsPriorityClass(priority);
-        bool success = ::SetPriorityClass(hProcess, winPriority) != 0;
+        bool success = ::SetPriorityClass(hProcess.get(), winPriority) != 0;
 
         if (success) {
             std::unique_lock lock(m_impl->m_mutex);
 
+            // Fix #4: SaveProcessState assumes lock is held
             if (m_impl->m_processStates.find(pid) == m_impl->m_processStates.end()) {
-                m_impl->SaveProcessState(pid, hProcess);
+                m_impl->SaveProcessState(pid, hProcess.get());
             }
 
             auto& state = m_impl->m_processStates[pid];
@@ -891,7 +1632,6 @@ PerformanceOptimizer::GetConfiguration() const {
             m_impl->m_stats.priorityChanges++;
         }
 
-        ::CloseHandle(hProcess);
         return success;
 
     } catch (const std::exception& e) {
@@ -905,7 +1645,8 @@ PerformanceOptimizer::GetConfiguration() const {
     IOPriority priority)
 {
     try {
-        HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+        // Fix #15: RAII handle
+        ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
             return false;
         }
@@ -913,10 +1654,19 @@ PerformanceOptimizer::GetConfiguration() const {
         bool success = false;
 
         if (auto ntSetInfo = GetNtSetInformationProcess()) {
-            ULONG ioPriority = static_cast<ULONG>(priority);
-            NTSTATUS status = ntSetInfo(hProcess, ProcessIoPriority,
+            // Fix #5: Use translation function
+            ULONG ioPriority = ToWindowsIOPriority(priority);
+            // Fix #6: Use ULONG constant
+            // Fix #16: Check NTSTATUS return
+            NTSTATUS status = ntSetInfo(hProcess.get(), SS_ProcessIoPriority,
                                        &ioPriority, sizeof(ioPriority));
             success = (status == 0);
+
+            if (!success) {
+                Utils::Logger::Warn("NtSetInformationProcess(IoPriority) failed for "
+                                    "PID {}: NTSTATUS 0x{:08X}", pid,
+                                    static_cast<uint32_t>(status));
+            }
 
             if (success) {
                 std::unique_lock lock(m_impl->m_mutex);
@@ -925,7 +1675,6 @@ PerformanceOptimizer::GetConfiguration() const {
             }
         }
 
-        ::CloseHandle(hProcess);
         return success;
 
     } catch (const std::exception& e) {
@@ -939,7 +1688,8 @@ PerformanceOptimizer::GetConfiguration() const {
     MemoryPriority priority)
 {
     try {
-        HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+        // Fix #15: RAII handle
+        ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
             return false;
         }
@@ -947,12 +1697,21 @@ PerformanceOptimizer::GetConfiguration() const {
         bool success = false;
 
         if (auto ntSetInfo = GetNtSetInformationProcess()) {
-            MEMORY_PRIORITY_INFORMATION memPriority{};
-            memPriority.MemoryPriority = 5 - static_cast<ULONG>(priority);
+            SS_MEMORY_PRIORITY_INFORMATION memPriority{};
+            // Fix #14: Explicit switch-based translation
+            memPriority.MemoryPriority = ToWindowsMemoryPriority(priority);
 
-            NTSTATUS status = ntSetInfo(hProcess, ProcessMemoryPriority,
+            // Fix #6: Use ULONG constant
+            // Fix #16: Check NTSTATUS return
+            NTSTATUS status = ntSetInfo(hProcess.get(), SS_ProcessMemoryPriority,
                                        &memPriority, sizeof(memPriority));
             success = (status == 0);
+
+            if (!success) {
+                Utils::Logger::Warn("NtSetInformationProcess(MemoryPriority) failed for "
+                                    "PID {}: NTSTATUS 0x{:08X}", pid,
+                                    static_cast<uint32_t>(status));
+            }
 
             if (success) {
                 std::unique_lock lock(m_impl->m_mutex);
@@ -961,7 +1720,6 @@ PerformanceOptimizer::GetConfiguration() const {
             }
         }
 
-        ::CloseHandle(hProcess);
         return success;
 
     } catch (const std::exception& e) {
@@ -970,31 +1728,60 @@ PerformanceOptimizer::GetConfiguration() const {
     }
 }
 
+/**
+ * Fix #17: Validate affinity mask against system affinity before applying.
+ * Fix #15: Use ScopedHandle for RAII.
+ */
 [[nodiscard]] bool PerformanceOptimizer::SetCPUAffinity(
     uint32_t pid,
     uint64_t affinityMask)
 {
     try {
-        HANDLE hProcess = m_impl->OpenProcessWithPrivileges(pid);
+        // Fix #17: Validate mask is non-zero
+        if (affinityMask == 0) {
+            Utils::Logger::Error("SetCPUAffinity: affinity mask must be non-zero");
+            return false;
+        }
+
+        // Fix #15: RAII handle
+        ScopedHandle hProcess(m_impl->OpenProcessWithPrivileges(pid));
         if (!hProcess) {
             return false;
         }
 
-        bool success = ::SetProcessAffinityMask(hProcess, affinityMask) != 0;
+        // Fix #17: Query system affinity and validate mask is a valid subset
+        DWORD_PTR processAffinity = 0, systemAffinity = 0;
+        if (!::GetProcessAffinityMask(hProcess.get(), &processAffinity, &systemAffinity)) {
+            Utils::Logger::Error("SetCPUAffinity: GetProcessAffinityMask failed for "
+                                 "PID {}: error {}", pid, ::GetLastError());
+            return false;
+        }
+
+        if ((affinityMask & systemAffinity) != affinityMask) {
+            Utils::Logger::Error("SetCPUAffinity: requested mask 0x{:X} is not a "
+                                 "subset of system affinity 0x{:X}",
+                                 affinityMask, static_cast<uint64_t>(systemAffinity));
+            return false;
+        }
+
+        bool success = ::SetProcessAffinityMask(hProcess.get(), affinityMask) != 0;
 
         if (success) {
             std::unique_lock lock(m_impl->m_mutex);
 
+            // Fix #4: SaveProcessState assumes lock is held
             if (m_impl->m_processStates.find(pid) == m_impl->m_processStates.end()) {
-                m_impl->SaveProcessState(pid, hProcess);
+                m_impl->SaveProcessState(pid, hProcess.get());
             }
 
             auto& state = m_impl->m_processStates[pid];
             state.currentAffinityMask = affinityMask;
             state.isModified = true;
+        } else {
+            Utils::Logger::Error("SetProcessAffinityMask failed for PID {}: error {}",
+                                 pid, ::GetLastError());
         }
 
-        ::CloseHandle(hProcess);
         return success;
 
     } catch (const std::exception& e) {
@@ -1033,59 +1820,105 @@ PerformanceOptimizer::GetModifiedProcesses() const {
 // MEMORY MANAGEMENT
 // ============================================================================
 
+/**
+ * Fix #1: processesT rimmed -> processesTrimmed
+ * Fix #7: Add blocklist for system-critical processes, skip excluded, skip foreground
+ * Fix #15: Use ScopedHandle
+ * Fix #18: Use heap-allocated EnumProcesses
+ */
 [[nodiscard]] uint64_t PerformanceOptimizer::TrimWorkingSet() {
     try {
         Utils::Logger::Info("Trimming working sets...");
 
         uint64_t totalFreed = 0;
-        uint32_t processesT rimmed = 0;
+        uint32_t processesTrimmed = 0;
 
-        // Enumerate processes
-        DWORD processes[1024];
-        DWORD bytesNeeded = 0;
-
-        if (!::EnumProcesses(processes, sizeof(processes), &bytesNeeded)) {
+        // Fix #18: Heap-allocated EnumProcesses with retry
+        auto pids = EnumAllProcesses();
+        if (pids.empty()) {
             return 0;
         }
 
-        size_t processCount = bytesNeeded / sizeof(DWORD);
+        // Fix #7: Determine the foreground window's process to skip it
+        DWORD foregroundPid = 0;
+        HWND hForeground = ::GetForegroundWindow();
+        if (hForeground) {
+            ::GetWindowThreadProcessId(hForeground, &foregroundPid);
+        }
 
-        for (size_t i = 0; i < processCount; ++i) {
-            DWORD pid = processes[i];
+        // Get config exclusions under a shared lock
+        std::vector<std::wstring> excludedProcesses;
+        {
+            std::shared_lock lock(m_impl->m_mutex);
+            excludedProcesses = m_impl->m_config.excludedProcesses;
+        }
+
+        for (DWORD pid : pids) {
             if (pid == 0) continue;
 
-            HANDLE hProcess = ::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA,
-                                           FALSE, pid);
+            // Fix #7: Skip the foreground process
+            if (pid == foregroundPid) continue;
+
+            // Fix #15: RAII handle
+            ScopedHandle hProcess(::OpenProcess(
+                PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA,
+                FALSE, pid));
             if (!hProcess) continue;
+
+            // Fix #7: Get process name and check blocklist/exclusions
+            wchar_t processPath[MAX_PATH] = {};
+            DWORD pathSize = MAX_PATH;
+            std::wstring processName;
+            if (::QueryFullProcessImageNameW(hProcess.get(), 0, processPath, &pathSize)) {
+                processName = std::filesystem::path(processPath).filename().wstring();
+            } else {
+                // Cannot determine name; skip to be safe
+                continue;
+            }
+
+            // Skip system-critical processes
+            if (IsSystemCriticalProcess(processName)) {
+                continue;
+            }
+
+            // Skip excluded processes from config
+            bool excluded = false;
+            for (const auto& excl : excludedProcesses) {
+                if (_wcsicmp(processName.c_str(), excl.c_str()) == 0) {
+                    excluded = true;
+                    break;
+                }
+            }
+            if (excluded) continue;
 
             // Get memory info before
             PROCESS_MEMORY_COUNTERS pmc{};
             pmc.cb = sizeof(PROCESS_MEMORY_COUNTERS);
             uint64_t before = 0;
 
-            if (::GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+            if (::GetProcessMemoryInfo(hProcess.get(), &pmc, sizeof(pmc))) {
                 before = pmc.WorkingSetSize;
             }
 
             // Trim working set
-            if (::EmptyWorkingSet(hProcess)) {
+            if (::EmptyWorkingSet(hProcess.get())) {
                 // Get memory info after
-                if (::GetProcessMemoryInfo(hProcess, &pmc, sizeof(pmc))) {
+                if (::GetProcessMemoryInfo(hProcess.get(), &pmc, sizeof(pmc))) {
                     uint64_t after = pmc.WorkingSetSize;
                     if (before > after) {
                         totalFreed += (before - after) / (1024 * 1024);
-                        processesT rimmed++;
+                        processesTrimmed++;
                     }
                 }
             }
 
-            ::CloseHandle(hProcess);
+            // ScopedHandle releases hProcess automatically
         }
 
         m_impl->m_stats.workingSetTrims++;
         m_impl->m_stats.totalMemoryFreedMB += totalFreed;
 
-        Utils::Logger::Info("Trimmed {} processes, freed {} MB", processesT rimmed, totalFreed);
+        Utils::Logger::Info("Trimmed {} processes, freed {} MB", processesTrimmed, totalFreed);
         return totalFreed;
 
     } catch (const std::exception& e) {
@@ -1094,18 +1927,58 @@ PerformanceOptimizer::GetModifiedProcesses() const {
     }
 }
 
+/**
+ * Fix #9: Implement real cache flush using SetSystemFileCacheSize with
+ * SE_INCREASE_QUOTA_NAME privilege. Falls back to EmptyWorkingSet on self
+ * if the privilege is not available.
+ */
 void PerformanceOptimizer::FlushCaches() {
     try {
         Utils::Logger::Info("Flushing system caches");
 
-        // Set system cache working set size to minimum
-        SYSTEM_CACHE_INFORMATION cacheInfo{};
-        cacheInfo.MinimumWorkingSet = static_cast<SIZE_T>(-1);
-        cacheInfo.MaximumWorkingSet = static_cast<SIZE_T>(-1);
+        // Attempt to enable SE_INCREASE_QUOTA_NAME privilege
+        bool hasPrivilege = EnablePrivilege(SE_INCREASE_QUOTA_NAME);
 
-        // This would require SE_INCREASE_QUOTA_NAME privilege
-        // For now, just trim our own working set
-        TrimWorkingSet();
+        if (hasPrivilege) {
+            // Use SetSystemFileCacheSize to flush standby page list.
+            // Passing (SIZE_T)-1 for both min and max with flags = 0
+            // resets the system file cache working set limits, which
+            // forces the memory manager to trim the cache.
+            SIZE_T minCache = 0, maxCache = 0;
+            DWORD flags = 0;
+
+            // First, get current settings so we can restore them
+            if (::GetSystemFileCacheSize(&minCache, &maxCache, &flags)) {
+                // Flush by setting both to -1 (no limit), which releases cache
+                if (!::SetSystemFileCacheSize(static_cast<SIZE_T>(-1),
+                                              static_cast<SIZE_T>(-1), 0)) {
+                    Utils::Logger::Warn("SetSystemFileCacheSize flush failed: error {}",
+                                        ::GetLastError());
+                } else {
+                    // Restore original cache limits
+                    ::SetSystemFileCacheSize(minCache, maxCache, flags);
+                    Utils::Logger::Info("System file cache flushed successfully");
+                }
+            } else {
+                Utils::Logger::Warn("GetSystemFileCacheSize failed: error {}",
+                                    ::GetLastError());
+            }
+        } else {
+            Utils::Logger::Warn("SE_INCREASE_QUOTA_NAME privilege not available; "
+                                "falling back to EmptyWorkingSet on self");
+
+            // Fall back to trimming our own working set
+            ScopedHandle hSelf(::OpenProcess(PROCESS_SET_QUOTA, FALSE,
+                                             ::GetCurrentProcessId()));
+            if (hSelf) {
+                if (::EmptyWorkingSet(hSelf.get())) {
+                    Utils::Logger::Info("Emptied own working set as cache flush fallback");
+                } else {
+                    Utils::Logger::Warn("EmptyWorkingSet on self failed: error {}",
+                                        ::GetLastError());
+                }
+            }
+        }
 
     } catch (const std::exception& e) {
         Utils::Logger::Error("FlushCaches failed: {}", e.what());
@@ -1119,7 +1992,7 @@ void PerformanceOptimizer::FlushCaches() {
         uint64_t totalFreed = TrimWorkingSet();
 
         if (totalFreed < targetMB && m_impl->m_config.enableAggressiveMemoryRelease) {
-            // Additional aggressive techniques could go here
+            // Additional aggressive techniques
             FlushCaches();
         }
 
@@ -1151,27 +2024,56 @@ void PerformanceOptimizer::FlushCaches() {
 // THROTTLING
 // ============================================================================
 
+/**
+ * Fix #3 / #10: Public EnableThrottling locks, then delegates to internal.
+ */
 void PerformanceOptimizer::EnableThrottling(const ThrottleSettings& settings) {
     std::unique_lock lock(m_impl->m_mutex);
-
-    m_impl->m_throttleSettings = settings;
-    m_impl->m_throttlingActive.store(true, std::memory_order_release);
-    m_impl->m_stats.throttleActivations++;
-
-    Utils::Logger::Info("Throttling enabled: {} MB/s disk, {}% CPU",
-                       settings.diskThroughputMBps, settings.cpuUsageLimit);
+    m_impl->EnableThrottlingInternal(settings);
 }
 
+/**
+ * Fix #3 / #10: Public DisableThrottling locks, then delegates to internal.
+ */
 void PerformanceOptimizer::DisableThrottling() {
     std::unique_lock lock(m_impl->m_mutex);
-
-    m_impl->m_throttlingActive.store(false, std::memory_order_release);
-
-    Utils::Logger::Info("Throttling disabled");
+    m_impl->DisableThrottlingInternal();
 }
 
 [[nodiscard]] bool PerformanceOptimizer::IsThrottlingActive() const noexcept {
     return m_impl->m_throttlingActive.load(std::memory_order_acquire);
+}
+
+/**
+ * Fix #10: ShouldThrottleScan implementation.
+ * Uses a sliding-window token-bucket approach. Returns true if the scan
+ * should be deferred (i.e., rate limit exceeded). Returns false if scanning
+ * is permitted.
+ */
+[[nodiscard]] bool PerformanceOptimizer::ShouldThrottleScan() const {
+    if (!m_impl->m_throttlingActive.load(std::memory_order_acquire)) {
+        return false;
+    }
+
+    std::lock_guard lock(m_impl->m_scanRateMutex);
+
+    auto now = Clock::now();
+    auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+        now - m_impl->m_scanWindowStart).count();
+
+    // Reset window every second
+    if (elapsed >= 1) {
+        m_impl->m_scanWindowStart = now;
+        m_impl->m_scansThisSecond = 0;
+    }
+
+    uint32_t current = m_impl->m_scansThisSecond;
+    if (current >= m_impl->m_scanRateLimit) {
+        return true; // Throttle: rate exceeded
+    }
+
+    m_impl->m_scansThisSecond = current + 1;
+    return false; // Scan permitted
 }
 
 [[nodiscard]] ThrottleSettings PerformanceOptimizer::GetThrottleSettings() const {
@@ -1294,9 +2196,12 @@ void PerformanceOptimizer::StopResourceMonitoring() {
             settings.deferBackgroundWork = true;
             break;
 
-        case OptimizationProfile::Custom:
+        // Fix #13: Add braces around Custom case to give the local variable
+        // its own scope, preventing jump-over-initialization warnings
+        case OptimizationProfile::Custom: {
             std::shared_lock lock(m_impl->m_mutex);
             return m_impl->m_customProfile;
+        }
     }
 
     return settings;
@@ -1310,31 +2215,32 @@ void PerformanceOptimizer::SetCustomProfile(const ProfileSettings& settings) {
 
 // ============================================================================
 // CALLBACKS
+// Fix #12: All callback registration/unregistration uses m_callbackMutex
 // ============================================================================
 
 void PerformanceOptimizer::RegisterOptimizationCallback(OptimizationCallback callback) {
     if (!callback) return;
 
-    std::unique_lock lock(m_impl->m_mutex);
+    std::lock_guard lock(m_impl->m_callbackMutex);
     m_impl->m_optimizationCallbacks.push_back(std::move(callback));
 }
 
 void PerformanceOptimizer::RegisterResourceCallback(ResourceCallback callback) {
     if (!callback) return;
 
-    std::unique_lock lock(m_impl->m_mutex);
+    std::lock_guard lock(m_impl->m_callbackMutex);
     m_impl->m_resourceCallbacks.push_back(std::move(callback));
 }
 
 void PerformanceOptimizer::RegisterErrorCallback(ErrorCallback callback) {
     if (!callback) return;
 
-    std::unique_lock lock(m_impl->m_mutex);
+    std::lock_guard lock(m_impl->m_callbackMutex);
     m_impl->m_errorCallbacks.push_back(std::move(callback));
 }
 
 void PerformanceOptimizer::UnregisterCallbacks() {
-    std::unique_lock lock(m_impl->m_mutex);
+    std::lock_guard lock(m_impl->m_callbackMutex);
 
     m_impl->m_optimizationCallbacks.clear();
     m_impl->m_resourceCallbacks.clear();
@@ -1405,6 +2311,20 @@ void PerformanceOptimizer::ResetStatistics() {
             }
         }
 
+        // Test 5: I/O priority translation sanity
+        if (ToWindowsIOPriority(IOPriority::VeryLow) != 0 ||
+            ToWindowsIOPriority(IOPriority::Critical) != 4) {
+            Utils::Logger::Error("Self-test failed: I/O priority translation");
+            allPassed = false;
+        }
+
+        // Test 6: Memory priority translation sanity
+        if (ToWindowsMemoryPriority(MemoryPriority::VeryHigh) != 5 ||
+            ToWindowsMemoryPriority(MemoryPriority::Lowest) != 1) {
+            Utils::Logger::Error("Self-test failed: Memory priority translation");
+            allPassed = false;
+        }
+
         if (allPassed) {
             Utils::Logger::Info("Self-test PASSED - All tests successful");
         } else {
@@ -1419,7 +2339,10 @@ void PerformanceOptimizer::ResetStatistics() {
     }
 }
 
-[[nodiscard]] std::string PerformanceOptimizer::GetVersionString() noexcept {
+/**
+ * Fix #20: Removed noexcept since std::to_string can throw.
+ */
+[[nodiscard]] std::string PerformanceOptimizer::GetVersionString() {
     return std::to_string(OptimizerConstants::VERSION_MAJOR) + "." +
            std::to_string(OptimizerConstants::VERSION_MINOR) + "." +
            std::to_string(OptimizerConstants::VERSION_PATCH);
@@ -1471,15 +2394,15 @@ void OptimizerStatistics::Reset() noexcept {
     Json j = Json::object();
 
     j["processId"] = processId;
-    j["processName"] = Utils::StringUtils::WideToUtf8(processName);
+    j["processName"] = Utils::StringUtils::ToNarrow(processName);
     j["originalPriority"] = static_cast<int>(originalPriority);
     j["currentPriority"] = static_cast<int>(currentPriority);
     j["originalIOPriority"] = static_cast<int>(originalIOPriority);
     j["currentIOPriority"] = static_cast<int>(currentIOPriority);
     j["originalMemoryPriority"] = static_cast<int>(originalMemoryPriority);
     j["currentMemoryPriority"] = static_cast<int>(currentMemoryPriority);
-    j["originalAffinityMask"] = Utils::StringUtils::ToHexString(originalAffinityMask);
-    j["currentAffinityMask"] = Utils::StringUtils::ToHexString(currentAffinityMask);
+    j["originalAffinityMask"] = std::format("0x{:X}", originalAffinityMask);
+    j["currentAffinityMask"] = std::format("0x{:X}", currentAffinityMask);
     j["isModified"] = isModified;
 
     return j.dump(2);
@@ -1628,19 +2551,77 @@ void OptimizerStatistics::Reset() noexcept {
     }
 }
 
+/**
+ * Fix #11: Implement using GetSystemCpuSetInformation API (Windows 10 1803+).
+ * Falls back to heuristic only if the API is unavailable.
+ * Queries EfficiencyClass field from SYSTEM_CPU_SET_INFORMATION to
+ * accurately identify efficiency cores on hybrid architectures (Intel 12th+).
+ */
 [[nodiscard]] uint64_t GetEfficiencyCoresMask() {
-    // This is a simplified implementation
-    // Real implementation would use CPUID or Windows CPU topology API
-    // For now, assume lower cores are efficiency cores on hybrid CPUs
+    // Try the proper API first
+    static auto pGetSystemCpuSetInformation =
+        reinterpret_cast<GetSystemCpuSetInformationFunc>(
+            ::GetProcAddress(::GetModuleHandleW(L"kernel32.dll"),
+                             "GetSystemCpuSetInformation"));
 
+    if (pGetSystemCpuSetInformation) {
+        ULONG requiredLength = 0;
+
+        // Query required buffer size
+        pGetSystemCpuSetInformation(nullptr, 0, &requiredLength, nullptr, 0);
+        if (requiredLength > 0 && requiredLength < 1024 * 1024) {
+            std::vector<uint8_t> buffer(requiredLength);
+            ULONG returnedLength = 0;
+
+            if (pGetSystemCpuSetInformation(
+                    reinterpret_cast<SS_SYSTEM_CPU_SET_INFORMATION*>(buffer.data()),
+                    requiredLength, &returnedLength, nullptr, 0)) {
+
+                uint64_t efficiencyMask = 0;
+                bool hasHybrid = false;
+                ULONG offset = 0;
+
+                // Iterate through the variable-length array of CPU set entries
+                while (offset + sizeof(SS_SYSTEM_CPU_SET_INFORMATION) <= returnedLength) {
+                    const auto* info = reinterpret_cast<const SS_SYSTEM_CPU_SET_INFORMATION*>(
+                        buffer.data() + offset);
+
+                    if (info->Size == 0) break; // Safety: avoid infinite loop
+
+                    // Type 0 = CpuSetInformation
+                    if (info->Type == 0) {
+                        // EfficiencyClass > 0 means efficiency core on Intel hybrid
+                        if (info->CpuSet.EfficiencyClass > 0) {
+                            uint8_t logicalIndex = info->CpuSet.LogicalProcessorIndex;
+                            if (logicalIndex < 64) {
+                                efficiencyMask |= (1ULL << logicalIndex);
+                            }
+                            hasHybrid = true;
+                        }
+                    }
+
+                    offset += info->Size;
+                }
+
+                if (hasHybrid && efficiencyMask != 0) {
+                    return efficiencyMask;
+                }
+
+                // If no hybrid topology detected, the system is homogeneous.
+                // Fall through to fallback below.
+            }
+        }
+    }
+
+    // Fallback: heuristic for non-hybrid or pre-1803 systems
     SYSTEM_INFO sysInfo{};
     ::GetSystemInfo(&sysInfo);
 
     uint32_t numCores = sysInfo.dwNumberOfProcessors;
 
-    // Assume half are efficiency cores (simplified)
+    // For 8+ core homogeneous systems, assume last 4 cores are less
+    // critical for foreground tasks
     if (numCores >= 8) {
-        // For 8+ core systems, assume last 4 cores are E-cores
         uint64_t mask = 0;
         for (uint32_t i = numCores - 4; i < numCores; ++i) {
             mask |= (1ULL << i);
@@ -1648,20 +2629,23 @@ void OptimizerStatistics::Reset() noexcept {
         return mask;
     }
 
-    // For smaller systems, return all cores
+    // For smaller systems, return all cores (no efficiency core distinction)
     return (1ULL << numCores) - 1;
 }
 
 [[nodiscard]] uint64_t GetPerformanceCoresMask() {
-    // Complement of efficiency cores
+    // Complement of efficiency cores within the system's logical processor set
     SYSTEM_INFO sysInfo{};
     ::GetSystemInfo(&sysInfo);
 
     uint32_t numCores = sysInfo.dwNumberOfProcessors;
-    uint64_t allCores = (1ULL << numCores) - 1;
+    uint64_t allCores = (numCores >= 64) ? ~0ULL : ((1ULL << numCores) - 1);
     uint64_t eCores = GetEfficiencyCoresMask();
 
-    return allCores & ~eCores;
+    uint64_t pCores = allCores & ~eCores;
+    // If masking out E-cores would leave nothing (homogeneous system),
+    // return all cores
+    return (pCores != 0) ? pCores : allCores;
 }
 
 }  // namespace ShadowStrike::GameMode
