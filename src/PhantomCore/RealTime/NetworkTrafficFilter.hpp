@@ -1518,6 +1518,17 @@ public:
      */
     void ResetStats();
 
+#ifdef SHADOWSTRIKE_FUZZING
+    /**
+     * @brief Clear transient runtime state for per-iteration fuzz isolation.
+     *
+     * Keeps configuration, rules, blocklists, and callbacks intact while
+     * resetting tracked connections, recent DNS/event history, beacon trackers,
+     * and associated counters.
+     */
+    void ResetFuzzingState();
+#endif
+
     /**
      * @brief Get bandwidth usage for process.
      */

@@ -1530,6 +1530,27 @@ void NetworkTrafficFilter::ResetStats() {
     // Keep activeConnections as-is (reflects live state)
 }
 
+#ifdef SHADOWSTRIKE_FUZZING
+void NetworkTrafficFilter::ResetFuzzingState() {
+    {
+        std::scoped_lock stateLock(
+            m_impl->m_connectionMutex,
+            m_impl->m_historyMutex,
+            m_impl->m_dnsMutex,
+            m_impl->m_eventMutex,
+            m_impl->m_beaconMutex);
+        m_impl->m_connections.clear();
+        m_impl->m_connectionHistory.clear();
+        m_impl->m_eventHistory.clear();
+        m_impl->m_recentDNS.clear();
+        m_impl->m_beaconTrackers.clear();
+    }
+
+    ResetStats();
+    m_impl->m_statActiveConnections.store(0, std::memory_order_relaxed);
+}
+#endif
+
 std::pair<uint64_t, uint64_t> NetworkTrafficFilter::GetProcessBandwidth(uint32_t pid) const {
     std::shared_lock lock(m_impl->m_connectionMutex);
     uint64_t sent = 0, received = 0;
