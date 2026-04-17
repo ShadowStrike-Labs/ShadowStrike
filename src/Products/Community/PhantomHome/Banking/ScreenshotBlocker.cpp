@@ -788,9 +788,9 @@ namespace ShadowStrike::Banking {
             DWORD affinity = WDA_NONE;
 
             if (IsExcludeFromCaptureSupported() && m_config.useEnhancedAffinity) {
-                affinity = ScreenshotConstants::WDA_EXCLUDEFROMCAPTURE;
+                affinity = ScreenshotConstants::kWdaExcludeFromCapture;
             } else {
-                affinity = ScreenshotConstants::WDA_MONITOR;
+                affinity = ScreenshotConstants::kWdaMonitor;
             }
 
             if (::SetWindowDisplayAffinity(hwnd, affinity)) {
@@ -798,8 +798,8 @@ namespace ShadowStrike::Banking {
             }
 
             // Fallback: if WDA_EXCLUDEFROMCAPTURE fails, try WDA_MONITOR
-            if (affinity == ScreenshotConstants::WDA_EXCLUDEFROMCAPTURE) {
-                if (::SetWindowDisplayAffinity(hwnd, ScreenshotConstants::WDA_MONITOR)) {
+            if (affinity == ScreenshotConstants::kWdaExcludeFromCapture) {
+                if (::SetWindowDisplayAffinity(hwnd, ScreenshotConstants::kWdaMonitor)) {
                     return true;
                 }
             }

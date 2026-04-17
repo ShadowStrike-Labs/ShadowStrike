@@ -139,15 +139,15 @@
 // SHADOWSTRIKE INFRASTRUCTURE INCLUDES
 // ============================================================================
 
-#include "../../../PhantomCore/Utils/Logger.hpp"
-#include "../../../PhantomCore/Utils/NetworkUtils.hpp"
-#include "../../../PhantomCore/Utils/CryptoUtils.hpp"
-#include "../../../PhantomCore/Utils/HashUtils.hpp"
-#include "../../../PhantomCore/Utils/StringUtils.hpp"
-#include "../../../PhantomCore/HashStore/HashStore.hpp"
-#include "../../../PhantomCore/PatternStore/PatternStore.hpp"
-#include "../../../PhantomCore/ThreatIntel/ThreatIntelManager.hpp"
-#include "../../../PhantomCore/Whitelist/WhiteListStore.hpp"
+#include "../Utils/Logger.hpp"
+#include "../Utils/NetworkUtils.hpp"
+#include "../Utils/CryptoUtils.hpp"
+#include "../Utils/HashUtils.hpp"
+#include "../Utils/StringUtils.hpp"
+#include "../HashStore/HashStore.hpp"
+#include "../PatternStore/PatternStore.hpp"
+#include "../ThreatIntel/ThreatIntelManager.hpp"
+#include "../Whitelist/WhiteListStore.hpp"
 
 // ============================================================================
 // FORWARD DECLARATIONS

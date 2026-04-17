@@ -993,7 +993,7 @@ public:
             if (!suspicious) continue;
 
             KeyboardHookInfo info{};
-            info.hookType = KeyboardHookType::WH_KEYBOARD_LL;
+            info.hookType = KeyboardHookType::Hook_KeyboardLL;
             info.processId = processId;
             info.moduleName = modName;
             info.hookProc = reinterpret_cast<uint64_t>(me32.modBaseAddr);
@@ -1801,10 +1801,10 @@ std::string_view GetKeyloggerTypeName(KeyloggerType type) noexcept {
 std::string_view GetKeyboardHookTypeName(KeyboardHookType type) noexcept {
     switch (type) {
         case KeyboardHookType::Unknown:          return "Unknown";
-        case KeyboardHookType::WH_KEYBOARD:      return "WH_KEYBOARD";
-        case KeyboardHookType::WH_KEYBOARD_LL:   return "WH_KEYBOARD_LL";
-        case KeyboardHookType::WH_JOURNALRECORD: return "WH_JOURNALRECORD";
-        case KeyboardHookType::WH_GETMESSAGE:    return "WH_GETMESSAGE";
+        case KeyboardHookType::Hook_Keyboard:     return "WH_KEYBOARD";
+        case KeyboardHookType::Hook_KeyboardLL:   return "WH_KEYBOARD_LL";
+        case KeyboardHookType::Hook_JournalRecord: return "WH_JOURNALRECORD";
+        case KeyboardHookType::Hook_GetMessage:   return "WH_GETMESSAGE";
         case KeyboardHookType::RawInputDevice:    return "RawInputDevice";
         case KeyboardHookType::DirectInputHook:   return "DirectInputHook";
     }
