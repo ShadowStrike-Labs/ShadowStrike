@@ -345,7 +345,6 @@
     <ClCompile Include="src\PhantomCore\API\Http\HttpTypes.cpp" />
     <ClCompile Include="src\PhantomCore\API\Http\HttpServer.cpp" />
     <ClCompile Include="src\PhantomCore\API\RESTServer.cpp" />
-    <ClCompile Include="src\PhantomCore\UI\SystemTray.cpp" />
     <ClCompile Include="src\PhantomCore\Config\ConfigManager.cpp" />
     <ClCompile Include="src\PhantomCore\Config\PolicyManager.cpp" />
     <ClCompile Include="src\PhantomCore\Config\ProductTier.cpp" />
@@ -889,7 +888,6 @@
     <ClInclude Include="src\PhantomCore\API\Http\HttpTypes.hpp" />
     <ClInclude Include="src\PhantomCore\API\Http\HttpServer.hpp" />
     <ClInclude Include="src\PhantomCore\API\RESTServer.hpp" />
-    <ClInclude Include="src\PhantomCore\UI\SystemTray.hpp" />
     <ClInclude Include="src\PhantomCore\Config\ConfigManager.hpp" />
     <ClInclude Include="src\PhantomCore\Config\PolicyManager.hpp" />
     <ClInclude Include="src\PhantomCore\Config\ProductTier.hpp" />

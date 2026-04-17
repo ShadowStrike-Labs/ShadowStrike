@@ -372,11 +372,16 @@ CLAUDE.md
 DAILY_MODULE_ROADMAP.md
 SHADOWSTRIKE_3_YEAR_ROADMAP.md
 
-# --- Commercial Product Tiers (NEVER push to public repo) ---
+# --- Commercial / Private (NEVER push to public repo) ---
 # Phantom Pro and Enterprise contain proprietary commercial code.
 # Only Community/ is open-source and tracked by git.
 src/Products/Pro/
 src/Products/Enterprise/
+
+# Cloud dashboard, cloud backend, and driver signing material.
+dashboard-cloud/
+cloud-backend/
+WDK/
 
 # .github — only allow FUNDING.yml and workflows/
 .github/*

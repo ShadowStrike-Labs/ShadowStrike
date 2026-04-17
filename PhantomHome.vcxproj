@@ -159,6 +159,7 @@
     <ClCompile Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.cpp" />
     <ClCompile Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\UI\SystemTray.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\BankingTrojanDetectorWiring.cpp" />
@@ -640,6 +641,7 @@
     <ClInclude Include="src\PhantomCore\AntiEvasion\TimeBasedEvasionDetector.hpp" />
     <ClInclude Include="src\PhantomCore\AntiEvasion\VMEvasionDetector.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.hpp" />
+    <ClInclude Include="src\Products\Community\PhantomHome\UI\SystemTray.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupManager.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\BackupScheduler.hpp" />
     <ClInclude Include="src\Products\Community\PhantomHome\Backup\IncrementalBackup.hpp" />

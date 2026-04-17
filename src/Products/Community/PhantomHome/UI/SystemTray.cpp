@@ -17,7 +17,7 @@
  */
 
 #include "pch.h"
-#include "PhantomCore/UI/SystemTray.hpp"
+#include "Products/Community/PhantomHome/UI/SystemTray.hpp"
 
 // ============================================================================
 // STANDARD LIBRARY
