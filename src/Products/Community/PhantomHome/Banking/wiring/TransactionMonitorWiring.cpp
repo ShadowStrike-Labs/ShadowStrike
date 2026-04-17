@@ -29,6 +29,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "../../HomeProductOrchestrator.hpp"
 #include "../TransactionMonitor.hpp"
 

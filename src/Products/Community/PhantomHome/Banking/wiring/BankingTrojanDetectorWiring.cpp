@@ -30,6 +30,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "../../HomeProductOrchestrator.hpp"
 #include "../BankingTrojanDetector.hpp"
 

@@ -58,6 +58,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "../HomeProductOrchestrator.hpp"
 #include "IPLeakProtection.hpp"
 

@@ -29,6 +29,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "../HomeProductOrchestrator.hpp"
 #include "../../../../PhantomCore/Utils/Logger.hpp"
 

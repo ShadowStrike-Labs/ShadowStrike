@@ -9,6 +9,8 @@
  * @brief Implementation of the PhantomHome lifecycle orchestrator.
  */
 
+#include "pch.h"
+
 #include "HomeProductOrchestrator.hpp"
 
 #include "Config/HomeConfigRegistration.hpp"

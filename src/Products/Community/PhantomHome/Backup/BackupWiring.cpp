@@ -45,6 +45,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "../HomeProductOrchestrator.hpp"
 #include "BackupManager.hpp"
 

@@ -32,6 +32,8 @@
  * ============================================================================
  */
 
+#include "pch.h"
+
 #include "CertificatePinning.hpp"
 #include "../Utils/Logger.hpp"
 #include "../Utils/StringUtils.hpp"
