@@ -61,6 +61,9 @@
 #include "TimelineAnalyzer.hpp"
 
 #include <algorithm>
+#include <array>
+#include <cmath>
+#include <cstring>
 #include <sstream>
 #include <iomanip>
 #include <fstream>
@@ -151,6 +154,258 @@ struct ProcessGenealogy {
     std::vector<uint32_t> children;
     int depth;
 };
+
+#ifdef _WIN32
+constexpr ULONG SS_ProcessBasicInformation = 0;
+constexpr size_t MAX_PROCESS_LINEAGE_DEPTH = 64;
+
+typedef NTSTATUS(NTAPI* NtQueryInformationProcessFn)(
+    HANDLE ProcessHandle,
+    ULONG ProcessInformationClass,
+    PVOID ProcessInformation,
+    ULONG ProcessInformationLength,
+    PULONG ReturnLength
+);
+
+struct SS_PROCESS_BASIC_INFORMATION {
+    PVOID Reserved1;
+    PVOID PebBaseAddress;
+    PVOID Reserved2[2];
+    ULONG_PTR UniqueProcessId;
+    ULONG_PTR InheritedFromUniqueProcessId;
+};
+
+struct ScopedHandle {
+    HANDLE handle = nullptr;
+
+    explicit ScopedHandle(HANDLE value = nullptr) noexcept
+        : handle(value) {
+    }
+
+    ~ScopedHandle() {
+        if (handle && handle != INVALID_HANDLE_VALUE) {
+            ::CloseHandle(handle);
+        }
+    }
+
+    ScopedHandle(const ScopedHandle&) = delete;
+    ScopedHandle& operator=(const ScopedHandle&) = delete;
+
+    ScopedHandle(ScopedHandle&& other) noexcept
+        : handle(other.handle) {
+        other.handle = nullptr;
+    }
+
+    ScopedHandle& operator=(ScopedHandle&& other) noexcept {
+        if (this != &other) {
+            if (handle && handle != INVALID_HANDLE_VALUE) {
+                ::CloseHandle(handle);
+            }
+            handle = other.handle;
+            other.handle = nullptr;
+        }
+        return *this;
+    }
+
+    [[nodiscard]] HANDLE get() const noexcept {
+        return handle;
+    }
+
+    [[nodiscard]] explicit operator bool() const noexcept {
+        return handle && handle != INVALID_HANDLE_VALUE;
+    }
+};
+
+[[nodiscard]] NtQueryInformationProcessFn GetNtQueryInformationProcess() noexcept {
+    static NtQueryInformationProcessFn function =
+        reinterpret_cast<NtQueryInformationProcessFn>(
+            ::GetProcAddress(::GetModuleHandleW(L"ntdll.dll"), "NtQueryInformationProcess"));
+    return function;
+}
+
+[[nodiscard]] FileTime WindowsFileTimeToUint64(const FILETIME& fileTime) noexcept {
+    ULARGE_INTEGER value{};
+    value.LowPart = fileTime.dwLowDateTime;
+    value.HighPart = fileTime.dwHighDateTime;
+    return value.QuadPart;
+}
+
+[[nodiscard]] bool TryGetProcessImagePath(HANDLE processHandle, std::wstring& imagePath) {
+    constexpr DWORD MAX_PROCESS_PATH_CHARS = 32768;
+
+    std::wstring buffer(MAX_PATH, L'\0');
+    while (buffer.size() <= MAX_PROCESS_PATH_CHARS) {
+        DWORD size = static_cast<DWORD>(buffer.size());
+        if (::QueryFullProcessImageNameW(processHandle, 0, buffer.data(), &size)) {
+            buffer.resize(size);
+            imagePath = std::move(buffer);
+            return true;
+        }
+
+        if (::GetLastError() != ERROR_INSUFFICIENT_BUFFER) {
+            break;
+        }
+
+        buffer.resize(buffer.size() * 2, L'\0');
+    }
+
+    wchar_t moduleName[MAX_PATH] = {};
+    if (::GetModuleBaseNameW(processHandle, nullptr, moduleName,
+                             static_cast<DWORD>(std::size(moduleName))) != 0) {
+        imagePath.assign(moduleName);
+        return true;
+    }
+
+    return false;
+}
+
+[[nodiscard]] bool TryGetProcessStartTime(HANDLE processHandle, FileTime& startTime) noexcept {
+    FILETIME creationTime{};
+    FILETIME exitTime{};
+    FILETIME kernelTime{};
+    FILETIME userTime{};
+    if (!::GetProcessTimes(processHandle, &creationTime, &exitTime, &kernelTime, &userTime)) {
+        return false;
+    }
+
+    startTime = WindowsFileTimeToUint64(creationTime);
+    return true;
+}
+#endif
+
+[[nodiscard]] std::string FormatStixTimestamp(SystemTimePoint timePoint) {
+    const auto secondsPoint = std::chrono::time_point_cast<std::chrono::seconds>(timePoint);
+    const auto milliseconds = std::chrono::duration_cast<std::chrono::milliseconds>(
+        timePoint - secondsPoint).count();
+    const std::time_t rawTime = std::chrono::system_clock::to_time_t(secondsPoint);
+
+    std::tm utcTime{};
+#ifdef _WIN32
+    gmtime_s(&utcTime, &rawTime);
+#else
+    utcTime = *std::gmtime(&rawTime);
+#endif
+
+    std::ostringstream oss;
+    oss << std::put_time(&utcTime, "%Y-%m-%dT%H:%M:%S")
+        << '.'
+        << std::setw(3) << std::setfill('0') << milliseconds
+        << 'Z';
+    return oss.str();
+}
+
+[[nodiscard]] std::string FormatStixTimestamp(FileTime fileTime) {
+    return FormatStixTimestamp(TimelineAnalyzer::FileTimeToSystemTime(fileTime));
+}
+
+[[nodiscard]] std::string NormalizeTechniquePath(std::string_view techniqueId) {
+    std::string normalized(techniqueId);
+    std::replace(normalized.begin(), normalized.end(), '.', '/');
+    return normalized;
+}
+
+[[nodiscard]] std::string ToStixKillChainPhase(MitreTactic tactic) {
+    switch (tactic) {
+        case MitreTactic::InitialAccess:       return "initial-access";
+        case MitreTactic::Execution:           return "execution";
+        case MitreTactic::Persistence:         return "persistence";
+        case MitreTactic::PrivilegeEscalation: return "privilege-escalation";
+        case MitreTactic::DefenseEvasion:      return "defense-evasion";
+        case MitreTactic::CredentialAccess:    return "credential-access";
+        case MitreTactic::Discovery:           return "discovery";
+        case MitreTactic::LateralMovement:     return "lateral-movement";
+        case MitreTactic::Collection:          return "collection";
+        case MitreTactic::CommandAndControl:   return "command-and-control";
+        case MitreTactic::Exfiltration:        return "exfiltration";
+        case MitreTactic::Impact:              return "impact";
+        default:                               return {};
+    }
+}
+
+[[nodiscard]] std::string BuildChainSeed(const AttackChain& chain) {
+    std::ostringstream oss;
+    oss << chain.chainId << '|'
+        << chain.chainName << '|'
+        << chain.startTime << '|'
+        << chain.endTime << '|'
+        << chain.durationMs << '|'
+        << chain.confidenceScore << '|'
+        << static_cast<int>(chain.confidence) << '|'
+        << Utils::StringUtils::ToNarrow(chain.initialAccessVector) << '|'
+        << Utils::StringUtils::ToNarrow(chain.finalObjective) << '|'
+        << chain.summary;
+
+    for (const auto eventId : chain.eventIds) {
+        oss << "|event:" << eventId;
+    }
+
+    for (const auto& technique : chain.techniques) {
+        oss << "|technique:"
+            << technique.techniqueId << ':'
+            << technique.techniqueName << ':'
+            << static_cast<int>(technique.tactic) << ':'
+            << technique.firstOccurrence << ':'
+            << technique.lastOccurrence << ':'
+            << technique.occurrenceCount << ':'
+            << technique.confidence;
+    }
+
+    for (const auto& link : chain.causalLinks) {
+        oss << "|link:"
+            << link.sourceEventId << ':'
+            << link.targetEventId << ':'
+            << static_cast<int>(link.relationType) << ':'
+            << link.confidence << ':'
+            << link.evidence;
+    }
+
+    return oss.str();
+}
+
+[[nodiscard]] std::string BuildDeterministicUuidV5(std::string_view name) {
+    constexpr std::array<uint8_t, 16> SHADOWSTRIKE_STIX_NAMESPACE = {
+        0x49, 0x89, 0x64, 0x1f, 0x83, 0x1d, 0x5f, 0x92,
+        0x96, 0xfd, 0x34, 0x17, 0x7c, 0x86, 0x6e, 0x9a
+    };
+
+    std::array<uint8_t, 16> uuidBytes = SHADOWSTRIKE_STIX_NAMESPACE;
+
+    std::vector<uint8_t> hashInput;
+    hashInput.reserve(SHADOWSTRIKE_STIX_NAMESPACE.size() + name.size());
+    hashInput.insert(hashInput.end(),
+                     SHADOWSTRIKE_STIX_NAMESPACE.begin(),
+                     SHADOWSTRIKE_STIX_NAMESPACE.end());
+    hashInput.insert(hashInput.end(), name.begin(), name.end());
+
+    std::vector<uint8_t> digest;
+    if (!Utils::HashUtils::Compute(Utils::HashUtils::Algorithm::SHA1,
+                                   hashInput.data(),
+                                   hashInput.size(),
+                                   digest) ||
+        digest.size() < uuidBytes.size()) {
+        throw std::runtime_error("SHA-1 computation failed for deterministic STIX UUID");
+    }
+
+    std::memcpy(uuidBytes.data(), digest.data(), uuidBytes.size());
+    uuidBytes[6] = static_cast<uint8_t>((uuidBytes[6] & 0x0F) | 0x50);
+    uuidBytes[8] = static_cast<uint8_t>((uuidBytes[8] & 0x3F) | 0x80);
+
+    std::ostringstream oss;
+    oss << std::hex << std::setfill('0');
+    for (size_t i = 0; i < uuidBytes.size(); ++i) {
+        oss << std::setw(2) << static_cast<unsigned>(uuidBytes[i]);
+        if (i == 3 || i == 5 || i == 7 || i == 9) {
+            oss << '-';
+        }
+    }
+
+    return oss.str();
+}
+
+[[nodiscard]] std::string BuildStixId(std::string_view objectType, std::string_view seed) {
+    return std::string(objectType) + "--" +
+           BuildDeterministicUuidV5(std::string(objectType) + ":" + std::string(seed));
+}
 
 } // anonymous namespace
 
@@ -790,32 +1045,81 @@ std::vector<ProcessNode> TimelineAnalyzerImpl::GetProcessLineage(uint32_t pid) {
 
     try {
 #ifdef _WIN32
+        if (pid == 0 || pid == 4) {
+            return lineage;
+        }
+
+        const auto ntQueryInformationProcess = GetNtQueryInformationProcess();
+        if (!ntQueryInformationProcess) {
+            Logger::Error("[TimelineAnalyzer] NtQueryInformationProcess unavailable; cannot build lineage for PID {}", pid);
+            return lineage;
+        }
+
         uint32_t currentPid = pid;
         std::set<uint32_t> visited;  // Prevent cycles
 
-        while (currentPid != 0 && visited.find(currentPid) == visited.end()) {
-            visited.insert(currentPid);
+        for (size_t depth = 0;
+             currentPid != 0 && currentPid != 4 && depth < MAX_PROCESS_LINEAGE_DEPTH;
+             ++depth) {
 
-            HANDLE hProcess = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, currentPid);
+            if (!visited.insert(currentPid).second) {
+                Logger::Warn("[TimelineAnalyzer] Detected cycle while building lineage for PID {}", pid);
+                break;
+            }
+
+            ScopedHandle hProcess(::OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | PROCESS_VM_READ,
+                                                FALSE,
+                                                currentPid));
             if (!hProcess) {
+                Logger::Debug("[TimelineAnalyzer] OpenProcess failed for PID {} while building lineage", currentPid);
                 break;
             }
 
             ProcessNode node;
             node.pid = currentPid;
 
-            wchar_t processName[MAX_PATH] = {};
-            DWORD size = MAX_PATH;
-            if (QueryFullProcessImageNameW(hProcess, 0, processName, &size)) {
-                node.processPath = processName;
-                node.processName = std::filesystem::path(processName).filename().wstring();
+            if (TryGetProcessImagePath(hProcess.get(), node.processPath)) {
+                node.processName = std::filesystem::path(node.processPath).filename().wstring();
+            } else {
+                Logger::Debug("[TimelineAnalyzer] Unable to resolve image path for PID {}", currentPid);
             }
 
-            lineage.push_back(node);
+            if (!TryGetProcessStartTime(hProcess.get(), node.creationTime)) {
+                Logger::Debug("[TimelineAnalyzer] Unable to resolve creation time for PID {}", currentPid);
+            }
 
-            // Get parent PID (simplified - would use NtQueryInformationProcess in production)
-            CloseHandle(hProcess);
-            break;  // Stop for now
+            SS_PROCESS_BASIC_INFORMATION processInfo{};
+            ULONG returnLength = 0;
+            const NTSTATUS status = ntQueryInformationProcess(
+                hProcess.get(),
+                SS_ProcessBasicInformation,
+                &processInfo,
+                static_cast<ULONG>(sizeof(processInfo)),
+                &returnLength);
+
+            if (status < 0) {
+                Logger::Warn("[TimelineAnalyzer] NtQueryInformationProcess failed for PID {} with status 0x{:08X}",
+                             currentPid,
+                             static_cast<uint32_t>(status));
+                lineage.push_back(std::move(node));
+                break;
+            }
+
+            node.parentPid = static_cast<uint32_t>(processInfo.InheritedFromUniqueProcessId);
+            lineage.push_back(std::move(node));
+
+            if (processInfo.InheritedFromUniqueProcessId == 0 ||
+                processInfo.InheritedFromUniqueProcessId == 4) {
+                break;
+            }
+
+            currentPid = static_cast<uint32_t>(processInfo.InheritedFromUniqueProcessId);
+        }
+
+        if (lineage.size() >= MAX_PROCESS_LINEAGE_DEPTH) {
+            Logger::Warn("[TimelineAnalyzer] Reached maximum lineage depth ({}) for PID {}",
+                         MAX_PROCESS_LINEAGE_DEPTH,
+                         pid);
         }
 #endif
 
@@ -985,27 +1289,172 @@ bool TimelineAnalyzerImpl::ExportProcessTree(std::span<const ProcessNode> tree, 
 }
 
 bool TimelineAnalyzerImpl::ExportToSTIX(const AttackChain& chain, std::wstring_view outputPath) {
-    // STIX 2.1 export - simplified implementation
     try {
-        nlohmann::json stix;
-        stix["type"] = "bundle";
-        stix["id"] = "bundle--" + chain.chainId;
-        stix["objects"] = nlohmann::json::array();
-
-        // Add attack pattern objects
-        for (const auto& technique : chain.techniques) {
-            nlohmann::json pattern;
-            pattern["type"] = "attack-pattern";
-            pattern["id"] = "attack-pattern--" + technique.techniqueId;
-            pattern["name"] = technique.techniqueName;
-            stix["objects"].push_back(pattern);
+        if (outputPath.empty()) {
+            Logger::Warn("[TimelineAnalyzer] ExportToSTIX called with empty output path");
+            return false;
         }
 
-        std::ofstream file(outputPath.data());
-        file << stix.dump(2);
-        file.close();
+        const auto now = std::chrono::system_clock::now();
+        const std::string chainSeed = BuildChainSeed(chain);
+        const SystemTimePoint createdTime =
+            chain.startTime != 0 ? TimelineAnalyzer::FileTimeToSystemTime(chain.startTime) : now;
+        const SystemTimePoint modifiedTime =
+            chain.endTime != 0 ? TimelineAnalyzer::FileTimeToSystemTime(chain.endTime) : createdTime;
+        const std::string created = FormatStixTimestamp(createdTime);
+        const std::string modified = FormatStixTimestamp(modifiedTime);
 
-        return true;
+        nlohmann::json bundle;
+        bundle["type"] = "bundle";
+        bundle["id"] = BuildStixId("bundle", chainSeed);
+        bundle["spec_version"] = "2.1";
+        bundle["objects"] = nlohmann::json::array();
+
+        const std::string observedDataId = BuildStixId("observed-data", chainSeed + "|observed");
+        nlohmann::json observedData = {
+            {"type", "observed-data"},
+            {"spec_version", "2.1"},
+            {"id", observedDataId},
+            {"created", created},
+            {"modified", modified},
+            {"first_observed", chain.startTime != 0 ? FormatStixTimestamp(chain.startTime) : created},
+            {"last_observed", chain.endTime != 0 ? FormatStixTimestamp(chain.endTime) : modified},
+            {"number_observed", std::max<size_t>(1, chain.eventIds.empty() ? chain.techniques.size() : chain.eventIds.size())},
+            {"x_shadowstrike_chain_id", chain.chainId},
+            {"x_shadowstrike_chain_name", chain.chainName},
+            {"x_shadowstrike_summary", chain.summary},
+            {"x_shadowstrike_event_ids", chain.eventIds}
+        };
+        bundle["objects"].push_back(observedData);
+
+        std::string indicatorPattern = "[x-shadowstrike-attack-chain:chain_id = '" +
+            (chain.chainId.empty() ? chainSeed : chain.chainId) + "']";
+        nlohmann::json indicator = {
+            {"type", "indicator"},
+            {"spec_version", "2.1"},
+            {"id", BuildStixId("indicator", chainSeed + "|indicator")},
+            {"created", created},
+            {"modified", modified},
+            {"name", chain.chainName.empty() ? "ShadowStrike reconstructed attack chain" : chain.chainName},
+            {"description", chain.summary.empty()
+                ? "Attack chain reconstructed by ShadowStrike TimelineAnalyzer."
+                : chain.summary},
+            {"indicator_types", nlohmann::json::array({"malicious-activity"})},
+            {"pattern_type", "stix"},
+            {"pattern_version", "2.1"},
+            {"valid_from", created},
+            {"pattern", indicatorPattern},
+            {"labels", nlohmann::json::array({"shadowstrike", "timeline", "forensics"})}
+        };
+        if (chain.confidenceScore > 0.0) {
+            indicator["confidence"] = std::clamp(
+                static_cast<int>(std::lround(chain.confidenceScore * 100.0)),
+                0,
+                100);
+        }
+        bundle["objects"].push_back(indicator);
+
+        const std::string indicatorId = indicator["id"].get<std::string>();
+        bundle["objects"].push_back(nlohmann::json{
+            {"type", "relationship"},
+            {"spec_version", "2.1"},
+            {"id", BuildStixId("relationship", chainSeed + "|indicator-based-on-observed")},
+            {"created", created},
+            {"modified", modified},
+            {"relationship_type", "based-on"},
+            {"source_ref", indicatorId},
+            {"target_ref", observedDataId},
+            {"description", "ShadowStrike indicator derived from reconstructed observed activity."}
+        });
+
+        std::string previousAttackPatternId;
+        for (size_t index = 0; index < chain.techniques.size(); ++index) {
+            const auto& technique = chain.techniques[index];
+            const std::string techniqueSeed = chainSeed + "|technique|" + std::to_string(index) + "|" +
+                technique.techniqueId + "|" + technique.techniqueName;
+            const std::string attackPatternId = BuildStixId("attack-pattern", techniqueSeed);
+
+            nlohmann::json attackPattern = {
+                {"type", "attack-pattern"},
+                {"spec_version", "2.1"},
+                {"id", attackPatternId},
+                {"created", created},
+                {"modified", modified},
+                {"name", technique.techniqueName.empty() ? technique.techniqueId : technique.techniqueName},
+                {"description", std::string("Technique observed in reconstructed ShadowStrike attack chain: ") +
+                    (technique.techniqueId.empty() ? "unknown-technique" : technique.techniqueId)},
+                {"x_shadowstrike_event_ids", technique.eventIds},
+                {"x_shadowstrike_first_observed", technique.firstOccurrence != 0 ? FormatStixTimestamp(technique.firstOccurrence) : created},
+                {"x_shadowstrike_last_observed", technique.lastOccurrence != 0 ? FormatStixTimestamp(technique.lastOccurrence) : modified}
+            };
+
+            if (!technique.techniqueId.empty()) {
+                attackPattern["external_references"] = nlohmann::json::array({
+                    {
+                        {"source_name", "mitre-attack"},
+                        {"external_id", technique.techniqueId},
+                        {"url", "https://attack.mitre.org/techniques/" + NormalizeTechniquePath(technique.techniqueId) + "/"}
+                    }
+                });
+            }
+
+            const auto killChainPhase = ToStixKillChainPhase(technique.tactic);
+            if (!killChainPhase.empty()) {
+                attackPattern["kill_chain_phases"] = nlohmann::json::array({
+                    {
+                        {"kill_chain_name", "mitre-attack"},
+                        {"phase_name", killChainPhase}
+                    }
+                });
+            }
+
+            if (technique.confidence > 0.0) {
+                attackPattern["confidence"] = std::clamp(
+                    static_cast<int>(std::lround(technique.confidence * 100.0)),
+                    0,
+                    100);
+            }
+
+            bundle["objects"].push_back(attackPattern);
+
+            bundle["objects"].push_back(nlohmann::json{
+                {"type", "relationship"},
+                {"spec_version", "2.1"},
+                {"id", BuildStixId("relationship", techniqueSeed + "|indicator-indicates")},
+                {"created", created},
+                {"modified", modified},
+                {"relationship_type", "indicates"},
+                {"source_ref", indicatorId},
+                {"target_ref", attackPatternId},
+                {"description", "Indicator evidence is consistent with the mapped ATT&CK technique."}
+            });
+
+            if (!previousAttackPatternId.empty()) {
+                bundle["objects"].push_back(nlohmann::json{
+                    {"type", "relationship"},
+                    {"spec_version", "2.1"},
+                    {"id", BuildStixId("relationship", techniqueSeed + "|sequence")},
+                    {"created", created},
+                    {"modified", modified},
+                    {"relationship_type", "related-to"},
+                    {"source_ref", previousAttackPatternId},
+                    {"target_ref", attackPatternId},
+                    {"description", "Observed chronological technique progression within the reconstructed attack chain."}
+                });
+            }
+
+            previousAttackPatternId = attackPatternId;
+        }
+
+        std::ofstream file(outputPath.data(), std::ios::binary);
+        if (!file) {
+            Logger::Error("[TimelineAnalyzer] Failed to open STIX output file {}",
+                          std::filesystem::path(outputPath).string());
+            return false;
+        }
+
+        file << bundle.dump(2);
+        return file.good();
 
     } catch (const std::exception& e) {
         Logger::Error("[TimelineAnalyzer] ExportToSTIX failed: {}", e.what());
