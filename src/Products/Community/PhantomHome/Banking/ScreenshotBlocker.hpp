@@ -165,14 +165,14 @@ namespace ScreenshotConstants {
     // WINDOWS DISPLAY AFFINITY FLAGS
     // ========================================================================
 
-    /// @brief No display affinity
-    inline constexpr uint32_t WDA_NONE = 0x00000000;
+    /// @brief No display affinity (mirrors WDA_NONE = 0)
+    inline constexpr uint32_t kWdaNone = 0x00000000;
 
-    /// @brief Exclude from monitor (legacy)
-    inline constexpr uint32_t WDA_MONITOR = 0x00000001;
+    /// @brief Exclude from monitor — legacy (mirrors WDA_MONITOR = 1)
+    inline constexpr uint32_t kWdaMonitor = 0x00000001;
 
-    /// @brief Exclude from capture (Windows 10 2004+)
-    inline constexpr uint32_t WDA_EXCLUDEFROMCAPTURE = 0x00000011;
+    /// @brief Exclude from capture, Windows 10 2004+ (mirrors WDA_EXCLUDEFROMCAPTURE = 0x11)
+    inline constexpr uint32_t kWdaExcludeFromCapture = 0x00000011;
 
     // ========================================================================
     // LIMITS

@@ -302,7 +302,12 @@
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductOrchestrator.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\HomeProductEntry.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Backup\BackupWiring.cpp" />
-    <ClCompile Include="src\Products\Community\PhantomHome\Banking\BankingWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\BankingTrojanDetectorWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\SecureBrowserWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\KeyloggerProtectionWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\ScreenshotBlockerWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\CertificatePinningWiring.cpp" />
+    <ClCompile Include="src\Products\Community\PhantomHome\Banking\wiring\TransactionMonitorWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Config\ConfigWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\CryptoMinersProtection\CryptoMinersWiring.cpp" />
     <ClCompile Include="src\Products\Community\PhantomHome\Email\EmailWiring.cpp" />

@@ -249,10 +249,10 @@ enum class KeyloggerType : uint8_t {
  */
 enum class KeyboardHookType : uint8_t {
     Unknown             = 0,
-    WH_KEYBOARD         = 1,    ///< Standard keyboard hook
-    WH_KEYBOARD_LL      = 2,    ///< Low-level keyboard hook
-    WH_JOURNALRECORD    = 3,    ///< Journal record hook
-    WH_GETMESSAGE       = 4,    ///< GetMessage hook
+    Hook_Keyboard       = 1,    ///< Standard keyboard hook (WH_KEYBOARD)
+    Hook_KeyboardLL     = 2,    ///< Low-level keyboard hook (WH_KEYBOARD_LL)
+    Hook_JournalRecord  = 3,    ///< Journal record hook (WH_JOURNALRECORD)
+    Hook_GetMessage     = 4,    ///< GetMessage hook (WH_GETMESSAGE)
     RawInputDevice      = 5,    ///< Raw input registered
     DirectInputHook     = 6     ///< DirectInput hook
 };
