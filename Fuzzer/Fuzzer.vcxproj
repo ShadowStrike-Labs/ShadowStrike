@@ -105,6 +105,7 @@
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorDecoderHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorExecutionHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\EmulatorPEHarness.hpp" />
+    <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\BehaviorHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\IPCHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\ServiceProtocolHarness.hpp" />
     <ClInclude Include="include\ShadowStrike\Fuzzer\Harnesses\TrafficHarness.hpp" />
@@ -129,6 +130,8 @@
     <ClCompile Include="src\EmulatorDecoderHarness.cpp" />
     <ClCompile Include="src\EmulatorExecutionHarness.cpp" />
     <ClCompile Include="src\EmulatorPEHarness.cpp" />
+    <ClCompile Include="src\BehaviorHarness.cpp" />
+    <ClCompile Include="src\BehaviorHarnessDepsStub.cpp" />
     <ClCompile Include="src\IPCHarness.cpp" />
     <ClCompile Include="src\ServiceProtocolHarness.cpp" />
     <ClCompile Include="src\TrafficHarness.cpp" />
@@ -201,11 +204,14 @@
     <ClCompile Include="..\src\PhantomCore\Utils\MemoryUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\StringUtils.cpp" />
     <ClCompile Include="..\src\PhantomCore\Utils\SystemUtils.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Utils\ThreadPool.cpp" />
     <ClCompile Include="..\src\PhantomCore\API\Http\HttpTypes.cpp" />
     <ClCompile Include="..\src\PhantomCore\API\Http\HttpServer.cpp" />
+    <ClCompile Include="..\src\PhantomCore\Core\Engine\BehaviorAnalyzer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Core\FileSystem\FileTypeAnalyzer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Core\Network\TrafficAnalyzer.cpp" />
     <ClCompile Include="..\src\PhantomCore\Communication\ServiceCommunication.cpp" />
+    <ClCompile Include="..\src\PhantomCore\RealTime\BehaviorBlocker.cpp" />
     <ClCompile Include="..\src\PhantomCore\RealTime\NetworkTrafficFilter.cpp" />
     <ClCompile Include="..\src\PhantomCore\SelfProtection\CryptoManager.cpp" />
     <!-- ThreatIntel feed parsers -->
