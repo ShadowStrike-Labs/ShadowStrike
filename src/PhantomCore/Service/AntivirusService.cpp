@@ -70,6 +70,7 @@
 #include "../ThreatIntel/ThreatIntelManager.hpp"
 #include "../ThreatIntel/ThreatIntelStore.hpp"
 #include "../Config/ConfigManager.hpp"
+#include "ProductExtensions.hpp"
 
 // ============================================================================
 // WINDOWS SDK
@@ -354,6 +355,21 @@ public:
                 SS_LOG_INFO(LOG_CATEGORY, L"Update callbacks wired: hot-reload, completion telemetry");
             }
 
+            // ==================================================================
+            // PRODUCT EXTENSION HOOK
+            // ==================================================================
+            // PhantomCore is product-agnostic. If a product binary (PhantomHome,
+            // PhantomEDR, PhantomXDR, ...) registered its orchestrator via a
+            // static initializer in its entry TU, invoke it now. Engine-only
+            // binaries and tests link cleanly because no product registers.
+            //
+            // Failure of a product extension is a hard error: we've already
+            // committed resources and the user expects the product to be up.
+            if (!ProductExtensions::Instance().InitializeProduct()) {
+                SS_LOG_FATAL(LOG_CATEGORY, L"Product extension initialization failed");
+                return false;
+            }
+
             m_initialized = true;
             SS_LOG_INFO(LOG_CATEGORY, L"Service initialization complete");
             return true;
@@ -431,6 +447,11 @@ public:
         ServiceMonitor::Instance().StopMonitoring();
 
         // Shutdown in reverse order
+
+        // Shut down product extension (e.g. PhantomHome orchestrator) FIRST while
+        // PhantomCore subsystems (RealTimeProtection, IPC, Logger) are still live
+        // so product modules can quiesce cleanly. No-op if no product registered.
+        ProductExtensions::Instance().ShutdownProduct();
 
         // Shutdown Communication subsystems first (they depend on IPCManager)
         Communication::ServiceCommunication::Instance().Stop();

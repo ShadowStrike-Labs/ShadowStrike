@@ -366,6 +366,7 @@
     <ClCompile Include="src\PhantomCore\Security\SelfDefense.cpp" />
     <ClCompile Include="src\PhantomCore\Security\TamperProtection.cpp" />
     <ClCompile Include="src\PhantomCore\Service\AntivirusService.cpp" />
+    <ClCompile Include="src\PhantomCore\Service\ProductExtensions.cpp" />
     <ClCompile Include="src\PhantomCore\Service\PerformanceProfiler.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceCommunicator.cpp" />
     <ClCompile Include="src\PhantomCore\Service\ServiceController.cpp" />
@@ -609,6 +610,7 @@
     <ClInclude Include="src\PhantomCore\Performance\NetworkPerformanceMonitor.hpp" />
     <ClInclude Include="src\PhantomCore\Performance\PerformanceProfiler.hpp" />
     <ClInclude Include="src\PhantomCore\Service\AntivirusService.hpp" />
+    <ClInclude Include="src\PhantomCore\Service\ProductExtensions.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceCommunicator.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceController.hpp" />
     <ClInclude Include="src\PhantomCore\Service\ServiceInstaller.hpp" />
