@@ -1044,11 +1044,11 @@ uint64_t LocalTelemetryStoreImpl::GetStorageSizeBytes() const {
 
 TelemetryStats LocalTelemetryStoreImpl::GetStats() const {
     TelemetryStats stats;
-    stats.eventsReceived  = m_eventsReceived.load(std::memory_order_relaxed);
-    stats.eventsStored    = m_eventsStored.load(std::memory_order_relaxed);
-    stats.eventsDropped   = m_eventsDropped.load(std::memory_order_relaxed);
-    stats.eventsFiltered  = m_eventsFiltered.load(std::memory_order_relaxed);
-    stats.purgeCount      = m_purgeCount.load(std::memory_order_relaxed);
+    stats.totalEventsReceived = m_eventsReceived.load(std::memory_order_relaxed);
+    stats.totalEventsStored   = m_eventsStored.load(std::memory_order_relaxed);
+    stats.totalEventsDropped  = m_eventsDropped.load(std::memory_order_relaxed);
+    stats.totalEventsFiltered = m_eventsFiltered.load(std::memory_order_relaxed);
+    stats.purgeCount          = m_purgeCount.load(std::memory_order_relaxed);
 
     for (size_t i = 0; i < kEventCategoryCount; ++i)
         stats.eventsByCategory[i] = m_eventsByCategory[i].load(std::memory_order_relaxed);

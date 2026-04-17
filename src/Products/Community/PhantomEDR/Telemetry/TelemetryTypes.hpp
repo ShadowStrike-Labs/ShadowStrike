@@ -344,10 +344,11 @@ struct QueryResult {
 /// @brief Snapshot of telemetry pipeline counters.
 ///        Values are plain integers copied from internal atomics.
 struct TelemetryStats {
-    uint64_t eventsReceived  = 0;
-    uint64_t eventsStored    = 0;
-    uint64_t eventsDropped   = 0;
-    uint64_t eventsFiltered  = 0;
+    uint64_t totalEventsReceived = 0;
+    uint64_t totalEventsStored   = 0;
+    uint64_t totalEventsDropped  = 0;
+    uint64_t totalEventsFiltered = 0;
+    uint64_t pendingEvents       = 0;   ///< Events queued but not yet flushed
     std::array<uint64_t, kEventCategoryCount> eventsByCategory{};
     uint64_t storageUsedBytes = 0;
     uint64_t purgeCount       = 0;

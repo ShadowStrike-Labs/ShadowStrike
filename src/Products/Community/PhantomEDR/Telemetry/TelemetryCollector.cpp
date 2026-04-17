@@ -294,7 +294,7 @@ void TelemetryCollectorImpl::SubmitProcessEvent(
     ev.processPath     = std::move(processPath);
 
     ProcessEventData data{};
-    data.type        = type;
+    data.subType     = type;
     data.commandLine = std::move(commandLine);
     ev.payload       = std::move(data);
 
@@ -311,7 +311,7 @@ void TelemetryCollectorImpl::SubmitFileEvent(
     ev.processId = pid;
 
     FileEventData data{};
-    data.type     = type;
+    data.subType  = type;
     data.filePath = std::move(filePath);
     ev.payload    = std::move(data);
 
@@ -329,7 +329,7 @@ void TelemetryCollectorImpl::SubmitRegistryEvent(
     ev.processId = pid;
 
     RegistryEventData data{};
-    data.type      = type;
+    data.subType   = type;
     data.keyPath   = std::move(keyPath);
     data.valueName = std::move(valueName);
     ev.payload     = std::move(data);
@@ -349,12 +349,12 @@ void TelemetryCollectorImpl::SubmitNetworkEvent(
     ev.processId = pid;
 
     NetworkEventData data{};
-    data.type          = type;
-    data.remoteAddress = std::move(remoteAddr);
-    data.remotePort    = remotePort;
-    data.localAddress  = std::move(localAddr);
-    data.localPort     = localPort;
-    ev.payload         = std::move(data);
+    data.subType    = type;
+    data.remoteAddr = std::move(remoteAddr);
+    data.remotePort = remotePort;
+    data.localAddr  = std::move(localAddr);
+    data.localPort  = localPort;
+    ev.payload      = std::move(data);
 
     SubmitEvent(std::move(ev));
 }
